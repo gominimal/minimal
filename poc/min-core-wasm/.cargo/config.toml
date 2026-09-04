@@ -1,0 +1,4 @@
+[target.wasm32-unknown-unknown]
+# No rust-lld in this sysroot; lld's wasm flavor is on PATH from the toolchain package.
+linker = "wasm-ld"
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

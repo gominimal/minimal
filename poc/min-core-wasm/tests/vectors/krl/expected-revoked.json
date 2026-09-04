@@ -1,0 +1,17 @@
+{
+  "krl_version": 1,
+  "ca": "ca-user",
+  "revoked_serials": [
+    5,
+    7,
+    8,
+    9
+  ],
+  "not_revoked_probe": [
+    1,
+    2,
+    6,
+    10
+  ],
+  "note": "serial 6 is invalid for a different reason (wrong CA), not revocation"
+}

@@ -1,0 +1,25 @@
+{
+  "serial": 2,
+  "type": "user",
+  "signing_ca": "ca-user",
+  "key_id_json": {
+    "v": 1,
+    "sub": "u:gh:583231",
+    "td": "acme.gatehouse.io",
+    "txn": "01JROOT0000000000000000000",
+    "chain": 1
+  },
+  "valid_principals": [
+    "u:gh:583231",
+    "dev",
+    "m:sbx:01JAAA"
+  ],
+  "valid_after": 1749999970,
+  "valid_before": 1750003600,
+  "actor_chain": [
+    {
+      "sub": "m:sbx:01JAAA"
+    }
+  ],
+  "subject_ckt": "hvL0H9HlCfI2FQIK-MUmS9vA5aPxqseD3JkBPBcUE1I"
+}
