@@ -222,7 +222,7 @@ proves, `nightly` ships.
   `docs/specs/NN-spec-<slug>/NN-spec-<slug>.md`. Start from
   [docs/specs/TEMPLATE.md](docs/specs/TEMPLATE.md); requirements are written as
   EARS and the format is decided in gominimal/foundry.
-- **Prose**: markdown is Vale-linted — `just lint-prose <file.md>` lints just
+- **Prose**: markdown is Vale-linted: `just lint-prose <file.md>` lints just
   the files you touched, bare `just lint-prose` lints the tree. Drive files you
   edit to zero, and leave untouched files' alerts alone rather than
   mass-rewriting them. Project terms go in

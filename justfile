@@ -373,8 +373,7 @@ lint-shell:
 # repo's run. The existing tree is not clean: drive files you touch to zero,
 # leave untouched files' alerts alone.
 #
-# Vale prose-lint tracked markdown; pass files to lint just those
-# (`just lint-prose README.md`).
+# Vale prose-lint tracked markdown (`just lint-prose README.md` for one file).
 lint-prose *args: (_need "vale" "brew install vale (or a release binary: github.com/errata-ai/vale/releases)")
     @[ -d styles/ai-tells ] && [ -d styles/ste ] || vale sync
     @files="{{args}}"; [ -n "$files" ] || files="$(git ls-files '*.md')"; echo "$files" | xargs vale --no-global
