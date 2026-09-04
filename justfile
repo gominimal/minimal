@@ -432,6 +432,14 @@ lint-shell:
 # scripts/verify-smoked.sh reads it back, over a stubbed `gcloud` backed by a
 # directory: no network, no auth. Shellcheck runs too, when present.
 #
+# Not a CI gate — run it when writing or reviewing prose. `vale sync` fetches the
+# packages into styles/ (gitignored) on first use; --no-global keeps a personal
+# ~/.vale.ini from leaking its styles into the repo's run.
+#
+# Vale prose-lint every tracked markdown file (Vale + ste + ai-tells, authored levels).
+lint-prose: (_need "vale" "brew install vale (or a release binary: github.com/errata-ai/vale/releases)")
+    git ls-files '*.md' | xargs vale --no-global
+#
 # Run the promotion gate's test harness (stubbed `gcloud`, no network or auth).
 test-promote-gate:
     #!/usr/bin/env bash
