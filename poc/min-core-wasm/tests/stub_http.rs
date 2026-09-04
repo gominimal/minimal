@@ -39,6 +39,7 @@ async fn start() -> (String, Arc<Stub>) {
                 host_key: host_key.clone(),
                 host_cert: Some(host_cert.clone()),
                 auth: Some(stub2.daemon_auth.clone()),
+                session_socket: None,
             };
             let stub3 = stub2.clone();
             tokio::spawn(async move {

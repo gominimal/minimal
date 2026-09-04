@@ -67,15 +67,29 @@ const t1 = performance.now();
 const att = await attach_wg(
   peer.wsUrl, peer.privateKey, peer.peerPublicKey, peer.localIp, peer.peerIp,
   peer.prefixLen ?? 24, peer.sshPort ?? 22,
-  "sess-headless", "xterm-256color", 100, 30,
+  process.env.MIN_CORE_SESSION_ID ?? "sess-headless", "xterm-256color", 100, 30,
   (bytes) => { buf += new TextDecoder().decode(bytes); check(); },
   (code) => globalThis.__onClose(code),
 );
 const tAttach = performance.now() - t1;
-await expect("attached sess-headless 100x30");
+// Against the fake server the banner is deterministic; against a real
+// daemon (MIN_CORE_SESSION_ID set) any output within the window will do.
+if (process.env.MIN_CORE_SESSION_ID) await expect("", 15000), await new Promise((r) => setTimeout(r, 1500));
+else await expect("attached sess-headless 100x30");
 const tBanner = performance.now() - t1;
 
 const t2 = performance.now();
+if (process.env.MIN_CORE_SESSION_ID) {
+  // A real shell: run a command and look for its output.
+  await att.write(new TextEncoder().encode("echo min-core-$((6*7))\n"));
+  await expect("min-core-42", 15000);
+  const rttReal = performance.now() - t2;
+  console.log(JSON.stringify({ ok: true, mode: "real-daemon", sessionId: process.env.MIN_CORE_SESSION_ID,
+    timingsMs: { instantiate: +tInit.toFixed(1), wsOpenToFirstOutput: +tBanner.toFixed(1), commandRoundTrip: +rttReal.toFixed(1) },
+    firstOutput: buf.slice(0, 400) }, null, 2));
+  await att.close();
+  process.exit(0);
+}
 await att.write(new TextEncoder().encode("ping\n"));
 await expect("echo ping\n");
 const rtt = performance.now() - t2;

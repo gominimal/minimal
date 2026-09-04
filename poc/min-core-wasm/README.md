@@ -106,6 +106,25 @@ headless check measures it end to end).
     cargo run --example wg-peer -- 127.0.0.1:7691 /tmp/peer.json --auth stub
     node js/headless-auth-check.mjs /tmp/peer.json
 
+## Stage 3a: a real `minimald` session in the tab
+
+`wg-peer --session-socket <ssh.sock>` splices the in-tunnel SSH stream onto a
+real daemon's Unix socket instead of the fake server. The stand-in never
+terminates SSH on this path — it sees ciphertext only, like a relay — so the
+daemon authenticates the tab as any UDS client (`Auth::Local`, `auth_none`),
+and `MINIMAL_SESSION_ID` must name a real session. Proven here on
+2026-09-04 against a host-native `minimald` (`just up`) with a session from
+`min session activate` on a small seeded project: the harness in real-daemon
+mode (`MIN_CORE_SESSION_ID=<uuid> node js/headless-check.mjs`) saw the
+session's attach-time output, ran `echo` in the real shell and read the
+answer back — first output 1.6 s after the WebSocket opened, the command
+3.1 s (the attach-time package sync runs first).
+
+    just up                                                  # host-native minimald
+    min --minimal-dir .scratch/native-state session activate . -n tab --no-prompt   # in a seeded project
+    cargo run --example wg-peer -- 127.0.0.1:7691 /tmp/peer.json \
+        --session-socket .scratch/native-state/providers/local-minimald0/ssh.sock
+
 ## Building
 
 Native (tests):

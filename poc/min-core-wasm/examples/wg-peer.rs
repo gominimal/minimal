@@ -5,14 +5,17 @@
 //! fake-minimald russh server on the accepted socket. Prints the peer config
 //! the page passes to `attach_mesh`.
 //!
-//!     cargo run --example wg-peer -- 127.0.0.1:7691 [/tmp/peer.json] [--auth stub]
+//!     cargo run --example wg-peer -- 127.0.0.1:7691 [/tmp/peer.json] [--auth stub | --session-socket <minimald.sock>]
 //!
 //! `--auth stub` (Stage 2): the daemon accepts certificate auth only, decided
 //! by the core's `verify_user_cert` against a throwaway User CA; it presents
 //! a host certificate from a throwaway Host CA; and the same listener serves
 //! the stub's HTTP API (`/ssh/ca`, `/certify`, `/token`, `/mesh/bind`,
-//! `/decisions`) with CORS. Throwaway: keys are generated at startup and
-//! printed; nothing persists.
+//! `/decisions`) with CORS. `--session-socket <path>` (Stage 3a): forward the
+//! in-tunnel SSH stream to a real `minimald` on that socket instead of the
+//! fake server, so the tab attaches to a real session; the page's sessionId
+//! must then be a real session uuid. Throwaway: keys are generated at startup
+//! and printed; nothing persists.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -35,6 +38,13 @@ fn b64(bytes: &[u8]) -> String {
 async fn main() -> anyhow_lite::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let auth_stub = args.windows(2).any(|w| w[0] == "--auth" && w[1] == "stub");
+    let session_socket = args
+        .windows(2)
+        .find(|w| w[0] == "--session-socket")
+        .map(|w| std::path::PathBuf::from(&w[1]));
+    if auth_stub && session_socket.is_some() {
+        return Err("--auth stub terminates SSH here; --session-socket forwards it to a daemon: pick one".into());
+    }
     let positional: Vec<&String> = {
         let mut out = Vec::new();
         let mut skip = false;
@@ -43,7 +53,7 @@ async fn main() -> anyhow_lite::Result<()> {
                 skip = false;
                 continue;
             }
-            if a == "--auth" {
+            if a == "--auth" || a == "--session-socket" {
                 skip = true;
                 continue;
             }
@@ -87,9 +97,18 @@ async fn main() -> anyhow_lite::Result<()> {
             "hostCa": [s.ca.host_ca_public()],
         });
     }
+    if let Some(p) = &session_socket {
+        page_config["sessionSocket"] = serde_json::json!(p.display().to_string());
+    }
     eprintln!(
         "wg-peer: listening on ws://{listen}{}; page config:\n{page_config:#}",
-        if auth_stub { " (certificate auth, stub CA + HTTP API on the same port)" } else { "" }
+        if auth_stub {
+            " (certificate auth, stub CA + HTTP API on the same port)".to_string()
+        } else if let Some(p) = &session_socket {
+            format!(" (forwarding in-tunnel SSH to minimald at {})", p.display())
+        } else {
+            String::new()
+        }
     );
     if let Some(path) = config_out {
         std::fs::write(&path, page_config.to_string())?;
@@ -111,6 +130,7 @@ async fn main() -> anyhow_lite::Result<()> {
             host_key: host_key.clone(),
             host_cert: host_cert.clone(),
             auth: stub.as_ref().map(|s| s.daemon_auth.clone()),
+            session_socket: session_socket.clone(),
         };
         let stub = stub.clone();
         tokio::spawn(async move {

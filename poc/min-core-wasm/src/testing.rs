@@ -258,6 +258,13 @@ pub struct PeerConfig {
     pub host_cert: Option<Certificate>,
     /// `Some`: certificate auth only.
     pub auth: Option<Arc<DaemonAuth>>,
+    /// `Some`: instead of the fake server, forward the in-tunnel SSH byte
+    /// stream to a real `minimald` on this Unix socket. The stand-in never
+    /// terminates SSH on this path — it sees ciphertext only, like a relay —
+    /// so the daemon authenticates the tab as it would any UDS client
+    /// (`Auth::Local`, `auth_none`) and `MINIMAL_SESSION_ID` must name a real
+    /// session on that daemon.
+    pub session_socket: Option<std::path::PathBuf>,
 }
 
 /// Serve one WireGuard-over-WebSocket peer on an accepted TCP connection:
@@ -276,6 +283,7 @@ pub async fn serve_wg_over_ws(
             host_key,
             host_cert: None,
             auth: None,
+            session_socket: None,
         },
     )
     .await
@@ -314,6 +322,7 @@ pub async fn serve_peer_ws(
         host_key,
         host_cert,
         auth,
+        session_socket,
     } = peer;
     let ws = tokio_tungstenite::accept_async(tcp).await?;
     let (mut sink, mut source) = ws.split();
@@ -347,7 +356,14 @@ pub async fn serve_peer_ws(
         },
     );
     children.spawn(driver);
-    let accepted = stack.listen(22);
+    let mut accepted = stack.listen(22);
+    if let Some(path) = session_socket {
+        // Real daemon: splice the in-tunnel TCP stream onto its UDS.
+        let mut unix = tokio::net::UnixStream::connect(&path).await?;
+        let (a, b) = tokio::io::copy_bidirectional(&mut accepted, &mut unix).await?;
+        log::debug!("session socket splice ended: {a} bytes to daemon, {b} bytes to tab");
+        return Ok(());
+    }
     let config = Arc::new(server::Config {
         keys: vec![host_key],
         certificates: host_cert.into_iter().collect(),
