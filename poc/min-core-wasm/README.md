@@ -35,9 +35,10 @@ that number.
   neither knows nor cares that the bytes cross a tunnel.
 - `src/rt.rs`: the only runtime services the network layer needs, clock and
   sleep, tokio natively and `Date.now` + `setTimeout` in a browser.
-- `vendor/boringtun` + `patches/`: boringtun 0.7.1 compiles for wasm with one
-  patch — its sleep-aware clock has unix and windows backends only; the patch
-  adds a `web-time` backend for other targets. Upstreamable.
+- `vendor/boringtun` + `patches/`: boringtun 0.7.1 compiles and *runs* on wasm
+  with one patch: its sleep-aware clock has unix and windows backends only, and
+  its TAI64N handshake stamp calls `std::time::SystemTime::now()`, which panics
+  on `wasm32-unknown-unknown`; both go through `web-time` now. Upstreamable.
 - `tests/wg_roundtrip.rs`: two in-process nodes cross-connected by datagram
   queues; the daemon node listens on TCP/22 inside the tunnel with the
   fake-minimald server, the tab node connects and runs the attach. Handshake,
@@ -49,10 +50,17 @@ that number.
   `attach_wg`.
 - `attach_wg(...)` in `src/web.rs` and `minMeshSocket` in `js/min-socket.mjs`:
   the browser head for the mesh path.
+- `js/headless-check.mjs`: drives the *built bundle* from Node (>= 22, global
+  `WebSocket`) against `wg-peer` exactly as the browser adapter would — the
+  handshake, banner, echo, resize, a 20 KB paste, exit — and prints timings.
+  `MIN_CORE_TRACE=1` logs every WebSocket frame. This is what catches
+  wasm-only failures (`SystemTime::now()` panics, dropped-closure traps)
+  before a browser does.
 
-Run the stand-in and point the page at it:
+Run the stand-in and point the page at it, or the headless check:
 
-    cargo run --example wg-peer -- 127.0.0.1:7691
+    cargo run --example wg-peer -- 127.0.0.1:7691 /tmp/peer.json
+    node js/headless-check.mjs /tmp/peer.json      # needs dist/ (see Building)
     # in the page: minMeshSocket({ peer: <the printed JSON>, sessionId, cols, rows })
 
 Caveats: interop is proven boringtun-to-boringtun (also what `minimald`
@@ -75,7 +83,7 @@ the target's `rust-std` (see the webapp issue).
     RUSTC_BOOTSTRAP=1 CC_wasm32_unknown_unknown=clang \
       cargo build --release --target wasm32-unknown-unknown -Zbuild-std=std,panic_abort
     wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/min_core.wasm
-    wasm-opt -Os -o pkg/min_core_bg.opt.wasm pkg/min_core_bg.wasm   # optional
+    wasm-opt -Os -g -o pkg/min_core_bg.opt.wasm pkg/min_core_bg.wasm   # -g keeps the name section for attributable traps
 
 `.cargo/config.toml` points the target at `wasm-ld` (no `rust-lld` in this
 sysroot) and sets `--cfg getrandom_backend="wasm_js"` for the getrandom 0.4
@@ -127,3 +135,8 @@ With the WireGuard + smoltcp layer (Stage 1b), same pipeline:
 | `min_core.js` glue | 31,492 B | 6,676 B |
 
 The network layer costs 183 KB raw / 91 KB gzip on top of the SSH-only module.
+
+Headless run of the built bundle in Node 24 against `wg-peer` on loopback
+(2026-09-04): instantiate 17 ms; WebSocket open → attach banner 95 ms
+(WireGuard handshake + TCP + SSH kex + auth + env/pty/shell); keystroke round
+trip 0.8 ms; 20 KB paste echoed in 43 ms.

@@ -20,8 +20,9 @@ work yet; that is Stage 2 and needs core changes first.
 All under `poc/min-core-wasm/`:
 
 - `dist/` — the built wasm bundle: `min_core.js` (ES module, wasm-bindgen
-  `--target web`), `min_core_bg.wasm` (1.09 MB raw / 447 KB gzip after
-  wasm-opt), the `.d.ts` files, and `SHA256SUMS`. Vendor these; do not try to
+  `--target web`), `min_core_bg.wasm` (1.44 MB raw / 496 KB gzip: optimized
+  with the `name` section kept so traps are attributable), the `.d.ts` files,
+  and `SHA256SUMS`. Vendor these; do not try to
   build the wasm in your sandbox (the toolchain packages are gominimal/webapp#755).
 - `js/min-socket.mjs` — `minMeshSocket({ peer, sessionId, cols, rows, term })`
   returns a WebSocket-shaped object (`onopen`, `onmessage`, `onclose`, `onerror`,
@@ -98,6 +99,12 @@ for this work.
   core fix pending); report how long until anything is noticed.
 - Browser matrix: Chrome, Firefox, Safari; anything that fails to instantiate.
 - Memory of the tab with the tunnel up.
+
+## Verified before handoff
+
+`js/headless-check.mjs` runs this exact bundle from Node against `wg-peer`
+and passes the full attach (banner, echo, resize, 20 KB paste, exit). If the
+browser fails where Node passes, the difference is the browser.
 
 ## Known gaps — do not work around them in the webapp
 
