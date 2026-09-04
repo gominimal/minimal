@@ -85,6 +85,11 @@ the facade, with no credential in the session.
   verify:   cargo nextest run -p minimal request_outside_repository_set_is_403_before_github
   property: for every repository set, the workbench project plus the declared repositories, and every target repository outside it, the reach decision is a refusal, and the refusal reaches the caller as a 403 with nothing forwarded to GitHub
   harness:  kani_outside_reach_is_refused, exhaustive to 8 declared repositories (unwind bound 9); requires the reach decision to be a pure function over owned repository identifiers, evaluated by the facade before any request is forwarded
+  - IF the repository a request targets cannot be resolved to one identifier
+    THEN THE SYSTEM SHALL refuse the request with a 403 before it reaches
+    GitHub.
+    tier:   T0
+    verify: cargo nextest run -p minimal unresolvable_target_is_refused_before_github
 
 - **GHS-006** WHEN a developer runs the sign-in command THE SYSTEM SHALL show
   the address of a browser page and a short code with which the developer
@@ -165,8 +170,12 @@ the facade, with no credential in the session.
   held for it.
   tier:     T0
   verify:   cargo nextest run -p minimal session_end_stops_addresses_and_discards_credentials
+  - IF a session has ended THEN THE SYSTEM SHALL forward no further request on
+    its behalf, admitted before the end or not.
+    tier:   T0
+    verify: cargo nextest run -p minimal session_end_wins_race_with_forwarding
 
-- **GHS-020** WHILE a session is live THE SYSTEM SHALL hold its GitHub
+- **GHS-020** WHILE a session is live THE SYSTEM SHALL hold its GitHub access
   credential for at most 8 hours before renewing or discarding it.
   tier:     T0
   verify:   cargo nextest run -p minimal facade_credential_held_at_most_8h
@@ -181,6 +190,21 @@ the facade, with no credential in the session.
   SHALL complete git and gh operations from it through the facade.
   tier:     T0
   verify:   cargo nextest run -p minimal github_work_needs_no_github_egress
+
+- **GHS-023** WHEN a request arrives at the facade THE SYSTEM SHALL attribute
+  it to exactly one live session and that session's developer before deciding
+  it.
+  tier:     T0
+  verify:   cargo nextest run -p minimal facade_request_bound_to_one_live_session
+  - IF a request cannot be attributed to a live session, or presents another
+    session's address, THEN THE SYSTEM SHALL refuse it with a 403.
+    tier:   T0
+    verify: cargo nextest run -p minimal cross_session_address_reuse_is_refused
+
+- **GHS-024** THE SYSTEM SHALL hold in the facade only a session's access
+  credential, and never the developer's refresh token.
+  tier:     T0
+  verify:   cargo nextest run -p minimal facade_holds_no_refresh_token
 
 ## Non-goals
 
@@ -217,7 +241,7 @@ the facade, with no credential in the session.
 ## Design reasoning
 
 **Three documents.** One spec per surface owner, decided 2026-09-03: this one
-for the CLI, the daemon and the in-session credential path; the identity
+for the CLI, the daemon and the host-side credential facade; the identity
 plane's for sign-in, minting, renewal and attenuation; the website's for the
 approval page. A single document here with the identity behaviours as open
 questions was the cheaper alternative and would have left the identity half
@@ -259,6 +283,21 @@ of its parent's (GHS-015) and its token is minted for that subset. The reach
 decision being pure and separable from the proxy is what the T2 harnesses
 require.
 
+**What a request targets, and who it belongs to.** A request's target is the
+repository GitHub would resolve it to: owner and name compared the way GitHub
+compares them, with or without a trailing `.git`, in any of the address forms
+git and gh emit. A target the facade cannot resolve is refused, not forwarded
+(the failure edge of GHS-005); requests that name no repository at all, such
+as an identity lookup, are an open question below. Every request is attributed
+to exactly one live session before it is decided (GHS-023), so an address
+handed to one session buys nothing in another; the mechanism that binds a
+request to its session, a per-session address, a per-session placeholder the
+facade recognises, or the source the switch attributes, is part of the
+facade's design and belongs with the architecture question below. The point
+of no return at session end is forwarding: a request already sent to GitHub
+completes, and one admitted but not yet forwarded is refused (the failure edge
+of GHS-019).
+
 **A child session gets a subset of its parent's scope, never more** (GHS-015).
 Whether a child may declare a narrower set, or a running session's set may
 change without a fresh sign-in, was left on 2026-08-20 as something to test
@@ -293,9 +332,9 @@ strongest of the four and the only one under which the session never holds a
 credential, the guest never holds one, a request outside the set is refused
 before it leaves, and access ends with the session (GHS-019). It costs a
 component the architecture of record does not have, a path by which the guest
-daemon reaches it for a child's grant, and the in-session routing of gh, which
-has no base-address override for github.com; the first two are the
-architecture question below, the third an open question here. The facade is
+daemon reaches it for a child's grant, and the in-session routing of gh, whose
+only host override treats its target as an enterprise server; the first two
+are the architecture question below, the third an open question here. The facade is
 transparent to git and gh: standard commands work (GHS-011), which is what the
 2026-08-20 decision required, and the earlier design of a forced in-session
 command stays retired.
@@ -303,7 +342,11 @@ command stays retired.
 **A session's credential expires within 8 hours**, GitHub's own user-token
 expiry (decided 2026-09-03), rather than an open question or a shorter ceiling
 set here at the cost of more renewals. It depends on the App's
-token-expiration setting staying on (Gatehouse §6.4.1).
+token-expiration setting staying on (Gatehouse §6.4.1). That bound is the
+access credential's. The developer's refresh token never reaches the facade
+(GHS-024): it stays in the identity plane, which rotates it on every renewal,
+refuses a reused one, and mints each renewed token narrowed to the same
+repository set as the one it replaces (the GitHub identity spec).
 
 **Work is attributed to the developer, from a session and from any box a
 workflow spawns** (GHS-012, decided 2026-09-03). This extends the 2026-08-20
@@ -374,13 +417,18 @@ under the developer's own sign-in, an open question below.
 ## Security considerations
 
 - **Invariant:** THE SYSTEM SHALL keep every GitHub credential and every
-  private key out of a session's filesystem, environment and memory, and out
-  of the guest virtual machine.
+  private key out of a session's filesystem and environment and out of the
+  guest virtual machine, and hand a session nothing that carries one.
   enforced by: the facade holding credentials on the host outside the guest
   and handing sessions only credential-free addresses, and the scan of the
   session filesystem and process environments the architecture requires
   (Gatehouse INV-1, T3, T15).
-  covered by: GHS-013, GHS-014, GHS-018
+  covered by: GHS-013, GHS-014, GHS-018, GHS-024
+- **Invariant:** THE SYSTEM SHALL decide no request at the facade without
+  first attributing it to one live session.
+  enforced by: the facade's per-request session binding, refusing anything it
+  cannot attribute (Gatehouse T15).
+  covered by: GHS-023
 - **Invariant:** THE SYSTEM SHALL admit through the facade no request for a
   repository outside the session's repository set.
   enforced by: the reach decision, a pure function over owned repository
@@ -418,10 +466,10 @@ under the developer's own sign-in, an open question below.
 - [NEEDS CLARIFICATION (HIGH): The credential facade is not in the
   architecture of record, whose §6.4 and §8.3 deliver the token into the box;
   a proposal for it has been filed against the architecture. Its placement
-  outside the guest, its identity toward the identity plane, and how a child
-  session created inside the guest obtains its grant from it are decided
-  there, and GHS-014, GHS-018 and GHS-019 are not implementable until they
-  are.]
+  outside the guest, its identity toward the identity plane, how it binds a
+  request to the session that sent it, and how a child session created inside
+  the guest obtains its grant from it are decided there, and GHS-014, GHS-018,
+  GHS-019 and GHS-023 are not implementable until they are.]
 - [NEEDS CLARIFICATION (HIGH): Is declared-egress enforcement a prerequisite
   for credential-free GitHub access, or its own epic? Egress is allow-all in
   running code, the relay-layer enforcement design was closed without being
@@ -440,8 +488,16 @@ under the developer's own sign-in, an open question below.
   GHS-011) work without enrollment? Client-mediated local enrollment
   (Gatehouse F16) is the alternative.]
 - [NEEDS CLARIFICATION (MEDIUM): gh has no base-address override for
-  github.com. GHS-011 requires it to work through the facade; the in-session
-  configuration that routes its requests there is undecided.]
+  github.com; it does honour a host override that treats any other host as a
+  GitHub Enterprise Server and sends requests to that host's enterprise-shaped
+  paths. Pointing that override at the facade, which serves those paths
+  against github.com, is the candidate mechanism for GHS-011. Which gh
+  behaviours differ under a non-github.com host, and whether any matter for
+  clone, push and pull requests, is undecided.]
+- [NEEDS CLARIFICATION (MEDIUM): Which GitHub requests that name no
+  repository, such as the identity lookup gh makes at start, does the facade
+  admit? GHS-005 bounds repository targets; a request with no repository is
+  neither in nor out of the set.]
 - [NEEDS CLARIFICATION (MEDIUM): May a child session declare a repository set
   narrower than its parent's, and may a running session's set change without
   signing in again? Left on 2026-08-20 as something to test against GitHub. A
