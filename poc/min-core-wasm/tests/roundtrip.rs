@@ -35,8 +35,8 @@ async fn attach_write_resize_exit() {
     writer.resize(Grid { cols: 100, rows: 30 }).await.unwrap();
     assert_eq!(next_text(&mut reader).await, "resize 100x30\r\n");
 
-    // Typed one keystroke at a time, as a terminal does.
-    for b in b"exit\n" {
+    // Typed one keystroke at a time, as a terminal does: Enter is `\r`.
+    for b in b"exit\r" {
         writer.write(&[*b]).await.unwrap();
     }
     let mut seen = Vec::new();

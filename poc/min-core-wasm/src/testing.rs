@@ -18,8 +18,8 @@ pub struct FakeMinimald {
     env: HashMap<ChannelId, HashMap<String, String>>,
     pty: HashSet<ChannelId>,
     grid: HashMap<ChannelId, (u32, u32)>,
-    /// Bytes since the last newline, per channel, so `exit` typed one
-    /// keystroke at a time is recognised, not only `exit\n` as one write.
+    /// Bytes since the last line end (`\n` or `\r`), per channel, so `exit`
+    /// typed one keystroke at a time and finished with Enter is recognised.
     line: HashMap<ChannelId, Vec<u8>>,
 }
 
@@ -100,12 +100,14 @@ impl server::Handler for FakeMinimald {
     }
 
     async fn data(&mut self, id: ChannelId, data: &[u8], session: &mut Session) -> Result<(), Self::Error> {
+        // A terminal sends `\r` on Enter and there is no PTY line discipline
+        // here to turn it into `\n`, so either byte ends a line.
         let line = self.line.entry(id).or_default();
         line.extend_from_slice(data);
         let mut exit = false;
-        while let Some(nl) = line.iter().position(|&b| b == b'\n') {
-            let completed: Vec<u8> = line.drain(..=nl).collect();
-            if completed.as_slice() == b"exit\n" || completed.as_slice() == b"exit\r\n" {
+        while let Some(end) = line.iter().position(|&b| b == b'\n' || b == b'\r') {
+            let completed: Vec<u8> = line.drain(..=end).collect();
+            if completed[..completed.len() - 1] == *b"exit" {
                 exit = true;
             }
         }
