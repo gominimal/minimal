@@ -421,7 +421,7 @@ group below.
   tier:     T0
   verify:   cargo nextest run -p minimal auth_status_reports_principals_and_expiry
 
-### Browser contract (MCC-060–080)
+### Browser contract (MCC-060–081)
 
 The browser client spec in gominimal/webapp (WMC) cites these by ID.
 Sub-groups: attach MCC-060–063, errors MCC-064–065, signer and credential
@@ -473,7 +473,8 @@ there.
   with no attachment object, carrying a reason whose prefix names the stage:
   `config:`; `credential:` (the core's own pre-check of its certificate at
   the injected clock before any dial — expired, not yet valid, host or CA
-  mismatch); `version:`; `transport:` (the relay named when it refused the
+  mismatch — and a credential call that failed, in the shape MCC-081 gives
+  it); `version:`; `transport:` (the relay named when it refused the
   ticket; a dial or handshake that did not complete in time); `host
   rejected:` with the failing check's code; `authentication rejected`;
   `signing:`; `attach:` (the daemon refused the env, pty or shell request,
@@ -623,6 +624,23 @@ there.
   nothing; WMC-031 renders it.
   tier:     T0
   verify:   just wasm-core-headless status_reports_certificate_tunnel_and_last_error
+
+- **MCC-081** IF a credential call of MCC-067 fails THEN THE SYSTEM SHALL
+  report it to the head in one of two shapes and no other: `credential:
+  refused (<code>)` when the issuer answered with an error, carrying the
+  issuer's error code and its human-readable reason verbatim; `credential:
+  unreachable` when no well-formed answer arrived within the call's bound
+  (a connection, TLS, timeout or non-JSON failure), carrying the transport
+  detail; so that a head can show the issuer's reason on a refusal and
+  choose between retrying and signing in again without parsing anything
+  else (WMC-006, WMC-007).
+  tier:     T0
+  verify:   just wasm-core-headless credential_call_failures_are_refused_or_unreachable
+  - IF the call that failed was a renewal during an open attach THEN THE
+    SYSTEM SHALL keep the attachment open and report the failure through the
+    status accessor (MCC-080) until the certificate expires (MCC-039).
+    tier:   T0
+    verify: just wasm-core-headless renewal_failure_is_reported_without_closing_the_attachment
 
 ## Non-goals
 
