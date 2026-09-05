@@ -152,6 +152,43 @@ minimal-cli:
 minimald-build:
     cargo build -p minimald --features {{features}} --locked
 
+# THE single build entrypoint for a shippable build: the four release binaries
+# for a target triple, built exactly the way release.yml's build jobs build
+# them (they call this same script), plus completions from the built `min`.
+# Per-package invocations (fat-LTO links serialize), FEATURES for the guest
+# minimald, and the fail-loud static-libkrun requirement for minvmd live in
+# scripts/dist-build.sh — read its header for the LIBKRUN_PREFIX /
+# COMPLETIONS_DIR / FEATURES env knobs.
+#
+# Linux-only: the shippable Linux build is musl-static, and running it from a
+# macOS host would skip minvmd's mandatory codesign and build minimald against
+# glibc — the [linux] attribute keeps the mistake unoffered (`just test-cross`
+# covers the Linux-only crates from macOS).
+[linux]
+dist-build target:
+    scripts/dist-build.sh {{quote(target)}}
+
+# Build the .deb/.rpm/.apk packages for a staged semver release from the
+# installer bucket via the pinned nfpm (fetched + sha256-verified by the
+# script). Packages land in dist/. Apt/dnf/apk repo-tree hosting lives in the
+# infra repo, not here.
+#
+# The semver row must exist: releases staged from the tag-push staging on are
+# carry one; earlier ones need scripts/backfill-version-row.sh first (that is
+# every release up to and including 0.5.3). Linux-only for the same host-check
+# reason as dist-build: the script downloads static musl ELFs and runs the
+# downloaded `min` to generate completions.
+[linux]
+pkg-nfpm pkgver:
+    PKGVER={{quote(pkgver)}} scripts/package-nfpm.sh
+
+# Restage an already-shipped release under its semver so the command above can
+# see it (the one-time fix for releases staged before the semver-row
+# convention, e.g. `just backfill-version-row abc12345 0.5.3`).
+[linux]
+backfill-version-row sha version:
+    scripts/backfill-version-row.sh --sha {{quote(sha)}} --version {{quote(version)}}
+
 # ── run & inspect ────────────────────────────────────────────────────────────
 
 # Run the dev-built `min` CLI, args forwarded (e.g. `just min loadout list`).
@@ -381,6 +418,29 @@ test-promote-gate:
     fi
     echo "== running verify-nightly-provenance_test.sh =="
     bash scripts/verify-nightly-provenance_test.sh
+
+# Run every scripts/*_test.sh harness in one go (the release/publishing logic:
+# semver resolution, version assertion, staged-version lookup, the packaging
+# renderer, and the AUR/brew publishers against fixture remotes). No network,
+# no credentials, no gcloud — the harnesses stub or fixture everything. CI runs
+# the same set through crates/common/tests/shell_harnesses.rs (part of
+# `just test`), which discovers them by convention so a new harness is never
+# forgotten.
+test-shell:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v shellcheck >/dev/null 2>&1; then
+        echo "== shellcheck =="
+        shellcheck scripts/*_test.sh
+    else
+        echo "== shellcheck not found, skipping static check =="
+    fi
+    failed=0
+    for t in scripts/*_test.sh; do
+        echo "== running $t =="
+        bash "$t" || failed=1
+    done
+    exit "$failed"
 
 # ── VM & e2e surfaces ────────────────────────────────────────────────────────
 
