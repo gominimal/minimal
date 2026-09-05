@@ -13,6 +13,7 @@
 pub mod config;
 use config::Config;
 pub use config::NetworkMode;
+pub mod hosts;
 pub mod network;
 pub use network::{AttachFuture, HostNet, NetGuard, Network, NetworkError, NoNet};
 use std::fs::{self, Permissions};
@@ -715,6 +716,19 @@ impl<C: Channel> Sandbox<C> {
             let etc_resolv = self.rootfs().join("etc").join("resolv.conf");
             std::fs::write(&etc_resolv, format!("nameserver {dns}\n"))
                 .map_err(|e| Error::IO("writing /etc/resolv.conf", etc_resolv.clone(), e))?;
+        }
+
+        // Publish the provider host under a stable name (`host.min.internal`) so
+        // integrations are written against the name, not the address behind it —
+        // which differs per provider and per network mode (see `crate::hosts`).
+        // Written pre-spawn into the rootfs for the same reason `/etc/resolv.conf`
+        // above is: hakoniwa binds `/etc` read-only from `<rootfs>/etc`. The
+        // parent is created here rather than assumed: `/etc` only exists so far
+        // if DNS/user synthesis ran, and neither is guaranteed.
+        if let Some(host_alias) = self.config.host_alias {
+            let rootfs = self.rootfs();
+            crate::hosts::install(&rootfs, host_alias)
+                .map_err(|e| Error::IO("writing /etc/hosts", rootfs.join("etc/hosts"), e))?;
         }
 
         if let Some(s) = &self.config.cpu_weight

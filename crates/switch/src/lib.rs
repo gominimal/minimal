@@ -26,6 +26,29 @@ pub const VSOCK_HOST_CID: u32 = 2;
 /// gvproxy `-listen` socket.
 pub const VSOCK_GVPROXY_SHUTTLE_PORT: u32 = 1024;
 
+/// The DNS suffix every Minimal-internal name carries. An opaque label: nothing
+/// under it is ever published to a real resolver.
+pub const INTERNAL_SUFFIX: &str = "min.internal";
+
+/// The stable name a session uses to reach **the host that runs its provider**.
+///
+/// The *address* behind this name is provider- and namespace-dependent, so the
+/// name — not the address — is the integration contract:
+///
+/// | Context | Reaches the host at |
+/// |---|---|
+/// | in a `minvmd` microVM (macOS, or Linux `local-minvmd`), `host-net` | [`SwitchSubnet::host_alias`] |
+/// | native Linux (`local-minimald`), `host-net` | `127.0.0.1` (the session shares the host netns) |
+/// | any provider, `own-ip` | [`SwitchSubnet::host_alias`] |
+/// | any provider, `no-net` | nothing — the host is unreachable by construction |
+///
+/// The per-context address is resolved by `minimald` at session launch and
+/// written into the sandbox's `/etc/hosts`; see `minimald::net::host_alias_target`
+/// and `sandbox2::hosts`. Third-party integrations should write
+/// `host.min.internal` rather than any literal address, so the address can move
+/// without breaking them.
+pub const HOST_ALIAS_NAME: &str = "host.min.internal";
+
 /// Default gvproxy switch subnet: the RFC 6598 (CGNAT) `100.64.0.0/16` block.
 ///
 /// Chosen so PTask switch addresses never collide with the common RFC 1918
@@ -316,6 +339,16 @@ mod tests {
         assert_eq!(net.gateway(), Ipv4Addr::new(100, 64, 0, 1));
         assert_eq!(net.host_alias(), Ipv4Addr::new(100, 64, 255, 254));
         assert_eq!(net.daemon_ip(), Ipv4Addr::new(100, 64, 255, 253));
+    }
+
+    /// The host alias name is a subdomain of the internal suffix, and is a
+    /// *name*, not an address: nothing may re-derive it by string-formatting an
+    /// IP. Cheap guard against the two drifting apart.
+    #[test]
+    fn host_alias_name_lives_under_the_internal_suffix() {
+        assert_eq!(HOST_ALIAS_NAME, "host.min.internal");
+        assert!(HOST_ALIAS_NAME.ends_with(INTERNAL_SUFFIX));
+        assert!(HOST_ALIAS_NAME.parse::<Ipv4Addr>().is_err());
     }
 
     #[test]

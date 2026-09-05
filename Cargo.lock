@@ -6377,6 +6377,7 @@ dependencies = [
  "hakoniwa",
  "nix 0.31.3",
  "sessions",
+ "switch",
  "tempfile",
  "tokio",
  "tokio-util",

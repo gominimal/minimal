@@ -2288,6 +2288,14 @@ impl SessionLauncher for SandboxLauncher {
         let mut local_own_ip: Option<(std::net::Ipv4Addr, std::path::PathBuf)> = None;
         let mut own_ip_tap: Option<sandbox2::config::OwnIpTap> = None;
         let mut own_ip_dns: Option<std::net::Ipv4Addr> = None;
+        // Every mode — not just own-IP — publishes `host.min.internal`, because
+        // the address that reaches the provider host differs per mode *and* per
+        // transport (see `net::host_alias_target`). Read under the same lock:
+        // both facts are switch-scoped and neither blocks.
+        let host_alias = {
+            let s = net_switch.lock().await;
+            crate::net::host_alias_target(network_mode, s.transport(), s.subnet())
+        };
         if matches!(network_mode, NetworkMode::OwnIp) {
             let mut s = net_switch.lock().await;
             let subnet = s.subnet();
@@ -2440,6 +2448,7 @@ impl SessionLauncher for SandboxLauncher {
                     .with_network_mode(network_mode)
                     .with_own_ip_tap(own_ip_tap)
                     .with_own_ip_dns(own_ip_dns)
+                    .with_host_alias(host_alias)
                     .with_username(username),
             ))
             .await?;

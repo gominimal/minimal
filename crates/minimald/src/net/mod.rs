@@ -46,9 +46,55 @@ use tokio::sync::watch;
 // `::switch` (leading `::`) is the extern crate, disambiguated from the sibling
 // `crate::net::switch` relay module.
 pub use ::switch::{
-    DEFAULT_MTU, DEFAULT_SUBNET, InvalidPrefix, MacAddr, SwitchSubnet, VSOCK_GVPROXY_SHUTTLE_PORT,
-    VSOCK_HOST_CID, render_gvproxy_config,
+    DEFAULT_MTU, DEFAULT_SUBNET, HOST_ALIAS_NAME, InvalidPrefix, MacAddr, SwitchSubnet,
+    VSOCK_GVPROXY_SHUTTLE_PORT, VSOCK_HOST_CID, render_gvproxy_config,
 };
+
+/// The address [`HOST_ALIAS_NAME`] must resolve to for a PTask in `mode`, on a
+/// daemon whose switch is reached by `transport`.
+///
+/// This is the whole per-context resolution, in one pure function, because the
+/// answer genuinely differs by context and a name that is right in only some of
+/// them is worse than the bare address it replaces:
+///
+/// - **`OwnIp`** (any provider) — the PTask sits in a fresh netns behind gvproxy,
+///   which NATs [`SwitchSubnet::host_alias`] to the host's loopback. gvproxy runs
+///   on the host in both transports (locally spawned on DM2, `minvmd`-owned and
+///   reached over the vsock shuttle on DM1/3/4), so the host that answers is the
+///   real host either way.
+/// - **`HostNet` under [`SwitchTransport::HostShuttle`]** (macOS, and Linux
+///   `local-minvmd`) — the PTask shares the *guest's* root netns, which
+///   `guest::bring_up_root_egress` put on the switch subnet at
+///   [`SwitchSubnet::daemon_ip`]. The host is off-VM, and the same NAT'd
+///   host alias is how the guest reaches it.
+/// - **`HostNet` under [`SwitchTransport::LocalSpawn`]** (Linux
+///   `local-minimald`) — the PTask shares the *host's* own netns. There is no VM
+///   and no switch in the path; the host is plain loopback. Pointing this case at
+///   the switch alias would name an address nothing in that namespace routes to.
+/// - **`NoNet`** — no network at all, so no address is honest. `None` leaves the
+///   name unresolvable rather than pointing it somewhere unreachable.
+///
+/// `transport` is derived from `Config::in_microvm` once at daemon startup (see
+/// `crate::server::ServerState::new`), so it is a reliable stand-in for "is this
+/// daemon inside a `minvmd` guest?" even when no own-IP session ever runs.
+#[must_use]
+pub fn host_alias_target(
+    mode: sessions::NetworkMode,
+    transport: SwitchTransport,
+    subnet: SwitchSubnet,
+) -> Option<Ipv4Addr> {
+    match mode {
+        sessions::NetworkMode::NoNet => None,
+        sessions::NetworkMode::OwnIp => Some(subnet.host_alias()),
+        sessions::NetworkMode::HostNet => match transport {
+            SwitchTransport::LocalSpawn => Some(Ipv4Addr::LOCALHOST),
+            SwitchTransport::HostShuttle { .. } => Some(subnet.host_alias()),
+        },
+        // `NetworkMode` is `#[non_exhaustive]`; a mode we do not understand gets
+        // no alias rather than a guess at where its host is.
+        _ => None,
+    }
+}
 
 /// How the per-host gvproxy switch is reached, selected by deployment model.
 ///
@@ -595,6 +641,88 @@ mod tests {
         let cfg = render_gvproxy_config(SwitchSubnet::default(), &[]);
         assert!(cfg.contains("dhcpStaticLeases:"));
         assert!(cfg.contains("{}"));
+    }
+
+    /// The four contexts of #586, in one table. `host.min.internal` has to be
+    /// right in every one of them — a name that only aliases the gvproxy address
+    /// would just rename the existing footgun for the native host-net case, where
+    /// the session shares the host's own netns and nothing routes to
+    /// `100.64.255.254`.
+    #[test]
+    fn host_alias_resolves_per_provider_and_mode() {
+        use sessions::NetworkMode::{HostNet, OwnIp};
+
+        let subnet = SwitchSubnet::default();
+        let shuttle = SwitchTransport::HostShuttle {
+            cid: VSOCK_HOST_CID,
+            port: VSOCK_GVPROXY_SHUTTLE_PORT,
+        };
+        let native = SwitchTransport::LocalSpawn;
+        let alias = Ipv4Addr::new(100, 64, 255, 254);
+
+        // macOS (minvmd only) and Linux `local-minvmd`: the session shares the
+        // guest root netns, and the host is off-VM behind the gvproxy NAT.
+        assert_eq!(host_alias_target(HostNet, shuttle, subnet), Some(alias));
+        // Linux `local-minimald` + host-net: the session *is* on the host netns.
+        assert_eq!(
+            host_alias_target(HostNet, native, subnet),
+            Some(Ipv4Addr::LOCALHOST)
+        );
+        // `--network own-ip`, either provider: always through the switch.
+        assert_eq!(host_alias_target(OwnIp, native, subnet), Some(alias));
+        assert_eq!(host_alias_target(OwnIp, shuttle, subnet), Some(alias));
+    }
+
+    /// A `NoNet` PTask has no path to the host in any provider, so the name is
+    /// left unresolvable rather than pointed at an address that cannot answer.
+    #[test]
+    fn no_net_publishes_no_host_alias() {
+        let subnet = SwitchSubnet::default();
+        for transport in [
+            SwitchTransport::LocalSpawn,
+            SwitchTransport::HostShuttle {
+                cid: VSOCK_HOST_CID,
+                port: VSOCK_GVPROXY_SHUTTLE_PORT,
+            },
+        ] {
+            assert_eq!(
+                host_alias_target(sessions::NetworkMode::NoNet, transport, subnet),
+                None
+            );
+        }
+    }
+
+    /// The alias tracks the *configured* subnet, not the default one: moving the
+    /// switch subnet moves the address the name resolves to, which is the point
+    /// of having the name at all.
+    #[test]
+    fn host_alias_follows_a_non_default_subnet() {
+        let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap();
+        assert_eq!(
+            host_alias_target(
+                sessions::NetworkMode::OwnIp,
+                SwitchTransport::LocalSpawn,
+                subnet
+            ),
+            Some(Ipv4Addr::new(10, 0, 0, 254)),
+        );
+    }
+
+    /// The rendered `/etc/hosts` a session sees carries the name, and — for the
+    /// native host-net case — carries it *without* the switch address the issue
+    /// is about. Ties the resolution table to the file that actually publishes it.
+    #[test]
+    fn rendered_hosts_file_publishes_the_resolved_address() {
+        let subnet = SwitchSubnet::default();
+        let native = host_alias_target(
+            sessions::NetworkMode::HostNet,
+            SwitchTransport::LocalSpawn,
+            subnet,
+        )
+        .expect("host-net always has a host");
+        let body = sandbox2::hosts::render(native);
+        assert!(body.contains(&format!("127.0.0.1\t{HOST_ALIAS_NAME}\n")));
+        assert!(!body.contains("100.64.255.254"));
     }
 
     #[test]
