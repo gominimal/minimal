@@ -1,9 +1,9 @@
 # Networking in Minimal — Spec with Diagrams
 
-This specificaiton outlines the networking use cases for the Minimal "minimald" tool.
+This specification outlines the networking use cases for the Minimal "minimald" tool.
 
 The is some exploration of implementation options that do not require the user
-to have root privileges. This does not exlude other implementation approaches or
+to have root privileges. This does not exclude other implementation approaches or
 additions such as enabling SSH port-forwarding (communications with the minimald are over SSH).
 
 The final three sections add the implementation analysis: diagram 6 maps each
@@ -30,7 +30,7 @@ software.  The OS can be MacOS and Linux.
 hours, days, weeks, months), Minimal-created, isolated environment
 that has exactly the executables, env vars, configuration files and
 network access specified by the PTask Specification. It may optionally
-be "paramterized" by files from the invocation directory/CWD,
+be "parameterized" by files from the invocation directory/CWD,
 mapped-in files and additional, passed-through CLI arguments.  A PTask
 may be interactive (Minimal-provided, re-attachable, terminal/PTY
 access for humans), or non-interactive (dedicated running processes,
@@ -43,7 +43,7 @@ host or have its own IP address.
 
 In the future there may be bi-directional file synchronization options
 between the invocation environment and the PTask. Interactive PTasks
-could even supoprt file synchronization to the re-attaching
+could even support file synchronization to the re-attaching
 environment, which might be different than the original invocation
 environment. Until then, it is assumed that file changes the user
 wants to be kept after the PTask is terminated will be pushed out over
@@ -205,7 +205,7 @@ key use cases:
    configure whether it allows no, some or full network ingress by
    specifying ports and protocols.  It should be possible to
    statically configure these mappings with the ptask spec. It should
-   be possible to dyanically configure port mappings from within the
+   be possible to dynamically configure port mappings from within the
    ptask itself, subject to policy in the ptask-spec or elsewhere
 
 key use cases:

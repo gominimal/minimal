@@ -1,6 +1,6 @@
 ---
 title: Release pipeline
-description: How releases are built, staged, smoke-tested, promoted, and installed: release.yml, nightly.yml, promote.yml, prune-releases.yml, and the curl|sh installer.
+description: "How releases are built, staged, smoke-tested, promoted, and installed: release.yml, nightly.yml, promote.yml, prune-releases.yml, and the curl|sh installer."
 ---
 
 > This is internal documentation. It is not published to the docs site.
