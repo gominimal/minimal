@@ -43,10 +43,11 @@ packages and environment through the task schema.
 
 ## Where loadouts live
 
-Each loadout is a single TOML file in your user config directory:
+Loadouts live in your user config directory, in either of two layouts:
 
 ```
-~/.config/minimal/loadouts/<name>.toml
+~/.config/minimal/loadouts/<name>.toml          # a loadout that is just a file
+~/.config/minimal/loadouts/<name>/loadout.toml  # a loadout you keep in git
 ```
 
 On Linux this is `$XDG_CONFIG_HOME/minimal/loadouts` (falling back to
@@ -55,10 +56,25 @@ same `~/.config` location for consistency with Minimal's state and cache
 directories. The global `--config-dir` flag overrides the base directory when
 you need a non-default location.
 
-The filename stem is the loadout's identifier. A file named `dev.toml`
-defines the loadout `dev` — nothing inside the file names it, so renaming
-the file renames the loadout. The directory is not created for you: make it
-and drop `<name>.toml` files in to get started.
+The filesystem names the loadout. A file named `dev.toml` and a directory
+named `dev/` holding a `loadout.toml` both define the loadout `dev` —
+nothing inside the file names it, so renaming the file (or the directory)
+renames the loadout. Defining one name both ways at once is an error rather
+than a precedence rule.
+
+The second shape exists so a whole loadout — its definition, the files it
+ships, its hook scripts — is one self-contained directory you can clone:
+
+```console
+$ git clone git@example.com:you/helix-loadout ~/.config/minimal/loadouts/dev
+```
+
+Nothing else changes between the two, because a loadout's own directory is
+`~/.config/minimal/loadouts/<name>/` either way. The
+[reference](../reference/loadouts.md#where-loadouts-live) has the details.
+
+The loadouts directory is not created for you: make it and add loadouts in
+either shape to get started.
 
 ## What a loadout carries
 
@@ -169,7 +185,8 @@ EDITOR = "hx"
 on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || true" }
 ```
 
-Saved as `~/.config/minimal/loadouts/dev.toml`, it is ready to apply.
+Saved as `~/.config/minimal/loadouts/dev.toml` — or as
+`~/.config/minimal/loadouts/dev/loadout.toml` — it is ready to apply.
 
 ## Applying a loadout
 

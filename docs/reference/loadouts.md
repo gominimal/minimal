@@ -19,10 +19,11 @@ described in [Tasks](./tasks.md).
 
 ## Where loadouts live
 
-Each loadout is a single TOML file at:
+Loadouts live under `<config>/minimal/loadouts/`, in either of two layouts:
 
 ```
-<config>/minimal/loadouts/<name>.toml
+<config>/minimal/loadouts/<name>.toml          # a loadout that is just a file
+<config>/minimal/loadouts/<name>/loadout.toml  # a loadout you keep in git
 ```
 
 `<config>` is the platform user config directory: `$XDG_CONFIG_HOME` on Linux
@@ -31,19 +32,54 @@ consistency with Minimal's state and cache dirs. The global
 [`--config-dir`](./cli-min.md#global-flags) flag overrides the base, and
 `min dirs` prints the resolved loadouts directory.
 
-The filename stem **is** the loadout's identifier:
+The two layouts are equivalent in every way but where the bytes sit. Pick the
+second when you want the whole loadout — its definition, the files it
+[ships](#loadout_root), its [hook scripts](#lifecycle_hooks) — to be one
+self-contained directory you can put under version control:
 
-- Nothing inside the file names it, so renaming the file renames the
-  loadout.
-- Names are trimmed and must be non-empty, with no `/`, `\`, or NUL
-  characters.
+```console
+$ git clone git@example.com:you/helix-loadout ~/.config/minimal/loadouts/dev
+$ min session activate . --loadout dev
+```
+
+Nothing else changes between them, because a loadout's own directory is
+`<config>/minimal/loadouts/<name>/` under both — see
+[`$LOADOUT_ROOT`](#loadout_root). To migrate an existing loadout, move it
+inside the directory its files already live in:
+
+```console
+$ cd ~/.config/minimal/loadouts && mkdir -p dev && mv dev.toml dev/loadout.toml
+```
+
+The **filesystem** names the loadout — the filename stem for `<name>.toml`, the
+directory name for `<name>/loadout.toml`:
+
+- Nothing inside the file names it, so renaming the file (or the directory)
+  renames the loadout.
+- Names are trimmed and must be usable as a single directory entry: non-empty,
+  neither `.` nor `..`, and with no `/`, `\`, or NUL characters. (A dot is only
+  special as the whole name — `dev.v2` is fine.)
 - A file that still carries the old `name` field loads anyway, with a
   warning that the field is no longer required. If the declared name
   disagrees with the filename, the warning says so and the filename wins;
   the declared name is discarded.
+- Defining one name in **both** layouts at once is an error, not a
+  precedence rule. `min loadout list` names both files and exits non-zero, and
+  so does an activation that selects the name — whichever file lost would
+  otherwise go on looking live while having no effect.
 
-The directory is not created automatically; create it and drop
-`<name>.toml` files there to get started.
+The directory is not created automatically; create it and add loadouts in
+either shape to get started.
+
+Two things to know if you do version-control a loadout:
+
+- A cloned `<name>/` contains a `.git` directory, which a broad
+  `$LOADOUT_ROOT/**/*` patch source would sweep into your session along with
+  everything else. Prefer patterns that name what you actually want.
+- `<name>/` must be a real directory, not a symlink into a dotfiles repo
+  elsewhere: a loadout's [external hook scripts](#lifecycle_hooks) refuse a
+  symlinked anchor, so they would fail to resolve. Clone into
+  `loadouts/<name>/` directly.
 
 ## Example
 
@@ -236,17 +272,22 @@ to the session user, whatever it was owned by on your host.
 
 Not every file a loadout patches in belongs in your dotfiles. For the ones
 that exist only to serve this loadout, keep them beside it and name them
-with `$LOADOUT_ROOT`, which expands to a directory named after the loadout
-next to its `.toml` -- the same directory its
-[external hook scripts](#lifecycle_hooks) resolve against:
+with `$LOADOUT_ROOT`, which expands to a directory named after the loadout --
+the same directory its [external hook scripts](#lifecycle_hooks) resolve
+against.
+
+That directory is `<config>/minimal/loadouts/<name>/` under
+[either layout](#where-loadouts-live). With a flat `dev.toml` it sits beside
+the file; with `dev/loadout.toml` it *is* the directory the definition lives
+in, which is what makes a loadout and its files one version-controllable tree:
 
 ```
-<config>/minimal/loadouts/
-├── dev.toml
-└── dev/
-    ├── config.toml
-    └── themes/
-        └── nord.toml
+<config>/minimal/loadouts/        <config>/minimal/loadouts/
+├── dev.toml                      └── dev/
+└── dev/                              ├── loadout.toml
+    ├── config.toml                   ├── config.toml
+    └── themes/                       └── themes/
+        └── nord.toml                     └── nord.toml
 ```
 
 ```toml
@@ -259,7 +300,8 @@ patches = [
 It resolves against the loadouts directory actually in use, so a
 `--config-dir` or `$XDG_CONFIG_HOME` that moves your config takes the
 loadout's files with it -- which a hard-coded `~/.config/minimal/loadouts/dev/`
-would not.
+would not. It is derived from the loadout's *name*, so it is also the same
+directory whichever layout the loadout is filed in.
 
 Details worth knowing:
 
@@ -321,25 +363,27 @@ resolve against the daemon, not the session. Default to POSIX `sh` where you
 can — it is the one interpreter a session is guaranteed to have.
 
 External script paths must be relative (absolute paths and `..` components
-are rejected at parse time). A loadout's scripts are anchored at a directory
-beside the loadout file, named after the loadout — so `dev.toml`'s scripts
-live in `dev/`:
+are rejected at parse time). A loadout's scripts are anchored at the directory
+named after the loadout — so `dev.toml`'s scripts live in `dev/`, and a
+`dev/loadout.toml`'s live beside it:
 
 ```
-<config>/minimal/loadouts/
-├── dev.toml
-└── dev/
-    ├── activate.sh
-    └── teardown.sh
+<config>/minimal/loadouts/        <config>/minimal/loadouts/
+├── dev.toml                      └── dev/
+└── dev/                              ├── loadout.toml
+    ├── activate.sh                   ├── activate.sh
+    └── teardown.sh                   └── teardown.sh
 ```
 
 This is the same directory [`$LOADOUT_ROOT`](#loadout_root) names, so a
 loadout's scripts and the files it patches in live together.
 
 A script must resolve to a regular file inside that directory. Symlinks are
-rejected rather than followed, at every path component — a symlink is the one
-way a path that passes every other check could still reach outside the
-anchor. All of this is checked on your machine before a session is created,
+rejected rather than followed, at every path component *and at the directory
+itself* — a symlink is the one way a path that passes every other check could
+still reach outside the anchor. (This is why a version-controlled loadout
+directory has to be a real checkout rather than a symlink into a dotfiles
+repo.) All of this is checked on your machine before a session is created,
 so a mistyped path fails immediately and names the file.
 
 Hooks from multiple contributors concatenate in declaration order, and run in
