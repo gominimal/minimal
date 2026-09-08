@@ -107,18 +107,18 @@ the sealed-credential path.
 - **GHS-009** WHEN a developer starts a local session whose spec declares no
   GitHub grant THE SYSTEM SHALL start it without requiring sign-in.
   tier:     T0
-  verify:   cargo nextest run -p minimal local_session_without_grant_starts_without_signin
+    verify:   cargo nextest run -p minimal local_session_without_grant_starts_without_signin
+  - IF a process inside a session that declares no GitHub grant attempts a
+    GitHub operation that needs a credential THEN THE SYSTEM SHALL tell it the
+    session declares no GitHub grant, rather than asking for a password.
+    tier:   T0
+    verify: cargo nextest run -p minimal github_op_without_grant_names_the_missing_grant
 
 - **GHS-010** IF a developer starts a local session whose spec declares a
   GitHub grant while they have no valid sign-in THEN THE SYSTEM SHALL require
   them to sign in before the session starts.
   tier:     T0
   verify:   cargo nextest run -p minimal local_session_with_grant_requires_signin
-  - IF a process inside a session that declares no GitHub grant attempts a
-    GitHub operation that needs a credential THEN THE SYSTEM SHALL tell it the
-    session declares no GitHub grant, rather than asking for a password.
-    tier:   T0
-    verify: cargo nextest run -p minimal github_op_without_grant_names_the_missing_grant
 
 - **GHS-011** WHILE a developer is signed in THE SYSTEM SHALL let standard git
   and gh commands inside a session clone, push and open pull requests without
@@ -209,10 +209,11 @@ the sealed-credential path.
   tier:     T0
   verify:   cargo nextest run -p minimal quic_to_credentialed_hosts_is_blocked
 
-- **GHS-030** IF a session's spec sets its network mode to none and declares a
-  runtime GitHub grant THEN THE SYSTEM SHALL refuse the spec as invalid.
+- **GHS-030** IF a session's spec declares a runtime GitHub grant and sets its
+  network mode to none or to the shared host address THEN THE SYSTEM SHALL
+  refuse the spec as invalid.
   tier:     T0
-  verify:   cargo nextest run -p minimal network_none_with_github_grant_is_rejected
+  verify:   cargo nextest run -p minimal github_grant_without_own_address_is_rejected
 
 - **GHS-031** WHERE a session's spec declares a GitHub grant and sets no
   network mode THE SYSTEM SHALL give the session its own network address.
@@ -276,7 +277,7 @@ the session. Sign-in for every session including local was set aside because
 it removes the account-free local path today's users have. The cost accepted
 is that a running local session gains GitHub access only by restarting with
 the grant, and that a GitHub operation in a grant-less session is answered
-with what is missing rather than with a credential (GHS-010's edge).
+with what is missing rather than with a credential (GHS-009's edge).
 
 **A local daemon enrolls itself before its first session with a GitHub grant**
 (GHS-025). A daemon not enrolled with the identity plane has no broker and no
@@ -352,17 +353,19 @@ declared credentialed hosts are steered to the proxy at the node, and QUIC to
 those hosts is blocked so the interceptable path is the only one. On a session
 with its own network address the proxy can attribute a request to the box that
 sent it and a stolen sealed value is dead across boxes; on a shared network
-namespace that attribution is impossible, and the architecture accepts the
-residual, a co-resident thief gets only the session's scoped, audited reach
-until expiry or revocation, as the tier the chooser of that mode accepted. A
-session with a GitHub grant therefore defaults to its own address (GHS-031); a
-spec that sets the shared address explicitly keeps the grant with that
-residual. The architecture's egress gateway design moves egress enforcement
-outside the node and proposes that grants require a node the fabric can pin; a
-laptop cannot be, and this document keeps GitHub grants on local daemons: the
-sealed value is dead off-node, so an escape on a laptop gains only the
-developer's own scoped, audited reach on the developer's own machine, the tier
-the local chooser accepts.
+namespace that attribution is impossible. A session with a GitHub grant
+therefore has its own address: by default when its spec sets no mode
+(GHS-031), and a spec that sets the shared address or no networking with a
+grant is refused (GHS-030). The architecture allows a grant on a shared
+address with a recorded residual; here that combination cannot exist, because
+an egress declaration is valid only on a session with its own address and a
+grant without one is a validation error (GHS-022), so it is refused rather
+than half-supported. The architecture's egress gateway design moves egress
+enforcement outside the node and proposes that grants require a node the
+fabric can pin; a laptop cannot be, and this document keeps GitHub grants on
+local daemons: the sealed value is dead off-node, so an escape on a laptop
+gains only the developer's own scoped, audited reach on the developer's own
+machine, the tier the local chooser accepts.
 
 **Nothing ships between sign-in and the proxy.** The identity plane's own
 build order puts sign-in early and the egress proxy late; this work is
@@ -390,11 +393,11 @@ parent's.
 **Work is attributed to the developer, from a session and from any box a
 workflow spawns** (GHS-012). GHS-012 binds session, agent and task boxes, the
 types a developer's workflow spawns, which default to developer-attributed
-tokens through a type-supplied attribute; service and build boxes default to
-App attribution and are outside the epic's criterion, a service outliving the
-workflow that spawned it; a tenant may forbid developer attribution per type,
-with a defaulted grant downgraded and recorded rather than silently kept
-(GHS-012's edge) and an explicit request refused.
+tokens through a type-supplied attribute; service, build and container-build
+boxes default to App attribution and are outside the epic's criterion, a
+service outliving the workflow that spawned it; a tenant may forbid developer
+attribution per type, with a defaulted grant downgraded and recorded rather
+than silently kept (GHS-012's edge) and an explicit request refused.
 
 **Standard git and gh, no forced interface.** Once a developer is signed in,
 git and gh inside a session work as the developer against the real hostnames
@@ -436,18 +439,18 @@ credential's reach is bounded by the token and the proxy whether or not
 anonymous traffic is filtered.
 
 **Generality:** GitHub.com is the sole provider by decision (GHS-007). The
-sealed-credential path is general by the architecture's design: the same
-proxy takes further upstreams as policy modules, and a separate epic proposes
-the Claude programming interface and model-context servers as the next ones;
-every bound stated here, the 403, the permission ceiling, the 8-hour lifetime,
-is GitHub's own model and does not carry. Across hosts the behaviours are
+sealed-credential path is general by the architecture's design: the same proxy
+takes further upstreams as policy modules, and a separate epic proposes the
+Claude programming interface and model-context servers as the next ones; every
+bound stated here, the 403, the permission ceiling, the 8-hour lifetime, is
+GitHub's own model and does not carry. Across hosts the behaviours are
 general: the session-to-proxy TLS session is the encryption in transit on a
 laptop guest, a cloud instance or a cluster pod alike, with no same-machine
-assumption; a session's network mode changes how strongly a sealed value is
-bound, not whether the path works. A local and a remote session differ only
-in when sign-in is required, always for remote and with a GitHub grant for
-local (GHS-008 to GHS-010), and in the local daemon's self-enrollment
-(GHS-025).
+assumption; a session with a GitHub grant always has its own address, so a
+sealed value is bound to its box everywhere. A local and a remote session
+differ only in when sign-in is required, always for remote and with a GitHub
+grant for local (GHS-008 to GHS-010), and in the local daemon's
+self-enrollment (GHS-025).
 
 ## Security considerations
 
@@ -495,7 +498,6 @@ local (GHS-008 to GHS-010), and in the local daemon's self-enrollment
   covered by: GHS-017, GHS-019
 
 ## Open questions
-
 
 - [NEEDS CLARIFICATION (MEDIUM): May a child session declare a repository set
   narrower than its parent's, and may a running session's set change without
