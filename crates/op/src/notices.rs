@@ -10,6 +10,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
 use lcache::{Cache, LocalDir};
@@ -154,8 +155,15 @@ pub fn record(cache: &Cache<LocalDir>, source_sha256: &str, root: &Path) -> io::
         files: scan(root)?,
     };
     let json = serde_json_lenient::to_string_pretty(&notices).map_err(io::Error::other)?;
-    // Write-then-rename so a reader never sees a partial record.
-    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    // Write-then-rename so a reader never sees a partial record. The temp name
+    // is unique per write — PID plus a process-local counter — so two
+    // concurrent writers for the same digest never share a temp file, and one
+    // writer's rename can never move another's still-in-flight write. The
+    // rename itself is atomic, so a final record already published by a racing
+    // writer is a fine idempotent outcome (identical archive → identical tree).
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp-{}-{seq}", std::process::id()));
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &path)?;
     Ok(path)
