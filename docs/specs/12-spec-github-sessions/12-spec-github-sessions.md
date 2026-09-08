@@ -340,8 +340,8 @@ decision below requires and which leaves no question of routing gh. GitHub is
 two hosts to a session, github.com for git and api.github.com for gh; a grant
 covers both (GHS-022, GHS-028) and the authority's constraint covers both. The
 cost is an interception authority inside the session, accepted as the smaller
-change on ephemeral Minimal-built boxes, and a dependency on the identity
-plane's fifth build phase, where the proxy lands.
+change on ephemeral Minimal-built boxes, and the proxy itself, which this work
+builds.
 
 **What the session side does for that path** (GHS-022, GHS-026, GHS-028,
 GHS-029, GHS-030, GHS-031). The egress list is the single reachability
@@ -363,6 +363,14 @@ laptop cannot be, and this document keeps GitHub grants on local daemons: the
 sealed value is dead off-node, so an escape on a laptop gains only the
 developer's own scoped, audited reach on the developer's own machine, the tier
 the local chooser accepts.
+
+**Nothing ships between sign-in and the proxy.** The identity plane's own
+build order puts sign-in early and the egress proxy late; this work is
+prioritised above that order, so the proxy and sealed delivery are built with
+it, and a session gets GitHub access only through the sealed path. An interim
+path, a raw or facade-delivered credential until the proxy exists, was set
+aside: it would ship the custody model this document rejects and then retire
+it, and every requirement here would be written twice.
 
 **A session's credential expires within 8 hours**, GitHub's own user-token
 expiry, rather than an open question or a shorter ceiling set here at the cost
@@ -488,10 +496,7 @@ local (GHS-008 to GHS-010), and in the local daemon's self-enrollment
 
 ## Open questions
 
-- [NEEDS CLARIFICATION (HIGH): The egress proxy and sealed delivery land with
-  the identity plane's fifth build phase, and sign-in with its second. What
-  ships for sessions in between, and does any interim credential path exist
-  before the proxy does?]
+
 - [NEEDS CLARIFICATION (MEDIUM): May a child session declare a repository set
   narrower than its parent's, and may a running session's set change without
   signing in again? To be tested against GitHub. A narrowed token cannot be
