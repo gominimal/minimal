@@ -5,7 +5,7 @@ status: draft
 owner: mitodrummer
 epic: gominimal/inbox#513
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
-updated: 2026-09-04
+updated: 2026-09-08
 ---
 
 # MCC — Shared min client core: one Rust core for the CLI, the browser and mobile
@@ -151,14 +151,20 @@ group below.
     verify: cargo nextest run -p min-core silent_peer_is_lost_after_60s_at_the_injected_clock
 
 - **MCC-014** WHEN a node's reachability options include a direct endpoint THE
-  SYSTEM SHALL dial it first, and SHALL dial the node's relay endpoint with
-  the node's ticket only when the direct dial fails or none is offered.
+  SYSTEM SHALL dial it first, and SHALL dial the node's home relay, as the
+  peer document names it from the node's advertised reachability, with the
+  node's ticket only when the direct dial fails or none is offered
+  (Gatehouse §6.9, architecture D7: direct paths preferred, the relay the
+  fallback and never the route of first resort).
   tier:     T0
   verify:   cargo nextest run -p min-core direct_endpoint_first_relay_as_fallback
 
-- **MCC-015** WHEN a head lists nodes THE SYSTEM SHALL return the peer
-  document's node set with the liveness and `last_seen` the identity plane
-  reports (MCC-070), opening no tunnel.
+- **MCC-015** WHEN a head lists nodes THE SYSTEM SHALL return the identity
+  plane's subject-scoped node listing (`GET /v1/nodes`, Gatehouse §8.2,
+  evaluated as `ReadNode`, §7.4) — each node's name, identity, class,
+  `last_seen`, liveness state (`reachable`, `stale` or `offline`) and
+  advertised reachability — joined to the peer document's entry for the node
+  (MCC-070), opening no tunnel.
   tier:     T0
   verify:   cargo nextest run -p min-core listing_opens_no_tunnel
 
@@ -246,7 +252,12 @@ group below.
   certificate decision of MCC-034 for the host type with an empty revocation
   set (no host KRL in v1, Design reasoning) and the expected principal named
   exactly or by the per-node wildcard `*.<node_id>.box.<td>` — refusing
-  anything else before authentication with the failing check named.
+  anything else before authentication with the failing check named. For a
+  mesh attach the expected principal is the node's canonical
+  `<node_id>.box.<td>` name the peer document carries, never the tunnel
+  address dialed (Gatehouse §5.3 mesh attaches, v1.15): the canonical name
+  must be among the certificate's own principals, since the wildcard covers
+  only the names beneath it.
   tier:     T1
   verify:   cargo nextest run -p min-core host_policy_accepts_iff_every_check_holds
   property: for every (certificate, anchors, expected, now): accept ⇔ decision(certificate, anchors, host, now, revoked = ∅) = ok (MCC-034) ∧ (expected ∈ principals ∨ ∃ p ∈ principals: p = "*." ‖ suffix ∧ expected ends with "." ‖ suffix); a refusal names the first failing check, the decision's order first and the principal last
@@ -258,6 +269,10 @@ group below.
     name under the node and no name beside it.
     tier:   T0
     verify: cargo nextest run -p min-core per_node_wildcard_principals_match_boxes_under_the_node
+  - WHERE the host was dialed at a tunnel address THE SYSTEM SHALL match the
+    canonical node name the peer document names and never the address.
+    tier:   T0
+    verify: cargo nextest run -p min-core tunnel_addressed_host_is_verified_against_its_canonical_name
 
 - **MCC-033** WHERE the transport is a local UDS or vsock THE SYSTEM SHALL
   accept the daemon without a host certificate, as today.
@@ -283,15 +298,18 @@ group below.
   key on the authorization request, the verifier and a DPoP proof on the
   token request, refresh with rotation, the tokens held in the core's
   memory — differing between heads only in the authorization leg: the
-  browser's HTTPS redirect, the CLI's device flow (GHS-006). Persistence
-  beyond memory is the head's: none in the browser (MCC-076, WMC-004), the
-  CLI's refresh token in its own store (MCC-050).
+  browser's HTTPS redirect, the CLI's device flow (GHS-006); in the browser
+  this is the `public` client kind of Gatehouse §6.1.7 (v1.11): exact-match
+  HTTPS redirect URIs on the terminal origin, `dpop_required`,
+  `auth_method = none`. Persistence beyond memory is the head's: none in the
+  browser (MCC-076, WMC-004), the CLI's refresh token in its own store
+  (MCC-050).
   tier:     T0
   verify:   cargo nextest run -p min-core login_is_pkce_and_dpop_bound_for_every_head
 
 - **MCC-036** THE SYSTEM SHALL attach a fresh DPoP proof, signed through the
   signer, to every token, certify, mesh-bind, relay-ticket and revoke
-  request it makes.
+  request it makes (Gatehouse §6.1.7, §6.9).
   tier:     T0
   verify:   cargo nextest run -p min-core every_issuer_request_carries_a_fresh_dpop_proof
 
@@ -299,14 +317,18 @@ group below.
   token with `box:ssh` THE SYSTEM SHALL request a certificate for the
   signer's public key with the profile and TTL the head configures:
   `interactive` for the CLI, `exchange` with a TTL of at most 900 s for the
-  browser.
+  browser (Gatehouse §6.6; the browser min client row of §5.7). The
+  certificate needs `box:ssh` on the token, which for a `public` client is a
+  tenant opt-in (§6.1.7): absent it, the issuer's refusal is reported as
+  MCC-081 shapes it.
   tier:     T0
   verify:   cargo nextest run -p min-core certify_carries_the_heads_profile_and_ttl
 
 - **MCC-038** THE SYSTEM SHALL take Host CA anchors only from the CA endpoint
-  of the issuer named in the credential it holds — never from the page
-  origin, the peer, the relay or a peer-document field — and SHALL attempt
-  no attach while it holds none.
+  of the issuer named in the credential it holds (`{iss}/v1/ssh/ca`,
+  Gatehouse §6.1.7, §8.2) — never from the page origin, the peer, the relay
+  or a peer-document field — and SHALL attempt no attach while it holds
+  none.
   tier:     T0
   verify:   cargo nextest run -p min-core anchors_come_only_from_the_credentials_issuer
   - IF a peer document's issuer field differs from the credential's issuer
@@ -315,9 +337,10 @@ group below.
     verify: cargo nextest run -p min-core peer_document_with_a_foreign_issuer_is_refused
 
 - **MCC-039** WHILE an attachment is open under a certificate THE SYSTEM SHALL
-  obtain a fresh certificate 120 s before the current one expires,
-  re-handshake over the same tunnel, re-attach, and continue with the
-  attachment object unchanged (MCC-069) and no action from the user.
+  obtain a fresh certificate 120 s before the current one expires (the
+  T-2 min renewal of Gatehouse §6.1.7 and §5.7), re-handshake over the same
+  tunnel, re-attach, and continue with the attachment object unchanged
+  (MCC-069) and no action from the user.
   tier:     T0
   verify:   cargo nextest run -p min-core renewal_reattaches_before_expiry_at_the_injected_clock
   - IF the issuer cannot be reached in time THEN THE SYSTEM SHALL let the
@@ -331,22 +354,29 @@ group below.
 - **MCC-040** WHERE the head is a browser THE SYSTEM SHALL renew without user
   presence only while an attachment is open and less than 8 h have passed
   since the presence-backed initial certify that began the chain (plan entry
-  8); past either bound, the next attach requires a presence-backed certify.
-  The CLI's rule is MCC-056.
+  8; Gatehouse §6.1.7's lifecycle rule, the chain cap aligned with the §6.9
+  user-device binding); past either bound, the next certify requires a
+  presence step — a user gesture at the head, never a fresh sign-in — which
+  starts a new chain; the identity plane's browser session may complete that
+  certify silently (WMC-009). The CLI's rule is MCC-056.
   tier:     T0
   verify:   cargo nextest run -p min-core renewal_chain_stops_at_8h_or_without_an_open_attach
 
 - **MCC-041** WHERE the head is a browser THE SYSTEM SHALL generate a fresh
   WireGuard keypair in memory per page session, request a binding for its
-  public key under the DPoP-bound token, use it for at most 8 h, and discard
-  it when the page session ends. The CLI's node key is MCC-053's.
+  public key under the DPoP-bound token (`JoinMesh`, a tenant opt-in for a
+  `public` client, Gatehouse §6.9), use it for at most 8 h, and discard it
+  when the page session ends (§6.9, client mesh keys; a WebCrypto-held key
+  is plan S13). The CLI's node key is MCC-053's.
   tier:     T0
   verify:   cargo nextest run -p min-core browser_mesh_key_is_fresh_per_page_session_bound_and_discarded
 
 - **MCC-042** THE SYSTEM SHALL use a head's signing key for DPoP proofs and
   SSH authentication signatures only, and SHALL derive no SSH-PoP (`sshpop`)
   assertion from it; a request to an issuer, relay or node is authenticated
-  with DPoP or the SSH certificate, never with an SSH-PoP assertion.
+  with DPoP or the SSH certificate, never with an SSH-PoP assertion
+  (Gatehouse §6.1.7: the tab's DPoP key is never an SSH-PoP or
+  DPoP-for-boxes key).
   tier:     T0
   verify:   cargo nextest run -p min-core heads_key_signs_only_dpop_and_ssh_userauth
 
@@ -381,16 +411,20 @@ group below.
 
 - **MCC-053** WHEN a developer runs `min net mesh join <network>` (today `min
   mesh join`; the architecture's command tree renames it) THE SYSTEM SHALL
-  obtain the binding and the peer document through the credential module and
-  bring the mesh up through the core's network layer over UDP, with no manual
-  key exchange, keeping its mesh node key across invocations for the lifetime
-  of the enrollment (its rotation is an open question).
+  request a §6.9 binding and consume the peer document through the
+  credential module (the command's shape since Gatehouse v1.14: the manual
+  key exchange is retired, the daemon's static peer table being the POC
+  interim, MMI-011) and bring the mesh up through the core's network layer
+  over UDP, keeping its mesh node key across invocations for the lifetime of
+  the enrollment (its rotation is an open question).
   tier:     T0
   verify:   cargo nextest run -p minimal mesh_join_needs_no_manual_key_exchange
 
 - **MCC-054** WHEN a developer lists sessions THE SYSTEM SHALL include the
-  sessions on every node of the peer document, addressed and attachable with
-  the same grammar as local ones.
+  sessions on every node the identity plane lists for the developer
+  (MCC-015), addressed and attachable with the same grammar as local ones;
+  hosts reached only through a client-managed provider list stay outside
+  that listing by construction (Gatehouse §8.2 scope decision, v1.13).
   tier:     T0
   verify:   cargo nextest run -p minimal list_and_attach_use_one_grammar_for_mesh_nodes
 
@@ -508,8 +542,9 @@ there.
   verify:   just wasm-core-headless signer_gets_bytes_and_returns_a_raw_signature
 
 - **MCC-067** THE SYSTEM SHALL perform the token exchange, refresh, certify,
-  anchors fetch, mesh-bind, relay-ticket request, renewal and the
-  refresh-token revoke at sign-out itself over an HTTP callback the page
+  anchors fetch, mesh-bind, node listing and peer-document fetch,
+  relay-ticket request, renewal and the refresh-token revoke at sign-out
+  itself over an HTTP callback the page
   supplies, produce the authorization URL the page navigates to, and consume
   the callback the page hands back, checking its `state` against the request
   and its `iss` against the deployment issuer set before exchanging; the page
@@ -523,8 +558,10 @@ there.
     verify: just wasm-core-headless foreign_iss_or_bad_state_exchanges_nothing
 
 - **MCC-068** THE SYSTEM SHALL send the certify request and read its response
-  as Gatehouse §6.6 shapes them, and fetch the anchors as §8.2 shapes
-  `GET {iss}/v1/ssh/ca`.
+  as Gatehouse §6.6 shapes them (dual-CKT audit, `exchange` profile for the
+  `public` client, §6.1.7), fetch the anchors as §8.2 shapes
+  `GET {iss}/v1/ssh/ca`, and read the node listing and the peer document as
+  §8.2 shapes `GET {iss}/v1/nodes` and `GET {iss}/v1/mesh/peers`.
   tier:     T0
   verify:   cargo nextest run -p min-core certify_and_anchors_exchanges_match_gatehouse
 
@@ -532,27 +569,44 @@ there.
   opening the new connection and attaching with the fresh certificate first,
   then closing its old channel itself — with no second attach call, no change
   to the attachment object and no close callback, the head observing only the
-  repaint (MCC-063), within the chain cap (MCC-040); where the daemon
-  supersedes the old channel before the core closes it (MMI-053), the
-  resulting `SUPERSEDED@minimal.dev` is consumed (MCC-065).
+  repaint (MCC-063), within the chain cap (MCC-040; Gatehouse §6.1.7); where
+  the daemon supersedes the old channel before the core closes it (MMI-053),
+  the resulting `SUPERSEDED@minimal.dev` is consumed (MCC-065).
   tier:     T0
   verify:   just wasm-core-headless renewal_is_invisible_to_the_page
 
-- **MCC-070** THE SYSTEM SHALL consume from the subject's peer document: per
-  subject and mesh, the tab's tunnel address and prefix length; per node,
-  node identity and friendly name, the node's WireGuard public key, the
-  node's tunnel address, the SSH port, the expected host principal, the
-  issuer field (checked against the credential's, MCC-038), the liveness the
-  identity plane reports with its `last_seen` time, and the reachability
-  options — a direct WebSocket endpoint and/or a relay endpoint with a
-  ticket.
+- **MCC-070** THE SYSTEM SHALL consume the subject's peer document as
+  Gatehouse §6.9 (v1.14) and §8.2 shape it — a `gatehouse-mesh-peers+jws`
+  feed over `GET /v1/mesh/peers?network=<mesh>` with payload `{td, mesh,
+  audience sub, seq, issued_at, peers[], revoked_bindings[]}` — taking per
+  subject and mesh the tab's tunnel address and prefix length, and per node
+  its identity and friendly name, `wg_pub` (the node's current binding),
+  tunnel address, allowed IPs, the SSH port, the expected host principal
+  (the node's canonical name, §5.3), the issuer field (checked against the
+  credential's, MCC-038), and the reachability options — a direct endpoint
+  and/or the node's home relay, the relay dialed with a ticket; liveness
+  and `last_seen` come from the node listing (MCC-015), not the document.
   tier:     T0
   verify:   cargo nextest run -p min-core peer_document_maps_onto_the_attach_configuration
+  - THE SYSTEM SHALL reject a document whose `seq` regresses below the last
+    one accepted for that (audience, mesh), and SHALL treat a document
+    older than `issued_at` + 5 min at the injected clock as expired: no new
+    tunnel is opened from it, while an established tunnel rides its
+    binding's TTL (§6.9 staleness bound; the revoked-bindings delta rides
+    in-band).
+    tier:   T0
+    verify: cargo nextest run -p min-core stale_or_regressed_peer_document_opens_no_new_tunnel
 
 - **MCC-071** WHEN dialing through a relay THE SYSTEM SHALL present the node's
-  ticket opaque and unmodified at WebSocket open, use a ticket only for the
-  node it was issued for, and obtain a new one when the relay reports it
-  expired.
+  ticket — a `gatehouse-relay-ticket+jws` over `{td, sub, node_id, cnf.jkt,
+  iat, exp, jti}` bound to the head's DPoP key, requested under the
+  DPoP-bound token and issued only where the subject may reach the node
+  (`ReadNode`; Gatehouse §6.9, §7.4) — opaque and unmodified at WebSocket
+  open, with a DPoP proof over it and the head's own §6.9 mesh binding, from
+  which the relay takes the client's mesh public key (MMI-071); use a ticket
+  only for the node it was issued for; and obtain a new one when the relay
+  reports it expired. The ticket authorizes routing only: the tunnel's
+  security stays the §6.9 binding plus SSH end to end (T29).
   tier:     T0
   verify:   cargo nextest run -p min-core relay_ticket_is_opaque_per_node_and_presented_at_open
 
@@ -562,7 +616,11 @@ there.
   show → a session's record and current screen; rename → the session renamed
   or the daemon's refusal; stop → `StopSession` (MMI-028): the session's
   process ended and the session listed with no running attributes; version →
-  the daemon's version (MCC-006).
+  the daemon's version (MCC-006). The daemon evaluates these as Gatehouse
+  §7.4 (v1.16) maps them — sessions are boxes: attach `SshConnect`, show and
+  list rows `BoxRead`, stop `StopBox`, rename `RenameBox`, a node-level
+  listing `ReadNode` — with the owner rule as the ratified interim
+  (MMI-025, MMI-027); the RPC names are the daemon's wire names.
   tier:     T0
   verify:   just wasm-core-headless v1_rpcs_run_through_the_driver_with_the_attach_taxonomy
 
@@ -652,10 +710,13 @@ there.
 - The browser page — origin, policy, integrity loading, key generation,
   storage rule, reconnect cadence, rendering, mobile layout, the terminal
   emulator, its tests: the browser client spec in gominimal/webapp (WMC).
-- The identity plane's capabilities — the public-client kind, certify for that
-  client, the peer document and node listing, heartbeats, relay tickets, the
-  §5.7 wording for a 15-minute certificate: gominimal/gatehouse, the
-  `01-spec-*` lineage, with the open questions below as the asks.
+- The identity plane's capabilities — the `public` client kind and certify
+  for it (Gatehouse §6.1.7, §6.6, §5.7, v1.11), the node listing and
+  heartbeat (§8.2, v1.13), relay tickets (§6.9, v1.12), the peer document
+  (§6.9, v1.14), the mesh-attach host principal (§5.3, v1.15) and the
+  session-operation decisions (§7.4, v1.16): recorded in the architecture of
+  record on 2026-09-07 (gominimal/arch#16 to #22), implemented in
+  gominimal/gatehouse, the `01-spec-*` lineage.
 - The mobile app and its in-process network stack: plan S13, later, from the
   same core.
 - Session recording: plan S9 and Gatehouse §14.4(1); daemon-side if ever.
@@ -666,8 +727,9 @@ there.
 - GitHub sign-in UX and credential-free git from sessions: the GitHub
   sessions spec (GHS) in this repo; MCC-050 is the credential it rides on.
 - Hosts reached only through providers in the client-managed Box Provider
-  List, un-enrolled with Gatehouse: invisible to the tab in v1 (plan S2),
-  carried with the peer-document open question.
+  List, un-enrolled with Gatehouse: invisible to the tab in v1 (plan S2; the
+  scope decision of Gatehouse §8.2, v1.13, a server-side provider list being
+  the v2 revisit).
 
 ## Non-functional requirements
 
@@ -717,17 +779,29 @@ Promotion updates AGENTS.md's crate table and `docs/architecture.md` §3
 builds there.
 
 **The tab is a mesh node and no server is in the session path** (decided
-2026-09-03, plan entries 12, 18, 23, 24). Servers remain for the page,
-Gatehouse, notifications and a stateless relay forwarding WireGuard
-ciphertext for daemons behind NAT; none holds a box credential or sees SSH
-bytes. A daemon exposes no inbound listener by default and connects outbound
-to its relay; the tab dials direct first (MCC-014) because a reachable daemon
-needs no relay.
+2026-09-03, plan entries 12, 18, 23, 24; architecture D7 and Gatehouse §6.9
+since v1.12). Servers remain for the page, Gatehouse, notifications and a
+stateless relay forwarding WireGuard ciphertext for daemons behind NAT; none
+holds a box credential or sees SSH bytes, and a relay compromise reads and
+terminates nothing (T29). A daemon exposes no inbound listener by default
+and connects outbound to its relay, registering with `sshpop-host` against
+a relay URL the issuer advertises in `gatehouse_node_endpoints`; the tab
+dials direct first (MCC-014) because a reachable daemon needs no relay, and
+opens a relay socket with a per-node ticket that authorizes routing only
+(MCC-071).
 
 **A public client with tokens in memory** (decided 2026-09-03, entries 10,
-15–17). With no backend nothing but the tab can hold tokens, and every token
-is sender-constrained to a non-extractable key (Gatehouse §5.4), which is
-what §6.1.7's rule guarded against. The core holds tokens in memory on every
+15–17; Gatehouse §6.1.7 since v1.11, the closure of §14.4(2)). With no
+backend nothing but the tab can hold tokens, and every token is
+sender-constrained to a non-extractable key (Gatehouse §5.4); the
+confidential-client rule that tokens never reach the browser stays for
+every other web client, and the `public` kind — PKCE with `dpop_jkt`,
+`auth_method = none`, tokens and the DPoP key in tab memory, nothing
+persisted, anchors from `{iss}/v1/ssh/ca` — is this one. §6.6 lets the
+certified key equal the DPoP key and the core signs both through one head
+key (MCC-042); §6.1.7's wording, "a fresh in-tab SSH key", is read as
+permitting that and carried as an open question. The core holds tokens in
+memory on every
 head; what outlives the process is the head's — none in the browser (MCC-076,
 WMC-004), the CLI's refresh token in its store (MCC-050). A reload re-mints
 through the SSO session, the client has its own origin, and the bundle is
@@ -738,15 +812,24 @@ origin serving the page is trusted for code integrity, never for data, and
 checkably so.
 
 **A 15-minute certificate with transparent renewal, capped** (decided
-2026-09-03, entries 7, 8, 22). The `interactive` 8 h profile would keep §5.7's
-wall warnings at the price of an 8 h window for an XSS that drives the key;
-`exchange` at 15 min keeps the window short and makes reconnect a core duty
-(MCC-039). Unattended renewals stop at the binding's 8 h and without an open
-attach (MCC-040), so the profiles are equivalent in XSS terms and differ in
-revocation latency only. The chain is anchored at the presence-backed initial
-certify (plan entry 8); WMC-009 counts from the sign-in and must align to the
-certify, or the two differ by the length of a login. A Gatehouse outage
-detaches at the next renewal with no grace period. The daemon-side repaint
+2026-09-03, entries 7, 8, 22; normative since Gatehouse v1.11 as the browser
+min client row of §5.7 and the lifecycle paragraph of §6.1.7). The
+`interactive` 8 h profile would keep §5.7's wall warnings at the price of an
+8 h window for an XSS that drives the key; `exchange` at 15 min keeps the
+window short and makes reconnect a core duty (MCC-039); §5.7 now suppresses
+the warnings for this client (MMI-031 is the daemon rule). Unattended
+renewals stop at the binding's 8 h and without an open attach (MCC-040), so
+the profiles are equivalent in XSS terms and differ in revocation latency
+only: the same 8 h envelope as a CLI cert, delivered as up to 32 short
+certificates. The chain is anchored at the presence-backed initial certify
+(plan entry 8), presence being a user gesture at the tab at the initial
+certify only, never per renewal, and never a fresh sign-in — the SSO
+session may complete the certify silently; WMC-009 counts from that certify.
+`box:ssh` and `JoinMesh` are tenant opt-ins for the `public` client, deny by
+default through the §5.8 issuance intersection, a personal tenant's sole
+admin opting in for themselves; where that opt-in surface lives is WMC's
+question. A Gatehouse outage detaches at the next renewal with no grace
+period. The daemon-side repaint
 makes each forced reconnect land on a full screen, which is why the
 mesh-ingress spec is a v1 prerequisite and MCC-063 states the repaint as
 observed.
@@ -770,6 +853,18 @@ empty revocation set (MCC-032). The exposure is a compromised host key that
 stays acceptable until its certificate's 30-day expiry (Gatehouse §5.7) or a
 Host CA rotation; user-certificate revocation is the daemon's KRL
 (MMI-034–037). Carried as an open question.
+
+**The expected principal is the node's canonical name** (Gatehouse §5.3,
+v1.15, the arch#21 ruling). A mesh attach dials the daemon's tunnel address
+and verifies the host certificate against `<node_id>.box.<td>`, which the
+peer document names in its expected-principal field — the same
+CNAME-onto-canonical move §5.3 makes for friendly names, with the peer
+document standing in for DNS canonicalization. Tunnel addresses are never
+certificate principals and owe no stability guarantee, so mesh renumbering
+forces no out-of-cycle host-cert renewal; the interim that added the
+address as a principal (MCC-032 as first drafted, MMI-029) is superseded.
+The core performs the check natively (MCC-032); the CLI's `known_hosts`
+fragment (MCC-052) is the `HostKeyAlias` form of the same rule.
 
 **Constants.** The 60 s silent-peer bound (MCC-013) is twice the 25 s
 persistent keepalive the network layer configures; 20 s to the first
@@ -799,10 +894,19 @@ is not the mesh peer plan S6 describes. P-256 is a one-variant fallback for
 the FIPS profile, covered by MCC-030's property.
 
 **Listing is the identity plane's node set plus heartbeats** (decided
-2026-09-03, entry 21). The tab reads nodes, liveness and `last_seen` in one
-call and handshakes only with the node it attaches to (MCC-015, MCC-017); a
-proof-of-concept design that opened a tunnel per node for liveness was
-retired by it.
+2026-09-03, entry 21; Gatehouse §8.2 since v1.13). The tab reads nodes,
+liveness and `last_seen` in one call — `GET /v1/nodes`, evaluated as
+`ReadNode` (§7.4), owner-only in v1: the enrolling subject of a
+`local`-class node — and handshakes only with the node it attaches to
+(MCC-015, MCC-017); a proof-of-concept design that opened a tunnel per node
+for liveness was retired by it. Liveness is the identity plane's derivation
+from `POST /v1/nodes/heartbeat` (60 s cadence; `reachable` within 150 s,
+`stale` within 15 min, `offline` beyond — §8.2 working values), and the
+same `ReadNode` decision gates relay-ticket issuance, so what a head can
+list and what it can dial never drift apart. Peer configuration is the
+§6.9 peer document (v1.14): bindings authorize, the document configures,
+with its `seq` and staleness bound enforced in the core (MCC-070); a stale
+document refuses new tunnels and never severs a live one.
 
 **CLI adoption order** (decided 2026-09-03, entry 6). The target is the
 in-process attach (MCC-052); the first step shares the non-TTY parts and keeps
@@ -822,13 +926,17 @@ is later work.
 **Working assumptions, not decisions.** Four defaults the owner confirmed on
 2026-09-04 (recorded in WMC) stay written as assumptions so a reversal is one
 visible edit: A1, the v1 browser command set is owner-only list, show,
-attach, rename and stop (MCC-072), with no create, sync, agent dispatch or
-share links; A2, the plan's decisions above stand; A3, the browser client
-lives on its own origin served from the webapp repo (MCC-075, WMC-035); A4,
-the Gatehouse capabilities this spec consumes are dependencies on the identity
-plane, bound by name and carried as HIGH open questions where the architecture
-has not ruled. Overturning one changes the requirements it names, not the
-core's shape.
+attach, rename and stop (MCC-072; Gatehouse §7.4 since v1.16 maps them onto
+`SshConnect`, `BoxRead`, `StopBox`, `RenameBox` and `ReadNode` — sessions
+are boxes, no parallel action family — and ratifies the daemon's owner rule
+as the interim, destroy staying local-only), with no create, sync, agent
+dispatch or share links; A2, the plan's decisions above stand; A3, the
+browser client lives on its own origin served from the webapp repo (MCC-075,
+WMC-035); A4, the Gatehouse capabilities this spec consumes are dependencies
+on the identity plane, bound by section since the v1.11 to v1.16.1 stack
+landed on 2026-09-07 (arch#16 to #22 closed) — no longer an assumption, the
+sections cited where each requirement binds. Overturning one changes the
+requirements it names, not the core's shape.
 
 **Tiers.** Three universals are at T1 — the signer's output shape (MCC-030),
 the host-policy decision (MCC-032) and the certificate decision (MCC-034) —
@@ -871,7 +979,8 @@ Gatehouse is the only identity plane in the system (§6.9).
   a host certificate verifying, for the expected principal, against anchors
   taken from the tenant issuer only.
   enforced by: the host policy in the server-key check, aborting before
-  authentication (Gatehouse §6.2, no TOFU); the anchors fetch bound to the
+  authentication (Gatehouse §6.2, no TOFU), the expected principal being the
+  node's canonical name (§5.3 mesh attaches); the anchors fetch bound to the
   issuer the credential names, with a peer document naming another issuer
   refused.
   covered by: MCC-032, MCC-038, MCC-051
@@ -905,45 +1014,19 @@ Gatehouse is the only identity plane in the system (§6.9).
 
 ## Open questions
 
-- [NEEDS CLARIFICATION (HIGH): A public-client registration kind does not
-  exist in the architecture of record: Gatehouse §6.1.7 says tokens never
-  reach the browser and a SPA holding tokens is out of v1 scope; §14.4(2)
-  leaves the in-browser path open. This spec needs a `public` kind — PKCE
-  with `dpop_jkt`, exact-match HTTPS redirect URIs, DPoP required, no client
-  authentication, tokens held by the client on a non-extractable key, and the
-  statement that the client's key never becomes an SSH-PoP key. MCC-035,
-  MCC-036, MCC-042, MCC-067 and MCC-076 wait on the ruling. Filed: gominimal/arch#16.]
-- [NEEDS CLARIFICATION (HIGH): Certify for the browser client. §6.1.7 grants
-  web clients no `box:ssh` by default, the website's registration
-  (minimal-hosted §4, §7) omits it, and §6.9 keeps `JoinMesh` deny-by-default.
-  This spec needs both as tenant opt-ins for the public client, a personal
-  tenant's sole admin opting in for themselves, both key thumbprints audited
-  on certify. MCC-037, MCC-041 and MCC-068 depend on it. Filed: gominimal/arch#16.]
-- [NEEDS CLARIFICATION (HIGH): A 15-minute `exchange` certificate for an
-  interactive browser session. §5.7 gives interactive users 8 h with wall
-  warnings at T-15 and T-1 min. This spec renews at T-2 min with the warnings
-  suppressed for a client that reconnects transparently, caps the unattended
-  chain at 8 h from the initial certify and requires presence there; §5.7
-  must say so. MCC-039, MCC-040 and MCC-069 depend on it. Filed: gominimal/arch#16.]
-- [NEEDS CLARIFICATION (HIGH): The peer document, node listing and
-  heartbeats. §6.9 issues bindings but no peer configuration; §9 holds nodes
-  with `last_seen` but exposes no per-subject read; §8.2 has no endpoint for
-  either. This spec needs one read returning the fields MCC-070 lists, with
-  liveness and `last_seen` from daemon heartbeats. MCC-014, MCC-015, MCC-017,
-  MCC-053, MCC-054 and MCC-070 depend on it; the un-enrolled provider-list
-  gap rides with it. Filed: gominimal/arch#19 and gominimal/arch#17.]
-- [NEEDS CLARIFICATION (HIGH): The relay tier and its tickets. No
-  architecture text describes a stateless ciphertext relay, a Gatehouse-issued
-  per-node ticket bound to the tab's DPoP key, or the daemon's outbound relay
-  connection under `sshpop-host`; box-provider-api §1 and the Cloudflare
-  sketch §1 keep the provider out of the box data path, which a ciphertext
-  relay needs restating. The protocol is the mesh-ingress spec's; the ticket's
-  issuer and shape are Gatehouse's. MCC-014 and MCC-071 depend on it. Filed: gominimal/arch#18.]
-- [NEEDS CLARIFICATION (MEDIUM): Which principal the host certificate carries
-  for a tunnel-addressed connection. §5.3 lists the names and IPs clients may
-  connect to; the tab dials a tunnel address. Either the address is a
-  principal or the peer document names the node's canonical name and the core
-  resolves it. MCC-032 and MCC-070 allow either; the document must pick one.]
+- [NEEDS CLARIFICATION (MEDIUM): One key or two. Gatehouse §6.1.7 mints the
+  browser client's certificate "onto a fresh in-tab SSH key" and §6.6 says
+  the certified key "needn't equal the DPoP key"; MCC-042 and WMC-003 sign
+  DPoP proofs and SSH authentication with one head key, as the proof of
+  concept did, so the dual-CKT audit records one thumbprint twice. Confirm
+  that one key is acceptable, or split it: a second signer for SSH costs the
+  head one more key and the core a second signer seam, nothing else.]
+- [NEEDS CLARIFICATION (MEDIUM): The relay ticket's claim set (Gatehouse
+  §6.9: `td, sub, node_id, cnf.jkt, iat, exp, jti`) carries no mesh public
+  key, which the relay needs to address frames (MMI-077). MCC-071 presents
+  the head's §6.9 binding beside the ticket and the relay takes the key from
+  it (MMI-071); the mesh-ingress spec asks the architecture whether a
+  `wg_pub` claim in the ticket is wanted instead.]
 - [NEEDS CLARIFICATION (MEDIUM): Host-certificate revocation. v1 checks no
   KRL for host certificates (MCC-032, Design reasoning), leaving a
   compromised host key acceptable until its 30-day certificate expires
@@ -965,10 +1048,6 @@ Gatehouse is the only identity plane in the system (§6.9).
 - [NEEDS CLARIFICATION (MEDIUM): The wasm head's packaging for the webapp —
   npm versioning of `min-core-web`, the wasm-bindgen pin policy, and how the
   webapp consumes the release manifest of MCC-073.]
-- [NEEDS CLARIFICATION (LOW): Stop is `StopSession` (MMI-028) and bound in
-  MCC-003 and MCC-072; destroy stays Local-only in the daemon (MMI-027). Does
-  the browser ever get destroy of an exited session, which WMC today does not
-  offer?]
 - [NEEDS CLARIFICATION (LOW): Whether `minimald`'s WireGuard pump moves onto
   the core's network layer or keeps its own driver over the same crate; the
   mesh-ingress spec's call, invisible to this spec's behaviours.]
