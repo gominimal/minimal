@@ -5,7 +5,7 @@ status: draft
 owner: mitodrummer
 epic: gominimal/inbox#513
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
-updated: 2026-09-04
+updated: 2026-09-08
 ---
 
 # MMI — minimald as a mesh-reachable session host: WireGuard ingress, certificate auth, terminal state, relay
@@ -127,11 +127,13 @@ developer running sessions both locally and remote.
   tier:     T0
   verify:   cargo nextest run -p minimald no_inbound_mesh_listener_without_opt_in
 
-- **MMI-008** WHERE a relay is configured THE SYSTEM SHALL connect outbound
-  to it over a TLS WebSocket, authenticate with its node identity (SSHPOP.md
-  §5.1.1(b), `aud` the relay's canonical URL from `gatehouse_node_endpoints`),
-  and treat each frame received there as a datagram from its UDP socket whose
-  source is the mesh public key the frame is addressed with (MMI-077).
+- **MMI-008** WHERE a relay is configured, by the peer document's relay
+  assignment or by configuration until one is, THE SYSTEM SHALL connect
+  outbound to it over a TLS WebSocket, authenticate with its node identity
+  (SSHPOP.md §5.1.1(b), `aud` the relay's canonical URL from the `relays`
+  member of `gatehouse_node_endpoints`; Gatehouse §6.9, §8.2; architecture
+  D7), and treat each frame received there as a datagram from its UDP socket
+  whose source is the mesh public key the frame is addressed with (MMI-077).
   tier:     T0
   verify:   cargo nextest run -p minimald relay_client_registers_with_sshpop_host
   - IF the relay connection fails or closes THEN THE SYSTEM SHALL reconnect
@@ -142,22 +144,39 @@ developer running sessions both locally and remote.
 
 - **MMI-009** THE SYSTEM SHALL send to a peer over a direct endpoint whenever
   that endpoint has authenticated a datagram from the peer within 180 s, and
-  otherwise over the relay connection addressed to that peer.
+  otherwise over the relay connection addressed to that peer (direct paths
+  preferred, the relay the fallback — Gatehouse §6.9, architecture D7).
   tier:     T0
   verify:   cargo nextest run -p minimald direct_endpoint_preferred_over_relay
 
-- **MMI-010** WHERE a peer document is configured THE SYSTEM SHALL admit a
-  peer only while the document holds a valid, unexpired mesh binding for
-  that peer's key, re-checked at every rekey (Gatehouse §6.9).
+- **MMI-010** WHERE a peer document is configured THE SYSTEM SHALL fetch the
+  daemon's mirror view of it — `GET /v1/mesh/peers` under `sshpop-host`, the
+  node-scoped endpoint advertised in `gatehouse_node_endpoints`, a
+  `gatehouse-mesh-peers+jws` feed carrying the keys to admit with their
+  bindings, tunnel addresses per `MeshNetwork` and the node's relay
+  assignment (Gatehouse §6.9 v1.14, §8.2) — and admit a peer only while the
+  document holds a valid, unexpired mesh binding for that peer's key,
+  re-checked at every rekey; the document configures and never authorizes,
+  so a forged or stale one can mis-route but never admit.
   tier:     T0
   verify:   cargo nextest run -p minimald peer_admitted_only_against_a_valid_binding
-  - IF a binding expires or is revoked THEN THE SYSTEM SHALL refuse the
-    peer's next handshake and end its carried connections within 60 s.
+  - IF a binding expires or is revoked, by TTL or by the document's in-band
+    `revoked_bindings[]` delta, THEN THE SYSTEM SHALL refuse the peer's next
+    handshake and end its carried connections within 60 s.
     tier:   T0
     verify: cargo nextest run -p minimald revoked_binding_ends_the_peer
+  - IF a document's `seq` regresses below the last accepted for its
+    (audience, mesh), or its `issued_at` is older than the 5 min staleness
+    bound, THEN THE SYSTEM SHALL keep the last accepted document, admit no
+    peer it did not already admit, and leave established tunnels to ride
+    their bindings' TTLs (the §8.2 anti-rollback discipline).
+    tier:   T0
+    verify: cargo nextest run -p minimald stale_or_regressed_peer_document_admits_no_new_peer
 
 - **MMI-011** WHERE a static peer table is configured and no peer document is
-  THE SYSTEM SHALL admit exactly the listed keys (R4.1).
+  THE SYSTEM SHALL admit exactly the listed keys (R4.1); the static table and
+  `min net mesh join`'s manual key exchange are the proof-of-concept interim
+  the peer document retires (Gatehouse §6.9, v1.14).
   tier:     T0
   verify:   cargo nextest run -p minimald static_peer_table_admits_listed_keys_only
 
@@ -223,7 +242,8 @@ developer running sessions both locally and remote.
 - **MMI-025** WHERE no authorization decision endpoint is configured THE
   SYSTEM SHALL admit only certificates whose subject equals the daemon's
   configured owner subject, refusing every other subject before any channel
-  opens.
+  opens — the ownership interim Gatehouse §7.4 (v1.16) ratifies rather than
+  replaces, its shipped baselines being ownership-shaped.
   tier:     T0
   verify:   cargo nextest run -p minimald owner_subject_rule_admits_only_the_owner
 
@@ -231,7 +251,12 @@ developer running sessions both locally and remote.
   session channel for a `Certified` connection only on an allow `SshConnect`
   decision for (subject, session) cached within 60 s, fetching a missing one
   with a 2 s deadline and denying on deadline or unreachability (Gatehouse
-  §6.3.1).
+  §6.3.1), and SHALL evaluate the other admitted requests on the same cache
+  as Gatehouse §7.4 (v1.16) maps them — sessions are boxes: `BoxRead` for
+  `GetSessionRecord`, `GetSessionScreen` and each `ListSessions` row,
+  `ReadNode` for the listing itself, `StopBox` for `StopSession`, `RenameBox`
+  for `RenameSession` — once the daemon's RPC evaluation point lands; until
+  then those decisions are deny by default beyond the owner rule.
   tier:     T0
   verify:   cargo nextest run -p minimald decision_cache_miss_fails_closed_when_the_sts_is_unreachable
 
@@ -239,9 +264,12 @@ developer running sessions both locally and remote.
   request, or direct-tcpip open by auth state: under `Local`, everything;
   under `Certified`, the shell attach path, `GetVersion`, `ListSessions`,
   `GetSessionRecord`, `GetSessionScreen`, and, for a session the connection's
-  subject owns (MMI-023), `RenameSession` and `StopSession`; under
-  `Pending`, nothing; refusing with channel failure or an
-  administratively-prohibited open.
+  subject owns (MMI-023; the creator baseline of `RenameBox` and `StopBox`,
+  Gatehouse §7.4), `RenameSession` and `StopSession`; under `Pending`,
+  nothing; refusing with channel failure or an administratively-prohibited
+  open. Every request outside that list stays local-only in v1, as §7.4
+  keeps exec, direct-tcpip, sftp, shutdown, cache, diagnostics, client-cert
+  issuance, create and destroy.
   tier:     T1
   verify:   cargo nextest run -p minimald rpc_allowlist_by_auth_state
   property: for every auth state s, every request r in the daemon's dispatched subsystem, exec, sftp and direct-tcpip vocabulary, and every ownership o in {owner, other}: admit(s, r, o) iff s = Local, or s = Certified and r in {attach, GetVersion, ListSessions, GetSessionRecord, GetSessionScreen}, or s = Certified and o = owner and r in {RenameSession, StopSession}; walked exhaustively
@@ -255,8 +283,10 @@ developer running sessions both locally and remote.
     tier:   T0
     verify: cargo nextest run -p minimald local_only_requests_refused_under_certified
 
-- **MMI-028** WHEN `StopSession` is admitted THE SYSTEM SHALL end the
-  session's process without the exit prompt, keep the record, end any
+- **MMI-028** WHEN `StopSession` is admitted (the `StopBox` decision of
+  Gatehouse §7.4, whose stop-the-process-keep-the-record semantics it
+  carries) THE SYSTEM SHALL end the session's process without the exit
+  prompt, keep the record, end any
   attached channel with the process's exit status as for a shell exit
   (MMI-053 names no signal for it), list the session as exited with no
   running attributes (MMI-055), answer a screen read as not active, and
@@ -265,9 +295,11 @@ developer running sessions both locally and remote.
   verify:   cargo nextest run -p minimald stop_session_ends_the_process_and_keeps_the_record
 
 - **MMI-029** WHERE a host certificate is configured THE SYSTEM SHALL present
-  it on every non-local connection, with principals covering the node's name,
-  the per-node wildcard `*.<node_id>.box.<td>`, and the daemon's tunnel
-  address (Gatehouse §5.3).
+  it on every non-local connection, with principals covering the node's
+  canonical `<node_id>.box.<td>` name and the per-node wildcard
+  `*.<node_id>.box.<td>`, and never the daemon's tunnel address (Gatehouse
+  §5.3 mesh attaches, v1.15: a mesh client dials the tunnel address and
+  verifies against the canonical name the peer document carries).
   tier:     T0
   verify:   cargo nextest run -p minimald host_certificate_presented_on_mesh_ingress
   - IF the host certificate is absent, unparsable, or expired THEN THE SYSTEM
@@ -276,7 +308,8 @@ developer running sessions both locally and remote.
     verify: cargo nextest run -p minimald expired_host_certificate_disables_the_mesh_ingress
   - WHERE a renewal endpoint is configured THE SYSTEM SHALL renew the host
     certificate at 50% of its lifetime, authenticating with the current one,
-    and present the new one without a restart.
+    requesting no tunnel address as a principal, and present the new one
+    without a restart; a change of tunnel address forces no renewal.
     tier:   T0
     verify: cargo nextest run -p minimald host_certificate_renewed_at_half_life
 
@@ -288,7 +321,9 @@ developer running sessions both locally and remote.
   verify:   cargo nextest run -p minimald reaper_closes_at_valid_before_and_the_session_survives
   - WHILE the certificate lifetime exceeds 1 h THE SYSTEM SHALL write wall
     warnings to the attached terminal at T-15 min and T-1 min, and for a
-    shorter lifetime none.
+    shorter lifetime none — the daemon-side rule Gatehouse §5.7 (v1.11)
+    names for the browser min client's 15-minute certificate, whose client
+    renews at T-2 min (§6.1.7).
     tier:   T0
     verify: cargo nextest run -p minimald wall_warnings_only_for_long_lived_certificates
 
@@ -414,10 +449,12 @@ developer running sessions both locally and remote.
 ### Heartbeats
 
 - **MMI-060** WHERE a control-plane issuer is configured THE SYSTEM SHALL
-  send a heartbeat every 30 s by default (configurable within 10 s to 300 s,
-  up to 10% jitter), authenticated with its node identity (SSHPOP.md
-  §5.1.1(b)), and within 5 s of its relay connection or direct ingress
-  changing state.
+  send a heartbeat to `POST /v1/nodes/heartbeat` (Gatehouse §8.2, v1.13; the
+  node-scoped endpoint advertised in `gatehouse_node_endpoints`) every 60 s
+  by default (configurable within 30 s, the server-enforced floor, to
+  300 s, up to 10% jitter), authenticated with its node identity (SSHPOP.md
+  §5.1.1(b), `aud` the advertised URL), and within 5 s of its relay
+  connection or direct ingress changing state.
   tier:     T0
   verify:   cargo nextest run -p minimald heartbeat_interval_and_state_change_within_bounds
   - IF the heartbeat endpoint is unreachable THEN THE SYSTEM SHALL keep
@@ -427,20 +464,32 @@ developer running sessions both locally and remote.
     tier:   T0
     verify: cargo nextest run -p minimald heartbeat_failure_does_not_affect_serving
 
-- **MMI-061** THE SYSTEM SHALL carry in a heartbeat, and report in
-  `GetMeshStatus`, only its node id, daemon version, mesh public key, tunnel
-  address, direct endpoints, relay name and connection state,
-  host-certificate serial and expiry, KRL `seq`, and the number of live
-  sessions, never a session name, project path, or screen content.
+- **MMI-061** THE SYSTEM SHALL carry in a heartbeat a `seq` that increases
+  with every heartbeat it sends and the `reachability` the identity plane
+  consumes — `direct_endpoint` where direct ingress is enabled, `relay` where
+  registered, and `mesh_addresses` (the payload of Gatehouse §8.2:
+  `{seq, reachability: {direct_endpoint?, relay?, mesh_addresses[]}}`, the
+  peer document's input) — and, in the heartbeat and in `GetMeshStatus`,
+  only its node id, daemon version, mesh public key, tunnel address, direct
+  endpoints, relay name and connection state, host-certificate serial and
+  expiry, KRL `seq`, and the number of live sessions, a superset the
+  identity plane may ignore; never a session name, project path, or screen
+  content.
   tier:     T0
   verify:   cargo nextest run -p minimald heartbeat_carries_no_session_data
+  - THE SYSTEM SHALL persist the heartbeat `seq` with the KRL high-water mark
+    (MMI-035) so that a restart never regresses it, a regression being
+    rejected by the identity plane (Gatehouse §8.2).
+    tier:   T0
+    verify: cargo nextest run -p minimald heartbeat_seq_never_regresses_across_restart
 
 ### Relay
 
 - **MMI-070** THE SYSTEM SHALL accept a node registration only over TLS with
-  an `sshpop-host` assertion whose `aud` is the relay's canonical URL and
-  whose certificate chains to a configured tenant Host CA, keyed by the node
-  id the certificate names.
+  an `sshpop-host` assertion whose `aud` is the relay's canonical URL as
+  advertised in the tenant's `gatehouse_node_endpoints` `relays` member
+  (Gatehouse §6.9, §8.2; architecture D7) and whose certificate chains to a
+  configured tenant Host CA, keyed by the node id the certificate names.
   tier:     T0
   verify:   cargo nextest run -p minrelay node_registration_requires_sshpop_host
   - IF a second registration arrives for the same node THEN THE SYSTEM SHALL
@@ -453,12 +502,16 @@ developer running sessions both locally and remote.
     verify: cargo nextest run -p minrelay idle_leg_closed_after_missed_keepalives
 
 - **MMI-071** THE SYSTEM SHALL accept a client connection only with a
-  Gatehouse-issued relay ticket, presented at WebSocket open, that verifies
-  under the issuer's keys, names one node and the client's mesh public key,
-  is unexpired, and is bound to a key whose DPoP proof over the ticket the
-  client presents with it; otherwise it closes with a refusal code and no
-  body, the code for an expired ticket distinct from every other refusal
-  (MCC-071).
+  Gatehouse-issued relay ticket, presented at WebSocket open — a
+  `gatehouse-relay-ticket+jws` over `{td, sub, node_id, cnf.jkt, iat, exp,
+  jti}` (Gatehouse §6.9, §14.1) — that verifies statelessly under the
+  issuer's published keys with no call to the issuer, names one node, is
+  unexpired, and is bound by `cnf.jkt` to a key whose DPoP proof over the
+  ticket the client presents with it, together with the client's own §6.9
+  mesh binding, from which the relay takes the client's mesh public key
+  (the ticket carries none; MMI-077, MCC-071); otherwise it closes with a
+  refusal code and no body, the code for an expired ticket distinct from
+  every other refusal. The ticket authorizes routing only (§6.9, T29).
   tier:     T0
   verify:   cargo nextest run -p minrelay ticket_bound_to_dpop_key_required
   - IF the ticket's node has no live registration THEN THE SYSTEM SHALL close
@@ -469,7 +522,8 @@ developer running sessions both locally and remote.
 - **MMI-072** THE SYSTEM SHALL forward each binary frame between a client
   connection and its node's registration unchanged and in order, reading
   nothing of a frame beyond its length and, on the node leg, its address
-  prefix (MMI-077).
+  prefix (MMI-077) — the "cannot read box traffic" invariant box-provider-api
+  v0.6 §1 and §10 state for a ciphertext relay, and Gatehouse T29.
   tier:     T1
   verify:   cargo nextest run -p minrelay frames_forwarded_verbatim_in_order
   property: for every sequence of datagrams sent on either leg, the paired leg receives the same datagrams, byte-identical, in the same order, the node leg's frames differing from the client leg's only by the address prefix
@@ -499,15 +553,16 @@ developer running sessions both locally and remote.
 
 - **MMI-076** THE SYSTEM SHALL log only node id, ticket key thumbprint,
   client mesh public key, source address, open and close times, close
-  reason, and frame and byte counts, never a frame payload.
+  reason, and frame and byte counts, never a frame payload (the traffic
+  metadata Gatehouse T29 names as the relay's residual).
   tier:     T0
   verify:   cargo nextest run -p minrelay relay_logs_metadata_only
 
 - **MMI-077** THE SYSTEM SHALL address every frame on a node's registration
   with the 32-byte mesh public key of the client it belongs to: a frame from
-  a client leg reaches the node prefixed with the key that client's ticket
-  names, and a frame from the node reaches, prefix stripped, the client leg
-  bound to the key its prefix names.
+  a client leg reaches the node prefixed with the key the client's mesh
+  binding names (MMI-071), and a frame from the node reaches, prefix
+  stripped, the client leg bound to the key its prefix names.
   tier:     T0
   verify:   cargo nextest run -p minrelay frames_are_addressed_by_client_mesh_key
   - IF a second client leg opens for the same node and mesh public key THEN
@@ -525,9 +580,13 @@ developer running sessions both locally and remote.
   mesh nodes: MCC-051 and MCC-054.
 - The browser page: the browser client spec in gominimal/webapp (WMC,
   gominimal/webapp#763).
-- The public-client ruling, certify, peer document and relay ticket
-  issuance, the node listing and heartbeat APIs, and mesh binding (§6.9):
-  the identity plane, gominimal/gatehouse `01-spec-*` lineage.
+- The `public` client kind and certify for it (Gatehouse §6.1.7, §5.7,
+  v1.11), relay-ticket issuance (§6.9, v1.12), the node listing and
+  heartbeat endpoints (§8.2, v1.13), the peer document (§6.9, v1.14), the
+  mesh-attach host principal (§5.3, v1.15), the session-operation decisions
+  (§7.4, v1.16) and mesh binding (§6.9): recorded in the architecture of
+  record on 2026-09-07 (gominimal/arch#16 to #22), implemented in the
+  identity plane, gominimal/gatehouse `01-spec-*` lineage.
 - Enrolling a daemon with the identity plane and the provenance of its
   owner subject: Gatehouse §6.2 F16(a) and gominimal/gatehouse; MMI-023 and
   MMI-025 read the subject from configuration meanwhile.
@@ -537,8 +596,9 @@ developer running sessions both locally and remote.
 - The UDP mesh between daemons (03-spec-networking Unit 4) except where
   MMI-003 to MMI-011 change it.
 - Destroying, creating, or composing sessions, `exec`, sftp, and port
-  forwarding from a non-local connection: Local-only here (MMI-027);
-  per-principal rules for them are the plan's S8.
+  forwarding from a non-local connection: Local-only here (MMI-027) and in
+  Gatehouse §7.4's v1 mapping; per-principal rules for them are the plan's
+  S8.
 - HTTP access to services inside boxes through a browser's tunnel:
   03-spec-networking UC2b, a product decision not yet taken.
 - Inter-relay forwarding and relay-assisted hole punching: a later relay
@@ -569,11 +629,14 @@ the wire contract, and the relay is a new binary in this workspace,
 `minrelay`, the fifth beside `min`, `mip`, `minimald`, and `minvmd`; the pull
 request that adds its crate extends AGENTS.md's binaries table and crate map
 and docs/architecture.md §3 (plan S5). The client core, the browser page, and
-Gatehouse have their own documents; this one binds them by name and carries
-each unruled dependency as a HIGH open question (A4). Working assumptions,
-defaults rather than decisions: the plan's 2026-09-03 decisions stand (A2);
-the browser is on its own origin (A3); the v1 browser command set is
-owner-only list, show, attach, rename, and stop (A1).
+Gatehouse have their own documents; this one binds them by section since the
+Gatehouse v1.11 to v1.16.1 stack landed on 2026-09-07 (arch#16 to #22
+closed), so A4 — identity-plane capabilities as named dependencies — is no
+longer an assumption. Working assumptions, defaults rather than decisions:
+the plan's 2026-09-03 decisions stand (A2); the browser is on its own origin
+(A3); the v1 browser command set is owner-only list, show, attach, rename,
+and stop (A1; Gatehouse §7.4 since v1.16 maps them onto existing decisions,
+below).
 
 **What exists today, and what is new** (verified against the tree,
 2026-09-04). The daemon dispatches the `minimald-v1-` subsystems
@@ -635,13 +698,16 @@ today, starts from the same configuration file as the trust anchors
 behind NAT is reachable from a tab only through a forwarder the daemon dials
 out to. That relay is the one hop that cannot be designed away for a page
 with no UDP; it carries WireGuard ciphertext wrapping SSH ciphertext, holds
-no key and no session state, and can read nothing (MMI-072, MMI-073). This
-reconciles box-provider-api §1's "never in the box data path" with §10's
-"cannot read box traffic": the §10 invariant survives, with a second cipher
-layer, and §1 should read "never terminates or can read the box data path".
-Nodes authenticate with `sshpop-host` as §10.2 prescribes for outbound
-daemon connections; tabs present a per-node ticket bound to their DPoP key
-so the relay decides statelessly.
+no key and no session state, and can read nothing (MMI-072, MMI-073). The
+architecture recorded it as D7 on 2026-09-06 (Gatehouse v1.12, §6.9 relay
+tickets, T29): box-provider-api v0.6 §1 and §10 now name "cannot read box
+traffic" as the invariant that survives relaying, and the Cloudflare sketch
+v0.6 keeps its cloudflared tunnel control-plane only. Nodes authenticate
+with `sshpop-host` as §10.2 prescribes for outbound daemon connections, the
+`aud` being a relay URL the issuer advertises in `gatehouse_node_endpoints`;
+tabs present a per-node ticket bound to their DPoP key, issued only where
+`ReadNode` admits the subject to the node, so the relay decides statelessly
+from the issuer's published keys and the ticket authorizes routing only.
 
 **The relay as the S12 record.** Each node registers with exactly one relay,
 its home, named in its configuration until the peer document names it
@@ -649,37 +715,55 @@ its home, named in its configuration until the peer document names it
 which is what lets v1 stay single-hop with no inter-relay forwarding. Frames
 on a node's registration are addressed by the client's mesh public key
 (MMI-077), the one field the relay reads, so the relay pairs legs without
-parsing WireGuard; the ticket names that key, so the pairing is decided at
-open (MMI-071) and the daemon sees the key as it would a UDP source address
-(MMI-008). Scale is horizontal: add relays, reassign homes through the peer
+parsing WireGuard. The ticket's claim set (Gatehouse §6.9: `td, sub,
+node_id, cnf.jkt, iat, exp, jti`) carries no mesh key, so the client
+presents its §6.9 mesh binding beside the ticket and the relay takes the
+key from the binding (MMI-071); the pairing is still decided at open and
+the daemon sees the key as it would a UDP source address (MMI-008). Whether
+the ticket should carry a `wg_pub` claim instead is asked of the
+architecture below. Scale is horizontal: add relays, reassign homes through
+the peer
 document, and daemons follow at their next reconnect, MMI-008's backoff
 bounding the gap. Direct paths are preferred at both ends (MMI-009, MCC-014),
 so the relay carries only what cannot go direct. The relay's own identity is
 a publicly trusted TLS certificate at its canonical URL; it holds the Host CA
 and issuer public keys of the tenants it serves and no private key of
 anyone's. Minimal operates it; a provider-run relay is the generality case
-below. The daemon never sees a ticket, and its mirror peer document is the
-server half of MCC-070's: admitted keys with their bindings, each peer's
-tunnel address, and the node's own relay assignment.
+below. The daemon never sees a ticket, and its mirror peer document (the
+daemon's view of `GET /v1/mesh/peers`, Gatehouse §6.9 v1.14) is the server
+half of MCC-070's: admitted keys with their bindings, each peer's tunnel
+address, and the node's own relay assignment — configuration, never
+authorization, on the same `seq` and staleness discipline (MMI-010).
 
-**`Certified` is an allowlist, and ownership stands in for Cedar**
-(2026-09-04). No request is gated by authentication today (above); admitting
-a remote principal through the session-channel gate alone would expose
-`Shutdown`, `CleanCache`, `IssueClientCert`, `exec`, sftp, and the create
-pipeline. Under A1, rename and stop are admitted for the session's owner,
-gated by ownership until the Cedar actions exist; attach and reads by
-`SshConnect` once a decision endpoint is configured (MMI-026); with no
-endpoint, MMI-025 admits only the configured owner subject, the
-`local`-class linkage of Gatehouse §6.2 F16(a) written into config.
-Ownership needs a field the record does not have (MMI-023); because
-`CreateSession` stays Local-only, every v1 session is created locally and
-owned by the node's subject, which is what owner-only v1 means, and the
-interim rule is an open question. `StopSession` is a new RPC (MMI-028): it
-reuses the internal stop that daemon shutdown already applies to every
-session, without the exit prompt, and keeps the record; the alternatives were
-mapping stop onto `DestroySession`, which deletes, or `AbortSession`, which
-acts only on a pending session. Destroy stays Local-only because deletion is
-the one action a prompt-injected agent holding a stolen tab could not undo.
+**`Certified` is an allowlist, and ownership is the ratified interim for
+Cedar** (2026-09-04; Gatehouse §7.4 since v1.16). No request is gated by
+authentication today (above); admitting a remote principal through the
+session-channel gate alone would expose `Shutdown`, `CleanCache`,
+`IssueClientCert`, `exec`, sftp, and the create pipeline. The owner ruling
+of 2026-09-07 is that sessions are boxes, with no parallel action family:
+attach is the cached `SshConnect`, show and each listed row `BoxRead`, stop
+`StopBox`, rename the one new action `RenameBox` (baselines creator,
+chain-ancestor, org-admin, deny by default until the daemon's RPC
+evaluation point lands), and a node-level listing `ReadNode`; every other
+RPC stays local-only in v1. Under A1, rename and stop are admitted for the
+session's owner (MMI-027), which is those baselines' creator arm; attach
+and reads by `SshConnect` once a decision endpoint is configured (MMI-026),
+the other decisions joining it on the same cache when the evaluation point
+exists; with no endpoint, MMI-025 admits only the configured owner subject,
+the `local`-class linkage of Gatehouse §6.2 F16(a) written into config —
+the interim §7.4 ratifies rather than replaces, its shipped baselines being
+ownership-shaped. Ownership needs a field the record does not have
+(MMI-023); because `CreateSession` stays Local-only, every v1 session is
+created locally and owned by the node's subject, which is what owner-only
+v1 means, and the provenance of that subject is an open question.
+`StopSession` is a new RPC (MMI-028) carrying `StopBox`'s
+stop-the-process-keep-the-record semantics: it reuses the internal stop
+that daemon shutdown already applies to every session, without the exit
+prompt, and keeps the record; the alternatives were mapping stop onto
+`DestroySession`, which deletes, or `AbortSession`, which acts only on a
+pending session. Destroy stays Local-only, as §7.4 keeps it, because
+deletion is the one action a prompt-injected agent holding a stolen tab
+could not undo.
 The username convention is plan Stage 3 option (i) (MMI-024): the presented
 name is the box login principal and must be among the certificate's
 principals; whether it must also equal the record's sandbox user is open.
@@ -696,11 +780,13 @@ certificate expired at the reaper boundary reconnects without dead time, and
 keeps the delay plus a three-attempt cap for repeated attempts on one
 connection, which a legitimate client never makes.
 
-**Reaper without grace, warnings only for long certificates** (decision 22).
-Gatehouse §5.7's cap at `valid_before` is exact (MMI-031). Its T-15/T-1
-warnings are meaningless under a 15-minute certificate whose client renews
-at T-2 and reconnects transparently, so they are written only for the
-interactive profile. Renewal is invisible to the daemon (cross-spec
+**Reaper without grace, warnings only for long certificates** (decision 22;
+Gatehouse §5.7 since v1.11). Gatehouse §5.7's cap at `valid_before` is exact
+(MMI-031). Its T-15/T-1 warnings are meaningless under a 15-minute
+certificate whose client renews at T-2 and reconnects transparently, so
+they are written only for the interactive profile — the rule §5.7 now
+states for the browser min client's certificate, naming MMI-031 as the
+daemon side. Renewal is invisible to the daemon (cross-spec
 decision 1): the core attaches on a new connection under the fresh
 certificate and then closes its old channel; if the new attach or the reaper
 reaches the old channel first, the client consumes `SUPERSEDED` or `EXPIRED`
@@ -708,6 +794,19 @@ reaches the old channel first, the client consumes `SUPERSEDED` or `EXPIRED`
 any other, and the daemon does not distinguish renewal. A transport-initiated
 loss, by contrast, ends the attachment (MMI-006, MMI-054), and the next
 attach is a new one by the head.
+
+**The host certificate names the node, never its tunnel address**
+(Gatehouse §5.3 since v1.15, the arch#21 ruling). A mesh client dials the
+daemon's tunnel address and verifies the host certificate against the
+node's canonical `<node_id>.box.<td>` name, which the peer document names
+in its expected-principal field; the first draft's tunnel-address principal
+(MMI-029) is superseded and must not be emitted. The daemon therefore
+requests nothing new at renewal, a change of tunnel address forces no
+out-of-cycle renewal of the 30-day certificate, and no stability guarantee
+is owed for tunnel addressing. The canonical name must be among the
+certificate's own principals, since the per-node wildcard covers only the
+names beneath it; OpenSSH clients get the check from stock `HostKeyAlias`,
+the core natively (MCC-032).
 
 **KRL** (Gatehouse §8.2, §12.1): no Rust crate reads PROTOCOL.krl, so the
 reader implements the certificates section the tenant CA emits and refuses
@@ -738,10 +837,19 @@ open question. MMI-052's scrollback replay is a daemon capability no v1 head
 requests (cross-spec decision 3): the repaint alone is what the browser and
 the CLI consume.
 
-**Heartbeats go to Gatehouse** (decision 21), not the provider channel the
-Cloudflare sketch describes, because the node set the tab lists is
-Gatehouse's (`nodes.last_seen`, §9); the payload is metadata only, and the
-browser's 30 s liveness refresh (WMC-012) rides the same default cadence.
+**Heartbeats go to Gatehouse** (decision 21; `POST /v1/nodes/heartbeat`,
+Gatehouse §8.2 since v1.13), because the node set the tab lists is
+Gatehouse's (`nodes.last_seen`, `advertised_reachability`, `heartbeat_seq`,
+§9) and the peer document consumes the advertised reachability. The
+Cloudflare sketch v0.6 keeps a separate provider-plane ops heartbeat on its
+Tunnel channel (usage counters, misconfiguration detection); this is the
+identity-plane liveness heartbeat, and a provider's `READY` never implies
+liveness here. The cadence is the architecture's 60 s working value with a
+server-enforced 30 s floor (MMI-060), from which Gatehouse derives
+`reachable` within 150 s, `stale` within 15 min and `offline` beyond; the
+`seq` is monotonic on the §8.2 anti-rollback discipline (MMI-061). The
+payload is metadata only, and the browser's 30 s liveness refresh (WMC-012)
+re-reads the derived state, not the heartbeat.
 
 **Tiers.** MMI-005, MMI-022, MMI-027, and MMI-072 are T1: each is a
 universal over a finite domain the test walks exhaustively, so no
@@ -759,14 +867,16 @@ the authentication surface, whose rules are OpenSSH's own. A provider-run
 relay fits MMI-070 to MMI-077, which need only the tenant Host CA and issuer
 keys. In a guest only the config path differs (MMI-039). What does not
 generalise is the owner rule (MMI-023, MMI-025): a multi-user node needs the
-Cedar decision, which is why that phase is interim.
+Cedar decisions Gatehouse §7.4 now names, which is why that phase is
+interim.
 
 ## Security considerations
 
 - **Invariant:** THE SYSTEM SHALL let no party other than the client and
   the daemon read SSH or WireGuard plaintext.
   enforced by: the relay forwarding frames unchanged, reading only the
-  address prefix, and holding no key (Gatehouse T7, architecture AT14).
+  address prefix, and holding no key (Gatehouse T7, T29; architecture AT14,
+  D7).
   covered by: MMI-072, MMI-073, MMI-076, MMI-077
 - **Invariant:** THE SYSTEM SHALL open no channel on a non-local connection
   without an accepted certificate decision and an authorization decision
@@ -779,7 +889,8 @@ Cedar decision, which is why that phase is interim.
   outside its allowlist, and no mutation of a session by a subject other
   than its owner.
   enforced by: the per-auth-state allowlist with the ownership check
-  against the recorded owner.
+  against the recorded owner, the creator arm of the `StopBox` and
+  `RenameBox` baselines (Gatehouse §7.4).
   covered by: MMI-023, MMI-027, MMI-028
 - **Invariant:** THE SYSTEM SHALL use no canonical-subject string as a
   sandbox user.
@@ -812,7 +923,8 @@ Cedar decision, which is why that phase is interim.
 
 - **Deploy:** `minrelay` per region behind Minimal's DNS, with the Host CA
   and issuer keys of the tenants it serves in its configuration and its
-  canonical URL published in each tenant's `gatehouse_node_endpoints`. The
+  canonical URL published in the `relays` member of each tenant's
+  `gatehouse_node_endpoints` (Gatehouse §8.2). The
   daemon side needs no rollout step: every behaviour here is off without
   configuration (MMI-N05).
 - **Rollback:** redeploy the previous image; connections drop and daemons
@@ -822,39 +934,19 @@ Cedar decision, which is why that phase is interim.
 
 ## Open questions
 
-- [NEEDS CLARIFICATION (HIGH): No architecture document describes an SSH
-  data path to a NAT'd `local`-class node; the relay tier, the daemon's
-  outbound data connection to it, and the tab's ticketed use of it are new,
-  and Gatehouse §10.2 covers outbound control connections only. MMI-008,
-  MMI-009, and MMI-070 to MMI-077 are blocked until the architecture
-  describes them. Filed: gominimal/arch#18.]
-- [NEEDS CLARIFICATION (HIGH): box-provider-api §1 says the provider is
-  "never in the box data path" while §10 says it "cannot read box traffic";
-  a ciphertext relay is in the path and reads nothing. §10 should be the
-  invariant and §1 restated, as should the Cloudflare sketch's "stay out of
-  the data path" (§1). MMI-072 and MMI-076 carry the invariant. Filed: gominimal/arch#18.]
-- [NEEDS CLARIFICATION (HIGH): Gatehouse §6.9 is Phase 5+ and describes
-  bindings, not peer configuration. The daemon needs a mirror peer document
-  (admitted keys with bindings, tunnel addresses per `MeshNetwork`, relay
-  assignment) on the §8.2 feed pattern, relay URLs in
-  `gatehouse_node_endpoints`, and a relay ticket type bound to a DPoP key
-  that names one node and the client's mesh public key from its binding
-  (MMI-071, MMI-077). MMI-008, MMI-010, and MMI-071 depend on these;
-  MMI-011 is the interim. Filed: gominimal/arch#19.]
-- [NEEDS CLARIFICATION (HIGH): Gatehouse names `nodes.last_seen` (§9) but no
-  heartbeat endpoint, payload, or authentication binding, and the Cloudflare
-  sketch routes heartbeats through the provider channel. MMI-060 and
-  MMI-061 assume a node-scoped endpoint under SSHPOP.md §5.1.1(b). Filed: gominimal/arch#17.]
-- [NEEDS CLARIFICATION (HIGH): Gatehouse §7.2 has no Cedar action for rename,
-  none for stopping a session's process short of `StopBox`, and `SshConnect`
-  covers attach only; listing a node's sessions is neither `BoxRead` per box
-  nor any node-level read. MMI-027 gates rename and stop on ownership and
-  MMI-025 on the owner subject until actions exist; MMI-026 and MMI-028 are
-  the binding points. Filed: gominimal/arch#20.]
 - [NEEDS CLARIFICATION (HIGH): 03-spec-networking Unit 4 has no own-address
   termination and no WireGuard-over-WebSocket ingress; R4.2's path ends at a
   box, and R4.3 and B6 still name wireguard-go. MMI-001 to MMI-004 extend
-  Unit 4, whose text should say so. Filed: gominimal/arch#18.]
+  Unit 4, whose text should say so; this is this repository's spec to
+  amend, not the architecture's (arch#18 closed with the relay tier as D7
+  and left Unit 4 untouched).]
+- [NEEDS CLARIFICATION (MEDIUM): The relay ticket's claim set in Gatehouse
+  §6.9 — `td, sub, node_id, cnf.jkt, iat, exp, jti` — carries no mesh public
+  key, which the relay needs to address frames (MMI-077). MMI-071 takes the
+  key from the §6.9 mesh binding the client presents beside the ticket,
+  which changes nothing in the architecture but makes the relay verify two
+  JWS at open. Should the ticket carry a `wg_pub` claim instead, so one
+  document decides the pairing?]
 - [NEEDS CLARIFICATION (MEDIUM): The interim owner rule. A session record
   has no owner today, and every v1 session is created over a local
   connection with no subject; MMI-023 assigns those to the node's enrolled
@@ -867,14 +959,6 @@ Cedar decision, which is why that phase is interim.
   while the record carries the creating user's name. MMI-024 admits the box
   login principal; whether it must equal the record's username, or the
   record's username wins on attach, is undecided.]
-- [NEEDS CLARIFICATION (MEDIUM): Gatehouse §5.7 prescribes T-15/T-1 wall
-  warnings and background CLI renewal; under a 15-minute certificate with
-  transparent reconnect MMI-031 writes none and the client renews at T-2.
-  The §5.7 text change belongs to the identity plane's ruling (plan S1). Filed: gominimal/arch#16.]
-- [NEEDS CLARIFICATION (MEDIUM): Gatehouse §5.3 lists "the DNS names/IPs
-  clients may connect to" as host-certificate principals; MMI-029 adds the
-  tunnel address, and a change of address forces an out-of-cycle renewal.
-  Does the identity plane keep a node's tunnel address stable? Filed: gominimal/arch#21.]
 - [NEEDS CLARIFICATION (MEDIUM): How does an un-enrolled daemon learn its
   owner subject for MMI-025 before client-mediated enrollment (Gatehouse
   §6.2 F16(a)) exists: a config value the CLI writes, or enrollment only?]
@@ -885,6 +969,11 @@ Cedar decision, which is why that phase is interim.
   them for a documented deadlock. Whether the same deadlock applies when the
   binding is torn down from a dead channel, and whether hooks should run
   there at all, is unverified.]
+- [NEEDS CLARIFICATION (LOW): Gatehouse §8.2's heartbeat payload is
+  `{seq, reachability: {direct_endpoint?, relay?, mesh_addresses[]}}`;
+  MMI-061 sends a superset (daemon version, certificate serial and expiry,
+  KRL `seq`, live session count) for `GetMeshStatus` parity. Whether the
+  endpoint ignores or refuses unknown members is unverified.]
 - [NEEDS CLARIFICATION (LOW): MMI-022 recognises the `source-address`
   critical option but no requirement enforces it against the peer's tunnel
   address, which OpenSSH would; should MMI-022 gain that edge?]
