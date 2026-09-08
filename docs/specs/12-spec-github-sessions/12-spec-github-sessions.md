@@ -229,12 +229,10 @@ the sealed-credential path.
   [the website sign-in spec](https://github.com/gominimal/webapp/blob/main/docs/specs/03-spec-website-signin/03-spec-website-signin.md).
 - Sign-in through any provider other than GitHub.com, including enterprise
   OIDC: Gatehouse §6.1.3 (F2), a later phase of the identity plane.
-- A forced in-session command for git: retired on 2026-08-20. Standard git and
-  gh are the path (GHS-011), and since the sealed-credential design they need
-  no configuration at all.
+- A forced in-session command for git: standard git and gh are the path
+  (GHS-011), and with sealed credentials they need no configuration at all.
 - Branch-aware activation, repository pre-priming, and a pull-request prompt
-  on session exit: the earlier GitHub-sessions PRD carries them as a
-  reference; none is in this epic's criteria.
+  on session exit: none is in this epic's criteria.
 - The Actions workflow permission: excluded from the App's permissions
   (GHI-004 in the GitHub identity spec).
 - Revoking an already-delivered credential at GitHub: TTL-bounded (Gatehouse
@@ -259,100 +257,89 @@ the sealed-credential path.
 
 ## Design reasoning
 
-**Three documents.** One spec per surface owner, decided 2026-09-03: this one
-for the CLI, the daemon and the session's side of the credential path; the
-identity plane's for sign-in, its browser pages, minting, sealing, the egress
-proxy and attenuation; the website's for its own sign-in as a client of the
-identity plane. A single document here with the identity behaviours as open
-questions was the cheaper alternative and would have left the identity half
-unspecified.
+**Three documents.** One spec per surface owner: this one for the CLI, the
+daemon and the session's side of the credential path; the identity plane's for
+sign-in, its browser pages, minting, sealing, the egress proxy and
+attenuation; the website's for its own sign-in as a client of the identity
+plane. A single document here with the identity behaviours as open questions
+was the cheaper alternative and would have left the identity half unspecified.
 
-**Sign-in gates remote sessions, and local ones that declare a GitHub
-grant** (decided 2026-09-03, revised 2026-09-08; mandatory sign-in for
-remote sessions was reconfirmed on 2026-08-20). A local session with no
-GitHub grant starts with no account (GHS-009); one whose spec declares a
-grant asks for sign-in before it starts (GHS-010), and the grant is explicit
-locally, so local stays opt-in. The 2026-09-03 cut prompted for sign-in
-inside a running local session at its first GitHub operation; it was set
-aside because the architecture makes box identity, the interception
-authority and the sealed value creation-time, and a daemon not yet enrolled
-cannot create a session with a grant at all, so the prompt could not be
-honoured without re-creating the session. The alternatives kept from the
-first decision were sign-in for every session including local, which removes
-the account-free local path today's users have, and remote only with local
-undecided. The cost accepted is that a running local session gains GitHub
-access only by restarting with the grant, and that a GitHub operation in a
-grant-less session is answered with what is missing rather than with a
-credential (GHS-010's edge).
+**Sign-in gates remote sessions, and local ones that declare a GitHub grant.**
+A local session with no GitHub grant starts with no account (GHS-009); one
+whose spec declares a grant asks for sign-in before it starts (GHS-010), and
+the grant is explicit locally, so local stays opt-in. Prompting for sign-in
+inside a running local session at its first GitHub operation was set aside:
+the architecture makes box identity, the interception authority and the sealed
+value creation-time, and a daemon not yet enrolled cannot create a session
+with a grant at all, so the prompt could not be honoured without re-creating
+the session. Sign-in for every session including local was set aside because
+it removes the account-free local path today's users have. The cost accepted
+is that a running local session gains GitHub access only by restarting with
+the grant, and that a GitHub operation in a grant-less session is answered
+with what is missing rather than with a credential (GHS-010's edge).
 
 **A local daemon enrolls itself before its first session with a GitHub grant**
-(GHS-025, decided 2026-09-08 from the architecture). A daemon not enrolled
-with the identity plane has no broker and no identity socket, so no sealed
-value can be minted for a session on it (Gatehouse §8.3); the architecture's
-answer is client-mediated local enrollment, in which a signed-in developer
-mints an enrollment token for their own laptop daemon (F16). Requiring the
-developer to enroll by hand, and leaving local sessions without GitHub access,
-were the alternatives; the first adds a step the epic's first story is written
-to avoid, the second contradicts the decision above.
+(GHS-025). A daemon not enrolled with the identity plane has no broker and no
+identity socket, so no sealed value can be minted for a session on it
+(Gatehouse §8.3); the architecture's answer is client-mediated local
+enrollment, in which a signed-in developer mints an enrollment token for their
+own laptop daemon (F16). Requiring the developer to enroll by hand, and
+leaving local sessions without GitHub access, were the alternatives; the first
+adds a step the epic's first story is written to avoid, the second contradicts
+the decision above.
 
-**Token reach is the workbench by default and wider when declared** (decided
-2026-09-03). This reconciles the epic's criterion, which bounds a token to the
-workbench project, with the 2026-08-20 ask that workbench-only be an option
-rather than a rule. "Whatever the App installation grants" was set aside
-because it does not meet the per-project bound at all. "The session's
-repository set" means the workbench project plus the declared repositories
-throughout this document. The set is computed here, at spec expansion, and
-carried digest-bound into the session's creation; two things then bound the
-token to it. The identity plane mints the session's token narrowed to the set
-where GitHub can express it, and its egress proxy refuses, per request and
-before GitHub, anything the sealed value's scope does not cover (GHS-005 is
-the behaviour a session observes; the decision is the identity plane's).
-GHS-005 binds requests that carry the session's sealed value: a request
-without one is anonymous and passes egress-checked, which is what dependency
-fetches from public repositories need and what the epic's criterion, written
-about the minted token, asks; requests that name no repository, GraphQL among
-them, ride the narrowed token's own bound at GitHub; and what a request
-targets is the identity plane's mapping of path and method to a repository,
-defined in the GitHub identity spec and not here (decided 2026-09-08). A set
-spanning more than one owner is refused at mint there, since the un-narrowed
-fallback the architecture allows would carry the developer's whole reach into
-the session; per-owner tokens are later work. The
-2026-08-20 record that a user-attributed token cannot be narrowed per
-repository holds for renewal from a refresh token and not for minting;
-renewal re-mints against the same set. Every session and every box a
-developer's workflow spawns uses a developer-attributed token; a child's set
-is a subset of its parent's (GHS-015). The reach decisions computed here
-being pure and separable from expansion is what the T2 harnesses require.
+**Token reach is the workbench by default and wider when declared.** This
+reconciles the epic's criterion, which bounds a token to the workbench
+project, with the ask that workbench-only be an option rather than a rule.
+"Whatever the App installation grants" was set aside because it does not meet
+the per-project bound at all. "The session's repository set" means the
+workbench project plus the declared repositories throughout this document. The
+set is computed here, at spec expansion, and carried digest-bound into the
+session's creation; two things then bound the token to it. The identity plane
+mints the session's token narrowed to the set where GitHub can express it, and
+its egress proxy refuses, per request and before GitHub, anything the sealed
+value's scope does not cover (GHS-005 is the behaviour a session observes; the
+decision is the identity plane's). GHS-005 binds requests that carry the
+session's sealed value: a request without one is anonymous and passes
+egress-checked, which is what dependency fetches from public repositories need
+and what the epic's criterion, written about the minted token, asks; requests
+that name no repository, GraphQL among them, ride the narrowed token's own
+bound at GitHub; and what a request targets is the identity plane's mapping of
+path and method to a repository, defined in the GitHub identity spec and not
+here. A set spanning more than one owner is refused at mint there, since the
+un-narrowed fallback the architecture allows would carry the developer's whole
+reach into the session; per-owner tokens are later work. That a
+user-attributed token cannot be narrowed per repository holds for renewal from
+a refresh token and not for minting; renewal re-mints against the same set.
+Every session and every box a developer's workflow spawns uses a
+developer-attributed token; a child's set is a subset of its parent's
+(GHS-015). The reach decisions computed here being pure and separable from
+expansion is what the T2 harnesses require.
 
 **Custody: the session holds a sealed value, never a raw credential**
-(GHS-013, GHS-027; decided 2026-09-03, revised 2026-09-06 in the architecture
-of record and accepted here 2026-09-08). Four placements were considered on
-2026-09-03. Delivering the raw token into the session per operation, the
-architecture's model at the time, was withdrawn because the architecture
-itself said the token was then a bearer any process in the session could
-reuse for its lifetime, which is what a prompt-injected agent would do.
-Holding it beside the daemon inside the guest left an 8-hour credential
-exposed to a sandbox escape or a guest snapshot. The choice taken that day, a
-host-side facade handing the session credential-free addresses, was itself
-superseded three days later by the architecture's ruling: reachability as
-authorization breaks under a shared network namespace, and a box whose egress
-denied github.com could still reach it through such an address, fragmenting
-the egress model. The shape adopted, and bound here on the session side, is
-the architecture's sealed secret (Gatehouse §6.10): the token is delivered
-exactly where a token was delivered before, the creation-time environment,
-the identity socket and the git credential helper, but encrypted to the
-tenant's egress proxy and bound to this session, its node, the upstream host,
-the minted scope and an expiry. The session presents it as an opaque bearer;
-the egress proxy, which terminates TLS for github.com with a per-tenant,
-name-constrained interception authority installed in the session's trust
-store (GHS-026), checks node, box, egress declaration and scope, substitutes
-the real credential, and forwards. Sessions talk to the real hostnames, so
-git and gh need no configuration, which is what the 2026-08-20 decision
-required and what dissolves the earlier question about routing gh. GitHub is
-two hosts to a session, github.com for git and api.github.com for gh; a
-grant covers both (GHS-022, GHS-028) and the authority's constraint covers
-both. The cost
-is an interception authority inside the session, accepted as the smaller
+(GHS-013, GHS-027). Four placements were weighed. Delivering the raw token
+into the session per operation was set aside because the token is then a
+bearer any process in the session can reuse for its lifetime, which is what a
+prompt-injected agent would do. Holding it beside the daemon inside the guest
+leaves an 8-hour credential exposed to a sandbox escape or a guest snapshot. A
+host-side facade handing the session credential-free addresses was set aside
+because reachability as authorization breaks under a shared network namespace,
+and a box whose egress denied github.com could still reach it through such an
+address, fragmenting the egress model. The shape adopted, and bound here on
+the session side, is the architecture's sealed secret (Gatehouse §6.10): the
+token is delivered exactly where a token was delivered before, the
+creation-time environment, the identity socket and the git credential helper,
+but encrypted to the tenant's egress proxy and bound to this session, its
+node, the upstream host, the minted scope and an expiry. The session presents
+it as an opaque bearer; the egress proxy, which terminates TLS for github.com
+with a per-tenant, name-constrained interception authority installed in the
+session's trust store (GHS-026), checks node, box, egress declaration and
+scope, substitutes the real credential, and forwards. Sessions talk to the
+real hostnames, so git and gh need no configuration, which the standard-tools
+decision below requires and which leaves no question of routing gh. GitHub is
+two hosts to a session, github.com for git and api.github.com for gh; a grant
+covers both (GHS-022, GHS-028) and the authority's constraint covers both. The
+cost is an interception authority inside the session, accepted as the smaller
 change on ephemeral Minimal-built boxes, and a dependency on the identity
 plane's fifth build phase, where the proxy lands.
 
@@ -368,52 +355,47 @@ sent it and a stolen sealed value is dead across boxes; on a shared network
 namespace that attribution is impossible, and the architecture accepts the
 residual, a co-resident thief gets only the session's scoped, audited reach
 until expiry or revocation, as the tier the chooser of that mode accepted. A
-session with a GitHub grant therefore defaults to its own address (GHS-031,
-decided 2026-09-08); a spec that sets the shared address explicitly keeps the
-grant with that residual. The architecture's egress gateway design, in its
-issues at the time of writing, moves egress enforcement outside the node and
-proposes that grants require a node the fabric can pin; a laptop cannot be,
-and this document keeps GitHub grants on local daemons (decided 2026-09-08):
-the sealed value is dead off-node, so an escape on a laptop gains only the
+session with a GitHub grant therefore defaults to its own address (GHS-031); a
+spec that sets the shared address explicitly keeps the grant with that
+residual. The architecture's egress gateway design moves egress enforcement
+outside the node and proposes that grants require a node the fabric can pin; a
+laptop cannot be, and this document keeps GitHub grants on local daemons: the
+sealed value is dead off-node, so an escape on a laptop gains only the
 developer's own scoped, audited reach on the developer's own machine, the tier
 the local chooser accepts.
 
 **A session's credential expires within 8 hours**, GitHub's own user-token
-expiry (decided 2026-09-03), rather than an open question or a shorter ceiling
-set here at the cost of more renewals. It depends on the App's
-token-expiration setting staying on (Gatehouse §6.4.1). That bound is the
-access credential's, and the sealed value carries it as its expiry. The
-developer's refresh token never enters a session: it stays in the identity
-plane, which rotates it on every renewal, refuses a reused one, and mints each
-renewed token narrowed to the same repository set (the GitHub identity spec).
+expiry, rather than an open question or a shorter ceiling set here at the cost
+of more renewals. It depends on the App's token-expiration setting staying on
+(Gatehouse §6.4.1). That bound is the access credential's, and the sealed
+value carries it as its expiry. The developer's refresh token never enters a
+session: it stays in the identity plane, which rotates it on every renewal,
+refuses a reused one, and mints each renewed token narrowed to the same
+repository set (the GitHub identity spec).
 
-**Every end of a session ends its grant** (GHS-017, GHS-019, decided
-2026-09-03 and restated 2026-09-08 in the architecture's terms). A session's
-end revokes its identity; the identity plane stops minting for it within a
-minute and its egress proxy consults the revocation feed, so a sealed value
-outlives its session by at most 60 seconds (GHS-019). A child's access ends
-with its parent's.
+**Every end of a session ends its grant** (GHS-017, GHS-019). A session's end
+revokes its identity; the identity plane stops minting for it within a minute
+and its egress proxy consults the revocation feed, so a sealed value outlives
+its session by at most 60 seconds (GHS-019). A child's access ends with its
+parent's.
 
 **Work is attributed to the developer, from a session and from any box a
-workflow spawns** (GHS-012, decided 2026-09-03 and adopted by the architecture
-on 2026-09-05). GHS-012 binds session, agent and task boxes, the types a
-developer's workflow spawns, which default to developer-attributed tokens
-through a type-supplied attribute; service and build boxes default to App
-attribution and are outside the epic's criterion, a service outliving the
+workflow spawns** (GHS-012). GHS-012 binds session, agent and task boxes, the
+types a developer's workflow spawns, which default to developer-attributed
+tokens through a type-supplied attribute; service and build boxes default to
+App attribution and are outside the epic's criterion, a service outliving the
 workflow that spawned it; a tenant may forbid developer attribution per type,
 with a defaulted grant downgraded and recorded rather than silently kept
 (GHS-012's edge) and an explicit request refused.
 
-**Standard git and gh, no forced interface** (decided 2026-08-20). Once a
-developer is signed in, git and gh inside a session work as the developer
-against the real hostnames (GHS-011). The earlier PRD's forced facade command
-stays retired.
+**Standard git and gh, no forced interface.** Once a developer is signed in,
+git and gh inside a session work as the developer against the real hostnames
+(GHS-011); a forced in-session command in their place is a non-goal above.
 
 **Permissions are repository contents, pull requests and issues read and
-write, and metadata read; Actions workflows are excluded** (decided
-2026-09-03, recorded in the architecture's manifest on 2026-09-05). Push and
-pull requests alone would deny an agent the issue triage it does from inside
-a session; adding workflows has the widest blast radius for a compromised
+write, and metadata read; Actions workflows are excluded.** Push and pull
+requests alone would deny an agent the issue triage it does from inside a
+session; adding workflows has the widest blast radius for a compromised
 session. Each App installation's administrator must approve the widened
 permissions before tokens for that installation carry them.
 
@@ -430,21 +412,20 @@ there is no decision to extract. GHS-013 is a universal and stays at T0 on
 purpose: sessions are not a domain a test can generate, so the
 filesystem-and-environment scan the architecture asks for under INV-1 runs as
 one named test, and the universal is stated in Security considerations. No
-requirement is at T3: there is no Lean project to hold a proof. Requirements
-GHS-014, GHS-018, GHS-021, GHS-023 and GHS-024 belonged to the superseded
-facade and were withdrawn on 2026-09-08; their identifiers are not reused.
-GHS-005's earlier edge for a target that could not be resolved moved to the
-identity spec's rule for requests its module cannot map.
+requirement is at T3: there is no Lean project to hold a proof. The
+identifiers GHS-014, GHS-018, GHS-021, GHS-023 and GHS-024 belonged to the
+set-aside facade and are not reused; the rule for a request the GitHub module
+cannot map to a repository is the identity spec's.
 
-**Egress enforcement is the gateway's, not this epic's prerequisite**
-(decided 2026-09-08). The initiative's constraint that nothing enters or
-leaves a box undeclared is met on the credential side (GHS-013, GHS-027) and,
-for credentialed reach, on the network side too: such reach rides the egress
-path and is re-checked at the proxy (GHS-022, GHS-028). Enforcement of the
-egress list for everything else is allow-all in running code today and has
-its own design chain in the architecture, the egress gateway; it is not a
-prerequisite here because the credential's reach is bounded by the token and
-the proxy whether or not anonymous traffic is filtered.
+**Egress enforcement is the gateway's, not this epic's prerequisite.** The
+initiative's constraint that nothing enters or leaves a box undeclared is met
+on the credential side (GHS-013, GHS-027) and, for credentialed reach, on the
+network side too: such reach rides the egress path and is re-checked at the
+proxy (GHS-022, GHS-028). Enforcement of the egress list for everything else
+is allow-all in running code today and has its own design chain in the
+architecture, the egress gateway; it is not a prerequisite here because the
+credential's reach is bounded by the token and the proxy whether or not
+anonymous traffic is filtered.
 
 **Generality:** GitHub.com is the sole provider by decision (GHS-007). The
 sealed-credential path is general by the architecture's design: the same
@@ -513,18 +494,16 @@ local (GHS-008 to GHS-010), and in the local daemon's self-enrollment
   before the proxy does?]
 - [NEEDS CLARIFICATION (MEDIUM): May a child session declare a repository set
   narrower than its parent's, and may a running session's set change without
-  signing in again? Left on 2026-08-20 as something to test against GitHub. A
-  narrowed token cannot be narrowed again, so widening means a fresh mint
-  from the refresh token.]
+  signing in again? To be tested against GitHub. A narrowed token cannot be
+  narrowed again, so widening means a fresh mint from the refresh token.]
 - [NEEDS CLARIFICATION (MEDIUM): How are the requested repositories and
   permissions shown to the developer before a session starts, and does a
   second session reuse the existing sign-in or mint a separately scoped token
-  by default? Both carried from the earlier PRD; neither is in this epic's
-  criteria.]
+  by default? Neither is in this epic's criteria.]
 - [NEEDS CLARIFICATION (LOW): The existing hidden sign-in command mints a
   client certificate for the HTTPS reverse proxy under the name the
   architecture's command tree gives to identity sign-in. What is the
   proxy-certificate command renamed to?]
 - [NEEDS CLARIFICATION (LOW): Should tooling that adds a Co-authored-by
-  trailer on an agent's behalf ask first? Recorded as a preference on
-  2026-08-20 with no resolution.]
+  trailer on an agent's behalf ask first? A stated preference with no
+  resolution.]
