@@ -395,9 +395,11 @@ workflow spawns** (GHS-012). GHS-012 binds session, agent and task boxes, the
 types a developer's workflow spawns, which default to developer-attributed
 tokens through a type-supplied attribute; service, build and container-build
 boxes default to App attribution and are outside the epic's criterion, a
-service outliving the workflow that spawned it; a tenant may forbid developer
-attribution per type, with a defaulted grant downgraded and recorded rather
-than silently kept (GHS-012's edge) and an explicit request refused.
+service outliving the workflow that spawned it, and so is any box in a chain
+rooted in a service rather than a developer, whatever its type; a tenant may
+forbid developer attribution per type, with a defaulted grant downgraded and
+recorded rather than silently kept (GHS-012's edge) and an explicit request
+refused.
 
 **Standard git and gh, no forced interface.** Once a developer is signed in,
 git and gh inside a session work as the developer against the real hostnames
@@ -496,6 +498,12 @@ self-enrollment (GHS-025).
   minting within a minute and reaches the proxy's revocation feed (Gatehouse
   F13, T23).
   covered by: GHS-017, GHS-019
+- **Invariant:** THE SYSTEM SHALL hold in a session no sealed GitHub value
+  older than 8 hours.
+  enforced by: renewal before expiry through the credential helper and the
+  identity socket, and the sealed value carrying the credential's own expiry
+  (Gatehouse §5.7, §6.4.1).
+  covered by: GHS-020
 
 ## Open questions
 
