@@ -69,6 +69,23 @@ args.name = "string"
 bash = "echo \"Hello %{name}!\""
 ```
 
+Command strings are always evaluated as Nickel strings, whether or not the task
+defines any args, so `%{` is significant even in a command that references no
+argument. A shell format specifier containing `%{` — most commonly curl's
+`-w "%{http_code}"` — is otherwise read as interpolation of an undefined
+variable and fails with `nickel eval failed for string`. To pass a literal `%{`
+through, escape it as `%{"%"}{`:
+
+```toml
+# Fails: `%{http_code}` is read as interpolation of an undefined `http_code`.
+[tasks.probe_broken]
+exec = 'curl -s -o /dev/null -w "%{http_code}" https://example.com'
+
+# Works: `%{"%"}{` yields a literal `%{`.
+[tasks.probe]
+exec = 'curl -s -o /dev/null -w "%{"%"}{http_code}" https://example.com'
+```
+
 
 ### `description` - Describe the task
 
