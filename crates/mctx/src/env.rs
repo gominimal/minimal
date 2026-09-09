@@ -1032,6 +1032,30 @@ mod tests {
         );
     }
 
+    /// The companion of the failure case above: the escape the error suggests
+    /// must actually work. Applying `%{"%"}{http_code}` to curl's `-w` yields
+    /// the literal `%{http_code}` in the resolved command — proving the escape
+    /// documented in the error and `docs/reference/tasks.md` is correct, not
+    /// just that a matching typo appears in both the code and the message.
+    #[test]
+    fn interpolate_escaped_percent_brace_yields_literal() {
+        let task = mfile::Task {
+            action: mfile::TaskAction::exec_from_str(
+                "curl -s -o /dev/null -w \"%{\"%\"}{http_code}\" https://example.com",
+            ),
+            ..Default::default()
+        };
+        let resolved = interpolate_task_strings(&task, None)
+            .expect("the escaped `%{` must evaluate successfully");
+        let mfile::TaskAction::Exec(mfile::StrOrList::Single(cmd)) = resolved.action else {
+            panic!("expected a single exec string");
+        };
+        assert_eq!(
+            cmd, "curl -s -o /dev/null -w \"%{http_code}\" https://example.com",
+            "the `%{{\"%\"}}{{...}}` escape should resolve to a literal `%{{http_code}}`"
+        );
+    }
+
     /// Helper: build a Context and Graph from the fakerepo test data,
     /// matching the pattern used in lib.rs tests.
     fn setup_ctx_and_graph() -> (TempDir, Context, Graph) {
