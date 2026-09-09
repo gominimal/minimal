@@ -6,3 +6,10 @@ target/
 # Claude Code / git worktree scratch dirs (agent worktrees, embedded repos)
 .claude/
 .worktrees/
+
+# Vale prose-linting: synced packages and sync-generated config are rebuilt by
+# `vale sync`; only the project vocabulary is tracked.
+/styles/*
+!/styles/config/
+/styles/config/*
+!/styles/config/vocabularies/

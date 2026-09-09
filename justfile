@@ -367,6 +367,51 @@ test-installer:
 lint-shell:
     bash scripts/lint-shell.sh
 
+# Not a CI gate. Default lints the markdown this branch touches (changed
+# against main, staged, unstaged, and untracked) so the common loop stays
+# short; pass files for specific ones, or --all for the whole tree. The
+# existing tree carries thousands of alerts: drive files you touch to zero,
+# leave untouched files' alerts alone. Packages fetch on first use (styles/
+# is gitignored; later runs never touch the network); --no-global keeps a
+# personal ~/.vale.ini from leaking its styles into the repo's run. Paths
+# with spaces are not supported.
+#
+# Vale prose-lint this branch's markdown (`just lint-prose [files|--all]`).
+lint-prose *args: (_need "vale" "brew install vale (or a release binary: github.com/errata-ai/vale/releases)")
+    #!/usr/bin/env sh
+    set -eu
+    args={{quote(args)}}
+    [ -d styles/ai-tells ] && [ -d styles/ste ] || vale sync
+    if [ "$args" = "--all" ]; then
+        exec vale --no-global -- $(git ls-files '*.md')
+    fi
+    if [ -n "$args" ]; then
+        exec vale --no-global -- $args
+    fi
+    base=main
+    git rev-parse -q --verify "$base" >/dev/null || base=origin/main
+    git rev-parse -q --verify "$base" >/dev/null || {
+        echo "lint-prose: no 'main' or 'origin/main' ref to diff against" >&2
+        exit 1
+    }
+    changed="$(
+        { git diff --name-only "$base...HEAD" -- '*.md'
+          git diff --name-only --cached -- '*.md'
+          git diff --name-only -- '*.md'
+          git ls-files --others --exclude-standard -- '*.md'
+        } | sort -u
+    )"
+    # Unquoted expansions below word-split on purpose: repo paths have no
+    # spaces. {{quote(args)}} keeps shell metacharacters in arguments inert;
+    # `--` stops vale from parsing leading-dash paths as options.
+    set -f
+    files=""
+    for f in $changed; do
+        if [ -f "$f" ]; then files="$files $f"; fi
+    done
+    [ -n "$files" ] || { echo "lint-prose: no changed markdown on this branch" >&2; exit 0; }
+    exec vale --no-global -- $files
+
 # Shellcheck runs too, when present.
 #
 # Run the promotion provenance gate's test harness (stubbed `gh`, no network or auth).
