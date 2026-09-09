@@ -5,7 +5,7 @@ status: draft
 owner: mitodrummer
 epic: gominimal/inbox#513
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
-updated: 2026-09-08
+updated: 2026-09-09
 ---
 
 # MMI — minimald as a mesh-reachable session host: WireGuard ingress, certificate auth, terminal state, relay
@@ -39,14 +39,15 @@ shell.
 
 **First slice:** One native daemon with a static trust anchor and peer table,
 a browser attach through its WebSocket ingress with a certificate, `auth_none`
-refused on that path, local socket clients unaffected, and a second attach
-that repaints the screen.
+refused on that path, local socket clients unchanged except for the
+terminal-state group, and a second attach that repaints the screen.
 
 ## Users and stories
 
 **Roles:** developer using a long-running agentic workflow who is away from
 the workstation; developer who deploys long-running workflows in sessions;
-developer running sessions both locally and remote.
+developer running sessions both locally and remote; operator of the relay
+tier, who runs `minrelay` for the daemons that cannot be reached directly.
 
 - AS A developer using long running agentic workflow, I WANT to monitor and
   jump into an session via a mobile or desktop web browser, SO THAT I can
@@ -70,25 +71,43 @@ developer running sessions both locally and remote.
   enumerate and reconnect with remote sessions just like local sessions, SO
   THAT I can work with all my sessions the same way.
   - Remote boxes are enumerable and attachable through the same CLI surface
-    as local ones; boxes and sessions are seen from both the shell and the
-    browser (gominimal/inbox#494, step 6).
+    as local ones.
+
+The initiative's sixth done-when step, boxes and sessions seen from both the
+shell and the browser (gominimal/inbox#494), is the context this split was
+made in, not a criterion of this epic.
 
 ## Requirements
+
+Configuration vocabulary. The control-plane issuer is one configuration
+item; every node-scoped endpoint this document names, the KRL feed
+(MMI-035), the decision endpoint (MMI-026), host-certificate renewal
+(MMI-029), the heartbeat (MMI-060), the peer document's mirror (MMI-010)
+and the relay set (MMI-008), is discovered from that issuer's
+`gatehouse_node_endpoints` (Gatehouse §8.2), so "WHERE … is configured" in
+each of them means the issuer is configured and advertises that endpoint.
+"Direct ingress" (MMI-007) is the one opt-in that opens the UDP mesh socket
+and the `/wg` route on a non-loopback address; the WebSocket ingress of
+MMI-001 is that route, one of the direct-ingress options, and on a loopback
+address it needs no opt-in.
 
 ### Mesh ingress
 
 - **MMI-001** WHERE the WebSocket ingress is enabled THE SYSTEM SHALL accept
-  WireGuard datagrams as binary frames, one datagram per frame, on the `/wg`
-  route of the existing TLS listener (03-spec-networking R4.4, port 7655), and
-  treat them exactly as datagrams read from its UDP mesh socket.
+  WireGuard datagrams as binary frames, one datagram per frame, over a
+  WebSocket at the direct endpoint it advertises, the `/wg` route of its TLS
+  listener (03-spec-networking R4.4, port 7655; the endpoint the peer
+  document carries, MMI-010), and a peer's tunnel SHALL behave identically
+  on that carrier and on UDP.
   tier:     T0
   verify:   cargo nextest run -p minimald mesh_ingress_ws_frames_reach_the_same_tunnels
 
 - **MMI-002** THE SYSTEM SHALL serve the `/wg` route without a TLS client
   certificate; the WireGuard handshake is that route's authentication (R4.4,
   R4.5).
-  tier:     T0
+  tier:     T1
   verify:   cargo nextest run -p minimald wg_route_needs_no_client_certificate
+  property: for every route r the TLS listener registers and every request to r that carries no client certificate, r is served iff r = `/wg`, and every other r answers the existing empty 401; walked over the listener's route table
   - THE SYSTEM SHALL keep answering every other route on that listener
     without a client certificate with the existing empty 401.
     tier:   T0
@@ -124,8 +143,9 @@ developer running sessions both locally and remote.
 - **MMI-007** THE SYSTEM SHALL open no inbound mesh listener, neither a UDP
   socket nor the `/wg` route on a non-loopback address, unless direct
   ingress is enabled in its configuration.
-  tier:     T0
+  tier:     T1
   verify:   cargo nextest run -p minimald no_inbound_mesh_listener_without_opt_in
+  property: for every configuration c whose mesh, relay and ingress options do not enable direct ingress, the set of sockets the daemon opens under c holds no UDP mesh socket and no `/wg` route bound to a non-loopback address; walked over every combination of those options
 
 - **MMI-008** WHERE a relay is configured, by the peer document's relay
   assignment or by configuration until one is, THE SYSTEM SHALL connect
@@ -183,8 +203,9 @@ developer running sessions both locally and remote.
 - **MMI-012** WHEN a datagram from an unrecognised source or a failed
   handshake is dropped THE SYSTEM SHALL log at most the bare source address,
   never a peer name, tunnel, switch, or session name (R4.5).
-  tier:     T0
+  tier:     T1
   verify:   cargo nextest run -p minimald mesh_auth_failure_logs_no_topology
+  property: for every drop reason the mesh layer emits and every dropped datagram d, the log line written for d carries at most d's source address and none of the names in the peer table, the tunnel, the switch or any session; walked over every drop reason against a topology whose names are sentinel strings
 
 ### Authentication surface
 
@@ -197,8 +218,9 @@ developer running sessions both locally and remote.
 - **MMI-021** THE SYSTEM SHALL refuse `none` authentication on every
   non-local connection, naming public-key authentication as the method to
   continue with.
-  tier:     T0
+  tier:     T1
   verify:   cargo nextest run -p minimald auth_none_refused_on_mesh_ingress
+  property: for every non-local connection and every authentication method in the SSH server's dispatched vocabulary, `none` is refused and the refusal names `publickey` as the method to continue with; walked over the method vocabulary
 
 - **MMI-022** THE SYSTEM SHALL decide a presented user certificate as a pure
   function of (certificate, username, clock, trusted User CA keys, revoked
@@ -227,25 +249,31 @@ developer running sessions both locally and remote.
   subject, the `local`-class linkage of Gatehouse §6.2 F16(a), held in
   configuration as the owner subject of MMI-025 until enrollment exists —
   and SHALL compare that owner, never the record's sandbox username, when
-  an ownership-gated request arrives.
-  tier:     T0
+  an ownership-gated request arrives; a record created before a subject was
+  configured is owned by no subject and refuses every ownership-gated
+  request.
+  tier:     T1
   verify:   cargo nextest run -p minimald session_owner_is_the_creating_subject_or_the_node_subject
+  property: for every creating-connection class c in {Local, Certified}, every configured-subject state in {configured, none}, and every record r created under them, owner(r) is the certificate subject when c is Certified, the configured subject when c is Local and one is configured, and no subject otherwise; and for every ownership-gated request in MMI-027's vocabulary the comparison reads owner(r) and never r's sandbox username; walked exhaustively
 
 - **MMI-024** THE SYSTEM SHALL accept the username a non-local connection
   presents only when it is among the certificate's principals and not in
   canonical-subject form (`u:` or `m:` prefix), refusing a subject-form
   username as `principal_mismatch`; a subject-form string is never used as
   a sandbox user.
-  tier:     T0
+  tier:     T1
   verify:   cargo nextest run -p minimald subject_form_username_is_refused
+  property: for every principal p in the arch's user-certificate vectors and every subject-form string built from p with the `u:` or `m:` prefix, presented as the username on a non-local connection, accepted(name) iff name is among the certificate's principals and carries neither prefix, and a refusal names `principal_mismatch`; walked over the vectors
 
 - **MMI-025** WHERE no authorization decision endpoint is configured THE
   SYSTEM SHALL admit only certificates whose subject equals the daemon's
   configured owner subject, refusing every other subject before any channel
-  opens — the ownership interim Gatehouse §7.4 (v1.16) ratifies rather than
+  opens, and with no owner subject configured SHALL admit no certificate —
+  the ownership interim Gatehouse §7.4 (v1.16) ratifies rather than
   replaces, its shipped baselines being ownership-shaped.
-  tier:     T0
+  tier:     T1
   verify:   cargo nextest run -p minimald owner_subject_rule_admits_only_the_owner
+  property: for every subject s in the arch's user-certificate vectors and every configured owner o drawn from the same set or absent, admitted(s) iff o is present and s = o; walked over the vectors' subject set
 
 - **MMI-026** WHERE a decision endpoint is configured THE SYSTEM SHALL open a
   session channel for a `Certified` connection only on an allow `SshConnect`
@@ -254,25 +282,30 @@ developer running sessions both locally and remote.
   §6.3.1), and SHALL evaluate the other admitted requests on the same cache
   as Gatehouse §7.4 (v1.16) maps them — sessions are boxes: `BoxRead` for
   `GetSessionRecord`, `GetSessionScreen` and each `ListSessions` row,
-  `ReadNode` for the listing itself, `StopBox` for `StopSession`, `RenameBox`
-  for `RenameSession` — once the daemon's RPC evaluation point lands; until
-  then those decisions are deny by default beyond the owner rule.
+  `ReadNode` over (subject, node) for the listing itself and for
+  `GetVersion`, `StopBox` for `StopSession`, `RenameBox` for
+  `RenameSession`. The daemon's RPC evaluation point is that evaluation,
+  and it lands with this requirement; until a decision endpoint is
+  configured, MMI-025 and MMI-027 govern: every read, attach and mutation
+  is admitted for the record's owner and refused to every other subject.
   tier:     T0
   verify:   cargo nextest run -p minimald decision_cache_miss_fails_closed_when_the_sts_is_unreachable
 
 - **MMI-027** THE SYSTEM SHALL admit a channel request, subsystem, exec
   request, or direct-tcpip open by auth state: under `Local`, everything;
-  under `Certified`, the shell attach path, `GetVersion`, `ListSessions`,
-  `GetSessionRecord`, `GetSessionScreen`, and, for a session the connection's
-  subject owns (MMI-023; the creator baseline of `RenameBox` and `StopBox`,
-  Gatehouse §7.4), `RenameSession` and `StopSession`; under `Pending`,
-  nothing; refusing with channel failure or an administratively-prohibited
-  open. Every request outside that list stays local-only in v1, as §7.4
-  keeps exec, direct-tcpip, sftp, shutdown, cache, diagnostics, client-cert
-  issuance, create and destroy.
+  under `Certified`, `GetVersion`, and, for a session the connection's
+  subject owns (MMI-023; the creator baseline of `BoxRead`, `RenameBox` and
+  `StopBox`, Gatehouse §7.4, owner-only in v1), the shell attach path
+  including the attach that restarts a stopped session (MMI-028),
+  `GetSessionRecord`, `GetSessionScreen`, `RenameSession` and
+  `StopSession`, with `ListSessions` returning only the rows the subject
+  owns; under `Pending`, nothing; refusing with channel failure or an
+  administratively-prohibited open. Every request outside that list stays
+  local-only in v1, as §7.4 keeps exec, direct-tcpip, sftp, shutdown,
+  cache, diagnostics, client-cert issuance, create and destroy.
   tier:     T1
   verify:   cargo nextest run -p minimald rpc_allowlist_by_auth_state
-  property: for every auth state s, every request r in the daemon's dispatched subsystem, exec, sftp and direct-tcpip vocabulary, and every ownership o in {owner, other}: admit(s, r, o) iff s = Local, or s = Certified and r in {attach, GetVersion, ListSessions, GetSessionRecord, GetSessionScreen}, or s = Certified and o = owner and r in {RenameSession, StopSession}; walked exhaustively
+  property: for every auth state s, every request r in the daemon's dispatched subsystem, exec, sftp and direct-tcpip vocabulary, and every ownership o in {owner, other}: admit(s, r, o) iff s = Local, or s = Certified and r = GetVersion, or s = Certified and o = owner and r in {attach, GetSessionRecord, GetSessionScreen, RenameSession, StopSession}; and every `ListSessions` row returned under Certified has o = owner; walked exhaustively
   - IF a `Certified` connection sends `exec`, `sftp`, `direct-tcpip`, or a
     subsystem outside the allowlist — `Shutdown`, `CleanCache`,
     `DiagBundleTarZst`, `IssueClientCert`, `GetMeshStatus`, the create
@@ -317,8 +350,9 @@ developer running sessions both locally and remote.
   certificate's `valid_before`, within 1 s and with no grace, leaving every
   session it was attached to running and detached and ending each attached
   channel with `EXPIRED@minimal.dev` (MMI-053; Gatehouse §5.7).
-  tier:     T0
+  tier:     T1
   verify:   cargo nextest run -p minimald reaper_closes_at_valid_before_and_the_session_survives
+  property: for every certificate c in the arch's user-certificate vectors and every clock t in {1750000000, valid_before(c) − 1 s, valid_before(c), valid_before(c) + 1 s}, the reaper decision closes c's connection iff t ≥ valid_before(c), and schedules wall warnings at T-15 min and T-1 min iff valid_before(c) − valid_after(c) > 1 h; walked over the vectors at those clocks
   - WHILE the certificate lifetime exceeds 1 h THE SYSTEM SHALL write wall
     warnings to the attached terminal at T-15 min and T-1 min, and for a
     shorter lifetime none — the daemon-side rule Gatehouse §5.7 (v1.11)
@@ -352,8 +386,9 @@ developer running sessions both locally and remote.
   `(seq, issued_at)` before applying, and after a restart keep enforcing the
   last accepted KRL and that mark until a fresh one is fetched (Gatehouse
   §8.2).
-  tier:     T0
+  tier:     T1
   verify:   cargo nextest run -p minimald krl_feed_rejects_a_regressed_seq_across_restart
+  property: for every KRL response varying signature validity, `typ`, `td` and `seq` against the persisted high-water mark, accepted iff the signature verifies under the issuer's keys and `typ` = `gatehouse-krl+jws` and `td` is the daemon's own and `seq` exceeds the mark, before and after a restart; walked over every combination of the four
   - IF the newest accepted KRL's `issued_at` is older than the staleness
     bound (default 5 min) THEN THE SYSTEM SHALL raise an alarm in its log
     and status and, where configured, refuse new non-local connections until
@@ -364,20 +399,23 @@ developer running sessions both locally and remote.
 - **MMI-037** WHEN a KRL is applied THE SYSTEM SHALL close every live
   `Certified` connection whose serial it revokes within 1 s, ending each
   attached channel with `REVOKED@minimal.dev` (MMI-053).
-  tier:     T0
+  tier:     T1
   verify:   cargo nextest run -p minimald revoked_serial_terminates_a_live_connection
+  property: for every KRL in the arch's KRL vectors and every live `Certified` connection under a certificate from the certificate vectors, the connection is closed within 1 s with `REVOKED@minimal.dev` iff the KRL revokes that certificate's serial; walked over every (KRL, certificate) pair
 
 - **MMI-038** WHEN no authentication configuration is present THE SYSTEM
   SHALL refuse every public-key offer before any signature exchange, accept
   no non-local connection, and serve local listeners exactly as today.
-  tier:     T0
+  tier:     T1
   verify:   cargo nextest run -p minimald absent_auth_config_refuses_every_publickey_offer
+  property: for every key and certificate in the arch's vectors offered as a public key on a non-local connection with no authentication configuration present, the offer is refused before any signature exchange; walked over the vectors
 
 - **MMI-039** THE SYSTEM SHALL read its trust anchors, host certificate, KRL
   source, owner subject, mesh identity, peers, relay, and ingress options
-  from one file named on its command line, and, in a microVM, from a fixed
-  path on the state volume and from nowhere else, starting the mesh from
-  that configuration.
+  from exactly one operator-controlled source — a file named on its command
+  line, or, in a microVM, the configuration the VM daemon places on the
+  state volume — and from no environment variable or socket, starting the
+  mesh from that configuration.
   tier:     T0
   verify:   cargo nextest run -p minimald microvm_reads_auth_config_from_the_state_volume
   - IF a private key file is readable by group or others THEN THE SYSTEM
@@ -405,9 +443,12 @@ developer running sessions both locally and remote.
   tier:     T0
   verify:   cargo nextest run -p minimald reattach_lands_on_the_current_screen_in_one_frame
 
-- **MMI-052** WHERE an attach declares a scrollback request THE SYSTEM SHALL
-  write up to the requested number of scrollback lines as plain lines ahead
-  of the repaint, and otherwise write none; no v1 client declares one.
+- **MMI-052** WHERE an attach declares a scrollback request — an `env`
+  channel request naming `MINIMAL_SCROLLBACK=<lines>` before the shell
+  request, the interim carrier while no client core declares one (MCC-061)
+  — THE SYSTEM SHALL write up to the requested number of scrollback lines as
+  plain lines ahead of the repaint, and otherwise write none; no v1 client
+  declares one.
   tier:     T0
   verify:   cargo nextest run -p minimald reattach_replays_the_requested_scrollback_tail
 
@@ -472,14 +513,16 @@ developer running sessions both locally and remote.
   peer document's input) — and, in the heartbeat and in `GetMeshStatus`,
   only its node id, daemon version, mesh public key, tunnel address, direct
   endpoints, relay name and connection state, host-certificate serial and
-  expiry, KRL `seq`, and the number of live sessions, a superset the
-  identity plane may ignore; never a session name, project path, or screen
-  content.
-  tier:     T0
+  expiry, KRL `seq`, and the number of live sessions — a superset of the
+  §8.2 payload, sent on the interim assumption that the endpoint ignores
+  unknown members (Open questions); never a session name, project path, or
+  screen content.
+  tier:     T1
   verify:   cargo nextest run -p minimald heartbeat_carries_no_session_data
-  - THE SYSTEM SHALL persist the heartbeat `seq` with the KRL high-water mark
-    (MMI-035) so that a restart never regresses it, a regression being
-    rejected by the identity plane (Gatehouse §8.2).
+  property: for every heartbeat and every `GetMeshStatus` answer the daemon emits, its member set is a subset of {seq, reachability, node id, daemon version, mesh public key, tunnel address, direct endpoints, relay name, relay connection state, host-certificate serial, host-certificate expiry, KRL seq, live session count}, and no value in it equals a session name, a project path or a screen line of any live session; walked over the emitter vocabulary against sessions whose names, paths and screens carry sentinel strings
+  - THE SYSTEM SHALL persist the heartbeat `seq` so that a restart never
+    regresses it, a regression being rejected by the identity plane
+    (Gatehouse §8.2).
     tier:   T0
     verify: cargo nextest run -p minimald heartbeat_seq_never_regresses_across_restart
 
@@ -493,7 +536,8 @@ developer running sessions both locally and remote.
   tier:     T0
   verify:   cargo nextest run -p minrelay node_registration_requires_sshpop_host
   - IF a second registration arrives for the same node THEN THE SYSTEM SHALL
-    replace the earlier one and close it.
+    replace the earlier one and close it with the `replaced` code (Design
+    reasoning names the close codes).
     tier:   T0
     verify: cargo nextest run -p minrelay newer_registration_replaces_older
   - IF a registration or a client connection answers no keepalive for 90 s
@@ -509,13 +553,16 @@ developer running sessions both locally and remote.
   unexpired, and is bound by `cnf.jkt` to a key whose DPoP proof over the
   ticket the client presents with it, together with the client's own §6.9
   mesh binding, from which the relay takes the client's mesh public key
-  (the ticket carries none; MMI-077, MCC-071); otherwise it closes with a
-  refusal code and no body, the code for an expired ticket distinct from
-  every other refusal. The ticket authorizes routing only (§6.9, T29).
+  (the ticket carries none; MMI-077, MCC-071) — the interim this document
+  shares with MCC-071 until the architecture answers whether the ticket
+  should carry the key (Open questions); otherwise it closes with no body
+  and the `expired` code for a ticket past `exp` or the `refused` code for
+  every other failure (Design reasoning names the close codes). The ticket
+  authorizes routing only (§6.9, T29).
   tier:     T0
   verify:   cargo nextest run -p minrelay ticket_bound_to_dpop_key_required
   - IF the ticket's node has no live registration THEN THE SYSTEM SHALL close
-    with a distinct offline code.
+    with the `offline` code.
     tier:   T0
     verify: cargo nextest run -p minrelay ticket_for_unregistered_node_refused
 
@@ -526,13 +573,13 @@ developer running sessions both locally and remote.
   v0.6 §1 and §10 state for a ciphertext relay, and Gatehouse T29.
   tier:     T1
   verify:   cargo nextest run -p minrelay frames_forwarded_verbatim_in_order
-  property: for every sequence of datagrams sent on either leg, the paired leg receives the same datagrams, byte-identical, in the same order, the node leg's frames differing from the client leg's only by the address prefix
+  property: for every sequence of datagrams sent on either leg, the paired leg receives the same datagrams, byte-identical, in the same order, the node leg's frames differing from the client leg's only by the address prefix; the test draws its sample from every frame length in {0, 1, 64, 1420, 65535}, counts up to 1,000, sent in order and interleaved on both legs
   - WHEN one leg of a pairing closes THE SYSTEM SHALL close the other within
     1 s.
     tier:   T0
     verify: cargo nextest run -p minrelay leg_close_propagates_within_one_second
 
-- **MMI-073** THE SYSTEM SHALL hold no state beyond its live connection map
+- **MMI-073** THE SYSTEM SHALL hold no state that outlives a connection
   and write nothing to disk; after a restart every connection is gone and
   nothing is recovered.
   tier:     T0
@@ -540,7 +587,7 @@ developer running sessions both locally and remote.
 
 - **MMI-074** THE SYSTEM SHALL cap concurrent client connections per node
   (default 16) and per ticket key (default 4), refusing beyond the cap with
-  a distinct code.
+  the `over_cap` code.
   tier:     T0
   verify:   cargo nextest run -p minrelay per_node_connection_cap_enforced
 
@@ -555,19 +602,21 @@ developer running sessions both locally and remote.
   client mesh public key, source address, open and close times, close
   reason, and frame and byte counts, never a frame payload (the traffic
   metadata Gatehouse T29 names as the relay's residual).
-  tier:     T0
+  tier:     T1
   verify:   cargo nextest run -p minrelay relay_logs_metadata_only
+  property: for every log line the relay writes at every log site, its fields are a subset of {node id, ticket key thumbprint, client mesh public key, source address, open time, close time, close reason, frame count, byte count}, and no field contains a byte sequence of any frame payload; walked over every log site against frames carrying sentinel bytes
 
 - **MMI-077** THE SYSTEM SHALL address every frame on a node's registration
   with the 32-byte mesh public key of the client it belongs to: a frame from
   a client leg reaches the node prefixed with the key the client's mesh
   binding names (MMI-071), and a frame from the node reaches, prefix
   stripped, the client leg bound to the key its prefix names.
-  tier:     T0
+  tier:     T1
   verify:   cargo nextest run -p minrelay frames_are_addressed_by_client_mesh_key
+  property: for every registered node n, every client leg bound to a mesh key k on n, and every frame f: a frame from that leg reaches n's registration prefixed with exactly k, and a frame from n prefixed with k' reaches, prefix stripped, exactly the leg bound to k' or is dropped when none is; walked over every (leg, key) pairing the relay holds
   - IF a second client leg opens for the same node and mesh public key THEN
-    THE SYSTEM SHALL replace the earlier one and close it with a distinct
-    code.
+    THE SYSTEM SHALL replace the earlier one and close it with the
+    `replaced` code.
     tier:   T0
     verify: cargo nextest run -p minrelay newer_client_leg_replaces_older
 
@@ -595,14 +644,17 @@ developer running sessions both locally and remote.
 - Mobile and an in-process netstack app: the plan's S13.
 - The UDP mesh between daemons (03-spec-networking Unit 4) except where
   MMI-003 to MMI-011 change it.
-- Destroying, creating, or composing sessions, `exec`, sftp, and port
-  forwarding from a non-local connection: Local-only here (MMI-027) and in
-  Gatehouse §7.4's v1 mapping; per-principal rules for them are the plan's
-  S8.
+- The owner's own remote create, destroy, compose, `exec`, sftp and port
+  forwarding, the remainder of the One Grammar story: local-only here
+  (MMI-027) and in Gatehouse §7.4's v1 mapping, and bound by no spec yet;
+  per-principal rules for them once they open are the plan's S8.
+- Copying files into or out of a box over the mesh, the epic's Sync Files
+  Out story: bound by no spec yet; sftp stays local-only here (MMI-027) and
+  neither the client core nor the browser page consumes it.
 - HTTP access to services inside boxes through a browser's tunnel:
   03-spec-networking UC2b, a product decision not yet taken.
-- Inter-relay forwarding and relay-assisted hole punching: a later relay
-  revision; v1 is single-hop.
+- Inter-relay forwarding and relay-assisted hole punching: owned by no spec
+  or issue yet; v1 is single-hop.
 
 ## Non-functional requirements
 
@@ -721,7 +773,13 @@ presents its §6.9 mesh binding beside the ticket and the relay takes the
 key from the binding (MMI-071); the pairing is still decided at open and
 the daemon sees the key as it would a UDP source address (MMI-008). Whether
 the ticket should carry a `wg_pub` claim instead is asked of the
-architecture below. Scale is horizontal: add relays, reassign homes through
+architecture below. The relay's close codes are a contract the client core
+acts on (MCC-071, MCC-064), so they are named here: `expired` for a ticket
+past `exp`, `offline` for a node with no live registration, `replaced` for
+a leg or registration superseded by a newer one (MMI-070, MMI-077),
+`over_cap` for a connection beyond MMI-074's caps, and `refused` for every
+other verification failure. Scale is horizontal: add relays, reassign
+homes through
 the peer
 document, and daemons follow at their next reconnect, MMI-008's backoff
 bounding the gap. Direct paths are preferred at both ends (MMI-009, MCC-014),
@@ -745,11 +803,16 @@ attach is the cached `SshConnect`, show and each listed row `BoxRead`, stop
 `StopBox`, rename the one new action `RenameBox` (baselines creator,
 chain-ancestor, org-admin, deny by default until the daemon's RPC
 evaluation point lands), and a node-level listing `ReadNode`; every other
-RPC stays local-only in v1. Under A1, rename and stop are admitted for the
-session's owner (MMI-027), which is those baselines' creator arm; attach
-and reads by `SshConnect` once a decision endpoint is configured (MMI-026),
-the other decisions joining it on the same cache when the evaluation point
-exists; with no endpoint, MMI-025 admits only the configured owner subject,
+RPC stays local-only in v1. Under A1, attach, reads, rename and stop are
+admitted for the session's owner (MMI-027), which is those baselines'
+creator arm, and refused to every other `Certified` subject; a decision
+endpoint, once configured, evaluates the same requests through `SshConnect`
+and the §7.4 mappings on one cache (MMI-026), and a `ListSessions` row or a
+node-level `GetVersion` is decided over the node rather than a session.
+The first draft admitted reads to every `Certified` subject; the owner-only
+reading was chosen on 2026-09-09 because `BoxRead`'s shipped baselines are
+ownership-shaped and teammate reads arrive with the S8 follow-up. With no
+endpoint, MMI-025 admits only the configured owner subject,
 the `local`-class linkage of Gatehouse §6.2 F16(a) written into config —
 the interim §7.4 ratifies rather than replaces, its shipped baselines being
 ownership-shaped. Ownership needs a field the record does not have
@@ -847,18 +910,35 @@ identity-plane liveness heartbeat, and a provider's `READY` never implies
 liveness here. The cadence is the architecture's 60 s working value with a
 server-enforced 30 s floor (MMI-060), from which Gatehouse derives
 `reachable` within 150 s, `stale` within 15 min and `offline` beyond; the
-`seq` is monotonic on the §8.2 anti-rollback discipline (MMI-061). The
+`seq` is monotonic on the §8.2 anti-rollback discipline (MMI-061) and is
+stored beside the KRL high-water mark (MMI-035), one persisted pair. The
 payload is metadata only, and the browser's 30 s liveness refresh (WMC-012)
 re-reads the derived state, not the heartbeat.
 
-**Tiers.** MMI-005, MMI-022, MMI-027, and MMI-072 are T1: each is a
-universal over a finite domain the test walks exhaustively, so no
-property-testing crate is added to `minimald` or `minrelay` (MCC confines
-one to `min-core`'s development dependencies). The tier buys pure decision
-functions over owned values, separate from the transport; MMI-022's decision
-is the one MCC-034 defines, exercised here through the daemon's
-authentication hook. Nothing is T2 or T3: there is no proof project, and a
-Kani harness over certificate parsing is out of proportion.
+**Tiers.** MMI-005, MMI-022, MMI-027 and MMI-072 were T1 from the first
+draft; MMI-002, MMI-007, MMI-012, MMI-021, MMI-023, MMI-024, MMI-025,
+MMI-031, MMI-035, MMI-037, MMI-038, MMI-061, MMI-076 and MMI-077 joined them
+on 2026-09-09, when the review found the security invariants resting on
+example tests. Each is a universal over a finite domain — a route table, an
+option set, a method or principal vocabulary, the certificate and KRL
+vectors at a fixed clock, a field allowlist, or every (leg, key) pairing the
+relay holds — that the test walks exhaustively, so no property-testing crate
+is added to `minimald` or `minrelay` (MCC confines one to `min-core`'s
+development dependencies). The tier buys pure decision functions over owned
+values, separate from the transport; MMI-022's decision is the one MCC-034
+defines, exercised here through the daemon's authentication hook, and
+MMI-031's reaper decision follows it at the same fixed clock. MMI-072's
+universal ranges over unbounded sequences, so its test draws the sample its
+property names rather than walking a domain. Everything else is T0 because
+it reaches a socket, a daemon or a browser: MMI-006, MMI-020, MMI-026,
+MMI-028, MMI-053, MMI-054 and MMI-073 are scenarios — a transport dying, a
+connection arriving, a decision fetched, a process ended, a channel closed,
+a restart — and the invariants that name them are held by the T1 decisions
+beside them (MMI-027 for the allowlist, MMI-025 and MMI-038 for admission,
+MMI-031 and MMI-037 for expiry and revocation, MMI-077 for addressing), so
+one example each is what a scenario needs. Nothing is T2 or T3: there is no
+proof project, and a Kani harness over certificate parsing is out of
+proportion.
 
 **Generality:** a second WireGuard implementation on the peer side (kernel
 WireGuard, wireguard-go) fits MMI-001 to MMI-011 unchanged, though interop is
@@ -905,8 +985,9 @@ interim.
   covered by: MMI-031, MMI-035, MMI-037
 - **Invariant:** THE SYSTEM SHALL keep a session's process running through
   any loss of the transport attached to it and any daemon-initiated close of
-  its channel.
-  enforced by: transport loss, supersession, and daemon-initiated closes
+  its channel other than daemon shutdown, which ends every session's process
+  and is the one close that carries `SHUTDOWN@minimal.dev` (MMI-053).
+  enforced by: transport loss, supersession, expiry and revocation closes
   detaching, never destroying.
   covered by: MMI-006, MMI-031, MMI-037, MMI-053, MMI-054
 - **Invariant:** THE SYSTEM SHALL expose no inbound mesh listener without
@@ -925,8 +1006,11 @@ interim.
   and issuer keys of the tenants it serves in its configuration and its
   canonical URL published in the `relays` member of each tenant's
   `gatehouse_node_endpoints` (Gatehouse §8.2). The
-  daemon side needs no rollout step: every behaviour here is off without
-  configuration (MMI-N05).
+  daemon side needs no rollout step: every ingress, authentication and relay
+  behaviour here is off without configuration (MMI-N05). The terminal-state
+  group (MMI-050 to MMI-055) is the exception, on for every transport: a
+  local client sees the DEC 2026 repaint, the attachment state, and a named
+  exit signal on supersession where today's `min` sees exit status 0.
 - **Rollback:** redeploy the previous image; connections drop and daemons
   reconnect within the MMI-008 backoff; no state to migrate.
 - **Blast radius:** browser sessions to NAT'd daemons in that region; direct
@@ -977,6 +1061,8 @@ interim.
 - [NEEDS CLARIFICATION (LOW): MMI-022 recognises the `source-address`
   critical option but no requirement enforces it against the peer's tunnel
   address, which OpenSSH would; should MMI-022 gain that edge?]
-- [NEEDS CLARIFICATION (LOW): MMI-052's scrollback replay is requested by no
-  v1 head (cross-spec decision 3); keep it as a daemon capability with its
-  test, or drop it until a head asks?]
+- [NEEDS CLARIFICATION (LOW): MMI-052's scrollback replay is kept as a
+  daemon capability with an interim `env` carrier that no v1 head declares
+  (cross-spec decision 3). Which head first consumes it, and whether the
+  carrier moves into the client core's configuration document (MCC-061), is
+  open.]
