@@ -440,8 +440,9 @@ and verified there.
   node's peer-document entry (MCC-070) as served, the session identifier,
   the terminal type and size, and an auth block naming the SSH username and
   the expected host principal, the certificate and anchors being those the
-  core holds (MCC-067); the core declares no scrollback request (MMI-052 is
-  a later daemon capability); a missing or malformed field rejects the
+  core holds (MCC-067); the core declares no scrollback request (the
+  daemon's replay requirement is retired until a head asks); a missing or
+  malformed field rejects the
   promise naming the field before any network activity.
   tier:     T0
   verify:   just wasm-core-headless config_rejections_name_the_field_before_dialing
