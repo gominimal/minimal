@@ -66,18 +66,19 @@ the sealed-credential path.
   verify:   cargo nextest run -p minimal token_renewal_never_prompts
 
 - **GHS-003** WHERE a session declares no additional repositories THE SYSTEM
-  SHALL bound its GitHub access to the project in its workbench.
+  SHALL bound the GitHub access its sealed value grants to the project in its
+  workbench.
   tier:     T2
   verify:   cargo nextest run -p sessions reach_default_is_workbench_only
-  property: for every session whose declared set is empty, the set of repositories a git operation may target is exactly the workbench project
+  property: for every session whose declared set is empty, the set of repositories a git operation carrying the session's sealed value may target is exactly the workbench project
   harness:  kani_reach_is_workbench_plus_declared, exhaustive to 8 declared repositories modelled as bounded identifiers (unwind bound 9); requires the reach decision to be a pure function over owned repository identifiers, separate from spec expansion
 
 - **GHS-004** WHERE a session declares additional repositories before it starts
-  THE SYSTEM SHALL bound its GitHub access to the workbench project and the
-  declared repositories, and nothing else.
+  THE SYSTEM SHALL bound the GitHub access its sealed value grants to the
+  workbench project and the declared repositories, and nothing else.
   tier:     T2
   verify:   cargo nextest run -p sessions reach_is_workbench_plus_declared
-  property: for every declared set D, the set of repositories a git operation may target is exactly the workbench project together with D
+  property: for every declared set D, the set of repositories a git operation carrying the session's sealed value may target is exactly the workbench project together with D
   harness:  kani_reach_is_workbench_plus_declared, exhaustive to 8 declared repositories modelled as bounded identifiers (unwind bound 9); the same pure reach decision as GHS-003
 
 - **GHS-005** IF a git or gh request from a session carries the session's
@@ -231,7 +232,8 @@ the sealed-credential path.
 - Sign-in through any provider other than GitHub.com, including enterprise
   OIDC: Gatehouse §6.1.3 (F2), a later phase of the identity plane.
 - A forced in-session command for git: standard git and gh are the path
-  (GHS-011), and with sealed credentials they need no configuration at all.
+  (GHS-011), and with sealed credentials they need no configuration by the
+  developer; how their connections reach the proxy is GHS-028's.
 - Branch-aware activation, repository pre-priming, and a pull-request prompt
   on session exit: none is in this epic's criteria.
 - The Actions workflow permission: excluded from the App's permissions
@@ -239,9 +241,11 @@ the sealed-credential path.
 - Revoking an already-delivered credential at GitHub: TTL-bounded (Gatehouse
   §12.9); here a session's end revokes its identity (GHS-019), which stops
   redemption of its sealed values.
-- Enforcing the egress list for uncredentialed traffic, and whether a node's
-  fabric can pin its egress: the egress gateway design in the architecture.
-  This document binds only that credentialed reach rides the egress path.
+- Enforcing the egress list for traffic that does not reach the egress proxy,
+  and whether a node's fabric can pin its egress: the egress gateway design
+  in the architecture. Every request that reaches the proxy is egress-checked
+  whether or not it carries a sealed value (the GitHub identity spec); this
+  document binds only that credentialed reach rides that path.
 - One narrowed token per owner for a repository set that spans owners: later
   work; such a set is refused at mint (the GitHub identity spec).
 - The same egress-proxy shape for upstreams other than GitHub, such as the
@@ -350,13 +354,17 @@ authority: a runtime GitHub grant whose upstream is absent from the declared
 egress is a validation error rather than a second path beside it, and a
 session with no networking cannot hold a runtime grant. Connections to
 declared credentialed hosts are steered to the proxy at the node, and QUIC to
-those hosts is blocked so the interceptable path is the only one. On a session
-with its own network address the proxy can attribute a request to the box that
-sent it and a stolen sealed value is dead across boxes; on a shared network
-namespace that attribution is impossible. A session with a GitHub grant
-therefore has its own address: by default when its spec sets no mode
-(GHS-031), and a spec that sets the shared address or no networking with a
-grant is refused (GHS-030). The architecture allows a grant on a shared
+those hosts is blocked so the interceptable path is the only one. GHS-028
+binds the outcome, not the mechanism: the architecture steers at the node, by
+name resolution and routing, so tools need no proxy setting; a proxy variable
+the daemon sets at creation would satisfy it too, at the cost that a tool
+ignoring the variable bypasses the proxy unless egress blocks the direct path.
+On a session with its own network address the proxy can attribute a request to
+the box that sent it and a stolen sealed value is dead across boxes; on a
+shared network namespace that attribution is impossible. A session with a
+GitHub grant therefore has its own address: by default when its spec sets no
+mode (GHS-031), and a spec that sets the shared address or no networking with
+a grant is refused (GHS-030). The architecture allows a grant on a shared
 address with a recorded residual; here that combination cannot exist, because
 an egress declaration is valid only on a session with its own address and a
 grant without one is a validation error (GHS-022), so it is refused rather
@@ -438,7 +446,8 @@ proxy (GHS-022, GHS-028). Enforcement of the egress list for everything else
 is allow-all in running code today and has its own design chain in the
 architecture, the egress gateway; it is not a prerequisite here because the
 credential's reach is bounded by the token and the proxy whether or not
-anonymous traffic is filtered.
+traffic to other hosts is filtered; a request to a credentialed host is
+egress-checked at the proxy with or without a sealed value.
 
 **Generality:** GitHub.com is the sole provider by decision (GHS-007). The
 sealed-credential path is general by the architecture's design: the same proxy
