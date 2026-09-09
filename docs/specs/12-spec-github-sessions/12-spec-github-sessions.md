@@ -107,7 +107,7 @@ the sealed-credential path.
 - **GHS-009** WHEN a developer starts a local session whose spec declares no
   GitHub grant THE SYSTEM SHALL start it without requiring sign-in.
   tier:     T0
-    verify:   cargo nextest run -p minimal local_session_without_grant_starts_without_signin
+  verify:   cargo nextest run -p minimal local_session_without_grant_starts_without_signin
   - IF a process inside a session that declares no GitHub grant attempts a
     GitHub operation that needs a credential THEN THE SYSTEM SHALL tell it the
     session declares no GitHub grant, rather than asking for a password.
