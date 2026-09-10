@@ -1,11 +1,10 @@
 ---
 id: MMI
 title: minimald as a mesh-reachable session host
-status: draft
 owner: mitodrummer
 epic: gominimal/inbox#513
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
-updated: 2026-09-09
+updated: 2026-09-10
 ---
 
 # MMI — minimald as a mesh-reachable session host
@@ -21,10 +20,13 @@ terminates SSH inside its own tunnel, admits a connection only on a
 certificate from the identity plane, reaches the outside through an outbound
 connection to a Minimal-run relay by default, reports its liveness to the
 identity plane, and repaints the current screen on every re-attach. This
-document covers the daemon and the relay, `minrelay`. It may be superseded
-by the networking spec in preparation (Open questions); until that spec
-exists it is the daemon-side reference, and its mesh-ingress and relay groups
-are the parts most likely to fold into it.
+document covers the daemon and the relay, `minrelay`. The deployment and
+egress-gateway design now owns the transport mechanism, down to a pinned
+host's gateway forwarding the attach path in the relay's role (§4.5), so
+the networking spec in preparation is expected to implement the daemon's
+side of that design (§4.1, §4.5) rather than supersede this document
+whole; the relay leg and path choice (MMI-008, MMI-009) are the parts
+expected to fold into it (Open questions).
 
 **Success:** A developer closes the laptop on a running session, opens the
 session's address in a phone browser, sees the current screen, types into
@@ -70,13 +72,17 @@ tier, who runs `minrelay` for the daemons that cannot be reached directly.
 ## Requirements
 
 Wire details, field names, feed shapes and error codes are the architecture
-of record's (Gatehouse §5.3, §5.7, §6.9, §7.4, §8.2; architecture D7) and
-the siblings'; the requirements cite them rather than repeat them. The
-siblings are the client core, MCC (gominimal/minimal#1355), which consumes
-this ingress and its close signals, and the browser client, WMC
-(gominimal/webapp#763), which consumes them through the core. The networking
-spec in preparation may absorb the mesh-ingress and relay groups (Open
-questions).
+of record's (Gatehouse v1.17 §5.3, §5.7, §6.9, §6.11, §7.4, §8.2;
+architecture D7, D8; the deployment and egress-gateway design,
+`specs/networking/deployment-and-egress-gateway.md`, cited below as the
+deployment design) and the siblings'; the requirements cite them rather
+than repeat them. The siblings are the client core, MCC
+(gominimal/minimal#1355), which consumes this ingress and its close
+signals, and the browser client, WMC (gominimal/webapp#763), which consumes
+them through the core. The gateway association and box address assignment
+are the deployment design's (§4.1, §4.2), implemented daemon-side by the
+networking spec in preparation; this document reports their state on the
+heartbeat and nothing more (MMI-061).
 
 Configuration vocabulary: the identity plane's issuer is one configuration
 item, and every node-scoped endpoint named below — the KRL feed, the
@@ -428,8 +434,9 @@ WebSocket ingress is that route, and on a loopback address needs no opt-in.
   send a heartbeat to `POST /v1/nodes/heartbeat` (Gatehouse §8.2) every 60 s
   by default (configurable within 30 s, the server-enforced floor, to 300 s,
   up to 10% jitter), authenticated with its node identity (`sshpop-host`,
-  `aud` the advertised URL), and within 5 s of its relay connection or
-  direct ingress changing state.
+  `aud` the advertised URL), and within 5 s of its relay connection, direct
+  ingress or gateway association changing state or of a box address being
+  assigned or released.
   tier:     T0
   verify:   cargo nextest run -p minimald heartbeat_interval_and_state_change_within_bounds
   - IF the heartbeat endpoint is unreachable THEN THE SYSTEM SHALL keep
@@ -439,19 +446,22 @@ WebSocket ingress is that route, and on a loopback address needs no opt-in.
     tier:   T0
     verify: cargo nextest run -p minimald heartbeat_failure_does_not_affect_serving
 
-- **MMI-061** THE SYSTEM SHALL carry in a heartbeat a `seq` that increases
-  with every heartbeat it sends and the `reachability` of Gatehouse §8.2
-  (`direct_endpoint` where direct ingress is enabled, `relay` where
-  registered, `mesh_addresses`), and, in the heartbeat and in
-  `GetMeshStatus`, only its node id, daemon version, mesh public key, tunnel
-  address, direct endpoints, relay name and connection state,
-  host-certificate serial and expiry, KRL `seq`, and the number of live
-  sessions — a superset of the §8.2 payload sent on the interim assumption
-  that the endpoint ignores unknown members (Open questions) — and never a
-  session name, project path, or screen content.
+- **MMI-061** THE SYSTEM SHALL carry in a heartbeat exactly the payload of
+  Gatehouse §8.2: a `seq` that increases with every heartbeat it sends; the
+  `reachability` members `direct_endpoint` where direct ingress is enabled,
+  `relay` naming its home relay, `mesh_addresses`, and, while a gateway
+  association is up, `egw` (gateway id, the node's WireGuard key,
+  transport); and `addresses`, one `{box_id, addr, epoch}` for each box
+  address it has assigned, carrying the allocation epoch of the block the
+  address came from (Gatehouse §6.9). `GetMeshStatus` SHALL answer with
+  only its node id, daemon version, mesh public key, tunnel address, direct
+  endpoints, relay name and connection state, gateway id and association
+  state, host-certificate serial and expiry, KRL `seq`, and the number of
+  live sessions. Neither SHALL carry a session name, project path, or
+  screen content.
   tier:     T1
   verify:   cargo nextest run -p minimald heartbeat_carries_no_session_data
-  property: for every heartbeat and every `GetMeshStatus` answer the daemon emits, its member set is a subset of {seq, reachability, node id, daemon version, mesh public key, tunnel address, direct endpoints, relay name, relay connection state, host-certificate serial, host-certificate expiry, KRL seq, live session count}, and no value in it equals a session name, a project path or a screen line of any live session; walked over the emitter vocabulary against sessions whose names, paths and screens carry sentinel strings
+  property: for every heartbeat the daemon emits, its members are a subset of {seq, reachability.direct_endpoint, reachability.relay, reachability.mesh_addresses, reachability.egw, addresses}, with `egw` present iff a gateway association is up; for every `GetMeshStatus` answer, its members are a subset of {node id, daemon version, mesh public key, tunnel address, direct endpoints, relay name, relay connection state, gateway id, gateway association state, host-certificate serial, host-certificate expiry, KRL seq, live session count}; and no value in either equals a session name, a project path or a screen line of any live session; walked over the emitter vocabulary, with and without a gateway association, against sessions whose names, paths and screens carry sentinel strings
   - THE SYSTEM SHALL persist the heartbeat `seq` so that a restart never
     regresses it (Gatehouse §8.2 rejects a regression).
     tier:   T0
@@ -544,7 +554,9 @@ WebSocket ingress is that route, and on a loopback address needs no opt-in.
 - The `public` client kind, relay-ticket issuance, the node listing and
   heartbeat endpoints, the peer document, the mesh-attach host principal and
   the session-operation decisions: Gatehouse v1.11 to v1.16 (gominimal/arch#16
-  to #22, closed), implemented in the identity plane.
+  to #22, closed); the address plan, the egress-policy feed and the
+  `gateway` node class: Gatehouse v1.17. All are implemented in the
+  identity plane.
 - Enrolling a daemon with the identity plane and the provenance of its
   owner subject: Gatehouse §6.2; MMI-023 and MMI-025 read the subject from
   configuration meanwhile.
@@ -571,13 +583,16 @@ WebSocket ingress is that route, and on a loopback address needs no opt-in.
   (MMI-027) and in Gatehouse §7.4's v1 mapping, and bound by no spec yet.
 - Copying files into or out of a box over the mesh, the epic's Sync Files
   Out story: bound by no spec yet; sftp stays local-only here.
-- HTTP access to services inside boxes through a browser's tunnel:
-  03-spec-networking UC2b, a product decision not yet taken.
+- HTTP access to services inside boxes through a browser's tunnel: UC2b
+  of the networking requirements, a product decision not yet taken.
 - Inter-relay forwarding and relay-assisted hole punching: owned by no spec
-  or issue yet; v1 is single-hop.
-- The transport a Box Host is reached over in each deployment style, and
-  where the relay sits beside the egress gateway: the networking spec in
-  preparation (Open questions), with arch#46 and arch#39 as its inputs.
+  or issue yet; v1 is single-hop, and the relay-to-gateway leg is an open
+  question.
+- The gateway association, box address assignment, and the transport a
+  Box Host is reached over in each deployment style: the deployment design
+  (§4.1, §4.2, §4.5, §7) over the networking requirements v2
+  (`specs/networking/networking-requirements.md`), implemented daemon-side
+  by the networking spec in preparation (Open questions).
 
 ## Non-functional requirements
 
@@ -593,9 +608,11 @@ the wire contract, and the relay is a new binary in this workspace,
 `minrelay`, beside `min`, `mip`, `minimald` and `minvmd`. Separate documents
 were considered and declined because the relay's only contract is what the
 daemon and the client core send it. The identity plane's side is bound by
-section since its v1.11 to v1.16.1 stack landed on 2026-09-07; the direction
-plan's decisions of 2026-09-03 stand, and the v1 browser command set is
-owner-only list, show, attach, rename and stop.
+section since its v1.11 to v1.16.1 stack landed on 2026-09-07 and v1.17
+added the address plan, the `gateway` node class and the heartbeat's
+gateway and address members on 2026-09-10; the direction plan's decisions
+of 2026-09-03 stand, and the v1 browser command set is owner-only list,
+show, attach, rename and stop.
 
 **Own-address termination on the existing TLS listener** (2026-09-03). The
 daemon's WireGuard peer routes every decrypted packet to the box switch;
@@ -619,6 +636,20 @@ Nodes authenticate with `sshpop-host` as Gatehouse §10.2 prescribes for
 outbound daemon connections; tabs present a per-node ticket bound to their
 DPoP key, issued only where `ReadNode` admits the subject, so the relay
 decides statelessly and the ticket authorizes routing only.
+
+**On a pinned host the gateway forwards in the relay's role** (2026-09-10;
+deployment design §4.5, architecture D8). The fabric pin admits one
+destination, the node's Egress Gateway, so mesh and attach traffic transit
+it, and the design makes that forwarding role exactly a D7 relay:
+ciphertext frames, nothing terminated or read, nodes admitted by their
+association and clients by relay ticket, over WireGuard on UDP or on a
+WebSocket on 443 in the relay's framing where only TCP/443 leaves the host
+(§4.1). The gateway is then the node's home relay and, for that node, the
+direct path. MMI-071 to MMI-077 are the contract the role keeps; MMI-070's
+`sshpop-host` registration is the relay's form of node admission, which
+the association replaces. How a relay reaches a pinned node is open (Open
+questions), and so is whether `minrelay` and the gateway become one binary
+with roles (deployment design §12, item 1; gominimal/arch#43).
 
 **Relay pairing and close codes** (the direction plan's S12). Each node
 registers with one relay, its home, so v1 stays single-hop. Frames on a
@@ -700,8 +731,14 @@ v1.13), because the node set the tab lists and the peer document's
 reachability are the identity plane's. The cadence is the architecture's
 60 s working value with a 30 s floor (MMI-060); `seq` is monotonic on the
 §8.2 anti-rollback discipline and persisted beside the KRL high-water mark
-(MMI-061). A provider's readiness never implies liveness here (BPA-015 in the
-box-provider abstraction spec states the provider's side).
+(MMI-061). Since v1.17 the heartbeat also carries the gateway association
+and the per-box address assignments with their allocation epochs, the
+inputs the egress-policy feed keys each `own_ip` box's entry by (Gatehouse
+§6.9, §6.11), so a change to either is reported within MMI-060's 5 s. The
+heartbeat now carries exactly the §8.2 payload; the daemon status that rode
+on it as an interim superset answers `GetMeshStatus` alone. A provider's
+readiness never implies liveness here (BPA-015 in the box-provider
+abstraction spec states the provider's side).
 
 **Tiers.** MMI-005, MMI-022, MMI-027 and MMI-072 were T1 from the first
 draft; MMI-002, MMI-007, MMI-021, MMI-023, MMI-024, MMI-025, MMI-031,
@@ -723,9 +760,11 @@ is out of proportion.
 MMI-001 to MMI-011 unchanged, though interop is proven boringtun-to-boringtun
 only; an OpenSSH client inside the mesh fits the authentication surface,
 whose rules are OpenSSH's own; a provider-run relay fits MMI-070 to MMI-077,
-which need only the tenant Host CA and issuer keys. What does not generalise
-is the owner rule (MMI-023, MMI-025): a multi-user node needs the Cedar
-decisions Gatehouse §7.4 names, which is why that phase is interim.
+which need only the tenant Host CA and issuer keys, and a gateway's
+forwarding role keeps MMI-071 to MMI-077 with its association in MMI-070's
+place. What does not generalise is the owner rule (MMI-023, MMI-025): a
+multi-user node needs the Cedar decisions Gatehouse §7.4 names, which is
+why that phase is interim.
 
 ## Security considerations
 
@@ -734,6 +773,14 @@ decisions Gatehouse §7.4 names, which is why that phase is interim.
   enforced by: the relay forwarding frames unchanged, reading only the
   address prefix, and holding no key (Gatehouse T29; architecture D7).
   covered by: MMI-072, MMI-073, MMI-076, MMI-077
+- **Invariant:** THE SYSTEM SHALL admit no peer and no user on a
+  forwarder's word, so a compromised relay or gateway on the attach path
+  holds ciphertext and traffic metadata only.
+  enforced by: peer admission against a valid §6.9 binding and user
+  admission on a certificate, both decided at the daemon; a gateway
+  forwarding in the relay's role (deployment design §4.5) is bounded as the
+  relay is (Gatehouse T29, T30).
+  covered by: MMI-005, MMI-010, MMI-020, MMI-022
 - **Invariant:** THE SYSTEM SHALL open no channel on a non-local connection
   without an accepted certificate decision and an authorization decision
   for its subject.
@@ -794,16 +841,17 @@ decisions Gatehouse §7.4 names, which is why that phase is interim.
 
 ## Open questions
 
-- [NEEDS CLARIFICATION (HIGH): this document may be superseded by the
-  networking spec in preparation, whose architecture inputs are the
-  networking requirements v2 (gominimal/arch#46: five deployment styles, the
-  escape-floor UC5, UC8 outbound-only operation, UC11 public exposure as a
-  capability, UC12 encryption in transit) and the deployment and
-  egress-gateway design (gominimal/arch#39). Which of its groups fold into
-  that spec and which stay here?] Survives because the networking spec does
-  not exist yet and this document is the daemon-side reference until it
-  does; the mesh-ingress and relay groups are the candidates to fold, the
-  authentication surface, terminal state and heartbeats the durable parts.
+- [NEEDS CLARIFICATION (HIGH): the networking spec in preparation
+  implements, daemon-side, the deployment design's gateway association and
+  forwarding role (§4.1, §4.5) over the networking requirements v2 (the
+  five deployment styles, UC2b's browser with no installed client, UC5's
+  escape-surviving floor, UC8 outbound-only operation, UC12 encryption in
+  transit). Do the daemon's relay leg and path choice (MMI-008, MMI-009)
+  move into it, and does the relay group follow `minrelay` if it
+  consolidates with the gateway (deployment design §12, item 1)?] Survives
+  because the networking spec does not exist yet and the consolidation is
+  open in the architecture; the authentication surface, terminal state and
+  heartbeats stay here either way.
 - [NEEDS CLARIFICATION (HIGH): 03-spec-networking Unit 4 has no own-address
   termination and no WireGuard-over-WebSocket ingress; R4.2's path ends at a
   box, and R4.3 and B6 still name wireguard-go. MMI-001 to MMI-003 extend
@@ -816,6 +864,15 @@ decisions Gatehouse §7.4 names, which is why that phase is interim.
   ticket, which makes the relay verify two JWS at open. Should the ticket
   carry a `wg_pub` claim instead?] Survives because it is a change to the
   architecture of record and belongs with its owner.
+- [NEEDS CLARIFICATION (MEDIUM): the deployment design names a pinned
+  node's gateway its home relay and admits nodes there by association
+  (§4.5), yet keeps the relays in every node's baseline set (§5.1), and a
+  relay ticket names the pinned node, which then holds no relay
+  registration of its own (MMI-071's `offline` close). Does a pinned node
+  also register with the relay through its gateway (MMI-008), does the
+  gateway register for its nodes, or do clients dial the gateway
+  directly?] Survives because the design leaves the relay-to-gateway leg
+  of §4.5 unshaped.
 - [NEEDS CLARIFICATION (MEDIUM): the interim owner rule. Every v1 session is
   created over a local connection; MMI-023 assigns it to the node's owner
   subject, read from configuration until enrollment (Gatehouse §6.2)
@@ -836,10 +893,6 @@ decisions Gatehouse §7.4 names, which is why that phase is interim.
   deadlock. Does the same deadlock apply when the binding is torn down from
   a dead channel?] Survives because it needs a test against the daemon, not
   a decision.
-- [NEEDS CLARIFICATION (LOW): Gatehouse §8.2's heartbeat payload is
-  `{seq, reachability}`; MMI-061 sends a superset for `GetMeshStatus`
-  parity. Does the endpoint ignore or refuse unknown members?] Survives
-  because the identity plane's endpoint does not exist to test against.
 - [NEEDS CLARIFICATION (LOW): MMI-022 recognises the `source-address`
   critical option but no requirement enforces it against the peer's tunnel
   address, which OpenSSH would. Should MMI-022 gain that edge?] Survives
