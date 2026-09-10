@@ -1626,16 +1626,33 @@ impl Session {
             for s in sops.drain(..) {
                 s.shutdown().await;
             }
-            if let Some((host, task)) = host {
+            if let Some((host, mut task)) = host {
                 // Signal the process to die, then await the runtime loop so the
                 // sandbox files backing its rootfs are released before the caller
-                // removes the session's directory tree. The kill is bounded: a
-                // wedged loop never accepts it, and awaiting such a loop would
-                // park daemon shutdown behind it forever, so a kill that does
-                // not land aborts the loop rather than waiting on it.
-                if host.kill(for_shutdown).await.is_ok() {
-                    let _ = task.await;
-                } else {
+                // removes the session's directory tree. Both the kill and the
+                // wait for the loop to act on it are bounded: `send_timeout`
+                // only bounds the wait for mailbox *capacity*, so a loop parked
+                // mid-`step()` (mailbox nearly empty) queues the kill yet never
+                // processes it, and awaiting that loop unbounded would park
+                // daemon shutdown behind it forever. So a kill that cannot be
+                // queued, or a loop that does not finish within
+                // `HOST_PROBE_TIMEOUT` of accepting it, aborts the loop instead
+                // of waiting on it.
+                //
+                // Aborting drops the loop at its await point, skipping the
+                // awaited `NetGuard` teardown in `Host::mainloop`; the wedged
+                // host's sandbox process and network are orphaned rather than
+                // reclaimed here. That leak is the acknowledged follow-up in
+                // this PR's description ("Directly reclaiming a wedged host's
+                // sandbox process ... is left as follow-up"): cancellation-safe
+                // ownership of the `NetGuard` is out of scope for bounding the
+                // shutdown wait, which is what actually unblocks `min stop`.
+                let killed = host.kill(for_shutdown).await.is_ok();
+                if !killed
+                    || tokio::time::timeout(HOST_PROBE_TIMEOUT, &mut task)
+                        .await
+                        .is_err()
+                {
                     task.abort();
                 }
             }
