@@ -8,8 +8,6 @@
 use async_dialog::Selection;
 use russh::Channel;
 use russh::server::Msg;
-#[cfg(not(test))]
-use sandbox2::Network;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
@@ -2275,44 +2273,52 @@ impl SessionLauncher for SandboxLauncher {
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
 
-        // Phase 1 (pre-spawn): for own-IP, snapshot the switch's DNS server from
-        // its live subnet (needed by *every* own-IP sandbox — both transports).
-        // A native (DM2/`LocalSpawn`) PTask must additionally allocate its lease
-        // and ensure gvproxy is up *now*, because hakoniwa builds the tap (and
-        // assigns its address) inside the sandbox namespace before the process is
-        // spawned; we snapshot the lease IP + control socket for the post-spawn
-        // relay and the tap params for the sandbox to configure. DM1/3/4
-        // (`HostShuttle`, root-in-VM) keep the post-spawn open-tap-then-move-into-
-        // netns path and allocate their lease there, so `own_ip_tap`/
-        // `local_own_ip` stay `None` — but `own_ip_dns` is still set for them.
-        let mut local_own_ip: Option<(std::net::Ipv4Addr, std::path::PathBuf)> = None;
+        // Phase 1 (pre-spawn): an own-IP PTask allocates its lease and ensures
+        // gvproxy is up *now*, on every deployment model. The sandbox layer builds
+        // the tap inside the PTask's own namespace and assigns its address as it
+        // does so (03-spec-networking R1.5), which happens before the process is
+        // spawned — so the IP has to be known here. We snapshot the lease IP, the
+        // gvproxy control channel for the post-spawn relay, and the tap params for
+        // the sandbox to configure.
+        //
+        // The transport is the only thing the deployment model decides: a local
+        // unix socket to the gvproxy this daemon spawned (DM2/`LocalSpawn`), or
+        // vsock to the one `minvmd` owns on the host (DM1/3/4/`HostShuttle`).
+        let mut own_ip_attach: Option<(std::net::Ipv4Addr, crate::net::policy::ControlChannel)> =
+            None;
         let mut own_ip_tap: Option<sandbox2::config::OwnIpTap> = None;
         let mut own_ip_dns: Option<std::net::Ipv4Addr> = None;
         if matches!(network_mode, NetworkMode::OwnIp) {
             let mut s = net_switch.lock().await;
             let subnet = s.subnet();
             own_ip_dns = Some(subnet.dns_server());
-            if matches!(s.transport(), crate::net::SwitchTransport::LocalSpawn) {
-                let attach = s.attach().await.map_err(|e| {
-                    io::Error::other(format!("attaching OwnIp PTask to switch: {e}"))
-                })?;
-                let sock = s.control_socket();
-                own_ip_tap = Some(sandbox2::config::OwnIpTap {
-                    address: attach.lease.ip,
-                    netmask: subnet.netmask(),
-                    gateway: subnet.gateway(),
-                    mtu: crate::net::DEFAULT_MTU,
-                });
-                local_own_ip = Some((attach.lease.ip, sock));
-            }
+            let attach = s
+                .attach()
+                .await
+                .map_err(|e| io::Error::other(format!("attaching OwnIp PTask to switch: {e}")))?;
+            let control = match s.transport() {
+                crate::net::SwitchTransport::LocalSpawn => {
+                    crate::net::policy::ControlChannel::Unix(s.control_socket())
+                }
+                crate::net::SwitchTransport::HostShuttle { cid, port } => {
+                    crate::net::policy::ControlChannel::Vsock { cid, port }
+                }
+            };
+            own_ip_tap = Some(sandbox2::config::OwnIpTap {
+                address: attach.lease.ip,
+                netmask: subnet.netmask(),
+                gateway: subnet.gateway(),
+                mtu: crate::net::DEFAULT_MTU,
+            });
+            own_ip_attach = Some((attach.lease.ip, control));
         }
 
         // Guard the phase-1 attach for the whole window until it is handed to an
-        // `OwnIpGuard`: an early `Err` return *or* a cancelled launch future now
-        // rolls the gvproxy attach count back (see `PhaseOneAttachGuard`). Armed
-        // only on the LocalSpawn path that did a pre-spawn attach; disarmed on the
-        // success handoff below.
-        let mut attach_guard = local_own_ip.as_ref().map(|_| PhaseOneAttachGuard {
+        // `OwnIpGuard`: an early `Err` return *or* a cancelled launch future rolls
+        // the gvproxy attach count back (see `PhaseOneAttachGuard`). One rollback
+        // owner for every deployment model, because there is one attach; disarmed
+        // on the success handoff below.
+        let mut attach_guard = own_ip_attach.as_ref().map(|_| PhaseOneAttachGuard {
             switch: std::sync::Arc::clone(&net_switch),
             armed: true,
         });
@@ -2521,19 +2527,20 @@ impl SessionLauncher for SandboxLauncher {
         let mut process = SpawnedProcessGuard::new(process);
 
         // Phase 2 (post-spawn): wire the freshly-unshared netns onto the switch.
-        // Native (DM2): hakoniwa already built + configured the tap in-namespace
-        // (rootless), so we only relay its fd. DM1/3/4: the post-spawn open-tap +
-        // move-into-netns + vsock relay behind the `GvproxyNetwork` abstraction.
+        // The sandbox layer already built and configured the tap inside that
+        // namespace (rootless, via hakoniwa's RustSlirp), on every deployment
+        // model, so all that is left is relaying its fd over the transport phase 1
+        // picked.
         //
         // Until this returns, an own-IP PTask's egress isn't up yet, but a shell
         // PTask never probes the network in this window (the SSH layer dispatches
         // commands only after `Launched` is returned).
         let net_guard: Option<Box<dyn sandbox2::NetGuard>> =
-            if let Some((lease_ip, sock)) = local_own_ip {
+            if let Some((lease_ip, control)) = own_ip_attach {
                 // hakoniwa hands us ownership of the tap fd (its `Child` has no
-                // `Drop`, so it never closes it); a missing fd means the in-VM
-                // RustSlirp setup did not run — `attach_guard` rolls the phase-1
-                // attach back on the `Err` return.
+                // `Drop`, so it never closes it); a missing fd means the RustSlirp
+                // setup did not run — `attach_guard` rolls the phase-1 attach back
+                // on the `Err` return.
                 let Some(raw) = process.get_mut().rustslirp_tapfd else {
                     return Err(io::Error::other(
                         "own-IP sandbox produced no in-namespace tap fd",
@@ -2543,10 +2550,10 @@ impl SessionLauncher for SandboxLauncher {
                 // hakoniwa; wrapping it transfers ownership to the relay, which
                 // closes it on teardown.
                 let tap_fd = unsafe { OwnedFd::from_raw_fd(raw) };
-                match crate::net::gvproxy_network::complete_local_own_ip_attach(
+                match crate::net::gvproxy_network::complete_own_ip_attach(
                     &net_switch,
                     tap_fd,
-                    sock,
+                    control,
                     lease_ip,
                     &session_name,
                     ingress.as_ref(),
@@ -2562,19 +2569,9 @@ impl SessionLauncher for SandboxLauncher {
                         }
                         Some(Box::new(guard) as Box<dyn sandbox2::NetGuard>)
                     }
-                    // `complete_local_own_ip_attach` leaves the switch
-                    // rollback to `attach_guard` and the process to
-                    // `process`, both on this `Err` return.
-                    Err(e) => return Err(io::Error::other(e)),
-                }
-            } else if matches!(network_mode, NetworkMode::OwnIp) {
-                let network = crate::net::gvproxy_network::GvproxyNetwork::new(
-                    std::sync::Arc::clone(&net_switch),
-                    session_name,
-                    ingress,
-                );
-                match network.attach(process.get_mut().id()).await {
-                    Ok(guard) => Some(guard),
+                    // `complete_own_ip_attach` leaves the switch rollback to
+                    // `attach_guard` and the process to `process`, both on this
+                    // `Err` return.
                     Err(e) => return Err(io::Error::other(e)),
                 }
             } else {
