@@ -89,10 +89,18 @@ the requirements cite them rather than restate them.
   tier:     T0
   verify:   cargo nextest run -p minimal-client certificate_renews_before_expiry_without_attach
 
-- **CRA-003** THE SYSTEM SHALL keep the CLI's signing key and refresh token
-  in the CLI's own credential store.
+- **CRA-003** THE SYSTEM SHALL sign the CLI's SSH authentication requests and
+  DPoP proofs only through a signer that never releases the key: a
+  hardware-backed key where the machine offers one, otherwise the operating
+  system's credential store, with the key held for this device only.
   tier:     T0
-  verify:   cargo nextest run -p minimal-client key_and_refresh_token_live_in_the_cli_store
+  verify:   cargo nextest run -p minimal-client cli_key_signs_only_through_a_non_exporting_signer
+
+- **CRA-031** THE SYSTEM SHALL place neither the CLI's signing key nor its
+  refresh token in any session, local or remote, whether as a file, an
+  environment variable or a forwarded agent.
+  tier:     T0
+  verify:   cargo nextest run -p minimal cli_credentials_reach_no_session
 
 ### Checking the daemon is genuine
 
@@ -340,9 +348,18 @@ revocation stays authoritative.
 (CRA-017), which suits long agent runs. Exiting on every drop, and retrying
 for a bounded window before exiting, were the alternatives.
 
-**Key custody.** CRA-003 says where the key and refresh token live. A
-narrower reading, that neither may ever leave the developer's machine, was
-offered and not taken.
+**The key stays in a signer that never releases it.** The CLI's key signs
+both SSH authentication and the proofs that make its refresh token usable, so
+the key, not the token, is what must not travel. It is held by a signer that
+never releases it (CRA-003), and neither it nor the refresh token reaches a
+session (CRA-031), which closes the paths a dotfile loadout or a forwarded
+agent would otherwise open (Gatehouse T20). It is the same contract the
+browser client meets later with a non-extractable WebCrypto key, so the core
+behind both never handles key bytes. Two lighter forms were considered and
+not taken: naming only where the key and token are stored, and storing them
+in the operating system's credential store while leaving the key exportable.
+The refresh token is bound to the key (Gatehouse T1), so no requirement fixes
+where the token itself is stored.
 
 **Everything at T0.** Three groups were offered above T0: the certificate
 vectors (CRA-007, CRA-022) walked over the whole manifest, the user
@@ -356,8 +373,9 @@ CLI and daemon repository has no Lean project.
 same way, whether a provider created its host or it runs on a developer's own
 machine; what differs is only the connection metadata a provider hands out
 and the path the networking layer supplies. A second SSH client, such as the
-browser build, fits by meeting CRA-001 to CRA-008, CRA-011 and CRA-012
-unchanged.
+browser build, fits by meeting CRA-001, CRA-002, CRA-004 to CRA-008, CRA-011
+and CRA-012 unchanged, and CRA-003's contract through a non-exporting signer
+of its own.
 
 ## Security considerations
 
@@ -379,6 +397,13 @@ unchanged.
   enforced by: the daemon's owner check on every list, attach, rename and
   stop, and the identity plane's connection check where configured
   covered by: CRA-023, CRA-026, CRA-027
+
+- **Invariant:** THE SYSTEM SHALL let no process in a session sign with, or
+  read, the CLI's signing key or its refresh token.
+  enforced by: a signer on the developer's machine that never releases the
+  key, and no file, environment variable or forwarded agent carrying either
+  into a session (Gatehouse T2, T20)
+  covered by: CRA-003, CRA-031
 
 - **Invariant:** THE SYSTEM SHALL end an expired or revoked certificate's
   access within 1 s of the daemon learning of it, leaving the sessions it
@@ -415,6 +440,13 @@ unchanged.
   §7.4) on top of the connection check?] Survives because the identity plane
   defines the decisions and no consumer has asked for them; until someone
   does, the connection check and the owner rule govern.
+
+- [NEEDS CLARIFICATION (MEDIUM): a hardware-backed key (CRA-003) is P-256,
+  while the identity plane's default client profile is Ed25519 (Gatehouse
+  N7): does P-256 become the default client profile, or only the profile of
+  a hardware-backed key?] Survives because the profile is the identity
+  plane's to set, and the answer decides whether the CLI and the browser tab
+  sign with one algorithm.
 
 - [NEEDS CLARIFICATION (MEDIUM): how wide is the range of daemon protocol
   versions the CLI accepts?] Survives because the architecture records it as
