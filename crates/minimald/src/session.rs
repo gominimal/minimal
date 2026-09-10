@@ -1639,14 +1639,11 @@ impl Session {
                 // `HOST_PROBE_TIMEOUT` of accepting it, aborts the loop instead
                 // of waiting on it.
                 //
-                // Aborting drops the loop at its await point, skipping the
-                // awaited `NetGuard` teardown in `Host::mainloop`; the wedged
-                // host's sandbox process and network are orphaned rather than
-                // reclaimed here. That leak is the acknowledged follow-up in
-                // this PR's description ("Directly reclaiming a wedged host's
-                // sandbox process ... is left as follow-up"): cancellation-safe
-                // ownership of the `NetGuard` is out of scope for bounding the
-                // shutdown wait, which is what actually unblocks `min stop`.
+                // Aborting drops the loop at its await point, so the awaited
+                // `NetGuard` teardown in `Host::mainloop` is skipped and the
+                // wedged host's sandbox process and network are orphaned
+                // rather than reclaimed here; reclamation is a tracked
+                // follow-up.
                 let killed = host.kill(for_shutdown).await.is_ok();
                 if !killed
                     || tokio::time::timeout(HOST_PROBE_TIMEOUT, &mut task)
