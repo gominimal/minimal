@@ -555,7 +555,11 @@ impl Env {
 
     /// Creates a fresh container in this environment's sandbox.
     pub fn container(&mut self) -> std::io::Result<Container> {
-        self.sandbox.new_container().map_err(sandbox_err_to_io)
+        // The plan this sandbox's own configuration implies. The session path
+        // moves onto the provider-supplied plan with the launch sequence; until
+        // then the built-in mapping is the same values by the same rules.
+        let plan = self.sandbox.built_in_plan();
+        self.sandbox.new_container(&plan).map_err(sandbox_err_to_io)
     }
 
     /// The assembled session rootfs on the daemon's filesystem.

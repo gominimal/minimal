@@ -129,24 +129,9 @@ impl WdSetup {
 
 /// Parameters for an own-IP user-mode (RustSlirp) tap.
 ///
-/// When set on an own-IP sandbox, hakoniwa creates and configures a TAP device
-/// *inside* the sandbox's user+network namespace (rootless — no host
-/// `CAP_NET_ADMIN`), assigning the address/netmask and a default route via the
-/// gateway, and surfaces the tap fd as [`hakoniwa::Child::rustslirp_tapfd`] for
-/// the caller to relay to the gvproxy switch. Replaces the privileged
-/// open-tap-then-move-into-netns path on the native (DM2) deployment.
-#[derive(Debug, Clone, Copy)]
-pub struct OwnIpTap {
-    /// The PTask's switch address, assigned to the tap in-namespace.
-    pub address: std::net::Ipv4Addr,
-    /// The switch subnet netmask (e.g. `255.255.0.0` for a `/16`).
-    pub netmask: std::net::Ipv4Addr,
-    /// The switch gateway, installed as the next-hop default route
-    /// (`0.0.0.0/0 via gateway`) — gvproxy answers DNS and routes egress there.
-    pub gateway: std::net::Ipv4Addr,
-    /// The tap MTU; must match the relay's frame buffer (`DEFAULT_MTU`).
-    pub mtu: u16,
-}
+/// The same type the network plan carries — one definition, so a config field
+/// and a plan cannot drift apart while the config fields are on their way out.
+pub use crate::network::TapSpec as OwnIpTap;
 
 /// Describes the setup of a sandbox.
 #[derive(Debug)]

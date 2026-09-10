@@ -457,8 +457,20 @@ impl<C: Channel> Sandbox<C> {
     /// on the calling thread and arms `PR_SET_PDEATHSIG(SIGKILL)`, tying the
     /// child's lifetime to that thread. See [`run_with_cancel`](Self::run_with_cancel)
     /// for the thread-affinity constraints this imposes on callers.
+    /// The network plan implied by this sandbox's built-in configuration —
+    /// [`network_mode`](config::Config::network_mode) plus the own-IP tap and
+    /// DNS fields.
+    ///
+    /// Those fields are on their way out (spec 012 step 6); until then this is
+    /// the one place that reads them, so the rest of the sandbox layer already
+    /// works from a plan and only the source changes later.
+    #[must_use]
+    pub fn built_in_plan(&self) -> network::NetPlan {
+        plan_from_config(&self.config)
+    }
+
     #[cfg(target_os = "linux")]
-    pub fn new_container(&self) -> Result<Container, Error> {
+    pub fn new_container(&self, plan: &network::NetPlan) -> Result<Container, Error> {
         let mut container = hakoniwa::Container::new();
         container
             .rootfs(self.rootfs())
@@ -490,44 +502,26 @@ impl<C: Channel> Sandbox<C> {
         // `NoNet`/`OwnIp` but this host cannot create a network namespace, we
         // fail closed rather than silently hand back full host networking, which
         // would void the isolation the mode promises (spec R1.2).
-        // A custom `Network` decides isolation; otherwise fall back to the
-        // built-in `network_mode` mapping. Phase-B wiring (own-IP tap/switch) is
-        // applied post-spawn via `attach_network`, never here.
-        let isolate = match self.config.network.as_deref() {
-            Some(net) => net.isolate_netns(),
-            None => isolates_network(self.config.network_mode),
-        };
+        // The plan decides isolation; `isolation_decision` fails closed when the
+        // host cannot make the namespace the plan needs. Post-spawn wiring (the
+        // switch attach) is the provider's, never this function's.
+        let isolate = isolation_decision(
+            plan,
+            self.config.network_mode,
+            network_namespaces_available(),
+        )?;
         if isolate {
-            if network_namespaces_available() {
-                container.unshare(hakoniwa::Namespace::Network);
-            } else {
-                return Err(Error::Execution(
-                    ExecutionError::NetworkIsolationUnavailable {
-                        mode: self.config.network_mode,
-                    },
-                ));
-            }
+            container.unshare(hakoniwa::Namespace::Network);
         }
 
-        // Own-IP (native/DM2): have hakoniwa create + configure the TAP inside the
-        // sandbox's user+net namespace (rootless — it enters the namespace as its
-        // container-root and needs no host `CAP_NET_ADMIN`). The tap fd comes back
-        // out post-spawn via `Child.rustslirp_tapfd` for the caller to relay to the
-        // gvproxy switch. `network()` does not imply the netns unshare, so it must
-        // follow the `unshare(Namespace::Network)` above (which `isolate` did).
-        if let Some(tap) = self.config.own_ip_tap {
-            // The tap only makes sense in an unshared netns: RustSlirp enters the
-            // sandbox's own network namespace to build it, and hakoniwa skips the
-            // setup entirely (leaving no tap fd) unless `Namespace::Network` was
-            // unshared. Configuring it against a shared netns would silently no-op,
-            // so reject the combination rather than hand back a sandbox with no tap.
-            if !isolate {
-                return Err(Error::Execution(
-                    ExecutionError::NetworkIsolationUnavailable {
-                        mode: self.config.network_mode,
-                    },
-                ));
-            }
+        // Have hakoniwa create + configure the TAP inside the sandbox's user+net
+        // namespace (rootless — it enters the namespace as its container-root and
+        // needs no host `CAP_NET_ADMIN`). The tap fd comes back out post-spawn via
+        // `Child.rustslirp_tapfd` for the provider to relay to the switch.
+        // `network()` does not imply the netns unshare, so it must follow the
+        // `unshare(Namespace::Network)` above — which a tap-carrying plan
+        // guarantees, since `NetPlan` cannot describe a tap without isolation.
+        if let Some(tap) = plan.tap() {
             container.network(
                 hakoniwa::RustSlirp::default()
                     // L2: the gvproxy relay is HyperKit-framed Ethernet, not L3.
@@ -700,20 +694,22 @@ impl<C: Channel> Sandbox<C> {
             container.hostname(hn);
         }
 
-        // An own-IP sandbox runs in a fresh netns where the synth rootfs's host
-        // stub resolver (`127.0.0.53`) is unreachable, so point `/etc/resolv.conf`
-        // at the switch's DNS server (gvproxy, at the gateway) instead. Sourced
-        // from `own_ip_dns` — set for *every* own-IP sandbox, both the DM2 tap
-        // path and the DM1/3/4 shuttle path (which has no `own_ip_tap`) — so DNS
-        // is not tied to tap params. Written to the rootfs before spawn, like
-        // `/etc/hostname` above: hakoniwa binds `/etc` read-only from
+        // An isolated sandbox runs in a fresh netns where the synth rootfs's host
+        // stub resolver (`127.0.0.53`) is unreachable, so the plan names the
+        // resolver to write instead — for an own-IP PTask, the switch's DNS
+        // server (gvproxy, at the gateway). Written to the rootfs before spawn,
+        // like `/etc/hostname` above: hakoniwa binds `/etc` read-only from
         // `<rootfs>/etc`, so an in-sandbox write would hit a read-only fs.
-        // Overwrites unconditionally — `synth_dns_config` already populated it
-        // with the host resolver, so a create-only guard would leave the (dead)
-        // host stub in place.
-        if let Some(dns) = self.config.own_ip_dns {
+        // Overwrites unconditionally — `synth_dns_config` may already have
+        // populated it with the host resolver, so a create-only guard would leave
+        // the (dead) host stub in place.
+        if let network::Resolver::Nameservers(servers) = plan.resolver() {
             let etc_resolv = self.rootfs().join("etc").join("resolv.conf");
-            std::fs::write(&etc_resolv, format!("nameserver {dns}\n"))
+            let body: String = servers
+                .iter()
+                .map(|s| format!("nameserver {s}\n"))
+                .collect();
+            std::fs::write(&etc_resolv, body)
                 .map_err(|e| Error::IO("writing /etc/resolv.conf", etc_resolv.clone(), e))?;
         }
 
@@ -836,7 +832,22 @@ impl<C: Channel> Sandbox<C> {
         W1: tokio::io::AsyncWrite + Unpin + Send,
         W2: tokio::io::AsyncWrite + Unpin + Send,
     {
-        let container = self.new_container()?;
+        // Pre-spawn: ask the provider what this sandbox needs, falling back to
+        // the built-in configuration when none is set. Borrow only the `Network`
+        // (which is `Send + Sync`) across the await, not the whole `Sandbox<C>`,
+        // so this doesn't impose `C: Sync` on the run future — the same reason
+        // the attach below is written that way.
+        //
+        // No `abandon` on the failure paths yet: it arrives with the launch
+        // sequence, which is what can see every way out of a launch (a cancelled
+        // future included). Nothing can leak in the meantime, because no provider
+        // exists to reserve anything — `Config::network` has no producer until
+        // the own-IP provider lands, after that sequence.
+        let plan = match self.config.network.as_deref() {
+            Some(net) => net.plan().await.map_err(Error::Network)?,
+            None => self.built_in_plan(),
+        };
+        let container = self.new_container(&plan)?;
         for (i, exec) in invocations.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(Error::Execution(ExecutionError::Cancelled));
@@ -1327,6 +1338,48 @@ pub fn isolates_network(mode: NetworkMode) -> bool {
     mode != NetworkMode::HostNet
 }
 
+/// The network plan a sandbox's built-in configuration implies.
+///
+/// A pure mapping over the config, so the rules are testable without building a
+/// sandbox. See [`Sandbox::built_in_plan`].
+fn plan_from_config(config: &config::Config) -> network::NetPlan {
+    let plan = match config.own_ip_tap {
+        Some(tap) => network::NetPlan::isolated_with_tap(tap),
+        None if isolates_network(config.network_mode) => network::NetPlan::isolated(),
+        None => network::NetPlan::host(),
+    };
+    // The two old DNS controls collapse into one value, resolving the precedence
+    // they used to settle by write order: `own_ip_dns` was written second and so
+    // always won over the synthesised host resolver.
+    let resolver = match (config.own_ip_dns, config.setup_dns_config) {
+        (Some(dns), _) => network::Resolver::Nameservers(vec![dns]),
+        (None, true) => network::Resolver::Host,
+        (None, false) => network::Resolver::None,
+    };
+    plan.with_resolver(resolver)
+}
+
+/// Whether to unshare the network namespace, or the error that says we will not
+/// hand back host networking instead.
+///
+/// Split out from `new_container` so 012-011 is provable without a host that
+/// lacks namespace support: the caller passes what the probe found, and this
+/// decides. Failing closed is a *security* boundary, unlike the cgroup-setup
+/// fallback next to it — a caller that asked for isolation and silently got the
+/// host's network would have none of what the mode promises, and no way to tell.
+fn isolation_decision(
+    plan: &network::NetPlan,
+    mode: NetworkMode,
+    netns_available: bool,
+) -> Result<bool, Error> {
+    if plan.isolates_netns() && !netns_available {
+        return Err(Error::Execution(
+            ExecutionError::NetworkIsolationUnavailable { mode },
+        ));
+    }
+    Ok(plan.isolates_netns())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1357,6 +1410,133 @@ mod tests {
         assert!(!isolates_network(NetworkMode::HostNet));
         assert!(isolates_network(NetworkMode::NoNet));
         assert!(isolates_network(NetworkMode::OwnIp));
+    }
+
+    fn tap_spec() -> network::TapSpec {
+        network::TapSpec {
+            address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            netmask: std::net::Ipv4Addr::new(255, 255, 0, 0),
+            gateway: std::net::Ipv4Addr::new(100, 64, 0, 1),
+            mtu: 1500,
+        }
+    }
+
+    /// 012-007. The property, over every way a plan can be built: a plan that
+    /// has tap parameters isolates the network namespace.
+    ///
+    /// This is not a policy the container builder applies — it is unrepresentable
+    /// otherwise, because `NetPlan` has no public fields and no constructor that
+    /// pairs a tap with a shared namespace. RustSlirp enters the sandbox's own
+    /// netns to build the tap, and hakoniwa silently produces no descriptor if
+    /// that namespace was never unshared, so the pairing has to be impossible
+    /// rather than merely checked.
+    #[test]
+    fn a_tap_plan_always_isolates() {
+        assert!(network::NetPlan::isolated_with_tap(tap_spec()).isolates_netns());
+        // Including after the only other builder that can touch a plan.
+        assert!(
+            network::NetPlan::isolated_with_tap(tap_spec())
+                .with_resolver(network::Resolver::Host)
+                .isolates_netns()
+        );
+        // And the converse: the plans that carry no tap are the only ones that
+        // may share the namespace.
+        assert!(network::NetPlan::host().tap().is_none());
+    }
+
+    /// 012-006. The mode bounds the access: `HostNet` shares the namespace and
+    /// gets no tap; `NoNet` isolates and gets no tap, so it has no route out at
+    /// all; `OwnIp` isolates and gets exactly the tap it was configured with.
+    /// No mode yields more than the one above it.
+    #[test]
+    fn the_mode_bounds_the_network_access() {
+        let plan_for = |mode, tap| {
+            let mut cfg = Config::new("t");
+            cfg.network_mode = mode;
+            cfg.own_ip_tap = tap;
+            cfg.setup_dns_config = false;
+            plan_from_config(&cfg)
+        };
+
+        let host = plan_for(NetworkMode::HostNet, None);
+        assert!(!host.isolates_netns(), "HostNet must share the namespace");
+        assert!(host.tap().is_none(), "HostNet must get no tap");
+
+        let nonet = plan_for(NetworkMode::NoNet, None);
+        assert!(nonet.isolates_netns(), "NoNet must isolate");
+        assert!(
+            nonet.tap().is_none(),
+            "NoNet must get no tap: an empty namespace is the whole mode"
+        );
+
+        let ownip = plan_for(NetworkMode::OwnIp, Some(tap_spec()));
+        assert!(ownip.isolates_netns(), "OwnIp must isolate");
+        assert_eq!(ownip.tap(), Some(tap_spec()));
+    }
+
+    /// 012-009. An own-IP sandbox's resolver names the switch, not the host's
+    /// stub — which is unreachable from a fresh netns, so inheriting it would
+    /// leave a sandbox that resolves nothing and cannot say why.
+    ///
+    /// Also pins the precedence the two old DNS controls settled by write order:
+    /// the switch address wins over the synthesised host resolver, rather than
+    /// depending on which write happened last.
+    #[test]
+    fn own_ip_resolver_points_at_the_switch() {
+        let dns = std::net::Ipv4Addr::new(100, 64, 0, 1);
+        let mut cfg = Config::new("t");
+        cfg.network_mode = NetworkMode::OwnIp;
+        cfg.own_ip_tap = Some(tap_spec());
+        cfg.own_ip_dns = Some(dns);
+        // Set, and still loses — this is the precedence being pinned.
+        cfg.setup_dns_config = true;
+        let plan = plan_from_config(&cfg);
+        assert_eq!(
+            plan.resolver(),
+            &network::Resolver::Nameservers(vec![dns]),
+            "an own-IP sandbox must resolve through the switch"
+        );
+
+        // With no switch DNS, the host resolver is still what a sandbox asking
+        // for DNS setup gets.
+        let mut cfg = Config::new("t");
+        cfg.setup_dns_config = true;
+        assert_eq!(plan_from_config(&cfg).resolver(), &network::Resolver::Host);
+    }
+
+    /// 012-011. A host that cannot make the namespace the plan needs fails the
+    /// launch, rather than handing back the host's network.
+    ///
+    /// Testable anywhere because the decision takes what the probe found as an
+    /// argument: a host that *can* create namespaces still proves the closed
+    /// path.
+    #[test]
+    fn no_namespace_support_fails_closed() {
+        let err = isolation_decision(&network::NetPlan::isolated(), NetworkMode::NoNet, false)
+            .expect_err("an isolating plan on a host without namespaces must fail");
+        assert!(
+            matches!(
+                err,
+                Error::Execution(ExecutionError::NetworkIsolationUnavailable { .. })
+            ),
+            "expected NetworkIsolationUnavailable, got {err:?}"
+        );
+
+        // A tap-carrying plan is an isolating plan, so it fails the same way
+        // rather than building a sandbox whose tap never materialises.
+        assert!(
+            isolation_decision(
+                &network::NetPlan::isolated_with_tap(tap_spec()),
+                NetworkMode::OwnIp,
+                false,
+            )
+            .is_err()
+        );
+
+        // A sandbox that asked for no isolation is unaffected by the probe.
+        assert!(
+            !isolation_decision(&network::NetPlan::host(), NetworkMode::HostNet, false).unwrap()
+        );
     }
 
     /// The Ubuntu 24.04+ default: restriction sysctl on, daemon unconfined —
