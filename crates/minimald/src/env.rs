@@ -195,8 +195,6 @@ pub struct EnvArgs {
     env_vars: Option<BTreeMap<String, EnvVarValue>>,
     ot: Option<OpTracker>,
     network_mode: NetworkMode,
-    own_ip_tap: Option<sandbox2::config::OwnIpTap>,
-    own_ip_dns: Option<std::net::Ipv4Addr>,
     /// Weak handle to the owning session actor, wired into the command channel
     /// so in-sandbox `min` commands can drive session side-ops (e.g. builds).
     /// Every session env has one — this `Env` is always session-scoped.
@@ -233,8 +231,6 @@ impl EnvArgs {
             env_vars: None,
             ot: None,
             network_mode: NetworkMode::HostNet,
-            own_ip_tap: None,
-            own_ip_dns: None,
             session,
             include_package_attr_wiring: true,
         }
@@ -308,25 +304,6 @@ impl EnvArgs {
     #[must_use]
     pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
         self.network_mode = mode;
-        self
-    }
-
-    /// Sets the own-IP user-mode tap parameters (native/DM2 own-IP). When set,
-    /// the sandbox's TAP is created + configured in-namespace by hakoniwa
-    /// (rootless) and the caller relays its fd to the switch. `None` keeps the
-    /// host/VM behaviour.
-    #[must_use]
-    pub fn with_own_ip_tap(mut self, tap: Option<sandbox2::config::OwnIpTap>) -> Self {
-        self.own_ip_tap = tap;
-        self
-    }
-
-    /// Sets the own-IP DNS server for the sandbox's `/etc/resolv.conf` (the
-    /// switch gateway). Set for every own-IP sandbox, independent of the tap
-    /// params, so both the DM2 and DM1/3/4 own-IP paths get a working resolver.
-    #[must_use]
-    pub fn with_own_ip_dns(mut self, dns: Option<std::net::Ipv4Addr>) -> Self {
-        self.own_ip_dns = dns;
         self
     }
 }
@@ -495,10 +472,6 @@ impl Env {
             .with_state_dir(args.state_base_dir.as_utf8_path())
             .with_env_vars(pkg_env_vars.into_iter())
             .with_network_mode(args.network_mode)
-            // Own-IP tap params are `None` for host/VM modes and the
-            // vsock-shuttle path. DNS is set on every own-IP sandbox.
-            .with_own_ip_tap(args.own_ip_tap)
-            .with_own_ip_dns(args.own_ip_dns)
             .with_hostname(args.name.clone())
             .with_daemon_id(ctx.daemon_id().unwrap()) // Always set under minimald
             .with_username(args.username.unwrap_or_else(|| "user".to_string()));
@@ -554,12 +527,8 @@ impl Env {
     }
 
     /// Creates a fresh container in this environment's sandbox.
-    pub fn container(&mut self) -> std::io::Result<Container> {
-        // The plan this sandbox's own configuration implies. The session path
-        // moves onto the provider-supplied plan with the launch sequence; until
-        // then the built-in mapping is the same values by the same rules.
-        let plan = self.sandbox.built_in_plan();
-        self.sandbox.new_container(&plan).map_err(sandbox_err_to_io)
+    pub fn container(&mut self, plan: &sandbox2::NetPlan) -> std::io::Result<Container> {
+        self.sandbox.new_container(plan).map_err(sandbox_err_to_io)
     }
 
     /// The assembled session rootfs on the daemon's filesystem.

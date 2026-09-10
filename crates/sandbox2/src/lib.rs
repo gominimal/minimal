@@ -14,7 +14,10 @@ pub mod config;
 use config::Config;
 pub use config::NetworkMode;
 pub mod network;
-pub use network::{AttachFuture, HostNet, NetGuard, Network, NetworkError, NoNet};
+pub use network::{
+    AbandonFuture, AttachFuture, HostNet, NetGuard, NetPlan, Network, NetworkError, NoNet,
+    PlanFuture, Resolver, Spawned, TapSpec,
+};
 use std::fs::{self, Permissions};
 #[cfg(target_os = "linux")]
 use std::io::Read;
@@ -1474,18 +1477,18 @@ impl Drop for PlannedLaunch {
 /// A pure mapping over the config, so the rules are testable without building a
 /// sandbox. See [`Sandbox::built_in_plan`].
 fn plan_from_config(config: &config::Config) -> network::NetPlan {
-    let plan = match config.own_ip_tap {
-        Some(tap) => network::NetPlan::isolated_with_tap(tap),
-        None if isolates_network(config.network_mode) => network::NetPlan::isolated(),
-        None => network::NetPlan::host(),
+    let plan = if isolates_network(config.network_mode) {
+        network::NetPlan::isolated()
+    } else {
+        network::NetPlan::host()
     };
-    // The two old DNS controls collapse into one value, resolving the precedence
-    // they used to settle by write order: `own_ip_dns` was written second and so
-    // always won over the synthesised host resolver.
-    let resolver = match (config.own_ip_dns, config.setup_dns_config) {
-        (Some(dns), _) => network::Resolver::Nameservers(vec![dns]),
-        (None, true) => network::Resolver::Host,
-        (None, false) => network::Resolver::None,
+    // No tap and no nameservers here by construction: those come from a provider
+    // now, and a sandbox with no provider has neither. `setup_dns_config` is what
+    // is left of the two DNS controls the config used to carry.
+    let resolver = if config.setup_dns_config {
+        network::Resolver::Host
+    } else {
+        network::Resolver::None
     };
     plan.with_resolver(resolver)
 }
@@ -1745,64 +1748,55 @@ mod tests {
         assert!(network::NetPlan::host().tap().is_none());
     }
 
-    /// 012-006. The mode bounds the access: `HostNet` shares the namespace and
-    /// gets no tap; `NoNet` isolates and gets no tap, so it has no route out at
-    /// all; `OwnIp` isolates and gets exactly the tap it was configured with.
-    /// No mode yields more than the one above it.
+    /// 012-006, for the modes the sandbox layer handles by itself: `HostNet`
+    /// shares the namespace and gets no tap, `NoNet` isolates and still gets no
+    /// tap — an empty namespace is the whole of that mode. Neither can reach
+    /// more than its mode states, because neither has anything to reach it with.
+    ///
+    /// `OwnIp` needs a provider, so its half of this requirement lives beside
+    /// that provider (`minimald::net::provider`).
     #[test]
     fn the_mode_bounds_the_network_access() {
-        let plan_for = |mode, tap| {
+        let plan_for = |mode| {
             let mut cfg = Config::new("t");
             cfg.network_mode = mode;
-            cfg.own_ip_tap = tap;
             cfg.setup_dns_config = false;
             plan_from_config(&cfg)
         };
 
-        let host = plan_for(NetworkMode::HostNet, None);
+        let host = plan_for(NetworkMode::HostNet);
         assert!(!host.isolates_netns(), "HostNet must share the namespace");
         assert!(host.tap().is_none(), "HostNet must get no tap");
 
-        let nonet = plan_for(NetworkMode::NoNet, None);
+        let nonet = plan_for(NetworkMode::NoNet);
         assert!(nonet.isolates_netns(), "NoNet must isolate");
         assert!(
             nonet.tap().is_none(),
             "NoNet must get no tap: an empty namespace is the whole mode"
         );
-
-        let ownip = plan_for(NetworkMode::OwnIp, Some(tap_spec()));
-        assert!(ownip.isolates_netns(), "OwnIp must isolate");
-        assert_eq!(ownip.tap(), Some(tap_spec()));
-    }
-
-    /// 012-009. An own-IP sandbox's resolver names the switch, not the host's
-    /// stub — which is unreachable from a fresh netns, so inheriting it would
-    /// leave a sandbox that resolves nothing and cannot say why.
-    ///
-    /// Also pins the precedence the two old DNS controls settled by write order:
-    /// the switch address wins over the synthesised host resolver, rather than
-    /// depending on which write happened last.
-    #[test]
-    fn own_ip_resolver_points_at_the_switch() {
-        let dns = std::net::Ipv4Addr::new(100, 64, 0, 1);
-        let mut cfg = Config::new("t");
-        cfg.network_mode = NetworkMode::OwnIp;
-        cfg.own_ip_tap = Some(tap_spec());
-        cfg.own_ip_dns = Some(dns);
-        // Set, and still loses — this is the precedence being pinned.
-        cfg.setup_dns_config = true;
-        let plan = plan_from_config(&cfg);
         assert_eq!(
-            plan.resolver(),
-            &network::Resolver::Nameservers(vec![dns]),
-            "an own-IP sandbox must resolve through the switch"
+            nonet.resolver(),
+            &network::Resolver::None,
+            "and no resolver to point anywhere"
         );
 
-        // With no switch DNS, the host resolver is still what a sandbox asking
-        // for DNS setup gets.
+        // A sandbox with no provider never gets a tap, whatever its mode says.
+        // The tap is the provider's to describe, so this is the bound holding by
+        // construction rather than by a check.
+        assert!(plan_for(NetworkMode::OwnIp).tap().is_none());
+    }
+
+    /// The host resolver is still what a sandbox asking for DNS setup gets when
+    /// no provider names one — the remaining half of the two DNS controls that
+    /// collapsed into [`network::Resolver`].
+    #[test]
+    fn dns_setup_without_a_provider_synthesises_the_host_resolver() {
         let mut cfg = Config::new("t");
         cfg.setup_dns_config = true;
         assert_eq!(plan_from_config(&cfg).resolver(), &network::Resolver::Host);
+
+        cfg.setup_dns_config = false;
+        assert_eq!(plan_from_config(&cfg).resolver(), &network::Resolver::None);
     }
 
     /// 012-011. A host that cannot make the namespace the plan needs fails the

@@ -2125,22 +2125,6 @@ pub(crate) struct SandboxLauncher {
     pub(crate) session: crate::session::WeakSessionHandle,
 }
 
-/// Rolls back a native-own-IP phase-1 switch attach if the launch is abandoned
-/// before the attach is handed off to an [`OwnIpGuard`].
-///
-/// Phase 1 (`SwitchClient::attach`) bumps gvproxy's attach count before the slow
-/// env build + spawn, so an early `Err` return *or* a dropped/cancelled launch
-/// future (e.g. the client disconnects mid-build) would otherwise leak the count
-/// and keep gvproxy running. The existing `Err` arms are covered, but `Drop` is
-/// what catches cancellation. `SwitchClient::detach` is async and `Drop` cannot
-/// await, so an armed drop spawns the detach on the current runtime; on the
-/// success path the guard is disarmed and `OwnIpGuard` owns teardown instead.
-#[cfg(not(test))]
-struct PhaseOneAttachGuard {
-    switch: std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
-    armed: bool,
-}
-
 /// Reaps a freshly-spawned sandbox process if the launch is abandoned
 /// before the process is handed off to a [`Launched`].
 ///
@@ -2155,8 +2139,8 @@ struct PhaseOneAttachGuard {
 /// sandbox the destroy then tries to delete out from under.
 ///
 /// Reaping is synchronous (`kill` + `wait` are not async), so unlike
-/// [`PhaseOneAttachGuard`] this needs no runtime to do its work in
-/// `Drop`.
+/// [`sandbox2::PlannedLaunch`] — which has to give a lease back, and spawns
+/// that release — this needs no runtime to do its work in `Drop`.
 #[cfg(not(test))]
 struct SpawnedProcessGuard {
     /// `None` once the process has been handed off — see
@@ -2206,33 +2190,6 @@ impl Drop for SpawnedProcessGuard {
 }
 
 #[cfg(not(test))]
-impl PhaseOneAttachGuard {
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-#[cfg(not(test))]
-impl Drop for PhaseOneAttachGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let switch = std::sync::Arc::clone(&self.switch);
-        // Detach off the current runtime — `Drop` cannot `.await`. If no runtime
-        // is running (the daemon is shutting down) the refcount no longer matters,
-        // so a failed spawn is harmless.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if let Err(e) = switch.lock().await.detach().await {
-                    tracing::warn!(error = %e, "detaching OwnIp PTask after launch was abandoned");
-                }
-            });
-        }
-    }
-}
-
-#[cfg(not(test))]
 impl SessionLauncher for SandboxLauncher {
     type Process = SandboxProcess;
     // The session env, kept alive for the session's lifetime (it owns the
@@ -2273,55 +2230,34 @@ impl SessionLauncher for SandboxLauncher {
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
 
-        // Phase 1 (pre-spawn): an own-IP PTask allocates its lease and ensures
-        // gvproxy is up *now*, on every deployment model. The sandbox layer builds
-        // the tap inside the PTask's own namespace and assigns its address as it
-        // does so (03-spec-networking R1.5), which happens before the process is
-        // spawned — so the IP has to be known here. We snapshot the lease IP, the
-        // gvproxy control channel for the post-spawn relay, and the tap params for
-        // the sandbox to configure.
+        // Step 1 (pre-spawn): the provider for this PTask's mode reserves what the
+        // sandbox needs and says what it is. For own-IP that means leasing an
+        // address and ensuring gvproxy is up *now*, because the sandbox layer
+        // assigns the address to the tap as it builds it inside the PTask's own
+        // namespace (03-spec-networking R1.5) — before the process exists.
         //
-        // The transport is the only thing the deployment model decides: a local
-        // unix socket to the gvproxy this daemon spawned (DM2/`LocalSpawn`), or
-        // vsock to the one `minvmd` owns on the host (DM1/3/4/`HostShuttle`).
-        let mut own_ip_attach: Option<(std::net::Ipv4Addr, crate::net::policy::ControlChannel)> =
-            None;
-        let mut own_ip_tap: Option<sandbox2::config::OwnIpTap> = None;
-        let mut own_ip_dns: Option<std::net::Ipv4Addr> = None;
-        if matches!(network_mode, NetworkMode::OwnIp) {
-            let mut s = net_switch.lock().await;
-            let subnet = s.subnet();
-            own_ip_dns = Some(subnet.dns_server());
-            let attach = s
-                .attach()
-                .await
-                .map_err(|e| io::Error::other(format!("attaching OwnIp PTask to switch: {e}")))?;
-            let control = match s.transport() {
-                crate::net::SwitchTransport::LocalSpawn => {
-                    crate::net::policy::ControlChannel::Unix(s.control_socket())
-                }
-                crate::net::SwitchTransport::HostShuttle { cid, port } => {
-                    crate::net::policy::ControlChannel::Vsock { cid, port }
-                }
-            };
-            own_ip_tap = Some(sandbox2::config::OwnIpTap {
-                address: attach.lease.ip,
-                netmask: subnet.netmask(),
-                gateway: subnet.gateway(),
-                mtu: crate::net::DEFAULT_MTU,
-            });
-            own_ip_attach = Some((attach.lease.ip, control));
-        }
-
-        // Guard the phase-1 attach for the whole window until it is handed to an
-        // `OwnIpGuard`: an early `Err` return *or* a cancelled launch future rolls
-        // the gvproxy attach count back (see `PhaseOneAttachGuard`). One rollback
-        // owner for every deployment model, because there is one attach; disarmed
-        // on the success handoff below.
-        let mut attach_guard = own_ip_attach.as_ref().map(|_| PhaseOneAttachGuard {
-            switch: std::sync::Arc::clone(&net_switch),
-            armed: true,
-        });
+        // `PlannedLaunch` owns the release from here: an early `Err` return *or* a
+        // cancelled launch future gives the lease back, in one place, for every
+        // deployment model. That is what the session host used to hold in a drop
+        // guard of its own.
+        let provider = crate::net::provider::network_for(
+            network_mode,
+            &net_switch,
+            &session_name,
+            ingress.clone(),
+        );
+        let planned = sandbox2::PlannedLaunch::begin(
+            provider,
+            // No provider means the sandbox layer's built-in handling of the mode,
+            // which is exactly what `NoNet`/`HostNet` need.
+            if sandbox2::isolates_network(network_mode) {
+                sandbox2::NetPlan::isolated()
+            } else {
+                sandbox2::NetPlan::host()
+            },
+        )
+        .await
+        .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;
 
         // Package + env-var union of the launcher baseline and every
         // contribution the composer collected. Packages: baseline set
@@ -2419,6 +2355,9 @@ impl SessionLauncher for SandboxLauncher {
         // Build the env + container and spawn the process. Any failure here (env
         // build, container build, spawn) leaves no process to reap; the phase-1
         // attach, if any, is rolled back by `attach_guard` on the `Err` return.
+        // Cloned out so the build block can own it: `planned` has to outlive the
+        // block, because the attach that discharges its release comes after.
+        let plan = planned.plan().clone();
         let build_and_spawn = async {
             // The env owns the context, graph and the sandbox files backing the
             // running process's rootfs, so it is `Send + 'static` and can be moved
@@ -2438,14 +2377,12 @@ impl SessionLauncher for SandboxLauncher {
                     // keeps the legacy un-gated wiring for now.
                     .without_package_attr_wiring()
                     .with_network_mode(network_mode)
-                    .with_own_ip_tap(own_ip_tap)
-                    .with_own_ip_dns(own_ip_dns)
                     .with_username(username),
             ))
             .await?;
 
             let mut container = env
-                .container()
+                .container(&plan)
                 .map_err(|e| io::Error::other(format!("container build: {e}")))?;
             container.set_session_leader();
 
@@ -2513,9 +2450,8 @@ impl SessionLauncher for SandboxLauncher {
         .await;
 
         let (env, master, process, tty_path) = match build_and_spawn {
-            // `attach_guard` (if armed) rolls the phase-1 attach back on this
-            // `Err` return when it drops. Nothing spawned, so there is no
-            // process to reap on this arm.
+            // `planned` releases its lease on this `Err` return when it drops.
+            // Nothing spawned, so there is no process to reap on this arm.
             Ok(parts) => parts,
             Err(e) => return Err(e),
         };
@@ -2526,57 +2462,26 @@ impl SessionLauncher for SandboxLauncher {
         // handoff at the bottom; an `Err` return or a drop reaps it.
         let mut process = SpawnedProcessGuard::new(process);
 
-        // Phase 2 (post-spawn): wire the freshly-unshared netns onto the switch.
-        // The sandbox layer already built and configured the tap inside that
-        // namespace (rootless, via hakoniwa's RustSlirp), on every deployment
-        // model, so all that is left is relaying its fd over the transport phase 1
-        // picked.
+        // Step 3 (post-spawn): hand the process to the provider, which wires its
+        // namespace onto the switch. The sandbox layer already built and
+        // configured the tap inside that namespace, on every deployment model, so
+        // the provider only relays its descriptor — which travels here inside
+        // `Spawned`, taken from the child exactly once.
         //
         // Until this returns, an own-IP PTask's egress isn't up yet, but a shell
         // PTask never probes the network in this window (the SSH layer dispatches
         // commands only after `Launched` is returned).
-        let net_guard: Option<Box<dyn sandbox2::NetGuard>> =
-            if let Some((lease_ip, control)) = own_ip_attach {
-                // hakoniwa hands us ownership of the tap fd (its `Child` has no
-                // `Drop`, so it never closes it); a missing fd means the RustSlirp
-                // setup did not run — `attach_guard` rolls the phase-1 attach back
-                // on the `Err` return.
-                let Some(raw) = process.get_mut().rustslirp_tapfd else {
-                    return Err(io::Error::other(
-                        "own-IP sandbox produced no in-namespace tap fd",
-                    ));
-                };
-                // SAFETY: `raw` is a live, owned tap fd handed out exactly once by
-                // hakoniwa; wrapping it transfers ownership to the relay, which
-                // closes it on teardown.
-                let tap_fd = unsafe { OwnedFd::from_raw_fd(raw) };
-                match crate::net::gvproxy_network::complete_own_ip_attach(
-                    &net_switch,
-                    tap_fd,
-                    control,
-                    lease_ip,
-                    &session_name,
-                    ingress.as_ref(),
-                )
-                .await
-                {
-                    Ok(guard) => {
-                        // Ownership of the attach now lives in `OwnIpGuard`, which
-                        // detaches at session end — disarm so the guard doesn't
-                        // also roll it back.
-                        if let Some(g) = attach_guard.as_mut() {
-                            g.disarm();
-                        }
-                        Some(Box::new(guard) as Box<dyn sandbox2::NetGuard>)
-                    }
-                    // `complete_own_ip_attach` leaves the switch rollback to
-                    // `attach_guard` and the process to `process`, both on this
-                    // `Err` return.
-                    Err(e) => return Err(io::Error::other(e)),
-                }
-            } else {
-                None
-            };
+        let net_guard: Option<Box<dyn sandbox2::NetGuard>> = {
+            let spawned = sandbox2::Spawned::from_child(process.get_mut());
+            match planned.attach(spawned).await {
+                // The returned guard owns the release now; it detaches at session
+                // end. Nothing left for this function to roll back.
+                Ok(guard) => Some(guard),
+                // A failed attach leaves the release with `planned`, which drops
+                // on this return, and the process with `process`.
+                Err(e) => return Err(io::Error::other(e)),
+            }
+        };
 
         Ok(Launched {
             master,
