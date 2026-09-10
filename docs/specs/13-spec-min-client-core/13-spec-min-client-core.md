@@ -755,7 +755,8 @@ no host-cert renewal. The core checks natively (MCC-032); the CLI's
 `known_hosts` fragment (MCC-052) is the `HostKeyAlias` form of the same
 rule.
 
-**Constants.** 60 s silent-peer (MCC-013) is twice the 25 s keepalive; 20 s
+**Constants.** 60 s silent-peer (MCC-013) is two 25 s keepalive intervals
+plus a 10 s margin for a late one; 20 s
 to the first handshake response (MCC-011) is four WireGuard retries at 5 s;
 10 s for the version exchange (MCC-006) and for a credential call
 (MCC-081), and 30 s for the whole attach (MCC-060), are the handshake bound
@@ -812,8 +813,9 @@ decision behind it; MCC-N01 to MCC-N03 were proof-of-concept measurements
 with headroom, not bounds anyone set.
 
 **Working assumptions.** Recorded in WMC and confirmed 2026-09-04: A1, the
-v1 browser command set is owner-only list, show, attach, rename and stop
-(MCC-072; Gatehouse §7.4 since v1.16 maps them, sessions being boxes); A2,
+v1 browser command set is owner-only attach (MCC-020, MCC-060) plus list
+sessions, show, rename, stop and version over the RPC driver (MCC-072;
+Gatehouse §7.4 since v1.16 maps them, sessions being boxes); A2,
 the plan's decisions stand; A3, the browser client lives on its own origin
 (MCC-075). Overturning one changes the requirements it names, not the
 core's shape.
