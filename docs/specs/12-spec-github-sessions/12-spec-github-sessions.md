@@ -40,9 +40,12 @@ starts a remote session, and a push to their project from inside it lands on
 GitHub attributed to them, with no raw credential typed, copied, or present
 anywhere in the session.
 
-**First slice:** The sign-in command, the browser approval, one remote session,
-and a push to the workbench project from inside it with unmodified git through
-the sealed-credential path.
+**First slice:** The sign-in command, the browser approval, the developer's
+own laptop daemon enrolled with the hosted identity plane under that sign-in
+(GHS-025), one local session that declares a GitHub grant, and a push to the
+workbench project from inside it with unmodified git through the
+sealed-credential path. No remote session: the same path on a remote Box Host
+is the second slice, and lands once a provider lists one.
 
 ## Users and stories
 
