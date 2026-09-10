@@ -9,9 +9,11 @@
 
 pkgname=minimal-bin
 pkgver=@@PKGVER@@
-# pkgver switched from short-shas to semver; shas sort above semver under
-# vercmp (e6cf884b > 0.5.3), so without the epoch the first semver publish
-# would read as a downgrade to existing users.
+# pkgver switched from short-shas to semver. Under vercmp a digit-leading
+# sha such as 6120afdf sorts above any semver, while an alpha-leading one
+# such as e6cf884b sorts below (0.5.3 > e6cf884b) — the published shape
+# cannot be known, so epoch=1 makes the first semver publish strictly
+# newer either way.
 epoch=1
 pkgrel=1
 pkgdesc="Isolated, reproducible development environments and a secure package manager that give your whole team identical environments, while keeping AI agents off the laptop"

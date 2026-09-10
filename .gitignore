@@ -6,3 +6,6 @@ target/
 # Claude Code / git worktree scratch dirs (agent worktrees, embedded repos)
 .claude/
 .worktrees/
+
+# just pkg-nfpm default OUT_DIR (scripts/package-nfpm.sh)
+/dist/
