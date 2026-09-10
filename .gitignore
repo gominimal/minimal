@@ -6,3 +6,7 @@ target/
 # Claude Code / git worktree scratch dirs (agent worktrees, embedded repos)
 .claude/
 .worktrees/
+
+# Finder metadata. macOS is a first-class dev platform here, so these appear in
+# every directory anyone browses; unignored, a wide `git add` sweeps them in.
+.DS_Store
