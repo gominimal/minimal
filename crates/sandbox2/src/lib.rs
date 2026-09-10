@@ -469,6 +469,31 @@ impl<C: Channel> Sandbox<C> {
         plan_from_config(&self.config)
     }
 
+    /// Step 1 of a launch: ask the provider what this sandbox needs, or fall
+    /// back to the built-in configuration when none is set.
+    ///
+    /// From here the plan's release is owed; see [`PlannedLaunch`]. Both spawn
+    /// paths start here — the invocation path below, and the caller-spawn path
+    /// `minimald`'s session host uses — so there is one sequence and not two.
+    ///
+    /// Deliberately **not** an `async fn`: that would hold `&Sandbox<C>` across
+    /// the await and so impose `C: Sync` on every caller's future, which the
+    /// build path does not satisfy. Everything touching `self` happens before
+    /// the returned future is built, so the borrow ends when this call does.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the provider's planning failure.
+    pub fn plan_launch(
+        &self,
+    ) -> impl Future<Output = Result<PlannedLaunch, Error>> + Send + 'static {
+        // Cloned, not borrowed: `PlannedLaunch` outlives this call, and its
+        // `Drop` moves the provider onto the runtime — which a borrow could not.
+        let network = self.config.network.clone();
+        let fallback = self.built_in_plan();
+        PlannedLaunch::begin(network, fallback)
+    }
+
     #[cfg(target_os = "linux")]
     pub fn new_container(&self, plan: &network::NetPlan) -> Result<Container, Error> {
         let mut container = hakoniwa::Container::new();
@@ -833,25 +858,20 @@ impl<C: Channel> Sandbox<C> {
         W2: tokio::io::AsyncWrite + Unpin + Send,
     {
         // Pre-spawn: ask the provider what this sandbox needs, falling back to
-        // the built-in configuration when none is set. Borrow only the `Network`
-        // (which is `Send + Sync`) across the await, not the whole `Sandbox<C>`,
-        // so this doesn't impose `C: Sync` on the run future — the same reason
-        // the attach below is written that way.
-        //
-        // No `abandon` on the failure paths yet: it arrives with the launch
-        // sequence, which is what can see every way out of a launch (a cancelled
-        // future included). Nothing can leak in the meantime, because no provider
-        // exists to reserve anything — `Config::network` has no producer until
-        // the own-IP provider lands, after that sequence.
-        let plan = match self.config.network.as_deref() {
-            Some(net) => net.plan().await.map_err(Error::Network)?,
-            None => self.built_in_plan(),
-        };
-        let container = self.new_container(&plan)?;
         for (i, exec) in invocations.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(Error::Execution(ExecutionError::Cancelled));
             }
+
+            // One launch per invocation, because one *spawn* is what gets a
+            // namespace: hakoniwa unshares per `spawn()`, so each invocation has
+            // its own netns and needs its own plan. Hoisting this out of the loop
+            // would give N processes one address, and would break the counting
+            // the abandon obligation rests on — every plan is released exactly
+            // once, by the attach below, or by `PlannedLaunch`'s drop on any
+            // early return or cancellation between here and there.
+            let planned = self.plan_launch().await?;
+            let container = self.new_container(planned.plan())?;
 
             let mut cmd = self.command(&container, &exec.executable, &exec.args, &exec.envs)?;
             cmd.stderr(hakoniwa::Stdio::MakePipe);
@@ -862,29 +882,25 @@ impl<C: Channel> Sandbox<C> {
                 .spawn()
                 .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
-            // Apply the configured per-sandbox network to this invocation's
-            // freshly-unshared netns (own-IP switch attach). No-op for
-            // HostNet/NoNet and when no custom `Network` is set, so existing
-            // build/task consumers are unaffected — this is what lets tasks, not
-            // just minimald sessions, get networking through the abstraction.
-            // Torn down explicitly once the invocation completes (both arms).
-            // Borrow only the `Network` (which is `Send + Sync`) across the await,
-            // not the whole `Sandbox<C>`, so this doesn't impose `C: Sync` on the
-            // run future.
-            let net_guard = match self.config.network.as_deref() {
-                Some(net) => match net.attach(child.id()).await {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        // Attach failed after spawn: kill+reap the child so it
-                        // doesn't outlive its sandbox (a `hakoniwa::Child` does
-                        // not terminate on drop). `wait` runs regardless of
-                        // `kill` (the process may have already exited).
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(Error::Network(e));
-                    }
-                },
-                None => network::noop_guard(),
+            // Step 3: wire this invocation's freshly-unshared netns. No-op for
+            // HostNet/NoNet and when no provider is set, so existing build/task
+            // consumers are unaffected — this is what lets tasks, not just
+            // minimald sessions, get networking through the abstraction. Torn
+            // down explicitly once the invocation completes (both arms).
+            let net_guard = match planned
+                .attach(network::Spawned::from_child(&mut child))
+                .await
+            {
+                Ok(guard) => guard,
+                Err(e) => {
+                    // Attach failed after spawn: kill+reap the child so it
+                    // doesn't outlive its sandbox (a `hakoniwa::Child` does
+                    // not terminate on drop). `wait` runs regardless of
+                    // `kill` (the process may have already exited).
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e);
+                }
             };
 
             // Take pipes from the child so threads can stream them into the stdout/stderr
@@ -1338,6 +1354,121 @@ pub fn isolates_network(mode: NetworkMode) -> bool {
     mode != NetworkMode::HostNet
 }
 
+/// A launch between its plan and its attach, owing the plan's release.
+///
+/// The sequence spec 012 asks for, as an explicit type rather than a closure
+/// the sandbox layer calls. The closure shape cannot express the session path:
+/// its environment build is asynchronous and consumes the plan's values, that
+/// environment owns the [`Sandbox`] a closure would have to borrow alongside
+/// it, and the launch future is already boxed against the compiler's query
+/// depth limit. The invariants are the same either way — what matters is that
+/// one value owns the obligation, not that one call frame does.
+///
+/// Between `plan` and `attach` a caller may do whatever it likes, including
+/// `await`. Every way out releases the plan exactly once:
+///
+/// - [`attach`](Self::attach) hands the obligation to the returned [`NetGuard`].
+/// - [`abandon`](Self::abandon) releases it, for a caller that gave up.
+/// - `Drop` releases it, which is what catches a **cancelled** launch — the
+///   caller's future going away is not something the caller can handle.
+///
+/// `Drop` cannot `await`, so an owed release is spawned on the current runtime,
+/// the same way `minimald`'s launch guard detaches from the switch. With no
+/// runtime running there is nothing left to release *to*, so dropping it is
+/// harmless.
+pub struct PlannedLaunch {
+    network: Option<std::sync::Arc<dyn network::Network>>,
+    plan: network::NetPlan,
+    /// Whether the release is still owed. Cleared by `attach` and `abandon`.
+    owed: bool,
+}
+
+impl std::fmt::Debug for PlannedLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlannedLaunch")
+            .field("plan", &self.plan)
+            .field("owed", &self.owed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PlannedLaunch {
+    /// Step 1: resolve the plan, and take on its release.
+    ///
+    /// `fallback` is used when there is no provider — the plan the sandbox's own
+    /// configuration implies. Split from [`Sandbox::plan_launch`] so the
+    /// sequence is reachable without a `Sandbox`, which is what lets a test
+    /// double drive the real code rather than a copy of it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the provider's planning failure. Nothing is owed on that path:
+    /// a plan that failed reserved nothing.
+    pub async fn begin(
+        network: Option<std::sync::Arc<dyn network::Network>>,
+        fallback: network::NetPlan,
+    ) -> Result<Self, Error> {
+        let plan = match &network {
+            Some(net) => net.plan().await.map_err(Error::Network)?,
+            None => fallback,
+        };
+        Ok(Self {
+            network,
+            plan,
+            owed: true,
+        })
+    }
+
+    /// What the sandbox needs, decided. Read this to build the container.
+    #[must_use]
+    pub fn plan(&self) -> &network::NetPlan {
+        &self.plan
+    }
+
+    /// The process exists: wire its namespace. The returned guard owns the
+    /// release from here, so no abandon follows.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the provider's attach failure. The plan's release stays owed
+    /// on that path, so dropping `self`— which this does — still runs it.
+    pub async fn attach(mut self, spawned: network::Spawned) -> Result<Box<dyn NetGuard>, Error> {
+        let Some(network) = self.network.clone() else {
+            self.owed = false;
+            return Ok(network::noop_guard());
+        };
+        let guard = network.attach(spawned).await.map_err(Error::Network)?;
+        // Only now: a failed attach leaves the release owed, and `self` drops on
+        // the `?` above with `owed` still set.
+        self.owed = false;
+        Ok(guard)
+    }
+
+    /// Give up before the process exists, releasing the plan.
+    pub async fn abandon(mut self) {
+        self.owed = false;
+        if let Some(network) = self.network.clone() {
+            network.abandon().await;
+        }
+    }
+}
+
+impl Drop for PlannedLaunch {
+    fn drop(&mut self) {
+        if !self.owed {
+            return;
+        }
+        let Some(network) = self.network.clone() else {
+            return;
+        };
+        // Off the current runtime — `Drop` cannot `await`. If none is running,
+        // the process is going away and there is nothing to release to.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { network.abandon().await });
+        }
+    }
+}
+
 /// The network plan a sandbox's built-in configuration implies.
 ///
 /// A pure mapping over the config, so the rules are testable without building a
@@ -1410,6 +1541,176 @@ mod tests {
         assert!(!isolates_network(NetworkMode::HostNet));
         assert!(isolates_network(NetworkMode::NoNet));
         assert!(isolates_network(NetworkMode::OwnIp));
+    }
+
+    /// A provider that records which operations ran, in order, so the sequence
+    /// itself can be asserted rather than its effects.
+    ///
+    /// The plan is data and the trait takes no container, which is what makes a
+    /// double like this possible at all — the reason spec 012 rejected handing
+    /// the container to the provider.
+    #[derive(Debug, Default)]
+    struct Recorder {
+        events: std::sync::Mutex<Vec<&'static str>>,
+        /// When set, `attach` fails — the path that must still leave the plan's
+        /// release owed.
+        attach_fails: bool,
+    }
+
+    impl Recorder {
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().unwrap().clone()
+        }
+        fn push(&self, e: &'static str) {
+            self.events.lock().unwrap().push(e);
+        }
+    }
+
+    impl network::Network for Recorder {
+        fn plan(&self) -> network::PlanFuture<'_> {
+            self.push("plan");
+            Box::pin(std::future::ready(Ok(network::NetPlan::isolated())))
+        }
+        fn attach(&self, spawned: network::Spawned) -> network::AttachFuture<'_> {
+            self.push("attach");
+            if self.attach_fails {
+                return Box::pin(std::future::ready(Err(network::NetworkError::new(
+                    std::io::Error::other("attach refused"),
+                ))));
+            }
+            drop(spawned);
+            Box::pin(std::future::ready(Ok(network::noop_guard())))
+        }
+        fn abandon(&self) -> network::AbandonFuture<'_> {
+            self.push("abandon");
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    fn planned_with(rec: &std::sync::Arc<Recorder>) -> PlannedLaunch {
+        PlannedLaunch {
+            network: Some(rec.clone() as std::sync::Arc<dyn network::Network>),
+            plan: network::NetPlan::isolated(),
+            owed: true,
+        }
+    }
+
+    /// 012-001. The plan completes before the container exists, and the attach
+    /// runs after the process does — so a full launch records exactly
+    /// `plan` then `attach`, in that order.
+    ///
+    /// The ordering is structural, not merely observed: `new_container` takes a
+    /// `&NetPlan`, so it cannot be called before one is made, and `attach` takes
+    /// a [`network::Spawned`], which only a spawned process yields.
+    #[tokio::test]
+    async fn network_phases_run_in_order() {
+        let rec = std::sync::Arc::new(Recorder::default());
+
+        // Step 1, through the real sequence. Nothing but the plan has run.
+        let planned = PlannedLaunch::begin(
+            Some(rec.clone() as std::sync::Arc<dyn network::Network>),
+            network::NetPlan::host(),
+        )
+        .await
+        .expect("planning");
+        assert_eq!(rec.events(), vec!["plan"]);
+        assert!(
+            planned.plan().isolates_netns(),
+            "the provider's plan must be the one carried forward, not the fallback"
+        );
+
+        // Step 3, standing in for a process that started.
+        let guard = planned.attach(network::Spawned::new(4242)).await.unwrap();
+        assert_eq!(
+            rec.events(),
+            vec!["plan", "attach"],
+            "attach must follow plan, and nothing may run between them"
+        );
+        guard.teardown().await;
+    }
+
+    /// 012-002. A launch that gives up between plan and attach releases the
+    /// plan, exactly once — the property `count(plan) = count(attach) +
+    /// count(abandon)`.
+    #[tokio::test]
+    async fn abandoned_launch_releases_the_plan() {
+        let rec = std::sync::Arc::new(Recorder::default());
+        rec.push("plan");
+        planned_with(&rec).abandon().await;
+        assert_eq!(rec.events(), vec!["plan", "abandon"]);
+
+        // Once, not twice: the explicit abandon consumes the launch, and the
+        // drop that follows must not release a second time.
+        let plans = rec.events().iter().filter(|e| **e == "plan").count();
+        let releases = rec.events().iter().filter(|e| **e == "abandon").count()
+            + rec.events().iter().filter(|e| **e == "attach").count();
+        assert_eq!(plans, releases, "every plan is released exactly once");
+
+        // A failed attach is *not* a release: the guard never existed, so the
+        // obligation stays with the launch and its drop discharges it.
+        let rec = std::sync::Arc::new(Recorder {
+            events: std::sync::Mutex::new(vec!["plan"]),
+            attach_fails: true,
+        });
+        // `NetGuard` is not `Debug`, so unwrap the arm rather than `expect_err`.
+        match planned_with(&rec).attach(network::Spawned::new(1)).await {
+            Err(Error::Network(_)) => {}
+            Err(e) => panic!("expected a network error, got {e:?}"),
+            Ok(_) => panic!("this provider refuses to attach"),
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            rec.events(),
+            vec!["plan", "attach", "abandon"],
+            "a failed attach must still release the plan"
+        );
+    }
+
+    /// 012-002 sub-requirement. The launch future going away is the one exit a
+    /// caller cannot handle, so the release has to ride on `Drop`.
+    #[tokio::test]
+    async fn cancelled_launch_releases_the_plan() {
+        let rec = std::sync::Arc::new(Recorder::default());
+        rec.push("plan");
+        drop(planned_with(&rec));
+        // `Drop` cannot await, so it spawns the release; let it run.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            rec.events(),
+            vec!["plan", "abandon"],
+            "a dropped launch must release its plan"
+        );
+    }
+
+    /// 012-010. The descriptor reaches the provider once and is owned there.
+    ///
+    /// `Spawned` holds an `OwnedFd`, so handing it over *is* the transfer; the
+    /// property this pins is that a second read yields nothing rather than a
+    /// second owner of the same descriptor.
+    #[test]
+    fn the_tap_descriptor_goes_to_the_provider_once() {
+        // A pipe end stands in for the tap: any real fd proves ownership moved,
+        // and this one needs no namespace.
+        let (read_end, _write_end) = std::io::pipe().expect("pipe");
+        let fd = std::os::fd::OwnedFd::from(read_end);
+        let raw = {
+            use std::os::fd::AsRawFd as _;
+            fd.as_raw_fd()
+        };
+
+        let mut spawned = network::Spawned::new(7).with_tap_fd(fd);
+        let taken = spawned.take_tap_fd().expect("the first take gets the tap");
+        {
+            use std::os::fd::AsRawFd as _;
+            assert_eq!(taken.as_raw_fd(), raw, "the same descriptor moved through");
+        }
+        assert!(
+            spawned.take_tap_fd().is_none(),
+            "a second take must not hand out the same descriptor again"
+        );
+
+        // A sandbox that asked for no tap simply has none.
+        assert!(network::Spawned::new(7).take_tap_fd().is_none());
     }
 
     fn tap_spec() -> network::TapSpec {

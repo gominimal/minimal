@@ -170,7 +170,7 @@ pub struct Config {
     /// any post-spawn wiring (e.g. an own-IP gvproxy switch attach). Keeping the
     /// wiring behind this trait is what lets tasks and sessions share one
     /// networking path instead of it living only in the minimald session host.
-    pub network: Option<Box<dyn Network>>,
+    pub network: Option<std::sync::Arc<dyn Network>>,
     /// Own-IP user-mode tap parameters. When `Some` (native/DM2 own-IP), the
     /// sandbox's TAP is created + configured inside its namespace by hakoniwa
     /// (rootless), and the tap fd is surfaced via `Child.rustslirp_tapfd`. `None`
@@ -464,7 +464,7 @@ impl Config {
     /// [`with_network_mode`](Self::with_network_mode). Use this for modes that
     /// need post-spawn wiring (e.g. own-IP gvproxy switch attach), supplied by
     /// the consumer so the wiring lives behind one abstraction for every sandbox.
-    pub fn with_network(mut self, network: Box<dyn Network>) -> Self {
+    pub fn with_network(mut self, network: std::sync::Arc<dyn Network>) -> Self {
         self.network = Some(network);
         self
     }

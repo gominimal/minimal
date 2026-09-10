@@ -185,14 +185,13 @@ pub trait Network: Send + Sync + std::fmt::Debug {
     /// (leasing an address, starting a switch).
     fn plan(&self) -> PlanFuture<'_>;
 
-    /// After the process starts: wire the network namespace of the launched
-    /// process `netns_pid` (which holds `/proc/<pid>/ns/net`). Returns a
+    /// After the process starts: wire its network namespace. Returns a
     /// [`NetGuard`] whose [`teardown`](NetGuard::teardown) reverses the wiring.
     ///
     /// The default is a no-op, for modes that need no post-spawn work
     /// ([`HostNet`], [`NoNet`]).
-    fn attach(&self, netns_pid: u32) -> AttachFuture<'_> {
-        let _ = netns_pid;
+    fn attach(&self, spawned: Spawned) -> AttachFuture<'_> {
+        drop(spawned);
         Box::pin(std::future::ready(Ok(noop_guard())))
     }
 
@@ -204,6 +203,74 @@ pub trait Network: Send + Sync + std::fmt::Debug {
     /// [`NetGuard`] owns the release from that point.
     fn abandon(&self) -> AbandonFuture<'_> {
         Box::pin(std::future::ready(()))
+    }
+}
+
+/// What a launched sandbox process hands to [`Network::attach`].
+///
+/// Carries the tap descriptor by value, so the provider *receives* it rather
+/// than reaching into a `hakoniwa::Child` for a raw fd. That is what makes
+/// 012-010 hold by construction: the descriptor is taken from the child once,
+/// where it is created, and moving it here transfers ownership — a second
+/// attach cannot get one, and the provider's guard closes it at teardown.
+#[derive(Debug)]
+pub struct Spawned {
+    netns_pid: u32,
+    tap_fd: Option<std::os::fd::OwnedFd>,
+}
+
+impl Spawned {
+    /// A launched process with no tap of its own.
+    #[must_use]
+    pub fn new(netns_pid: u32) -> Self {
+        Self {
+            netns_pid,
+            tap_fd: None,
+        }
+    }
+
+    /// Adds the tap descriptor the sandbox layer's in-namespace tap produced.
+    #[must_use]
+    pub fn with_tap_fd(mut self, tap_fd: std::os::fd::OwnedFd) -> Self {
+        self.tap_fd = Some(tap_fd);
+        self
+    }
+
+    /// The PID whose `/proc/<pid>/ns/net` is the sandbox's network namespace.
+    #[must_use]
+    pub fn netns_pid(&self) -> u32 {
+        self.netns_pid
+    }
+
+    /// Takes the tap descriptor, if the plan asked for one. Yields it once;
+    /// a second call returns `None`.
+    pub fn take_tap_fd(&mut self) -> Option<std::os::fd::OwnedFd> {
+        self.tap_fd.take()
+    }
+
+    /// Reads a just-spawned container process: its PID, and the tap descriptor
+    /// hakoniwa produced if the plan asked for a tap.
+    ///
+    /// The `unsafe` fd adoption lives here, beside the code that asked hakoniwa
+    /// to create the descriptor, rather than in each consumer. Taking it out of
+    /// the child is what makes it once-only: a `hakoniwa::Child` has no `Drop`
+    /// and never closes the fd, so leaving it in place would let a second reader
+    /// adopt the same descriptor and double-close it.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn from_child(child: &mut hakoniwa::Child) -> Self {
+        use std::os::fd::FromRawFd as _;
+
+        let netns_pid = child.id();
+        // SAFETY: hakoniwa hands out a live, owned tap fd exactly once, and
+        // `take` is what enforces the "once" — adopting it transfers ownership
+        // to this `Spawned`, and from there to the provider, whose guard closes
+        // it at teardown.
+        let tap_fd = child
+            .rustslirp_tapfd
+            .take()
+            .map(|raw| unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
+        Self { netns_pid, tap_fd }
     }
 }
 
