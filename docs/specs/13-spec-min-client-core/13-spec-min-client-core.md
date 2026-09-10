@@ -130,8 +130,9 @@ MMI by ID.
   connections inside the tunnel.
   tier:     T0
   verify:   cargo nextest run -p min-core ssh_attach_through_the_tunnel
-  - IF no handshake response arrives within 20 s THEN THE SYSTEM SHALL fail
-    the dial with a `transport:` outcome (MCC-064) naming the endpoint.
+  - IF no handshake response arrives within 20 s of the dial request,
+    a pipe that never opens included, THEN THE SYSTEM SHALL cancel the dial
+    and fail it with a `transport:` outcome (MCC-064) naming the endpoint.
     tier:   T0
     verify: cargo nextest run -p min-core silent_handshake_fails_after_20s_at_the_injected_clock
 
@@ -154,9 +155,10 @@ MMI by ID.
 
 - **MCC-014** WHEN a node advertises a direct endpoint THE SYSTEM SHALL dial
   it first, and dial the node's home relay with the node's ticket only when
-  the direct dial fails — a refused connection, or no handshake response
-  within MCC-011's 20 s — or none is advertised (Gatehouse §6.9;
-  architecture D7); the fallback runs inside MCC-060's attach bound.
+  the direct dial fails — a refused connection, or MCC-011's 20 s passing
+  from the dial request with no handshake response, the pipe never opening
+  included — or none is advertised (Gatehouse §6.9; architecture D7); the
+  fallback runs inside MCC-060's attach bound.
   tier:     T0
   verify:   cargo nextest run -p min-core direct_endpoint_first_relay_as_fallback
 
@@ -184,8 +186,8 @@ MMI by ID.
 - **MCC-020** WHEN a head attaches THE SYSTEM SHALL authenticate, open one
   session channel, set the session identifier, request a PTY of the given
   size and a shell, deliver output and the daemon's error stream in the
-  order they arrive on the channel, which is the order the daemon wrote
-  them, forward input and window changes, and deliver the exit status.
+  order they arrive on the channel, forward input and window changes, and
+  deliver the exit status.
   tier:     T0
   verify:   cargo nextest run -p min-core attach_write_resize_exit
   - IF the daemon refuses the shell THEN THE SYSTEM SHALL report which
@@ -252,7 +254,7 @@ MMI by ID.
   named.
   tier:     T1
   verify:   cargo nextest run -p min-core host_policy_accepts_iff_every_check_holds
-  property: for every (certificate, anchors, expected, now): accept ⇔ decision(certificate, anchors, host, now, revoked = ∅) = ok (MCC-034) ∧ (expected ∈ principals ∨ ∃ p ∈ principals: p = "*." ‖ suffix ∧ expected ends with "." ‖ suffix); a refusal names the first failing check, the decision's order first and the principal last
+  property: for every host reached over a transport other than a local UDS or vsock and every (certificate, anchors, expected, now): accept ⇔ decision(certificate, anchors, host, now, revoked = ∅) = ok (MCC-034) ∧ (expected ∈ principals ∨ ∃ p ∈ principals: p = "*." ‖ suffix ∧ expected ends with "." ‖ suffix); a refusal names the first failing check, the decision's order first and the principal last; over a local UDS or vsock the decision is not consulted (MCC-033)
   - IF the host presents a bare key, a certificate from outside the anchors,
     or one for another principal THEN THE SYSTEM SHALL refuse it.
     tier:   T0
@@ -316,7 +318,7 @@ MMI by ID.
   while it holds none; a local UDS or vsock needs none (MCC-033).
   tier:     T1
   verify:   cargo nextest run -p min-core anchors_come_only_from_the_credentials_issuer
-  property: for every credential c, every peer document d and every anchor state: the only anchors request the core composes is to `{iss}/v1/ssh/ca` for c's issuer; d is refused and opens no tunnel whenever its `td` differs from c's trust domain; and no attach is composed while no anchors are held
+  property: for every credential c, every peer document d and every anchor state: the only anchors request the core composes is to `{iss}/v1/ssh/ca` for c's issuer; d is refused and opens no tunnel whenever its `td` differs from c's trust domain; and no certificate-authenticated attach is composed while no anchors are held, an attach over a local UDS or vsock (MCC-033) needing none
   - IF a peer document's `td` differs from the credential's trust domain
     THEN THE SYSTEM SHALL refuse the document and open no tunnel from it.
     tier:   T0
