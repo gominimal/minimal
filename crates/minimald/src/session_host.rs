@@ -2297,15 +2297,9 @@ impl SessionLauncher for SandboxLauncher {
                     io::Error::other(format!("attaching OwnIp PTask to switch: {e}"))
                 })?;
                 let sock = s.control_socket();
-                let prefix = subnet.prefix();
-                let mask = if prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - prefix)
-                };
                 own_ip_tap = Some(sandbox2::config::OwnIpTap {
                     address: attach.lease.ip,
-                    netmask: std::net::Ipv4Addr::from(mask),
+                    netmask: subnet.netmask(),
                     gateway: subnet.gateway(),
                     mtu: crate::net::DEFAULT_MTU,
                 });
