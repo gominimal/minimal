@@ -1860,9 +1860,23 @@ impl Session {
             tracing::info!(
                 "replacing the hook-launched session shell with one minted for the attaching terminal"
             );
-            let (handle, join) = slot.take().expect("matched on Some");
-            let _ = handle.kill(false).await;
-            let _ = join.await;
+            let (handle, mut join) = slot.take().expect("matched on Some");
+            // Bound the wait for the hook host to wind down, mirroring
+            // `stop_running`: `kill` can time out against a wedged loop, and an
+            // unbounded `join.await` would then park the attach forever — the
+            // very "attach hangs with no timeout" symptom this change removes.
+            // A kill that cannot land, or a loop that does not finish within
+            // `HOST_PROBE_TIMEOUT` of accepting it, aborts the loop instead of
+            // waiting on it (leaving the same acknowledged process-reclaim gap
+            // as `stop_running`).
+            let killed = handle.kill(false).await.is_ok();
+            if !killed
+                || tokio::time::timeout(HOST_PROBE_TIMEOUT, &mut join)
+                    .await
+                    .is_err()
+            {
+                join.abort();
+            }
         }
 
         let host = match &mut self.inner {
@@ -2158,7 +2172,16 @@ impl Session {
         let SessionInner::Active { host, .. } = &mut self.inner else {
             unreachable!("mint_session_host is only reachable from the Active state");
         };
-        *host = Some(launched);
+        // A wedged-but-alive host can reach here via attach's re-mint branch
+        // (`session_host.rs` `SendTimeoutError::Timeout`): its loop task is
+        // still running. Dropping the replaced `(HostHandle, JoinHandle)`
+        // would detach that task, leaking the old sandbox process, pty master,
+        // and `NetGuard` for the daemon's lifetime — one leak per attach to the
+        // same wedged host. Abort the task being replaced, mirroring
+        // `stop_running` (a no-op when the old loop had already exited).
+        if let Some((_, task)) = host.replace(launched) {
+            task.abort();
+        }
         // Minted by an attach: its environment describes the terminal that is
         // here, so nothing may replace it out from under that client.
         self.host_origin = HostOrigin::Interactive;
