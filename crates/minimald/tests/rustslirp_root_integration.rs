@@ -316,13 +316,23 @@ fn rustslirp_tap_comes_up_as_root() {
         .output()
         .expect("re-execing this test binary under sudo (is passwordless sudo available?)");
 
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
     assert!(
         out.status.success(),
         "RustSlirp did not bring a tap up with a root parent — the in-VM own-IP path \
          cannot use the rootless mechanism without a change in hakoniwa itself.\n\
-         status={:?}\nstdout={}\nstderr={}",
+         status={:?}\nstdout={stdout}\nstderr={stderr}",
         out.status.code(),
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
+    );
+    // libtest exits 0 when its filter matches nothing, so a successful status
+    // alone would also be what a silently-skipped inner run looks like. The
+    // whole spike turns on this result, so insist the proof actually ran.
+    assert!(
+        stdout.contains("1 passed"),
+        "the sudo re-exec exited 0 without running the proof — a green here would \
+         mean nothing. Check the libtest filter and `--include-ignored`.\n\
+         stdout={stdout}\nstderr={stderr}",
     );
 }
