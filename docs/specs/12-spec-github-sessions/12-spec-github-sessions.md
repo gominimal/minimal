@@ -1,7 +1,6 @@
 ---
 id: GHS
 title: GitHub sign-in and credential-free repository access from sessions
-status: draft
 owner: norrietaylor
 epic: gominimal/inbox#512
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
