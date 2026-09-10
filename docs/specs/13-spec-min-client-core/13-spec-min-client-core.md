@@ -240,9 +240,10 @@ MMI by ID.
     tier:   T0
     verify: cargo nextest run -p min-core each_refusal_case_is_refused
 
-- **MCC-032** THE SYSTEM SHALL accept a host off a local socket only when its
-  host certificate verifies under the host policy — MCC-034's decision for
-  the host type with an empty revocation set — for the expected principal,
+- **MCC-032** THE SYSTEM SHALL accept a host reached over any transport other
+  than a local UDS or vsock (MCC-033) only when its host certificate verifies
+  under the host policy — MCC-034's decision for the host type with an
+  empty revocation set — for the expected principal,
   named exactly or by the per-node wildcard `*.<node_id>.box.<td>`,
   refusing anything else before authentication with the failing check
   named.
@@ -308,7 +309,8 @@ MMI by ID.
 
 - **MCC-038** THE SYSTEM SHALL take Host CA anchors only from
   `{iss}/v1/ssh/ca` of the issuer named in the credential it holds
-  (Gatehouse §8.2), and SHALL attempt no attach while it holds none.
+  (Gatehouse §8.2), and SHALL attempt no certificate-authenticated attach
+  while it holds none; a local UDS or vsock needs none (MCC-033).
   tier:     T1
   verify:   cargo nextest run -p min-core anchors_come_only_from_the_credentials_issuer
   property: for every credential c, every peer document d and every anchor state: the only anchors request the core composes is to `{iss}/v1/ssh/ca` for c's issuer; d is refused and opens no tunnel whenever its `td` differs from c's trust domain; and no attach is composed while no anchors are held
@@ -849,9 +851,10 @@ Gatehouse is the only identity plane in the system.
   enforced by: the signer seam as the only signing path, and the browser's
   non-extractable key behind a callback (WMC-003).
   covered by: MCC-030, MCC-066, MCC-077
-- **Invariant:** THE SYSTEM SHALL attach to no host off a local socket
-  without a host certificate verifying, for the expected principal,
-  against anchors taken from the tenant issuer only.
+- **Invariant:** THE SYSTEM SHALL attach to no host reached over a
+  transport other than a local UDS or vsock without a host certificate
+  verifying, for the expected principal, against anchors taken from the
+  tenant issuer only.
   enforced by: the host policy in the server-key check, aborting before
   authentication (Gatehouse §6.2, no TOFU); the anchors fetch bound to the
   issuer the credential names.
