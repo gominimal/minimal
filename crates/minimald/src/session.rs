@@ -1629,9 +1629,15 @@ impl Session {
             if let Some((host, task)) = host {
                 // Signal the process to die, then await the runtime loop so the
                 // sandbox files backing its rootfs are released before the caller
-                // removes the session's directory tree.
-                let _ = host.kill(for_shutdown).await;
-                let _ = task.await;
+                // removes the session's directory tree. The kill is bounded: a
+                // wedged loop never accepts it, and awaiting such a loop would
+                // park daemon shutdown behind it forever, so a kill that does
+                // not land aborts the loop rather than waiting on it.
+                if host.kill(for_shutdown).await.is_ok() {
+                    let _ = task.await;
+                } else {
+                    task.abort();
+                }
             }
         }
     }
@@ -1873,7 +1879,7 @@ impl Session {
                 {
                     Ok(()) => Ok(()),
                     Err((channel, sz)) => {
-                        // session host is dead
+                        // The host is gone, or wedged past the attach deadline.
                         self.mint_session_host(
                             session_hnd,
                             conn_username,
