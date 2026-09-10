@@ -153,8 +153,9 @@ MMI by ID.
 
 - **MCC-014** WHEN a node advertises a direct endpoint THE SYSTEM SHALL dial
   it first, and dial the node's home relay with the node's ticket only when
-  the direct dial fails or none is advertised (Gatehouse §6.9; architecture
-  D7).
+  the direct dial fails — a refused connection, or no handshake response
+  within MCC-011's 20 s — or none is advertised (Gatehouse §6.9;
+  architecture D7); the fallback runs inside MCC-060's attach bound.
   tier:     T0
   verify:   cargo nextest run -p min-core direct_endpoint_first_relay_as_fallback
 
@@ -181,8 +182,9 @@ MMI by ID.
 
 - **MCC-020** WHEN a head attaches THE SYSTEM SHALL authenticate, open one
   session channel, set the session identifier, request a PTY of the given
-  size and a shell, deliver output and the daemon's error stream in order,
-  forward input and window changes, and deliver the exit status.
+  size and a shell, deliver output and the daemon's error stream in the
+  order they arrive on the channel, which is the order the daemon wrote
+  them, forward input and window changes, and deliver the exit status.
   tier:     T0
   verify:   cargo nextest run -p min-core attach_write_resize_exit
   - IF the daemon refuses the shell THEN THE SYSTEM SHALL report which
@@ -428,8 +430,8 @@ and verified there.
   document, a signer callback, a data callback and a close callback THE
   SYSTEM SHALL resolve to an attachment offering `write(bytes)`,
   `resize(cols, rows)` and `close()`, and deliver every byte of session
-  output and of the daemon's error stream, merged in order, to the data
-  callback.
+  output and of the daemon's error stream, merged in channel arrival order
+  (MCC-020), to the data callback.
   tier:     T0
   verify:   just wasm-core-headless attach_api_shape
   - IF the attach has not reached the accepted shell within 30 s of the
@@ -492,18 +494,22 @@ and verified there.
     verify: just wasm-core-headless own_renewal_supersession_is_not_surfaced
 
 - **MCC-066** THE SYSTEM SHALL call the signer callback with the exact bytes
-  to sign and require a raw signature back, 64 bytes for Ed25519,
-  performing every SSH and JWS encoding itself.
+  to sign and require a raw signature back — 64 bytes for Ed25519, and
+  64 bytes r ‖ s for P-256 under the FIPS profile, the algorithm being the
+  head key's — performing every SSH and JWS encoding itself (MCC-030).
   tier:     T0
   verify:   just wasm-core-headless signer_gets_bytes_and_returns_a_raw_signature
 
 - **MCC-067** THE SYSTEM SHALL perform the token exchange, refresh, certify,
   anchors fetch, mesh-bind, node listing, peer-document fetch, relay-ticket
   request, renewal and the revoke at sign-out itself over the HTTP call the
-  host supplies, produce the authorization URL the page navigates to, and
+  host supplies, which follows no redirect (a 3xx answer is a refused call,
+  MCC-081), produce the authorization URL the page navigates to, and
   consume the callback the page hands back, checking its `state` against
-  the request and its `iss` against the issuer set (Gatehouse §6.1.6)
-  before exchanging; the page composes none of these requests.
+  the request and its `iss` against the issuer set before exchanging; the
+  check is set membership, not equality with the issuer the request
+  started at, because the front door may land a sign-in on a tenant
+  issuer (Gatehouse §6.1.6); the page composes none of these requests.
   tier:     T0
   verify:   just wasm-core-headless credential_helpers_run_in_the_core_over_the_supplied_fetch
   - IF the callback's `iss` is outside the issuer set or its `state` does
@@ -567,7 +573,9 @@ and verified there.
 - **MCC-073** THE SYSTEM SHALL publish the wasm module and its JS glue as
   content-addressed assets with one manifest per CLI release, and `min`
   SHALL verify a served bundle's hash against the manifest of the release
-  whose core version the bundle reports (MCC-074).
+  whose core version the bundle reports (MCC-074), refusing a bundle whose
+  core release is older than `min`'s own, so that a server cannot roll a
+  client back to an older valid bundle.
   tier:     T0
   verify:   cargo nextest run -p minimal served_bundle_hash_verifies_against_the_release_manifest
 
@@ -619,8 +627,8 @@ and verified there.
   report it to the head in one of two shapes: `credential: refused (<code>)`
   when the issuer answered with an error, carrying its code and reason
   verbatim; `credential: unreachable` when no well-formed answer arrived
-  within the call's bound, carrying the transport detail (WMC-006,
-  WMC-007).
+  within 10 s at the injected clock, the call being cancelled at that
+  bound, carrying the transport detail (WMC-006, WMC-007).
   tier:     T0
   verify:   just wasm-core-headless credential_call_failures_are_refused_or_unreachable
   - IF the call that failed was a renewal during an open attach THEN THE
@@ -746,10 +754,11 @@ rule.
 
 **Constants.** 60 s silent-peer (MCC-013) is twice the 25 s keepalive; 20 s
 to the first handshake response (MCC-011) is four WireGuard retries at 5 s;
-10 s for the version exchange (MCC-006) and 30 s for the whole attach
-(MCC-060) are the handshake bound plus key exchange, authentication and the
-attach requests, which the proof of concept measured at 55 ms median on
-loopback.
+10 s for the version exchange (MCC-006) and for a credential call
+(MCC-081), and 30 s for the whole attach (MCC-060), are the handshake bound
+plus key exchange, authentication and the attach requests, which the proof
+of concept measured at 55 ms median on loopback; a direct dial that fails
+at 20 s leaves 10 s for the relay fallback (MCC-014).
 
 **Credential helpers run in the core over an injected HTTP call** (decided
 2026-09-04, MCC-067). Renewal must run inside the core during an open
