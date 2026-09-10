@@ -5,7 +5,7 @@ status: draft
 owner: tom@minimal.dev
 epic: gominimal/minimal#TBD
 arch: none
-updated: 2026-09-04
+updated: 2026-09-10
 ---
 
 # 012 — One network provider for every sandbox
@@ -149,7 +149,9 @@ or a session, and the operator who runs the daemon.
 - A new network mode: this work adds none.
 - Dynamic ingress port mappings: unchanged, in 03-spec-networking R2.3.
 - The tools that the guest root filesystem needs for the in-VM task attach:
-  separate work, see [Open questions](#open-questions).
+  none. The sandbox layer makes the tap in the namespace of the sandbox on
+  every deployment model, so the daemon runs no program to move a tap or to
+  enter a namespace. See [One tap mechanism](#one-tap-mechanism).
 - A network mode of its own for a task run: the command that starts a task has
   no option for the mode today, and it always asks for the host network. This
   spec makes the mode of a task reach its sandbox; it adds no option. See
@@ -165,7 +167,7 @@ or a session, and the operator who runs the daemon.
 
 ## Design reasoning
 
-Three facts about the current code explain the shape below.
+Four facts about the current code explain the shape below.
 
 First, the sandbox layer has an interface for a network, but only one of the
 two paths that start a process uses it. The session layer builds its own
@@ -176,10 +178,10 @@ difficulty is highest.
 
 Second, the interface can describe only the work that comes after the process
 starts. Its one operation before the process starts answers a yes-or-no
-question about the network namespace. An own-IP sandbox on a native Linux host
-needs an address, a netmask, a gateway, an MTU and a DNS server *before* the
-process starts, because the sandbox layer builds the tap device inside the
-namespace at that moment. The interface cannot return those values, so they
+question about the network namespace. An own-IP sandbox needs an address, a
+netmask, a gateway, an MTU and a DNS server *before* the process starts,
+because the sandbox layer builds the tap device inside the namespace at that
+moment. The interface cannot return those values, so they
 travel as separate configuration fields, and the code that produces them sits
 above the sandbox layer.
 
@@ -190,6 +192,38 @@ the context crate holds a fifth copy of the mode. The same gap keeps a rollback
 guard for the switch count in the session layer, keeps an unsafe descriptor
 transfer at the top of the daemon, and holds two attach paths with two
 different owners for the same rollback.
+
+Fourth, those two attach paths exist because of privilege, not because of the
+deployment model, and only one of the two follows
+[03-spec-networking](../03-spec-networking/03-spec-networking.md) R1.5. That
+requirement states one mechanism — "create a network namespace, **provision a
+virtual tap interface inside it**, and pass the tap file descriptor to the
+running gvproxy" — and names the file-descriptor transport as the only part
+that the deployment model changes: a unix socket on DM2, vsock on DM1. The
+native path does this. The in-VM path does not: it creates the tap in the
+root network namespace of the guest, with `CAP_NET_ADMIN`, and then moves the
+tap into the namespace of the sandbox with the `ip` program. See
+[One tap mechanism](#one-tap-mechanism).
+
+### One tap mechanism
+
+The rootless mechanism works when the parent process is root, so the in-VM
+path can use it too. A proof runs both cases in the native lane
+(`crates/minimald/tests/rustslirp_root_integration.rs`).
+
+This removes the second mechanism, and with it the second rollback owner. The
+two deployment paths then differ in one value: the transport that carries the
+file descriptor to the switch. Both transports already share one frame relay,
+so the frames do not change.
+
+Three consequences follow, and they make step 6 below smaller than it would be
+with two mechanisms:
+
+1. The provider holds one attach path, not a branch on the deployment model.
+2. The daemon stops running the `ip` and `nsenter` programs for the network,
+   and the code that hardens those program lookups goes away with them.
+3. 012-005 holds the same way on every deployment model, instead of holding
+   first on a native Linux host and later inside a microVM.
 
 ### The shape
 
@@ -250,9 +284,10 @@ Five results follow from these three pieces:
    enum leaves the sandbox configuration, and the two DNS controls become the
    one `Resolver` value of the plan.
 2. The call site no longer selects between the two deployment paths. The
-   provider returns tap parameters on a native Linux host, and returns none
-   inside a microVM. One implementation holds both branches, and that
-   implementation owns the rollback.
+   provider returns tap parameters on every deployment model, because the
+   sandbox layer makes the tap in the namespace of the sandbox in every case.
+   The deployment model selects the transport that carries the file descriptor
+   to the switch, and nothing else. One implementation owns the rollback.
 3. The rollback guard for a cancelled launch moves into the sandbox layer.
    One piece of code holds it, and one test covers it.
 4. The unsafe descriptor transfer moves next to the code that creates the
@@ -282,17 +317,30 @@ Each step compiles, and each step ships on its own.
 
 1. Move the netmask arithmetic onto the subnet type in the `switch` crate. No
    change in behaviour.
-2. Add the plan operation and the plan type. The old configuration fields feed
+2. Give the in-VM path the rootless tap mechanism, so that the deployment model
+   selects a transport and nothing else. See
+   [One tap mechanism](#one-tap-mechanism).
+3. Delete the mechanism that step 2 stops using, and the program lookups that
+   only it needed.
+4. Add the plan operation and the plan type. The old configuration fields feed
    a plan that the sandbox layer builds. No consumer changes.
-3. Add the launch operation, and move the invocation path onto it.
-4. Write the own-IP provider for both deployment paths, move the rollback guard
-   and the descriptor transfer into it, and move the session path onto the
-   launch operation. Delete the old configuration fields.
-5. Move the task path onto the provider function. This stops the drop to the
+5. Add the launch operation, and move the invocation path onto it.
+6. Write the own-IP provider, move the rollback guard and the descriptor
+   transfer into it, and move the session path onto the launch operation.
+   Delete the old configuration fields.
+7. Move the task path onto the provider function. This stops the drop to the
    host network, and it satisfies 012-005 for a task.
-6. Remove the mode enum from the public interface of the sandbox layer. This
+8. Remove the mode enum from the public interface of the sandbox layer. This
    step touches the build crate and the context crate, and the edits are
    mechanical.
+9. Measure one own-IP launch, set the bound of 012-N01 from that measurement,
+   and add a `just` recipe that runs one test.
+
+Steps 2 and 3 come first because they decide the shape of step 6, and because
+they can fail: a proof that the in-VM transport carries a tap that the sandbox
+layer made must pass before step 6 is written. If that proof fails, steps 2 and
+3 come out and the provider of step 6 keeps a branch on the deployment model.
+Every other step stands without them.
 
 **Generality:** A second provider fits, because the plan states what the
 sandbox needs and not how the provider gets it. A provider for a different
@@ -323,21 +371,36 @@ every other layer stays the same.
 
 ## Open questions
 
-- [NEEDS CLARIFICATION (HIGH): Does the closure of the launch operation keep
-  the current thread and `Sync` limits of the invocation path? The session path
-  builds a terminal and a command inside that closure. If the limits break, the
-  same sequence becomes an explicit type with three steps, which holds the same
-  invariants.]
-- [NEEDS CLARIFICATION (HIGH): Can the in-VM task path attach to the switch
-  before the guest root filesystem has the `ip` and `nsenter` tools? 012-005
-  holds on a native Linux host without them. Name the issue that adds them.]
+### Answered
+
+- **The launch operation takes an explicit type with three steps, and not a
+  closure.** (Was HIGH.) The limits break, for four reasons. The session path
+  builds its environment with an asynchronous operation, and a closure that the
+  sandbox layer calls is synchronous. That same operation reads the values of
+  the plan, so the plan operation must complete before the environment build
+  and not only before the container. The environment owns the sandbox, and the
+  closure must borrow the environment to build the command, which the borrow
+  rules refuse. The closure must also return a terminal and a path, and not
+  only a process. The environment build is on the heap today because the layout
+  of the launch future reaches the query depth limit of the compiler, and one
+  more generic layer puts that limit at risk again. The explicit type holds the
+  same invariants, as this section stated.
+- **The in-VM task path needs no tools in the guest root filesystem.** (Was
+  HIGH.) The question assumed two tap mechanisms. With one mechanism the
+  sandbox layer makes the tap in the namespace of the sandbox on every
+  deployment model, so the daemon runs no `ip` program and no `nsenter`
+  program for the network. No issue is needed. See
+  [One tap mechanism](#one-tap-mechanism).
+- **The repository gets a `just` recipe that runs one test.** (Was MEDIUM.)
+  Step 9 adds it. The `verify:` lines keep the direct command, because a spec
+  must name the test and not the wrapper.
+
+### Open
+
 - [NEEDS CLARIFICATION (MEDIUM): A task run always asks for the host network,
   because the command that starts it has no option for the mode. Does the
   option belong to this work, or to a later change? 012-005 holds either way,
   because it reads the mode that the PTask carries.]
-- [NEEDS CLARIFICATION (MEDIUM): The repository has no `just` recipe that runs
-  one test, so every `verify:` line above names a `cargo nextest` command. Add
-  a recipe, or accept the direct command in specs.]
 - [NEEDS CLARIFICATION (MEDIUM): Is the bound in 012-N01 the right one? The
   number states that four launches must not serialize, but no measurement of
   one launch exists today.]
