@@ -5,7 +5,7 @@ status: draft
 owner: mitodrummer
 epic: gominimal/inbox#513
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
-updated: 2026-09-09
+updated: 2026-09-10
 ---
 
 # MCC — Shared min client core: one Rust core for the CLI, the browser and mobile
