@@ -752,9 +752,11 @@ decision functions over owned values, separate from the transport. MMI-072
 ranges over unbounded sequences, so its test draws the sample its property
 names. Everything else is T0 because it reaches a socket, a daemon or a
 browser: MMI-006, MMI-020, MMI-026, MMI-028, MMI-053, MMI-054 and MMI-073 are
-scenarios whose invariants are held by the T1 decisions beside them. Nothing
-is T2 or T3: no proof project exists, and a harness over certificate parsing
-is out of proportion.
+scenarios whose invariants are held by the T1 decisions beside them, and
+MMI-010's binding check is a signature verification over a fetched feed
+whose enforcement is the WireGuard handshake itself. Nothing is T2 or T3:
+no proof project exists, and a harness over certificate parsing is out of
+proportion.
 
 **Generality:** a second WireGuard implementation on the peer side fits
 MMI-001 to MMI-011 unchanged, though interop is proven boringtun-to-boringtun
