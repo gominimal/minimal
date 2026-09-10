@@ -52,8 +52,8 @@ package.rust-version = "1.95"
 # Must stay UNTIL the next tag lands: it is the version a no-.git build
 # (source tarball) reports, so leaving it at an already-shipped release makes
 # such a build report that release — exactly what release.yml's
-# assert-version job exists to catch. 0.5.4 until v0.5.4 is tagged.
-package.version = "0.5.4"
+# assert-version job exists to catch. 0.5.5 until v0.5.5 is tagged.
+package.version = "0.5.5"
 
 [profile.release]
 strip = true
