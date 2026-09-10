@@ -19,8 +19,9 @@ that lives in a tab, and the owner's direction rules out any server in the
 session path. After this ships one Rust core carries the mesh peer, the
 attach sequence, the RPC driver, the credential flow and host trust for
 every head: the `min` CLI, the browser bundle, and later a mobile app. The
-direction is [the direction plan](../../../plans/browser-min-client-direction.plan.md)
-and the identity plane is Gatehouse; neither is restated here.
+direction is [the direction plan](https://github.com/gominimal/minimal/blob/feat/min-core-wasm-poc/plans/browser-min-client-direction.plan.md)
+carried on the proof-of-concept branch (#1350), and the identity plane is
+Gatehouse; neither is restated here.
 
 **Success:** A developer signed in with GitHub attaches from a browser tab
 to a session on a daemon they own, SSH terminating in the tab under a
