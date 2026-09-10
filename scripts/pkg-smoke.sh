@@ -40,7 +40,7 @@ set -euo pipefail
 die() { printf 'pkg-smoke: error: %s\n' "$*" >&2; exit 1; }
 note() { printf 'pkg-smoke: %s\n' "$*"; }
 
-usage() { sed -n '2,41p' "$0" | sed 's/^# \?//'; }
+usage() { sed -n '2,/^set -euo/{/^set -euo/!p;}' "$0" | sed 's/^# \{0,1\}//'; }
 
 pkg_dir="dist"
 formats="deb,rpm,apk"
@@ -119,8 +119,10 @@ for i in "${!fmts[@]}"; do
             installs+=("sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y")
             uninstalls+=("sudo dpkg -r minimal")
             # The expected version string is checked against the manager's own
-            # record; dpkg-query -f '\${Version}' expands inside the box.
-            version_probes+=("dpkg-query -W -f '\\\${Version}\\n' minimal")
+            # record. dpkg-query's default output is TAB-delimited
+            # "<package>	<version>", so cut replaces a --showformat string
+            # whose $ escaping has to survive distrobox argument forwarding.
+            version_probes+=("dpkg-query -W minimal | cut -f2")
             ;;
         rpm)
             boxes+=("min-test-rpm")
