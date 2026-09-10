@@ -1872,8 +1872,7 @@ impl Session {
             );
             let (handle, mut join) = slot.take().expect("matched on Some");
             // Bound the wait for the hook host to wind down, aborting a wedged
-            // loop rather than parking the attach behind it — the very "attach
-            // hangs with no timeout" symptom this change removes. Same bounded
+            // loop rather than parking the attach behind it. Same bounded
             // kill-and-stop as shutdown; see [`Session::kill_and_stop_loop`].
             Self::kill_and_stop_loop(&handle, &mut join, false).await;
         }
