@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BuildDep, BuildSpec, BuildSpecRef, Graph, RuntimeDep, SubsetInput};
 use common::SpecOrigin;
-use decode::Stack;
+use decode::{Container, Stack};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -35,6 +35,7 @@ const TAG_TOP_LEVELS: u8 = 0x04;
 const TAG_PROFILE: u8 = 0x05; // profiles were removed, tag is ignored
 const TAG_STACK: u8 = 0x06;
 const TAG_SUPPLY_CHAIN: u8 = 0x07;
+const TAG_CONTAINER: u8 = 0x08;
 const TAG_FOOTER: u8 = 0xFF;
 
 /// Upper bound on a single framed record's payload length. A malformed stream
@@ -221,6 +222,12 @@ struct StackRecord {
     stack: Stack,
 }
 
+#[derive(Serialize, Deserialize)]
+struct ContainerRecord {
+    name: String,
+    container: Container,
+}
+
 // ── GraphWriter (sync) ──────────────────────────────────────────────────────
 
 /// Writes a [`Graph`] to any [`Write`] sink using the streaming wire format.
@@ -302,6 +309,15 @@ impl<W: Write> GraphWriter<W> {
                 stack: stack.clone(),
             };
             self.write_record(TAG_STACK, &serde_json_lenient::to_vec(&record)?)?;
+        }
+
+        // ── Containers ──
+        for (name, container) in graph.iter_containers() {
+            let record = ContainerRecord {
+                name: name.clone(),
+                container: container.clone(),
+            };
+            self.write_record(TAG_CONTAINER, &serde_json_lenient::to_vec(&record)?)?;
         }
 
         // ── SupplyChain ──
@@ -456,6 +472,7 @@ impl<R: Read> GraphReader<R> {
 
         let mut top_levels_raw: Vec<(usize, u64)> = Vec::new();
         let mut stacks: BTreeMap<String, Stack> = BTreeMap::new();
+        let mut containers: BTreeMap<String, Container> = BTreeMap::new();
         let mut supply_chain: Vec<SpecOrigin> = Vec::new();
 
         // ── Body ──
@@ -521,6 +538,11 @@ impl<R: Read> GraphReader<R> {
                     stacks.insert(record.name, record.stack);
                 }
 
+                TAG_CONTAINER => {
+                    let record: ContainerRecord = serde_json_lenient::from_slice(&payload)?;
+                    containers.insert(record.name, record.container);
+                }
+
                 TAG_SUPPLY_CHAIN => {
                     supply_chain = serde_json_lenient::from_slice(&payload)?;
                 }
@@ -560,7 +582,15 @@ impl<R: Read> GraphReader<R> {
         }
 
         Ok((
-            Graph::from_parts(arena, top_levels, stacks, by_name, supply_chain, target),
+            Graph::from_parts(
+                arena,
+                top_levels,
+                stacks,
+                containers,
+                by_name,
+                supply_chain,
+                target,
+            ),
             temp_dir,
         ))
     }
@@ -787,6 +817,16 @@ impl<W: AsyncWrite + Unpin> AsyncGraphWriter<W> {
                 .await?;
         }
 
+        // Containers
+        for (name, container) in graph.iter_containers() {
+            let record = ContainerRecord {
+                name: name.clone(),
+                container: container.clone(),
+            };
+            self.write_record(TAG_CONTAINER, &serde_json_lenient::to_vec(&record)?)
+                .await?;
+        }
+
         // SupplyChain
         self.write_record(
             TAG_SUPPLY_CHAIN,
@@ -922,6 +962,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
 
         let mut top_levels_raw: Vec<(usize, u64)> = Vec::new();
         let mut stacks: BTreeMap<String, Stack> = BTreeMap::new();
+        let mut containers: BTreeMap<String, Container> = BTreeMap::new();
         let mut supply_chain: Vec<SpecOrigin> = Vec::new();
 
         loop {
@@ -982,6 +1023,11 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
                     stacks.insert(record.name, record.stack);
                 }
 
+                TAG_CONTAINER => {
+                    let record: ContainerRecord = serde_json_lenient::from_slice(&payload)?;
+                    containers.insert(record.name, record.container);
+                }
+
                 TAG_SUPPLY_CHAIN => {
                     supply_chain = serde_json_lenient::from_slice(&payload)?;
                 }
@@ -1018,7 +1064,15 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
         }
 
         Ok((
-            Graph::from_parts(arena, top_levels, stacks, by_name, supply_chain, target),
+            Graph::from_parts(
+                arena,
+                top_levels,
+                stacks,
+                containers,
+                by_name,
+                supply_chain,
+                target,
+            ),
             temp_dir,
         ))
     }
@@ -1030,7 +1084,9 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
 mod tests {
     use super::*;
     use crate::builds::SpecTest;
-    use common::SpecOrigin;
+    use common::{SpecOrigin, target::Arch};
+    use decode::{ExposedPort, ExposedPortProto};
+    use nickel_lang_core::term::IndexMap;
     use smallvec::smallvec;
     use std::sync::Arc;
 
@@ -1786,5 +1842,340 @@ mod tests {
                 "[{label}] config.txt should be 0644"
             );
         }
+    }
+
+    // ── Container tests ──────────────────────────────────────────────────────
+
+    /// A container with every field populated, so a roundtrip proves each one
+    /// survives rather than only the handful a minimal declaration sets.
+    fn full_container(name: &str) -> Container {
+        Container {
+            name: name.to_string(),
+            packages: vec!["shared".into(), "top".into()],
+            entrypoint: Some(vec!["/bin/app".into(), "--serve".into()]),
+            cmd: Some(vec!["--port".into(), "8080".into()]),
+            arch: Some(Arch::Arm64),
+            working_dir: Some("/srv".into()),
+            env_vars: IndexMap::from_iter([
+                ("PATH".to_string(), "/bin".to_string()),
+                ("PORT".to_string(), "8080".to_string()),
+                ("RUST_LOG".to_string(), "debug".to_string()),
+            ]),
+            exposed_ports: vec![
+                ExposedPort {
+                    proto: ExposedPortProto::Tcp,
+                    port: 8080,
+                },
+                ExposedPort {
+                    proto: ExposedPortProto::Udp,
+                    port: 53,
+                },
+            ],
+            volumes: vec!["/var/lib/data".into(), "/tmp".into()],
+            user: Some("1000:1000".into()),
+            stop_signal: Some("SIGTERM".into()),
+            labels: IndexMap::from_iter([
+                (
+                    "org.opencontainers.image.title".to_string(),
+                    name.to_string(),
+                ),
+                (
+                    "org.opencontainers.image.version".to_string(),
+                    "1.2.3".to_string(),
+                ),
+            ]),
+            config: IndexMap::from_iter([("StopTimeout".to_string(), "30".to_string())]),
+        }
+    }
+
+    /// Two packages, a stack, and two containers: one fully populated and one
+    /// left at its defaults, so both the "everything set" and "nothing set"
+    /// shapes cross the wire in the same stream.
+    fn graph_with_containers() -> Graph {
+        let mut graph = Graph::new();
+        let origin = Arc::new(SpecOrigin::Inline);
+        let shared = graph.insert_build(BuildSpec {
+            name: "shared".into(),
+            from: origin.clone(),
+            ..Default::default()
+        });
+        let top = graph.insert_build(BuildSpec {
+            name: "top".into(),
+            build_deps: smallvec![BuildDep::Build(shared)],
+            from: origin,
+            ..Default::default()
+        });
+        graph.top_levels = vec![top];
+
+        graph.stacks.insert("rust".into(), Stack::default());
+        graph.containers.insert("app".into(), full_container("app"));
+        graph.containers.insert(
+            "bare".into(),
+            Container {
+                name: "bare".into(),
+                ..Default::default()
+            },
+        );
+        graph
+    }
+
+    #[test]
+    fn container_roundtrip_preserves_every_field() {
+        let graph = graph_with_containers();
+        let (restored, _td) = roundtrip(&graph);
+
+        assert_eq!(
+            restored.containers, graph.containers,
+            "container map should survive the wire format unchanged"
+        );
+
+        // Spot-check the fields whose representations are easiest to lose:
+        // the OCI exec-form argvs, the port protocols, and the arch enum.
+        let app = restored.containers.get("app").expect("app container");
+        assert_eq!(
+            app.entrypoint.as_deref(),
+            Some(&["/bin/app".to_string(), "--serve".to_string()][..])
+        );
+        assert_eq!(
+            app.cmd.as_deref(),
+            Some(&["--port".to_string(), "8080".to_string()][..])
+        );
+        assert_eq!(app.arch, Some(Arch::Arm64));
+        assert_eq!(
+            app.exposed_ports,
+            vec![
+                ExposedPort {
+                    proto: ExposedPortProto::Tcp,
+                    port: 8080
+                },
+                ExposedPort {
+                    proto: ExposedPortProto::Udp,
+                    port: 53
+                },
+            ]
+        );
+
+        // A defaulted container must come back defaulted, not filled in.
+        let bare = restored.containers.get("bare").expect("bare container");
+        assert_eq!(
+            bare,
+            &Container {
+                name: "bare".into(),
+                ..Default::default()
+            }
+        );
+    }
+
+    /// `env_vars`, `labels`, and `config` are `IndexMap`s: an image config is
+    /// order-sensitive, so the wire format must not reorder them into a plain
+    /// map's iteration order.
+    #[test]
+    fn container_map_ordering_survives_roundtrip() {
+        let graph = graph_with_containers();
+        let (restored, _td) = roundtrip(&graph);
+        let app = restored.containers.get("app").expect("app container");
+
+        assert_eq!(
+            app.env_vars.keys().collect::<Vec<_>>(),
+            vec!["PATH", "PORT", "RUST_LOG"]
+        );
+        assert_eq!(
+            app.labels.keys().collect::<Vec<_>>(),
+            vec![
+                "org.opencontainers.image.title",
+                "org.opencontainers.image.version"
+            ]
+        );
+        assert_eq!(app.config.keys().collect::<Vec<_>>(), vec!["StopTimeout"]);
+    }
+
+    /// A container names its packages by string; those names must still resolve
+    /// against the restored arena, whose indices are remapped on read.
+    #[test]
+    fn container_packages_resolve_in_restored_graph() {
+        let graph = graph_with_containers();
+        let (restored, _td) = roundtrip(&graph);
+
+        let app = restored.containers.get("app").expect("app container");
+        assert_eq!(app.packages, vec!["shared".to_string(), "top".to_string()]);
+        for pkg in &app.packages {
+            assert!(
+                restored.by_name(pkg).is_some(),
+                "container package {pkg:?} should resolve in the restored graph"
+            );
+        }
+    }
+
+    /// A graph carrying no containers writes no container records, and the
+    /// reader must not invent any.
+    #[test]
+    fn graph_without_containers_roundtrips_empty() {
+        let mut graph = Graph::new();
+        let bsr = graph.insert_build(BuildSpec {
+            name: "solo".into(),
+            from: Arc::new(SpecOrigin::Inline),
+            ..Default::default()
+        });
+        graph.top_levels = vec![bsr];
+
+        let (restored, _td) = roundtrip(&graph);
+        assert_eq!(restored.iter_containers().count(), 0);
+    }
+
+    /// Containers must survive every writer/reader pairing, and must not
+    /// disturb the positional local-file records that follow each build spec.
+    #[tokio::test]
+    async fn container_roundtrip_across_all_stream_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let content = b"container-stream patch\n";
+        let fpath = tmp.path().join("patch.diff");
+        std::fs::write(&fpath, content).unwrap();
+
+        let mut graph = graph_with_containers();
+        let origin = Arc::new(SpecOrigin::Inline);
+        graph.insert_build(BuildSpec {
+            name: "with-file".into(),
+            build_deps: smallvec![BuildDep::Local {
+                full_path: fpath.clone(),
+                filename: "patch.diff".into(),
+                file_hash: blake3::hash(content),
+            }],
+            from: origin,
+            ..Default::default()
+        });
+
+        for label in ["sync", "async", "sync->async", "async->sync"] {
+            let (restored, td) = match label {
+                "sync" => roundtrip(&graph),
+                "async" => async_roundtrip(&graph).await,
+                "sync->async" => sync_write_async_read(&graph).await,
+                _ => async_write_sync_read(&graph).await,
+            };
+            assert!(td.is_some(), "[{label}] should have materialised files");
+
+            assert_eq!(
+                restored.containers, graph.containers,
+                "[{label}] container map should survive the wire format unchanged"
+            );
+
+            // The local file still lands correctly with container records in
+            // the same stream.
+            let spec = restored
+                .get(restored.by_name("with-file").unwrap())
+                .unwrap();
+            let BuildDep::Local { full_path, .. } = &spec.build_deps[0] else {
+                panic!("[{label}] expected Local dep");
+            };
+            assert_eq!(std::fs::read(full_path).unwrap(), content);
+        }
+    }
+
+    /// Both writers must frame container records identically; a divergence here
+    /// would break the cross-format paths above only for graphs with containers.
+    #[tokio::test]
+    async fn sync_and_async_container_bytes_identical() {
+        let graph = graph_with_containers();
+
+        let mut sync_buf = Vec::new();
+        GraphWriter::new(&mut sync_buf).write_graph(&graph).unwrap();
+
+        let mut async_buf = Vec::new();
+        AsyncGraphWriter::new(&mut async_buf)
+            .write_graph(&graph)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sync_buf, async_buf,
+            "sync and async writers diverge on container records"
+        );
+    }
+
+    /// Frames `records` and appends a valid footer checksum, so a test can hand
+    /// the reader a stream the writers would never produce.
+    fn framed_stream(records: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut hasher = blake3::Hasher::new();
+        for (tag, payload) in records {
+            let mut frame = vec![*tag];
+            encode_varint(payload.len() as u64, &mut frame);
+            frame.extend_from_slice(payload);
+            hasher.update(&frame);
+            buf.extend_from_slice(&frame);
+        }
+        buf.push(TAG_FOOTER);
+        encode_varint(32, &mut buf);
+        buf.extend_from_slice(hasher.finalize().as_bytes());
+        buf
+    }
+
+    /// A container record whose payload does not fit [`Container`] must surface
+    /// as a decode error, not a panic — the stream may come from the network.
+    #[tokio::test]
+    async fn malformed_container_record_is_a_clean_error() {
+        let header = serde_json_lenient::to_vec(&HeaderRecord {
+            version: STREAM_VERSION,
+            build_count: 0,
+            target: None,
+        })
+        .unwrap();
+        let stream = framed_stream(&[
+            (TAG_HEADER, header),
+            (
+                TAG_CONTAINER,
+                br#"{"name":"app","container":{"name":"app","packages":"not-an-array"}}"#.to_vec(),
+            ),
+        ]);
+
+        let err = GraphReader::new(io::Cursor::new(stream.clone()))
+            .read_graph()
+            .unwrap_err();
+        assert!(matches!(err, WireError::Json(_)), "sync: got {err:?}");
+
+        let err = AsyncGraphReader::new(io::Cursor::new(stream))
+            .read_graph()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WireError::Json(_)), "async: got {err:?}");
+    }
+
+    /// Containers are keyed by name on both sides, so a stream is free to place
+    /// them anywhere after the header — the reader must not depend on the
+    /// writer's ordering.
+    #[test]
+    fn container_records_decode_before_build_specs() {
+        let header = serde_json_lenient::to_vec(&HeaderRecord {
+            version: STREAM_VERSION,
+            build_count: 0,
+            target: None,
+        })
+        .unwrap();
+        let container = serde_json_lenient::to_vec(&ContainerRecord {
+            name: "app".into(),
+            container: full_container("app"),
+        })
+        .unwrap();
+        let spec = serde_json_lenient::to_vec(&BuildSpecRecord {
+            arena_idx: 0,
+            arena_gen: 0,
+            spec: BuildSpec {
+                name: "shared".into(),
+                from: Arc::new(SpecOrigin::Inline),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+        let stream = framed_stream(&[
+            (TAG_HEADER, header),
+            (TAG_CONTAINER, container),
+            (TAG_BUILD_SPEC, spec),
+        ]);
+
+        let (restored, _td) = GraphReader::new(io::Cursor::new(stream))
+            .read_graph()
+            .unwrap();
+        assert_eq!(restored.containers.get("app"), Some(&full_container("app")));
+        assert!(restored.by_name("shared").is_some());
     }
 }

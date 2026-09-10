@@ -29,6 +29,11 @@
 #   --version VER         Release version / folder name   (VERSION, default: git short sha)
 #   --bucket URL          gs:// bucket URL                 (BUCKET, default: gs://minimal-one)
 #   --allow-missing       Warn and omit rows whose artifact is absent (default: hard error)
+#   --pkg-dir DIR         Also upload DIR's .deb/.rpm/.apk into versions/<V>/pkg/
+#                         (PKG_DIR). With --pkg-only, THAT is all this run does:
+#                         no artifacts dir, no manifest — just the packages,
+#                         for a row that is already staged.
+#   --pkg-only            Only upload --pkg-dir (PKG_ONLY)
 #   --dry-run             Print the manifest and planned uploads; touch nothing
 #   -h, --help            Show this help
 #
@@ -52,6 +57,8 @@ ARTIFACTS_DIR="${ARTIFACTS_DIR:-artifacts}"
 BUCKET="${BUCKET:-gs://minimal-one}"
 VERSION="${VERSION:-}"
 ALLOW_MISSING=0
+PKG_DIR="${PKG_DIR:-}"
+PKG_ONLY="${PKG_ONLY:-0}"
 DRY_RUN=0
 
 # Manifest format version. Bump only on a breaking change to the column layout;
@@ -59,12 +66,19 @@ DRY_RUN=0
 # unsupported value rather than misparsing.
 FORMAT_VERSION=1
 
+# Immutable version artifacts: cache aggressively. Content is addressed by the
+# version segment, so a given URL never changes payload. Shared by both upload
+# paths (the versions/<V>/ row and the --pkg-dir packages).
+IMMUTABLE_CACHE="public, max-age=31536000, immutable"
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --artifacts-dir) ARTIFACTS_DIR="$2"; shift 2 ;;
         --version)       VERSION="$2"; shift 2 ;;
         --bucket)        BUCKET="$2"; shift 2 ;;
         --allow-missing) ALLOW_MISSING=1; shift ;;
+        --pkg-dir)       PKG_DIR="$2"; shift 2 ;;
+        --pkg-only)      PKG_ONLY=1; shift ;;
         --dry-run)       DRY_RUN=1; shift ;;
         -h|--help)       usage 0 ;;
         *)               die "unknown argument: $1 (try --help)" ;;
@@ -81,6 +95,36 @@ case "$VERSION" in
     *[!A-Za-z0-9._-]*) die "version '$VERSION' contains characters outside [A-Za-z0-9._-]" ;;
 esac
 
+# --- The distro-package upload (--pkg-dir / --pkg-only) ---------------------
+#
+# One definition of the versions/<VERSION>/pkg/ write — same immutable cache
+# header as every other staging write — so a workflow does not grow its own
+# gcloud invocation. --pkg-only stages ONLY the packages (no artifacts dir, no
+# manifest): the semver row itself is already staged at that point.
+if [ "$PKG_ONLY" -eq 1 ] && [ -z "$PKG_DIR" ]; then
+    die "--pkg-only needs --pkg-dir"
+fi
+
+upload_pkg_dir() {
+    [ -d "$PKG_DIR" ] || die "pkg dir not found: $PKG_DIR"
+    pkg_files=()
+    for f in "$PKG_DIR"/*; do
+        [ -f "$f" ] && pkg_files+=("$f")
+    done
+    [ "${#pkg_files[@]}" -gt 0 ] || die "no package files in $PKG_DIR (package-nfpm.sh did not run?)"
+    printf '=== %d package(s) -> %s/versions/%s/pkg/ ===\n' "${#pkg_files[@]}" "$BUCKET" "$VERSION" >&2
+    printf '  %s\n' "${pkg_files[@]}" >&2
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    gcloud storage cp \
+        --cache-control="$IMMUTABLE_CACHE" \
+        "${pkg_files[@]}" "$BUCKET/versions/$VERSION/pkg/"
+}
+
+if [ "$PKG_ONLY" -eq 1 ]; then
+    upload_pkg_dir
+    printf 'stage-release: staged packages for %s (no row changes; see set-channel.sh)\n' "$VERSION" >&2
+    exit 0
+fi
 [ -d "$ARTIFACTS_DIR" ] || die "artifacts dir not found: $ARTIFACTS_DIR"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found"
 if [ "$DRY_RUN" -eq 0 ]; then
@@ -268,6 +312,10 @@ gcloud storage cp \
 gcloud storage cp \
     --cache-control="$IMMUTABLE_CACHE" \
     "$manifest" "$version_prefix/components"
+
+if [ -n "$PKG_DIR" ]; then
+    upload_pkg_dir
+fi
 
 printf 'stage-release: staged %s at %s (no channel updated; see set-channel.sh)\n' \
     "$VERSION" "$version_prefix" >&2

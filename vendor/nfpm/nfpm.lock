@@ -1,0 +1,8 @@
+# nfpm pinned pre-built release, verified by SHA-256.
+# Source: https://github.com/goreleaser/nfpm/releases/tag/v2.47.0
+# Digests are the upstream-published sha256sums for each release asset
+# (the release's checksums.txt). scripts/package-nfpm.sh reads this lock
+# the same way scripts/fetch-gvproxy.sh reads vendor/gvproxy/gvproxy.lock.
+version=v2.47.0
+nfpm_2.47.0_Linux_x86_64.tar.gz=0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
+nfpm_2.47.0_Linux_arm64.tar.gz=1c0f5f2999b9a974bfb04fdb0cc3306096de530ac5dbb25d739cc5f5219c919c

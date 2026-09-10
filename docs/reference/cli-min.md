@@ -107,6 +107,15 @@ when `--no-input` is set or stdin/stdout is not a terminal). Attach to the
 existing session instead when you mean to
 rejoin it.
 
+When `PATH` has no `minimal.toml`, activation still succeeds and the session
+comes up with a default environment. On an interactive terminal `min` first
+offers to scaffold a `minimal.toml`; accepting writes one into `PATH`, while
+declining leaves your directory untouched. When prompts are skipped
+(`--no-input`, or a non-terminal stdin) `min` prints a notice and continues
+without writing anything to `PATH` — the daemon fabricates a default config
+inside the session's own workspace instead. `--loadout` is resolved before any
+of this, so an unknown loadout name errors even in a directory with no config.
+
 ### `session attach`
 
 ```

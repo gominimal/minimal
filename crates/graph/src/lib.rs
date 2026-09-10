@@ -29,6 +29,8 @@ pub enum Error {
     ConflictingProfile { name: String },
     /// A stack has the same name as a stack in a higher layer.
     ConflictingStack { name: String },
+    /// A container has the same name as a container in a higher layer.
+    ConflictingContainer { name: String },
     /// A package with a certain name was requested, but not found in the graph.
     NoSuchPkg { name: String },
     /// Failed to load the source code for an upstream.
@@ -69,6 +71,9 @@ impl Error {
             .unwrap(),
             Error::ConflictingStack { name } => {
                 writeln!(writer, "Error: stack '{}' already exists", name,).unwrap()
+            }
+            Error::ConflictingContainer { name } => {
+                writeln!(writer, "Error: container '{}' already exists", name,).unwrap()
             }
             Error::ConflictingPackage { from, .. } => {
                 writeln!(writer, "Error: package '{}' already exists", from.1,).unwrap()
@@ -202,7 +207,7 @@ pub use loader::{ChainLoader, LayerCache, LayerCacheDir, SourceProvider};
 pub mod wire;
 
 mod spec_hasher;
-pub use spec_hasher::SpecHasher;
+pub use spec_hasher::{ContainerHasher, SpecHasher};
 
 mod planner;
 pub use planner::Dep as PlannerDep;

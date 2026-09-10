@@ -10,3 +10,5 @@ target/
 # Finder metadata. macOS is a first-class dev platform here, so these appear in
 # every directory anyone browses; unignored, a wide `git add` sweeps them in.
 .DS_Store
+# just pkg-nfpm default OUT_DIR (scripts/package-nfpm.sh)
+/dist/
