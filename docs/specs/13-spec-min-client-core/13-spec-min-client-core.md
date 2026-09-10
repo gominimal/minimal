@@ -1,7 +1,6 @@
 ---
 id: MCC
 title: "Shared min client core: one Rust core for the CLI, the browser and mobile"
-status: draft
 owner: mitodrummer
 epic: gominimal/inbox#513
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
@@ -78,11 +77,11 @@ cites them rather than repeating them.
 Siblings: the browser client spec (WMC, webapp#763) consumes the browser
 contract group by ID; the mesh-ingress spec (MMI, #1356) is the daemon
 side, bound by ID here, and may be superseded by the networking spec in
-preparation, whose inputs are the architecture's networking requirements v2
-(arch#46) and its deployment and egress-gateway design — ingress and
-transport bind to that spec by name once it exists; the GitHub sessions
-spec (GHS, #1351) owns the CLI sign-in ceremony; the Box Provider
-abstraction (BPA, arch#45) states what a provider reports about a host.
+preparation, which implements the architecture's networking requirements
+v2 and its [deployment and egress-gateway design](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)
+v0.2 (the *networking design*, cited by section); the GitHub sessions spec
+(GHS, #1351) owns the CLI sign-in ceremony; the Box Provider abstraction
+(BPA, arch#45) states what a provider reports about a host.
 
 ### Core boundary
 
@@ -115,9 +114,11 @@ abstraction (BPA, arch#45) states what a provider reports about a host.
 
 ### Transport and network layer
 
-How a daemon is reached — whether the head is a mesh peer or dials a
-gateway — is the networking spec's to decide; until it exists these bind to
-MMI by ID.
+Off the local machine the head is a mesh peer of the node it attaches to.
+On a pinned host the attach path transits the host's Egress Gateway, which
+forwards exactly as a relay does; direct paths are preferred only for
+unpinned nodes (networking design §4.5). The daemon side binds to MMI by
+ID until the networking spec replaces it.
 
 - **MCC-010** THE SYSTEM SHALL run the attach sequence and the RPC driver
   over any byte stream the host supplies, exchanging the same messages with
@@ -157,8 +158,9 @@ MMI by ID.
   it first, and dial the node's home relay with the node's ticket only when
   the direct dial fails — a refused connection, or MCC-011's 20 s passing
   from the dial request with no handshake response, the pipe never opening
-  included — or none is advertised (Gatehouse §6.9; architecture D7); the
-  fallback runs inside MCC-060's attach bound.
+  included — or none is advertised, as for a pinned host, whose home relay
+  is its Egress Gateway (Gatehouse §6.9; architecture D7; networking design
+  §4.5); the fallback runs inside MCC-060's attach bound.
   tier:     T0
   verify:   cargo nextest run -p min-core direct_endpoint_first_relay_as_fallback
 
@@ -543,8 +545,10 @@ and verified there.
   tunnel address and prefix, and per node its identity, `wg_pub`, tunnel
   address, allowed IPs, SSH port, expected host principal, `td` (checked
   against the credential's trust domain, MCC-038) and reachability options
-  — a direct endpoint and/or a home relay dialed with a ticket; liveness,
-  `last_seen` and the display name come from the node listing (MCC-015).
+  — a direct endpoint and/or a home relay dialed with a ticket, which for a
+  pinned host is its Egress Gateway, with no direct endpoint (networking
+  design §4.5); liveness, `last_seen` and the display name come from the
+  node listing (MCC-015).
   tier:     T0
   verify:   cargo nextest run -p min-core peer_document_maps_onto_the_attach_configuration
   - THE SYSTEM SHALL reject a document whose `seq` regresses below the last
@@ -645,7 +649,8 @@ and verified there.
 - The daemon's ingress, certificate-auth surface and allowlist, host
   certificate, terminal state and repaint, exit signals and the relay
   service: the mesh-ingress spec (MMI, #1356), which the networking spec in
-  preparation may supersede.
+  preparation may supersede. The Egress Gateway and its forwarding role:
+  the networking design (§4), implemented by that networking spec.
 - The browser page — origin, policy, integrity loading, key generation,
   storage, reconnect cadence, rendering, mobile layout: the browser client
   spec (WMC, webapp#763).
@@ -699,15 +704,17 @@ the architecture overview (plan S5).
 
 **The tab is a mesh node and no server is in the session path** (decided
 2026-09-03, plan entries 12, 18, 23, 24; Gatehouse §6.9 and architecture
-D7 since v1.12). Servers remain for the page, the identity plane and a
-stateless relay forwarding ciphertext for daemons behind NAT; none holds a
-box credential or sees SSH bytes (T29). The tab dials direct first
-(MCC-014) and opens a relay socket with a per-node ticket that authorizes
-routing only (MCC-071). Whether that shape survives — a tab as a WireGuard
-peer, or a tab dialing a host's gateway ingress — is the networking spec's
-to decide (decided 2026-09-09); this document moves no transport text until
-it exists, and MMI, which this document binds for ingress and the relay,
-may fold into it.
+D7 since v1.12). Servers remain for the page, the identity plane, a
+stateless relay forwarding ciphertext for daemons behind NAT and, for a
+pinned host, its Egress Gateway forwarding the same way; none holds a box
+credential or sees SSH bytes (Gatehouse T29, T30). The tab dials direct
+first (MCC-014) and opens a relay socket with a per-node ticket that
+authorizes routing only (MCC-071). Whether the tab stays a WireGuard peer
+was deferred to the networking spec on 2026-09-09; the networking design
+that spec implements answers it (v0.2, §4.5, §6): the tab stays a peer,
+the gateway admits it by the same ticket, and gateway ingress serves
+public exposure, not attach. MMI, which this document binds for ingress
+and the relay, may fold into that spec.
 
 **A public client with tokens in memory** (decided 2026-09-03, entries 10,
 15 to 17; Gatehouse §6.1.7 since v1.11). With no backend, only the tab can
@@ -750,10 +757,11 @@ Host CA rotates. Carried as an open question.
 **The expected principal is the node's canonical name** (Gatehouse §5.3,
 v1.15). A mesh attach dials a tunnel address and verifies the certificate
 against `<node_id>.box.<td>`, which the peer document names; tunnel
-addresses are never principals and owe no stability, so renumbering forces
-no host-cert renewal. The core checks natively (MCC-032); the CLI's
-`known_hosts` fragment (MCC-052) is the `HostKeyAlias` form of the same
-rule.
+addresses are never principals and owe no stability — since v1.17 they
+come from the tenant's address plan and may renumber freely (§6.9) — so
+renumbering forces no host-cert renewal. The core checks natively
+(MCC-032); the CLI's `known_hosts` fragment (MCC-052) is the
+`HostKeyAlias` form of the same rule.
 
 **Constants.** 60 s silent-peer (MCC-013) is two 25 s keepalive intervals
 plus a 10 s margin for a late one; 20 s
@@ -851,11 +859,11 @@ WMC's.
 **Generality:** A second head fits by construction: the mobile app is the
 same core behind a UDP datagram pipe and a keystore-backed signer; the CLI
 is the same core behind a local socket and an agent-backed signer. A second
-daemon fits if it terminates SSH inside the tunnel the networking spec
-chooses and presents a Gatehouse host certificate. A second identity plane
-does not fit: the certify, anchors, peer-document and ticket shapes
-(MCC-068, MCC-070, MCC-071) are Gatehouse's by decision, acceptable because
-Gatehouse is the only identity plane in the system.
+daemon fits if it terminates SSH inside the mesh tunnel the networking
+design specifies and presents a Gatehouse host certificate. A second
+identity plane does not fit: the certify, anchors, peer-document and
+ticket shapes (MCC-068, MCC-070, MCC-071) are Gatehouse's by decision,
+acceptable because Gatehouse is the only identity plane in the system.
 
 ## Security considerations
 
@@ -880,6 +888,14 @@ Gatehouse is the only identity plane in the system.
   sign-in (Gatehouse §6.1.1); the head's key used for DPoP and SSH
   authentication only.
   covered by: MCC-035, MCC-036, MCC-042
+- **Invariant:** THE SYSTEM SHALL carry nothing through a relay or an
+  Egress Gateway but the WireGuard datagrams of a tunnel to the ticket's
+  node, SSH running end to end inside it, so a forwarder sees ciphertext
+  and metadata only.
+  enforced by: one datagram per frame as the socket's only payload, the
+  ticket used only for its node, and host verification inside the tunnel
+  (Gatehouse T29, T30; networking design §4.5).
+  covered by: MCC-011, MCC-012, MCC-032, MCC-071
 - **Invariant:** THE SYSTEM SHALL renew a browser credential unattended for
   at most 8 h and only while an attachment is open, and hold a browser mesh
   key for at most 8 h.
