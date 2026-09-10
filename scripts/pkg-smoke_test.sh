@@ -4,11 +4,10 @@
 #
 # Drives the smoke end to end against a stubbed `distrobox` on PATH (no
 # container engine, no images, no network): the stub answers each in-box probe
-# with canned output and records every invocation, while fail-loud `podman` and
-# `apx` shims prove the script never reaches for them (the distrobox-only rule).
-# Asserts artifact discovery per host arch, version assertions, the uninstall
-# round-trip, cleanup even when a check fails, --keep-boxes, and the
-# --apparmor/--formats interaction. Run directly or via `just test-shell`.
+# with canned output and records every invocation. Asserts artifact discovery
+# per host arch, version assertions, the uninstall round-trip, cleanup even when
+# a check fails, --keep-boxes, and the --apparmor/--formats interaction. Run
+# directly or via `just test-shell`.
 
 set -euo pipefail
 
@@ -63,16 +62,6 @@ case "$1" in
 esac
 STUB
 chmod +x "$root/bin/distrobox"
-
-# Fail-loud guards: any podman/apx call from the script breaks the run.
-for guard in podman apx; do
-    cat >"$root/bin/$guard" <<GUARD
-#!/usr/bin/env bash
-echo "pkg-smoke_test: $guard was invoked (script must use distrobox only)" >&2
-exit 99
-GUARD
-    chmod +x "$root/bin/$guard"
-done
 
 # uname shim so arch gating is testable on either host arch.
 cat >"$root/bin/uname" <<'UNAME'

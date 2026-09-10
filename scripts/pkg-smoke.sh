@@ -20,10 +20,6 @@
 # CAP_MAC_ADMIN) and kernels without AppArmor cannot take a profile at all —
 # the package must install cleanly either way, which is the invariant here.
 #
-# This script drives distrobox and nothing else: no apx, no raw podman. apx
-# subsystems are distrobox boxes under the hood, but apx has no non-interactive
-# exec, and mixing the two CLIs leaves the boxes in different namespaces.
-#
 # Usage:
 #   scripts/pkg-smoke.sh [--pkg-dir DIR] [--formats deb,rpm,apk]
 #                        [--apparmor] [--keep-boxes]
@@ -64,7 +60,7 @@ while [ $# -gt 0 ]; do
 done
 
 command -v distrobox >/dev/null 2>&1 ||
-    die "distrobox not found on PATH; it drives the boxes (no apx, no raw podman)"
+    die "distrobox not found on PATH"
 
 # Host arch → package arch. The aarch64 variants only install on an arm64 host;
 # a cross smoke would need an arm64 box image, which distrobox cannot fake.
