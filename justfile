@@ -182,6 +182,19 @@ dist-build target:
 pkg-nfpm pkgver:
     PKGVER={{quote(pkgver)}} scripts/package-nfpm.sh
 
+# Install-smoke packages built by pkg-nfpm (default OUT_DIR: dist/) in
+# throwaway distrobox boxes named min-test-{deb,rpm,apk}: the package manager
+# accepts and records the exact version, every shipped path exists, the
+# binaries run on the box's libc, and an uninstall round-trip cleans up. This
+# is the pre-publish ritual from the review feedback — run it before staging a
+# tag; the CI-native container smoke is a separate, follow-up lane. Distrobox
+# drives everything (no apx, no raw podman — see the script header); boxes are
+# removed even on failure unless --keep-boxes is passed through.
+# Linux-only: needs distrobox and a container engine on the host.
+[linux]
+pkg-smoke pkgdir="dist" *args:
+    scripts/pkg-smoke.sh --pkg-dir {{quote(pkgdir)}} {{args}}
+
 # Restage an already-shipped release under its semver so the command above can
 # see it (the one-time fix for releases staged before the semver-row
 # convention, e.g. `just backfill-version-row abc12345 0.5.3`).
