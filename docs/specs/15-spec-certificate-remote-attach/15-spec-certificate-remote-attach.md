@@ -30,7 +30,7 @@ daemon enrolled with the identity plane the way they work with local ones,
 and a session outlives the laptop that started it.
 
 **Success:** a developer on a machine with no `ssh` installed signs in once,
-then lists, attaches to, renames and stops sessions on a remote Box Host and
+then lists, attaches to, renames and destroys sessions on a remote Box Host and
 on another of their own enrolled machines with the same commands as local
 ones; a dropped connection leaves each session running detached, and a
 revoked certificate loses its access within a second of the daemon learning
@@ -156,7 +156,7 @@ the requirements cite them rather than restate them.
 ### Same commands, local or remote
 
 - **CRA-009** THE SYSTEM SHALL accept `min session attach`, `ls`, `rename`
-  and `stop` for a session on a remote daemon with the same arguments and
+  and `destroy` for a session on a remote daemon with the same arguments and
   output as for a local one.
   tier:     T0
   verify:   cargo nextest run -p minimal remote_session_commands_match_local_grammar
@@ -261,9 +261,11 @@ the requirements cite them rather than restate them.
   verify:   cargo nextest run -p minimald user_certificate_vectors_refused_with_named_reason
 
 - **CRA-023** THE SYSTEM SHALL let a certificate-authenticated connection
-  list, attach to, rename or stop only the sessions its subject owns: the
-  subject whose connection created the session, or, for a session created
-  over the local socket or vsock, the node's enrolling owner.
+  perform any operation on a session, whether listing, attaching, running a
+  command, renaming, destroying or one added later, only when its subject
+  owns the session: the subject whose connection created it, or, for a
+  session created over the local socket or vsock, the node's enrolling
+  owner.
   tier:     T0
   verify:   cargo nextest run -p minimald certificate_connection_reaches_only_owned_sessions
 
@@ -366,11 +368,23 @@ was offered and declined; so was letting hand-configured trust anchors stand
 in for enrolment, which would have made a second way in. How a remote client
 reaches a laptop is the networking work's.
 
+**One owner rule for every operation.** CRA-023 covers every operation on a
+session, those added later included, so a new command is owner-only without
+an edit here. Naming `destroy` and `exec` beside the original four, or leaving
+them to the security invariant, were the alternatives (review of this spec,
+2026-09-11).
+
 **No `ssh` required.** The first version could have kept the system `ssh`
 client, which already speaks user and host certificates, and deferred an
 in-process client to the browser build. The in-process client was chosen now
 (CRA-010), because it is the foundation the browser build reuses and it
 removes a dependency developers otherwise need.
+
+**Today's command names.** CRA-009 names `destroy`, the CLI's session verb
+today, where the epic's story says `stop`; a command that ends a session's
+processes and keeps its record is left to the remote-sessions work. Keeping
+`stop`, or naming both, were the alternatives, and the story keeps the epic's
+words until the epic is edited (review of this spec, 2026-09-11).
 
 **Reconnect until back or detached.** A dropped attach retries on its own
 (CRA-017), which suits long agent runs. Exiting on every drop, and retrying
@@ -428,8 +442,7 @@ CRA-003.
 
 - **Invariant:** THE SYSTEM SHALL expose no session to a subject that does
   not own it.
-  enforced by: the daemon's owner check on every list, attach, rename and
-  stop
+  enforced by: the daemon's owner check on every operation on a session
   covered by: CRA-023
 
 - **Invariant:** THE SYSTEM SHALL let no process in a session sign with, or
