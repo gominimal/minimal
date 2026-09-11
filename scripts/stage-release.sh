@@ -134,11 +134,22 @@ fi
 # smoke then fails leaves an unpromotable row, not a stale blessing; the
 # restage's own run re-records once its smoke passes. Called at the first
 # upload site of whichever path runs (the row, or --pkg-only).
+# Only a confirmed not-found is tolerated: any other failure (auth, permission,
+# a transient storage error) would leave the stale marker in place under the
+# new bytes, so it stops the restage before the first upload.
 invalidate_smoked() {
     [ "$RESTAGE" -eq 1 ] || return 0
-    if gcloud storage rm "$BUCKET/versions/$VERSION/smoked" >/dev/null 2>&1; then
+    local marker="$BUCKET/versions/$VERSION/smoked" err
+    if err="$(gcloud storage rm "$marker" 2>&1 >/dev/null)"; then
         printf 'stage-release: --restage: removed versions/%s/smoked — the row must be smoked again before it can be promoted\n' "$VERSION" >&2
+        return 0
     fi
+    case "$err" in
+        *"matched no objects"*|*NotFound*|*"404"*|*"does not exist"*)
+            printf 'stage-release: --restage: versions/%s/smoked was not present (nothing to invalidate)\n' "$VERSION" >&2 ;;
+        *)
+            die "--restage could not remove $marker, so its stale smoke provenance would survive the overwrite — nothing was uploaded. gcloud said: $err" ;;
+    esac
 }
 
 # --- The distro-package upload (--pkg-dir / --pkg-only) ---------------------

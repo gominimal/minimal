@@ -28,7 +28,9 @@ if [ "${1:-} ${2:-} ${3:-}" = "storage objects describe" ]; then
     exit 1
 fi
 if [ "${1:-} ${2:-}" = "storage rm" ]; then
+    # GCLOUD_STUB_RM_ERROR overrides the not-found failure with another one.
     [ "${GCLOUD_STUB_SMOKED:-0}" = 1 ] && exit 0
+    printf '%s\n' "${GCLOUD_STUB_RM_ERROR:-ERROR: (gcloud.storage.rm) The following URLs matched no objects or files: $3}" >&2
     exit 1
 fi
 exit 0
@@ -42,7 +44,7 @@ if ! command -v sha256sum >/dev/null 2>&1; then
 fi
 export PATH="$root/bin:$PATH"
 export GCLOUD_STUB_ARGS="$root/gcloud-args"
-unset GCLOUD_STUB_EXISTS GCLOUD_STUB_SMOKED RESTAGE VERSION BUCKET ARTIFACTS_DIR PKG_DIR PKG_ONLY
+unset GCLOUD_STUB_EXISTS GCLOUD_STUB_SMOKED GCLOUD_STUB_RM_ERROR RESTAGE VERSION BUCKET ARTIFACTS_DIR PKG_DIR PKG_ONLY
 
 mkdir -p "$root/artifacts" "$root/pkg"
 printf 'fake min\n' >"$root/artifacts/minimal-linux-amd64"
@@ -150,7 +152,27 @@ fi
 expect 0 "staged 0.6.0" "--restage over a never-smoked row is fine (no marker to remove)" -- \
     with GCLOUD_STUB_EXISTS=1 GCLOUD_STUB_SMOKED=0 -- stage --version 0.6.0 --restage
 expect_calls 1 "^storage rm " "the removal is still attempted, and its absence is not an error"
-expect_calls 0 "removed versions" "no removal is claimed when there was no marker"
+expect 0 "smoked was not present (nothing to invalidate)" "a confirmed not-found is reported as such" -- \
+    with GCLOUD_STUB_EXISTS=1 GCLOUD_STUB_SMOKED=0 -- stage --version 0.6.0 --restage
+expect 0 "staged 0.6.0" "gcloud's NotFoundException spelling is also tolerated" -- \
+    with GCLOUD_STUB_EXISTS=1 GCLOUD_STUB_SMOKED=0 GCLOUD_STUB_RM_ERROR="ERROR: (gcloud.storage.rm) NotFoundException: 404 gs://test-bucket/versions/0.6.0/smoked does not exist." -- \
+    stage --version 0.6.0 --restage
+
+# Any other deletion failure stops the restage before the first upload: the
+# stale marker would otherwise survive under the new bytes.
+for rm_err in \
+    "ERROR: (gcloud.storage.rm) HTTPError 403: user@example.com does not have storage.objects.delete access to the Google Cloud Storage object." \
+    "ERROR: (gcloud.storage.rm) There was a problem refreshing your current auth tokens: Reauthentication is needed." \
+    "ERROR: (gcloud.storage.rm) HTTPError 503: Service Unavailable"; do
+    expect 1 "could not remove gs://test-bucket/versions/0.6.0/smoked, so its stale smoke provenance would survive the overwrite — nothing was uploaded. gcloud said: $rm_err" \
+        "--restage dies on: ${rm_err:26:40}..." -- \
+        with GCLOUD_STUB_EXISTS=1 GCLOUD_STUB_SMOKED=0 GCLOUD_STUB_RM_ERROR="$rm_err" -- stage --version 0.6.0 --restage
+    expect_calls 0 "^storage cp " "nothing is uploaded after a failed marker deletion (${rm_err:26:20}...)"
+done
+expect 1 "could not remove" "--pkg-only --restage dies the same way" -- \
+    with GCLOUD_STUB_EXISTS=1 GCLOUD_STUB_SMOKED=0 GCLOUD_STUB_RM_ERROR="ERROR: (gcloud.storage.rm) HTTPError 403: forbidden" -- \
+    stage --version 0.6.0 --restage --pkg-only --pkg-dir "$root/pkg"
+expect_calls 0 "^storage cp " "--pkg-only uploads nothing after a failed marker deletion"
 with GCLOUD_STUB_EXISTS=0 GCLOUD_STUB_SMOKED=1 -- stage --version 0.6.0 >/dev/null 2>&1
 expect_calls 0 "^storage rm " "a fresh (non-restage) stage never touches a marker"
 expect 0 "removed versions/0.6.0/smoked" "--pkg-only --restage also invalidates the marker before its upload" -- \
