@@ -1,0 +1,66 @@
+[package]
+name = "min-core"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Probe: the min attach sequence over a pluggable transport, built for wasm32-unknown-unknown"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# ring, not aws-lc-rs: the browser target cannot build aws-lc-rs, and ring is
+# what russh's own wasm CI uses (flate2,ring).
+russh = { version = "0.63.1", default-features = false, features = ["ring", "flate2"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "sync", "macros"] }
+thiserror = "2"
+bytes = "1"
+base64 = "0.22"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+getrandom = "0.2"
+ring = "0.17"
+# Stage 1b: userspace WireGuard + TCP/IP so SSH runs inside the tunnel.
+boringtun = { version = "0.7", default-features = false }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "alloc", "medium-ip", "proto-ipv4", "socket-tcp", "async", "log"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2.126"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["WebSocket", "MessageEvent", "BinaryType", "CloseEvent", "ErrorEvent", "Event"] }
+send_wrapper = { version = "0.6", features = ["futures"] }
+console_error_panic_hook = "0.1"
+gloo-timers = { version = "0.3", features = ["futures"] }
+# ring's wasm32-unknown-unknown entropy path (getrandom 0.2 `js` feature).
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+# getrandom 0.4 arrives via ssh-key -> p256 -> elliptic-curve -> crypto-bigint;
+# on wasm32-unknown-unknown it needs the wasm_js feature plus the
+# `--cfg getrandom_backend="wasm_js"` rustflag in .cargo/config.toml.
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["net", "rt", "macros", "io-util", "time"] }
+# Native only, for the test doubles: the WebSocket peer that stands in for a
+# daemon with a WireGuard-over-WebSocket ingress.
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
+
+[dev-dependencies]
+boringtun = { version = "0.7", default-features = false }
+rand_core = { version = "0.6", features = ["getrandom"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "sync"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[patch.crates-io]
+# boringtun 0.7.1's sleep-aware clock has unix and windows backends only; this
+# adds a web-time backend for wasm32-unknown-unknown. See patches/.
+boringtun = { path = "vendor/boringtun" }
+
+[workspace]

@@ -1,0 +1,27 @@
+{
+  "serial": 1,
+  "type": "user",
+  "signing_ca": "ca-user",
+  "key_id_json": {
+    "v": 1,
+    "sub": "u:gh:583231",
+    "td": "acme.gatehouse.io",
+    "txn": "01JROOT0000000000000000000",
+    "chain": 0
+  },
+  "valid_principals": [
+    "u:gh:583231",
+    "dev"
+  ],
+  "valid_after": 1749900000,
+  "valid_before": 1781536000,
+  "extensions_include": [
+    "permit-pty",
+    "subject@gatehouse.dev",
+    "chain@gatehouse.dev",
+    "scope@gatehouse.dev",
+    "txn@gatehouse.dev"
+  ],
+  "critical_options": [],
+  "subject_ckt": "ee1dGdZ-I4seKblZ3jOgIy6ZiTCu4XvCPeegCcbuFgw"
+}

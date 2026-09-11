@@ -1,0 +1,9 @@
+{
+  "serial": 100,
+  "type": "host",
+  "signing_ca": "ca-host",
+  "valid_principals": [
+    "sbx-01jx.sbx.acme.gatehouse.io",
+    "10.0.0.5"
+  ]
+}

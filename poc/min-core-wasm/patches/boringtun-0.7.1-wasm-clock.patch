@@ -1,0 +1,70 @@
+diff -ruN '--exclude=benches' '--exclude=.cargo*' '--exclude=Cargo.lock' '--exclude=*.orig' state/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/boringtun-0.7.1/Cargo.toml workbench/.scratch/min-core-wasm/vendor/boringtun/Cargo.toml
+--- boringtun/Cargo.toml	2006-07-24 01:21:28.000000000 +0000
++++ boringtun/Cargo.toml	2026-09-04 04:59:16.290711725 +0000
+@@ -126,6 +126,9 @@
+ [dependencies.untrusted]
+ version = "0.9.0"
+ 
++[dependencies.web-time]
++version = "1.1"
++
+ [dependencies.x25519-dalek]
+ version = "2.0.1"
+ features = [
+diff -ruN '--exclude=benches' '--exclude=.cargo*' '--exclude=Cargo.lock' '--exclude=*.orig' state/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/boringtun-0.7.1/src/noise/handshake.rs workbench/.scratch/min-core-wasm/vendor/boringtun/src/noise/handshake.rs
+--- boringtun/src/noise/handshake.rs	2006-07-24 01:21:28.000000000 +0000
++++ boringtun/src/noise/handshake.rs	2026-09-04 04:59:16.290711725 +0000
+@@ -14,7 +14,10 @@
+ use rand_core::OsRng;
+ use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+ use std::convert::TryInto;
+-use std::time::{Duration, SystemTime};
++use std::time::Duration;
++// Wall clock for the TAI64N stamp: `std::time::SystemTime` on native, `Date.now()`
++// on wasm32-unknown-unknown, where std's implementation panics (min-core patch).
++use web_time::SystemTime;
+ 
+ #[cfg(feature = "mock-instant")]
+ use mock_instant::Instant;
+diff -ruN '--exclude=benches' '--exclude=.cargo*' '--exclude=Cargo.lock' '--exclude=*.orig' state/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/boringtun-0.7.1/src/sleepyinstant/mod.rs workbench/.scratch/min-core-wasm/vendor/boringtun/src/sleepyinstant/mod.rs
+--- boringtun/src/sleepyinstant/mod.rs	2006-07-24 01:21:28.000000000 +0000
++++ boringtun/src/sleepyinstant/mod.rs	2026-09-03 21:22:33.166573594 +0000
+@@ -13,6 +13,11 @@
+ #[cfg(unix)]
+ use unix as inner;
+ 
++#[cfg(not(any(unix, target_os = "windows")))]
++mod wasm;
++#[cfg(not(any(unix, target_os = "windows")))]
++use wasm as inner;
++
+ /// A measurement of a monotonically nondecreasing clock.
+ /// Opaque and useful only with [`Duration`].
+ ///
+diff -ruN '--exclude=benches' '--exclude=.cargo*' '--exclude=Cargo.lock' '--exclude=*.orig' state/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/boringtun-0.7.1/src/sleepyinstant/wasm.rs workbench/.scratch/min-core-wasm/vendor/boringtun/src/sleepyinstant/wasm.rs
+--- boringtun/src/sleepyinstant/wasm.rs	1970-01-01 00:00:00.000000000 +0000
++++ boringtun/src/sleepyinstant/wasm.rs	2026-09-03 21:22:33.158573594 +0000
+@@ -0,0 +1,23 @@
++//! Fallback clock for targets with neither `clock_gettime` nor the Windows
++//! APIs — in practice `wasm32-unknown-unknown`, where `std::time::Instant`
++//! panics. `web-time` reads `performance.now()` in a browser and is a plain
++//! `std::time::Instant` everywhere else. A page cannot observe host sleep the
++//! way the unix backend does, so this clock is monotonic but not sleep-aware.
++use std::time::Duration;
++
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct Instant {
++    t: web_time::Instant,
++}
++
++impl Instant {
++    pub(crate) fn now() -> Self {
++        Self {
++            t: web_time::Instant::now(),
++        }
++    }
++
++    pub(crate) fn duration_since(&self, earlier: Instant) -> Duration {
++        self.t.saturating_duration_since(earlier.t)
++    }
++}
