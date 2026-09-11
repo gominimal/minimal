@@ -561,9 +561,19 @@ pub fn interpolate_task_strings(
         common::ncl_eval::VarCtx::from_iter(base)
     };
     task.map_exec_strings(|s| {
-        var_ctx
-            .eval_string(s)
-            .map_err(|_| anyhow::anyhow!("nickel eval failed for string: {}", s))
+        var_ctx.eval_string(s).map_err(|_| {
+            if s.contains("%{") {
+                anyhow::anyhow!(
+                    "nickel eval failed for string: {s}\n\
+                     note: command strings are Nickel-evaluated, so `%{{` opens an \
+                     interpolation even when the task defines no matching arg; to keep a \
+                     literal `%{{` (as in curl's `-w \"%{{http_code}}\"`), escape it as \
+                     `%{{\"%\"}}{{http_code}}` — see docs/reference/tasks.md"
+                )
+            } else {
+                anyhow::anyhow!("nickel eval failed for string: {s}")
+            }
+        })
     })
     .map_err(Error::Other)
 }
@@ -999,6 +1009,50 @@ mod tests {
             declared_by(&packages, "~/.npmrc", "test"),
             "task `test`",
             "a path no package declared came from the task's own patch table"
+        );
+    }
+
+    /// A command string carrying a shell format specifier such as curl's
+    /// `%{http_code}` is Nickel-interpolated; with no matching arg defined the
+    /// eval fails, and the error must point at the literal-`%{` escape rather
+    /// than reporting a bare eval failure.
+    #[test]
+    fn interpolate_surfaces_percent_brace_escape() {
+        let task = mfile::Task {
+            action: mfile::TaskAction::exec_from_str(
+                "curl -s -o /dev/null -w \"%{http_code}\" https://example.com",
+            ),
+            ..Default::default()
+        };
+        let err = interpolate_task_strings(&task, None).expect_err("eval must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("%{\"%\"}{"),
+            "error should suggest the literal-`%{{` escape, got: {msg}"
+        );
+    }
+
+    /// The companion of the failure case above: the escape the error suggests
+    /// must actually work. Applying `%{"%"}{http_code}` to curl's `-w` yields
+    /// the literal `%{http_code}` in the resolved command — proving the escape
+    /// documented in the error and `docs/reference/tasks.md` is correct, not
+    /// just that a matching typo appears in both the code and the message.
+    #[test]
+    fn interpolate_escaped_percent_brace_yields_literal() {
+        let task = mfile::Task {
+            action: mfile::TaskAction::exec_from_str(
+                "curl -s -o /dev/null -w \"%{\"%\"}{http_code}\" https://example.com",
+            ),
+            ..Default::default()
+        };
+        let resolved = interpolate_task_strings(&task, None)
+            .expect("the escaped `%{` must evaluate successfully");
+        let mfile::TaskAction::Exec(mfile::StrOrList::Single(cmd)) = resolved.action else {
+            panic!("expected a single exec string");
+        };
+        assert_eq!(
+            cmd, "curl -s -o /dev/null -w \"%{http_code}\" https://example.com",
+            "the `%{{\"%\"}}{{...}}` escape should resolve to a literal `%{{http_code}}`"
         );
     }
 
