@@ -149,9 +149,11 @@ or a session, and the operator who runs the daemon.
 - A new network mode: this work adds none.
 - Dynamic ingress port mappings: unchanged, in 03-spec-networking R2.3.
 - The tools that the guest root filesystem needs for the in-VM task attach:
-  none. The sandbox layer makes the tap in the namespace of the sandbox on
-  every deployment model, so the daemon runs no program to move a tap or to
-  enter a namespace. See [One tap mechanism](#one-tap-mechanism).
+  none on the path this spec describes, because the sandbox layer makes the
+  tap in the namespace of the sandbox. The fallback for the one deployment
+  model where that does not work still runs `ip` and `nsenter`, and the guest
+  root filesystem already has both. See
+  [One tap mechanism](#one-tap-mechanism).
 - A network mode of its own for a task run: the command that starts a task has
   no option for the mode today, and it always asks for the host network. This
   spec makes the mode of a task reach its sandbox; it adds no option. See
@@ -211,17 +213,36 @@ The rootless mechanism works when the parent process is root, so the in-VM
 path can use it too. A proof runs both cases in the native lane
 (`crates/minimald/tests/rustslirp_root_integration.rs`).
 
-This removes the second mechanism, and with it the second rollback owner. The
-two deployment paths then differ in one value: the transport that carries the
-file descriptor to the switch. Both transports already share one frame relay,
-so the frames do not change.
+This removes the second mechanism from the design, and with it the second
+rollback owner. The two deployment paths then differ in one value: the
+transport that carries the file descriptor to the switch. Both transports
+already share one frame relay, so the frames do not change.
+
+**One deployment model does not do this yet.** In the x86_64 KVM guest the
+sandbox layer makes no tap, and gives out no file descriptor. This is not a
+lack of the two things the mechanism needs: the daemon reports that
+`/dev/net/tun` is present and that user namespaces are available. The same
+code makes a tap correctly on a native host as root (the proof above, on an
+x86_64 runner) and in the aarch64 microVM guest (the session end-to-end proof
+on the macOS lane). The cause is in the x86_64 guest and is not yet known.
+
+So the daemon keeps the privileged mechanism as a **fallback**, and uses it
+when two conditions hold together: the sandbox layer gave out no file
+descriptor, and the daemon is inside a microVM whose network it owns. On a
+native host there is no fallback — the daemon is unprivileged by design, and
+a failure there must stay a failure. `net::provider::own_ip_fallback_reason`
+holds that rule, and a test holds it in place.
+
+The result is still one attach path with one rollback owner, in one module.
+The deployment model selects a transport and, in this one case, a way to get
+the tap.
 
 Three consequences follow, and they make step 6 below smaller than it would be
 with two mechanisms:
 
 1. The provider holds one attach path, not a branch on the deployment model.
-2. The daemon stops running the `ip` and `nsenter` programs for the network,
-   and the code that hardens those program lookups goes away with them.
+2. The daemon stops running the `ip` and `nsenter` programs for the network
+   on every deployment model but one, where they remain as a fallback.
 3. 012-005 holds the same way on every deployment model, instead of holding
    first on a native Linux host and later inside a microVM.
 
@@ -320,8 +341,8 @@ Each step compiles, and each step ships on its own.
 2. Give the in-VM path the rootless tap mechanism, so that the deployment model
    selects a transport and nothing else. See
    [One tap mechanism](#one-tap-mechanism).
-3. Delete the mechanism that step 2 stops using, and the program lookups that
-   only it needed.
+3. Keep the mechanism that step 2 stops using, as the fallback for the one
+   deployment model that needs it, and give it one caller.
 4. Add the plan operation and the plan type. The old configuration fields feed
    a plan that the sandbox layer builds. No consumer changes.
 5. Add the launch operation, and move the invocation path onto it.
@@ -386,11 +407,10 @@ every other layer stays the same.
   more generic layer puts that limit at risk again. The explicit type holds the
   same invariants, as this section stated.
 - **The in-VM task path needs no tools in the guest root filesystem.** (Was
-  HIGH.) The question assumed two tap mechanisms. With one mechanism the
-  sandbox layer makes the tap in the namespace of the sandbox on every
-  deployment model, so the daemon runs no `ip` program and no `nsenter`
-  program for the network. No issue is needed. See
-  [One tap mechanism](#one-tap-mechanism).
+  HIGH.) The question assumed the daemon must move a tap into the namespace of
+  the sandbox. On the path this spec describes it does not. The fallback does,
+  and the guest root filesystem already has `ip` and `nsenter`, so no issue is
+  needed either way. See [One tap mechanism](#one-tap-mechanism).
 - **The repository gets a `just` recipe that runs one test.** (Was MEDIUM.)
   Step 9 adds it. The `verify:` lines keep the direct command, because a spec
   must name the test and not the wrapper.

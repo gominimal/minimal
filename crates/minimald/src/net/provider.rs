@@ -73,10 +73,61 @@ fn own_ip_plan(subnet: crate::net::SwitchSubnet, lease_ip: std::net::Ipv4Addr) -
     NetPlan::isolated_with_tap(tap).with_resolver(Resolver::Nameservers(vec![subnet.dns_server()]))
 }
 
+/// Why a daemon-created tap is permitted for this PTask, or `None` if it is not.
+///
+/// 03-spec-networking R1.5 wants one mechanism — the sandbox layer provisions
+/// the tap *inside* the PTask's namespace — and that is what runs on a native
+/// host and inside a libkrun guest. It does not produce a descriptor in the
+/// x86_64 KVM guest, with `/dev/net/tun` present and user namespaces available,
+/// for a reason not yet diagnosed. Rather than leave that deployment model with
+/// no own-IP networking, the daemon makes the tap itself there.
+///
+/// Narrow on purpose. The fallback needs `CAP_NET_ADMIN` in the host namespace
+/// and execs `ip`/`nsenter`, which is exactly the privilege the in-namespace tap
+/// exists to avoid (R3.4's no-root direction). So it is offered only where the
+/// daemon already holds that privilege as a matter of deployment — inside a
+/// microVM it owns, reached over vsock — and never on a native host, where an
+/// unprivileged daemon must fail loudly instead of trying and failing again with
+/// a worse error.
+fn own_ip_fallback_reason(control: &ControlChannel) -> Option<&'static str> {
+    match control {
+        // DM1/3/4: minimald is root in a guest whose network it owns outright.
+        ControlChannel::Vsock { .. } => Some("in-VM daemon, privileged tap available"),
+        // DM2: the daemon is unprivileged by design; there is nothing to fall
+        // back to, and pretending otherwise would only change the error.
+        //
+        // No catch-all arm: a new transport must decide this deliberately, and
+        // the compiler is the only thing that will insist.
+        ControlChannel::Unix(_) => None,
+    }
+}
+
+/// Creates a tap in the daemon's own network namespace, moves it into the
+/// PTask's, and configures it there — the privileged path R1.5 supersedes,
+/// kept as the fallback [`own_ip_fallback_reason`] governs.
+async fn privileged_tap(
+    lease: crate::net::PtaskLease,
+    subnet: crate::net::SwitchSubnet,
+    netns_pid: u32,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    // A locally-administered name unique within the switch /16 — its low two
+    // octets distinguish every PTask address — and within the 15-char
+    // `IFNAMSIZ` limit (`mtapNNN_NNN` is at most 11 chars).
+    let o = lease.ip.octets();
+    let tap = format!("mtap{}_{}", o[2], o[3]);
+    let tap_fd = crate::net::switch::open_tap(&tap)?;
+    crate::net::switch::move_tap_into_netns(&tap, netns_pid, lease, subnet).await?;
+    Ok(tap_fd)
+}
+
 /// What [`OwnIpNetwork::plan`] reserved, waiting for an attach or an abandon.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Reserved {
-    lease_ip: std::net::Ipv4Addr,
+    /// The full lease, not just its address: the privileged fallback needs the
+    /// MAC too, to configure a tap it made itself.
+    lease: crate::net::PtaskLease,
+    /// Carried for the same reason — the fallback renders the lease as CIDR.
+    subnet: crate::net::SwitchSubnet,
     /// gvproxy's control channel: a local socket on DM2, host vsock on DM1/3/4.
     /// The one value the deployment model decides.
     control: ControlChannel,
@@ -119,7 +170,7 @@ impl Network for OwnIpNetwork {
     /// that returns data.
     fn plan(&self) -> PlanFuture<'_> {
         Box::pin(async move {
-            let (lease_ip, control, subnet) = {
+            let (lease, control, subnet) = {
                 let mut s = self.switch.lock().await;
                 let subnet = s.subnet();
                 let attach = s.attach().await.map_err(NetworkError::new)?;
@@ -131,11 +182,15 @@ impl Network for OwnIpNetwork {
                         ControlChannel::Vsock { cid, port }
                     }
                 };
-                (attach.lease.ip, control, subnet)
+                (attach.lease, control, subnet)
             };
 
-            *self.reserved.lock().await = Some(Reserved { lease_ip, control });
-            Ok(own_ip_plan(subnet, lease_ip))
+            *self.reserved.lock().await = Some(Reserved {
+                lease,
+                subnet,
+                control,
+            });
+            Ok(own_ip_plan(subnet, lease.ip))
         })
     }
 
@@ -147,40 +202,53 @@ impl Network for OwnIpNetwork {
     /// gvproxy running for a PTask that never came up (012-008).
     fn attach(&self, mut spawned: Spawned) -> AttachFuture<'_> {
         Box::pin(async move {
-            // A plan that asked for a tap and a sandbox that produced none is a
-            // broken launch, not a degraded one: without the descriptor there is
-            // nothing to relay, so the PTask would come up silently unreachable.
-            //
-            // Name the two host capabilities the in-namespace tap needs, because
-            // the bare fact is not actionable: the sandbox layer builds the tap
-            // by entering the PTask's user and network namespaces and opening
-            // the tun device from this process's mount view, so a missing
-            // descriptor is almost always one of those two being unavailable —
-            // and which one is the difference between a kernel config problem
-            // and a policy problem.
-            let Some(tap_fd) = spawned.take_tap_fd() else {
-                let tun = std::path::Path::new("/dev/net/tun").exists();
-                let userns = sandbox2::user_namespaces_restriction()
-                    .map_or_else(|| "available".to_string(), |r| r.to_string());
-                return Err(NetworkError::new(std::io::Error::other(format!(
-                    "own-IP sandbox produced no in-namespace tap fd \
-                     (/dev/net/tun present: {tun}; user namespaces: {userns})"
-                ))));
-            };
-            let (lease_ip, control) = {
+            let reserved = {
                 let reserved = self.reserved.lock().await;
                 let Some(r) = reserved.as_ref() else {
                     return Err(NetworkError::new(std::io::Error::other(
                         "own-IP attach without a plan: nothing was leased",
                     )));
                 };
-                (r.lease_ip, r.control.clone())
+                r.clone()
             };
+
+            // Normally the sandbox layer already built the tap inside the
+            // PTask's own namespace and handed the descriptor out here, on every
+            // deployment model (R1.5). Where it did not, and this daemon can make
+            // one itself, do that instead — see `own_ip_fallback_reason`.
+            let tap_fd = match spawned.take_tap_fd() {
+                Some(fd) => fd,
+                None => {
+                    let Some(reason) = own_ip_fallback_reason(&reserved.control) else {
+                        // Nothing to fall back to: report what the in-namespace
+                        // tap needs, because the bare fact is not actionable.
+                        // Which capability is missing separates a kernel-config
+                        // problem from a policy one.
+                        let tun = std::path::Path::new("/dev/net/tun").exists();
+                        let userns = sandbox2::user_namespaces_restriction()
+                            .map_or_else(|| "available".to_string(), |r| r.to_string());
+                        return Err(NetworkError::new(std::io::Error::other(format!(
+                            "own-IP sandbox produced no in-namespace tap fd \
+                             (/dev/net/tun present: {tun}; user namespaces: {userns})"
+                        ))));
+                    };
+                    tracing::warn!(
+                        ip = %reserved.lease.ip,
+                        reason,
+                        "own-IP PTask fell back to a daemon-created tap: the sandbox \
+                         layer produced no in-namespace descriptor"
+                    );
+                    privileged_tap(reserved.lease, reserved.subnet, spawned.netns_pid())
+                        .await
+                        .map_err(NetworkError::new)?
+                }
+            };
+
             let guard = crate::net::gvproxy_network::complete_own_ip_attach(
                 &self.switch,
                 tap_fd,
-                control,
-                lease_ip,
+                reserved.control,
+                reserved.lease.ip,
                 &self.identity,
                 self.ingress.as_ref(),
             )
@@ -239,6 +307,26 @@ mod tests {
         assert!(
             network_for(NetworkMode::NoNet, &switch, "s", None).is_none(),
             "no-net is an isolation decision and no post-spawn work"
+        );
+    }
+
+    /// The fallback is offered where the daemon is privileged by deployment,
+    /// and nowhere else.
+    ///
+    /// Getting this backwards is the whole risk of keeping a fallback at all:
+    /// on a native host it would exec `ip` with `CAP_NET_ADMIN` the daemon does
+    /// not have, turning a clear "no tap descriptor" into a confusing
+    /// permissions failure one layer further down — and eroding the no-root
+    /// property (R3.4) that the in-namespace tap exists to provide.
+    #[test]
+    fn only_the_in_vm_transport_may_fall_back_to_a_privileged_tap() {
+        assert!(
+            own_ip_fallback_reason(&ControlChannel::Vsock { cid: 2, port: 1024 }).is_some(),
+            "an in-VM daemon owns its guest's network and may make the tap itself"
+        );
+        assert!(
+            own_ip_fallback_reason(&ControlChannel::Unix("/run/gvproxy.sock".into())).is_none(),
+            "a native daemon is unprivileged by design and must fail loudly instead"
         );
     }
 

@@ -130,18 +130,16 @@ pub fn open_tap(name: &str) -> io::Result<OwnedFd> {
 /// the interface and loopback up, install a default route via the switch
 /// gateway).
 ///
-/// **No production caller.** The daemon used to exec these with `CAP_NET_ADMIN`
-/// to move a host-side tap into a PTask's namespace; it now has the sandbox layer
-/// build the tap *inside* that namespace instead, rootless, per
-/// 03-spec-networking R1.5. The only remaining caller is
-/// `tests/netns_root_integration.rs`, which still models a PTask the old way and
-/// is being ported onto the same mechanism the daemon uses; this function goes
-/// with it.
+/// Each command is returned as an argv vector rather than executed, so the two
+/// callers can run them under the privileges they have: the daemon
+/// ([`move_tap_into_netns`]) execs them directly with `CAP_NET_ADMIN`, while the
+/// netns proof (`tests/netns_root_integration.rs`) wraps each in `sudo` on an
+/// unprivileged runner. Single-sourcing the command construction keeps the proof
+/// driving the same wiring the daemon does.
 ///
-/// Each command is returned as an argv vector rather than executed, so the
-/// unprivileged proof can wrap each one in `sudo`.
-///
-/// The namespace is identified by PID, addressing `/proc/<pid>/ns/net`.
+/// The namespace is identified by PID, addressing `/proc/<pid>/ns/net` — the
+/// namespace `sandbox2` unshared for the PTask, surfaced to the launcher via the
+/// `hakoniwa::Child`'s PID.
 #[must_use]
 pub fn tap_netns_commands(
     tap: &str,
@@ -177,6 +175,87 @@ pub fn tap_netns_commands(
         nsenter(&["ip", "link", "set", "lo", "up"]),
         nsenter(&["ip", "route", "add", "default", "via", &gw]),
     ]
+}
+
+/// Trusted directories (and the `PATH` handed to the children) searched for the
+/// privileged `ip`/`nsenter` binaries, ordered most- to least-specific. Using a
+/// fixed list instead of the inherited `PATH` is what keeps a tampered `PATH`
+/// from shadowing them when they exec with `CAP_NET_ADMIN`.
+const TRUSTED_EXEC_PATH: &str = "/usr/sbin:/sbin:/usr/bin:/bin";
+
+/// Resolves `program` to an absolute path under [`TRUSTED_EXEC_PATH`]. Falls
+/// back to the bare name if it is in none of those directories (an unusual
+/// layout still works, just without the hardening).
+fn trusted_program(program: &str) -> String {
+    for dir in TRUSTED_EXEC_PATH.split(':') {
+        let candidate = std::path::Path::new(dir).join(program);
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    program.to_string()
+}
+
+/// Moves the opened tap `tap` into the PTask network namespace held by
+/// `netns_pid` and configures its switch address there, by execing the
+/// [`tap_netns_commands`] directly. The host-side tap fd keeps working after the
+/// interface moves namespaces, which is what [`attach_to_switch`] relays on.
+///
+/// Run on the `minimald` (daemon) side; requires `CAP_NET_ADMIN` in the host
+/// namespace. `sandbox2` never calls this — it only unshares the namespace and
+/// surfaces the PID (no dependency cycle).
+///
+/// **The fallback, not the path.** Every own-IP PTask is meant to get its tap
+/// built inside its own namespace, rootless (03-spec-networking R1.5), and that
+/// is what happens on a native host and inside a libkrun guest. It does not work
+/// in the x86_64 KVM guest — hakoniwa's RustSlirp yields no descriptor there,
+/// with `/dev/net/tun` present and user namespaces available — so
+/// `net::provider` falls back to this when the sandbox layer produced no tap and
+/// the daemon has the privilege to make one itself.
+///
+/// # Errors
+///
+/// Returns an error if `ip`/`nsenter` cannot be spawned or any command exits
+/// non-zero, naming the failing command line.
+pub async fn move_tap_into_netns(
+    tap: &str,
+    netns_pid: u32,
+    lease: PtaskLease,
+    subnet: SwitchSubnet,
+) -> io::Result<()> {
+    for (index, argv) in tap_netns_commands(tap, netns_pid, lease, subnet)
+        .into_iter()
+        .enumerate()
+    {
+        let (program, rest) = argv
+            .split_first()
+            .expect("tap_netns_commands never yields an empty argv");
+        // These run with `CAP_NET_ADMIN` in the host namespace, so resolve the
+        // binary against a fixed trusted directory list rather than an inherited
+        // `PATH` (a malicious `ip`/`nsenter` shadow placed early in `PATH` would
+        // otherwise execute at that capability). The pinned `PATH` covers the
+        // inner `ip` that `nsenter -n` execs inside the PTask namespace, which
+        // resolves against this child's environment.
+        let status = tokio::process::Command::new(trusted_program(program))
+            .args(rest)
+            .env("PATH", TRUSTED_EXEC_PATH)
+            .status()
+            .await?;
+        if !status.success() {
+            // Command 0 moves the tap into the PTask namespace; the rest
+            // configure it there, so name the phase the failing command is in.
+            let phase = if index == 0 {
+                "moving PTask tap into its namespace"
+            } else {
+                "configuring PTask tap"
+            };
+            return Err(io::Error::other(format!(
+                "{phase} failed (`{}` exited with {status})",
+                argv.join(" ")
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Sets `O_NONBLOCK` on `fd` so the tap device can be epoll-driven via
