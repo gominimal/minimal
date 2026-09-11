@@ -1501,6 +1501,11 @@ fn plan_from_config(config: &config::Config) -> network::NetPlan {
 /// decides. Failing closed is a *security* boundary, unlike the cgroup-setup
 /// fallback next to it — a caller that asked for isolation and silently got the
 /// host's network would have none of what the mode promises, and no way to tell.
+///
+/// Linux-only, like [`new_container`](Sandbox::new_container), its one caller:
+/// `ExecutionError` is itself imported only there, and network namespaces are
+/// not a concept the other platforms have.
+#[cfg(target_os = "linux")]
 fn isolation_decision(
     plan: &network::NetPlan,
     mode: NetworkMode,
@@ -1802,9 +1807,10 @@ mod tests {
     /// 012-011. A host that cannot make the namespace the plan needs fails the
     /// launch, rather than handing back the host's network.
     ///
-    /// Testable anywhere because the decision takes what the probe found as an
-    /// argument: a host that *can* create namespaces still proves the closed
-    /// path.
+    /// Testable on any *Linux* host because the decision takes what the probe
+    /// found as an argument: a host that *can* create namespaces still proves
+    /// the closed path. Gated with the function it covers.
+    #[cfg(target_os = "linux")]
     #[test]
     fn no_namespace_support_fails_closed() {
         let err = isolation_decision(&network::NetPlan::isolated(), NetworkMode::NoNet, false)
