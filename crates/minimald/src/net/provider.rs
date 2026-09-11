@@ -150,10 +150,22 @@ impl Network for OwnIpNetwork {
             // A plan that asked for a tap and a sandbox that produced none is a
             // broken launch, not a degraded one: without the descriptor there is
             // nothing to relay, so the PTask would come up silently unreachable.
+            //
+            // Name the two host capabilities the in-namespace tap needs, because
+            // the bare fact is not actionable: the sandbox layer builds the tap
+            // by entering the PTask's user and network namespaces and opening
+            // the tun device from this process's mount view, so a missing
+            // descriptor is almost always one of those two being unavailable —
+            // and which one is the difference between a kernel config problem
+            // and a policy problem.
             let Some(tap_fd) = spawned.take_tap_fd() else {
-                return Err(NetworkError::new(std::io::Error::other(
-                    "own-IP sandbox produced no in-namespace tap fd",
-                )));
+                let tun = std::path::Path::new("/dev/net/tun").exists();
+                let userns = sandbox2::user_namespaces_restriction()
+                    .map_or_else(|| "available".to_string(), |r| r.to_string());
+                return Err(NetworkError::new(std::io::Error::other(format!(
+                    "own-IP sandbox produced no in-namespace tap fd \
+                     (/dev/net/tun present: {tun}; user namespaces: {userns})"
+                ))));
             };
             let (lease_ip, control) = {
                 let reserved = self.reserved.lock().await;
