@@ -39,9 +39,9 @@ of it.
 **First slice:** one remote Box Host, reached at the SSH endpoint its
 provider publishes. The CLI attaches in process with its sign-in certificate
 and checks the host's certificate; the daemon admits the certificate to its
-owner's sessions only; a dropped connection re-attaches. The identity plane's
-per-connection check (CRA-026, CRA-027) and the revocation feed (CRA-029,
-CRA-030) are configured options that follow without changing the attach.
+owner's sessions only; a dropped connection re-attaches. The revocation feed
+(CRA-029, CRA-030) is a configured option that follows with the identity
+plane's revocation work, without changing the attach.
 
 ## Users and stories
 
@@ -89,12 +89,11 @@ the requirements cite them rather than restate them.
   tier:     T0
   verify:   cargo nextest run -p minimal-client certificate_renews_before_expiry_without_attach
 
-- **CRA-003** THE SYSTEM SHALL sign the CLI's SSH authentication requests and
-  DPoP proofs only through a signer that never releases the key: a
-  hardware-backed key where the machine offers one, otherwise the operating
-  system's credential store, with the key held for this device only.
+- **CRA-003** THE SYSTEM SHALL keep the CLI's signing key in the operating
+  system's credential store, held for this device only, and use it for no
+  process other than the CLI.
   tier:     T0
-  verify:   cargo nextest run -p minimal-client cli_key_signs_only_through_a_non_exporting_signer
+  verify:   cargo nextest run -p minimal-client cli_key_lives_in_the_os_store_for_this_device
 
 - **CRA-031** THE SYSTEM SHALL place neither the CLI's signing key nor its
   refresh token in any session, local or remote, whether as a file, an
@@ -246,17 +245,8 @@ the requirements cite them rather than restate them.
   tier:     T0
   verify:   cargo nextest run -p minimald failed_auth_throttled_then_closed_after_third
 
-- **CRA-026** WHERE the identity plane's connection check is configured THE
-  SYSTEM SHALL open a session channel for a certificate-authenticated
-  connection only on an `SshConnect` allow for that subject and session no
-  older than 60 s (Gatehouse §7.4, §8.2).
-  tier:     T0
-  verify:   cargo nextest run -p minimald channel_opens_only_on_fresh_sshconnect_allow
-
-- **CRA-027** WHERE the identity plane's connection check is configured, IF
-  no decision arrives within 2 s THEN THE SYSTEM SHALL refuse the channel.
-  tier:     T0
-  verify:   cargo nextest run -p minimald undecided_sshconnect_within_2s_refuses
+CRA-026 and CRA-027, the identity plane's per-connection check, were retired
+on 2026-09-11 and are not reused; see Non-goals.
 
 ### Expiry and revocation
 
@@ -286,6 +276,15 @@ the requirements cite them rather than restate them.
   the connection metadata a host is reached by: the Box Provider abstraction
   and its endpoints spec (gominimal/arch#45, BPA and BPE). BPA-023 limits a
   provider to handing out that metadata; this spec starts where it stops.
+- The identity plane checking each connection against current policy
+  (`SshConnect`), and per-action decisions for stopping and renaming
+  (`StopBox`, `RenameBox`): the policy follow-on of gominimal/inbox#648 (its
+  S5), which arrives with its own epic and spec rather than partially. When
+  it lands, an identity plane that cannot be reached refuses the attach, as
+  decided on 2026-09-10.
+- A CLI key held in hardware: the follow-on S6 of gominimal/inbox#648. The
+  identity plane certifies P-256 user keys, the ones hardware keystores hold,
+  only under its FIPS profile (Gatehouse §5.3, N7).
 - The path to a remote daemon, whether a published endpoint, the mesh or a
   relay and Egress Gateway: the networking work, designed in
   [deployment-and-egress-gateway.md](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)
@@ -338,28 +337,23 @@ in-process client to the browser build. The in-process client was chosen now
 (CRA-010), because it is the foundation the browser build reuses and it
 removes a dependency developers otherwise need.
 
-**When the identity plane cannot be reached, refuse.** Where the connection
-check is configured, a missing decision refuses the channel (CRA-027) and the
-owner rule applies regardless (CRA-023). Letting the owner in during an
-outage was offered, trading central deny for availability, and declined:
-revocation stays authoritative.
-
 **Reconnect until back or detached.** A dropped attach retries on its own
 (CRA-017), which suits long agent runs. Exiting on every drop, and retrying
 for a bounded window before exiting, were the alternatives.
 
-**The key stays in a signer that never releases it.** The CLI's key signs
-both SSH authentication and the proofs that make its refresh token usable, so
-the key, not the token, is what must not travel. It is held by a signer that
-never releases it (CRA-003), and neither it nor the refresh token reaches a
-session (CRA-031), which closes the paths a dotfile loadout or a forwarded
-agent would otherwise open (Gatehouse T20). It is the same contract the
-browser client meets later with a non-extractable WebCrypto key, so the core
-behind both never handles key bytes. Two lighter forms were considered and
-not taken: naming only where the key and token are stored, and storing them
-in the operating system's credential store while leaving the key exportable.
-The refresh token is bound to the key (Gatehouse T1), so no requirement fixes
-where the token itself is stored.
+**Key custody this cycle, hardware later.** The CLI's key signs both SSH
+authentication and the proofs that make its refresh token usable, so the key,
+not the token, is what must not travel: neither reaches a session (CRA-031),
+which closes the paths a dotfile loadout or a forwarded agent would otherwise
+open (Gatehouse T20). A signer that never releases the key, hardware-backed
+where the machine has it, was the preferred form, because the browser client
+meets the same contract with a non-extractable WebCrypto key. It waits for
+the identity plane to certify P-256 user keys outside its FIPS profile, which
+moved to a follow-on on 2026-09-11, so this cycle keeps the key in the
+operating system's credential store for this device (CRA-003). Naming only
+where the key is stored was the other form considered. The refresh token is
+bound to the key (Gatehouse T1), so no requirement fixes where the token
+itself is stored.
 
 **Everything at T0.** Three groups were offered above T0: the certificate
 vectors (CRA-007, CRA-022) walked over the whole manifest, the user
@@ -373,9 +367,9 @@ CLI and daemon repository has no Lean project.
 same way, whether a provider created its host or it runs on a developer's own
 machine; what differs is only the connection metadata a provider hands out
 and the path the networking layer supplies. A second SSH client, such as the
-browser build, fits by meeting CRA-001, CRA-002, CRA-004 to CRA-008, CRA-011
-and CRA-012 unchanged, and CRA-003's contract through a non-exporting signer
-of its own.
+browser build, fits by meeting CRA-001, CRA-002, CRA-004 to CRA-008, CRA-011,
+CRA-012 and CRA-031 unchanged, with key custody of its own in place of
+CRA-003.
 
 ## Security considerations
 
@@ -395,14 +389,14 @@ of its own.
 - **Invariant:** THE SYSTEM SHALL expose no session to a subject that does
   not own it.
   enforced by: the daemon's owner check on every list, attach, rename and
-  stop, and the identity plane's connection check where configured
-  covered by: CRA-023, CRA-026, CRA-027
+  stop
+  covered by: CRA-023
 
 - **Invariant:** THE SYSTEM SHALL let no process in a session sign with, or
   read, the CLI's signing key or its refresh token.
-  enforced by: a signer on the developer's machine that never releases the
-  key, and no file, environment variable or forwarded agent carrying either
-  into a session (Gatehouse T2, T20)
+  enforced by: the operating system's credential store on the developer's
+  machine, and no file, environment variable or forwarded agent carrying
+  either into a session (Gatehouse T2, T20)
   covered by: CRA-003, CRA-031
 
 - **Invariant:** THE SYSTEM SHALL end an expired or revoked certificate's
@@ -418,7 +412,9 @@ of its own.
   listing, or both?] Survives because the two sources cover different
   daemons: provider-created hosts appear in their provider's inventory and,
   today, not in the identity plane's listing (gominimal/arch#47), while a
-  developer's own enrolled machine appears only in the latter.
+  developer's own enrolled machine appears only in the latter. The identity
+  plane's listing covering both is gominimal/inbox#648's S3a; once it lands,
+  one source may do.
 
 - [NEEDS CLARIFICATION (HIGH): copying files or directories out of a box, the
   epic's sync-out story, has no spec in any repository.] Survives because it
@@ -434,19 +430,6 @@ of its own.
 - [NEEDS CLARIFICATION (MEDIUM): what does the CLI do at sign-out?] Survives
   because it was kept out of this spec and neither the GitHub-sessions spec
   nor the identity plane's spec states it.
-
-- [NEEDS CLARIFICATION (MEDIUM): do stopping and renaming a remote session
-  each need their own central decision (`StopBox`, `RenameBox`, Gatehouse
-  §7.4) on top of the connection check?] Survives because the identity plane
-  defines the decisions and no consumer has asked for them; until someone
-  does, the connection check and the owner rule govern.
-
-- [NEEDS CLARIFICATION (MEDIUM): a hardware-backed key (CRA-003) is P-256,
-  while the identity plane's default client profile is Ed25519 (Gatehouse
-  N7): does P-256 become the default client profile, or only the profile of
-  a hardware-backed key?] Survives because the profile is the identity
-  plane's to set, and the answer decides whether the CLI and the browser tab
-  sign with one algorithm.
 
 - [NEEDS CLARIFICATION (MEDIUM): how wide is the range of daemon protocol
   versions the CLI accepts?] Survives because the architecture records it as
