@@ -345,15 +345,17 @@ gcloud storage cp \
     "${cp_flags[@]}" \
     "${upload_list[@]}" "$version_prefix/"
 
-gcloud storage cp \
-    "${cp_flags[@]}" \
-    "$manifest" "$version_prefix/components"
-
 if [ "${#EXTRA_FILES[@]}" -gt 0 ]; then
     gcloud storage cp \
         "${cp_flags[@]}" \
         "${EXTRA_FILES[@]}" "$version_prefix/"
 fi
+
+# LAST: its presence means a complete row (see Write-once above), so nothing
+# may be uploaded after it.
+gcloud storage cp \
+    "${cp_flags[@]}" \
+    "$manifest" "$version_prefix/components"
 
 if [ -n "$PKG_DIR" ]; then
     upload_pkg_dir

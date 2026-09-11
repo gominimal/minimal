@@ -1460,4 +1460,5 @@ jobs:
                     --version "$VERSION" \
                     --run-url "$RUN_URL" \
                     --run-id "$RUN_ID" \
+                    --sha "$GITHUB_SHA" \
                     --bucket gs://minimal-one

@@ -212,6 +212,14 @@ expect 1 "not strictly greater than the newest tag v0.6.0-rc1" \
     "check: an rc below the cut rc is stale" -- check 0.6.0-rc0
 expect 0 "package.version 0.6.0-rc1.1 satisfies" "check: a longer pre-release ranks above its prefix" -- check 0.6.0-rc1.1
 
+# --- non-SemVer v* tags are ignored -------------------------------------------
+
+commit "chore: a tag that only looks like a version" v999-backup v999backup
+expect_out "0.6.0" "v999-backup / v999backup do not become the newest tag or the range base" -- nv
+expect 0 "package.version 0.6.0 satisfies" "check: malformed v* tags do not fail a valid package.version" -- check 0.6.0
+expect 0 "is greater than the newest tag v0.6.0-rc1" "check: the newest tag is still the newest SemVer one" -- check 0.6.0
+expect_notes "notes still span since the last released SemVer tag" "since v0.5.4."
+
 # --- --rev walks an older release point ---------------------------------------
 
 expect_out "0.5.5" "--rev at the fix-only commit derives a patch" -- nv --next --rev v0.5.4~0

@@ -98,12 +98,13 @@ expect 0 "record-smoked: dry run, nothing written" "record --dry-run prints the 
 if [ -e "$root/bucket/versions/0.6.0/smoked" ]; then bad "dry run wrote a marker"; else ok "dry run left no marker"; fi
 
 expect 0 "record-smoked: versions/0.6.0 smoked by https://example/run/1" "record writes the marker" -- \
-    "$record" --version 0.6.0 --run-url https://example/run/1 --run-id 1 --bucket gs://test-bucket
+    "$record" --version 0.6.0 --run-url https://example/run/1 --run-id 1 --sha 8e7e72c2 --bucket gs://test-bucket
 marker="$root/bucket/versions/0.6.0/smoked"
 if [ -f "$marker" ] && [ "$(jq -r .version "$marker")" = "0.6.0" ] \
     && [ "$(jq -r .run_id "$marker")" = "1" ] \
+    && [ "$(jq -r .sha "$marker")" = "8e7e72c2" ] \
     && [ "$(jq -r .components_sha256 "$marker")" = "$(sha256sum "$root/bucket/versions/0.6.0/components" | cut -d' ' -f1)" ]; then
-    ok "the marker is JSON carrying the version, run id, and the live components digest"
+    ok "the marker is JSON carrying the version, commit sha, run id, and the live components digest"
 else
     bad "unexpected marker: $(cat "$marker" 2>&1)"
 fi
@@ -136,6 +137,8 @@ expect 1 "carries no components_sha256" "verify refuses a marker without a diges
 
 expect 1 "missing --version" "record needs --version" -- "$record" --run-url u
 expect 1 "missing --run-url" "record needs --run-url" -- "$record" --version 0.6.0
+expect 1 "is not a lowercase hex commit sha" "record rejects a non-hex --sha" -- \
+    "$record" --version 0.6.0 --run-url u --sha 0.6.0
 expect 1 "missing --version" "verify needs --version" -- "$verify"
 expect 1 "characters outside" "a version with a slash is rejected" -- "$verify" --version ../x
 expect 1 "unknown argument" "unknown flags are rejected" -- "$verify" --version 0.6.0 --bogus

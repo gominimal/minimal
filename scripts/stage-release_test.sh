@@ -157,7 +157,12 @@ expect 0 "staged 0.6.0" "--extra uploads join a fresh row" -- \
     with GCLOUD_STUB_EXISTS=0 -- stage --version 0.6.0 --extra "$root/install.sh" --extra "$root/notes.md"
 expect_calls 1 "^storage cp --cache-control=public, max-age=31536000, immutable --if-generation-match=0 $root/install.sh $root/notes.md gs://test-bucket/versions/0.6.0/$" \
     "the extra files upload together into versions/<V>/ with the precondition"
-expect_calls 3 "^storage cp " "artifacts, manifest, extras: three uploads"
+expect_calls 3 "^storage cp " "artifacts, extras, manifest: three uploads"
+if [ "$(grep '^storage cp ' "$GCLOUD_STUB_ARGS" | tail -n 1 | grep -c '/components$')" -eq 1 ]; then
+    ok "the manifest is the last object written, after the extras"
+else
+    bad "the manifest was not the last upload: $(tr '\n' '|' <"$GCLOUD_STUB_ARGS")"
+fi
 expect 1 "--extra needs an existing file" "--extra with a missing file fails before anything runs" -- \
     with GCLOUD_STUB_EXISTS=0 -- stage --version 0.6.0 --extra "$root/absent"
 

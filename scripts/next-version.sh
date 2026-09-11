@@ -159,18 +159,27 @@ is_semver() {
 
 # --- The tags ----------------------------------------------------------------
 
-# Newest RELEASED tag reachable from the rev: the range base. --exclude drops
-# pre-release tags so a final's notes and level cover everything since the
+# Only tags that are SemVer (`vX.Y.Z[-pre][+build]`) count: `v[0-9]*` alone
+# would also match a `v999-backup` or `v999backup`, and either would win a
+# version sort. Newest first — git's version sort ranks `v0.6.0-rc1` ABOVE
+# `v0.6.0` unless told a `-` suffix is a pre-release.
+semver_tags() {
+    git -C "$REPO" -c versionsort.suffix=- tag -l 'v[0-9]*' --sort=-version:refname "$@" \
+        | while IFS= read -r t; do is_semver "${t#v}" && printf '%s\n' "$t"; done
+}
+
+# Newest RELEASED tag reachable from the rev: the range base. Pre-release
+# tags are skipped so a final's notes and level cover everything since the
 # previous final.
-base_tag="$(git -C "$REPO" describe --tags --abbrev=0 --match 'v[0-9]*' --exclude 'v*-*' "$REV" 2>/dev/null || true)"
+# (`|| true`: under pipefail an empty selection is grep's exit 1, which must
+# reach the die below as "no tag", not abort the substitution silently.)
+base_tag="$(semver_tags --merged "$REV" | grep -v -- '-' | sed -n '1p' || true)"
 [ -n "$base_tag" ] || die "no released v* tag (vX.Y.Z) reachable from $REV in $REPO — nothing to derive from (shallow clone? actions/checkout needs fetch-depth: 0)"
 base_version="${base_tag#v}"
-is_semver "$base_version" || die "tag $base_tag is not a SemVer vX.Y.Z tag"
 
-# Newest v* tag overall, pre-releases included, for the strictly-greater
-# check. Git's version sort ranks `v0.6.0-rc1` ABOVE `v0.6.0` unless told a
-# `-` suffix is a pre-release.
-newest_tag="$(git -C "$REPO" -c versionsort.suffix=- tag -l 'v[0-9]*' --sort=-version:refname | sed -n '1p')"
+# Newest SemVer tag overall, pre-releases included, for the strictly-greater
+# check.
+newest_tag="$(semver_tags | sed -n '1p' || true)"
 newest_version="${newest_tag#v}"
 
 # --- The walk ----------------------------------------------------------------

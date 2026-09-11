@@ -5,8 +5,9 @@
 # Provenance is a property of the ROW, not of run history. After the
 # shipped-artifact smokes pass, the release run writes
 # versions/<VERSION>/smoked: a JSON marker carrying the SHA-256 of the row's
-# `components` manifest (which itself carries every artifact's SHA-256) and
-# the run that smoked it. Promotion (scripts/verify-smoked.sh) then checks
+# `components` manifest (which itself carries every artifact's SHA-256), the
+# commit the row was built from, and the run that smoked it. Promotion
+# (scripts/verify-smoked.sh) then checks
 # "these exact bytes were smoked" against the live manifest instead of
 # inferring it from a workflow run id — so a re-staged row can never inherit
 # a stale blessing, and the check runs on the default path rather than being
@@ -24,6 +25,9 @@
 #   --version VER     Staged version (short sha or semver)   (VERSION)
 #   --run-url URL     The workflow run that smoked it         (RUN_URL)
 #   --run-id ID       Its numeric run id                      (RUN_ID, optional)
+#   --sha SHA         The commit the row was built from        (COMMIT_SHA, optional;
+#                     a semver row's only link back to its source — the docs
+#                     rebuild on promotion pins to it)
 #   --bucket URL      gs:// bucket URL                        (BUCKET, default: gs://minimal-one)
 #   --dry-run         Print the marker; write nothing
 #   -h, --help        Show this help
@@ -47,17 +51,19 @@ usage() {
 VERSION="${VERSION:-}"
 RUN_URL="${RUN_URL:-}"
 RUN_ID="${RUN_ID:-}"
+COMMIT_SHA="${COMMIT_SHA:-}"
 BUCKET="${BUCKET:-gs://minimal-one}"
 DRY_RUN=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --version|--run-url|--run-id|--bucket)
+        --version|--run-url|--run-id|--sha|--bucket)
             [ $# -ge 2 ] || die "missing value for $1"
             case "$1" in
                 --version) VERSION="$2" ;;
                 --run-url) RUN_URL="$2" ;;
                 --run-id)  RUN_ID="$2" ;;
+                --sha)     COMMIT_SHA="$2" ;;
                 --bucket)  BUCKET="$2" ;;
             esac
             shift 2 ;;
@@ -71,6 +77,9 @@ done
 [ -n "$RUN_URL" ] || die "missing --run-url"
 case "$VERSION" in
     *[!A-Za-z0-9._-]*) die "version '$VERSION' contains characters outside [A-Za-z0-9._-]" ;;
+esac
+case "$COMMIT_SHA" in
+    ""|*[!0-9a-f]*) [ -z "$COMMIT_SHA" ] || die "--sha '$COMMIT_SHA' is not a lowercase hex commit sha" ;;
 esac
 command -v gcloud >/dev/null 2>&1 || die "gcloud not found"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found"
@@ -86,8 +95,8 @@ gcloud storage cat "$row/components" >"$workdir/components" 2>/dev/null \
 [ -s "$workdir/components" ] || die "$row/components is empty"
 digest="$(sha256sum "$workdir/components" | cut -d' ' -f1)"
 
-printf '{"version":"%s","components_sha256":"%s","run_url":"%s","run_id":"%s","smoked_at":"%s"}\n' \
-    "$VERSION" "$digest" "$RUN_URL" "$RUN_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$workdir/smoked"
+printf '{"version":"%s","sha":"%s","components_sha256":"%s","run_url":"%s","run_id":"%s","smoked_at":"%s"}\n' \
+    "$VERSION" "$COMMIT_SHA" "$digest" "$RUN_URL" "$RUN_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$workdir/smoked"
 
 printf '=== %s/smoked ===\n' "$row" >&2
 cat "$workdir/smoked" >&2

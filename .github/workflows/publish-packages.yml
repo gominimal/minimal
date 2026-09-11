@@ -33,6 +33,8 @@ jobs:
         permissions:
             contents: write # publishing the draft creates the tag
         outputs:
+            # The version the package publishers should ship; empty for a
+            # nightly sha AND for a prerelease (see the step).
             semver: ${{ steps.publish.outputs.semver }}
         steps:
             - name: Publish the draft GitHub Release (creates the tag)
@@ -62,16 +64,23 @@ jobs:
                     echo "::error::GitHub Release $tag is already published (target $target); refusing to re-publish"
                     exit 1
                   fi
+                  # A prerelease (a `-` tail, judged before any `+build`
+                  # metadata) never becomes "Latest" and never reaches the AUR
+                  # or the tap: pacman forbids a hyphen in pkgver, Homebrew has
+                  # no channel to keep an rc off, and both publish scripts
+                  # reject the tail. Its GitHub Release is still published.
                   extra=()
-                  case "$semver" in
-                    *-*) ;;                       # a prerelease never becomes "Latest"
+                  publish_semver="$semver"
+                  case "${semver%%+*}" in
+                    *-*) publish_semver=""
+                         echo "::notice::$tag is a prerelease — GitHub Release published; AUR and Homebrew skipped" ;;
                     *)   extra+=(--latest) ;;
                   esac
                   gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false "${extra[@]}"
                   # The tag now exists at the draft's target; say where.
                   tagged="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)"
                   echo "published $tag at $tagged (draft targeted $target)"
-                  echo "semver=$semver" >> "$GITHUB_OUTPUT"
+                  echo "semver=$publish_semver" >> "$GITHUB_OUTPUT"
 
     publish-aur:
         # The AUR package tracks stable semver releases; its PKGBUILD fetches

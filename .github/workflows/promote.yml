@@ -226,8 +226,26 @@ jobs:
                     --bucket gs://minimal-one \
                     $DRY_FLAG
 
-                  # Export the resolved version for the publish and docs steps below.
-                  echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+                  # The commit behind the row, for the docs rebuild below
+                  # (its contract is a commit sha, never a version): a
+                  # nightly row IS its short sha; a versioned (semver) row
+                  # records its commit in the smoked marker
+                  # (scripts/record-smoked.sh --sha). Only an emergency
+                  # override can reach here without a marker; then a semver
+                  # has no commit to offer and the docs step skips itself.
+                  if [[ "$VERSION" =~ ^[0-9a-f]{7,40}$ ]]; then
+                    SHA="$VERSION"
+                  else
+                    SHA="$(gcloud storage cat "gs://minimal-one/versions/$VERSION/smoked" 2>/dev/null | jq -r '.sha // empty' || true)"
+                    [ -n "$SHA" ] || echo "::warning::no commit recorded for versions/$VERSION (no smoked marker) — the docs rebuild will be skipped"
+                  fi
+
+                  # Export the resolved version and commit for the publish and
+                  # docs steps below.
+                  {
+                    echo "version=${VERSION}"
+                    echo "sha=${SHA}"
+                  } >> "$GITHUB_OUTPUT"
 
             # Mint a short-lived token scoped to gominimal/webapp via the
             # gominimal-aw-bot GitHub App (org standard — App tokens over PATs, see
@@ -247,19 +265,27 @@ jobs:
                   repositories: webapp
 
             - name: Trigger docs rebuild
+              # client_payload[sha] is a COMMIT sha (the webapp pins its docs
+              # sync to it as MINIMAL_DOCS_SHA), resolved above; a version
+              # string would not do.
               env:
                   GH_TOKEN: ${{ steps.docs-token.outputs.token }}
                   DRY_RUN: ${{ inputs.dry_run }}
                   VERSION: ${{ steps.promote.outputs.version }}
+                  SHA: ${{ steps.promote.outputs.sha }}
               run: |
                   set -euo pipefail
+                  if [ -z "$SHA" ]; then
+                    echo "::warning::no commit sha for ${VERSION}; not dispatching reference-docs-promoted (rerun docs-hotfix.yml by hand)"
+                    exit 0
+                  fi
                   if [ "$DRY_RUN" = "true" ]; then
-                    echo "[dry-run] would dispatch reference-docs-promoted to gominimal/webapp for ${VERSION}"
+                    echo "[dry-run] would dispatch reference-docs-promoted to gominimal/webapp for ${VERSION} (commit ${SHA})"
                   else
                      gh api repos/gominimal/webapp/dispatches \
                        -f event_type=reference-docs-promoted \
-                       -F "client_payload[sha]=${VERSION}"
-                     echo "Dispatched reference-docs-promoted to gominimal/webapp for ${VERSION}"
+                       -F "client_payload[sha]=${SHA}"
+                     echo "Dispatched reference-docs-promoted to gominimal/webapp for ${VERSION} (commit ${SHA})"
                    fi
 
     publish:

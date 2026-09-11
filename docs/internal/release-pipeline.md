@@ -189,8 +189,12 @@ published reference docs at docs.minimal.dev.
 [`.github/workflows/publish-packages.yml`](../../.github/workflows/publish-packages.yml).
 When the promoted version is a semver it publishes the draft GitHub Release —
 which is what creates the `v<semver>` tag, last, on the already-smoked commit
-and triggers no build — then runs the AUR and Homebrew publishers. A promoted
-nightly sha has nothing versioned to publish and the workflow says so.
+and triggers no build — then runs the AUR and Homebrew publishers. A
+prerelease (`0.6.0-rc1`) gets its GitHub Release but skips the AUR and the
+tap, which cannot carry one. A promoted nightly sha has nothing versioned to
+publish and the workflow says so. The docs rebuild dispatched by `promote`
+pins to the row's commit: the nightly sha itself, or the commit the versioned
+row's `smoked` marker records.
 
 ## prune-releases.yml: GitHub Release housekeeping
 
