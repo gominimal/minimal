@@ -193,6 +193,25 @@ mnl() {
   min ${E2E_MINIMAL_ARGS:-} "$@"
 }
 
+# `::error::<headline>` plus the contents of each file, folded into the one
+# annotation line.
+#
+# GitHub renders annotations where it does not render logs: a reader without
+# repo access, or a tool reading the check run, sees the headline and nothing
+# else. For a failure that only one lane can produce, that leaves the evidence
+# unreachable exactly when it is needed. `%0A`/`%0D`/`%25` are the workflow
+# command escapes — `%` first, or it would re-escape the escapes.
+annotate() {
+  local headline="$1" body="" chunk
+  shift
+  for f in "$@"; do
+    [ -s "$f" ] || continue
+    chunk="$(head -c 1200 "$f" | sed 's/%/%25/g' | sed 's/\r/%0D/g' | awk '{printf "%s%%0A", $0}')"
+    body="$body%0A--- $(basename "$f") ---%0A$chunk"
+  done
+  echo "::error::${headline}${body}"
+}
+
 teardown() {
   mnl stop --force >/dev/null 2>&1 || true
   if [ -n "$E2E_VM" ]; then
@@ -430,10 +449,20 @@ if [ -n "${MINVMD_GVPROXY_BIN:-}" ]; then
   # none of the evidence. One exec, checked at the top level, avoids both — and
   # removes the second and third chances for an unrelated exec hiccup to look
   # like a networking result.
-  if ! mnl session exec "$ownip_sid" \
+  # `sh -c` rather than one semicolon-joined string: the exec proof above
+  # establishes that argv form for a multi-command probe ("multi-word argv must
+  # reach the session with the quoting the local shell already removed"), and
+  # establishes the bare-string form only for a single command. Use the shape
+  # this script already proves works.
+  if ! mnl session exec "$ownip_sid" sh -c \
     'echo ---DEV---; cat /proc/net/dev; echo ---ROUTE---; cat /proc/net/route; echo ---RESOLV---; cat /etc/resolv.conf' \
     >"$WORK/ownip-facts.out" 2>"$WORK/ownip-facts.err" || [ ! -s "$WORK/ownip-facts.out" ]; then
-    echo "::error::could not read the own-IP session's network state — the probe failed, which says nothing about the tap"
+    # Carry the captured streams INTO the annotation, not just the log. A
+    # failure only this lane can produce is one most readers cannot open the
+    # log for — `::error::` text is visible where the log is not, so the
+    # evidence has to travel with the headline.
+    annotate "could not read the own-IP session's network state — the probe failed, which says nothing about the tap" \
+      "$WORK/ownip-facts.err" "$WORK/ownip-facts.out" "$WORK/ownip.err"
     echo "--- stdout ---"; cat "$WORK/ownip-facts.out" 2>/dev/null || true
     echo "--- stderr ---"; cat "$WORK/ownip-facts.err" 2>/dev/null || true
     echo "--- activate stderr ---"; cat "$WORK/ownip.err" 2>/dev/null || true
