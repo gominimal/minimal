@@ -58,9 +58,26 @@ expect 1 "package.version is 0.6.0" "plain version under a prerelease tag fails"
 
 # --- non-tag flows skip, they do not fail ----------------------------------
 
-expect 0 "not a tag push" "branch ref skips the assertion" -- \
-    env GITHUB_REF_TYPE=branch GITHUB_REF_NAME=main "$script" --cargo-toml "$root/Cargo.toml"
-expect 0 "not a v* semver tag" "release-<sha> ref skips the assertion" -- run release-abc12345
+expect 0 "MINIMAL_RELEASE_VERSION unset — nothing to assert" "branch ref skips the assertion" -- \
+    env -u MINIMAL_RELEASE_VERSION GITHUB_REF_TYPE=branch GITHUB_REF_NAME=main "$script" --cargo-toml "$root/Cargo.toml"
+expect 0 "not a v* semver tag" "release-<sha> ref skips the assertion" -- \
+    env -u MINIMAL_RELEASE_VERSION "$script" --tag release-abc12345 --cargo-toml "$root/Cargo.toml"
+
+# --- MINIMAL_RELEASE_VERSION: a release build on an untagged commit --------
+
+cargo_toml 'package.version = "0.6.0"'
+expect 0 "matches MINIMAL_RELEASE_VERSION" "the override matching package.version passes on a branch ref" -- \
+    env MINIMAL_RELEASE_VERSION=0.6.0 GITHUB_REF_TYPE=branch GITHUB_REF_NAME=main "$script" --cargo-toml "$root/Cargo.toml"
+expect 1 "MINIMAL_RELEASE_VERSION is 0.5.5 but package.version is 0.6.0" "a stale override fails on a branch ref" -- \
+    env MINIMAL_RELEASE_VERSION=0.5.5 GITHUB_REF_TYPE=branch GITHUB_REF_NAME=main "$script" --cargo-toml "$root/Cargo.toml"
+expect 0 "matches MINIMAL_RELEASE_VERSION" "the override is asserted with no ref at all" -- \
+    env MINIMAL_RELEASE_VERSION=0.6.0 "$script" --cargo-toml "$root/Cargo.toml"
+expect 1 "MINIMAL_RELEASE_VERSION is 0.6.1 but package.version is 0.6.0" "a mismatched override fails alongside a matching tag" -- \
+    env MINIMAL_RELEASE_VERSION=0.6.1 "$script" --tag v0.6.0 --cargo-toml "$root/Cargo.toml"
+expect 0 "matches tag v0.6.0" "override and tag both matching passes both" -- \
+    env MINIMAL_RELEASE_VERSION=0.6.0 "$script" --tag v0.6.0 --cargo-toml "$root/Cargo.toml"
+expect 0 "MINIMAL_RELEASE_VERSION unset" "an empty override is unset" -- \
+    env MINIMAL_RELEASE_VERSION= GITHUB_REF_TYPE=branch GITHUB_REF_NAME=main "$script" --cargo-toml "$root/Cargo.toml"
 
 # --- malformed input fails loudly -------------------------------------------
 
