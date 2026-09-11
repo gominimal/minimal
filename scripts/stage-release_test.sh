@@ -27,6 +27,10 @@ if [ "${1:-} ${2:-} ${3:-}" = "storage objects describe" ]; then
     [ "${GCLOUD_STUB_EXISTS:-0}" = 1 ] && exit 0
     exit 1
 fi
+if [ "${1:-} ${2:-}" = "storage rm" ]; then
+    [ "${GCLOUD_STUB_SMOKED:-0}" = 1 ] && exit 0
+    exit 1
+fi
 exit 0
 EOF
 chmod +x "$root/bin/gcloud"
@@ -38,7 +42,7 @@ if ! command -v sha256sum >/dev/null 2>&1; then
 fi
 export PATH="$root/bin:$PATH"
 export GCLOUD_STUB_ARGS="$root/gcloud-args"
-unset GCLOUD_STUB_EXISTS RESTAGE VERSION BUCKET ARTIFACTS_DIR PKG_DIR PKG_ONLY
+unset GCLOUD_STUB_EXISTS GCLOUD_STUB_SMOKED RESTAGE VERSION BUCKET ARTIFACTS_DIR PKG_DIR PKG_ONLY
 
 mkdir -p "$root/artifacts" "$root/pkg"
 printf 'fake min\n' >"$root/artifacts/minimal-linux-amd64"
@@ -132,6 +136,30 @@ expect_calls 2 "^storage cp --cache-control=public, max-age=31536000, immutable 
     "--restage keeps the immutable cache header"
 expect 0 "write-once guard OFF" "RESTAGE=1 in the environment is the same opt-in" -- \
     with GCLOUD_STUB_EXISTS=1 RESTAGE=1 -- stage --version 0.6.0
+
+# A restage invalidates the smoke marker before its first upload.
+expect 0 "removed versions/0.6.0/smoked — the row must be smoked again" \
+    "--restage over a smoked row removes the marker and says so" -- \
+    with GCLOUD_STUB_EXISTS=1 GCLOUD_STUB_SMOKED=1 -- stage --version 0.6.0 --restage
+expect_calls 1 "^storage rm gs://test-bucket/versions/0.6.0/smoked$" "the marker is deleted exactly once"
+if [ "$(sed -n '1p' "$GCLOUD_STUB_ARGS")" = "storage rm gs://test-bucket/versions/0.6.0/smoked" ]; then
+    ok "the marker is deleted before any upload"
+else
+    bad "the marker deletion did not come first: $(tr '\n' '|' <"$GCLOUD_STUB_ARGS")"
+fi
+expect 0 "staged 0.6.0" "--restage over a never-smoked row is fine (no marker to remove)" -- \
+    with GCLOUD_STUB_EXISTS=1 GCLOUD_STUB_SMOKED=0 -- stage --version 0.6.0 --restage
+expect_calls 1 "^storage rm " "the removal is still attempted, and its absence is not an error"
+expect_calls 0 "removed versions" "no removal is claimed when there was no marker"
+with GCLOUD_STUB_EXISTS=0 GCLOUD_STUB_SMOKED=1 -- stage --version 0.6.0 >/dev/null 2>&1
+expect_calls 0 "^storage rm " "a fresh (non-restage) stage never touches a marker"
+expect 0 "removed versions/0.6.0/smoked" "--pkg-only --restage also invalidates the marker before its upload" -- \
+    with GCLOUD_STUB_EXISTS=1 GCLOUD_STUB_SMOKED=1 -- stage --version 0.6.0 --restage --pkg-only --pkg-dir "$root/pkg"
+if [ "$(sed -n '1p' "$GCLOUD_STUB_ARGS")" = "storage rm gs://test-bucket/versions/0.6.0/smoked" ]; then
+    ok "--pkg-only --restage deletes the marker before the packages upload"
+else
+    bad "--pkg-only --restage did not delete the marker first: $(tr '\n' '|' <"$GCLOUD_STUB_ARGS")"
+fi
 
 # --- the packages upload is guarded the same way ------------------------------
 

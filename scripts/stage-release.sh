@@ -127,6 +127,20 @@ else
     cp_flags+=(--if-generation-match=0)
 fi
 
+# A restage invalidates the row's smoke provenance BEFORE it touches anything:
+# versions/<V>/smoked (scripts/record-smoked.sh) digests only the components
+# manifest, and a restage can replace the packages, install.sh, or notes
+# without moving that digest. Deleting the marker first means a restage whose
+# smoke then fails leaves an unpromotable row, not a stale blessing; the
+# restage's own run re-records once its smoke passes. Called at the first
+# upload site of whichever path runs (the row, or --pkg-only).
+invalidate_smoked() {
+    [ "$RESTAGE" -eq 1 ] || return 0
+    if gcloud storage rm "$BUCKET/versions/$VERSION/smoked" >/dev/null 2>&1; then
+        printf 'stage-release: --restage: removed versions/%s/smoked — the row must be smoked again before it can be promoted\n' "$VERSION" >&2
+    fi
+}
+
 # --- The distro-package upload (--pkg-dir / --pkg-only) ---------------------
 #
 # One definition of the versions/<VERSION>/pkg/ write — same immutable cache
@@ -148,6 +162,7 @@ upload_pkg_dir() {
     printf '=== %d package(s) -> %s/versions/%s/pkg/ ===\n' "${#pkg_files[@]}" "$BUCKET" "$VERSION" >&2
     printf '  %s\n' "${pkg_files[@]}" >&2
     [ "$DRY_RUN" -eq 1 ] && return 0
+    invalidate_smoked
     gcloud storage cp \
         "${cp_flags[@]}" \
         "${pkg_files[@]}" "$BUCKET/versions/$VERSION/pkg/"
@@ -344,6 +359,7 @@ fi
 if [ "$RESTAGE" -eq 0 ] && gcloud storage objects describe "$version_prefix/components" >/dev/null 2>&1; then
     die "versions/$VERSION is already staged ($version_prefix/components exists) and staged versions are immutable — nothing was uploaded. Stage under a new version, or pass --restage to overwrite it deliberately."
 fi
+invalidate_smoked
 
 gcloud storage cp \
     "${cp_flags[@]}" \

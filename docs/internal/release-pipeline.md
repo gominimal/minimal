@@ -128,10 +128,9 @@ in `ARTIFACTS_DIR` mode, pinned nfpm). Then:
   whose `components` manifest already exists fails before any upload, and
   every upload carries `--if-generation-match=0` so an existing object is
   never replaced. The `restage` input (`--restage`) is the explicit, logged
-  opt-in for re-running a versioned build that failed after staging;
-- [`scripts/set-channel.sh`](../../scripts/set-channel.sh) points the
-  `unstable` channel at the new version. `unstable` auto-advances on every
-  release: no gate.
+  opt-in for re-running a versioned build that failed after staging; it
+  deletes the row's `smoked` marker before its first upload, so a restage is
+  unpromotable until its own smoke passes.
 
 **smoke jobs.** Three jobs run the shared session e2e
 ([`scripts/session-e2e.sh`](../../scripts/session-e2e.sh)) against the
@@ -147,7 +146,10 @@ on dry runs too; only the recording below is skipped.
 manifest plus the run URL. Provenance is thereby a property of the row — the
 promotion gate hashes the live manifest and compares, so "these bytes were
 smoked" is checked directly rather than inferred from a workflow run id, and
-a re-staged row can never inherit a stale blessing.
+a re-staged row can never inherit a stale blessing. Only then does
+[`scripts/set-channel.sh`](../../scripts/set-channel.sh) point the `unstable`
+channel at the row: `unstable` auto-advances on every smoked release with no
+approval gate, but never at bytes that have not passed the smoke.
 
 ## nightly.yml: daily cut + smoke + nightly channel
 
@@ -156,7 +158,10 @@ a re-staged row can never inherit a stale blessing.
 HEAD request on the version's `components` manifest), then invokes release.yml
 via `workflow_call`, which builds, stages, smokes, and records the smoke as
 described above. Only if that whole run succeeds (or was skipped as a no-op)
-does `promote-nightly` flip the `nightly` pointer via set-channel.sh.
+does `promote-nightly` run, and it verifies the row's `smoked` marker
+(`verify-smoked.sh`) before flipping the `nightly` pointer via
+set-channel.sh — so a no-op night cannot bless a row an earlier run staged
+but failed to smoke.
 `nightly-tests.yml` is the separate 06:00 UTC nightly *test* tier, unrelated
 to releasing; see [docs/ci-strategy.md](../ci-strategy.md).
 

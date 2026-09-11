@@ -34,10 +34,14 @@ case "${1:-} ${2:-}" in
         f="$(local_path "$3")"
         [ -f "$f" ] || { echo "CommandException: no such object $3" >&2; exit 1; }
         cat "$f" ;;
+    "storage rm")
+        f="$(local_path "$3")"
+        [ -f "$f" ] || { echo "CommandException: no such object $3" >&2; exit 1; }
+        rm -f "$f" ;;
     "storage cp")
         shift 2
         args=(); for a in "$@"; do case "$a" in --*) ;; *) args+=("$a") ;; esac; done
-        dst="$(local_path "${args[-1]}")"
+        dst="$(local_path "${args[$((${#args[@]} - 1))]}")"   # no negative subscripts: macOS bash 3.2
         mkdir -p "$(dirname "$dst")"
         cp "${args[0]}" "$dst" ;;
     *) echo "gcloud stub: unexpected $*" >&2; exit 2 ;;

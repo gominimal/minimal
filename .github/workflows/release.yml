@@ -1055,17 +1055,6 @@ jobs:
                   [ -z "$RELEASE_VERSION" ] || args+=(--pkg-dir "$DIST")
                   [ "$RESTAGE" != "true" ] || args+=(--restage)
                   scripts/stage-release.sh "${args[@]}"
-            - name: Point unstable channel at this release
-              # `unstable` auto-advances to every fresh build — it is the
-              # bleeding-edge channel, so no approval gate. Promotion to `stable`
-              # is the manual, gated promote-cli workflow.
-              env:
-                  VERSION: ${{ needs.assert-version.outputs.version }}
-              run: |
-                  scripts/set-channel.sh \
-                    --channel unstable \
-                    --version "$VERSION" \
-                    --bucket gs://minimal-one
 
     # --- Smoke: prove the artifacts this run just built actually run, BEFORE
     # anything can point a channel at them. Each smoke job downloads the
@@ -1434,7 +1423,8 @@ jobs:
         # so "these bytes were smoked" is checked directly rather than inferred
         # from a workflow run id, and a re-staged row can never inherit a stale
         # blessing. Needs every gate green: staged (so not a dry run) and
-        # smoked.
+        # smoked. Only then does `unstable` advance: a channel never points at
+        # bytes that have not passed the smoke.
         needs: [assert-version, stage-installer, smoke-success]
         runs-on: ubuntu-latest
         timeout-minutes: 10
@@ -1461,4 +1451,16 @@ jobs:
                     --run-url "$RUN_URL" \
                     --run-id "$RUN_ID" \
                     --sha "$GITHUB_SHA" \
+                    --bucket gs://minimal-one
+            - name: Point unstable channel at this release
+              # `unstable` auto-advances to every fresh, smoked build — it is
+              # the bleeding-edge channel, so no approval gate, but it advances
+              # only here, after the smokes and the marker. Promotion to
+              # `stable` is the manual, gated promote-cli workflow.
+              env:
+                  VERSION: ${{ needs.assert-version.outputs.version }}
+              run: |
+                  scripts/set-channel.sh \
+                    --channel unstable \
+                    --version "$VERSION" \
                     --bucket gs://minimal-one

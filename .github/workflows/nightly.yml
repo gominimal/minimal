@@ -114,6 +114,15 @@ jobs:
               with:
                   project_id: "524228262772"
                   workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
+            - name: Verify the staged row was smoked
+              # On a no-op night `release` is skipped because the row already
+              # exists — but an earlier run may have staged it and then failed
+              # its smoke or its recording. Staged is not smoked: the same gate
+              # promote.yml applies (scripts/verify-smoked.sh) must pass here
+              # before `nightly` can point at the row.
+              env:
+                  SHA: ${{ needs.check.outputs.sha }}
+              run: scripts/verify-smoked.sh --version "$SHA" --bucket gs://minimal-one
             - name: Point nightly channel at this release
               # The SHA `check` computed is HEAD at this ref, i.e. exactly what
               # release.yml staged. set-channel.sh verifies versions/<sha>/ is
