@@ -71,11 +71,13 @@ set -euo pipefail
 # nothing beyond what its type does (0.x/alpha rule). 1: breaking -> major.
 ALLOW_MAJOR="${NEXT_VERSION_ALLOW_MAJOR:-0}"
 
+# die <message> — print it with the script prefix on stderr and exit 1.
 die() {
     printf 'next-version: %s\n' "$1" >&2
     exit 1
 }
 
+# usage [code] — print the header comment block as help and exit.
 usage() {
     sed -n '2,/^set -euo/{/^set -euo/!p;}' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
@@ -153,6 +155,7 @@ semver_cmp() {
     echo eq
 }
 
+# is_semver <version> — SemVer 2.0 shape: X.Y.Z with optional -pre and +build tails.
 is_semver() {
     [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]
 }

@@ -53,11 +53,13 @@
 #
 set -euo pipefail
 
+# die <message> — print it with the script prefix on stderr and exit 1.
 die() {
     printf 'package-nfpm: %s\n' "$1" >&2
     exit 1
 }
 
+# usage [code] — print the header comment block as help and exit.
 usage() {
     sed -n '2,/^set -euo/{/^set -euo/!p;}' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
@@ -115,6 +117,7 @@ OUT_DIR="${OUT_DIR:-$ROOT/dist}"
 mkdir -p "$OUT_DIR"
 [ -f "$ROOT/packaging/nfpm.yaml" ] || die "no such config: $ROOT/packaging/nfpm.yaml"
 
+# sha256_of <file> — the file's SHA-256 hex digest, via sha256sum or shasum.
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
     else shasum -a 256 "$1" | cut -d' ' -f1; fi

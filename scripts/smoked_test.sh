@@ -53,6 +53,7 @@ export GCLOUD_STUB_BUCKET="$root/bucket"
 unset VERSION RUN_URL RUN_ID BUCKET
 
 pass=0 fail=0
+# ok / bad <description> — count and print one passing / failing case.
 ok()  { pass=$((pass + 1)); printf 'ok   - %s\n' "$*"; }
 bad() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$*"; }
 
@@ -70,6 +71,7 @@ expect() {
     fi
 }
 
+# stage_row <version> <sha256> — write a one-row components manifest into the fake bucket.
 stage_row() {
     mkdir -p "$root/bucket/versions/$1"
     printf '# format: 1\nminimal linux amd64 %s %s file bin/min versions/%s/minimal-linux-amd64\n' "$1" "$2" "$1" \

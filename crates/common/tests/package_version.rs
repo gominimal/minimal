@@ -21,6 +21,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The workspace root, from this crate's manifest dir.
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is crates/common; the workspace root is two up.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -30,6 +31,7 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// `git <args>` in the repo root: trimmed stdout, or `None` when git fails or is absent.
 fn git(args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .args(args)

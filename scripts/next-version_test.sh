@@ -39,11 +39,13 @@ commit() {
     done
 }
 
+# cargo_toml <version-line> — write a fixture Cargo.toml carrying the given package.version.
 cargo_toml() {
     printf '[package]\nname = "minimal"\nversion = "0.0.0"\npackage.version = "%s"\n' "$1" >"$root/Cargo.toml"
 }
 
 pass=0 fail=0
+# ok / bad <description> — count and print one passing / failing case.
 ok()  { pass=$((pass + 1)); printf 'ok   - %s\n' "$*"; }
 bad() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$*"; }
 
@@ -99,10 +101,12 @@ refute_notes() {
     ok "$desc"
 }
 
+# nv <args...> — the script under test against the fixture repo.
 nv() {
     "$script" --repo "$repo" "$@"
 }
 
+# check <version> — write the fixture package.version, then run --check against it.
 check() {
     cargo_toml "$1"
     nv --check --cargo-toml "$root/Cargo.toml"

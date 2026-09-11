@@ -49,11 +49,13 @@
 
 set -euo pipefail
 
+# die <message> — print it with the script prefix on stderr and exit 1.
 die() {
     printf 'stage-release: %s\n' "$1" >&2
     exit 1
 }
 
+# usage [code] — print the header comment block as help and exit.
 usage() {
     sed -n '2,/^set -euo/{/^set -euo/!p;}' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
@@ -135,6 +137,7 @@ if [ "$PKG_ONLY" -eq 1 ] && [ -z "$PKG_DIR" ]; then
     die "--pkg-only needs --pkg-dir"
 fi
 
+# upload_pkg_dir — upload every file in PKG_DIR into versions/<V>/pkg/ (or list them on a dry run).
 upload_pkg_dir() {
     [ -d "$PKG_DIR" ] || die "pkg dir not found: $PKG_DIR"
     pkg_files=()
@@ -260,6 +263,7 @@ manifest="$workdir/components"
 staged_dir="$workdir/staged"
 mkdir -p "$staged_dir"
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+# stage_repo_file <repo-path> <basename> — copy a checkout file into the staging dir under that name.
 stage_repo_file() {
     [ -f "$repo_root/$1" ] || die "missing repo file for staging: $1"
     cp "$repo_root/$1" "$staged_dir/$2" || die "failed to stage $1 into $staged_dir"

@@ -165,6 +165,7 @@ fn with_dirty(mut v: String, dirty: bool) -> String {
 mod tests {
     use super::*;
 
+    /// `Inputs` with a fixed short hash, so a case reads as its four variables.
     fn inputs<'a>(
         release_version: Option<&'a str>,
         cargo_version: &'a str,
@@ -180,6 +181,7 @@ mod tests {
         }
     }
 
+    /// The compact version string for `i`, panicking on a derivation error.
     fn version(i: &Inputs<'_>) -> String {
         derive(i).expect("derives").version
     }

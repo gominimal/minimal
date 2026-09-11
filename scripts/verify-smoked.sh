@@ -31,11 +31,13 @@
 
 set -euo pipefail
 
+# die <message> — print it with the script prefix on stderr and exit 1.
 die() {
     printf 'verify-smoked: %s\n' "$1" >&2
     exit 1
 }
 
+# usage [code] — print the header comment block as help and exit.
 usage() {
     sed -n '2,/^set -euo/{/^set -euo/!p;}' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"

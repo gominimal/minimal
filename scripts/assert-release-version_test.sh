@@ -16,11 +16,13 @@ script="$here/assert-release-version.sh"
 root="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-verassert)"
 trap 'rm -rf "$root"' EXIT
 
+# cargo_toml <version-line> — write a fixture Cargo.toml carrying the given package.version.
 cargo_toml() {
     printf '[package]\nname = "minimal"\nversion = "0.0.0"\n%s\n' "$1" >"$root/Cargo.toml"
 }
 
 pass=0 fail=0
+# ok / bad <description> — count and print one passing / failing case.
 ok()  { pass=$((pass + 1)); printf 'ok   - %s\n' "$*"; }
 bad() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$*"; }
 
@@ -38,6 +40,7 @@ expect() {
     fi
 }
 
+# run <tag> — the script under test against the fixture Cargo.toml.
 run() {
     "$script" --tag "$1" --cargo-toml "$root/Cargo.toml"
 }
