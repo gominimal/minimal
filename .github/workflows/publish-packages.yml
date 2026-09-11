@@ -1,0 +1,125 @@
+name: publish-packages
+
+# Publish an already-promoted versioned release. Called by promote.yml after a
+# `stable` promotion; never runs on its own. Three steps, in order:
+#
+#   1. publish-release — publish the DRAFT GitHub Release `v<semver>` the
+#      versioned release build parked (release.yml). Publishing a draft is
+#      what creates the tag: v<semver> lands on the commit the draft targets
+#      — already built, staged, smoked, and promoted — and triggers no build.
+#   2. publish-aur — the PKGBUILD keys on the staged versions/<semver>/ row.
+#   3. publish-brew — the formula keys on the GitHub Release published in 1.
+#
+# The apt/dnf/apk repo trees are built by the infra repo from the staged
+# versions/<semver>/pkg/ row and are not this workflow's concern.
+#
+# A promoted NIGHTLY sha (not a semver) has nothing versioned to publish:
+# publish-release says so and the publishers skip.
+on:
+    workflow_call:
+        inputs:
+            version:
+                description: "The promoted version: a semver (X.Y.Z[-pre]) publishes; anything else skips with a notice."
+                required: true
+                type: string
+
+permissions:
+    contents: read
+
+jobs:
+    publish-release:
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        permissions:
+            contents: write # publishing the draft creates the tag
+        outputs:
+            semver: ${{ steps.publish.outputs.semver }}
+        steps:
+            - name: Publish the draft GitHub Release (creates the tag)
+              id: publish
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  VERSION: ${{ inputs.version }}
+              run: |
+                  set -euo pipefail
+                  semver=""
+                  case "$VERSION" in
+                    [0-9]*.[0-9]*.[0-9]*) semver="$VERSION" ;;
+                    *)
+                      echo "::notice::promoted version '$VERSION' is not a semver (a nightly sha) — nothing versioned to publish"
+                      echo "semver=" >> "$GITHUB_OUTPUT"
+                      exit 0 ;;
+                  esac
+                  tag="v$semver"
+                  # The draft must exist: the versioned release build parks it
+                  # with the notes and every artifact attached. A missing or
+                  # already-published release is a pipeline invariant broken
+                  # upstream, not something to paper over here.
+                  state="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,targetCommitish --jq '"\(.isDraft) \(.targetCommitish)"' 2>/dev/null)" \
+                    || { echo "::error::no GitHub Release $tag — was $semver cut by a versioned release build (release.yml versioned: true)?"; exit 1; }
+                  read -r is_draft target <<<"$state"
+                  if [ "$is_draft" != "true" ]; then
+                    echo "::error::GitHub Release $tag is already published (target $target); refusing to re-publish"
+                    exit 1
+                  fi
+                  extra=()
+                  case "$semver" in
+                    *-*) ;;                       # a prerelease never becomes "Latest"
+                    *)   extra+=(--latest) ;;
+                  esac
+                  gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false "${extra[@]}"
+                  # The tag now exists at the draft's target; say where.
+                  tagged="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)"
+                  echo "published $tag at $tagged (draft targeted $target)"
+                  echo "semver=$semver" >> "$GITHUB_OUTPUT"
+
+    publish-aur:
+        # The AUR package tracks stable semver releases; its PKGBUILD fetches
+        # from versions/<semver>/ in the installer bucket, which the versioned
+        # release build staged and the promotion just verified.
+        needs: publish-release
+        if: ${{ needs.publish-release.outputs.semver != '' }}
+        runs-on: ubuntu-latest
+        container: archlinux:base-devel
+        timeout-minutes: 30
+        permissions:
+            contents: read
+        steps:
+            - name: Install git and openssh
+              # base-devel carries neither. curl is already in the image (the
+              # publish script uses it to fetch versioned artifacts from the
+              # public bucket).
+              run: pacman -Syu --noconfirm --needed git openssh
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Publish minimal-bin to the AUR
+              env:
+                  PKGVER: ${{ needs.publish-release.outputs.semver }}
+                  AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+              run: scripts/publish-aur.sh
+
+    publish-brew:
+        # Homebrew has no channels, so the tap is stable-only and publishes on
+        # the stable promote — never on a tag, where a release (or an RC)
+        # would overwrite the tap's only formula for every user with no way
+        # to opt out, bypassing the promotion gate. The formula fetches the
+        # GitHub Release v<semver>, hence `needs: publish-release`. The tap
+        # repo must exist and BREW_TAP_TOKEN (a fine-grained PAT with write
+        # access to it) must be set (user actions).
+        needs: publish-release
+        if: ${{ needs.publish-release.outputs.semver != '' }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Publish minimal to gominimal/homebrew-minimal
+              env:
+                  PKGVER: ${{ needs.publish-release.outputs.semver }}
+                  BREW_TAP_REPO: https://github.com/gominimal/homebrew-minimal.git
+                  GITHUB_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}
+              run: scripts/publish-brew.sh

@@ -3,19 +3,17 @@
 # latest-staged-version.sh — the default promote target: the most recently
 # STAGED COMMIT, not just the most recently staged thing.
 #
-# promote.yml resolves an omitted --sha by taking the newest row under
-# versions/. Every staged release lands there twice now: under its short sha
-# (what channels point at) and, since tag pushes stage packaging rows, under
-# its semver. Sorting both by creation time makes the semver row the newest —
-# and promoting "0.5.4" as if it were a sha fails verify-nightly-provenance
-# only after the human approval gate (or, with override_provenance, points
-# stable at a non-commit). So this filters to commit-sha rows before picking.
+# promote.yml resolves an omitted --version by taking the newest row under
+# versions/. Nightly builds stage under their short sha; versioned release
+# builds stage under their semver. Sorting both by creation time would make
+# whichever ran last the default — and a versioned row is promoted
+# deliberately, by name, never as "whatever is newest". So this filters to
+# commit-sha rows before picking.
 #
 # The rows are `versions/<name>/components` manifests written by
-# stage-release.sh; `<name>` is either an 8-char short sha (the default) or a
-# semver. A sha row is 7-40 lowercase hex characters — the same commit names
-# set-channel.sh, verify-nightly-provenance.sh, and the installer already
-# consume.
+# stage-release.sh; `<name>` is either an 8-char short sha (the nightly
+# default) or a semver. A sha row is 7-40 lowercase hex characters — the same
+# commit names set-channel.sh and the installer already consume.
 #
 # Usage: scripts/latest-staged-version.sh [--bucket gs://minimal-one]
 # Prints the short sha on stdout. Exit 0 = resolved, 1 = nothing staged (a

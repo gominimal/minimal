@@ -3,14 +3,21 @@
 # package-nfpm.sh — build minimal's deb/rpm/apk packages from the staged
 # release artifacts.
 #
-# A release is staged into the installer bucket as a versions/<version>/ row
-# (scripts/stage-release.sh): the static musl binaries, the AppArmor files,
-# and the rest. This script takes a promoted semver (PKGVER), pulls the
-# staged Linux artifacts for both amd64 and arm64, generates shell
-# completions from the built `min` (the scripts/dist-build.sh technique),
-# and runs the pinned nfpm — fetched and SHA-256-verified against
-# vendor/nfpm/nfpm.lock, the same pin pattern as scripts/fetch-gvproxy.sh —
-# once per format x arch against packaging/nfpm.yaml.
+# Two sources of the Linux binaries for both amd64 and arm64:
+#
+#   * ARTIFACTS_DIR set — the release run's own build output (the
+#     platform-suffixed files stage-release.sh is about to hash and upload).
+#     Packages are built in the same run as the binaries, before anything is
+#     staged, so the .deb/.rpm/.apk ship the exact bytes the run smokes.
+#   * otherwise — the staged versions/<PKGVER>/ row in the installer bucket
+#     (scripts/stage-release.sh), each download verified against the row's
+#     `components` manifest before use.
+#
+# Either way it generates shell completions from the built `min` (the
+# scripts/dist-build.sh technique) and runs the pinned nfpm — fetched and
+# SHA-256-verified against vendor/nfpm/nfpm.lock, the same pin pattern as
+# scripts/fetch-gvproxy.sh — once per format x arch against
+# packaging/nfpm.yaml.
 #
 # This script only produces packages. Repo-tree hosting — reprepro/aptly for
 # apt, createrepo_c for dnf/yum, apk index for apk, and serving from the
@@ -20,10 +27,14 @@
 # Usage: scripts/package-nfpm.sh [--formats deb,rpm,apk]
 #
 # Env:
-#   PKGVER              Required. Promoted semver WITHOUT the v prefix
-#                       (X.Y.Z, optional -prerelease/+build tail). Artifacts
-#                       are fetched from <bucket>/versions/$PKGVER/ — the
-#                       same names the AUR PKGBUILD's source arrays use.
+#   PKGVER              Required. The semver WITHOUT the v prefix (X.Y.Z,
+#                       optional -prerelease/+build tail). Without
+#                       ARTIFACTS_DIR, artifacts are fetched from
+#                       <bucket>/versions/$PKGVER/ — the same names the AUR
+#                       PKGBUILD's source arrays use.
+#   ARTIFACTS_DIR       Optional. Directory of local build output holding
+#                       <name>-linux-{amd64,arm64} for minimal, minimald,
+#                       mip, minvmd, and gvproxy; nothing is downloaded.
 #   NFPM_VERSION        Optional. Must equal the version pinned in
 #                       vendor/nfpm/nfpm.lock; it exists to catch a stale
 #                       environment, not to override the pin (bump the lock
@@ -169,11 +180,11 @@ echo "package-nfpm: using ${nfpm_bin}"
 workdir="$(mktemp -d 2>/dev/null || mktemp -d -t package-nfpm)"
 trap 'rm -rf "$workdir"' EXIT
 
-# --- Download the staged Linux artifacts ------------------------------------
-# artifact basename under versions/$PKGVER/ | installed name. Same mapping as
-# the PKGBUILD's source arrays (min::minimal-linux-amd64, ...), plus minvmd,
-# which every staged row carries — see the file-list decision in
-# packaging/nfpm.yaml's header.
+# --- Gather the Linux artifacts ------------------------------------------------
+# artifact basename (under versions/$PKGVER/ or ARTIFACTS_DIR) | installed
+# name. Same mapping as the PKGBUILD's source arrays
+# (min::minimal-linux-amd64, ...), plus minvmd, which every staged row
+# carries — see the file-list decision in packaging/nfpm.yaml's header.
 ARTIFACTS=(
     "minimal|min"
     "minimald|minimald"
@@ -183,49 +194,68 @@ ARTIFACTS=(
 )
 artifacts_root="$workdir/artifacts"
 
-# --- Verify before use -------------------------------------------------------
-# stage-release.sh writes versions/<pkgver>/components with one row per
-# artifact and its SHA-256 — the same manifest the curl|sh installer verifies
-# against, and the bucket's trust root. Every downloaded binary is checked
-# against it BEFORE anything chmods, executes, or packages it: a corrupted,
-# truncated, or wrongly-staged object must fail this job, not enter the
-# .deb/.rpm/.apk that users install.
-manifest_url="$BUCKET_URL/versions/$PKGVER/components"
-curl -fsSL --retry 3 -o "$workdir/components" "$manifest_url" \
-    || die "cannot download $manifest_url — is $PKGVER staged in the bucket? (see stage-release.sh)"
-
-declare -A manifest_sha=()
-while IFS= read -r row; do
-    case "$row" in '#'*) continue ;; esac
-    read -r -a cols <<<"$row"
-    # component os arch version sha256 kind dest src
-    [ "${#cols[@]}" -eq 8 ] || die "unexpected components row in $manifest_url: $row"
-    src="${cols[7]}"
-    case "$src" in
-        "versions/$PKGVER/"*) manifest_sha["${src##*/}"]="${cols[4]}" ;;
-        *) ;; # symlink rows and other versions' rows carry no artifact here
-    esac
-done <"$workdir/components"
-
-[ "${#manifest_sha[@]}" -gt 0 ] || die "no artifact rows for $PKGVER in the staged components manifest"
-
-for arch in amd64 arm64; do
-    art_dir="$artifacts_root/$arch"
-    mkdir -p "$art_dir"
-    for entry in "${ARTIFACTS[@]}"; do
-        IFS='|' read -r staged installed <<<"$entry"
-        url="$BUCKET_URL/versions/$PKGVER/${staged}-linux-${arch}"
-        curl -fsSL --retry 3 -o "$art_dir/$installed" "$url" \
-            || die "cannot download $url — is $PKGVER staged in the bucket? (see stage-release.sh)"
-        want="${manifest_sha[${staged}-linux-${arch}]:-}"
-        [ -n "$want" ] \
-            || die "no digest for ${staged}-linux-${arch} in the staged components manifest — refusing to package an unverified artifact"
-        got="$(sha256_of "$art_dir/$installed")"
-        [ "$got" = "$want" ] \
-            || die "SHA-256 mismatch for ${staged}-linux-${arch}: got $got, the staged manifest says $want"
-        chmod +x "$art_dir/$installed"
+if [ -n "${ARTIFACTS_DIR:-}" ]; then
+    # Local build output: the release run's own artifacts, not yet staged.
+    # There is no manifest to verify against — stage-release.sh will hash
+    # these very files into it — so the only check is that each one exists.
+    [ -d "$ARTIFACTS_DIR" ] || die "ARTIFACTS_DIR not found: $ARTIFACTS_DIR"
+    echo "package-nfpm: packaging local build output from $ARTIFACTS_DIR"
+    for arch in amd64 arm64; do
+        art_dir="$artifacts_root/$arch"
+        mkdir -p "$art_dir"
+        for entry in "${ARTIFACTS[@]}"; do
+            IFS='|' read -r staged installed <<<"$entry"
+            src="$ARTIFACTS_DIR/${staged}-linux-${arch}"
+            [ -f "$src" ] || die "missing local artifact $src (the release build did not produce it?)"
+            cp "$src" "$art_dir/$installed"
+            chmod +x "$art_dir/$installed"
+        done
     done
-done
+else
+    # --- Download the staged row, verifying before use ------------------------
+    # stage-release.sh writes versions/<pkgver>/components with one row per
+    # artifact and its SHA-256 — the same manifest the curl|sh installer
+    # verifies against, and the bucket's trust root. Every downloaded binary
+    # is checked against it BEFORE anything chmods, executes, or packages it:
+    # a corrupted, truncated, or wrongly-staged object must fail this job, not
+    # enter the .deb/.rpm/.apk that users install.
+    manifest_url="$BUCKET_URL/versions/$PKGVER/components"
+    curl -fsSL --retry 3 -o "$workdir/components" "$manifest_url" \
+        || die "cannot download $manifest_url — is $PKGVER staged in the bucket? (see stage-release.sh)"
+
+    declare -A manifest_sha=()
+    while IFS= read -r row; do
+        case "$row" in '#'*) continue ;; esac
+        read -r -a cols <<<"$row"
+        # component os arch version sha256 kind dest src
+        [ "${#cols[@]}" -eq 8 ] || die "unexpected components row in $manifest_url: $row"
+        src="${cols[7]}"
+        case "$src" in
+            "versions/$PKGVER/"*) manifest_sha["${src##*/}"]="${cols[4]}" ;;
+            *) ;; # symlink rows and other versions' rows carry no artifact here
+        esac
+    done <"$workdir/components"
+
+    [ "${#manifest_sha[@]}" -gt 0 ] || die "no artifact rows for $PKGVER in the staged components manifest"
+
+    for arch in amd64 arm64; do
+        art_dir="$artifacts_root/$arch"
+        mkdir -p "$art_dir"
+        for entry in "${ARTIFACTS[@]}"; do
+            IFS='|' read -r staged installed <<<"$entry"
+            url="$BUCKET_URL/versions/$PKGVER/${staged}-linux-${arch}"
+            curl -fsSL --retry 3 -o "$art_dir/$installed" "$url" \
+                || die "cannot download $url — is $PKGVER staged in the bucket? (see stage-release.sh)"
+            want="${manifest_sha[${staged}-linux-${arch}]:-}"
+            [ -n "$want" ] \
+                || die "no digest for ${staged}-linux-${arch} in the staged components manifest — refusing to package an unverified artifact"
+            got="$(sha256_of "$art_dir/$installed")"
+            [ "$got" = "$want" ] \
+                || die "SHA-256 mismatch for ${staged}-linux-${arch}: got $got, the staged manifest says $want"
+            chmod +x "$art_dir/$installed"
+        done
+    done
+fi
 
 # --- Generate completions ----------------------------------------------------
 # The technique scripts/dist-build.sh uses: XDG overrides steer the binary's
