@@ -2,7 +2,7 @@
 id: CRA
 title: Remote attach with certificates
 owner: mitodrummer
-epic: gominimal/inbox#513
+epic: gominimal/inbox#668
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
 updated: 2026-09-10
 ---
@@ -45,27 +45,48 @@ plane's revocation work, without changing the attach.
 
 ## Users and stories
 
-**Roles:** developers who run long workflows in sessions and need them to
-outlive their laptop, and developers who run sessions both locally and on
-remote machines and want one way to work with all of them.
+**Roles:** developer running sessions both locally and on remote hosts, developer running long workflows in remote sessions, developer attaching to a remote host, developer
 
-- AS A developer who deploys long running workflow in sessions, I WANT my sessions to stay active when my laptop is closed or asleep, SO THAT my workflow can successfully complete its objective without interruption or retries.
+- AS A developer running sessions both locally and on remote hosts, I WANT `min session attach`, `ls`, `rename` and `stop` to work on a remote session the way they work on a local one, SO THAT I work with all my sessions the same way.
   <!-- Acceptance criteria, for the EARS step:
-       - Processes in the session remain continuously active, and the session is in a state equivalent to detached, not exited.
+       - The commands take the same arguments and give the same output for a remote session as for a local one.
+       - `min session ls` shows, for every session, whether it is attached, detached or exited, and when it was last active.
+       - Attaching to a remote session works on a machine with no `ssh` installed.
+       - A daemon on a protocol version the CLI does not support is refused with both versions and the remedy named.
   -->
-- AS A developer running sessions both locally and remote, I WANT to enumerate and reconnect with remote sessions just like local sessions, SO THAT I can work with all my sessions the same way.
+- AS A developer running long workflows in remote sessions, I WANT my session to keep running when my laptop sleeps or my connection drops, and the CLI to reconnect on its own, SO THAT a closed lid or a network blip never costs me my work.
   <!-- Acceptance criteria, for the EARS step:
-       - Remote boxes are enumerable and attachable through the same CLI surface as local ones.
+       - When the connection under an attached session drops, the session keeps running and shows as detached, not exited, within 5 s.
+       - The CLI reconnects on its own, retrying after 1 s and doubling the wait to at most 30 s, until it is back or the developer detaches.
+       - Reattaching shows the session's current screen before any new output.
+       - A second attach moves the session to the new terminal, and the first is told it was superseded.
+  -->
+- AS A developer attaching to a remote host, I WANT the CLI to check the host's identity against my identity plane, with no prompt to accept an unknown key, SO THAT nobody can impersonate a host I attach to.
+  <!-- Acceptance criteria, for the EARS step:
+       - The host's certificate must verify under the identity plane's host authority for the name the CLI dialed; otherwise the attach stops before signing in, and there is no way to accept the key instead.
+       - With no host authority keys from the identity plane, the CLI attempts no remote attach.
+       - Every host certificate the identity plane's test vectors mark invalid is refused with the vector's reason.
+  -->
+- AS A developer, I WANT a remote daemon to accept only my identity-plane certificate, and only for sessions I own, SO THAT nobody else can see or attach to my sessions.
+  <!-- Acceptance criteria, for the EARS step:
+       - A daemon accepts remote connections only with a certificate; passwords and unauthenticated connections are refused.
+       - A connection sees, attaches to, renames and stops only the sessions its certificate's owner owns.
+       - When a certificate expires, its connection closes within 1 s and the sessions it reached keep running.
+       - A daemon enrolled with the identity plane — a provider's host or a developer's own machine — accepts remote certificates with no further setting; a daemon that is not enrolled accepts no remote connection.
+       - Repeated failed sign-in attempts on one connection are slowed and the connection closed after the third.
+  -->
+- AS A developer, I WANT the CLI's key and refresh token kept on my machine and out of every session, SO THAT an agent or a compromised box cannot use them.
+  <!-- Acceptance criteria, for the EARS step:
+       - The key is kept in the operating system's credential store, for this device only.
+       - Neither the key nor the refresh token reaches any session, local or remote — not as a file, an environment variable or a forwarded agent.
+       - The CLI renews its certificate in the background before it expires, with no browser step.
   -->
 
-The epic's other stories belong to siblings. Specifying a box's CPU and
-memory is the Box Provider abstraction's, with its criteria deferred to
-gominimal/inbox#570. Enumerating remote *boxes* is the Box Provider
-abstraction's inventory; enumerating and attaching to their *sessions* is
-this spec's. Monitoring a session from a browser is the browser client's,
-built on this one. Copying files out of a box has no spec; see Open
-questions. The epic's residue items, R9 and R12, are routed by the Box
-Provider abstraction and add nothing here.
+These stories carve the CLI-attach half of gominimal/inbox#513's "One
+Grammar" and "Closed Laptop" stories into their own epic. The epic's
+follow-ons (attaching from a browser, copying files out of a box,
+revocation, a per-attach policy check, hardware-backed keys and CLI
+sign-out) are Non-goals or open questions here.
 
 ## Requirements
 
