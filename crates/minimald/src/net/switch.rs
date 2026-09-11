@@ -133,9 +133,9 @@ pub fn open_tap(name: &str) -> io::Result<OwnedFd> {
 /// Each command is returned as an argv vector rather than executed, so the two
 /// callers can run them under the privileges they have: the daemon
 /// ([`move_tap_into_netns`]) execs them directly with `CAP_NET_ADMIN`, while the
-/// unprivileged netns proof (tests/netns.rs, mothballed) wraps each in `sudo`.
-/// Single-sourcing the
-/// command construction keeps the proof driving the same wiring the daemon does.
+/// netns proof (`tests/netns_root_integration.rs`) wraps each in `sudo` on an
+/// unprivileged runner. Single-sourcing the command construction keeps the proof
+/// driving the same wiring the daemon does.
 ///
 /// The namespace is identified by PID, addressing `/proc/<pid>/ns/net` — the
 /// namespace `sandbox2` unshared for the PTask, surfaced to the launcher via the
@@ -177,19 +177,6 @@ pub fn tap_netns_commands(
     ]
 }
 
-/// Moves the opened tap `tap` into the PTask network namespace held by
-/// `netns_pid` and configures its switch address there, by execing the
-/// [`tap_netns_commands`] directly. The host-side tap fd keeps working after the
-/// interface moves namespaces, which is what [`attach_to_switch`] relays on.
-///
-/// Run on the `minimald` (daemon) side; requires `CAP_NET_ADMIN` in the host
-/// namespace. `sandbox2` never calls this — it only unshares the namespace and
-/// surfaces the PID (no dependency cycle).
-///
-/// # Errors
-///
-/// Returns an error if `ip`/`nsenter` cannot be spawned or any command exits
-/// non-zero, naming the failing command line.
 /// Trusted directories (and the `PATH` handed to the children) searched for the
 /// privileged `ip`/`nsenter` binaries, ordered most- to least-specific. Using a
 /// fixed list instead of the inherited `PATH` is what keeps a tampered `PATH`
@@ -209,6 +196,27 @@ fn trusted_program(program: &str) -> String {
     program.to_string()
 }
 
+/// Moves the opened tap `tap` into the PTask network namespace held by
+/// `netns_pid` and configures its switch address there, by execing the
+/// [`tap_netns_commands`] directly. The host-side tap fd keeps working after the
+/// interface moves namespaces, which is what [`attach_to_switch`] relays on.
+///
+/// Run on the `minimald` (daemon) side; requires `CAP_NET_ADMIN` in the host
+/// namespace. `sandbox2` never calls this — it only unshares the namespace and
+/// surfaces the PID (no dependency cycle).
+///
+/// **The fallback, not the path.** Every own-IP PTask is meant to get its tap
+/// built inside its own namespace, rootless (03-spec-networking R1.5), and that
+/// is what happens on a native host and inside a libkrun guest. It does not work
+/// in the x86_64 KVM guest — hakoniwa's RustSlirp yields no descriptor there,
+/// with `/dev/net/tun` present and user namespaces available — so
+/// `net::provider` falls back to this when the sandbox layer produced no tap and
+/// the daemon has the privilege to make one itself.
+///
+/// # Errors
+///
+/// Returns an error if `ip`/`nsenter` cannot be spawned or any command exits
+/// non-zero, naming the failing command line.
 pub async fn move_tap_into_netns(
     tap: &str,
     netns_pid: u32,

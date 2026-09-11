@@ -86,6 +86,7 @@ TASK_SEED_DIR="" # seeded by the `min task run` proof below; removed on teardown
 HOOK_SEED_DIR="" # seeded by the lifecycle-hooks proof below; removed on teardown
 PATCH_SRC_DIR="" # patch sources for the patch-modes proof; removed on teardown
 SKIP_SEED_DIR="" # seeded by the skip-lane scaffold proof below; removed on teardown
+OWNIP_SEED_DIR="" # seeded by the own-IP proof below; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -192,6 +193,25 @@ mnl() {
   min ${E2E_MINIMAL_ARGS:-} "$@"
 }
 
+# `::error::<headline>` plus the contents of each file, folded into the one
+# annotation line.
+#
+# GitHub renders annotations where it does not render logs: a reader without
+# repo access, or a tool reading the check run, sees the headline and nothing
+# else. For a failure that only one lane can produce, that leaves the evidence
+# unreachable exactly when it is needed. `%0A`/`%0D`/`%25` are the workflow
+# command escapes — `%` first, or it would re-escape the escapes.
+annotate() {
+  local headline="$1" body="" chunk
+  shift
+  for f in "$@"; do
+    [ -s "$f" ] || continue
+    chunk="$(head -c 1200 "$f" | sed 's/%/%25/g' | sed 's/\r/%0D/g' | awk '{printf "%s%%0A", $0}')"
+    body="$body%0A--- $(basename "$f") ---%0A$chunk"
+  done
+  echo "::error::${headline}${body}"
+}
+
 teardown() {
   mnl stop --force >/dev/null 2>&1 || true
   if [ -n "$E2E_VM" ]; then
@@ -203,6 +223,7 @@ teardown() {
   [ -n "$HOOK_SEED_DIR" ] && rm -rf "$HOOK_SEED_DIR"
   [ -n "$PATCH_SRC_DIR" ] && rm -rf "$PATCH_SRC_DIR"
   [ -n "$SKIP_SEED_DIR" ] && rm -rf "$SKIP_SEED_DIR"
+  [ -n "$OWNIP_SEED_DIR" ] && rm -rf "$OWNIP_SEED_DIR"
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
   # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
@@ -369,6 +390,134 @@ if grep -q "unsupported command" "$lookalike_err"; then
 fi
 echo "session exec proof OK"
 echo "::endgroup::"
+
+# ---------------------------------------------------------------------------
+# Own-IP proof: a `--network own-ip` session gets a tap of its own, built by the
+# sandbox layer INSIDE the session's network namespace and relayed to the
+# gvproxy switch (03-spec-networking R1.5).
+#
+# Gated on MINVMD_GVPROXY_BIN, which is the one signal that a switch exists:
+# `just e2e` sets it for the VM lanes, and `just e2e-native` deliberately does
+# not ("Boots switchless like CI's step"), because the native lane's e2e job
+# fetches no gvproxy. So this runs exactly where own-IP can work, and needs no
+# workflow edit to say so.
+#
+# On those lanes minimald is inside a microVM, so the tap's frames reach the
+# host's gvproxy over vsock. Activation is itself half the proof: the relay is
+# attached before `activate` returns, so a switch that refused the client — or a
+# transport that could not carry the descriptor out of the guest — fails here
+# and not later. The assertions below are the other half, the namespace side.
+#
+# Deliberately tool-free. A session rootfs carries the baseline packages, not
+# iproute2, so every fact is read from /proc and /etc — written by the kernel
+# and by the sandbox layer, not by a program that might be missing.
+if [ -n "${MINVMD_GVPROXY_BIN:-}" ]; then
+  echo "::group::own-IP session proof (--network own-ip)"
+  OWNIP_SEED_DIR="$(mktemp -d /tmp/mnlo.XXXXXX)"
+  OWNIP_SEED_DIR="$(cd "$OWNIP_SEED_DIR" && pwd -P)"
+  {
+    awk '
+      /^\[upstream\]/            { grab = 1; print; next }
+      grab && (/^$/ || /^\[/)    { exit }
+      grab                       { print }
+    ' "$ROOT/.minimal/minimal.toml"
+    printf '\n[stack]\nuse = "shell"\n'
+  } > "$OWNIP_SEED_DIR/minimal.toml"
+  # The `.git` marker the headless upload gate wants, as the other seeded
+  # fixtures do. Its own directory, because activating a path that already has
+  # a session does not mint a second one.
+  mkdir "$OWNIP_SEED_DIR/.git"
+
+  ownip_sid="$(cd "$OWNIP_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-own-ip --network own-ip 2>"$WORK/ownip.err")" || {
+    echo "::error::'min session activate --network own-ip' failed"
+    echo "--- stderr ---"; cat "$WORK/ownip.err" 2>/dev/null || true
+    fail
+  }
+  ownip_sid="$(printf '%s\n' "$ownip_sid" | tail -n1 | tr -d '\r')"
+
+  # Read every fact in ONE exec, and prove that read happened before reading
+  # anything into it.
+  #
+  # Two lessons from earlier runs are baked in here. An exec that failed
+  # returns no output, which the assertions below would each report as "the tap
+  # never came up" — blaming the change under test for a broken probe; the
+  # root-integration harness has a preflight for exactly that. And a probe
+  # helper whose failure path ran inside `$(...)` could not abort the script
+  # (the `fail` exited only the subshell) and swallowed `fail`'s diagnostics
+  # into the captured variable, so the run reported a downstream symptom with
+  # none of the evidence. One exec, checked at the top level, avoids both — and
+  # removes the second and third chances for an unrelated exec hiccup to look
+  # like a networking result.
+  # `sh -c` rather than one semicolon-joined string: the exec proof above
+  # establishes that argv form for a multi-command probe ("multi-word argv must
+  # reach the session with the quoting the local shell already removed"), and
+  # establishes the bare-string form only for a single command. Use the shape
+  # this script already proves works.
+  if ! mnl session exec "$ownip_sid" sh -c \
+    'echo ---DEV---; cat /proc/net/dev; echo ---ROUTE---; cat /proc/net/route; echo ---RESOLV---; cat /etc/resolv.conf' \
+    >"$WORK/ownip-facts.out" 2>"$WORK/ownip-facts.err" || [ ! -s "$WORK/ownip-facts.out" ]; then
+    # Carry the captured streams INTO the annotation, not just the log. A
+    # failure only this lane can produce is one most readers cannot open the
+    # log for — `::error::` text is visible where the log is not, so the
+    # evidence has to travel with the headline.
+    annotate "could not read the own-IP session's network state — the probe failed, which says nothing about the tap" \
+      "$WORK/ownip-facts.err" "$WORK/ownip-facts.out" "$WORK/ownip.err"
+    echo "--- stdout ---"; cat "$WORK/ownip-facts.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/ownip-facts.err" 2>/dev/null || true
+    echo "--- activate stderr ---"; cat "$WORK/ownip.err" 2>/dev/null || true
+    fail
+  fi
+  # Everything between one marker and the next.
+  ownip_section() {
+    awk -v want="---$1---" '
+      $0 == want   { grab = 1; next }
+      /^---.*---$/ { grab = 0 }
+      grab         { print }
+    ' "$WORK/ownip-facts.out"
+  }
+
+  # An interface besides `lo`. /proc/net/dev's two header lines carry `|`, and
+  # every interface line carries `:`, so two or more colons means the tap is
+  # there. A HostNet session would show the daemon's interfaces instead, but
+  # this session is in its own namespace — the only way anything but `lo`
+  # appears is if the sandbox layer built it.
+  ownip_dev="$(ownip_section DEV)"
+  if [ "$(printf '%s\n' "$ownip_dev" | grep -c ':')" -lt 2 ]; then
+    echo "::error::own-IP session has no interface besides lo; the tap never came up"
+    echo "--- all probed facts ---"; cat "$WORK/ownip-facts.out"
+    echo "--- activate stderr ---"; cat "$WORK/ownip.err" 2>/dev/null || true
+    fail
+  fi
+
+  # A default route on that interface: destination 0.0.0.0, which /proc/net/route
+  # spells as eight zeroes in field 2. Without it the tap would be up but the
+  # PTask would reach nothing, which is the failure an address-only check misses.
+  ownip_route="$(ownip_section ROUTE)"
+  if ! printf '%s\n' "$ownip_route" \
+    | awk 'NR > 1 && $2 == "00000000" && $1 != "lo" { found = 1 } END { exit !found }'; then
+    echo "::error::own-IP session has no default route off its tap"
+    echo "--- all probed facts ---"; cat "$WORK/ownip-facts.out"
+    fail
+  fi
+
+  # The resolver points at the switch, not at the synth rootfs's host stub
+  # (127.0.0.53), which is unreachable from a fresh netns. 100.64/16 is the
+  # default switch subnet, and CI does not override it.
+  ownip_resolv="$(ownip_section RESOLV)"
+  if ! printf '%s\n' "$ownip_resolv" | grep -q '^nameserver 100\.64\.'; then
+    echo "::error::own-IP session's resolver does not point at the switch"
+    echo "--- all probed facts ---"; cat "$WORK/ownip-facts.out"
+    fail
+  fi
+
+  mnl session destroy --force "$ownip_sid" >/dev/null 2>&1 || true
+  rm -rf "$OWNIP_SEED_DIR"; OWNIP_SEED_DIR=""
+  echo "own-IP session proof OK (tap up, default route, switch resolver)"
+  echo "::endgroup::"
+else
+  echo "own-IP session proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+fi
 
 # ---------------------------------------------------------------------------
 # `min task run` proof: a declared task runs in an ephemeral session — output

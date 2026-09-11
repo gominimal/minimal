@@ -830,8 +830,12 @@ impl<'a> Env<'a> {
 
     #[cfg(target_os = "linux")]
     pub fn container(&mut self) -> Result<Container, Error> {
+        // The plan this sandbox's own configuration implies. Callers that need a
+        // provider to decide it use the launch sequence instead, which can await
+        // `Network::plan`; this one is the built-in mapping and stays sync.
+        let plan = self.sandbox.built_in_plan();
         self.sandbox
-            .new_container()
+            .new_container(&plan)
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
     }
 
