@@ -175,7 +175,7 @@ the requirements cite them rather than restate them.
 - **CRA-012** IF the daemon's protocol version is outside the configured
   range of daemon protocol versions the CLI supports THEN THE SYSTEM SHALL
   refuse the connection, naming both versions and the remedy (the
-  architecture's version skew paragraph).
+  architecture's version skew paragraph, [Client maintenance](https://github.com/gominimal/arch/blob/main/architecture.md#client-maintenance)).
   tier:     T0
   verify:   cargo nextest run -p minimal-client out_of_window_daemon_refused_with_both_versions
 
@@ -220,7 +220,8 @@ the requirements cite them rather than restate them.
 - **CRA-033** WHILE the CLI is re-attaching after a certificate expired, IF
   renewing the certificate fails THEN THE SYSTEM SHALL stop re-attaching,
   tell the developer to sign in again, naming the sign-in command, and exit
-  with status 5, the architecture's exit code for an authentication failure.
+  with status 5, the architecture's exit code for an authentication failure
+  ([Exit codes](https://github.com/gominimal/arch/blob/main/architecture.md#exit-codes)).
   tier:     T0
   verify:   cargo nextest run -p minimal-client failed_renewal_stops_reattach_and_asks_for_signin
 
@@ -323,13 +324,13 @@ on 2026-09-11 and are not reused; see Non-goals.
   relay and Egress Gateway: the networking work, designed in
   [deployment-and-egress-gateway.md](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)
   and to be specified in its own spec. The daemon's mesh-ingress half is
-  drafted in [MMI](../14-spec-minimald-mesh-ingress/14-spec-minimald-mesh-ingress.md)
-  until then.
+  drafted in [MMI](https://github.com/gominimal/minimal/pull/1356) until
+  then.
 - Issuing, renewing and revoking certificates on the identity plane's side,
   and the CLI's sign-in ceremony: the identity plane's spec (gominimal/gatehouse#1,
-  GHI) and [GHS](../12-spec-github-sessions/12-spec-github-sessions.md).
+  GHI) and [GHS](https://github.com/gominimal/minimal/pull/1351).
 - Attaching from a browser: the browser client
-  ([MCC](../13-spec-min-client-core/13-spec-min-client-core.md) and
+  ([MCC](https://github.com/gominimal/minimal/pull/1355) and
   gominimal/webapp#763), on hold until this spec lands, and built on it.
 - Two developers in one session: ruled out on 2026-08-20, so the daemon
   admits a session's owner only (CRA-023).
