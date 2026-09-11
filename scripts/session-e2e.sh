@@ -417,22 +417,35 @@ if [ -n "${MINVMD_GVPROXY_BIN:-}" ]; then
   }
   ownip_sid="$(printf '%s\n' "$ownip_sid" | tail -n1 | tr -d '\r')"
 
-  # Read the namespace's facts once, and prove the read itself worked before
-  # reading anything into it. An exec that failed returns empty output, which
-  # every assertion below would otherwise report as "the tap never came up" —
-  # blaming the change under test for a broken probe. The root-integration
-  # harness separates these two for the same reason.
-  ownip_probe() {
-    if ! mnl session exec "$ownip_sid" "cat $1" \
-      >"$WORK/ownip-probe.out" 2>"$WORK/ownip-probe.err" \
-      || [ ! -s "$WORK/ownip-probe.out" ]; then
-      echo "::error::could not read $1 from the own-IP session — the probe failed, which says nothing about the tap"
-      echo "--- stdout ---"; cat "$WORK/ownip-probe.out" 2>/dev/null || true
-      echo "--- stderr ---"; cat "$WORK/ownip-probe.err" 2>/dev/null || true
-      echo "--- activate stderr ---"; cat "$WORK/ownip.err" 2>/dev/null || true
-      fail
-    fi
-    cat "$WORK/ownip-probe.out"
+  # Read every fact in ONE exec, and prove that read happened before reading
+  # anything into it.
+  #
+  # Two lessons from earlier runs are baked in here. An exec that failed
+  # returns no output, which the assertions below would each report as "the tap
+  # never came up" — blaming the change under test for a broken probe; the
+  # root-integration harness has a preflight for exactly that. And a probe
+  # helper whose failure path ran inside `$(...)` could not abort the script
+  # (the `fail` exited only the subshell) and swallowed `fail`'s diagnostics
+  # into the captured variable, so the run reported a downstream symptom with
+  # none of the evidence. One exec, checked at the top level, avoids both — and
+  # removes the second and third chances for an unrelated exec hiccup to look
+  # like a networking result.
+  if ! mnl session exec "$ownip_sid" \
+    'echo ---DEV---; cat /proc/net/dev; echo ---ROUTE---; cat /proc/net/route; echo ---RESOLV---; cat /etc/resolv.conf' \
+    >"$WORK/ownip-facts.out" 2>"$WORK/ownip-facts.err" || [ ! -s "$WORK/ownip-facts.out" ]; then
+    echo "::error::could not read the own-IP session's network state — the probe failed, which says nothing about the tap"
+    echo "--- stdout ---"; cat "$WORK/ownip-facts.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/ownip-facts.err" 2>/dev/null || true
+    echo "--- activate stderr ---"; cat "$WORK/ownip.err" 2>/dev/null || true
+    fail
+  fi
+  # Everything between one marker and the next.
+  ownip_section() {
+    awk -v want="---$1---" '
+      $0 == want   { grab = 1; next }
+      /^---.*---$/ { grab = 0 }
+      grab         { print }
+    ' "$WORK/ownip-facts.out"
   }
 
   # An interface besides `lo`. /proc/net/dev's two header lines carry `|`, and
@@ -440,10 +453,10 @@ if [ -n "${MINVMD_GVPROXY_BIN:-}" ]; then
   # there. A HostNet session would show the daemon's interfaces instead, but
   # this session is in its own namespace — the only way anything but `lo`
   # appears is if the sandbox layer built it.
-  ownip_dev="$(ownip_probe /proc/net/dev)"
+  ownip_dev="$(ownip_section DEV)"
   if [ "$(printf '%s\n' "$ownip_dev" | grep -c ':')" -lt 2 ]; then
     echo "::error::own-IP session has no interface besides lo; the tap never came up"
-    echo "--- /proc/net/dev ---"; printf '%s\n' "$ownip_dev"
+    echo "--- all probed facts ---"; cat "$WORK/ownip-facts.out"
     echo "--- activate stderr ---"; cat "$WORK/ownip.err" 2>/dev/null || true
     fail
   fi
@@ -451,21 +464,21 @@ if [ -n "${MINVMD_GVPROXY_BIN:-}" ]; then
   # A default route on that interface: destination 0.0.0.0, which /proc/net/route
   # spells as eight zeroes in field 2. Without it the tap would be up but the
   # PTask would reach nothing, which is the failure an address-only check misses.
-  ownip_route="$(ownip_probe /proc/net/route)"
+  ownip_route="$(ownip_section ROUTE)"
   if ! printf '%s\n' "$ownip_route" \
     | awk 'NR > 1 && $2 == "00000000" && $1 != "lo" { found = 1 } END { exit !found }'; then
     echo "::error::own-IP session has no default route off its tap"
-    echo "--- /proc/net/route ---"; printf '%s\n' "$ownip_route"
+    echo "--- all probed facts ---"; cat "$WORK/ownip-facts.out"
     fail
   fi
 
   # The resolver points at the switch, not at the synth rootfs's host stub
   # (127.0.0.53), which is unreachable from a fresh netns. 100.64/16 is the
   # default switch subnet, and CI does not override it.
-  ownip_resolv="$(ownip_probe /etc/resolv.conf)"
+  ownip_resolv="$(ownip_section RESOLV)"
   if ! printf '%s\n' "$ownip_resolv" | grep -q '^nameserver 100\.64\.'; then
     echo "::error::own-IP session's resolver does not point at the switch"
-    echo "--- /etc/resolv.conf ---"; printf '%s\n' "$ownip_resolv"
+    echo "--- all probed facts ---"; cat "$WORK/ownip-facts.out"
     fail
   fi
 
