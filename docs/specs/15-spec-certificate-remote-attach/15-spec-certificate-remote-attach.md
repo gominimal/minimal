@@ -4,7 +4,7 @@ title: Remote attach with certificates
 owner: mitodrummer
 epic: gominimal/inbox#668
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
-updated: 2026-09-10
+updated: 2026-09-11
 ---
 
 # CRA — Remote attach with certificates
@@ -172,9 +172,10 @@ the requirements cite them rather than restate them.
   tier:     T0
   verify:   cargo nextest run -p minimal-client protocol_version_agreed_before_session_ops
 
-- **CRA-012** IF the daemon's protocol version is outside the range the CLI
-  supports THEN THE SYSTEM SHALL refuse the connection, naming both versions
-  and the remedy (the architecture's version skew paragraph).
+- **CRA-012** IF the daemon's protocol version is outside the configured
+  range of daemon protocol versions the CLI supports THEN THE SYSTEM SHALL
+  refuse the connection, naming both versions and the remedy (the
+  architecture's version skew paragraph).
   tier:     T0
   verify:   cargo nextest run -p minimal-client out_of_window_daemon_refused_with_both_versions
 
@@ -204,12 +205,24 @@ the requirements cite them rather than restate them.
   tier:     T0
   verify:   cargo nextest run -p minimald dropped_client_leaves_session_detached_not_exited
 
-- **CRA-017** WHEN a remote attach ends because the connection was lost or
-  the certificate expired THE SYSTEM SHALL attach again, after 1 s and
-  doubling the wait to at most 30 s, until it succeeds or the developer
-  detaches.
+- **CRA-017** WHEN a remote attach ends because the connection was lost THE
+  SYSTEM SHALL attach again, after 1 s and doubling the wait to at most 30 s,
+  until it succeeds or the developer detaches.
   tier:     T0
   verify:   cargo nextest run -p minimal-client lost_attach_retries_1s_doubling_to_30s
+
+- **CRA-032** WHEN a remote attach ends because the certificate expired THE
+  SYSTEM SHALL renew the certificate (CRA-002) and verify the daemon's host
+  certificate again (CRA-004) before its next attempt.
+  tier:     T0
+  verify:   cargo nextest run -p minimal-client expired_attach_renews_and_reverifies_host_first
+
+- **CRA-033** WHILE the CLI is re-attaching after a certificate expired, IF
+  renewing the certificate fails THEN THE SYSTEM SHALL stop re-attaching,
+  tell the developer to sign in again, naming the sign-in command, and exit
+  with status 5, the architecture's exit code for an authentication failure.
+  tier:     T0
+  verify:   cargo nextest run -p minimal-client failed_renewal_stops_reattach_and_asks_for_signin
 
 ### Who the daemon admits
 
@@ -360,7 +373,12 @@ removes a dependency developers otherwise need.
 
 **Reconnect until back or detached.** A dropped attach retries on its own
 (CRA-017), which suits long agent runs. Exiting on every drop, and retrying
-for a bounded window before exiting, were the alternatives.
+for a bounded window before exiting, were the alternatives. An expired
+certificate is renewed and the host verified again before the next attempt
+(CRA-032), and a renewal that fails ends the loop with the authentication
+exit status (CRA-033), so the CLI never retries a credential it cannot
+renew; printing the sign-in instruction without an exit-code rule was the
+alternative (review of this spec, 2026-09-11).
 
 **Key custody this cycle, hardware later.** The CLI's key signs both SSH
 authentication and the proofs that make its refresh token usable, so the key,
@@ -433,7 +451,9 @@ CRA-003.
   listing, or both?] Survives because the two sources cover different
   daemons: provider-created hosts appear in their provider's inventory and,
   today, not in the identity plane's listing (gominimal/arch#47), while a
-  developer's own enrolled machine appears only in the latter. The identity
+  developer's own enrolled machine appears only in the latter. The same
+  answer settles how one session reached through both is listed once and how
+  a daemon that does not answer is shown. The identity
   plane's listing covering both is gominimal/inbox#648's S3a; once it lands,
   one source may do.
 
@@ -454,4 +474,6 @@ CRA-003.
 
 - [NEEDS CLARIFICATION (MEDIUM): how wide is the range of daemon protocol
   versions the CLI accepts?] Survives because the architecture records it as
-  an open gap, and CRA-012 needs a range to refuse against.
+  an open gap. CRA-012 refuses against the configured range whatever its
+  width, so the requirement is testable today and the width is a value to
+  set, not a behaviour to add.
