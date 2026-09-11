@@ -34,6 +34,14 @@
 #                         no artifacts dir, no manifest — just the packages,
 #                         for a row that is already staged.
 #   --pkg-only            Only upload --pkg-dir (PKG_ONLY)
+#   --extra FILE          Also upload FILE into versions/<V>/ under its basename
+#                         (repeatable): the version-pinned install.sh, the
+#                         release notes. Not manifest rows; same guard and
+#                         cache header as everything else in the row.
+#   --restage             Overwrite an already-staged version (RESTAGE). Staged
+#                         versions are write-once; without this, a version whose
+#                         `components` manifest already exists fails before any
+#                         upload, and every upload refuses to replace an object.
 #   --dry-run             Print the manifest and planned uploads; touch nothing
 #   -h, --help            Show this help
 #
@@ -59,6 +67,8 @@ VERSION="${VERSION:-}"
 ALLOW_MISSING=0
 PKG_DIR="${PKG_DIR:-}"
 PKG_ONLY="${PKG_ONLY:-0}"
+RESTAGE="${RESTAGE:-0}"
+EXTRA_FILES=()
 DRY_RUN=0
 
 # Manifest format version. Bump only on a breaking change to the column layout;
@@ -79,6 +89,8 @@ while [ $# -gt 0 ]; do
         --allow-missing) ALLOW_MISSING=1; shift ;;
         --pkg-dir)       PKG_DIR="$2"; shift 2 ;;
         --pkg-only)      PKG_ONLY=1; shift ;;
+        --restage)       RESTAGE=1; shift ;;
+        --extra)         [ -f "${2:-}" ] || die "--extra needs an existing file (got '${2:-}')"; EXTRA_FILES+=("$2"); shift 2 ;;
         --dry-run)       DRY_RUN=1; shift ;;
         -h|--help)       usage 0 ;;
         *)               die "unknown argument: $1 (try --help)" ;;
@@ -94,6 +106,24 @@ fi
 case "$VERSION" in
     *[!A-Za-z0-9._-]*) die "version '$VERSION' contains characters outside [A-Za-z0-9._-]" ;;
 esac
+
+# --- Write-once ------------------------------------------------------------
+#
+# A staged version is immutable: the docs say so, every object is served with
+# a one-year immutable cache header, and the promotion gate reasons about the
+# bytes that were smoked — none of which survives a silent re-upload (the
+# 0.5.4 tag push rewrote the nightly-smoked row exactly that way). So every
+# upload carries `--if-generation-match=0`: the object must not exist yet, or
+# gcloud fails instead of overwriting. The row's `components` manifest is
+# additionally probed BEFORE the first upload, so a complete row fails before
+# any of its objects is touched rather than partway through. --restage is the
+# explicit, logged opt-in for a deliberate rewrite.
+cp_flags=(--cache-control="$IMMUTABLE_CACHE")
+if [ "$RESTAGE" -eq 1 ]; then
+    printf 'stage-release: --restage: overwriting whatever already exists under versions/%s (write-once guard OFF)\n' "$VERSION" >&2
+else
+    cp_flags+=(--if-generation-match=0)
+fi
 
 # --- The distro-package upload (--pkg-dir / --pkg-only) ---------------------
 #
@@ -116,7 +146,7 @@ upload_pkg_dir() {
     printf '  %s\n' "${pkg_files[@]}" >&2
     [ "$DRY_RUN" -eq 1 ] && return 0
     gcloud storage cp \
-        --cache-control="$IMMUTABLE_CACHE" \
+        "${cp_flags[@]}" \
         "${pkg_files[@]}" "$BUCKET/versions/$VERSION/pkg/"
 }
 
@@ -295,23 +325,35 @@ printf '=== components manifest (%s/components) ===\n' "$version_prefix" >&2
 cat "$manifest" >&2
 printf '=== %d artifact(s) -> %s/ ===\n' "${#upload_list[@]}" "$version_prefix" >&2
 printf '  %s\n' "${upload_list[@]}" >&2
+if [ "${#EXTRA_FILES[@]}" -gt 0 ]; then
+    printf '=== %d extra file(s) -> %s/ ===\n' "${#EXTRA_FILES[@]}" "$version_prefix" >&2
+    printf '  %s\n' "${EXTRA_FILES[@]}" >&2
+fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
     printf 'stage-release: dry run, nothing uploaded\n' >&2
     exit 0
 fi
 
-# Immutable version artifacts: cache aggressively. Content is addressed by the
-# version segment, so a given URL never changes payload.
-IMMUTABLE_CACHE="public, max-age=31536000, immutable"
+# The manifest is the last object a staging run writes, so its presence means
+# a complete row. Probe it before touching anything (see Write-once above).
+if [ "$RESTAGE" -eq 0 ] && gcloud storage objects describe "$version_prefix/components" >/dev/null 2>&1; then
+    die "versions/$VERSION is already staged ($version_prefix/components exists) and staged versions are immutable — nothing was uploaded. Stage under a new version, or pass --restage to overwrite it deliberately."
+fi
 
 gcloud storage cp \
-    --cache-control="$IMMUTABLE_CACHE" \
+    "${cp_flags[@]}" \
     "${upload_list[@]}" "$version_prefix/"
 
 gcloud storage cp \
-    --cache-control="$IMMUTABLE_CACHE" \
+    "${cp_flags[@]}" \
     "$manifest" "$version_prefix/components"
+
+if [ "${#EXTRA_FILES[@]}" -gt 0 ]; then
+    gcloud storage cp \
+        "${cp_flags[@]}" \
+        "${EXTRA_FILES[@]}" "$version_prefix/"
+fi
 
 if [ -n "$PKG_DIR" ]; then
     upload_pkg_dir

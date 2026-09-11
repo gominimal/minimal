@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+#
+# stage-release_test.sh — test harness for scripts/stage-release.sh's
+# write-once contract.
+#
+# `gcloud` is stubbed by prepending a temp dir to PATH containing a fake that
+# records every invocation and answers `storage objects describe` (the
+# already-staged probe) from GCLOUD_STUB_EXISTS — no network, no auth, no
+# bucket. The artifacts are two fake files under --allow-missing; the
+# component table and manifest format are not under test here. Run directly
+# or via `just test-shell`.
+
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+script="$here/stage-release.sh"
+[ -f "$script" ] || { echo "cannot find stage-release.sh next to test" >&2; exit 1; }
+
+root="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-stagetest)"
+trap 'rm -rf "$root"' EXIT
+
+mkdir -p "$root/bin"
+cat >"$root/bin/gcloud" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${GCLOUD_STUB_ARGS:?}"
+if [ "${1:-} ${2:-} ${3:-}" = "storage objects describe" ]; then
+    [ "${GCLOUD_STUB_EXISTS:-0}" = 1 ] && exit 0
+    exit 1
+fi
+exit 0
+EOF
+chmod +x "$root/bin/gcloud"
+# The script hashes with sha256sum (coreutils); a macOS dev box may only have
+# shasum. Shim it so the harness runs everywhere the script's own tests do.
+if ! command -v sha256sum >/dev/null 2>&1; then
+    printf '#!/usr/bin/env bash\nexec shasum -a 256 "$@"\n' >"$root/bin/sha256sum"
+    chmod +x "$root/bin/sha256sum"
+fi
+export PATH="$root/bin:$PATH"
+export GCLOUD_STUB_ARGS="$root/gcloud-args"
+unset GCLOUD_STUB_EXISTS RESTAGE VERSION BUCKET ARTIFACTS_DIR PKG_DIR PKG_ONLY
+
+mkdir -p "$root/artifacts" "$root/pkg"
+printf 'fake min\n' >"$root/artifacts/minimal-linux-amd64"
+printf 'fake mip\n' >"$root/artifacts/mip-linux-amd64"
+printf 'fake deb\n' >"$root/pkg/minimal_0.6.0_amd64.deb"
+
+pass=0 fail=0
+ok()  { pass=$((pass + 1)); printf 'ok   - %s\n' "$*"; }
+bad() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$*"; }
+
+# expect <want_rc> <want_substring> <description> -- <command...>
+expect() {
+    local want_rc="$1" want_msg="$2" desc="$3"; shift 3
+    [ "${1:-}" = "--" ] || { bad "$desc (test bug: missing -- separator)"; return; }
+    shift
+    local out rc=0
+    out="$("$@" 2>&1)" || rc=$?
+    if [ "$rc" -eq "$want_rc" ] && [[ "$out" == *"$want_msg"* ]]; then
+        ok "$desc"
+    else
+        bad "$desc (want rc=$want_rc and '$want_msg'; got rc=$rc, out: $out)"
+    fi
+}
+
+# calls <grep pattern> — how many recorded gcloud invocations match.
+calls() {
+    grep -c -- "$1" "$GCLOUD_STUB_ARGS" 2>/dev/null || true
+}
+
+# expect_calls <want_count> <grep pattern> <description>
+expect_calls() {
+    local got
+    got="$(calls "$2")"
+    if [ "$got" -eq "$1" ]; then
+        ok "$3"
+    else
+        bad "$3 (want $1 call(s) matching '$2', got $got: $(tr '\n' '|' <"$GCLOUD_STUB_ARGS" 2>/dev/null))"
+    fi
+}
+
+# stage <args...> — a fresh recording, the fixture artifacts, a test bucket.
+stage() {
+    : >"$GCLOUD_STUB_ARGS"
+    "$script" --artifacts-dir "$root/artifacts" --bucket gs://test-bucket --allow-missing "$@"
+}
+
+# with VAR=value... -- <command...> — run a shell function with those
+# variables exported, in a subshell so nothing leaks between cases (`env`
+# cannot run a function).
+with() {
+    (
+        while [ "${1:-}" != "--" ]; do export "${1?}"; shift; done
+        shift
+        "$@"
+    )
+}
+
+# --- a fresh version stages with the precondition on every upload -----------
+
+expect 0 "staged 0.6.0 at gs://test-bucket/versions/0.6.0" "a fresh version stages" -- \
+    with GCLOUD_STUB_EXISTS=0 -- stage --version 0.6.0
+expect_calls 1 "^storage objects describe gs://test-bucket/versions/0.6.0/components$" \
+    "the components manifest is probed once before uploading"
+expect_calls 2 "^storage cp " "two uploads: the artifacts and the manifest"
+expect_calls 2 "^storage cp --cache-control=public, max-age=31536000, immutable --if-generation-match=0 " \
+    "both uploads carry the immutable cache header and the must-not-exist precondition"
+expect_calls 1 "mip-linux-amd64 .*minimal-linux-amd64 .* gs://test-bucket/versions/0.6.0/$" \
+    "the artifact upload targets the version row"
+expect_calls 1 "/components gs://test-bucket/versions/0.6.0/components$" \
+    "the manifest upload targets versions/<V>/components"
+
+# --- an already-staged version fails before any upload ----------------------
+
+expect 1 "versions/0.6.0 is already staged (gs://test-bucket/versions/0.6.0/components exists)" \
+    "an existing manifest fails the run, naming the version" -- \
+    with GCLOUD_STUB_EXISTS=1 -- stage --version 0.6.0
+expect 1 "pass --restage to overwrite it deliberately" "the failure names the opt-in" -- \
+    with GCLOUD_STUB_EXISTS=1 -- stage --version 0.6.0
+expect_calls 0 "^storage cp " "nothing is uploaded when the version already exists"
+
+# --- --restage is the explicit, logged opt-in --------------------------------
+
+expect 0 "stage-release: --restage: overwriting whatever already exists under versions/0.6.0 (write-once guard OFF)" \
+    "--restage proceeds over an existing version and logs it" -- \
+    with GCLOUD_STUB_EXISTS=1 -- stage --version 0.6.0 --restage
+expect_calls 0 "^storage objects describe " "--restage skips the probe"
+expect_calls 2 "^storage cp " "--restage uploads both objects"
+expect_calls 0 "if-generation-match" "--restage drops the precondition so the objects are replaced"
+expect_calls 2 "^storage cp --cache-control=public, max-age=31536000, immutable " \
+    "--restage keeps the immutable cache header"
+expect 0 "write-once guard OFF" "RESTAGE=1 in the environment is the same opt-in" -- \
+    with GCLOUD_STUB_EXISTS=1 RESTAGE=1 -- stage --version 0.6.0
+
+# --- the packages upload is guarded the same way ------------------------------
+
+expect 0 "staged 0.6.0" "--pkg-dir on a fresh version stages the row and the packages" -- \
+    with GCLOUD_STUB_EXISTS=0 -- stage --version 0.6.0 --pkg-dir "$root/pkg"
+expect_calls 3 "^storage cp --cache-control=public, max-age=31536000, immutable --if-generation-match=0 " \
+    "all three uploads carry the precondition"
+expect_calls 1 "minimal_0.6.0_amd64.deb gs://test-bucket/versions/0.6.0/pkg/$" \
+    "the packages land under versions/<V>/pkg/"
+
+# --pkg-only adds packages to a row that is already staged BY DESIGN: the
+# manifest probe must not fire, but each package object is still write-once.
+expect 0 "staged packages for 0.6.0" "--pkg-only stages into an existing row" -- \
+    with GCLOUD_STUB_EXISTS=1 -- stage --version 0.6.0 --pkg-only --pkg-dir "$root/pkg"
+expect_calls 0 "^storage objects describe " "--pkg-only does not probe the manifest"
+expect_calls 1 "^storage cp --cache-control=public, max-age=31536000, immutable --if-generation-match=0 .*/pkg/$" \
+    "--pkg-only's single upload carries the precondition"
+
+# --- --extra files join the row under the same guard ---------------------------
+
+printf 'fake installer\n' >"$root/install.sh"
+printf '## 0.6.0\n' >"$root/notes.md"
+expect 0 "staged 0.6.0" "--extra uploads join a fresh row" -- \
+    with GCLOUD_STUB_EXISTS=0 -- stage --version 0.6.0 --extra "$root/install.sh" --extra "$root/notes.md"
+expect_calls 1 "^storage cp --cache-control=public, max-age=31536000, immutable --if-generation-match=0 $root/install.sh $root/notes.md gs://test-bucket/versions/0.6.0/$" \
+    "the extra files upload together into versions/<V>/ with the precondition"
+expect_calls 3 "^storage cp " "artifacts, manifest, extras: three uploads"
+expect 1 "--extra needs an existing file" "--extra with a missing file fails before anything runs" -- \
+    with GCLOUD_STUB_EXISTS=0 -- stage --version 0.6.0 --extra "$root/absent"
+
+# --- --dry-run never talks to gcloud ------------------------------------------
+
+expect 0 "dry run, nothing uploaded" "--dry-run over an existing version still passes" -- \
+    with GCLOUD_STUB_EXISTS=1 -- stage --version 0.6.0 --dry-run
+expect_calls 0 "" "--dry-run makes no gcloud call at all"
+
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
