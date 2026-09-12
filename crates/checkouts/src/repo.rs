@@ -123,38 +123,39 @@ impl Repo {
     }
 
     /// Creates a new worktree at the given path, checked-out to the given ref.
+    ///
+    /// Every worktree is a detached checkout, a branch included. Git lets a
+    /// branch be checked out by at most one worktree of a repository, so a
+    /// worktree *on* `main` makes the next `new_worktree` for `main` fail
+    /// (`cannot force update the branch 'main' used by worktree at ...`) —
+    /// and that next request is routine, because every [`crate::Manager`]
+    /// over a shared cache dir carries its own snapshot of the checkout
+    /// registry, and one that predates another's checkout asks for its own.
+    /// Detached, the worktrees are independent; a branch checkout is
+    /// refreshed by [`Self::worktree_checkout`] via `origin/<branch>`
+    /// regardless, which detaches too.
     pub fn new_worktree(&mut self, path: PathBuf, git_ref: GitRef) -> Result<Checkout, Error> {
-        if let GitRef::Branch(b) = &git_ref {
-            self.run_git_bare(
-                GIT_SEC_ARGS
-                    .into_iter()
-                    .chain([
-                        "worktree",
-                        "add",
-                        "-f",
-                        "--track",
-                        "-B",
-                        b.as_str(),
-                        path.to_str().unwrap(),
-                        b.as_str(),
-                    ])
-                    .collect::<Vec<_>>(),
-            )?;
-        } else {
-            self.run_git_bare(
-                GIT_SEC_ARGS
-                    .into_iter()
-                    .chain([
-                        "worktree",
-                        "add",
-                        "-f",
-                        "--checkout",
-                        path.to_str().unwrap(),
-                        git_ref.as_str(),
-                    ])
-                    .collect::<Vec<_>>(),
-            )?;
-        }
+        // Drop registrations whose directories are gone first, so a stale
+        // entry cannot claim the path this add is about to use.
+        self.run_git_bare(
+            GIT_SEC_ARGS
+                .into_iter()
+                .chain(["worktree", "prune"])
+                .collect::<Vec<_>>(),
+        )?;
+        self.run_git_bare(
+            GIT_SEC_ARGS
+                .into_iter()
+                .chain([
+                    "worktree",
+                    "add",
+                    "-f",
+                    "--detach",
+                    path.to_str().unwrap(),
+                    git_ref.as_str(),
+                ])
+                .collect::<Vec<_>>(),
+        )?;
 
         let output = self.run_git_checkout(&path, ["rev-parse", "HEAD"].into())?;
         Ok(Checkout {

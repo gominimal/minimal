@@ -184,6 +184,15 @@ fn create_unique_id_and_dir(base_dir: &Path, prefix: String) -> std::io::Result<
     ))
 }
 
+/// Runs [`Repo::new_worktree`] into `dir`, removing the directory again when
+/// git refuses: the add is not recorded in the state file, so a leftover would
+/// sit under the checkouts dir unrecorded.
+fn new_worktree_or_cleanup(repo: &mut Repo, dir: &Path, at: GitRef) -> Result<Checkout, Error> {
+    repo.new_worktree(dir.to_path_buf(), at).inspect_err(|_| {
+        let _ = fs::remove_dir_all(dir);
+    })
+}
+
 /// A handle to the manager for source-code checkouts.
 #[derive(Debug, Clone)]
 pub struct ManagerHandle(Arc<Mutex<Manager>>);
@@ -363,7 +372,7 @@ impl Manager {
                 if !self.offline {
                     repo.fetch()?;
                 }
-                let checkout = repo.new_worktree(checkout_dir.clone(), at.clone())?;
+                let checkout = new_worktree_or_cleanup(repo, &checkout_dir, at.clone())?;
                 let git_hash = checkout.rev.clone();
 
                 self.state
@@ -395,7 +404,7 @@ impl Manager {
                 // Make checkout
                 let checkout_dir = tempdir_in(self.git_checkouts_dir()).unwrap().keep();
                 let relative_dir = checkout_dir.strip_prefix(self.git_checkouts_dir()).unwrap();
-                let checkout = repo.new_worktree(checkout_dir.clone(), at.clone())?;
+                let checkout = new_worktree_or_cleanup(&mut repo, &checkout_dir, at.clone())?;
                 let git_hash = checkout.rev.clone();
 
                 self.state
@@ -662,6 +671,70 @@ mod tests {
             "commit ref must reuse the branch worktree"
         );
         assert_eq!(commit_rev, hash);
+    }
+
+    /// Two managers over one cache dir, the second holding a registry snapshot
+    /// that predates the first's branch checkout — the shape of two daemon
+    /// contexts scaffolding against the same cache. Each must get a usable
+    /// checkout of `main`: a worktree *on* the branch would make git refuse
+    /// the second one (`cannot force update the branch 'main' used by
+    /// worktree at ...`).
+    #[test]
+    fn checkout_of_branch_from_a_stale_manager_does_not_collide() {
+        let (src, hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+
+        // Register the remote through a commit checkout, so a manager created
+        // now knows the repo but has no checkout of the branch to reuse.
+        let mut first = Manager::new_in_dir(base.path()).unwrap();
+        first
+            .checkout_of(&remote, GitRef::Commit(hash.clone()))
+            .unwrap();
+        let mut stale = Manager::new_in_dir(base.path()).unwrap();
+
+        let (path1, rev1) = first
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+        let (path2, rev2) = stale
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+
+        assert_eq!(rev1, hash);
+        assert_eq!(rev2, hash);
+        assert_ne!(
+            path1, path2,
+            "the stale manager cannot know the first's checkout"
+        );
+        assert!(path2.join("hello.txt").exists());
+    }
+
+    /// A refused worktree add leaves nothing behind under the checkouts dir.
+    #[test]
+    fn checkout_of_unknown_ref_leaves_no_checkout_dir() {
+        let (src, _) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+
+        // Registers the remote; the next call takes the known-remote path.
+        handle
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+        let before = std::fs::read_dir(base.path().join("git").join("checkouts"))
+            .unwrap()
+            .count();
+
+        assert!(
+            handle
+                .checkout_of(&remote, GitRef::Tag("no-such-tag".to_string()))
+                .is_err()
+        );
+
+        let after = std::fs::read_dir(base.path().join("git").join("checkouts"))
+            .unwrap()
+            .count();
+        assert_eq!(before, after, "the refused add must not leak a directory");
     }
 
     /// A single unreachable remote must not gate `update_remote` for a
