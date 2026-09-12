@@ -801,6 +801,43 @@ mod tests {
         );
     }
 
+    /// A cache whose bare clone carries only `refs/heads/<branch>` (cloned
+    /// before remote-tracking refs were fetched at clone time, never updated
+    /// since) still serves a branch checkout offline.
+    #[test]
+    fn offline_checkout_of_branch_from_a_legacy_cache_uses_the_local_ref() {
+        use std::process::Command;
+        let (src, hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+
+        // Register the remote online, then strip the remote-tracking refs the
+        // clone-time fetch wrote, leaving the legacy shape.
+        let mut online = Manager::new_in_dir(base.path()).unwrap();
+        online
+            .checkout_of(&remote, GitRef::Commit(hash.clone()))
+            .unwrap();
+        let bare = std::fs::read_dir(base.path().join("git").join("db"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let out = Command::new("git")
+            .args(["update-ref", "-d", "refs/remotes/origin/main"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let mut offline = Manager::new_in_dir_with_offline(base.path(), true).unwrap();
+        let (path, rev) = offline
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+        assert_eq!(rev, hash);
+        assert!(path.join("hello.txt").exists());
+    }
+
     /// A refused ref on a remote the manager has never seen leaves no bare
     /// clone behind either: the remote is not recorded, so a leftover
     /// `git/db/<id>` would make the next request clone again under a

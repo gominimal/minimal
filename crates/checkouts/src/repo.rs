@@ -160,7 +160,17 @@ impl Repo {
                 .collect::<Vec<_>>(),
         )?;
         let target = match &git_ref {
-            GitRef::Branch(b) => format!("origin/{b}"),
+            // A cache cloned before remote-tracking refs were fetched at clone
+            // time, and never updated since, carries only `refs/heads/<b>`;
+            // offline that is the only copy of the branch there is.
+            GitRef::Branch(b) => {
+                let tracking = format!("refs/remotes/origin/{b}");
+                if self.ref_exists(&tracking) {
+                    tracking
+                } else {
+                    format!("refs/heads/{b}")
+                }
+            }
             GitRef::Commit(s) | GitRef::Tag(s) => s.clone(),
         };
         self.run_git_bare(
@@ -182,6 +192,12 @@ impl Repo {
             version: git_ref,
             rev: String::from_utf8_lossy(&output.stdout).trim().to_string(),
         })
+    }
+
+    /// Whether the bare repository has the given fully-qualified ref.
+    fn ref_exists(&self, full_ref: &str) -> bool {
+        self.run_git_bare(["show-ref", "--verify", "--quiet", full_ref].into())
+            .is_ok()
     }
 
     /// Returns a list of all tags in the repository.
