@@ -1611,6 +1611,35 @@ impl Session {
         Ok(rx)
     }
 
+    /// Kills `host` and stops its runtime loop `task`, bounded so a wedged
+    /// host cannot park the caller. Both the kill and the wait for the loop to
+    /// act on it are bounded: `HostHandle::kill`'s `send_timeout` only bounds
+    /// the wait for mailbox *capacity*, so a loop parked mid-`step()` (mailbox
+    /// nearly empty) queues the kill yet never processes it, and awaiting that
+    /// loop unbounded would park the caller behind it forever. So a kill that
+    /// cannot be queued, or a loop that does not finish within
+    /// `HOST_PROBE_TIMEOUT` of accepting it, aborts the loop instead of
+    /// waiting on it.
+    ///
+    /// Aborting drops the loop at its await point, so the awaited `NetGuard`
+    /// teardown in `Host::mainloop` is skipped and the wedged host's sandbox
+    /// process and network are orphaned rather than reclaimed here;
+    /// reclamation is a tracked follow-up.
+    async fn kill_and_stop_loop(
+        host: &session_host::HostHandle,
+        task: &mut JoinHandle<Result<i32, std::io::Error>>,
+        for_shutdown: bool,
+    ) {
+        let killed = host.kill(for_shutdown).await.is_ok();
+        if !killed
+            || tokio::time::timeout(HOST_PROBE_TIMEOUT, &mut *task)
+                .await
+                .is_err()
+        {
+            task.abort();
+        }
+    }
+
     /// Tears down any runtime objects, such as the host or side ops. Shutdown
     /// of these objects is complete once awaited.
     ///
@@ -1626,12 +1655,13 @@ impl Session {
             for s in sops.drain(..) {
                 s.shutdown().await;
             }
-            if let Some((host, task)) = host {
-                // Signal the process to die, then await the runtime loop so the
-                // sandbox files backing its rootfs are released before the caller
-                // removes the session's directory tree.
-                let _ = host.kill(for_shutdown).await;
-                let _ = task.await;
+            if let Some((host, mut task)) = host {
+                // Signal the process to die, then stop its runtime loop so the
+                // sandbox files backing its rootfs are released before the
+                // caller removes the session's directory tree. The wait is
+                // bounded and aborts a wedged loop rather than parking shutdown
+                // behind it — see [`Session::kill_and_stop_loop`].
+                Self::kill_and_stop_loop(&host, &mut task, for_shutdown).await;
             }
         }
     }
@@ -1840,9 +1870,11 @@ impl Session {
             tracing::info!(
                 "replacing the hook-launched session shell with one minted for the attaching terminal"
             );
-            let (handle, join) = slot.take().expect("matched on Some");
-            let _ = handle.kill(false).await;
-            let _ = join.await;
+            let (handle, mut join) = slot.take().expect("matched on Some");
+            // Bound the wait for the hook host to wind down, aborting a wedged
+            // loop rather than parking the attach behind it. Same bounded
+            // kill-and-stop as shutdown; see [`Session::kill_and_stop_loop`].
+            Self::kill_and_stop_loop(&handle, &mut join, false).await;
         }
 
         let host = match &mut self.inner {
@@ -1873,7 +1905,7 @@ impl Session {
                 {
                     Ok(()) => Ok(()),
                     Err((channel, sz)) => {
-                        // session host is dead
+                        // The host is gone, or wedged past the attach deadline.
                         self.mint_session_host(
                             session_hnd,
                             conn_username,
@@ -2138,7 +2170,16 @@ impl Session {
         let SessionInner::Active { host, .. } = &mut self.inner else {
             unreachable!("mint_session_host is only reachable from the Active state");
         };
-        *host = Some(launched);
+        // A wedged-but-alive host can reach here via attach's re-mint branch
+        // (`session_host.rs` `SendTimeoutError::Timeout`): its loop task is
+        // still running. Dropping the replaced `(HostHandle, JoinHandle)`
+        // would detach that task, leaking the old sandbox process, pty master,
+        // and `NetGuard` for the daemon's lifetime — one leak per attach to the
+        // same wedged host. Abort the task being replaced, mirroring
+        // `stop_running` (a no-op when the old loop had already exited).
+        if let Some((_, task)) = host.replace(launched) {
+            task.abort();
+        }
         // Minted by an attach: its environment describes the terminal that is
         // here, so nothing may replace it out from under that client.
         self.host_origin = HostOrigin::Interactive;
@@ -3010,6 +3051,46 @@ mod tests {
                 .num_alive_tasks(),
             alive_before,
             "every probe task should be gone, not merely abandoned",
+        );
+    }
+
+    /// The bounded stop path gives up on a host whose loop accepted the kill
+    /// but never winds down, aborting the loop task instead of awaiting it
+    /// forever.
+    ///
+    /// This is the shape `HostHandle::kill`'s `send_timeout` alone cannot
+    /// cover: the mailbox has room, so the kill enqueues (`kill` returns
+    /// `Ok`) and the `!killed` short-circuit does not fire, yet the runtime
+    /// loop is parked mid-`step()` and never processes the queued kill. The
+    /// *join* bound — not the kill's own deadline — is what has to return the
+    /// caller and abort the loop. `kill_to_a_wedged_host_gives_up_instead_of_parking`
+    /// covers the saturated-mailbox sibling, where the kill itself times out.
+    #[tokio::test(start_paused = true)]
+    async fn stopping_a_wedged_host_aborts_its_loop_instead_of_parking() {
+        // Mailbox held but not saturated: the kill enqueues within its
+        // deadline, so the join bound is the branch under test.
+        let (host, _mailbox) = HostHandle::wedged();
+
+        // A loop that accepted the kill but never resolves — models the
+        // mainloop parked mid-`step()`.
+        let mut task = tokio::spawn(std::future::pending::<Result<i32, std::io::Error>>());
+
+        // Far past HOST_PROBE_TIMEOUT: under the paused clock the join bound is
+        // the deadline that returns this call. Reaching GIVE_UP would mean the
+        // wait was unbounded.
+        tokio::time::timeout(
+            GIVE_UP,
+            super::Session::kill_and_stop_loop(&host, &mut task, true),
+        )
+        .await
+        .expect("the bounded stop path must return, not park on a wedged loop");
+
+        // The loop task is torn down, not left running behind a detached
+        // handle: awaiting it yields a cancelled join.
+        let outcome = task.await;
+        assert!(
+            outcome.is_err_and(|e| e.is_cancelled()),
+            "a loop that never wound down within the deadline must be aborted",
         );
     }
 
