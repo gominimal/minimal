@@ -400,11 +400,22 @@ impl Manager {
                 };
                 // Make repo
                 let (id, dir) = create_unique_id_and_dir(&self.git_bares_dir(), prefix)?;
-                let mut repo = Repo::new(remote, dir)?;
+                let mut repo = Repo::new(remote, dir.clone())?;
                 // Make checkout
                 let checkout_dir = tempdir_in(self.git_checkouts_dir()).unwrap().keep();
                 let relative_dir = checkout_dir.strip_prefix(self.git_checkouts_dir()).unwrap();
-                let checkout = new_worktree_or_cleanup(&mut repo, &checkout_dir, at.clone())?;
+                // Nothing about this remote is recorded until the checkout
+                // succeeds, so a refused ref must also take the bare clone with
+                // it: left in place, the next request for the same remote would
+                // find the directory taken and clone again under a suffixed id.
+                let checkout = match new_worktree_or_cleanup(&mut repo, &checkout_dir, at.clone()) {
+                    Ok(checkout) => checkout,
+                    Err(err) => {
+                        drop(repo);
+                        let _ = fs::remove_dir_all(&dir);
+                        return Err(err);
+                    }
+                };
                 let git_hash = checkout.rev.clone();
 
                 self.state
@@ -735,6 +746,34 @@ mod tests {
             .unwrap()
             .count();
         assert_eq!(before, after, "the refused add must not leak a directory");
+    }
+
+    /// A refused ref on a remote the manager has never seen leaves no bare
+    /// clone behind either: the remote is not recorded, so a leftover
+    /// `git/db/<id>` would make the next request clone again under a
+    /// suffixed id.
+    #[test]
+    fn checkout_of_unknown_ref_on_new_remote_leaves_no_bare_repo() {
+        let (src, hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+
+        assert!(
+            handle
+                .checkout_of(&remote, GitRef::Tag("no-such-tag".to_string()))
+                .is_err()
+        );
+        let bares = base.path().join("git").join("db");
+        let leftover = std::fs::read_dir(&bares).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(leftover, 0, "the refused add must not leak the bare clone");
+
+        // The remote is still unknown, so a good ref clones once, unsuffixed.
+        let (_, rev) = handle
+            .checkout_of(&remote, GitRef::Commit(hash.clone()))
+            .unwrap();
+        assert_eq!(rev, hash);
+        assert_eq!(std::fs::read_dir(&bares).unwrap().count(), 1);
     }
 
     /// A single unreachable remote must not gate `update_remote` for a
