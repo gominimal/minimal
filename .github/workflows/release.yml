@@ -1422,10 +1422,13 @@ jobs:
         # (scripts/verify-smoked.sh) re-hashes the live manifest and compares,
         # so "these bytes were smoked" is checked directly rather than inferred
         # from a workflow run id, and a re-staged row can never inherit a stale
-        # blessing. Needs every gate green: staged (so not a dry run) and
-        # smoked. Only then does `unstable` advance: a channel never points at
-        # bytes that have not passed the smoke.
+        # blessing. Needs every gate green: staged and smoked. Only then does
+        # `unstable` advance: a channel never points at bytes that have not
+        # passed the smoke. A dry run stages nothing, so `needs` alone already
+        # skips this job (a skipped dependency skips its dependents); the
+        # explicit `if` says so where a reader looks for it.
         needs: [assert-version, stage-installer, smoke-success]
+        if: ${{ !inputs.dry_run }}
         runs-on: ubuntu-latest
         timeout-minutes: 10
         permissions:

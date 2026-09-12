@@ -191,6 +191,11 @@ expect_calls 3 "^storage cp --cache-control=public, max-age=31536000, immutable 
     "all three uploads carry the precondition"
 expect_calls 1 "minimal_0.6.0_amd64.deb gs://test-bucket/versions/0.6.0/pkg/$" \
     "the packages land under versions/<V>/pkg/"
+if [ "$(grep '^storage cp ' "$GCLOUD_STUB_ARGS" | tail -n 1 | grep -c '/components$')" -eq 1 ]; then
+    ok "with --pkg-dir the manifest is still the last object written, after the packages"
+else
+    bad "the manifest was not the last upload with --pkg-dir: $(tr '\n' '|' <"$GCLOUD_STUB_ARGS")"
+fi
 
 # --pkg-only adds packages to a row that is already staged BY DESIGN: the
 # manifest probe must not fire, but each package object is still write-once.

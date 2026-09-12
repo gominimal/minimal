@@ -382,15 +382,15 @@ if [ "${#EXTRA_FILES[@]}" -gt 0 ]; then
         "${EXTRA_FILES[@]}" "$version_prefix/"
 fi
 
-# LAST: its presence means a complete row (see Write-once above), so nothing
-# may be uploaded after it.
-gcloud storage cp \
-    "${cp_flags[@]}" \
-    "$manifest" "$version_prefix/components"
-
 if [ -n "$PKG_DIR" ]; then
     upload_pkg_dir
 fi
+
+# LAST: its presence means a complete row (see Write-once above), so nothing
+# — not the extras, not the packages — may be uploaded after it.
+gcloud storage cp \
+    "${cp_flags[@]}" \
+    "$manifest" "$version_prefix/components"
 
 printf 'stage-release: staged %s at %s (no channel updated; see set-channel.sh)\n' \
     "$VERSION" "$version_prefix" >&2
