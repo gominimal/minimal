@@ -60,7 +60,17 @@ impl Repo {
             });
         }
 
-        Ok(Self { url, bare: base })
+        // A bare clone writes only `refs/heads/*`; every branch lookup in this
+        // crate goes through `refs/remotes/origin/*`, so populate those now
+        // rather than leaving the first branch checkout to fail on a ref the
+        // clone never wrote. A clone that cannot be fetched is not a usable
+        // cache entry: take the directory with the error.
+        let mut repo = Self { url, bare: base };
+        if let Err(err) = repo.fetch() {
+            let _ = std::fs::remove_dir_all(&repo.bare);
+            return Err(err);
+        }
+        Ok(repo)
     }
 
     /// Returns the path to the bare git repository.
@@ -123,44 +133,71 @@ impl Repo {
     }
 
     /// Creates a new worktree at the given path, checked-out to the given ref.
+    ///
+    /// Every worktree is a detached checkout, a branch included. Git lets a
+    /// branch be checked out by at most one worktree of a repository, so a
+    /// worktree *on* `main` makes the next `new_worktree` for `main` fail
+    /// (`cannot force update the branch 'main' used by worktree at ...`) —
+    /// and that next request is routine, because every [`crate::Manager`]
+    /// over a shared cache dir carries its own snapshot of the checkout
+    /// registry, and one that predates another's checkout asks for its own.
+    /// Detached, the worktrees are independent; a branch checkout is
+    /// refreshed by [`Self::worktree_checkout`] via `origin/<branch>`
+    /// regardless, which detaches too.
+    ///
+    /// A branch is added at `origin/<branch>`, the ref [`Self::fetch`]
+    /// updates, not at the bare name: that resolves to the bare clone's own
+    /// `refs/heads/<branch>`, which nothing refreshes after the clone, so the
+    /// worktree would land on the clone-time tip and a branch created
+    /// upstream since would not resolve at all.
     pub fn new_worktree(&mut self, path: PathBuf, git_ref: GitRef) -> Result<Checkout, Error> {
-        if let GitRef::Branch(b) = &git_ref {
-            self.run_git_bare(
-                GIT_SEC_ARGS
-                    .into_iter()
-                    .chain([
-                        "worktree",
-                        "add",
-                        "-f",
-                        "--track",
-                        "-B",
-                        b.as_str(),
-                        path.to_str().unwrap(),
-                        b.as_str(),
-                    ])
-                    .collect::<Vec<_>>(),
-            )?;
-        } else {
-            self.run_git_bare(
-                GIT_SEC_ARGS
-                    .into_iter()
-                    .chain([
-                        "worktree",
-                        "add",
-                        "-f",
-                        "--checkout",
-                        path.to_str().unwrap(),
-                        git_ref.as_str(),
-                    ])
-                    .collect::<Vec<_>>(),
-            )?;
-        }
+        // Drop registrations whose directories are gone first, so a stale
+        // entry cannot claim the path this add is about to use.
+        self.run_git_bare(
+            GIT_SEC_ARGS
+                .into_iter()
+                .chain(["worktree", "prune"])
+                .collect::<Vec<_>>(),
+        )?;
+        let target = match &git_ref {
+            // A cache cloned before remote-tracking refs were fetched at clone
+            // time, and never updated since, carries only `refs/heads/<b>`;
+            // offline that is the only copy of the branch there is.
+            GitRef::Branch(b) => {
+                let tracking = format!("refs/remotes/origin/{b}");
+                if self.ref_exists(&tracking) {
+                    tracking
+                } else {
+                    format!("refs/heads/{b}")
+                }
+            }
+            GitRef::Commit(s) | GitRef::Tag(s) => s.clone(),
+        };
+        self.run_git_bare(
+            GIT_SEC_ARGS
+                .into_iter()
+                .chain([
+                    "worktree",
+                    "add",
+                    "-f",
+                    "--detach",
+                    path.to_str().unwrap(),
+                    target.as_str(),
+                ])
+                .collect::<Vec<_>>(),
+        )?;
 
         let output = self.run_git_checkout(&path, ["rev-parse", "HEAD"].into())?;
         Ok(Checkout {
             version: git_ref,
             rev: String::from_utf8_lossy(&output.stdout).trim().to_string(),
         })
+    }
+
+    /// Whether the bare repository has the given fully-qualified ref.
+    fn ref_exists(&self, full_ref: &str) -> bool {
+        self.run_git_bare(["show-ref", "--verify", "--quiet", full_ref].into())
+            .is_ok()
     }
 
     /// Returns a list of all tags in the repository.

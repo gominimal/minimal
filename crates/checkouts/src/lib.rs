@@ -184,6 +184,15 @@ fn create_unique_id_and_dir(base_dir: &Path, prefix: String) -> std::io::Result<
     ))
 }
 
+/// Runs [`Repo::new_worktree`] into `dir`, removing the directory again when
+/// git refuses: the add is not recorded in the state file, so a leftover would
+/// sit under the checkouts dir unrecorded.
+fn new_worktree_or_cleanup(repo: &mut Repo, dir: &Path, at: GitRef) -> Result<Checkout, Error> {
+    repo.new_worktree(dir.to_path_buf(), at).inspect_err(|_| {
+        let _ = fs::remove_dir_all(dir);
+    })
+}
+
 /// A handle to the manager for source-code checkouts.
 #[derive(Debug, Clone)]
 pub struct ManagerHandle(Arc<Mutex<Manager>>);
@@ -363,7 +372,7 @@ impl Manager {
                 if !self.offline {
                     repo.fetch()?;
                 }
-                let checkout = repo.new_worktree(checkout_dir.clone(), at.clone())?;
+                let checkout = new_worktree_or_cleanup(repo, &checkout_dir, at.clone())?;
                 let git_hash = checkout.rev.clone();
 
                 self.state
@@ -391,11 +400,22 @@ impl Manager {
                 };
                 // Make repo
                 let (id, dir) = create_unique_id_and_dir(&self.git_bares_dir(), prefix)?;
-                let mut repo = Repo::new(remote, dir)?;
+                let mut repo = Repo::new(remote, dir.clone())?;
                 // Make checkout
                 let checkout_dir = tempdir_in(self.git_checkouts_dir()).unwrap().keep();
                 let relative_dir = checkout_dir.strip_prefix(self.git_checkouts_dir()).unwrap();
-                let checkout = repo.new_worktree(checkout_dir.clone(), at.clone())?;
+                // Nothing about this remote is recorded until the checkout
+                // succeeds, so a refused ref must also take the bare clone with
+                // it: left in place, the next request for the same remote would
+                // find the directory taken and clone again under a suffixed id.
+                let checkout = match new_worktree_or_cleanup(&mut repo, &checkout_dir, at.clone()) {
+                    Ok(checkout) => checkout,
+                    Err(err) => {
+                        drop(repo);
+                        let _ = fs::remove_dir_all(&dir);
+                        return Err(err);
+                    }
+                };
                 let git_hash = checkout.rev.clone();
 
                 self.state
@@ -662,6 +682,188 @@ mod tests {
             "commit ref must reuse the branch worktree"
         );
         assert_eq!(commit_rev, hash);
+    }
+
+    /// Two managers over one cache dir, the second holding a registry snapshot
+    /// that predates the first's branch checkout — the shape of two daemon
+    /// contexts scaffolding against the same cache. Each must get a usable
+    /// checkout of `main`: a worktree *on* the branch would make git refuse
+    /// the second one (`cannot force update the branch 'main' used by
+    /// worktree at ...`).
+    #[test]
+    fn checkout_of_branch_from_a_stale_manager_does_not_collide() {
+        let (src, hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+
+        // Register the remote through a commit checkout, so a manager created
+        // now knows the repo but has no checkout of the branch to reuse.
+        let mut first = Manager::new_in_dir(base.path()).unwrap();
+        first
+            .checkout_of(&remote, GitRef::Commit(hash.clone()))
+            .unwrap();
+        let mut stale = Manager::new_in_dir(base.path()).unwrap();
+
+        let (path1, rev1) = first
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+        let (path2, rev2) = stale
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+
+        assert_eq!(rev1, hash);
+        assert_eq!(rev2, hash);
+        assert_ne!(
+            path1, path2,
+            "the stale manager cannot know the first's checkout"
+        );
+        assert!(path2.join("hello.txt").exists());
+    }
+
+    /// A refused worktree add leaves nothing behind under the checkouts dir.
+    #[test]
+    fn checkout_of_unknown_ref_leaves_no_checkout_dir() {
+        let (src, _) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+
+        // Registers the remote; the next call takes the known-remote path.
+        handle
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+        let before = std::fs::read_dir(base.path().join("git").join("checkouts"))
+            .unwrap()
+            .count();
+
+        assert!(
+            handle
+                .checkout_of(&remote, GitRef::Tag("no-such-tag".to_string()))
+                .is_err()
+        );
+
+        let after = std::fs::read_dir(base.path().join("git").join("checkouts"))
+            .unwrap()
+            .count();
+        assert_eq!(before, after, "the refused add must not leak a directory");
+    }
+
+    /// A fresh branch checkout lands on the fetched tip, not the bare
+    /// clone's clone-time copy of the branch, and a branch that upstream
+    /// created after the clone resolves at all.
+    #[test]
+    fn checkout_of_branch_lands_on_the_fetched_tip() {
+        use std::process::Command;
+        let (src, first_hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+
+        // Clone the bare repo at the first commit.
+        let (_, rev) = handle
+            .checkout_of(&remote, GitRef::Commit(first_hash.clone()))
+            .unwrap();
+        assert_eq!(rev, first_hash);
+
+        // Move `main` upstream and add a branch that postdates the clone.
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(src.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::write(src.path().join("hello.txt"), b"hello again").unwrap();
+        git(&["commit", "-am", "second"]);
+        let second_hash = git(&["rev-parse", "HEAD"]);
+        git(&["branch", "dev"]);
+
+        let (path, rev) = handle
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+        assert_eq!(
+            rev, second_hash,
+            "a branch checkout must land on the fetched tip"
+        );
+        assert_eq!(
+            std::fs::read(path.join("hello.txt")).unwrap(),
+            b"hello again"
+        );
+
+        let (_, rev) = handle
+            .checkout_of(&remote, GitRef::Branch("dev".to_string()))
+            .unwrap();
+        assert_eq!(
+            rev, second_hash,
+            "a branch created after the clone must resolve"
+        );
+    }
+
+    /// A cache whose bare clone carries only `refs/heads/<branch>` (cloned
+    /// before remote-tracking refs were fetched at clone time, never updated
+    /// since) still serves a branch checkout offline.
+    #[test]
+    fn offline_checkout_of_branch_from_a_legacy_cache_uses_the_local_ref() {
+        use std::process::Command;
+        let (src, hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+
+        // Register the remote online, then strip the remote-tracking refs the
+        // clone-time fetch wrote, leaving the legacy shape.
+        let mut online = Manager::new_in_dir(base.path()).unwrap();
+        online
+            .checkout_of(&remote, GitRef::Commit(hash.clone()))
+            .unwrap();
+        let bare = std::fs::read_dir(base.path().join("git").join("db"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let out = Command::new("git")
+            .args(["update-ref", "-d", "refs/remotes/origin/main"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let mut offline = Manager::new_in_dir_with_offline(base.path(), true).unwrap();
+        let (path, rev) = offline
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+        assert_eq!(rev, hash);
+        assert!(path.join("hello.txt").exists());
+    }
+
+    /// A refused ref on a remote the manager has never seen leaves no bare
+    /// clone behind either: the remote is not recorded, so a leftover
+    /// `git/db/<id>` would make the next request clone again under a
+    /// suffixed id.
+    #[test]
+    fn checkout_of_unknown_ref_on_new_remote_leaves_no_bare_repo() {
+        let (src, hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+
+        assert!(
+            handle
+                .checkout_of(&remote, GitRef::Tag("no-such-tag".to_string()))
+                .is_err()
+        );
+        let bares = base.path().join("git").join("db");
+        let leftover = std::fs::read_dir(&bares).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(leftover, 0, "the refused add must not leak the bare clone");
+
+        // The remote is still unknown, so a good ref clones once, unsuffixed.
+        let (_, rev) = handle
+            .checkout_of(&remote, GitRef::Commit(hash.clone()))
+            .unwrap();
+        assert_eq!(rev, hash);
+        assert_eq!(std::fs::read_dir(&bares).unwrap().count(), 1);
     }
 
     /// A single unreachable remote must not gate `update_remote` for a
