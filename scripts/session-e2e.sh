@@ -1022,6 +1022,15 @@ exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     fail
   fi
   echo "declared shell OK (SHELL=/usr/bin/sh started sh, not bash)"
+  # The driver's "Delete" at the exit prompt is not this proof's teardown: the
+  # daemon hands a shell's exit to the attached binding best-effort (a
+  # non-blocking send it drops when the binding's queue is full — "could not
+  # hand the teardown to the binding; no shell-exit prompt will render"), and
+  # this shell exits within milliseconds of starting. When the hand-off drops,
+  # no prompt renders, the attach still ends cleanly, and the session survives
+  # to block the unforced `min stop` below. Destroy it explicitly; a no-op when
+  # the prompt already did.
+  mnl session destroy --force "$sh_sid" >/dev/null 2>&1 || true
 
   # The fallback: a shell that isn't installed leaves bash running AND tells
   # the user why, on the terminal, before the first prompt.
@@ -1051,6 +1060,8 @@ exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     echo "--- transcript ---"; printf '%s\n' "$miss_out"
     fail
   fi
+  # Same best-effort prompt as above; same explicit teardown.
+  mnl session destroy --force "$miss_sid" >/dev/null 2>&1 || true
   rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
   rm -f "$XDG_CONFIG_HOME/minimal/loadouts/shelldev.toml"
   rm -f "$XDG_CONFIG_HOME/minimal/loadouts/shellmissing.toml"
