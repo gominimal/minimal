@@ -80,14 +80,55 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
     )
     .await;
 
+    // Both loadout layouts: `<name>.toml` and `<name>/loadout.toml`. Only
+    // the definition file either way — the rest of a loadout's directory
+    // ($LOADOUT_ROOT assets, hook scripts) is the user's own content and
+    // has never been collected.
     match tokio::fs::read_dir(paths.config.join("loadouts")).await {
         Ok(mut entries) => loop {
             match entries.next_entry().await {
                 Ok(Some(entry)) => {
                     let path = entry.path();
-                    if path.extension().is_some_and(|e| e == "toml")
-                        && let Some(name) = path.file_name().and_then(|n| n.to_str())
-                    {
+                    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    // `DirEntry::file_type` does not follow symlinks, and
+                    // that is the point: descending into a symlinked
+                    // `<name>/` would read a `loadout.toml` from wherever
+                    // it pointed, and `open_regular_nofollow` could not
+                    // stop it — `O_NOFOLLOW` guards only the final
+                    // component. A symlinked directory is therefore not a
+                    // directory here, matching the daemon-side refusal of
+                    // a symlinked hook anchor.
+                    let is_dir = match entry.file_type().await {
+                        Ok(ft) => ft.is_dir(),
+                        Err(e) => {
+                            w.skip(
+                                format!("config/loadouts/{name}"),
+                                format!("unreadable: {e}"),
+                            );
+                            continue;
+                        }
+                    };
+                    if is_dir {
+                        let file = path.join(sessions::client::disk::LOADOUT_FILE_NAME);
+                        // Existence only. Whether this is a *safe* file to
+                        // read is `add_redacted_toml`'s call, and it makes
+                        // it independently — a symlinked `loadout.toml` is
+                        // refused at open and the refusal recorded, the
+                        // same way a symlinked `<name>.toml` is below.
+                        if tokio::fs::metadata(&file).await.is_ok_and(|m| m.is_file()) {
+                            add_redacted_toml(
+                                w,
+                                &file,
+                                &format!(
+                                    "config/loadouts/{name}/{}.redacted",
+                                    sessions::client::disk::LOADOUT_FILE_NAME
+                                ),
+                            )
+                            .await;
+                        }
+                    } else if path.extension().is_some_and(|e| e == "toml") {
                         add_redacted_toml(w, &path, &format!("config/loadouts/{name}.redacted"))
                             .await;
                     }

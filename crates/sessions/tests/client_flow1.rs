@@ -606,6 +606,93 @@ source = "${LOADOUT_ROOT}/themes/**/*.toml"
     );
 }
 
+/// The two on-disk layouts are anchor-equivalent: a loadout filed as
+/// `<dir>/vc/loadout.toml` resolves `$LOADOUT_ROOT` to `<dir>/vc/` —
+/// the very directory holding its definition — exactly as the flat
+/// `<dir>/dev.toml` resolves it to the sibling `<dir>/dev/`.
+///
+/// This is the property that makes the directory layout a pure
+/// relocation of the definition file: `Source::loadout_dir` derives
+/// the anchor from the loadout's *name*, so nothing downstream of
+/// discovery has to know which layout was used. A loadout migrates
+/// with `mkdir dev && mv dev.toml dev/loadout.toml` and keeps patching
+/// the same files.
+#[test]
+fn loadout_root_is_the_same_directory_under_both_layouts() {
+    // The same patch declarations, filed both ways below: `dev.toml`
+    // beside a `dev/` of assets, and `vc/loadout.toml` inside its own
+    // `vc/`.
+    const PATCHES: &str = r#"
+[[patches]]
+dest = ".config/helix/config.toml"
+source = "$LOADOUT_ROOT/config.toml"
+
+[[patches]]
+dest = ".config/helix/themes"
+source = "${LOADOUT_ROOT}/themes/**/*.toml"
+"#;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = Utf8Path::from_path(tmp.path()).unwrap();
+    loadouts_dir_fixture(root);
+
+    std::fs::write(root.join("dev.toml").as_std_path(), PATCHES).unwrap();
+    fixture_tree(
+        root,
+        [
+            ("vc/config.toml", "theme = 'nord'\n"),
+            ("vc/themes/nord.toml", "# nord\n"),
+        ],
+    );
+    std::fs::write(root.join("vc/loadout.toml").as_std_path(), PATCHES).unwrap();
+
+    // Resolve each through the shared name→loadout entry point, the
+    // way an activation does, and collect the host paths each ends up
+    // patching from.
+    let sources_for = |name: &str| -> Vec<String> {
+        let loadout_name = sessions::core::loadout::LoadoutName::try_new(name).unwrap();
+        let (loadout, _layout) =
+            sessions::client::disk::load_loadout(root.as_std_path(), &loadout_name)
+                .expect("fixture loadout loads");
+        let mut composer = UserComposer::new()
+            .with_env(pinned_env(&[]))
+            .with_loadouts_dir(paths::HostAbsPath::try_new(root.to_owned()).unwrap());
+        composer.add(loadout).unwrap();
+        let (wire, _) = composer
+            .compose(UserPolicy::empty(), ComposeOptions::default())
+            .unwrap();
+        let mut hosts: Vec<String> = wire
+            .patches
+            .iter()
+            .map(|p| p.patch.host_path.as_str().to_owned())
+            .collect();
+        hosts.sort_unstable();
+        hosts
+    };
+
+    let flat = sources_for("dev");
+    let directory = sources_for("vc");
+
+    assert_eq!(flat.len(), 2, "got: {flat:?}");
+    assert_eq!(directory.len(), 2, "got: {directory:?}");
+    assert_paths_equivalent(&directory[0], root.join("vc/config.toml").as_std_path());
+    assert_paths_equivalent(
+        &directory[1],
+        root.join("vc/themes/nord.toml").as_std_path(),
+    );
+
+    // The same declarations reach the same files under each layout,
+    // differing only in the loadout's own name.
+    let rebased: Vec<String> = directory
+        .iter()
+        .map(|p| p.replace("/vc/", "/dev/"))
+        .collect();
+    assert_eq!(
+        rebased, flat,
+        "the layouts must anchor identically: {directory:?} vs {flat:?}",
+    );
+}
+
 /// The reference is reserved in patch sources: a loadout that also
 /// exports a `LOADOUT_ROOT` variable still patches from its own
 /// directory, and the variable itself reaches the session untouched.

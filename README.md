@@ -145,8 +145,9 @@ exit
 
 The project's `minimal.toml` describes what every contributor's session
 needs; a **loadout** carries what *you* want on top: your editor, terminal
-multiplexer, shell config, and dotfiles. Loadouts are single TOML files under
-`~/.config/minimal/loadouts/`:
+multiplexer, shell config, and dotfiles. Loadouts live under
+`~/.config/minimal/loadouts/`, either as `<name>.toml` or — to keep one under
+version control, alongside the files it ships — as `<name>/loadout.toml`:
 
 ```toml
 # ~/.config/minimal/loadouts/dev.toml
@@ -177,7 +178,9 @@ on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || 
 
 Apply one with `min session activate --loadout dev --attach .`, or list it in
 `default_loadouts` under `[loadouts]` in `~/.config/minimal/config.toml` to have it join every
-session automatically. `min loadout list` shows what's available. The full
+session automatically. `min loadout list` shows what's available, in either
+layout — so `git clone <repo> ~/.config/minimal/loadouts/dev` is enough to
+pick up a loadout someone else published. The full
 schema (file patches, lifecycle hooks, environment-variable inheritance,
 composition rules) is in the
 [loadouts reference](docs/reference/loadouts.md).

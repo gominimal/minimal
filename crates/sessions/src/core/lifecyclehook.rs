@@ -528,11 +528,15 @@ pub fn staged_script_path(
 /// Whether `s` is usable as a single path component that stays put:
 /// non-empty, no separators or NUL, and not a relative-directory name.
 ///
-/// [`LoadoutName`](crate::core::loadout::LoadoutName) enforces all of
-/// this except the `.`/`..` cases — a name is a display string first and
-/// a path fragment second, and neither dot form contains a separator.
-/// Both are excluded here because this fragment is joined into a path
-/// the daemon then reads from.
+/// The dot forms are excluded because a fragment reaching here is
+/// joined into a path that is then read from, and neither contains a
+/// separator to be caught by the check above it.
+///
+/// This is also the validation
+/// [`LoadoutName`](crate::core::loadout::LoadoutName) is built on, so a
+/// name constructed on this machine already satisfies it. The function
+/// is still applied at every join, because a name decoded from the wire
+/// has been through no such construction — see [`staged_script_path`].
 #[must_use]
 pub fn safe_path_component(s: &str) -> bool {
     !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0'])
