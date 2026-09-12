@@ -1067,7 +1067,14 @@ impl Session {
                 let _ = r.send(match &self.inner {
                     // Awaiting a verdict: a client is mid create flow.
                     SessionInner::Draft { pending } => pending.is_some(),
-                    SessionInner::Active { host, .. } => host.is_some(),
+                    // A *live* host, not merely a held one: the slot outlives
+                    // the process (see `launch_host_for_hooks`), so a session
+                    // whose shell has exited still holds a handle to a host
+                    // that runs nothing — and nothing is what an unforced
+                    // shutdown would interrupt there.
+                    SessionInner::Active { host, .. } => {
+                        host.as_ref().is_some_and(|(h, _)| h.is_alive())
+                    }
                 });
             }
             SessionMessage::Stop(r) => {
