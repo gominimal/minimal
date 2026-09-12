@@ -46,14 +46,17 @@ package.license = "Apache-2.0"
 # 1.95 is the dependency-driven floor (sysinfo 0.39 requires rustc 1.95); no
 # resolved dependency requires newer. The build toolchain pin is 1.97.0.
 package.rust-version = "1.95"
-# Shared base version for the workspace. This is the fallback the `version` crate
-# reports when no `v*` git tag is reachable; the real release version comes from
-# `git describe` at build time. See crates/version/build.rs.
-# Must stay UNTIL the next tag lands: it is the version a no-.git build
-# (source tarball) reports, so leaving it at an already-shipped release makes
-# such a build report that release — exactly what release.yml's
-# assert-version job exists to catch. 0.5.5 until v0.5.5 is tagged.
-package.version = "0.5.5"
+# The DECLARED next release. The `version` crate builds every dev version on
+# it (`0.6.0-dev.<N>.g<sha>`, N commits past the last v* tag), a release build
+# is handed it as MINIMAL_RELEASE_VERSION (asserted equal by build.rs and
+# scripts/assert-release-version.sh), and a no-.git build (source tarball)
+# reports it verbatim. See crates/version/src/scheme.rs.
+# Bump it when the commits since the last tag require it: `feat:` -> minor,
+# anything else -> patch; while the project is 0.x no breaking change bumps the
+# major (scripts/next-version.sh). `scripts/next-version.sh --check` (the
+# workspace `package_version` test, `just check-version`) fails the PR that
+# leaves it stale or not strictly greater than the newest v* tag.
+package.version = "0.6.0"
 
 [profile.release]
 strip = true

@@ -1,8 +1,28 @@
 name: Release
 
+# Two shapes of run, one pipeline:
+#
+#   * a NIGHTLY / plain dispatch build stages versions/<short-sha>/ and cuts a
+#     `release-<sha>` GitHub Release (auto-pruned);
+#   * a VERSIONED build (`versioned: true`) builds with
+#     MINIMAL_RELEASE_VERSION = Cargo.toml package.version so every binary
+#     reports the release version on an UNTAGGED commit, packages the
+#     .deb/.rpm/.apk from the same bytes, generates the release notes, stages
+#     versions/<semver>/ (binaries, manifest, pkg/, notes.md, install.sh),
+#     and parks a DRAFT GitHub Release `v<semver>` with everything attached.
+#
+# Both then smoke the shipped artifacts in this same run and, on success,
+# record versions/<version>/smoked — the provenance the promote workflow
+# checks. The tag comes LAST: promote publishes the draft, which creates
+# `v<semver>` on the already-smoked, already-promoted commit and triggers no
+# build. No tag push ever builds here.
 on:
     workflow_dispatch:
         inputs:
+            versioned:
+                description: "Cut a versioned release: build with MINIMAL_RELEASE_VERSION = Cargo.toml package.version, package .deb/.rpm/.apk, stage versions/<semver>/ with release notes, park a draft GitHub Release v<semver>. The tag is created by promote, last."
+                type: boolean
+                default: false
             dry_run:
                 description: "Build, sign, and assemble everything but publish nothing (no GCS upload, no GitHub release, no installer-bucket write, no channel advance)."
                 type: boolean
@@ -11,22 +31,27 @@ on:
                 description: "Bypass the verify-ci gate that requires this commit's five lane aggregators to be green. Admin override for a commit whose checks are known-good but unreported."
                 type: boolean
                 default: false
+            restage:
+                description: "Overwrite an already-staged versions/<version>/ row (staged rows are write-once). Only for re-running a versioned build that failed after staging; the re-run smokes and re-records provenance."
+                type: boolean
+                default: false
     # Invoked by nightly.yml, which depends on this run completing before it
-    # flips the `nightly` channel. Inputs default to a real, verified release.
+    # flips the `nightly` channel. Inputs default to a real, verified,
+    # sha-keyed (non-versioned) release.
     workflow_call:
         inputs:
+            versioned:
+                type: boolean
+                default: false
             dry_run:
                 type: boolean
                 default: false
             skip_ci_verify:
                 type: boolean
                 default: false
-    # Push a version tag (vMAJOR.MINOR.PATCH, optionally a `-prerelease` suffix) to
-    # cut a real, versioned GitHub Release.
-    # Does not release to any channel but unstable.
-    push:
-        tags:
-            - "v[0-9]*.[0-9]*.[0-9]*"
+            restage:
+                type: boolean
+                default: false
 
 env:
     # Route package-cache reads through the R2 mirror. min binaries built
@@ -91,30 +116,59 @@ jobs:
                   exit "$fail"
 
     assert-version:
-        # Fail the run before the expensive builds when the tag being released
-        # does not match the workspace `package.version`. crates/version/build.rs
-        # derives versions from `git describe` and falls back to package.version
-        # only when no `v*` tag is reachable (e.g. a source tarball with no
-        # .git) — a stale package.version would make such a build report the
-        # wrong -V. Tag pushes are the only flow with a semver tag to assert;
-        # the dispatch and nightly (release-<sha>) flows have none and skip.
+        # Resolve the version this run releases under, and fail before the
+        # expensive builds if it is wrong.
+        #
+        # `version` is the staged row name and channel target: the short sha
+        # for a nightly/plain build, the semver for a versioned one.
+        # `release_version` is the semver for a versioned build and EMPTY
+        # otherwise; every build job exports it as MINIMAL_RELEASE_VERSION,
+        # which crates/version/build.rs bakes in verbatim (empty = unset, so
+        # the nightly path keeps its `git describe` dev versions).
+        #
+        # The semver is Cargo.toml `package.version` — the declared next
+        # release — and it must be exactly that: not yet tagged, and at least
+        # what the Conventional Commits since the last release require
+        # (scripts/next-version.sh --check, the same lint every PR runs).
         runs-on: ubuntu-latest
         timeout-minutes: 5
+        outputs:
+            version: ${{ steps.resolve.outputs.version }}
+            release_version: ${{ steps.resolve.outputs.release_version }}
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
-            - name: Assert package.version matches the tag
+                  # Full history + tags: the lint walks the commits since the
+                  # last v* tag and checks the version is not already tagged.
+                  fetch-depth: 0
+                  fetch-tags: true
+            - name: Resolve the release version
+              id: resolve
               env:
-                  REF_TYPE: ${{ github.ref_type }}
-                  REF_NAME: ${{ github.ref_name }}
-              # The comparison lives in scripts/assert-release-version.sh —
-              # tested by scripts/assert-release-version_test.sh (`just
-              # test-shell`, and the workspace suite via
-              # crates/common/tests/shell_harnesses.rs) — not inline here.
+                  VERSIONED: ${{ inputs.versioned }}
               run: |
-                  GITHUB_REF_TYPE="$REF_TYPE" GITHUB_REF_NAME="$REF_NAME" \
-                    scripts/assert-release-version.sh
+                  set -euo pipefail
+                  short_sha="$(git rev-parse --short=8 HEAD)"
+                  release_version=""
+                  if [ "$VERSIONED" = "true" ]; then
+                    release_version="$(sed -n 's/^package\.version[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' Cargo.toml | head -n 1)"
+                    [ -n "$release_version" ] || { echo "::error::could not read package.version from Cargo.toml"; exit 1; }
+                    if git rev-parse -q --verify "refs/tags/v$release_version" >/dev/null; then
+                      echo "::error::v$release_version is already tagged — package.version must name the NEXT release (bump Cargo.toml)"
+                      exit 1
+                    fi
+                    scripts/next-version.sh --check
+                    version="$release_version"
+                    echo "versioned release: $release_version (row versions/$version/, draft release v$release_version)"
+                  else
+                    version="$short_sha"
+                    echo "sha-keyed release: row versions/$version/, release release-$short_sha"
+                  fi
+                  {
+                    echo "version=$version"
+                    echo "release_version=$release_version"
+                  } >> "$GITHUB_OUTPUT"
 
     build-release-linux-amd64:
         runs-on: ubuntu-latest
@@ -133,6 +187,8 @@ jobs:
         # workflow-level block above rather than replacing it.
         env:
             CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+            # Empty on a nightly/plain build (build.rs treats empty as unset).
+            MINIMAL_RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
         steps:
             - name: Free Disk Space
               # Static release build of the full workspace; the cargo target dir
@@ -262,6 +318,7 @@ jobs:
         # linker`, so the build leaves the checkout untouched.
         env:
             CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+            MINIMAL_RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
         steps:
             - name: Free Disk Space
               # Static release build of the full workspace; the cargo target dir
@@ -374,6 +431,8 @@ jobs:
         timeout-minutes: 45
         needs: [assert-version]
         if: vars.RUN_MACOS_CI != 'false'
+        env:
+            MINIMAL_RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
@@ -728,7 +787,7 @@ jobs:
         # NAME is exactly what `min -V` reports — one source of truth.
         runs-on: ubuntu-latest
         timeout-minutes: 5
-        needs: [build-release-linux-amd64]
+        needs: [assert-version, build-release-linux-amd64]
         outputs:
             version: ${{ steps.read.outputs.version }}
         steps:
@@ -738,18 +797,31 @@ jobs:
                   name: minimald-linux-amd64
             - name: Read version from the built binary
               id: read
+              env:
+                  RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
               run: |
                   set -euo pipefail
                   chmod +x minimald-linux-amd64
                   # "-V" => "minimald <version>"; take the version field.
                   ver="$(./minimald-linux-amd64 -V | awk '{print $2}')"
                   [ -n "$ver" ] || { echo "::error::could not read version from binary"; exit 1; }
+                  # A versioned build must report exactly the release version:
+                  # the override is what makes the tag-last flow sound.
+                  if [ -n "$RELEASE_VERSION" ] && [ "$ver" != "$RELEASE_VERSION" ]; then
+                    echo "::error::built binary reports '$ver' but this is a versioned build of '$RELEASE_VERSION' (MINIMAL_RELEASE_VERSION not honoured?)"
+                    exit 1
+                  fi
                   echo "version=$ver" >> "$GITHUB_OUTPUT"
                   echo "resolved release version: $ver"
 
     release:
+        # Assemble everything: completions, the legacy archive, the release
+        # notes, and (versioned) the distro packages; then cut the GitHub
+        # Release — `release-<sha>` for a nightly/plain build, or a DRAFT
+        # `v<semver>` for a versioned one, which promote publishes later
+        # (publishing the draft is what creates the tag).
         runs-on: ubuntu-latest
-        timeout-minutes: 30
+        timeout-minutes: 40
         needs:
             [
                 verify-ci,
@@ -769,23 +841,42 @@ jobs:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
+                  # Full history + tags: the release notes walk the commits
+                  # since the last released tag.
+                  fetch-depth: 0
+                  fetch-tags: true
             - name: Generate release info
               id: release_info
               env:
-                  REF_TYPE: ${{ github.ref_type }}
-                  REF_NAME: ${{ github.ref_name }}
+                  RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
               run: |
-                  # A version-tag push releases AT that tag (e.g. v1.2.3). The
-                  # SHA-based dispatch/nightly flow keeps its release-<sha> tag, which
-                  # the installer bucket layout and channel pointers key off. Either
-                  # way the release NAME uses the version string (Create Release step).
+                  # A versioned build parks a draft `v<semver>` release on this
+                  # commit; the sha-based dispatch/nightly flow keeps its
+                  # release-<sha> tag, which the installer bucket layout and
+                  # channel pointers key off. Either way the release NAME uses
+                  # the version string (Create Release step).
                   SHORT_SHA=$(git rev-parse --short=8 HEAD)
                   echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
-                  if [ "$REF_TYPE" = "tag" ]; then
-                    echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+                  echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+                  if [ -n "$RELEASE_VERSION" ]; then
+                    echo "tag=v$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
                   else
                     echo "tag=release-$SHORT_SHA" >> "$GITHUB_OUTPUT"
                   fi
+            - name: Generate release notes
+              # One walk of the full commit bodies since the last released tag
+              # (scripts/next-version.sh), so a BREAKING CHANGE footer under a
+              # plain subject is rendered, not dropped. Titled with
+              # package.version — the versioned release's own number; on a
+              # nightly it names the release the commits are heading toward.
+              run: scripts/next-version.sh --notes "$RUNNER_TEMP/notes.md"
+            - name: Upload release notes
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: release-notes
+                  path: ${{ runner.temp }}/notes.md
+                  if-no-files-found: error
+                  retention-days: 7
             - name: Download artifacts
               uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
@@ -796,6 +887,26 @@ jobs:
               run: rm -f artifacts/temp-*
             - name: Make binaries executable
               run: chmod +x artifacts/*-*-*
+            - name: Build the distro packages (versioned release only)
+              # .deb/.rpm/.apk for both Linux arches from THIS run's binaries
+              # (ARTIFACTS_DIR mode, no bucket round-trip), via the pinned
+              # nfpm. They are attached to the draft release below, staged as
+              # versions/<semver>/pkg/ by stage-installer, and the .deb is
+              # install-smoked by smoke-linux-amd64 — all the same bytes.
+              if: ${{ needs.assert-version.outputs.release_version != '' }}
+              env:
+                  PKGVER: ${{ needs.assert-version.outputs.release_version }}
+                  ARTIFACTS_DIR: artifacts
+                  OUT_DIR: ${{ runner.temp }}/dist
+              run: scripts/package-nfpm.sh
+            - name: Upload distro packages
+              if: ${{ needs.assert-version.outputs.release_version != '' }}
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: packages
+                  path: ${{ runner.temp }}/dist/
+                  if-no-files-found: error
+                  retention-days: 7
             - name: Generate completions
               # `min` splits printing from installing (`completions print
               # <shell>`); `mip` and `minimald` keep the flat verb. The `min`
@@ -837,22 +948,37 @@ jobs:
                   DRY_RUN: ${{ inputs.dry_run }}
                   REL_TAG: ${{ steps.release_info.outputs.tag }}
                   REL_TITLE: minimal ${{ needs.compute-version-string.outputs.version }}
-                  REF_TYPE: ${{ github.ref_type }}
-                  REF_NAME: ${{ github.ref_name }}
+                  REL_SHA: ${{ steps.release_info.outputs.sha }}
+                  RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
+                  NOTES: ${{ runner.temp }}/notes.md
+                  DIST: ${{ runner.temp }}/dist
               run: |
+                  set -euo pipefail
                   tar -C artifacts/completions -czf artifacts/completions.tar.gz .
+                  if [ -n "$RELEASE_VERSION" ]; then
+                    cp "$DIST"/* artifacts/
+                  fi
                   if [ "$DRY_RUN" = "true" ]; then
                     echo "::notice::dry_run — assembled release artifacts but skipping GitHub release create"
                     exit 0
                   fi
-                  # A pre-release version tag (e.g. v0.5.0-rc1, i.e. one with a `-`
-                  # suffix) is marked a GitHub prerelease so it doesn't show as
-                  # "Latest"; an exact vX.Y.Z becomes the latest release.
                   extra=()
-                  if [ "$REF_TYPE" = "tag" ]; then
-                    case "$REF_NAME" in
+                  if [ -n "$RELEASE_VERSION" ]; then
+                    # Versioned: a DRAFT parked on this commit. Drafts create no
+                    # tag; promote publishes it (publish-packages.yml), and THAT
+                    # creates v<semver> — last, on a smoked and promoted commit.
+                    # A pre-release version (one with a `-` suffix) is marked a
+                    # GitHub prerelease so it never shows as "Latest". A
+                    # leftover draft from an earlier attempt at the same version
+                    # is replaced (it was never published).
+                    extra+=(--draft --target "$REL_SHA")
+                    case "$RELEASE_VERSION" in
                       *-*) extra+=(--prerelease) ;;
                     esac
+                    if gh release view "$REL_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null | grep -qx true; then
+                      echo "replacing the leftover draft $REL_TAG"
+                      gh release delete "$REL_TAG" --repo "$GITHUB_REPOSITORY" --yes
+                    fi
                   fi
                   cd artifacts/
                   # find output is intentionally word-split so each artifact becomes
@@ -862,16 +988,21 @@ jobs:
                     $(find . -maxdepth 1 -type f) \
                     --repo="${GITHUB_REPOSITORY}" \
                     --title="$REL_TITLE" \
+                    --notes-file "$NOTES" \
                     "${extra[@]}"
 
     stage-installer:
         # Publish the release into gs://minimal-one in the layout the curl|bash
-        # installer reads (docs/specs/07-spec-installer). It re-fetches the same
+        # installer reads (docs/specs/07-spec-installer): ONE write-once row,
+        # versions/<version>/ — the short sha for a nightly/plain build, the
+        # semver for a versioned one — holding the binaries, the `components`
+        # manifest, the version-pinned install.sh, the release notes, and
+        # (versioned) pkg/ with the .deb/.rpm/.apk. It re-fetches the same
         # build artifacts and touches only gs://minimal-one. Wholly a publish
         # step, so it is skipped entirely on a dry run.
         runs-on: ubuntu-latest
         timeout-minutes: 20
-        needs: [release]
+        needs: [assert-version, release]
         if: ${{ !inputs.dry_run }}
         permissions:
             contents: read
@@ -880,17 +1011,23 @@ jobs:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
-            - name: Generate release info
-              id: release_info
-              run: |
-                  SHORT_SHA=$(git rev-parse --short=8 HEAD)
-                  echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
             - name: Download artifacts
               uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   pattern: "*-*-*"
                   path: artifacts/
                   merge-multiple: true
+            - name: Download release notes
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: release-notes
+                  path: ${{ runner.temp }}/notes
+            - name: Download distro packages (versioned release only)
+              if: ${{ needs.assert-version.outputs.release_version != '' }}
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: packages
+                  path: ${{ runner.temp }}/dist
             - name: Authenticate to Google Cloud (installer bucket)
               # Distinct project + workload-identity pool from the release job's
               # minimal-shim auth; this one grants write to gs://minimal-one.
@@ -899,64 +1036,434 @@ jobs:
                   project_id: "524228262772"
                   workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
             - name: Stage release into installer bucket
-              # Upload versions/<sha>/{components,<artifacts>}. Inert on its own:
-              # changes nothing users receive until a channel points at it.
+              # Upload versions/<version>/{components,<artifacts>,install.sh,
+              # notes.md[,pkg/]}. Inert on its own: changes nothing users
+              # receive until a channel points at it. Staged rows are
+              # write-once — a row that already exists fails here before any
+              # object is touched — unless `restage` was set to re-run a
+              # versioned build that failed after staging.
               env:
-                  SHORT_SHA: ${{ steps.release_info.outputs.short_sha }}
+                  VERSION: ${{ needs.assert-version.outputs.version }}
+                  RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
+                  RESTAGE: ${{ inputs.restage }}
+                  NOTES: ${{ runner.temp }}/notes/notes.md
+                  DIST: ${{ runner.temp }}/dist
               run: |
-                  scripts/stage-release.sh \
-                    --artifacts-dir artifacts \
-                    --version "$SHORT_SHA" \
+                  set -euo pipefail
+                  args=(--artifacts-dir artifacts --version "$VERSION" --bucket gs://minimal-one)
+                  args+=(--extra scripts/install.sh --extra "$NOTES")
+                  [ -z "$RELEASE_VERSION" ] || args+=(--pkg-dir "$DIST")
+                  [ "$RESTAGE" != "true" ] || args+=(--restage)
+                  scripts/stage-release.sh "${args[@]}"
+
+    # --- Smoke: prove the artifacts this run just built actually run, BEFORE
+    # anything can point a channel at them. Each smoke job downloads the
+    # uploaded artifacts by name, puts the SHIPPED binaries on PATH (never a
+    # fresh target/ build), and runs the ONE shared session e2e
+    # (scripts/session-e2e.sh — the same proof the CI lanes run). The smokes
+    # gate `record-smoked` via the `smoke-success` aggregator below, and that
+    # marker is what promote's provenance gate reads: a version nobody smoked
+    # is not promotable. They run on dry runs too (a rehearsal that skips its
+    # smoke proves nothing); only the recording is skipped.
+
+    smoke-linux-amd64:
+        # DM2 (native minimald on the host, no VM): the SHIPPED static-musl
+        # `min`/`minimald` — downloaded back by name — must auto-spawn a daemon
+        # and pass the session e2e. Mirrors ci-linux-native's `native-daemon-e2e`
+        # job, but against the release artifacts instead of a target/debug build.
+        # A versioned build additionally installs the .deb it packaged and
+        # checks the installed `min` reports the release version.
+        needs: [assert-version, release]
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Download shipped min
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: minimal-linux-amd64
+                  path: ${{ runner.temp }}/bin
+            - name: Download shipped minimald
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: minimald-linux-amd64
+                  path: ${{ runner.temp }}/bin
+            - name: Put the shipped binaries on PATH
+              # download-artifact drops each file under its platform-suffixed
+              # name; the CLI autospawns the daemon by the bare `minimald` name
+              # and users invoke `min`, so rename both and prepend the dir to PATH.
+              run: |
+                  set -euo pipefail
+                  BIN="$RUNNER_TEMP/bin"
+                  mv "$BIN/minimal-linux-amd64" "$BIN/min"
+                  mv "$BIN/minimald-linux-amd64" "$BIN/minimald"
+                  chmod +x "$BIN/min" "$BIN/minimald"
+                  echo "$BIN" >> "$GITHUB_PATH"
+            - name: Enable unprivileged user namespaces
+              # The session sandbox (hakoniwa) needs userns; Ubuntu 24.04
+              # restricts them via AppArmor by default. Mirrors the native lane.
+              run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            - name: Cache minimal package cache
+              # Session creation materializes the project's stack via cache pulls
+              # keyed by the pinned upstream commit; carry it across runs so the
+              # smoke isn't dominated by pulls. The e2e resets XDG_STATE_HOME /
+              # XDG_RUNTIME_DIR but leaves XDG_CACHE_HOME alone for this reason.
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+              with:
+                  path: ~/.cache/minimal
+                  key: smoke-amd64-minimal-cache-${{ hashFiles('.minimal/minimal.toml') }}
+                  restore-keys: smoke-amd64-minimal-cache-
+            - name: Session e2e (shipped native minimald)
+              # No E2E_* knobs: native target, host daemon, and the e2e seeds its
+              # own project workspace (E2E_PROJECT_DIR defaults to the checkout).
+              run: ./scripts/session-e2e.sh
+            - name: Download the distro packages (versioned release only)
+              if: ${{ needs.assert-version.outputs.release_version != '' }}
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: packages
+                  path: ${{ runner.temp }}/pkg
+            - name: Install the .deb and check the version it reports
+              # The package is installed from the file (no repo), so this
+              # proves the .deb built from this run's bytes installs on a
+              # stock Ubuntu and its `min` reports the release version. Runs
+              # AFTER the e2e so the PATH-first shipped binaries above are what
+              # the e2e exercised; /usr/bin/min is addressed explicitly.
+              if: ${{ needs.assert-version.outputs.release_version != '' }}
+              env:
+                  RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
+                  PKG: ${{ runner.temp }}/pkg
+              run: |
+                  set -euo pipefail
+                  deb="$(find "$PKG" -maxdepth 1 -name '*amd64*.deb' | head -n 1)"
+                  [ -n "$deb" ] || { echo "::error::no amd64 .deb among the packages"; ls -l "$PKG"; exit 1; }
+                  sudo apt-get install -y "$deb"
+                  got="$(/usr/bin/min -V | awk '{print $2}')"
+                  [ "$got" = "$RELEASE_VERSION" ] \
+                    || { echo "::error::installed min reports '$got', expected '$RELEASE_VERSION'"; exit 1; }
+                  echo "installed $(basename "$deb"): min -V reports $got"
+
+    smoke-linux-kvm:
+        # DM3 (native Linux + a minvmd/libkrun microVM): boot a REAL microVM from
+        # the SHIPPED minvmd and pass the session e2e over the vsock bridge, the
+        # same proof ci-linux-kvm's `test-kvm` runs. Every moving part is a
+        # downloaded release artifact: the static-musl `minvmd`, the guest kernel
+        # + ext4 rootfs + initramfs, and the pinned gvproxy switch. Nothing is
+        # materialized and no LD_LIBRARY_PATH is set — minvmd links libkrun
+        # statically and dlopens nothing, so the host needs no libkrun at all.
+        needs: [release]
+        runs-on: ubuntu-latest # x86_64; KVM-capable
+        timeout-minutes: 30
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Enable /dev/kvm access
+              # GitHub-hosted x86_64 Linux runners expose /dev/kvm but the runner
+              # user is not in the `kvm` group; widen the node so libkrun can open
+              # it. Fail fast if this runner has no KVM at all. (Ported from
+              # ci-linux-kvm's test-kvm.)
+              run: |
+                  if [ ! -e /dev/kvm ]; then
+                    echo "::error::/dev/kvm not present on this runner; cannot boot the microVM." >&2
+                    exit 1
+                  fi
+                  echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+                    | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+                  sudo udevadm control --reload-rules
+                  sudo udevadm trigger --name-match=kvm
+                  ls -l /dev/kvm
+            - name: Enable unprivileged user namespaces
+              # Ubuntu 24.04 restricts unprivileged userns via AppArmor by
+              # default, and the sandboxed build the session e2e drives needs it.
+              # (This used to be justified by the libkrun `mip materialize` step,
+              # which a static minvmd made unnecessary; the e2e's own need for
+              # userns is unchanged, so the sysctl stays.)
+              run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            - name: Download shipped linux-amd64 binaries
+              # Pulls min, minvmd, mip and gvproxy (plus minimald, unused on the
+              # host — it ships inside the initramfs). `*-linux-amd64` is a clean
+              # glob here: only darwin artifacts carry the `temp-` prefix.
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  pattern: "*-linux-amd64"
+                  path: ${{ runner.temp }}/bin
+                  merge-multiple: true
+            - name: Download shipped guest kernel
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: virtio-kernel-amd64
+                  path: ${{ runner.temp }}/guest
+            - name: Download shipped guest rootfs
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: minvmd-rootfs-amd64
+                  path: ${{ runner.temp }}/guest
+            - name: Download shipped guest initramfs
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: minimald-initramfs-amd64
+                  path: ${{ runner.temp }}/guest
+            - name: Put the shipped binaries on PATH
+              # Rename off the platform suffix and prepend to PATH so `min`
+              # autospawns `minvmd` by bare name. gvproxy is NOT resolved from
+              # PATH — minvmd only honours MINVMD_GVPROXY_BIN, the installer
+              # bin dir, or /usr/lib/minimal/bin (see resolve_gvproxy_path) —
+              # so the e2e step below points MINVMD_GVPROXY_BIN at it.
+              run: |
+                  set -euo pipefail
+                  BIN="$RUNNER_TEMP/bin"
+                  mv "$BIN/minimal-linux-amd64" "$BIN/min"
+                  mv "$BIN/minvmd-linux-amd64" "$BIN/minvmd"
+                  mv "$BIN/mip-linux-amd64" "$BIN/mip"
+                  mv "$BIN/gvproxy-linux-amd64" "$BIN/gvproxy"
+                  chmod +x "$BIN/min" "$BIN/minvmd" "$BIN/mip" "$BIN/gvproxy"
+                  echo "$BIN" >> "$GITHUB_PATH"
+            - name: Verify the shipped minvmd needs no libkrun at runtime
+              # The shipped minvmd links libkrun statically and dlopens nothing,
+              # so this job no longer materializes a libkrun prefix or sets
+              # LD_LIBRARY_PATH. Assert that rather than assume it: a regression
+              # to a dynamic build would otherwise surface as a confusing
+              # loader error mid-boot, and the smoke's whole point is to run the
+              # artifact exactly as a user receives it.
+              run: |
+                  set -euo pipefail
+                  bin="$RUNNER_TEMP/bin/minvmd"
+                  # x86_64-musl emits a static PIE, which file(1) reports as
+                  # "static-pie linked"; aarch64-musl reports "statically linked".
+                  file "$bin" | grep -qE 'statically linked|static-pie linked' \
+                    || { echo "::error::shipped minvmd is not statically linked"; file "$bin"; exit 1; }
+                  echo "shipped minvmd is self-contained; no libkrun on the host"
+            - name: Point the microVM env at the shipped guest artifacts
+              run: |
+                  {
+                    echo "MINVMD_KERNEL_PATH=$RUNNER_TEMP/guest/vmlinuz-amd64"
+                    echo "MINVMD_ROOTFS_PATH=$RUNNER_TEMP/guest/rootfs-amd64.img"
+                    echo "MINVMD_INITRAMFS=$RUNNER_TEMP/guest/initramfs-amd64.cpio"
+                  } >> "$GITHUB_ENV"
+            - name: Session e2e (shipped minvmd microVM)
+              # activate must auto-spawn minvmd, boot the guest, and round-trip a
+              # session. E2E_PROJECT_DIR=/tmp — the guest sees no host project dir
+              # yet (no project sync), and /tmp exists in the guest image.
+              # MINVMD_GVPROXY_BIN: without it minvmd boots the VM switchless
+              # (gvproxy resolution is best-effort and never errors) and every
+              # guest egress — including the in-guest `pkgs` clone during
+              # session mint — dies with "Could not resolve host".
+              env:
+                  MINVMD_BOOT_LOG: ${{ runner.temp }}/cli-e2e-boot.log
+                  MINVMD_GVPROXY_BIN: ${{ runner.temp }}/bin/gvproxy
+              run: E2E_VM=1 E2E_MINIMAL_ARGS="--provider local-minvmd" E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
+            - name: Reap leftover VM processes
+              # The autospawned minvmd can leak a __krun-vmm child on a failed
+              # teardown; reap defensively (ported from test-kvm). The runner is
+              # ephemeral, so this is hygiene, not correctness.
+              if: always()
+              run: |
+                  sudo pkill -x minvmd || true
+                  sudo pkill -f __krun-vmm || true
+            - name: Upload guest boot console log
+              if: always()
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: smoke-linux-kvm-boot-log
+                  path: ${{ runner.temp }}/cli-e2e-boot.log
+                  if-no-files-found: ignore
+
+    smoke-macos:
+        # DM1 (macOS is always VM-backed): prove the SIGNED macOS artifacts boot
+        # the microVM from the INSTALLER LAYOUT — the same session e2e ci-macos
+        # runs, but against the Developer-ID-signed `min`/`minvmd`, the signed
+        # shipped `libkrun.1.dylib` laid out as a `lib/` sibling of `bin/` (minvmd
+        # resolves it via its @loader_path/../lib rpath, exactly as
+        # scripts/install.sh drops it), the signed gvproxy, and the shipped arm64
+        # guest kernel/rootfs/initramfs.
+        #
+        # SKIP-TOLERANT: runs on the single self-hosted Apple-Silicon mini (it
+        # holds the signing keychain), a scarce shared resource. Gated on the same
+        # RUN_MACOS_CI kill-switch as the mac build/sign jobs, so taking the mini
+        # offline skips this smoke as `skipped` (never `failure`); `smoke-success`
+        # treats a skip as pass, so a skipped mac smoke does not wedge the run.
+        if: vars.RUN_MACOS_CI != 'false'
+        needs: [release]
+        runs-on: [self-hosted, macOS, ARM64]
+        timeout-minutes: 30
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  # Don't leave git credentials on the persistent self-hosted runner.
+                  persist-credentials: false
+            - name: Download signed CLI (min)
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: minimal-macos-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download signed minvmd
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: minvmd-macos-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download signed libkrun dylib
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: libkrun-macos-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download signed gvproxy
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: gvproxy-darwin-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download shipped guest kernel
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: virtio-kernel-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download shipped guest rootfs
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: minvmd-rootfs-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download shipped guest initramfs
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: minimald-initramfs-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Assemble the installer layout
+              # Reproduce the on-disk tree scripts/install.sh writes (spec 07):
+              # bin/{min,minvmd,gvproxy}, lib/libkrun.1.dylib (bin's sibling, the
+              # @rpath target), data/{vmlinuz,rootfs.img,initramfs.cpio}. The dylib
+              # basename MUST be libkrun.1.dylib — minvmd's load command is
+              # @rpath/libkrun.1.dylib. Then bin/ joins PATH so `min` autospawns
+              # `minvmd` (which finds libkrun via @loader_path/../lib) by bare
+              # name. gvproxy is NOT resolved from PATH — the e2e step below
+              # points MINVMD_GVPROXY_BIN at the laid-out binary.
+              run: |
+                  set -euo pipefail
+                  DL="$RUNNER_TEMP/dl"
+                  ROOT="$RUNNER_TEMP/install"
+                  mkdir -p "$ROOT/bin" "$ROOT/lib" "$ROOT/data"
+                  mv "$DL/minimal-macos-arm64" "$ROOT/bin/min"
+                  mv "$DL/minvmd-macos-arm64" "$ROOT/bin/minvmd"
+                  mv "$DL/gvproxy-darwin-arm64" "$ROOT/bin/gvproxy"
+                  mv "$DL/libkrun-macos-arm64.dylib" "$ROOT/lib/libkrun.1.dylib"
+                  mv "$DL/vmlinuz-arm64" "$ROOT/data/vmlinuz"
+                  mv "$DL/rootfs-arm64.img" "$ROOT/data/rootfs.img"
+                  mv "$DL/initramfs-arm64.cpio" "$ROOT/data/initramfs.cpio"
+                  chmod +x "$ROOT/bin/min" "$ROOT/bin/minvmd" "$ROOT/bin/gvproxy"
+                  echo "$ROOT/bin" >> "$GITHUB_PATH"
+            - name: Reap stale VM processes before the smoke
+              # The mini is persistent and shared: a prior run's stray minvmd,
+              # __krun-vmm or gvproxy would wedge the host->guest vsock bridge and
+              # sink the cold activate. Clear the tree first (mirrors ci-macos).
+              run: |
+                  pkill -x minvmd 2>/dev/null || true
+                  pkill -f '__krun-vmm' 2>/dev/null || true
+                  pkill -f gvproxy 2>/dev/null || true
+                  sleep 1
+            - name: Session e2e (signed microVM, installer layout)
+              # activate must auto-spawn minvmd, boot the guest, and round-trip a
+              # session. E2E_PROJECT_DIR=/tmp — the guest sees no host project dir
+              # yet, and /tmp exists in the guest image. Runs the laid-out binaries
+              # directly (never cargo, which would relink and unsign minvmd).
+              env:
+                  MINVMD_KERNEL_PATH: ${{ runner.temp }}/install/data/vmlinuz
+                  MINVMD_ROOTFS_PATH: ${{ runner.temp }}/install/data/rootfs.img
+                  MINVMD_INITRAMFS: ${{ runner.temp }}/install/data/initramfs.cpio
+                  MINVMD_BOOT_LOG: ${{ runner.temp }}/cli-e2e-boot.log
+                  MINVMD_GVPROXY_BIN: ${{ runner.temp }}/install/bin/gvproxy
+              run: E2E_VM=1 E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
+            - name: Reap VM processes
+              # Leave the shared mini clean for the next job (Guest teardown does
+              # not always reap the __krun-vmm grandchild or the gvproxy switch).
+              if: always()
+              run: |
+                  pkill -x minvmd 2>/dev/null || true
+                  pkill -f '__krun-vmm' 2>/dev/null || true
+                  pkill -f gvproxy 2>/dev/null || true
+            - name: Upload guest boot console log
+              if: always()
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: smoke-macos-boot-log
+                  path: ${{ runner.temp }}/cli-e2e-boot.log
+                  if-no-files-found: ignore
+
+    smoke-success:
+        # Skip-tolerant gate that `record-smoked` needs: the shipped-artifact
+        # smokes must pass BEFORE the row is marked smoked. `if: always()` so a
+        # kill-switch skip (RUN_MACOS_CI off skipping smoke-macos) still lets
+        # this run, and only a real failure/cancellation reds it — a `skipped`
+        # smoke reads as pass, mirroring the lane `*-success` aggregators. The
+        # two Linux smokes are never skipped when `release` ran, so a green
+        # here always means they passed.
+        if: always()
+        needs: [smoke-linux-amd64, smoke-linux-kvm, smoke-macos]
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        permissions:
+            contents: read
+        steps:
+            - name: Verify every smoke job succeeded or was skipped
+              if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+              run: exit 1
+            - run: echo "shipped-artifact smoke green"
+
+    record-smoked:
+        # Provenance as a property of the row: write versions/<version>/smoked
+        # carrying the SHA-256 of the row's `components` manifest and this
+        # run's URL (scripts/record-smoked.sh). promote's gate
+        # (scripts/verify-smoked.sh) re-hashes the live manifest and compares,
+        # so "these bytes were smoked" is checked directly rather than inferred
+        # from a workflow run id, and a re-staged row can never inherit a stale
+        # blessing. Needs every gate green: staged and smoked. Only then does
+        # `unstable` advance: a channel never points at bytes that have not
+        # passed the smoke. A dry run stages nothing, so `needs` alone already
+        # skips this job (a skipped dependency skips its dependents); the
+        # explicit `if` says so where a reader looks for it.
+        needs: [assert-version, stage-installer, smoke-success]
+        if: ${{ !inputs.dry_run }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        permissions:
+            contents: read
+            id-token: write
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Authenticate to Google Cloud (installer bucket)
+              uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+              with:
+                  project_id: "524228262772"
+                  workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
+            - name: Record the smoke against the staged bytes
+              env:
+                  VERSION: ${{ needs.assert-version.outputs.version }}
+                  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+                  RUN_ID: ${{ github.run_id }}
+              run: |
+                  scripts/record-smoked.sh \
+                    --version "$VERSION" \
+                    --run-url "$RUN_URL" \
+                    --run-id "$RUN_ID" \
+                    --sha "$GITHUB_SHA" \
                     --bucket gs://minimal-one
-            - name: Also stage under the semver tag
-              # Downstream packaging (the AUR PKGBUILD, brew formula, and nfpm
-              # renders) fetches from versions/<semver>/ — only tag pushes
-              # carry a semver. Same inert row layout as the sha-keyed upload
-              # above; the channel pointers still key off the sha row.
-              if: ${{ github.ref_type == 'tag' }}
-              env:
-                  SEMVER: ${{ github.ref_name }}
-              run: |
-                  scripts/stage-release.sh \
-                    --artifacts-dir artifacts \
-                    --version "${SEMVER#v}" \
-                    --bucket gs://minimal-one
-            - name: Build distro packages and stage versions/<semver>/pkg/
-              # .deb/.rpm/.apk from the just-staged semver row via the pinned
-              # nfpm. The apt/dnf/apk repo trees the infra repo builds on
-              # promote consume this row; nothing else reads it. The pkg/
-              # upload goes through stage-release.sh (--pkg-only) like every
-              # other staging write, so the cache headers have one definition.
-              if: ${{ github.ref_type == 'tag' }}
-              env:
-                  SEMVER: ${{ github.ref_name }}
-              run: |
-                  PKGVER="${SEMVER#v}" scripts/package-nfpm.sh
-                  scripts/stage-release.sh \
-                    --pkg-only --pkg-dir dist \
-                    --version "${SEMVER#v}" \
-                    --bucket gs://minimal-one
-            - name: Stage the installer script into the versioned folder
-              # Keep a version-pinned copy of the curl|sh installer next to the
-              # components it reads, so each version's install path is immutable
-              # and self-contained. Same immutable cache header as the other
-              # versions/<sha>/ artifacts. Done before the channel advances so the
-              # versioned folder is complete when anything points at it.
-              env:
-                  SHORT_SHA: ${{ steps.release_info.outputs.short_sha }}
-              run: |
-                  gcloud storage cp \
-                    --cache-control="public, max-age=31536000, immutable" \
-                    scripts/install.sh \
-                    "gs://minimal-one/versions/$SHORT_SHA/install.sh"
             - name: Point unstable channel at this release
-              # `unstable` auto-advances to every fresh build — it is the
-              # bleeding-edge channel, so no approval gate. Promotion to `stable`
-              # is the manual, gated promote-cli workflow.
+              # `unstable` auto-advances to every fresh, smoked build — it is
+              # the bleeding-edge channel, so no approval gate, but it advances
+              # only here, after the smokes and the marker. Promotion to
+              # `stable` is the manual, gated promote-cli workflow.
               env:
-                  SHORT_SHA: ${{ steps.release_info.outputs.short_sha }}
+                  VERSION: ${{ needs.assert-version.outputs.version }}
               run: |
                   scripts/set-channel.sh \
                     --channel unstable \
-                    --version "$SHORT_SHA" \
+                    --version "$VERSION" \
                     --bucket gs://minimal-one

@@ -187,7 +187,7 @@ Verified against the current tree; sources in parentheses.
 Canonical docs: [docs/ci-strategy.md](docs/ci-strategy.md) (design and
 rationale) and
 [docs/internal/release-pipeline.md](docs/internal/release-pipeline.md)
-(release/promotion mechanics). The 12 workflows on `main`:
+(release/promotion mechanics). The 13 workflows on `main`:
 
 | Workflow | One line |
 |---|---|
@@ -198,9 +198,10 @@ rationale) and
 | `ci-shell-installer` | POSIX-sh gate for the shell installer and the AppArmor profile installer (shellcheck + harness under sh/dash/macOS sh). |
 | `commitlint` | Conventional Commits enforcement on PRs. |
 | `nightly-tests` | 06:00 UTC **test tier**: advisory re-checks, session-e2e soak, toolchain/dependency canaries, workflow hygiene; failures file tracking issues. |
-| `nightly` | 10:00 UTC **channel cut**: reuses `release.yml` to build/stage, then blesses the `nightly` channel after smoke tests. |
-| `release` | Manual build/sign/stage of all shipped artifacts; its verify-ci gate requires the five lane aggregators green on the commit. |
-| `promote` | Manual, gated pointer flip of the `stable`/`unstable` channels to a staged version. |
+| `nightly` | 10:00 UTC **channel cut**: reuses `release.yml` to build/stage/smoke, then blesses the `nightly` channel. |
+| `release` | Manual (or nightly-called) build/sign/stage/smoke of all shipped artifacts; `versioned: true` builds with `MINIMAL_RELEASE_VERSION`, packages, stages `versions/<semver>/`, and parks a draft GitHub Release. Records smoke provenance on the staged row. Its verify-ci gate requires the five lane aggregators green on the commit. |
+| `promote` | Manual, gated pointer flip of the `stable`/`unstable` channels to a staged, smoked version; a stable promotion of a semver calls `publish-packages`. |
+| `publish-packages` | Reusable, called by `promote`: publishes the draft GitHub Release (which creates the `v<semver>` tag, last), then the AUR and Homebrew publishers. |
 | `docs-hotfix` | Manual: repoint the public docs on `gominimal/webapp` to a chosen `main` sha between releases, without cutting or promoting a binary release. |
 | `prune-releases` | Scheduled housekeeping: deletes aged auto-cut `release-<sha>` GitHub Releases (never tagged `vX.Y.Z` releases). |
 
