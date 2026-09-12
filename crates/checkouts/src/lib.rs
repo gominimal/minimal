@@ -748,6 +748,59 @@ mod tests {
         assert_eq!(before, after, "the refused add must not leak a directory");
     }
 
+    /// A fresh branch checkout lands on the fetched tip, not the bare
+    /// clone's clone-time copy of the branch, and a branch that upstream
+    /// created after the clone resolves at all.
+    #[test]
+    fn checkout_of_branch_lands_on_the_fetched_tip() {
+        use std::process::Command;
+        let (src, first_hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+
+        // Clone the bare repo at the first commit.
+        let (_, rev) = handle
+            .checkout_of(&remote, GitRef::Commit(first_hash.clone()))
+            .unwrap();
+        assert_eq!(rev, first_hash);
+
+        // Move `main` upstream and add a branch that postdates the clone.
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(src.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::write(src.path().join("hello.txt"), b"hello again").unwrap();
+        git(&["commit", "-am", "second"]);
+        let second_hash = git(&["rev-parse", "HEAD"]);
+        git(&["branch", "dev"]);
+
+        let (path, rev) = handle
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+        assert_eq!(
+            rev, second_hash,
+            "a branch checkout must land on the fetched tip"
+        );
+        assert_eq!(
+            std::fs::read(path.join("hello.txt")).unwrap(),
+            b"hello again"
+        );
+
+        let (_, rev) = handle
+            .checkout_of(&remote, GitRef::Branch("dev".to_string()))
+            .unwrap();
+        assert_eq!(
+            rev, second_hash,
+            "a branch created after the clone must resolve"
+        );
+    }
+
     /// A refused ref on a remote the manager has never seen leaves no bare
     /// clone behind either: the remote is not recorded, so a leftover
     /// `git/db/<id>` would make the next request clone again under a

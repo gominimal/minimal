@@ -60,7 +60,17 @@ impl Repo {
             });
         }
 
-        Ok(Self { url, bare: base })
+        // A bare clone writes only `refs/heads/*`; every branch lookup in this
+        // crate goes through `refs/remotes/origin/*`, so populate those now
+        // rather than leaving the first branch checkout to fail on a ref the
+        // clone never wrote. A clone that cannot be fetched is not a usable
+        // cache entry: take the directory with the error.
+        let mut repo = Self { url, bare: base };
+        if let Err(err) = repo.fetch() {
+            let _ = std::fs::remove_dir_all(&repo.bare);
+            return Err(err);
+        }
+        Ok(repo)
     }
 
     /// Returns the path to the bare git repository.
@@ -134,6 +144,12 @@ impl Repo {
     /// Detached, the worktrees are independent; a branch checkout is
     /// refreshed by [`Self::worktree_checkout`] via `origin/<branch>`
     /// regardless, which detaches too.
+    ///
+    /// A branch is added at `origin/<branch>`, the ref [`Self::fetch`]
+    /// updates, not at the bare name: that resolves to the bare clone's own
+    /// `refs/heads/<branch>`, which nothing refreshes after the clone, so the
+    /// worktree would land on the clone-time tip and a branch created
+    /// upstream since would not resolve at all.
     pub fn new_worktree(&mut self, path: PathBuf, git_ref: GitRef) -> Result<Checkout, Error> {
         // Drop registrations whose directories are gone first, so a stale
         // entry cannot claim the path this add is about to use.
@@ -143,6 +159,10 @@ impl Repo {
                 .chain(["worktree", "prune"])
                 .collect::<Vec<_>>(),
         )?;
+        let target = match &git_ref {
+            GitRef::Branch(b) => format!("origin/{b}"),
+            GitRef::Commit(s) | GitRef::Tag(s) => s.clone(),
+        };
         self.run_git_bare(
             GIT_SEC_ARGS
                 .into_iter()
@@ -152,7 +172,7 @@ impl Repo {
                     "-f",
                     "--detach",
                     path.to_str().unwrap(),
-                    git_ref.as_str(),
+                    target.as_str(),
                 ])
                 .collect::<Vec<_>>(),
         )?;
