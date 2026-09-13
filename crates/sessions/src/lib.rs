@@ -34,6 +34,25 @@ pub enum NetworkMode {
     OwnIp,
 }
 
+impl NetworkMode {
+    /// Whether this mode runs a `PTask` in its own network namespace rather than
+    /// sharing the host's.
+    ///
+    /// [`HostNet`](Self::HostNet) shares the host/VM network namespace (the
+    /// default); every other mode — [`NoNet`](Self::NoNet) and
+    /// [`OwnIp`](Self::OwnIp) — isolates the `PTask` in a fresh one. This is what
+    /// a caller turns a mode into a `sandbox2::NetPlan` with, and the contract a
+    /// `NoNet` `PTask`'s no-egress behaviour (UC1) rests on.
+    ///
+    /// It lives here, beside the enum, rather than in the sandbox layer: the
+    /// sandbox layer acts on plans and has no notion of a mode, so a mode's own
+    /// meaning is not its to hold.
+    #[must_use]
+    pub fn isolates_network(self) -> bool {
+        !matches!(self, Self::HostNet)
+    }
+}
+
 /// An IP transport protocol, used in egress/ingress policy rules.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

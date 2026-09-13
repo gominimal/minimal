@@ -1,11 +1,9 @@
-use crate::network::Network;
+use crate::network::{NetPlan, Network};
 use crate::{Error, Sandbox};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
-
-pub use sessions::NetworkMode;
 
 /// Something in the FS that needs to be mapped into the sandbox.
 #[derive(Debug)]
@@ -159,15 +157,17 @@ pub struct Config {
 
     /// Synthesize DNS config.
     pub setup_dns_config: bool,
-    /// The network isolation mode for this sandbox.
+    /// What this sandbox's network looks like when no provider decides it.
     ///
-    /// Used only when [`network`](Self::network) is `None` (the built-in
-    /// `HostNet`/`NoNet` path). A custom [`Network`] takes precedence.
-    pub network_mode: NetworkMode,
+    /// Used only when [`network`](Self::network) is `None`. A caller that has a
+    /// network *mode* turns it into a plan; the sandbox layer does not know what
+    /// a mode is, which is the point — a plan says what to do, where a mode says
+    /// only what it is called.
+    pub plan: NetPlan,
     /// A custom per-sandbox [`Network`], if injected via
-    /// [`with_network`](Self::with_network). When set it overrides
-    /// [`network_mode`](Self::network_mode), and decides both netns isolation and
-    /// any post-spawn wiring (e.g. an own-IP gvproxy switch attach). Keeping the
+    /// [`with_network`](Self::with_network). When set its plan overrides
+    /// [`plan`](Self::plan), and it decides both netns isolation and any
+    /// post-spawn wiring (e.g. an own-IP gvproxy switch attach). Keeping the
     /// wiring behind this trait is what lets tasks and sessions share one
     /// networking path instead of it living only in the minimald session host.
     pub network: Option<std::sync::Arc<dyn Network>>,
@@ -351,7 +351,7 @@ impl Config {
         Self {
             name: name.into(),
             setup_dns_config: true,
-            network_mode: NetworkMode::HostNet,
+            plan: NetPlan::host(),
             network: None,
             env_vars: HashMap::with_capacity(12),
             hostname: None,
@@ -439,15 +439,16 @@ impl Config {
         self.rootfs.insert(file);
         self
     }
-    /// Sets the network isolation mode for this sandbox (built-in
-    /// `HostNet`/`NoNet` path). Ignored if a custom [`Network`] is set via
-    /// [`with_network`](Self::with_network).
-    pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
-        self.network_mode = mode;
+    /// Sets what this sandbox's network looks like when no provider decides it.
+    /// Ignored if a custom [`Network`] is set via
+    /// [`with_network`](Self::with_network), whose own plan wins.
+    #[must_use]
+    pub fn with_plan(mut self, plan: NetPlan) -> Self {
+        self.plan = plan;
         self
     }
     /// Sets a custom per-sandbox [`Network`], overriding
-    /// [`with_network_mode`](Self::with_network_mode). Use this for modes that
+    /// [`with_plan`](Self::with_plan). Use this for modes that
     /// need post-spawn wiring (e.g. own-IP gvproxy switch attach), supplied by
     /// the consumer so the wiring lives behind one abstraction for every sandbox.
     pub fn with_network(mut self, network: std::sync::Arc<dyn Network>) -> Self {

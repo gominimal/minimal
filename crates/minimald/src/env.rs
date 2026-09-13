@@ -43,7 +43,6 @@ use ot::OpTracker;
 use paths::{DaemonAbsPath, DaemonRelPath, SandboxAbsPath};
 use sandbox2::config::{Config, SandboxMapped};
 use sandbox2::{Container, Sandbox};
-use sessions::NetworkMode;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, spawn_blocking};
@@ -194,7 +193,7 @@ pub struct EnvArgs {
     patches: Option<EnvPatches>,
     env_vars: Option<BTreeMap<String, EnvVarValue>>,
     ot: Option<OpTracker>,
-    network_mode: NetworkMode,
+    network: sandbox2::NetPlan,
     /// Weak handle to the owning session actor, wired into the command channel
     /// so in-sandbox `min` commands can drive session side-ops (e.g. builds).
     /// Every session env has one — this `Env` is always session-scoped.
@@ -230,7 +229,7 @@ impl EnvArgs {
             patches: None,
             env_vars: None,
             ot: None,
-            network_mode: NetworkMode::HostNet,
+            network: sandbox2::NetPlan::host(),
             session,
             include_package_attr_wiring: true,
         }
@@ -300,10 +299,11 @@ impl EnvArgs {
         self
     }
 
-    /// Sets the network isolation mode for the session sandbox.
+    /// Sets what the session sandbox's network looks like when no provider
+    /// decides it — a plan, because that is what the sandbox layer acts on.
     #[must_use]
-    pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
-        self.network_mode = mode;
+    pub fn with_network(mut self, plan: sandbox2::NetPlan) -> Self {
+        self.network = plan;
         self
     }
 }
@@ -471,7 +471,7 @@ impl Env {
             )
             .with_state_dir(args.state_base_dir.as_utf8_path())
             .with_env_vars(pkg_env_vars.into_iter())
-            .with_network_mode(args.network_mode)
+            .with_plan(args.network)
             .with_hostname(args.name.clone())
             .with_daemon_id(ctx.daemon_id().unwrap()) // Always set under minimald
             .with_username(args.username.unwrap_or_else(|| "user".to_string()));

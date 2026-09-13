@@ -527,7 +527,7 @@ pub struct EnvArgs<'a> {
     pub hostname: Option<String>,
 
     /// If set, overrides the network isolation mode for the sandbox.
-    pub override_network_mode: Option<sandbox2::NetworkMode>,
+    pub override_network: Option<sandbox2::NetPlan>,
     /// The operation tracker to use downstream, if applicable.
     pub ot: Option<OpTracker>,
 }
@@ -714,32 +714,38 @@ impl<'a> Env<'a> {
             })
             .collect();
 
-        let mut config = sandbox2::config::Config::new(args.name)
-            .with_wd(args.cwd.clone(), false, fs_mappings)
-            .with_home(home.clone())
-            .with_rootfs(
-                args.transitives
-                    .keys()
-                    .map(|bsr| ctx.daemon.cache.read_dir(&graph.spec_hash(bsr)))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| Error::Other(anyhow::anyhow!("loading dependency: {}", e)))?
-                    .into_iter()
-                    .map(|ce| SandboxMapped::Dir(ce.path().to_path_buf())),
-            )
-            .with_state_dir(&args.state_base_dir)
-            .with_dns(
-                args.override_network_mode
-                    .map(|m| !matches!(m, sandbox2::NetworkMode::NoNet))
-                    .unwrap_or(needs_dns),
-            )
-            .with_network_mode(args.override_network_mode.unwrap_or(
-                if !needs_dns && !needs_internet {
-                    sandbox2::NetworkMode::NoNet
-                } else {
-                    sandbox2::NetworkMode::HostNet
-                },
-            ))
-            .with_env_vars(pkg_env_vars.into_iter());
+        let mut config =
+            sandbox2::config::Config::new(args.name)
+                .with_wd(args.cwd.clone(), false, fs_mappings)
+                .with_home(home.clone())
+                .with_rootfs(
+                    args.transitives
+                        .keys()
+                        .map(|bsr| ctx.daemon.cache.read_dir(&graph.spec_hash(bsr)))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| Error::Other(anyhow::anyhow!("loading dependency: {}", e)))?
+                        .into_iter()
+                        .map(|ce| SandboxMapped::Dir(ce.path().to_path_buf())),
+                )
+                .with_state_dir(&args.state_base_dir)
+                .with_dns(match &args.override_network {
+                    // An overridden plan that isolates and names no resolver of its
+                    // own is the no-network case: synthesising the host's resolver
+                    // into it would name a server the sandbox cannot reach. Any
+                    // other plan gets DNS, as the equivalent mode used to.
+                    Some(plan) => {
+                        !plan.isolates_netns() || plan.resolver() != &sandbox2::Resolver::None
+                    }
+                    None => needs_dns,
+                })
+                .with_plan(args.override_network.clone().unwrap_or(
+                    if !needs_dns && !needs_internet {
+                        sandbox2::NetPlan::isolated()
+                    } else {
+                        sandbox2::NetPlan::host()
+                    },
+                ))
+                .with_env_vars(pkg_env_vars.into_iter());
         if let Some(id) = ctx.daemon_id() {
             config = config.with_daemon_id(id);
         }

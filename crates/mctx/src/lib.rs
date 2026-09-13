@@ -840,9 +840,9 @@ impl Context {
 
     /// Constructs an environment from which executions can be run, based on the given parameters.
     #[allow(clippy::too_many_arguments)]
-    /// Builds an [`env::Env`] with the default `HostNet` sandbox network. Use
-    /// [`make_env_with_network`](Self::make_env_with_network) to run the sandbox
-    /// in another [`sandbox2::NetworkMode`] (e.g. a `NoNet`/`OwnIp` PTask).
+    /// Builds an [`env::Env`] whose sandbox shares the host network. Use
+    /// [`make_env_with_network`](Self::make_env_with_network) to run it under
+    /// another [`sandbox2::NetPlan`] (e.g. an isolated PTask).
     pub async fn make_env<'a, S: PackageSelection>(
         &'a mut self,
         name: &'a str,
@@ -862,16 +862,20 @@ impl Context {
             patches,
             env_vars,
             packages,
-            sandbox2::NetworkMode::HostNet,
+            sandbox2::NetPlan::host(),
             home,
         )
         .await
     }
 
-    /// Like [`make_env`](Self::make_env) but runs the sandbox in the given
-    /// [`sandbox2::NetworkMode`], so callers (e.g. the minimald task-exec path)
-    /// can give a task the same network isolation as its session rather than
-    /// always `HostNet`.
+    /// Like [`make_env`](Self::make_env) but runs the sandbox under the given
+    /// [`sandbox2::NetPlan`], so callers (e.g. the minimald task-exec path) can
+    /// give a task the same network isolation as its session rather than always
+    /// the host's.
+    ///
+    /// A plan, not a mode: the caller owns the mode and what it means, and the
+    /// sandbox layer acts on what to do. A caller with a network *provider*
+    /// passes the plan it planned; one without passes what its mode implies.
     ///
     /// `home` is the directory `~/`-rooted patch paths expand against; see
     /// [`PatchHome`] for why every caller states it rather than letting
@@ -886,7 +890,7 @@ impl Context {
         patches: Option<&'a EnvPatches>,
         env_vars: Option<&'a BTreeMap<String, EnvVarValue>>,
         packages: S,
-        network_mode: sandbox2::NetworkMode,
+        network: sandbox2::NetPlan,
         home: PatchHome,
     ) -> Result<env::Env<'a>, Error> {
         let mfile = self.minimal_file();
@@ -961,7 +965,7 @@ impl Context {
                 home,
                 env_vars,
                 hostname: Some(name.to_string()),
-                override_network_mode: Some(network_mode),
+                override_network: Some(network),
                 ot: self.daemon.config.ot.clone(),
             },
         )

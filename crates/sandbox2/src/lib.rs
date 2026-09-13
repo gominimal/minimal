@@ -12,7 +12,6 @@
 
 pub mod config;
 use config::Config;
-pub use config::NetworkMode;
 pub mod network;
 pub use network::{
     AbandonFuture, AttachFuture, HostNet, NetGuard, NetPlan, Network, NetworkError, NoNet,
@@ -528,16 +527,11 @@ impl<C: Channel> Sandbox<C> {
         // Unlike the cgroup-setup fallback above (which degrades resource
         // *accounting*), this is a *security* boundary: if a caller asks for
         // `NoNet`/`OwnIp` but this host cannot create a network namespace, we
-        // fail closed rather than silently hand back full host networking, which
-        // would void the isolation the mode promises (spec R1.2).
         // The plan decides isolation; `isolation_decision` fails closed when the
-        // host cannot make the namespace the plan needs. Post-spawn wiring (the
+        // host cannot make the namespace the plan needs, rather than silently
+        // handing back full host networking (spec R1.2). Post-spawn wiring (the
         // switch attach) is the provider's, never this function's.
-        let isolate = isolation_decision(
-            plan,
-            self.config.network_mode,
-            network_namespaces_available(),
-        )?;
+        let isolate = isolation_decision(plan, network_namespaces_available())?;
         if isolate {
             container.unshare(hakoniwa::Namespace::Network);
         }
@@ -1343,20 +1337,6 @@ fn userns_restriction_from(
     (restricted && unconfined).then_some(UsernsRestriction::ApparmorUnconfined)
 }
 
-/// Whether `mode` runs the sandbox in its own network namespace rather than
-/// sharing the host's.
-///
-/// [`NetworkMode::HostNet`] shares the host/VM network namespace (the default);
-/// every other mode — [`NetworkMode::NoNet`] and [`NetworkMode::OwnIp`] —
-/// isolates the sandbox in a fresh network namespace. This is the predicate
-/// `new_container` uses to decide whether to unshare the network namespace (and
-/// to fail closed when it cannot), and the contract a `NoNet` PTask's no-egress
-/// behaviour (UC1) rests on.
-#[must_use]
-pub fn isolates_network(mode: NetworkMode) -> bool {
-    mode != NetworkMode::HostNet
-}
-
 /// A launch between its plan and its attach, owing the plan's release.
 ///
 /// The sequence spec 012 asks for, as an explicit type rather than a closure
@@ -1477,20 +1457,16 @@ impl Drop for PlannedLaunch {
 /// A pure mapping over the config, so the rules are testable without building a
 /// sandbox. See [`Sandbox::built_in_plan`].
 fn plan_from_config(config: &config::Config) -> network::NetPlan {
-    let plan = if isolates_network(config.network_mode) {
-        network::NetPlan::isolated()
-    } else {
-        network::NetPlan::host()
-    };
-    // No tap and no nameservers here by construction: those come from a provider
-    // now, and a sandbox with no provider has neither. `setup_dns_config` is what
-    // is left of the two DNS controls the config used to carry.
+    // No tap and no nameservers on this path by construction: those come from a
+    // provider, and a sandbox with no provider has neither. `setup_dns_config`
+    // is what is left of the two DNS controls the config used to carry, and is
+    // why the stored plan's resolver is set here rather than by the caller.
     let resolver = if config.setup_dns_config {
         network::Resolver::Host
     } else {
         network::Resolver::None
     };
-    plan.with_resolver(resolver)
+    config.plan.clone().with_resolver(resolver)
 }
 
 /// Whether to unshare the network namespace, or the error that says we will not
@@ -1506,14 +1482,10 @@ fn plan_from_config(config: &config::Config) -> network::NetPlan {
 /// `ExecutionError` is itself imported only there, and network namespaces are
 /// not a concept the other platforms have.
 #[cfg(target_os = "linux")]
-fn isolation_decision(
-    plan: &network::NetPlan,
-    mode: NetworkMode,
-    netns_available: bool,
-) -> Result<bool, Error> {
+fn isolation_decision(plan: &network::NetPlan, netns_available: bool) -> Result<bool, Error> {
     if plan.isolates_netns() && !netns_available {
         return Err(Error::Execution(
-            ExecutionError::NetworkIsolationUnavailable { mode },
+            ExecutionError::NetworkIsolationUnavailable,
         ));
     }
     Ok(plan.isolates_netns())
@@ -1542,13 +1514,6 @@ mod tests {
     fn locked_mount_flags_empty_on_statfs_failure() {
         let opts = locked_mount_flags(Path::new("/nonexistent-path-for-statfs-test"));
         assert!(opts.is_empty());
-    }
-
-    #[test]
-    fn host_net_shares_the_network_namespace_others_isolate() {
-        assert!(!isolates_network(NetworkMode::HostNet));
-        assert!(isolates_network(NetworkMode::NoNet));
-        assert!(isolates_network(NetworkMode::OwnIp));
     }
 
     /// A provider that records which operations ran, in order, so the sequence
@@ -1783,7 +1748,7 @@ mod tests {
     #[tokio::test]
     async fn both_spawn_paths_agree_without_a_provider() {
         let (_tmp, base) = make_base_with_synth();
-        let config = Config::new("test-both-paths-bare").with_network_mode(NetworkMode::NoNet);
+        let config = Config::new("test-both-paths-bare").with_plan(network::NetPlan::isolated());
         let sandbox = Sandbox::new(base, config, ()).unwrap();
 
         let from_invocation = sandbox.plan_launch().await.expect("plan");
@@ -1830,42 +1795,40 @@ mod tests {
         assert!(network::NetPlan::host().tap().is_none());
     }
 
-    /// 012-006, for the modes the sandbox layer handles by itself: `HostNet`
-    /// shares the namespace and gets no tap, `NoNet` isolates and still gets no
-    /// tap — an empty namespace is the whole of that mode. Neither can reach
-    /// more than its mode states, because neither has anything to reach it with.
+    /// 012-006, for the plans the sandbox layer handles by itself: a shared
+    /// namespace gets no tap, and an isolated one still gets no tap — an empty
+    /// namespace is the whole of what `NoNet` is. Neither can reach more than it
+    /// was given, because neither has anything to reach it with.
     ///
-    /// `OwnIp` needs a provider, so its half of this requirement lives beside
-    /// that provider (`minimald::net::provider`).
+    /// Stated over plans rather than modes because the sandbox layer no longer
+    /// knows what a mode is. The mode half — that each mode maps to the right
+    /// plan — is `minimald::net::provider` and `sessions::NetworkMode`.
     #[test]
     fn the_mode_bounds_the_network_access() {
-        let plan_for = |mode| {
-            let mut cfg = Config::new("t");
-            cfg.network_mode = mode;
+        let plan_for = |plan| {
+            let mut cfg = Config::new("t").with_plan(plan);
             cfg.setup_dns_config = false;
             plan_from_config(&cfg)
         };
 
-        let host = plan_for(NetworkMode::HostNet);
-        assert!(!host.isolates_netns(), "HostNet must share the namespace");
-        assert!(host.tap().is_none(), "HostNet must get no tap");
-
-        let nonet = plan_for(NetworkMode::NoNet);
-        assert!(nonet.isolates_netns(), "NoNet must isolate");
+        let host = plan_for(network::NetPlan::host());
         assert!(
-            nonet.tap().is_none(),
-            "NoNet must get no tap: an empty namespace is the whole mode"
+            !host.isolates_netns(),
+            "a host plan must share the namespace"
+        );
+        assert!(host.tap().is_none(), "a host plan must get no tap");
+
+        let isolated = plan_for(network::NetPlan::isolated());
+        assert!(isolated.isolates_netns(), "an isolated plan must isolate");
+        assert!(
+            isolated.tap().is_none(),
+            "and get no tap: an empty namespace is the whole of NoNet"
         );
         assert_eq!(
-            nonet.resolver(),
+            isolated.resolver(),
             &network::Resolver::None,
             "and no resolver to point anywhere"
         );
-
-        // A sandbox with no provider never gets a tap, whatever its mode says.
-        // The tap is the provider's to describe, so this is the bound holding by
-        // construction rather than by a check.
-        assert!(plan_for(NetworkMode::OwnIp).tap().is_none());
     }
 
     /// The host resolver is still what a sandbox asking for DNS setup gets when
@@ -1890,12 +1853,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn no_namespace_support_fails_closed() {
-        let err = isolation_decision(&network::NetPlan::isolated(), NetworkMode::NoNet, false)
+        let err = isolation_decision(&network::NetPlan::isolated(), false)
             .expect_err("an isolating plan on a host without namespaces must fail");
         assert!(
             matches!(
                 err,
-                Error::Execution(ExecutionError::NetworkIsolationUnavailable { .. })
+                Error::Execution(ExecutionError::NetworkIsolationUnavailable)
             ),
             "expected NetworkIsolationUnavailable, got {err:?}"
         );
@@ -1903,18 +1866,11 @@ mod tests {
         // A tap-carrying plan is an isolating plan, so it fails the same way
         // rather than building a sandbox whose tap never materialises.
         assert!(
-            isolation_decision(
-                &network::NetPlan::isolated_with_tap(tap_spec()),
-                NetworkMode::OwnIp,
-                false,
-            )
-            .is_err()
+            isolation_decision(&network::NetPlan::isolated_with_tap(tap_spec()), false,).is_err()
         );
 
         // A sandbox that asked for no isolation is unaffected by the probe.
-        assert!(
-            !isolation_decision(&network::NetPlan::host(), NetworkMode::HostNet, false).unwrap()
-        );
+        assert!(!isolation_decision(&network::NetPlan::host(), false).unwrap());
     }
 
     /// The Ubuntu 24.04+ default: restriction sysctl on, daemon unconfined —

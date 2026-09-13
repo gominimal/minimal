@@ -143,7 +143,7 @@ impl Exec for TaskExec {
 /// record of the session it runs in. See [`task_network`].
 struct TaskNetwork {
     /// The isolation mode the task's sandbox gets.
-    mode: sandbox2::NetworkMode,
+    mode: sessions::NetworkMode,
     /// The static ingress forwards to apply once it is attached.
     ingress: Option<sessions::IngressPolicy>,
     /// The name its PTask registers as, so peers can resolve it.
@@ -261,7 +261,14 @@ async fn task_producer(
                 Some(&task.patch),
                 Some(&task.vars),
                 task.packages.clone(),
-                network_mode,
+                // The plan this mode implies when no provider decides otherwise.
+                // A provider's plan wins below; this is the fallback the launch
+                // sequence uses when there is none (HostNet and NoNet).
+                if network_mode.isolates_network() {
+                    sandbox2::NetPlan::isolated()
+                } else {
+                    sandbox2::NetPlan::host()
+                },
                 mctx::PatchHome::Session(session_home),
             )
             .await
@@ -1909,7 +1916,7 @@ mod tests {
 
     /// A session record carrying `mode`, with everything else at its default.
     #[cfg(target_os = "linux")]
-    fn record_with(mode: sandbox2::NetworkMode) -> sessions::Record {
+    fn record_with(mode: sessions::NetworkMode) -> sessions::Record {
         sessions::Record {
             id: sessions::SessionId::nil(),
             name: None,
@@ -1934,9 +1941,9 @@ mod tests {
     #[test]
     fn every_ptask_kind_gets_its_own_mode() {
         for mode in [
-            sandbox2::NetworkMode::HostNet,
-            sandbox2::NetworkMode::NoNet,
-            sandbox2::NetworkMode::OwnIp,
+            sessions::NetworkMode::HostNet,
+            sessions::NetworkMode::NoNet,
+            sessions::NetworkMode::OwnIp,
         ] {
             assert_eq!(
                 super::task_network(&record_with(mode)).mode,
@@ -1953,12 +1960,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_task_takes_the_mode_of_its_session() {
-        let mut record = record_with(sandbox2::NetworkMode::OwnIp);
+        let mut record = record_with(sessions::NetworkMode::OwnIp);
         record.name = Some("web".to_string());
         record.policy.ingress = Some(sessions::IngressPolicy::default());
 
         let inherited = super::task_network(&record);
-        assert_eq!(inherited.mode, sandbox2::NetworkMode::OwnIp);
+        assert_eq!(inherited.mode, sessions::NetworkMode::OwnIp);
         assert_eq!(inherited.identity, "web");
         assert!(
             inherited.ingress.is_some(),
@@ -1967,7 +1974,7 @@ mod tests {
 
         // No name: the session id, which every record has, rather than an empty
         // hostname the switch would register for every unnamed session at once.
-        let unnamed = super::task_network(&record_with(sandbox2::NetworkMode::OwnIp));
+        let unnamed = super::task_network(&record_with(sessions::NetworkMode::OwnIp));
         assert_eq!(unnamed.identity, sessions::SessionId::nil().to_string());
     }
 

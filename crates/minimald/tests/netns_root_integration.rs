@@ -80,8 +80,8 @@ fn sudo_ok(label: &str, args: &[&str]) {
 ///
 /// Drives the egress attempt through `unshare --net`, which calls the same
 /// `CLONE_NEWNET` syscall that `sandbox2::new_container` calls for
-/// `NetworkMode::NoNet`. If `new_container` stopped calling `CLONE_NEWNET`,
-/// the `isolates_network` assertion would no longer match the actual namespacing
+/// an isolating plan. If `new_container` stopped calling `CLONE_NEWNET`, the
+/// `isolates_network` assertion would no longer match the actual namespacing
 /// behaviour; the `unshare --net` egress test guards the OS-level contract.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a network namespace; gated on MINIMALD_NETNS_TEST; runs in the ci-linux-native netns job"]
@@ -91,9 +91,10 @@ async fn netns_nonet_refuses_egress() {
     }
 
     // The production decision under test: NoNet isolates the network namespace,
-    // HostNet shares it.
-    assert!(sandbox2::isolates_network(sandbox2::NetworkMode::NoNet));
-    assert!(!sandbox2::isolates_network(sandbox2::NetworkMode::HostNet));
+    // HostNet shares it. The sandbox layer acts on the plan a mode implies, so
+    // the mode's own meaning lives with the mode.
+    assert!(sessions::NetworkMode::NoNet.isolates_network());
+    assert!(!sessions::NetworkMode::HostNet.isolates_network());
 
     // Exercise the same OS primitive that sandbox2::new_container uses for NoNet
     // (CLONE_NEWNET via unshare): enter a fresh, empty network namespace and

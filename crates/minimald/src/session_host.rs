@@ -2268,7 +2268,7 @@ impl SessionLauncher for SandboxLauncher {
             provider,
             // No provider means the sandbox layer's built-in handling of the mode,
             // which is exactly what `NoNet`/`HostNet` need.
-            if sandbox2::isolates_network(network_mode) {
+            if network_mode.isolates_network() {
                 sandbox2::NetPlan::isolated()
             } else {
                 sandbox2::NetPlan::host()
@@ -2394,7 +2394,10 @@ impl SessionLauncher for SandboxLauncher {
                     // uses a different `Env::build` (mctx::env::Env) and
                     // keeps the legacy un-gated wiring for now.
                     .without_package_attr_wiring()
-                    .with_network_mode(network_mode)
+                    // The plan the launch sequence resolved above — the
+                    // provider's when there is one. The env must build the
+                    // sandbox for the network it is actually going to get.
+                    .with_network(plan.clone())
                     .with_username(username),
             ))
             .await?;

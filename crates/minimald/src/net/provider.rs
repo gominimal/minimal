@@ -16,9 +16,10 @@
 use std::sync::Arc;
 
 use sandbox2::{
-    AbandonFuture, AttachFuture, NetGuard, NetPlan, Network, NetworkError, NetworkMode, PlanFuture,
-    Resolver, Spawned, TapSpec,
+    AbandonFuture, AttachFuture, NetGuard, NetPlan, Network, NetworkError, PlanFuture, Resolver,
+    Spawned, TapSpec,
 };
+use sessions::NetworkMode;
 use tokio::sync::Mutex;
 
 use crate::net::SwitchClient;

@@ -292,7 +292,7 @@ impl From<sandbox2::Error> for Error {
                 sandbox2::error::ExecutionError::MountError { .. } => {
                     Self::Other(anyhow::anyhow!(e.to_string()))
                 }
-                sandbox2::error::ExecutionError::NetworkIsolationUnavailable { .. } => {
+                sandbox2::error::ExecutionError::NetworkIsolationUnavailable => {
                     Self::Other(anyhow::anyhow!(e.to_string()))
                 }
             },
