@@ -50,11 +50,14 @@ fn find<'a>(files: &'a BTreeMap<String, Vec<u8>>, suffix: &str) -> Option<&'a Ve
         .map(|(_, contents)| contents)
 }
 
-/// A config dir with a loadout holding a canary secret, to prove redaction.
+/// A config dir with loadouts holding a canary secret, to prove
+/// redaction. One of each layout — `dev.toml` and `vc/loadout.toml` —
+/// so a directory-layout loadout is proved to be collected *and*
+/// redacted, not quietly skipped.
 fn fake_config_dir() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path().join("minimal");
-    std::fs::create_dir_all(root.join("loadouts")).unwrap();
+    std::fs::create_dir_all(root.join("loadouts/vc")).unwrap();
     std::fs::write(
         root.join("config.toml"),
         "[loadouts]\ndefault_loadouts = [\"dev\"]\n",
@@ -63,6 +66,11 @@ fn fake_config_dir() -> tempfile::TempDir {
     std::fs::write(
         root.join("loadouts/dev.toml"),
         "packages = [\"ripgrep\"]\n\n[vars]\nGITHUB_TOKEN = \"canary-secret-value\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("loadouts/vc/loadout.toml"),
+        "packages = [\"fd\"]\n\n[vars]\nGITLAB_TOKEN = \"canary-secret-value\"\n",
     )
     .unwrap();
     dir
@@ -347,6 +355,20 @@ async fn planted_secrets_never_reach_the_bundle() {
     std::fs::write(&target, "stolen = \"symlink-target-contents\"\n").unwrap();
     std::os::unix::fs::symlink(&target, config.path().join("minimal/loadouts/evil.toml")).unwrap();
 
+    // The same attack through the directory layout: a symlinked
+    // `<name>/` whose target holds a `loadout.toml`. `O_NOFOLLOW`
+    // cannot stop this one — it guards only the final component — so
+    // the collector must decline to descend into the link at all.
+    let outside_dir = outside.path().join("evildir");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    std::fs::write(
+        outside_dir.join("loadout.toml"),
+        "stolen = \"symlink-target-contents\"\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&outside_dir, config.path().join("minimal/loadouts/evildir"))
+        .unwrap();
+
     let out_dir = tempfile::TempDir::new().unwrap();
     let out = out_dir.path().join("diag.tar.zst");
     cmd_bug(&args, bug_args(&out)).await.unwrap();
@@ -356,6 +378,8 @@ async fn planted_secrets_never_reach_the_bundle() {
     // The symlink was refused at open, its target never read, and the
     // refusal recorded.
     assert!(find(&files, "evil.toml.redacted").is_none());
+    // The symlinked directory was never descended into.
+    assert!(find(&files, "evildir/loadout.toml.redacted").is_none());
     for contents in files.values() {
         assert!(
             !contents
@@ -374,6 +398,19 @@ async fn planted_secrets_never_reach_the_bundle() {
     assert!(
         loadout.contains("<redacted:len=19>"),
         "masked value records its length: {loadout}"
+    );
+
+    // The directory layout is collected under its own directory, and
+    // redacted by the same path — a loadout kept in git must not be a
+    // hole in the bundle's masking.
+    let vc = find(&files, "loadouts/vc/loadout.toml.redacted")
+        .expect("redacted directory-layout loadout");
+    let vc = String::from_utf8_lossy(vc);
+    assert!(vc.contains("GITLAB_TOKEN"), "keys survive: {vc}");
+    assert!(vc.contains("fd"), "packages survive: {vc}");
+    assert!(
+        vc.contains("<redacted:len=19>"),
+        "masked value records its length: {vc}"
     );
 
     // The canary value never appears anywhere in the archive.
