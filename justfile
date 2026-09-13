@@ -355,6 +355,17 @@ fuzz crate target *args: (_need "cargo-fuzz" "cargo install cargo-fuzz --locked"
 test: _nextest
     cargo nextest run {{scope}} {{ci-profile}} --locked --no-tests=fail
 
+# The tight loop while writing one test, and what a spec's `verify:` line means
+# in practice — those name a bare `cargo nextest` command because this did not
+# exist. Output is shown, so a test that prints a measurement is readable
+# without remembering `--nocapture`, and `--no-tests=fail` makes a filter that
+# matches nothing say so rather than pass silently.
+#
+# Run the tests matching a filter (`just test-one own_ip [-p minimald]`).
+test-one filter *args: _nextest
+    cargo nextest run {{args}} {{ if args == "" { scope } else { "" } }} \
+        --locked --no-tests=fail --no-capture -E 'test(/{{filter}}/)'
+
 # Doctests — nextest can't run them, so they are their own surface.
 doctest:
     cargo test {{scope}} --doc --locked

@@ -597,6 +597,11 @@ enum SessionMessage {
     /// record.
     Destroy(oneshot::Sender<Result<(), std::io::Error>>),
     GetRecord(oneshot::Sender<Record>),
+    /// Hand back an `Arc` clone of the daemon's shared gvproxy switch, so the
+    /// task-exec path can build the same network provider the session host
+    /// builds. The switch is daemon-scoped, not session-scoped; it is reached
+    /// through the session only because that is the handle the task path holds.
+    GetNetSwitch(oneshot::Sender<Arc<Mutex<crate::net::SwitchClient>>>),
     /// Hand back the session's composition, if it has one. Sourced from
     /// the persisted snapshot: `Session::run` loads it at spawn, so this
     /// answers for an actor brought up from disk after a restart.
@@ -1125,6 +1130,9 @@ impl Session {
             }
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.record.record().await.unwrap());
+            }
+            SessionMessage::GetNetSwitch(r) => {
+                let _ = r.send(Arc::clone(&self.net_switch));
             }
             #[cfg(test)]
             SessionMessage::PeekComposition(r) => {
@@ -2756,6 +2764,20 @@ impl SessionHandle {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::GetRecord(send)).await;
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })
+    }
+
+    /// The daemon's shared gvproxy switch, so the task-exec path can build a
+    /// network provider for an own-IP task the same way the session host does.
+    /// A dead actor maps to `NotConnected`.
+    pub(crate) async fn net_switch(
+        &self,
+    ) -> Result<Arc<Mutex<crate::net::SwitchClient>>, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(SessionMessage::GetNetSwitch(send)).await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })

@@ -139,6 +139,40 @@ impl Exec for TaskExec {
     }
 }
 
+/// Everything a task's sandbox needs to know about networking, read off the
+/// record of the session it runs in. See [`task_network`].
+struct TaskNetwork {
+    /// The isolation mode the task's sandbox gets.
+    mode: sessions::NetworkMode,
+    /// The static ingress forwards to apply once it is attached.
+    ingress: Option<sessions::IngressPolicy>,
+    /// The name its PTask registers as, so peers can resolve it.
+    identity: String,
+}
+
+/// What a task inherits from its session: its network mode, unchanged, plus the
+/// ingress policy and identity that go with it.
+///
+/// A task is a PTask, and a PTask gets the mode it was given. This is a named
+/// function with a test because what it replaced was a `match` that mapped
+/// `OwnIp` to `HostNet` — silently granting an own-IP task *host* egress, which
+/// is more network access than its mode states and the defect spec 012 exists to
+/// remove (012-005). That downgrade was load-bearing at the time: the per-PTask
+/// tap and switch attach lived in the session host, out of the task path's
+/// reach. The provider factory and the launch sequence are what make this an
+/// ordinary read.
+fn task_network(record: &sessions::Record) -> TaskNetwork {
+    TaskNetwork {
+        // No `match`. Every mode reaches the sandbox as it stands, including any
+        // added later: `NetworkMode` is `#[non_exhaustive]`, and a mode this
+        // daemon does not recognise must not quietly become host access.
+        mode: record.network,
+        ingress: record.policy.ingress.clone(),
+        // Falls back to the session id, which every record has.
+        identity: record.name.clone().unwrap_or_else(|| record.id.to_string()),
+    }
+}
+
 /// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
 /// `env` lives on a single stack frame across every spawn — that frame
 /// is alive for the whole life of this tokio task, which in turn is
@@ -207,23 +241,12 @@ async fn task_producer(
             task.vars
                 .insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
         }
-        // A task inherits its session's network isolation, through the same
-        // sandbox2 `Network` seam the interactive session uses, rather than the
-        // old hardcoded `HostNet` (which leaked host egress to a no-net
-        // session's tasks). `NoNet`/`HostNet` are fully handled by sandbox2's
-        // netns decision. `OwnIp` additionally needs the per-PTask tap/switch
-        // attach (as `attach_own_ip` does for sessions); wiring that into the
-        // task-exec producer/consumer is a follow-up (and is blocked by the
-        // guest rootfs lacking `ip`/`nsenter`), so an `OwnIp` session's task
-        // falls back to `HostNet` here instead of running in an empty,
-        // egress-less netns.
-        let network_mode = match session.record().await?.network {
-            m @ (sandbox2::NetworkMode::HostNet | sandbox2::NetworkMode::NoNet) => m,
-            // OwnIp falls back to HostNet (the per-PTask tap/switch attach for the
-            // task producer is a follow-up); `NetworkMode` is #[non_exhaustive],
-            // so any future mode also takes the safe HostNet default.
-            _ => sandbox2::NetworkMode::HostNet,
-        };
+        let record = session.record().await?;
+        let TaskNetwork {
+            mode: network_mode,
+            ingress,
+            identity,
+        } = task_network(&record);
         // A task's `~/` resolves against the session's home, the same
         // directory the interactive session sees at `/home`. The daemon's own
         // ambient home is `/` inside the guest, and expanding against that
@@ -238,7 +261,14 @@ async fn task_producer(
                 Some(&task.patch),
                 Some(&task.vars),
                 task.packages.clone(),
-                network_mode,
+                // The plan this mode implies when no provider decides otherwise.
+                // A provider's plan wins below; this is the fallback the launch
+                // sequence uses when there is none (HostNet and NoNet).
+                if network_mode.isolates_network() {
+                    sandbox2::NetPlan::isolated()
+                } else {
+                    sandbox2::NetPlan::host()
+                },
                 mctx::PatchHome::Session(session_home),
             )
             .await
@@ -247,9 +277,9 @@ async fn task_producer(
             .task_invocations(&task, exec.args.as_ref())
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let container = env
-            .container()
-            .map_err(|e| io::Error::other(format!("building container failed: {}", e)))?;
+        // The daemon-shared switch an own-IP provider leases from. Fetched once,
+        // outside the loop: it is daemon-scoped state, not per-invocation.
+        let net_switch = session.net_switch().await?;
 
         for inv in invocations {
             // Wait for the consumer to ask. `None` means the consumer
@@ -257,18 +287,60 @@ async fn task_producer(
             if req_rx.recv().await.is_none() {
                 return Ok(());
             }
-            let result = (|| -> io::Result<TaskProcess> {
+            let result = async {
+                // One plan, one container and one attach per invocation.
+                // hakoniwa unshares per `spawn()`, so each invocation gets its
+                // own network namespace and so needs its own address — hoisting
+                // this out of the loop would give N processes one lease.
+                // `sandbox2::run_with_cancel` does the same, for the same
+                // reason.
+                //
+                // `network_for` yields `None` for every mode but `OwnIp`, so a
+                // HostNet or NoNet task costs nothing here and sandbox2's netns
+                // decision does all the work, exactly as before.
+                let provider = crate::net::provider::network_for(
+                    network_mode,
+                    &net_switch,
+                    &identity,
+                    ingress.clone(),
+                );
+                let planned = sandbox2::PlannedLaunch::begin(provider, env.built_in_plan())
+                    .await
+                    .map_err(|e| {
+                        io::Error::other(format!("planning the task network failed: {e}"))
+                    })?;
+                let container = env
+                    .container(planned.plan())
+                    .map_err(|e| io::Error::other(format!("building container failed: {}", e)))?;
                 let mut cmd = env
                     .command(&container, &inv.executable, inv.args.iter())
                     .map_err(|e| io::Error::other(format!("building command failed: {}", e)))?;
                 cmd.stdin(hakoniwa::Stdio::piped())
                     .stdout(hakoniwa::Stdio::piped())
                     .stderr(hakoniwa::Stdio::piped());
-                let child = cmd
+                let mut child = cmd
                     .spawn()
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
-                Ok(TaskProcess::Sandbox(HakoniwaProcess::new(child)))
-            })();
+                // The namespace exists only now. A failure here must not leave a
+                // task running with the network it failed to get — kill and reap
+                // before returning, as `run_with_cancel` does. The plan's release
+                // stays owed and `PlannedLaunch`'s drop pays it.
+                let guard = match planned
+                    .attach(sandbox2::Spawned::from_child(&mut child))
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(io::Error::other(format!(
+                            "attaching the task network failed: {e}"
+                        )));
+                    }
+                };
+                Ok(TaskProcess::Sandbox(HakoniwaProcess::new(child, guard)))
+            }
+            .await;
             if let Err(send_err) = proc_tx.send(result).await {
                 // Receiver dropped between our `recv` returning `Some`
                 // and our `send`. If we just spawned a child, kill it
@@ -314,6 +386,12 @@ async fn task_producer(
 pub struct HakoniwaProcess {
     pid: libc::pid_t,
     state: WaitState,
+    /// The network wiring this task's namespace got, held until the process
+    /// exits. Teardown is explicit and async ([`sandbox2::NetGuard`]), so it
+    /// runs at the end of [`wait`](Process::wait) rather than on drop — the
+    /// one point that is both after the process is gone and on a live runtime.
+    /// `None` once torn down, and for a task whose mode needed no provider.
+    net_guard: Option<Box<dyn sandbox2::NetGuard>>,
 }
 
 enum WaitState {
@@ -337,10 +415,11 @@ enum WaitState {
 }
 
 impl HakoniwaProcess {
-    fn new(child: hakoniwa::Child) -> Self {
+    fn new(child: hakoniwa::Child, net_guard: Box<dyn sandbox2::NetGuard>) -> Self {
         Self {
             pid: child.id() as libc::pid_t,
             state: WaitState::Spawned(Box::new(child)),
+            net_guard: Some(net_guard),
         }
     }
 }
@@ -385,6 +464,14 @@ impl Process for HakoniwaProcess {
                 Ok(Ok(status)) => WaitState::Exited(Some(status.code)),
                 Ok(Err(_)) | Err(_) => WaitState::Failed,
             };
+        }
+
+        // Terminal either way, so the network this invocation held goes back
+        // now — including on the `Failed` arm, where the process is equally
+        // gone and a retained lease would leak. `take` makes a repeated `wait()`
+        // a no-op here, which the cancel-and-resume path above depends on.
+        if let Some(guard) = self.net_guard.take() {
+            guard.teardown().await;
         }
 
         match &self.state {
@@ -1826,6 +1913,122 @@ mod tests {
 
     use super::bridge;
     use super::testing::{MockEndpoints, build_mock, build_mock_seq};
+
+    /// A session record carrying `mode`, with everything else at its default.
+    #[cfg(target_os = "linux")]
+    fn record_with(mode: sessions::NetworkMode) -> sessions::Record {
+        sessions::Record {
+            id: sessions::SessionId::nil(),
+            name: None,
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
+            network: mode,
+            policy: sessions::SessionPolicy::default(),
+            status: sessions::SessionStatus::Active,
+            hooks_enabled: true,
+            attrs: Default::default(),
+        }
+    }
+
+    /// 012-005. Every kind of PTask runs with the network mode it was given —
+    /// the task path narrows nothing and widens nothing.
+    ///
+    /// `OwnIp` is the case that matters: it used to arrive as `HostNet`, which
+    /// gave a task whose whole point is its own address the *host's* egress
+    /// instead. The other two are here so a future change cannot fix own-IP by
+    /// breaking them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_ptask_kind_gets_its_own_mode() {
+        for mode in [
+            sessions::NetworkMode::HostNet,
+            sessions::NetworkMode::NoNet,
+            sessions::NetworkMode::OwnIp,
+        ] {
+            assert_eq!(
+                super::task_network(&record_with(mode)).mode,
+                mode,
+                "a {mode:?} session's task must run with {mode:?}",
+            );
+        }
+    }
+
+    /// 012-005. The rest of what a task inherits comes from the same record: the
+    /// ingress forwards to apply once attached, and the identity its PTask
+    /// registers under. A task that took the mode but not the policy would be
+    /// own-IP with nobody able to reach it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_task_takes_the_mode_of_its_session() {
+        let mut record = record_with(sessions::NetworkMode::OwnIp);
+        record.name = Some("web".to_string());
+        record.policy.ingress = Some(sessions::IngressPolicy::default());
+
+        let inherited = super::task_network(&record);
+        assert_eq!(inherited.mode, sessions::NetworkMode::OwnIp);
+        assert_eq!(inherited.identity, "web");
+        assert!(
+            inherited.ingress.is_some(),
+            "the session's ingress policy must reach its tasks",
+        );
+
+        // No name: the session id, which every record has, rather than an empty
+        // hostname the switch would register for every unnamed session at once.
+        let unnamed = super::task_network(&record_with(sessions::NetworkMode::OwnIp));
+        assert_eq!(unnamed.identity, sessions::SessionId::nil().to_string());
+    }
+
+    /// 012-005. An own-IP task whose attach fails must fail, not fall back to
+    /// host networking — the failure mode the old downgrade normalised.
+    ///
+    /// Driven through the real [`sandbox2::PlannedLaunch`] with a provider whose
+    /// attach errors, so what is asserted is the sequence's own behaviour: the
+    /// error propagates, and the plan the container was built from was the
+    /// provider's isolated one, never `host()`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_failed_task_attach_does_not_use_host_net() {
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct RefusesToAttach;
+
+        impl sandbox2::Network for RefusesToAttach {
+            fn plan(&self) -> sandbox2::PlanFuture<'_> {
+                Box::pin(std::future::ready(Ok(sandbox2::NetPlan::isolated())))
+            }
+            fn attach(&self, _: sandbox2::Spawned) -> sandbox2::AttachFuture<'_> {
+                Box::pin(std::future::ready(Err(sandbox2::NetworkError::new(
+                    std::io::Error::other("switch refused the client"),
+                ))))
+            }
+        }
+
+        let planned = sandbox2::PlannedLaunch::begin(
+            Some(Arc::new(RefusesToAttach)),
+            // The fallback a no-provider sandbox would use. If the sequence ever
+            // reached for it here, the assertion below would catch it.
+            sandbox2::NetPlan::host(),
+        )
+        .await
+        .expect("planning succeeds; it is the attach that fails");
+
+        assert!(
+            planned.plan().isolates_netns(),
+            "the provider's plan decides the namespace, not the host fallback",
+        );
+
+        // `Box<dyn NetGuard>` is not `Debug`, so the success arm cannot be
+        // unwrapped into a panic message; match instead.
+        let err = match planned.attach(sandbox2::Spawned::new(1)).await {
+            Ok(_) => panic!("a refused attach must surface as an error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("switch refused the client"),
+            "the provider's reason must reach the caller, got: {err}",
+        );
+    }
 
     /// Bytes flow client→child stdin and child stdout/stderr→client,
     /// and the child's exit code propagates to the bridge's return.
