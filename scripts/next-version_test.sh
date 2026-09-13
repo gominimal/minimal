@@ -241,6 +241,24 @@ else
     bad "--notes FILE did not write a file titled with package.version"
 fi
 
+# --- a tag on an unmerged branch: not the range base, but counted by the lint --
+#
+# Tags are repo-global: a version tagged on ANY branch is a version that was
+# published, so package.version must exceed it even though it is not
+# reachable from the rev under test.
+
+git -C "$repo" checkout -q -b stray v0.5.4
+commit "chore: cut a stray rc off an unmerged branch" v0.7.0-rc1
+git -C "$repo" checkout -q -
+expect_out "0.6.0" "an unmerged branch's tag is not the range base: the derivation still spans since v0.5.4" -- nv
+expect_notes "notes ignore the unmerged branch's commits" "since v0.5.4." "- **op**: an rc fix ("
+refute_notes "the stray branch's commit is not in the notes" "cut a stray rc"
+expect 1 "package.version 0.6.0 is not strictly greater than the newest tag v0.7.0-rc1" \
+    "check: a tag anywhere in the repo counts (tags are one namespace)" -- check 0.6.0
+expect 0 "package.version 0.7.0 satisfies" "check: declaring above the stray tag passes" -- check 0.7.0
+git -C "$repo" tag -d v0.7.0-rc1 >/dev/null
+git -C "$repo" branch -q -D stray
+
 # --- malformed input -----------------------------------------------------------
 
 expect 1 "no such Cargo.toml" "--check without a Cargo.toml fails loudly" -- \

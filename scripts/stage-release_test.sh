@@ -183,6 +183,25 @@ else
     bad "--pkg-only --restage did not delete the marker first: $(tr '\n' '|' <"$GCLOUD_STUB_ARGS")"
 fi
 
+# The row path and --pkg-dir each carry an invalidation site; a restage that
+# stages both must still delete the marker once, and must not follow the real
+# deletion with a "was not present" for the marker it just removed.
+restage_pkg_out="$(with GCLOUD_STUB_EXISTS=1 GCLOUD_STUB_SMOKED=1 -- \
+    stage --version 0.6.0 --restage --pkg-dir "$root/pkg" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" -eq 0 ] && [[ "$restage_pkg_out" == *"removed versions/0.6.0/smoked"* ]] \
+    && [[ "$restage_pkg_out" != *"was not present"* ]]; then
+    ok "--restage --pkg-dir removes the marker once and never reports it absent"
+else
+    bad "--restage --pkg-dir double-invalidated or failed (rc=$rc): $restage_pkg_out"
+fi
+expect_calls 1 "^storage rm gs://test-bucket/versions/0.6.0/smoked$" \
+    "--restage --pkg-dir deletes the marker exactly once across both upload sites"
+if [ "$(sed -n '1p' "$GCLOUD_STUB_ARGS")" = "storage rm gs://test-bucket/versions/0.6.0/smoked" ]; then
+    ok "--restage --pkg-dir deletes the marker before any upload"
+else
+    bad "--restage --pkg-dir did not delete the marker first: $(tr '\n' '|' <"$GCLOUD_STUB_ARGS")"
+fi
+
 # --- the packages upload is guarded the same way ------------------------------
 
 expect 0 "staged 0.6.0" "--pkg-dir on a fresh version stages the row and the packages" -- \

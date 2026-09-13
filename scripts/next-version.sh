@@ -181,7 +181,14 @@ base_tag="$(semver_tags --merged "$REV" | grep -v -- '-' | sed -n '1p' || true)"
 base_version="${base_tag#v}"
 
 # Newest SemVer tag overall, pre-releases included, for the strictly-greater
-# check.
+# check. Deliberately NOT scoped to tags reachable from the rev (unlike the
+# range base above): tags are one namespace for the whole repository, and a
+# release must exceed every version ever tagged, whatever branch it was cut
+# from — the publishers (Homebrew, AUR) have no channels, so a version below
+# an existing tag is a downgrade for their users and an equal one is a tag
+# collision at publish. A tag on an unmerged branch that sits above
+# package.version therefore fails --check on purpose: main's declared next
+# release is genuinely wrong until it is bumped past it.
 newest_tag="$(semver_tags | sed -n '1p' || true)"
 newest_version="${newest_tag#v}"
 

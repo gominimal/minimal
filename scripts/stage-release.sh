@@ -133,12 +133,18 @@ fi
 # without moving that digest. Deleting the marker first means a restage whose
 # smoke then fails leaves an unpromotable row, not a stale blessing; the
 # restage's own run re-records once its smoke passes. Called at the first
-# upload site of whichever path runs (the row, or --pkg-only).
+# upload site of whichever path runs (the row, or --pkg-only); a run that
+# stages the row AND --pkg-dir reaches both sites, so the second call is a
+# no-op (one deletion per run, one log line, no misleading "was not present"
+# for a marker this run just removed).
 # Only a confirmed not-found is tolerated: any other failure (auth, permission,
 # a transient storage error) would leave the stale marker in place under the
 # new bytes, so it stops the restage before the first upload.
+smoked_invalidated=0
 invalidate_smoked() {
     [ "$RESTAGE" -eq 1 ] || return 0
+    [ "$smoked_invalidated" -eq 0 ] || return 0
+    smoked_invalidated=1
     local marker="$BUCKET/versions/$VERSION/smoked" err
     if err="$(gcloud storage rm "$marker" 2>&1 >/dev/null)"; then
         printf 'stage-release: --restage: removed versions/%s/smoked — the row must be smoked again before it can be promoted\n' "$VERSION" >&2
