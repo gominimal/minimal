@@ -1721,6 +1721,83 @@ mod tests {
         assert!(network::Spawned::new(7).take_tap_fd().is_none());
     }
 
+    /// 012-004. Both ways a sandbox process gets started reach the provider,
+    /// through one sequence rather than two copies of it.
+    ///
+    /// The two are the sandbox layer's own invocation path
+    /// ([`Sandbox::run_with_cancel`], which enters at [`Sandbox::plan_launch`])
+    /// and the caller-spawn path `minimald`'s session host and task exec use
+    /// (which enters at [`PlannedLaunch::begin`]). Before this spec they applied
+    /// the network differently, which is how the session path grew a rollback
+    /// the invocation path did not have, and how a task ended up with a mode it
+    /// was never given.
+    ///
+    /// Asserted at the entry points rather than by running a sandbox: what makes
+    /// the paths one sequence is that `plan_launch` *is* `begin` plus the
+    /// sandbox's own fallback, and that is checkable without a rootfs. Their
+    /// shared tail — container from the plan, spawn, attach — is covered by
+    /// `network_phases_run_in_order`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn both_spawn_paths_apply_the_network() {
+        let recorder = std::sync::Arc::new(Recorder::default());
+        let (_tmp, base) = make_base_with_synth();
+        let config = Config::new("test-both-paths")
+            .with_network(recorder.clone() as std::sync::Arc<dyn network::Network>);
+        let sandbox = Sandbox::new(base, config, ()).unwrap();
+
+        // The invocation path's step 1.
+        let from_invocation = sandbox.plan_launch().await.expect("plan");
+        // The caller-spawn path's step 1, given the same provider.
+        let from_caller = PlannedLaunch::begin(
+            Some(recorder.clone() as std::sync::Arc<dyn network::Network>),
+            sandbox.built_in_plan(),
+        )
+        .await
+        .expect("plan");
+
+        assert_eq!(
+            recorder.events(),
+            vec!["plan", "plan"],
+            "each path must ask the provider exactly once, and neither may skip it",
+        );
+        assert_eq!(
+            from_invocation.plan().isolates_netns(),
+            from_caller.plan().isolates_netns(),
+            "the same provider must decide the same namespace on both paths",
+        );
+
+        // Neither owes anything once released, and both release the same way.
+        from_invocation.abandon().await;
+        from_caller.abandon().await;
+        assert_eq!(
+            recorder.events(),
+            vec!["plan", "plan", "abandon", "abandon"]
+        );
+    }
+
+    /// 012-004, the other half: with no provider, both paths still agree — on
+    /// the sandbox's own configuration. A path that silently differed here would
+    /// give a build and a session different networks from the same config.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn both_spawn_paths_agree_without_a_provider() {
+        let (_tmp, base) = make_base_with_synth();
+        let config = Config::new("test-both-paths-bare").with_network_mode(NetworkMode::NoNet);
+        let sandbox = Sandbox::new(base, config, ()).unwrap();
+
+        let from_invocation = sandbox.plan_launch().await.expect("plan");
+        let from_caller = PlannedLaunch::begin(None, sandbox.built_in_plan())
+            .await
+            .expect("plan");
+
+        assert!(from_invocation.plan().isolates_netns());
+        assert_eq!(
+            from_invocation.plan().isolates_netns(),
+            from_caller.plan().isolates_netns(),
+        );
+    }
+
     fn tap_spec() -> network::TapSpec {
         network::TapSpec {
             address: std::net::Ipv4Addr::new(100, 64, 0, 2),

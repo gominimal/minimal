@@ -150,9 +150,9 @@ or a session, and the operator who runs the daemon.
 - Dynamic ingress port mappings: unchanged, in 03-spec-networking R2.3.
 - The tools that the guest root filesystem needs for the in-VM task attach:
   none on the path this spec describes, because the sandbox layer makes the
-  tap in the namespace of the sandbox. The fallback for the one deployment
-  model where that does not work still runs `ip` and `nsenter`, and the guest
-  root filesystem already has both. See
+  tap in the namespace of the sandbox. The one deployment model where that does
+  not work still runs `ip` and `nsenter`, and the guest root filesystem already
+  has both. See
   [One tap mechanism](#one-tap-mechanism).
 - A network mode of its own for a task run: the command that starts a task has
   no option for the mode today, and it always asks for the host network. This
@@ -218,31 +218,39 @@ rollback owner. The two deployment paths then differ in one value: the
 transport that carries the file descriptor to the switch. Both transports
 already share one frame relay, so the frames do not change.
 
-**One deployment model does not do this yet.** In the x86_64 KVM guest the
-sandbox layer makes no tap, and gives out no file descriptor. This is not a
-lack of the two things the mechanism needs: the daemon reports that
-`/dev/net/tun` is present and that user namespaces are available. The same
-code makes a tap correctly on a native host as root (the proof above, on an
-x86_64 runner) and in the aarch64 microVM guest (the session end-to-end proof
-on the macOS lane). The cause is in the x86_64 guest and is not yet known.
+**One deployment model does not do this.** In the x86_64 KVM guest the sandbox
+layer makes no tap and gives out no file descriptor. This is not a lack of the
+two things the mechanism needs: the daemon reports that `/dev/net/tun` is
+present and that user namespaces are available. The same code makes a tap
+correctly on a native host as root (the proof above, on an x86_64 runner) and in
+the aarch64 microVM guest (the session end-to-end proof on the macOS lane).
 
-So the daemon keeps the privileged mechanism as a **fallback**, and uses it
-when two conditions hold together: the sandbox layer gave out no file
-descriptor, and the daemon is inside a microVM whose network it owns. On a
-native host there is no fallback — the daemon is unprivileged by design, and
-a failure there must stay a failure. `net::provider::own_ip_fallback_reason`
-holds that rule, and a test holds it in place.
+Asking for a tap there also **destroys the sandbox**. The lane caught the whole
+sequence: the daemon then tried to move a tap of its own into the namespace of
+the process, and `ip link set mtap0_2 netns 103` answered `Invalid "netns"
+value`, with `/proc/103/ns/net present: false`. The supervisor of the container
+was gone. The cause inside that guest is still not known; the effect is known
+and is enough to decide the design.
 
-The result is still one attach path with one rollback owner, in one module.
-The deployment model selects a transport and, in this one case, a way to get
-the tap.
+It decides it this way: **the mechanism is chosen before the sandbox starts,
+from the deployment model, and is not a fallback.** A fallback cannot work
+here, because by the time the first mechanism has visibly failed there is no
+namespace left to put a tap into. So the daemon inside a microVM whose network
+it owns asks the sandbox layer for a namespace and no tap, and makes the tap
+itself. On a native host the daemon is unprivileged by design and the rootless
+mechanism is the only one; a failure there stays a failure.
+`net::provider::tap_mechanism` holds that rule, and two tests hold it in place.
+
+The result is one attach path with one rollback owner, in one module. The
+deployment model selects a transport and, in this one case, a way to get the
+tap — both read once, at the same point, from the same value.
 
 Three consequences follow, and they make step 6 below smaller than it would be
-with two mechanisms:
+with two attach paths:
 
 1. The provider holds one attach path, not a branch on the deployment model.
-2. The daemon stops running the `ip` and `nsenter` programs for the network
-   on every deployment model but one, where they remain as a fallback.
+2. The daemon stops running the `ip` and `nsenter` programs for the network on
+   every deployment model but one.
 3. 012-005 holds the same way on every deployment model, instead of holding
    first on a native Linux host and later inside a microVM.
 
@@ -338,11 +346,12 @@ Each step compiles, and each step ships on its own.
 
 1. Move the netmask arithmetic onto the subnet type in the `switch` crate. No
    change in behaviour.
-2. Give the in-VM path the rootless tap mechanism, so that the deployment model
-   selects a transport and nothing else. See
-   [One tap mechanism](#one-tap-mechanism).
-3. Keep the mechanism that step 2 stops using, as the fallback for the one
-   deployment model that needs it, and give it one caller.
+2. Give the in-VM path the rootless tap mechanism where it works, so that the
+   deployment model selects a transport and, in the one guest where the
+   rootless mechanism does not work, a way to get the tap. Both are read at the
+   same point from the same value. See [One tap mechanism](#one-tap-mechanism).
+3. Keep the mechanism that step 2 stops using, for that one deployment model,
+   and give it one caller.
 4. Add the plan operation and the plan type. The old configuration fields feed
    a plan that the sandbox layer builds. No consumer changes.
 5. Add the launch operation, and move the invocation path onto it.
@@ -408,7 +417,7 @@ every other layer stays the same.
   same invariants, as this section stated.
 - **The in-VM task path needs no tools in the guest root filesystem.** (Was
   HIGH.) The question assumed the daemon must move a tap into the namespace of
-  the sandbox. On the path this spec describes it does not. The fallback does,
+  the sandbox. On a native host it does not. In the x86_64 KVM guest it does,
   and the guest root filesystem already has `ip` and `nsenter`, so no issue is
   needed either way. See [One tap mechanism](#one-tap-mechanism).
 - **The repository gets a `just` recipe that runs one test.** (Was MEDIUM.)
