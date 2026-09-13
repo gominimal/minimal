@@ -171,13 +171,14 @@ dist-build target:
 # Build the .deb/.rpm/.apk packages for a staged semver release from the
 # installer bucket via the pinned nfpm (fetched + sha256-verified by the
 # script). Packages land in dist/. Apt/dnf/apk repo-tree hosting lives in the
-# infra repo, not here.
+# infra repo, not here. (The release workflow builds them from its own
+# artifacts instead — ARTIFACTS_DIR mode — before the row is staged.)
 #
-# The semver row must exist: releases staged from the tag-push staging on are
-# carry one; earlier ones need scripts/backfill-version-row.sh first (that is
-# every release up to and including 0.5.3). Linux-only for the same host-check
-# reason as dist-build: the script downloads static musl ELFs and runs the
-# downloaded `min` to generate completions.
+# The semver row must exist: every versioned release build stages one;
+# releases up to and including 0.5.3 need scripts/backfill-version-row.sh
+# first. Linux-only for the same host-check reason as dist-build: the script
+# downloads static musl ELFs and runs the downloaded `min` to generate
+# completions.
 [linux]
 pkg-nfpm pkgver:
     PKGVER={{quote(pkgver)}} scripts/package-nfpm.sh
@@ -386,12 +387,12 @@ test-cross: (_need "cross" "cargo install cross --locked")
 #
 # The local PR gate set, cheapest first.
 [linux]
-ci: fmt-check clippy deny test doctest test-ignored
+ci: fmt-check check-version clippy deny test doctest test-ignored
     @echo "ci: local PR gates green"
 
 # The local PR gate set, cheapest first (`just test-cross` covers the Linux-only crates).
 [macos]
-ci: fmt-check clippy deny test doctest
+ci: fmt-check check-version clippy deny test doctest
     @echo "ci: local PR gates green"
 
 # Run the curl|sh installer's tests under every POSIX sh. CI: ci-shell-installer.yml.
@@ -417,20 +418,33 @@ test-installer:
 lint-shell:
     bash scripts/lint-shell.sh
 
-# Shellcheck runs too, when present.
+# scripts/record-smoked.sh writes the smoke-provenance marker and
+# scripts/verify-smoked.sh reads it back, over a stubbed `gcloud` backed by a
+# directory: no network, no auth. Shellcheck runs too, when present.
 #
-# Run the promotion provenance gate's test harness (stubbed `gh`, no network or auth).
+# Run the promotion gate's test harness (stubbed `gcloud`, no network or auth).
 test-promote-gate:
     #!/usr/bin/env bash
     set -euo pipefail
     if command -v shellcheck >/dev/null 2>&1; then
         echo "== shellcheck =="
-        shellcheck scripts/verify-nightly-provenance.sh scripts/verify-nightly-provenance_test.sh
+        shellcheck scripts/record-smoked.sh scripts/verify-smoked.sh scripts/smoked_test.sh
     else
         echo "== shellcheck not found, skipping static check =="
     fi
-    echo "== running verify-nightly-provenance_test.sh =="
-    bash scripts/verify-nightly-provenance_test.sh
+    echo "== running smoked_test.sh =="
+    bash scripts/smoked_test.sh
+
+# package.version must be the declared NEXT release: strictly above the newest
+# v* tag and at least what the Conventional Commits since the last release
+# require (feat -> minor, else patch; no major while 0.x). The workspace
+# `package_version` test (crates/common/tests/package_version.rs) runs the same
+# check but self-skips on the hosted lanes' shallow, tagless checkouts, so this
+# recipe (part of `just ci`) is the proof that actually runs. Needs the tags.
+#
+# Assert Cargo.toml package.version against the commits since the last v* tag (scripts/next-version.sh --check).
+check-version:
+    scripts/next-version.sh --check
 
 # Run every scripts/*_test.sh harness in one go (the release/publishing logic:
 # semver resolution, version assertion, staged-version lookup, the packaging
