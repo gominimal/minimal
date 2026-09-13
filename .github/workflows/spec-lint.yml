@@ -24,6 +24,12 @@ on:
 
 permissions:
   contents: read
+  # This is the scope that posts and edits the advisory comment. A comment on
+  # a pull request is an issue comment, so the endpoint reads
+  # `issues/<n>/comments` and every review of this file asks for
+  # `issues: write` on the strength of that path. It is not needed: the
+  # number belongs to a pull request, and `pull-requests: write` carries both
+  # the POST and the PATCH. The run record on the installed copies shows it.
   pull-requests: write
 
 concurrency:
@@ -63,7 +69,7 @@ jobs:
       - name: Mint a token for the private linter
         id: app-token
         continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ vars.AW_BOT_APP_ID }}
           private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
@@ -92,7 +98,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
+          # No `-e`. The selection loop's `[ ] &&` and the `grep -q` below both
+          # return non-zero on ordinary paths, and under `-e` either one ends
+          # the step non-zero — which is the merge gate decision 9 says this
+          # never becomes. Every exit in this script is a deliberate zero.
           set -uo pipefail
+
+          # The checkout step is continue-on-error like every other, so a
+          # failed one arrives here as a missing directory rather than a failed
+          # job. A PR that touches a spec would reach the linter and report no
+          # output; a workflow-only PR would not, because the self-test below
+          # looks for a TEMPLATE.md that is not there, and the log then reads
+          # exactly like a PR that changed no spec. Say the real reason here,
+          # while it is still known.
+          if [ ! -d pr ]; then
+            echo "::warning::the tree under review could not be checked out; no comment this run"
+            echo "state=quiet" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # Changed files come from the API, not from git: a shallow checkout of
           # the head sha has no base to diff against, and deepening it to find
@@ -102,10 +125,24 @@ jobs:
           # predate it, so a PR editing one spec must not be told about findings
           # in eleven it did not write. Renames arrive as added; deletions are
           # dropped, since a file that is gone cannot be linted.
-          mapfile -t changed < <(
-            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate \
-              --jq '.[] | select(.status != "removed") | .filename' 2>/dev/null || true
-          )
+          #
+          # Read into a variable first, so the exit status survives: a rate
+          # limit or a transient 5xx here returns nothing, and an empty list
+          # reads exactly like a PR that touches no spec. Silence is a real
+          # answer this step gives; it must not double as the failure.
+          if ! changed_out="$(
+                gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate \
+                  --jq '.[] | select(.status != "removed") | .filename' 2>/tmp/files.err
+              )"; then
+            echo "::warning::the changed-file list could not be read from the API; no comment this run"
+            sed -n '1,10p' /tmp/files.err
+            echo "state=quiet" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # `mapfile` on an empty string would yield a one-element array holding
+          # the empty string, which the loop below would then try to match.
+          changed=()
+          [ -n "$changed_out" ] && mapfile -t changed <<< "$changed_out"
 
           # A spec directory holds one spec and any number of supporting
           # documents beside it — `architecture.md` in five of them today.
@@ -186,12 +223,33 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           STATE: ${{ steps.lint.outputs.state }}
         run: |
+          # No `-e`, for the reason the lint step gives: an edit the API
+          # refuses would end this step non-zero, and the job's promise is that
+          # nothing here can fail the check.
           set -uo pipefail
 
           # One comment, edited in place. A PR that pushes six times should
           # carry one current comment, not six historical ones.
+          #
+          # Author and marker, not the marker alone. Anyone can open a comment
+          # that starts with the marker — a quoted reply, a pasted report — and
+          # if theirs sorts first the PATCH below is aimed at a comment
+          # `github.token` may not edit. It fails, this step continues on error,
+          # and the run goes green having said nothing.
+          #
+          # Every match, then `head -1`, because `--paginate` hands `--jq` one
+          # document per page: a filter ending in `.[0]` picks the first match
+          # *of each page*, so a PR past thirty comments puts several ids in a
+          # variable that holds one. `--slurp` would join the pages into one
+          # array, but gh refuses it alongside `--jq` — "the `--slurp` option
+          # is not supported with `--jq` or `--template`", from its own flag
+          # validation — and that error would arrive on the stderr this line
+          # discards, leaving `existing` empty and a fresh comment posted on
+          # every push. Streaming ids in page order and taking the first is the
+          # same answer with no second tool and no flag conflict.
           existing="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate \
-            --jq 'map(select(.body | startswith("<!-- spec-lint -->"))) | .[0].id // empty' 2>/dev/null || true)"
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- spec-lint -->"))) | .id' 2>/dev/null \
+            | head -1 || true)"
 
           # A clean run never opens a comment — the absence of one is the
           # result. It does update a comment that already exists, because the
