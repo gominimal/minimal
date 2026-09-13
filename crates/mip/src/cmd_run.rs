@@ -265,8 +265,11 @@ pub async fn run_task(
     // Resolve the invocations to run from the task definition.
     let (_interactive, invocations) = env.task_invocations(task, parsed_args.as_ref()).await?;
 
+    // `mip run` has no network provider — it is the build plane's own path —
+    // so the sandbox's configuration decides the plan on its own.
+    let plan = env.built_in_plan();
     let container = env
-        .container()
+        .container(&plan)
         .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
     for (i, inv) in invocations.iter().enumerate() {
         let mut cmd = env

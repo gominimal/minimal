@@ -1454,7 +1454,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let container = env.container().unwrap();
+            let plan = env.built_in_plan();
+            let container = env.container(&plan).unwrap();
 
             // Smoketest: date command should succeed, and regardless of the time the output should contain a colon.
             let output = env

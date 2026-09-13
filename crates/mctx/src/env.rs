@@ -828,14 +828,27 @@ impl<'a> Env<'a> {
         ))
     }
 
+    /// The plan this sandbox's own configuration implies, for callers with no
+    /// provider to ask. A caller that has one drives [`sandbox2::PlannedLaunch`]
+    /// instead and passes its plan to [`Env::container`]; this is the built-in
+    /// mapping, and stays sync because nothing needs awaiting to compute it.
     #[cfg(target_os = "linux")]
-    pub fn container(&mut self) -> Result<Container, Error> {
-        // The plan this sandbox's own configuration implies. Callers that need a
-        // provider to decide it use the launch sequence instead, which can await
-        // `Network::plan`; this one is the built-in mapping and stays sync.
-        let plan = self.sandbox.built_in_plan();
+    #[must_use]
+    pub fn built_in_plan(&self) -> sandbox2::NetPlan {
+        self.sandbox.built_in_plan()
+    }
+
+    /// Builds the container this env's invocations run in, configured for
+    /// `plan`.
+    ///
+    /// The plan is a parameter rather than something read back off the sandbox
+    /// because the caller may have got it from a network provider, which only
+    /// an `await` can ask — and because one *spawn* is what gets a namespace,
+    /// so a caller running several invocations needs a container per plan.
+    #[cfg(target_os = "linux")]
+    pub fn container(&mut self, plan: &sandbox2::NetPlan) -> Result<Container, Error> {
         self.sandbox
-            .new_container(&plan)
+            .new_container(plan)
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
     }
 
