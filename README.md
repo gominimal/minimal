@@ -33,7 +33,7 @@ Minimal is a declarative, content-addressed build system and development-environ
 
 The executables inside a sandbox (git, claude-code, compilers, shells, and more) are delivered by Minimal's secure package manager from a curated registry that is refreshed daily. Because packages are addressed by content rather than mutable version tags and builds are hermetic, the same blueprint resolves to the same environment on every machine. Moving the whole team to the freshest tool versions is one `min update`, which re-pins the blueprint in place. No more stale setup wikis, no more version drift.
 
-Per-developer Loadouts then layer each person's own editors, terminal multiplexers, and configs on top of that shared toolchain, so the environment stays identical for everyone while you keep the muscle memory you have earned.
+Per-developer Loadouts then layer each person's own editors, shells, and configs on top of that shared toolchain, so the environment stays identical for everyone while you keep the muscle memory you have earned.
 
 > Full documentation lives at [minimal.dev/docs](https://minimal.dev/docs).
 
@@ -144,9 +144,12 @@ exit
 ### Add a Minimal Loadout with your preferred tools and configurations
 
 The project's `minimal.toml` describes what every contributor's session
-needs; a **loadout** carries what *you* want on top: your editor, terminal
-multiplexer, shell config, and dotfiles. Loadouts are single TOML files under
-`~/.config/minimal/loadouts/`:
+needs; a **loadout** carries what *you* want on top: your editor, shell
+config, and dotfiles. Minimal is not a multiplexer: run tmux or zellij inside
+the box, from your loadout, and keep the muscle memory you have earned.
+Loadouts are single TOML files under `~/.config/minimal/loadouts/`, and the
+[`minimal-loadouts`](https://github.com/gominimal/minimal-skills/tree/main/skills/minimal-loadouts)
+skill automates authoring one:
 
 ```toml
 # ~/.config/minimal/loadouts/dev.toml
