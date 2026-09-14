@@ -90,11 +90,12 @@ EDITOR = "hx"
 VISUAL = "hx"
 ```
 
-Vars are the main lever for interactive setup, because the shell you get from
-`min session attach` sources no rc files. Your prompt (`PS1`), a one-time banner, and
-similar touches all travel through `[vars]` rather than through a `.bashrc`
-patch. The [reference](../reference/loadouts.md) walks through the prompt and
-banner patterns in detail.
+Vars are the main lever for interactive setup: your prompt (`PS1`) and a
+one-time banner travel through `[vars]`, and they reach every shell. An rc
+file is the other lever — the shell `min session attach` gives you sources
+the startup file you [patched](#file-patches) into the session home, bash's
+`.bashrc` included. The [reference](../reference/loadouts.md) walks through
+both in detail.
 
 ### File patches
 

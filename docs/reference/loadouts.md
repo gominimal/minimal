@@ -583,12 +583,37 @@ file means an empty policy; a fresh install activates fine without it.
 The interactive shell minted by [`min session attach`](./cli-min.md#session-attach)
 is bash unless a loadout says otherwise — see
 [`SHELL`](#session-shell) below. bash is started as
-`bash --noprofile --rcfile <daemon rc> -i`: it sources **none** of your
-startup files (not `/etc/profile`, `~/.bash_profile`, or `~/.bashrc`), so
-rc-file patches cannot influence it — the only rc it reads is the daemon's
-own, which installs the [attached terminal](#attached-terminal) hook and
-nothing else. Interactive setup travels through the environment instead,
-i.e. through `[vars]`:
+`bash --noprofile --rcfile <daemon rc> -i`, so it finds none of its startup
+files on its own: the daemon's rc is the only file it is given. That rc
+installs the [attached terminal](#attached-terminal) hook and then sources
+**your `~/.bashrc`** out of the session home, so a [patched-in](#patches)
+`.bashrc` applies — the same way a patched `.zshrc` or `config.fish` does
+for those shells.
+
+`~/.bashrc`, and nothing else — that is the file bash itself would read
+here. A session shell is an interactive **non-login** bash, and the login
+chain (`~/.bash_profile`, `~/.bash_login`, `~/.profile`) belongs to a login
+shell, which this is not: `shopt login_shell` reports off inside it. Those
+files hold once-per-login setup, so running them here would be a thing
+bash does nowhere else.
+
+If your bash setup lives in `~/.bash_profile`, point the patch at
+`.bashrc` — a patch names its own destination, so the file's name on your
+host doesn't have to be the name it lands under:
+
+```toml
+patches = [
+    { dest = ".bashrc", source = "~/dotfiles/bash_profile" },
+]
+```
+
+The daemon's hook goes in before your file runs, which leaves one sharp
+edge: bash's refresh is a `DEBUG` trap, and a `~/.bashrc` that installs a
+`DEBUG` trap of its own replaces it. Call `__minimal_attach_env` from yours
+to keep the [`TERM` refresh](#attached-terminal) working.
+
+Interactive setup can also travel through the environment, i.e. through
+`[vars]`, which is where the prompt and the banner live:
 
 - **Prompt**: the session launcher seeds a baseline environment
   (a stock `PS1`, plus the [orientation banner](#orientation-banner)
@@ -653,13 +678,14 @@ This is the loadout's `SHELL`, not the `$SHELL` of the terminal you ran
 `min` from: a session is a declared environment, and the shell it hands
 you is part of the declaration.
 
-Three things worth knowing:
+Four things worth knowing:
 
-- **bash is unchanged**, rc suppression included. Every other shell reads
-  its own startup files from the session home — which is where
-  [patches](#patches) land, so a patched-in `config.fish` or `.zshrc`
-  applies. That asymmetry is deliberate: bash's behaviour predates this
-  and stays as it was.
+- **Every shell reads your startup file.** zsh, fish, and nushell find
+  theirs in the session home — which is where [patches](#patches) land —
+  on their own; bash is handed none of its own files, so the daemon's rc
+  sources yours for it ([above](#vars-in-the-attach-shell)). The one
+  exception is `sh`, whose startup file *is* `$ENV` by POSIX rule, and
+  `$ENV` is the daemon's.
 - **The shell is chosen once**, at the attach that mints the session
   shell, and that shell outlives later attaches. Changing `SHELL`
   afterwards takes a new session.
@@ -726,7 +752,9 @@ up. bash's `DEBUG` trap covers both cases on its own.
 bash uses a trap rather than `PROMPT_COMMAND` for the same reason the
 mechanism is not a var at all: `PROMPT_COMMAND` is composed, and the MOTD
 recipe unsets it. A trap is shell state, which nothing in a composition can
-reach.
+reach. Your own `~/.bashrc` can, though — the same rc sources it, right
+after setting the trap — so a `DEBUG` trap you install there replaces this
+one; call `__minimal_attach_env` from yours to keep the refresh.
 
 #### Other POSIX shells {#attached-terminal-posix}
 
