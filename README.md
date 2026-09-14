@@ -68,7 +68,7 @@ curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/' | sh -s -- --uni
 
 ## Getting Started
 
-The examples below walk through the two most common workflows: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`.
+The examples below walk through the two most common workflows: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`. Once sessions are running, `min dash` opens a terminal UI for browsing and managing them without attaching to each one. `min session policy` prints the effective networking policy for a session.
 
 ### Create a new project with Minimal
 
@@ -141,6 +141,9 @@ claude
 exit
 ```
 
+Beyond GitHub, `git push min://` sends commits to another running session by
+name, using a git helper that `min` installs.
+
 ### Add a Minimal Loadout with your preferred tools and configurations
 
 The project's `minimal.toml` describes what every contributor's session
@@ -177,7 +180,9 @@ on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || 
 
 Apply one with `min session activate --loadout dev --attach .`, or list it in
 `default_loadouts` under `[loadouts]` in `~/.config/minimal/config.toml` to have it join every
-session automatically. `min loadout list` shows what's available. The full
+session automatically. `min loadout list` shows what's available. Lifecycle hooks such as
+`on_activate` run a command when a session is activated, as the loadout above
+does to warm Helix's grammar cache. The full
 schema (file patches, lifecycle hooks, environment-variable inheritance,
 composition rules) is in the
 [loadouts reference](docs/reference/loadouts.md).
