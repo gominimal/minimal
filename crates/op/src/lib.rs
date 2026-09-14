@@ -1,4 +1,5 @@
 //! Home for complicated operations using the minimal graph, such as builds or constructing cache objects.
+#![recursion_limit = "256"]
 #![allow(clippy::result_large_err)]
 
 use std::path::PathBuf;
