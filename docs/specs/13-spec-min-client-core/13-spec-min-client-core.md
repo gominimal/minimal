@@ -4,7 +4,7 @@ title: "Shared min client core: one Rust core for the CLI, the browser and mobil
 owner: mitodrummer
 epic: gominimal/inbox#513
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
-updated: 2026-09-10
+updated: 2026-09-14
 ---
 
 # MCC — Shared min client core: one Rust core for the CLI, the browser and mobile
@@ -405,9 +405,10 @@ ID until the networking spec replaces it.
 
 - **MCC-054** WHEN a developer lists sessions THE SYSTEM SHALL include the
   sessions on every node the identity plane lists for the developer
-  (MCC-015), addressed and attachable with the same grammar as local ones;
-  hosts reached only through the client-managed provider list stay listed
-  by today's path (Gatehouse §8.2 scope decision; BPA-013, BPA-015).
+  (MCC-015) in the one listing, addressed and attached with the one grammar,
+  that the box data path specifies (BDP-005, BDP-006; arch#45); hosts
+  reached only through the client-managed provider list stay listed by
+  today's path (Gatehouse §8.2 scope decision; BPA-013, BPA-015).
   tier:     T0
   verify:   cargo nextest run -p minimal list_and_attach_use_one_grammar_for_mesh_nodes
 
@@ -797,6 +798,12 @@ that opened a tunnel per node for liveness was retired by it. The same
 and what it can dial never drift apart. Bindings authorize; the peer
 document configures, with its `seq` and staleness bound enforced in the
 core (MCC-070).
+
+**One list and one grammar are the box data path's** (decided 2026-09-14).
+MCC-054 states which sessions the listing includes and defers the shape of
+that listing, and the grammar for acting on what it holds, to the box data
+path (BDP-005, BDP-006), so one spec owns them. Restating the contract here,
+and retiring MCC-054 into a non-goal, were the alternatives.
 
 **CLI adoption order** (decided 2026-09-03, entry 6). The target is the
 in-process attach (MCC-052); the first step shares the non-TTY parts and
