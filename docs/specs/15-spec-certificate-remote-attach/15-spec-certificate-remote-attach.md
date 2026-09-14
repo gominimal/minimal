@@ -4,7 +4,7 @@ title: Remote attach with certificates
 owner: mitodrummer
 epic: gominimal/inbox#668
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
-updated: 2026-09-12
+updated: 2026-09-14
 ---
 
 # CRA — Remote attach with certificates
@@ -158,8 +158,8 @@ the requirements cite them rather than restate them.
 - **CRA-009** THE SYSTEM SHALL accept `min session attach`, `ls`, `rename`
   and `stop` for a session on a remote daemon with the same arguments and
   output as for a local one (the architecture's v1 remote set, Gatehouse
-  §7.4 and MMI-027; creating and destroying a session stay local-only in
-  v1).
+  §7.4 and MMI-027; creating and destroying a session stay local-only in v1,
+  [raised with the architecture](https://github.com/gominimal/arch/issues/65)).
   tier:     T0
   verify:   cargo nextest run -p minimal remote_session_commands_match_local_grammar
 
@@ -226,6 +226,16 @@ the requirements cite them rather than restate them.
   ([Exit codes](https://github.com/gominimal/arch/blob/main/architecture.md#exit-codes)).
   tier:     T0
   verify:   cargo nextest run -p minimal-client failed_renewal_stops_reattach_and_asks_for_signin
+
+- **CRA-034** WHILE the CLI is re-attaching after a lost connection
+  (CRA-017), IF the session's provider reports its host PAUSED (Box Provider
+  API §6) THEN THE SYSTEM SHALL stop re-attaching, tell the developer the
+  host is paused, naming the command that resumes it (`min host resume`, the
+  remote-hosts spec), and exit with status 7, the architecture's exit code
+  for a provider or host that cannot be reached
+  ([Exit codes](https://github.com/gominimal/arch/blob/main/architecture.md#exit-codes)).
+  tier:     T0
+  verify:   cargo nextest run -p minimal-client reattach_stops_when_host_paused
 
 ### Who the daemon admits
 
@@ -384,8 +394,8 @@ removes a dependency developers otherwise need.
 **The architecture's v1 remote set.** CRA-009 names the commands the
 architecture admits on a certificate connection in v1 (Gatehouse §7.4,
 MMI-027), which the epic's story names too; naming `destroy`, today's local
-verb, was the alternative, and waits on admitting create and destroy on CLI
-certificate connections, raised with the architecture. `min session stop` is
+verb, was the alternative, and waits on
+[admitting create and destroy on CLI certificate connections](https://github.com/gominimal/arch/issues/65). `min session stop` is
 new, because today's `min stop` stops the daemon rather than a session.
 
 **Reconnect until back or detached.** A dropped attach retries on its own
@@ -395,7 +405,10 @@ certificate is renewed and the host verified again before the next attempt
 (CRA-032), and a renewal that fails ends the loop with the authentication
 exit status (CRA-033), so the CLI never retries a credential it cannot
 renew; printing the sign-in instruction without an exit-code rule was the
-alternative (review of this spec, 2026-09-11).
+alternative (review of this spec, 2026-09-11). A paused host ends the loop
+too (CRA-034): letting a retry count as attaching and resume the host was the
+alternative, declined because an unattended laptop would then keep a paused
+host running, and so was leaving the case open (2026-09-14).
 
 **Key custody this cycle, hardware later.** The CLI's key signs both SSH
 authentication and the proofs that make its refresh token usable, so the key,
