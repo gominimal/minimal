@@ -7,7 +7,7 @@
 
 <h1 align="center">Minimal</h1>
 
-<p align="center"><strong>Build Software You Can Trust</strong><br>Isolated, reproducible development sandboxes and a secure package manager that give your whole team identical environments, while keeping AI agents off the laptop.</p>
+<p align="center"><strong>Run your agent session in a Minimal box: its own copy of the repo, its own boundary, built from a file your whole team shares.</strong></p>
 
 <p align="center">
   <a href="https://minimal.dev/docs">Documentation</a> ·
@@ -29,7 +29,7 @@
 
 ## What is Minimal?
 
-Minimal is a declarative, content-addressed build system and development-environment manager. It repeatably builds Linux, terminal-based development sandboxes, each populated with exactly the toolsets and agents a project needs, all declared in a single `minimal.toml` blueprint. A sandbox runs natively on Linux via unprivileged user namespaces and inside a lightweight libkrun microVM on macOS, so the same environment travels across your team's machines. Commit that blueprint to your repository and every teammate gets an identical environment, one that keeps AI agents sealed inside the sandbox and off the host laptop.
+Several agent sessions, several branches, one `min dash` that shows which is which. Each box is built from a `minimal.toml`, with every package traced back to source: an unprivileged user namespace or a libkrun microVM on Linux, a libkrun microVM on macOS. Detach and come back; nothing in the box is on your laptop.
 
 The executables inside a sandbox (git, claude-code, compilers, shells, and more) are delivered by Minimal's secure package manager from a curated registry that is refreshed daily. Because packages are addressed by content rather than mutable version tags and builds are hermetic, the same blueprint resolves to the same environment on every machine. Moving the whole team to the freshest tool versions is one `min update`, which re-pins the blueprint in place. No more stale setup wikis, no more version drift.
 
