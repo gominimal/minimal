@@ -75,6 +75,10 @@ VISUAL    = "hx"
 on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || true" }
 ```
 
+`[[lifecycle_hooks]]` is top-level here because this is a loadout; in a
+project `minimal.toml` the same hooks nest under `[session]`, written
+`[[session.lifecycle_hooks]]`.
+
 Saved as `<config>/minimal/loadouts/dev.toml`, this is applied with
 `min session activate --loadout dev`, or automatically via
 [`default_loadouts`](#client-config).

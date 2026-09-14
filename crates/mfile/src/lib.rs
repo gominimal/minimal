@@ -1,10 +1,11 @@
 //! Finding & reading the `minimal.toml` file.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 mod error;
 pub use error::Error;
@@ -900,6 +901,18 @@ pub struct File {
     layout: Option<Layout>,
 }
 
+/// Maps a key that is unknown at the top level of an mfile to the nesting
+/// path where it is actually valid, when there is one. `lifecycle_hooks` is
+/// top-level in a loadout but nests under `[session]` in a project mfile, so a
+/// user who lifts the documented loadout snippet lands it here; the correct
+/// path is more useful than the blanket upgrade advice.
+fn misplaced_top_level_key(key: &str) -> Option<&'static str> {
+    match key {
+        "lifecycle_hooks" => Some("[[session.lifecycle_hooks]]"),
+        _ => None,
+    }
+}
+
 impl File {
     /// Parses a `minimal.toml` from raw bytes — the pure, filesystem-free core
     /// of [`File::from_dir`], exposed for fuzzing (crates/mfile/fuzz) and tests.
@@ -1020,14 +1033,35 @@ impl File {
     }
 
     fn warn_unknown_fields(&self) {
+        // One command decodes the same file several times; without this a
+        // single load prints each warning once per decode. Surface them only
+        // the first time a given path is validated in this process.
+        if let Some(path) = &self.mfile_path {
+            static WARNED_PATHS: LazyLock<Mutex<HashSet<PathBuf>>> =
+                LazyLock::new(|| Mutex::new(HashSet::new()));
+            if !WARNED_PATHS.lock().unwrap().insert(path.clone()) {
+                return;
+            }
+        }
+
         let mut was_unknown_fields = false;
         if !self.extra.is_empty() {
-            tracing::warn!(
-                "unknown fields in {}: {}",
-                MFILE_NAME,
-                self.extra.keys().cloned().collect::<Vec<_>>().join(",")
-            );
-            was_unknown_fields = true;
+            // A key that is valid at another nesting level is not really
+            // unknown; point at the correct path instead of the generic
+            // upgrade hint, which cannot fix it.
+            let mut unknown = Vec::new();
+            for key in self.extra.keys() {
+                match misplaced_top_level_key(key) {
+                    Some(correct) => tracing::warn!(
+                        "{key} is unknown at the top level of {MFILE_NAME}; did you mean {correct}?"
+                    ),
+                    None => unknown.push(key.clone()),
+                }
+            }
+            if !unknown.is_empty() {
+                tracing::warn!("unknown fields in {}: {}", MFILE_NAME, unknown.join(","));
+                was_unknown_fields = true;
+            }
         }
         if !self.defaults.extra.is_empty() {
             tracing::warn!(
@@ -2160,6 +2194,15 @@ mod tests {
         .unwrap();
         let session = mf.session.expect("populated block parses");
         assert!(session.extra.contains_key("weird_new_thing"));
+    }
+
+    #[test]
+    fn top_level_lifecycle_hooks_points_at_the_session_path() {
+        assert_eq!(
+            misplaced_top_level_key("lifecycle_hooks"),
+            Some("[[session.lifecycle_hooks]]")
+        );
+        assert_eq!(misplaced_top_level_key("genuinely_unknown"), None);
     }
 
     #[test]
