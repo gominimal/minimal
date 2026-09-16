@@ -4,7 +4,7 @@ title: GitHub sign-in and credential-free repository access from sessions
 owner: norrietaylor
 epic: gominimal/inbox#512
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
-updated: 2026-09-08
+updated: 2026-09-16
 ---
 
 # GHS — GitHub sign-in and credential-free repository access from sessions
@@ -369,7 +369,7 @@ mode (GHS-031), and a spec that sets the shared address or no networking with
 a grant is refused (GHS-030). The architecture allows a grant on a shared
 address with a recorded residual; here that combination cannot exist, because
 an egress declaration is valid only on a session with its own address and a
-grant without one is a validation error (GHS-022), so it is refused rather
+grant without one is a validation error (GHS-030), so it is refused rather
 than half-supported. The architecture's egress gateway design moves egress
 enforcement outside the node and proposes that grants require a node the
 fabric can pin; a laptop cannot be, and this document keeps GitHub grants on

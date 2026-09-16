@@ -35,11 +35,13 @@ Two rules run through it:
 - **Every requirement must be verifiable.** If a line cannot be checked against a
   running system, it is background, not a requirement.
 
-Behaviour is written in Given/When/Then, because it reads to non-engineers and
-maps one-to-one onto the test suite. A prose-paragraph requirement was proposed
-and rejected on the second rule: a paragraph is not testable. Each behaviour
-carries a failure line and names the test that proves it. There are no
-requirement IDs — the proof name is the anchor — and there is no line limit.
+Behaviour is written in EARS (`WHEN … THE SYSTEM SHALL …` and its siblings),
+one requirement per behaviour, because that shape is a property a test can
+check; a prose paragraph is not testable and was rejected on the second rule.
+Each requirement carries a stable `XXX-NNN` ID that `verify:` lines and security
+invariants point at, and `tier:` and `verify:` lines naming its proof. Failure
+and edge behaviour is an indented sub-bullet under it — encouraged, not
+required. There is no line limit.
 
 ## Lifecycle
 
@@ -79,16 +81,25 @@ change**, where the spec is about to do work.
 
 ## The lint
 
-`scripts/lint-specs.py` runs on PRs that touch this directory and posts what it
-finds as a comment. **It never blocks a merge and is not a required check.** It
-points at missing sections, behaviours with no failure line or no proof, proofs
-naming a test that does not exist, unmeasured adjectives, unresolved CRITICAL
-open questions, missing ownership, and content that belongs somewhere else.
+`spec_lint.py` from [`gominimal/foundry`](https://github.com/gominimal/foundry)
+runs on PRs that touch this directory: `.github/workflows/spec-lint.yml` checks
+the linter out at run time, lints the specs the PR touches, and posts what it
+finds as one comment, edited in place on each push. **It never blocks a merge
+and is not a required check.** It points at missing or misordered sections,
+requirements not in EARS, a requirement with no `tier:` or `verify:` line, a
+tier claiming more than its fields carry, a `verify:` naming a test that does
+not exist yet, unmeasured adjectives, unresolved CRITICAL open questions,
+missing frontmatter such as `owner:`, and an architecture section that belongs
+in `gominimal/arch`.
 
-Run it yourself:
+Run it yourself. The linter lives in foundry, a private repo, so a sparse clone
+of its `spec/` directory needs read access there; run from the repo root with
+`--repo-root .` so `verify:` targets resolve, as the workflow does:
 
 ```sh
-python3 scripts/lint-specs.py docs/specs/NN-spec-name/NN-spec-name.md
+git clone --depth 1 --filter=blob:none --sparse https://github.com/gominimal/foundry.git ../foundry
+git -C ../foundry sparse-checkout set spec
+python3 ../foundry/spec/spec_lint.py --repo-root . --format markdown docs/specs/NN-spec-name/NN-spec-name.md
 ```
 
 ## What lives elsewhere
