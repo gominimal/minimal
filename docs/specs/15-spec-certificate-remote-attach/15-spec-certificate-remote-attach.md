@@ -4,7 +4,7 @@ title: Remote attach with certificates
 owner: mitodrummer
 epic: gominimal/inbox#668
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
-updated: 2026-09-14
+updated: 2026-09-16
 ---
 
 # CRA — Remote attach with certificates
@@ -209,7 +209,8 @@ the requirements cite them rather than restate them.
 
 - **CRA-017** WHEN a remote attach ends because the connection was lost THE
   SYSTEM SHALL attach again, after 1 s and doubling the wait to at most 30 s,
-  until it succeeds or the developer detaches.
+  until it succeeds, the developer detaches, or a terminal condition
+  (CRA-033, CRA-034, CRA-035, CRA-036) ends it.
   tier:     T0
   verify:   cargo nextest run -p minimal-client lost_attach_retries_1s_doubling_to_30s
 
@@ -237,6 +238,24 @@ the requirements cite them rather than restate them.
   tier:     T0
   verify:   cargo nextest run -p minimal-client reattach_stops_when_host_paused
 
+- **CRA-035** WHILE the CLI is re-attaching after a lost connection
+  (CRA-017), IF the daemon's host certificate does not verify under the
+  issuer's Host CA (CRA-004) THEN THE SYSTEM SHALL stop re-attaching, report
+  the failure as CRA-004 does, and exit with status 6, the architecture's
+  exit code for a verification failure
+  ([Exit codes](https://github.com/gominimal/arch/blob/main/architecture.md#exit-codes)).
+  tier:     T0
+  verify:   cargo nextest run -p minimal-client reattach_stops_when_host_certificate_fails
+
+- **CRA-036** WHILE the CLI is re-attaching after a lost connection
+  (CRA-017), IF the daemon's protocol version is outside the configured
+  range (CRA-012) THEN THE SYSTEM SHALL stop re-attaching, name both versions
+  and the remedy as CRA-012 does, and exit with status 7, the architecture's
+  exit code for a provider or host that cannot be reached
+  ([Exit codes](https://github.com/gominimal/arch/blob/main/architecture.md#exit-codes)).
+  tier:     T0
+  verify:   cargo nextest run -p minimal-client reattach_stops_on_protocol_version_skew
+
 ### Who the daemon admits
 
 - **CRA-018** WHERE the daemon is enrolled with an identity plane THE SYSTEM
@@ -253,10 +272,11 @@ the requirements cite them rather than restate them.
   verify:   cargo nextest run -p minimald unenrolled_daemon_accepts_no_remote_connection
 
 - **CRA-020** IF a non-local connection offers authentication other than a
-  certificate THEN THE SYSTEM SHALL refuse it, naming public-key
-  authentication as the method to use.
+  certificate THEN THE SYSTEM SHALL refuse it, naming certificate
+  authentication — a user certificate offered over the SSH publickey method —
+  as the method to use.
   tier:     T0
-  verify:   cargo nextest run -p minimald non_certificate_auth_refused_naming_publickey
+  verify:   cargo nextest run -p minimald non_certificate_auth_refused_naming_certificate
 
 - **CRA-021** THE SYSTEM SHALL decide a user certificate from the
   certificate, the username, the clock, the trusted User CA keys and the
@@ -408,7 +428,10 @@ renew; printing the sign-in instruction without an exit-code rule was the
 alternative (review of this spec, 2026-09-11). A paused host ends the loop
 too (CRA-034): letting a retry count as attaching and resume the host was the
 alternative, declined because an unattended laptop would then keep a paused
-host running, and so was leaving the case open (2026-09-14).
+host running, and so was leaving the case open (2026-09-14). A host whose
+certificate does not verify and a daemon outside the protocol window end the
+loop too (CRA-035, CRA-036), for the reason a failed renewal does: a retry
+cannot change the outcome.
 
 **Key custody this cycle, hardware later.** The CLI's key signs both SSH
 authentication and the proofs that make its refresh token usable, so the key,
