@@ -651,7 +651,8 @@ which five shells there are to choose from. Nothing fails either way.
 
 This is the loadout's `SHELL`, not the `$SHELL` of the terminal you ran
 `min` from: a session is a declared environment, and the shell it hands
-you is part of the declaration.
+you is part of the declaration. A project sets it the same way through its
+[`[session.vars]`](./minimal-dot-toml.md#session).
 
 Three things worth knowing:
 
