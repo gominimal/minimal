@@ -3,7 +3,7 @@ id: SBOM
 title: session/task SBOM + CycloneDX Blueprint
 owner: bryan-minimal
 epic: gominimal/inbox#582
-arch: none
+arch: https://github.com/gominimal/arch/blob/d77725b6dcca73918efb66f0e15e97120db62a0e/architecture.md
 updated: 2026-09-16
 ---
 
@@ -195,6 +195,16 @@ reproducible. Decisions and alternatives live in minimal#700 (D1-D11). The `veri
 pointers name the model crate `sbom`; the name follows the crate when the
 emitter question below settles.
 
+Where the command lives is the architecture's to say, not this spec's. The
+command tree (architecture.md, Command tree) reserves `sbom` under `pkg` (a
+package's own document, the input this spec composes over) and `container`;
+the `box` noun has no such verb, and the CycloneDX Blueprint is the same
+"declared posture" artifact that `min box spec <entry>` already renders as
+TOML/JSON/YAML. gominimal/arch#66 asks for both rulings — a `min box sbom
+<box>` home, and whether the Blueprint is a `box spec` output format or a
+`box sbom --format` — so this spec names no command until they land; the
+requirements bind either answer.
+
 SBOM-009 through SBOM-012 answer a review question raised in the spec's
 review (minimal#1304) rather than an acceptance criterion: the epic predates the choice between eager
 whole-environment emission and composition, and its criteria do not reach it.
@@ -250,9 +260,15 @@ the spec that defines the sandbox.
 ## Open questions
 
 - [NEEDS CLARIFICATION (CRITICAL): D4 — `--format cdx-blueprint` naming vs
-  "blueprint" already meaning minimal.toml in user docs; renames the CLI
-  surface. Recommendation on record in minimal#700; decide before the
-  format flag ships.]
+  "blueprint" already meaning the Box Spec in the architecture's own
+  vocabulary, and whether the Blueprint is an output format of `min box
+  spec` (the declared-posture command) or of the SBOM command. Recommendation
+  on record in minimal#700; ruling requested as gominimal/arch#66; decide
+  before the format flag ships.]
+- [NEEDS CLARIFICATION (HIGH): command home — the architecture reserves
+  `sbom` under `pkg` and `container` only; a session/task document needs a
+  verb under `box` (proposed `min box sbom <box>`, gominimal/arch#66). The
+  spec names no command until ruled.]
 - [NEEDS CLARIFICATION (CRITICAL): D11 — Sandbox-Spec vocabulary conflicts;
   answers change every emitted document's vocabulary; settle before golden
   fixtures land.]
