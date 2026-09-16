@@ -66,6 +66,19 @@ Minimal can be uninstalled with:
 curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/' | sh -s -- --uninstall
 ```
 
+## For coding agents
+
+If you are an agent setting up Minimal for your user, install the Minimal
+plugin and follow its `minimal-setup` skill:
+
+```shell
+claude plugin marketplace add gominimal/minimal-skills
+claude plugin install minimal@gominimal
+```
+
+Stop and ask your user before pasting any credential into a session.
+Contributors to this repository should read [AGENTS.md](AGENTS.md).
+
 ## Getting Started
 
 The examples below walk through the two most common workflows: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`.
@@ -147,7 +160,9 @@ The project's `minimal.toml` describes what every contributor's session
 needs; a **loadout** carries what *you* want on top: your editor, shell
 config, and dotfiles. Minimal is not a multiplexer: run tmux or zellij inside
 the box, from your loadout, and keep the muscle memory you have earned.
-Loadouts are single TOML files under `~/.config/minimal/loadouts/`, and the
+Loadouts live under `~/.config/minimal/loadouts/`, either as `<name>.toml` or
+— to keep one under version control, alongside the files it ships — as
+`<name>/loadout.toml`; the
 [`minimal-loadouts`](https://github.com/gominimal/minimal-skills/tree/main/skills/minimal-loadouts)
 skill automates authoring one:
 
@@ -180,7 +195,9 @@ on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || 
 
 Apply one with `min session activate --loadout dev --attach .`, or list it in
 `default_loadouts` under `[loadouts]` in `~/.config/minimal/config.toml` to have it join every
-session automatically. `min loadout list` shows what's available. The full
+session automatically. `min loadout list` shows what's available, in either
+layout — so `git clone <repo> ~/.config/minimal/loadouts/dev` is enough to
+pick up a loadout someone else published. The full
 schema (file patches, lifecycle hooks, environment-variable inheritance,
 composition rules) is in the
 [loadouts reference](docs/reference/loadouts.md).
