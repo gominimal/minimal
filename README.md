@@ -63,7 +63,7 @@ This installs the stable channel of Minimal, adds `min` to your PATH, and sets u
 Minimal can be uninstalled with:
 
 ```shell
-curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/' | sh -s -- --uninstall
+curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/stable' | sh -s -- --uninstall
 ```
 
 ## For coding agents
@@ -81,17 +81,19 @@ Contributors to this repository should read [AGENTS.md](AGENTS.md).
 
 ## Getting Started
 
-The shortest path from an existing repository to a running session is three commands. It leads the section; the two examples after it add a GitHub credential: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`.
+If you have a repository and want a session, three commands get you there — no GitHub PAT, no keychain entry, no account. The two walkthroughs after them add a GitHub credential: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`.
 
 ### Start in three commands
 
-Run these three commands from the root of an existing repository. No PAT, no keychain entry, no account:
+Run these from the root of a repository that has no `minimal.toml` yet. No PAT, no keychain entry, no account:
 
 ```shell
 curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh
 min init
 min session activate --attach
 ```
+
+Joining a project that already ships a `minimal.toml`? Skip `min init`; the walkthrough below covers it.
 
 ### Create a new project with Minimal
 
