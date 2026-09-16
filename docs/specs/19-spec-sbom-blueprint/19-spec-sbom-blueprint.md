@@ -1,11 +1,10 @@
 ---
 id: SBOM
 title: session/task SBOM + CycloneDX Blueprint
-status: draft
 owner: bryan-minimal
 epic: gominimal/inbox#582
 arch: none
-updated: 2026-09-03
+updated: 2026-09-16
 ---
 
 # SBOM — session/task SBOM + CycloneDX Blueprint
@@ -128,8 +127,9 @@ developer running agent sessions; build-infra operator; auditor.
   document.
   tier:     T1
   verify:   cargo nextest run -p sbom sbom_env_values_never_embedded_in_any_serializer
-  property: for all compositions c, serializers s in {cdx, spdx, blueprint},
-    vars v: values(v) intersect bytes(emit_s(c)) is empty
+  property: for all compositions c, serializers s in {cdx, spdx, blueprint}:
+    every environment asset in parse_s(emit_s(c)) carries only name and
+    provenance fields, and for all vars v: values(v) not in ir(c)
 
 - **SBOM-009** WHEN a component has a per-package document sealed under the
   environment's pin THE SYSTEM SHALL emit that component's detail equal to
