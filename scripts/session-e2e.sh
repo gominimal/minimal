@@ -917,6 +917,59 @@ LOADOUT
   echo "loadout-declared hooks proof OK (ran, ungated)"
   echo "::endgroup::"
 
+  # -- Directory-layout loadout ----------------------------------------------
+  # The same loadout, filed as `<name>/loadout.toml` instead of `<name>.toml`
+  # so it can be kept under version control. The proof is deliberately an
+  # EXTERNAL hook script plus a patch, because both anchor at
+  # `<loadouts>/<name>/` — which under this layout is the directory holding
+  # `loadout.toml` itself. If discovery and anchoring ever disagreed about
+  # which directory a loadout owns, the script would fail to stage and the
+  # patch would resolve to nothing; neither can pass by accident.
+  echo "::group::loadout layouts: <name>/loadout.toml"
+  mkdir -p "$XDG_CONFIG_HOME/minimal/loadouts/vcdev"
+  cat > "$XDG_CONFIG_HOME/minimal/loadouts/vcdev/loadout.toml" <<'LOADOUT'
+description = "e2e directory-layout loadout"
+
+patches = [
+  { dest = ".config/vcdev.conf", source = "$LOADOUT_ROOT/vcdev.conf" },
+]
+
+[[lifecycle_hooks]]
+on_activate = { type = "external", value = "activate.sh" }
+LOADOUT
+  printf 'VCDEV_PATCH_OK\n' > "$XDG_CONFIG_HOME/minimal/loadouts/vcdev/vcdev.conf"
+  # `/usr/bin/bash` for the same reason the external-hook fixture above uses
+  # it: it is the interpreter the session is known to have.
+  printf '#!/usr/bin/bash\necho HOOK_VCDEV_OK > /home/hook-vcdev\n' \
+    > "$XDG_CONFIG_HOME/minimal/loadouts/vcdev/activate.sh"
+  chmod +x "$XDG_CONFIG_HOME/minimal/loadouts/vcdev/activate.sh"
+  HOOK_SEED_DIR="$(hook_mktemp /tmp/mnlv.XXXXXX)"
+  hook_seed_preamble > "$HOOK_SEED_DIR/minimal.toml"
+  mkdir "$HOOK_SEED_DIR/.git"
+
+  vc_sid="$(cd "$HOOK_SEED_DIR" && mnl session activate . --no-prompt --loadout vcdev 2>"$WORK/loadout-vcdev.err")" || {
+    echo "::error::activation with a directory-layout loadout failed"
+    echo "--- stderr ---"; cat "$WORK/loadout-vcdev.err" 2>/dev/null || true
+    fail
+  }
+  vc_hook="$(mnl session exec "$vc_sid" 'cat /home/hook-vcdev' 2>/dev/null)"
+  if [[ "$vc_hook" != *HOOK_VCDEV_OK* ]]; then
+    echo "::error::directory-layout loadout's external hook did not run (marker: '$vc_hook')"
+    echo "--- activate stderr ---"; cat "$WORK/loadout-vcdev.err" 2>/dev/null || true
+    fail
+  fi
+  vc_patch="$(mnl session exec "$vc_sid" 'cat ~/.config/vcdev.conf' 2>/dev/null)"
+  if [[ "$vc_patch" != *VCDEV_PATCH_OK* ]]; then
+    echo "::error::\$LOADOUT_ROOT patch from a directory-layout loadout did not land (got: '$vc_patch')"
+    echo "--- activate stderr ---"; cat "$WORK/loadout-vcdev.err" 2>/dev/null || true
+    fail
+  fi
+  mnl session destroy --force "$vc_sid" >/dev/null 2>&1 || true
+  rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
+  rm -rf "$XDG_CONFIG_HOME/minimal/loadouts/vcdev"
+  echo "directory-layout loadout proof OK (discovered, \$LOADOUT_ROOT patch + external hook resolved)"
+  echo "::endgroup::"
+
   # -- Patch file modes ------------------------------------------------------
   # A patch's permission bits cross three hops, and each has unit coverage of
   # its own end only: the client stamps the source's mode on the tar header,
