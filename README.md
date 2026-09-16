@@ -66,6 +66,19 @@ Minimal can be uninstalled with:
 curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/' | sh -s -- --uninstall
 ```
 
+## For coding agents
+
+If you are an agent setting up Minimal for your user, install the Minimal
+plugin and follow its `minimal-setup` skill:
+
+```shell
+claude plugin marketplace add gominimal/minimal-skills
+claude plugin install minimal@gominimal
+```
+
+Stop and ask your user before pasting any credential into a session.
+Contributors to this repository should read [AGENTS.md](AGENTS.md).
+
 ## Getting Started
 
 The examples below walk through the two most common workflows: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`.
