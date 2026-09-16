@@ -81,8 +81,7 @@ Contributors to this repository should read [AGENTS.md](AGENTS.md).
 
 ## Getting Started
 
-<<<<<<< HEAD
-If you have a repository and want a session, three commands get you there — no GitHub PAT, no keychain entry, no account. The two walkthroughs after them add a GitHub credential: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`.
+If you have a repository and want a session, three commands get you there — no GitHub PAT, no keychain entry, no account. The two walkthroughs after them add a GitHub credential: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`. Once sessions are running, `min dash` opens a terminal UI for browsing and managing them without attaching to each one. `min session policy` prints the effective networking policy for a session.
 
 ### Start in three commands
 
@@ -95,9 +94,6 @@ min session activate --attach
 ```
 
 Joining a project that already ships a `minimal.toml`? Skip `min init`; the walkthrough below covers it.
-=======
-The examples below walk through the two most common workflows: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`. Once sessions are running, `min dash` opens a terminal UI for browsing and managing them without attaching to each one. `min session policy` prints the effective networking policy for a session.
->>>>>>> origin/main
 
 ### Create a new project with Minimal
 
