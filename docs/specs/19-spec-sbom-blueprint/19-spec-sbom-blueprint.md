@@ -173,7 +173,7 @@ developer running agent sessions; build-infra operator; auditor.
 - Full SPDX profile depth: minimal#700 D10 (minimal-valid only here)
 - Usage/link-tier axis: model field reserved, minimal#700 refs
 - Converging legacy `mfile::Task` onto sessions primitives: minimal#700 D6
-- Network-zone enforcement: the sessions/sandbox spec (zones are declared
+- Network-zone enforcement: the Box Spec and networking requirements (zones are declared
   and caveated here)
 - Signing composed environment documents: they are derivations over signed
   per-package inputs and carry those bundles by reference — signing policy
@@ -229,9 +229,19 @@ how a fourth implementation gets written.
 **Generality:** a second document format fits behind the serializer seam
 (SPDX proves it in the first slice); a second consumer (build infra) is a
 design input, not an afterthought. What does not generalize: posture
-vocabulary is bound to the Sandbox Spec — a second sandbox model would need
-its own axis mapping, which is acceptable because the vocabulary follows
-the spec that defines the sandbox.
+vocabulary is bound to the Box Spec — a second box model would need its own
+axis mapping, which is acceptable because the vocabulary follows the spec
+that defines the box.
+
+Emitted vocabulary is the Box Spec's, verbatim, as architecture.md defines
+it: `[network] mode = none | host_ip | own_ip`, `[[file_imports]]` /
+`[[file_exports]]`, `[machine]`, `[secrets]` references; the meaning of the
+network modes is `specs/networking/networking-requirements.md` (v2, merged).
+Earlier drafts followed the pre-architecture Sandbox Spec (whose
+`network.type = none | host_ip | no_ip` already diverged), which is what D11
+in minimal#700 was guarding against; with the architecture binding, a Box
+Spec rename is an arch change and rolls this spec's golden fixtures in the
+same PR rather than surprising them.
 
 ## Security considerations
 
@@ -269,9 +279,6 @@ the spec that defines the sandbox.
   `sbom` under `pkg` and `container` only; a session/task document needs a
   verb under `box` (proposed `min box sbom <box>`, gominimal/arch#66). The
   spec names no command until ruled.]
-- [NEEDS CLARIFICATION (CRITICAL): D11 — Sandbox-Spec vocabulary conflicts;
-  answers change every emitted document's vocabulary; settle before golden
-  fixtures land.]
 - [NEEDS CLARIFICATION (HIGH): is a composed environment document signed in
   its own right, or a verifiable derivation over signed per-package inputs
   it references? Recommendation on record: a derivation — it needs no
