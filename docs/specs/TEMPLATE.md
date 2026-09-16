@@ -1,7 +1,6 @@
 ---
 id: XXX
 title: <feature name>
-status: draft
 owner: <github-handle>
 epic: <org/repo#N>
 arch: <gominimal/arch link, or: none>
@@ -11,7 +10,7 @@ updated: <YYYY-MM-DD>
 # XXX — <feature name>
 
 <!--
-SOURCE  gominimal/foundry spec/template.md @ 842b37aa97e44cccff5a0d51ea79e9e099aee111
+SOURCE  gominimal/foundry spec/template.md @ 84fa7182161886d0be29f2934e3417c9057c3515
   This file is a copy. Edit it in foundry and open a PR here; a change made
   only in this repo is lost the next time the template is updated. The SOURCE
   line is what a drift check reads to tell whether this copy is behind.
@@ -38,6 +37,13 @@ WHEN TO WRITE ONE
 WHERE IT LIVES
   In the repo where the code is going to be written, at
   docs/specs/NN-spec-<slug>/NN-spec-<slug>.md.
+
+STATUS
+  There is no status field. A spec on a branch or an open pull request is a
+  draft. A spec on main is merged, and a merged PR makes it binding. A spec is
+  shipped when the lint, run with --repo-root, resolves every verify: and
+  proof: line and no verify: none remains. Git and the lint say which; nothing
+  is written down by hand.
 
 OWNERSHIP
   Whoever touches the code owns the spec. Own the epic, own the spec; change the
