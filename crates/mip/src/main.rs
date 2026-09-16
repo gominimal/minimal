@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![allow(clippy::result_large_err)]
 
 use anyhow::anyhow;
