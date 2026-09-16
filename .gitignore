@@ -7,6 +7,9 @@ target/
 .claude/
 .worktrees/
 
+# just pkg-nfpm default OUT_DIR (scripts/package-nfpm.sh)
+/dist/
+
 # Vale prose-linting: synced packages and sync-generated config are rebuilt by
 # `vale sync`; only the project vocabulary is tracked.
 /styles/*
