@@ -18,7 +18,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc::error::SendError;
+use tokio::sync::mpsc::error::{SendError, SendTimeoutError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
@@ -1350,9 +1350,20 @@ impl HostHandle {
     }
 
     pub async fn kill(&self, for_shutdown: bool) -> Result<(), ()> {
-        match self.sender.send(Message::Kill(for_shutdown)).await {
+        match self
+            .sender
+            .send_timeout(
+                Message::Kill(for_shutdown),
+                crate::session::HOST_PROBE_TIMEOUT,
+            )
+            .await
+        {
             Ok(()) => Ok(()),
-            Err(_e) => Err(()), // closed
+            // A closed channel, or a wedged loop that never drains its mailbox
+            // so the send cannot be queued before the deadline: either way the
+            // kill did not land, and the caller must not block awaiting a loop
+            // that will never observe it.
+            Err(_e) => Err(()),
         }
     }
     /// Binds `c` to this host, carrying the attaching terminal's facts.
@@ -1373,11 +1384,18 @@ impl HostHandle {
     ) -> Result<(), (Channel<Msg>, WinSize)> {
         match self
             .sender
-            .send(Message::Attach(c, sz, connection, keys))
+            .send_timeout(
+                Message::Attach(c, sz, connection, keys),
+                crate::session::HOST_PROBE_TIMEOUT,
+            )
             .await
         {
             Ok(()) => Ok(()),
-            Err(SendError(Message::Attach(c, sz, _, _))) => Err((c, sz)),
+            // A wedged loop that never drains its mailbox (the send times out)
+            // and a loop that has gone (the channel is closed) both hand the
+            // channel back; the caller re-mints a host from it either way.
+            Err(SendTimeoutError::Timeout(Message::Attach(c, sz, _, _)))
+            | Err(SendTimeoutError::Closed(Message::Attach(c, sz, _, _))) => Err((c, sz)),
             Err(e) => unreachable!("{:?}", e),
         }
     }
@@ -4528,6 +4546,37 @@ mod tests {
         assert!(
             outcome.is_ok(),
             "mainloop should return the reaped exit status, got: {outcome:?}",
+        );
+    }
+
+    /// A kill aimed at a host whose loop has stopped draining its mailbox
+    /// gives up on its own deadline instead of parking forever. Left
+    /// unbounded, this send blocked once the mailbox filled — the wedged-host
+    /// hang behind a stuck `min stop` and, via the same send, `min session
+    /// attach`.
+    #[tokio::test(start_paused = true)]
+    async fn kill_to_a_wedged_host_gives_up_instead_of_parking() {
+        // Holding the mailbox is what makes the host wedged: it accepts
+        // messages up to its capacity and never drains one.
+        let (host, _mailbox) = HostHandle::wedged();
+
+        // Queue past the mailbox so the next send has to block trying to
+        // enqueue at all — the case an unbounded send never returned from.
+        for _ in 0..HOST_MAILBOX_CAPACITY {
+            host.kill(false)
+                .await
+                .expect("queuing into an open mailbox should succeed");
+        }
+
+        // Far longer than the send's own deadline, so under the paused clock
+        // the send's timeout is the one that fires; reaching this outer bound
+        // would mean the send had no deadline at all.
+        let outcome = tokio::time::timeout(Duration::from_secs(600), host.kill(false))
+            .await
+            .expect("a bounded kill must return on its own deadline, not park forever");
+        assert!(
+            outcome.is_err(),
+            "a kill that cannot be queued before the deadline must report failure",
         );
     }
 

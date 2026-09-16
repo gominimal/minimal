@@ -8,7 +8,7 @@
 #![allow(clippy::single_match)]
 
 use common::{SpecOrigin, Target};
-use decode::Stack;
+use decode::{Container, Stack};
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
@@ -18,7 +18,7 @@ use std::sync::{Arc, RwLock};
 use crate::BuildSpecRef;
 use crate::builds::*;
 use crate::spec_hasher::SubsetHasher;
-use crate::{Error, SpecHash, SpecHasher};
+use crate::{ContainerHasher, Error, SpecHash, SpecHasher};
 
 /// Describes a match between a search term and a package.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +88,13 @@ pub struct Graph {
     /// stack with a stable sort that preserves the iteration order for ties.
     pub(crate) stacks: BTreeMap<String, Stack>,
 
+    /// Container specs by name.
+    ///
+    /// Ordered by name for the same reason as [`Self::stacks`]: `iter_containers`
+    /// feeds the wire writers, so hash order would make the serialised bytes
+    /// differ run to run for the same graph.
+    pub(crate) containers: BTreeMap<String, Container>,
+
     /// Indexes build-specs by name.
     pub(crate) by_name: HashMap<String, BuildSpecRef>,
 
@@ -122,6 +129,7 @@ impl Graph {
             by_name: HashMap::with_capacity(2048),
             top_levels: Vec::new(),
             stacks: BTreeMap::new(),
+            containers: BTreeMap::new(),
             supply_chain: Vec::with_capacity(6),
             target: Target::host(),
             hash_cache: Arc::new(RwLock::new((
@@ -285,6 +293,21 @@ impl Graph {
     /// Returns an iterator over all stacks configured in the graph.
     pub fn iter_stacks(&self) -> impl Iterator<Item = (&String, &Stack)> {
         self.stacks.iter()
+    }
+
+    /// Returns an iterator over all containers configured in the graph.
+    pub fn iter_containers(&self) -> impl Iterator<Item = (&String, &Container)> {
+        self.containers.iter()
+    }
+
+    /// Returns the container declared under `name`, if any.
+    pub fn container<S: AsRef<str>>(&self, name: S) -> Option<&Container> {
+        self.containers.get(name.as_ref())
+    }
+
+    /// Returns the specification hash of the given container.
+    pub fn container_hash(&self, container: &Container) -> Result<SpecHash, Error> {
+        ContainerHasher::hash(self, container)
     }
 
     /// Returns a list of [BuildSpecRef] objects who's names matched the given search term.
@@ -458,6 +481,7 @@ impl Graph {
         builds: Arena<BuildSpec>,
         top_levels: Vec<BuildSpecRef>,
         stacks: BTreeMap<String, Stack>,
+        containers: BTreeMap<String, Container>,
         by_name: HashMap<String, BuildSpecRef>,
         supply_chain: Vec<SpecOrigin>,
         target: Target,
@@ -466,6 +490,7 @@ impl Graph {
             builds,
             top_levels,
             stacks,
+            containers,
             by_name,
             supply_chain,
             target,

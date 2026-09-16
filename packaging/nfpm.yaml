@@ -1,0 +1,142 @@
+# nfpm config for minimal's Linux distro packages: one config -> .deb, .rpm,
+# and .apk. scripts/package-nfpm.sh runs `nfpm package --packager <format>`
+# once per (format, arch) against this file, so `arch` comes from the
+# environment, not a per-format section.
+#
+# Environment: nfpm expands ${VAR} in the metadata fields below and in every
+# content entry marked `expand: true`. scripts/package-nfpm.sh exports:
+#   PKGVER           the promoted semver, without the v prefix
+#   NFPM_ARCH        amd64 or arm64 (one nfpm run per arch)
+#   ARTIFACT_DIR     per-arch dir of the staged static binaries, already
+#                    renamed to their installed names (min, minimald, mip,
+#                    minvmd, gvproxy-min)
+#   COMPLETIONS_DIR  completions generated from the built `min` (the
+#                    scripts/dist-build.sh technique)
+#   APPARMOR_DIR     the repo's packaging/apparmor tree
+#   APPARMOR_LOADER  the repo's scripts/install-apparmor-profile.sh
+# The scripts.* paths are NOT env-expanded by nfpm, so postinstall points at
+# the fixed .scratch location the driver materializes on every run.
+#
+# The file list mirrors packaging/arch/PKGBUILD-bin.tmpl — same binaries, same
+# git-remote-min symlink, same AppArmor layout under /usr/share/minimal/ — and
+# both ship minvmd. Every staged versions/<version>/ row carries
+# minvmd-linux-{amd64,arm64}, built with a static libkrun and verified static
+# in .github/workflows/release.yml, so the Linux distro packages and the AUR
+# package agree on the VM-host binary without any extra runtime dependency.
+
+name: minimal
+version: ${PKGVER}
+arch: ${NFPM_ARCH}
+# Release revision (rpm's Release:; the AUR pkgrel equivalent). Bump when the
+# package contents or metadata change without an upstream version bump.
+release: 1
+license: Apache-2.0
+# Env-expanded like the other fields above; package-nfpm.sh defaults
+# MAINTAINER to the current identity — one place to swap when the contact
+# email changes.
+maintainer: "${MAINTAINER}"
+homepage: https://minimal.dev
+# The AUR PKGBUILD's pkgdesc.
+description: Isolated, reproducible development environments and a secure package manager that give your whole team identical environments, while keeping AI agents off the laptop
+# deb only: Debian section for user utilities.
+section: utils
+# The AUR PKGBUILD's depends=(git): min drives git-remote-min (git's
+# remote-helper protocol) and resolves git-remote:// and min:// through it.
+depends:
+    - git
+
+contents:
+    # The staged static musl binaries, renamed by the driver the way the
+    # PKGBUILD's source arrays rename them (min::minimal-linux-amd64, ...).
+    # Explicit modes: curl'd files carry the host umask, and a 0644 binary
+    # would not run.
+    - src: ${ARTIFACT_DIR}/min
+      dst: /usr/bin/min
+      expand: true
+      file_info:
+          mode: 0755
+    - src: ${ARTIFACT_DIR}/minimald
+      dst: /usr/bin/minimald
+      expand: true
+      file_info:
+          mode: 0755
+    - src: ${ARTIFACT_DIR}/mip
+      dst: /usr/bin/mip
+      expand: true
+      file_info:
+          mode: 0755
+    - src: ${ARTIFACT_DIR}/minvmd
+      dst: /usr/bin/minvmd
+      expand: true
+      file_info:
+          mode: 0755
+    - src: ${ARTIFACT_DIR}/gvproxy-min
+      dst: /usr/bin/gvproxy-min
+      expand: true
+      file_info:
+          mode: 0755
+    # git-remote-min is a symlink to min. For nfpm symlink entries, src is
+    # the link target and dst the link path — both inside the installed
+    # package, unlike regular files where src is a build-environment path.
+    - src: /usr/bin/min
+      dst: /usr/bin/git-remote-min
+      type: symlink
+    # AppArmor profile, tunable, and the loader that installs them, exactly
+    # the PKGBUILD layout under /usr/share/minimal/apparmor/.
+    - src: ${APPARMOR_DIR}/minimald
+      dst: /usr/share/minimal/apparmor/minimald
+      expand: true
+      file_info:
+          mode: 0644
+    - src: ${APPARMOR_DIR}/tunables/minimald
+      dst: /usr/share/minimal/apparmor/tunables/minimald
+      expand: true
+      file_info:
+          mode: 0644
+    - src: ${APPARMOR_LOADER}
+      dst: /usr/share/minimal/apparmor/install-apparmor-profile.sh
+      expand: true
+      file_info:
+          mode: 0755
+    # Completions generated from the built `min`, at the same true paths the
+    # PKGBUILD and scripts/dist-build.sh assert.
+    - src: ${COMPLETIONS_DIR}/bash-completion/completions/min
+      dst: /usr/share/bash-completion/completions/min
+      expand: true
+      file_info:
+          mode: 0644
+    - src: ${COMPLETIONS_DIR}/zsh/completions/_min
+      dst: /usr/share/zsh/site-functions/_min
+      expand: true
+      file_info:
+          mode: 0644
+    - src: ${COMPLETIONS_DIR}/fish/completions/min.fish
+      dst: /usr/share/fish/vendor_completions.d/min.fish
+      expand: true
+      file_info:
+          mode: 0644
+
+scripts:
+    # One postinstall reaches all three formats: deb DEBIAN/postinst,
+    # rpm %post, and apk .post-install (nfpm maps the same field to each).
+    # It runs the installed loader and never hard-fails: hosts without
+    # AppArmor (most rpm/apk targets) warn and exit 0, so the package always
+    # installs.
+    postinstall: .scratch/package-nfpm/postinstall.sh
+
+overrides:
+    deb:
+        # The PKGBUILD's optdepends (bash/zsh/fish back the shipped
+        # completions) map to Suggests, the only deb relation with the same
+        # "optional, the user's choice" semantics.
+        suggests:
+            - bash
+            - zsh
+            - fish
+    # rpm: not declared. RPM has a Suggests tag, but the closest installable
+    # relation (Recommends) is auto-installed by dnf, and forcing shells onto
+    # a user is not what optdepends means.
+    # apk: not declared. apk has no suggestion mechanism at all, and the only
+    # available relation (Depends) would make the shells mandatory.
+    # Either way the completions ship unconditionally; each shell picks them
+    # up from the vendor paths above only if it is installed.
