@@ -20,8 +20,8 @@ at publish chained to the signed per-commit closure; developers granting
 agent sessions want the posture story reviewable before granting it.
 
 **Success:** a session or task+loadout yields schema-valid supply-chain
-documents whose component digests chain to the signed catalog closure, and
-whose regeneration is byte-identical.
+documents whose component digests chain to the signed catalog closure or
+carry a declared digest gap, and whose regeneration is byte-identical.
 
 A **catalog pin** is the triple {repo, commit, closure object} the epic
 defines; every document is emitted under one, and "the pin" below always means
@@ -66,25 +66,28 @@ developer running agent sessions; build-infra operator; auditor.
   serials, namespaces, and timestamps from content and pin, never from wall
   clock or randomness.
   tier:     T1
-  verify:   just test-one sbom_regeneration_deterministic
-  property: for all pin, inputs: emit(pin, inputs) == emit(pin, inputs)
-  - IF the cache's contents differ between two emissions under the same pin
-    THEN THE SYSTEM SHALL still produce byte-identical documents, the
-    composition being a function of the pin and its closure rather than of
-    what the cache happens to hold.
+  verify:   cargo nextest run -p sbom sbom_regeneration_deterministic
+  property: for all pin, inputs, and independent emissions a, b under
+    (pin, inputs): bytes(a) == bytes(b)
+  - IF the cache's contents differ between two emissions under the same pin,
+    every object the pinned closure references remaining fetchable, THEN THE
+    SYSTEM SHALL still produce byte-identical documents, the composition
+    being a function of the pin and its closure rather than of what the
+    cache happens to hold. (An unfetchable referenced object is SBOM-012's
+    failure, and fails the same way on every emission.)
     tier:   T0
-    verify: just test-one sbom_determinism_independent_of_cache_state
+    verify: cargo nextest run -p sbom sbom_determinism_independent_of_cache_state
 
 - **SBOM-002** WHEN a document is emitted as CycloneDX THE SYSTEM SHALL
   produce output that validates against the vendored CycloneDX 1.5 schema.
   tier:     T1
-  verify:   just test-one sbom_cdx_schema_conformance
+  verify:   cargo nextest run -p sbom sbom_cdx_schema_conformance
   property: for all compositions c: cdx_schema_valid(emit_cdx(c))
 
 - **SBOM-003** WHEN a document is emitted as SPDX THE SYSTEM SHALL produce
   minimal-valid SPDX 2.3.
   tier:     T1
-  verify:   just test-one sbom_spdx_validity
+  verify:   cargo nextest run -p sbom sbom_spdx_validity
   property: for all compositions c: spdx_valid(emit_spdx(c))
 
 - **SBOM-004** THE SYSTEM SHALL attach to every component either an
@@ -92,38 +95,41 @@ developer running agent sessions; build-infra operator; auditor.
   explicit digest gap of `built-locally` or `non-redistributable` — never
   neither and never both.
   tier:     T1
-  verify:   just test-one sbom_digest_or_gap_total
-  property: for all components k: has_sha256(k) xor has_digest_gap(k)
+  verify:   cargo nextest run -p sbom sbom_digest_or_gap_total
+  property: for all components k: has_sha256(k) xor has_digest_gap(k),
+    and has_sha256(k) implies resolves(sha256(k), closure(pin))
 
 - **SBOM-005** THE SYSTEM SHALL include every package present in the
   environment as a component, with launcher-injected packages carrying
   `minimal:added-by=launcher`.
   tier:     T1
-  verify:   just test-one sbom_launcher_packages_present
-  property: for all environments e: components(emit(e)) superset packages(e)
+  verify:   cargo nextest run -p sbom sbom_launcher_packages_present
+  property: for all environments e: components(emit(e)) superset packages(e),
+    and for all k in launcher_injected(e): added_by(component(k)) == launcher
 
 - **SBOM-006** WHEN a document is emitted as a CycloneDX 2.0 Blueprint THE
   SYSTEM SHALL validate against the vendored draft schema and SHALL emit
   axes the session model cannot declare as schema-TODO properties, never as
   fabricated values.
   tier:     T1
-  verify:   just test-one blueprint_schema_conformance
-  property: for all compositions c: bp_schema_valid(emit_bp(c)) and
-    fabricated_axes(emit_bp(c)) is empty
+  verify:   cargo nextest run -p sbom blueprint_schema_conformance
+  property: for all compositions c: bp_schema_valid(emit_bp(c)),
+    fabricated_axes(emit_bp(c)) is empty, and undeclarable_axes(c) subset
+    schema_todo_properties(emit_bp(c))
 
 - **SBOM-007** WHEN a session SBOM is emitted under a pin whose commit
   carries a sealed attribution manifest THE SYSTEM SHALL emit component
   licenses equal to the manifest's license entries for that pin.
   tier:     T0
-  verify: just test-one sbom_licenses_match_attribution
+  verify: cargo nextest run -p sbom sbom_licenses_match_attribution
 
 - **SBOM-008** THE SYSTEM SHALL record environment-variable assets by name
   and provenance only, and SHALL never embed variable values in any
   document.
   tier:     T1
-  verify:   just test-one blueprint_env_values_never_embedded
-  property: for all compositions c, vars v: values(v) intersect
-    bytes(emit(c)) is empty
+  verify:   cargo nextest run -p sbom sbom_env_values_never_embedded_in_any_serializer
+  property: for all compositions c, serializers s in {cdx, spdx, blueprint},
+    vars v: values(v) intersect bytes(emit_s(c)) is empty
 
 - **SBOM-009** WHEN a component has a per-package document sealed under the
   environment's pin THE SYSTEM SHALL emit that component's detail equal to
@@ -131,31 +137,35 @@ developer running agent sessions; build-infra operator; auditor.
   infrastructure emits and this command reads, so its content is part of the
   contract rather than an implementation choice.
   tier:     T0
-  verify:   just test-one sbom_component_detail_equals_sealed_document
+  verify:   cargo nextest run -p sbom sbom_component_detail_equals_sealed_document
 
 - **SBOM-010** THE SYSTEM SHALL derive composition-level facts — launcher
   injection, posture axes, and environment assets — from the environment's
   own declaration, never from a component document, which cannot carry
   them.
   tier:     T1
-  verify:   just test-one sbom_envelope_facts_are_environment_derived
+  verify:   cargo nextest run -p sbom sbom_envelope_facts_are_environment_derived
   property: for all environments e: envelope(emit(e)) == declared_facts(e)
 
-- **SBOM-011** IF a component has no per-package document resolvable
-  through the pinned closure THEN THE SYSTEM SHALL emit that component
-  carrying its declared digest gap, never omitting it.
+- **SBOM-011** IF a component has no per-package document referenced by
+  the pinned closure — a declared gap: `built-locally` or
+  `non-redistributable` — THEN THE SYSTEM SHALL emit that component
+  carrying that digest gap, never omitting it. (A document the closure
+  *does* reference but that cannot be fetched is not a gap; it is
+  SBOM-012's failure.)
   tier:     T1
-  verify:   just test-one sbom_unresolvable_component_becomes_a_gap
-  property: for all environments e: components(emit(e)) superset packages(e)
+  verify:   cargo nextest run -p sbom sbom_unreferenced_component_carries_its_gap
+  property: for all environments e, k in packages(e): unreferenced(k,
+    closure(pin(e))) implies k in components(emit(e)) and has_digest_gap(k)
 
 - **SBOM-012** IF the pinned index or a referenced per-package document
   cannot be fetched THEN THE SYSTEM SHALL fail naming the pin, the
   unresolved object, and the remediation, never emitting a document whose
   component set is silently incomplete.
   tier:     T1
-  verify:   just test-one sbom_unfetchable_reference_fails_loudly
-  property: for all emissions e: emitted(e) implies every component of e
-    resolved or carries a declared gap
+  verify:   cargo nextest run -p sbom sbom_unfetchable_reference_fails_loudly
+  property: for all attempts a: unfetchable_reference(a) implies not
+    emitted(a) and error(a) names (pin, unresolved object, remediation)
 
 ## Non-goals
 
@@ -181,10 +191,12 @@ model crate serves both the CLI and build-infra per-package emission — the
 second consumer is why the model takes no CLI or daemon dependencies. A
 content-derived catalog pin replaces random serials and wall-clock so
 documents chain to a Sigstore-verifiable object and regeneration is
-reproducible. Decisions and alternatives live in minimal#700 (D1-D11).
+reproducible. Decisions and alternatives live in minimal#700 (D1-D11). The `verify:`
+pointers name the model crate `sbom`; the name follows the crate when the
+emitter question below settles.
 
-SBOM-009 through SBOM-012 answer a review question on the spec PR rather than
-an acceptance criterion: the epic predates the choice between eager
+SBOM-009 through SBOM-012 answer a review question raised in the spec's
+review (minimal#1304) rather than an acceptance criterion: the epic predates the choice between eager
 whole-environment emission and composition, and its criteria do not reach it.
 Composition by reference rather than eager whole-environment emission: the
 per-package document is the unit publish already has the inputs for, one
@@ -252,6 +264,12 @@ the spec that defines the sandbox.
 - [NEEDS CLARIFICATION (HIGH): which existing emitter does the model crate
   subsume — `minimal-supply-chain::sbom`, `pkgmgr-rs`'s `commands::sbom`,
   or `attest-sbom`? Answering it late means a fourth implementation.]
+- [NEEDS CLARIFICATION (MEDIUM): SBOM-009's projection — whether the sealed
+  per-package document is embedded verbatim as the component's detail or
+  referenced from it, and which stable fields carry the catalog pin and the
+  document's digest. Settle with the per-package document contract that
+  build infrastructure's publish emitter defines, before first-slice golden
+  fixtures.]
 - [NEEDS CLARIFICATION (LOW): SPDX `created` timestamp source (proposal:
   pinned commit's committer timestamp); both answers satisfy SBOM-001;
   settle in first-slice review.]
