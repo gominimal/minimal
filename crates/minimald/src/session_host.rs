@@ -3346,10 +3346,27 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         self.attrs.stdout_last = Some(SystemTime::now());
                         self.parser.process(b);
                         if let Some((tx, _hnd)) = self.remote.as_mut() {
-                            match tx.send(BindingMsg::Stdin(b.to_vec())).await {
+                            // Bounded, not an unbounded await: once the binding
+                            // stops draining (a client whose transport went
+                            // dark), its mailbox fills and an unbounded send
+                            // parks this whole loop for good — the host then
+                            // never returns to pump the pty or drain its own
+                            // mailbox, so one dark client freezes the session.
+                            // A binding that cannot take a write within the
+                            // probe deadline is shed like a closed channel; a
+                            // re-attach re-mints a fresh binding on the same shell.
+                            match tx
+                                .send_timeout(
+                                    BindingMsg::Stdin(b.to_vec()),
+                                    crate::session::HOST_PROBE_TIMEOUT,
+                                )
+                                .await
+                            {
                                 Ok(()) => {},
                                 Err(e) => {
-                                    tracing::warn!("failed stdout=>remote send: {e}");
+                                    tracing::warn!(
+                                        "shedding stalled binding on stdout=>remote send: {e}"
+                                    );
                                     self.remote = None;
                                 }
                             };
@@ -3909,6 +3926,82 @@ mod tests {
             !exit.is_abnormal(),
             "a shell that exited on its own is not abnormal: {exit:?}",
         );
+    }
+
+    /// A binding whose client transport has stopped draining must not wedge the
+    /// host loop. The host forwards each pty read into the binding's mailbox;
+    /// once that mailbox fills, an unbounded send parked the loop for good, so
+    /// the host could no longer pump the pty, drain its own mailbox, or observe
+    /// the shell exiting — one dark client froze the whole session. The bounded
+    /// send sheds the stalled binding instead and keeps serving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_binding_does_not_wedge_the_host_loop() {
+        let (mut host, handle) = Host::build(
+            MockLauncher,
+            "test-session".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+            None,
+            None,
+            None,
+            std::env::temp_dir(),
+            sessions::SessionId::nil(),
+            None,
+            ConnectionEnv::new(),
+        )
+        .await
+        .expect("failed to build host");
+
+        // A binding at the production mailbox size, pre-filled to capacity and
+        // never drained: the receiver is held open but never read, standing in
+        // for a client whose transport has gone dark mid-write. The next
+        // forwarded pty read cannot be queued.
+        let (tx, _rx_never_drained) = mpsc::channel(4);
+        for _ in 0..4 {
+            tx.try_send(BindingMsg::Stdin(Vec::new()))
+                .expect("pre-fill stays within the mailbox capacity");
+        }
+        host.remote = Some((tx, tokio::spawn(async {})));
+
+        let stdin = host.remote_tx.clone();
+        let task = tokio::spawn(host.mainloop());
+
+        // Make the shell echo so the host reads pty output and tries to forward
+        // it to the full binding.
+        stdin
+            .send(stdin_bytes(b"ping\n".to_vec()))
+            .await
+            .expect("failed to send line");
+
+        // Proof the loop did not wedge: it still answers its mailbox and has
+        // stamped the stdout it read. An unbounded forward-send would have
+        // parked the loop, and this probe would hang until the outer deadline.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let attrs = handle
+                    .get_attrs()
+                    .await
+                    .expect("host must keep answering its mailbox");
+                if attrs.stdout_last.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a stalled binding must not wedge the host loop");
+
+        // Having shed the binding, the host still drives the shell to exit.
+        stdin
+            .send(stdin_bytes(format!("{MOCK_EXIT_LINE}\n").into_bytes()))
+            .await
+            .expect("failed to send exit line");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("mainloop should terminate after the shell exits")
+            .expect("host task should not panic during teardown")
+            .expect("mainloop should return the reaped exit status");
     }
 
     /// Reads forwarded stdout off the binding channel until `needle` shows up.
