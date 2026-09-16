@@ -3,6 +3,7 @@
 //! The primary type here is [Orchestrator], which is parameterized by a [Backend]. The intention is that
 //! different backends can be used for local builds vs remote builds and other architectural variants, while all
 //! the main/control logic stays the same.
+#![recursion_limit = "256"]
 #![allow(clippy::result_large_err)]
 
 use std::sync::Arc;
