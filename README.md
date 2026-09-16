@@ -66,6 +66,19 @@ Minimal can be uninstalled with:
 curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/' | sh -s -- --uninstall
 ```
 
+## For coding agents
+
+If you are an agent setting up Minimal for your user, install the Minimal
+plugin and follow its `minimal-setup` skill:
+
+```shell
+claude plugin marketplace add gominimal/minimal-skills
+claude plugin install minimal@gominimal
+```
+
+Stop and ask your user before pasting any credential into a session.
+Contributors to this repository should read [AGENTS.md](AGENTS.md).
+
 ## Getting Started
 
 The examples below walk through the two most common workflows: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`. Once sessions are running, `min dash` opens a terminal UI for browsing and managing them without attaching to each one. `min session policy` prints the effective networking policy for a session.
@@ -148,8 +161,9 @@ name, using a git helper that `min` installs.
 
 The project's `minimal.toml` describes what every contributor's session
 needs; a **loadout** carries what *you* want on top: your editor, terminal
-multiplexer, shell config, and dotfiles. Loadouts are single TOML files under
-`~/.config/minimal/loadouts/`:
+multiplexer, shell config, and dotfiles. Loadouts live under
+`~/.config/minimal/loadouts/`, either as `<name>.toml` or — to keep one under
+version control, alongside the files it ships — as `<name>/loadout.toml`:
 
 ```toml
 # ~/.config/minimal/loadouts/dev.toml
@@ -180,7 +194,9 @@ on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || 
 
 Apply one with `min session activate --loadout dev --attach .`, or list it in
 `default_loadouts` under `[loadouts]` in `~/.config/minimal/config.toml` to have it join every
-session automatically. `min loadout list` shows what's available. Lifecycle hooks such as
+session automatically. `min loadout list` shows what's available, in either
+layout — so `git clone <repo> ~/.config/minimal/loadouts/dev` is enough to
+pick up a loadout someone else published. Lifecycle hooks such as
 `on_activate` run a command when a session is activated, as the loadout above
 does to warm Helix's grammar cache. The full
 schema (file patches, lifecycle hooks, environment-variable inheritance,
