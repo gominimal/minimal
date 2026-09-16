@@ -1,0 +1,25 @@
+# pacman hook for minimal-bin: load the minimald AppArmor profile when the
+# package lands on a host. The loader ships under /usr/share/minimal/apparmor/
+# (profile, tunable, and script installed side by side, the layout it expects)
+# and needs apparmor_parser plus root. AppArmor is optional, so a miss here
+# must never fail the pacman transaction: warn on stderr and return 0.
+
+_install_apparmor_profile() {
+    /usr/share/minimal/apparmor/install-apparmor-profile.sh ||
+        printf '%s\n' \
+            "warning: could not load the minimald AppArmor profile" \
+            "(AppArmor unavailable or disabled on this host?)." \
+            "minimald still works; on hosts with" \
+            "kernel.apparmor_restrict_unprivileged_userns=1, re-run" \
+            "sudo /usr/share/minimal/apparmor/install-apparmor-profile.sh" \
+            "once AppArmor is installed and enabled." >&2
+    return 0
+}
+
+post_install() {
+    _install_apparmor_profile
+}
+
+post_upgrade() {
+    _install_apparmor_profile
+}

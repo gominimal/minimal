@@ -60,7 +60,7 @@ impl ProjectOp for InitProject {
                 (origin, link, file_path)
             }
             None => {
-                env.update_checkouts()?;
+                env.update_checkout(DEFAULT_PKGS)?;
                 let rev = env.checkout_branch(DEFAULT_PKGS, DEFAULT_PKGS_BRANCH)?;
                 let origin = SpecOrigin::Repo(Repo::Git {
                     url: DEFAULT_PKGS.to_string(),
