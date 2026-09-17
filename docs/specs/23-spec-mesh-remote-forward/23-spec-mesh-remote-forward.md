@@ -4,7 +4,7 @@ title: Mesh and remote forward: reaching boxes across machines
 owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
-updated: 2026-09-16
+updated: 2026-09-17
 ---
 
 # MRF — Mesh and remote forward: reaching boxes across machines
@@ -133,6 +133,15 @@ peers (MRF-005), against one remote host that already serves mesh ingress.
   §4.5](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)):
   the gateway component; the host's side of the association is
   [EHE](https://github.com/gominimal/minimal/pull/1418).
+- Attach to a VM on a bare-metal fleet host, which is SSH through a ticket- or
+  ACL-gated host-side forwarder with no direct WireGuard endpoint advertised,
+  and mesh for such hosts through the gateway's forwarding role ([design
+  §7.6](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md);
+  [architecture, Deployment
+  Styles](https://github.com/gominimal/arch/blob/main/architecture.md)):
+  [CRA](https://github.com/gominimal/minimal/pull/1374) for the attach, EHE for
+  the host's obligations. The architecture keeps WireGuard mesh on hosts with a
+  VM as a later increment.
 
 ## Design reasoning
 
@@ -173,7 +182,10 @@ attach under a pinned host's gateway are [design
 native or VM-backed; a pinned remote host's path transits its gateway's
 forwarding role ([design
 §4.5](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)),
-which changes the route and not the requirement. What breaks on a laptop that
+which changes the route and not the requirement, and a host with a VM
+terminates the mesh in its host-side helper rather than in the VM ([design
+§4.1](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)),
+which changes the component and not the behaviour. What breaks on a laptop that
 cannot enrol is nothing here: every requirement is scoped WHERE the host is
 enrolled or has joined a mesh, and the local forward stays in NET.
 
@@ -195,10 +207,15 @@ enrolled or has joined a mesh, and the local forward stays in NET.
 - [NEEDS CLARIFICATION (HIGH): MRF-007 and MRF-008 bind the daemon's
   peer-document mirror and binding admission on the laptop, and
   [MMI](https://github.com/gominimal/minimal/pull/1356) binds the same on a
-  mesh-reachable session host (its peer-document and relay requirements); MMI's
-  first open question expects its relay leg and path choice to fold into the
-  networking spec. Which document owns the daemon's half, and does the relay
-  leg fold here? It survives because MMI is under review in parallel and the
+  mesh-reachable session host; MMI's first open question expects its relay leg
+  and path choice to fold into the networking spec. Since [design
+  §4.1](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)
+  v0.7 a third party holds the endpoint on a laptop: the node side of any
+  association is the VM together with its host-side helper, terminated
+  host-side, so the mirror and the admission may belong to the helper rather
+  than the VM's daemon. Which component owns the laptop's half, which document
+  owns the daemon's, and does the relay leg fold here? It survives because MMI
+  is under review in parallel, the helper's role is [proposed], and the
   gateway-relay consolidation is open in the architecture (design §12 item 1).]
 - [NEEDS CLARIFICATION (MEDIUM): what is the grant model for box-to-box reach
   across hosts (provider, named network, identity)? It blocks the non-goal
