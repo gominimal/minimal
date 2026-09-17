@@ -3367,7 +3367,17 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                                     tracing::warn!(
                                         "shedding stalled binding on stdout=>remote send: {e}"
                                     );
-                                    self.remote = None;
+                                    // Take the binding and abort its task before
+                                    // discarding it: dropping the `JoinHandle`
+                                    // only detaches the task, which can still be
+                                    // parked in `w.write_all(...)` on a transport
+                                    // that is not draining. Aborting converges the
+                                    // shed with the closed-channel outcome, where
+                                    // the binding task has already exited and
+                                    // released the channel (EOF/close).
+                                    if let Some((_tx, binding_task)) = self.remote.take() {
+                                        binding_task.abort();
+                                    }
                                 }
                             };
                         }
@@ -3428,6 +3438,19 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                                     }
                                 }
                                 FeedOutcome::Action(KeyAction::Detach) => {
+                                    // worker-iterate:declined — a review suggested
+                                    // bounding this send (and the bell/detach/
+                                    // daemon-shutdown/supercede sibling sends) with
+                                    // `send_timeout` like the stdout-forward path.
+                                    // Not applied: these are teardown/detach paths
+                                    // where the host is already unwinding, and a
+                                    // bounded send that times out would drop the
+                                    // teardown message and change the documented
+                                    // teardown semantics (the supercede path
+                                    // deliberately awaits the incumbent binding's
+                                    // join handle so its unwind codes finish first).
+                                    // A broader pattern fix belongs in a follow-up,
+                                    // not this targeted stdout-forward fix.
                                     let uc = self.unwind_codes();
                                     if let Some((tx, _hnd)) = self.remote.as_mut() {
                                         match tx.send(BindingMsg::TeardownDueToDetach(uc)).await {
