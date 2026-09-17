@@ -336,10 +336,12 @@ Five results follow from these three pieces:
    One piece of code holds it, and one test covers it.
 4. The unsafe descriptor transfer moves next to the code that creates the
    descriptor, and the provider receives an owned descriptor.
-5. The task path calls the same function as the session path, so 017-005
-   costs one line instead of a second implementation. A build has no mode: its
-   sandbox plans itself from what the build declares, an empty namespace or
-   the host network, so the build crate stops carrying the mode enum.
+5. Both ways a task starts in a session — over an exec channel, and from
+   inside the session over its own channel — call the same function as the
+   session path, so 017-005 costs one line for each instead of a second
+   implementation. A build has no mode: its sandbox plans itself from what
+   the build declares, an empty namespace or the host network, so the build
+   crate stops carrying the mode enum.
 
 ### The alternatives
 
