@@ -4,7 +4,7 @@ title: Enrolled box host egress: the gateway association, the policy feed, and t
 owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md
-updated: 2026-09-16
+updated: 2026-09-17
 ---
 
 # EHE — Enrolled box host egress: the gateway association, the policy feed, and the pin
@@ -18,16 +18,21 @@ the host: every box host's egress transits an Egress Gateway that lives outside
 its escape boundary, takes its policy from a signed feed, clamps each
 association to the host's allocated address blocks, and records honestly, per
 host, whether the fabric pins egress to it ([design §1, §4, §5.1, and §7.2 to
-§7.5](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md);
+§7.6](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md);
 [architecture
-D8](https://github.com/gominimal/arch/blob/main/architecture.md)). This
-document binds the box host's side: the daemon that holds the association and
-routes egress into it with box source addresses preserved, consumes the feed,
-asserts the host's pin, refuses a box that exceeds the host's ceiling, takes
-its address blocks from the control plane, keeps local names valid under
-enrolment, and stays fully functional with no inbound reachability. The gateway
-itself, the feed's issuance, allocation, and the node attributes are the
-gateway component's and the identity plane's
+D8](https://github.com/gominimal/arch/blob/main/architecture.md)). On a
+bare-metal fleet host the gateway is a per-host process on the metal host,
+reached over the machine-internal link, or a site gateway over the association
+([design
+§7.6](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)).
+This document binds the box host's side: the daemon that holds the association
+and routes egress into it with box source addresses preserved, consumes the
+feed, asserts the host's pin, refuses a box that exceeds the host's ceiling,
+takes its address blocks from the control plane, keeps local names valid under
+enrolment, stays fully functional with no inbound reachability, and, as the
+host agent of a bare-metal fleet host, keeps the helper's keys and the per-VM
+pin outside every VM. The gateway itself, the feed's issuance, allocation, and
+the node attributes are the gateway component's and the identity plane's
 ([NPOL](https://github.com/gominimal/gatehouse/blob/main/docs/specs/02-spec-network-policy-plane/02-spec-network-policy-plane.md)).
 
 It is written from the same epic as NET and was cut from it (local-first
@@ -38,13 +43,17 @@ two-identity classifier, and DNS-pinned admission that a host applies locally
 (NET-060 to NET-085) are what the association carries to the gateway. EHE-001
 and EHE-002 implement the enrolment clause of NET's first story: the local
 names carry over when the host enrols, and tenant-zone names are listed first.
+EHE-020 to EHE-026 bind the bare-metal fleet story added to the epic on
+2026-09-17, sequenced after the Linux VM-stack stories and before the remote
+styles because its enforcement is NET's host-side helpers per VM; what is new
+is service mode, key custody, the forwarder, and restore.
 
-After this ships, a box on an enrolled cloud VM, pod, or managed-platform host
-reaches exactly its declared egress at the gateway; an escapee with root on the
-host reaches only the union of resident boxes' declared egress plus the
-baseline set; a host in a private subnet with no public address receives policy
-and is reachable through the relay tier; and policy can keep secret-bearing
-boxes off hosts whose pin is not enforced.
+After this ships, a box on an enrolled cloud VM, pod, managed-platform host, or
+bare-metal fleet host reaches exactly its declared egress at the gateway; an
+escapee with root on the host reaches only the union of resident boxes'
+declared egress plus the baseline set; a host in a private subnet with no
+public address receives policy and is reachable through the relay tier; and
+policy can keep secret-bearing boxes off hosts whose pin is not enforced.
 
 **Success:** on an enrolled host with a gateway association, a box's allowed
 destination completes at the gateway and a denied one is dropped; a process
@@ -59,8 +68,9 @@ preserved (EHE-003, EHE-004), against a gateway that applies the feed.
 
 ## Users and stories
 
-**Roles:** platform engineer running box hosts on cloud VMs, platform engineer running box hosts as pods, platform engineer writing policy, platform engineer, platform engineer standing up a box host in a private subnet, platform engineer running box hosts for several teams
+**Roles:** platform engineer running VM box hosts on bare-metal Linux or macOS machines I operate, platform engineer running box hosts on cloud VMs, platform engineer running box hosts as pods, platform engineer writing policy, platform engineer, platform engineer standing up a box host in a private subnet, platform engineer running box hosts for several teams
 
+- AS A platform engineer running VM box hosts on bare-metal Linux or macOS machines I operate, I WANT each metal host to run the VM host daemon as a service under a fleet provider, with the switch and egress filter per VM as the pin, a per-host Egress Gateway and a node-local Box Egress Proxy on the host OS outside every VM, and each VM reached over SSH through a host-side forwarder, SO THAT a rack of Mac minis or Linux servers gives me LocalVM's enforcement with CloudVM's remote access and no WireGuard to operate.
 - AS A platform engineer running box hosts on cloud VMs, I WANT the host's fabric rule to admit only its Egress Gateway on both address families, with the gateway enforcing each box's declared egress from the signed policy feed, SO THAT my compliance story does not depend on container isolation holding.
 - AS A platform engineer running box hosts as pods, I WANT a default-deny egress NetworkPolicy plus allow-to-gateway to be the entire fabric pin, SO THAT I need no FQDN-capable CNI.
 - AS A platform engineer writing policy, I WANT every box host to carry `egress_pin` (pinned, pinned_site, advisory, none), asserted by the provider or admin, SO THAT boxes holding brokered secrets can be kept off hosts whose egress floor is not externally enforced.
@@ -167,6 +177,45 @@ preserved (EHE-003, EHE-004), against a gateway that applies the feed.
   verify:   cargo nextest run -p minimald renumber_preserves_identity
   <!-- S17/AC2; prose 65; event-driven; formerly NET-103 -->
 
+- **EHE-020** WHERE the host is a bare-metal fleet host, WHEN the host agent creates a VM THE SYSTEM SHALL give the VM exactly one virtual network device, attached to the host-side switch, and program the VM's dual-stack pin before the VM is ready.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd fleet_vm_single_nic_pinned_before_ready
+  <!-- S6c/AC1; feature+event; design §7.6, §10 -->
+  - IF a box-level egress change arrives for a VM THEN THE SYSTEM SHALL leave the VM's pin unchanged.
+    tier:   T0
+    verify: cargo nextest run -p minvmd fleet_pin_never_widened_per_box
+    <!-- S6c/AC1; unwanted -->
+
+- **EHE-021** WHERE the host is a bare-metal fleet host THE SYSTEM SHALL hold the helper's sealing, CA, and host-certificate private keys on the host OS and deliver only public halves and enrolment tokens into a VM, over a host-to-guest control channel.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd fleet_helper_private_keys_stay_host_side
+  <!-- S6c/AC2; optional-feature; design §10 -->
+
+- **EHE-022** WHERE the host is a bare-metal fleet host THE SYSTEM SHALL forward each box's source address to the per-host Egress Gateway without NAT.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd fleet_box_source_forwarded_without_nat
+  <!-- S6c/AC3; optional-feature; design §7.6 -->
+
+- **EHE-023** WHERE the host is a bare-metal fleet host, IF a process with root inside a VM spoofs another box's address THEN THE SYSTEM SHALL confine its reach to the union of that VM's resident boxes' declared egress plus the baseline set.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd fleet_vm_escape_bounded_to_resident_union
+  <!-- S6c/AC3; feature+unwanted; design §8 -->
+
+- **EHE-024** WHERE the host is a bare-metal fleet host THE SYSTEM SHALL publish each VM's SSH endpoint through a host-side forwarder that admits a connection only with a valid ticket or under the operator's access list.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd fleet_ssh_endpoint_via_gated_forwarder
+  <!-- S6c/AC4; optional-feature; design §7.6, §10 -->
+
+- **EHE-025** WHERE the host is a bare-metal fleet host THE SYSTEM SHALL advertise no direct WireGuard endpoint for a VM.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd fleet_vm_advertises_no_direct_endpoint
+  <!-- S6c/AC4; optional-feature; design §10 -->
+
+- **EHE-026** WHERE the host is a bare-metal fleet host, WHEN a VM is restored from a snapshot THE SYSTEM SHALL reset the host-side association state for that VM.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd fleet_restore_resets_association_state
+  <!-- S6c/AC5; feature+event; design §5.5, §10 -->
+
 ## Non-goals
 
 - Everything a box host does with no identity plane: names, the hostname proxy,
@@ -200,10 +249,31 @@ preserved (EHE-003, EHE-004), against a gateway that applies the feed.
   once a provider implements the pod style. The story is transcribed here
   because the host's obligations under that pin are this document's; no
   requirement here binds a NetworkPolicy.
-- The association a grant-holding host maintains with its Box Egress Proxy
+- The association a host with a remote Box Egress Proxy maintains with its
   endpoint ([design
-  §5.6](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md);
-  schema in gominimal/arch#63): the broker documents (gominimal/inbox#625).
+  §5.6](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md),
+  scoped since v0.7 to the remote-BEP path; schema in gominimal/arch#63): the
+  broker documents (gominimal/inbox#625). A host whose helper registered a
+  sealing key redeems at a node-local proxy and holds no such association
+  ([Gatehouse
+  §6.10](https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md),
+  v1.19).
+- The fleet provider's side of a bare-metal fleet host: the provider's channel
+  to the host agent, per-host gateway packaging, the forwarder-ticket shape,
+  and placement across metal hosts ([design §7.6 and §12 item
+  14](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md);
+  [Box Provider
+  API](https://github.com/gominimal/arch/blob/main/specs/box-provider/box-provider-api.md)
+  open questions 8 and 9). No epic owns it yet.
+- Asserting `egress_pin` for a provider-run fleet host: the provider's,
+  recorded at enrolment-token mint ([Box Provider API
+  §6.1](https://github.com/gominimal/arch/blob/main/specs/box-provider/box-provider-api.md)),
+  as on a cloud VM. EHE-010 and EHE-011 bind only the hosts where the `min`
+  client is the provider.
+- The node-local Box Egress Proxy the helper runs beside the per-host gateway,
+  and store references: the node-local Box Egress Proxy document ([Gatehouse
+  §6.10](https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md),
+  v1.19).
 - The relay tier and the daemon's mesh ingress:
   [MMI](https://github.com/gominimal/minimal/pull/1356). EHE-015 assumes a
   relay tier it does not build.
@@ -221,14 +291,18 @@ requirements moved unchanged in text and tier; their former NET IDs are
 recorded beside each one so the plan and the sibling documents can follow them.
 
 **Every enrolled style, scoped by WHERE.** Requirements name the box host and
-are scoped `WHERE the host holds a gateway association` or `WHERE the host is
-enrolled`. One document per deployment style was considered and rejected: the
-architecture maps every style to one contract ([design
+are scoped `WHERE the host holds a gateway association`, `WHERE the host is
+enrolled`, or `WHERE the host is a bare-metal fleet host`. One document per
+deployment style was considered and rejected: the architecture maps every style
+to one contract ([design
 §7](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md))
 and the host's obligations do not differ by style; what differs is who programs
 the pin, which is the provider's obligation ([Box Provider API
 §6.1](https://github.com/gominimal/arch/blob/main/specs/box-provider/box-provider-api.md)),
-not this document's.
+not this document's. On a host with a VM the node side of any association is
+the VM together with its host-side helper, terminated host-side ([design
+§4.1](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)),
+so EHE-003 to EHE-009 bind the helper there.
 
 **The pin is asserted, not measured.** EHE-010 and EHE-011 have the `min`
 client assert `pinned` for a VM-backed laptop host and `advisory` or `none` for
@@ -237,7 +311,18 @@ a shared Linux host, from the style mapping ([design
 The alternative, the host probing its own fabric, was rejected because the
 attribute is provider- or admin-asserted by design ([design
 §4.4](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md))
-and a host inside the escape boundary cannot attest to what is outside it.
+and a host inside the escape boundary cannot attest to what is outside it. A
+bare-metal fleet host works like a remote provider for the pin (decision
+2026-09-17): the provider asserts it, and a host-agent assertion was rejected
+for the same reason.
+
+**The metal host reuses the local enforcement.** The bare-metal fleet story is
+sequenced after the Linux VM-stack stories and before the remote styles because
+its pin is NET's switch and filter per VM and its escape bound (EHE-023) is
+NET-085's, enforced on the metal host; EHE-020 to EHE-026 bind only what is
+new: service mode, key custody, the forwarder, and restore. The per-host
+gateway and the node-local proxy it runs are the local Egress Gateway contract
+and the node-local Box Egress Proxy, each specified elsewhere.
 
 **The escape bound at the gateway is a system test.** EHE-006 stays T0 with a
 root-on-host spoofer; its universal is the residency clamp the gateway
@@ -247,16 +332,21 @@ enforces, not a decision the host owns, so no harness here can exhaust it.
 an incoming sequence and a persisted high-water is a pure function over two
 64-bit values, separable from fetch and persistence, and the tier constrains
 the daemon to keep it so. Everything else is T0 with a named test against a
-feed fixture or a gateway stub. T3 was refused: the effect shells are an
-association, sockets, and a control-plane round trip, which fail the
-no-concurrency constraint, and the repository has no Lean project.
+feed fixture, a gateway stub, or a VM host daemon in service mode. T3 was
+refused: the effect shells are an association, sockets, and a control-plane
+round trip, which fail the no-concurrency constraint, and the repository has no
+Lean project.
 
 **Cross-cutting decisions live in the architecture.** The two-address
 node-netns split, feed semantics with the residency clamp, the ceiling and the
-honesty attribute, the provisioning handshake, and lifecycle under snapshot and
-restore are [design §4.1, §4.3, §4.4, §5.2, and
-§5.5](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md);
-the feed's fields are [Gatehouse
+honesty attribute, the provisioning handshake, lifecycle under snapshot and
+restore, the bare-metal fleet style with its host agent and escape analysis,
+and the conformance checklist are [design §4.1, §4.3, §4.4, §5.2, §5.5, §7.6,
+§8, and
+§10](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md);
+the style definitions are [architecture, Deployment
+Styles](https://github.com/gominimal/arch/blob/main/architecture.md); the
+feed's fields and the node-local proxy are [Gatehouse §6.10 and
 §6.11](https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md).
 This document binds the box host's observable behaviour under them and restates
 none of them.
@@ -277,7 +367,7 @@ point is honesty, not the document: such a host asserts `advisory` or `none`
   enforced by: every own-address box's source preserved into the association
   and the gateway's residency clamp over the host's blocks
   ([design §4.3 rule 0 and §8](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md))
-  covered by: EHE-004, EHE-006
+  covered by: EHE-004, EHE-006, EHE-023
 - **Invariant:** THE SYSTEM SHALL accept no policy feed whose sequence number
   does not exceed the persisted high-water, and serve none before the
   high-water is reloaded or a fresh feed fetched.
@@ -291,6 +381,12 @@ point is honesty, not the document: such a host asserts `advisory` or `none`
   host's recorded ceiling.
   enforced by: the ceiling check at creation
   covered by: EHE-013
+- **Invariant:** THE SYSTEM SHALL let no private key of the host-side helper
+  enter a VM.
+  enforced by: the host agent holds the keys on the host OS and delivers
+  public halves only, over a host-to-guest channel
+  ([design §10](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md))
+  covered by: EHE-021
 
 ## Open questions
 
@@ -302,7 +398,22 @@ point is honesty, not the document: such a host asserts `advisory` or `none`
   §4.1](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md);
   [Gatehouse
   §6.11](https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md)).]
-- [NEEDS CLARIFICATION (MEDIUM): does an enrolled VM-backed laptop host hold a
+- [NEEDS CLARIFICATION (MEDIUM): the laptop's default path holds no gateway
+  association ([design §7.1 and
+  §11](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md),
+  v0.7), so EHE-003 to EHE-009 skip there and EHE-010 asserts `pinned`
+  regardless. The open part is the hairpin opt-in, a laptop routing egress
+  through an org gateway for policy (roadmap, gominimal/arch#43): if it lands,
+  do EHE-003 to EHE-009 apply to it unchanged?]
+- [NEEDS CLARIFICATION (MEDIUM): what is the forwarder-ticket shape for
+  EHE-024, a relay ticket reused or an operator access list, and does the host
+  agent need a node class beyond the helper's `gateway` node? Both are [design
+  §12 item
+  14](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)
+  and [Box Provider
+  API](https://github.com/gominimal/arch/blob/main/specs/box-provider/box-provider-api.md)
+  open question 8; the host agent's channel to its provider is
+  provider-internal today.]
   gateway association at all, or only the Box Egress Proxy association? [Design
   §7.1](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)
   makes the gateway association optional for a laptop and feed consumption
