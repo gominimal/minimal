@@ -14,11 +14,11 @@ updated: 2026-09-16
 A developer on a stock install reaches a box through one surface today, the
 Host-header hostname proxy, and nothing else the networking design promises
 exists: no box name in a browser without proxy configuration, no egress
-enforcement, hidden network-mode and ingress flags, and a VM stack that only
-macOS installs receive. The architecture of record defines what a box host must
-enforce in every deployment style and, for un-enrolled local hosts, a
-degraded-mode profile that is buildable with no identity plane ([design §7.1
-and
+enforcement, hidden network-mode and ingress flags, and no proof that a fresh
+Linux install with KVM activates a VM-backed box. The architecture of record
+defines what a box host must enforce in every deployment style and, for
+un-enrolled local hosts, a degraded-mode profile that is buildable with no
+identity plane ([design §7.1 and
 §7.4](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)).
 This document binds that profile on the box host: the `min` CLI, the session
 daemon, the VM host daemon, the installer, and the release manifests, on a
@@ -249,10 +249,10 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimal cli_reference_documents_network_flags
   <!-- S4a/AC1; prose 23; ubiquitous -->
 
-- **NET-037** WHEN `--network host-net` or `--network own-ip` is given THE SYSTEM SHALL accept it as a legacy spelling and print a hint naming the new spelling.
+- **NET-037** WHEN `--network no-net`, `--network host-net`, or `--network own-ip` is given THE SYSTEM SHALL accept it as a legacy spelling and print a hint naming the new spelling.
   tier:     T0
   verify:   cargo nextest run -p minimal legacy_network_spellings_parse_with_hint
-  <!-- S4a/AC2; prose 24; event-driven; "for one release" is a plan fact; legacy/new spelling corrected -->
+  <!-- S4a/AC2; prose 24; event-driven; "for one release" is a plan fact; legacy/new spelling corrected; `no-net` added to the enumeration -->
 
 - **NET-038** WHILE a box runs with `--network none` THE SYSTEM SHALL refuse every socket the box opens to a destination outside itself.
   tier:     T0
