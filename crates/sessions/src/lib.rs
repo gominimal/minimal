@@ -12,6 +12,7 @@ use paths::HostAbsPath;
 pub mod client;
 pub mod core;
 pub mod daemon;
+pub mod keys;
 pub mod store;
 pub mod terminal;
 pub mod wire;

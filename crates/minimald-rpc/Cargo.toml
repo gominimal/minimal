@@ -13,8 +13,6 @@ hex.workspace = true
 paths.workspace = true
 rand.workspace = true
 serde.workspace = true
+serde_json_lenient.workspace = true
 
 sessions.workspace = true
-
-[dev-dependencies]
-serde_json_lenient.workspace = true

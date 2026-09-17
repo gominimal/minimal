@@ -17,6 +17,7 @@ use clap::Args;
 pub mod collect;
 pub mod guest;
 pub mod net;
+pub mod project;
 pub mod redact;
 
 use collect::DiagPaths;
@@ -110,6 +111,14 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     collect_step!(w, "host.terminal", collect::terminal(&mut w));
     collect_step!(w, "host.env", collect::env(&mut w));
     collect_step!(w, "host.dirs", dirs_report(&mut w, global));
+    // Which project this bundle is *about*. Runs early: it sets the
+    // manifest's project scope, and a bundle that cannot be attributed to a
+    // project is the failure this collector exists to prevent (#1211).
+    collect_step!(
+        w,
+        "project",
+        project::project(&mut w, &paths.cwd, global.repo_dir.as_deref())
+    );
     // Incident collectors: the wedged-system captures. The mechanics live in
     // `diagnostics`; minimal supplies the marker list and the "host" group.
     collect_step!(

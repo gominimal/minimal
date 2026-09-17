@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 use paths::DaemonAbsPath;
-use russh::keys::ssh_key;
+use russh::keys::PublicKeyOrCertificate;
 use sessions::SessionId;
 use tempfile::TempDir;
 use tokio::net::{UnixListener, UnixStream};
@@ -299,7 +299,8 @@ impl TestClient {
         &mut self,
         session_id: SessionId,
     ) -> russh::Channel<russh::client::Msg> {
-        self.open_shell_with_term(session_id, "xterm").await
+        self.open_shell_with_term_and_keys(session_id, "xterm", &[])
+            .await
     }
 
     /// [`Self::open_shell`], naming the terminal type the PTY request
@@ -311,11 +312,41 @@ impl TestClient {
         session_id: SessionId,
         term: &str,
     ) -> russh::Channel<russh::client::Msg> {
+        self.open_shell_with_term_and_keys(session_id, term, &[])
+            .await
+    }
+
+    /// Like [`Self::open_shell`], but also sets session-key env vars on the
+    /// channel — mirroring a `min` client that negotiated a remapped leader
+    /// chord. Each `(name, value)` pair is sent via `set_env` before the PTY
+    /// and shell requests, so the daemon parses them from the channel's env
+    /// vars at attach.
+    pub async fn open_shell_with_keys(
+        &mut self,
+        session_id: SessionId,
+        keys: &[(&str, &str)],
+    ) -> russh::Channel<russh::client::Msg> {
+        self.open_shell_with_term_and_keys(session_id, "xterm", keys)
+            .await
+    }
+
+    /// [`Self::open_shell_with_term`] plus [`Self::open_shell_with_keys`]:
+    /// names both the terminal type the PTY request carries and the
+    /// session-key env vars set before it.
+    pub async fn open_shell_with_term_and_keys(
+        &mut self,
+        session_id: SessionId,
+        term: &str,
+        keys: &[(&str, &str)],
+    ) -> russh::Channel<russh::client::Msg> {
         let channel = self.handle.channel_open_session().await.unwrap();
         channel
             .set_env(true, crate::MINIMAL_SESSION_ID_ENV, session_id.to_string())
             .await
             .unwrap();
+        for (name, value) in keys {
+            channel.set_env(true, *name, *value).await.unwrap();
+        }
         channel
             .request_pty(true, term, 80, 24, 0, 0, &[])
             .await
@@ -419,7 +450,7 @@ struct TestClientHandler;
 impl russh::client::Handler for TestClientHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, _: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(&mut self, _: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
         // Tests run against an ephemeral key we just generated, so
         // there is nothing to check.
         Ok(true)
@@ -442,6 +473,9 @@ pub fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSess
             hooks_enabled: true,
             attrs: Default::default(),
         },
+        // No assertion: the harness's client *is* this daemon's build, and
+        // the version gate has its own tests.
+        must_match_version: None,
     }
 }
 

@@ -25,6 +25,14 @@ pub enum CacheArgs {
         #[arg(long, value_parser = parse_duration, default_value = "14d")]
         older_than: Duration,
     },
+    /// Show the upstream attribution files captured from a source archive
+    ///
+    /// Prints the `NOTICE` / `COPYRIGHT` / `COPYING` files recorded when the
+    /// archive with this sha256 was last extracted, as JSON.
+    Notices {
+        /// The archive's sha256, as declared in the build spec
+        source_sha256: String,
+    },
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, anyhow::Error> {
@@ -43,7 +51,22 @@ fn parse_duration(arg: &str) -> Result<std::time::Duration, anyhow::Error> {
 }
 
 pub async fn cmd_cache(args: CacheArgs, ctx: &mut Context) -> Result<(), Error> {
-    let CacheArgs::Clean { older_than } = args;
+    let older_than = match args {
+        CacheArgs::Clean { older_than } => older_than,
+        CacheArgs::Notices { source_sha256 } => {
+            let notices = op::notices::read(&ctx.local_cache(), &source_sha256)
+                .map_err(|e| Error::Other(e.into()))?
+                .ok_or_else(|| {
+                    Error::Other(anyhow!(
+                        "no notices recorded for {source_sha256}; extract the source first"
+                    ))
+                })?;
+            let json = serde_json_lenient::to_string_pretty(&notices)
+                .map_err(|e| Error::Other(e.into()))?;
+            println!("{json}");
+            return Ok(());
+        }
+    };
 
     // Everything this project's tasks and stack need, whatever its age.
     let keep = ctx.needed_packages()?;

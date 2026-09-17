@@ -13,6 +13,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sessions::SessionId;
 
+pub mod exec;
+pub mod taskenv;
 pub mod trace;
 
 pub use sessions::{EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy};
@@ -97,6 +99,43 @@ impl OneshotSshRpc for GetVersion {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetVersion");
     type Request<'a> = ();
     type Response = GetVersionResponse;
+}
+
+/// Set to a non-empty value to downgrade the version gate to a warning.
+/// Escape hatch for deliberate skew (bisecting a daemon regression against a
+/// known-good CLI); named in [`version_skew_message`] so anyone who hits the
+/// gate finds it.
+pub const SKEW_OVERRIDE_VAR: &str = "MINIMAL_ALLOW_VERSION_SKEW";
+
+/// How [`version_skew_message`] names a daemon whose reply carried no
+/// `daemon_version` at all.
+///
+/// Every RPC that the gated paths piggyback on reports the daemon's build
+/// (see [`CreateSessionResponse::daemon_version`]). A reply without one comes
+/// from a daemon built before that field existed — which is itself proof that
+/// it is not this build, so it is a skew, not an unknown.
+pub const UNVERSIONED_DAEMON: &str = "an older build that does not report its version";
+
+/// The operator-facing account of a CLI/daemon version skew, or `None` when
+/// the two builds match.
+///
+/// Lives in the wire crate because *both* ends produce it: the client when a
+/// reply reports a build it did not expect, and the daemon when it refuses a
+/// create whose [`CreateSessionRequest::must_match_version`] does not name it.
+/// One definition means the operator reads the same sentence whichever side
+/// caught the skew.
+#[must_use]
+pub fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
+    (cli != daemon).then(|| {
+        format!(
+            "This CLI is minimal {cli}, but the running minimald is {daemon}. \
+             The two speak the same RPCs only when built together, so continuing \
+             would fail partway through and tear down whatever it had created. \
+             Restart the daemon on the new build: run `min stop`, then re-run this \
+             command (the daemon is started again automatically). \
+             Set {SKEW_OVERRIDE_VAR}=1 to proceed anyway."
+        )
+    })
 }
 
 /// An RPC to list sessions managed by this minimald.
@@ -189,6 +228,34 @@ pub struct ListSessionsResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_pool: Option<ResourcePool>,
     pub sessions: Vec<ListSessionsEntry>,
+    /// The build this daemon runs, so a client can assert the pair matches
+    /// without spending a round trip on [`GetVersion`]. `None` from a daemon
+    /// that predates the field — see [`UNVERSIONED_DAEMON`] for why that is a
+    /// skew rather than an unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
+    /// Why `<name>.local.min.internal` hostnames will not route, when they
+    /// will not. `None` means the daemon brought its host-side proxy up, or
+    /// predates this field.
+    ///
+    /// The daemon keeps serving when the proxy fails to come up — sessions
+    /// still activate and exec still works — so nothing else in this response
+    /// betrays the loss. Without this the only trace is a `warn!` in the
+    /// daemon log, and the user is at a terminal watching curl fail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname_routing_unavailable: Option<String>,
+    /// Why the mTLS reverse proxy (`:7655`) is not serving, when it is not.
+    ///
+    /// Separate from [`Self::hostname_routing_unavailable`] because they are
+    /// different services with different consumers: losing `:7654` costs every
+    /// session its hostname, losing `:7655` costs whatever terminates TLS
+    /// against it. Reporting them through one field would tell a user their
+    /// hostnames are broken when they are not.
+    ///
+    /// Always `None` from a daemon built without the `networking-proxy`
+    /// feature, which is the default — there is no proxy to be unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtls_proxy_unavailable: Option<String>,
 }
 
 impl OneshotSshRpc for ListSessions {
@@ -217,6 +284,12 @@ pub enum GetSessionRecordRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetSessionRecordResponse {
     pub record: Option<sessions::Record>,
+    /// The build this daemon runs, so a client can assert the pair matches
+    /// without spending a round trip on [`GetVersion`]. `None` from a daemon
+    /// that predates the field — see [`UNVERSIONED_DAEMON`] for why that is a
+    /// skew rather than an unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
 }
 
 impl OneshotSshRpc for GetSessionRecord {
@@ -328,6 +401,25 @@ fn default_hooks_enabled() -> bool {
 pub struct CreateSessionRequest {
     /// Out-of-band session config.
     pub config: SessionConfig,
+    /// The build the caller expects the daemon to be. When set, the daemon
+    /// compares it against its own version and fails the RPC with
+    /// [`version_skew_message`] *before allocating anything*, so a skewed pair
+    /// cannot leave a half-built session behind (#1251). `None` asserts
+    /// nothing and behaves exactly as this RPC always has — which is what a
+    /// client sends when the operator set [`SKEW_OVERRIDE_VAR`], since a
+    /// daemon-side refusal is not something a client-side override could
+    /// downgrade to a warning.
+    ///
+    /// Carried here rather than checked by a preceding [`GetVersion`] because
+    /// this is the first RPC of the activation path, and that path must not
+    /// pay a round trip for a check the create can make itself.
+    ///
+    /// A daemon that predates this field ignores it —
+    /// [`CreateSessionRequest`] is not `deny_unknown_fields`, deliberately, so
+    /// that older clients keep working — and is caught instead by the
+    /// [`CreateSessionResponse::daemon_version`] it fails to echo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub must_match_version: Option<String>,
 }
 
 /// The response for a [`CreateSession`] RPC: the allocated session.
@@ -339,6 +431,29 @@ pub struct CreateSessionRequest {
 pub struct CreateSessionResponse {
     /// Daemon-assigned session id.
     pub id: SessionId,
+    /// The build this daemon runs, so a client can assert the pair matches
+    /// without spending a round trip on [`GetVersion`]. `None` from a daemon
+    /// that predates the field — see [`UNVERSIONED_DAEMON`] for why that is a
+    /// skew rather than an unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
+    /// Why `<name>.local.min.internal` hostnames will not route, when they
+    /// will not — see [`ListSessionsResponse::hostname_routing_unavailable`].
+    ///
+    /// Carried on the activation reply as well as the list because activation
+    /// is where a user is about to rely on it, and the session comes up
+    /// looking healthy either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname_routing_unavailable: Option<String>,
+    /// Why the mTLS reverse proxy is not serving, when it is not — see
+    /// [`ListSessionsResponse::mtls_proxy_unavailable`].
+    ///
+    /// Here for the same reason as the field above it: both proxies are
+    /// daemon-wide rather than session-scoped, so the thing that decides
+    /// whether activation should mention them is whether the person
+    /// activating is about to depend on one, and that is not ours to know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtls_proxy_unavailable: Option<String>,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -460,6 +575,11 @@ pub struct RanHook {
     /// The hook's own description, when it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Tail of the hook's captured stdout and stderr, when it wrote
+    /// any. Serde-defaulted so a daemon that predates the field still
+    /// answers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output: String,
 }
 
 impl OneshotSshRpc for FinalizeSession {
@@ -1022,6 +1142,38 @@ mod tests {
         }
     }
 
+    /// A hook's captured output must cross the wire, so the client can
+    /// show what the hook said rather than only its author-supplied
+    /// description.
+    #[test]
+    fn a_ran_hook_carries_its_captured_output() {
+        let resp = FinalizeSessionResponse {
+            activate_hooks: vec![RanHook {
+                declared_by: "user loadout `dev`".to_string(),
+                description: Some("emit to stdout and stderr".to_string()),
+                output: "HOOK_STDOUT_VISIBLE\nHOOK_STDERR_VISIBLE\n".to_string(),
+            }],
+        };
+        let wire = serde_json_lenient::to_string(&resp).expect("must serialize");
+        let back: FinalizeSessionResponse =
+            serde_json_lenient::from_str(&wire).expect("must decode");
+        assert_eq!(back, resp);
+        assert_eq!(
+            back.activate_hooks[0].output,
+            "HOOK_STDOUT_VISIBLE\nHOOK_STDERR_VISIBLE\n"
+        );
+
+        // A daemon predating the field still decodes, with empty output.
+        let old: Errorable<FinalizeSessionResponse> = serde_json_lenient::from_str(
+            r#"{"activate_hooks":[{"declared_by":"user loadout `dev`"}]}"#,
+        )
+        .expect("a field-less hook must decode");
+        match old {
+            Errorable::Ok(ok) => assert!(ok.activate_hooks[0].output.is_empty()),
+            Errorable::Err { error } => panic!("a success decoded as an error: {error}"),
+        }
+    }
+
     /// An empty request body must decode with the documented defaults so a
     /// bare `{}` probe (or an older client) still gets a full bundle.
     #[test]
@@ -1219,8 +1371,59 @@ mod tests {
                     .into_iter()
                     .collect(),
             },
+            must_match_version: Some("0.6.0".into()),
         };
         assert_eq!(round_trip(&req), req);
+    }
+
+    /// A client that predates `must_match_version` sends no such field, and
+    /// the daemon must read that as "assert nothing" rather than fail to
+    /// decode the request. `CreateSessionRequest` is deliberately *not*
+    /// `deny_unknown_fields`, which is the same property read the other way:
+    /// a daemon that predates the field ignores it instead of rejecting the
+    /// create outright.
+    #[test]
+    fn create_session_request_predating_must_match_version_asserts_nothing() {
+        let json = r#"{"config":{
+            "name": "s",
+            "project_path": "/p",
+            "network": "host_net",
+            "attrs": {}
+        }}"#;
+        let req: CreateSessionRequest =
+            serde_json_lenient::from_str(json).expect("legacy request must load");
+        assert!(req.must_match_version.is_none());
+
+        // And the forward direction: an old daemon's serde ignores the new
+        // field rather than refusing the request.
+        let with_field = r#"{"config":{
+            "name": "s",
+            "project_path": "/p",
+            "network": "host_net",
+            "attrs": {}
+        },"must_match_version":"0.6.0"}"#;
+        let req: CreateSessionRequest =
+            serde_json_lenient::from_str(with_field).expect("the new field must decode");
+        assert_eq!(req.must_match_version.as_deref(), Some("0.6.0"));
+    }
+
+    /// The skew wording names both builds, the recovery, and the override —
+    /// and says nothing at all when the two builds agree.
+    #[test]
+    fn version_skew_message_names_both_builds_the_recovery_and_the_override() {
+        assert!(version_skew_message("0.6.0", "0.6.0").is_none());
+        let msg = version_skew_message("0.6.0", "0.5.0-dev.12.g86ce5c3a")
+            .expect("differing builds are a skew");
+        assert!(msg.contains("0.6.0"), "missing the CLI version: {msg}");
+        assert!(
+            msg.contains("0.5.0-dev.12.g86ce5c3a"),
+            "missing the daemon version: {msg}"
+        );
+        assert!(msg.contains("min stop"), "missing the recovery: {msg}");
+        assert!(
+            msg.contains(SKEW_OVERRIDE_VAR),
+            "missing the override: {msg}"
+        );
     }
 
     /// A `SessionConfig` from a client that predates `hooks_enabled`
@@ -1242,8 +1445,92 @@ mod tests {
     fn create_session_response_round_trips() {
         let resp = CreateSessionResponse {
             id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            daemon_version: Some("0.6.0".into()),
+            hostname_routing_unavailable: None,
+            mtls_proxy_unavailable: None,
         };
         assert_eq!(round_trip(&resp), resp);
+    }
+
+    /// A daemon that predates `hostname_routing_unavailable` must still decode,
+    /// with the field absent. Absent has to mean "said nothing", not "reported
+    /// a fault": an older daemon is not evidence that routing is down, and a
+    /// client that read it that way would warn on every session it lists.
+    #[test]
+    fn responses_predating_hostname_routing_field_decode_as_absent() {
+        let list: ListSessionsResponse =
+            serde_json_lenient::from_str(r#"{"sessions":[],"daemon_version":"0.5.0"}"#)
+                .expect("a pre-field ListSessions reply must still decode");
+        assert!(list.hostname_routing_unavailable.is_none());
+        assert!(list.mtls_proxy_unavailable.is_none());
+
+        let create: Errorable<CreateSessionResponse> = serde_json_lenient::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000001","daemon_version":"0.5.0"}"#,
+        )
+        .expect("a pre-field CreateSession reply must still decode");
+        match create {
+            Errorable::Ok(c) => {
+                assert!(c.hostname_routing_unavailable.is_none());
+                assert!(c.mtls_proxy_unavailable.is_none());
+            }
+            Errorable::Err { error } => panic!("expected Ok, got {error}"),
+        }
+    }
+
+    /// The field is omitted from the wire when there is nothing wrong, so the
+    /// healthy path costs no bytes and an older client sees exactly what it
+    /// saw before.
+    #[test]
+    fn hostname_routing_field_is_omitted_when_healthy() {
+        let resp = ListSessionsResponse {
+            daemon_version: Some("0.6.0".into()),
+            hostname_routing_unavailable: None,
+            mtls_proxy_unavailable: None,
+            resource_pool: None,
+            sessions: vec![],
+        };
+        let json = serde_json_lenient::to_string(&resp).expect("serializes");
+        assert!(
+            !json.contains("hostname_routing_unavailable"),
+            "healthy reply should omit the field, got {json}"
+        );
+        assert!(
+            !json.contains("mtls_proxy_unavailable"),
+            "healthy reply should omit the mTLS field too, got {json}"
+        );
+
+        let down = ListSessionsResponse {
+            hostname_routing_unavailable: Some("port 7654 is held".into()),
+            ..resp
+        };
+        let json = serde_json_lenient::to_string(&down).expect("serializes");
+        let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
+        assert_eq!(
+            back.hostname_routing_unavailable.as_deref(),
+            Some("port 7654 is held")
+        );
+    }
+
+    /// The reply a daemon that predates `daemon_version` sends must still
+    /// decode — with `None`, which is what tells the client it is talking to
+    /// a build older than the handshake and therefore a skewed one.
+    #[test]
+    fn create_session_response_predating_daemon_version_decodes_as_absent() {
+        let resp: Errorable<CreateSessionResponse> =
+            serde_json_lenient::from_str(r#"{"id":"00000000-0000-0000-0000-000000000001"}"#)
+                .expect("a legacy reply must decode");
+        assert!(resp.unwrap().daemon_version.is_none());
+    }
+
+    /// Same for the two read RPCs the attach/exec paths gate on.
+    #[test]
+    fn read_responses_predating_daemon_version_decode_as_absent() {
+        let listed: ListSessionsResponse =
+            serde_json_lenient::from_str(r#"{"sessions":[]}"#).expect("deserialize");
+        assert!(listed.daemon_version.is_none());
+        let record: GetSessionRecordResponse =
+            serde_json_lenient::from_str(r#"{"record":null}"#).expect("deserialize");
+        assert!(record.daemon_version.is_none());
     }
 
     #[test]

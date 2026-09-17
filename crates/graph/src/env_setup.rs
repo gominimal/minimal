@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
 };
 
@@ -12,9 +12,9 @@ use mfile::EnvPatches;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupForPackages {
     /// Environment variables that need to be set, typically for an env_state_wiring entry.
-    pub env_vars: HashMap<String, String>,
+    pub env_vars: BTreeMap<String, String>,
     /// Directories that should be created in `/state`, typically from an env_state_wiring entry.
-    pub state_dirs: HashSet<String>,
+    pub state_dirs: BTreeSet<String>,
 
     /// Whether any package sets `needs.dns`.
     pub needs_dns: bool,
@@ -28,7 +28,7 @@ pub struct SetupForPackages {
     ///
     /// Consumed when a mapping can't be honoured, so the error can name the
     /// package to go and look at rather than only the path it landed on.
-    pub fs_mapping_packages: HashMap<String, String>,
+    pub fs_mapping_packages: BTreeMap<String, String>,
 }
 
 impl SetupForPackages {
@@ -44,10 +44,10 @@ impl SetupForPackages {
         i: I,
     ) -> Result<SetupForPackages, std::io::Error> {
         let mut patch = EnvPatches::default();
-        let mut fs_mapping_packages: HashMap<String, String> = Default::default();
+        let mut fs_mapping_packages: BTreeMap<String, String> = Default::default();
         let (mut needs_dns, mut needs_internet) = (false, false);
-        let mut env_vars: HashMap<String, String> = Default::default();
-        let mut state_dirs = HashSet::default();
+        let mut env_vars: BTreeMap<String, String> = Default::default();
+        let mut state_dirs = BTreeSet::default();
 
         for dep in i.into_iter() {
             let b = g.get(dep).unwrap();
@@ -184,10 +184,10 @@ mod tests {
                 needs_internet: false,
                 state_dirs: Default::default(),
                 fs_mappings: EnvPatches {
-                    dir: HashMap::from_iter([("~/.claude".to_string(), PatchSetting::ReadWrite)]),
-                    file: HashMap::new(),
+                    dir: BTreeMap::from_iter([("~/.claude".to_string(), PatchSetting::ReadWrite)]),
+                    file: BTreeMap::new(),
                 },
-                fs_mapping_packages: HashMap::from_iter([(
+                fs_mapping_packages: BTreeMap::from_iter([(
                     "~/.claude".to_string(),
                     "b1".to_string()
                 )]),
@@ -329,16 +329,76 @@ mod tests {
         assert_eq!(
             SetupForPackages::build(&g, [g.by_name("b1").unwrap()]).unwrap(),
             SetupForPackages {
-                env_vars: HashMap::from_iter([
+                env_vars: BTreeMap::from_iter([
                     ("GOCACHE".to_string(), "/state/gocache".to_string(),),
                     ("GOMODCACHE".to_string(), "/state/gomodcache".to_string(),)
                 ]),
                 needs_dns: false,
                 needs_internet: false,
-                state_dirs: HashSet::from_iter(["gocache".to_string(), "gomodcache".to_string()]),
+                state_dirs: BTreeSet::from_iter(["gocache".to_string(), "gomodcache".to_string()]),
                 fs_mappings: Default::default(),
                 fs_mapping_packages: Default::default(),
             }
         )
+    }
+
+    /// The same packages walked in opposite orders yield the same env-var,
+    /// fs-mapping and package-attribution key sequences and the same
+    /// state-dir set: the ordered collections take their order from their
+    /// keys, not from the walk, so the sandbox setup is stable run to run.
+    #[test]
+    fn build_is_walk_order_independent() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+            let {BuildSpec, ..} = import \"minimal.ncl\" in
+
+            let
+                b1 = {
+                    name = \"b1\",
+                    build_deps = [],
+                    cmd = \"\",
+                    attrs = {
+                        env_state_wiring = [{ env_var = \"AVAR\", prefix = \"adir\" }],
+                        env_dir_mappings = [{ read_only = false, path = \"~/a\", class = 'State }],
+                    },
+                } | BuildSpec,
+                b2 = {
+                    name = \"b2\",
+                    build_deps = [],
+                    cmd = \"\",
+                    attrs = {
+                        env_state_wiring = [{ env_var = \"BVAR\", prefix = \"bdir\" }],
+                        env_dir_mappings = [{ read_only = false, path = \"~/b\", class = 'State }],
+                    },
+                } | BuildSpec,
+            in
+            [b1, b2]
+            "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let g = Graph::new().ingest(layer).unwrap();
+        let (b1, b2) = (g.by_name("b1").unwrap(), g.by_name("b2").unwrap());
+
+        let forward = SetupForPackages::build(&g, [b1, b2]).unwrap();
+        let reverse = SetupForPackages::build(&g, [b2, b1]).unwrap();
+
+        let keys = |m: &BTreeMap<String, String>| m.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys(&forward.env_vars), keys(&reverse.env_vars));
+        assert_eq!(
+            keys(&forward.fs_mapping_packages),
+            keys(&reverse.fs_mapping_packages)
+        );
+        assert_eq!(
+            forward.fs_mappings.dir.keys().collect::<Vec<_>>(),
+            reverse.fs_mappings.dir.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(forward.state_dirs, reverse.state_dirs);
     }
 }

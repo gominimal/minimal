@@ -399,6 +399,28 @@ paths, and the archive layout.
   which is the one that rendered wrong only when the user reports from the
   same window; that caveat is inherent and is why the field sits beside the
   other host facts rather than being presented as the incident's terminal.
+- **R2.11**: The bundle shall be scoped to the project it was collected in.
+  `manifest.json` shall carry a `project` field, and `project/project.json`
+  shall repeat it alongside the directory the command actually ran from —
+  which is not the project root whenever `min bug` ran in a subdirectory,
+  and is the difference between "minimal read no config" and "minimal read
+  the config one level up". Every other collector describes a *machine*, and
+  a machine hosts many projects, so two bundles taken on one host from two
+  checkouts are otherwise indistinguishable and get filed against whichever
+  project the reader guesses. Resolution shall use the same resolver the
+  rest of the CLI loads config with and shall honor `--repo-dir` identically:
+  a bundle must name the project the command would have acted on. Being
+  outside a project is a **finding, not an error** — the scope records
+  `unknown` with a reason and the entry becomes a manifest skip, since
+  `min bug` is run from wherever the user is standing. Identity only: name,
+  root, and the config file's relative path. The root shall be resolved
+  against the filesystem rather than echoed back from `--repo-dir`: it is
+  recorded as an absolute path on the producing host, and a bundle is read
+  somewhere the caller's relative path means nothing. No configuration *values* enter
+  here; the config itself is collected under R2.5's redaction. A malformed
+  config is reported as malformed without quoting the offending line, which
+  would be a line of the user's configuration. `SCHEMA_VERSION` stays at 1:
+  the field is additive and a v1 reader is unaffected.
 
 **Proof Artifacts:**
 
@@ -415,6 +437,15 @@ paths, and the archive layout.
    size, a pipe carries neither device nor size. Paired with the `diagnostics`
    unit tests, which point the probe at a real pty of known dimensions and at
    a pipe — covers R2.10.
+5. **Test:** `the_bundle_names_the_project_it_came_from` — the manifest and
+   `project/project.json` agree on the identity;
+   `a_bundle_collected_outside_a_project_says_so` — the scope is `unknown`
+   with a reason and the entry is a skip, never a silent absence; and
+   `the_recorded_project_root_is_resolved_not_echoed` — the root is resolved
+   against the filesystem rather than echoed from `--repo-dir`; and
+   `a_malformed_config_is_reported_without_quoting_it` — a secret planted on
+   the line the TOML parser rejects reaches no file in the bundle, the
+   manifest's own reason included. Covers R2.11.
 
 ---
 
@@ -1134,6 +1165,7 @@ Unit 8's dual-format rework, sequenced after Unit 6.
 | 2 | R2.4, R2.5 | Test | planted secret → `<redacted:len=N>`, never verbatim |
 | 2 | R2.3, R2.7-R2.9 | CLI | `min bug` on dev box; manifest counts, `host/` entries |
 | 2 | R2.10 | Test | `the_invoking_terminal_is_described`; `cargo test -p diagnostics terminal` — pty of known size, pipe reports nothing |
+| 2 | R2.11 | Test | `the_bundle_names_the_project_it_came_from`, `a_bundle_collected_outside_a_project_says_so` — manifest scope agrees with `project/project.json`; no project is a reasoned skip |
 | 3 | R3.2-R3.4 | CLI (gate) | idle attach + `minvmd stop` → clean ext4 journal; `boot.log` in provider dir, `minimald.log*` on volume next boot |
 | 3 | R3.4 | Test | release runs exactly once, before quiesce returns |
 | 3 | R3.6 | Test | size-threshold rotation + retention pruning |

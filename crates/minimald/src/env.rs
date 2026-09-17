@@ -23,7 +23,7 @@
 //!   requests one at a time on the runtime, so every handler is a plain
 //!   `async fn` that `.await`s — no nested runtimes, no sync/async bridge writers.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::Permissions;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -192,7 +192,7 @@ pub struct EnvArgs {
 
     packages: Vec<String>,
     patches: Option<EnvPatches>,
-    env_vars: Option<HashMap<String, EnvVarValue>>,
+    env_vars: Option<BTreeMap<String, EnvVarValue>>,
     ot: Option<OpTracker>,
     network_mode: NetworkMode,
     own_ip_tap: Option<sandbox2::config::OwnIpTap>,
@@ -271,7 +271,7 @@ impl EnvArgs {
 
     /// Sets environment variables to apply on top of the package-derived ones.
     #[must_use]
-    pub fn with_env_vars(mut self, env_vars: HashMap<String, EnvVarValue>) -> Self {
+    pub fn with_env_vars(mut self, env_vars: BTreeMap<String, EnvVarValue>) -> Self {
         self.env_vars = Some(env_vars);
         self
     }
@@ -379,9 +379,7 @@ impl RuntimeEnv {
 /// resolved env-var value shaped `/state/<single-component>`.
 /// Multi-component and empty prefixes are dropped — they can't be
 /// distinguished from coincidental `/state/`-prefixed values.
-fn state_dirs_from_env_vars(
-    env_vars: &HashMap<String, String>,
-) -> std::collections::HashSet<String> {
+fn state_dirs_from_env_vars(env_vars: &BTreeMap<String, String>) -> BTreeSet<String> {
     env_vars
         .values()
         .filter_map(|v| v.strip_prefix("/state/"))
@@ -449,7 +447,7 @@ impl Env {
                 .map_err(std::io::Error::other)?;
             (state_dirs, env_vars)
         } else {
-            (std::collections::HashSet::<String>::new(), HashMap::new())
+            (BTreeSet::<String>::new(), BTreeMap::new())
         };
 
         if let Some(vars) = &args.env_vars {
@@ -471,7 +469,7 @@ impl Env {
         // `deny` policy on some GOCACHE env var) also skips creating
         // its state dir — no orphaned `/state` slot for a var the
         // session doesn't actually have.
-        let state_dirs: std::collections::HashSet<String> = if args.include_package_attr_wiring {
+        let state_dirs: BTreeSet<String> = if args.include_package_attr_wiring {
             legacy_state_dirs
         } else {
             state_dirs_from_env_vars(&pkg_env_vars)
@@ -558,6 +556,22 @@ impl Env {
     /// Creates a fresh container in this environment's sandbox.
     pub fn container(&mut self) -> std::io::Result<Container> {
         self.sandbox.new_container().map_err(sandbox_err_to_io)
+    }
+
+    /// The assembled session rootfs on the daemon's filesystem.
+    ///
+    /// Exposed so the launcher can answer "is this shell installed in
+    /// this session" before it spawns one
+    /// ([`crate::session_shell::resolve`]) — the same question
+    /// [`install_min_helpers`] answers about directories it writes into.
+    /// Only meaningful once [`Env::build`] has returned: the rootfs is
+    /// what that assembles.
+    ///
+    /// Read only by the real `SandboxLauncher` (`cfg(not(test))`), which
+    /// the mock launcher stands in for under test.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn rootfs(&self) -> std::path::PathBuf {
+        self.sandbox.rootfs()
     }
 
     /// Builds a command to run `program` inside the given container.
@@ -2057,7 +2071,7 @@ mod tests {
     /// it can be unit-tested directly.
     #[test]
     fn state_dirs_from_env_vars_extracts_single_component_prefixes() {
-        let env = HashMap::from([
+        let env = BTreeMap::from([
             ("GOCACHE".to_string(), "/state/gocache".to_string()),
             ("GOMODCACHE".to_string(), "/state/gomodcache".to_string()),
             ("HOME".to_string(), "/home/user".to_string()),
@@ -2073,7 +2087,7 @@ mod tests {
     /// ignored — creating `state_base_dir/` itself is nonsense.
     #[test]
     fn state_dirs_from_env_vars_ignores_bare_state() {
-        let env = HashMap::from([("WEIRD".to_string(), "/state/".to_string())]);
+        let env = BTreeMap::from([("WEIRD".to_string(), "/state/".to_string())]);
         assert!(state_dirs_from_env_vars(&env).is_empty());
     }
 
@@ -2415,7 +2429,7 @@ mod tests {
     /// diagnosing bad ones.
     #[test]
     fn state_dirs_from_env_vars_silently_drops_multi_component() {
-        let env = HashMap::from([("WEIRD".to_string(), "/state/foo/bar".to_string())]);
+        let env = BTreeMap::from([("WEIRD".to_string(), "/state/foo/bar".to_string())]);
         assert!(state_dirs_from_env_vars(&env).is_empty());
     }
 }

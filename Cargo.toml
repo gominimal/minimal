@@ -49,7 +49,11 @@ package.rust-version = "1.95"
 # Shared base version for the workspace. This is the fallback the `version` crate
 # reports when no `v*` git tag is reachable; the real release version comes from
 # `git describe` at build time. See crates/version/build.rs.
-package.version = "0.5.0-rc1"
+# Must stay UNTIL the next tag lands: it is the version a no-.git build
+# (source tarball) reports, so leaving it at an already-shipped release makes
+# such a build report that release — exactly what release.yml's
+# assert-version job exists to catch. 0.5.5 until v0.5.5 is tagged.
+package.version = "0.5.5"
 
 [profile.release]
 strip = true
@@ -93,7 +97,7 @@ constcat = "0.6"
 copy_dir = "0.1.3"
 chrono = {version = "0.4", features = ["serde", "std"]}
 crossterm = { version = "0.29", features = ["event-stream"] }
-dirs = "6"
+dirs = "7"
 fd-lock = "4"
 either = { version = "1.17", default-features = false }
 flate2 = "1.1"
@@ -148,7 +152,7 @@ prost = "0.14"
 prost-build = "0.14"
 prost-types = "0.14"
 resolv-conf = "0.7"
-russh = { version = "0.62", default-features = false, features = ["aws-lc-rs", "flate2"] }
+russh = { version = "0.63", default-features = false, features = ["aws-lc-rs", "flate2"] }
 russh-sftp = "2.4"
 serde_json_lenient = { version = "0.2" }
 serial_test = "4"
@@ -176,7 +180,7 @@ unicode-width = "0.2"
 url = "2" # keep in sync with reqwest
 uuid = { version = "1.24", features = ["v4", "v7", "serde"] }
 vt100 = { version = "0.16.2" }
-zstd = "0.13"
+zstd = "0.14"
 
 moka = { version = "0.12", default-features = false, features = ["sync"] }
 globset = "0.4"

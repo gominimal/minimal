@@ -73,6 +73,45 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     run_foreground()
 }
 
+/// Outcome of one poll of the `--detach` readiness loop, decided from the
+/// three observable signals in [`run_detach`]. Split out from the loop so the
+/// decision is unit-testable on hosts without libkrun, where the loop itself
+/// is not compiled.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+enum DetachPoll {
+    /// The readiness predicate holds: the VM is serving. Return success.
+    Ready,
+    /// Neither ready nor failed yet: sleep and poll again until the deadline.
+    Keep,
+    /// The supervisor child exited with no daemon up: a real startup failure.
+    Failed(std::process::ExitStatus),
+}
+
+/// Classify one readiness poll. `ready` is the readiness predicate (UDS
+/// connectable, alive lock held, lifecycle `Running`); `child_status` is the
+/// supervisor child's exit status once it has exited; `daemon_alive` is whether
+/// some minvmd holds the alive lock.
+///
+/// A child that exits while a daemon still holds the alive lock lost the
+/// autospawn race: `try_acquire_alive_lock` handed the lock to a peer that is
+/// still coming up and will reach `Running` shortly. That is success in the
+/// making, not a startup failure — keep waiting to the deadline. Only a child
+/// exit with no live daemon is a genuine failure.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn classify_detach_poll(
+    ready: bool,
+    child_status: Option<std::process::ExitStatus>,
+    daemon_alive: bool,
+) -> DetachPoll {
+    if ready {
+        return DetachPoll::Ready;
+    }
+    match child_status {
+        Some(status) if !daemon_alive => DetachPoll::Failed(status),
+        _ => DetachPoll::Keep,
+    }
+}
+
 /// Spawn `minvmd run` as a detached background supervisor, then poll until
 /// the VM is serving (up to `timeout_secs`).
 #[cfg(minvmd_libkrun)]
@@ -124,24 +163,26 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     // it at VMM start — long before the guest serves — dialling the guest
     // vsock lazily per connection, so an early connect succeeds and then
     // drops at ssh time. Running is written only after the guest's READY
-    // marker, which follows its vsock bind. A child exit surfaces as an error
-    // instead of a silent timeout.
+    // marker, which follows its vsock bind. A child exit with no live daemon
+    // surfaces as an error rather than a silent timeout; a child that lost the
+    // autospawn race to a live peer keeps waiting for that peer to serve.
     let uds_path = crate::sock::resolve_uds_path().context("resolving host UDS path")?;
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
     loop {
-        if let Some(status) = child.try_wait().context("polling supervisor child")? {
-            bail!(
+        let child_status = child.try_wait().context("polling supervisor child")?;
+        let daemon_alive = state_dir.daemon_alive().context("probing alive lock")?;
+        let ready = daemon_alive
+            && std::os::unix::net::UnixStream::connect(&uds_path).is_ok()
+            && state_dir.read_state().context("reading state")?.lifecycle
+                == crate::lifecycle::Lifecycle::Running;
+        match classify_detach_poll(ready, child_status, daemon_alive) {
+            DetachPoll::Ready => return Ok(()),
+            DetachPoll::Failed(status) => bail!(
                 "the detached supervisor exited during startup ({status}); \
                  see {} for its error output",
                 log_path.display()
-            );
-        }
-        if std::os::unix::net::UnixStream::connect(&uds_path).is_ok()
-            && state_dir.daemon_alive().context("probing alive lock")?
-            && state_dir.read_state().context("reading state")?.lifecycle
-                == crate::lifecycle::Lifecycle::Running
-        {
-            return Ok(());
+            ),
+            DetachPoll::Keep => {}
         }
         if std::time::Instant::now() >= deadline {
             bail!(
@@ -522,5 +563,41 @@ mod tests {
                 .contains("`--timeout` only applies with `--detach`"),
             "expected --timeout guard message, got: {err}"
         );
+    }
+
+    fn exited(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn detach_poll_ready_predicate_wins_over_child_exit() {
+        // The child exited, but the readiness predicate already holds: the VM
+        // is serving, so this is success regardless of the exit.
+        assert!(matches!(
+            super::classify_detach_poll(true, Some(exited(1)), true),
+            super::DetachPoll::Ready
+        ));
+    }
+
+    #[test]
+    fn detach_poll_lost_race_keeps_waiting() {
+        // The supervisor exited because a peer already holds the alive lock —
+        // the winner is still coming up. Keep waiting rather than reporting a
+        // startup failure that isn't one.
+        assert!(matches!(
+            super::classify_detach_poll(false, Some(exited(1)), true),
+            super::DetachPoll::Keep
+        ));
+    }
+
+    #[test]
+    fn detach_poll_child_exit_without_daemon_is_failure() {
+        // Child exited and nothing holds the alive lock: a genuine startup
+        // failure, still surfaced as an error.
+        assert!(matches!(
+            super::classify_detach_poll(false, Some(exited(1)), false),
+            super::DetachPoll::Failed(_)
+        ));
     }
 }

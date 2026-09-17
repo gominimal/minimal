@@ -16,7 +16,7 @@ use nickel_lang_core::{
     program::Program,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 mod load;
@@ -72,8 +72,8 @@ pub struct Layer {
     pub builds: Arena<BuildDecl>,
     pub top_levels: Vec<generational_arena::Index>,
 
-    pub stacks: HashMap<String, Stack>,
-    pub containers: HashMap<String, Container>,
+    pub stacks: BTreeMap<String, Stack>,
+    pub containers: BTreeMap<String, Container>,
 
     read_ids: HashMap<u64, generational_arena::Index>,
 }
@@ -174,8 +174,8 @@ impl Layer {
             builds: Arena::with_capacity(512),
             read_ids: HashMap::with_capacity(512),
 
-            stacks: HashMap::with_capacity(32),
-            containers: HashMap::with_capacity(32),
+            stacks: BTreeMap::new(),
+            containers: BTreeMap::new(),
         };
 
         // The top-level of the nickel tree can either evaluate to:
@@ -202,7 +202,7 @@ impl Layer {
                     if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("stacks")) {
                         let rt = eval_if_closure(&rt, &mut program)?;
                         if let Some(a) = rt.as_array() {
-                            layer.stacks = HashMap::from_iter(
+                            layer.stacks = BTreeMap::from_iter(
                                 a.iter()
                                     .map(|p| layer.ingest_stack(p, &mut program))
                                     .collect::<Result<Vec<_>, Error>>()?
@@ -214,7 +214,7 @@ impl Layer {
                     if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("containers")) {
                         let rt = eval_if_closure(&rt, &mut program)?;
                         if let Some(a) = rt.as_array() {
-                            layer.containers = HashMap::from_iter(
+                            layer.containers = BTreeMap::from_iter(
                                 a.iter()
                                     .map(|c| layer.ingest_container(c, &mut program))
                                     .collect::<Result<Vec<_>, Error>>()?
@@ -431,8 +431,8 @@ pub(crate) fn patches_from_term(
 ) -> Result<EnvPatches, Error> {
     let patch_rt = eval_if_closure(rt, program)?;
 
-    let mut dirs: Option<HashMap<String, PatchSetting>> = None;
-    let mut files: Option<HashMap<String, PatchSetting>> = None;
+    let mut dirs: Option<BTreeMap<String, PatchSetting>> = None;
+    let mut files: Option<BTreeMap<String, PatchSetting>> = None;
 
     let Some(r) = record_data_from_val(&patch_rt) else {
         return Err(Error::unexpected_type(
@@ -486,7 +486,7 @@ pub(crate) fn patches_from_term(
                                     ))
                                 },
                             )
-                            .collect::<Result<HashMap<_, _>, Error>>()?,
+                            .collect::<Result<BTreeMap<_, _>, Error>>()?,
                     );
                     Ok(())
                 }
@@ -529,7 +529,7 @@ pub(crate) fn patches_from_term(
                                     ))
                                 },
                             )
-                            .collect::<Result<HashMap<_, _>, Error>>()?,
+                            .collect::<Result<BTreeMap<_, _>, Error>>()?,
                     );
                     Ok(())
                 }

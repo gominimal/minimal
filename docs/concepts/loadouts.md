@@ -43,10 +43,11 @@ packages and environment through the task schema.
 
 ## Where loadouts live
 
-Each loadout is a single TOML file in your user config directory:
+Loadouts live in your user config directory, in either of two layouts:
 
 ```
-~/.config/minimal/loadouts/<name>.toml
+~/.config/minimal/loadouts/<name>.toml          # a loadout that is just a file
+~/.config/minimal/loadouts/<name>/loadout.toml  # a loadout you keep in git
 ```
 
 On Linux this is `$XDG_CONFIG_HOME/minimal/loadouts` (falling back to
@@ -55,10 +56,25 @@ same `~/.config` location for consistency with Minimal's state and cache
 directories. The global `--config-dir` flag overrides the base directory when
 you need a non-default location.
 
-The filename stem is the loadout's identifier. A file named `dev.toml`
-defines the loadout `dev` — nothing inside the file names it, so renaming
-the file renames the loadout. The directory is not created for you: make it
-and drop `<name>.toml` files in to get started.
+The filesystem names the loadout. A file named `dev.toml` and a directory
+named `dev/` holding a `loadout.toml` both define the loadout `dev` —
+nothing inside the file names it, so renaming the file (or the directory)
+renames the loadout. Defining one name both ways at once is an error rather
+than a precedence rule.
+
+The second shape exists so a whole loadout — its definition, the files it
+ships, its hook scripts — is one self-contained directory you can clone:
+
+```console
+$ git clone git@example.com:you/helix-loadout ~/.config/minimal/loadouts/dev
+```
+
+Nothing else changes between the two, because a loadout's own directory is
+`~/.config/minimal/loadouts/<name>/` either way. The
+[reference](../reference/loadouts.md#where-loadouts-live) has the details.
+
+The loadouts directory is not created for you: make it and add loadouts in
+either shape to get started.
 
 ## What a loadout carries
 
@@ -113,6 +129,20 @@ A source that does not exist on your host is skipped with a warning rather
 than failing activation, so you can opportunistically patch a dotfile tree
 that may not be present on every machine.
 
+For files that exist only to serve one loadout, keep them beside it instead
+and name them with `$LOADOUT_ROOT` — the directory next to the loadout file,
+named after the loadout, which is also where its hook scripts live:
+
+```toml
+patches = [
+    { dest = ".config/helix/config.toml", source = "$LOADOUT_ROOT/config.toml" },
+]
+```
+
+That makes the loadout and its files one movable unit, with no absolute path
+into your config directory to keep in sync. See the
+[reference](../reference/loadouts.md#loadout_root) for the rules.
+
 ### Lifecycle hooks
 
 Hooks run inside your session, with its packages, variables, files, and
@@ -155,7 +185,8 @@ EDITOR = "hx"
 on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || true" }
 ```
 
-Saved as `~/.config/minimal/loadouts/dev.toml`, it is ready to apply.
+Saved as `~/.config/minimal/loadouts/dev.toml` — or as
+`~/.config/minimal/loadouts/dev/loadout.toml` — it is ready to apply.
 
 ## Applying a loadout
 

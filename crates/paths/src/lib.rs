@@ -370,6 +370,27 @@ pub fn minimal_config_dir() -> DaemonAbsPath {
     default_dir(xdg_config_home, ".config")
 }
 
+/// Returns minimal's config directory, honouring the `--config-dir`
+/// override: `<override>/minimal` when `over` is given, else the platform
+/// default ([`minimal_config_dir`]). Which flag feeds `over` is the caller's
+/// business; this only fixes that an override names the *parent* of the
+/// `minimal/` subdirectory, so both branches produce the same layout.
+///
+/// The return is a plain [`std::path::PathBuf`]: a user-passed flag is
+/// untyped on the way in and is not daemon-realm data, so forcing the
+/// realm-tagged type on `Some` would lie — and the default branch is
+/// converted down to match.
+#[must_use]
+pub fn minimal_config_dir_with_override(over: Option<&Path>) -> std::path::PathBuf {
+    match over {
+        Some(dir) => dir.join("minimal"),
+        None => minimal_config_dir()
+            .as_utf8_path()
+            .as_std_path()
+            .to_path_buf(),
+    }
+}
+
 /// Return `$XDG_CONFIG_HOME` if it's set to an absolute path. Matches the
 /// spec: [XDG Base Directory Specification, "XDG_CONFIG_HOME"](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
 /// says relative paths are invalid and should be ignored.

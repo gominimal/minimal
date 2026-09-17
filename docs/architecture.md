@@ -63,8 +63,9 @@ sessions is a **provider**.
   `minimald` over a UNIX domain socket.
 - **minimald** is the session daemon: an SSH server that hosts sessions and
   task/sandbox executions within them. On Linux it runs natively on the host.
-  Oneshot RPCs (create session, list, exec, sftp, …) share a wire contract
-  defined in the **minimald-rpc** crate.
+  Oneshot RPCs (create session, list, sftp, …) share a wire contract defined
+  in the **minimald-rpc** crate, which also defines the tagged vocabulary the
+  streaming exec channel speaks.
 - **minvmd** is the microVM host daemon for platforms (macOS) or setups where
   `minimald` cannot run natively: it boots a Linux microVM via libkrun
   (Hypervisor.framework on macOS, KVM on Linux), supervises its lifecycle, and
@@ -205,10 +206,13 @@ Notable crates, in roughly the order the build pipeline drives them:
 | `mctx` | shared | Top-level 'minimal context' API tying configuration, decoding, graph, and cache together. |
 | `mfile` | build | Finding and reading the `minimal.toml` file. |
 | `minimal` | session | The `min` session CLI, which pairs with and talks to `minimald`. |
+| `minimal-client` | session | SSH client transport to `minimald` over the UDS bridge, shared by `min` and the TUI. |
+| `minimal-tui` | session | `min dash`: the session-manager TUI (ratatui/crossterm, Elm-style loop). |
 | `minimald` | session | The session daemon: an SSH server hosting sessions and task/sandbox executions. |
-| `minimald-rpc` | session | Wire contract for `minimald`'s oneshot SSH RPCs. |
+| `minimald-rpc` | session | Wire contract for `minimald`'s oneshot SSH RPCs and for the exec channel's request vocabulary. |
 | `minvmd` | session | Host daemon that boots Linux microVMs via libkrun and bridges host UDS to in-VM vsock. |
 | `mip` | build | The Minimal package/build CLI. |
+| `mlog` | shared | JSON file-log layer both `minimald` and `minvmd` write through; one definition of the on-disk log format. |
 | `op` | build | Complex operations over the graph and packages (builds, cache object construction). |
 | `orchestrator` | build | Runtime orchestration of builds behind a pluggable `Backend`. |
 | `ot` | shared | Operation tracking for progress rendering (render-agnostic core + drivers). |

@@ -495,6 +495,48 @@ impl io::Write for StdoutWriter {
     }
 }
 
+/// A writer to stderr which coordinates with progress-bar drawing by
+/// suspending the shared [`MultiProgress`] for the duration of each write.
+///
+/// The stderr counterpart of [`StdoutWriter`], for diagnostic output (trace
+/// logs) that must not land on stdout — stdout is reserved for a command's
+/// machine-readable payload.
+pub struct StderrWriter(MultiProgress);
+
+impl Default for StderrWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StderrWriter {
+    pub fn new() -> Self {
+        StderrWriter(global_progress())
+    }
+}
+
+impl io::Write for StderrWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.suspend(|| io::stderr().write(buf))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.suspend(|| io::stderr().flush())
+    }
+
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        self.0.suspend(|| io::stderr().write_vectored(bufs))
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.0.suspend(|| io::stderr().write_all(buf))
+    }
+
+    fn write_fmt(&mut self, fmt: std::fmt::Arguments<'_>) -> io::Result<()> {
+        self.0.suspend(|| io::stderr().write_fmt(fmt))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indicatif::ProgressDrawTarget;

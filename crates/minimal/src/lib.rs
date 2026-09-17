@@ -21,6 +21,13 @@ pub mod config;
 pub mod diag;
 pub mod dirs;
 use minimal_client::file_upload;
+// The version gate lives in `minimal-client`, next to the transport it guards,
+// so the dashboard's activation path (`minimal-tui`, which cannot depend on
+// this crate) gates on the same wording and the same override.
+// `ensure_version_reported` asserts a build a reply already carried;
+// `ensure_version_match` is the round-trip form, for paths with no first RPC
+// of their own to carry it.
+use minimal_client::{ensure_version_match, ensure_version_reported, version_assertion};
 pub mod git_remote;
 pub mod loadouts;
 pub mod prompt;
@@ -192,6 +199,12 @@ pub enum SessionCommand {
     Attach(AttachArgs),
     /// Execute a command in an existing session
     Exec(ExecArgs),
+    /// Run a declared task in an existing session
+    ///
+    /// The task runs in the named session's context, serviced by the daemon —
+    /// the counterpart to `min task run <task>`, which composes a task session
+    /// of its own instead of reusing one you already have.
+    Run(SessionRunArgs),
     /// Destroy (terminate) a session
     Destroy(DestroyArgs),
     /// Rename an existing session
@@ -254,8 +267,22 @@ pub struct ExecArgs {
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Command to execute in the session context
+    ///
+    /// A single argument is a shell command, run by the session's shell with
+    /// its pipes, globs and `$VAR` intact: `min session exec s 'echo $PWD'`.
+    /// Several arguments are an argv, quoted so the session sees exactly the
+    /// words you typed: `min session exec s sh -c 'echo A B'`.
     #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionRunArgs {
+    /// Session identifier (UUID or session name).
+    #[arg(add = completion::session_completer())]
+    pub session: String,
+    /// Name of a task declared in the session project's minimal.toml
+    pub task: String,
 }
 
 #[derive(Debug, Args)]
@@ -620,7 +647,7 @@ pub struct DestroyArgs {
 
 #[derive(Debug, Args)]
 pub struct StopArgs {
-    /// Force shutdown even if active sessions exist
+    /// Force shutdown even if a session is mid-create or still holds a host handle (even a dead one)
     #[arg(long, short, default_value_t = false)]
     pub force: bool,
 }
@@ -785,6 +812,7 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SessionCommand::Activate(args) => cmd_activate(&cli.global_args, args).await,
             SessionCommand::Attach(args) => cmd_attach(&cli.global_args, args).await,
             SessionCommand::Exec(args) => cmd_exec(&cli.global_args, args).await,
+            SessionCommand::Run(args) => cmd_session_run(&cli.global_args, args).await,
             SessionCommand::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
             SessionCommand::Rename(args) => cmd_rename(&cli.global_args, args).await,
             SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
@@ -941,15 +969,21 @@ async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     let mut client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
+    // Connects directly rather than through `connect_daemon` (it needs `sock`
+    // for the attach hand-off), so the gate is applied by hand — this path can
+    // end in an activation just as `min session activate` does. It rides on the
+    // `ListSessions` this path had to send anyway; nothing here spends a round
+    // trip on the version alone.
+    let listed = list_sessions_version_gated(&mut client).await?;
 
-    match resolve_smart_attach(&mut client, global).await? {
+    match resolve_smart_attach(&listed.sessions, global)? {
         SmartAttach::Attach(entry) => {
             tracing::info!(
                 session_id = %entry.id,
                 session_name = ?entry.name,
                 "found session"
             );
-            session_via_ssh(&sock, entry.id, vec![]).await
+            session_via_ssh(&sock, entry.id, None, global.config_dir.as_deref()).await
         }
         // Two ways to land on create-and-attach: no sessions exist at all
         // (first run), or the ambiguity picker's `+ Create a new session`
@@ -1094,6 +1128,60 @@ fn entry_handle(entry: &minimald_rpc::ListSessionsEntry) -> String {
     }
 }
 
+/// Warn when the daemon already tracks a session for `target`.
+///
+/// Activating a path that already has a session mints a second, independent
+/// one; bare `min` from that directory is then ambiguous between them. The
+/// activation still proceeds — this only surfaces the foot-gun the caller
+/// would otherwise hit silently, and points at `attach` as the way to reuse
+/// the existing session. Pure, so the message is unit-testable.
+fn duplicate_session_warning(
+    entries: &[minimald_rpc::ListSessionsEntry],
+    target: &paths::HostAbsPath,
+) -> Option<String> {
+    // When several sessions track the same path, prefer an `Active` one: it is
+    // the only status `attach` accepts, so recommending it (rather than the
+    // first match, which may be `Pending`/`Materializing`) points the user at a
+    // session they can actually reuse. Fall back to the first match when none is
+    // active, so the "still being created; wait" guidance still fires.
+    let existing = entries
+        .iter()
+        .filter(|e| e.project_path.as_ref() == Some(target))
+        .find(|e| e.status == sessions::SessionStatus::Active)
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|e| e.project_path.as_ref() == Some(target))
+        })?;
+    let handle = entry_handle(existing);
+    let lead = format!(
+        "warning: a session already exists for this path ({handle}); activating \
+         creates a second one, leaving bare `min` here ambiguous between them."
+    );
+    // Only point at `attach` for a session it will actually accept. Attach
+    // refuses anything not yet `Active` (see `sessions::SessionStatus`), so for
+    // a `Pending`/`Materializing` duplicate the reuse command would fail
+    // immediately — say to wait instead. When we do suggest it, use a key
+    // `SessionLookup::parse` can resolve: a name matches by name and the full id
+    // parses as a UUID, but the short unnamed handle would parse as a
+    // nonexistent name and the attach lookup would miss.
+    match existing.status {
+        sessions::SessionStatus::Active => {
+            let key = existing
+                .name
+                .clone()
+                .unwrap_or_else(|| existing.id.to_string());
+            Some(format!(
+                "{lead} To reuse it instead: min session attach {key}"
+            ))
+        }
+        _ => Some(format!(
+            "{lead} The existing session is still being created; wait for it to \
+             become active, then reuse it instead of creating a second."
+        )),
+    }
+}
+
 /// Abbreviate a home-prefixed path to `~`/`~/...` for display; any other
 /// path renders absolute, unchanged.
 fn display_with_home_tilde(path: &camino::Utf8Path, home: Option<&camino::Utf8Path>) -> String {
@@ -1104,8 +1192,32 @@ fn display_with_home_tilde(path: &camino::Utf8Path, home: Option<&camino::Utf8Pa
     }
 }
 
-/// Connect to the daemon, resolving the socket path from global args.
+/// Connect to the daemon, resolving the socket path from global args, and
+/// refuse to proceed against a daemon of a different build
+/// ([`ensure_version_match`]).
+///
+/// Costs a `GetVersion` round trip, which is why the paths that care — the
+/// activation, and the attach/exec hand-offs — do not come through here: they
+/// fold the assertion into the RPC they were already sending. This stays the
+/// safe default for the rest, whose first call differs from one command to the
+/// next and none of which is hot.
 pub async fn connect_daemon(global: &GlobalArgs) -> Result<client::Client, anyhow::Error> {
+    let mut client = connect_daemon_unchecked(global).await?;
+    ensure_version_match(&mut client).await?;
+    Ok(client)
+}
+
+/// [`connect_daemon`] without the `GetVersion` gate.
+///
+/// Two kinds of caller. The commands that must keep working *because* the pair
+/// is skewed — `min stop` is the recovery the gate's own message prescribes, so
+/// gating it would leave the operator with no way out. And the activation path,
+/// which *is* gated, just not from here: its `CreateSession` carries the
+/// assertion itself, so routing it through [`connect_daemon`] would only add
+/// the round trip this connector exists to skip.
+pub(crate) async fn connect_daemon_unchecked(
+    global: &GlobalArgs,
+) -> Result<client::Client, anyhow::Error> {
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
         .context("Failed to resolve daemon socket path")?;
 
@@ -1169,16 +1281,64 @@ async fn resolve_session(
     client: &mut client::Client,
     session: &str,
 ) -> Result<sessions::Record, anyhow::Error> {
+    let resp = get_session_record(client, session).await?;
+    named_record(resp.record, session)
+}
+
+/// [`resolve_session`] for the paths that must refuse a version-skewed daemon:
+/// the same lookup, with the build it reports asserted before the record is
+/// used for anything.
+///
+/// The lookup is the first RPC `min session attach`, `min session exec`,
+/// `min session setup-zed`, and `min ssh-forward` make, so the gate rides on
+/// its reply rather than on a `GetVersion` sent ahead of it — an activation
+/// must not pay a round trip for a check the calls it already makes can carry
+/// (#1251). Ordered so the skew is reported ahead of a "no session found":
+/// against the wrong daemon, the name is the less useful of the two answers.
+async fn resolve_session_version_gated(
+    client: &mut client::Client,
+    session: &str,
+) -> Result<sessions::Record, anyhow::Error> {
+    let resp = get_session_record(client, session).await?;
+    ensure_version_reported(resp.daemon_version.as_deref())?;
+    named_record(resp.record, session)
+}
+
+/// The `GetSessionRecord` round trip both resolvers share.
+async fn get_session_record(
+    client: &mut client::Client,
+    session: &str,
+) -> Result<minimald_rpc::GetSessionRecordResponse, anyhow::Error> {
     use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
     let lookup: GetSessionRecordRequest = SessionLookup::parse(session).into();
-    let resp = client
+    client
         .oneshot_rpc::<GetSessionRecord>(lookup)
         .await
-        .context("GetSessionRecord RPC failed")?;
-    match resp.record {
-        Some(r) => Ok(r),
-        None => bail!("No session found matching '{session}'"),
-    }
+        .context("GetSessionRecord RPC failed")
+}
+
+/// Unwrap a looked-up record, naming what was asked for when nothing matched.
+fn named_record(
+    record: Option<sessions::Record>,
+    session: &str,
+) -> Result<sessions::Record, anyhow::Error> {
+    record.ok_or_else(|| anyhow::anyhow!("No session found matching '{session}'"))
+}
+
+/// `ListSessions` with the daemon's build asserted off the same reply, for the
+/// paths that go on to attach or activate. See
+/// [`resolve_session_version_gated`] for why the gate rides here rather than on
+/// a `GetVersion` of its own.
+async fn list_sessions_version_gated(
+    client: &mut client::Client,
+) -> Result<minimald_rpc::ListSessionsResponse, anyhow::Error> {
+    use minimald_rpc::ListSessions;
+    let resp = client
+        .oneshot_rpc::<ListSessions>(())
+        .await
+        .context("ListSessions RPC failed")?;
+    ensure_version_reported(resp.daemon_version.as_deref())?;
+    Ok(resp)
 }
 
 /// Bidirectionally pipe stdio to a daemon UDS socket.
@@ -1202,17 +1362,43 @@ pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyho
         .await
         .with_context(|| format!("connect to {}", socket_path))?;
 
+    proxy_bridge(stream, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// Bridge proxy stdio to the daemon socket until either side closes.
+///
+/// The socket half (`from_sock`) reaching EOF means the daemon has torn the
+/// socket down; returning then — instead of waiting on stdin, which the
+/// driving `ssh` holds open indefinitely — is what keeps the proxy from
+/// lingering against a dead socket. When stdin closes first, its write half
+/// is shut down and any remaining daemon output is drained before exit.
+async fn proxy_bridge<I, O>(
+    stream: tokio::net::UnixStream,
+    mut stdin: I,
+    mut stdout: O,
+) -> Result<(), anyhow::Error>
+where
+    I: tokio::io::AsyncRead + Unpin,
+    O: tokio::io::AsyncWrite + Unpin,
+{
     let (mut rx, mut tx) = stream.into_split();
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
 
     let to_sock = async {
         tokio::io::copy(&mut stdin, &mut tx).await?;
         tx.shutdown().await
     };
     let from_sock = tokio::io::copy(&mut rx, &mut stdout);
+    tokio::pin!(from_sock);
 
-    tokio::try_join!(to_sock, from_sock).context("proxy")?;
+    tokio::select! {
+        res = &mut from_sock => {
+            res.context("proxy")?;
+        }
+        res = to_sock => {
+            res.context("proxy")?;
+            from_sock.await.context("proxy")?;
+        }
+    }
     Ok(())
 }
 
@@ -1275,6 +1461,7 @@ pub async fn cmd_dash(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         loadouts::compose_user_contribution(active, user_policy, compose_options, true)?;
     minimal_tui::run(minimal_tui::DashOptions {
         minimal_dir: global.minimal_dir.clone(),
+        config_dir: global.config_dir.clone(),
         contribution,
     })
     .await
@@ -1292,8 +1479,37 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
         .await
         .context("ListSessions RPC failed")?;
 
+    // On stderr, and outside `format_ls`: every output mode should carry a
+    // fault this severe — `--raw` most of all, since a script parsing bare ids
+    // is exactly what will go on using hostnames that no longer resolve — and
+    // stdout stays clean for the parser either way.
+    warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref());
+    warn_if_mtls_proxy_down(resp.mtls_proxy_unavailable.as_deref());
     format_ls(&mut std::io::stdout(), &args, &resp)?;
     Ok(())
+}
+
+/// Tells the user that `<name>.local.min.internal` will not resolve, and why.
+///
+/// The daemon keeps serving without its host-side proxy, so nothing else the
+/// user sees is different: sessions activate, exec works, the list prints. The
+/// only other trace is a `warn!` in the daemon log, which is not where someone
+/// watching curl fail is looking (gominimal/inbox#560).
+fn warn_if_hostname_routing_down(reason: Option<&str>) {
+    if let Some(reason) = reason {
+        eprintln!("warning: session hostnames will not route: {reason}");
+    }
+}
+
+/// Tells the user the mTLS reverse proxy is not serving, and why.
+///
+/// Kept separate from [`warn_if_hostname_routing_down`] so the two faults read
+/// as what they are: hostnames failing to resolve and TLS termination being
+/// absent are different problems with different fixes.
+fn warn_if_mtls_proxy_down(reason: Option<&str>) {
+    if let Some(reason) = reason {
+        eprintln!("warning: the mTLS reverse proxy is not serving: {reason}");
+    }
 }
 
 /// Format the session list for the given output mode. Split from
@@ -1515,6 +1731,7 @@ async fn drive_pending_to_active(
     policy: sessions::core::policy::UserPolicy,
     options: sessions::core::compose::ComposeOptions,
     hooks: &dyn sessions::core::hooks::PolicyHooks,
+    project_dir: &camino::Utf8Path,
 ) -> Result<
     (
         sessions::SessionId,
@@ -1528,7 +1745,13 @@ async fn drive_pending_to_active(
         Ok(v) => v,
         Err(e) => {
             send_abort(client, session_id).await;
-            bail!("Composition gating failed: {e}");
+            // Declining at the prompt is not a broken project: only a
+            // genuine compose failure gets the directory-led message.
+            use sessions::core::compose::ComposeError;
+            match e {
+                ComposeError::Aborted | ComposeError::Denied { .. } => bail!("{e}"),
+                _ => bail!(composition_failure_message(project_dir, &e.to_string())),
+            }
         }
     };
     // Extract the approved-patch destinations before submit consumes
@@ -1667,6 +1890,15 @@ async fn upload_and_finalize(
                     Some(d) => eprintln!("Ran activation hook from {}: {d}", hook.declared_by),
                     None => eprintln!("Ran activation hook from {}", hook.declared_by),
                 }
+                // The description is an author-supplied label; what the
+                // hook actually said is its captured output. Echo it to
+                // stderr — stdout is reserved for the bare session id.
+                if !hook.output.is_empty() {
+                    eprint!("{}", hook.output);
+                    if !hook.output.ends_with('\n') {
+                        eprintln!();
+                    }
+                }
             }
             Ok(())
         }
@@ -1716,6 +1948,9 @@ fn arm_activation_interrupt(
             return;
         }
         eprintln!("\nAborting activation; cleaning up session {session_id}…");
+        // Deliberately not version-gated: this is the cleanup half of an
+        // activation the gate already cleared, and a cleanup that refuses to
+        // run is the orphaned session #1251 is about.
         if let Ok(sock) = sock
             && let Ok(mut client) = client::Client::connect(&sock).await
         {
@@ -1793,7 +2028,14 @@ fn offer_mfile_scaffold(
             .build()
             .map_err(|e| anyhow::anyhow!("{e}"))?
     };
-    run_init_flow(config, false, false)
+    // stderr, unlike `cmd_init`: this scaffold runs inside `min activate`,
+    // whose stdout is reserved for the bare session id that scripted callers
+    // read (`id=$(min activate)`). A result line on stdout here would land
+    // ahead of that id and corrupt the capture.
+    if let Some(line) = run_init_flow(config, false, false)?.result_line() {
+        eprintln!("{line}");
+    }
+    Ok(())
 }
 
 /// Resolves the directory whose tree should be uploaded as the session
@@ -1835,6 +2077,20 @@ fn project_lifecycle_hook_count(root: &camino::Utf8Path) -> usize {
     }
 }
 
+/// The user-facing text for a session that could not be composed, by
+/// either route: a refused `ConfigureLoadout` or failed gating of what it
+/// sent back. The underlying error names an internal step the caller never
+/// asked for, so the directory leads and that text follows as the only
+/// diagnostic there is. Shared with `min task run` (`crate::task`), which
+/// creates a session through the same two steps.
+pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error: &str) -> String {
+    format!(
+        "Cannot start a session for {project_dir}: composing a session environment from \
+         that directory's project configuration failed, so no session was activated. Fix \
+         the configuration there, then re-run.\n\ncause: {error}"
+    )
+}
+
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     activate_session(global, args, true).await
@@ -1867,10 +2123,6 @@ async fn activate_session(
     let abs_path =
         paths::HostAbsPath::try_new(utf8_path.clone()).context("Invalid project path")?;
 
-    if offer_scaffold {
-        offer_mfile_scaffold(&utf8_path, global)?;
-    }
-
     let mut port_mappings = Vec::with_capacity(args.ingress.len());
     for spec in &args.ingress {
         let mapping = parse_ingress_mapping(spec)?;
@@ -1899,7 +2151,7 @@ async fn activate_session(
     // connection context; the client doesn't send it.
     let config = minimald_rpc::SessionConfig {
         name: Some(session_name),
-        project_path: abs_path,
+        project_path: abs_path.clone(),
         network: args.network.into(),
         policy,
         hooks_enabled: !args.no_hooks,
@@ -1917,6 +2169,14 @@ async fn activate_session(
     let compose_options = loadouts::compose_options_from_config(&cfg);
     let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
     let active = loadouts::resolve_active_loadouts(selection, &cfg, global)?;
+
+    // Scaffold-offer a missing `minimal.toml` only after loadouts resolve:
+    // a bad `--loadout` must error before anything prints, so the user is
+    // never told the session is proceeding and then that it is not.
+    if offer_scaffold {
+        offer_mfile_scaffold(&utf8_path, global)?;
+    }
+
     if !active.loadouts.is_empty() {
         let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
         eprintln!("Applying loadouts: {}", names.join(", "));
@@ -1930,8 +2190,7 @@ async fn activate_session(
     // touches the daemon: a mistyped path, a symlinked script, or a
     // missing loadout script directory should fail here, on this
     // machine, rather than after a session exists on the daemon.
-    let hook_scripts =
-        loadouts::stage_loadout_hook_scripts(&active, global, &utf8_path, !args.no_hooks)?;
+    let hook_scripts = loadouts::stage_loadout_hook_scripts(&active, &abs_path, !args.no_hooks)?;
 
     // Same idea for the *project's* hooks, which the daemon composes from
     // the uploaded mfile and which therefore never pass through the
@@ -1939,7 +2198,7 @@ async fn activate_session(
     // its own scripts — but the checks a staging pass would have made are
     // still worth making on this machine, before a session exists.
     if !args.no_hooks {
-        loadouts::check_project_hooks(&utf8_path)?;
+        loadouts::check_project_hooks(&abs_path)?;
     }
 
     // The daemon runs the composition's `on_activate` hooks inside
@@ -1975,7 +2234,50 @@ async fn activate_session(
             file_upload::is_empty_or_home(root.as_std_path(), std::env::home_dir().as_deref())
         });
 
-    let mut client = connect_daemon(global).await?;
+    // Deliberately not `connect_daemon`: this path's version gate travels on
+    // the `CreateSession` below rather than on a `GetVersion` sent ahead of it.
+    // Activation is the hot path #1251's gate landed on, and it must not pay a
+    // round trip for a check its own first RPC can make.
+    let mut client = connect_daemon_unchecked(global).await?;
+
+    // Warn before minting a second session for a path that already has one:
+    // the duplicate leaves bare `min` from this directory ambiguous between
+    // them. Advisory only — a listing failure (ordinary transport or
+    // daemon-side error) must not block activation, so the duplicate check is
+    // skipped on error. But `oneshot_rpc` reuses one `russh` handle, and a
+    // transport-level listing failure can close the shared connection, which
+    // would then break the `CreateSession` channel below; so on any listing
+    // error, reconnect before creation. A benign daemon-side error leaves the
+    // old connection usable and the reconnect is merely a no-op cost on the
+    // rare failure path — the happy path still pays no extra round trip. The
+    // hard version gate is unaffected: `CreateSession` below carries its own
+    // `must_match_version`, so a version-skewed daemon is still refused there
+    // even when this enumeration is skipped.
+    match list_sessions_version_gated(&mut client).await {
+        Ok(existing_sessions) => {
+            if let Some(warning) =
+                duplicate_session_warning(&existing_sessions.sessions, &config.project_path)
+            {
+                eprintln!("{warning}");
+            }
+        }
+        Err(_) => {
+            // The listing failed. A transport-level closure can leave the
+            // shared `russh` handle unusable, which would then break the
+            // `CreateSession` channel below, so try to reconnect. But a
+            // daemon-side listing error closes only the RPC channel and leaves
+            // the SSH connection intact — so if the reconnect itself fails,
+            // keep the original client and let `CreateSession` proceed on it
+            // rather than aborting activation outright. `CreateSession` carries
+            // its own hard version gate and surfaces a clear error if the
+            // connection really is dead, so retaining the original client can
+            // only help the daemon-side-error case and never regresses the
+            // transport-closure case.
+            if let Ok(reconnected) = connect_daemon_unchecked(global).await {
+                client = reconnected;
+            }
+        }
+    }
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
@@ -1991,6 +2293,11 @@ async fn activate_session(
         let resp = client
             .oneshot_rpc::<CreateSession>(CreateSessionRequest {
                 config: config.clone(),
+                // The version gate: a daemon of another build refuses this
+                // call outright, before it has allocated anything to tear
+                // down. `None` under the skew override, which is what lets an
+                // operator proceed.
+                must_match_version: version_assertion(),
             })
             .await
             .context("CreateSession RPC failed")?;
@@ -2006,6 +2313,15 @@ async fn activate_session(
             }
         }
     };
+    // The other half of the gate: a daemon old enough to predate
+    // `must_match_version` ignored the assertion instead of answering it, and
+    // says so by echoing no version at all. Being older than the field is
+    // itself proof of a skew, so refuse here — still before the upload, the
+    // loadout, and the finalize that #1251 died at, and with the session left
+    // unfinalized for the daemon to reap when this connection drops.
+    ensure_version_reported(created.daemon_version.as_deref())?;
+    warn_if_hostname_routing_down(created.hostname_routing_unavailable.as_deref());
+    warn_if_mtls_proxy_down(created.mtls_proxy_unavailable.as_deref());
     let id = created.id;
 
     // From here the session exists on the daemon in an unfinalized state.
@@ -2044,17 +2360,19 @@ async fn activate_session(
                 eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
             }
             // Guard against accidentally uploading a non-VCS directory
-            // (e.g. `~`). A VCS root uploads unconditionally. For a non-VCS
-            // root an interactive caller gets the confirm (default No); a
-            // headless caller (CI, pipes, agents, `--no-prompt`,
-            // `--no-input`) can't be asked, so it skips the upload with a
-            // warning rather than silently shipping a directory nobody
-            // confirmed — `--sync tarball` (via `sync_explicit`) is the
+            // (e.g. `~`). A VCS root, or a directory carrying a
+            // `minimal.toml` (a declared project), uploads unconditionally.
+            // For an undeclared non-VCS root an interactive caller gets the
+            // confirm (default No); a headless caller (CI, pipes, agents,
+            // `--no-prompt`, `--no-input`) can't be asked, so it skips the
+            // upload with a warning rather than silently shipping a directory
+            // nobody confirmed — `--sync tarball` (via `sync_explicit`) is the
             // escape hatch that force-uploads it anyway (#770).
             let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
             let should_upload = match file_upload::upload_gate(
                 file_upload::is_vcs_root(upload_root.as_std_path()),
                 sync_explicit,
+                project_has_mfile(&upload_root),
                 headless,
             ) {
                 file_upload::UploadGate::Upload => true,
@@ -2078,8 +2396,8 @@ async fn activate_session(
                         );
                     }
                     eprintln!(
-                        "warning: {upload_root} is not a version control repository root; \
-                         skipping file upload (pass --sync tarball to upload anyway)"
+                        "{}",
+                        file_upload::skipped_upload_warning(upload_root.as_std_path())
                     );
                     false
                 }
@@ -2136,8 +2454,10 @@ async fn activate_session(
         .context("ConfigureLoadout RPC failed")?;
     let configured = match configured {
         minimald_rpc::Errorable::Ok(r) => r,
+        // Bails before the `println!("{id}")` below: a session that cannot
+        // compose never puts an id on stdout for a script to capture.
         minimald_rpc::Errorable::Err { error } => {
-            bail!("ConfigureLoadout failed: {error}");
+            bail!(composition_failure_message(&utf8_path, &error));
         }
     };
     // The daemon may finalize immediately (`Ready`) or ask the
@@ -2168,7 +2488,11 @@ async fn activate_session(
                 Ok((verdict, _final_policy)) => verdict,
                 Err(e) => {
                     send_abort(&mut client, session_id).await;
-                    bail!("Composition gating failed: {e}");
+                    // The route an activation actually reaches today: the
+                    // daemon routes project config back for gating, so a
+                    // project it cannot compose surfaces here rather than as
+                    // the `Errorable::Err` above.
+                    bail!(composition_failure_message(&utf8_path, &e.to_string()));
                 }
             };
             let summary = hooks.into_summary();
@@ -2202,6 +2526,7 @@ async fn activate_session(
                 user_policy,
                 compose_options,
                 &hooks,
+                &utf8_path,
             )
             .await;
             if let Ok((_, _, ref approved)) = result {
@@ -2301,13 +2626,20 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
     let mut client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
-
+    // Connects directly rather than through `connect_daemon` (it needs `sock`
+    // for the ssh hand-off), so the gate is applied by hand — with no session
+    // named, this path creates one, and a skewed activation is #1251 exactly.
+    // Both arms below gate on the build the daemon reports on the lookup they
+    // were already making, so the gate costs no round trip of its own.
     let (id, name) = match args.session {
         Some(ref s) => {
-            let r = resolve_session(&mut client, s).await?;
+            let r = resolve_session_version_gated(&mut client, s).await?;
             (r.id, r.name)
         }
-        None => match resolve_smart_attach(&mut client, global).await? {
+        None => match resolve_smart_attach(
+            &list_sessions_version_gated(&mut client).await?.sessions,
+            global,
+        )? {
             SmartAttach::Attach(entry) => (entry.id, entry.name),
             SmartAttach::CreateForCwd => return activate_new_for_attach(global).await,
             SmartAttach::NoSessions => {
@@ -2322,7 +2654,7 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
         "found session"
     );
 
-    session_via_ssh(&sock, id, vec![]).await
+    session_via_ssh(&sock, id, None, global.config_dir.as_deref()).await
 }
 
 /// Executes a command in an existing session.
@@ -2338,36 +2670,80 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
     let mut client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
-
-    let r = resolve_session(&mut client, &args.session).await?;
+    // Gated by hand for the same reason as `cmd_attach`: this hands off into a
+    // live session (the daemon mints the exec channel and runs the attach
+    // hooks around it), which is not something to drive on a skewed pair. The
+    // gate rides on the lookup's reply — no `GetVersion` ahead of it.
+    let r = resolve_session_version_gated(&mut client, &args.session).await?;
     tracing::info!(
         session_id = %r.id,
         session_name = ?r.name,
         "found session"
     );
 
-    session_via_ssh(&sock, r.id, args.command).await
+    session_via_ssh(
+        &sock,
+        r.id,
+        minimal_client::attach::remote_command(&args.command),
+        None,
+    )
+    .await
+}
+
+/// Runs a task declared by the session's project, in that session.
+///
+/// The daemon services this itself rather than handing it to the session's
+/// shell, so the task composes against the session's context. Named on the wire
+/// as [`minimald_rpc::exec::ExecRequest::TaskRun`]; nothing is inferred from the
+/// text, which is what lets a task share a name with a program on `PATH`.
+pub async fn cmd_session_run(
+    global: &GlobalArgs,
+    args: SessionRunArgs,
+) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .context("Failed to resolve daemon socket path")?;
+
+    let mut client = client::Client::connect(&sock)
+        .await
+        .context("Failed to connect to minimald")?;
+    // Gated by hand for the same reason as `cmd_exec`: this hands off into a
+    // live session, which is not something to drive on a skewed pair.
+    let r = resolve_session_version_gated(&mut client, &args.session).await?;
+    tracing::info!(
+        session_id = %r.id,
+        session_name = ?r.name,
+        task = %args.task,
+        "found session"
+    );
+
+    session_via_ssh(
+        &sock,
+        r.id,
+        Some(minimald_rpc::exec::ExecRequest::TaskRun(args.task).encode()),
+        None,
+    )
+    .await
 }
 
 /// Resolve a session to attach to when the user supplied no explicit session
-/// reference. Lists sessions, matches against the current working directory,
-/// and either attaches directly (unambiguous), opens the interactive picker
-/// (ambiguous), or errors (ambiguous but non-interactive).
+/// reference. Matches an already-fetched session list against the current
+/// working directory, and either attaches directly (unambiguous), opens the
+/// interactive picker (ambiguous), or errors (ambiguous but non-interactive).
+///
+/// Takes the list rather than fetching it so its two callers can assert the
+/// daemon's build off the `ListSessions` reply — before the picker blocks on a
+/// human, not after.
 ///
 /// Returns [`SmartAttach::NoSessions`] when no sessions exist at all, which
 /// `min session attach` reports as an error pointing at `min session activate`.
-async fn resolve_smart_attach(
-    client: &mut client::Client,
+fn resolve_smart_attach(
+    sessions: &[minimald_rpc::ListSessionsEntry],
     global: &GlobalArgs,
 ) -> Result<SmartAttach, anyhow::Error> {
-    use minimald_rpc::ListSessions;
-
-    let resp = client
-        .oneshot_rpc::<ListSessions>(())
-        .await
-        .context("ListSessions RPC failed")?;
     let cwd = attach::cwd_host_path(global)?;
-    match attach::resolve_for_attach(&resp.sessions, &cwd) {
+    match attach::resolve_for_attach(sessions, &cwd) {
         attach::SmartResolve::NoSessions => Ok(SmartAttach::NoSessions),
         attach::SmartResolve::Attach(entry) => {
             // Unambiguous auto-resolve: the operator never chose this session,
@@ -2456,20 +2832,34 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
 /// Split from [`cmd_attach`] so the activate-then-attach chain and the
 /// smart-resolution picker can attach without re-resolving an entry they
 /// already hold.
+///
+/// The interactive path (no `wire`) negotiates the configurable session
+/// keys from `config_dir` so the daemon adopts the user's detach/forward
+/// chord for that channel; the exec path (`wire` set) has no detach
+/// and sends none.
 async fn session_via_ssh(
     sock: &std::path::Path,
     id: sessions::SessionId,
-    command: Vec<String>,
+    wire: Option<String>,
+    config_dir: Option<&std::path::Path>,
 ) -> Result<(), anyhow::Error> {
     // The command itself lives in minimal-client, shared with the dash TUI's
-    // suspend-attach-resume flow.
-    let mut ssh = minimal_client::attach::attach_command(sock, id, &command)?;
+    // suspend-attach-resume flow. The interactive path resolves the
+    // session-key config from `config_dir` and forwards it per channel; the
+    // exec path has no detach and passes `None`.
+    let session_keys = if wire.is_none() {
+        Some(minimal_client::attach::resolve_session_keys(config_dir)?)
+    } else {
+        None
+    };
+    let mut ssh =
+        minimal_client::attach::attach_command(sock, id, wire.as_deref(), session_keys.as_ref())?;
 
     // `-tt` over a *non-terminal* stdin is a trap: ssh still forces the
     // remote PTY, yet the interactive shell reading it never sees an EOF from a
     // redirected local stdin (`< /dev/null`, a pipe), so the command blocks
     // forever (#953). Fail fast instead of hanging.
-    if command.is_empty() {
+    if wire.is_none() {
         ensure_interactive_attach_tty(std::io::stdin().is_terminal())?;
 
         // The interactive path waits on ssh rather than `exec()`ing it, so this
@@ -2566,7 +2956,11 @@ pub async fn cmd_session_setup_zed(
     let mut daemon_client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
-    let record = resolve_session(&mut daemon_client, &args.session).await?;
+    // Gated: the record read here is baked into Zed's settings.json and
+    // outlives the command, so it must not be sourced from a daemon the
+    // operator is about to restart onto another build. The daemon names its
+    // build on the lookup's own reply.
+    let record = resolve_session_version_gated(&mut daemon_client, &args.session).await?;
 
     // Pin the socket explicitly rather than leaning on `min proxy`'s own
     // resolution: Zed launches the ProxyCommand from its own environment, which
@@ -3148,7 +3542,9 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     // Racy by nature: the daemon may go down between the probe and this connect
     // (or `--provider` may point the probe and the client at different backends),
     // so a connect failure is still a real error, not something to swallow.
-    let mut client = connect_daemon(global).await?;
+    // Unchecked: stopping a version-skewed daemon is exactly what the version
+    // gate tells the operator to do, so this command must never be gated by it.
+    let mut client = connect_daemon_unchecked(global).await?;
 
     use minimald_rpc::{Shutdown, ShutdownRequest};
     let resp = client
@@ -3322,8 +3718,10 @@ pub async fn cmd_ssh_forward(
     let mut daemon_client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
-
-    let record = resolve_session(&mut daemon_client, &args.session).await?;
+    // Gated: like `cmd_attach`, this hands off into a live session — the
+    // forward's server-side auth gate is keyed on wire types both builds have
+    // to agree on. Asserted off the lookup this command already makes.
+    let record = resolve_session_version_gated(&mut daemon_client, &args.session).await?;
 
     // Validate the forward spec format: local:remote_host:remote_port.
     // We accept either `local_port:host:port` (3 components, last two joined by
@@ -3477,6 +3875,31 @@ pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
     Ok(builder.build()?)
 }
 
+/// What [`run_init_flow`] did. Returned rather than printed because the two
+/// callers publish it on different streams: `min init` puts the line on
+/// stdout — it is that command's whole scriptable result — while
+/// `min activate`'s scaffold offer keeps it on stderr, where stdout carries
+/// only the session id (see [`activate_session`]).
+enum InitOutcome {
+    /// The operator declined the confirmation; nothing was written.
+    Declined,
+    /// A `minimal.toml` was created at this path.
+    Created(std::path::PathBuf),
+    /// An existing `minimal.toml` at this path was overwritten.
+    Updated(std::path::PathBuf),
+}
+
+impl InitOutcome {
+    /// The one-line result to report, or `None` when nothing was written.
+    fn result_line(&self) -> Option<String> {
+        match self {
+            Self::Declined => None,
+            Self::Created(path) => Some(format!("Created {}", path.display())),
+            Self::Updated(path) => Some(format!("Updated {}", path.display())),
+        }
+    }
+}
+
 /// Run the init flow for a given config: detect the project's stack,
 /// generate a `minimal.toml`, show the plan, prompt for confirmation,
 /// and write the file. Shared by `cmd_init` and the `cmd_activate`
@@ -3485,7 +3908,7 @@ fn run_init_flow(
     config: mctx::Config,
     skip_confirm: bool,
     force: bool,
-) -> Result<(), anyhow::Error> {
+) -> Result<InitOutcome, anyhow::Error> {
     use op::ProjectOp as _;
     let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| anyhow::anyhow!("{e}"))?;
     let plan = op::InitProject
@@ -3513,26 +3936,31 @@ fn run_init_flow(
         eprintln!();
         if !confirm("Continue?", true)? {
             eprintln!("Aborted.");
-            return Ok(());
+            return Ok(InitOutcome::Declined);
         }
     }
 
     std::fs::write(&plan.toml_path, &plan.content)
         .with_context(|| format!("writing {}", plan.toml_path.display()))?;
 
-    eprintln!(
-        "{} {}",
-        if exists { "Updated" } else { "Created" },
-        plan.toml_path.display()
-    );
-
-    Ok(())
+    Ok(if exists {
+        InitOutcome::Updated(plan.toml_path)
+    } else {
+        InitOutcome::Created(plan.toml_path)
+    })
 }
 
 /// Initialize a `minimal.toml` based on the source tree.
 pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::Error> {
     let config = build_config(global)?;
-    run_init_flow(config, args.yes, args.force).map_err(mctx::Error::Other)
+    let outcome = run_init_flow(config, args.yes, args.force).map_err(mctx::Error::Other)?;
+    // stdout: the result line is `min init`'s scriptable output, so it
+    // survives `min init > audit.log` while the preview and prompt above
+    // stay on stderr.
+    if let Some(line) = outcome.result_line() {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 /// Add packages as dependencies to the project's `minimal.toml`.
@@ -3560,11 +3988,22 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
             graph.top_levels.clone(),
             mctx::AddDepMode::TaskPackages { name: task },
         )?,
-        AddKind { session: true, .. } => ctx.add_deps(
-            &graph,
-            graph.top_levels.clone(),
-            mctx::AddDepMode::SessionPackages,
-        )?,
+        AddKind { session: true, .. } => {
+            ctx.add_deps(
+                &graph,
+                graph.top_levels.clone(),
+                mctx::AddDepMode::SessionPackages,
+            )?;
+            // The host-side add updates `minimal.toml`; unlike the
+            // in-session helper it does not install into a running session.
+            // Qualify the success line so it is not read as a live install.
+            eprintln!(
+                "Note: this updated minimal.toml; a running session is \
+                 not modified. The package will be present in sessions \
+                 activated after this change; to add it to an already-running \
+                 session, run `min add --session` from inside that session."
+            );
+        }
         _ => unreachable!(),
     }
 
@@ -3666,6 +4105,9 @@ pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         }
     };
 
+    // Deliberately not version-gated: reporting the two versions is how an
+    // operator sees a skew at all, so this must answer on a skewed pair rather
+    // than refuse — and the gate's own check is this very RPC.
     let mut client = match client::Client::connect(&sock).await {
         Ok(c) => c,
         Err(e) => {
@@ -3723,6 +4165,264 @@ mod tests {
         assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(9)), 137);
     }
 
+    /// A CLI upgraded past its daemon must be refused up front, naming both
+    /// builds and the recovery. Before #1251 the skew surfaced only at
+    /// `FinalizeSession`, by which point the activation's cleanup had already
+    /// destroyed the session it had just created.
+    #[test]
+    fn version_skew_is_reported_with_both_builds_and_a_recovery() {
+        let msg = client::version_skew_message("0.6.0", "0.5.0-dev.12.g86ce5c3a")
+            .expect("differing builds are a skew");
+        assert!(msg.contains("0.6.0"), "missing the CLI version: {msg}");
+        assert!(
+            msg.contains("0.5.0-dev.12.g86ce5c3a"),
+            "missing the daemon version: {msg}"
+        );
+        assert!(msg.contains("min stop"), "missing the recovery: {msg}");
+        assert!(
+            msg.contains(client::SKEW_OVERRIDE_VAR),
+            "missing the override: {msg}"
+        );
+    }
+
+    /// Every direct daemon connection in this crate is either version-gated or
+    /// deliberately not, and this test is where that decision is recorded.
+    ///
+    /// #1251 shipped the gate but wired it to two call sites; the rest reached
+    /// activations and live-session hand-offs ungated. A new connection is easy
+    /// to add and easy to forget, so the inventory is asserted rather than
+    /// documented: adding, removing, or un-gating one fails here and forces the
+    /// same judgement — can this path leave daemon state half-built (gate it),
+    /// or must it work *because* the pair is skewed (leave it, with a comment
+    /// saying why)?
+    #[test]
+    fn every_daemon_connection_is_classified() {
+        assert_eq!(
+            connect_site_inventory(env!("CARGO_MANIFEST_DIR")),
+            [
+                "diag/net.rs::probe_socket = ungated",
+                "lib.rs::arm_activation_interrupt = ungated",
+                "lib.rs::cmd_attach = gated",
+                "lib.rs::cmd_bare = gated",
+                "lib.rs::cmd_exec = gated",
+                "lib.rs::cmd_session_run = gated",
+                "lib.rs::cmd_session_setup_zed = gated",
+                "lib.rs::cmd_ssh_forward = gated",
+                "lib.rs::cmd_version = ungated",
+                "lib.rs::connect_daemon_unchecked = ungated",
+                "task.rs::arm_task_run_interrupt = ungated",
+            ]
+        );
+    }
+
+    /// Every `CreateSession` this crate sends states, in the request itself,
+    /// whether it asserts the daemon's build.
+    ///
+    /// The struct field makes omitting the decision a compile error; this
+    /// makes answering it "no" a visible one. Both session-creating paths
+    /// assert — they are the ones #1251 is about — and the inventory is what
+    /// stops a third from quietly passing `None`.
+    #[test]
+    fn every_create_session_asserts_the_daemon_build() {
+        assert_eq!(
+            create_site_inventory(env!("CARGO_MANIFEST_DIR")),
+            [
+                "lib.rs::activate_session = asserts",
+                "task.rs::cmd_task_run = asserts",
+            ]
+        );
+    }
+
+    /// The activation path must not spend a round trip on the version.
+    ///
+    /// That was the cost of #1251's first fix: a `GetVersion` ahead of the
+    /// create, on the one path where an extra RTT is felt. The check now rides
+    /// on the `CreateSession` the path was already sending, so the marks of
+    /// the old mechanism — `GetVersion`, `ensure_version_match`, or the
+    /// `connect_daemon` that issues it — must be absent from both creators,
+    /// and the marks of the new one present.
+    #[test]
+    fn the_activation_path_makes_no_version_round_trip() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (file, func) in [
+            ("src/lib.rs", "activate_session"),
+            ("src/task.rs", "cmd_task_run"),
+        ] {
+            let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
+            let body = function_body(&text, func)
+                .unwrap_or_else(|| panic!("{file} no longer defines {func}"));
+            for round_trip in ["GetVersion", "ensure_version_match", "connect_daemon("] {
+                assert!(
+                    !body.contains(round_trip),
+                    "{func} reintroduced a version round trip ({round_trip})"
+                );
+            }
+            assert!(
+                body.contains("must_match_version"),
+                "{func} no longer asserts its build on the create"
+            );
+            assert!(
+                body.contains("ensure_version_reported"),
+                "{func} no longer checks the build the create echoed back"
+            );
+        }
+    }
+
+    /// The code of the named free function, from its `fn` line to the next
+    /// one, with comment lines dropped — the prose here talks *about* the
+    /// mechanisms the caller is scanning for, and a rationale comment naming
+    /// `GetVersion` must not read as a call to it.
+    fn function_body(text: &str, name: &str) -> Option<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let decls = fn_decl_lines(&lines);
+        let start = decls.iter().position(|(_, n)| n == name)?;
+        let from = decls[start].0;
+        let to = decls.get(start + 1).map_or(lines.len(), |(d, _)| *d);
+        Some(
+            lines[from..to]
+                .iter()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    /// Every free-function declaration in `lines`, as `(line index, name)`.
+    fn fn_decl_lines(lines: &[&str]) -> Vec<(usize, String)> {
+        lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                let t = l.trim_start();
+                let t = t
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| t.strip_prefix("pub "))
+                    .unwrap_or(t);
+                let t = t.strip_prefix("async ").unwrap_or(t);
+                t.strip_prefix("fn ")
+                    .map(|rest| (i, rest.split(['(', '<']).next().unwrap_or("").to_string()))
+            })
+            .collect()
+    }
+
+    /// Every `.rs` file under `<crate>/src`, sorted.
+    fn crate_sources(manifest_dir: &str) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+        let src = std::path::Path::new(manifest_dir).join("src");
+        let mut files = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("crate src must be readable") {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        (src, files)
+    }
+
+    /// Attributes every line matching `needle` under `<crate>/src` to the
+    /// function containing it, labelling that function by whether its body
+    /// carries one of `markers`.
+    fn source_inventory(
+        manifest_dir: &str,
+        needle: &str,
+        markers: &[&str],
+        labels: (&str, &str),
+    ) -> Vec<String> {
+        let (src, files) = crate_sources(manifest_dir);
+        let mut sites = Vec::new();
+        for path in files {
+            let text = std::fs::read_to_string(&path).expect("source file must be readable");
+            let lines: Vec<&str> = text.lines().collect();
+            let decls = fn_decl_lines(&lines);
+            let rel = path
+                .strip_prefix(&src)
+                .expect("scanned under src")
+                .to_string_lossy()
+                .into_owned();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains(needle) {
+                    continue;
+                }
+                let (start, name) = decls
+                    .iter()
+                    .rev()
+                    .find(|(d, _)| *d < i)
+                    .cloned()
+                    .unwrap_or((0, "<top level>".to_string()));
+                let end = decls
+                    .iter()
+                    .find(|(d, _)| *d > start)
+                    .map_or(lines.len(), |(d, _)| *d);
+                let marked = lines[start..end]
+                    .iter()
+                    .any(|l| markers.iter().any(|m| l.contains(m)));
+                sites.push(format!(
+                    "{rel}::{name} = {}",
+                    if marked { labels.0 } else { labels.1 }
+                ));
+            }
+        }
+        sites.sort();
+        sites
+    }
+
+    /// Attributes every `CreateSessionRequest` construction under
+    /// `<crate>/src` to its function, and reports whether it asserts this
+    /// build.
+    fn create_site_inventory(manifest_dir: &str) -> Vec<String> {
+        // Built by concatenation so this scanner does not match itself.
+        const NEEDLE: &str = concat!("CreateSession", "Request {");
+        source_inventory(
+            manifest_dir,
+            NEEDLE,
+            &[
+                "must_match_version: version_assertion()",
+                "must_match_version: minimal_client::version_assertion()",
+            ],
+            ("asserts", "asserts nothing"),
+        )
+    }
+
+    /// Attributes every direct `Client` connection under `<crate>/src` to the
+    /// function that opens it, and reports whether that function also applies
+    /// the version gate. Source-level on purpose: the alternative is a live
+    /// daemon per call site.
+    ///
+    /// A path counts as gated whichever way it gets its answer: the
+    /// `GetVersion` round trip (`ensure_version_match`), a build a reply it was
+    /// already making carried (`ensure_version_reported`, directly or through a
+    /// `*_version_gated` lookup helper), or the assertion it puts on its own
+    /// `CreateSession`. What the inventory records is that the decision was
+    /// made, not which mechanism made it.
+    fn connect_site_inventory(manifest_dir: &str) -> Vec<String> {
+        // Built by concatenation so this scanner does not match itself.
+        const NEEDLE: &str = concat!("Client", "::connect(");
+        source_inventory(
+            manifest_dir,
+            NEEDLE,
+            &[
+                "ensure_version_match",
+                "ensure_version_reported",
+                "_version_gated(",
+                "must_match_version",
+            ],
+            ("gated", "ungated"),
+        )
+    }
+
+    /// Matching builds are the overwhelmingly common case and must cost the
+    /// operator nothing.
+    #[test]
+    fn matching_versions_are_not_a_skew() {
+        assert!(client::version_skew_message(version::VERSION, version::VERSION).is_none());
+    }
+
     /// The `Cli` command tree must stay well-formed: a malformed clap
     /// definition panics in `debug_assert`/render, not at parse time, so
     /// `min --help` (which bare `min` no longer prints, but which must keep
@@ -3769,6 +4469,117 @@ mod tests {
              Next:\n\
              \x20 min session attach --command 'min task run <task>' web\n\
              \x20 min ls --json\n"
+        );
+    }
+
+    /// A session already tracked for the target path warns with that
+    /// session's handle and the `attach` reuse hint; a path with no session
+    /// stays silent.
+    #[test]
+    fn duplicate_session_warning_flags_only_a_matching_path() {
+        let entries = vec![twin_entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            Some("/w"),
+            sessions::SessionStatus::Active,
+        )];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(warning.contains("web"), "warning names the existing handle");
+        assert!(
+            warning.contains("min session attach web"),
+            "warning points at attach for reuse"
+        );
+
+        let free = paths::HostAbsPath::try_new("/elsewhere").unwrap();
+        assert!(
+            duplicate_session_warning(&entries, &free).is_none(),
+            "an untaken path does not warn"
+        );
+    }
+
+    /// An unnamed existing session must still be reusable: the reuse hint must
+    /// carry the full id, which `SessionLookup::parse` resolves back to an id.
+    /// The short unnamed handle would parse as a nonexistent name, so the attach
+    /// lookup would miss.
+    #[test]
+    fn duplicate_session_warning_reuses_unnamed_session_by_id() {
+        let id = "019f5d0f-0a99-78b1-9165-0809440f0052";
+        let entries = vec![twin_entry(
+            id,
+            None,
+            Some("/w"),
+            sessions::SessionStatus::Active,
+        )];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(
+            warning.contains(&format!("min session attach {id}")),
+            "unnamed reuse hint carries the full id, got: {warning}"
+        );
+        // The id the hint prints must resolve through the attach lookup path.
+        assert!(
+            matches!(SessionLookup::parse(id), SessionLookup::Id(_)),
+            "the full id resolves as an id, not a name"
+        );
+    }
+
+    /// Attach refuses a `Materializing` session, so the warning must not point
+    /// at it; the duplicate is still flagged, just without an attach hint.
+    #[test]
+    fn duplicate_session_warning_skips_attach_for_materializing() {
+        let entries = vec![twin_entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            Some("/w"),
+            sessions::SessionStatus::Materializing,
+        )];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(
+            !warning.contains("min session attach"),
+            "no attach hint for a non-attachable session, got: {warning}"
+        );
+    }
+
+    /// When several sessions track the target path with mixed statuses, the
+    /// warning must recommend the `Active` one — the only status `attach`
+    /// accepts — even when a non-active match sorts first in the listing.
+    #[test]
+    fn duplicate_session_warning_prefers_active_over_pending_match() {
+        let pending_id = "019f5d0f-0a99-78b1-9165-0809440f0052";
+        let active_id = "019f5d0f-0a99-78b1-9165-0809440f0053";
+        let entries = vec![
+            twin_entry(
+                pending_id,
+                Some("mzing"),
+                Some("/w"),
+                sessions::SessionStatus::Materializing,
+            ),
+            twin_entry(
+                active_id,
+                Some("live"),
+                Some("/w"),
+                sessions::SessionStatus::Active,
+            ),
+        ];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(
+            warning.contains("min session attach live"),
+            "warning points at the active match for reuse, got: {warning}"
+        );
+        assert!(
+            !warning.contains("still being created"),
+            "an attachable active match must not print the wait guidance, got: {warning}"
         );
     }
 
@@ -4231,6 +5042,40 @@ mod tests {
         );
     }
 
+    /// `min session run <session> <task>` names both the session to run in and
+    /// the task to run, in that order — the session-scoped counterpart to
+    /// `min task run <task>`, which composes a session of its own.
+    #[test]
+    fn session_run_takes_a_session_then_a_task() {
+        let cli = Cli::try_parse_from(["min", "session", "run", "web", "build"]).unwrap();
+        let Some(Command::Session(SessionArgs {
+            command: SessionCommand::Run(a),
+        })) = cli.command
+        else {
+            panic!("expected a session run command");
+        };
+        assert_eq!(a.session, "web");
+        assert_eq!(a.task, "build");
+
+        // Both operands are required: a lone session names no task.
+        assert!(Cli::try_parse_from(["min", "session", "run", "web"]).is_err());
+        assert!(Cli::try_parse_from(["min", "session", "run"]).is_err());
+    }
+
+    /// The task reaches the daemon as a named form, so a task whose name
+    /// collides with a program on the session's `PATH` is still a task —
+    /// nothing is inferred from the text (gominimal/inbox#558).
+    #[test]
+    fn session_run_encodes_a_task_form_not_a_command() {
+        let wire = minimald_rpc::exec::ExecRequest::TaskRun("check".to_string()).encode();
+        assert_eq!(
+            minimald_rpc::exec::ExecRequest::parse(&wire),
+            Ok(minimald_rpc::exec::ExecRequest::TaskRun(
+                "check".to_string()
+            ))
+        );
+    }
+
     /// `min task run <task>` parses with `--keep` off by default; the flag
     /// and the optional path positional are accepted in any order.
     #[test]
@@ -4412,6 +5257,67 @@ mod tests {
         assert!(resolve_upload_root(path).is_err());
     }
 
+    /// A refused composition is reported in the user's terms — the
+    /// directory the activation ran from — with the daemon's own text kept
+    /// as subordinate detail rather than as the headline (#581).
+    ///
+    /// The daemon error below is the one from the report: it names an
+    /// internal package server the caller never asked for and cannot reach.
+    #[test]
+    fn composition_failure_leads_with_the_directory_not_the_daemon_step() {
+        let daemon_error = "init of minimal context: other: git command 'fetch' failed \
+                            (exit status: 128): fatal: unable to access \
+                            'http://:8898/pkgs-local.git/': Failed to connect to server";
+        let msg =
+            composition_failure_message(camino::Utf8Path::new("/home/dev/myproject"), daemon_error);
+
+        let headline = msg.lines().next().expect("a first line");
+        assert!(
+            headline.contains("/home/dev/myproject"),
+            "the headline must name the directory: {msg}"
+        );
+        assert!(
+            !headline.contains("pkgs-local.git") && !headline.contains("ConfigureLoadout"),
+            "the headline must not lead with the internal step: {msg}"
+        );
+        assert!(
+            msg.contains(daemon_error),
+            "the daemon's error is the only diagnostic and must survive: {msg}"
+        );
+    }
+
+    /// Every site that reports an uncomposable session goes through the one
+    /// helper: the refused `ConfigureLoadout` and the headless gating bail in
+    /// each creator, plus the interactive gating bail they share via
+    /// [`drive_pending_to_active`]. Asserted rather than documented — the
+    /// wording was already duplicated across the creators once, and the
+    /// interactive site was missed the first time precisely because it lives
+    /// in a third function.
+    #[test]
+    fn both_creators_share_the_composition_failure_message() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (file, func, uses) in [
+            ("src/lib.rs", "activate_session", 2),
+            ("src/task.rs", "cmd_task_run", 2),
+            ("src/lib.rs", "drive_pending_to_active", 1),
+        ] {
+            let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
+            let body = function_body(&text, func)
+                .unwrap_or_else(|| panic!("{file} no longer defines {func}"));
+            assert_eq!(
+                body.matches("composition_failure_message").count(),
+                uses,
+                "{func} must route its composition failures through the shared message"
+            );
+            for bare in ["ConfigureLoadout failed", "Composition gating failed"] {
+                assert!(
+                    !body.contains(bare),
+                    "{func} still names the internal step instead of the directory ({bare})"
+                );
+            }
+        }
+    }
+
     /// A project outside a VCS root that declares lifecycle hooks must be
     /// detected as hook-carrying, so the headless activation path refuses
     /// rather than silently dropping the hooks with the skipped tree
@@ -4572,5 +5478,39 @@ mod tests {
         cmd_stop(&global, StopArgs { force: false })
             .await
             .expect("an already-stopped daemon is the goal state, not an error");
+    }
+
+    /// A `min proxy` bridge must not outlive the daemon socket: when the daemon
+    /// tears the connection down, the proxy exits even though its stdin — held
+    /// open by the driving `ssh` — never closes. Otherwise the proxy, and the
+    /// `ssh` process feeding it, orphan against a dead socket.
+    #[tokio::test]
+    async fn proxy_exits_when_the_daemon_closes_the_socket() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("proxy.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+
+        // Stand in for the daemon: accept the proxy's connection, then drop it,
+        // the way `min stop` tears the socket down under a live proxy.
+        tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            drop(conn);
+        });
+
+        let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+
+        // Stdin that stays open with no data, the way `ssh` holds it; the other
+        // duplex half must outlive the bridge so the reader never sees EOF.
+        let (client_stdin, _ssh_stdin) = tokio::io::duplex(64);
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy_bridge(stream, client_stdin, tokio::io::sink()),
+        )
+        .await
+        .expect("proxy must exit once the socket closes, not hang on open stdin")
+        .expect("a bridge that ends on a closed socket is not an error");
     }
 }

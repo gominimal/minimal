@@ -16,7 +16,7 @@ use oci_spec::image::{
     SCHEMA_VERSION, Sha256Digest,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Seek;
 use std::str::FromStr;
 
@@ -28,7 +28,7 @@ pub(crate) struct OciImage<'a> {
     pub name: &'a str,
     pub entrypoint: Option<&'a [String]>,
     pub cmd: Option<&'a [String]>,
-    pub vars: &'a HashMap<String, String>,
+    pub vars: &'a BTreeMap<String, String>,
 }
 
 impl OciImage<'_> {
@@ -150,13 +150,12 @@ impl OciImage<'_> {
                         cb = cb.cmd(cmd.to_vec());
                     };
                     if !self.vars.is_empty() {
-                        // HashMap iteration order is random per process; env
-                        // order is part of the config blob and therefore the
-                        // image digest. Sort by key.
-                        let mut vars: Vec<_> = self.vars.iter().collect();
-                        vars.sort_by_key(|(k, _)| k.as_str());
+                        // Env order is part of the config blob and therefore
+                        // the image digest; a BTreeMap iterates in key order,
+                        // so the blob is stable from run to run.
                         cb = cb.env(
-                            vars.into_iter()
+                            self.vars
+                                .iter()
                                 .map(|(k, v)| String::from_iter([k, "=", v]))
                                 .collect::<Vec<_>>(),
                         );

@@ -5,10 +5,11 @@
 //! so the bridge logic can be exercised with a mock in tests without
 //! going through `tokio::process` or russh.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::io;
 use std::process::Stdio;
+use std::time::Duration;
 
 use futures::{
     StreamExt,
@@ -86,6 +87,25 @@ pub trait Process: Send + 'static {
 pub struct TaskExec {
     pub task: String,
     pub args: Option<args::ArgsSet>,
+    /// The task's `env_vars`, already resolved against the invoking shell
+    /// by the client and carried on the channel environment (see
+    /// [`minimald_rpc::taskenv`]). Applied over the task's own
+    /// declarations, so an `inherit` entry never reaches the daemon-side
+    /// `std::env::var` that cannot see the user's `export` (#585).
+    ///
+    /// Empty when the client sent none — an older `min`, or any caller
+    /// other than `min task run` — in which case resolution falls back to
+    /// the daemon-side path exactly as before.
+    pub env: BTreeMap<String, String>,
+    /// Names the client's `[vars] ignore` policy matched, to be removed
+    /// from the task's declarations outright.
+    ///
+    /// Omitting a name from [`Self::env`] cannot express this: the overlay
+    /// only inserts, so an omitted name keeps whatever `minimal.toml`
+    /// declared and an `inherit` among them would be resolved against the
+    /// daemon's own environment — the very indirection #585 removes. A
+    /// dropped name has to be named.
+    pub drop_env: BTreeSet<String>,
 }
 
 impl Exec for TaskExec {
@@ -166,10 +186,27 @@ async fn task_producer(
         .await
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
-        let (task, mut graph) = ctx
+        let (mut task, mut graph) = ctx
             .task(graph, &exec.task)
             .map_err(|e| io::Error::other(e.to_string()))?
             .ok_or_else(|| io::Error::other(format!("No such task: {}", exec.task)))?;
+        // Values the client resolved against the invoking shell win over the
+        // task's own declarations. That is what turns `{ inherit = true }`
+        // into something the daemon can apply: resolving it here would read
+        // *this* process's environment, which the user's `export` never
+        // reaches (#585). An entry the client did not send keeps whatever
+        // the task declared, so the daemon-side path still serves in-box
+        // `min run` and older clients.
+        // Removals first. The two sets are disjoint, so the order is not
+        // load-bearing, but reading it in policy order — drop, then apply —
+        // matches how the client decided.
+        for name in &exec.drop_env {
+            task.vars.remove(name);
+        }
+        for (name, value) in &exec.env {
+            task.vars
+                .insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
+        }
         // A task inherits its session's network isolation, through the same
         // sandbox2 `Network` seam the interactive session uses, rather than the
         // old hardcoded `HostNet` (which leaked host egress to a no-net
@@ -484,15 +521,41 @@ impl Exec for TokioExec {
     }
 }
 
+/// What to run inside the session, and whether a shell stands between the
+/// client's words and the process.
+#[derive(Debug, Clone)]
+pub enum SessionProgram {
+    /// A command line for the session's shell. The client wrote a shell
+    /// command, so quoting, globs, pipes and redirections are part of what it
+    /// means — matching what `ssh host '...'` does everywhere else.
+    Shell(String),
+    /// An argv to exec directly. Nothing re-splits these words, which is the
+    /// whole point: a shell in the middle would undo the quoting the client
+    /// already resolved. Guaranteed non-empty by
+    /// [`minimald_rpc::exec::ExecRequest::parse`].
+    Argv(Vec<String>),
+}
+
+impl SessionProgram {
+    /// The program and arguments to hand the session, resolving a shell
+    /// command into an explicit `bash -c` argv.
+    fn argv(self) -> (String, Vec<String>) {
+        match self {
+            Self::Shell(cmd) => (SESSION_SHELL.to_string(), vec!["-c".to_string(), cmd]),
+            Self::Argv(mut words) => {
+                // Non-empty by construction; `remove(0)` cannot panic.
+                let program = words.remove(0);
+                (program, words)
+            }
+        }
+    }
+}
+
 /// An [`Exec`] that runs a command *inside* the session's sandbox, joining the
 /// namespaces of the running session process.
-///
-/// `argv` is handed to the session's shell rather than split here, matching
-/// what `ssh host '...'` does everywhere else: the client wrote a shell command,
-/// and quoting, globs, pipes and redirections are part of what it means.
 #[derive(Debug, Clone)]
 pub struct SessionExec {
-    pub argv: String,
+    pub program: SessionProgram,
     /// The SSH username, needed only if the session has no host running and one
     /// has to be launched to service this request.
     pub conn_username: String,
@@ -515,9 +578,8 @@ impl Exec for SessionExec {
                 .ensure_host(self.conn_username)
                 .await
                 .map_err(|e| io::Error::other(format!("{e}")))?;
-            let command = host
-                .command_in_session(SESSION_SHELL, ["-c", &self.argv])
-                .await?;
+            let (program, args) = self.program.argv();
+            let command = host.command_in_session(&program, &args).await?;
 
             let mut command = Command::from(command);
             command
@@ -663,24 +725,51 @@ where
 }
 
 /// Drives one [`Process`] to completion: pumps `r → child stdin` and
-/// `child stdout/stderr → w/e` concurrently until both output streams
-/// hit EOF, then reaps the child and returns the SSH-encoded exit code.
+/// `child stdout/stderr → w/e` concurrently, and returns the
+/// SSH-encoded exit code once **the child exits** — not once its pipes
+/// close (gominimal/inbox#566).
 ///
-/// EOF on both stdout and stderr is the exit signal. When the child
-/// exits (or is killed), the kernel closes its stdio fds, which surfaces
-/// as EOF on our read side — so once both are drained the subsequent
-/// `process.wait()` resolves promptly. The one case this misses is a
-/// child that forks a grandchild and lets it inherit stdout/stderr;
-/// then the pipes stay open past the child's own exit and we drain
-/// until the grandchild exits too. That matches the existing semantics
-/// (drain everything before returning) and is fine for `min run` and
-/// `sh -c` usage.
+/// The two are usually the same event: when the child exits the kernel
+/// closes its stdio fds and our read side sees EOF. They come apart
+/// when the child forks a grandchild that inherits stdout/stderr and
+/// outlives it — `sh -c 'sleep 20 & echo STARTED'`. The write ends stay
+/// open, so waiting for EOF would hold the caller for as long as the
+/// grandchild lives. Note that the direct child here is the `nsenter`
+/// shim, which itself blocks in `Child::wait` on the session shell, so
+/// "the child exited" already means "the user's command finished";
+/// pipelines and foreground jobs are waited on by that shell and are
+/// unaffected.
 ///
-/// Polling the three I/O sources in a single `select!` lets a slow
-/// consumer on one side apply backpressure without starving the others.
-/// On an SSH-channel write failure we also `start_kill` the child: with
-/// no one reading its output the pipe buffer would fill, the child
-/// would block on write, and EOF (and `wait`) would never resolve.
+/// So the loop ends on the *first* of: both output streams at EOF, the
+/// child exiting, or an SSH-channel write failing. On child exit we
+/// then, in order:
+///
+/// 1. **Drain what is already buffered** ([`drain_ready`]): everything
+///    the child wrote before exiting is sitting in the pipe and still
+///    belongs to the caller. Reads stop the moment a pipe would block,
+///    so this costs nothing when there is no grandchild.
+/// 2. **Return the exit code.**
+/// 3. **Hand any still-open read end to a detached drain-and-discard
+///    task** ([`spawn_pipe_drain`]). Dropping it instead would leave
+///    the grandchild writing into a pipe with no reader — EPIPE, and
+///    SIGPIPE, which kills a detached service on its first log line.
+///
+/// The trade is that a grandchild's output after we return is silently
+/// discarded; `nohup cmd >/dev/null 2>&1 &` is the way to detach
+/// cleanly (documented in `docs/reference/cli-min.md`).
+///
+/// Polling the I/O sources in a single `select!` lets a slow consumer
+/// on one side apply backpressure without starving the others, which is
+/// why the branches stay unbiased rather than ranking `process.wait()`
+/// last. The cost is that `wait` can win a race against readable
+/// output; step 1 is what makes that harmless. Nothing is lost to the
+/// branches `select!` cancels either way: `read` is cancel-safe, and
+/// the SSH writes live in branch *handlers*, which run after the
+/// `select!` has already resolved.
+///
+/// On an SSH-channel write failure we stop and `start_kill` the child:
+/// with no one reading its output the pipe buffer would fill, the child
+/// would block on write, and `wait` would never resolve.
 ///
 /// `stdin_open` is threaded by `&mut` so once the SSH client closes
 /// stdin (EOF or read error), every subsequent child in the sequence
@@ -712,8 +801,16 @@ where
 
     let mut stdout_open = true;
     let mut stderr_open = true;
+    // Set when a write to the SSH channel fails. The channel is gone,
+    // so there is nothing left to relay and the child has to be killed
+    // rather than left to block on a pipe nobody drains.
+    let mut ssh_write_failed = false;
+    // `Some` once the child has been reaped; also the loop's exit
+    // signal, since anything still holding the pipes open past this
+    // point is a grandchild we do not wait for.
+    let mut child_exit: Option<io::Result<Option<i32>>> = None;
 
-    while stdout_open || stderr_open {
+    while (stdout_open || stderr_open) && !ssh_write_failed && child_exit.is_none() {
         tokio::select! {
             // Gated on `child_stdin.is_some()`: if the current child's
             // stdin pipe broke mid-step (write failure below) we stop
@@ -765,8 +862,7 @@ where
                                 %channel_id, error = %err,
                                 "exec: failed to forward child stdout to ssh channel; killing child",
                             );
-                            stdout_open = false;
-                            let _ = process.start_kill();
+                            ssh_write_failed = true;
                         }
                     }
                 }
@@ -787,16 +883,74 @@ where
                                 %channel_id, error = %err,
                                 "exec: failed to forward child stderr to ssh channel; killing child",
                             );
-                            stderr_open = false;
-                            let _ = process.start_kill();
+                            ssh_write_failed = true;
                         }
                     }
                 }
             }
+            // Lowest-value branch but deliberately unbiased: `select!`
+            // picks at random among ready branches, so this can win a
+            // race with pending output. That is what the post-loop
+            // `drain_ready` covers. Nothing here touches `process`, so
+            // the `&mut process` this future holds is uncontended.
+            status = process.wait() => child_exit = Some(status),
         }
     }
 
-    match process.wait().await {
+    // Nobody is reading the child's output any more, so it would wedge
+    // on a full pipe and never be reapable. Kill, then fall through to
+    // the `wait` below.
+    if ssh_write_failed {
+        let _ = process.start_kill();
+    }
+
+    // The child is gone but a grandchild may still hold the write ends.
+    // Everything the child itself wrote is already in the pipe buffer
+    // and still belongs to the caller — take it before returning.
+    if child_exit.is_some() {
+        let relayed = drain_ready(
+            &channel_id,
+            &mut child_stdout,
+            &mut stdout_open,
+            w,
+            &mut stdout_buf,
+            "stdout",
+        )
+        .await;
+        // A dead SSH channel takes stderr with it; skip the second
+        // drain rather than log the same failure twice. Neither flag is
+        // cleared — a pipe we stopped reading is exactly the one the
+        // background drain below has to keep alive.
+        if relayed {
+            drain_ready(
+                &channel_id,
+                &mut child_stderr,
+                &mut stderr_open,
+                e,
+                &mut stderr_buf,
+                "stderr",
+            )
+            .await;
+        }
+    }
+
+    // Let anything still attached see EOF on its stdin; `*stdin_open`
+    // is untouched, so the next child in the sequence still reads `r`.
+    drop(child_stdin);
+
+    // Hand off before returning: an orphan writing into a pipe whose
+    // read end we dropped takes SIGPIPE and dies. See `spawn_pipe_drain`.
+    spawn_pipe_drain(
+        channel_id.to_string(),
+        stdout_open.then_some(child_stdout),
+        stderr_open.then_some(child_stderr),
+    );
+
+    let status = match child_exit {
+        Some(status) => status,
+        None => process.wait().await,
+    };
+    match status {
         Ok(code) => code.unwrap_or(1) as u32,
         Err(err) => {
             tracing::warn!(
@@ -808,6 +962,128 @@ where
     }
 }
 
+/// How long [`drain_ready`] waits for a pipe to produce something after
+/// the child has been reaped, before concluding that whatever still
+/// holds the write end is a grandchild whose output we do not owe the
+/// caller.
+///
+/// Only paid when a grandchild really is holding the pipe: in the
+/// ordinary case EOF is already pending and the read returns at once.
+const DRAIN_GRACE: Duration = Duration::from_millis(100);
+
+/// Relays whatever `src` already has buffered to `sink`, stopping once
+/// `src` goes quiet for [`DRAIN_GRACE`].
+///
+/// Called once the child has been reaped, when a grandchild may be
+/// holding the write end open: the bytes the child wrote before exiting
+/// are still owed to the caller, but there is nothing beyond them worth
+/// waiting for.
+///
+/// The stopping condition is a short timeout rather than a single
+/// `now_or_never` poll, and that distinction is load-bearing. Tokio
+/// learns a pipe is readable from a reactor turn, so a lone poll issued
+/// on the turn where `wait()` resolved can report "would block" for a
+/// pipe that already holds the child's output — silently truncating the
+/// common `min session exec echo hi` case. Waiting for readiness
+/// instead of guessing at it costs nothing when EOF is already pending
+/// (the overwhelmingly common shape) and at most one [`DRAIN_GRACE`]
+/// when a grandchild really is holding the write end open.
+///
+/// Sets `*open = false` on EOF or a read error. Returns `false` if a
+/// write to the SSH channel failed, so the caller can stop relaying.
+async fn drain_ready<S, W>(
+    channel_id: &impl Display,
+    src: &mut S,
+    open: &mut bool,
+    sink: &mut W,
+    buf: &mut [u8],
+    stream_name: &'static str,
+) -> bool
+where
+    S: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    // Bound the drain: a grandchild writing faster than we relay could
+    // otherwise keep every read succeeding forever and reintroduce the
+    // very hang this function exists to end. 64 rounds of an 8 KiB
+    // buffer is many times a pipe's capacity, so a real backlog always
+    // fits.
+    const MAX_ROUNDS: usize = 64;
+
+    for _ in 0..MAX_ROUNDS {
+        if !*open {
+            return true;
+        }
+        // An elapsed timeout means the pipe went quiet: whatever is
+        // still holding the write end is not the child we just reaped,
+        // so its output is not ours to relay. `read` is cancel-safe, so
+        // losing the race here drops no bytes.
+        let Ok(read_res) = tokio::time::timeout(DRAIN_GRACE, src.read(buf)).await else {
+            return true;
+        };
+        match read_res {
+            Ok(0) => *open = false,
+            Err(err) => {
+                tracing::warn!(
+                    %channel_id, error = %err, stream = stream_name,
+                    "exec: failed to read child output while draining; treating as eof",
+                );
+                *open = false;
+            }
+            Ok(n) => {
+                if let Err(err) = sink.write_all(&buf[..n]).await {
+                    tracing::warn!(
+                        %channel_id, error = %err, stream = stream_name,
+                        "exec: failed to forward drained child output to ssh channel",
+                    );
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Reads and discards a grandchild's inherited stdio for as long as it
+/// holds the write end open.
+///
+/// Handed the read ends of an exited child's stdout/stderr once
+/// [`bridge_one`] has stopped relaying. Simply dropping them would
+/// point the orphan's next write at a pipe with no reader: EPIPE, and
+/// SIGPIPE, whose default disposition kills the process — turning a
+/// visible hang into a backgrounded service that dies on its first log
+/// line. Draining costs two fds and one task for the orphan's life,
+/// which is what the blocking bridge held anyway.
+///
+/// Does nothing (and spawns nothing) when both handles are `None`, the
+/// case for every child that closes its pipes on exit.
+fn spawn_pipe_drain<O, E>(channel_id: String, stdout: Option<O>, stderr: Option<E>)
+where
+    O: AsyncRead + Unpin + Send + 'static,
+    E: AsyncRead + Unpin + Send + 'static,
+{
+    if stdout.is_none() && stderr.is_none() {
+        return;
+    }
+    tracing::debug!(
+        %channel_id,
+        "exec: child exited with its stdio still held open; draining in the background",
+    );
+    spawn(async move {
+        async fn discard<S: AsyncRead + Unpin>(src: Option<S>) {
+            let Some(mut src) = src else { return };
+            let mut buf = [0u8; 8 * 1024];
+            while let Ok(n) = src.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+        tokio::join!(discard(stdout), discard(stderr));
+        tracing::debug!(%channel_id, "exec: background stdio drain finished");
+    });
+}
+
 /// Handles a request to run a program on an SSH channel.
 ///
 /// Looks up the target session via the `MINIMAL_SESSION_ID` env var the
@@ -817,14 +1093,16 @@ where
 ///
 /// Accepted forms are:
 ///  * `git-receive-pack min://<session ID>` - handles a git receive-pack, routing
-///    with the trailing session ID
-///  * `min task run <task>` (canonical) or `min run <task>` (legacy alias) -
-///    runs a task, routed via a `MINIMAL_SESSION_ID` env var that must be set
-///    on the channel by the client
-///  * `min package build <args>` - builds package(s), routed via a
-///    `MINIMAL_SESSION_ID` env var that must be set on the channel by the client
-///  * `min check <args>` - lints the session's `minimal.toml`, packages,
-///    profiles, and stacks, routed the same way as `min package build`
+///    with the trailing session ID. Matched before the vocabulary below, and
+///    not part of it: git speaks the pack protocol, not exec requests.
+///  * a [`minimald_rpc::exec::ExecRequest`], which is where the rest of the
+///    vocabulary is defined. The daemon-serviced forms — `min://task/run`,
+///    `min://package/build` and `min://check` — are each routed via a
+///    `MINIMAL_SESSION_ID` env var that must be set on the channel by the
+///    client. `min://shell` and `min://argv` are handed to the session.
+///  * anything else: a shell command for the session. Nothing about a
+///    command's text routes it, so a session command can never be mistaken
+///    for one of the daemon's own (gominimal/inbox#558).
 pub(crate) async fn handle_exec(
     argv: &[u8],
     serv: ServerStateHandle,
@@ -896,135 +1174,109 @@ pub(crate) async fn handle_exec(
     // refused below.
     tracing::info!(%session_id, command = %argv, "exec request");
 
-    let rem = match argv.strip_prefix("min ") {
-        Some(c) => c,
-        // Not one of the daemon's own commands, so it is a command for the
-        // session: run it in the sandbox, the way `ssh host '<cmd>'` runs it on
-        // the host it names.
-        None => {
+    // Parsed, never sniffed. The vocabulary in `minimald_rpc::exec` is the only
+    // way to ask for one of the daemon's own forms, so a session command can no
+    // longer be mistaken for one — `min --version` names the session's `min`
+    // and reaches it, where the old `strip_prefix("min ")` claimed and refused
+    // it (gominimal/inbox#558).
+    let request = match minimald_rpc::exec::ExecRequest::parse(&argv) {
+        Ok(request) => request,
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e, "execution request rejected");
+            // Accept-then-report, as the bad-flag path does: a bare
+            // `channel_failure` would reach the client as an opaque "exec
+            // request failed" with none of the detail the error carries.
+            session.channel_success(id)?;
+            spawn(async move {
+                reject_unsupported_exec(channel, e.to_string()).await;
+            });
+            return Ok(());
+        }
+    };
+
+    use minimald_rpc::exec::ExecRequest;
+    match request {
+        ExecRequest::Shell(_) | ExecRequest::Argv(_) => {
+            let program = match request {
+                ExecRequest::Shell(cmd) => SessionProgram::Shell(cmd),
+                ExecRequest::Argv(words) => SessionProgram::Argv(words),
+                _ => unreachable!("the match arm admits only Shell and Argv"),
+            };
             let span = exec_span(&config, session_id, &argv);
             session.channel_success(id)?;
             spawn(
-                run_in_session(serv, conn, session_handle, id, channel, argv, conn_username)
-                    .instrument(span),
+                run_in_session(
+                    serv,
+                    conn,
+                    session_handle,
+                    id,
+                    channel,
+                    program,
+                    conn_username,
+                )
+                .instrument(span),
             );
-            return Ok(());
         }
-    }
-    .to_string();
-
-    let mut c = rem.split(' ');
-    match c.next() {
-        None => {
-            tracing::warn!(%session_id, "execution request rejected: expected `min <sub command>`");
-            session.channel_failure(id)?;
-            return Ok(());
-        }
-        Some("run") => {
-            // `min run` with no task name would leave `strip_prefix("run ")`
-            // as `None` (and a trailing-space `min run ` as empty) — reject
-            // both before acking, rather than panicking on `.unwrap()`.
-            let task = rem.strip_prefix("run ").unwrap_or("").trim();
+        ExecRequest::TaskRun(task) => {
+            let task = task.trim().to_string();
             if task.is_empty() {
-                tracing::warn!(%session_id, "execution request rejected: expected `min run <task name>`");
+                tracing::warn!(%session_id, "execution request rejected: task/run names no task");
                 session.channel_failure(id)?;
                 return Ok(());
             }
-            let task = task.to_string();
+            // A task's `env_vars`, resolved by the client against the invoking
+            // shell and carried on the channel environment (#585). Empty from a
+            // client that predates it — in which case the task path resolves
+            // them the old way, daemon-side.
+            let task_env = minimald_rpc::taskenv::from_channel_env(&config.env_vars);
+            let drop_env = minimald_rpc::taskenv::drops_from_channel_env(&config.env_vars);
             session.channel_success(id)?;
-
             spawn(async move {
                 let exec_task = ExecTask {
                     conn,
                     serv,
                     session: session_handle,
                     channel_id: id,
-                    exec: TaskExec { args: None, task },
+                    exec: TaskExec {
+                        args: None,
+                        task,
+                        env: task_env,
+                        drop_env,
+                    },
                 };
                 exec_task.run(channel).await;
             });
         }
-        Some("task") => {
-            // `min task run <task>` is the canonical spelling of the legacy
-            // bare `min run <task>`; `run` is its only sub-command. A bare
-            // `min task`, an unknown sub-command, or a prefix match like
-            // `min task runx` is refused before acking.
-            let rest = rem.strip_prefix("task").unwrap_or("").trim();
-            let task = rest
-                .strip_prefix("run")
-                .filter(|task| task.is_empty() || task.starts_with(' '))
-                .map(str::trim)
-                .unwrap_or("");
-            if task.is_empty() {
-                tracing::warn!(%session_id, "execution request rejected: expected `min task run <task name>`");
-                session.channel_failure(id)?;
-                return Ok(());
-            }
-            let task = task.to_string();
+        ExecRequest::PackageBuild(args) => {
             session.channel_success(id)?;
-
-            spawn(async move {
-                let exec_task = ExecTask {
-                    conn,
-                    serv,
-                    session: session_handle,
-                    channel_id: id,
-                    exec: TaskExec { args: None, task },
-                };
-                exec_task.run(channel).await;
-            });
-        }
-        Some("package") => {
-            // `build` is the only `package` sub-command serviced here; a
-            // bare `min package`, an unknown sub-command, or a prefix match
-            // like `min package buildx` is refused before acking.
-            let rest = rem.strip_prefix("package").unwrap_or("").trim();
-            let Some(build_args) = rest
-                .strip_prefix("build")
-                .filter(|args| args.is_empty() || args.starts_with(' '))
-            else {
-                tracing::warn!(%session_id, "execution request rejected: expected `min package build [args...]`");
-                session.channel_failure(id)?;
-                return Ok(());
-            };
-            session.channel_success(id)?;
-            // Everything after the sub-command is the build's args
-            // (`--verbose` / `--rebuild` / package names).
-            let build_args = build_args.trim().to_string();
+            let build_args = args.trim().to_string();
             spawn(async move {
                 run_build_exec(session_handle, id, channel, build_args).await;
             });
         }
-        Some("check") => {
+        ExecRequest::Check(args) => {
             session.channel_success(id)?;
-            let check_args = rem.strip_prefix("check").unwrap_or("").trim().to_string();
+            let check_args = args.trim().to_string();
             spawn(async move {
                 run_check_exec(session_handle, id, channel, check_args).await;
             });
         }
-        Some(other) => {
-            tracing::warn!(%session_id, "execution request rejected: unexpected min sub-command `{other}`");
-            session.channel_success(id)?;
-            spawn(async move {
-                reject_unsupported_exec(channel, argv).await;
-            });
-        }
-    };
+    }
 
     Ok(())
 }
 
-/// Accepts the channel and reports an exec request that is not one of the
-/// accepted forms on the SSH stderr stream, then exits non-zero. A bare
-/// `channel_failure` would reach the client only as an opaque "exec request
-/// failed", so — mirroring the accept-then-report shape `run_check_exec` uses
-/// for a bad flag — this names the rejected command and lists what the daemon
-/// runs. The command is still refused; nothing is spawned.
-async fn reject_unsupported_exec(channel: Channel<Msg>, rejected: String) {
+/// Accepts the channel and reports an exec request the daemon cannot serve on
+/// the SSH stderr stream, then exits non-zero. A bare `channel_failure` would
+/// reach the client only as an opaque "exec request failed", so — mirroring the
+/// accept-then-report shape `run_check_exec` uses for a bad flag — this relays
+/// the parse error, which already names the form asked for and lists the ones
+/// this daemon serves. The command is still refused; nothing is spawned.
+async fn reject_unsupported_exec(channel: Channel<Msg>, reason: String) {
     let (_rs, ws) = channel.split();
     let mut e = ws.make_writer_ext(Some(1));
     let _ = e
-        .write_all(unsupported_command_message(&rejected).as_bytes())
+        .write_all(unsupported_command_message(&reason).as_bytes())
         .await;
     let _ = e.flush().await;
     let _ = ws.eof().await;
@@ -1032,13 +1284,11 @@ async fn reject_unsupported_exec(channel: Channel<Msg>, rejected: String) {
     let _ = ws.close().await; // needed to release the remote
 }
 
-/// The stderr copy for an exec request that is not an accepted form: names the
-/// rejected command and lists the forms the daemon services.
-fn unsupported_command_message(rejected: &str) -> String {
-    format!(
-        "minimald: unsupported command '{rejected}'; accepted: \
-         min run <task>, min package build [args...], min check [args...]\n"
-    )
+/// The stderr copy for an exec request the daemon cannot serve. The reason
+/// comes from [`minimald_rpc::exec::ExecParseError`], which already names the
+/// form that was asked for and the ones this daemon serves.
+fn unsupported_command_message(reason: &str) -> String {
+    format!("minimald: {reason}\n")
 }
 
 /// The tracing span an in-session exec runs under, mirroring the `rpc` span in
@@ -1089,7 +1339,7 @@ async fn run_in_session(
     session: SessionHandle,
     channel_id: ChannelId,
     channel: Channel<Msg>,
-    argv: String,
+    program: SessionProgram,
     conn_username: String,
 ) {
     let exec_task = ExecTask {
@@ -1098,7 +1348,7 @@ async fn run_in_session(
         session,
         channel_id,
         exec: SessionExec {
-            argv,
+            program,
             conn_username,
         },
     };
@@ -1686,6 +1936,83 @@ mod tests {
         assert!(ctrl.was_killed());
     }
 
+    /// A grandchild that inherited the child's stdout keeps the pipe
+    /// open past the child's own exit — `sh -c 'sleep 20 & echo
+    /// STARTED'`. The bridge must return on the *child's* exit, relay
+    /// what the child wrote before exiting, and keep reading the orphan's
+    /// pipe rather than dropping it (gominimal/inbox#566).
+    ///
+    /// Every other test here drops the stdout writer *before* signalling
+    /// exit, which is why none of them caught this: holding it is the
+    /// whole point.
+    #[tokio::test]
+    async fn bridge_returns_on_child_exit_with_stdout_still_held_open() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader: _stdin_reader,
+                mut stdout_writer,
+                stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+        // Only stdout models the inherited fd; stderr EOFs as usual.
+        drop(stderr_writer);
+
+        // SSH stdin closed: bridge sees EOF immediately.
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (mut client_stdout, mut bridge_stdout) = duplex(1024 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+            )
+            .await
+        });
+
+        // What the child printed before exiting, then the exit — with
+        // the writer still held, standing in for the backgrounded
+        // grandchild's copy of the fd.
+        stdout_writer.write_all(b"STARTED\n").await.unwrap();
+        ctrl.signal_exit(0).await;
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("bridge must return on child exit, not wait out the orphan")
+            .unwrap();
+        assert_eq!(exit, 0);
+        assert!(!ctrl.was_killed());
+
+        // The orphan lives on. Its next write must not hit a closed read
+        // end — that is EPIPE, and SIGPIPE kills a real process — and
+        // more than a pipeful must still move, proving something is
+        // actually draining rather than merely holding the fd.
+        let orphan_output = vec![b'x'; 256 * 1024];
+        timeout(
+            Duration::from_secs(10),
+            stdout_writer.write_all(&orphan_output),
+        )
+        .await
+        .expect("the daemon must keep draining the orphan's pipe, not stall on a full one")
+        .expect("dropping the read end would break the orphan's pipe (EPIPE/SIGPIPE)");
+
+        // Pre-exit output is still relayed in full; post-exit output is
+        // discarded, so the client sees exactly the former.
+        drop(stdout_writer);
+        let mut out = Vec::new();
+        client_stdout.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"STARTED\n");
+    }
+
     /// A two-process sequence: the first child exits non-zero, so the
     /// bridge must stop and report that code without ever pulling the
     /// second process from the iter. If it tried to drive process 2,
@@ -1834,6 +2161,8 @@ mod tests {
         //! and `handle_exec` request routing.
         use sessions::SessionId;
 
+        use minimald_rpc::exec::ExecRequest;
+
         use crate::MINIMAL_SESSION_ID_ENV;
         use crate::test_harness::{
             TestClient, TestServer, create_configured_session, create_session_req,
@@ -1971,11 +2300,11 @@ mod tests {
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "min run echo_ok",
+                    &ExecRequest::TaskRun("echo_ok".to_string()).encode(),
                     &[],
                 )
                 .await
-                .expect("min run echo_ok should be accepted");
+                .expect("a task/run request should be accepted");
 
             assert_eq!(out.stdout, b"MINIMALD_SESSION_OK\n");
             assert_eq!(out.exit_status, Some(0));
@@ -2003,26 +2332,47 @@ mod tests {
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "min task run some_task",
+                    &ExecRequest::TaskRun("some_task".to_string()).encode(),
                     &[],
                 )
                 .await;
             assert!(
                 accepted.is_ok(),
-                "`min task run <task>` must be accepted, got {accepted:?}",
+                "a task/run request naming a task must be accepted, got {accepted:?}",
             );
 
-            let rejected = client
+            // A task/run naming no task is refused before anything spawns, and
+            // there is nothing useful to stream, so it is a channel failure.
+            let empty = client
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "min task runx",
+                    &ExecRequest::TaskRun(String::new()).encode(),
                     &[],
                 )
                 .await;
             assert!(
-                rejected.is_err(),
-                "`min task runx` is not `min task run <task>` and must be refused, got {rejected:?}",
+                empty.is_err(),
+                "a task/run naming no task must be refused, got {empty:?}",
+            );
+
+            // A near-miss tag is a form this daemon does not serve. It is not
+            // silently downgraded to a session shell command: the scheme was
+            // named, so the client asked for something specific.
+            let unknown = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    "min://task/runx some_task",
+                    &[],
+                )
+                .await
+                .expect("an unknown form is reported over the channel, not a channel failure");
+            assert_ne!(unknown.exit_status, Some(0));
+            assert!(
+                String::from_utf8_lossy(&unknown.stderr).contains("min://task/runx"),
+                "the refusal should name the form asked for, got {:?}",
+                String::from_utf8_lossy(&unknown.stderr),
             );
         }
 
@@ -2046,11 +2396,11 @@ mod tests {
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "min check",
+                    &ExecRequest::Check(String::new()).encode(),
                     &[],
                 )
                 .await
-                .expect("min check should be accepted");
+                .expect("a check request should be accepted");
 
             assert_eq!(out.exit_status, Some(0));
             assert_eq!(
@@ -2080,7 +2430,7 @@ mod tests {
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "min check --packags",
+                    &ExecRequest::Check("--packags".to_string()).encode(),
                     &[],
                 )
                 .await
@@ -2099,13 +2449,23 @@ mod tests {
             );
         }
 
-        /// `min check` takes its flags after the sub-command, so a prefix match
-        /// like `min checkx` must not be serviced as `min check`. A `min`
-        /// sub-command the daemon doesn't know is refused outright rather than
-        /// handed to the session — and refusing it means never running it, on
-        /// the daemon's filesystem least of all.
+        /// A command that merely *looks* like one of the daemon's own belongs
+        /// to the session, and reaches it.
+        ///
+        /// This is the contract that replaced prefix-sniffing: the daemon used
+        /// to claim every command starting with `min ` and refuse the ones it
+        /// did not recognise, which made a session's own `min` binary
+        /// unreachable through exec (gominimal/inbox#558). Now only the
+        /// `min://` scheme addresses the daemon, so `min checkx` is just a
+        /// command — routed to the session, and never run on the daemon's own
+        /// filesystem.
+        ///
+        /// The marker file pins the second half: had it run here, it would
+        /// exist. This harness launches a mock host with no sandbox to join, so
+        /// the command fails rather than running in-session; where it was
+        /// *sent* is what matters and what can be proved without a real sandbox.
         #[tokio::test]
-        async fn a_check_lookalike_is_not_serviced_as_check() {
+        async fn a_min_lookalike_goes_to_the_session_not_the_daemon() {
             let server = TestServer::new().await;
             let mut client = server.connect().await;
             let session_id = fresh_session(&mut client).await;
@@ -2131,12 +2491,80 @@ mod tests {
             assert_ne!(
                 out.exit_status,
                 Some(0),
-                "`min checkx` is not `min check` and must not succeed; stdout was {:?}",
+                "the mock harness has no sandbox to run in, so this cannot succeed; stdout was {:?}",
                 String::from_utf8_lossy(&out.stdout),
             );
+            // Routed, not refused: the old daemon answered this with an
+            // "unsupported command" refusal instead of handing it over.
+            let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(
-                String::from_utf8_lossy(&out.stderr).contains("min checkx"),
-                "the refusal should name the rejected command, got {:?}",
+                !stderr.contains("unsupported"),
+                "a `min` lookalike must be routed to the session, not refused, got {stderr:?}",
+            );
+        }
+
+        /// An argv reaches the session as words, not as a line for some shell
+        /// to re-split — the fix for gominimal/inbox#558. The mock harness has
+        /// no sandbox, so what is provable here is that the form is accepted
+        /// and routed to the session rather than refused or run on the daemon.
+        #[tokio::test]
+        async fn an_argv_form_is_accepted_and_routed_to_the_session() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id = fresh_session(&mut client).await;
+            let session_str = session_id.to_string();
+            let marker = daemon_marker("argv");
+            let _ = std::fs::remove_file(&marker);
+
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &ExecRequest::Argv(vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!("printf pwned > {}", marker.display()),
+                    ])
+                    .encode(),
+                    &[],
+                )
+                .await
+                .expect("an argv request is serviced over the channel");
+
+            assert!(
+                !marker.exists(),
+                "an argv exec ran on the daemon's filesystem, creating {}",
+                marker.display(),
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !stderr.contains("unsupported"),
+                "the argv form must be routed to the session, not refused, got {stderr:?}",
+            );
+        }
+
+        /// An argv naming no program is refused rather than guessed at.
+        #[tokio::test]
+        async fn an_empty_argv_is_refused() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id = fresh_session(&mut client).await;
+            let session_str = session_id.to_string();
+
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    "min://argv []",
+                    &[],
+                )
+                .await
+                .expect("the refusal is reported over the channel");
+
+            assert_ne!(out.exit_status, Some(0));
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("names no program"),
+                "got {:?}",
                 String::from_utf8_lossy(&out.stderr),
             );
         }

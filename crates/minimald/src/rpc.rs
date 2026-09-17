@@ -30,6 +30,11 @@ use crate::{
     sessions::SessionKeyPredicate,
 };
 
+/// This daemon's build, reported on every reply a version-gated client path
+/// piggybacks its check on. One name for it so the assertion in
+/// `serve_create_session` and the versions echoed to clients cannot drift.
+const OWN_VERSION: &str = version::VERSION;
+
 /// Server-side serving glue for [`OneshotSshRpc`]s.
 ///
 /// The wire contract (names, request/response schemas) lives in the
@@ -121,6 +126,9 @@ async fn serve_list_sessions(
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             Ok(ListSessionsResponse {
+                daemon_version: Some(OWN_VERSION.to_string()),
+                hostname_routing_unavailable: s.proxy_unavailable().await,
+                mtls_proxy_unavailable: s.mtls_unavailable().await,
                 resource_pool,
                 // The git probes run in parallel across sessions: each is
                 // one small process under a deadline, and serializing them
@@ -233,6 +241,7 @@ async fn serve_get_session_record(
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
             Ok(GetSessionRecordResponse {
+                daemon_version: Some(OWN_VERSION.to_string()),
                 record: mngr
                     .get_record(match req {
                         GetSessionRecordRequest::Id(id) => SessionKeyPredicate::Id(id),
@@ -261,6 +270,18 @@ async fn serve_create_session(
 ) -> Result<(), ConnectionError> {
     CreateSession
         .handle_channel(c, async |req| {
+            // The version gate, made by the RPC the activation path was
+            // already sending rather than by a `GetVersion` ahead of it
+            // (#1251). Checked here, before the manager allocates anything,
+            // because the failure this closes is precisely a session that
+            // exists and then gets torn down by its own caller's cleanup:
+            // refusing after `create_session` would reproduce it.
+            if let Some(asserted) = req.must_match_version.as_deref()
+                && let Some(message) = minimald_rpc::version_skew_message(asserted, OWN_VERSION)
+            {
+                return Ok(Errorable::Err { error: message });
+            }
+
             let mngr = s.sessions_manager().await;
             // Read the name off the config before it is handed to the
             // manager: the success record below needs it, and the reply
@@ -279,7 +300,12 @@ async fn serve_create_session(
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
                         "session created"
                     );
-                    Errorable::Ok(minimald_rpc::CreateSessionResponse { id })
+                    Errorable::Ok(minimald_rpc::CreateSessionResponse {
+                        id,
+                        daemon_version: Some(OWN_VERSION.to_string()),
+                        hostname_routing_unavailable: s.proxy_unavailable().await,
+                        mtls_proxy_unavailable: s.mtls_unavailable().await,
+                    })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
                     error: "A session with that name already exists".to_string(),
@@ -1129,6 +1155,12 @@ struct UnpackTarget {
 /// but the client is untrusted, so the same checks run again here —
 /// a peer writing raw tar bytes bypasses every client-side layer.
 ///
+/// Each entry's **permission bits** are reproduced on disk, masked to
+/// the standard nine. That is what carries a patched script's exec bit
+/// and a patched secret's `0600` into the session; ownership is not
+/// carried at all — every file here belongs to the daemon, and the
+/// sandbox's user namespace maps that to the session user.
+///
 /// On success, drops `target.marker` under `target.dir`. The write
 /// order matters: the marker only appears once every entry is on disk,
 /// which is what lets `FinalizeSession` treat its presence as proof
@@ -1274,6 +1306,20 @@ async fn unpack_tar_zst_into(target: UnpackTarget, c: &mut RuChannel<Msg>) -> Re
                 ));
             }
             let entry_size = entry.header().size().unwrap_or(0);
+            // The entry's permission bits, which the write below
+            // reproduces on disk: a patched script has to stay
+            // executable and a patched secret has to stay unreadable
+            // to anyone else, and neither survives a hardcoded mode.
+            //
+            // Masked to the standard nine. setuid/setgid/sticky are
+            // dropped rather than honoured — this header came off the
+            // wire, so the daemon is not in a position to trust it with
+            // a privilege bit, and `async_tar::Archive::unpack` (which
+            // unpacks the workspace tree a few functions up) applies
+            // exactly the same `& 0o777` for the same reason. A header
+            // whose mode field doesn't parse falls back to 0o644, the
+            // mode every entry landed as before this was read at all.
+            let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
             // Per-entry cap: refuses forged headers that would push
             // `Vec::with_capacity` into an allocation panic or OOM
             // (allocator abort → whole daemon down) before we ever
@@ -1322,17 +1368,49 @@ async fn unpack_tar_zst_into(target: UnpackTarget, c: &mut RuChannel<Msg>) -> Re
             let dest = staging_dir.join(&entry_path);
             let path_display = entry_path.display().to_string();
             inflight.spawn(async move {
+                // `tokio::fs::OpenOptions::mode` is inherent on unix,
+                // so no `OpenOptionsExt` import is needed for it.
+                use std::os::unix::fs::PermissionsExt as _;
+                use tokio::io::AsyncWriteExt as _;
+
                 if let Some(parent) = dest.parent() {
                     tokio::fs::create_dir_all(parent)
                         .await
                         .map_err(|e| format!("creating parent dir for `{path_display}`: {e}"))?;
                 }
-                tokio::fs::write(&dest, &body)
+                // Create *with* the mode rather than writing and then
+                // widening: `.mode()` is masked by the daemon's umask,
+                // so the file is never briefly more permissive than the
+                // entry asked for. The explicit `set_permissions` below
+                // then takes it the rest of the way, since that same
+                // umask would otherwise quietly clear bits the entry
+                // does ask for.
+                let mut file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(mode)
+                    .open(&dest)
+                    .await
+                    .map_err(|e| format!("creating `{path_display}`: {e}"))?;
+                file.write_all(&body)
                     .await
                     .map_err(|e| format!("writing `{path_display}`: {e}"))?;
+                // A `tokio::fs::File` completes its writes in the
+                // background; dropping one unflushed truncates it
+                // silently.
+                file.flush()
+                    .await
+                    .map_err(|e| format!("flushing `{path_display}`: {e}"))?;
+                // Through the handle, not the path: the mode lands on
+                // the file we just wrote rather than on whatever a
+                // concurrent unpack may have swapped in at that path.
+                file.set_permissions(std::fs::Permissions::from_mode(mode))
+                    .await
+                    .map_err(|e| format!("setting mode on `{path_display}`: {e}"))?;
                 // Explicit drop keeps the permit alive across the
-                // fs::write so the byte budget only frees up after
-                // the buffer is genuinely gone.
+                // write so the byte budget only frees up after the
+                // buffer is genuinely gone.
                 drop(body);
                 drop(permit);
                 Ok::<_, String>(())
@@ -1967,6 +2045,92 @@ mod tests {
         );
     }
 
+    /// Build a tar+zstd archive whose entries carry the modes given,
+    /// rather than `tar_zst`'s uniform `0o644` — the shape the patches
+    /// uploader produces once it stopped flattening the source's mode.
+    async fn tar_zst_with_modes(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let mut tar = async_tar::Builder::new(Vec::new());
+        for (path, contents, mode) in entries {
+            let mut header = async_tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(*mode);
+            tar.append_data(&mut header, path, *contents).await.unwrap();
+        }
+        let tar_bytes = tar.into_inner().await.unwrap();
+        let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
+        encoder.write_all(&tar_bytes).await.unwrap();
+        encoder.shutdown().await.unwrap();
+        encoder.into_inner()
+    }
+
+    /// An entry's permission bits reach the staged file, so a patched
+    /// script stays executable and a patched secret stays private. The
+    /// `0o600` case is the one that proves the mode is applied
+    /// explicitly rather than left to the daemon's umask, which would
+    /// have produced `0o644` from the same header.
+    ///
+    /// setuid is masked off: the header arrives over the wire, so a
+    /// peer must not be able to ask the daemon to create a setuid file
+    /// in a session's tree. (`async_tar::Archive::unpack`, which
+    /// handles the workspace stream, drops it for the same reason.)
+    #[tokio::test]
+    async fn stream_workspace_patches_preserves_entry_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let payload = tar_zst_with_modes(&[
+            (".local/bin/tool", b"#!/bin/sh\necho hi\n", 0o755),
+            (".config/secret.toml", b"token = 'hunter2'\n", 0o600),
+            (".local/bin/suid", b"#!/bin/sh\n", 0o4755),
+        ])
+        .await;
+
+        let channel = client
+            .open_subsystem(
+                STREAM_WORKSPACE_PATCHES,
+                &[(MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
+            )
+            .await;
+        let mut stream = channel.into_stream();
+        stream.write_all(&payload).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut trailing = Vec::new();
+        stream.read_to_end(&mut trailing).await.unwrap();
+
+        let mngr = server.state.sessions_manager().await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should be retrievable");
+        let paths = handle.paths().await.unwrap();
+        let patches = paths.patches.as_utf8_path();
+
+        let mode_of = async |rel: &str| {
+            tokio::fs::metadata(patches.join(rel))
+                .await
+                .unwrap_or_else(|e| panic!("staged patch `{rel}` should exist: {e}"))
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+
+        assert_eq!(mode_of(".local/bin/tool").await, 0o755, "exec bit survives");
+        assert_eq!(
+            mode_of(".config/secret.toml").await,
+            0o600,
+            "a private mode is applied exactly, not widened by the umask",
+        );
+        assert_eq!(
+            mode_of(".local/bin/suid").await,
+            0o755,
+            "setuid is masked off, the rest of the mode is kept",
+        );
+    }
+
     /// Build a tar+zstd archive with full control over each entry's
     /// type and declared size, so tests can produce the malformed
     /// shapes a hostile peer would hand-craft — `tar_zst` can only
@@ -2477,6 +2641,91 @@ mod tests {
         );
     }
 
+    /// The version gate, made by the RPC the activation path already sends
+    /// rather than by a `GetVersion` ahead of it (#1251).
+    ///
+    /// A matching assertion is invisible; a differing one fails the call with
+    /// the skew message *and leaves nothing behind* — which is the whole
+    /// point, since the failure this closes is a session that exists and is
+    /// then destroyed by its own caller's cleanup. An absent assertion (an
+    /// older client) behaves exactly as this RPC always did.
+    #[tokio::test]
+    async fn create_session_refuses_a_version_skew_before_allocating_anything() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let mut skewed = req("skewed", "/uwu");
+        skewed.must_match_version = Some("0.0.0-not-this-build".to_string());
+        let refused = client.call::<CreateSession>(&skewed).await;
+        let error = refused.err().expect("a skewed create must be refused");
+        assert!(
+            error.contains("0.0.0-not-this-build") && error.contains(OWN_VERSION),
+            "the refusal must name both builds, got: {error}"
+        );
+        assert!(error.contains("min stop"), "missing the recovery: {error}");
+        assert!(
+            error.contains(minimald_rpc::SKEW_OVERRIDE_VAR),
+            "missing the override: {error}"
+        );
+        assert!(
+            client.call::<ListSessions>(&()).await.sessions.is_empty(),
+            "a refused create must not have allocated a session"
+        );
+
+        // The matching assertion goes through, and the reply names the build
+        // that honoured it — the half of the handshake that catches a daemon
+        // too old to have looked at `must_match_version` at all.
+        let mut matching = req("matching", "/uwu");
+        matching.must_match_version = Some(OWN_VERSION.to_string());
+        let created = client
+            .call::<CreateSession>(&matching)
+            .await
+            .ok()
+            .expect("a matching assertion must be accepted");
+        assert_eq!(created.daemon_version.as_deref(), Some(OWN_VERSION));
+
+        // And a client that asserts nothing — an older one, or one running
+        // under the skew override — is unaffected.
+        let created = client
+            .call::<CreateSession>(&req("unasserted", "/uwu"))
+            .await
+            .ok()
+            .expect("an unasserted create must behave as it always has");
+        assert_eq!(created.daemon_version.as_deref(), Some(OWN_VERSION));
+    }
+
+    /// The two read RPCs the attach / exec / setup-zed / ssh-forward paths
+    /// gate on must report the daemon's build, or those paths have nothing to
+    /// assert against and would have to spend a `GetVersion` to find out.
+    #[tokio::test]
+    async fn the_read_rpcs_report_the_daemon_build() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let id = client
+            .call::<CreateSession>(&req("my session", "/uwu"))
+            .await
+            .unwrap()
+            .id;
+
+        assert_eq!(
+            client
+                .call::<ListSessions>(&())
+                .await
+                .daemon_version
+                .as_deref(),
+            Some(OWN_VERSION)
+        );
+        assert_eq!(
+            client
+                .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(id))
+                .await
+                .daemon_version
+                .as_deref(),
+            Some(OWN_VERSION)
+        );
+    }
+
     #[tokio::test]
     async fn get_session_policy_returns_the_policy_configured_at_launch() {
         // R2.6: GetSessionPolicy reads the live per-session policy from the
@@ -2500,6 +2749,7 @@ mod tests {
                     hooks_enabled: true,
                     attrs: Default::default(),
                 },
+                must_match_version: None,
             })
             .await
             .unwrap()
@@ -2700,6 +2950,7 @@ mod tests {
                     hooks_enabled: true,
                     attrs: Default::default(),
                 },
+                must_match_version: None,
             })
             .await;
         assert_eq!(
@@ -2911,6 +3162,87 @@ mod tests {
                 .is_some(),
             "an unforced, refused shutdown must not tear down live sessions",
         );
+    }
+
+    /// A session whose shell has exited still holds its host (the slot
+    /// outlives the process), but nothing runs there for an unforced shutdown
+    /// to interrupt, so it must not refuse. Driven the way the session e2e
+    /// meets it: exit the shell, keep the session at the exit prompt, then
+    /// stop the daemon.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_without_force_proceeds_once_a_sessions_shell_has_exited() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let mut channel = client.open_shell(session_id).await;
+        channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+        let mut stdout = Vec::new();
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    stdout.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&stdout).contains("got:hello") {
+                        break;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("channel closed before the echo arrived"),
+            }
+        }
+
+        // Exit the shell and take the prompt's default (keep): the session
+        // survives, its host gone.
+        channel
+            .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+            .await
+            .unwrap();
+        let mut answered = false;
+        let mut prompt_out = Vec::new();
+        while let Ok(msg) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), channel.wait()).await
+        {
+            match msg {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    prompt_out.extend_from_slice(&data);
+                    if !answered
+                        && String::from_utf8_lossy(&prompt_out)
+                            .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                    {
+                        channel.data_bytes(b"\r".to_vec()).await.unwrap();
+                        answered = true;
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(
+            answered,
+            "expected the session-exit prompt to render; got: {:?}",
+            String::from_utf8_lossy(&prompt_out)
+        );
+
+        let mngr = server.state.sessions_manager().await;
+        let session = mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("keep leaves the session in place");
+        // The host loop winds down after the channel closes; bounded wait.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while session.is_busy().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a session whose shell has exited stayed busy",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let resp = client
+            .call::<Shutdown>(&ShutdownRequest { force: false })
+            .await;
+        assert_eq!(resp, ShutdownResponse::ShuttingDown);
     }
 
     #[tokio::test]

@@ -73,6 +73,14 @@ AWS_PROFILE = { inherit = true }
 
 A string value like `EDITOR = "nano"` defines a fixed variable. Using `{ inherit = true }` passes through the value from your host environment, which is useful for credentials or configuration that varies per developer.
 
+Inheriting this way is required, not opportunistic. If `AWS_PROFILE` is not set in your host environment, activation fails rather than starting the session without it:
+
+```
+error: Composition gating failed: could not resolve pending var `AWS_PROFILE`: environment variable not found
+```
+
+Since `minimal.toml` is checked in, that applies to everyone on the project — write `{ inherit = true, default = "..." }` instead when the variable is genuinely optional. A loadout's `[vars]` takes the opposite view of the same spelling and only warns; see [Where `{ inherit = true }` differs](../reference/minimal-dot-toml.md#inherit-divergence).
+
 ### Run setup on activation
 
 To run setup steps when a session comes up, declare lifecycle hooks in the `[session]` block:

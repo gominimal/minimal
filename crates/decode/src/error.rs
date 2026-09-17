@@ -588,6 +588,17 @@ mod tests {
     }
 
     #[test]
+    fn attr_too_deep_reports_max_depth() {
+        let e = Error::AttrTooDeep { max_depth: 42 };
+        let out = capture(&e);
+        assert!(
+            out.contains("nested too deeply"),
+            "expected 'nested too deeply' in: {out:?}"
+        );
+        assert!(out.contains("42"), "expected max depth in: {out:?}");
+    }
+
+    #[test]
     fn nickel_error_renders_diagnostic() {
         // A Nickel contract violation loaded through the decoder surfaces as
         // `Error::Nickel`. `report_to` must render its underlying Nickel

@@ -1,13 +1,12 @@
 #![no_main]
 
-//! Fuzz `archive::normalize_within_root` — the containment primitive three
+//! Fuzz `archive::normalize_within_root` — the containment primitive two
 //! crates now depend on.
 //!
-//! `common::archive` uses it for tar entry paths and link targets,
+//! `common::archive` uses it for tar entry paths and link targets, and
 //! `op::materialize` for raw-file outputs ("both `../../etc/shadow` and
-//! `/../../etc/shadow` land here"), and `minimald` for the client's uploaded
-//! workspace tarball. Each trusts the same contract, so a gap here is a gap
-//! in all three at once — and none of them re-checks the result.
+//! `/../../etc/shadow` land here"). Each trusts the same contract, so a gap
+//! here is a gap in both at once — and neither re-checks the result.
 //!
 //! Fuzzed directly rather than only through `archive_extract` because it is a
 //! pure function: no tempdir, no extraction, so it runs orders of magnitude

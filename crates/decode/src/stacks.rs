@@ -584,7 +584,7 @@ impl Stack {
                 .chain(self.runtime_packages.iter())
                 .cloned()
                 .collect(),
-            vars: HashMap::from_iter(
+            vars: std::collections::BTreeMap::from_iter(
                 self.build_env_vars
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone())),

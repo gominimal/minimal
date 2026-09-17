@@ -46,7 +46,7 @@ The CLI reference overview is [docs/reference/cli.md](docs/reference/cli.md).
 | `minimal-client` | SSH client transport to `minimald` over the UDS bridge, shared by `min` and the TUI. |
 | `minimal-tui` | `min dash`: the session-manager TUI (ratatui/crossterm, Elm-style loop). |
 | `minimald` | The session daemon: an SSH server hosting sessions and task/sandbox executions. |
-| `minimald-rpc` | Wire contract for `minimald`'s oneshot SSH RPCs. |
+| `minimald-rpc` | Wire contract for `minimald`'s oneshot SSH RPCs and the exec channel's request vocabulary. |
 | `minvmd` | Host daemon that boots Linux microVMs via libkrun and bridges host UDS to in-VM vsock. |
 | `mip` | The Minimal package/build CLI. |
 | `mlog` | JSON file-log layer both `minimald` and `minvmd` write through; one definition of the on-disk log format. |
@@ -218,6 +218,10 @@ proves, `nightly` ships.
   [docs/commit-conventions.md](docs/commit-conventions.md).
 - **Rust standards**:
   [docs/rust-coding-standards.md](docs/rust-coding-standards.md).
+- **Specs**: work carrying `kind:epic` gets one, at
+  `docs/specs/NN-spec-<slug>/NN-spec-<slug>.md`. Start from
+  [docs/specs/TEMPLATE.md](docs/specs/TEMPLATE.md); requirements are written as
+  EARS and the format is decided in gominimal/foundry.
 - **`.github/workflows/` is frozen** and CODEOWNER-gated. Do not edit it.
   Extend CI coverage through convention-discovered tests, `scripts/`, and the
   `justfile`, per the test-extension contract in

@@ -1,7 +1,8 @@
 //! Top-level API for minimal tooling.
+#![recursion_limit = "256"]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -850,7 +851,7 @@ impl Context {
         wd: Option<PathBuf>,
         state_key: Option<&String>,
         patches: Option<&'a EnvPatches>,
-        env_vars: Option<&'a HashMap<String, EnvVarValue>>,
+        env_vars: Option<&'a BTreeMap<String, EnvVarValue>>,
         packages: S,
         home: PatchHome,
     ) -> Result<env::Env<'a>, Error> {
@@ -884,7 +885,7 @@ impl Context {
         wd: Option<PathBuf>,
         state_key: Option<&String>,
         patches: Option<&'a EnvPatches>,
-        env_vars: Option<&'a HashMap<String, EnvVarValue>>,
+        env_vars: Option<&'a BTreeMap<String, EnvVarValue>>,
         packages: S,
         network_mode: sandbox2::NetworkMode,
         home: PatchHome,
@@ -1120,7 +1121,7 @@ impl Context {
             AddDepMode::BuildPackages => {
                 if let Some(h) = doc["stack"].as_table_mut() {
                     did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved);
-                    println!("Added [{}] to stack.build_packages", resolved.join(","));
+                    println!("Added {} to stack.build_packages", resolved.join(", "));
                 } else {
                     return Err(Error::Other(anyhow!(
                         "could not find [stack] in minimal.toml: needed for update"
@@ -1130,7 +1131,7 @@ impl Context {
             AddDepMode::RuntimePackages => {
                 if let Some(h) = doc["stack"].as_table_mut() {
                     did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved);
-                    println!("Added [{}] to stack.runtime_packages", resolved.join(","));
+                    println!("Added {} to stack.runtime_packages", resolved.join(", "));
                 } else {
                     return Err(Error::Other(anyhow!(
                         "could not find [stack] in minimal.toml: needed for update"
@@ -1143,7 +1144,7 @@ impl Context {
                     && let Some(t) = t.as_table_mut()
                 {
                     did_edit |= upsert_toml_packages_list(t, "packages", &resolved);
-                    println!("Added [{}] to tasks.{}.packages", resolved.join(","), name);
+                    println!("Added {} to tasks.{}.packages", resolved.join(", "), name);
                 } else {
                     return Err(Error::Other(anyhow!(
                         "could not find [tasks.{}] in minimal.toml: needed for update",
@@ -1164,7 +1165,7 @@ impl Context {
                     );
                     did_edit = true;
                 }
-                println!("Added [{}] to session.packages", resolved.join(","));
+                println!("Added {} to session.packages", resolved.join(", "));
             }
         }
 

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::collections::BTreeMap;
 
 pub mod channel_progress;
@@ -17,6 +19,7 @@ pub mod server;
 mod session;
 mod session_delta;
 pub mod session_host;
+mod session_shell;
 pub mod session_sop;
 mod sessions;
 mod sftp;

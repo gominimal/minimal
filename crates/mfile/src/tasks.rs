@@ -1,6 +1,6 @@
 use super::{EnvPatches, EnvVarValue, StrOrList};
 use args::ArgsSpec;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A task, defined in a `[tasks.<task_name>]` section of [File].
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -23,8 +23,14 @@ pub struct Task {
     #[serde(default)]
     pub packages: Vec<String>,
     /// Environment variables to set on the process this task launches.
+    ///
+    /// Ordered, like the patch tables next to it (#1319): these are
+    /// iterated to build a sandbox environment and to report the first
+    /// unresolvable `inherit`, so hash order would let the same
+    /// declaration name a different variable in its error from run to
+    /// run. Var names are `Ord`, so ordering by them costs nothing.
     #[serde(default, alias = "env_vars")]
-    pub vars: HashMap<String, EnvVarValue>,
+    pub vars: BTreeMap<String, EnvVarValue>,
     /// Files/directories to be patched into the sandbox this task executes in.
     #[serde(default, alias = "patches")]
     pub patch: EnvPatches,

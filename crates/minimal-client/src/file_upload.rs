@@ -65,7 +65,8 @@ pub fn is_empty_or_home(dir: &Path, home: Option<&Path>) -> bool {
 /// `Prompt` case is resolved by the caller (#441).
 #[derive(Debug, PartialEq, Eq)]
 pub enum UploadGate {
-    /// Upload without asking: a VCS root, or an explicit `--sync tarball`.
+    /// Upload without asking: a VCS root, a directory carrying a
+    /// `minimal.toml`, or an explicit `--sync tarball`.
     Upload,
     /// Headless caller, non-VCS root, implicit sync: skip and warn.
     SkipHeadless,
@@ -73,18 +74,45 @@ pub enum UploadGate {
     Prompt,
 }
 
-/// Decide the non-VCS-root upload gate. `headless` means no interactive
-/// confirm is possible (`--no-prompt`, `--no-input`, or a non-TTY); an
-/// explicit `--sync tarball` (`sync_explicit`) forces the upload, else a
-/// headless caller skips rather than upload a directory nobody confirmed.
-pub fn upload_gate(is_vcs_root: bool, sync_explicit: bool, headless: bool) -> UploadGate {
-    if is_vcs_root || sync_explicit {
+/// Decide the non-empty, non-`$HOME` upload gate. `headless` means no
+/// interactive confirm is possible (`--no-prompt`, `--no-input`, or a
+/// non-TTY). An explicit `--sync tarball` (`sync_explicit`), a directory
+/// carrying a `minimal.toml` (`has_blueprint` — `min init` declared it,
+/// so its config should reach the session), or a VCS root each force the
+/// upload; otherwise a headless caller skips rather than upload a
+/// directory nobody confirmed, and an interactive one is asked. The
+/// `$HOME` and empty-directory carve-outs are decided by the caller via
+/// [`is_empty_or_home`] before this runs, so `$HOME` never syncs on a
+/// blueprint alone.
+pub fn upload_gate(
+    is_vcs_root: bool,
+    sync_explicit: bool,
+    has_blueprint: bool,
+    headless: bool,
+) -> UploadGate {
+    if sync_explicit || has_blueprint || is_vcs_root {
         UploadGate::Upload
     } else if headless {
         UploadGate::SkipHeadless
     } else {
         UploadGate::Prompt
     }
+}
+
+/// The warning shown when an implicit upload is skipped because
+/// `upload_root` is neither a VCS root nor carries a `minimal.toml`.
+/// Names what the session gets — an empty workspace on a default
+/// blueprint — not only what was skipped, and points at the `--sync
+/// tarball` escape hatch. Shared by both upload callers (session
+/// activate and task run) so the wording cannot drift between them.
+pub fn skipped_upload_warning(upload_root: &Path) -> String {
+    format!(
+        "warning: {} is not a version control repository root and has no \
+         minimal.toml — skipping file upload; the session starts with an \
+         empty workspace and a default blueprint (pass --sync tarball to \
+         upload anyway)",
+        upload_root.display()
+    )
 }
 
 fn is_default_excluded(name: &str) -> bool {
@@ -268,9 +296,12 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ProgressWriter<
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AddFileOptions {
     /// Override the archive-entry mode. `None` copies the source
-    /// file's mode (masked to the standard permission bits) as-is;
-    /// `Some(m)` forces `m` (e.g. `0o644` for the patches uploader
-    /// normalizing writable copies into the sandbox home).
+    /// file's mode (masked to the standard permission bits) as-is —
+    /// what both the workspace walker and the patches uploader want,
+    /// since flattening a mode strips the exec bit off whatever it is
+    /// applied to. `Some(m)` forces `m`: the hook-script uploader
+    /// stamps `0o644` because the executor runs `bash <script>`, so a
+    /// script is read rather than exec'd and never needs the bit.
     pub mode_override: Option<u32>,
 }
 
@@ -367,14 +398,21 @@ impl<W: AsyncWrite + Unpin + Send + Sync> TarZstArchive<W> {
             .metadata()
             .await
             .with_context(|| format!("statting {}", host_path.display()))?;
-        // Default mode: the source's own permission bits (masked to
-        // the standard nine + suid/sgid/sticky). Matches the
-        // `mode_override = None` docstring; otherwise an executable
-        // dropped in through `default()` would archive as 0o644 and
-        // silently lose its exec bit on unpack.
+        // Default mode: the source's own permission bits, masked to the
+        // standard nine. Matches the `mode_override = None` docstring;
+        // otherwise an executable dropped in through `default()` would
+        // archive as 0o644 and silently lose its exec bit on unpack.
+        //
+        // setuid/setgid/sticky are not emitted, because nothing on the
+        // other end honours them: the daemon's unpacker masks them off,
+        // and so does `async_tar::Archive::unpack` for the workspace
+        // stream. Sending a bit that is always discarded only makes the
+        // archive claim something the session will never have. The
+        // daemon still masks — it has to, since a peer writing raw tar
+        // bytes never runs this code.
         let default_mode = {
             use std::os::unix::fs::PermissionsExt as _;
-            metadata.permissions().mode() & 0o7777
+            metadata.permissions().mode() & 0o777
         };
         let mut header = async_tar::Header::new_gnu();
         header.set_size(metadata.len());
@@ -606,14 +644,14 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
                     .metadata()
                     .await
                     .with_context(|| format!("statting {}", entry_path.display()))?;
-                // Preserve the source's permission bits (masked to the
-                // standard nine + suid/sgid/sticky), same as
-                // `TarZstArchive::add_file`'s default. Hardcoding 0o644
-                // here silently strips the exec bit off scripts and
-                // binaries in every workspace upload.
+                // Preserve the source's permission bits, masked to the
+                // standard nine — same rule, and same reason for the
+                // mask, as `TarZstArchive::add_file`'s default.
+                // Hardcoding 0o644 here silently strips the exec bit off
+                // scripts and binaries in every workspace upload.
                 let mode = {
                     use std::os::unix::fs::PermissionsExt as _;
-                    metadata.permissions().mode() & 0o7777
+                    metadata.permissions().mode() & 0o777
                 };
                 // Preserve the mtime too: leaving the header's zero
                 // stamp unpacks every file at the epoch, which breaks
@@ -1178,12 +1216,30 @@ mod tests {
     fn upload_gate_covers_three_lanes() {
         // A VCS root, or an explicit `--sync tarball`, always uploads —
         // headless or not.
-        assert_eq!(upload_gate(true, false, true), UploadGate::Upload);
-        assert_eq!(upload_gate(false, true, true), UploadGate::Upload);
-        // Headless + non-VCS root + implicit sync: skip and warn.
-        assert_eq!(upload_gate(false, false, true), UploadGate::SkipHeadless);
-        // Interactive + non-VCS root + implicit sync: confirm first.
-        assert_eq!(upload_gate(false, false, false), UploadGate::Prompt);
+        assert_eq!(upload_gate(true, false, false, true), UploadGate::Upload);
+        assert_eq!(upload_gate(false, true, false, true), UploadGate::Upload);
+        // A declared project (a `minimal.toml` is present) uploads even
+        // when it is neither a VCS root nor an explicit sync — the
+        // `min init && min session activate` case (rule 3 beats rule 6).
+        assert_eq!(upload_gate(false, false, true, true), UploadGate::Upload);
+        // An explicit `--sync tarball` is obeyed regardless of a blueprint.
+        assert_eq!(upload_gate(false, true, true, true), UploadGate::Upload);
+        // Neither blueprint nor VCS root, implicit sync: a headless caller
+        // skips and warns, an interactive one confirms first.
+        assert_eq!(
+            upload_gate(false, false, false, true),
+            UploadGate::SkipHeadless
+        );
+        assert_eq!(upload_gate(false, false, false, false), UploadGate::Prompt);
+    }
+
+    #[test]
+    fn skipped_upload_warning_names_what_the_session_gets() {
+        let warning = skipped_upload_warning(Path::new("/srv/data/run42"));
+        assert!(warning.contains("/srv/data/run42"));
+        assert!(warning.contains("has no minimal.toml"));
+        assert!(warning.contains("empty workspace and a default blueprint"));
+        assert!(warning.contains("--sync tarball"));
     }
 
     // ---- TarZstArchive per-entry API ----
@@ -1287,9 +1343,54 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&copied).unwrap(), "target-contents");
     }
 
-    /// `add_file` with `mode_override` honours the requested mode.
-    /// Verifies the patches uploader's normalize-to-0o644 story
-    /// (Nix-store 0o444 sources landing as writable copies).
+    /// With the default options — what the patches uploader passes —
+    /// the entry carries the source file's own permission bits. A
+    /// script patched into a session has to arrive executable, and a
+    /// `0600` source has to arrive private; both are decided here, on
+    /// the header.
+    #[tokio::test]
+    async fn tar_zst_archive_add_file_defaults_to_the_source_mode() {
+        let src = tempfile::TempDir::new().unwrap();
+        let cases = [("tool.sh", 0o755), ("secret.toml", 0o600)];
+        for (name, mode) in cases {
+            let path = src.path().join(name);
+            std::fs::write(&path, "x").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        let src_path = src.path().to_path_buf();
+        let buf = build_via_archive(async move |archive| {
+            for (name, _) in cases {
+                archive
+                    .add_file(&src_path.join(name), name, AddFileOptions::default())
+                    .await?;
+            }
+            Ok(())
+        })
+        .await;
+
+        let decoder = async_compression::tokio::bufread::ZstdDecoder::new(&buf[..]);
+        let out = tempfile::TempDir::new().unwrap();
+        async_tar::Archive::new(decoder)
+            .unpack(out.path().to_path_buf())
+            .await
+            .unwrap();
+        for (name, mode) in cases {
+            let meta = std::fs::metadata(out.path().join(name)).unwrap();
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                mode,
+                "{name} should have kept its source mode",
+            );
+        }
+    }
+
+    /// `add_file` with `mode_override` honours the requested mode over
+    /// the source's own. Verifies the hook-script uploader's
+    /// flatten-to-0o644 story: those are read by `bash <script>`, never
+    /// exec'd, so their source mode is deliberately not carried. The
+    /// patches uploader takes the `None` branch instead — see
+    /// [`tar_zst_archive_add_file_defaults_to_the_source_mode`].
     #[tokio::test]
     async fn tar_zst_archive_add_file_honours_mode_override() {
         let src = tempfile::TempDir::new().unwrap();

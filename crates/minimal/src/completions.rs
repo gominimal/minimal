@@ -95,14 +95,10 @@ pub fn cmd_print(shell: Shell) -> Result<(), anyhow::Error> {
 /// the end of an install the binaries are already correctly in place, and one
 /// unwritable shared directory must not make the run look failed.
 pub fn cmd_install(shells: &[InstallShell]) -> Result<(), anyhow::Error> {
-    let targets = if shells.is_empty() {
-        &InstallShell::ALL[..]
-    } else {
-        shells
-    };
+    let targets = install_targets(shells);
 
     let mut stdout = std::io::stdout().lock();
-    for shell in targets {
+    for shell in &targets {
         match install_one(*shell) {
             Ok(path) => writeln!(stdout, "{}", path.display())
                 .context("write installed completion path to stdout")?,
@@ -110,6 +106,23 @@ pub fn cmd_install(shells: &[InstallShell]) -> Result<(), anyhow::Error> {
         }
     }
     Ok(())
+}
+
+/// The shells to install for, in the order they were named and without repeats:
+/// an empty request means every installable shell, and a shell named more than
+/// once is installed once (first occurrence keeps its position). Without this a
+/// repeated argument would write the file — and print its path — once per copy.
+fn install_targets(shells: &[InstallShell]) -> Vec<InstallShell> {
+    if shells.is_empty() {
+        return InstallShell::ALL.to_vec();
+    }
+    let mut targets = Vec::with_capacity(shells.len());
+    for &shell in shells {
+        if !targets.contains(&shell) {
+            targets.push(shell);
+        }
+    }
+    targets
 }
 
 /// Install one shell's registration, returning the path written.
@@ -278,9 +291,25 @@ fn fpath_contains(fpath: &std::ffi::OsStr, dir: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::fpath_contains;
+    use super::{InstallShell, fpath_contains, install_targets};
     use std::ffi::OsString;
     use std::path::Path;
+
+    #[test]
+    fn install_targets_dedupes_preserving_order() {
+        // A shell named twice is installed once, not once per copy.
+        assert_eq!(
+            install_targets(&[InstallShell::Zsh, InstallShell::Zsh]),
+            vec![InstallShell::Zsh]
+        );
+        // The first occurrence fixes each shell's position.
+        assert_eq!(
+            install_targets(&[InstallShell::Fish, InstallShell::Bash, InstallShell::Fish]),
+            vec![InstallShell::Fish, InstallShell::Bash]
+        );
+        // An empty request means every installable shell.
+        assert_eq!(install_targets(&[]), InstallShell::ALL.to_vec());
+    }
 
     #[test]
     fn fpath_membership_is_exact() {

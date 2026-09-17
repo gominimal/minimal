@@ -79,7 +79,7 @@ description = "orientation banner and shaped prompt"
 PROMPT_COMMAND = 'eval "$MINIMAL_MOTD"; unset PROMPT_COMMAND MINIMAL_MOTD'
 PS1 = 'minimal:\w\$ '
 MINIMAL_MOTD = '''
-[ -t 1 ] && { printf '\n     ████  ████▄\n  ▄▄▄ ▀███▄ ▀███▄\n  ▀███  ▀███  ▀███\n\n'; printf '  minimal · session %s · loadout %s\n  detach: ctrl-w' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-default (built-in)}"; [ -f /workbench/minimal.toml ] || [ -f /workbench/.minimal/minimal.toml ] || printf ' · no minimal.toml here — min init to add one'; printf '\n\n  Add tools to this box:   min add --session <pkg>\n  Search the registry:     min search <query>\n\n'; }
+[ -t 1 ] && { printf '\n     ████  ████▄\n  ▄▄▄ ▀███▄ ▀███▄\n  ▀███  ▀███  ▀███\n\n'; printf '  minimal · session %s · loadout %s\n  detach: %s' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-default (built-in)}" "${MINIMAL_DETACH_HINT:-ctrl-] then d}"; [ -f /workbench/minimal.toml ] || [ -f /workbench/.minimal/minimal.toml ] || printf ' · no minimal.toml here — min init to add one'; printf '\n\n  Add tools to this box:   min add --session <pkg>\n  Search the registry:     min search <query>\n\n'; }
 '''
 "#;
 
@@ -99,9 +99,18 @@ fn builtin_default_loadout() -> sessions::core::loadout::Loadout {
 pub(crate) struct ActiveLoadouts {
     /// The loadouts to compose, in application order.
     pub(crate) loadouts: Vec<sessions::core::loadout::Loadout>,
+    /// The directory these loadouts were read from — whatever
+    /// `--config-dir` / `$XDG_CONFIG_HOME` resolved to for this run.
+    ///
+    /// Travels with the loadouts rather than being recomputed by each
+    /// consumer, so everything anchored at a loadout's own directory
+    /// (`<dir>/<name>/`) — its external hook scripts, and
+    /// `$LOADOUT_ROOT` in its patch sources — resolves against the
+    /// directory the files actually came from.
+    pub(crate) loadouts_dir: paths::HostAbsPath,
     /// True when the zero-config fallback used the built-in `default`
     /// loadout (as opposed to user files, including a shadowing user
-    /// `default.toml`).
+    /// `default` loadout of their own).
     pub(crate) builtin_default: bool,
 }
 
@@ -114,18 +123,19 @@ pub(crate) struct ActiveLoadouts {
 ///
 /// With no flags and an empty `default_loadouts`, falls back to the
 /// built-in [`builtin_default_loadout`] so a zero-config box is
-/// oriented rather than bare; a user `default.toml` on disk shadows
-/// the built-in.
+/// oriented rather than bare; a user `default` loadout on disk — in
+/// either layout — shadows the built-in.
 pub(crate) fn resolve_active_loadouts(
     selection: LoadoutSelection,
     cfg: &sessions::client::config::Config,
     global: &GlobalArgs,
 ) -> Result<ActiveLoadouts, anyhow::Error> {
-    let loadouts_dir = resolve_minimal_config_dir(global).join("loadouts");
+    let loadouts_dir = resolve_loadouts_dir_for_activation(global)?;
     let (names, source): (Vec<String>, &str) = match selection {
         LoadoutSelection::None => {
             return Ok(ActiveLoadouts {
                 loadouts: Vec::new(),
+                loadouts_dir,
                 builtin_default: false,
             });
         }
@@ -135,11 +145,19 @@ pub(crate) fn resolve_active_loadouts(
             if configured.is_empty() {
                 // Zero-config: no flags and no configured defaults.
                 // Fall back to the built-in `default` loadout unless
-                // the user shadows it with their own `default.toml`,
+                // the user shadows it with their own — in either
+                // layout, `default.toml` or `default/loadout.toml` —
                 // in which case that file is loaded instead.
-                if !loadouts_dir.join("default.toml").exists() {
+                //
+                // Probed through the resolver rather than a bare
+                // `exists()` so both layouts are found by one rule,
+                // and so a `default` that exists but is broken
+                // (malformed TOML, both layouts at once) is reported
+                // as the error it is instead of being read as absence.
+                if !user_default_exists(&loadouts_dir)? {
                     return Ok(ActiveLoadouts {
                         loadouts: vec![builtin_default_loadout()],
+                        loadouts_dir,
                         builtin_default: true,
                     });
                 }
@@ -152,19 +170,97 @@ pub(crate) fn resolve_active_loadouts(
     let loadouts = names
         .iter()
         .map(|name| {
-            let path = loadouts_dir.join(format!("{name}.toml"));
+            // Validate before the name reaches a path join. Without
+            // this, `--loadout ../../evil` would be interpolated
+            // straight into a filename and read an arbitrary `.toml`
+            // off disk — the post-read stem check does not catch it,
+            // since `file_stem("../../evil.toml")` is just `evil`.
+            //
+            // `LoadoutName`'s own error is the nutype-generated
+            // "failed the predicate test", which tells the user
+            // nothing about what a loadout name may contain — so the
+            // rule is spelled out here instead.
+            let name = sessions::core::loadout::LoadoutName::try_new(name)
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "`{name}` is not a loadout name: names are the file or directory \
+                         a loadout is filed under, so they cannot be empty, be `.` or \
+                         `..`, or contain `/`, `\\`, or NUL"
+                    )
+                })
+                .with_context(|| format!("{source} `{name}`"))?;
             // `LoadError`'s Display already embeds its I/O source, so flatten
             // it to a leaf before adding context; otherwise anyhow re-renders
             // the underlying error a second time from the chain.
-            sessions::client::disk::read_loadout_file(&path)
+            sessions::client::disk::load_loadout(loadouts_dir.as_utf8_path().as_std_path(), &name)
+                .map(|(loadout, _layout)| loadout)
                 .map_err(|e| anyhow::anyhow!("{e}"))
                 .with_context(|| format!("{source} `{name}`"))
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ActiveLoadouts {
         loadouts,
+        loadouts_dir,
         builtin_default: false,
     })
+}
+
+/// Whether the user has a `default` loadout of their own on disk, in
+/// either layout — the probe behind the zero-config fallback in
+/// [`resolve_active_loadouts`].
+///
+/// Absence is the normal answer here, so [`LoadError::NotFound`] maps
+/// to `Ok(false)`. Every other error means the file is *there* and
+/// unusable, which the user wants told rather than silently replaced
+/// by the built-in.
+///
+/// [`LoadError::NotFound`]: sessions::client::disk::LoadError::NotFound
+fn user_default_exists(loadouts_dir: &paths::HostAbsPath) -> Result<bool, anyhow::Error> {
+    let name = sessions::core::loadout::LoadoutName::try_new(BUILTIN_DEFAULT_NAME)
+        .expect("the built-in default's name is a valid loadout name");
+    match sessions::client::disk::load_loadout(loadouts_dir.as_utf8_path().as_std_path(), &name) {
+        Ok(_) => Ok(true),
+        Err(sessions::client::disk::LoadError::NotFound { .. }) => Ok(false),
+        Err(e) => Err(anyhow::anyhow!("{e}")).context("default_loadouts `default`"),
+    }
+}
+
+/// The loadouts directory an activation reads from:
+/// `<config>/minimal/loadouts`, under whatever
+/// [`resolve_minimal_config_dir`] resolved for this run.
+///
+/// UTF-8 is required rather than best-effort: the directory is joined
+/// with a loadout's name to anchor that loadout's own files (hook
+/// scripts, `$LOADOUT_ROOT` patch sources), and those anchors travel
+/// through UTF-8 path types all the way to the daemon.
+///
+/// A **relative** `--config-dir` is anchored at the process working
+/// directory rather than refused. Every other consumer of the flag
+/// reads it straight off the CWD, so refusing one here would break
+/// `--config-dir some/rel/dir` for every activation — including ones
+/// that apply no loadouts at all — over an anchor those runs never use.
+/// The join is lexical (no `canonicalize`): the directory need not
+/// exist yet, and resolving symlinks here would quietly change which
+/// path a loadout's hook scripts are checked against. One consequence:
+/// a relative dir containing `..` stays unnormalized, so a loadout
+/// under it that uses `$LOADOUT_ROOT` fails expansion, which rejects
+/// `..` in any pattern.
+fn resolve_loadouts_dir_for_activation(
+    global: &GlobalArgs,
+) -> Result<paths::HostAbsPath, anyhow::Error> {
+    let dir = resolve_minimal_config_dir(global).join("loadouts");
+    let utf8 = camino::Utf8PathBuf::from_path_buf(dir)
+        .map_err(|p| anyhow::anyhow!("loadouts directory is not valid UTF-8: {}", p.display()))?;
+    match paths::HostAbsPath::try_new(utf8) {
+        Ok(abs) => Ok(abs),
+        Err(paths::Error::NotAbsolute(rel)) => {
+            let cwd = paths::HostAbsPath::from_cwd()
+                .context("resolving a relative --config-dir against the working directory")?;
+            paths::HostAbsPath::try_new(cwd.as_utf8_path().join(rel))
+                .map_err(|e| anyhow::anyhow!("loadouts directory: {e}"))
+        }
+        Err(e) => Err(anyhow::anyhow!("loadouts directory: {e}")),
+    }
 }
 
 /// Human-readable list of the active loadouts, as interpolated into the
@@ -213,8 +309,7 @@ pub(crate) fn compose_options_from_config(
 /// nothing is staged, uploaded, or run.
 pub(crate) fn stage_loadout_hook_scripts(
     active: &ActiveLoadouts,
-    global: &GlobalArgs,
-    project_root: &camino::Utf8Path,
+    project_root: &paths::HostAbsPath,
     hooks_enabled: bool,
 ) -> Result<Vec<sessions::client::hookscripts::StagedScript>, anyhow::Error> {
     use sessions::client::hookscripts::{ScriptAnchors, stage_external_scripts};
@@ -223,11 +318,6 @@ pub(crate) fn stage_loadout_hook_scripts(
     if !hooks_enabled {
         return Ok(Vec::new());
     }
-    let loadouts_dir =
-        camino::Utf8PathBuf::from_path_buf(resolve_minimal_config_dir(global).join("loadouts"))
-            .map_err(|p| {
-                anyhow::anyhow!("loadouts directory is not valid UTF-8: {}", p.display())
-            })?;
 
     let hooks: Vec<ProvenancedHook> = active
         .loadouts
@@ -243,8 +333,8 @@ pub(crate) fn stage_loadout_hook_scripts(
         .collect();
 
     let anchors = ScriptAnchors {
-        loadouts_dir,
-        project_root: project_root.to_owned(),
+        loadouts_dir: active.loadouts_dir.clone(),
+        project_root: project_root.clone(),
     };
     stage_external_scripts(&hooks, &anchors).map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -265,12 +355,12 @@ pub(crate) fn stage_loadout_hook_scripts(
 /// A project with no mfile, or one that does not parse, is not this
 /// function's problem — the activation has its own handling for both, and
 /// duplicating it here would report the same fault twice.
-pub(crate) fn check_project_hooks(project_root: &camino::Utf8Path) -> Result<(), anyhow::Error> {
+pub(crate) fn check_project_hooks(project_root: &paths::HostAbsPath) -> Result<(), anyhow::Error> {
     use sessions::client::hookscripts::{ScriptAnchors, stage_external_scripts};
     use sessions::core::lifecyclehook::{HookScript, HookScriptBody};
     use sessions::core::source::{ProvenancedHook, Source};
 
-    let Ok(mfile) = mfile::File::from_dir(project_root.as_std_path()) else {
+    let Ok(mfile) = mfile::File::from_dir(project_root.as_utf8_path().as_std_path()) else {
         return Ok(());
     };
     let Some(session) = mfile.session.as_ref() else {
@@ -312,14 +402,14 @@ pub(crate) fn check_project_hooks(project_root: &camino::Utf8Path) -> Result<(),
                 h.clone(),
                 Source::Project {
                     path: paths::HostPath::try_new(project_root.as_str())
-                        .expect("an activation's project path is a valid host path"),
+                        .expect("an absolute host path is a valid host path"),
                 },
             )
         })
         .collect();
     let anchors = ScriptAnchors {
-        loadouts_dir: project_root.to_owned(),
-        project_root: project_root.to_owned(),
+        loadouts_dir: project_root.clone(),
+        project_root: project_root.clone(),
     };
     stage_external_scripts(&provenanced, &anchors).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
@@ -413,7 +503,11 @@ pub(crate) fn compose_user_contribution(
     };
 
     let mut composer = sessions::client::composer::UserComposer::new()
-        .with_orientation(sessions::core::compose::Orientation { loadouts_display });
+        .with_orientation(sessions::core::compose::Orientation { loadouts_display })
+        // Anchors `$LOADOUT_ROOT` in the loadouts' patch sources at the
+        // directory they were read from, so a loadout can patch in files
+        // shipped beside it without naming an absolute config path.
+        .with_loadouts_dir(active.loadouts_dir);
     composer
         .add_all(loadouts)
         .map_err(|e| anyhow::anyhow!("composing loadouts: {e}"))?;
@@ -436,10 +530,12 @@ fn resolve_loadouts_dir(args: &LoadoutListArgs, global: &GlobalArgs) -> PathBuf 
     resolve_minimal_config_dir(global).join("loadouts")
 }
 
-/// List loadouts discovered in the loadouts directory. One row per
-/// parseable `.toml` file; files that fail to parse are reported on
-/// stderr and make the command exit non-zero, leaving the table of
-/// valid loadouts intact. Loadouts named in
+/// List loadouts discovered in the loadouts directory, in both
+/// layouts (`<name>.toml` and `<name>/loadout.toml`). One row per
+/// parseable loadout; ones that fail to load — a parse error, or a
+/// name defined in both layouts at once — are reported on stderr and
+/// make the command exit non-zero, leaving the table of valid
+/// loadouts intact. Loadouts named in
 /// `[loadouts].default_loadouts` in the client config are marked
 /// with a leading `*`.
 pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<(), anyhow::Error> {
@@ -451,7 +547,8 @@ pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<()
         // orients the user. Note where to add their own and continue.
         Err(sessions::client::disk::ListError::NotFound { path }) => {
             eprintln!(
-                "No loadouts directory at {} yet — drop `<name>.toml` files there to add your own.",
+                "No loadouts directory at {} yet — add your own as `<name>.toml` \
+                 there, or as `<name>/loadout.toml` to keep one under version control.",
                 path.display()
             );
             Vec::new()
@@ -475,19 +572,20 @@ pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<()
     // invisible until the user wondered why their loadout wasn't
     // active.
     let present: std::collections::HashSet<&str> =
-        entries.iter().map(|e| e.file_stem.as_str()).collect();
+        entries.iter().map(|e| e.name.as_str()).collect();
     defaults
         .iter()
         .filter(|missing| !present.contains(missing.as_str()))
         .for_each(|missing| {
             eprintln!(
-                "Warning: `{missing}` listed in default_loadouts but no `{missing}.toml` in {}",
+                "Warning: `{missing}` listed in default_loadouts but no `{missing}.toml` \
+                 or `{missing}/loadout.toml` in {}",
                 dir.display(),
             );
         });
 
     // The built-in `default` loadout is always available, so it gets a
-    // row unless the user has shadowed it with their own `default.toml`.
+    // row unless the user has shadowed it with a `default` of their own.
     let show_builtin = !present.contains(BUILTIN_DEFAULT_NAME);
 
     // Partition discovered entries: parsed loadouts become table rows,
@@ -540,8 +638,10 @@ pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<()
         println!("* default (from `[loadouts].default_loadouts`)");
     }
     if failures > 0 {
+        // "failed to load", not "failed to parse": a conflicting pair
+        // of layouts is counted here too, and it parses fine.
         bail!(
-            "{failures} loadout file{} failed to parse",
+            "{failures} loadout{} failed to load",
             if failures == 1 { "" } else { "s" }
         );
     }
@@ -568,14 +668,14 @@ impl LoadoutRow {
         loadout: &sessions::core::loadout::Loadout,
         defaults: &std::collections::HashSet<String>,
     ) -> Self {
-        let marker = if defaults.contains(&entry.file_stem) {
+        let marker = if defaults.contains(&entry.name) {
             "*"
         } else {
             " "
         };
         Self {
             marker,
-            name: entry.file_stem.clone(),
+            name: entry.name.clone(),
             desc: loadout.description().unwrap_or("").to_string(),
             counts: format!(
                 "{} pkg / {} var / {} patch",
@@ -608,6 +708,14 @@ impl LoadoutRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The directory these tests pretend their hand-built loadouts were
+    /// read from. Nothing here declares a `$LOADOUT_ROOT` patch source
+    /// or an external hook script, so the path only has to be
+    /// well-formed — it is never touched on disk.
+    fn stub_loadouts_dir() -> paths::HostAbsPath {
+        paths::HostAbsPath::try_new("/nonexistent/minimal/loadouts").unwrap()
+    }
 
     /// `LoadoutSelection::from_flags` — full truth table.
     #[test]
@@ -649,9 +757,9 @@ mod tests {
     }
 
     /// `resolve_active_loadouts` errors when a `--loadout NAME`
-    /// selection names a file that isn't on disk. The concrete
-    /// error goes to stderr via the closure; here we only assert
-    /// the Result is Err.
+    /// selection names a loadout that is on disk in neither layout,
+    /// and the message names both places it looked — a user who
+    /// mistyped needs to know where the file was expected.
     #[test]
     fn resolve_active_loadouts_cli_missing_file_errors() {
         let tmp = tempfile::tempdir().unwrap();
@@ -665,18 +773,30 @@ mod tests {
             no_input: false,
         };
         let selection = LoadoutSelection::Cli(vec!["missing".to_string()]);
-        assert!(resolve_active_loadouts(selection, &cfg, &global).is_err());
+        let err = resolve_active_loadouts(selection, &cfg, &global)
+            .expect_err("a missing --loadout must error");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("missing.toml"), "got: {rendered}");
+        assert!(rendered.contains("missing/loadout.toml"), "got: {rendered}");
     }
 
-    /// The `--loadout NAME` missing-file error names the underlying OS failure
-    /// exactly once. `LoadError`'s Display already embeds its source, so the
+    /// The `--loadout NAME` error names the underlying failure exactly
+    /// once. `LoadError`'s Display already embeds its source, so the
     /// context chain must not re-render it (see the flatten in
     /// [`resolve_active_loadouts`]).
+    ///
+    /// Exercised through a malformed file rather than a missing one:
+    /// absence is now [`LoadError::NotFound`], which has no source to
+    /// double, so it could not catch a regression here.
+    ///
+    /// [`LoadError::NotFound`]: sessions::client::disk::LoadError::NotFound
     #[test]
-    fn resolve_active_loadouts_cli_missing_file_error_not_doubled() {
+    fn resolve_active_loadouts_cli_error_not_doubled() {
         let tmp = tempfile::tempdir().unwrap();
         let loadouts = tmp.path().join("minimal/loadouts");
         std::fs::create_dir_all(&loadouts).unwrap();
+        let malformed = "= not = toml =";
+        std::fs::write(loadouts.join("broken.toml"), malformed).unwrap();
         let cfg = sessions::client::config::Config::default();
         let global = GlobalArgs {
             repo_dir: None,
@@ -685,20 +805,59 @@ mod tests {
             provider: None,
             no_input: false,
         };
-        let selection = LoadoutSelection::Cli(vec!["missing".to_string()]);
+        let selection = LoadoutSelection::Cli(vec!["broken".to_string()]);
         let err = resolve_active_loadouts(selection, &cfg, &global)
-            .expect_err("a missing --loadout file must error");
+            .expect_err("a malformed --loadout file must error");
         let rendered = format!("{err:#}");
-        // The concrete OS-error text is platform-dependent, so derive it from
-        // the same failing read and assert it appears once, not twice.
-        let needle = std::fs::read_to_string(loadouts.join("missing.toml"))
-            .expect_err("the loadout file must be absent")
+        // The parse-error text belongs to `toml`, so derive it from the
+        // same failing parse and assert it appears once, not twice.
+        let needle = toml::from_str::<sessions::core::loadout::LoadoutFile>(malformed)
+            .expect_err("the fixture must not parse")
             .to_string();
         assert_eq!(
             rendered.matches(&needle).count(),
             1,
-            "OS error should appear once in `{rendered}`",
+            "parse error should appear once in `{rendered}`",
         );
+    }
+
+    /// A `--loadout` value is validated as a name before it is joined
+    /// into a path. Without that, `../../evil` would be interpolated
+    /// straight into a filename and read an arbitrary `.toml` off
+    /// disk — the stem check downstream does not catch it, because
+    /// `file_stem("../../evil.toml")` is just `evil`.
+    #[test]
+    fn resolve_active_loadouts_rejects_a_traversing_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("minimal/loadouts")).unwrap();
+        // Plant the file the traversal would have reached, so the test
+        // fails loudly if the name ever gets through.
+        std::fs::write(
+            tmp.path().join("evil.toml"),
+            "description = \"should never load\"\n",
+        )
+        .unwrap();
+        let cfg = sessions::client::config::Config::default();
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(tmp.path().to_path_buf()),
+            provider: None,
+            no_input: false,
+        };
+        // The dot forms carry no separator, so they need their own
+        // refusal: under the directory layout `..` would resolve
+        // `<loadouts>/../loadout.toml`, one level above the loadouts
+        // directory, and `.` would resolve `<loadouts>/./loadout.toml`
+        // — aliasing the flat loadout named `loadout` under a name
+        // taken from the parent directory.
+        for name in ["../evil", "../../evil", "sub/evil", ".", "..", "  ..  "] {
+            let selection = LoadoutSelection::Cli(vec![name.to_string()]);
+            assert!(
+                resolve_active_loadouts(selection, &cfg, &global).is_err(),
+                "`{name}` must be refused as a loadout name",
+            );
+        }
     }
 
     /// A loadout that declares a session transition script contributes
@@ -730,6 +889,7 @@ on_activate = { type = "inline", value = "echo activated" }
         let (wire, _policy) = compose_user_contribution(
             ActiveLoadouts {
                 loadouts: vec![loadout],
+                loadouts_dir: stub_loadouts_dir(),
                 builtin_default: false,
             },
             sessions::core::policy::UserPolicy::empty(),
@@ -768,6 +928,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         .expect("loadout parses");
         let active = ActiveLoadouts {
             loadouts: vec![loadout],
+            loadouts_dir: stub_loadouts_dir(),
             builtin_default: false,
         };
         // A tempdir with no minimal.toml: the project side contributes
@@ -831,7 +992,8 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             !motd.contains("MINIMAL_BLUEPRINT"),
             "blueprint is a session-filesystem fact, not an env var"
         );
-        assert!(motd.contains("detach: ctrl-w"));
+        assert!(motd.contains("detach: %s"));
+        assert!(motd.contains("${MINIMAL_DETACH_HINT:-ctrl-] then d}"));
         assert!(motd.contains("min init"));
     }
 
@@ -845,6 +1007,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         };
         let active = ActiveLoadouts {
             loadouts: vec![mk("helix"), mk("fish")],
+            loadouts_dir: stub_loadouts_dir(),
             builtin_default: false,
         };
         assert_eq!(loadout_display_list(&active), "helix, fish");
@@ -860,6 +1023,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         let (wire, _policy) = compose_user_contribution(
             ActiveLoadouts {
                 loadouts: Vec::new(),
+                loadouts_dir: stub_loadouts_dir(),
                 builtin_default: true,
             },
             sessions::core::policy::UserPolicy::empty(),
@@ -928,6 +1092,201 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         assert_eq!(loadout_display_list(&out), "default");
     }
 
+    /// A `--loadout NAME` resolves the directory layout,
+    /// `<loadouts>/<name>/loadout.toml`, exactly as it resolves the
+    /// flat file — same name, same contents, and the same
+    /// `loadouts_dir` anchor, which is what makes `$LOADOUT_ROOT` and
+    /// the loadout's hook scripts land in `<loadouts>/<name>/` either
+    /// way.
+    #[test]
+    fn resolve_active_loadouts_reads_the_directory_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loadouts = tmp.path().join("minimal/loadouts");
+        std::fs::create_dir_all(loadouts.join("dev")).unwrap();
+        std::fs::write(
+            loadouts.join("dev").join("loadout.toml"),
+            "description = \"version controlled\"\npackages = [\"helix\"]\n",
+        )
+        .unwrap();
+        let cfg = sessions::client::config::Config::default();
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(tmp.path().to_path_buf()),
+            provider: None,
+            no_input: false,
+        };
+        let out = resolve_active_loadouts(
+            LoadoutSelection::Cli(vec!["dev".to_string()]),
+            &cfg,
+            &global,
+        )
+        .expect("a directory-layout loadout resolves");
+        assert_eq!(out.loadouts.len(), 1);
+        assert_eq!(out.loadouts[0].name().as_ref(), "dev");
+        assert_eq!(out.loadouts[0].description(), Some("version controlled"));
+        assert_eq!(out.loadouts[0].packages(), &["helix"]);
+        // The anchor is the loadouts dir, not the loadout's own
+        // directory — `Source::loadout_dir` appends the name.
+        assert_eq!(out.loadouts_dir.as_str(), loadouts.to_str().unwrap());
+    }
+
+    /// One name in both layouts is refused rather than resolved by
+    /// precedence, and the error names both files.
+    #[test]
+    fn resolve_active_loadouts_refuses_a_name_in_both_layouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loadouts = tmp.path().join("minimal/loadouts");
+        std::fs::create_dir_all(loadouts.join("dev")).unwrap();
+        std::fs::write(loadouts.join("dev.toml"), "description = \"flat\"\n").unwrap();
+        std::fs::write(
+            loadouts.join("dev").join("loadout.toml"),
+            "description = \"dir\"\n",
+        )
+        .unwrap();
+        let cfg = sessions::client::config::Config::default();
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(tmp.path().to_path_buf()),
+            provider: None,
+            no_input: false,
+        };
+        let err = resolve_active_loadouts(
+            LoadoutSelection::Cli(vec!["dev".to_string()]),
+            &cfg,
+            &global,
+        )
+        .expect_err("an ambiguous loadout must error");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("dev.toml"), "got: {rendered}");
+        assert!(rendered.contains("loadout.toml"), "got: {rendered}");
+    }
+
+    /// A user `default/loadout.toml` shadows the built-in just as
+    /// `default.toml` does — the zero-config probe looks in both
+    /// layouts.
+    #[test]
+    fn resolve_active_loadouts_directory_default_shadows_builtin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loadouts = tmp.path().join("minimal/loadouts");
+        std::fs::create_dir_all(loadouts.join("default")).unwrap();
+        std::fs::write(
+            loadouts.join("default").join("loadout.toml"),
+            "description = \"user override\"\n",
+        )
+        .unwrap();
+        let cfg = sessions::client::config::Config::default();
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(tmp.path().to_path_buf()),
+            provider: None,
+            no_input: false,
+        };
+        let out = resolve_active_loadouts(LoadoutSelection::Defaults, &cfg, &global)
+            .expect("user default resolves");
+        assert_eq!(out.loadouts.len(), 1);
+        assert_eq!(out.loadouts[0].description(), Some("user override"));
+        assert!(!out.builtin_default);
+        assert_eq!(loadout_display_list(&out), "default");
+    }
+
+    /// The zero-config probe reports a `default` that is present but
+    /// unusable, instead of reading the failure as absence and
+    /// silently substituting the built-in — which would leave the user
+    /// wondering why their file had no effect.
+    #[test]
+    fn resolve_active_loadouts_reports_a_broken_user_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loadouts = tmp.path().join("minimal/loadouts");
+        std::fs::create_dir_all(&loadouts).unwrap();
+        std::fs::write(loadouts.join("default.toml"), "= not = toml =").unwrap();
+        let cfg = sessions::client::config::Config::default();
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(tmp.path().to_path_buf()),
+            provider: None,
+            no_input: false,
+        };
+        assert!(
+            resolve_active_loadouts(LoadoutSelection::Defaults, &cfg, &global).is_err(),
+            "a malformed user `default` must be reported, not fall back",
+        );
+    }
+
+    /// Every resolution carries the loadouts directory it read from,
+    /// and that directory follows `--config-dir` — this is what makes
+    /// `$LOADOUT_ROOT` (and a loadout's hook scripts) resolve against
+    /// the files that are actually in play, not a platform default.
+    ///
+    /// Asserted across all three exits: the `--no-loadouts`
+    /// short-circuit, the zero-config built-in fallback, and a real
+    /// file read from disk.
+    #[test]
+    fn resolve_active_loadouts_carries_the_effective_loadouts_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loadouts = tmp.path().join("minimal/loadouts");
+        std::fs::create_dir_all(&loadouts).unwrap();
+        let expected = paths::HostAbsPath::try_new(
+            camino::Utf8PathBuf::from_path_buf(loadouts.clone()).unwrap(),
+        )
+        .unwrap();
+        let cfg = sessions::client::config::Config::default();
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(tmp.path().to_path_buf()),
+            provider: None,
+            no_input: false,
+        };
+
+        let none = resolve_active_loadouts(LoadoutSelection::None, &cfg, &global).unwrap();
+        assert_eq!(none.loadouts_dir, expected, "--no-loadouts");
+
+        let builtin = resolve_active_loadouts(LoadoutSelection::Defaults, &cfg, &global).unwrap();
+        assert!(builtin.builtin_default);
+        assert_eq!(builtin.loadouts_dir, expected, "built-in fallback");
+
+        std::fs::write(loadouts.join("dev.toml"), "description = \"d\"\n").unwrap();
+        let named = resolve_active_loadouts(
+            LoadoutSelection::Cli(vec!["dev".to_string()]),
+            &cfg,
+            &global,
+        )
+        .unwrap();
+        assert_eq!(named.loadouts_dir, expected, "--loadout dev");
+        assert_eq!(named.loadouts[0].name().as_ref(), "dev");
+    }
+
+    /// A relative `--config-dir` still resolves: it is anchored at the
+    /// working directory, the way every other consumer of the flag
+    /// reads it.
+    ///
+    /// Regression guard. `$LOADOUT_ROOT` needs an absolute anchor, but
+    /// that requirement must not leak back onto the flag — a run with
+    /// no loadouts at all (or none using the reference) has no business
+    /// failing because the config dir was spelled relatively.
+    #[test]
+    fn resolve_active_loadouts_anchors_a_relative_config_dir_at_the_cwd() {
+        let cfg = sessions::client::config::Config::default();
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(PathBuf::from("rel-cfg")),
+            provider: None,
+            no_input: false,
+        };
+        let out = resolve_active_loadouts(LoadoutSelection::None, &cfg, &global)
+            .expect("a relative --config-dir must still resolve");
+        let cwd = camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(
+            out.loadouts_dir.as_utf8_path(),
+            cwd.join("rel-cfg/minimal/loadouts"),
+        );
+    }
+
     /// The built-in listing row carries the `(built-in)` tag and a
     /// zero-package contributes cell.
     #[test]
@@ -962,6 +1321,71 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         assert!(cmd_loadout_list(args, &global).is_err());
     }
 
+    /// A name defined in both layouts is a listing failure, exactly as
+    /// a malformed file is: reported on stderr and a non-zero exit,
+    /// with the valid loadouts beside it still listed.
+    #[test]
+    fn cmd_loadout_list_errors_on_a_name_in_both_layouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loadouts = tmp.path().join("loadouts");
+        std::fs::create_dir_all(loadouts.join("dev")).unwrap();
+        std::fs::write(loadouts.join("dev.toml"), "description = \"flat\"\n").unwrap();
+        std::fs::write(
+            loadouts.join("dev").join("loadout.toml"),
+            "description = \"dir\"\n",
+        )
+        .unwrap();
+        std::fs::write(loadouts.join("fine.toml"), "description = \"ok\"\n").unwrap();
+        let args = LoadoutListArgs {
+            dir: Some(loadouts),
+        };
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(tmp.path().to_path_buf()),
+            provider: None,
+            no_input: false,
+        };
+        assert!(cmd_loadout_list(args, &global).is_err());
+    }
+
+    /// The listing shows both layouts, and a `<name>/` directory that
+    /// holds no `loadout.toml` is not one of them — it is the asset
+    /// directory beside a flat `<name>.toml`, and listing it would
+    /// invent a loadout that does not exist.
+    #[test]
+    fn cmd_loadout_list_lists_both_layouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loadouts = tmp.path().join("loadouts");
+        std::fs::create_dir_all(loadouts.join("vc")).unwrap();
+        std::fs::write(loadouts.join("flat.toml"), "description = \"flat\"\n").unwrap();
+        std::fs::write(
+            loadouts.join("vc").join("loadout.toml"),
+            "description = \"dir\"\n",
+        )
+        .unwrap();
+        // Assets beside `flat.toml`: a directory, but not a loadout.
+        std::fs::create_dir_all(loadouts.join("flat")).unwrap();
+        std::fs::write(loadouts.join("flat").join("config.toml"), "x = 1\n").unwrap();
+
+        let entries = sessions::client::disk::list_loadouts(&loadouts).expect("lists");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["flat", "vc"]);
+        assert!(entries.iter().all(|e| e.loadout.is_ok()));
+
+        let args = LoadoutListArgs {
+            dir: Some(loadouts),
+        };
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(tmp.path().to_path_buf()),
+            provider: None,
+            no_input: false,
+        };
+        assert!(cmd_loadout_list(args, &global).is_ok());
+    }
+
     /// A loadout carrying a hook contributes it when hooks are on and
     /// contributes nothing when `--no-hooks` turns them off.
     ///
@@ -983,6 +1407,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             );
             let active = ActiveLoadouts {
                 loadouts: vec![loadout],
+                loadouts_dir: stub_loadouts_dir(),
                 builtin_default: false,
             };
             let (contribution, _) = compose_user_contribution(

@@ -1,5 +1,6 @@
 //! The minimal daemon, an SSH server which hosts sessions and
 //! task/sandbox executions within them.
+#![recursion_limit = "256"]
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;

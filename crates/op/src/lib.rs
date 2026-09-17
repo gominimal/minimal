@@ -1,4 +1,5 @@
 //! Home for complicated operations using the minimal graph, such as builds or constructing cache objects.
+#![recursion_limit = "256"]
 #![allow(clippy::result_large_err)]
 
 use std::path::PathBuf;
@@ -42,6 +43,8 @@ pub use subsets::SubsetBuild;
 mod cache_clean;
 pub use cache_clean::{CleanCache, CleanEvent, CleanReport, StaleKind};
 
+pub mod notices;
+pub use notices::{NoticeFile, SourceNotices};
 mod sources;
 pub use sources::{SourceFetcher, SourceLoad};
 mod specs;

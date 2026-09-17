@@ -22,6 +22,7 @@ serde_json_lenient.workspace = true
 sessions.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+version.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

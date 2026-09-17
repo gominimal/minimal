@@ -7,7 +7,7 @@
 //! can build one directly.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ pub enum OutputSpec {
         /// The image's default command, already split into argv.
         cmd: Option<Vec<String>>,
         /// Environment variables baked into the image config.
-        vars: HashMap<String, String>,
+        vars: BTreeMap<String, String>,
     },
     /// A single file at `path`, taken from the first package in the closure
     /// that ships it.
@@ -636,7 +636,7 @@ mod tests {
         let spec: OutputSpec = mfile::OutputKind::OciImage {
             entrypoint: Some(mfile::StrOrList::Single("/bin/sh -c 'echo hi'".to_string())),
             cmd: Some(mfile::StrOrList::Multiple(vec!["--flag".to_string()])),
-            vars: HashMap::new(),
+            vars: BTreeMap::new(),
         }
         .try_into()
         .expect("a well-formed entrypoint converts");
@@ -650,7 +650,7 @@ mod tests {
                     "echo hi".to_string()
                 ]),
                 cmd: Some(vec!["--flag".to_string()]),
-                vars: HashMap::new(),
+                vars: BTreeMap::new(),
             }
         );
     }
@@ -664,7 +664,7 @@ mod tests {
                 "/bin/sh -c 'unbalanced".to_string(),
             )),
             cmd: None,
-            vars: HashMap::new(),
+            vars: BTreeMap::new(),
         }
         .try_into()
         .map(|_: OutputSpec| ())

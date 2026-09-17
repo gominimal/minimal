@@ -6,7 +6,10 @@
 //! `dest` paths are inside the sandbox; `source` paths are on the
 //! host. Leading `~` in `source` expands at gate time against the
 //! host home; leading `~` in `dest` expands inside the sandbox at
-//! runtime.
+//! runtime. `$LOADOUT_ROOT` in a `source` expands to this loadout's
+//! own directory — `<loadouts dir>/<name>/`, beside the file — for
+//! files shipped with the loadout rather than kept in the user's
+//! dotfiles (see [`expansion::LOADOUT_ROOT`]).
 //!
 //! ```toml
 //! packages = ["helix", "zellij"]
@@ -25,6 +28,10 @@
 //!       source = "~/dotfiles/zellij/config.kdl" },
 //!     { dest = "~/.config/zellij/layouts/",
 //!       source = { base = "~/dotfiles/zellij/layouts", patterns = ["**/*.kdl"] } },
+//!
+//!     # This loadout's own file, shipped beside it in `<name>/`.
+//!     { dest = "~/.config/helix/ignore",
+//!       source = "$LOADOUT_ROOT/helix-ignore" },
 //! ]
 //!
 //! [vars]
@@ -40,6 +47,8 @@
 //! [[lifecycle_hooks]]
 //! on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || true" }
 //! ```
+//!
+//! [`expansion::LOADOUT_ROOT`]: crate::core::expansion::LOADOUT_ROOT
 
 use std::collections::BTreeMap;
 
@@ -48,16 +57,23 @@ use nutype::nutype;
 use crate::core::lifecyclehook::LifecycleHook;
 use crate::core::primitives::{LenientVarEntry, Patch, Patches, StrictVarName, VarName, VarValue};
 
-/// A loadout's identifier — trimmed, non-empty, and free of path
-/// separators and NUL bytes.
+/// A loadout's identifier — trimmed, and usable as a single path
+/// component that stays put: non-empty, free of path separators and
+/// NUL bytes, and neither `.` nor `..`.
 ///
 /// Names appear in user-facing contexts (selection menus, error
-/// messages) and are the filename stems the loader reads loadouts
+/// messages) and name the file or directory the loader reads a loadout
 /// from, so they're constrained at construction time rather than at
-/// point of use.
+/// point of use. The rule is [`safe_path_component`] itself, so the
+/// two cannot drift: a name that reaches
+/// [`Layout::path_for`](crate::client::disk::Layout::path_for) is
+/// joined into a path that is then read from, and the `.`/`..` forms
+/// contain no separator yet still move the join somewhere else.
+///
+/// [`safe_path_component`]: crate::core::lifecyclehook::safe_path_component
 #[nutype(
     sanitize(trim),
-    validate(not_empty, predicate = |s: &str| !s.contains(['/', '\\', '\0'])),
+    validate(not_empty, predicate = |s: &str| crate::core::lifecyclehook::safe_path_component(s)),
     derive(
         Clone, Debug, Display, AsRef, PartialEq, Eq, Hash, PartialOrd, Ord,
         Serialize, Deserialize,
@@ -648,6 +664,29 @@ mod tests {
         assert!(LoadoutName::try_new("a\0b").is_err());
         let n = LoadoutName::try_new("  dev  ").unwrap();
         assert_eq!(n.as_ref(), "dev");
+    }
+
+    /// The relative-directory names are refused too. They carry no
+    /// separator, so the check above them does not catch them, yet a
+    /// name is joined into a path that is then read from: `..` would
+    /// send `<loadouts>/<name>/loadout.toml` up out of the loadouts
+    /// directory, and `.` would alias the flat loadout named
+    /// `loadout` while taking its name from the parent directory.
+    ///
+    /// Trimming applies first, so the padded forms are refused as
+    /// well.
+    #[test]
+    fn loadout_name_rejects_relative_directory_names() {
+        for bad in [".", "..", "  .  ", "  ..  "] {
+            assert!(
+                LoadoutName::try_new(bad).is_err(),
+                "`{bad}` must not be a loadout name",
+            );
+        }
+        // Dots are only special as the whole name; they stay legal
+        // inside one.
+        assert_eq!(LoadoutName::try_new("..dev").unwrap().as_ref(), "..dev");
+        assert_eq!(LoadoutName::try_new("dev.v2").unwrap().as_ref(), "dev.v2");
     }
 
     #[test]

@@ -104,6 +104,21 @@ a new session to retry.
 The user's loadouts are added to a `UserComposer` via
 `UserComposer::add`. Each `Loadout::contribute(env)` call resolves
 `VarValue::Inherit*` and tags items with `Source::UserLoadout`.
+
+Loadout var resolution is deliberately **not** the shared
+`ResolvedVar::resolve_with` path. `Loadout::contribute` runs its own
+`resolve_var_declaration`, which differs on one branch: a bare
+`VarValue::Inherit` whose lookup returns `VarError::NotPresent` is
+`warn!`ed and dropped (`Ok(None)`) instead of erroring, so a loadout
+that opportunistically inherits `COLORTERM` doesn't fail activation on
+a host that doesn't set it. Every other branch — `NotUnicode`,
+`InheritWithDefault`, `Specified` — matches `resolve_with`. Phase 3's
+project and package vars go through `resolve_with` itself and so
+**do** hard-fail on an unset bare `Inherit`; the divergence is
+intentional and user-visible, and is documented for end users under
+"Where `{ inherit = true }` differs" in
+`docs/reference/minimal-dot-toml.md`.
+
 `UserComposer::compose(policy)` runs the **shared client-side gate
 pipeline** (described below). User-origin items auto-pass the
 `allow` step but still hit `deny` and `ignore`; vars whose value
@@ -183,7 +198,10 @@ project vars still land but package contributions are empty.
 The client receives the `ContributionResponse` and runs
 `client::handler::handle_response` over the pending batch: resolves
 any `Inherit`/`InheritWithDefault` vars against the client env
-(`ResolvedVar::resolve_with`), expands patch sources against the
+(`ResolvedVar::resolve_with` — so a bare `Inherit` the client env
+does not carry aborts the whole activation with
+`ComposeError::VarResolution`, unlike the Phase 1 loadout path that
+drops it with a warning), expands patch sources against the
 already-gated vars from Phase 1 plus anything approved in this
 batch, applies the user policy, and prompts via local `PolicyHooks`
 when the policy can't decide. Result: one `ContributionVerdict`,

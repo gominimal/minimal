@@ -15,6 +15,7 @@ use mctx::ConfigBuilder;
 use ot::OpTracker;
 use paths::DaemonAbsPath;
 use russh::{Channel, server::Msg};
+use sessions::keys::SessionKeys;
 use sessions::wire::request::ContributionResponse;
 use sessions::{
     Record, SessionStatus,
@@ -44,6 +45,13 @@ use tokio::task::JoinHandle;
 /// checked the patches-ready marker, so a missing file at this
 /// point is a bug (the marker was written but the file it should
 /// have gated on didn't land).
+///
+/// The copy is `fs::copy` specifically because it carries the source's
+/// permission bits across, which is the last link in the chain that
+/// keeps a patched script executable in the session (the unpacker set
+/// those bits on the staged file from the tar header). A hand-rolled
+/// read-then-write here would silently flatten every patch to the
+/// daemon's umask default.
 async fn materialize_patches_into_home(
     patches_dir: &DaemonAbsPath,
     home_dir: &DaemonAbsPath,
@@ -241,8 +249,11 @@ pub(crate) fn registry_name(record: &Record) -> String {
 /// The server-side `AcceptEnv` allowlist: locale and timezone vars a client is
 /// permitted to forward from its shell into the session (OpenSSH's default
 /// `AcceptEnv LANG LC_*`, plus `TZ`). Everything else the client set on the
-/// channel — e.g. `MINIMAL_SESSION_ID`, `TRACEPARENT` — is control plumbing and
-/// must not leak into the shell environment, so it is filtered out here.
+/// channel — e.g. `MINIMAL_SESSION_ID`, `TRACEPARENT`, and the session-key
+/// negotiation vars in `sessions::keys` (`LEADER_ENV`, `DETACH_KEY_ENV`,
+/// `FORWARD_KEY_ENV`, `BELL_ENV`) — is control plumbing read by the daemon's
+/// `shell_request` (and re-validated as a backstop) and must not leak into the
+/// shell environment, so it is filtered out here.
 fn inherited_session_env(
     channel_env: &std::collections::BTreeMap<String, String>,
 ) -> Vec<(String, String)> {
@@ -464,6 +475,43 @@ impl fmt::Debug for WorkspaceBaseline {
             Self::Armed(delta) => write!(f, "Armed(present: {})", delta.is_some()),
         }
     }
+}
+
+/// Deadline for a read-only probe of a session's host — the terminal
+/// attributes and the screen snapshot.
+///
+/// Spawning those probes off the session actor (see
+/// [`Session::handle_message`]) keeps the *actor* responsive, but says
+/// nothing about the spawned task: against a host that never answers, an
+/// unbounded probe outlives every caller that gave up on it. Nor does it
+/// stay parked in the same place:
+/// [`HOST_MAILBOX_CAPACITY`](crate::session_host::HOST_MAILBOX_CAPACITY)
+/// messages in, a wedged host's mailbox is full and the probe blocks in
+/// `send` rather than `recv` — still forever, and still one stranded task
+/// per poll. `min dash` polls the focused session's screen on every refresh
+/// tick, which makes that leak unbounded in the one case the bound exists
+/// for.
+///
+/// So the probe is bounded here too, not only at its callers: a task that
+/// cannot answer within the deadline ends, and the caller reads the same
+/// `None` a session with no running host already reports.
+///
+/// [`crate::sessions::Manager`] bounds these probes again on its own
+/// mainloop. That is not redundant — this deadline covers a wedged *host*,
+/// and the manager's covers a wedged *session actor*, which can be parked in
+/// an inline `EnsureHost`, `Attach`, or `ConfigureLoadout` and never reach
+/// the spawn at all.
+pub(crate) const HOST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Awaits a host probe under [`HOST_PROBE_TIMEOUT`], collapsing both a
+/// missed deadline and a dead host to `None`.
+pub(crate) async fn probe_host<T>(
+    probe: impl std::future::Future<Output = Result<T, ()>>,
+) -> Option<T> {
+    tokio::time::timeout(HOST_PROBE_TIMEOUT, probe)
+        .await
+        .ok()?
+        .ok()
 }
 
 /// The PTY size a host minted with nothing attached starts at. A client that
@@ -910,14 +958,29 @@ impl Session {
             SessionMessage::EnsureHost(r, session_hnd, conn_username) => {
                 let _ = r.send(self.ensure_host(session_hnd, conn_username).await);
             }
-            SessionMessage::GetHostAttrs(r) => {
-                let _ = r.send(match &self.inner {
-                    SessionInner::Active {
-                        host: Some((h, _)), ..
-                    } => h.get_attrs().await.ok(),
-                    _ => None,
-                });
-            }
+            SessionMessage::GetHostAttrs(r) => match &self.inner {
+                SessionInner::Active {
+                    host: Some((h, _)), ..
+                } => {
+                    // Forwarded off-actor for the same reason as
+                    // `GetWorkspaceDelta`: the host loop can be mid-attach or
+                    // mid-teardown, and awaiting it from here parks this
+                    // actor — which the manager awaits in turn, from its own
+                    // mainloop, where a park costs every session RPC.
+                    //
+                    // Bounded *inside* the task: dropping the caller's
+                    // receiver does not cancel a spawned future, so an
+                    // unbounded probe would strand one task per poll against
+                    // a host that never answers.
+                    let h = h.clone();
+                    tokio::spawn(async move {
+                        let _ = r.send(probe_host(h.get_attrs()).await);
+                    });
+                }
+                _ => {
+                    let _ = r.send(None);
+                }
+            },
             SessionMessage::GetWorkspaceDelta(r) => match &self.inner {
                 SessionInner::Active {
                     host: Some((h, _)), ..
@@ -934,14 +997,21 @@ impl Session {
                     let _ = r.send(minimald_rpc::SessionDeltaResponse::Unavailable);
                 }
             },
-            SessionMessage::GetHostScreen(r) => {
-                let _ = r.send(match &self.inner {
-                    SessionInner::Active {
-                        host: Some((h, _)), ..
-                    } => h.get_screen().await.ok(),
-                    _ => None,
-                });
-            }
+            SessionMessage::GetHostScreen(r) => match &self.inner {
+                SessionInner::Active {
+                    host: Some((h, _)), ..
+                } => {
+                    // Off-actor and bounded for the same reasons as
+                    // `GetHostAttrs`.
+                    let h = h.clone();
+                    tokio::spawn(async move {
+                        let _ = r.send(probe_host(h.get_screen()).await);
+                    });
+                }
+                _ => {
+                    let _ = r.send(None);
+                }
+            },
             SessionMessage::ConfigureLoadout(contribution, r) => {
                 // Honour what the user chose at `min session activate`.
                 let hooks_enabled = match self.record.record().await {
@@ -997,7 +1067,14 @@ impl Session {
                 let _ = r.send(match &self.inner {
                     // Awaiting a verdict: a client is mid create flow.
                     SessionInner::Draft { pending } => pending.is_some(),
-                    SessionInner::Active { host, .. } => host.is_some(),
+                    // A *live* host, not merely a held one: the slot outlives
+                    // the process (see `launch_host_for_hooks`), so a session
+                    // whose shell has exited still holds a handle to a host
+                    // that runs nothing — and nothing is what an unforced
+                    // shutdown would interrupt there.
+                    SessionInner::Active { host, .. } => {
+                        host.as_ref().is_some_and(|(h, _)| h.is_alive())
+                    }
                 });
             }
             SessionMessage::Stop(r) => {
@@ -1111,13 +1188,23 @@ impl Session {
         let object = self.record.object().await?;
         let workspace_path = object.workspace_path();
 
-        // Deliberately no scaffold here: composing is not the moment to
-        // fabricate a project. `scaffold_default_mfile` resolves the default
-        // package repo's branch head over the network, and the default's
-        // packages reach the sandbox through the launcher's context (built
-        // from the workspace mfile) rather than through the composition —
-        // so paying for it here would buy nothing. A bare workspace composes
-        // to an empty loadout, and the scaffold lands at context-build time.
+        // Scaffold before composing, not after: the launcher's package set is
+        // its baseline unioned with the composition's packages (see the note
+        // on `SessionInner::Active::composition`), so a default written any
+        // later never reaches the sandbox. Propagated, not logged — an
+        // activation that hands back a session id must hand back a usable
+        // session, and a box with no blueprint can't run anything.
+        //
+        // Fenced: the scaffold resolves the default package repo over the
+        // network and runs inline on the session actor, so an unfenced call
+        // would pin a worker for the whole fetch. Flavor-guarded because
+        // `block_in_place` panics on a current-thread runtime.
+        let scaffold = || self.scaffold_mfile_if_missing(&workspace_path);
+        match tokio::runtime::Handle::current().runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(scaffold),
+            _ => scaffold(),
+        }
+        .map_err(|e| std::io::Error::other(format!("scaffolding a default mfile: {e}")))?;
 
         // Phase 1+2: resolve the project and drive the composer. Kept fully
         // synchronous — its non-`Send` intermediaries must not cross an
@@ -1446,6 +1533,7 @@ impl Session {
                     ran.extend(outcomes.iter().map(|o| minimald_rpc::RanHook {
                         declared_by: o.declared_by.clone(),
                         description: o.description.clone(),
+                        output: o.output.clone(),
                     }));
                 }
 
@@ -1530,6 +1618,35 @@ impl Session {
         Ok(rx)
     }
 
+    /// Kills `host` and stops its runtime loop `task`, bounded so a wedged
+    /// host cannot park the caller. Both the kill and the wait for the loop to
+    /// act on it are bounded: `HostHandle::kill`'s `send_timeout` only bounds
+    /// the wait for mailbox *capacity*, so a loop parked mid-`step()` (mailbox
+    /// nearly empty) queues the kill yet never processes it, and awaiting that
+    /// loop unbounded would park the caller behind it forever. So a kill that
+    /// cannot be queued, or a loop that does not finish within
+    /// `HOST_PROBE_TIMEOUT` of accepting it, aborts the loop instead of
+    /// waiting on it.
+    ///
+    /// Aborting drops the loop at its await point, so the awaited `NetGuard`
+    /// teardown in `Host::mainloop` is skipped and the wedged host's sandbox
+    /// process and network are orphaned rather than reclaimed here;
+    /// reclamation is a tracked follow-up.
+    async fn kill_and_stop_loop(
+        host: &session_host::HostHandle,
+        task: &mut JoinHandle<Result<i32, std::io::Error>>,
+        for_shutdown: bool,
+    ) {
+        let killed = host.kill(for_shutdown).await.is_ok();
+        if !killed
+            || tokio::time::timeout(HOST_PROBE_TIMEOUT, &mut *task)
+                .await
+                .is_err()
+        {
+            task.abort();
+        }
+    }
+
     /// Tears down any runtime objects, such as the host or side ops. Shutdown
     /// of these objects is complete once awaited.
     ///
@@ -1545,12 +1662,13 @@ impl Session {
             for s in sops.drain(..) {
                 s.shutdown().await;
             }
-            if let Some((host, task)) = host {
-                // Signal the process to die, then await the runtime loop so the
-                // sandbox files backing its rootfs are released before the caller
-                // removes the session's directory tree.
-                let _ = host.kill(for_shutdown).await;
-                let _ = task.await;
+            if let Some((host, mut task)) = host {
+                // Signal the process to die, then stop its runtime loop so the
+                // sandbox files backing its rootfs are released before the
+                // caller removes the session's directory tree. The wait is
+                // bounded and aborts a wedged loop rather than parking shutdown
+                // behind it — see [`Session::kill_and_stop_loop`].
+                Self::kill_and_stop_loop(&host, &mut task, for_shutdown).await;
             }
         }
     }
@@ -1598,14 +1716,21 @@ impl Session {
         // Capture the environment this attach contributes to the shell it may
         // mint: the locale/timezone vars the client forwarded (folded as
         // defaults below the composition) and the per-connection facts folded
-        // above it. Currently the only connection fact is `TERM`, from the
-        // client's PTY request.
+        // above it — `TERM` from the client's PTY request, and the banner's
+        // detach hint derived from the negotiated keys below.
         //
         // `SSH_TTY` and `SSH_CONNECTION`/`SSH_CLIENT` are intentionally omitted:
         // the session sandbox has no host `/dev/pts` and the transport is a
         // local Unix socket (no peer IP/port), so any value would name something
         // that doesn't exist in-session and would only mislead audit logs,
         // source-IP checks, or `$SSH_TTY` consumers.
+        // The negotiated session keys: the leader chord and detach/forward
+        // subcommand keys the client sent on this channel, re-validated here as
+        // a silent safety backstop (a bad chord falls back to the default,
+        // never garbling the screen). Per-channel: two clients with different
+        // configs on the same session each get their own chord.
+        let session_keys = SessionKeys::from_env(&config.env_vars).validated_or_default();
+
         let attach_env = {
             let inherited = inherited_session_env(&config.env_vars);
             let mut connection = Vec::new();
@@ -1629,6 +1754,20 @@ impl Session {
                      keeping the last published TERM"
                 ),
             }
+            // The orientation banner's detach hint: derived from the negotiated
+            // keys so a remapped leader/detach chord advertises itself. Seeded
+            // daemon-side (like MINIMAL_SESSION_NAME), never forwarded from the
+            // client — the client sends raw key names, the daemon builds the
+            // display string. The MOTD template interpolates this with a
+            // `${VAR:-fallback}` so an unset var (no negotiation) still renders.
+            connection.push((
+                "MINIMAL_DETACH_HINT".to_string(),
+                format!(
+                    "{} then {}",
+                    session_keys.leader.as_config_str(),
+                    session_keys.detach_key.as_config_str(),
+                ),
+            ));
             session_host::AttachEnv {
                 inherited,
                 connection,
@@ -1728,7 +1867,7 @@ impl Session {
         // improve `TERM` is a bad trade. That case rides on the per-attach
         // environment the host republishes instead.
         let respawn_for_terminal =
-            self.host_origin == HostOrigin::Hooks && !attach_env.connection.is_empty();
+            self.host_origin == HostOrigin::Hooks && attach_env.declares_terminal();
         if respawn_for_terminal
             && let SessionInner::Active {
                 host: slot @ Some(_),
@@ -1738,9 +1877,11 @@ impl Session {
             tracing::info!(
                 "replacing the hook-launched session shell with one minted for the attaching terminal"
             );
-            let (handle, join) = slot.take().expect("matched on Some");
-            let _ = handle.kill(false).await;
-            let _ = join.await;
+            let (handle, mut join) = slot.take().expect("matched on Some");
+            // Bound the wait for the hook host to wind down, aborting a wedged
+            // loop rather than parking the attach behind it. Same bounded
+            // kill-and-stop as shutdown; see [`Session::kill_and_stop_loop`].
+            Self::kill_and_stop_loop(&handle, &mut join, false).await;
         }
 
         let host = match &mut self.inner {
@@ -1751,19 +1892,36 @@ impl Session {
         };
         match host {
             None => {
-                self.mint_session_host(session_hnd, conn_username, channel, sz, attach_env)
-                    .await
+                self.mint_session_host(
+                    session_hnd,
+                    conn_username,
+                    channel,
+                    sz,
+                    attach_env,
+                    session_keys,
+                )
+                .await
             }
             Some((h, _)) => {
                 // Every attach carries the connection facts, not just the one
                 // that mints the shell: `TERM` describes whichever terminal is
                 // on the other end of *this* channel.
-                match h.attach(channel, sz, attach_env.connection_env()).await {
+                match h
+                    .attach(channel, sz, attach_env.connection_env(), session_keys)
+                    .await
+                {
                     Ok(()) => Ok(()),
                     Err((channel, sz)) => {
-                        // session host is dead
-                        self.mint_session_host(session_hnd, conn_username, channel, sz, attach_env)
-                            .await
+                        // The host is gone, or wedged past the attach deadline.
+                        self.mint_session_host(
+                            session_hnd,
+                            conn_username,
+                            channel,
+                            sz,
+                            attach_env,
+                            session_keys,
+                        )
+                        .await
                     }
                 }
             }
@@ -1979,6 +2137,7 @@ impl Session {
         channel: Channel<Msg>,
         sz: WinSize,
         attach_env: session_host::AttachEnv,
+        session_keys: SessionKeys,
     ) -> Result<(), AttachError> {
         let progress = ChannelProgress::new(channel, self.tracker.clone(), (sz.cols, sz.rows));
         let (channel, launched) = self
@@ -2003,7 +2162,12 @@ impl Session {
         // them, and an empty map means "no revision", not "no terminal".
         launched
             .0
-            .attach(channel, sz, session_host::ConnectionEnv::new())
+            .attach(
+                channel,
+                sz,
+                session_host::ConnectionEnv::new(),
+                session_keys,
+            )
             .await
             .map_err(|_| {
                 AttachError::SpawnFailed(std::io::Error::other(
@@ -2013,7 +2177,16 @@ impl Session {
         let SessionInner::Active { host, .. } = &mut self.inner else {
             unreachable!("mint_session_host is only reachable from the Active state");
         };
-        *host = Some(launched);
+        // A wedged-but-alive host can reach here via attach's re-mint branch
+        // (`session_host.rs` `SendTimeoutError::Timeout`): its loop task is
+        // still running. Dropping the replaced `(HostHandle, JoinHandle)`
+        // would detach that task, leaking the old sandbox process, pty master,
+        // and `NetGuard` for the daemon's lifetime — one leak per attach to the
+        // same wedged host. Abort the task being replaced, mirroring
+        // `stop_running` (a no-op when the old loop had already exited).
+        if let Some((_, task)) = host.replace(launched) {
+            task.abort();
+        }
         // Minted by an attach: its environment describes the terminal that is
         // here, so nothing may replace it out from under that client.
         self.host_origin = HostOrigin::Interactive;
@@ -2300,6 +2473,10 @@ impl Session {
     /// session's workspace if it has none, so [`mctx::Context::new`] can
     /// succeed and the session gets a usable set of packages. A workspace
     /// that already holds an uploaded `minimal.toml` is left alone.
+    ///
+    /// Runs from [`Self::configure_loadout`], ahead of the composition that
+    /// decides the launcher's packages; [`Self::build_context`] repeats it as
+    /// an idempotent backstop for sessions brought up from disk.
     fn scaffold_mfile_if_missing(&self, wsp: &DaemonAbsPath) -> Result<(), String> {
         if wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
             return Ok(());
@@ -2307,16 +2484,45 @@ impl Session {
         match mfile::File::from_dir(wsp.as_utf8_path()) {
             Ok(_) => Ok(()), // it exists
             Err(mfile::Error::NotFound) => {
-                let config = self.workspace_config(wsp)?;
-
-                use op::ProjectOp as _;
-                let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
-                let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
-
-                std::fs::write(&plan.toml_path, &plan.content).map_err(|e| e.to_string())
+                let (toml_path, content) = self.default_mfile_plan(wsp)?;
+                std::fs::write(&toml_path, &content).map_err(|e| e.to_string())
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// The default `minimal.toml` [`Self::scaffold_mfile_if_missing`] writes:
+    /// `op::InitProject` detects the workspace's stack against the default
+    /// package repo, whose branch head it resolves over the network.
+    #[cfg(not(any(test, feature = "test-support")))]
+    fn default_mfile_plan(
+        &self,
+        wsp: &DaemonAbsPath,
+    ) -> Result<(std::path::PathBuf, String), String> {
+        let config = self.workspace_config(wsp)?;
+
+        use op::ProjectOp as _;
+        let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
+        let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
+
+        Ok((plan.toml_path, plan.content))
+    }
+
+    /// Under test, stand in for `op::InitProject`'s network round-trip: tests
+    /// run offline, and what they need from the scaffold is that it lands
+    /// before the composition — not what stack detection would have picked.
+    /// Same two packages `op::InitProject` falls back to when nothing matches.
+    #[cfg(any(test, feature = "test-support"))]
+    fn default_mfile_plan(
+        &self,
+        wsp: &DaemonAbsPath,
+    ) -> Result<(std::path::PathBuf, String), String> {
+        Ok((
+            wsp.as_utf8_path()
+                .join(mfile::MFILE_NAME)
+                .into_std_path_buf(),
+            "[session]\npackages = [\"base\", \"vim\"]\n".to_string(),
+        ))
     }
 
     /// Do the actual context construction: run [`mctx::Context::new`] against
@@ -2324,7 +2530,9 @@ impl Session {
     /// [`Self::context`].
     ///
     /// The workspace mfile it parses is either the client's uploaded one or
-    /// a default scaffolded here on the way past.
+    /// the default [`Self::configure_loadout`] scaffolded. The scaffold is
+    /// repeated here as a backstop — it early-returns when the mfile exists,
+    /// so it only fires for a session whose compose predates it.
     ///
     /// [`Config`]: mctx::Config
     async fn build_context(&self, scaffold_if_missing: bool) -> Result<mctx::Context, String> {
@@ -2797,7 +3005,101 @@ mod tests {
 
     use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
 
+    use crate::session_host::{HOST_MAILBOX_CAPACITY, HostHandle};
     use crate::test_harness::{TestClient, TestServer, create_configured_session};
+
+    /// Far longer than [`super::HOST_PROBE_TIMEOUT`], so under a paused
+    /// clock the probe's own deadline is always the one that fires first.
+    /// Reaching *this* one means the probe had no deadline at all.
+    const GIVE_UP: Duration = Duration::from_secs(600);
+
+    /// A probe of a host that never answers has to end on its own deadline.
+    ///
+    /// The session actor forwards `GetHostAttrs`/`GetHostScreen` to a spawned
+    /// task so the actor stays responsive, but nothing cancels that task:
+    /// dropping the caller's receiver does not stop a spawned future. Left
+    /// unbounded, every poll of a wedged host stranded one task forever — and
+    /// `min dash` polls the focused session on every refresh tick, so the
+    /// leak is unbounded in exactly the case the timeout exists for.
+    ///
+    /// Probes well past the mailbox capacity, which covers both places the
+    /// probe can park: the first `HOST_MAILBOX_CAPACITY` block awaiting a
+    /// reply that never comes, and the rest block trying to queue at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_of_a_wedged_host_ends_instead_of_stranding_its_task() {
+        // Holding the mailbox is what makes the host wedged: messages are
+        // accepted and none is ever answered.
+        let (host, _mailbox) = HostHandle::wedged();
+        let alive_before = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+
+        let probes: Vec<_> = (0..3 * HOST_MAILBOX_CAPACITY)
+            .map(|_| {
+                let host = host.clone();
+                tokio::spawn(async move { super::probe_host(host.get_attrs()).await })
+            })
+            .collect();
+
+        for (i, probe) in probes.into_iter().enumerate() {
+            let attrs = tokio::time::timeout(GIVE_UP, probe)
+                .await
+                .unwrap_or_else(|_| panic!("probe {i} never finished: the await is unbounded"))
+                .expect("the probe task should not panic");
+            assert!(
+                attrs.is_none(),
+                "probe {i} of a host that never answers should report no attrs",
+            );
+        }
+
+        assert_eq!(
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks(),
+            alive_before,
+            "every probe task should be gone, not merely abandoned",
+        );
+    }
+
+    /// The bounded stop path gives up on a host whose loop accepted the kill
+    /// but never winds down, aborting the loop task instead of awaiting it
+    /// forever.
+    ///
+    /// This is the shape `HostHandle::kill`'s `send_timeout` alone cannot
+    /// cover: the mailbox has room, so the kill enqueues (`kill` returns
+    /// `Ok`) and the `!killed` short-circuit does not fire, yet the runtime
+    /// loop is parked mid-`step()` and never processes the queued kill. The
+    /// *join* bound — not the kill's own deadline — is what has to return the
+    /// caller and abort the loop. `kill_to_a_wedged_host_gives_up_instead_of_parking`
+    /// covers the saturated-mailbox sibling, where the kill itself times out.
+    #[tokio::test(start_paused = true)]
+    async fn stopping_a_wedged_host_aborts_its_loop_instead_of_parking() {
+        // Mailbox held but not saturated: the kill enqueues within its
+        // deadline, so the join bound is the branch under test.
+        let (host, _mailbox) = HostHandle::wedged();
+
+        // A loop that accepted the kill but never resolves — models the
+        // mainloop parked mid-`step()`.
+        let mut task = tokio::spawn(std::future::pending::<Result<i32, std::io::Error>>());
+
+        // Far past HOST_PROBE_TIMEOUT: under the paused clock the join bound is
+        // the deadline that returns this call. Reaching GIVE_UP would mean the
+        // wait was unbounded.
+        tokio::time::timeout(
+            GIVE_UP,
+            super::Session::kill_and_stop_loop(&host, &mut task, true),
+        )
+        .await
+        .expect("the bounded stop path must return, not park on a wedged loop");
+
+        // The loop task is torn down, not left running behind a detached
+        // handle: awaiting it yields a cancelled join.
+        let outcome = task.await;
+        assert!(
+            outcome.is_err_and(|e| e.is_cancelled()),
+            "a loop that never wound down within the deadline must be aborted",
+        );
+    }
 
     /// The `AcceptEnv` allowlist keeps locale + timezone vars and drops
     /// everything else — critically the control-plane vars, which must never
@@ -3720,12 +4022,13 @@ mod tests {
         );
     }
 
-    /// The ctrl-w detach chord (a single `0x17` byte) detaches the current
+    /// The detach chord (leader `ctrl-]` then `d`) detaches the current
     /// channel — sending a detach notice down it before it closes — without
     /// tearing the session down, so a later channel resumes it (the earlier
-    /// `got:hello` is flushed on reattach).
+    /// `got:hello` is flushed on reattach). The default keys apply because the
+    /// test's `open_shell` sends no session-key env vars.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ctrl_w_detaches_channel_then_session_resumes_on_reattach() {
+    async fn detach_chord_detaches_channel_then_session_resumes_on_reattach() {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
         let session_id = create_session(&mut client).await;
@@ -3751,9 +4054,12 @@ mod tests {
             }
         }
 
-        // Send the detach chord. The host writes a detach notice down the
-        // channel and then closes it.
-        first.data_bytes(vec![0x17]).await.unwrap();
+        // Send the detach chord as two separate chunks — the leader (0x1d)
+        // enters command mode (swallowed), then `d` detaches. (The streaming
+        // matcher also handles the two bytes coalesced into one chunk; split
+        // sends exercise the cross-chunk pending path instead.)
+        first.data_bytes(vec![0x1d]).await.unwrap();
+        first.data_bytes(vec![b'd']).await.unwrap();
         let mut detach_out = Vec::new();
         let mut first_closed = false;
         while let Ok(msg) = tokio::time::timeout(Duration::from_secs(5), first.wait()).await {
@@ -3768,7 +4074,7 @@ mod tests {
         }
         let detach_out = String::from_utf8_lossy(&detach_out);
         assert!(
-            detach_out.contains("Detaching due to ctrl-w."),
+            detach_out.contains("Detaching from session."),
             "expected a detach notice on the channel before it closed, got: {detach_out:?}",
         );
         assert!(first_closed, "channel should close after the detach chord");
@@ -3790,6 +4096,222 @@ mod tests {
         assert!(
             flushed.contains("got:hello"),
             "reattaching should flush prior terminal state, got: {flushed:?}",
+        );
+    }
+
+    /// A remapped leader (negotiated via env vars at attach) is honored: the
+    /// old default leader (`ctrl-]`, `0x1d`) no longer detaches — it forwards to
+    /// the shell — while the remapped leader (`ctrl-^`, `0x1e`) then the
+    /// remapped detach key (`x`) does. Proves the per-channel negotiation and
+    /// the dynamic matcher end-to-end through the real attach path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remapped_leader_detaches_old_leader_forwards() {
+        use sessions::keys::{DETACH_KEY_ENV, LEADER_ENV};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        // Attach with a remapped leader (ctrl-^) and detach key (x).
+        let mut ch = client
+            .open_shell_with_keys(session_id, &[(LEADER_ENV, "ctrl-^"), (DETACH_KEY_ENV, "x")])
+            .await;
+
+        // The old default leader (0x1d, ctrl-]) must no longer detach: it
+        // forwards to the shell. Send it, then a normal line; the shell echoes
+        // both back, proving the channel survived (no detach fired).
+        ch.data_bytes(vec![0x1d]).await.unwrap();
+        ch.data_bytes(b"ping\n".to_vec()).await.unwrap();
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), ch.wait()).await {
+                Ok(Some(ChannelMsg::Data { data })) => {
+                    out.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&out).contains("got:") {
+                        break;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let out = String::from_utf8_lossy(&out);
+                    panic!(
+                        "channel closed after the old leader; it should have forwarded, got: {out:?}"
+                    );
+                }
+                Err(_) => panic!("timed out waiting for echo after the old leader"),
+            }
+        }
+
+        // The remapped leader (0x1e, ctrl-^) enters command mode (swallowed),
+        // then `x` detaches — sent as two separate chunks here to exercise the
+        // cross-chunk pending path; the coalesced form is covered by
+        // `reattach_renegotiates_the_chord_per_channel`.
+        ch.data_bytes(vec![0x1e]).await.unwrap();
+        ch.data_bytes(vec![b'x']).await.unwrap();
+        let mut detach_out = Vec::new();
+        let mut closed = false;
+        while let Ok(msg) = tokio::time::timeout(Duration::from_secs(5), ch.wait()).await {
+            match msg {
+                Some(ChannelMsg::Data { data }) => detach_out.extend_from_slice(&data),
+                Some(_) => {}
+                None => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        let detach_out = String::from_utf8_lossy(&detach_out);
+        assert!(
+            detach_out.contains("Detaching from session."),
+            "remapped chord should detach, got: {detach_out:?}",
+        );
+        assert!(
+            closed,
+            "channel should close after the remapped detach chord"
+        );
+    }
+
+    /// Drives `ch` until `needle` appears in its stdout (the mock echoes each
+    /// input line as `got:<line>`), panicking if the channel closes or stalls
+    /// first. Returns everything received anew.
+    async fn recv_until(ch: &mut russh::Channel<russh::client::Msg>, needle: &str) -> String {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), ch.wait()).await {
+                Ok(Some(ChannelMsg::Data { data })) => {
+                    out.extend_from_slice(&data);
+                    let text = String::from_utf8_lossy(&out);
+                    if text.contains(needle) {
+                        return text.into_owned();
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("channel closed before {needle:?} appeared; got {out:?}"),
+                Err(_) => panic!("timed out waiting for {needle:?}; got {out:?}"),
+            }
+        }
+    }
+
+    /// Drains `ch` until it closes (e.g. after a detach chord), returning
+    /// everything received. Panics if the channel stays open.
+    async fn collect_to_close(ch: &mut russh::Channel<russh::client::Msg>) -> String {
+        let mut out = Vec::new();
+        while let Ok(msg) = tokio::time::timeout(Duration::from_secs(5), ch.wait()).await {
+            match msg {
+                Some(ChannelMsg::Data { data }) => out.extend_from_slice(&data),
+                Some(_) => {}
+                None => return String::from_utf8_lossy(&out).into_owned(),
+            }
+        }
+        panic!("channel did not close within the timeout; got {out:?}");
+    }
+
+    /// A client negotiating an unsafe leader (`ctrl-c`) hits the daemon's
+    /// silent backstop: the leader falls back to `ctrl-]` while the valid
+    /// detach remap (`x`) survives — the fallback is field-scoped, so the
+    /// effective chord is `ctrl-]` then `x`. The unsafe byte forwards as data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_leader_falls_back_to_default_chord() {
+        use sessions::keys::{DETACH_KEY_ENV, LEADER_ENV};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        let mut ch = client
+            .open_shell_with_keys(session_id, &[(LEADER_ENV, "ctrl-c"), (DETACH_KEY_ENV, "x")])
+            .await;
+
+        // 0x03 must NOT enter command mode: it is data (the shell renders it
+        // `^C` and it never reaches the echoed line). If it had entered, the
+        // `x` below would be the detach subcommand and the channel would
+        // close; instead the mock echoes the line back.
+        ch.data_bytes(vec![0x03]).await.unwrap();
+        ch.data_bytes(b"xping\n".to_vec()).await.unwrap();
+        recv_until(&mut ch, "got:xping").await;
+
+        // The fallback chord — default leader, surviving detach remap — fires.
+        ch.data_bytes(vec![0x1d]).await.unwrap();
+        ch.data_bytes(b"x".to_vec()).await.unwrap();
+        let out = collect_to_close(&mut ch).await;
+        assert!(
+            out.contains("Detaching from session."),
+            "fallback leader + surviving detach remap should detach, got {out:?}"
+        );
+    }
+
+    /// Two channels on one session each get their own negotiated chord. The
+    /// first attach uses the defaults; the second negotiates `ctrl-^`/`x`,
+    /// finds its *own* old leader bytes (0x1d here) reduced to inert data,
+    /// and detaches via the remapped chord. Both chords are sent COALESCED —
+    // single SSH data messages exercising the streaming matcher's
+    // coalescing path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reattach_renegotiates_the_chord_per_channel() {
+        use sessions::keys::{DETACH_KEY_ENV, LEADER_ENV};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        // First attach: defaults — detach via the coalesced `\x1dd` chord.
+        let mut first = client.open_shell(session_id).await;
+        first.data_bytes(b"boot\n".to_vec()).await.unwrap();
+        recv_until(&mut first, "got:boot").await;
+        first.data_bytes(b"\x1dd".to_vec()).await.unwrap();
+        let out = collect_to_close(&mut first).await;
+        assert!(
+            out.contains("Detaching from session."),
+            "coalesced default chord should detach, got {out:?}"
+        );
+
+        // Reattach with negotiated keys: the per-channel renegotiation.
+        let mut second = client
+            .open_shell_with_keys(session_id, &[(LEADER_ENV, "ctrl-^"), (DETACH_KEY_ENV, "x")])
+            .await;
+        // The old leader 0x1d is inert data on this channel: if it entered
+        // command mode, the `ping\n` below would be swallowed/mistaken; the
+        // mock echo proves it flowed as data instead.
+        second.data_bytes(vec![0x1d]).await.unwrap();
+        second.data_bytes(b"ping\n".to_vec()).await.unwrap();
+        recv_until(&mut second, "got:\u{1d}ping").await;
+        // The remapped chord, coalesced, detaches.
+        second.data_bytes(b"\x1ex".to_vec()).await.unwrap();
+        let out = collect_to_close(&mut second).await;
+        assert!(
+            out.contains("Detaching from session."),
+            "coalesced remapped chord should detach, got {out:?}"
+        );
+    }
+
+    /// An unbound subcommand key is swallowed and cancels command mode: the
+    /// key never reaches the shell, the line after forwards normally, and the
+    /// real chord still works afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unbound_subcommand_swallows_and_cancels_command_mode() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        let mut ch = client.open_shell(session_id).await;
+        ch.data_bytes(b"boot\n".to_vec()).await.unwrap();
+        recv_until(&mut ch, "got:boot").await;
+
+        // Leader enters command mode; `q` is unbound: swallowed, mode
+        // cancelled. The next line must arrive as plain `ping` — a leaked `q`
+        // would echo as `got:qping` and this would time out.
+        ch.data_bytes(vec![0x1d]).await.unwrap();
+        ch.data_bytes(b"q".to_vec()).await.unwrap();
+        ch.data_bytes(b"ping\n".to_vec()).await.unwrap();
+        recv_until(&mut ch, "got:ping").await;
+
+        // The real chord is unaffected by the cancelled attempt.
+        ch.data_bytes(vec![0x1d]).await.unwrap();
+        ch.data_bytes(b"d".to_vec()).await.unwrap();
+        let out = collect_to_close(&mut ch).await;
+        assert!(
+            out.contains("Detaching from session."),
+            "the chord should still detach after a cancelled command mode, got {out:?}"
         );
     }
 
@@ -4138,6 +4660,56 @@ mod tests {
             record_status(&mut client, session_id).await,
             Some(sessions::SessionStatus::Active),
             "a session whose activate hook succeeded should be attachable",
+        );
+    }
+
+    /// A successful activate hook's captured output must reach the client
+    /// over `FinalizeSession`, not just its author-supplied description.
+    /// The rpc-crate round-trip test proves `RanHook.output` serializes;
+    /// this proves the daemon actually populates it from the hook outcome,
+    /// which is what the CLI echoes as the hook's receipt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activate_hook_output_reaches_the_client() {
+        use crate::test_harness::{create_session_req, unwrap_ready};
+        use minimald_rpc::{
+            ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+            FinalizeSessionRequest,
+        };
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let id = client
+            .call::<CreateSession>(&create_session_req("activate-hook-output", "/uwu"))
+            .await
+            .unwrap()
+            .id;
+        unwrap_ready(
+            client
+                .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: contribution_with_hook(
+                        sessions::wire::primitives::WireLifecycleHook {
+                            on_activate: Some(inline("echo HOOK_SAID_HELLO".to_string())),
+                            ..Default::default()
+                        },
+                    ),
+                })
+                .await
+                .unwrap(),
+        );
+
+        let ran = match client
+            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .await
+        {
+            Errorable::Ok(ok) => ok.activate_hooks,
+            Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+        };
+
+        assert!(
+            ran.iter().any(|h| h.output.contains("HOOK_SAID_HELLO")),
+            "the captured activate-hook output should reach the client; got: {ran:?}",
         );
     }
 
@@ -4603,5 +5175,84 @@ mod tests {
             "destroy ran a hook declared for another transition"
         );
         assert!(!record_exists(&mut client, session_id).await);
+    }
+
+    /// The staged patch's permission bits reach the session home. This
+    /// is the last hop of the chain that keeps a patched script
+    /// executable — the uploader puts the source's mode on the tar
+    /// header, the unpacker applies it to the staged file, and this
+    /// copy has to carry it the rest of the way.
+    ///
+    /// Pins the `fs::copy` in [`super::materialize_patches_into_home`]:
+    /// a hand-rolled read-then-write there would pass this test's
+    /// content assertions while silently flattening every mode.
+    #[tokio::test]
+    async fn materializing_patches_carries_their_modes_into_the_home() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use paths::{DaemonAbsPath, HostAbsPath, SandboxRelPath};
+        use sessions::core::compose::Composition;
+        use sessions::wire::primitives::{WireResolvedPatch, WireSessionPatch, WireSource};
+        use sessions::wire::request::{COMPOSITION_SNAPSHOT_VERSION, WireComposition};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(tmp.path()).unwrap();
+        let patches_dir = root.join("patches");
+        let home_dir = root.join("home");
+        std::fs::create_dir_all(patches_dir.join(".local/bin").as_std_path()).unwrap();
+        std::fs::create_dir_all(home_dir.as_std_path()).unwrap();
+
+        // Two staged patches: one executable, one private. Modes are set
+        // on the staged files the way the unpacker sets them.
+        let staged = [(".local/bin/tool", 0o755), (".config/secret.toml", 0o600)];
+        for (rel, mode) in staged {
+            let path = patches_dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap().as_std_path()).unwrap();
+            std::fs::write(path.as_std_path(), b"x").unwrap();
+            std::fs::set_permissions(path.as_std_path(), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+
+        let composition = Composition::try_from(WireComposition {
+            version: COMPOSITION_SNAPSHOT_VERSION,
+            vars: Vec::new(),
+            patches: staged
+                .iter()
+                .map(|(rel, _)| WireSessionPatch {
+                    patch: WireResolvedPatch {
+                        // The host path is not read here — the copy
+                        // sources from the staged tree, keyed by
+                        // destination — but the wire type requires one.
+                        host_path: HostAbsPath::try_new(patches_dir.join(rel)).unwrap(),
+                        destination: SandboxRelPath::try_new(*rel).unwrap(),
+                    },
+                    source: WireSource::UserLoadout {
+                        name: "dev".to_string(),
+                    },
+                })
+                .collect(),
+            packages: Vec::new(),
+            lifecycle_hooks: Vec::new(),
+            orientation: Default::default(),
+        })
+        .expect("a patch-only composition converts back");
+
+        super::materialize_patches_into_home(
+            &DaemonAbsPath::try_new(patches_dir.clone()).unwrap(),
+            &DaemonAbsPath::try_new(home_dir.clone()).unwrap(),
+            &composition,
+        )
+        .await
+        .expect("materializing staged patches");
+
+        for (rel, mode) in staged {
+            let meta = std::fs::metadata(home_dir.join(rel).as_std_path())
+                .unwrap_or_else(|e| panic!("`{rel}` should have landed in the home: {e}"));
+            assert_eq!(
+                meta.permissions().mode() & 0o7777,
+                mode,
+                "`{rel}` lost its mode on the way into the session home",
+            );
+        }
     }
 }
