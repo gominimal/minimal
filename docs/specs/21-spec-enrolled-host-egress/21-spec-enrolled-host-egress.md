@@ -187,12 +187,12 @@ preserved (EHE-003, EHE-004), against a gateway that applies the feed.
   host-enrolment work (gominimal/inbox#648). Every requirement here assumes an
   enrolled host it does not enrol.
 - Public exposure through the gateway and the enrolled dynamic-ingress path:
-  [GWI](https://github.com/gominimal/minimal/pull/{GWI_PR}).
+  [GWI](https://github.com/gominimal/minimal/pull/1419).
 - Mesh join and the remote forward, and the gateway's forwarding role for mesh
   and attach traffic on a pinned host ([design
   §4.5](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)):
-  [MRF](https://github.com/gominimal/minimal/pull/{MRF_PR}) for the laptop's
-  side; the gateway component for the forwarding role.
+  [MRF](https://github.com/gominimal/minimal/pull/1420) for the laptop's side;
+  the gateway component for the forwarding role.
 - An operator recipe for pods as box hosts (default-deny NetworkPolicy plus
   allow-to-gateway, Kata as the recommended runtime): the Box Provider API's
   operator documentation ([design
