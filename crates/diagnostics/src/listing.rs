@@ -33,14 +33,34 @@ pub struct Listing {
 /// `tokio::task::spawn_blocking`, or a wedged filesystem blocks the worker
 /// thread and their timeouts never fire.
 pub fn listing(root: &Path, max_entries: usize) -> Result<Listing, anyhow::Error> {
+    listing_pruned(root, max_entries, |_| false)
+}
+
+/// Like [`listing`], but `prune(rel)` — given each entry's path relative to
+/// `root` — may return true for a directory whose subtree should be summarised
+/// rather than walked: the directory itself is still listed, a single
+/// `<pruned: …>` line stands in for its contents, and neither the descent nor
+/// those contents count against `max_entries`. A caller uses this to keep a
+/// content-addressed store, whose files can number in the hundreds of
+/// thousands, from spending the whole entry budget before the rest of the tree
+/// is reached.
+pub fn listing_pruned(
+    root: &Path,
+    max_entries: usize,
+    prune: impl Fn(&Path) -> bool,
+) -> Result<Listing, anyhow::Error> {
     use std::fmt::Write as _;
     use std::os::unix::fs::MetadataExt as _;
 
     std::fs::read_dir(root).with_context(|| format!("listing {}", root.display()))?;
     let mut text = String::from("type\tsize\tmtime\tmode\tpath\n");
     let mut truncated = false;
-    let walk = walkdir::WalkDir::new(root).min_depth(1).sort_by_file_name();
-    for (seen, entry) in walk.into_iter().enumerate() {
+    let mut walk = walkdir::WalkDir::new(root)
+        .min_depth(1)
+        .sort_by_file_name()
+        .into_iter();
+    let mut seen = 0;
+    while let Some(entry) = walk.next() {
         if seen >= max_entries {
             truncated = true;
             text.push_str("<truncated: listing cap reached>\n");
@@ -61,6 +81,14 @@ pub fn listing(root: &Path, max_entries: usize) -> Result<Listing, anyhow::Error
                     Err(_) => ('?', "-".into(), "-".into(), "-".into()),
                 };
                 let _ = writeln!(text, "{kind}\t{size}\t{mtime}\t{mode}\t{}", rel.display());
+                // A pruned directory is listed, but a single summary line stands
+                // in for its subtree, which is never descended into — so its
+                // entries cannot spend the cap before the rest of the tree is
+                // reached.
+                if entry.file_type().is_dir() && prune(rel) {
+                    let _ = writeln!(text, "<pruned: {} — contents not listed>", rel.display());
+                    walk.skip_current_dir();
+                }
             }
             Err(err) => {
                 let rel = err
@@ -70,6 +98,7 @@ pub fn listing(root: &Path, max_entries: usize) -> Result<Listing, anyhow::Error
                 let _ = writeln!(text, "?\t-\t-\t-\t{rel} <unreadable>");
             }
         }
+        seen += 1;
     }
     Ok(Listing { text, truncated })
 }
@@ -157,6 +186,54 @@ mod tests {
     fn unreadable_root_is_an_error_not_an_empty_listing() {
         let err = listing(Path::new("/nonexistent/diag-listing-root"), 10).unwrap_err();
         assert!(err.to_string().contains("listing"), "got: {err:#}");
+    }
+
+    #[test]
+    fn listing_pruned_summarises_a_subtree_without_spending_the_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A store-shaped subtree with more files than the cap, beside a sibling
+        // that sorts after it (c < s) and must still be reached.
+        let store = tmp.path().join("cache/built/aa/deadbeef");
+        std::fs::create_dir_all(&store).unwrap();
+        for i in 0..50 {
+            std::fs::write(store.join(format!("blob{i}.bin")), "").unwrap();
+        }
+        std::fs::create_dir_all(tmp.path().join("sessions/x")).unwrap();
+        std::fs::write(tmp.path().join("sessions/x/record.json"), "{}").unwrap();
+
+        // Prune the store entry `cache/built/<hh>/<hash>`: list it, summarise
+        // its contents.
+        let prune = |rel: &Path| {
+            let names: Vec<_> = rel.components().map(|c| c.as_os_str()).collect();
+            names.len() == 4 && names[0] == "cache" && names[1] == "built"
+        };
+        let listing = listing_pruned(tmp.path(), 20, prune).unwrap();
+
+        assert!(
+            !listing.truncated,
+            "the store must not exhaust the cap: {}",
+            listing.text
+        );
+        assert!(
+            listing.text.contains("cache/built/aa/deadbeef"),
+            "the store entry is still listed, one line: {}",
+            listing.text
+        );
+        assert!(
+            listing.text.contains("<pruned:"),
+            "a summary line stands in for the subtree: {}",
+            listing.text
+        );
+        assert!(
+            !listing.text.contains("blob0.bin"),
+            "the store contents are summarised, not walked: {}",
+            listing.text
+        );
+        assert!(
+            listing.text.contains("sessions/x/record.json"),
+            "the walk still reaches the diagnosis-relevant siblings: {}",
+            listing.text
+        );
     }
 
     #[test]

@@ -515,6 +515,27 @@ async fn logs<W: BundleSink>(
     Ok(())
 }
 
+/// A content-addressed store entry: `cache/built/<hh>/<hash>` under the state
+/// dir. A populated store holds far more than the entry cap in these subtrees
+/// alone, and `cache` sorts ahead of `logs`/`sessions`/`tasks`, so without
+/// pruning the cap is spent inside the store and the directories a wedge
+/// diagnosis needs never appear. Each store entry is listed as one line; its
+/// contents, which carry nothing a diagnosis reads, are not walked.
+fn is_content_store_entry(rel: &Path) -> bool {
+    let mut components = rel.components().map(|c| c.as_os_str());
+    matches!(
+        (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+        ),
+        (Some(cache), Some(built), Some(_), Some(_), None)
+            if cache == "cache" && built == "built"
+    )
+}
+
 async fn state_listing<W: BundleSink>(
     w: &mut BundleWriter<W>,
     state_dir: &Path,
@@ -528,11 +549,12 @@ async fn state_listing<W: BundleSink>(
     // so a wedged filesystem strands a blocking thread and not the worker whose
     // collect_step! timeout is the failsafe.
     let dir = state_dir.to_path_buf();
-    let listing =
-        tokio::task::spawn_blocking(move || diagnostics::listing(&dir, LISTING_MAX_ENTRIES))
-            .await
-            .context("listing worker")?
-            .context("listing state dir")?;
+    let listing = tokio::task::spawn_blocking(move || {
+        diagnostics::listing_pruned(&dir, LISTING_MAX_ENTRIES, is_content_store_entry)
+    })
+    .await
+    .context("listing worker")?
+    .context("listing state dir")?;
     if listing.truncated {
         w.skip(
             "state-listing.txt (tail)",
@@ -1308,6 +1330,45 @@ mod tests {
                 .to_string()
                 .contains("state-listing.txt"),
             "an omission is recorded"
+        );
+    }
+
+    /// A populated content-addressed store must not spend the listing's entry
+    /// cap: its `cache/built/<hh>/<hash>` subtrees are summarised, one line
+    /// each, so the walk still reaches `sessions/` and the rest of the state
+    /// tree. Without the prune, `cache` sorts first and the cap lands inside
+    /// the store, hiding the directories a wedge diagnosis reads.
+    #[tokio::test]
+    async fn state_listing_prunes_the_content_store() {
+        let server = TestServer::new().await;
+        let state_dir = server.state.minimal_state_dir().await;
+        let root = state_dir.as_utf8_path().as_std_path();
+        let store = root.join("cache/built/aa/deadbeef");
+        std::fs::create_dir_all(&store).unwrap();
+        for i in 0..8 {
+            std::fs::write(store.join(format!("blob{i}.bin")), "").unwrap();
+        }
+        std::fs::create_dir_all(root.join("sessions/sess-x")).unwrap();
+        std::fs::write(root.join("sessions/sess-x/record.json"), b"{}").unwrap();
+
+        let files = fetch_bundle(&server).await;
+        let listing = String::from_utf8_lossy(&files["state-listing.txt"]);
+
+        assert!(
+            listing.contains("cache/built/aa/deadbeef"),
+            "the store entry is listed, one line: {listing}"
+        );
+        assert!(
+            listing.contains("<pruned:"),
+            "a summary line stands in for the store subtree: {listing}"
+        );
+        assert!(
+            !listing.contains("blob0.bin"),
+            "the store contents are summarised, not walked: {listing}"
+        );
+        assert!(
+            listing.contains("sessions/sess-x"),
+            "the walk still reaches sessions/: {listing}"
         );
     }
 }
