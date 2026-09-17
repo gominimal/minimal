@@ -355,6 +355,19 @@ fuzz crate target *args: (_need "cargo-fuzz" "cargo install cargo-fuzz --locked"
 test: _nextest
     cargo nextest run {{scope}} {{ci-profile}} --locked --no-tests=fail
 
+# The tight loop while writing one test. Output is shown, so a test that prints
+# a measurement is readable without remembering `--no-capture`, and
+# `--no-tests=fail` makes a filter that matches nothing say so rather than pass
+# silently. The filter is nextest's own substring match and every argument is
+# passed positionally, so no character in it needs escaping and a quoted
+# argument stays one word.
+#
+# Run the tests whose name contains a substring (`just test-one own_ip [-p minimald]`).
+[positional-arguments]
+test-one filter *args: _nextest
+    cargo nextest run {{ if args == "" { scope } else { "" } }} \
+        --locked --no-tests=fail --no-capture "$@"
+
 # Doctests — nextest can't run them, so they are their own surface.
 doctest:
     cargo test {{scope}} --doc --locked
