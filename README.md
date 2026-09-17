@@ -35,7 +35,7 @@ An unattended agent can only touch what you give it access to, so Minimal lets y
 
 Each box is built from a `minimal.toml`, letting you compose the exact tools your agent needs, the files it needs, and other isolation mechanisms. On Linux the box is an unprivileged user namespace by default (`local-minimald`), or a libkrun microVM with `--provider local-minvmd`; on macOS it is always a libkrun microVM.
 
-Minimal's secure package manager delivers the executables inside a sandbox (git, claude, compilers, shells, and more) from a curated registry refreshed daily. The coding agents it packages today are claude, codex, opencode, and pi. Because packages are addressed by content rather than mutable version tags and builds are hermetic, the same blueprint resolves to the same environment, regardless of the machine you launch it from.
+Minimal's package manager delivers the executables inside a sandbox (git, claude, compilers, shells, and more) from a curated registry that publishes, for every package, a CycloneDX SBOM over its build and runtime closure, the advisories that affect it, its dependency graph, and an OpenSSF Scorecard where the upstream has one, all without an account. What it does not do yet: `min` checks a fetched artifact's SHA-256 only, verifying neither a package signature nor a build attestation, and there is no credential broker, so a token you export is visible to the agent in that session. The coding agents it packages today are claude, codex, opencode, and pi. Because packages are addressed by content rather than mutable version tags and builds are hermetic, the same blueprint resolves to the same environment, regardless of the machine you launch it from.
 
 > Full documentation lives at [minimal.dev/docs](https://minimal.dev/docs).
 
