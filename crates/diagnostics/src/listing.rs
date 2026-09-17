@@ -84,10 +84,13 @@ pub fn listing_pruned(
                 // A pruned directory is listed, but a single summary line stands
                 // in for its subtree, which is never descended into — so its
                 // entries cannot spend the cap before the rest of the tree is
-                // reached.
+                // reached. The pruned directory itself is not charged to the
+                // cap either: more pruned siblings than `max_entries` must not
+                // exhaust the budget before later, diagnosis-relevant entries.
                 if entry.file_type().is_dir() && prune(rel) {
                     let _ = writeln!(text, "<pruned: {} — contents not listed>", rel.display());
                     walk.skip_current_dir();
+                    continue;
                 }
             }
             Err(err) => {
@@ -227,6 +230,41 @@ mod tests {
         assert!(
             !listing.text.contains("blob0.bin"),
             "the store contents are summarised, not walked: {}",
+            listing.text
+        );
+        assert!(
+            listing.text.contains("sessions/x/record.json"),
+            "the walk still reaches the diagnosis-relevant siblings: {}",
+            listing.text
+        );
+    }
+
+    #[test]
+    fn pruned_siblings_do_not_charge_the_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // More pruned store entries than the cap, each with contents that would
+        // otherwise exhaust the budget, plus a `sessions/` sibling that sorts
+        // after `cache` and must still be reached.
+        for i in 0..10 {
+            let store = tmp.path().join(format!("cache/built/aa/hash{i:02}"));
+            std::fs::create_dir_all(&store).unwrap();
+            std::fs::write(store.join("blob.bin"), "").unwrap();
+        }
+        std::fs::create_dir_all(tmp.path().join("sessions/x")).unwrap();
+        std::fs::write(tmp.path().join("sessions/x/record.json"), "{}").unwrap();
+
+        let prune = |rel: &Path| {
+            let names: Vec<_> = rel.components().map(|c| c.as_os_str()).collect();
+            names.len() == 4 && names[0] == "cache" && names[1] == "built"
+        };
+        // Six non-pruned entries (cache, cache/built, cache/built/aa, sessions,
+        // sessions/x, sessions/x/record.json) fit exactly; the ten pruned
+        // siblings would push the walk past the cap if they were charged.
+        let listing = listing_pruned(tmp.path(), 6, prune).unwrap();
+
+        assert!(
+            !listing.truncated,
+            "pruned siblings must not charge the cap: {}",
             listing.text
         );
         assert!(
