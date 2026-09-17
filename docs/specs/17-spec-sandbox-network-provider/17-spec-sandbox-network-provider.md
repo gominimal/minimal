@@ -5,28 +5,30 @@ status: draft
 owner: tom@minimal.dev
 epic: gominimal/minimal#TBD
 arch: none
-updated: 2026-09-04
+updated: 2026-09-16
 ---
 
 # 017 — One network provider for every sandbox
 
 ## Context
 
-Each sandboxed unit is a PTask, and each PTask has one of three network modes:
-no network, the host network, or its own IP address on the local switch (see
+Each PTask has one of three network modes: no network, the host network, or
+its own IP address on the local switch (see
 [03-spec-networking](../03-spec-networking/03-spec-networking.md) R1.1). An
 interactive session is a PTask. A task is a PTask too: a task run mints a
-session of its own, so it is a session that no person attaches to. A build is a
-third one. The code that starts an own-IP network, however, is at the top of
-the daemon, in the layer that only interactive sessions pass through. A new
-network option must pass through four layers of code before it reaches the
-sandbox. The top layer also holds the rollback logic for a switch attachment
-that the sandbox layer does not know about. Two different paths start a sandbox
-process, and only one of the two paths applies the network. Because of this,
-the daemon drops the own-IP mode of a task to the host network, which gives
-that task more network access than its mode states. That defect makes this work
-necessary now. After this change, one interface supplies the network to every
-PTask, and the sandbox layer controls the sequence and the rollback.
+session of its own, so it is a session that no person attaches to. A build is
+not a PTask and has no mode: its sandbox is planned from what the build
+declares, a resolver or the internet, through the same plan type. The code
+that starts an own-IP network, however, is at the top of the daemon, in the
+layer that only interactive sessions pass through. A new network option must
+pass through four layers of code before it reaches the sandbox. The top layer
+also holds the rollback logic for a switch attachment that the sandbox layer
+does not know about. Two different paths start a sandbox process, and only one
+of the two paths applies the network. Because of this, the daemon drops the
+own-IP mode of a task to the host network, which gives that task more network
+access than its mode states. That defect makes this work necessary now. After
+this change, one interface supplies the network to every sandbox, and the
+sandbox layer controls the sequence and the rollback.
 
 **Success:** A task and an interactive session with the same network mode get
 the same network, and only one module in the daemon reads the network mode.
@@ -83,20 +85,20 @@ or a session, and the operator who runs the daemon.
   verify:   `cargo nextest run -p sandbox2 both_spawn_paths_apply_the_network`
 
 - **017-005** THE SYSTEM SHALL apply the network mode of a PTask to the sandbox
-  of that PTask, for an interactive session, for a task and for a build.
+  of that PTask, for an interactive session and for a task.
   tier:     T1
-  verify:   `cargo nextest run -p minimald every_ptask_kind_gets_its_own_mode`
+  verify:   `cargo nextest run -p minimald a_task_takes_the_network_of_its_session`
   property: for every PTask p, the mode of the sandbox of p is equal to the
             mode of p
   - WHEN a task runs in an existing session and states no mode of its own, THE
     SYSTEM SHALL apply the mode of that session to the sandbox of the task.
     tier:   T0
-    verify: `cargo nextest run -p minimald a_task_takes_the_mode_of_its_session`
+    verify: `cargo nextest run -p minimald a_task_takes_the_network_of_its_session`
   - IF the daemon cannot give a task the network of its mode, THEN THE SYSTEM
     SHALL stop the task with an error and SHALL keep the task off the host
     network.
     tier:   T0
-    verify: `cargo nextest run -p minimald a_failed_task_attach_does_not_use_host_net`
+    verify: `cargo nextest run -p sandbox2 abandoned_launch_releases_the_plan`
 
 - **017-006** THE SYSTEM SHALL limit the network access of a sandbox to the
   access that the mode of that sandbox states.
@@ -122,15 +124,15 @@ or a session, and the operator who runs the daemon.
   DNS server address of the switch into the resolver file of that sandbox, on
   every deployment model.
   tier:     T0
-  verify:   `cargo nextest run -p sandbox2 own_ip_resolver_points_at_the_switch`
+  verify:   `cargo nextest run -p minimald own_ip_resolver_points_at_the_switch`
 
 - **017-010** WHEN the sandbox layer creates a tap device in the namespace of
   the sandbox, THE SYSTEM SHALL give the file descriptor of that device to the
   network provider one time.
   tier:     T1
   verify:   `cargo nextest run -p sandbox2 the_tap_descriptor_goes_to_the_provider_once`
-  property: for every sandbox, the tap descriptor is given one time and closes
-            at teardown
+  property: for every sandbox whose tap the sandbox layer builds, the tap
+            descriptor is given one time and closes at teardown
 
 - **017-011** IF the host cannot create a network namespace and the plan needs
   one, THEN THE SYSTEM SHALL stop the launch with an error.
@@ -148,8 +150,9 @@ or a session, and the operator who runs the daemon.
   R1.4).
 - A new network mode: this work adds none.
 - Dynamic ingress port mappings: unchanged, in 03-spec-networking R2.3.
-- The tools that the guest root filesystem needs for the in-VM task attach:
-  separate work, see [Open questions](#open-questions).
+- Tools in the guest root filesystem: none new. The privileged tap mechanism
+  runs `ip` and `nsenter`, and the guest root filesystem has both. See
+  [The tap mechanism](#the-tap-mechanism).
 - A network mode of its own for a task run: the command that starts a task has
   no option for the mode today, and it always asks for the host network. This
   spec makes the mode of a task reach its sandbox; it adds no option. See
@@ -191,6 +194,37 @@ guard for the switch count in the session layer, keeps an unsafe descriptor
 transfer at the top of the daemon, and holds two attach paths with two
 different owners for the same rollback.
 
+### The tap mechanism
+
+An own-IP sandbox needs a tap device inside its network namespace, and there
+are two ways to build one. The sandbox layer builds it inside the user and
+network namespace of the PTask, without privilege, and hands the descriptor to
+the provider; or the daemon builds it in its own namespace under
+`CAP_NET_ADMIN`, after the process exists, and moves it into the namespace of
+the PTask with the `ip` and `nsenter` programs.
+
+The control channel of the switch decides which. A unix socket (DM2) means a
+native host and an unprivileged daemon: the sandbox layer builds the tap, and
+the plan carries tap parameters; a root-integration proof drives that path
+from the plan to the running process on the native lane
+(`crates/minimald/tests/own_ip_tap_root_integration.rs`). A vsock channel
+(DM1, DM3 and DM4) means the daemon is root inside a microVM whose network it
+owns: the plan asks for a namespace and no tap, and the daemon builds the tap
+itself. One function reads the control channel once, before the sandbox
+starts, and yields both the transport that carries the descriptor to the
+switch and the mechanism.
+
+The choice is not a fallback, and cannot be one. In the x86_64 KVM guest,
+asking the sandbox layer for a tap it cannot build destroys the container
+supervisor, and the network namespace of the process is gone by the time the
+failure is visible, so there is nothing left to put a tap into. Why the
+in-namespace mechanism fails there is not known: `/dev/net/tun` is present and
+user namespaces are available. Whether it works in the aarch64 libkrun guest is
+not proved, because every vsock deployment uses the privileged mechanism. See
+[Open questions](#open-questions). The provider holds both mechanisms behind
+one attach path with one rollback owner, and 017-010 holds where the sandbox
+layer builds the tap, because only that mechanism hands out a descriptor.
+
 ### The shape
 
 The network interface gets three operations, and the plan operation returns
@@ -219,29 +253,44 @@ pub trait Network: Send + Sync + Debug {
     /// Release what plan() reserved, when no attach operation follows.
     fn abandon(&self) -> AbandonFuture<'_>;
 }
+
+impl Network for NetPlan { .. }  // a plan is its own provider; reserves nothing
+pub struct HostNet;               // plans the host network, host resolver
+pub struct NoNet;                 // plans an empty namespace
 ```
 
-The sandbox layer owns the sequence for both paths:
+The sandbox layer owns the sequence for both paths, as an explicit type with
+three steps:
 
 ```rust
-impl Sandbox<C> {
-    /// plan() -> build the container from the plan -> the caller starts the
-    /// process -> attach(). abandon() runs if the launch stops in between.
-    pub async fn launch<F>(&mut self, spawn: F) -> Result<Launched, Error>
-    where F: FnOnce(&Container) -> Result<hakoniwa::Child, Error>;
+// sandbox2
+impl PlannedLaunch {
+    /// plan() -> the caller builds the container from the plan and starts
+    /// the process -> attach(). abandon() runs if the launch stops in between.
+    pub async fn begin(network: Arc<dyn Network>) -> Result<Self, Error>;
+    pub fn plan(&self) -> &NetPlan;
+    pub async fn attach(self, spawned: Spawned)
+        -> Result<Box<dyn NetGuard>, Error>;
+    pub async fn abandon(self);
 }
 ```
 
-The daemon gets one function that reads the mode:
+A sandbox with no provider of its own passes its own plan, so every launch has
+a provider. The container build consumes the resolver of the plan: the host
+resolver goes only into a root filesystem that has none, and named servers
+replace whatever is there.
+
+The daemon gets one function that reads the mode, and it returns a provider
+for every mode:
 
 ```rust
 // crates/minimald/src/net/provider.rs
 pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
-    identity: PtaskIdentity,   // the name to register on the switch
-    policy: &SessionPolicy,    // ingress today, egress later
-) -> Box<dyn sandbox2::Network>
+    identity: &str,                   // the name to register on the switch
+    ingress: Option<IngressPolicy>,
+) -> Arc<dyn sandbox2::Network>       // HostNet, NoNet, or the own-IP provider
 ```
 
 Five results follow from these three pieces:
@@ -250,16 +299,18 @@ Five results follow from these three pieces:
    enum leaves the sandbox configuration, and the two DNS controls become the
    one `Resolver` value of the plan.
 2. The call site no longer selects between the two deployment paths. The
-   provider returns tap parameters on a native Linux host, and returns none
-   inside a microVM. One implementation holds both branches, and that
-   implementation owns the rollback.
+   provider reads the control channel once, for the transport and the tap
+   mechanism together: it returns tap parameters on a native Linux host, and
+   returns none inside a microVM. One implementation holds both branches, and
+   that implementation owns the rollback.
 3. The rollback guard for a cancelled launch moves into the sandbox layer.
    One piece of code holds it, and one test covers it.
 4. The unsafe descriptor transfer moves next to the code that creates the
    descriptor, and the provider receives an owned descriptor.
-5. The task path and the build path call the same function as the session
-   path, so 017-005 costs one line for each of them instead of a second
-   implementation.
+5. The task path calls the same function as the session path, so 017-005
+   costs one line instead of a second implementation. A build has no mode: its
+   sandbox plans itself from what the build declares, an empty namespace or
+   the host network, so the build crate stops carrying the mode enum.
 
 ### The alternatives
 
@@ -282,17 +333,25 @@ Each step compiles, and each step ships on its own.
 
 1. Move the netmask arithmetic onto the subnet type in the `switch` crate. No
    change in behaviour.
-2. Add the plan operation and the plan type. The old configuration fields feed
+2. Collapse the two attach paths into one that takes the transport as a value,
+   and decide the tap mechanism before the sandbox starts, in one function,
+   from the control channel. No deployment model changes mechanism. See
+   [The tap mechanism](#the-tap-mechanism).
+3. Give the privileged mechanism one caller. After step 6 that caller is the
+   provider.
+4. Add the plan operation and the plan type. The old configuration fields feed
    a plan that the sandbox layer builds. No consumer changes.
-3. Add the launch operation, and move the invocation path onto it.
-4. Write the own-IP provider for both deployment paths, move the rollback guard
-   and the descriptor transfer into it, and move the session path onto the
-   launch operation. Delete the old configuration fields.
-5. Move the task path onto the provider function. This stops the drop to the
+5. Add the launch operation, and move the invocation path onto it.
+6. Write the own-IP provider, move the rollback guard and the descriptor
+   transfer into it, and move the session path onto the launch operation.
+   Delete the old configuration fields.
+7. Move the task path onto the provider function. This stops the drop to the
    host network, and it satisfies 017-005 for a task.
-6. Remove the mode enum from the public interface of the sandbox layer. This
+8. Remove the mode enum from the public interface of the sandbox layer. This
    step touches the build crate and the context crate, and the edits are
    mechanical.
+9. Measure one own-IP launch, and set the bound of 017-N01 from that
+   measurement.
 
 **Generality:** A second provider fits, because the plan states what the
 sandbox needs and not how the provider gets it. A provider for a different
@@ -323,23 +382,41 @@ every other layer stays the same.
 
 ## Open questions
 
-- [NEEDS CLARIFICATION (HIGH): Does the closure of the launch operation keep
-  the current thread and `Sync` limits of the invocation path? The session path
-  builds a terminal and a command inside that closure. If the limits break, the
-  same sequence becomes an explicit type with three steps, which holds the same
-  invariants.]
-- [NEEDS CLARIFICATION (HIGH): Can the in-VM task path attach to the switch
-  before the guest root filesystem has the `ip` and `nsenter` tools? 017-005
-  holds on a native Linux host without them. Name the issue that adds them.]
+### Answered
+
+- **The launch operation takes an explicit type with three steps, and not a
+  closure.** A closure breaks, for four reasons. The session path builds its
+  environment with an asynchronous operation, and a closure that the sandbox
+  layer calls is synchronous. That same operation reads the values of the
+  plan, so the plan operation must complete before the environment build and
+  not only before the container. The environment owns the sandbox, and the
+  closure must borrow the environment to build the command, which the borrow
+  rules refuse. The closure must also return a terminal and a path, and not
+  only a process. The environment build is on the heap today because the
+  launch future reaches the query depth limit of the compiler, and one more
+  generic layer puts that limit at risk again. The explicit type holds the same
+  invariants.
+- **The in-VM task path needs no new tools in the guest root filesystem.** The
+  privileged mechanism runs `ip` and `nsenter`, and the guest root filesystem
+  has both, so no issue is needed. See [The tap mechanism](#the-tap-mechanism).
+- **The repository gets a `just` recipe that runs one test.** Separate work
+  adds it. The `verify:` lines keep the direct command, because a spec must
+  name the test and not the wrapper.
+
+### Open
+
+- [NEEDS CLARIFICATION (HIGH): Why does the in-namespace tap mechanism fail
+  inside the x86_64 KVM guest, and does it work inside the aarch64 libkrun
+  guest? `/dev/net/tun` is present there and user namespaces are available,
+  yet the sandbox layer yields no descriptor. Until the cause is known, every
+  vsock deployment uses the privileged mechanism.]
 - [NEEDS CLARIFICATION (MEDIUM): A task run always asks for the host network,
   because the command that starts it has no option for the mode. Does the
   option belong to this work, or to a later change? 017-005 holds either way,
   because it reads the mode that the PTask carries.]
-- [NEEDS CLARIFICATION (MEDIUM): The repository has no `just` recipe that runs
-  one test, so every `verify:` line above names a `cargo nextest` command. Add
-  a recipe, or accept the direct command in specs.]
 - [NEEDS CLARIFICATION (MEDIUM): Is the bound in 017-N01 the right one? The
-  number states that four launches must not serialize, but no measurement of
-  one launch exists today.]
+  test that verifies it proves structure, that the switch lock is not held
+  between the plan and attach operations and that four launches hold four
+  leases at once; it does not measure time. Step 9 takes the measurement.]
 - [NEEDS CLARIFICATION (LOW): The epic number and the GitHub handle of the
   owner.]
