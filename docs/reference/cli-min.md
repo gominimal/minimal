@@ -356,6 +356,15 @@ commands: initialize minimal configuration from your source tree, add a
 tool or dependency, and refresh local checkouts of upstream packages and
 the standard library. See the [mip reference](./cli-mip.md) for details.
 
+`min update` is not a self-update. It re-pins the project's `[upstream]` link
+(and any sideloads) in `minimal.toml` to the current head of each tracking
+branch — rewriting `locked_commit` and leaving the file modified in your
+working tree — then refreshes the local checkouts to match. The next `min
+session activate` materializes the new closure, which can take several
+minutes on the first activate. When no pin has moved it reports that and
+leaves `minimal.toml` unchanged. To update the `min` binary itself, reinstall
+it with the installer.
+
 These three are deliberate exceptions to the `min <noun> <verb>` convention:
 they are passthroughs to the `mip` commands of the same name, and keeping the
 spelling identical across the two CLIs is worth more than the hierarchy.

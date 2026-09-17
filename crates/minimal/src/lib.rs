@@ -145,7 +145,17 @@ pub enum Command {
     Init(InitArgs),
     /// Add a new tool or dependency
     Add(AddArgs),
-    /// Refresh local checkouts of upstream packages & the standard library
+    /// Re-pin upstream & the standard library to their latest commits (not a self-update)
+    ///
+    /// Re-pins the project's `[upstream]` link (and any sideloads) in
+    /// `minimal.toml` to the current head of each tracking branch, rewriting
+    /// `locked_commit`, then refreshes the local checkouts to match. This
+    /// leaves `minimal.toml` modified in your working tree (a diff to commit),
+    /// and the next `min session activate` materializes the new closure, which
+    /// can take several minutes on the first activate.
+    ///
+    /// This does not update the `min` binary itself; reinstall it with the
+    /// installer to do that.
     Update(UpdateArgs),
     /// Print CLI and daemon version information
     Version,
@@ -4013,7 +4023,8 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
     Ok(())
 }
 
-/// Refresh local checkouts of upstream packages & the standard library.
+/// Re-pin `[upstream]` (and sideloads) to their branch heads and refresh the
+/// local checkouts to match.
 pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mctx::Error> {
     use op::ProjectOp as _;
     let config = build_config(global)?;
@@ -4049,6 +4060,18 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
             c.from.as_deref().unwrap_or("<unpinned>"),
             c.to,
         );
+    }
+
+    if report.upstream.is_some() || !report.sideloads.is_empty() {
+        println!(
+            "\nRe-pinned minimal.toml (a diff to commit). The next \
+             'min session activate' materializes the new closure, which can \
+             take several minutes on the first activate.\n\
+             This did not update the 'min' binary; reinstall it with the \
+             installer to do that."
+        );
+    } else {
+        println!("Already up to date; no pins moved and minimal.toml is unchanged.");
     }
 
     // Re-initialize the context to pick up the updated minimal.toml, then
