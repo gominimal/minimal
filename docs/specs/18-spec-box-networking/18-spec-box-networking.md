@@ -57,8 +57,11 @@ next thing built and is a separate document that cites this one. It depends on
 four behaviours bound here: box-zone resolution (NET-072, NET-073),
 `egress.allow_dns_hosts` with DNS-pinned admission (NET-066, NET-067), the
 hostname-proxy parity rule (NET-069 to NET-071), and the relay's source-address
-check (NET-084), which is what lets the proxy attribute a box by its switch
-source address. Its default `dns` steering mode needs the box-zone resolver and
+check (NET-084), which on a VM-backed host is what lets the proxy attribute a
+box by its switch source address: each own-address box holds one lease there.
+On a co-resident host the host-address boxes share the host's address and are
+attributed as one cohort (NET-078); a per-box mapping for them is the
+classifier question below. Its default `dns` steering mode needs the box-zone resolver and
 the DNS-pinned name path to exist. UDP a box has not declared is dropped
 (NET-064), so HTTP/3 to a steered host falls back to TCP ([design
 §5.3](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)).
@@ -75,7 +78,7 @@ included, with every refusal logged (NET-001 to NET-004).
 
 ## Users and stories
 
-**Roles:** developer previewing a box on my own machine, developer running a dev server in a box on my own machine, developer running two boxes that both listen on port 3000, developer previewing a box by name, developer who just started a server inside a box, developer on a host where names resolve natively and box ports are published by identity, developer relying on box hostnames, developer running a native box host and a VM box host on the same machine, developer activating a session, developer on a fresh macOS or Linux install, developer who just started a server inside a box I am attached to, developer on a Linux workstation, developer on an arm64 Linux machine, developer who wants strong isolation between two projects, developer with two VMs, developer running an agent in a box, developer who wants to allow `github.com` and nothing else, developer who has restricted a box's ingress, platform engineer, platform engineer, developer on macOS or Linux running VM-backed boxes, developer with a service in a remote box, maintainer, maintainer
+**Roles:** developer previewing a box on my own machine, developer running a dev server in a box on my own machine, developer running two boxes that both listen on port 3000, developer previewing a box by name, developer who just started a server inside a box, developer on a host where names resolve natively and box ports are published by identity, developer relying on box hostnames, developer running a native box host and a VM box host on the same machine, developer activating a session, developer on a fresh macOS or Linux install, developer who just started a server inside a box I am attached to, developer on a Linux workstation, developer on an arm64 Linux machine, developer who wants strong isolation between two projects, developer with two VMs, developer running an agent in a box, developer who wants to allow `github.com` and nothing else, developer who has restricted a box's ingress, platform engineer, platform engineer, developer on macOS or Linux running VM-backed boxes, developer with a service in a remote box, maintainer, platform engineer running box hosts for several teams, maintainer
 
 - AS A developer previewing a box on my own machine, I WANT boxes to answer at `<name>.min.internal` and the host at `host.min.internal` on an un-enrolled laptop, with the same names carrying over when the host enrols, SO THAT the names in my recipes stay valid from first install through enrolment.
 - AS A developer running a dev server in a box on my own machine, I WANT `http://<name>.min.internal:<port>` to resolve in any browser without a proxy, PAC file, or `HTTP_PROXY`, SO THAT previewing my work is one URL, not a browser-profile recipe.
@@ -100,6 +103,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - AS A developer on macOS or Linux running VM-backed boxes, I WANT per-box egress rules applied by the switch and filter on my laptop's host OS, outside the VM, SO THAT a workload that breaks out of its box into the VM still reaches only what the resident boxes declared.
 - AS A developer with a service in a remote box, I WANT `min net forward <box> <local>:<port>` to open a local listener that tunnels to the box over my existing SSH session, SO THAT I can hit a remote service on `localhost` with nothing else installed or configured.
 - AS A maintainer, I WANT every VM lane to assert that a session can reach the network and that a box's egress policy is enforced, SO THAT a lane that silently loses its switch or filter can no longer report green.
+- AS A platform engineer running box hosts for several teams, I WANT box and host addresses allocated per tenant from a plan that cannot collide with my RFC 1918 networks and can be renumbered without breaking identity or audit, SO THAT two teams' hosts never collide and a renumbering never invalidates a certificate or an audit trail.
 - AS A maintainer, I WANT the retired per-daemon mTLS/OIDC reverse proxy and its CLI removed from the tree, with the `direct-tcpip` handler kept, SO THAT a surface the architecture has ruled out does not persist unowned behind a feature gate.
 
 ## Requirements
@@ -118,10 +122,10 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald legacy_local_zone_routes_with_deprecation
   <!-- S1a/AC1; prose 2; event-driven; "for one release" is a plan fact -->
 
-- **NET-003** THE SYSTEM SHALL resolve `host.min.internal` from host-address, own-address, and VM-backed boxes to the host's loopback services.
+- **NET-003** THE SYSTEM SHALL resolve `host.min.internal` from host-address, own-address, and VM-backed boxes to the host's loopback address.
   tier:     T0
-  verify:   cargo nextest run -p minimald host_min_internal_reaches_host_loopback_from_each_mode
-  <!-- S1a/AC2; prose 3; ubiquitous -->
+  verify:   cargo nextest run -p minimald host_min_internal_resolves_to_host_loopback_from_each_mode
+  <!-- S1a/AC2; prose 3; ubiquitous; resolution only: reach over the name is local reach under the box's egress rules (NET-079; design §7.1 local names), so a deny-all box resolves it and reaches nothing -->
 
 - **NET-004** WHEN a box connects to the literal `100.64.255.254` THE SYSTEM SHALL route the connection as `host.min.internal` and emit a deprecation notice.
   tier:     T0
@@ -143,12 +147,12 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   ./scripts/session-e2e.sh native_resolution_without_proxy_env
   <!-- S1b-1; prose 5; optional-feature; "any browser" sharpened to "any process resolving through the host resolver" -->
 
-- **NET-010** WHEN a box is published THE SYSTEM SHALL assign it a host loopback address of its own and publish its ports at the box's own port numbers.
+- **NET-010** WHEN a box is published THE SYSTEM SHALL assign it a host loopback address of its own from the host-global allocation and publish its ports at the box's own port numbers.
   tier:     T2
   verify:   cargo nextest run -p minimald each_box_gets_own_loopback_address
-  property: for every sequence of publish and withdraw operations up to 8 live boxes, no two live boxes hold the same loopback address
-  harness:  kani_loopback_alloc_injective, exhaustive to 8 live boxes; requires the allocator to be a pure function over an owned set of leased addresses, separate from the publish call
-  <!-- S1b-2a; prose 6; event-driven; the no-collision clause is the universal for spec-tiers -->
+  property: for every sequence of publish and withdraw operations from every daemon on the host, up to 8 live boxes, no two live boxes hold the same loopback address
+  harness:  kani_loopback_alloc_injective, exhaustive to 8 live boxes across daemons; requires the allocator to be a pure function over one host-wide owned set of leased addresses, separate from the publish call and from any daemon's own state
+  <!-- S1b-2a; prose 6; event-driven; the no-collision clause is the universal for spec-tiers; "host-global" per design §7.1: allocation is arbitrated through the answerer's authenticated channel and no daemon self-assigns -->
 
 - **NET-011** WHEN a session is finalised THE SYSTEM SHALL register `<name>.min.internal` for the box's loopback address.
   tier:     T0
@@ -243,7 +247,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-027** WHILE two daemons run on one machine THE SYSTEM SHALL route both daemons' box hostnames at the same time.
   tier:     T0
   verify:   cargo nextest run -p minimald two_daemons_route_hostnames_concurrently
-  <!-- S2b/AC2; prose 17; state-driven -->
+  <!-- S2b/AC2; prose 17; state-driven; both daemons' addresses come from the host-global allocation NET-010 binds -->
 
 - **NET-035** THE SYSTEM SHALL show `--network none|host_ip|own_ip` and `--ingress` in `min session activate --help`.
   tier:     T0
@@ -283,7 +287,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-043** WHERE the host is un-enrolled, WHEN `min net expose <port>` is run inside a box THE SYSTEM SHALL send the same request shape to the local daemon and evaluate it against the box's `dynamic_ingress` setting.
   tier:     T0
   verify:   cargo nextest run -p minimald expose_unenrolled_local_rpc_evaluates_dynamic_ingress
-  <!-- S5/AC1; prose 28; feature+event -->
+  <!-- S5/AC1; prose 28; feature+event; `dynamic_ingress` is design §7.1's name and supersedes 03-spec R2.3's `dynamic_allowed_ports`, which no crate implements (Design reasoning, field names) -->
 
 - **NET-044** WHEN a dynamic ingress request is decided `allow` THE SYSTEM SHALL publish the port and show the mapping in `min session policy`.
   tier:     T0
@@ -298,6 +302,10 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimald expose_ask_prompts_attached_human
   <!-- S5/AC2; prose 29; event-driven -->
+  - IF a dynamic ingress request is decided `ask` while no client is attached THEN THE SYSTEM SHALL refuse it with a typed error saying no one is attached to answer.
+    tier:   T0
+    verify: cargo nextest run -p minimald expose_ask_without_client_refused
+    <!-- S5/AC2; prose 29; unwanted; review finding: a box outlives its client (NET-015), so `ask` can arrive with nobody to prompt; fail closed, NET-046 records it -->
 
 - **NET-046** WHERE the host is un-enrolled THE SYSTEM SHALL record each dynamic ingress decision in the local audit log.
   tier:     T0
@@ -369,10 +377,10 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald two_vms_hostnames_route_concurrently
   <!-- S7b/AC2; prose 38; state-driven -->
 
-- **NET-060** THE SYSTEM SHALL accept `egress.allow_subnets` and `egress.allow_protocols` in the box spec.
+- **NET-060** THE SYSTEM SHALL accept `egress.allow_subnets`, `egress.allow_protocols`, and `egress.allow_dns_hosts` in the box spec.
   tier:     T0
   verify:   cargo nextest run -p sessions spec_accepts_egress_allow_fields
-  <!-- S8a/AC1; prose 39; ubiquitous -->
+  <!-- S8a/AC1 + S8b/AC1; prose 39; ubiquitous; `allow_dns_hosts` added: NET-066 and NET-067 require it and the local Box Egress Proxy validates its grants against it -->
 
 - **NET-061** THE SYSTEM SHALL show a box's effective egress rules in `min session policy`.
   tier:     T0
@@ -405,7 +413,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-065** IF a box spec declares `egress` on a `none` box THEN THE SYSTEM SHALL reject it as a validation error.
   tier:     T0
   verify:   cargo nextest run -p sessions egress_on_none_box_is_validation_error
-  <!-- S8a/AC3; prose 41; unwanted -->
+  <!-- S8a/AC3; prose 41; unwanted; `none` only: a host-address box's `egress` is accepted (NET-120) -->
 
 - **NET-066** WHEN a box resolves a name matched by its `egress.allow_dns_hosts` THE SYSTEM SHALL admit the answer's addresses for that box for the admission window the architecture defines.
   tier:     T0
@@ -448,10 +456,10 @@ included, with every refusal logged (NET-001 to NET-004).
   property: for every network mode, every rule set, and every request, the hostname proxy's verdict equals the direct connection's verdict
   <!-- S8c/AC2; prose 45; ubiquitous -->
 
-- **NET-072** THE SYSTEM SHALL resolve box-zone names with no `egress_allow_dns` entry.
+- **NET-072** THE SYSTEM SHALL resolve box-zone names with no `egress.allow_dns_hosts` entry.
   tier:     T0
   verify:   cargo nextest run -p minimald box_zone_resolution_needs_no_allow_entry
-  <!-- S8c/AC3; prose 46; ubiquitous -->
+  <!-- S8c/AC3; prose 46; ubiquitous; one spelling for the field throughout; design §7.1 writes it `egress_allow_dns` under §5.4's placeholder names -->
 
 - **NET-073** WHEN a box connects to a box-zone name THE SYSTEM SHALL enforce the target's ingress rules and the source's egress rules at connection time.
   tier:     T0
@@ -521,15 +529,15 @@ included, with every refusal logged (NET-001 to NET-004).
   harness:  kani_frame_verdict_admits_nothing_undeclared, exhaustive to an unwind bound of 4 over a 40-byte IPv4+L4 header and at most 4 rules; requires the admit/drop decision to be a pure function over an owned frame summary and owned rules, separate from the relay loop
   <!-- S10a/AC3; prose 53; unwanted -->
 
-- **NET-085** WHERE the host is VM-backed, IF a process with root inside the VM spoofs another box's address THEN THE SYSTEM SHALL confine its reach to the union of resident boxes' declared egress plus the enumerated baseline set.
+- **NET-085** WHERE the host is VM-backed, IF a process with root inside the VM spoofs another box's address THEN THE SYSTEM SHALL confine its reach to the union of resident boxes' declared egress plus the node-plane baseline set the architecture enumerates in design §5.1.
   tier:     T0
   verify:   cargo nextest run -p minvmd vm_escape_bounded_to_resident_union
-  <!-- S10a/AC4; prose 54; feature+unwanted -->
+  <!-- S10a/AC4; prose 54; feature+unwanted; the union bound is design §4.3 rule 0 and §8 -->
 
 - **NET-102** WHERE the host is un-enrolled THE SYSTEM SHALL self-allocate box addresses from the default plan.
   tier:     T0
   verify:   cargo nextest run -p switch unenrolled_self_allocates_default_plan
-  <!-- S17/AC1; prose 64; optional-feature -->
+  <!-- S17/AC1, its un-enrolled clause; prose 64; optional-feature; the enrolled clauses are EHE's (formerly NET-100, NET-101, NET-103) -->
 
 - **NET-104** WHEN `min net forward <box> <local>:<port>` is run THE SYSTEM SHALL open a local listener relayed over the session's SSH channel so that a request to `localhost:<local>` returns the in-box server's response.
   tier:     T0
@@ -565,6 +573,11 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimal cli_reference_has_no_retired_commands
   <!-- S18/AC3; prose 72; ubiquitous; "just ci passes" is process -->
+
+- **NET-120** THE SYSTEM SHALL accept an `egress` section on a host-address box.
+  tier:     T0
+  verify:   cargo nextest run -p sessions egress_on_host_ip_box_accepted
+  <!-- S9b/AC2; review finding; ubiquitous; supersedes the shipped 03-spec R2.1 rule that `egress` on a HostNet PTask is a parse-time error, which the daemon's session RPC still enforces; NET-079 and NET-080 presuppose this; NET-065 keeps the `none` rejection -->
 
 ## Non-goals
 
@@ -604,7 +617,7 @@ included, with every refusal logged (NET-001 to NET-004).
   metal host's obligations are EHE's; the host-side enforcement this document
   binds (NET-081 to NET-085) is what such a host reuses per VM.
 - The schema of the box spec's `[network]` fields: the box-spec document
-  (gominimal/inbox#570). NET-060 binds acceptance of two fields, not the
+  (gominimal/inbox#570). NET-060 binds acceptance of three fields, not the
   schema.
 - Creating, listing, and choosing VMs as box providers: the Box Provider
   abstraction (gominimal/arch#45). NET-052 to NET-059 bind only the box-host
@@ -654,6 +667,10 @@ with a `port` directive, written once by an advisory command that the session
 start names. NET-018 and NET-019 take their WHERE from the same ruling: the
 proxy is superseded only when host-OS resolution and published addresses are
 both deployed on that host, and identity plays no part in the condition.
+Allocation from the reserved range is host-global, arbitrated through the
+answerer's authenticated channel, and no daemon self-assigns (design §7.1);
+that is why NET-010's no-collision property ranges over every daemon on the
+host and why NET-027 and NET-059 can route two daemons' names at once.
 
 **A box outlives its client.** NET-015 states that a box runs from activation
 until destroy whether or not a client is attached. Two alternatives were
@@ -686,6 +703,39 @@ rejected as leaving the opt-out flag unbound.
 **Bounds that were chosen here.** "Local-only" for `*.min.internal` means the
 zone is answered only to lookups that originate on the machine (NET-006);
 answering only loopback addresses was the weaker reading considered.
+`host.min.internal` resolves from every box (NET-003) and reach over it is
+local reach evaluated under the box's egress rules, default-deny except
+configured host exposures ([design
+§7.1](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)
+local names): a deny-all box resolves the name and reaches nothing (NET-079),
+and the daemon's own package fetch is node-plane traffic, not the box's
+(NET-080). Making the host's loopback a baseline exception for every box was
+considered and rejected: it would give the shared-namespace lane a reach the
+box never declared.
+
+**An unanswered `ask` is a refusal.** A box outlives its client (NET-015), so a
+dynamic ingress request decided `ask` can arrive with nobody attached to
+prompt. NET-045's failure case refuses it with a typed error, and NET-046
+records the refusal like every other decision. Queueing the request until a
+client attaches was considered and rejected: the request would sit with no
+owner and no bound on how long, and a port would appear on the host at a
+moment nobody asked for it. The caller retries once a human is attached.
+
+**Field names follow the architecture, and two shipped rules are superseded.**
+`dynamic_ingress` (NET-043 to NET-047) is [design
+§7.1](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)'s
+name for the setting the shipped 03-spec R2.3 called `dynamic_allowed_ports`;
+no crate implements either, so the architecture's name is taken with no
+compatibility clause. `egress.allow_dns_hosts` is the one spelling for the
+DNS-allowlist field here (NET-060, NET-066, NET-072), matching the session
+crate's `EgressPolicy`; design §7.1 writes it `egress_allow_dns` under §5.4's
+stated placeholder names. And an `egress` section on a host-address box is
+accepted (NET-120): 03-spec R2.1 made it a parse-time error for a HostNet
+PTask, which the daemon still enforces, but the two-address classifier
+(NET-078, design §4.1) gives the host-address cohort an enforcement identity,
+and the deny-all story for those boxes (NET-079, NET-080) needs the
+declaration. NET-065 keeps the rejection for `none` boxes, where there is
+nothing to enforce.
 
 **Lane stories are product behaviours.** The maintainer's lane-assertion story
 became NET-107 and NET-108, whose named tests are the lane assertions; keeping
@@ -741,7 +791,7 @@ that gap visible to policy is EHE's.
   covered by: NET-071, NET-073
 - **Invariant:** THE SYSTEM SHALL bound the reach of any process inside the
   escape boundary, root included, to the union of resident boxes' declared
-  egress plus the enumerated baseline set.
+  egress plus the node-plane baseline set (design §5.1).
   enforced by: per-box source-addressed rules applied outside the VM, boxes
   without `CAP_NET_RAW`, the relay's source-address check, and guest IPv6
   disabled
