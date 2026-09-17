@@ -145,12 +145,14 @@ pub enum Command {
     Init(InitArgs),
     /// Add a new tool or dependency
     Add(AddArgs),
-    /// Re-pin upstream & the standard library to their latest commits (not a self-update)
+    /// Re-pin upstream & sideloads to their latest commits (not a self-update)
     ///
     /// Re-pins the project's `[upstream]` link (and any sideloads) in
     /// `minimal.toml` to the current head of each tracking branch, rewriting
-    /// `locked_commit`, then refreshes the local checkouts to match. This
-    /// leaves `minimal.toml` modified in your working tree (a diff to commit),
+    /// `locked_commit`, then refreshes the local checkouts to match. The
+    /// standard library is embedded in the `min` binary and is only refreshed
+    /// or verified locally — its commit is not re-pinned. This leaves
+    /// `minimal.toml` modified in your working tree (a diff to commit),
     /// and the next `min session activate` materializes the new closure, which
     /// can take several minutes on the first activate.
     ///
