@@ -132,7 +132,7 @@ peers (MRF-005), against one remote host that already serves mesh ingress.
   ([design
   §4.5](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)):
   the gateway component; the host's side of the association is
-  [EHE](https://github.com/gominimal/minimal/pull/{EHE_PR}).
+  [EHE](https://github.com/gominimal/minimal/pull/1418).
 
 ## Design reasoning
 
