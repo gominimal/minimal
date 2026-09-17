@@ -100,7 +100,7 @@ or a session, and the operator who runs the daemon.
     SHALL stop the task with an error and SHALL keep the task off the host
     network.
     tier:   T0
-    verify: `cargo nextest run -p minimald a_task_takes_the_network_of_its_session`
+    verify: `cargo nextest run -p minimald a_refused_task_attach_stops_the_task`
 
 - **017-006** THE SYSTEM SHALL limit the network access of a sandbox to the
   access that the mode of that sandbox states.
