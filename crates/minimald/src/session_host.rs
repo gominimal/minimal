@@ -3375,6 +3375,15 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                                     // shed with the closed-channel outcome, where
                                     // the binding task has already exited and
                                     // released the channel (EOF/close).
+                                    //
+                                    // Bump the generation before removing the
+                                    // binding: stdin the shed binding already
+                                    // queued into the shared stdin channel still
+                                    // carries the old generation, so the stdin arm
+                                    // drops it instead of handing a dead channel's
+                                    // keystrokes to the shell (or to a later
+                                    // re-attach's fresh chord).
+                                    self.binding_generation += 1;
                                     if let Some((_tx, binding_task)) = self.remote.take() {
                                         binding_task.abort();
                                     }
@@ -4015,9 +4024,27 @@ mod tests {
         .await
         .expect("a stalled binding must not wedge the host loop");
 
-        // Having shed the binding, the host still drives the shell to exit.
+        // The shed bumped the binding generation, so input still stamped with
+        // the shed generation must be discarded rather than reach the shell.
         stdin
             .send(stdin_bytes(format!("{MOCK_EXIT_LINE}\n").into_bytes()))
+            .await
+            .expect("failed to send stale exit line");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !task.is_finished(),
+            "input from the shed generation must not reach the shell",
+        );
+
+        // The same bytes on the post-shed generation still drive the shell to
+        // exit: the host keeps serving after shedding the stalled binding.
+        stdin
+            .send(StdinMsg::new(
+                1,
+                StdinMsgKind::Bytes(bytes::Bytes::from(
+                    format!("{MOCK_EXIT_LINE}\n").into_bytes(),
+                )),
+            ))
             .await
             .expect("failed to send exit line");
         tokio::time::timeout(Duration::from_secs(10), task)
