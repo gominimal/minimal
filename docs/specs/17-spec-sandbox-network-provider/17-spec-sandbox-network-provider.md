@@ -66,7 +66,9 @@ or a session, and the operator who runs the daemon.
   operation, THEN THE SYSTEM SHALL run the abandon operation one time.
   tier:     T1
   verify:   `cargo nextest run -p sandbox2 abandoned_launch_releases_the_plan`
-  property: for every launch, count(plan) = count(attach) + count(abandon)
+  property: for every launch, count(plan) = count(attach) + count(abandon),
+            where count(plan) counts plan operations that return a plan; a
+            plan operation that fails reserves nothing and owes nothing
   - IF the launch future stops because the caller drops it, THEN THE SYSTEM
     SHALL run the abandon operation one time.
     tier:   T0
@@ -98,7 +100,7 @@ or a session, and the operator who runs the daemon.
     SHALL stop the task with an error and SHALL keep the task off the host
     network.
     tier:   T0
-    verify: `cargo nextest run -p sandbox2 abandoned_launch_releases_the_plan`
+    verify: `cargo nextest run -p minimald a_task_takes_the_network_of_its_session`
 
 - **017-006** THE SYSTEM SHALL limit the network access of a sandbox to the
   access that the mode of that sandbox states.
@@ -161,8 +163,8 @@ or a session, and the operator who runs the daemon.
 ## Non-functional requirements
 
 - **017-N01** WHILE four own-IP sandboxes start at the same time, THE SYSTEM
-  SHALL complete every launch in less than two times the duration of one
-  launch.
+  SHALL hold the switch for the address lease of each launch only, and SHALL
+  hold four leases at once.
   tier:   T0
   verify: `cargo nextest run -p minimald concurrent_own_ip_launches_do_not_serialize`
 
@@ -242,6 +244,10 @@ impl NetPlan {                    // constructors only, no public fields
     pub fn host() -> Self;
     pub fn isolated() -> Self;
     pub fn isolated_with_tap(spec: TapSpec) -> Self;   // isolation is implied
+    pub fn with_resolver(self, resolver: Resolver) -> Self;
+    pub fn isolates_netns(&self) -> bool;              // what the launch reads
+    pub fn tap(&self) -> Option<TapSpec>;
+    pub fn resolver(&self) -> &Resolver;
 }
 
 pub trait Network: Send + Sync + Debug {
@@ -279,6 +285,29 @@ A sandbox with no provider of its own passes its own plan, so every launch has
 a provider. The container build consumes the resolver of the plan: the host
 resolver goes only into a root filesystem that has none, and named servers
 replace whatever is there.
+
+The launch owns the release of the plan from `begin` until one of three
+transitions, each of which runs exactly once:
+
+- `attach` returns a guard: the guard owns the release from then on, and its
+  teardown operation gives the lease back and closes the tap descriptor when
+  the sandbox stops. The abandon operation does not run after this.
+- `attach` returns an error: the guard does not exist, so the launch still
+  owes the release; the launch is dropped on that path, and its drop runs the
+  abandon operation. The caller stops the process it started.
+- `abandon`, or the drop of a launch that still owes its release: the abandon
+  operation runs. A drop cannot await, so it starts the abandon operation on
+  the runtime; with no runtime running there is nothing to release to. A
+  launch dropped while the plan operation is pending owes nothing, because a
+  provider records its reservation in the same poll that takes it.
+
+The provider factory maps each mode to one plan. `HostNet` plans the host
+network with the host resolver. `NoNet` plans an empty namespace, no tap and
+no resolver. `OwnIp` plans an isolated namespace with the resolver of the
+switch, and tap parameters where the sandbox layer builds the tap. The sandbox
+layer trusts its provider: what a provider plans is what the sandbox gets, so
+the invariant of 017-006 is enforced where providers are made, in the one
+function that reads the mode, and no other code in the daemon makes one.
 
 The daemon gets one function that reads the mode, and it returns a provider
 for every mode:
@@ -364,8 +393,9 @@ every other layer stays the same.
 
 - **Invariant:** THE SYSTEM SHALL limit the network access of a sandbox to the
   access that the mode of that sandbox states.
-  enforced by: one function that maps a mode to a provider, and an error when
-  the host cannot make the namespace that the mode needs.
+  enforced by: one function that maps a mode to a provider, which is the only
+  code in the daemon that makes a provider; and an error when the host cannot
+  make the namespace that the mode needs.
   covered by: 017-005, 017-006, 017-011
 
 - **Invariant:** THE SYSTEM SHALL leave the switch attachment count unchanged
@@ -414,9 +444,10 @@ every other layer stays the same.
   because the command that starts it has no option for the mode. Does the
   option belong to this work, or to a later change? 017-005 holds either way,
   because it reads the mode that the PTask carries.]
-- [NEEDS CLARIFICATION (MEDIUM): Is the bound in 017-N01 the right one? The
-  test that verifies it proves structure, that the switch lock is not held
-  between the plan and attach operations and that four launches hold four
-  leases at once; it does not measure time. Step 9 takes the measurement.]
+- [NEEDS CLARIFICATION (MEDIUM): What time bound do four concurrent own-IP
+  launches get? 017-N01 states the structure that keeps them from serializing
+  and no duration, because no measurement of one launch exists. Step 9 takes
+  the measurement and states the bound from it, with the workload, the timing
+  method and the allowed variance.]
 - [NEEDS CLARIFICATION (LOW): The epic number and the GitHub handle of the
   owner.]
