@@ -181,7 +181,9 @@ Loadouts live under `~/.config/minimal/loadouts/`, either as `<name>.toml` or
 — to keep one under version control, alongside the files it ships — as
 `<name>/loadout.toml`; the
 [`minimal-loadouts`](https://github.com/gominimal/minimal-skills/tree/main/skills/minimal-loadouts)
-skill automates authoring one:
+skill automates authoring one, and the
+[`cozy`](https://minimal.dev/blog/theres-no-place-like-loadouts) loadout is a
+worked example:
 
 ```toml
 # ~/.config/minimal/loadouts/dev.toml
