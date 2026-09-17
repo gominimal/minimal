@@ -386,8 +386,9 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     egress_out="$(mnl session exec "$sid" \
       "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 30 https://$egress_host" \
       2>"$WORK/egress.err")"
-    if [ "$egress_out" != "HTTP:200" ]; then
-      echo "::error::guest egress to https://$egress_host failed (got '${egress_out:-<none>}', want HTTP:200): the session has no working egress. On a VM lane (E2E_VM='${E2E_VM:-}') this is the gvproxy switch not being wired — a switchless boot has no NAT/DNS, so read this as 'no switch', not 'DNS is broken'; the guest boot console follows in the diagnostics."
+    egress_status=$?
+    if [ "$egress_status" -ne 0 ] || [ "$egress_out" != "HTTP:200" ]; then
+      echo "::error::guest egress to https://$egress_host failed (exec status ${egress_status}, got '${egress_out:-<none>}', want HTTP:200): the session has no working egress. On a VM lane (E2E_VM='${E2E_VM:-}') a lost gvproxy switch is one hypothesis — a switchless boot has no NAT/DNS — but a nonzero exec status or a non-200 code can equally be a DNS, TLS/CA, or exec-transport failure; the guest boot console and curl stderr follow in the diagnostics."
       echo "--- curl stderr ---"; cat "$WORK/egress.err" 2>/dev/null || true
       fail
     fi
