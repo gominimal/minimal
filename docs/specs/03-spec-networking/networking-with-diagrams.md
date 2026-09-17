@@ -2,7 +2,7 @@
 
 This specification outlines the networking use cases for the Minimal "minimald" tool.
 
-The is some exploration of implementation options that do not require the user
+There is some exploration of implementation options that do not require the user
 to have root privileges. This does not exclude other implementation approaches or
 additions such as enabling SSH port-forwarding (communications with the minimald are over SSH).
 
