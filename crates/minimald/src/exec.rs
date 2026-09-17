@@ -139,6 +139,57 @@ impl Exec for TaskExec {
     }
 }
 
+/// The network a task gets: the provider for its session's mode (017-005).
+/// Shared by the two ways a task starts — over an exec channel here, and from
+/// inside the session (`env::SessionChannel::run_task`).
+///
+/// The mode, not the identity: an own-IP task is a second PTask beside the
+/// session's, on the same switch at the same time, so it registers under its
+/// own name and carries none of the session's ingress — forwards a task
+/// applied would come down again at its teardown.
+pub(crate) fn task_network(
+    record: &sessions::Record,
+    switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
+) -> std::sync::Arc<dyn sandbox2::Network> {
+    let id = record.id.to_string();
+    let session = record.name.as_deref().unwrap_or(&id);
+    crate::net::provider::network_for(record.network, switch, &format!("{session}-task"), None)
+}
+
+/// The slice of `hakoniwa::Child` the attach-failure arm needs, so the arm can
+/// be tested without a container.
+trait Reapable {
+    /// Kill the process and wait for it, so it does not outlive its sandbox.
+    fn kill_and_reap(&mut self);
+}
+
+impl Reapable for hakoniwa::Child {
+    fn kill_and_reap(&mut self) {
+        // `wait` runs regardless of `kill`: the process may have already exited.
+        let _ = self.kill();
+        let _ = self.wait();
+    }
+}
+
+/// Step 3 of a task launch: wire the process's namespace, or kill and reap the
+/// process so it does not run on with the network it failed to get — as
+/// `sandbox2::run_with_cancel` does. `PlannedLaunch`'s drop releases the plan.
+async fn attach_or_reap<P: Reapable>(
+    planned: sandbox2::PlannedLaunch,
+    spawned: sandbox2::Spawned,
+    child: &mut P,
+) -> io::Result<Box<dyn sandbox2::NetGuard>> {
+    match planned.attach(spawned).await {
+        Ok(guard) => Ok(guard),
+        Err(e) => {
+            child.kill_and_reap();
+            Err(io::Error::other(format!(
+                "attaching the task network failed: {e}"
+            )))
+        }
+    }
+}
+
 /// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
 /// `env` lives on a single stack frame across every spawn — that frame
 /// is alive for the whole life of this tokio task, which in turn is
@@ -207,19 +258,7 @@ async fn task_producer(
             task.vars
                 .insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
         }
-        // A task inherits its session's network isolation, through the same
-        // sandbox2 `Network` seam the interactive session uses, rather than the
-        // old hardcoded `HostNet` (which leaked host egress to a no-net
-        // session's tasks). `OwnIp` additionally needs the per-PTask tap/switch
-        // attach (as `attach_own_ip` does for sessions); wiring that into the
-        // task-exec producer/consumer is a follow-up, so an `OwnIp` session's
-        // task falls back to `HostNet` here instead of running in an empty,
-        // egress-less netns. `NetworkMode` is #[non_exhaustive], so any future
-        // mode also takes the safe HostNet default.
-        let network: std::sync::Arc<dyn sandbox2::Network> = match session.record().await?.network {
-            sessions::NetworkMode::NoNet => std::sync::Arc::new(sandbox2::NoNet),
-            _ => std::sync::Arc::new(sandbox2::HostNet),
-        };
+        let network = task_network(&session.record().await?, &session.net_switch().await?);
         // A task's `~/` resolves against the session's home, the same
         // directory the interactive session sees at `/home`. The daemon's own
         // ambient home is `/` inside the guest, and expanding against that
@@ -243,15 +282,6 @@ async fn task_producer(
             .task_invocations(&task, exec.args.as_ref())
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
-        // Neither provider above wires anything after the spawn, so the launch
-        // is not attached; its drop releases the (empty) plan.
-        let planned = env
-            .plan_launch()
-            .await
-            .map_err(|e| io::Error::other(format!("planning the task network failed: {e}")))?;
-        let container = env
-            .container(planned.plan())
-            .map_err(|e| io::Error::other(format!("building container failed: {}", e)))?;
 
         for inv in invocations {
             // Wait for the consumer to ask. `None` means the consumer
@@ -259,25 +289,39 @@ async fn task_producer(
             if req_rx.recv().await.is_none() {
                 return Ok(());
             }
-            let result = (|| -> io::Result<TaskProcess> {
+            let result = async {
+                // One plan, container and attach per invocation: hakoniwa
+                // unshares per `spawn()`, so each needs its own address.
+                let planned = env.plan_launch().await.map_err(|e| {
+                    io::Error::other(format!("planning the task network failed: {e}"))
+                })?;
+                let container = env
+                    .container(planned.plan())
+                    .map_err(|e| io::Error::other(format!("building container failed: {}", e)))?;
                 let mut cmd = env
                     .command(&container, &inv.executable, inv.args.iter())
                     .map_err(|e| io::Error::other(format!("building command failed: {}", e)))?;
                 cmd.stdin(hakoniwa::Stdio::piped())
                     .stdout(hakoniwa::Stdio::piped())
                     .stderr(hakoniwa::Stdio::piped());
-                let child = cmd
+                let mut child = cmd
                     .spawn()
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
-                Ok(TaskProcess::Sandbox(HakoniwaProcess::new(child)))
-            })();
+                let spawned = sandbox2::Spawned::from_child(&mut child);
+                let guard = attach_or_reap(planned, spawned, &mut child).await?;
+                Ok(TaskProcess::Sandbox(HakoniwaProcess::new(child, guard)))
+            }
+            .await;
             if let Err(send_err) = proc_tx.send(result).await {
                 // Receiver dropped between our `recv` returning `Some`
                 // and our `send`. If we just spawned a child, kill it
                 // before `env` drops so it doesn't outlive its sandbox
-                // rootfs.
+                // rootfs — and reap it, which is what releases its network.
                 if let Ok(mut proc) = send_err.0 {
                     let _ = proc.start_kill();
+                    tokio::spawn(async move {
+                        let _ = proc.wait().await;
+                    });
                 }
                 return Ok(());
             }
@@ -316,6 +360,55 @@ async fn task_producer(
 pub struct HakoniwaProcess {
     pid: libc::pid_t,
     state: WaitState,
+    /// The network wiring this task's namespace got, released at the end of
+    /// [`wait`](Process::wait).
+    net: NetRelease,
+}
+
+/// The release of a task's network, owed once its process is gone.
+///
+/// [`Process::wait`] is polled inside a `select!` and may be dropped at any
+/// await, so the teardown cannot be awaited in place: dropped mid-teardown, a
+/// guard would never detach. It runs on its own task instead, and `wait`
+/// awaits the handle, which survives being dropped and re-awaited.
+struct NetRelease {
+    guard: Option<Box<dyn sandbox2::NetGuard>>,
+    /// The teardown in flight, once started.
+    running: Option<JoinHandle<()>>,
+}
+
+impl Drop for NetRelease {
+    /// A process dropped before its `wait` completed — an aborted bridge —
+    /// still owes its network back. `Drop` cannot await, so the teardown goes
+    /// onto the runtime; with none running there is nothing to release to.
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(guard.teardown());
+        }
+    }
+}
+
+impl NetRelease {
+    fn new(guard: Box<dyn sandbox2::NetGuard>) -> Self {
+        Self {
+            guard: Some(guard),
+            running: None,
+        }
+    }
+
+    /// Runs the teardown to completion, once. Cancel-safe: a dropped call
+    /// leaves the teardown running, and the next call waits for it.
+    async fn release(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            self.running = Some(tokio::spawn(guard.teardown()));
+        }
+        if let Some(running) = &mut self.running {
+            let _ = running.await;
+            self.running = None;
+        }
+    }
 }
 
 enum WaitState {
@@ -339,10 +432,11 @@ enum WaitState {
 }
 
 impl HakoniwaProcess {
-    fn new(child: hakoniwa::Child) -> Self {
+    fn new(child: hakoniwa::Child, net_guard: Box<dyn sandbox2::NetGuard>) -> Self {
         Self {
             pid: child.id() as libc::pid_t,
             state: WaitState::Spawned(Box::new(child)),
+            net: NetRelease::new(net_guard),
         }
     }
 }
@@ -388,6 +482,10 @@ impl Process for HakoniwaProcess {
                 Ok(Err(_)) | Err(_) => WaitState::Failed,
             };
         }
+
+        // Terminal either way, so the network goes back now — on the `Failed`
+        // arm too, where the process is equally gone.
+        self.net.release().await;
 
         match &self.state {
             WaitState::Exited(code) => Ok(*code),
@@ -1828,6 +1926,178 @@ mod tests {
 
     use super::bridge;
     use super::testing::{MockEndpoints, build_mock, build_mock_seq};
+
+    /// A session record carrying `mode`, with everything else at its default.
+    #[cfg(target_os = "linux")]
+    fn record_with(mode: sessions::NetworkMode) -> sessions::Record {
+        sessions::Record {
+            id: sessions::SessionId::nil(),
+            name: None,
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
+            network: mode,
+            policy: sessions::SessionPolicy::default(),
+            status: sessions::SessionStatus::Active,
+            hooks_enabled: true,
+            attrs: Default::default(),
+        }
+    }
+
+    /// 017-005. A task's sandbox is planned for its session's mode; `OwnIp`
+    /// is the case that matters, as it used to arrive as `HostNet`. The switch
+    /// is `HostShuttle`, so an own-IP plan is pure bookkeeping.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_task_takes_the_network_of_its_session() {
+        use std::sync::Arc;
+
+        let switch = Arc::new(tokio::sync::Mutex::new(
+            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                }),
+        ));
+
+        let host = super::task_network(&record_with(sessions::NetworkMode::HostNet), &switch);
+        assert!(!host.plan().await.unwrap().isolates_netns());
+
+        let no_net = super::task_network(&record_with(sessions::NetworkMode::NoNet), &switch);
+        let plan = no_net.plan().await.unwrap();
+        assert!(plan.isolates_netns() && plan.tap().is_none());
+
+        let mut record = record_with(sessions::NetworkMode::OwnIp);
+        record.name = Some("web".to_string());
+        record.policy.ingress = Some(sessions::IngressPolicy::default());
+        let own_ip = super::task_network(&record, &switch);
+        let plan = own_ip.plan().await.unwrap();
+        assert!(
+            plan.isolates_netns(),
+            "an own-IP task gets its own namespace"
+        );
+        assert!(matches!(
+            plan.resolver(),
+            sandbox2::Resolver::Nameservers(_)
+        ));
+        // Its own identity on the switch, and none of the session's ingress:
+        // the session's PTask is attached at the same time.
+        let described = format!("{own_ip:?}");
+        assert!(
+            described.contains("\"web-task\"") && described.contains("has_ingress: false"),
+            "got {described}"
+        );
+        own_ip.abandon().await;
+
+        // No name: the session id, rather than an empty hostname.
+        let unnamed = super::task_network(&record_with(sessions::NetworkMode::OwnIp), &switch);
+        assert!(format!("{unnamed:?}").contains(&sessions::SessionId::nil().to_string()));
+    }
+
+    /// 017-005. An own-IP task whose attach is refused stops with the
+    /// provider's error: the process is killed and reaped, and the plan it was
+    /// built from was the provider's, never the host's.
+    #[tokio::test]
+    async fn a_refused_task_attach_stops_the_task() {
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct Refuses;
+        impl sandbox2::Network for Refuses {
+            fn plan(&self) -> sandbox2::PlanFuture<'_> {
+                Box::pin(std::future::ready(Ok(sandbox2::NetPlan::isolated())))
+            }
+            fn attach(&self, _: sandbox2::Spawned) -> sandbox2::AttachFuture<'_> {
+                Box::pin(std::future::ready(Err(sandbox2::NetworkError::new(
+                    std::io::Error::other("switch refused the client"),
+                ))))
+            }
+        }
+
+        struct Child {
+            reaped: bool,
+        }
+        impl super::Reapable for Child {
+            fn kill_and_reap(&mut self) {
+                self.reaped = true;
+            }
+        }
+
+        let planned = sandbox2::PlannedLaunch::begin(Arc::new(Refuses))
+            .await
+            .expect("planning succeeds; it is the attach that fails");
+        assert!(planned.plan().isolates_netns());
+
+        let mut child = Child { reaped: false };
+        let err = super::attach_or_reap(planned, sandbox2::Spawned::new(1), &mut child)
+            .await
+            .err()
+            .expect("a refused attach must surface as an error");
+        assert!(child.reaped, "the task must not run on");
+        assert!(
+            err.to_string().contains("switch refused the client"),
+            "the provider's reason must reach the caller, got: {err}",
+        );
+    }
+
+    /// A guard whose teardown blocks until told to finish, then counts.
+    struct SlowGuard {
+        go: std::sync::Arc<tokio::sync::Notify>,
+        done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl sandbox2::NetGuard for SlowGuard {
+        fn teardown(
+            self: Box<Self>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            Box::pin(async move {
+                self.go.notified().await;
+                self.done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        }
+    }
+
+    /// 017-003 on the task path. `wait` is polled inside a `select!` and can
+    /// be dropped while the network is being released; the release must still
+    /// run, once, and the next `wait` must not return before it is done. A
+    /// process dropped before any `wait` completed releases the same way.
+    #[tokio::test]
+    async fn a_dropped_wait_still_releases_the_network_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let go = Arc::new(tokio::sync::Notify::new());
+        let done = Arc::new(AtomicUsize::new(0));
+        let guard = || {
+            Box::new(SlowGuard {
+                go: go.clone(),
+                done: done.clone(),
+            })
+        };
+
+        // The first `wait` is dropped mid-release, as `select!` does.
+        let mut net = super::NetRelease::new(guard());
+        let dropped = tokio::time::timeout(std::time::Duration::from_millis(20), net.release())
+            .await
+            .is_err();
+        assert!(dropped, "the release must still be in flight");
+        assert_eq!(done.load(Ordering::SeqCst), 0);
+
+        // The next `wait` waits for the same release, which then finishes;
+        // a later one has nothing left to do.
+        go.notify_one();
+        net.release().await;
+        net.release().await;
+        assert_eq!(done.load(Ordering::SeqCst), 1, "released exactly once");
+
+        // Dropped before any `wait`: `Drop` spawns the release; let it run.
+        drop(super::NetRelease::new(guard()));
+        go.notify_one();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            2,
+            "a dropped process still releases"
+        );
+    }
 
     /// Bytes flow client→child stdin and child stdout/stderr→client,
     /// and the child's exit code propagates to the bridge's return.

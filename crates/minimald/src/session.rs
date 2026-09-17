@@ -597,6 +597,9 @@ enum SessionMessage {
     /// record.
     Destroy(oneshot::Sender<Result<(), std::io::Error>>),
     GetRecord(oneshot::Sender<Record>),
+    /// The daemon's shared gvproxy switch, reached through the session because
+    /// that is the handle the task path holds.
+    GetNetSwitch(oneshot::Sender<Arc<Mutex<crate::net::SwitchClient>>>),
     /// Hand back the session's composition, if it has one. Sourced from
     /// the persisted snapshot: `Session::run` loads it at spawn, so this
     /// answers for an actor brought up from disk after a restart.
@@ -1132,6 +1135,9 @@ impl Session {
             }
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.record.record().await.unwrap());
+            }
+            SessionMessage::GetNetSwitch(r) => {
+                let _ = r.send(Arc::clone(&self.net_switch));
             }
             #[cfg(test)]
             SessionMessage::PeekComposition(r) => {
@@ -2763,6 +2769,19 @@ impl SessionHandle {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::GetRecord(send)).await;
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })
+    }
+
+    /// The daemon's shared gvproxy switch, for the task path's network
+    /// provider. A dead actor maps to `NotConnected`.
+    pub(crate) async fn net_switch(
+        &self,
+    ) -> Result<Arc<Mutex<crate::net::SwitchClient>>, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(SessionMessage::GetNetSwitch(send)).await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })

@@ -21,10 +21,11 @@ pub mod policy;
 pub mod proxy;
 pub mod switch;
 
-// The own-IP `sandbox2::Network` impl. Gated like the session-host attach path
-// it replaces: the real (non-test) launcher wires it; the mock launcher does not.
-#[cfg(not(test))]
+// The own-IP switch attach, and the mode-to-provider factory that reaches it.
+// Not `#[cfg(not(test))]`: `provider` carries unit tests, and gating the module
+// would compile them out.
 pub(crate) mod gvproxy_network;
+pub(crate) mod provider;
 
 // WireGuard mesh peer (Unit 4). Compiled only under `networking-wg` so the
 // default build carries no WireGuard code (R4.7).
@@ -253,6 +254,12 @@ impl SwitchClient {
     #[must_use]
     pub fn transport(&self) -> SwitchTransport {
         self.transport
+    }
+
+    /// How many `OwnIp` PTasks are attached; the switch runs while non-zero.
+    #[must_use]
+    pub fn attached(&self) -> usize {
+        self.attached
     }
 
     /// The control socket path gvproxy listens on (host side only).

@@ -1161,9 +1161,22 @@ impl SessionChannel {
             None
         };
 
+        let Some(session) = self.session.upgrade() else {
+            let _ = writeln!(stream, "error: session is gone");
+            return;
+        };
+
         let result: Result<(), Error> = async {
+            // A task started from inside the session is a PTask of that
+            // session's mode too (017-005).
+            let gone = |e: std::io::Error| Error::IO("reading the session", Default::default(), e);
+            // Two statements: `mctx::Error` is not `Send`, and one expression
+            // would hold it across the second await in a spawned future.
+            let record = session.record().await.map_err(gone)?;
+            let switch = session.net_switch().await.map_err(gone)?;
+            let network = crate::exec::task_network(&record, &switch);
             let mut env = ctx
-                .make_env(
+                .make_env_with_network(
                     task_name,
                     &mut graph,
                     task.inherit_cwd
@@ -1172,6 +1185,7 @@ impl SessionChannel {
                     Some(&task.patch),
                     Some(&task.vars),
                     task.packages.clone(),
+                    network,
                     // The session's own home, not the daemon's. `minimald` is
                     // pid 1 with `HOME=/` inside the guest, so the ambient
                     // home would expand a package's `~/.claude.json` onto the
