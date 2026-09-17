@@ -127,6 +127,7 @@ if pid == 0:  # child
 
 buf = bytearray()
 answered = False
+failed = False
 
 
 def drain_ready(timeout):
@@ -180,6 +181,7 @@ try:
                     f"e2e-attach-pty: no {answer!r} lane in the session-exit "
                     f"menu; saw {menu_rows(bytes(buf))!r}\n"
                 )
+                failed = True
                 break
 finally:
     # Don't let a hung attach wedge the lane.
@@ -196,5 +198,5 @@ finally:
 
 sys.stdout.buffer.write(bytes(buf))
 sys.stdout.flush()
-ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+ok = not failed and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 sys.exit(0 if ok else 1)
