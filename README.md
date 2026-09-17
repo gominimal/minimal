@@ -7,7 +7,7 @@
 
 <h1 align="center">Minimal</h1>
 
-<p align="center"><strong>Run your agent session in a Minimal box: its own copy of the repo, its own boundary, built from a file your whole team shares.</strong></p>
+<p align="center"><strong>Run your agent in a Minimal box: Ship and run software with isolation on your own computer.</strong></p>
 
 <p align="center">
   <a href="https://minimal.dev/docs">Documentation</a> ·
@@ -29,11 +29,13 @@
 
 ## What is Minimal?
 
-Several agent sessions, several branches, one `min dash` that shows which is which. Each box is built from a `minimal.toml`, with every package traced back to source: an unprivileged user namespace or a libkrun microVM on Linux, a libkrun microVM on macOS. Detach and come back; nothing in the box is on your laptop.
+Minimal allows you to run coding agents inside a microVM on your own machine.
 
-The executables inside a sandbox (git, claude, compilers, shells, and more) are delivered by Minimal's secure package manager from a curated registry that is refreshed daily. The coding agents it packages today are claude, codex, opencode, and pi. Because packages are addressed by content rather than mutable version tags and builds are hermetic, the same blueprint resolves to the same environment on every machine. Moving the whole team to the freshest tool versions is one `min update`, which re-pins the blueprint in place. No more stale setup wikis, no more version drift.
+An unattended agent can only touch what you give it access to, so Minimal lets you scope access to specific projects, files, credentials, or configurations.
 
-Per-developer Loadouts then layer each person's own editors, shells, and configs on top of that shared toolchain, so the environment stays identical for everyone while you keep the muscle memory you have earned.
+Each box is built from a `minimal.toml`, letting you compose the exact tools your agent needs, the files it needs, and other isolation mechanisms. Every execution runs in an unprivileged user namespace or a libkrun microVM on Linux, or a libkrun microVM on macOS.
+
+Minimal's secure package manager delivers the executables inside a sandbox (git, claude, compilers, shells, and more) from a curated registry refreshed daily. The coding agents it packages today are claude, codex, opencode, and pi. Because packages are addressed by content rather than mutable version tags and builds are hermetic, the same blueprint resolves to the same environment, regardless of the machine you launch it from.
 
 > Full documentation lives at [minimal.dev/docs](https://minimal.dev/docs).
 
@@ -48,7 +50,7 @@ Minimal works on:
 - macOS on ARM64 (Apple Silicon)
 - Ubuntu and Debian Linux on ARM64 and x86_64, with a Linux kernel >= 5.10. Rootless user-namespace creation must be enabled for non-VM usage.
 
-Not on one of these platforms yet? Tell us what you'd like to see supported in [Discussions](https://github.com/gominimal/minimal/discussions). It helps us prioritize.
+Not on one of these platforms yet? Tell us what you'd like to see supported in [Discussions](https://github.com/gominimal/minimal/discussions).
 
 ## Installation
 
