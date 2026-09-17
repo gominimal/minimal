@@ -4,7 +4,7 @@ title: Box networking on the local host: preview by name and bounded egress
 owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md
-updated: 2026-09-16
+updated: 2026-09-17
 ---
 
 # NET — Box networking on the local host: preview by name and bounded egress
@@ -23,7 +23,10 @@ identity plane ([design §7.1 and
 This document binds that profile on the box host: the `min` CLI, the session
 daemon, the VM host daemon, the installer, and the release manifests, on a
 laptop running VM-backed boxes and on a Linux machine where the client and the
-box host share the machine.
+box host share the machine. On that host the default path carries no WireGuard:
+the pin, the Egress Gateway contract, and the Box Egress Proxy are all
+machine-internal ([design §7.1 and
+§11](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)).
 
 The scope is local by decision (local-first ordering, 2026-09-15): the
 un-enrolled local host is the deployment target first, and the architecture
@@ -45,16 +48,19 @@ the session, all through one `min net` grammar. The constraint holds in both
 directions: nothing reaches a box and nothing leaves it unless declared, and a
 hostname-routing surface is never a policy side door.
 
-The local Box Egress Proxy, the local form of the sealed-secrets design
-([architecture
-D6](https://github.com/gominimal/arch/blob/main/architecture.md)), is the next
-thing built and is a separate document that cites this one. It depends on three
-behaviours bound here: box-zone resolution (NET-072, NET-073),
-`egress.allow_dns_hosts` with DNS-pinned admission (NET-066, NET-067), and the
-hostname-proxy parity rule (NET-069 to NET-071); its default `dns` steering
-mode needs the box-zone resolver and the DNS-pinned name path to exist. UDP a
-box has not declared is dropped (NET-064), so HTTP/3 to a steered host falls
-back to TCP ([design
+The node-local Box Egress Proxy ([architecture
+D6](https://github.com/gominimal/arch/blob/main/architecture.md); [Gatehouse
+§6.10](https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md),
+v1.19), which on a local host runs beside the switch outside the VM and,
+un-enrolled, serves store references from the host's own secret stores, is the
+next thing built and is a separate document that cites this one. It depends on
+four behaviours bound here: box-zone resolution (NET-072, NET-073),
+`egress.allow_dns_hosts` with DNS-pinned admission (NET-066, NET-067), the
+hostname-proxy parity rule (NET-069 to NET-071), and the relay's source-address
+check (NET-084), which is what lets the proxy attribute a box by its switch
+source address. Its default `dns` steering mode needs the box-zone resolver and
+the DNS-pinned name path to exist. UDP a box has not declared is dropped
+(NET-064), so HTTP/3 to a steered host falls back to TCP ([design
 §5.3](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)).
 
 **Success:** on a stock install, a browser opens
@@ -578,9 +584,11 @@ included, with every refusal logged (NET-001 to NET-004).
 - An operator recipe for pods as box hosts: EHE's non-goal, destined for the
   Box Provider API's operator documentation.
 - Choosing how a box's credentialed traffic finds the Box Egress Proxy
-  (steering mode and HTTP/3 posture): the local Box Egress Proxy document; the
-  fields live in the box spec's `[network]` section but the behaviour is the
-  proxy's.
+  (steering mode and HTTP/3 posture), store references, and the client's
+  `[secret-store-rules]` consent: the node-local Box Egress Proxy document; the
+  fields live in the box spec's `[network]` and `[secrets]` sections but the
+  behaviour is the proxy's ([Gatehouse
+  §6.10](https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md)).
 - Host enrolment, the node record's creation, host listing, and revocation: the
   host-enrolment work (gominimal/inbox#648). No requirement here assumes an
   enrolled host.
@@ -589,8 +597,12 @@ included, with every refusal logged (NET-001 to NET-004).
 - The daemon as a mesh-reachable session host, the relay tier, and the browser
   client: [MMI](https://github.com/gominimal/minimal/pull/1356) and
   [MCC](https://github.com/gominimal/minimal/pull/1355).
-- Sealed secrets and the credential broker: the broker document
+- Sealed secrets and the hosted Box Egress Proxy: the broker document
   (gominimal/inbox#625).
+- BareMetalVM, the sixth deployment style ([architecture, Deployment
+  Styles](https://github.com/gominimal/arch/blob/main/architecture.md)): a
+  metal host's obligations are EHE's; the host-side enforcement this document
+  binds (NET-081 to NET-085) is what such a host reuses per VM.
 - The schema of the box spec's `[network]` fields: the box-spec document
   (gominimal/inbox#570). NET-060 binds acceptance of two fields, not the
   schema.
@@ -696,9 +708,13 @@ feed-regression harness moved to EHE with the requirement that owns it.
 
 **Cross-cutting decisions live in the architecture.** The two-address
 node-netns split, the residency clamp, DNS-pinned FQDN rules with the rebinding
-defence, and the degraded-mode profile with its host-OS resolution and
-published-address rules are [design §4.1, §4.3, §5.3, §7.1, and
-§7.4](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md).
+defence, the degraded-mode profile with its host-OS resolution and
+published-address rules, and the rule that on a host with a VM the node side of
+any association is the VM together with its host-side helper are [design §4.1,
+§4.3, §5.3, §7.1, and
+§7.4](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md);
+the WireGuard-free local path is [design
+§11](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md).
 This document binds the box host's observable behaviour under them and restates
 none of them.
 
@@ -762,8 +778,9 @@ that gap visible to policy is EHE's.
   classifier, and are host-address boxes on a co-resident Linux host in scope
   of NET-078 to NET-080? [Design
   §7.4](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)
-  applies the profile's naming and addressing to that host and says nothing
-  about the classifier.]
+  applies the profile's naming and addressing to that host and now permits a
+  node-local Box Egress Proxy inside its boundary at the advisory tier; it says
+  nothing about the classifier.]
 - [NEEDS CLARIFICATION (MEDIUM): with a box outliving its client (NET-015), who
   owns the idle and stop policy, and how does it compose with the closed-laptop
   story in the remote-sessions work?]
