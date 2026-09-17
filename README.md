@@ -7,7 +7,7 @@
 
 <h1 align="center">Minimal</h1>
 
-<p align="center"><strong>Run your agent in a Minimal box: Ship and run software with isolation on your own computer.</strong></p>
+<p align="center"><strong>Run your agent in a Minimal box. Ship and run software with isolation on your own computer.</strong></p>
 
 <p align="center">
   <a href="https://minimal.dev/docs">Documentation</a> ·
@@ -29,11 +29,11 @@
 
 ## What is Minimal?
 
-Minimal allows you to run coding agents inside a microVM on your own machine.
+Minimal allows you to run coding agents in an isolated box on your own machine.
 
 An unattended agent can only touch what you give it access to, so Minimal lets you scope access to specific projects, files, credentials, or configurations.
 
-Each box is built from a `minimal.toml`, letting you compose the exact tools your agent needs, the files it needs, and other isolation mechanisms. Every execution runs in an unprivileged user namespace or a libkrun microVM on Linux, or a libkrun microVM on macOS.
+Each box is built from a `minimal.toml`, letting you compose the exact tools your agent needs, the files it needs, and other isolation mechanisms. On Linux the box is an unprivileged user namespace by default (`local-minimald`), or a libkrun microVM with `--provider local-minvmd`; on macOS it is always a libkrun microVM.
 
 Minimal's secure package manager delivers the executables inside a sandbox (git, claude, compilers, shells, and more) from a curated registry refreshed daily. The coding agents it packages today are claude, codex, opencode, and pi. Because packages are addressed by content rather than mutable version tags and builds are hermetic, the same blueprint resolves to the same environment, regardless of the machine you launch it from.
 
