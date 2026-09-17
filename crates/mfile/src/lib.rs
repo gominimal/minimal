@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::hash::{Hash, Hasher};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -1036,10 +1037,30 @@ impl File {
         // One command decodes the same file several times; without this a
         // single load prints each warning once per decode. Surface them only
         // the first time a given path is validated in this process.
+        //
+        // The dedup key is (path, content) rather than path alone: a
+        // long-lived process (notably `minimald`) re-reads and re-validates
+        // the workspace `minimal.toml` on every session bring-up, and keying
+        // on path alone would permanently silence the warning after the first
+        // decode — even if the user edits the file and breaks it again. The
+        // content hash collapses the repeated decodes of an unchanged file
+        // while still re-warning when the file is edited or re-broken.
         if let Some(path) = &self.mfile_path {
-            static WARNED_PATHS: LazyLock<Mutex<HashSet<PathBuf>>> =
+            static WARNED_FILES: LazyLock<Mutex<HashSet<(PathBuf, u64)>>> =
                 LazyLock::new(|| Mutex::new(HashSet::new()));
-            if !WARNED_PATHS.lock().unwrap().insert(path.clone()) {
+            let content_hash = std::fs::read(path)
+                .ok()
+                .map(|bytes| {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    bytes.hash(&mut hasher);
+                    hasher.finish()
+                })
+                .unwrap_or(0);
+            if !WARNED_FILES
+                .lock()
+                .unwrap()
+                .insert((path.clone(), content_hash))
+            {
                 return;
             }
         }
@@ -1393,6 +1414,7 @@ mod tests {
 
     use super::*;
     use indoc::indoc;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
@@ -2377,5 +2399,84 @@ mod tests {
         assert!(hook.on_detach().is_some());
         assert!(hook.on_destroy().is_some());
         assert!(hook.description().is_some());
+    }
+
+    /// The once-per-path warning dedup must key on (path, content), not path
+    /// alone: a long-lived process re-validates the same file repeatedly, and
+    /// an edited file must re-warn. This test drives `warn_unknown_fields`
+    /// through the public `validate` path and counts the emitted warnings.
+    #[test]
+    fn warn_unknown_fields_rewarns_when_file_content_changes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MFILE_NAME);
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let write = |contents: &str| {
+            std::fs::write(&path, contents).unwrap();
+            let file = File::from_dir(dir.path()).unwrap();
+            file.validate().unwrap();
+        };
+
+        // First decode of a file with an unknown field warns once.
+        write("[unknown_top_level]\nkey = \"v\"\n");
+        assert_eq!(count_unknown_warnings(&capture), 1);
+
+        // Re-validating the unchanged file does not warn again.
+        write("[unknown_top_level]\nkey = \"v\"\n");
+        assert_eq!(count_unknown_warnings(&capture), 1);
+
+        // Editing the file (new content) re-warns.
+        write("[unknown_top_level]\nkey = \"v\"\nother = \"w\"\n");
+        assert_eq!(count_unknown_warnings(&capture), 2);
+
+        drop(guard);
+    }
+
+    fn count_unknown_warnings(capture: &CaptureWriter) -> usize {
+        capture
+            .contents()
+            .lines()
+            .filter(|line| line.contains("unknown fields in"))
+            .count()
+    }
+
+    /// Minimal `MakeWriter` that records formatted tracing output into a
+    /// shared buffer so tests can assert on emitted warnings.
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl CaptureWriter {
+        fn default() -> Self {
+            Self(Arc::new(Mutex::new(Vec::new())))
+        }
+
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CaptureWriter(self.0.clone())
+        }
     }
 }
