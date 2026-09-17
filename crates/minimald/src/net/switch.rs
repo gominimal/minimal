@@ -228,12 +228,16 @@ pub async fn move_tap_into_netns(
         // otherwise execute at that capability). The pinned `PATH` covers the
         // inner `ip` that `nsenter -n` execs inside the PTask namespace, which
         // resolves against this child's environment.
-        let status = tokio::process::Command::new(trusted_program(program))
+        // `output()` rather than `status()`: `ip` and `nsenter` distinguish
+        // their failures only on stderr — "Cannot open network namespace" and
+        // "Cannot find device" are both exit 255 — and an exit code alone has
+        // already cost one diagnosis here.
+        let out = tokio::process::Command::new(trusted_program(program))
             .args(rest)
             .env("PATH", TRUSTED_EXEC_PATH)
-            .status()
+            .output()
             .await?;
-        if !status.success() {
+        if !out.status.success() {
             // Command 0 moves the tap into the PTask namespace; the rest
             // configure it there, so name the phase the failing command is in.
             let phase = if index == 0 {
@@ -241,9 +245,21 @@ pub async fn move_tap_into_netns(
             } else {
                 "configuring PTask tap"
             };
+            let said = String::from_utf8_lossy(&out.stderr);
+            let said = said.trim();
+            let said = if said.is_empty() {
+                "no stderr".to_string()
+            } else {
+                format!("said {said:?}")
+            };
+            // Whether the namespace this addresses still exists separates "the
+            // supervisor exited under us" from "the tap is not where we think".
+            // Both reach here as 255, and only one of them is our bug.
+            let ns = std::path::Path::new(&format!("/proc/{netns_pid}/ns/net")).exists();
             return Err(io::Error::other(format!(
-                "{phase} failed (`{}` exited with {status})",
-                argv.join(" ")
+                "{phase} failed (`{}` exited with {}, {said}; /proc/{netns_pid}/ns/net present: {ns})",
+                argv.join(" "),
+                out.status
             )));
         }
     }
