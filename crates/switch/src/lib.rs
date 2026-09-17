@@ -187,6 +187,16 @@ impl SwitchSubnet {
         self.prefix
     }
 
+    /// The subnet mask in dotted-quad form, for the callers that configure an
+    /// interface rather than render CIDR.
+    ///
+    /// [`prefix`](Self::prefix) is the same fact in the other notation; a tap
+    /// wants this one, because that is the shape the interface API takes.
+    #[must_use]
+    pub fn netmask(self) -> Ipv4Addr {
+        Ipv4Addr::from(self.mask())
+    }
+
     /// The network address (host bits zeroed).
     #[must_use]
     pub fn network(self) -> Ipv4Addr {
@@ -329,6 +339,20 @@ mod tests {
             Err(InvalidPrefix(30))
         );
         assert!(SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).is_ok());
+    }
+
+    #[test]
+    fn netmask_is_the_prefix_in_dotted_quad() {
+        assert_eq!(
+            SwitchSubnet::default().netmask(),
+            Ipv4Addr::new(255, 255, 0, 0)
+        );
+        // Both ends of the prefix range `new` accepts, so the shift is proved
+        // at the boundaries a caller can actually reach.
+        let widest = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 8).unwrap();
+        assert_eq!(widest.netmask(), Ipv4Addr::new(255, 0, 0, 0));
+        let narrowest = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
+        assert_eq!(narrowest.netmask(), Ipv4Addr::new(255, 255, 255, 248));
     }
 
     #[test]

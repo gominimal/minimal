@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use sandbox2::{AttachFuture, NetGuard, Network, NetworkError};
+use sandbox2::{AttachFuture, NetGuard, NetPlan, Network, NetworkError, PlanFuture, Spawned};
 use tokio::sync::Mutex;
 
 use crate::net::SwitchClient;
@@ -62,15 +62,18 @@ impl std::fmt::Debug for GvproxyNetwork {
 }
 
 impl Network for GvproxyNetwork {
-    fn isolate_netns(&self) -> bool {
-        true
+    /// The daemon builds the tap itself after the process exists, so the plan
+    /// asks for an isolated namespace and no tap. The resolver is the session
+    /// host's to set, with the rest of the session's plan.
+    fn plan(&self) -> PlanFuture<'_> {
+        Box::pin(std::future::ready(Ok(NetPlan::isolated())))
     }
 
-    fn attach(&self, netns_pid: u32) -> AttachFuture<'_> {
+    fn attach(&self, spawned: Spawned) -> AttachFuture<'_> {
         Box::pin(async move {
             let guard = attach_own_ip(
                 &self.switch,
-                netns_pid,
+                spawned.netns_pid(),
                 &self.session_name,
                 self.ingress.as_ref(),
             )

@@ -265,18 +265,35 @@ pub async fn run_task(
     // Resolve the invocations to run from the task definition.
     let (_interactive, invocations) = env.task_invocations(task, parsed_args.as_ref()).await?;
 
-    let container = env
-        .container()
-        .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
     for (i, inv) in invocations.iter().enumerate() {
+        // One launch per invocation, as `sandbox2::run_with_cancel` does: a
+        // spawn is what gets a namespace, so each needs its own plan.
+        let planned = env.plan_launch().await?;
+        let container = env
+            .container(planned.plan())
+            .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
         let mut cmd = env
             .command(&container, &inv.executable, inv.args.iter())
             .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
-        let status = cmd
+        let mut child = cmd
             .spawn()
-            .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
+            .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?;
+        let guard = match planned
+            .attach(sandbox2::Spawned::from_child(&mut child))
+            .await
+        {
+            Ok(guard) => guard,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e.into());
+            }
+        };
+        let status = child
             .wait()
-            .map_err(|e| Error::Other(anyhow!("command failed: {}", e)))?;
+            .map_err(|e| Error::Other(anyhow!("command failed: {}", e)));
+        guard.teardown().await;
+        let status = status?;
         if !status.success() {
             return Err(Error::Execution {
                 idx: i,

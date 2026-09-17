@@ -2293,43 +2293,44 @@ impl SessionLauncher for SandboxLauncher {
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
 
-        // Phase 1 (pre-spawn): for own-IP, snapshot the switch's DNS server from
-        // its live subnet (needed by *every* own-IP sandbox — both transports).
-        // A native (DM2/`LocalSpawn`) PTask must additionally allocate its lease
-        // and ensure gvproxy is up *now*, because hakoniwa builds the tap (and
-        // assigns its address) inside the sandbox namespace before the process is
-        // spawned; we snapshot the lease IP + control socket for the post-spawn
-        // relay and the tap params for the sandbox to configure. DM1/3/4
-        // (`HostShuttle`, root-in-VM) keep the post-spawn open-tap-then-move-into-
-        // netns path and allocate their lease there, so `own_ip_tap`/
-        // `local_own_ip` stay `None` — but `own_ip_dns` is still set for them.
+        // Phase 1 (pre-spawn): the plan the sandbox is built for. For own-IP
+        // that names the switch's DNS server (needed by *every* own-IP sandbox
+        // — both transports). A native (DM2/`LocalSpawn`) PTask must additionally
+        // allocate its lease and ensure gvproxy is up *now*, because hakoniwa
+        // builds the tap (and assigns its address) inside the sandbox namespace
+        // before the process is spawned; we snapshot the lease IP + control
+        // socket for the post-spawn relay and put the tap params in the plan.
+        // DM1/3/4 (`HostShuttle`, root-in-VM) keep the post-spawn
+        // open-tap-then-move-into-netns path and allocate their lease there, so
+        // their plan isolates with no tap and `local_own_ip` stays `None`.
         let mut local_own_ip: Option<(std::net::Ipv4Addr, std::path::PathBuf)> = None;
-        let mut own_ip_tap: Option<sandbox2::config::OwnIpTap> = None;
-        let mut own_ip_dns: Option<std::net::Ipv4Addr> = None;
-        if matches!(network_mode, NetworkMode::OwnIp) {
-            let mut s = net_switch.lock().await;
-            let subnet = s.subnet();
-            own_ip_dns = Some(subnet.dns_server());
-            if matches!(s.transport(), crate::net::SwitchTransport::LocalSpawn) {
-                let attach = s.attach().await.map_err(|e| {
-                    io::Error::other(format!("attaching OwnIp PTask to switch: {e}"))
-                })?;
-                let sock = s.control_socket();
-                let prefix = subnet.prefix();
-                let mask = if prefix == 0 {
-                    0
+        let plan = match network_mode {
+            NetworkMode::OwnIp => {
+                let mut s = net_switch.lock().await;
+                let subnet = s.subnet();
+                let plan = if matches!(s.transport(), crate::net::SwitchTransport::LocalSpawn) {
+                    let attach = s.attach().await.map_err(|e| {
+                        io::Error::other(format!("attaching OwnIp PTask to switch: {e}"))
+                    })?;
+                    local_own_ip = Some((attach.lease.ip, s.control_socket()));
+                    sandbox2::NetPlan::isolated_with_tap(sandbox2::TapSpec {
+                        address: attach.lease.ip,
+                        netmask: subnet.netmask(),
+                        gateway: subnet.gateway(),
+                        mtu: crate::net::DEFAULT_MTU,
+                    })
                 } else {
-                    u32::MAX << (32 - prefix)
+                    sandbox2::NetPlan::isolated()
                 };
-                own_ip_tap = Some(sandbox2::config::OwnIpTap {
-                    address: attach.lease.ip,
-                    netmask: std::net::Ipv4Addr::from(mask),
-                    gateway: subnet.gateway(),
-                    mtu: crate::net::DEFAULT_MTU,
-                });
-                local_own_ip = Some((attach.lease.ip, sock));
+                plan.with_resolver(sandbox2::Resolver::Nameservers(vec![subnet.dns_server()]))
             }
-        }
+            NetworkMode::HostNet => {
+                sandbox2::NetPlan::host().with_resolver(sandbox2::Resolver::Host)
+            }
+            // `NetworkMode` is #[non_exhaustive]; an unknown mode isolates, as
+            // every mode but host-net did when the sandbox layer mapped modes.
+            _ => sandbox2::NetPlan::isolated(),
+        };
 
         // Guard the phase-1 attach for the whole window until it is handed to an
         // `OwnIpGuard`: an early `Err` return *or* a cancelled launch future now
@@ -2455,15 +2456,13 @@ impl SessionLauncher for SandboxLauncher {
                     // uses a different `Env::build` (mctx::env::Env) and
                     // keeps the legacy un-gated wiring for now.
                     .without_package_attr_wiring()
-                    .with_network_mode(network_mode)
-                    .with_own_ip_tap(own_ip_tap)
-                    .with_own_ip_dns(own_ip_dns)
+                    .with_network(plan.clone())
                     .with_username(username),
             ))
             .await?;
 
             let mut container = env
-                .container()
+                .container(&plan)
                 .map_err(|e| io::Error::other(format!("container build: {e}")))?;
             container.set_session_leader();
 
@@ -2552,21 +2551,18 @@ impl SessionLauncher for SandboxLauncher {
         // Until this returns, an own-IP PTask's egress isn't up yet, but a shell
         // PTask never probes the network in this window (the SSH layer dispatches
         // commands only after `Launched` is returned).
+        let mut spawned = sandbox2::Spawned::from_child(process.get_mut());
         let net_guard: Option<Box<dyn sandbox2::NetGuard>> =
             if let Some((lease_ip, sock)) = local_own_ip {
-                // hakoniwa hands us ownership of the tap fd (its `Child` has no
-                // `Drop`, so it never closes it); a missing fd means the in-VM
-                // RustSlirp setup did not run — `attach_guard` rolls the phase-1
-                // attach back on the `Err` return.
-                let Some(raw) = process.get_mut().rustslirp_tapfd else {
+                // The sandbox layer took the tap fd from the child; a missing
+                // one means the in-VM RustSlirp setup did not run —
+                // `attach_guard` rolls the phase-1 attach back on the `Err`
+                // return.
+                let Some(tap_fd) = spawned.take_tap_fd() else {
                     return Err(io::Error::other(
                         "own-IP sandbox produced no in-namespace tap fd",
                     ));
                 };
-                // SAFETY: `raw` is a live, owned tap fd handed out exactly once by
-                // hakoniwa; wrapping it transfers ownership to the relay, which
-                // closes it on teardown.
-                let tap_fd = unsafe { OwnedFd::from_raw_fd(raw) };
                 match crate::net::gvproxy_network::complete_local_own_ip_attach(
                     &net_switch,
                     tap_fd,
@@ -2597,7 +2593,7 @@ impl SessionLauncher for SandboxLauncher {
                     session_name,
                     ingress,
                 );
-                match network.attach(process.get_mut().id()).await {
+                match network.attach(spawned).await {
                     Ok(guard) => Some(guard),
                     Err(e) => return Err(io::Error::other(e)),
                 }

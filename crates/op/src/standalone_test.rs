@@ -204,10 +204,13 @@ impl<'a> Runnable for StandaloneTest<'a> {
         let mut config = sandbox2::config::Config::new("test")
             .with_rootfs(deps.into_iter())
             .with_dns(needs_dns)
-            .with_network_mode(if !needs_dns && !needs_internet {
-                sandbox2::NetworkMode::NoNet
+            // A test that needs neither DNS nor the internet runs in an empty
+            // network namespace; anything else shares the host's. Said as a plan
+            // rather than as a mode: the sandbox layer acts on plans.
+            .with_plan(if !needs_dns && !needs_internet {
+                sandbox2::NetPlan::isolated()
             } else {
-                sandbox2::NetworkMode::HostNet
+                sandbox2::NetPlan::host()
             })
             .with_hostname("test")
             .with_env_var("HOME", "/tmp");
