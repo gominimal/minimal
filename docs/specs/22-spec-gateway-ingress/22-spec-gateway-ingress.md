@@ -4,7 +4,7 @@ title: Gateway ingress: public exposure and enrolled dynamic ingress
 owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md
-updated: 2026-09-16
+updated: 2026-09-17
 ---
 
 # GWI — Gateway ingress: public exposure and enrolled dynamic ingress
@@ -177,6 +177,15 @@ capability breaks nothing: GWI-001 is the behaviour there.
 
 ## Open questions
 
+- [NEEDS CLARIFICATION (LOW): on a BareMetalVM host the default path holds no
+  gateway association and the Egress Gateway is a per-host process on the metal
+  host ([design
+  §7.6](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md));
+  [design
+  §6](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)
+  still describes gateway ingress as riding the node's association. Whether a
+  per-host gateway serves public exposure, and over what, is unstated; GWI-006
+  binds delivery only WHERE the host holds an association.]
 - [NEEDS CLARIFICATION (MEDIUM): where a provider declares fabric-native
   gateway ingress with a protocol and port policy ([Box Provider
   API](https://github.com/gominimal/arch/blob/main/specs/box-provider/box-provider-api.md)),
