@@ -3963,6 +3963,17 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
     Ok(())
 }
 
+/// Whether `min update` / `min add` should warm the host artifact cache after
+/// moving a pin.
+///
+/// Only a native daemon reads the host cache. A VM-backed provider caches on
+/// its own guest data volume and never reads the host cache, so warming it
+/// there spends bandwidth and disk on artifacts no session start reads — the
+/// daemon re-fetches the whole closure on the next activate regardless.
+fn should_warm_host_cache(use_minvmd: bool) -> bool {
+    client::client_provider_kind(use_minvmd) != paths::ProviderKind::Minvmd
+}
+
 /// Add packages as dependencies to the project's `minimal.toml`.
 pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Error> {
     let config = build_config(global)?;
@@ -4007,8 +4018,15 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
         _ => unreachable!(),
     }
 
-    ctx.download_if_available(&graph, graph.top_levels.clone())
-        .await?;
+    if should_warm_host_cache(global.use_minvmd()) {
+        ctx.download_if_available(&graph, graph.top_levels.clone())
+            .await?;
+    } else {
+        eprintln!(
+            "Note: not warming the host cache; the session daemon fetches the \
+             closure into its own cache on the next `min session activate`."
+        );
+    }
 
     Ok(())
 }
@@ -4056,7 +4074,14 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
     ctx = ctx.cloned_reinit()?;
     let graph = ctx.graph_from_all_packages()?;
     let ensure_pkgs = ctx.scaffolding_packages()?;
-    ctx.download_if_available(&graph, ensure_pkgs).await?;
+    if should_warm_host_cache(global.use_minvmd()) {
+        ctx.download_if_available(&graph, ensure_pkgs).await?;
+    } else {
+        eprintln!(
+            "Note: not warming the host cache; the session daemon fetches the \
+             closure into its own cache on the next `min session activate`."
+        );
+    }
 
     Ok(())
 }
@@ -4421,6 +4446,21 @@ mod tests {
     #[test]
     fn matching_versions_are_not_a_skew() {
         assert!(client::version_skew_message(version::VERSION, version::VERSION).is_none());
+    }
+
+    /// The host-cache warm-up is gated on the session provider: a VM-backed
+    /// provider caches on its own guest volume and never reads the host cache,
+    /// so `--provider local-minvmd` (and macOS, always minvmd-backed) skip the
+    /// warm-up, while the native daemon shares the host cache and downloads.
+    #[test]
+    fn host_cache_warmup_skips_vm_backed_providers() {
+        assert!(
+            !should_warm_host_cache(true),
+            "a VM-backed provider must not warm the host cache"
+        );
+        // macOS is always minvmd-backed regardless of the flag; elsewhere the
+        // native daemon shares the host cache, so the warm-up runs.
+        assert_eq!(should_warm_host_cache(false), !cfg!(target_os = "macos"));
     }
 
     /// The `Cli` command tree must stay well-formed: a malformed clap
