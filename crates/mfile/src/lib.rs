@@ -897,6 +897,11 @@ pub struct File {
     /// Where the minimal file is located on disk, if it was loaded from disk.
     #[serde(skip)]
     mfile_path: Option<PathBuf>,
+    /// Hash of the bytes that produced this `File`, when loaded from disk.
+    /// Used to dedup warnings per (path, content) without re-reading the
+    /// file, which could have been replaced between parse and validate.
+    #[serde(skip)]
+    content_hash: Option<u64>,
     /// What layout this repo/layer is using, if loaded from disk.
     #[serde(skip)]
     layout: Option<Layout>,
@@ -912,6 +917,15 @@ fn misplaced_top_level_key(key: &str) -> Option<&'static str> {
         "lifecycle_hooks" => Some("[[session.lifecycle_hooks]]"),
         _ => None,
     }
+}
+
+/// Hash the raw bytes of an mfile so warning dedup can key on the content
+/// that actually produced the parsed `File`, rather than re-reading the path
+/// (which may have been replaced between parse and validate).
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl File {
@@ -945,9 +959,15 @@ impl File {
     }
 
     /// Helper to finish initialization of the structure after being deserialized.
-    fn init_toml(mut self, path: &PathBuf, layout: Layout) -> Result<Self, Error> {
+    fn init_toml(
+        mut self,
+        path: &PathBuf,
+        layout: Layout,
+        content_hash: u64,
+    ) -> Result<Self, Error> {
         self.mfile_path = Some(path.to_path_buf());
         self.layout = Some(layout);
+        self.content_hash = Some(content_hash);
         if let Some(u) = self.upstream.as_mut() {
             u.fixup_relative(path);
             for sideload in u.sideloads.iter_mut() {
@@ -1001,6 +1021,7 @@ impl File {
                     toml::from_slice(&file_data).map_err(Error::Format)?,
                     &path,
                     Layout::Root,
+                    hash_bytes(&file_data),
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1014,6 +1035,7 @@ impl File {
                 toml::from_slice(&file_data).map_err(Error::Format)?,
                 &path,
                 Layout::DotMinimal,
+                hash_bytes(&file_data),
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound),
             Err(e) => Err(Error::IO("minimal file", path, e)),
@@ -1045,17 +1067,14 @@ impl File {
         // decode — even if the user edits the file and breaks it again. The
         // content hash collapses the repeated decodes of an unchanged file
         // while still re-warning when the file is edited or re-broken.
-        if let Some(path) = &self.mfile_path {
+        //
+        // The hash is computed from the bytes that produced `self` (see
+        // `hash_bytes`), not re-read from disk here: re-reading could hash a
+        // replacement file written between parse and validate, and then a
+        // later validation of that replacement would be wrongly suppressed.
+        if let (Some(path), Some(content_hash)) = (&self.mfile_path, self.content_hash) {
             static WARNED_FILES: LazyLock<Mutex<HashSet<(PathBuf, u64)>>> =
                 LazyLock::new(|| Mutex::new(HashSet::new()));
-            let content_hash = std::fs::read(path)
-                .ok()
-                .map(|bytes| {
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    bytes.hash(&mut hasher);
-                    hasher.finish()
-                })
-                .unwrap_or(0);
             if !WARNED_FILES
                 .lock()
                 .unwrap()
@@ -1513,6 +1532,7 @@ mod tests {
                 session: None,
                 extra: HashMap::new(),
                 mfile_path: None,
+                content_hash: None,
                 layout: None,
             }
         )
