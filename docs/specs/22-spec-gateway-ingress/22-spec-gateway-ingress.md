@@ -106,7 +106,7 @@ today.
   enrolled one, and the parity rule for every hostname-routing surface:
   [NET](https://github.com/gominimal/minimal/pull/1380).
 - The gateway association the exposure rides:
-  [EHE](https://github.com/gominimal/minimal/pull/{EHE_PR}).
+  [EHE](https://github.com/gominimal/minimal/pull/1418).
 - The `ExposeIngress` evaluation point, the feed's ingress entries, and their
   revocation on the identity plane:
   [NPOL](https://github.com/gominimal/gatehouse/blob/main/docs/specs/02-spec-network-policy-plane/02-spec-network-policy-plane.md)
@@ -121,7 +121,7 @@ today.
   gateways: roadmap (gominimal/arch#43). On an un-enrolled host GWI-001 is the
   whole behaviour.
 - Teammate access to a box, which is not public exposure:
-  [MRF](https://github.com/gominimal/minimal/pull/{MRF_PR}),
+  [MRF](https://github.com/gominimal/minimal/pull/1420),
   [MMI](https://github.com/gominimal/minimal/pull/1356), and
   [CRA](https://github.com/gominimal/minimal/pull/1374).
 
