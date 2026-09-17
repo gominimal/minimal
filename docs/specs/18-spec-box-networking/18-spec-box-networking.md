@@ -52,18 +52,21 @@ The node-local Box Egress Proxy ([architecture
 D6](https://github.com/gominimal/arch/blob/main/architecture.md); [Gatehouse
 §6.10](https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md),
 v1.19), which on a local host runs beside the switch outside the VM and,
-un-enrolled, serves store references from the host's own secret stores, is the
-next thing built and is a separate document that cites this one. It depends on
-four behaviours bound here: box-zone resolution (NET-072, NET-073),
-`egress.allow_dns_hosts` with DNS-pinned admission (NET-066, NET-067), the
-hostname-proxy parity rule (NET-069 to NET-071), and the relay's source-address
-check (NET-084), which on a VM-backed host is what lets the proxy attribute a
-box by its switch source address: each own-address box holds one lease there.
-On a co-resident host the host-address boxes share the host's address and are
-attributed as one cohort (NET-078); a per-box mapping for them is the
-classifier question below. Its default `dns` steering mode needs the box-zone resolver and
-the DNS-pinned name path to exist. UDP a box has not declared is dropped
-(NET-064), so HTTP/3 to a steered host falls back to TCP ([design
+un-enrolled, redeems store references from the host's own secret stores and
+GitHub grants the `min` client minted from its own GitHub sign-in (no
+Gatehouse-brokered grants; the ruling on gominimal/arch#69, 2026-09-17,
+proposed in gominimal/arch#71), is the next thing built and is a separate
+document that cites this one. It depends on four behaviours bound here:
+box-zone resolution (NET-072, NET-073), `egress.allow_dns_hosts` with
+DNS-pinned admission (NET-066, NET-067), the hostname-proxy parity rule
+(NET-069 to NET-071), and the relay's source-address check (NET-084), which on
+a VM-backed host is what lets the proxy attribute a box by its switch source
+address: each own-address box holds one lease there. On a co-resident host the
+host-address boxes share the host's address and are attributed as one cohort
+(NET-078); a per-box mapping for them is the classifier question below. Its
+default `dns` steering mode needs the box-zone resolver and the DNS-pinned name
+path to exist. UDP a box has not declared is dropped (NET-064), so HTTP/3 to a
+steered host falls back to TCP ([design
 §5.3](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)).
 
 **Success:** on a stock install, a browser opens
