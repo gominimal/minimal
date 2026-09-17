@@ -1,4 +1,5 @@
 //! Top-level API for minimal tooling.
+#![recursion_limit = "256"]
 
 use std::{
     collections::{BTreeMap, HashSet},

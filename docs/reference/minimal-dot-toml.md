@@ -171,6 +171,11 @@ on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&
   optional again. A loadout spells the bare form the same way but treats it
   as optional — see
   [Where `{ inherit = true }` differs](#inherit-divergence).
+
+  One name is read specially: setting `SHELL` to a supported, installed
+  shell makes the session's attach shell that shell instead of bash. See
+  [`SHELL` — Which shell an attach starts](./loadouts.md#session-shell) for
+  the supported shells and the fallback behavior.
 - **`patches`**: `{ source, dest }` rows copying files into the session.
   `dest` is relative to the session user's home directory; `source` resolves
   on the host, typically inside the repo. The one expansion a loadout has

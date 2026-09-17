@@ -31,9 +31,9 @@
 
 Minimal is a declarative, content-addressed build system and development-environment manager. It repeatably builds Linux, terminal-based development sandboxes, each populated with exactly the toolsets and agents a project needs, all declared in a single `minimal.toml` blueprint. A sandbox runs natively on Linux via unprivileged user namespaces and inside a lightweight libkrun microVM on macOS, so the same environment travels across your team's machines. Commit that blueprint to your repository and every teammate gets an identical environment, one that keeps AI agents sealed inside the sandbox and off the host laptop.
 
-The executables inside a sandbox (git, claude-code, compilers, shells, and more) are delivered by Minimal's secure package manager from a curated registry that is refreshed daily. Because packages are addressed by content rather than mutable version tags and builds are hermetic, the same blueprint resolves to the same environment on every machine. Moving the whole team to the freshest tool versions is one `min update`, which re-pins the blueprint in place. No more stale setup wikis, no more version drift.
+The executables inside a sandbox (git, claude, compilers, shells, and more) are delivered by Minimal's secure package manager from a curated registry that is refreshed daily. The coding agents it packages today are claude, codex, opencode, and pi. Because packages are addressed by content rather than mutable version tags and builds are hermetic, the same blueprint resolves to the same environment on every machine. Moving the whole team to the freshest tool versions is one `min update`, which re-pins the blueprint in place. No more stale setup wikis, no more version drift.
 
-Per-developer Loadouts then layer each person's own editors, terminal multiplexers, and configs on top of that shared toolchain, so the environment stays identical for everyone while you keep the muscle memory you have earned.
+Per-developer Loadouts then layer each person's own editors, shells, and configs on top of that shared toolchain, so the environment stays identical for everyone while you keep the muscle memory you have earned.
 
 > Full documentation lives at [minimal.dev/docs](https://minimal.dev/docs).
 
@@ -55,7 +55,7 @@ Not on one of these platforms yet? Tell us what you'd like to see supported in [
 To get started, install Minimal with the following shell command:
 
 ```shell
-curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/' | sh
+curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/stable' | sh
 ```
 
 This installs the stable channel of Minimal, adds `min` to your PATH, and sets up shell completions for bash, fish, and zsh.
@@ -63,12 +63,37 @@ This installs the stable channel of Minimal, adds `min` to your PATH, and sets u
 Minimal can be uninstalled with:
 
 ```shell
-curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/' | sh -s -- --uninstall
+curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/stable' | sh -s -- --uninstall
 ```
+
+## For coding agents
+
+If you are an agent setting up Minimal for your user, install the Minimal
+plugin and follow its `minimal-setup` skill:
+
+```shell
+claude plugin marketplace add gominimal/minimal-skills
+claude plugin install minimal@gominimal
+```
+
+Stop and ask your user before pasting any credential into a session.
+Contributors to this repository should read [AGENTS.md](AGENTS.md).
 
 ## Getting Started
 
-The examples below walk through the two most common workflows: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`.
+If you have a repository and want a session, three commands get you there — no GitHub PAT, no keychain entry, no account. The two walkthroughs after them add a GitHub credential: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`. Once sessions are running, `min dash` opens a terminal UI for browsing and managing them without attaching to each one. `min session policy` prints the effective networking policy for a session.
+
+### Start in three commands
+
+Run these from the root of a repository that has no `minimal.toml` yet. No PAT, no keychain entry, no account:
+
+```shell
+curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh
+min init
+min session activate --attach
+```
+
+Joining a project that already ships a `minimal.toml`? Skip `min init`; the walkthrough below covers it.
 
 ### Create a new project with Minimal
 
@@ -141,12 +166,20 @@ claude
 exit
 ```
 
+Beyond GitHub, `git push min://` sends commits to another running session by
+name, using a git helper that `min` installs.
+
 ### Add a Minimal Loadout with your preferred tools and configurations
 
 The project's `minimal.toml` describes what every contributor's session
-needs; a **loadout** carries what *you* want on top: your editor, terminal
-multiplexer, shell config, and dotfiles. Loadouts are single TOML files under
-`~/.config/minimal/loadouts/`:
+needs; a **loadout** carries what *you* want on top: your editor, shell
+config, and dotfiles. Minimal is not a multiplexer: run tmux or zellij inside
+the box, from your loadout, and keep the muscle memory you have earned.
+Loadouts live under `~/.config/minimal/loadouts/`, either as `<name>.toml` or
+— to keep one under version control, alongside the files it ships — as
+`<name>/loadout.toml`; the
+[`minimal-loadouts`](https://github.com/gominimal/minimal-skills/tree/main/skills/minimal-loadouts)
+skill automates authoring one:
 
 ```toml
 # ~/.config/minimal/loadouts/dev.toml
@@ -177,7 +210,11 @@ on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || 
 
 Apply one with `min session activate --loadout dev --attach .`, or list it in
 `default_loadouts` under `[loadouts]` in `~/.config/minimal/config.toml` to have it join every
-session automatically. `min loadout list` shows what's available. The full
+session automatically. `min loadout list` shows what's available, in either
+layout — so `git clone <repo> ~/.config/minimal/loadouts/dev` is enough to
+pick up a loadout someone else published. Lifecycle hooks such as
+`on_activate` run a command when a session is activated, as the loadout above
+does to warm Helix's grammar cache. The full
 schema (file patches, lifecycle hooks, environment-variable inheritance,
 composition rules) is in the
 [loadouts reference](docs/reference/loadouts.md).
