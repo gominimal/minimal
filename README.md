@@ -43,13 +43,6 @@ Minimal's secure package manager delivers the executables inside a sandbox (git,
   <img src="docs/public/dash-demo.gif" alt="Three sessions of one repository, each on its own branch, listed by min dash" width="720">
 </p>
 
-Three sessions of one repository, each on its own branch, and `min dash` listing them. To get there, activate a session from each checkout, then open the dash:
-
-```shell
-min session activate --name api   # run once in each checkout; no --attach, so it returns
-min dash
-```
-
 ## Supported Platforms
 
 Minimal works on:
@@ -103,6 +96,17 @@ min session activate --attach
 ```
 
 Joining a project that already ships a `minimal.toml`? Skip `min init`; the walkthrough below covers it.
+
+### See every session in `min dash`
+
+The demo above is three sessions of one repository, each from its own checkout on its own branch. Activate a session from each checkout without attaching, then open the dash:
+
+```shell
+min session activate --name api   # run once in each checkout; without --attach it returns
+min dash
+```
+
+Each row shows the session and its branch; `enter` attaches, `q` quits.
 
 ### Create a new project with Minimal
 
