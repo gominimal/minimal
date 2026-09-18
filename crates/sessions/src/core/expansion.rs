@@ -334,7 +334,26 @@ fn expand_pattern(
             pattern: normalized,
         });
     }
-    FileSet::try_new(normalized).map_err(ExpandError::from)
+    // When the expanded pattern is a plain directory path with no glob
+    // metacharacters, the walker would match only the directory itself
+    // (not its contents) — a silent no-op. Append `/**/*` so it behaves
+    // identically to the explicit glob form the user would otherwise
+    // have to write.
+    let pattern = if require_absolute == RequireAbsolute::Yes
+        && !has_glob_metacharacters(&normalized)
+        && std::path::Path::new(&normalized).is_dir()
+    {
+        let mut with_glob = normalized;
+        if with_glob.ends_with('/') {
+            with_glob.push_str("**/*");
+        } else {
+            with_glob.push_str("/**/*");
+        }
+        with_glob
+    } else {
+        normalized
+    };
+    FileSet::try_new(pattern).map_err(ExpandError::from)
 }
 
 /// Drop `.` and empty components, reject any `..` component.
@@ -486,6 +505,34 @@ pub fn literal_policy_pattern(path: &str) -> String {
         escape_glob_metas(run, &mut out);
     }
     out
+}
+
+/// Returns `true` when `s` contains any glob metacharacter that
+/// would cause `walk_root()` to truncate before the end of the
+/// pattern — `*`, `?`, `[` (except the single-char bracket-escape
+/// form `[X]`), or `{`.
+fn has_glob_metacharacters(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' if i + 2 < bytes.len() && bytes[i + 2] == b']' => {
+                // Single-char bracket escape `[X]` — a literal
+                // character, not a glob class. Skip it.
+                i += 3;
+            }
+            b'*' | b'?' | b'{' | b'[' => return true,
+            _ => {
+                let ch_len = s[i..]
+                    .chars()
+                    .next()
+                    .expect("non-empty slice has at least one char")
+                    .len_utf8();
+                i += ch_len;
+            }
+        }
+    }
+    false
 }
 
 fn escape_glob_metas(value: &str, out: &mut String) {
@@ -1106,5 +1153,52 @@ mod tests {
             matches!(err, ExpandError::PathTraversal { .. }),
             "got: {err:?}",
         );
+    }
+
+    // ---- plain-directory source ----
+
+    /// A patch source that names an existing directory with no glob
+    /// metacharacters is treated as `<dir>/**/*`, so it delivers the
+    /// directory tree instead of silently matching nothing.
+    #[test]
+    fn plain_directory_source_appends_recursive_glob() {
+        let dir = std::env::temp_dir().join("minimal-expansion-plain-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let vars: [ResolvedVar; 0] = [];
+        let pat = expand(dir.to_str().unwrap(), vars.as_slice()).unwrap();
+        assert_eq!(pat, format!("{}/**/*", dir.to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A plain directory source with a trailing slash still appends the
+    /// recursive glob without doubling the separator.
+    #[test]
+    fn plain_directory_source_with_trailing_slash_appends_recursive_glob() {
+        let dir = std::env::temp_dir().join("minimal-expansion-plain-dir-slash");
+        std::fs::create_dir_all(&dir).unwrap();
+        let vars: [ResolvedVar; 0] = [];
+        let raw = format!("{}/", dir.to_str().unwrap());
+        let pat = expand(&raw, vars.as_slice()).unwrap();
+        assert_eq!(pat, format!("{}/**/*", dir.to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A plain path that is *not* an existing directory is left alone —
+    /// it may be a file, or a directory that doesn't exist on this host
+    /// (the walker already warns-and-drops those).
+    #[test]
+    fn plain_non_directory_source_is_left_alone() {
+        let vars: [ResolvedVar; 0] = [];
+        let pat = expand("/definitely/not/a/real/dir", vars.as_slice()).unwrap();
+        assert_eq!(pat, "/definitely/not/a/real/dir");
+    }
+
+    /// A pattern that already carries glob metacharacters is left alone,
+    /// even when it names a directory.
+    #[test]
+    fn globbed_source_is_left_alone() {
+        let vars: [ResolvedVar; 0] = [];
+        let pat = expand("/tmp/**/*.lua", vars.as_slice()).unwrap();
+        assert_eq!(pat, "/tmp/**/*.lua");
     }
 }
