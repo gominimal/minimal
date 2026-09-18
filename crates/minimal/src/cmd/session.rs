@@ -105,7 +105,14 @@ pub(crate) async fn activate_session(
     // a bad `--loadout` must error before anything prints, so the user is
     // never told the session is proceeding and then that it is not.
     if offer_scaffold {
-        offer_mfile_scaffold(&utf8_path, global)?;
+        offer_mfile_scaffold(
+            &utf8_path,
+            global,
+            Some(
+                "Continuing without one; the session gets a default environment. \
+                 Run 'min init' to give the project its own config.",
+            ),
+        )?;
     }
 
     if !active.loadouts.is_empty() {
