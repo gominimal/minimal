@@ -10,11 +10,13 @@
 # Env overrides:
 #   DEMO_DIR         scratch dir for clones + recording (default: mktemp)
 #   REPO_URL         repo to clone (default: gominimal/minimal on GitHub)
-#   BRANCHES         space-separated branch list, first is shown first
-#                     (default: three branches verified to exist on origin
-#                     at the time this script was written; pass your own if
-#                     any have since been merged/deleted)
-#   SESSION_PREFIX   session name prefix (default: none, the branch slug is the name)
+#   SESSIONS         space-separated name=branch pairs, one session each
+#                     (default: "main=main api=feat/api ci=fix/ci"). A branch
+#                     that exists on origin is cloned; one that does not is
+#                     created from main in that clone, so the dash shows a
+#                     real branch per row without touching origin. Short
+#                     names fit beside the branch in the dash's session pane.
+#   SESSION_PREFIX   session name prefix (default: none)
 #   RENDER           set to 0 to stop after the cast (a host without fonts cannot run agg)
 #   OUT              output gif path (default: docs/public/dash-demo.gif)
 #   KEEP             set to 1 to keep DEMO_DIR and the sessions after a run
@@ -25,7 +27,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 DEMO_DIR="${DEMO_DIR:-$(mktemp -d /tmp/min-dash-demo.XXXXXX)}"
 REPO_URL="${REPO_URL:-https://github.com/gominimal/minimal.git}"
-BRANCHES="${BRANCHES:-main chore/vale-lint oss/integration}"
+SESSIONS="${SESSIONS:-main=main api=feat/api ci=fix/ci}"
 SESSION_PREFIX="${SESSION_PREFIX:-}"
 RENDER="${RENDER:-1}"
 OUT="${OUT:-$REPO_ROOT/docs/public/dash-demo.gif}"
@@ -67,17 +69,16 @@ for tool in min asciinema agg python3 git jq; do
   }
 done
 
-read -r -a branch_array <<<"$BRANCHES"
-if [ "${#branch_array[@]}" -lt 3 ]; then
-  echo "record-dash-demo: BRANCHES must list at least 3 branches (got: $BRANCHES)" >&2
+read -r -a session_array <<<"$SESSIONS"
+if [ "${#session_array[@]}" -lt 3 ]; then
+  echo "record-dash-demo: SESSIONS must list at least 3 name=branch pairs (got: $SESSIONS)" >&2
   exit 1
 fi
-for branch in "${branch_array[@]}"; do
-  if ! git ls-remote --exit-code --heads "$REPO_URL" "$branch" >/dev/null 2>&1; then
-    echo "record-dash-demo: branch '$branch' not found on $REPO_URL" >&2
-    echo "Pass BRANCHES=\"main <existing-branch> <existing-branch>\" with branches that exist now." >&2
-    exit 1
-  fi
+for pair in "${session_array[@]}"; do
+  case "$pair" in
+    *=*) ;;
+    *) echo "record-dash-demo: SESSIONS entry '$pair' is not name=branch" >&2; exit 1 ;;
+  esac
 done
 
 mkdir -p "$DEMO_DIR"
@@ -93,13 +94,19 @@ min ls >/dev/null 2>&1 || true
 echo "==> Cloning $REPO_URL once (bare) into $DEMO_DIR/_source.git"
 git clone --quiet --bare "$REPO_URL" "$DEMO_DIR/_source.git"
 
-for branch in "${branch_array[@]}"; do
-  safe_name="${branch//\//-}"
-  checkout_dir="$DEMO_DIR/$safe_name"
-  session_name="${SESSION_PREFIX:+${SESSION_PREFIX}-}${safe_name}"
+for pair in "${session_array[@]}"; do
+  name="${pair%%=*}"
+  branch="${pair#*=}"
+  checkout_dir="$DEMO_DIR/$name"
+  session_name="${SESSION_PREFIX:+${SESSION_PREFIX}-}${name}"
 
-  echo "==> Cloning $branch into $checkout_dir (plain clone, not a worktree)"
-  git clone --quiet --branch "$branch" --single-branch "$DEMO_DIR/_source.git" "$checkout_dir"
+  echo "==> Cloning into $checkout_dir on $branch (plain clone, not a worktree)"
+  if git --git-dir="$DEMO_DIR/_source.git" show-ref --verify --quiet "refs/heads/$branch"; then
+    git clone --quiet --branch "$branch" --single-branch "$DEMO_DIR/_source.git" "$checkout_dir"
+  else
+    git clone --quiet --branch main --single-branch "$DEMO_DIR/_source.git" "$checkout_dir"
+    git -C "$checkout_dir" checkout --quiet -b "$branch"
+  fi
 
   echo "==> Activating session '$session_name' for $branch"
   (cd "$checkout_dir" && min session activate . --name "$session_name" --no-prompt >/dev/null)
