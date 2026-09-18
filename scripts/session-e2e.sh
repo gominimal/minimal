@@ -561,6 +561,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     printf '\n[stack]\nuse = "shell"\n'
     printf '\n[tasks.e2e-echo]\necho = "TASK_RUN_E2E_OK"\n'
     printf '\n[tasks.e2e-fail]\nbash = "exit 7"\n'
+    printf '\n[tasks.e2e-envprint]\nexec = "printenv E2E_INHERIT_MARKER"\nenv_vars.E2E_INHERIT_MARKER = { inherit = true }\n'
   } > "$TASK_SEED_DIR/minimal.toml"
   mkdir "$TASK_SEED_DIR/.git"
 
@@ -673,6 +674,52 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   fi
   grep -q 'min task run' "$WORK/task-alias.err" \
     || { echo "::error::hidden 'min run' error does not name 'min task run'"; cat "$WORK/task-alias.err" 2>/dev/null || true; fail; }
+
+  # env_vars inherit crosses the VM boundary: the client reads the value out
+  # of the invoking shell and the task's `printenv` sees it inside the
+  # session. The var is project-origin, so it must be allow-listed first.
+  mkdir -p "$XDG_CONFIG_HOME/minimal"
+  printf '[vars]\nallow = ["E2E_INHERIT_MARKER"]\n' > "$XDG_CONFIG_HOME/minimal/user_policy.toml"
+  env_out="$(cd "$TASK_SEED_DIR" && export E2E_INHERIT_MARKER=hello-from-the-host && mnl task run e2e-envprint 2>"$WORK/env-inherit.err")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min task run e2e-envprint' with inherited var exited $rc (expected 0)"
+    echo "--- task stderr ---"; cat "$WORK/env-inherit.err" 2>/dev/null || true
+    fail
+  fi
+  if [[ "$env_out" != *hello-from-the-host* ]]; then
+    echo "::error::inherited env var did not reach the task, got '$env_out'"
+    fail
+  fi
+  echo "env_vars inherit: value crossed the VM boundary OK"
+
+  # An inherited var that is not set in the invoking shell is a client-side
+  # error naming the var, before any session is composed.
+  unset E2E_INHERIT_MARKER
+  (cd "$TASK_SEED_DIR" && mnl task run e2e-envprint >/dev/null 2>"$WORK/env-unset.err")
+  rc=$?
+  if [ "$rc" -ne 1 ]; then
+    echo "::error::'min task run e2e-envprint' with unset inherited var exited $rc (expected 1)"
+    fail
+  fi
+  grep -q 'E2E_INHERIT_MARKER is not set in this shell' "$WORK/env-unset.err" \
+    || { echo "::error::unset inherited var error does not name the var"; cat "$WORK/env-unset.err" 2>/dev/null || true; fail; }
+  echo "env_vars inherit: unset var refused client-side OK"
+
+  # Without the allow entry the var is refused at the policy gate, and the
+  # error carries the `[vars] allow` snippet to paste.
+  rm -f "$XDG_CONFIG_HOME/minimal/user_policy.toml"
+  (cd "$TASK_SEED_DIR" && export E2E_INHERIT_MARKER=hello-from-the-host && mnl task run e2e-envprint >/dev/null 2>"$WORK/env-ungranted.err")
+  rc=$?
+  if [ "$rc" -ne 1 ]; then
+    echo "::error::'min task run e2e-envprint' with ungranted var exited $rc (expected 1)"
+    fail
+  fi
+  grep -Fq '[vars]' "$WORK/env-ungranted.err" \
+    || { echo "::error::ungranted var error does not carry the [vars] allow snippet"; cat "$WORK/env-ungranted.err" 2>/dev/null || true; fail; }
+  grep -q 'E2E_INHERIT_MARKER' "$WORK/env-ungranted.err" \
+    || { echo "::error::ungranted var error does not name the var"; cat "$WORK/env-ungranted.err" 2>/dev/null || true; fail; }
+  echo "env_vars inherit: ungranted var refused at the policy gate OK"
 
   echo "task run proof OK"
   echo "::endgroup::"
