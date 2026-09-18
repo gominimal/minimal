@@ -44,15 +44,17 @@ private repository of the signed-in account succeed; the same sealed value
 copied to the host shell or into another box is refused; and every admit and
 refuse is readable per box.
 
-**First slice:** `proxy_env` steering, the GitHub v1 host set as the one
-module, a sealed member minted by the device-flow `min auth login`, redemption
-with every check, the local audit log with its one-shot `min box audit <box>`
-read, and `min box spec` showing the CA and the upstream set. The demo box
-declares `github:user-token`, the honest spelling of a `full` member, so the
-slice also exercises `min box spec`'s over-broad flag. Keychain references with
-`min secret`, `dns` steering, the browser sign-in flow, `min box audit
---follow` and `--parent`, audit segment rotation, signing-CA rotation, the PAC
-recipe and `host_ip` cohort handling are later slices.
+**First slice:** `proxy_env` steering, the GitHub v1 host set (Gatehouse §6.10
+Module host sets: `github.com`, `api.github.com`, `uploads.github.com`,
+`codeload.github.com`; `objects.githubusercontent.com` stays ordinary egress) as
+the one module, a sealed member minted by the device-flow `min auth login`,
+redemption with every check, the local audit log with its one-shot `min box
+audit <box>` read, and `min box spec` showing the CA and the upstream set. The
+demo box declares `github:user-token`, the honest spelling of a `full` member,
+so the slice also exercises `min box spec`'s over-broad flag. Keychain
+references with `min secret`, `dns` steering, the browser sign-in flow, `min box
+audit --follow` and `--parent`, audit segment rotation, signing-CA rotation, the
+PAC recipe and `host_ip` cohort handling are later slices.
 
 ## Users and stories
 
@@ -106,6 +108,7 @@ Minting and sealing
 - **BEP-006** WHEN a GitHub member is minted THE SYSTEM SHALL seal it to this host's proxy key with the box, the host, the module identifier, the host-set version, the mode, the breadth and the expiry bound in the authenticated context.
   tier:     T0
   verify:   cargo nextest run -p bep sealed_context_binds_box_host_module_version_expiry
+  <!-- the module's host set and its version are Gatehouse §6.10's (Module host sets): the v1 GitHub set is `github.com`, `api.github.com`, `uploads.github.com` and `codeload.github.com`, enumerated and versioned by the module definition; every "host set" in this document reads there -->
 
 - **BEP-007** WHEN a sealed member is delivered THE SYSTEM SHALL place the sealed value, and no plaintext token, in the grant's environment variable in the box.
   tier:     T0
@@ -294,9 +297,10 @@ Redemption
 
 Store references
 
-- **BEP-032** WHERE a box declares a `source = "store"` reference matched by a `[secret-store-rules]` rule, WHEN a request from that box to the rule's registered upstream passes the redemption checks THE SYSTEM SHALL inject the referenced Keychain value in the rule's injection form.
+- **BEP-032** WHERE a box declares a `source = "store"` reference matched by a `[secret-store-rules]` rule, WHEN a request from that box to the rule's registered upstream passes BEP-019, BEP-020, BEP-022 to BEP-024 and BEP-064 THE SYSTEM SHALL inject the referenced Keychain value in the rule's injection form.
   tier:     T0
   verify:   cargo nextest run -p bep store_reference_injects_in_registered_form
+  <!-- the store handle (BEP-063) is the member inside the same sealed envelope, so BEP-019 and BEP-020 apply unchanged; BEP-064's handle checks stand where BEP-021, BEP-031 and BEP-058 read a module host set, mode and breadth, with the handle's `upstream` as the bound set; one decision function over both member kinds (BEP-025) -->
 
 - **BEP-033** WHEN a store reference is redeemed THE SYSTEM SHALL read the value from the Keychain for that request and write it to no file.
   tier:     T0
@@ -359,7 +363,7 @@ Review, audit and revocation
 - **BEP-040** THE SYSTEM SHALL write no credential, injected header value, or request body to the audit log.
   tier:     T1
   verify:   cargo nextest run -p bep prop_audit_records_never_contain_secrets
-  property: for every two requests identical in every BEP-039 field and differing only in body, the serialized records are identical; and for every request carrying a member credential or store value S, S is not a substring of any record it produces
+  property: for every two requests identical in every BEP-039 field and differing only in body, the serialized records are identical; and every record field is derived from the BEP-039 field set, which carries neither the member credential nor the store value, so for every request carrying a credential or store value S of at least 16 bytes, S is not a substring of any record it produces
 
 - **BEP-041** THE SYSTEM SHALL open the audit log for append only and modify or remove no existing record.
   tier:     T0
@@ -593,16 +597,22 @@ recorded in the same chain (BEP-067). Segments rotate at a size bound with the
 chain continued across them (BEP-068), because an unbounded log fills a laptop
 disk.
 
-**The redemption decision is pure, and proved at T2.** Every check in BEP-019
-to BEP-025, BEP-031, BEP-058 and BEP-064 is a decision over owned values, and
-the tier constrains the code: the decision is one function, separate from the
-TLS and socket shell, with authorities interned as small ids so Kani can
-exhaust host sets of at most four authorities and two members. Expansion
-validation (BEP-008, 009, 017, 036, 056, 057), name constraints (BEP-013),
-upstream validation (BEP-055), audit secrecy (BEP-040) and the hash chain
-(BEP-049) are property-tested at T1 or T2 for the same reason; T1 adds
-`proptest` to the workspace as a dev-dependency. T3 was refused: the repository has no Lean
-project, so any T3 is also a toolchain and a CI lane.
+**The redemption decision is pure, and proved at T2.** Every check in BEP-019 to
+BEP-025, BEP-031, BEP-058 and BEP-064 is a decision over owned values, and the
+tier constrains the code: the decision is one function, separate from the TLS
+and socket shell, with authorities interned as small ids so Kani can exhaust
+host sets of at most four authorities and two members. Expansion validation
+(BEP-008, 009, 017, 036, 056, 057), name constraints (BEP-013), upstream
+validation (BEP-055), audit secrecy (BEP-040) and the hash chain (BEP-049) are
+property-tested at T1 or T2 for the same reason; T1 adds `proptest` to the
+workspace as a dev-dependency. T3 was refused: the repository has no Lean
+project, so any T3 is also a toolchain and a CI lane. Two invariants stay at T0
+by design: no plaintext credential in the box is a placement property the e2e
+observes directly in the box's environment and filesystem (BEP-002, BEP-007,
+BEP-033), and unattended key and store access confined to the proxy identity is
+enforced by keychain access control rather than by a decision function this code
+owns (BEP-014, BEP-051, BEP-059), so a property test would restate the
+keychain's contract.
 
 **Three-layer CA, keys in the keychain.** A root as the injected anchor, a
 keychain-held signing CA that rotates freely, and per-hostname leaves is the
@@ -671,7 +681,7 @@ deny set and per-request Keychain access control.
   enforced by: audit record construction from the decision only; `min box spec` and `min secret` render identifiers and references only
   covered by: BEP-004, BEP-038, BEP-040, BEP-050, BEP-052
 
-- **Invariant:** THE SYSTEM SHALL hold the signing key and store access only in the proxy process.
+- **Invariant:** THE SYSTEM SHALL grant unattended access to the signing key, the sealing key and store items to the proxy's process identity alone.
   enforced by: process separation; keychain access control bound to the proxy's identity
   covered by: BEP-014, BEP-047, BEP-051, BEP-059, BEP-060
 
