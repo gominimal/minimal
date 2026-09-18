@@ -5,6 +5,13 @@ use common::{SpecHash, SpecOrigin};
 use serde::{Deserialize, Serialize};
 
 /// An error during construction or processing of the dependency graph.
+///
+/// Left hand-rolled rather than converted to `thiserror` (Phase 3): its only
+/// `Display`-like output is the bespoke terminal renderer in [`Error::report_to`],
+/// and it has no `Display`/`std::error::Error` impl to reproduce. `thiserror`'s
+/// required `#[error("...")]` strings would therefore *introduce* new observable
+/// output instead of preserving existing bytes, and the lone `From<decode::Error>`
+/// below is not worth a derive on its own.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Error {
