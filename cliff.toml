@@ -41,7 +41,7 @@ breaking_always_bump_major = false
 # too: the range base is the newest FINAL, so a final's notes and bump cover
 # everything since the previous final, not just the last rc — the same rule
 # next-version.sh applies to its own base_tag.
-tag_pattern = "v[0-9]+\\.[0-9]+\\.[0-9]+$"
+tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
 topo_order = false
 sort_commits = "oldest"
 # Off deliberately: the shell script listed a non-Conventional commit under
