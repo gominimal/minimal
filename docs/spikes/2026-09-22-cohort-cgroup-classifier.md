@@ -91,14 +91,21 @@ cgroup v1 `meta cgroup` form was not needed and was not tried.
 
 ## What the tree does today
 
-- **No sandbox is in a cgroup of its own.** `sandbox2` only asks hakoniwa for
-  cgroup resources when `Config::cpu_weight` is set and the host booted with
+- **No box or session sandbox is in a cgroup of its own.** `sandbox2` only
+  asks hakoniwa for cgroup resources when `Config::cpu_weight` is set and
+  the host booted with
   systemd (`crates/sandbox2/src/lib.rs:701`, `booted_with_systemd` at
   `lib.rs:1121`); hakoniwa then creates a **systemd transient scope** named
   `hakoniwa.slice:hakoniwa:<pid>` through libcgroups
   (`hakoniwa/src/cgroups/manager.rs:15`), keyed by pid, not by box. Nothing in
   `crates/minimald`, `crates/sessions` or `crates/mip` calls
-  `with_cpu_weight`, so today every sandbox stays in the daemon's own cgroup.
+  `with_cpu_weight`, so a box or session sandbox stays in the daemon's own
+  cgroup today. Builds are the exception: `crates/orchestrator` sets
+  `cpu_weight` on every local build
+  (`crates/orchestrator/src/local_backend.rs:221`, applied at
+  `crates/op/src/specs.rs:329`), so on a systemd host each build sandbox does
+  get a scope of its own — a pid-keyed one, which is why Conclusion (a) says
+  that path is not this tree.
 - **Every sandbox unshares a cgroup namespace** unconditionally
   (`crates/sandbox2/src/lib.rs:506`, `.unshare(hakoniwa::Namespace::Cgroup)`
   with `Runctl::IgnoreCgroupSetupFailed`).
@@ -363,9 +370,13 @@ namespace; and the rules are installed by a privileged step the unprivileged
 native daemon does not have.
 
 **(a) The layout.** One tree per daemon, rooted at a cgroup the daemon owns:
-natively its delegated `user.slice/user-<uid>.slice/user@<uid>.service/minimald/`,
-which finding H measured; in the VM the guest daemon is pid 1 and roots at
-`/sys/fs/cgroup/minimald/`. A host with no user manager has no delegated
+natively `user.slice/user-<uid>.slice/user@<uid>.service/minimald.slice/`, the
+path finding H created under the subtree the user manager delegates; in the
+VM the guest daemon is pid 1 and roots at `/sys/fs/cgroup/minimald.slice/`,
+the name phase 1 used. The `.slice` suffix is the experiment's name, not a requirement —
+nothing here depends on it — but `L`, the depth `<root>` renders into every
+`socket cgroupv2` match, does depend on the final path, so T38 fixes the name
+once and derives `L` from it. A host with no user manager has no delegated
 subtree to build under, so its root has to be created and chowned by
 something privileged. **That path is unverified here**: D2 ran in a tree
 `sudo` chowned by hand and says only that the shape behaves (and that the
