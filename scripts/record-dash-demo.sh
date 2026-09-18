@@ -144,13 +144,25 @@ echo "==> Recording asciinema cast to $CAST"
 # asciinema 3.x defaults to asciicast-v3; agg and the existing
 # docs/public/loadout-demo.cast are asciicast-v2, so request that format
 # explicitly (asciinema --version to confirm which generation is installed).
-asciinema rec \
-  --command "$DRIVER" \
-  --output-format asciicast-v2 \
-  --window-size "${COLS}x${ROWS}" \
-  --overwrite \
-  --title "min dash" \
-  "$CAST"
+# asciinema 3.x (Rust) and 2.x (Python) spell the geometry flags differently
+# and 3.x defaults to asciicast-v3, which agg cannot read; 2.x writes v2.
+if asciinema --version 2>/dev/null | grep -qE ' 3\.'; then
+  asciinema rec \
+    --command "$DRIVER" \
+    --output-format asciicast-v2 \
+    --window-size "${COLS}x${ROWS}" \
+    --overwrite \
+    --title "min dash" \
+    "$CAST"
+else
+  asciinema rec \
+    --command "$DRIVER" \
+    --cols "$COLS" \
+    --rows "$ROWS" \
+    --overwrite \
+    --title "min dash" \
+    "$CAST"
+fi
 
 echo "==> Rendering $OUT with agg"
 # --cols/--rows/--line-height match docs/public/loadout-demo.cast's recorded
