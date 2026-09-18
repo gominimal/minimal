@@ -193,7 +193,7 @@ Steering and the interception CA
 - **BEP-015** WHILE a box with steering `proxy_env` holds a sealed GitHub member THE SYSTEM SHALL complete `git clone`, `git push` and `gh api` against a private repository of the signed-in account with no tool configuration in the box beyond what the box carries at creation.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_git_and_gh_against_private_repo
-  <!-- a clone's pack fetch is served by `github.com` itself over the smart HTTP protocol, inside the host set; release assets and archive downloads redirect to `objects.githubusercontent.com`, ordinary egress a box lists in `[network.bep] no_proxy` under `proxy_env` (Gatehouse §6.10: `NO_PROXY` is the compatibility lever) -->
+  <!-- a clone's pack fetch is served by `github.com` itself over the smart HTTP protocol, inside the host set; archive downloads redirect to `codeload.github.com`, also inside the host set; release assets redirect to `release-assets.githubusercontent.com`, ordinary egress a box lists in `[network.bep] no_proxy` under `proxy_env` (Gatehouse §6.10: `NO_PROXY` is the compatibility lever) -->
 
 - **BEP-016** WHERE a box spec declares a credentialed upstream and no `steering` THE SYSTEM SHALL resolve `steering` to `dns`.
   tier:     T0
