@@ -28,7 +28,10 @@ env:
     # on arrays with more than 64 elements (kani#2416/#4408, fixed by the
     # CBMC 6.8.0 upgrade in 0.67.0) — one index_file wire record is 68
     # bytes, so an older cached Kani would fail proofs that are correct.
-    KANI_VERSION: 0.67.0
+    # 0.68.0 is the floor because its bundled toolchain is the first above
+    # the workspace rust-version, which let scripts/kani.sh drop its
+    # scratch-copy MSRV relaxation.
+    KANI_VERSION: 0.68.0
 
 concurrency:
     group: ci-kani-${{ github.ref }}
