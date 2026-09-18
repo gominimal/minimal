@@ -384,13 +384,35 @@ echo "::endgroup::"
 # because only then is the shell stack (and thus curl) guaranteed present.
 if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   echo "::group::guest egress proof (curl from inside the session)"
+  # Retried per host, because the claim is "this session has egress", not "two
+  # third-party endpoints answer on the first try". One attempt each made the
+  # lane depend on both staying up: main went red on a docs-only commit when
+  # example.com returned HTTP:200 and example.org then lost the TLS handshake
+  # (curl 35, HTTP:000). The first host had already proven DNS, NAT and TLS all
+  # worked, so that run failed on weather, not on the session. A session with no
+  # NAT/DNS fails every attempt against every host, so the switchless boot this
+  # proof exists to catch still fails it exactly as before.
   for egress_host in example.com example.org; do
-    egress_out="$(mnl session exec "$sid" \
-      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 30 https://$egress_host" \
-      2>"$WORK/egress.err")"
-    egress_status=$?
+    egress_status=0
+    egress_out=""
+    for egress_try in 1 2 3; do
+      egress_out="$(mnl session exec "$sid" \
+        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 30 https://$egress_host" \
+        2>"$WORK/egress.err")"
+      egress_status=$?
+      if [ "$egress_status" -eq 0 ] && [ "$egress_out" = "HTTP:200" ]; then
+        break
+      fi
+      # Not ::error:: — a retried attempt is not a lane failure, and annotating
+      # it would put a red mark on a run that goes on to pass.
+      if [ "$egress_try" -lt 3 ]; then
+        echo "guest egress to https://$egress_host failed on attempt ${egress_try}/3 (exec status ${egress_status}, got '${egress_out:-<none>}'); retrying in $((egress_try * 3))s"
+        cat "$WORK/egress.err" 2>/dev/null || true
+        sleep "$((egress_try * 3))"
+      fi
+    done
     if [ "$egress_status" -ne 0 ] || [ "$egress_out" != "HTTP:200" ]; then
-      echo "::error::guest egress to https://$egress_host failed (exec status ${egress_status}, got '${egress_out:-<none>}', want HTTP:200): the session has no working egress. On a VM lane (E2E_VM='${E2E_VM:-}') a lost gvproxy switch is one hypothesis — a switchless boot has no NAT/DNS — but a nonzero exec status or a non-200 code can equally be a DNS, TLS/CA, or exec-transport failure; the guest boot console and curl stderr follow in the diagnostics."
+      echo "::error::guest egress to https://$egress_host failed all 3 attempts (last exec status ${egress_status}, got '${egress_out:-<none>}', want HTTP:200): the session has no working egress. On a VM lane (E2E_VM='${E2E_VM:-}') a lost gvproxy switch is one hypothesis — a switchless boot has no NAT/DNS — but a nonzero exec status or a non-200 code can equally be a DNS, TLS/CA, or exec-transport failure; the guest boot console and curl stderr follow in the diagnostics."
       echo "--- curl stderr ---"; cat "$WORK/egress.err" 2>/dev/null || true
       fail
     fi
