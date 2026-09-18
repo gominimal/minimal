@@ -403,8 +403,7 @@ impl Error {
 
     /// Writes a human-friendly representation of the error to standard out.
     pub fn report_to_stderr(&self) {
-        use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
-        self.report_to(&mut StandardStream::stderr(ColorChoice::Auto).lock());
+        common::report_to_stderr(|w| self.report_to(w));
     }
 }
 
