@@ -1,7 +1,7 @@
 [upstream] # Source of software & tooling
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
-locked_commit = "ff15baa9a765148b7ec28f18b1019e12adeaa4da"
+locked_commit = "f4de33d06dada4edcf5076dded10e9c303cf597e"
 
 [stack]
 use = "rust"
@@ -21,7 +21,7 @@ runtime_packages = [
 state_key = "dev"
 
 [session]
-packages = ["just", "shellcheck", "python"]
+packages = ["just", "shellcheck", "python", "cargo-nextest"]
 
 [tasks.build]
 description = "Builds the minimal CLI"
@@ -68,6 +68,33 @@ set -e
 cargo test --verbose
 # cargo fmt -- --check
 # cargo clippy --all-targets -- -D warnings
+"""
+
+# The agent runtime runs this one on the coder's files and amends the result
+# into its last commit (runner/runner/jobs/implement.py, `run_fmt`). It must be
+# `bash = `: a `spec.get("bash")` that is not a string reads as "no fmt task",
+# and the PR then lands red on CI's `fmt` job for whitespace.
+[tasks.fmt]
+description = "rustfmt across the workspace; the runtime amends it into the coder's commit"
+inherit_cwd = true
+bash = """
+set -e
+cargo fmt --all
+"""
+
+# `min task run verify` — this repository's own word for "does this tree pass",
+# run in a fresh clone at the pushed sha under a 10-minute budget
+# (probeWallClockSeconds, worker/src/config.ts). Deliberately rustfmt only: a
+# cold `cargo clippy --all-targets` on this workspace does not fit that budget,
+# and each task's own `test:` lines already compile the crate they touch.
+# Without this block the runtime falls back to the plan survey's `just test-one`,
+# which has no filter to run.
+[tasks.verify]
+description = "the cheap gate the agent runtime runs after a task's test lines"
+inherit_cwd = true
+bash = """
+set -e
+cargo fmt --all -- --check
 """
 
 [outputs.bash-img]

@@ -112,7 +112,6 @@ impl From<(BuildSpecRef, HashSet<String>)> for SubsetInput {
 ///
 /// Each entry in a build-spec's `build_deps` array corresponds to one [BuildDep].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub enum BuildDep {
     Build(BuildSpecRef),
     Source(SourceInput),
@@ -124,7 +123,7 @@ pub enum BuildDep {
     Subset(SubsetInput),
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 impl BuildDep {
     /// Returns the underlying build-spec reference if this value was the Build variant.
     pub(crate) fn as_build(&self) -> Option<&BuildSpecRef> {
@@ -137,7 +136,6 @@ impl BuildDep {
 
 /// An output from a build.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[allow(dead_code)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum BuildOutput {
     /// This output describes shared libraries matched with the given glob.
@@ -207,7 +205,6 @@ pub struct SpecTest {
 
 /// Definition of a package in the dependency graph.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct BuildSpec {
     /// The human-readable name declared on the build spec.
     pub name: String,
