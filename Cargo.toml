@@ -93,6 +93,7 @@ boringtun = { version = "0.7", default-features = false }
 bytes = "1.12" # keep in sync with reqwest
 bzip2 = "0.6"
 camino = { version = "1", features = ["serde1"] }
+caps = "0.5.6"
 clap = { version = "4.6", features = ["derive", "env", "string"] }
 clap_complete = { version = "4.6" }
 codespan-reporting = { version = "0.13", features = ["serialization"] } # Keep in sync with nickel-lang-core

@@ -191,6 +191,14 @@ pub struct Config {
     /// Suffix marker to identify the process in the names of temp files/directories. Defaults
     /// to the PID when not set.
     pub daemon_id: Option<String>,
+
+    /// Drop `CAP_NET_RAW` from the sandboxed process's capability bounding set
+    /// before it execs. This removes the ability to open raw sockets even if the
+    /// process later gains privileges inside its user namespace.
+    ///
+    /// Defaults to `true`; the diagnostics for the applied set are available via
+    /// [`Sandbox::process_capabilities`](crate::Sandbox::process_capabilities).
+    pub drop_cap_net_raw: bool,
 }
 
 /// A command to be run in the sandbox.
@@ -359,6 +367,7 @@ impl Config {
             },
             cpu_weight: None,
             daemon_id: None,
+            drop_cap_net_raw: true,
         }
     }
 
@@ -499,6 +508,13 @@ impl Config {
     /// Sets the identifier for the process/daemon doing the build.
     pub fn with_daemon_id(mut self, id: String) -> Self {
         self.daemon_id = Some(id);
+        self
+    }
+
+    /// Configures whether `CAP_NET_RAW` is dropped from the sandboxed process's
+    /// capability bounding set. Defaults to `true`.
+    pub fn with_drop_cap_net_raw(mut self, drop_cap: bool) -> Self {
+        self.drop_cap_net_raw = drop_cap;
         self
     }
 

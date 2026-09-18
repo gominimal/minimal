@@ -17,5 +17,7 @@ walkdir.workspace = true
 common.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+caps.workspace = true
 hakoniwa.workspace = true
+libc.workspace = true
 nix.workspace = true

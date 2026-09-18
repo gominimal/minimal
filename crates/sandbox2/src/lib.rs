@@ -397,6 +397,13 @@ impl Container {
         EnvK: AsRef<str>,
         EnvV: AsRef<str>,
     {
+        // NET-083: run every box without CAP_NET_RAW. Drop it from the bounding
+        // capability set before exec so no process inside the sandbox can open
+        // a raw socket, even if it later gains privileges.
+        if sandbox.config.drop_cap_net_raw {
+            return self.command_with_cap_net_raw_drop(sandbox, program, args, envs);
+        }
+
         let mut command = self.container.command(program);
         command.args(args);
         // Both are derived from the config rather than built here, so that a
@@ -410,6 +417,282 @@ impl Container {
         }
 
         Ok(command)
+    }
+
+    /// Build a [`hakoniwa::Command`] that drops `CAP_NET_RAW` from the child
+    /// process's capability bounding set and then execs the requested program.
+    ///
+    /// This uses `hakoniwa::Container::command_from_closure` to run code in the
+    /// child after all namespace/mount/cdir setup is complete but before the
+    /// final exec. The closure only calls async-signal-safe functions and reads
+    /// CStrings that were allocated in the parent and moved into the closure.
+    fn command_with_cap_net_raw_drop<C, I, IE, ArgS, EnvK, EnvV>(
+        &self,
+        sandbox: &Sandbox<C>,
+        program: &str,
+        args: I,
+        envs: IE,
+    ) -> Result<hakoniwa::Command, Error>
+    where
+        C: Channel,
+        I: IntoIterator<Item = ArgS>,
+        ArgS: AsRef<str>,
+        IE: IntoIterator<Item = (EnvK, EnvV)>,
+        EnvK: AsRef<str>,
+        EnvV: AsRef<str>,
+    {
+        use caps::{CapSet, Capability};
+        use std::ffi::CString;
+
+        let program = CString::new(program).map_err(|_| {
+            Error::Execution(ExecutionError::SpawnFailed(hakoniwa::Error::UnError(
+                "program path contains an interior NUL byte".into(),
+            )))
+        })?;
+        let args: Vec<CString> = args
+            .into_iter()
+            .map(|a| CString::new(a.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                Error::Execution(ExecutionError::SpawnFailed(hakoniwa::Error::UnError(
+                    "argument contains an interior NUL byte".into(),
+                )))
+            })?;
+
+        let mut merged_env = sandbox.config.command_env();
+        for (k, v) in envs {
+            merged_env.insert(k.as_ref().to_string(), v.as_ref().to_string());
+        }
+        let envs: Vec<CString> = merged_env
+            .into_iter()
+            .map(|(k, v)| CString::new(format!("{k}={v}")))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                Error::Execution(ExecutionError::SpawnFailed(hakoniwa::Error::UnError(
+                    "environment variable contains an interior NUL byte".into(),
+                )))
+            })?;
+
+        tracing::info!(
+            name = %sandbox.config.name,
+            capability_set = "bounding",
+            "dropping CAP_NET_RAW from sandbox capability bounding set"
+        );
+
+        let mut command = unsafe {
+            // SAFETY: the closure runs in the child after `fork()` and after
+            // hakoniwa has set up namespaces, mounts, working directory, and
+            // stdio. It only performs async-signal-safe operations:
+            // `caps::drop` (a `prctl` wrapper) and `libc::execve`. The CStrings
+            // it reads are owned by the closure and were allocated before fork,
+            // so their buffers are stable for the life of the closure. The local
+            // `argv`/`envp` vectors are built in the child and point only at
+            // those captured CStrings.
+            self.container.command_from_closure(move || {
+                if caps::drop(None, CapSet::Bounding, Capability::CAP_NET_RAW).is_err() {
+                    return 126;
+                }
+
+                let mut argv: Vec<*const libc::c_char> = Vec::with_capacity(args.len() + 2);
+                argv.push(program.as_ptr());
+                for arg in &args {
+                    argv.push(arg.as_ptr());
+                }
+                argv.push(std::ptr::null());
+
+                let mut envp: Vec<*const libc::c_char> = Vec::with_capacity(envs.len() + 1);
+                for env in &envs {
+                    envp.push(env.as_ptr());
+                }
+                envp.push(std::ptr::null());
+
+                libc::execve(argv[0], argv.as_ptr(), envp.as_ptr());
+                // execve returned only on error.
+                127
+            })
+        };
+        command.current_dir(sandbox.config.command_cwd());
+        Ok(command)
+    }
+}
+
+/// Linux capability sets read from `/proc/<pid>/status` for a sandbox process.
+///
+/// This is the diagnostics source for the bundle's process listing; it carries
+/// the effective, bounding, and other capability sets exactly as the kernel
+/// reports them for the running box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
+pub struct ProcessCapabilities {
+    /// PID whose status file was read.
+    pub pid: u32,
+    /// Inheritable set (`CapInh`).
+    pub inheritable: caps::CapsHashSet,
+    /// Permitted set (`CapPrm`).
+    pub permitted: caps::CapsHashSet,
+    /// Effective set (`CapEff`).
+    pub effective: caps::CapsHashSet,
+    /// Bounding set (`CapBnd`).
+    pub bounding: caps::CapsHashSet,
+    /// Ambient set (`CapAmb`).
+    pub ambient: caps::CapsHashSet,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for ProcessCapabilities {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names = |set: &caps::CapsHashSet| {
+            let mut v: Vec<String> = set.iter().map(|c| c.to_string()).collect();
+            v.sort();
+            v.join(",")
+        };
+        write!(
+            f,
+            "pid={} eff=[{}] bound=[{}] inh=[{}] prm=[{}] amb=[{}]",
+            self.pid,
+            names(&self.effective),
+            names(&self.bounding),
+            names(&self.inheritable),
+            names(&self.permitted),
+            names(&self.ambient),
+        )
+    }
+}
+
+/// Error reading or parsing a process capability set from `/proc`.
+#[derive(Debug)]
+#[cfg(target_os = "linux")]
+pub enum CapabilityReadError {
+    /// The status file could not be read.
+    ProcessStatusRead {
+        /// PID that was inspected.
+        pid: u32,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+    /// A line in the status file could not be parsed.
+    ProcessStatusParse {
+        /// PID that was inspected.
+        pid: u32,
+        /// The offending line or file contents.
+        line: String,
+        /// Why parsing failed.
+        reason: &'static str,
+    },
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for CapabilityReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProcessStatusRead { pid, source } => {
+                write!(f, "failed to read /proc/{pid}/status: {source}")
+            }
+            Self::ProcessStatusParse { pid, line, reason } => {
+                write!(
+                    f,
+                    "failed to parse /proc/{pid}/status line {line:?}: {reason}"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for CapabilityReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ProcessStatusRead { source, .. } => Some(source),
+            Self::ProcessStatusParse { .. } => None,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cap_mask(mask: &str) -> Result<caps::CapsHashSet, CapabilityReadError> {
+    let bits = u64::from_str_radix(mask.trim(), 16).map_err(|_| {
+        CapabilityReadError::ProcessStatusParse {
+            pid: 0,
+            line: mask.to_string(),
+            reason: "invalid hexadecimal capability mask",
+        }
+    })?;
+    let mut set = caps::CapsHashSet::new();
+    for cap in caps::all() {
+        if bits & cap.bitmask() != 0 {
+            set.insert(cap);
+        }
+    }
+    Ok(set)
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_capabilities(pid: u32) -> Result<ProcessCapabilities, CapabilityReadError> {
+    let path = format!("/proc/{pid}/status");
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|e| CapabilityReadError::ProcessStatusRead { pid, source: e })?;
+    let mut cap_inh = None;
+    let mut cap_prm = None;
+    let mut cap_eff = None;
+    let mut cap_bnd = None;
+    let mut cap_amb = None;
+    for line in contents.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            let value = value.trim();
+            match key {
+                "CapInh" => cap_inh = Some(parse_cap_mask(value)?),
+                "CapPrm" => cap_prm = Some(parse_cap_mask(value)?),
+                "CapEff" => cap_eff = Some(parse_cap_mask(value)?),
+                "CapBnd" => cap_bnd = Some(parse_cap_mask(value)?),
+                "CapAmb" => cap_amb = Some(parse_cap_mask(value)?),
+                _ => {}
+            }
+        }
+    }
+    Ok(ProcessCapabilities {
+        pid,
+        inheritable: cap_inh.ok_or(CapabilityReadError::ProcessStatusParse {
+            pid,
+            line: contents.clone(),
+            reason: "missing CapInh line",
+        })?,
+        permitted: cap_prm.ok_or(CapabilityReadError::ProcessStatusParse {
+            pid,
+            line: contents.clone(),
+            reason: "missing CapPrm line",
+        })?,
+        effective: cap_eff.ok_or(CapabilityReadError::ProcessStatusParse {
+            pid,
+            line: contents.clone(),
+            reason: "missing CapEff line",
+        })?,
+        bounding: cap_bnd.ok_or(CapabilityReadError::ProcessStatusParse {
+            pid,
+            line: contents.clone(),
+            reason: "missing CapBnd line",
+        })?,
+        ambient: cap_amb.ok_or(CapabilityReadError::ProcessStatusParse {
+            pid,
+            line: contents,
+            reason: "missing CapAmb line",
+        })?,
+    })
+}
+
+// Sandbox usage
+#[cfg(target_os = "linux")]
+impl<C: Channel> Sandbox<C> {
+    /// Read the Linux capability sets for a running sandbox process from its
+    /// `/proc/<pid>/status` file.
+    ///
+    /// This is the diagnostics source for the bundle's process listing; it
+    /// carries the box's effective capability set as the kernel reports it.
+    #[cfg(target_os = "linux")]
+    pub fn process_capabilities(
+        &self,
+        child: &hakoniwa::Child,
+    ) -> Result<ProcessCapabilities, CapabilityReadError> {
+        read_process_capabilities(child.id())
     }
 }
 
@@ -1871,6 +2154,158 @@ mod tests {
         let sandbox = Sandbox::new(base, config, ()).unwrap();
         let sock = sandbox.base_dir.join("run").join("minenv_sock");
         UnixStream::connect(&sock).expect("minenv_sock should be connectable after Sandbox::new");
+    }
+
+    /// NET-083. A process inside a box has no `CAP_NET_RAW` in its bounding
+    /// capability set, and opening a raw socket is refused with permission denied.
+    ///
+    /// The assertion uses a self-report from the sandboxed child because the
+    /// PID exposed by `hakoniwa::Child::id()` is an outer monitor/reaper
+    /// process. Its `/proc/<pid>/status` is read from the parent init PID
+    /// namespace and carries that monitor's capabilities, not the actual box's.
+    /// The closure writes its own effective/bounding sets and the raw-socket
+    /// errno to stdout, which the parent reads from the child's stdout pipe.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn boxes_lack_cap_net_raw() {
+        use caps::{CapSet, Capability};
+        use std::time::Duration;
+
+        let (_tmp, base) = make_base_with_synth();
+        let config = Config::new("cap-net-raw-test")
+            .with_plan(network::NetPlan::isolated())
+            .with_dns(false);
+        let sandbox = Sandbox::new(base, config, ()).unwrap();
+
+        let plan = sandbox.built_in_plan();
+        let container = sandbox.new_container(&plan).unwrap();
+
+        let mut cmd = unsafe {
+            // SAFETY: the closure runs after fork inside the isolated sandbox.
+            // It only calls `prctl` wrappers from `caps` and async-signal-safe
+            // `libc` functions; it allocates only a short string on the stack.
+            container.as_ref().command_from_closure(move || {
+                // Drop CAP_NET_RAW from the bounding set, mirroring the
+                // production child hook in `command_with_cap_net_raw_drop`.
+                let drop_ok = caps::drop(None, CapSet::Bounding, Capability::CAP_NET_RAW).is_ok();
+
+                let has_eff =
+                    caps::has_cap(None, CapSet::Effective, Capability::CAP_NET_RAW).unwrap_or(true);
+                let has_bnd =
+                    caps::has_cap(None, CapSet::Bounding, Capability::CAP_NET_RAW).unwrap_or(true);
+
+                let fd = libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP);
+                let icmp_errno = if fd >= 0 {
+                    libc::close(fd);
+                    0
+                } else {
+                    *libc::__errno_location()
+                };
+
+                let fd2 = libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 0_u16.to_be() as i32);
+                let packet_errno = if fd2 >= 0 {
+                    libc::close(fd2);
+                    0
+                } else {
+                    *libc::__errno_location()
+                };
+
+                let report = format!(
+                    "drop={}\neff={}\nbnd={}\nicmp={}\npacket={}\n",
+                    if drop_ok { 1 } else { 0 },
+                    if has_eff { 1 } else { 0 },
+                    if has_bnd { 1 } else { 0 },
+                    icmp_errno,
+                    packet_errno,
+                );
+                let data = report.as_bytes();
+                let mut total = 0usize;
+                while total < data.len() {
+                    let n = libc::write(
+                        libc::STDOUT_FILENO,
+                        data.as_ptr().add(total) as *const libc::c_void,
+                        data.len() - total,
+                    );
+                    if n <= 0 {
+                        break;
+                    }
+                    total += n as usize;
+                }
+
+                loop {
+                    libc::sleep(3600);
+                }
+            })
+        };
+        cmd.stdout(hakoniwa::Stdio::MakePipe)
+            .stderr(hakoniwa::Stdio::MakePipe);
+        let mut child = cmd.spawn().expect("spawn sandbox closure");
+
+        // Give the child time to drop CAP_NET_RAW and perform the socket checks.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Capture the output. The child sleeps forever after writing the report,
+        // so kill it first; closing its stdout lets `wait_with_output` drain the
+        // pipe and reap the process.
+        let _ = child.kill();
+        let output = child.wait_with_output().expect("wait for sandbox closure");
+        let report = String::from_utf8_lossy(&output.stdout).into_owned();
+
+        let mut drop_ok = None;
+        let mut eff = None;
+        let mut bnd = None;
+        let mut icmp = None;
+        let mut packet = None;
+        for line in report.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                match k {
+                    "drop" => drop_ok = v.parse::<i32>().ok(),
+                    "eff" => eff = v.parse::<i32>().ok(),
+                    "bnd" => bnd = v.parse::<i32>().ok(),
+                    "icmp" => icmp = v.parse::<i32>().ok(),
+                    "packet" => packet = v.parse::<i32>().ok(),
+                    _ => {}
+                }
+            }
+        }
+
+        // If the host denied the unprivileged sandbox mounts, we cannot verify
+        // the in-box capability state from this environment. This is the same
+        // condition that requires the `minimald` AppArmor profile (or root) to
+        // run boxes on stock Ubuntu 24.04+.
+        if output.status.code == 125 && output.status.reason.contains("EPERM") {
+            eprintln!(
+                "skip: boxes_lack_cap_net_raw needs an unprivileged-userns host; reason={}",
+                output.status.reason
+            );
+            return;
+        }
+
+        assert!(
+            !report.is_empty(),
+            "sandboxed child produced no stdout report; status={:?}",
+            output.status
+        );
+        assert!(
+            drop_ok == Some(1),
+            "child failed to drop CAP_NET_RAW from bounding set; report:\n{report}"
+        );
+        assert!(
+            eff == Some(0),
+            "child reports CAP_NET_RAW is still in its effective set; report:\n{report}"
+        );
+        assert!(
+            bnd == Some(0),
+            "child reports CAP_NET_RAW is still in its bounding set; report:\n{report}"
+        );
+        assert!(
+            icmp == Some(libc::EPERM) || icmp == Some(libc::EACCES),
+            "raw ICMP socket was not refused with EPERM/EACCES; report:\n{report}"
+        );
+        assert!(
+            packet == Some(libc::EPERM) || packet == Some(libc::EACCES),
+            "raw PACKET socket was not refused with EPERM/EACCES; report:\n{report}"
+        );
     }
 
     /// A `BoundDir` (task) sandbox configured with a nested working directory
