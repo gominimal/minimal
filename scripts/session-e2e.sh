@@ -379,20 +379,33 @@ echo "::endgroup::"
 # switch boots switchless, has no egress, and still reports green. The symptom
 # then reaches a user as a bogus "could not resolve host" that is not a DNS
 # problem. Prove reachability from inside the live session: the `shell` stack
-# composes curl, so no package is added, and two distinct hosts make a pass
-# real resolution rather than one cached answer. Gated on a seed we own,
-# because only then is the shell stack (and thus curl) guaranteed present.
+# composes curl, so no package is added. Gated on a seed we own, because only
+# then is the shell stack (and thus curl) guaranteed present.
+#
+# What is asserted is what the symptom is: THIS SESSION can reach the internet.
+# So the bar is one host answering, over several hosts and several attempts —
+# not every host answering first time. Two things taught that. A single attempt
+# per host made the lane depend on two third-party endpoints both being up, and
+# main went red on a docs-only commit when example.com returned HTTP:200 and
+# example.org then lost the TLS handshake (curl 35, HTTP:000) — the first host
+# had already proven DNS, NAT and TLS all worked, so the run failed on weather.
+# Requiring every host to answer has the same flaw at a longer timescale: an
+# endpoint down for the whole retry window still fails a session with provably
+# working egress. A switchless boot has no NAT and no DNS, so it fails every
+# host on every attempt and is caught exactly as before — that is the thing
+# this proof exists to catch, and one host answering cannot mask it.
+#
+# The cost is that a partial fault — one name resolving, another not — lands as
+# a warning rather than a failure. That is the intended trade: the lane is a
+# gate on the session, and no CI gate should turn red because example.org is
+# having a bad minute.
 if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   echo "::group::guest egress proof (curl from inside the session)"
-  # Retried per host, because the claim is "this session has egress", not "two
-  # third-party endpoints answer on the first try". One attempt each made the
-  # lane depend on both staying up: main went red on a docs-only commit when
-  # example.com returned HTTP:200 and example.org then lost the TLS handshake
-  # (curl 35, HTTP:000). The first host had already proven DNS, NAT and TLS all
-  # worked, so that run failed on weather, not on the session. A session with no
-  # NAT/DNS fails every attempt against every host, so the switchless boot this
-  # proof exists to catch still fails it exactly as before.
+  egress_ok=0
+  egress_total=0
+  egress_failed=""
   for egress_host in example.com example.org; do
+    egress_total=$((egress_total + 1))
     egress_status=0
     egress_out=""
     for egress_try in 1 2 3; do
@@ -411,13 +424,22 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
         sleep "$((egress_try * 3))"
       fi
     done
-    if [ "$egress_status" -ne 0 ] || [ "$egress_out" != "HTTP:200" ]; then
-      echo "::error::guest egress to https://$egress_host failed all 3 attempts (last exec status ${egress_status}, got '${egress_out:-<none>}', want HTTP:200): the session has no working egress. On a VM lane (E2E_VM='${E2E_VM:-}') a lost gvproxy switch is one hypothesis — a switchless boot has no NAT/DNS — but a nonzero exec status or a non-200 code can equally be a DNS, TLS/CA, or exec-transport failure; the guest boot console and curl stderr follow in the diagnostics."
-      echo "--- curl stderr ---"; cat "$WORK/egress.err" 2>/dev/null || true
-      fail
+    if [ "$egress_status" -eq 0 ] && [ "$egress_out" = "HTTP:200" ]; then
+      egress_ok=$((egress_ok + 1))
+    else
+      egress_failed="${egress_failed} https://$egress_host (exec status ${egress_status}, got '${egress_out:-<none>}')"
+      # Warned, not failed: another host answering proves the session's egress,
+      # which makes this that endpoint's problem and not the lane's. Still
+      # surfaced, so a partial fault is visible instead of silently absorbed.
+      echo "::warning::guest egress to https://$egress_host failed all 3 attempts (exec status ${egress_status}, got '${egress_out:-<none>}', want HTTP:200); not fatal while another host still proves the session has egress."
+      echo "--- curl stderr ($egress_host) ---"; cat "$WORK/egress.err" 2>/dev/null || true
     fi
   done
-  echo "guest egress proof OK (DNS + HTTPS reachable from the session)"
+  if [ "$egress_ok" -eq 0 ]; then
+    echo "::error::guest egress failed every attempt against all ${egress_total} hosts —${egress_failed}: the session has no working egress. On a VM lane (E2E_VM='${E2E_VM:-}') a lost gvproxy switch is one hypothesis — a switchless boot has no NAT/DNS — but a nonzero exec status or a non-200 code can equally be a DNS, TLS/CA, or exec-transport failure; the per-host curl stderr is above and the guest boot console follows in the diagnostics."
+    fail
+  fi
+  echo "guest egress proof OK (DNS + HTTPS reachable from the session; ${egress_ok}/${egress_total} hosts answered)"
   echo "::endgroup::"
 fi
 
