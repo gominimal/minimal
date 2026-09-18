@@ -6373,9 +6373,11 @@ dependencies = [
 name = "sandbox2"
 version = "0.0.1"
 dependencies = [
+ "caps",
  "common",
  "globset",
  "hakoniwa",
+ "libc",
  "nix 0.31.3",
  "tempfile",
  "tokio",

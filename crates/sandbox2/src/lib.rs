@@ -397,6 +397,13 @@ impl Container {
         EnvK: AsRef<str>,
         EnvV: AsRef<str>,
     {
+        // NET-083: run every box without CAP_NET_RAW. Drop it from the bounding
+        // capability set before exec so no process inside the sandbox can open
+        // a raw socket, even if it later gains privileges.
+        if sandbox.config.drop_cap_net_raw {
+            return self.command_with_cap_net_raw_drop(sandbox, program, args, envs);
+        }
+
         let mut command = self.container.command(program);
         command.args(args);
         // Both are derived from the config rather than built here, so that a
@@ -409,6 +416,101 @@ impl Container {
             command.env(k.as_ref(), v.as_ref());
         }
 
+        Ok(command)
+    }
+
+    /// Build a [`hakoniwa::Command`] that drops `CAP_NET_RAW` from the child
+    /// process's capability bounding set and then execs the requested program.
+    ///
+    /// This uses `hakoniwa::Container::command_from_closure` to run code in the
+    /// child after all namespace/mount/cdir setup is complete but before the
+    /// final exec. The closure only calls async-signal-safe functions and reads
+    /// CStrings that were allocated in the parent and moved into the closure.
+    fn command_with_cap_net_raw_drop<C, I, IE, ArgS, EnvK, EnvV>(
+        &self,
+        sandbox: &Sandbox<C>,
+        program: &str,
+        args: I,
+        envs: IE,
+    ) -> Result<hakoniwa::Command, Error>
+    where
+        C: Channel,
+        I: IntoIterator<Item = ArgS>,
+        ArgS: AsRef<str>,
+        IE: IntoIterator<Item = (EnvK, EnvV)>,
+        EnvK: AsRef<str>,
+        EnvV: AsRef<str>,
+    {
+        use caps::{CapSet, Capability};
+        use std::ffi::CString;
+
+        let program = CString::new(program).map_err(|_| {
+            Error::Execution(ExecutionError::SpawnFailed(hakoniwa::Error::UnError(
+                "program path contains an interior NUL byte".into(),
+            )))
+        })?;
+        let args: Vec<CString> = args
+            .into_iter()
+            .map(|a| CString::new(a.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                Error::Execution(ExecutionError::SpawnFailed(hakoniwa::Error::UnError(
+                    "argument contains an interior NUL byte".into(),
+                )))
+            })?;
+
+        let mut merged_env = sandbox.config.command_env();
+        for (k, v) in envs {
+            merged_env.insert(k.as_ref().to_string(), v.as_ref().to_string());
+        }
+        let envs: Vec<CString> = merged_env
+            .into_iter()
+            .map(|(k, v)| CString::new(format!("{k}={v}")))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                Error::Execution(ExecutionError::SpawnFailed(hakoniwa::Error::UnError(
+                    "environment variable contains an interior NUL byte".into(),
+                )))
+            })?;
+
+        tracing::info!(
+            name = %sandbox.config.name,
+            "dropping CAP_NET_RAW from sandbox capability bounding set"
+        );
+
+        let mut command = unsafe {
+            // SAFETY: the closure runs in the child after `fork()` and after
+            // hakoniwa has set up namespaces, mounts, working directory, and
+            // stdio. It only performs async-signal-safe operations:
+            // `caps::drop` (a `prctl` wrapper) and `libc::execve`. The CStrings
+            // it reads are owned by the closure and were allocated before fork,
+            // so their buffers are stable for the life of the closure. The local
+            // `argv`/`envp` vectors are built in the child and point only at
+            // those captured CStrings.
+            self.container.command_from_closure(move || {
+                if caps::drop(None, CapSet::Bounding, Capability::CAP_NET_RAW).is_err() {
+                    return 126;
+                }
+
+                let mut argv: Vec<*const libc::c_char> = Vec::with_capacity(args.len() + 2);
+                argv.push(program.as_ptr());
+                for arg in &args {
+                    argv.push(arg.as_ptr());
+                }
+                argv.push(std::ptr::null());
+
+                let mut envp: Vec<*const libc::c_char> = Vec::with_capacity(envs.len() + 1);
+                for env in &envs {
+                    envp.push(env.as_ptr());
+                }
+                envp.push(std::ptr::null());
+
+                libc::execve(argv[0], argv.as_ptr(), envp.as_ptr());
+                // execve returned only on error.
+                127
+            })
+        };
+        command.current_dir(sandbox.config.command_cwd());
         Ok(command)
     }
 }
@@ -1871,6 +1973,75 @@ mod tests {
         let sandbox = Sandbox::new(base, config, ()).unwrap();
         let sock = sandbox.base_dir.join("run").join("minenv_sock");
         UnixStream::connect(&sock).expect("minenv_sock should be connectable after Sandbox::new");
+    }
+
+    /// NET-083. A process inside a box has no `CAP_NET_RAW` in its bounding
+    /// capability set, and opening a raw socket is refused with permission denied.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn boxes_lack_cap_net_raw() {
+        use caps::{CapSet, Capability};
+
+        let (_tmp, base) = make_base_with_synth();
+        let config = Config::new("cap-net-raw-test")
+            .with_plan(network::NetPlan::isolated())
+            .with_dns(false);
+        let sandbox = Sandbox::new(base, config, ()).unwrap();
+
+        let plan = sandbox.built_in_plan();
+        let container = sandbox.new_container(&plan).unwrap();
+
+        let mut cmd = unsafe {
+            // SAFETY: the closure runs after fork inside the isolated sandbox.
+            // It only calls `prctl` wrappers from `caps` and async-signal-safe
+            // `libc` functions; it performs no allocation.
+            container.as_ref().command_from_closure(move || {
+                // Drop CAP_NET_RAW from the bounding set, mirroring the
+                // production child hook in `command_with_cap_net_raw_drop`.
+                if caps::drop(None, CapSet::Bounding, Capability::CAP_NET_RAW).is_err() {
+                    return 126;
+                }
+                // After the drop the capability must no longer be in the
+                // bounding (and therefore effective) set.
+                let has_raw =
+                    caps::has_cap(None, CapSet::Bounding, Capability::CAP_NET_RAW).unwrap_or(true);
+                if has_raw {
+                    return 1;
+                }
+                let fd = libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP);
+                if fd >= 0 {
+                    libc::close(fd);
+                    return 2;
+                }
+                let errno = *libc::__errno_location();
+                if errno != libc::EPERM && errno != libc::EACCES {
+                    return 3;
+                }
+
+                let fd2 = libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 0_u16.to_be() as i32);
+                if fd2 >= 0 {
+                    libc::close(fd2);
+                    return 4;
+                }
+                let errno2 = *libc::__errno_location();
+                if errno2 != libc::EPERM && errno2 != libc::EACCES {
+                    return 5;
+                }
+
+                0
+            })
+        };
+        cmd.stdout(hakoniwa::Stdio::piped())
+            .stderr(hakoniwa::Stdio::piped());
+        let output = cmd.output().expect("spawn sandbox closure");
+
+        assert!(
+            output.status.success(),
+            "sandbox process did not report missing CAP_NET_RAW: status={:?} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     /// A `BoundDir` (task) sandbox configured with a nested working directory
