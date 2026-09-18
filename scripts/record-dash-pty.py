@@ -61,7 +61,13 @@ try:
     while time.monotonic() < hard_deadline:
         now = time.monotonic()
         if not sent_quit and now >= quit_at:
-            os.write(fd, QUIT_KEY)
+            if os.environ.get("DASH_EXIT", "kill") == "quit":
+                os.write(fd, QUIT_KEY)
+            else:
+                # End the recording on the dash itself: a clean quit restores
+                # the main screen and the gif's last frame goes blank, so
+                # by default the child is terminated while still drawing.
+                os.kill(pid, signal.SIGTERM)
             sent_quit = True
         ready, _, _ = select.select([fd], [], [], 0.2)
         if not ready:
