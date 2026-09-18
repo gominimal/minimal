@@ -105,8 +105,10 @@ total 6 probes in 0.11 ms
 ```
 
 The probe is microseconds per address and never blocks, so probing the whole
-range at session start (254 binds, under 2 ms extrapolated) is affordable and
-NET-123 can probe every address, not only the answerer's `.1`.
+range at session start (254 binds, a few ms extrapolated from the 18 us per
+probe this run averaged; 2.53 ms measured over 256 once the range was up,
+section 7) is affordable and NET-123 can probe every address, not only the
+answerer's `.1`.
 
 The route table already sends all of `127/8` to `lo0`; what is missing is the
 address, not the route. That matters for the failure mode: a connect to an
@@ -619,10 +621,11 @@ The interim is a temporary per-host state and the open question closes.
 
 1. In the NET spec's HIGH open question, replace "pending the loopback-alias
    measurement" with a pointer to this spike and the root-run steps that remain.
-2. In NET-123's comment, add that the probe covers the whole range at under
-   2 ms, that a connect to an absent range address times out rather than
-   refusing, and that the interim exists to keep the answerer from handing out
-   range addresses before the probe passes.
+2. In NET-123's comment, add that the probe covers the whole range in a few
+   ms (2.53 ms measured over 256 addresses), that a connect to an absent
+   range address times out rather than refusing, and that the interim exists
+   to keep the answerer from handing out range addresses before the probe
+   passes.
 3. In T10 (issue #1470), make the advisory command install three files in one
    privileged step: the plist, the alias script at
    `/Library/PrivilegedHelperTools`, and `/etc/resolver/min.internal`, and
