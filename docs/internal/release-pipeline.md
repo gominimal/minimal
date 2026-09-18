@@ -58,13 +58,15 @@ override, `git describe` supplies only the commit count and hash on top of
 `package.version`, which is therefore the *declared next release* rather than
 a guess: `feat:` since the last tag means a minor, anything else a patch, and
 while the project is 0.x a breaking change is reported but never bumps the
-major. [`scripts/next-version.sh`](../../scripts/next-version.sh) derives the
-level and the release notes from one walk of the full commit bodies since the
-last released tag (so a `BREAKING CHANGE:` footer under a plain subject is
-caught), and its `--check` mode is the lint — the workspace `package_version`
-test, run for real on the native lane's full-history checkout, and `just
-check-version` — that fails a PR whose `package.version` is stale or not
-strictly above the newest `v*` tag.
+major. [`scripts/next-version.sh`](../../scripts/next-version.sh) runs
+[git-cliff](https://git-cliff.org) with [`cliff.toml`](../../cliff.toml) —
+through [`scripts/git-cliff.sh`](../../scripts/git-cliff.sh), which fetches
+and SHA-512-verifies the pinned binary — to derive the level and render the
+notes from the commits since the last released tag, so a `BREAKING CHANGE:`
+footer under a plain subject is caught. Its `--check` mode is the lint — the
+workspace `package_version` test, run for real on the native lane's
+full-history checkout, and `just check-version` — that fails a PR whose
+`package.version` is stale or not strictly above the newest `v*` tag.
 
 **Build jobs.**
 
@@ -99,8 +101,9 @@ strictly above the newest `v*` tag.
   asserts it is the release version.
 
 **release job.** Downloads everything, generates the release notes
-([`scripts/next-version.sh --notes`](../../scripts/next-version.sh): full
-commit bodies since the last released tag, breaking changes first),
+([`scripts/next-version.sh --notes`](../../scripts/next-version.sh): the
+git-cliff sections for the commits since the last released tag, breaking
+changes first),
 generates shell completions for `mip`, `min`, and `minimald`, and on a
 versioned build packages the `.deb`/`.rpm`/`.apk` for both Linux arches from
 this run's binaries ([`scripts/package-nfpm.sh`](../../scripts/package-nfpm.sh)

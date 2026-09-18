@@ -1,25 +1,23 @@
 #!/usr/bin/env bash
 #
 # next-version.sh — the next release version, its bump level, and the release
-# notes, all derived from the Conventional Commits since the last release.
+# notes, derived from the Conventional Commits since the last release.
 #
-# ONE walk of `<last release tag>..<rev>` reading FULL commit bodies
-# (`git log --format=%B`), so a `BREAKING CHANGE:` footer under a plain
-# `feat:` subject is seen — the exact entry a subject-line filter drops (the
-# 0.5.4 range's detach-chord change had one). Both consumers read that one
-# walk rather than each growing its own parser:
+# The derivation is git-cliff's (config: cliff.toml at the repo root), run
+# through scripts/git-cliff.sh so nothing has to be installed:
 #
-#   * the bump level: `feat:` -> minor; `fix:`/`perf:` (and a range with
-#     nothing release-worthy) -> patch. Commitlint enforces the format, so the
-#     range determines the level. Breaking changes (`!` or a
-#     `BREAKING CHANGE:`/`BREAKING-CHANGE:` footer) are DETECTED and rendered
-#     first in the notes but do NOT move the number while the project is
-#     0.x/alpha: no major increment is cut until the team decides on GA, so
-#     this lint never demands 1.0.0. ALLOW_MAJOR below is the one-line switch
-#     for that day (an explicit item on the GA checklist).
-#   * the notes: markdown grouped as breaking changes / features / fixes /
-#     other changes, each entry keeping its scope, PR reference, and short sha.
-#     Breaking entries carry their footer text.
+#   * the next version and its bump level: git-cliff --bumped-version, from the
+#     [bump] rules in cliff.toml. A feature is always a minor; a breaking change
+#     is a minor while the major is 0 (NEXT_VERSION_ALLOW_MAJOR=1 makes it a
+#     major, the GA switch). Commitlint enforces the commit format, so the range
+#     determines the level.
+#   * the notes: cliff.toml's template and commit_parsers, grouped as
+#     breaking changes / features / fixes / other changes, each entry keeping
+#     its scope, PR reference, and short sha. A `BREAKING CHANGE:` footer under
+#     a plain `feat:` subject is seen, and rendered first.
+#
+# This script keeps the parts that are policy rather than derivation: which tag
+# is the range base, the "N commit(s) since <tag>" header line, and --check.
 #
 # The declared version lives in Cargo.toml `package.version`: the base of
 # every `-dev.N.g<sha>` build and the version a release build is given as
@@ -39,14 +37,15 @@
 # The range base is the newest RELEASED tag reachable from the rev (plain
 # vX.Y.Z; `v0.6.0-rc1` is skipped over), so the notes and the level for a
 # final release cover everything since the previous final, not just the last
-# rc.
+# rc. git-cliff only ever sees SemVer v* tags (cliff.toml's tag_pattern), so a
+# `vendor/…-20260901` or `release-<sha>` tag cannot become a version.
 #
 # Usage:
 #   scripts/next-version.sh [options] [MODE]
 #
 # Modes (default: --next):
 #   --next                print the derived next version (X.Y.Z) on stdout
-#   --bump                print the bump level: minor | patch (major only with ALLOW_MAJOR=1)
+#   --bump                print the bump level: major | minor | patch
 #   --notes [FILE]        write release-notes markdown to FILE (stdout if omitted)
 #   --check               assert Cargo.toml package.version against the derivation
 #
@@ -60,15 +59,18 @@
 #   -h, --help            show this help
 #
 # Exit codes: 0 ok; 1 lint failure or hard error (no git, no released v* tag
-# reachable, unreadable Cargo.toml for --check).
+# reachable, unreadable Cargo.toml for --check, git-cliff unavailable).
 #
 # Requires: git with the tags fetched (actions/checkout needs fetch-depth: 0;
-# the workspace test self-skips on a shallow or tagless clone).
+# the workspace test self-skips on a shallow or tagless clone). git-cliff is
+# fetched and verified by scripts/git-cliff.sh; set GIT_CLIFF_BIN to use a
+# local build instead.
 
 set -euo pipefail
 
-# The GA switch. 0: a breaking change is detected and reported but bumps
-# nothing beyond what its type does (0.x/alpha rule). 1: breaking -> major.
+# The GA switch. 0: a breaking change is detected and reported but bumps only
+# to a minor while the project is 0.x. 1: breaking -> major. Mirrors
+# cliff.toml's breaking_always_bump_major.
 ALLOW_MAJOR="${NEXT_VERSION_ALLOW_MAJOR:-0}"
 
 # die <message> — print it with the script prefix on stderr and exit 1.
@@ -113,6 +115,27 @@ done
 command -v git >/dev/null 2>&1 || die "git not found"
 git -C "$REPO" rev-parse --verify --quiet "${REV}^{commit}" >/dev/null 2>&1 \
     || die "git cannot resolve $REV in $REPO (bad rev, or a checkout without history)"
+
+# The wrapper and its config belong to this installation, not to the repo being
+# walked (--repo names the git repo to read). Resolved next to this script.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CLIFF="$SCRIPT_DIR/git-cliff.sh"
+CONFIG="$SCRIPT_DIR/../cliff.toml"
+[ -x "$CLIFF" ] || die "missing $CLIFF"
+[ -f "$CONFIG" ] || die "missing $CONFIG"
+
+# NEXT_VERSION_ALLOW_MAJOR=1 flips the one [bump] rule that is a release-policy
+# switch rather than a fact about the commits. Edited into a temp copy so the
+# checked-in cliff.toml keeps its 0.x default and the CLI stays the same.
+cliff_config="$CONFIG"
+if [ "$ALLOW_MAJOR" = 1 ]; then
+    # A temp dir, not a bare mktemp file: git-cliff infers the config format
+    # from the extension, so the copy has to be named cliff.toml.
+    cliff_tmpdir="$(mktemp -d)"
+    cliff_config="$cliff_tmpdir/cliff.toml"
+    trap 'rm -f "$cliff_config"; rmdir "$cliff_tmpdir" 2>/dev/null || true' EXIT
+    sed 's/^breaking_always_bump_major = false/breaking_always_bump_major = true/' "$CONFIG" >"$cliff_config"
+fi
 
 # --- SemVer precedence -------------------------------------------------------
 
@@ -192,92 +215,33 @@ base_version="${base_tag#v}"
 newest_tag="$(semver_tags | sed -n '1p' || true)"
 newest_version="${newest_tag#v}"
 
-# --- The walk ----------------------------------------------------------------
+# --- The derivation ----------------------------------------------------------
 #
-# One record per commit: sha, subject, body, separated by \x1f (unit) and
-# terminated by \x1e (record), so multi-line bodies survive. Merges carry no
-# change of their own (main is squash-merged; a merge commit's subject is
-# not a Conventional Commit).
+# git-cliff's --bumped-version reads the range's commits under cliff.toml's
+# [bump] rules and returns the next version, `v`-prefixed.
 
-level="patch"
-n_commits=0 n_feat=0 n_fix=0 n_breaking=0
-breaking_entries=() feat_entries=() fix_entries=() other_entries=()
-feat_drivers=()
+bumped=""
+range_commits="$(git -C "$REPO" rev-list --no-merges --count "$base_tag..$REV")"
+if [ "$range_commits" -eq 0 ]; then
+    # Nothing since the last release (a rev cut exactly on its tag). The
+    # contract is a patch — a release always increments — but an empty range
+    # makes git-cliff fall back to the whole history, so bump it here.
+    IFS=. read -r base_major base_minor base_patch <<<"${base_version%%-*}"
+    next="$base_major.$base_minor.$((base_patch + 1))"
+else
+    bumped="$( cd "$REPO" && "$CLIFF" --config "$cliff_config" "$base_tag..$REV" --bumped-version 2>/dev/null )" \
+        || die "git-cliff --bumped-version failed (is $CLIFF able to fetch the pinned binary?)"
+    next="${bumped#v}"
+fi
 
-# entry <sha> <scope> <desc> — one markdown bullet.
-entry() {
-    local sha="$1" scope="$2" desc="$3"
-    if [ -n "$scope" ]; then
-        printf -- '- **%s**: %s (%s)' "$scope" "$desc" "$sha"
-    else
-        printf -- '- %s (%s)' "$desc" "$sha"
-    fi
-}
-
-# breaking_footer <body> — the BREAKING CHANGE footer paragraph(s), each from
-# its footer line to the next blank line or the end of the body.
-breaking_footer() {
-    printf '%s\n' "$1" | awk '
-        /^BREAKING[ -]CHANGE: / { on = 1 }
-        /^[[:space:]]*$/       { on = 0 }
-        on                     { print }
-    '
-}
-
-# `type(scope)!: description` — parentheses in a regex literal do not parse
-# inside [[ ]], so it lives in a variable.
-subject_re='^([a-z]+)(\(([^)]*)\))?(!)?:[[:space:]]+(.+)$'
-
-while IFS=$'\x1f' read -r -d $'\x1e' sha subject body; do
-    sha="${sha#"${sha%%[![:space:]]*}"}"   # a leading newline precedes every record but the first
-    [ -n "$sha" ] || continue
-    n_commits=$((n_commits + 1))
-    short="${sha:0:8}"
-
-    type="" scope="" bang="" desc="$subject"
-    if [[ "$subject" =~ $subject_re ]]; then
-        type="${BASH_REMATCH[1]}"
-        scope="${BASH_REMATCH[3]}"
-        bang="${BASH_REMATCH[4]}"
-        desc="${BASH_REMATCH[5]}"
-    fi
-
-    footer="$(breaking_footer "$body")"
-    if [ -n "$bang" ] || [ -n "$footer" ]; then
-        n_breaking=$((n_breaking + 1))
-        e="$(entry "$short" "$scope" "$desc")"
-        if [ -n "$footer" ]; then
-            e="$e"$'\n\n'"$(printf '%s\n' "$footer" | sed 's/^/  /')"
-        fi
-        breaking_entries+=("$e")
-        [ "$ALLOW_MAJOR" = 1 ] && level=major
-    fi
-
-    case "$type" in
-        feat)
-            n_feat=$((n_feat + 1))
-            feat_drivers+=("$short $subject")
-            [ "$level" = major ] || level=minor
-            [ -n "$bang" ] || [ -n "$footer" ] || feat_entries+=("$(entry "$short" "$scope" "$desc")")
-            ;;
-        fix|perf)
-            n_fix=$((n_fix + 1))
-            [ -n "$bang" ] || [ -n "$footer" ] || fix_entries+=("$(entry "$short" "$scope" "$desc")")
-            ;;
-        *)
-            [ -n "$bang" ] || [ -n "$footer" ] || other_entries+=("$(entry "$short" "$scope" "$desc")")
-            ;;
-    esac
-done < <(git -C "$REPO" log --no-merges --reverse --format=$'%H\x1f%s\x1f%b\x1e' "$base_tag..$REV")
-
-# --- The next version --------------------------------------------------------
-
-IFS=. read -r major minor patch <<<"$base_version"
-case "$level" in
-    major) next="$((major + 1)).0.0" ;;
-    minor) next="$major.$((minor + 1)).0" ;;
-    patch) next="$major.$minor.$((patch + 1))" ;;
-esac
+# The bump level, from base -> next. Three numeric fields, so a field compare
+# is enough; a pre-release on either side cannot change which field moved.
+IFS=. read -r base_major base_minor _ <<<"${base_version%%-*}"
+IFS=. read -r next_major next_minor _ <<<"${next%%-*}"
+if [ "$next_major" != "$base_major" ]; then level=major
+elif [ "$next_minor" != "$base_minor" ]; then level=minor
+else level="patch"
+fi
 
 # --- Cargo.toml package.version ---------------------------------------------
 
@@ -295,23 +259,15 @@ fi
 emit_notes() {
     local title="${package_version:-$next}"
     printf '## %s\n\n' "$title"
-    printf '%d commit(s) since %s.\n' "$n_commits" "$base_tag"
-    if [ "${#breaking_entries[@]}" -gt 0 ]; then
-        printf '\n### Breaking changes\n\n'
-        printf '%s\n' "${breaking_entries[@]}"
-    fi
-    if [ "${#feat_entries[@]}" -gt 0 ]; then
-        printf '\n### Features\n\n'
-        printf '%s\n' "${feat_entries[@]}"
-    fi
-    if [ "${#fix_entries[@]}" -gt 0 ]; then
-        printf '\n### Fixes\n\n'
-        printf '%s\n' "${fix_entries[@]}"
-    fi
-    if [ "${#other_entries[@]}" -gt 0 ]; then
-        printf '\n### Other changes\n\n'
-        printf '%s\n' "${other_entries[@]}"
-    fi
+    # --no-merges so the count matches the sections: cliff.toml skips merges.
+    printf '%d commit(s) since %s.\n\n' \
+        "$range_commits" "$base_tag"
+    # git-cliff reads the repository from its working directory, so run it in
+    # $REPO (which --repo may have pointed elsewhere) while --config and the
+    # wrapper stay absolute. The awk trims git-cliff's leading/trailing blanks.
+    ( cd "$REPO" && "$CLIFF" --config "$cliff_config" "$base_tag..$REV" --tag "$next" ) \
+        | awk '{ line[NR] = $0 } $0 != "" { if (!first) first = NR; last = NR }
+               END { for (i = first; i <= last; i++) print line[i] }'
 }
 
 case "$MODE" in
@@ -324,8 +280,8 @@ case "$MODE" in
     notes)
         if [ -n "$NOTES_FILE" ]; then
             emit_notes >"$NOTES_FILE"
-            printf 'next-version: wrote release notes for %s (%d commits since %s) to %s\n' \
-                "${package_version:-$next}" "$n_commits" "$base_tag" "$NOTES_FILE" >&2
+            printf 'next-version: wrote release notes for %s (%s bump, since %s) to %s\n' \
+                "${package_version:-$next}" "$level" "$base_tag" "$NOTES_FILE" >&2
         else
             emit_notes
         fi
@@ -341,12 +297,9 @@ case "$MODE" in
         declared_core="${package_version%%-*}"
         declared_core="${declared_core%%+*}"
         if [ "$(semver_cmp "$declared_core" "$next")" = lt ]; then
-            reason="$n_fix fix/perf commit(s)"
-            [ "$level" = minor ] && reason="$n_feat feat commit(s): $(printf '%s; ' "${feat_drivers[@]}" | sed 's/; $//')"
-            [ "$level" = major ] && reason="$n_breaking breaking change(s)"
-            die "package.version $package_version is behind the commits since $base_tag, which require a $level bump to at least $next ($reason) — bump $CARGO_TOML"
+            die "package.version $package_version is behind the $range_commits commit(s) since $base_tag, which require a $level bump to at least $next — bump $CARGO_TOML"
         fi
         printf 'next-version: package.version %s satisfies the %d commit(s) since %s (%s bump, at least %s) and is greater than the newest tag %s\n' \
-            "$package_version" "$n_commits" "$base_tag" "$level" "$next" "$newest_tag"
+            "$package_version" "$range_commits" "$base_tag" "$level" "$next" "$newest_tag"
         ;;
 esac

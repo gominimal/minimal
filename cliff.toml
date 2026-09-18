@@ -1,0 +1,71 @@
+# cliff.toml — release-notes config for git-cliff.
+#
+# Renders the grouped sections of a release's notes, reproducing what
+# scripts/next-version.sh used to hand-roll: markdown grouped as
+# Breaking changes / Features / Fixes / Other changes, each entry keeping its
+# scope, PR reference, and short sha. The title and the "N commit(s) since
+# <tag>" line are emitted by next-version.sh, which knows the range base.
+#
+# Invoked through scripts/git-cliff.sh, which pins the binary. The range and
+# the version are supplied by next-version.sh on the command line.
+
+[changelog]
+header = ""
+# git-cliff trims leading whitespace on every rendered line by default, which
+# flattens the two-space indent that continues a breaking-change footer under
+# its bullet. Off, so the notes keep the shape the shell script produced.
+trim = false
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}### {{ group | striptags | trim }}
+
+{% for commit in commits %}- {% if commit.scope %}**{{ commit.scope }}**: {% endif %}{{ commit.message }} ({{ commit.id | truncate(length=8, end="") }})
+{% if commit.breaking %}{% for footer in commit.footers %}{% if footer.token == "BREAKING CHANGE" or footer.token == "BREAKING-CHANGE" %}
+{{ footer.token }}: {{ footer.value }}
+{% endif %}{% endfor %}{% endif %}{% endfor %}
+{% endfor %}"""
+footer = ""
+
+# The 0.x rule: a feature is always a minor, and a breaking change is a minor
+# while the major is 0 (the shell script detected breaking changes and rendered
+# them first, but never let one move the number past what its type did). Set
+# breaking_always_bump_major = true at GA; next-version.sh's
+# NEXT_VERSION_ALLOW_MAJOR=1 does exactly that override.
+[bump]
+features_always_bump_minor = true
+breaking_always_bump_major = false
+
+[git]
+# A release is cut by promoting a draft tag, and every other tag in the repo is
+# noise for the notes: `vendor/…-20260901` markers, `release-<sha>`. Only plain
+# SemVer release tags count, and pre-release tags (`v0.6.0-rc1`) are excluded
+# too: the range base is the newest FINAL, so a final's notes and bump cover
+# everything since the previous final, not just the last rc — the same rule
+# next-version.sh applies to its own base_tag.
+tag_pattern = "v[0-9]+\\.[0-9]+\\.[0-9]+$"
+topo_order = false
+sort_commits = "oldest"
+# Off deliberately: the shell script listed a non-Conventional commit under
+# "Other changes" rather than dropping it, and a nightly range can contain one.
+filter_unconventional = false
+filter_commits = false
+
+# First match wins, and a commit lands in exactly one group. Breaking changes
+# are exclusive to their own section, as they were in the shell script.
+commit_parsers = [
+  # A merge carries no change of its own (main is squash-merged).
+  { message = "^Merge", skip = true },
+
+  # `type(scope)!: description` — the `!` is REQUIRED here; without it this
+  # parser would swallow every conventional commit.
+  { message = "^[a-z]+(\\([^)]*\\))?!:", group = "<!-- 0 -->Breaking changes" },
+
+  # A `BREAKING CHANGE:`/`BREAKING-CHANGE:` footer under a plain subject — the
+  # entry a subject-line filter drops.
+  { footers = "^BREAKING[ -]CHANGE", group = "<!-- 0 -->Breaking changes" },
+
+  { message = "^feat", group = "<!-- 1 -->Features" },
+
+  { message = "^fix|^perf", group = "<!-- 2 -->Fixes" },
+
+  { message = ".*", group = "<!-- 3 -->Other changes" },
+]
