@@ -243,6 +243,10 @@ Redemption
   verify:   cargo nextest run -p bep prop_host_header_mismatch_is_refused
   property: for every connection authority, every `Host` value and every request-target authority (the connection authority itself for an origin-form request), substitution happens only when all three are equal
   harness:  kani_redeem_pins_request_authority, same bound and purity constraint as BEP-019
+  - IF a connection negotiates HTTP/2 (ALPN `h2`) THEN THE SYSTEM SHALL refuse it at the listener, before any request is read or any substitution.
+    tier:   T0
+    verify: cargo nextest run -p bep http2_connection_is_refused_at_listener
+    <!-- the networking spec limits the initial proxy to HTTP/1.1 and WebSockets (03-spec-networking Non-Goals); HTTP/2 carries `:authority` rather than `Host`, so refusing it keeps BEP-023's authority pinning total over every supported request form -->
 
 - **BEP-024** IF a sealed value's expiry has passed, or the value has been revoked THEN THE SYSTEM SHALL refuse the request.
   tier:     T2
@@ -257,10 +261,10 @@ Redemption
   harness:  kani_redeem_refuses_unbounded_member, same bound and purity constraint as BEP-019
   <!-- Gatehouse §6.4 makes `breadth` required and fail-closed; the local envelope is the same by ruling -->
 
-- **BEP-025** WHEN a request carrying a sealed value passes every redemption check THE SYSTEM SHALL replace the sealed value with the member's credential and forward the request to the connection authority.
+- **BEP-025** WHEN a request carrying a sealed value passes every redemption check THE SYSTEM SHALL replace the sealed value with the member's credential and forward the request to the connection authority, only after BEP-055's upstream validation has succeeded.
   tier:     T2
   verify:   cargo nextest run -p bep prop_admit_iff_every_check_passes
-  property: for every redemption input, the decision is Admit exactly when every check of BEP-019 to BEP-024, BEP-031, BEP-058 and BEP-064 passes, and Refuse naming the first failing check otherwise
+  property: for every redemption input, the decision is Admit exactly when every check of BEP-019 to BEP-024, BEP-031, BEP-058 and BEP-064 passes, and Refuse naming the first failing check otherwise; Admit is the pre-TLS redemption decision, and forwarding or substitution stays blocked until BEP-055 succeeds
   harness:  kani_redeem_admits_iff_all_checks_pass, same bound and purity constraint as BEP-019
 
 - **BEP-055** WHEN the proxy opens the upstream connection for a flow it terminated THE SYSTEM SHALL validate the upstream certificate chain and hostname against the host's trust store, never against the interception root, before forwarding any request on it or substituting any credential.
