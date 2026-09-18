@@ -1114,6 +1114,78 @@ async fn send_traceparent(channel: &russh::Channel<russh::client::Msg>) {
         .await;
 }
 
+/// Per-probe deadline for the `git rev-parse` calls [`fill_git_info`] runs:
+/// a list response must stay fast even when a session's project sits on a
+/// wedged filesystem.
+const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Probes the git context of `path` for [`minimald_rpc::GitInfo`]: one
+/// `rev-parse` invocation answers the branch, the toplevel, and the git
+/// directory. `--absolute-git-dir` (not `--git-dir`) keeps the worktree
+/// comparison exact — the relative form prints `.git` when `path` is the
+/// toplevel. Anything but a clean success — not a repo, no git binary, a
+/// timeout — yields `None`.
+///
+/// Runs on the host (the CLI/TUI process), not in the daemon: on macOS the
+/// daemon lives in the minvmd guest, where the host's project paths do not
+/// exist and git is not on PATH, so a daemon-side probe always returns
+/// `None`.
+pub async fn probe_git_info(path: &Path) -> Option<minimald_rpc::GitInfo> {
+    let out = tokio::time::timeout(
+        GIT_PROBE_TIMEOUT,
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args([
+                "rev-parse",
+                "--abbrev-ref",
+                "HEAD",
+                "--show-toplevel",
+                "--absolute-git-dir",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut lines = text.lines();
+    let (branch, toplevel, git_dir) = match (lines.next(), lines.next(), lines.next(), lines.next())
+    {
+        (Some(branch), Some(toplevel), Some(git_dir), None) => (branch, toplevel, git_dir),
+        _ => return None,
+    };
+    Some(minimald_rpc::GitInfo {
+        branch: branch.to_string(),
+        repo_root: toplevel.to_string(),
+        is_worktree: git_dir != format!("{toplevel}/.git"),
+    })
+}
+
+/// Fills each entry's `git` field by probing its project path on the host,
+/// in parallel. Entries without a project path are left as `None`.
+pub async fn fill_git_info(entries: &mut [minimald_rpc::ListSessionsEntry]) {
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        let Some(path) = entry.project_path.as_ref() else {
+            continue;
+        };
+        let path = path.as_utf8_path().as_std_path().to_path_buf();
+        set.spawn(async move { (idx, probe_git_info(&path).await) });
+    }
+    while let Some(res) = set.join_next().await {
+        if let Ok((idx, git)) = res {
+            entries[idx].git = git.map(Box::new);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Client, resolve_socket_path};
@@ -1266,5 +1338,80 @@ mod tests {
         let assertion = |override_set: bool| (!override_set).then(|| version::VERSION.to_string());
         assert_eq!(assertion(false).as_deref(), Some(version::VERSION));
         assert_eq!(assertion(true), None);
+    }
+
+    /// `probe_git_info` answers branch and toplevel for a plain repo, the
+    /// worktree flag for a linked worktree, and `None` for a non-repo
+    /// directory. Skipped where no git binary exists.
+    #[tokio::test]
+    async fn probe_git_info_reports_branch_toplevel_and_worktree() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: no git binary in this environment");
+            return;
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["commit", "--allow-empty", "-m", "initial"]);
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("wt");
+        git(&[
+            "worktree",
+            "add",
+            "-b",
+            "feature",
+            wt_path.to_str().unwrap(),
+        ]);
+        let plain = tempfile::tempdir().unwrap();
+
+        // `--show-toplevel` canonicalizes; tempdir paths may pass through
+        // symlinks (/var → /private/var on macOS).
+        let repo_root = std::fs::canonicalize(repo.path()).unwrap();
+        let repo_info = super::probe_git_info(repo.path())
+            .await
+            .expect("repo must have git info");
+        assert_eq!(repo_info.branch, "main");
+        assert_eq!(
+            std::fs::canonicalize(&repo_info.repo_root).unwrap(),
+            repo_root
+        );
+        assert!(!repo_info.is_worktree);
+
+        let wt_info = super::probe_git_info(&wt_path)
+            .await
+            .expect("worktree must have git info");
+        assert_eq!(wt_info.branch, "feature");
+        assert!(wt_info.is_worktree, "linked worktree must be flagged");
+
+        assert_eq!(
+            super::probe_git_info(plain.path()).await,
+            None,
+            "non-repo must probe to None"
+        );
     }
 }
