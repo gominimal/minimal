@@ -69,6 +69,9 @@ jobs:
           private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
           owner: gominimal
           repositories: foundry
+          # Scoped to what the token is actually used for: a read-only,
+          # sparse-checkout of gominimal/foundry (zizmor github-app audit).
+          permission-contents: read
 
       - name: Check out the linter (gominimal/foundry@main)
         id: linter
