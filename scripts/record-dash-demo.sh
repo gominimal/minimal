@@ -14,7 +14,8 @@
 #                     (default: three branches verified to exist on origin
 #                     at the time this script was written; pass your own if
 #                     any have since been merged/deleted)
-#   SESSION_PREFIX   session name prefix (default: demo)
+#   SESSION_PREFIX   session name prefix (default: none, the branch slug is the name)
+#   RENDER           set to 0 to stop after the cast (a host without fonts cannot run agg)
 #   OUT              output gif path (default: docs/public/dash-demo.gif)
 #   KEEP             set to 1 to keep DEMO_DIR and the sessions after a run
 set -euo pipefail
@@ -25,13 +26,15 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEMO_DIR="${DEMO_DIR:-$(mktemp -d /tmp/min-dash-demo.XXXXXX)}"
 REPO_URL="${REPO_URL:-https://github.com/gominimal/minimal.git}"
 BRANCHES="${BRANCHES:-main chore/vale-lint oss/integration}"
-SESSION_PREFIX="${SESSION_PREFIX:-demo}"
+SESSION_PREFIX="${SESSION_PREFIX:-}"
+RENDER="${RENDER:-1}"
 OUT="${OUT:-$REPO_ROOT/docs/public/dash-demo.gif}"
 KEEP="${KEEP:-0}"
 
 # Matches the loadout-demo.cast terminal geometry (docs/public/loadout-demo.cast).
-COLS=90
-ROWS=25
+# Wide enough for the 32 % session pane to show a branch beside each name.
+COLS=120
+ROWS=22
 export COLS ROWS
 MAX_GIF_BYTES=4194304 # 4 MB README asset budget
 
@@ -49,7 +52,7 @@ cleanup() {
     [ -n "$name" ] && min session destroy "$name" -f >/dev/null 2>&1
   done
   if [ "$KEEP" = "1" ]; then
-    echo "KEEP=1: leaving $DEMO_DIR and its sessions in place"
+    echo "KEEP=1: leaving $DEMO_DIR in place (sessions destroyed)"
   else
     rm -rf "$DEMO_DIR"
   fi
@@ -93,7 +96,7 @@ git clone --quiet --bare "$REPO_URL" "$DEMO_DIR/_source.git"
 for branch in "${branch_array[@]}"; do
   safe_name="${branch//\//-}"
   checkout_dir="$DEMO_DIR/$safe_name"
-  session_name="${SESSION_PREFIX}-${safe_name}"
+  session_name="${SESSION_PREFIX:+${SESSION_PREFIX}-}${safe_name}"
 
   echo "==> Cloning $branch into $checkout_dir (plain clone, not a worktree)"
   git clone --quiet --branch "$branch" --single-branch "$DEMO_DIR/_source.git" "$checkout_dir"
@@ -134,8 +137,6 @@ DRIVER="$DEMO_DIR/driver.sh"
 cat >"$DRIVER" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-min session list
-sleep 2
 python3 "$SCRIPT_DIR/record-dash-pty.py" 8
 EOF
 chmod +x "$DRIVER"
@@ -162,6 +163,11 @@ else
     --overwrite \
     --title "min dash" \
     "$CAST"
+fi
+
+if [ "$RENDER" = "0" ]; then
+  echo "==> RENDER=0: cast left at $CAST; render elsewhere with agg"
+  exit 0
 fi
 
 echo "==> Rendering $OUT with agg"
