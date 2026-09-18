@@ -1,7 +1,7 @@
 [upstream] # Source of software & tooling
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
-locked_commit = "ff15baa9a765148b7ec28f18b1019e12adeaa4da"
+locked_commit = "f4de33d06dada4edcf5076dded10e9c303cf597e"
 
 [stack]
 use = "rust"
@@ -21,7 +21,7 @@ runtime_packages = [
 state_key = "dev"
 
 [session]
-packages = ["just", "shellcheck", "python"]
+packages = ["just", "shellcheck", "python", "cargo-nextest"]
 
 [tasks.build]
 description = "Builds the minimal CLI"
