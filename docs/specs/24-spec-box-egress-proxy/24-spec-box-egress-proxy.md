@@ -51,7 +51,7 @@ the one module, a sealed member minted by the device-flow `min auth login`,
 redemption with every check, the local audit log with its one-shot `min box
 audit <box>` read, and `min box spec` showing the CA and the upstream set. The
 demo box declares `github:user-token`, the honest spelling of a `full` member,
-so the slice also exercises `min box spec`'s over-broad flag. Keychain
+so the slice also exercises `min box spec`'s `full` marker (BEP-038). Keychain
 references with `min secret`, `dns` steering, the browser sign-in flow, `min box
 audit --follow` and `--parent`, audit segment rotation, signing-CA rotation, the
 PAC recipe and `host_ip` cohort handling are later slices.
@@ -165,8 +165,8 @@ Steering and the interception CA
 - **BEP-013** WHEN a box connects to an admitted credentialed hostname through the proxy THE SYSTEM SHALL present a leaf certificate for that hostname that chains to the host root CA through the host's one signing CA, whose name constraints equal the union of the credentialed upstream sets every box on the host declares.
   tier:     T1
   verify:   cargo nextest run -p bep prop_signing_ca_constraints_equal_declared_union
-  property: for every family of declared credentialed upstream sets on a host, the signing CA's permitted-names constraint equals their union, a leaf for a name in the union validates against the root, and a leaf for any name outside the union fails validation
-  <!-- Gatehouse §6.10 un-enrolled bullet: the host-generated CA is name-constrained to the union of the host's declared credentialed upstream sets, exactly as the enrolled intermediate; one keychain-held signing CA per host (BEP-014, BEP-059 to BEP-061), not one per box; a box's own reach within the union is bounded by its egress declaration (BEP-022) and its sealed values' host sets (BEP-021) -->
+  property: for every family of declared credentialed upstream sets on a host, the signing CA's permitted-names constraint equals their union, a leaf for a name in the union validates against the root, a leaf for any name outside the subtrees the union permits fails validation, and the proxy issues leaves for names in the union alone
+  <!-- Gatehouse §6.10 un-enrolled bullet: the host-generated CA is name-constrained to the union of the host's declared credentialed upstream sets, exactly as the enrolled intermediate; one keychain-held signing CA per host (BEP-014, BEP-059 to BEP-061), not one per box; X.509 permitted subtrees admit a name's subdomains (RFC 5280 §4.2.1.10), so exact admission is by leaf issuance, never by the constraint alone; a box's own reach within the union is bounded by its egress declaration (BEP-022) and its sealed values' host sets (BEP-021) -->
 
 - **BEP-014** THE SYSTEM SHALL hold the signing CA private key in the host keychain as a non-exportable key and write it to no file.
   tier:     T0
@@ -193,6 +193,7 @@ Steering and the interception CA
 - **BEP-015** WHILE a box with steering `proxy_env` holds a sealed GitHub member THE SYSTEM SHALL complete `git clone`, `git push` and `gh api` against a private repository of the signed-in account with no tool configuration in the box beyond what the box carries at creation.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_git_and_gh_against_private_repo
+  <!-- a clone's pack fetch is served by `github.com` itself over the smart HTTP protocol, inside the host set; release assets and archive downloads redirect to `objects.githubusercontent.com`, ordinary egress a box lists in `[network.bep] no_proxy` under `proxy_env` (Gatehouse §6.10: `NO_PROXY` is the compatibility lever) -->
 
 - **BEP-016** WHERE a box spec declares a credentialed upstream and no `steering` THE SYSTEM SHALL resolve `steering` to `dns`.
   tier:     T0
@@ -362,6 +363,10 @@ Review, audit and revocation
 - **BEP-038** WHEN `min box spec` is run for an entry declaring a credentialed upstream THE SYSTEM SHALL render the root CA fingerprint, the derived upstream set for each grant, the resolved steering mode, and each store reference with its registered authorities.
   tier:     T0
   verify:   cargo nextest run -p minimal box_spec_renders_ca_upstreams_steering_and_references
+  - WHEN `min box spec` renders a grant whose member is `full` breadth THE SYSTEM SHALL mark the grant `full` beside its declared scope.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_spec_marks_full_breadth_member
+    <!-- event-driven; the marker the first slice exercises with `github:user-token`; BEP-057's acknowledged case renders the acknowledgement beside the same marker -->
 
 - **BEP-039** WHEN the proxy admits or refuses a request THE SYSTEM SHALL append one JSONL record under the `min/v1` audit schema carrying its `kind`, the subject box, `act` and `txn` left empty, the upstream authority, the member or store identifier or `none`, the mapped resource and permission or `module_unmapped`, the decision and any marker.
   tier:     T0
@@ -512,10 +517,10 @@ client presents the Minimal-published GitHub App, and the App's registration is
 the member's ceiling: a GitHub App user token is the App's permissions
 intersected with the user's and with the installations the user holds, expires
 in 8 hours and renews on GitHub's refresh token, which is where BEP-002's
-refresh material and BEP-005's bound come from. The App must be installed on
-the account or organization whose repositories the token should reach, surfaced
-at first sign-in. Two alternatives were considered. Enforcing the repository
-set in the proxy by mapping request paths to repositories was rejected because
+refresh material and BEP-005's bound come from. The App must be installed on the
+account or organization whose repositories the token should reach, surfaced at
+first sign-in. Two alternatives were considered. Enforcing the repository set in
+the proxy by mapping request paths to repositories was rejected because
 Gatehouse §6.10 rules that the proxy refuses only on its own invariants and
 never on endpoint mapping, and because GraphQL and repository-less endpoints
 would be unmapped. Having the user create a fine-grained token in GitHub's UI
@@ -526,7 +531,7 @@ scopes is refused un-enrolled unless the operator acknowledges the widening
 against the local App under the embedded client secret, with the non-scoped
 token never leaving the host keychain (Gatehouse §14.4 item 7). The demo box
 declares `github:user-token` rather than setting the acknowledgement, because
-that is the honest spelling of the member and it exercises the over-broad flag.
+that is the honest spelling of the member and it exercises the `full` marker.
 **`source = "broker"` names the local grant.** The grammar is kept so a spec is
 unchanged at enrollment; Gatehouse §6.2, §6.3, §8.3 and §6.10 carry the
 un-enrolled form. A new source value was rejected because it forces every spec
