@@ -195,6 +195,9 @@ pub struct Config {
     /// Drop `CAP_NET_RAW` from the sandboxed process's capability bounding set
     /// before it execs. This removes the ability to open raw sockets even if the
     /// process later gains privileges inside its user namespace.
+    ///
+    /// Defaults to `true`; the diagnostics for the applied set are available via
+    /// [`Sandbox::process_capabilities`](crate::Sandbox::process_capabilities).
     pub drop_cap_net_raw: bool,
 }
 
