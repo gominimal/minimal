@@ -1,10 +1,10 @@
 ---
 id: 1453
 title: "SP1: Does the macOS loopback alias step hold across a reboot?"
-status: partial
+status: proved
 date: 2026-09-18
 budget_hours: 16
-actual_hours: 0.8
+actual_hours: 2.5
 related:
   - "issue #1453 (this spike, SP1 of the box-networking plan)"
   - "issue #1437 (NET epic)"
@@ -372,9 +372,142 @@ line, not launchd state, is the evidence that it ran; the scripts now say so.
 `since_boot` on this run is the host's uptime and means nothing until the
 reboot.
 
-### 7. Reboot and after (pending)
+### 7. Reboot and after (done)
 
-## Left for a person with root
+`sudo reboot` at 00:43 local, login, then `verify-after-reboot.sh` from the
+repository root:
+
+```
+## boot time
+{ sec = 1789717410, usec = 313873 } Fri Sep 18 00:43:30 2026
+## launchd state (LaunchOnlyOnce: 'Could not find service' means it ran and exited)
+Could not find service "dev.minimal.loopback" in domain for system
+## alias count
+254
+## daemon log
+dev.minimal.loopback: 2026-09-18T07:36:43Z since_boot=143946s added=254 present=254/254 on lo0
+dev.minimal.loopback: 2026-09-18T07:43:54Z since_boot=24s added=254 present=254/254 on lo0
+## bind probe, every address in the range (expect 254 OK, plus 127.0.0.1 and ::1)
+127.0.64.254   OK                                               port=51106       5.7 us
+total 256 probes in 2.53 ms
+254
+## alias timing relative to boot (unified log, first 3 minutes after boot)
+2026-09-18 00:43:54.251 Df launchd[1:12bd] [system:] service inactive: dev.minimal.loopback
+2026-09-18 00:43:54.251 Df launchd[1:12bd] [system:] removing service: dev.minimal.loopback
+## resolver
+  domain   : min.internal
+  nameserver[0] : 127.0.0.1
+  port     : 15353
+  reach    : 0x00030002 (Reachable,Local Address,Directly Reachable Address)
+```
+
+The job ran and finished 24 s after the kernel started, before the login
+window, and all 254 addresses were on `lo0` and bindable at first login. The
+hypothesis' "within a second of boot" was about the script's own run time
+(under 0.4 s, section 2); the 24 s is launchd reaching the system daemons on a
+cold boot and is earlier than any session could start. `kern.boottime` and
+`since_boot` are measured from the same clock, so the daemon log is the
+timing record; the unified log only shows launchd dropping the launch-once
+job.
+
+### 8. Two boxes on one port, three browsers (done)
+
+Stand-in answerer (`answerer.py`, beside this document) on `127.0.0.1:15353`
+answering `a.min.internal` with `127.0.64.10` and `b.min.internal` with
+`127.0.64.11`; two `python3 -m http.server 18080` bound to those addresses,
+serving `box-a` and `box-b`.
+
+```
+$ dscacheutil -q host -a name a.min.internal
+name: a.min.internal
+ip_address: 127.0.64.10
+$ dscacheutil -q host -a name b.min.internal
+name: b.min.internal
+ip_address: 127.0.64.11
+$ curl -s -w " [%{remote_ip} %{time_total}s]\n" http://a.min.internal:18080/
+box-a
+ [127.0.64.10 0.605859s]
+$ curl -s -w " [%{remote_ip} %{time_total}s]\n" http://b.min.internal:18080/
+box-b
+ [127.0.64.11 0.650319s]
+$ cat answerer.log
+63533 a.min.internal. type=28 -> rcode=0
+63768 _dns.resolver.arpa. type=64 -> rcode=3
+51980 a.min.internal. type=1 -> 127.0.64.10
+56672 b.min.internal. type=28 -> rcode=0
+65206 b.min.internal. type=1 -> 127.0.64.11
+```
+
+Same port, two names, two addresses, the right body from each. The 0.6 s on
+the first `curl` is resolution, not the fetch: the scoped resolver asks AAAA
+first, then a DDR probe (`_dns.resolver.arpa` SVCB), then A; a repeat by name
+is served from the system cache with no answerer traffic. The real answerer
+should answer AAAA with an empty NOERROR as the stand-in does, or the resolver
+waits for it.
+
+| browser | a.min.internal | b.min.internal | load |
+|---|---|---|---|
+| Chrome (default profile, via the browser extension) | `box-a` from 127.0.64.10 | `box-b` from 127.0.64.11 | instant; server log shows `GET /` and the favicon request |
+| Safari (default profile) | `box-a` from 127.0.64.10 | `box-b` from 127.0.64.11 | instant once the answerer sent SOA-bearing negatives (section 9); the first attempt, before that fix, never painted |
+| Firefox (fresh install, DoH at default) | `box-a` from 127.0.64.10 | `box-b` from 127.0.64.11 | instant; no DoH change needed |
+
+Box logs for the Safari and Firefox rounds, one `GET /` per page load, each from
+its own address:
+
+```
+127.0.64.10 - - [18/Sep/2026 01:08:52] "GET / HTTP/1.1" 200 -
+127.0.64.10 - - [18/Sep/2026 01:09:41] "GET / HTTP/1.1" 200 -
+127.0.64.11 - - [18/Sep/2026 01:09:00] "GET / HTTP/1.1" 200 -
+127.0.64.11 - - [18/Sep/2026 01:09:48] "GET / HTTP/1.1" 200 -
+```
+
+Query types the resolver sent the answerer across the browser rounds: A, AAAA
+and HTTPS (type 65), plus one DDR probe (`_dns.resolver.arpa` SVCB) earlier.
+
+### 9. The stand-in answerer took the whole resolver down
+
+Safari's first load of `a.min.internal` resolved through the answerer (an A
+and an AAAA query logged at 00:52) and the box served `GET /` with 200, but
+Safari never painted the page. Minutes later two Chrome tabs opened by hand
+spun with no query reaching the answerer and no request reaching either box,
+`curl` by name timed out at 5 s, and a download from `mozilla.org` failed:
+every lookup on the host, scoped or not, had stopped. The answerer process
+was alive and idle in `recvfrom`. Killing the answerer and the two servers and
+running `dscacheutil -flushcache` restored general resolution at once
+(`mozilla.org` in 0.7 s).
+
+A second answerer with raw packet logging and a watchdog (kill it when a
+general lookup stalls) answered every query it received in 0 ms, and `dig`
+against it directly shows well-formed replies (`qr aa rd ra`, one A record,
+empty NOERROR for AAAA, NXDOMAIN for an unknown name), yet the system took
+6.6 s and 32.9 s to return `a.min.internal`, and 31 s to return nothing for
+`b.min.internal` although the answerer had sent its A record instantly. The
+resolver also asked for HTTPS (type 65) records first. The unified log for
+`mDNSResponder` is empty to an unprivileged reader, so the resolver's own
+account is not available here; the state was cleared with a root
+`killall -HUP mDNSResponder`.
+
+After the root `killall -HUP mDNSResponder` the stall came straight back: each
+scoped lookup hung 60 s and the watchdog killed the stand-ins when general
+lookups stalled too. The cause was the answerer's negative replies. They
+carried no SOA record in the authority section, so the resolver had nothing
+to cache for "no AAAA record" and kept the query open, and while that query
+was open every other lookup on the host waited behind it. With an SOA in the
+authority section of every NODATA and NXDOMAIN reply (RFC 2308) the first
+lookups took 5.1 s and 3.7 s, cached ones under 1.2 s, fetches by name under
+a second, general resolution was untouched, and all three browsers painted
+both boxes.
+
+What this says for the real answerer: the earlier native-DNS spike recorded a
+60 s hang when the answerer is down; this run shows that a reachable answerer
+whose negatives are not cacheable stalls every lookup on the host, scoped or
+not. The answerer must send an SOA with every negative reply, answer AAAA
+and HTTPS with an empty NOERROR rather than NXDOMAIN, and be tested against
+`mDNSResponder` with the query types it actually sends (A, AAAA, HTTPS, and
+the DDR probe `_dns.resolver.arpa` SVCB). The advisory that installs the
+resolver file must not run before the answerer is listening.
+
+## The root procedure, as run
 
 Run from the repository root (Artifacts lists every file). The
 password prompt happens once at the first `sudo`; nothing afterwards prompts.
@@ -444,11 +577,20 @@ for n in $(seq 1 254); do sudo ifconfig lo0 -alias 127.0.64.$n; done
 
 # Conclusion
 
-**Status: partial.** The mechanism is the right one and nothing measured here
-argues against the hypothesis; the reboot itself, the boot timing and the
-three-browser check need a person with root and are laid out above.
+**Status: proved.** A root LaunchDaemon installed by the advisory command
+re-applies the reserved range on `lo0` at boot: after a reboot all 254
+addresses were present and bindable 24 s after the kernel started, before the
+login window, and two boxes published on the same port at two range addresses
+loaded by name in Safari, Chrome and Firefox. The `127.0.0.1` interim is a
+temporary per-host state, as the spec assumes, and T10 and T11 keep their
+macOS half. The open question closes on this run; design 12 item 13 flips to
+measured.
 
-What is established without root:
+One finding beside the question: a scoped answerer whose negative replies
+carry no SOA stalls every DNS lookup on the Mac (section 9). That is a
+requirement on the answerer, not on the alias step.
+
+What was established without root:
 
 1. On a stock macOS 26 host `lo0` carries `127.0.0.1` only; every range address
    fails `bind` with `EADDRNOTAVAIL` in microseconds, so NET-123's probe is
@@ -468,13 +610,10 @@ What is established without root:
 5. The artifacts (plist, idempotent script with a since-boot stamp, resolver
    file) lint clean and are ready to install.
 
-What the root run decides: whether the `RunAtLoad` job completes before a
-session could plausibly start (the `since_boot` figure), and whether the three
-browsers resolve range addresses through the scoped resolver as they did
-`127.0.0.1` in the earlier spike. If both hold, the interim is confirmed as a
-temporary per-host state and the open question closes. If the timing is poor,
-the mechanism still holds and NET-123's interim covers the window; only if the
-daemon fails to run at all does the assumption fail.
+What the root run decided: the `RunAtLoad` job completed 24 s after the kernel
+started and long before a session could start, and the three browsers resolved
+range addresses through the scoped resolver and loaded the right box from each.
+The interim is a temporary per-host state and the open question closes.
 
 # Action items
 
@@ -498,8 +637,15 @@ daemon fails to run at all does the assumption fail.
 6. In the design 7.1 mechanism bullet, record that the plist runs a root-owned
    script (not literal `ifconfig` arguments) because 254 addresses do not fit
    one `ProgramArguments`, and that the script's only inputs are literals.
-7. After the root run, append its output to this document, set the status to
-   `proved` or `disproved`, and flip design 12 item 13 accordingly.
+7. Flip design 12 item 13 to measured, pointing at this document.
+8. In the answerer task (T9, issue #1460), send an SOA in the authority section
+   of every NODATA and NXDOMAIN reply, answer AAAA and HTTPS with an empty
+   NOERROR, and add a test that drives `mDNSResponder` through the scoped
+   resolver with A, AAAA, HTTPS and the DDR probe and asserts that an
+   unrelated name still resolves in under a second meanwhile.
+9. In T10, order the advisory's install so the resolver file is written only
+   after the answerer is listening, since a scoped resolver with no answerer
+   or a bad one takes every lookup on the host with it.
 
 # Artifacts
 
@@ -603,6 +749,11 @@ for a in addrs:
     print(f"{a:<14} {r:<48} {'port='+str(port) if port else '':<12} {us:7.1f} us")
 print(f"total {len(addrs)} probes in {(time.perf_counter()-t_all)*1e3:.2f} ms")
 ```
+
+## `answerer.py` (no install; the stand-in answerer for the browser check)
+
+Beside this document. A UDP DNS server on `127.0.0.1:15353` with a fixed
+table, SOA-bearing negatives, raw packet logging. Not the real answerer.
 
 ## `verify-after-reboot.sh` (no install; run after the reboot, no root)
 
