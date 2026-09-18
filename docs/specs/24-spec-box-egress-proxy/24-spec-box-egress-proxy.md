@@ -4,7 +4,7 @@ title: Local Box Egress Proxy — sealed GitHub credentials and host-store secre
 owner: norrietaylor
 epic: gominimal/inbox#625
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
-updated: 2026-09-17
+updated: 2026-09-18
 ---
 
 # BEP — Local Box Egress Proxy — sealed GitHub credentials and host-store secrets without Gatehouse
@@ -72,14 +72,14 @@ recipe and `host_ip` cohort handling are later slices.
 
 Sign-in
 
-- **BEP-001** WHERE no Gatehouse is configured, WHEN `min auth login` is run THE SYSTEM SHALL complete the GitHub device flow under the Minimal-published GitHub App and report the signed-in account.
+- **BEP-001** WHERE no Gatehouse is configured, WHEN `min auth login` is run with no flow flag or with `--device` THE SYSTEM SHALL complete the GitHub device flow under the Minimal-published GitHub App and report the signed-in account.
   tier:     T0
   verify:   cargo nextest run -p minimal auth_login_completes_device_flow_and_reports_account
-  <!-- Gatehouse §6.10 un-enrolled bullet: device flow is the reference profile; the App's registration is the member's ceiling -->
-  - WHEN `min auth login` is run with the browser flow selected THE SYSTEM SHALL complete the authorization-code flow with PKCE under the same App and report the signed-in account.
+  <!-- Gatehouse §6.10 un-enrolled bullet: device flow is the reference profile; the App's registration is the member's ceiling; the command tree's `--device` is accepted as the explicit spelling of this default (Design reasoning) -->
+  - WHEN `min auth login --browser` is run THE SYSTEM SHALL complete the authorization-code flow with PKCE under the same App and report the signed-in account.
     tier:   T0
     verify: cargo nextest run -p minimal auth_login_completes_browser_pkce_flow
-    <!-- additive; the embedded public client secret is a recorded decision, rationale in Gatehouse §6.10; the flag spelling follows the command tree -->
+    <!-- additive; the embedded public client secret is a recorded decision, rationale in Gatehouse §6.10; `--browser` is this document's flag for the un-enrolled case, where the command tree's bare verb describes the enrolled default (Design reasoning) -->
 
 - **BEP-002** WHEN a GitHub sign-in completes THE SYSTEM SHALL store the token and refresh material in the host keychain and in no file under the project or the box.
   tier:     T0
@@ -255,18 +255,19 @@ Redemption
   property: for every redemption input, the decision is Admit exactly when every check of BEP-019 to BEP-024, BEP-031, BEP-058 and BEP-064 passes, and Refuse naming the first failing check otherwise
   harness:  kani_redeem_admits_iff_all_checks_pass, same bound and purity constraint as BEP-019
 
-- **BEP-055** WHEN the proxy opens the upstream connection for a request that will carry a substituted credential THE SYSTEM SHALL validate the upstream certificate chain and hostname against the host's trust store, never against the interception root, before substituting.
+- **BEP-055** WHEN the proxy opens the upstream connection for a flow it terminated THE SYSTEM SHALL validate the upstream certificate chain and hostname against the host's trust store, never against the interception root, before forwarding any request on it or substituting any credential.
   tier:     T1
   verify:   cargo nextest run -p bep prop_upstream_tls_validated_before_substitution
-  property: for every upstream chain and every connection authority, substitution happens only when the chain validates against the host trust store for that authority; a chain rooted in the interception root, an expired chain, or a hostname mismatch is refused before substitution
-  <!-- a resolver or route compromise at an allowed name otherwise receives the real credential, the theft the sealing exists to end -->
+  property: for every upstream chain and every connection authority, a request is forwarded on a terminated flow, and a credential substituted, only when the chain validates against the host trust store for that authority; a chain rooted in the interception root, an expired chain, or a hostname mismatch is refused before any forwarding
+  <!-- a resolver or route compromise at an allowed name otherwise receives the real credential, the theft the sealing exists to end; BEP-030's passthrough rides the same leg, so a box's own credential is validated no less than a direct connection would be -->
   - IF upstream validation fails THEN THE SYSTEM SHALL refuse the request and record an audit event marked `upstream_tls_invalid`.
     tier:   T0
     verify: cargo nextest run -p bep upstream_tls_failure_is_refused_and_audited
 
-- **BEP-026** IF a request carrying a sealed value arrives from a connection that is not a box attachment on this host THEN THE SYSTEM SHALL refuse the request.
+- **BEP-026** IF a connection arrives that is not a box attachment on this host THEN THE SYSTEM SHALL refuse it at the listener, sealed value or not.
   tier:     T0
   verify:   cargo nextest run -p bep host_shell_connection_is_refused
+  <!-- Gatehouse §6.10: a connection attempt outside any node association is refused at the listener; the proxy is a credential proxy for boxes, never a general egress proxy for the host -->
 
 - **BEP-027** THE SYSTEM SHALL deliver sealed values that `api.github.com` rejects as a credential when presented directly.
   tier:     T0
@@ -422,9 +423,9 @@ Setting secrets
   tier:     T0
   verify:   cargo nextest run -p minimal secret_set_stores_in_keychain_and_prints_id_only
   <!-- the architecture's `min secret` reference: one grammar, the store deciding which fields are the caller's; the host's native store is the macOS Keychain here, the Linux default waits on the store roster -->
-  - IF the value is supplied as a command-line argument THEN THE SYSTEM SHALL refuse the command and name the terminal and standard input as the accepted sources.
+  - IF the value is supplied as a command-line argument or through an environment-variable flag THEN THE SYSTEM SHALL refuse the command and name the terminal and standard input as the accepted sources.
     tier:   T0
-    verify: cargo nextest run -p minimal secret_set_refuses_value_argument
+    verify: cargo nextest run -p minimal secret_set_refuses_value_argument_and_env_flag
   - IF the command runs with no terminal and no standard input THEN THE SYSTEM SHALL fail immediately.
     tier:   T0
     verify: cargo nextest run -p minimal secret_set_without_tty_or_stdin_fails_immediately
@@ -455,7 +456,7 @@ Setting secrets
 - The Gatehouse-hosted proxy, the enrolled `gateway` helper, the tenant secret store and the revocation feed: [GHI](https://github.com/gominimal/gatehouse/pull/1), Gatehouse §6.10, §6.11, §8.6. With a Gatehouse configured, `min` delegates sign-in, minting and sealing to it; nothing here forecloses that and the envelope is the same.
 - Repository narrowing of a locally minted GitHub member: later work, the §6.4 scoped-token endpoint against the local App under the embedded client secret (Gatehouse §14.4 item 7); an open question below records the residual meanwhile.
 - An in-box re-mint path for a locally minted member: none exists un-enrolled, since there is no `identity.sock`; members are creation-time snapshots and a box that outlives its member's expiry is re-created to re-mint (Gatehouse §8.3). BEP-024 refuses the expired value; the local re-mint surface is Gatehouse §14.4 item 7.
-- The box-zone resolver, DNS-pinned admission, `network.mode` and the `[network]` table's egress fields: [NET](https://github.com/gominimal/minimal/pull/1380) (NET-060, NET-066, NET-072, NET-122). This document owns `[network.bep]` (`steering`, `proxy_env`, `no_proxy`) and `quic443`; the rest of the `[network]` schema is gominimal/inbox#570.
+- The box-zone resolver, DNS-pinned admission, `network.mode` and the `[network]` table's egress fields: [NET](https://github.com/gominimal/minimal/pull/1380) (NET-060, NET-066, NET-072, NET-122). This document owns `[network.bep]` (`steering`, `proxy_env`, `no_proxy`) and `quic443`; the rest of the `[network]` schema is [gominimal/inbox#570](https://github.com/gominimal/inbox/issues/570).
 - `min secret` against the Gatehouse tenant store (deposits): Gatehouse §8.6 and the architecture's `min secret` reference; here the noun binds host stores only and refuses `--store gatehouse` (BEP-050), and the two forms share one grammar.
 - `min login` as the alias for `min auth login`: the command tree; the daemon-mTLS meaning the verb carries today is retired by NET (NET-109).
 - The `:7654` hostname proxy's own parity obligations: NET-069 to NET-071.
@@ -523,17 +524,23 @@ of existing specs at the flip; requiring an explicit mode was rejected because
 it privileges neither mode and adds a validation error the architecture does
 not have.
 
-**Sign-in and audit verbs.** `min auth login | logout | status` and the `min
-box audit` grammar follow the command tree; `login` is the tree's alias for
-`min auth login`, and NET retires the daemon-mTLS meaning the verb carries
-today. The device flow is the default and the browser flow additive because the
-device flow needs no client secret while GitHub's web flow requires one at the
-code exchange; the embedded public secret and its rationale are Gatehouse
-§6.10's. `min box audit self` is refused un-enrolled in v1: there is no
-`identity.sock`, and a relay through minimald to the proxy is a new socket
+**Sign-in and audit verbs.** `min auth login | logout | status` and the `min box
+audit` grammar follow the command tree; `login` is the tree's alias for `min
+auth login`, and NET retires the daemon-mTLS meaning the verb carries today.
+Un-enrolled, the bare verb runs the device flow and `--browser` selects the
+browser flow; the command tree's prose describes the enrolled default the other
+way round, browser flow bare and `--device` the opt-in. The decision follows
+Gatehouse §6.10, which makes the device flow the reference profile and the
+browser flow additive: the device flow needs no client secret, the first slice
+ships it alone, and a bare verb whose meaning changed when the additive flow
+landed would move under scripts. `--device` is accepted as the explicit spelling
+of the default so the tree's flag keeps working, and the tree gains `--browser`
+for the un-enrolled case. The embedded public secret and its rationale are
+Gatehouse §6.10's. `min box audit self` is refused un-enrolled in v1: there is
+no `identity.sock`, and a relay through minimald to the proxy is a new socket
 surface for one verb, so it waits for the local surface Gatehouse §14.4 item 7
-names. `--follow` and `--parent` are bound now and built in a later slice so
-the grammar does not change under scripts.
+names. `--follow` and `--parent` are bound now and built in a later slice so the
+grammar does not change under scripts.
 **The proxy is its own crate.** The verify lines name `bep`: a host-side crate
 beside the switch, with the shipped `:7654` router's head-parsing core shared
 or copied as the plan sees fit. Extending the router in place was rejected
@@ -678,5 +685,5 @@ AT7 and AT25 (architecture threat model).
 ## Open questions
 
 - [NEEDS CLARIFICATION (MEDIUM): When does local repository narrowing land? The path is recorded, the §6.4 scoped-token endpoint against the local App under the embedded client secret (Gatehouse §14.4 item 7), and until it does the member is `full` breadth and the T28 residual is the signed-in account's manifest-capped reach for at most 8 hours.]
-- [NEEDS CLARIFICATION (MEDIUM): Does every intended client accept the sealed handle as its bearer unmodified? Claude Code with an OAuth token and MCP clients send `Authorization: Bearer <value>`, which BEP-032 substitutes, but a client that validates token shape before sending, or sends the credential in a header the rule does not name, needs the harness adapter (gominimal/inbox#345); unmeasured, a plan spike.]
+- [NEEDS CLARIFICATION (MEDIUM): Does every intended client accept the sealed handle as its bearer unmodified? Claude Code with an OAuth token and MCP clients send `Authorization: Bearer <value>`, which BEP-032 substitutes, but a client that validates token shape before sending, or sends the credential in a header the rule does not name, needs the harness adapter ([gominimal/inbox#345](https://github.com/gominimal/inbox/issues/345)); unmeasured, a plan spike.]
 - [NEEDS CLARIFICATION (MEDIUM): On a Linux LocalVM host, which key store holds the signing CA key as non-exportable (TPM 2.0 via a PKCS#11 provider, or Secret Service without hardware backing)? BEP-014 is written over "the host keychain"; the plan carries a spike, and until it lands the Linux host is unverified for BEP-014.]
