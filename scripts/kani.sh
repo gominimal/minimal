@@ -105,6 +105,12 @@ elif [ -n "$btver" ] && [ -z "$btsrc" ]; then
     # skipping mutely: a lane that then fails on E0659 is one read from
     # diagnosed instead of three nights of guessing.
     echo "WARNING: backtrace-$btver not unpacked in the cargo registry — E0659 workaround SKIPPED" >&2
+elif [ -n "$btver" ]; then
+    # Source present, call site no longer matching. Two futures reach here
+    # and the log cannot tell them apart: backtrace fixed the call (delete
+    # this block) or merely reformatted it (the pattern needs widening, and
+    # the build is about to say E0659). Name both rather than pass over it.
+    echo "NOTE: backtrace-$btver no longer matches the patched call site — E0659 workaround not applied; delete this block if upstream fixed it, widen the pattern if the proof build now fails on E0659" >&2
 fi
 
 cd "$ws"
