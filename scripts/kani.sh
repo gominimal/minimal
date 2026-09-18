@@ -3,20 +3,22 @@
 # crates: rcache (index_file untrusted-bytes parse path) and sessions
 # (PathDecision combination lattice).
 #
-# Install: cargo install --locked kani-verifier --version 0.67.0
+# Install: cargo install --locked kani-verifier --version 0.68.0
 #          && cargo kani setup
-# Pin EXACTLY 0.67.0+: older releases give spurious verification
-# failures on arrays >64 elements (kani#2416/#4408) — one wire record
-# is 68 bytes.
+# Pin EXACTLY 0.68.0+, for two reasons. Releases older than 0.67.0 give
+# spurious verification failures on arrays >64 elements
+# (kani#2416/#4408) — one wire record is 68 bytes. And 0.68.0 is the
+# first release whose bundled toolchain (nightly-2026-08-21, rustc
+# 1.100.0-nightly) sits above the workspace's declared rust-version
+# floor: cargo hard-errors on that floor and cargo-kani exposes no
+# --ignore-rust-version, so 0.67.0's 1.93-nightly needed the floor
+# patched down before it would build this tree at all.
 #
-# MSRV note, and why the scratch copy exists: Kani 0.67.0 bundles a
-# 1.93-nightly toolchain, numerically below the workspace's declared
-# rust-version floor. The gate is declarative only — the nightly
-# compiles this tree fine (all proofs verify) — but cargo hard-errors
-# on the floor and cargo-kani exposes no --ignore-rust-version. Until
-# Kani ships a >=floor toolchain, run from a scratch copy with the
-# floor relaxed. The copy includes uncommitted changes (rsync of the
-# working tree, not a git checkout) so local iteration works.
+# Why the scratch copy exists: the backtrace workaround below rewrites
+# Cargo.toml to add a [patch.crates-io] entry, and that must not touch
+# the real tree. It is an rsync of the working tree rather than a clean
+# checkout, so uncommitted changes are proved too and local iteration
+# works.
 #
 # Sequential on purpose: -j once OOMed CBMC running four byte-level
 # harnesses at once; the whole suite solves in seconds sequentially.
@@ -43,10 +45,6 @@ trap cleanup EXIT INT TERM
 
 rsync -a --exclude target --exclude .git --exclude .claude --exclude .scratch \
     --exclude 'crates/*/fuzz/corpus' ./ "$ws/"
-
-# Relax the single workspace-level floor (every crate inherits it).
-sed -i.kani-bak 's/^package\.rust-version = "[0-9.][0-9.]*"/package.rust-version = "1.90"/' "$ws/Cargo.toml"
-rm -f "$ws/Cargo.toml.kani-bak"
 
 # Kani builds every crate against its own `std` shim (passed as
 # `--extern std=$KANI/lib/libstd.rlib`), which `#[macro_export]`s Kani's
@@ -135,7 +133,16 @@ expect() { # crate expected_count
     # tee masks cargo's status (no pipefail in sh): the count grep below
     # is the gate, and a failed run cannot print the success line.
     grep -q "Complete - $2 successfully verified harnesses, 0 failures" "$log" || {
-        echo "FATAL: expected $2 verified harnesses in $1 — vacuous or failing lane" >&2
+        # Say which kind of failure this is: a dependency that will not
+        # build is not a proof regression, though the count message reads
+        # like one (three canary nights were read that way). A log with no
+        # rustc error — `cargo kani` missing, or dead before compiling —
+        # falls through to the count message, which fits that case.
+        if grep -q '^error: could not compile' "$log"; then
+            echo "FATAL: $1 proof build failed to COMPILE — not a proof result; see the rustc error above" >&2
+        else
+            echo "FATAL: expected $2 verified harnesses in $1 — vacuous or failing lane" >&2
+        fi
         exit 1
     }
 }
