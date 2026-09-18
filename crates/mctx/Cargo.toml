@@ -12,6 +12,7 @@ check.workspace = true
 codespan-reporting.workspace = true
 google-cloud-auth.workspace = true
 google-cloud-storage.workspace = true
+thiserror.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
 tempfile.workspace = true
