@@ -697,6 +697,17 @@ on this host and are reproduced here in full.
 
 ## `dev.minimal.loopback.sh` (install to `/Library/PrivilegedHelperTools/`, root:wheel 0755)
 
+One correction since the run: the skip guard builds `present` with `printf
+"%s "` rather than `print`, so the addresses are space-separated. `awk`'s
+`print` emitted one per line, and `case " $present " in *" $addr "*` only
+matches an address bounded by spaces, so the guard never fired and a re-run
+re-issued all 254 `ifconfig` calls. It is inert for everything measured here —
+both recorded runs started with no range alias on `lo0`, so every address took
+the alias branch either way, and `added=254 present=254/254` is what the
+unguarded loop and the fixed one both produce — but the header's idempotence
+claim and action item 10's retry both rest on the guard working, so it is
+fixed here rather than left as a trap for whoever installs this.
+
 ```sh
 #!/bin/sh
 # dev.minimal.loopback: re-apply the reserved local range 127.0.64.0/24 on lo0.
@@ -708,7 +719,7 @@ set -u
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
 IFACE=lo0
 PREFIX=127.0.64
-present=$(ifconfig "$IFACE" inet 2>/dev/null | awk '$1 == "inet" { print $2 }')
+present=$(ifconfig "$IFACE" inet 2>/dev/null | awk '$1 == "inet" { printf "%s ", $2 }')
 added=0
 n=1
 while [ "$n" -le 254 ]; do

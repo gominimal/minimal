@@ -8,7 +8,7 @@ set -u
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
 IFACE=lo0
 PREFIX=127.0.64
-present=$(ifconfig "$IFACE" inet 2>/dev/null | awk '$1 == "inet" { print $2 }')
+present=$(ifconfig "$IFACE" inet 2>/dev/null | awk '$1 == "inet" { printf "%s ", $2 }')
 added=0
 n=1
 while [ "$n" -le 254 ]; do
