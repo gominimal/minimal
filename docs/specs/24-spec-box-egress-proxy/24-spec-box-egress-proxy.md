@@ -90,7 +90,7 @@ Sign-in
 - **BEP-003** WHILE a GitHub sign-in is held, WHEN a box declaring a GitHub grant is created THE SYSTEM SHALL create it without prompting for sign-in.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_second_box_needs_no_sign_in
-  - IF a box declaring a GitHub grant is created while no GitHub sign-in is held THEN THE SYSTEM SHALL fail the creation with the defined error `github_sign_in_required` and prompt for no sign-in.
+  - IF a box declaring a GitHub grant is created while no GitHub sign-in is held THEN THE SYSTEM SHALL fail the creation with the defined error `github_sign_in_required` and not prompt for sign-in.
     tier:   T0
     verify: cargo nextest run -p sessions creation_without_sign_in_fails_with_defined_error
     <!-- Gatehouse §6.2 v1.20 leaves the error name to this document; distinct from `gatehouse_unenrolled_node`, which stays the refusal where no proxy exists -->
@@ -127,6 +127,10 @@ Minting and sealing
 - **BEP-010** IF a box spec declares `steering = "off"` and a GitHub grant THEN THE SYSTEM SHALL create the box with no interception CA injected and emit a validation warning naming the grant.
   tier:     T0
   verify:   cargo nextest run -p sessions steering_off_with_grant_warns_and_injects_no_ca
+  - IF a box spec declares `steering = "off"` and `[network.bep] proxy_env = true` THEN THE SYSTEM SHALL refuse the expansion with exit 3 naming both fields.
+    tier:   T0
+    verify: cargo nextest run -p sessions steering_off_with_proxy_env_is_refused
+    <!-- design §5.4 composes `proxy_env` with any steering mode, but `off` also disables CA injection, so an environment pointing at the proxy would fail every TLS handshake; the combination is unbuildable and is refused rather than warned -->
 
 - **BEP-056** WHERE the host is not enrolled, IF a box spec declares a GitHub grant with `mode = "installation"` THEN THE SYSTEM SHALL refuse expansion with exit 3 naming the grant.
   tier:     T1
@@ -233,10 +237,10 @@ Redemption
   property: for every egress declaration and every authority, the proxy admits only when the declaration admits the authority, whether or not the request carries a sealed value
   harness:  kani_redeem_requires_egress_admission, same bound and purity constraint as BEP-019
 
-- **BEP-023** IF a request's `Host` header differs from the connection authority it arrived on THEN THE SYSTEM SHALL refuse the request before substitution.
+- **BEP-023** IF a request's `Host` header, or the authority of an absolute-form request target, differs from the connection authority it arrived on THEN THE SYSTEM SHALL refuse the request before substitution.
   tier:     T2
   verify:   cargo nextest run -p bep prop_host_header_mismatch_is_refused
-  property: for every connection authority and every `Host` value, substitution happens only when the two are equal
+  property: for every connection authority, every `Host` value and every request-target authority (the connection authority itself for an origin-form request), substitution happens only when all three are equal
   harness:  kani_redeem_pins_request_authority, same bound and purity constraint as BEP-019
 
 - **BEP-024** IF a sealed value's expiry has passed, or the value has been revoked THEN THE SYSTEM SHALL refuse the request.
@@ -272,7 +276,7 @@ Redemption
   verify:   cargo nextest run -p bep host_shell_connection_is_refused
   <!-- Gatehouse §6.10: a connection attempt outside any node association is refused at the listener; the proxy is a credential proxy for boxes, never a general egress proxy for the host -->
 
-- **BEP-027** THE SYSTEM SHALL deliver sealed values that `api.github.com` rejects as a credential when presented directly.
+- **BEP-027** THE SYSTEM SHALL seal values in a form that `api.github.com` rejects as a credential when presented directly.
   tier:     T0
   verify:   cargo nextest run -p bep --run-ignored ignored-only sealed_value_rejected_by_github
 
@@ -306,10 +310,14 @@ Store references
   tier:     T0
   verify:   cargo nextest run -p bep store_value_read_per_request_never_written
 
-- **BEP-063** WHEN a store reference is minted for a box THE SYSTEM SHALL issue a handle signed under the client's local key carrying the store, the identifier, the registered upstream authorities, the injection form and a short expiry, and register that key with the proxy over the local socket at first use.
+- **BEP-063** WHEN a store reference is minted for a box THE SYSTEM SHALL issue a handle signed under the client's local key carrying the store, the identifier, the registered upstream authorities, the injection form and a short expiry, and register that key with the proxy over the proxy's control socket at first use.
   tier:     T0
   verify:   cargo nextest run -p minimal store_handle_signed_and_key_registered
-  <!-- Gatehouse §6.10 store members, un-enrolled: the client signs handles in the store-handle wire format under its local key -->
+  <!-- Gatehouse §6.10 store members, un-enrolled: the client signs handles in the store-handle wire format under its local key; the control socket is the local UDS of §6.2's same-machine trust, distinct from the redemption listener BEP-026 closes to non-box connections -->
+  - THE SYSTEM SHALL accept key registration and audit submissions only over a control socket owned by the operator's user with mode `0600`, separate from the redemption listener.
+    tier:   T0
+    verify: cargo nextest run -p bep control_socket_is_owner_only_and_separate_from_listener
+    <!-- ubiquitous; the operator's own processes are the trust boundary un-enrolled (Gatehouse §6.2), and the redemption listener stays closed to them (BEP-026) -->
 
 - **BEP-064** IF a store handle's signature does not verify under a registered client key, its expiry has passed, its `upstream` is not a subset of the current rule for its store and identifier, or its `inject` differs from that rule's THEN THE SYSTEM SHALL refuse the request and record an audit event marked `store_handle_invalid`.
   tier:     T2
@@ -355,15 +363,15 @@ Review, audit and revocation
   verify:   cargo nextest run -p bep every_decision_appends_one_audit_record
   <!-- the F12 shape by ruling (Gatehouse §6.10 Audit bullet, v1.20.1); `kind` tells a proxy decision from an identity event once the host enrolls; off-module and unsealed records carry `none` -->
 
-- **BEP-067** WHEN the client mints a member or `min auth logout` completes THE SYSTEM SHALL append a record of kind `mint` or `revocation` to the same log.
+- **BEP-067** WHEN the client mints a member or `min auth logout` completes THE SYSTEM SHALL append a record of kind `mint` or `revocation` to the same log through the proxy, the log's sole writer, over the control socket.
   tier:     T0
   verify:   cargo nextest run -p minimal mint_and_logout_append_audit_records
-  <!-- so a box's trail reads the same un-enrolled and enrolled, where the STS pipeline carries the box's identity events -->
+  <!-- so a box's trail reads the same un-enrolled and enrolled, where the STS pipeline carries the box's identity events; one writer means the head read, the append and the chain advance are one operation in one process, so concurrent client and proxy records cannot share a predecessor -->
 
 - **BEP-040** THE SYSTEM SHALL write no credential, injected header value, or request body to the audit log.
   tier:     T1
   verify:   cargo nextest run -p bep prop_audit_records_never_contain_secrets
-  property: for every two requests identical in every BEP-039 field and differing only in body, the serialized records are identical; and every record field is derived from the BEP-039 field set, which carries neither the member credential nor the store value, so for every request carrying a credential or store value S of at least 16 bytes, S is not a substring of any record it produces
+  property: for every two requests identical in every BEP-039 field and differing only in body, the serialized records are identical apart from BEP-048's chain field; and every record field is derived from the BEP-039 field set and the chain field alone, which carry neither the member credential, the store value, an injected header value nor the body
 
 - **BEP-041** THE SYSTEM SHALL open the audit log for append only and modify or remove no existing record.
   tier:     T0
@@ -410,16 +418,17 @@ Review, audit and revocation
   tier:     T0
   verify:   cargo nextest run -p minvmd bep_and_gvproxy_are_separate_processes_and_users
 
-- **BEP-048** WHEN a record is appended to the audit log THE SYSTEM SHALL include in it the hash of the previous record.
+- **BEP-048** WHEN a record is appended to the audit log THE SYSTEM SHALL include in it, as `previous_hash`, the SHA-256 of the previous record's serialized line, the UTF-8 JSON bytes without the trailing newline, or the all-zero hash for the first record of a log.
   tier:     T0
   verify:   cargo nextest run -p bep audit_record_carries_previous_hash
+  <!-- the construction the writer, the verifier, the segment rotator (BEP-068) and the harness (BEP-049) share: the hash covers the whole previous line, its own `previous_hash` included; F12 fixes the fields, this document fixes the bytes -->
 
 - **BEP-049** IF an audit log's records were altered or removed without recomputing every hash that follows THEN THE SYSTEM SHALL report the chain as failing verification in `min doctor`.
   tier:     T2
   verify:   cargo nextest run -p bep prop_audit_chain_detects_unrecomputed_edit
-  property: for every sequence of records, the chain built from it verifies, and every sequence obtained by altering or removing one record without recomputing the hashes that follow fails verification
+  property: for every sequence of records, the chain built from it verifies, and every sequence obtained by altering or removing one record that has a successor, without recomputing the hashes that follow, fails verification
   harness:  kani_audit_chain_detects_edit, exhaustive to 4 records of at most 64 bytes; requires chaining and verification to be pure functions over bytes, separate from the file writer
-  <!-- what a bare chain detects; an edit followed by recomputation is the T31 residual; whole-log verification is a `min doctor` check, never an `audit` flag -->
+  <!-- what a bare chain detects; an edit followed by recomputation, and alteration or removal of the terminal record, are the T31 residual; whole-log verification is a `min doctor` check, never an `audit` flag -->
 
 Setting secrets
 
