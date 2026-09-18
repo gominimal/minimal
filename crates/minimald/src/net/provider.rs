@@ -408,4 +408,59 @@ mod tests {
         }
         assert_eq!(switch.lock().await.attached(), 0);
     }
+
+    /// NET-038. A `--network none` box plans an isolated namespace with no tap
+    /// and no resolver — the only interface is a down `lo` — so every socket
+    /// it opens to a destination outside itself is refused before it leaves
+    /// the box. Planning must not even touch the switch: with nothing to lease
+    /// there is nothing to attach.
+    #[tokio::test]
+    async fn network_none_blocks_all_outside_sockets() {
+        let switch = counting_switch();
+        let net = network_for(NetworkMode::NoNet, &switch, "s", None);
+
+        let plan = net
+            .plan()
+            .await
+            .expect("a none box plans without the switch");
+        assert!(
+            plan.isolates_netns(),
+            "a none box must run in its own network namespace"
+        );
+        assert!(plan.tap().is_none(), "a none box must not build a tap");
+        assert_eq!(
+            plan.resolver(),
+            &Resolver::None,
+            "a none box must not write a resolver it could use to reach out"
+        );
+        assert_eq!(
+            switch.lock().await.attached(),
+            0,
+            "a none box leases nothing from the switch"
+        );
+    }
+
+    /// NET-039. A `--network none` box still accepts attach: the attach is a
+    /// no-op beyond the plan, succeeds without any switch wiring, and the
+    /// returned guard tears down cleanly — with the switch count unmoved.
+    #[tokio::test]
+    async fn network_none_attach_works() {
+        let switch = counting_switch();
+        let net = network_for(NetworkMode::NoNet, &switch, "s", None);
+        net.plan()
+            .await
+            .expect("a none box plans without the switch");
+
+        let guard = net
+            .attach(Spawned::new(4242))
+            .await
+            .expect("attaching to a none box must succeed");
+        guard.teardown().await;
+
+        assert_eq!(
+            switch.lock().await.attached(),
+            0,
+            "a none box's attach must not move the switch count"
+        );
+    }
 }

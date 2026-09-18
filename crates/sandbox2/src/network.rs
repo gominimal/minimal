@@ -295,3 +295,33 @@ pub(crate) fn noop_guard() -> Box<dyn NetGuard> {
     }
     Box::new(NoopGuard)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `none` box plans a fresh, empty network namespace: no tap, no
+    /// resolver. The only interface is a down `lo`, so every socket the box
+    /// opens to a destination outside itself is refused before it leaves the
+    /// namespace (NET-038). The provider's no-op attach — the NET-039 half,
+    /// asserted at the daemon layer in `minimald` — is where a none box
+    /// proves it still accepts attach.
+    #[tokio::test]
+    async fn no_net_plan_isolates_netns() {
+        let plan = NoNet
+            .plan()
+            .await
+            .expect("a none box plans without reserving anything");
+
+        assert!(
+            plan.isolates_netns(),
+            "a none box must run in its own network namespace"
+        );
+        assert!(plan.tap().is_none(), "a none box gets no tap");
+        assert_eq!(
+            plan.resolver(),
+            &Resolver::None,
+            "a none box gets no resolver"
+        );
+    }
+}
