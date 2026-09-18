@@ -183,12 +183,28 @@ echo "==> Rendering $OUT with agg"
 # No --theme: like the loadout-demo render, this relies on the cast's own
 # embedded theme so the two gifs share a look. --speed 1.2 is a fresh choice
 # for this recording, not something matched from loadout-demo.
+# Drop the idle lead-in before the dash's first paint (asciinema starts the
+# clock at process start, and the dash takes a moment to talk to the daemon),
+# and hold the final frame so the loop rests on the dash.
+python3 - "$CAST" <<'PY'
+import json, sys
+path = sys.argv[1]
+lines = open(path).read().splitlines()
+events = [json.loads(l) for l in lines[1:] if l.strip()]
+if events:
+    t0 = max(events[0][0] - 0.05, 0)
+    with open(path, "w") as f:
+        f.write(lines[0] + "\n")
+        for t, k, d in events:
+            f.write(json.dumps([round(max(t - t0, 0), 4), k, d]) + "\n")
+PY
 agg \
   --cols "$COLS" \
   --rows "$ROWS" \
   --font-size 16 \
   --line-height 1.3 \
   --speed 1.2 \
+  --last-frame-duration 4 \
   "$CAST" "$OUT"
 
 gif_bytes=$(wc -c <"$OUT" | tr -d ' ')

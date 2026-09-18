@@ -55,11 +55,18 @@ fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 # parent: fd is the pty master for the `min dash` child
 quit_at = time.monotonic() + dwell
 sent_quit = False
+# Select the first row after a second so the right pane shows a session
+# instead of "no session selected".
+select_at = time.monotonic() + 1.0
+sent_select = False
 hard_deadline = quit_at + 15  # safety cap: don't let a hung dash wedge recording
 
 try:
     while time.monotonic() < hard_deadline:
         now = time.monotonic()
+        if not sent_select and now >= select_at:
+            os.write(fd, b"\x1b[B")  # Down
+            sent_select = True
         if not sent_quit and now >= quit_at:
             if os.environ.get("DASH_EXIT", "kill") == "quit":
                 os.write(fd, QUIT_KEY)
