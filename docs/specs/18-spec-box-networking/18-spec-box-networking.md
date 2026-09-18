@@ -182,14 +182,14 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimald abrupt_client_loss_keeps_task
     <!-- S1b-2c; prose 10; unwanted; client loss splits on the PTY, not on the verb: a lost PTY attach is a detach; in this tree the entrypoint is the session's shell -->
-  - IF the client of a non-PTY exec (`min session exec`, and the `min task run` or `min session run` command it carries) is lost abruptly THEN THE SYSTEM SHALL end the command that exec spawned and keep the box running.
+  - IF the client of a non-PTY exec (`min session exec`, and the `min task run` or `min session run` command it carries) is lost abruptly THEN THE SYSTEM SHALL end the command that exec spawned and keep the box running; a box created for that run then ends under NET-131.
     tier:   T0
     verify: cargo nextest run -p minimald lost_exec_client_kills_only_its_own_process
-    <!-- S1b-2c; unwanted; every exec in this tree is non-PTY (a pty-req on the exec channel is logged and ignored), so the rule as scoped is the shipped behaviour; the PTY exec the architecture defines is a re-attachable attach and falls under the sub-requirement above -->
-  - THE SYSTEM SHALL stop a box only when its client issues stop, destroy, or delete, when its entrypoint exits (subject to the exit prompt), or when the box host tears it down by force: daemon shutdown, an abandoned launch, or the host reclaiming the VM.
+    <!-- S1b-2c; unwanted; a pty-req on the exec channel is refused at the channel, so no exec in this tree runs with a PTY and the rule as scoped is the shipped behaviour; the PTY exec the architecture defines is a re-attachable attach and falls under the sub-requirement above -->
+  - THE SYSTEM SHALL stop a box only when its client issues stop, destroy, or delete, when its entrypoint exits (subject to the exit prompt), or, for a box created for a run, when the run's command exits (NET-131), or when the box host tears it down by force: daemon shutdown, an abandoned launch, or the host reclaiming the VM.
     tier:   T0
     verify: cargo nextest run -p minimald box_has_no_idle_stop
-    <!-- S1b-2c; ubiquitous within the WHILE; the idle and stop policy is the client's (Design reasoning); a declared execution timeout is the client's policy, set at creation, and is not built here -->
+    <!-- S1b-2c; ubiquitous within the WHILE; the idle and stop policy is the client's (Design reasoning); a declared execution timeout is the client's policy, set at creation, and is not built here; "end" is this tree's destroy, and the architecture retains a completed box's record until reaped so a wait can read the exit code after the client is gone -->
 
 - **NET-131** WHILE a box was created for a non-detached run, WHEN the run's command exits THE SYSTEM SHALL end the box, whether or not the client that started the run is still present.
   tier:     T0
@@ -779,8 +779,9 @@ works whether or not a client is attached" narrower than the epic wrote it. The
 chosen shape makes port publication unconditional and coheres with the
 closed-laptop story elsewhere. **Idle and stop are the client's.** A box ends
 only when its client issues stop, destroy, or delete, when its entrypoint exits
-subject to the exit prompt, or when the box host tears it down by force: daemon
-shutdown, an abandoned launch, or the host reclaiming the VM. A declared
+subject to the exit prompt, when the run it was created for ends (NET-131), or
+when the box host tears it down by force: daemon shutdown, an abandoned launch,
+or the host reclaiming the VM. A declared
 execution ceiling is the client's policy, set at creation. There is no
 daemon-side idle timeout. A daemon idle timeout was
 considered and rejected: it stops a box nobody asked to stop, and it breaks the
