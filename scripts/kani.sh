@@ -59,6 +59,15 @@ rm -f "$ws/Cargo.toml.kani-bak"
 # re-fingerprinted (and its dependents rebuilt) on every run. When a fixed
 # backtrace ships, the `grep` stops matching and this block self-disables —
 # delete it then.
+# Fetch FIRST: the vendored copy is cut from the registry's UNPACKED source,
+# but nothing has run cargo at this point (the first build is the `cargo kani`
+# below), so a registry holding only the `.crate` archive leaves the glob empty
+# and this whole block no-ops — the lane then dies with the very E0659 it
+# exists to prevent. CI's cache is exactly that shape: rust-cache deletes
+# registry/src before saving (everything but `-sys` crates) and restores only
+# registry/cache. `cargo fetch` extracts, and settles Cargo.lock before the
+# version is read out of it.
+(cd "$ws" && cargo fetch)
 btver="$(sed -n '/^name = "backtrace"$/{n;s/^version = "\(.*\)"$/\1/p;}' "$ws/Cargo.lock")"
 btsrc=""
 for d in "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/backtrace-"$btver"; do
@@ -91,6 +100,11 @@ if [ -n "$btver" ] && [ -n "$btsrc" ] &&
         echo "FATAL: no [patch.crates-io] table to carry the backtrace E0659 workaround" >&2
         exit 1
     }
+elif [ -n "$btver" ] && [ -z "$btsrc" ]; then
+    # Unreachable after the fetch above, so say so out loud rather than
+    # skipping mutely: a lane that then fails on E0659 is one read from
+    # diagnosed instead of three nights of guessing.
+    echo "WARNING: backtrace-$btver not unpacked in the cargo registry — E0659 workaround SKIPPED" >&2
 fi
 
 cd "$ws"
