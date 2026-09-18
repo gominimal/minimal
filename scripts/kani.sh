@@ -138,7 +138,12 @@ expect() { # crate expected_count
         # like one (three canary nights were read that way). A log with no
         # rustc error — `cargo kani` missing, or dead before compiling —
         # falls through to the count message, which fits that case.
-        if grep -q '^error: could not compile' "$log"; then
+        # Match the bare phrase, not an `error:` prefix: the lane runs under
+        # CARGO_TERM_COLOR=always, where cargo writes the summary as
+        # `\033[1m\033[91merror\033[0m: could not compile ...` and an escape
+        # sits between `error` and the colon, so neither an anchored nor an
+        # unanchored `error: could not compile` can match.
+        if grep -q 'could not compile' "$log"; then
             echo "FATAL: $1 proof build failed to COMPILE — not a proof result; see the rustc error above" >&2
         else
             echo "FATAL: expected $2 verified harnesses in $1 — vacuous or failing lane" >&2
