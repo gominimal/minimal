@@ -4,7 +4,7 @@ title: Box networking on the local host: preview by name and bounded egress
 owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md
-updated: 2026-09-17
+updated: 2026-09-18
 ---
 
 # NET — Box networking on the local host: preview by name and bounded egress
@@ -147,12 +147,12 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   ./scripts/session-e2e.sh native_resolution_without_proxy_env
   <!-- S1b-1; prose 5; optional-feature; "any browser" sharpened to "any process resolving through the host resolver" -->
 
-- **NET-010** WHEN an own-address or `none` box is published THE SYSTEM SHALL assign it a host loopback address of its own from the host-global allocation and publish its ports at the box's own port numbers.
+- **NET-010** WHERE the reserved local range is present on the host, WHEN an own-address or `none` box is published THE SYSTEM SHALL assign it a host loopback address of its own from the host-global allocation and publish its ports at the box's own port numbers.
   tier:     T2
   verify:   cargo nextest run -p minimald each_box_gets_own_loopback_address
-  property: for every sequence of publish and withdraw operations from every daemon on the host, up to 8 live boxes, no two live own-address or `none` boxes hold the same loopback address
+  property: for every host with the reserved local range present and every sequence of publish and withdraw operations from every daemon on it, up to 8 live boxes, no two live own-address or `none` boxes hold the same loopback address
   harness:  kani_loopback_alloc_injective, exhaustive to 8 live boxes across daemons; requires the allocator to be a pure function over one host-wide owned set of leased addresses, separate from the publish call and from any daemon's own state
-  <!-- S1b-2a; prose 6; event-driven; the no-collision clause is the universal for spec-tiers; "host-global" per design §7.1: allocation is arbitrated through the answerer's authenticated channel and no daemon self-assigns; host-address boxes mirror their node's address (NET-129) -->
+  <!-- S1b-2a; prose 6; event-driven; the no-collision clause is the universal for spec-tiers; "host-global" per design §7.1: allocation is arbitrated through the answerer's authenticated channel and no daemon self-assigns; host-address boxes mirror their node's address (NET-129); a host without the range publishes at `127.0.0.1` under NET-123's interim, outside this requirement -->
 
 - **NET-011** WHEN a session is finalised THE SYSTEM SHALL register `<name>.min.internal` for the box's loopback address.
   tier:     T0
@@ -425,7 +425,7 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald denied_range_resolution_refused
   property: for every resolved answer set and every allow, deny, and infrastructure-deny CIDR set, the admitted set contains no denied address
   harness:  kani_rebinding_intersection_admits_no_denied_address, exhaustive to an unwind bound of 4 over IPv4 answers with at most 4 CIDRs per set; requires the intersection to be a pure function over owned addresses and CIDRs, separate from resolver I/O
-  <!-- S8b/AC2; prose 43; unwanted; the infrastructure deny set is design §5.3's: link-local and metadata ranges, loopback space, the `100.64.0.0/10` plane, the gateway's own addresses, and RFC 1918 unless `egress.allow_subnets` covers the answer -->
+  <!-- S8b/AC2; prose 43; unwanted; the infrastructure deny set is design §5.3's: link-local and metadata ranges, loopback space, the `100.64.0.0/10` plane, the gateway's own addresses (un-enrolled, the helper's and the answerer's), and RFC 1918 unless `egress.allow_subnets` covers the answer -->
   - IF an allowed name resolves into a denied range THEN THE SYSTEM SHALL log the name and the answer.
     tier:   T0
     verify: cargo nextest run -p minimald denied_range_resolution_logged
@@ -459,7 +459,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-072** THE SYSTEM SHALL resolve box-zone names with no `egress.allow_dns_hosts` entry.
   tier:     T0
   verify:   cargo nextest run -p minimald box_zone_resolution_needs_no_allow_entry
-  <!-- S8c/AC3; prose 46; ubiquitous; one spelling for the field throughout; design §7.1 writes it `egress_allow_dns` under §5.4's placeholder names -->
+  <!-- S8c/AC3; prose 46; ubiquitous; one spelling for the field throughout; the architecture's canonical Box Spec spelling is `egress_allow_dns` (box.toml), reconciled by the box-spec schema work (Design reasoning) -->
 
 - **NET-073** WHEN a box connects to a box-zone name THE SYSTEM SHALL enforce the target's ingress rules and the source's egress rules at connection time.
   tier:     T0
@@ -578,10 +578,14 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimald declared_ports_bound_before_name_registered
   <!-- S1b-2c; design §7.1 (enforcement parity, bind discipline); event-driven; NET-016 covers ports a permit range allows and no declaration names -->
-  - IF a declared port's ingress is revoked THEN THE SYSTEM SHALL unbind its forwarder.
+  - IF a declared port's ingress is revoked THEN THE SYSTEM SHALL unbind its forwarder and terminate the connections it holds.
     tier:   T0
-    verify: cargo nextest run -p minimald ingress_revocation_unbinds_forwarder
-    <!-- design §7.1; unwanted -->
+    verify: cargo nextest run -p minimald ingress_revocation_unbinds_forwarder_and_terminates_connections
+    <!-- design §7.1: "ingress revocation unbinds and terminates established connections"; unwanted -->
+  - IF a declared port's forwarder cannot bind THEN THE SYSTEM SHALL report the failure with the reason and publish neither the name nor a substitute address for that port.
+    tier:   T0
+    verify: cargo nextest run -p minimald failed_forwarder_bind_is_reported_not_substituted
+    <!-- design §7.1: a failed bind is "a surfaced error, never a silent fallback or a standing-capability grant"; unwanted; NET-020 covers the hostname listener -->
 
 - **NET-122** WHILE the host's native resolver is not configured for the box zone, WHEN a session starts THE SYSTEM SHALL print an advisory naming the exact command that configures it, with no privilege prompt.
   tier:     T0
@@ -644,48 +648,55 @@ included, with every refusal logged (NET-001 to NET-004).
 
 - Public exposure, gateway ingress, and the enrolled dynamic-ingress path over
   the box's identity socket (formerly NET-028 to NET-034 and NET-042):
-  [GWI](https://github.com/gominimal/minimal/pull/1419). - The gateway
-  association, the signed policy feed, the pin and the ceiling, address blocks
-  from the control plane and their heartbeat reporting, relay reach and
-  WireGuard over WebSocket, renumbering, and local names under enrolment
-  (formerly NET-005, NET-008, NET-086 to NET-101, and NET-103):
-  [EHE](https://github.com/gominimal/minimal/pull/1418). - Mesh join, peer
-  documents, remote box names, and `min net forward` against a remote session
-  (formerly NET-106 and NET-112 to NET-119):
-  [MRF](https://github.com/gominimal/minimal/pull/1420). - Box-to-box reach
-  across hosts by named-network grant: MRF's non-goal, blocked on an
-  architecture ruling that has not been made. - An operator recipe for pods as
-  box hosts: EHE's non-goal, destined for the Box Provider API's operator
-  documentation. - Choosing how a box's credentialed traffic finds the Box
-  Egress Proxy (steering mode and HTTP/3 posture), store references, and the
-  client's `[secret-store-rules]` consent: the node-local Box Egress Proxy
-  document; the fields live in the box spec's `[network]` and `[secrets]`
-  sections but the behaviour is the proxy's ([Gatehouse §6.10][gatehouse]). -
-  Host enrolment, the node record's creation, host listing, and revocation: the
-  host-enrolment work (gominimal/inbox#648). No requirement here assumes an
-  enrolled host. - Certificate-authenticated remote attach from the CLI:
-  [CRA](https://github.com/gominimal/minimal/pull/1374). - The daemon as a
-  mesh-reachable session host, the relay tier, and the browser client:
-  [MMI](https://github.com/gominimal/minimal/pull/1356) and
-  [MCC](https://github.com/gominimal/minimal/pull/1355). - Sealed secrets and
-  the hosted Box Egress Proxy: the broker document (gominimal/inbox#625). -
-  BareMetalVM, the sixth deployment style ([architecture, Deployment
+  [GWI](https://github.com/gominimal/minimal/pull/1419).
+- The gateway association, the signed policy feed, the pin and the ceiling,
+  address blocks from the control plane and their heartbeat reporting, relay
+  reach and WireGuard over WebSocket, renumbering, and local names under
+  enrolment (formerly NET-005, NET-008, NET-086 to NET-101, and NET-103):
+  [EHE](https://github.com/gominimal/minimal/pull/1418).
+- Mesh join, peer documents, remote box names, and `min net forward` against a
+  remote session (formerly NET-106 and NET-112 to NET-119):
+  [MRF](https://github.com/gominimal/minimal/pull/1420).
+- Box-to-box reach across hosts by named-network grant: MRF's non-goal, blocked
+  on an architecture ruling that has not been made.
+- An operator recipe for pods as box hosts: EHE's non-goal, destined for the Box
+  Provider API's operator documentation.
+- Choosing how a box's credentialed traffic finds the Box Egress Proxy (steering
+  mode and HTTP/3 posture), store references, and the client's
+  `[secret-store-rules]` consent: the node-local Box Egress Proxy document; the
+  fields live in the box spec's `[network]` and `[secrets]` sections but the
+  behaviour is the proxy's ([Gatehouse §6.10][gatehouse]).
+- Host enrolment, the node record's creation, host listing, and revocation: the
+  host-enrolment work
+  ([gominimal/inbox#648](https://github.com/gominimal/inbox/issues/648)). No
+  requirement here assumes an enrolled host.
+- Certificate-authenticated remote attach from the CLI:
+  [CRA](https://github.com/gominimal/minimal/pull/1374).
+- The daemon as a mesh-reachable session host, the relay tier, and the browser
+  client: [MMI](https://github.com/gominimal/minimal/pull/1356) and
+  [MCC](https://github.com/gominimal/minimal/pull/1355).
+- Sealed secrets and the hosted Box Egress Proxy: the broker document
+  ([gominimal/inbox#625](https://github.com/gominimal/inbox/issues/625)).
+- BareMetalVM, the sixth deployment style ([architecture, Deployment
   Styles][arch]): a metal host's obligations are EHE's; the host-side
   enforcement this document binds (NET-081 to NET-085) is what such a host
-  reuses per VM. - The schema of the box spec's `[network]` fields: the
-  box-spec document (gominimal/inbox#570). NET-060 binds acceptance of four
-  fields, not the schema. - Creating, listing, and choosing VMs as box
-  providers: the Box Provider abstraction (gominimal/arch#45). NET-052 to
-  NET-059 bind only the box-host obligations of a named VM. - The policy feed,
-  ingress-entry authorization, node attributes, address allocation, mesh
-  bindings, and peer documents on the identity plane:
+  reuses per VM.
+- The schema of the box spec's `[network]` fields: the box-spec document
+  ([gominimal/inbox#570](https://github.com/gominimal/inbox/issues/570)).
+  NET-060 binds acceptance of four fields, not the schema.
+- Creating, listing, and choosing VMs as box providers: the Box Provider
+  abstraction ([gominimal/arch#45](https://github.com/gominimal/arch/pull/45)).
+  NET-052 to NET-059 bind only the box-host obligations of a named VM.
+- The policy feed, ingress-entry authorization, node attributes, address
+  allocation, mesh bindings, and peer documents on the identity plane:
   [NPOL](https://github.com/gominimal/gatehouse/blob/main/docs/specs/02-spec-network-policy-plane/02-spec-network-policy-plane.md).
-  - Release notes stating the install-size growth, and documentation naming the
-  exact outbound destinations a box host needs: deliverables of the plan for
-  the VM-stack slices. - Retiring `<name>.local.min.internal`, the literal host
-  address, the legacy flag spellings, and the deny-all opt-out after one
-  release: ordering facts recorded in the plan; the requirements here bind the
-  compatibility behaviour while it exists.
+- Release notes stating the install-size growth, and documentation naming the
+  exact outbound destinations a box host needs: deliverables of the plan for the
+  VM-stack slices.
+- Retiring `<name>.local.min.internal`, the literal host address, the legacy
+  flag spellings, and the deny-all opt-out after one release: ordering facts
+  recorded in the plan; the requirements here bind the compatibility behaviour
+  while it exists.
 
 ## Design reasoning
 
@@ -804,16 +815,18 @@ moment nobody asked for it. The caller retries once a human is attached.
 
 **Field names follow the shipped crate, and three shipped rules are
 superseded.** `dynamic_ingress` (NET-043 to NET-047) is [design §7.1][design]'s
-name for the setting the shipped 03-spec R2.3 called `dynamic_allowed_ports`;
-no crate implements either, so the architecture's name is taken with no
-compatibility clause. The egress fields are bound in the nested spelling the
+name for the setting the shipped 03-spec R2.3 called `dynamic_allowed_ports`; no
+crate implements either, so the architecture's name is taken with no
+compatibility clause. Three egress fields are bound in the nested spelling the
 session crate's `EgressPolicy` carries, `egress.allow_subnets`,
-`egress.allow_protocols`, `egress.allow_dns_hosts` and `egress.deny_subnets`
-(NET-060, NET-066, NET-067, NET-072); the architecture's canonical Box Spec
-fields are the flat `egress_allow_dns`, `egress_allow_subnets` and
-`egress_deny_subnets`
+`egress.allow_protocols` and `egress.allow_dns_hosts` (NET-060, NET-066,
+NET-072); `egress.deny_subnets` (NET-060, NET-067) has no crate counterpart and
+is introduced here, in the same spelling, from design §5.3's
+`egress_deny_subnets`. The architecture's canonical Box Spec fields are the flat
+`egress_allow_dns`, `egress_allow_subnets` and `egress_deny_subnets`
 ([box.toml](https://github.com/gominimal/arch/blob/main/box.toml); design §4.3,
-§5.3, §7.1), and the box-spec schema work (gominimal/inbox#570) owns the
+§5.3, §7.1), and the box-spec schema work
+([gominimal/inbox#570](https://github.com/gominimal/inbox/issues/570)) owns the
 reconciliation. Three shipped rules are superseded: 03-spec R2.1's parse-time
 error for `egress` on a HostNet PTask (NET-120), because the two-address
 classifier (NET-078, design §4.1) gives the host-address cohort an enforcement
@@ -822,17 +835,17 @@ declaration, while NET-065 keeps the rejection for `none` boxes, where there is
 nothing to enforce; R2.1's allow-all default for absent `egress` fields
 (NET-074, inside the window NET-076 and NET-077 bind); and R2.3's
 `dynamic_allowed_ports` (NET-043). **Command tree.** This document binds the
-shipped verbs: `min session activate`, `min session policy`, and `min ls`. The
-architecture's command tree spells them `min session start`, `min box show
---network` with `min box port`, and `min box list`, with `min net status
-[<box>]` for effective rules; the migration to those names is a separate
-change, and the requirements here follow it when it lands without changing
-meaning. `min net expose` and `min net forward` are the tree's own names and
-are new surfaces here. NET-109 retires a surface, not a verb: the reverse
-proxy's daemon-issued client certificates and `min ssh-forward` go, `min login`
-becomes the GitHub sign-in, the alias for `min auth login` that the Box Egress
-Proxy document binds, and identity-plane certificates for remote attach are
-CRA's.
+shipped verbs `min session activate` and `min session policy`. The
+architecture's command tree spells them `min session start` and `min box show
+--network` with `min box port`, with `min net status [<box>]` for effective
+rules; the migration to those names is a separate change, and the requirements
+here follow it when it lands without changing meaning. `min ls` is the tree's
+own alias for `min box list` and needs no migration. `min net expose` and `min
+net forward` are the tree's own names and are new surfaces here. NET-109 retires
+a surface, not a verb: the reverse proxy's daemon-issued client certificates and
+`min ssh-forward` go, `min login` becomes the GitHub sign-in, the alias for `min
+auth login` that the Box Egress Proxy document binds, and identity-plane
+certificates for remote attach are CRA's.
 
 **Lane stories are product behaviours.** The maintainer's lane-assertion story
 became NET-107, whose named test is the lane's outbound-reach assertion; the
@@ -914,27 +927,27 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   covered by: NET-006, NET-007, NET-127
 
 ## Open questions
-
 - [NEEDS CLARIFICATION (HIGH): the macOS mechanism for per-box loopback
   addresses, a root-installed boot re-apply of the reserved range installed by
-  the same advisory command that writes the resolver file (NET-122), is
-  proposed in [design §7.1][design] pending the loopback-alias measurement
-  (design §12 item 13). NET-123 binds the interim: until the step is installed
-  on a host, macOS publishes every box at `127.0.0.1`, and NET-010 binds
-  distinct addresses once it is; the interim is a per-host state, not a
-  platform exception.] - [NEEDS CLARIFICATION (MEDIUM): what is the cgroup
-  layout for the two-address classifier that gives each host-address box its
-  own identity inside the box host (NET-079), and are host-address boxes on a
-  co-resident Linux host in scope of NET-078 to NET-080? [Design §7.4][design]
-  applies the profile's naming and addressing to that host and now permits a
-  node-local Box Egress Proxy inside its boundary at the advisory tier; it says
-  nothing about the classifier.] - [NEEDS CLARIFICATION (MEDIUM): with a box
-  outliving its client (NET-015), who owns the idle and stop policy, and how
-  does it compose with the closed-laptop story in the remote-sessions work?] -
-  [NEEDS CLARIFICATION (LOW): are HTTP/2 and HTTP/3 through any proxy surface
-  in scope? [Design §5.3][design] governs QUIC for egress and leaves the proxy
-  surfaces unaddressed; the local Box Egress Proxy document needs the answer
-  for its steered hosts.]
+  the same advisory command that writes the resolver file (NET-122), is proposed
+  in [design §7.1][design] pending the loopback-alias measurement (design §12
+  item 13). NET-123 binds the interim: until the step is installed on a host,
+  macOS publishes every box at `127.0.0.1`, and NET-010 binds distinct addresses
+  once it is; the interim is a per-host state, not a platform exception.]
+- [NEEDS CLARIFICATION (MEDIUM): what is the cgroup layout for the two-address
+  classifier that gives each host-address box its own identity inside the box
+  host (NET-079), and are host-address boxes on a co-resident Linux host in
+  scope of NET-078 to NET-080? [Design §7.4][design] applies the profile's
+  naming and addressing to that host and now permits a node-local Box Egress
+  Proxy inside its boundary at the advisory tier; it says nothing about the
+  classifier.]
+- [NEEDS CLARIFICATION (MEDIUM): with a box outliving its client (NET-015), who
+  owns the idle and stop policy, and how does it compose with the closed-laptop
+  story in the remote-sessions work?]
+- [NEEDS CLARIFICATION (LOW): are HTTP/2 and HTTP/3 through any proxy surface in
+  scope? [Design §5.3][design] governs QUIC for egress and leaves the proxy
+  surfaces unaddressed; the local Box Egress Proxy document needs the answer for
+  its steered hosts.]
 
 [design]: https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md
 [arch]: https://github.com/gominimal/arch/blob/main/architecture.md
