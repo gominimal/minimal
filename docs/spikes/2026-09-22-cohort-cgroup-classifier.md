@@ -121,9 +121,10 @@ cgroup v1 `meta cgroup` form was not needed and was not tried.
   (`crates/sessions/src/lib.rs:32`) maps to `sandbox2::HostNet`
   (`crates/minimald/src/net/provider.rs:30`), whose plan is `NetPlan::host()`
   with the host resolver (`crates/sandbox2/src/network.rs:266`): no network
-  namespace, no wiring. The daemon's session RPC still rejects an `egress`
-  section on a HostNet box (`crates/minimald/src/rpc.rs:2959`), the rule
-  NET-120 supersedes.
+  namespace, no wiring. A HostNet box still cannot carry an `egress` section:
+  `PTask::validate_policy` returns `PolicyError::EgressRequiresOwnIp`
+  (`crates/sessions/src/lib.rs:486`, asserted over the session RPC at
+  `crates/minimald/src/rpc.rs:2959`), the rule NET-120 supersedes.
 - **The native daemon is unprivileged.** On Linux `min` runs
   `minimald run --detach --instance-num 0` as the invoking user
   (`crates/minimal/src/autospawn.rs:400`); the daemon daemonizes itself with
