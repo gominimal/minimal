@@ -43,7 +43,6 @@ pub struct RequestedPty {
 
 /// Represents the currently configured parameters for a channel being created.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct ChannelConfig {
     pub(crate) env_vars: BTreeMap<String, String>,
     pub(crate) pty: Option<RequestedPty>,
