@@ -82,9 +82,10 @@ jobs:
               # Nextest profiles change how this lane's tests run.
               - ".config/nextest.toml"
               - "scripts/**"
-              # The Kani lane's path filter is asserted by a workspace test
-              # (crates/minimal/tests/kani_workflow.rs); a workflow-only
-              # narrowing must run that test, or it guards nothing.
+              # A workflow-only change to the Kani lane's path filter decides
+              # which pull requests run the proofs, and no other lane's filter
+              # names that file. Run the workspace suite on it, so a guard test
+              # over that filter has a lane that executes it.
               - ".github/workflows/ci-kani.yml"
               - ".minimal/**"
               # The gvproxy pin: the netns job fetches + SHA-checks it, so a pin
