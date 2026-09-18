@@ -55,16 +55,17 @@ fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 # parent: fd is the pty master for the `min dash` child
 quit_at = time.monotonic() + dwell
 sent_quit = False
-# Select the first row after a second so the right pane shows a session
-# instead of "no session selected".
-select_at = time.monotonic() + 1.0
+# Select the first row shortly after the dash's first paint so the right
+# pane shows a session instead of "no session selected". Sending it before
+# raw mode is on would echo the escape sequence into the recording.
+select_at = None
 sent_select = False
 hard_deadline = quit_at + 15  # safety cap: don't let a hung dash wedge recording
 
 try:
     while time.monotonic() < hard_deadline:
         now = time.monotonic()
-        if not sent_select and now >= select_at:
+        if not sent_select and select_at is not None and now >= select_at:
             os.write(fd, b"\x1b[B")  # Down
             sent_select = True
         if not sent_quit and now >= quit_at:
@@ -85,6 +86,8 @@ try:
             break  # pty closed (child exited)
         if not chunk:
             break
+        if select_at is None and b"\x1b[?1049h" in chunk:
+            select_at = time.monotonic() + 0.6
         if CPR_QUERY in chunk:
             os.write(fd, CPR_REPLY * chunk.count(CPR_QUERY))
             chunk = chunk.replace(CPR_QUERY, b"")
