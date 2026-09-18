@@ -4,10 +4,11 @@
 #
 # Builds a throwaway git repo with a fixed tag topology and Conventional
 # Commit history (no checkout of the real repo) and asserts the derivation
-# contract: feat -> minor, fix/perf and everything else -> patch, breaking
-# changes detected from `!` AND from body-only footers but never moving the
-# number while ALLOW_MAJOR is off, pre-release tags skipped over as the range
-# base yet counted by the strictly-greater lint, and --check's two rules.
+# contract: feat -> minor, a breaking change under any type (bang or
+# body-only footer) -> minor while 0.x and never a major while ALLOW_MAJOR is
+# off, fix/perf and everything else -> patch, pre-release tags skipped over
+# as the range base yet counted by the strictly-greater lint, and --check's
+# two rules.
 #
 # The derivation itself is git-cliff's (cliff.toml), run through
 # scripts/git-cliff.sh, which fetches and SHA-512-verifies the pinned binary on
@@ -271,6 +272,31 @@ printf '# package.version moved into a comment\n' >"$root/Cargo.toml"
 expect 1 "could not extract package.version" "--check with no package.version fails loudly" -- \
     nv --check --cargo-toml "$root/Cargo.toml"
 expect 1 "unknown argument" "unknown flags are rejected" -- nv --bogus
+
+# --- a lone non-feat breaking commit: minor, not patch -------------------------
+#
+# A `!` (or a BREAKING CHANGE footer) under a non-feat type is still a
+# breaking change: while 0.x it bumps minor, and a patch declaration is
+# stale. This is the bump rule the old docs got wrong.
+
+commit "chore: cut the final" v0.6.0
+commit "fix(lcache)!: drop the old cache format"
+expect_out "0.7.0" "a lone non-feat breaking commit bumps minor, not patch" -- nv
+expect_out "minor" "a lone non-feat breaking commit's bump is minor" -- nv --bump
+expect_notes "a non-feat breaking commit lands under Breaking changes" \
+    "since v0.6.0." "### Breaking changes" "- **lcache**: drop the old cache format ("
+refute_notes "the non-feat breaking commit is not misfiled under Fixes" "### Fixes"
+expect 0 "package.version 0.7.0 satisfies" \
+    "check: the minor over a lone non-feat breaking commit passes" -- check 0.7.0
+expect 1 "which require a minor bump to at least 0.7.0" \
+    "check: a patch declared over a lone non-feat breaking commit fails" -- check 0.6.1
+commit "fix(op): retire the legacy manifest
+
+BREAKING CHANGE: the manifest format is gone"
+expect_out "0.7.0" "a footer-only non-feat breaking commit still bumps minor" -- nv
+expect_notes "the footer-only breaking entry renders under Breaking changes" \
+    "### Breaking changes" "- **op**: retire the legacy manifest (" \
+    "BREAKING CHANGE: the manifest format is gone"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
