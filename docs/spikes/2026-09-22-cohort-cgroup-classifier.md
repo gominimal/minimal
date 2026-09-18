@@ -199,11 +199,21 @@ NEW socket after move: TimeoutError('timed out')
 ```
 
 The match reads the socket's cgroup pointer, set at socket creation, not the
-process's current cgroup. Consequence: **moving a process between leaves
-does not change the verdict of its open flows; rewriting the rule for the
-leaf does**, because each packet is re-evaluated against the ruleset. A
-policy encoded purely by placement cannot cut established flows; a policy
-encoded by rules can.
+process's current cgroup. Measured consequence: **moving a process between
+leaves does not change the verdict of its open flows**, so a policy encoded
+purely by placement cannot reach a flow that is already up.
+
+The other half — that rewriting the rule for the leaf *does* reach the open
+flow, because nftables re-evaluates every packet against the current ruleset
+— **was not measured here**. Test E rewrote the ruleset but only fetched
+afterwards, so it exercised new connections, not established ones. What a
+rewrite does to a live flow is also not one outcome: a `drop` blackholes it
+until the peer's retransmit timeout rather than tearing it down, and a
+`reject` is refused per packet, so a declaration change may need the box's
+sockets killed as well. Action item 6 assumes the rewrite reaches the flow
+and requires termination anyway; T38 should measure both before relying on
+either (rewrite the leaf's rule under a live transfer, record whether it is
+dropped or rejected and whether the socket survives).
 
 **C. user namespace and cgroup namespace inside the leaf.** The host blocks
 unprivileged user namespaces with `kernel.apparmor_restrict_unprivileged_userns=1`
@@ -353,9 +363,16 @@ namespace; and the rules are installed by a privileged step the unprivileged
 native daemon does not have.
 
 **(a) The layout.** One tree per daemon, rooted at a cgroup the daemon owns:
-natively its delegated `user.slice/user-<uid>.slice/user@<uid>.service/minimald/`
-(or a root-created and chowned cgroup on a host without a user manager); in
-the VM the guest daemon is pid 1 and roots at `/sys/fs/cgroup/minimald/`.
+natively its delegated `user.slice/user-<uid>.slice/user@<uid>.service/minimald/`,
+which finding H measured; in the VM the guest daemon is pid 1 and roots at
+`/sys/fs/cgroup/minimald/`. A host with no user manager has no delegated
+subtree to build under, so its root has to be created and chowned by
+something privileged. **That path is unverified here**: D2 ran in a tree
+`sudo` chowned by hand and says only that the shape behaves (and that the
+box escapes its leaf without a cgroup namespace); nothing in this run
+establishes who creates that root, who delegates it, or that it survives a
+reboot. T38 must settle it, or scope the native classifier to hosts with a
+user manager.
 
 ```
 <root>/                 the daemon's tree; no controller is ever enabled here while it has a process
@@ -372,9 +389,10 @@ icmpx admin-prohibited` for an immediate refusal); `level L+1 "<root>/boxes"`
 as the cohort identity (NET-078); `level L+1 "<root>/daemon"` as the
 node-plane identity (NET-078, NET-080). Per-box rules go first, then cohort,
 then daemon. A change of a box's declaration is a rule rewrite for its leaf,
-which cuts its established flows; moving the box's processes would not.
-`sandbox2`'s own cgroup path (`cpu_weight` via a systemd scope keyed by pid) is
-not this tree and should not be reused for it.
+not a move of its processes: moving them is measured not to touch their open
+flows (finding B), while what the rewrite does to an open flow is untested
+and T38 must measure it. `sandbox2`'s own cgroup path (`cpu_weight` via a
+systemd scope keyed by pid) is not this tree and should not be reused for it.
 
 **(b) Scope.** Host-address boxes on a co-resident Linux host **are in scope**
 for NET-078 to NET-080 as far as the mechanism goes: the classifier is one
@@ -415,11 +433,18 @@ guest daemon is pid 1 and root, so it owns the tree and the ruleset).
    and would root the box's namespace at the daemon's cgroup.
 6. In T38, treat a change of a box's declaration as a rule rewrite plus
    flow termination, since an established socket keeps the cgroup it was
-   created in.
-7. In T38, enter the `daemon/` leaf at startup before any box exists and
+   created in. Measure the rewrite half first, which this run did not:
+   rewrite a leaf's rule under a live transfer and record whether the flow
+   is dropped or rejected and whether the socket has to be killed for the
+   new verdict to hold.
+7. In T38, settle the root of the tree on a host with no user manager, which
+   this run did not cover: name who creates and chowns it and how it comes
+   back after a reboot, or scope the native classifier to hosts whose user
+   manager delegates a subtree (finding H) and leave the rest to the VM.
+8. In T38, enter the `daemon/` leaf at startup before any box exists and
    never enable a controller on `<root>` while it holds a process; the
    existing `cpu_weight` path must not be pointed at this tree.
-8. Correct the plan's SP2 assumption line: the task that narrows to the
+9. Correct the plan's SP2 assumption line: the task that narrows to the
    VM-backed host is T38 (#1482) alone; T40 (#1492) is dynamic ingress and
    unrelated, and #1494 is T22.
 
