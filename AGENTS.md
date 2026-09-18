@@ -187,7 +187,7 @@ Verified against the current tree; sources in parentheses.
 Canonical docs: [docs/ci-strategy.md](docs/ci-strategy.md) (design and
 rationale) and
 [docs/internal/release-pipeline.md](docs/internal/release-pipeline.md)
-(release/promotion mechanics). The 14 workflows on `main`:
+(release/promotion mechanics). The workflows on `main`:
 
 | Workflow | One line |
 |---|---|
