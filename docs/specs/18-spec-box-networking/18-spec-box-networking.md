@@ -191,6 +191,11 @@ included, with every refusal logged (NET-001 to NET-004).
     verify: cargo nextest run -p minimald box_has_no_idle_stop
     <!-- S1b-2c; ubiquitous within the WHILE; the idle and stop policy is the client's (Design reasoning); a declared execution timeout is the client's policy, set at creation, and is not built here -->
 
+- **NET-131** WHILE a box was created for a non-detached run, WHEN the run's command exits THE SYSTEM SHALL end the box, whether or not the client that started the run is still present.
+  tier:     T0
+  verify:   cargo nextest run -p minimald run_box_ends_when_its_run_ends
+  <!-- S1b-2c; event-driven within the WHILE; `min task run` creates a session for the run, execs the task into it, and today destroys it from the client; the destroy moves to the daemon side of the exec's exit so a lost client strands no session; the abandoned-launch reap covers only un-finalized sessions and does not reach this case -->
+
 - **NET-016** WHILE a box is running, WHEN a process in it starts listening on a port its ingress rules permit and no declaration names THE SYSTEM SHALL publish that port on the box's address.
   tier:     T0
   verify:   cargo nextest run -p minimald listen_publishes_permitted_port
@@ -789,7 +794,11 @@ reshelled; the architecture places an exec inside the box under the box's
 identity, ceilings, and network posture, argv only, with a re-attachable PTY
 form. Nothing bound here depends on the sibling-sandbox shape, and the exec
 requirement is worded for the non-PTY exec so the PTY exec does not contradict
-it when it lands.
+it when it lands. A box created for a run ends when the run ends, from the
+daemon's side of the exec's exit (NET-131). Leaving the destroy to the client,
+as the tree does today, was considered and rejected: a `min task run` client
+lost mid-run would strand its session, since the abandoned-launch reap covers
+only un-finalized sessions and there is no idle stop to catch it.
 
 **The proxy keeps running after native resolution supersedes it.** NET-018 and
 NET-019 make tooling report native DNS as the live surface while the hostname
@@ -970,13 +979,6 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   naming and addressing to that host and now permits a node-local Box Egress
   Proxy inside its boundary at the advisory tier; it says nothing about the
   classifier.]
-- [NEEDS CLARIFICATION (MEDIUM): a `min task run` client creates a session,
-  execs the task into it, and destroys it afterwards; under NET-015 a client
-  lost mid-run leaves that session running with nothing to destroy it, since
-  the abandoned-launch reap covers only un-finalized sessions. The architecture
-  ends a box created for a non-detached run when the run ends, which moves the
-  destroy to the daemon side of the exec's exit; whether this tree adopts that
-  shape or accepts the leaked session as the interim is undecided.]
 - [NEEDS CLARIFICATION (LOW): are HTTP/2 and HTTP/3 through any proxy surface in
   scope? [Design §5.3][design] governs QUIC for egress and leaves the proxy
   surfaces unaddressed; the local Box Egress Proxy document needs the answer for
