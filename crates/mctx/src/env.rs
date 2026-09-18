@@ -17,7 +17,6 @@ use sandbox2::Container;
 use sandbox2::config::{Invocation, SandboxMapped};
 use tempfile::TempDir;
 
-#[allow(dead_code)]
 struct EnvChannel<'a> {
     graph: &'a mut Graph,
     ctx: &'a mut Context,
