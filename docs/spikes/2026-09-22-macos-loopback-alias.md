@@ -646,6 +646,22 @@ The interim is a temporary per-host state and the open question closes.
 9. In T10, order the advisory's install so the resolver file is written only
    after the answerer is listening, since a scoped resolver with no answerer
    or a bad one takes every lookup on the host with it.
+10. In T10, do not ship `LaunchOnlyOnce`. The spike used it and paid for it
+    twice: launchd drops the job the moment it exits, so `launchctl print`
+    could not confirm the run (section 6), and because the script exits
+    nonzero when fewer than 254 aliases are present, launchd will not retry a
+    partial apply until the next boot — a single failed `ifconfig` would
+    leave the range short for the whole session, which is exactly the state
+    NET-123's probe reads as "range absent". The shipped job wants a
+    throttled retry on nonzero exit (`KeepAlive` with `SuccessfulExit`
+    false), which the script's idempotence already tolerates: a re-run adds
+    only the missing aliases.
+11. In T10, make the post-install check poll for the 254 aliases with a
+    bounded timeout instead of a fixed wait. `launchctl bootstrap` returns
+    before the helper finishes, and the first install run read 0 aliases for
+    that reason (section 6); the spike's by-hand recipe settled for
+    `sleep 2`, but an advisory that reports success or failure to a person
+    must wait on the count, not on the clock.
 
 # Artifacts
 
