@@ -186,7 +186,7 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimald lost_exec_client_kills_only_its_own_process
     <!-- S1b-2c; unwanted; exec's per-command process is not the box: it is its own sandboxed process with its own lease, and nobody is left to read its output -->
-  - THE SYSTEM SHALL stop a box only when its client stops, destroys, or deletes it, or when the daemon shuts down.
+  - THE SYSTEM SHALL stop a box only when its client stops, destroys, or deletes it, or when the box host tears it down by force: daemon shutdown, an abandoned launch, or the host reclaiming the VM.
     tier:   T0
     verify: cargo nextest run -p minimald box_has_no_idle_stop
     <!-- S1b-2c; ubiquitous within the WHILE; the idle and stop policy is the client's (Design reasoning) -->
