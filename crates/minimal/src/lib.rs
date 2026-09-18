@@ -1486,10 +1486,14 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     let mut client = connect_daemon(global).await?;
 
     use minimald_rpc::ListSessions;
-    let resp = client
+    let mut resp = client
         .oneshot_rpc::<ListSessions>(())
         .await
         .context("ListSessions RPC failed")?;
+
+    // The daemon cannot probe git (on macOS it runs in the minvmd guest),
+    // so fill each session's git context host-side before formatting.
+    minimal_client::fill_git_info(&mut resp.sessions).await;
 
     // On stderr, and outside `format_ls`: every output mode should carry a
     // fault this severe — `--raw` most of all, since a script parsing bare ids
