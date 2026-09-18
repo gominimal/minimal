@@ -5,7 +5,6 @@ use russh::{
 use sessions::SessionId;
 use std::{
     collections::BTreeMap,
-    fmt,
     sync::{Arc, LazyLock},
 };
 // Used only by the `ssh-forward` direct-tcpip handler.
@@ -225,58 +224,25 @@ impl ConnectionHandle {
 }
 
 /// An error when handling the SSH connection.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
 pub enum ConnectionError {
     /// A protocol error.
-    Protocol(russh::Error),
+    #[error("Protocol error: {0}")]
+    Protocol(#[from] russh::Error),
     /// An internal error.
+    #[error("Internal error: {0}")]
     Internal(String),
 
     /// Failed to (de)serialize a JSON-encoded RPC message.
-    Json(serde_json_lenient::Error),
+    #[error("Serialization error: {0}")]
+    Json(#[from] serde_json_lenient::Error),
 
     /// An operation was attempted after the session was launched
     /// (i.e. setting env vars after exec), which is both non-sensical and
     /// heavily implied by RFC 4254 to be invalid.
+    #[error("Protocol error: Attempted channel configuration after initialization")]
     SetupAfterInitiation,
-}
-
-impl From<russh::Error> for ConnectionError {
-    fn from(value: russh::Error) -> Self {
-        ConnectionError::Protocol(value)
-    }
-}
-
-impl From<serde_json_lenient::Error> for ConnectionError {
-    fn from(value: serde_json_lenient::Error) -> Self {
-        ConnectionError::Json(value)
-    }
-}
-
-impl fmt::Display for ConnectionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConnectionError::Protocol(e) => write!(f, "Protocol error: {}", e),
-            ConnectionError::Internal(e) => write!(f, "Internal error: {}", e),
-            ConnectionError::Json(e) => write!(f, "Serialization error: {}", e),
-            ConnectionError::SetupAfterInitiation => write!(
-                f,
-                "Protocol error: Attempted channel configuration after initialization",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ConnectionError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            ConnectionError::Protocol(e) => Some(e),
-            ConnectionError::Json(e) => Some(e),
-            ConnectionError::Internal(_) => None,
-            ConnectionError::SetupAfterInitiation => None,
-        }
-    }
 }
 
 /// A [`russh::server::Handler`] for a [`Connection`].
