@@ -93,6 +93,8 @@ the current directory).
 |------|-------|-------------|
 | `--name <NAME>` | `-n` | Optional session name |
 | `--sync <MODE>` | | How to load project files into the session: `tarball` (default: stream a tarball of your project and unpack it) or `none` (do not populate the worktree) |
+| `--network <MODE>` | | Network isolation mode: `none` (no network access), `host_ip` (share the host's network namespace; the default), or `own_ip` (the box's own address on the switch, for `--ingress` and egress policy). The earlier spellings `no-net`, `host-net`, and `own-ip` still work |
+| `--ingress <EXT:INT[/PROTO]>` | | Publish the box port `INT` on host port `EXT` (`PROTO` = `tcp` or `udp`, default `tcp`). Repeatable; requires `--network own_ip` |
 | `--loadout <NAME>` | | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml` or `<config>/minimal/loadouts/<NAME>/loadout.toml`. Repeatable; if given, config-file `default_loadouts` are ignored |
 | `--no-loadouts` | | Apply no loadouts at all (also skips the config's `default_loadouts`). Conflicts with `--loadout` |
 | `--no-hooks` | | Run none of the session's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from either the loadouts or the project's `minimal.toml`. Recorded on the session, so it applies to the later attach, detach, and destroy transitions too |

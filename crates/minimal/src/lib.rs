@@ -30,6 +30,7 @@ use minimal_client::file_upload;
 use minimal_client::{ensure_version_match, ensure_version_reported, version_assertion};
 pub mod git_remote;
 pub mod loadouts;
+mod notice;
 pub mod prompt;
 pub mod task;
 pub mod theme;
@@ -496,25 +497,16 @@ pub struct ActivateArgs {
     /// are otherwise skipped without a prompt.
     #[arg(long, value_enum)]
     pub sync: Option<SyncMode>,
-    /// Network mode: no-net, host-net (default), or own-ip.
+    /// Network mode: `none|host_ip|own_ip` (default: `host_ip`).
     ///
-    /// Hidden from `--help` while `own-ip` is not usable on an installed host:
-    /// the daemon resolves a switch binary that no install ships yet
-    /// (gominimal/minimal#980), so advertising the flag offers a mode that
-    /// cannot work outside a dev checkout. Still accepted, and `host-net`
-    /// remains the default, so nothing that passes it today breaks. Unhide,
-    /// and restore the row in docs/reference/cli-min.md, once own-ip works
-    /// from an install.
+    /// `none` gives the session no network access, `host_ip` shares the host
+    /// (or VM) network namespace, and `own_ip` attaches the box to the switch
+    /// with its own address, published ports (`--ingress`), and egress policy.
     #[arg(long, value_enum, default_value_t = CliNetworkMode::HostNet)]
-    #[clap(hide = true)]
     pub network: CliNetworkMode,
     /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
-    /// tcp). Repeatable. Requires `--network own-ip`.
-    ///
-    /// Hidden for the same reason as `--network`: it is only meaningful with
-    /// `--network own-ip`.
+    /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
-    #[clap(hide = true)]
     pub ingress: Vec<String>,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
     /// Repeatable. If any `--loadout` is specified, defaults from
@@ -571,10 +563,18 @@ pub enum SyncMode {
 
 /// CLI surface for [`sessions::NetworkMode`]. A local `ValueEnum` keeps the
 /// `sessions` crate free of a clap dependency.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+///
+/// The value spellings are the current network-mode names: `none`, `host_ip`,
+/// and `own_ip`. The previous spellings (`no-net`, `host-net`, `own-ip`) stay
+/// as clap aliases for one release and are matched to a deprecation hint in
+/// [`crate::notice`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum CliNetworkMode {
+    #[value(name = "none", alias = "no-net")]
     NoNet,
+    #[value(name = "host_ip", alias = "host-net")]
     HostNet,
+    #[value(name = "own_ip", alias = "own-ip")]
     OwnIp,
 }
 
@@ -2119,6 +2119,10 @@ async fn activate_session(
     args: ActivateArgs,
     offer_scaffold: bool,
 ) -> Result<(), anyhow::Error> {
+    // Compatibility hint for a legacy `--network` spelling, printed before any
+    // daemon work: the parse has already accepted the spelling, this is the
+    // only notice of the rename.
+    notice::emit_legacy_network_hints();
     ensure_daemon(global)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
@@ -4496,6 +4500,123 @@ mod tests {
     fn cli_command_tree_stays_renderable() {
         use clap::CommandFactory as _;
         Cli::command().debug_assert();
+    }
+
+    /// `min session activate --help` advertises `--network` with its three
+    /// current spellings and `--ingress`, now that both work from a stock
+    /// install (the flags were hidden while `own_ip` needed a dev checkout).
+    #[test]
+    fn activate_help_shows_network_flags() {
+        use clap::CommandFactory as _;
+        let help = Cli::command()
+            .find_subcommand_mut("session")
+            .expect("session subcommand")
+            .find_subcommand_mut("activate")
+            .expect("activate subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("--network"),
+            "help must show --network: {help}"
+        );
+        assert!(
+            help.contains("none|host_ip|own_ip"),
+            "help must name the current network spellings: {help}"
+        );
+        assert!(
+            help.contains("--ingress"),
+            "help must show --ingress: {help}"
+        );
+        assert!(
+            !help.contains("no-net") && !help.contains("host-net") && !help.contains("own-ip"),
+            "help must not advertise the legacy spellings: {help}"
+        );
+    }
+
+    /// The legacy `--network` spellings still parse (to the value they
+    /// replaced) and each produces a hint naming the current spelling.
+    #[test]
+    fn legacy_network_spellings_parse_with_hint() {
+        use clap::Parser as _;
+        for (legacy, current, expected) in [
+            ("no-net", "none", CliNetworkMode::NoNet),
+            ("host-net", "host_ip", CliNetworkMode::HostNet),
+            ("own-ip", "own_ip", CliNetworkMode::OwnIp),
+        ] {
+            let cli = Cli::try_parse_from(["min", "session", "activate", "--network", legacy])
+                .expect("legacy spelling must still parse");
+            let Cli {
+                command:
+                    Some(Command::Session(SessionArgs {
+                        command: SessionCommand::Activate(activate),
+                    })),
+                ..
+            } = cli
+            else {
+                panic!("--network {legacy} must parse to session activate");
+            };
+            assert_eq!(activate.network, expected, "value of --network {legacy}");
+
+            let hints = notice::legacy_network_hints(&[
+                "min".to_string(),
+                "session".to_string(),
+                "activate".to_string(),
+                "--network".to_string(),
+                legacy.to_string(),
+            ]);
+            assert_eq!(hints.len(), 1, "one hint per legacy spelling: {hints:?}");
+            assert!(
+                hints[0].contains(current),
+                "hint must name the current spelling {current:?}: {}",
+                hints[0]
+            );
+
+            let joined = format!("--network={legacy}");
+            let hints = notice::legacy_network_hints(&["min".to_string(), joined]);
+            assert_eq!(
+                hints.len(),
+                1,
+                "the --network=<value> form is matched: {hints:?}"
+            );
+            assert!(hints[0].contains(current));
+
+            let hints = notice::legacy_network_hints(&[
+                "min".to_string(),
+                "session".to_string(),
+                "activate".to_string(),
+                "--network".to_string(),
+                current.to_string(),
+            ]);
+            assert!(
+                hints.is_empty(),
+                "the current spelling {current:?} must not hint: {hints:?}"
+            );
+        }
+    }
+
+    /// `docs/reference/cli-min.md` documents `--network` and `--ingress` under
+    /// `session activate`, using the current spellings.
+    #[test]
+    fn cli_reference_documents_network_flags() {
+        let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("docs")
+            .join("reference")
+            .join("cli-min.md");
+        let text = std::fs::read_to_string(docs).expect("cli-min.md must be readable");
+        assert!(
+            text.contains("`--network"),
+            "reference must document --network"
+        );
+        assert!(
+            text.contains("`--ingress"),
+            "reference must document --ingress"
+        );
+        assert!(
+            text.contains("`none`") && text.contains("`host_ip`") && text.contains("`own_ip`"),
+            "reference must use the current network spellings"
+        );
     }
 
     /// Entry constructor for the bare-`min` state-report tests.
