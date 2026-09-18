@@ -162,10 +162,11 @@ Steering and the interception CA
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_proxy_env_and_no_proxy_are_set
 
-- **BEP-013** WHEN a box connects to an admitted credentialed hostname through the proxy THE SYSTEM SHALL present a leaf certificate for that hostname that chains to the host root CA through a signing CA whose name constraints equal the box's declared credentialed upstream set.
+- **BEP-013** WHEN a box connects to an admitted credentialed hostname through the proxy THE SYSTEM SHALL present a leaf certificate for that hostname that chains to the host root CA through the host's one signing CA, whose name constraints equal the union of the credentialed upstream sets every box on the host declares.
   tier:     T1
-  verify:   cargo nextest run -p bep prop_signing_ca_constraints_equal_declared_set
-  property: for every declared credentialed upstream set, the signing CA's permitted-names constraint equals the set, a leaf for a name in the set validates against the root, and a leaf for any name outside the set fails validation
+  verify:   cargo nextest run -p bep prop_signing_ca_constraints_equal_declared_union
+  property: for every family of declared credentialed upstream sets on a host, the signing CA's permitted-names constraint equals their union, a leaf for a name in the union validates against the root, and a leaf for any name outside the union fails validation
+  <!-- Gatehouse §6.10 un-enrolled bullet: the host-generated CA is name-constrained to the union of the host's declared credentialed upstream sets, exactly as the enrolled intermediate; one keychain-held signing CA per host (BEP-014, BEP-059 to BEP-061), not one per box; a box's own reach within the union is bounded by its egress declaration (BEP-022) and its sealed values' host sets (BEP-021) -->
 
 - **BEP-014** THE SYSTEM SHALL hold the signing CA private key in the host keychain as a non-exportable key and write it to no file.
   tier:     T0
@@ -270,6 +271,10 @@ Redemption
   - IF upstream validation fails THEN THE SYSTEM SHALL refuse the request and record an audit event marked `upstream_tls_invalid`.
     tier:   T0
     verify: cargo nextest run -p bep upstream_tls_failure_is_refused_and_audited
+  - IF a request to a credentialed host, sealed or not, would ride an upstream leg that is not TLS THEN THE SYSTEM SHALL refuse the request and record an audit event marked `upstream_not_tls`.
+    tier:   T0
+    verify: cargo nextest run -p bep plaintext_request_to_credentialed_host_is_refused
+    <!-- unwanted; an absolute-form `http://` request under `proxy_env` reaches the proxy inside the CONNECT-port connection, where BEP-031's port discipline does not see it; the v1 authorities carry the default port 443 (Gatehouse §6.10 Module host sets), so no plaintext authority exists in the set and there is no chain for the parent requirement to validate -->
 
 - **BEP-026** IF a connection arrives that is not a box attachment on this host THEN THE SYSTEM SHALL refuse it at the listener, sealed value or not.
   tier:     T0
@@ -676,7 +681,7 @@ deny set and per-request Keychain access control.
   covered by: BEP-019, BEP-020, BEP-026, BEP-028, BEP-058
 
 - **Invariant:** THE SYSTEM SHALL substitute a credential only into a request whose connection authority and `Host` are one declared authority of its module or registration, on an upstream connection that authenticated as that authority.
-  enforced by: host-set membership, request-authority pinning, port discipline, name-constrained CA, upstream validation against the host trust store
+  enforced by: host-set membership, request-authority pinning, port discipline, name-constrained CA, upstream validation against the host trust store, TLS-only upstream legs for credentialed hosts
   covered by: BEP-013, BEP-021, BEP-023, BEP-031, BEP-032, BEP-055, BEP-064, BEP-065
 
 - **Invariant:** THE SYSTEM SHALL admit no credentialed reach that the box's declared egress denies.
