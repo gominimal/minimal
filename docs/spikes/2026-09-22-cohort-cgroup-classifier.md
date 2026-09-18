@@ -268,6 +268,19 @@ of its own leaf, which a `level N` prefix match still covers. The cgroup
 namespace is therefore load-bearing, and its root must be the leaf, which is
 exactly what hakoniwa's ordering does not give (see above).
 
+D3 holds under a condition this run had for free and did not name: the kernel
+confines migration to the cgroup namespace only when cgroup2 is mounted with
+`nsdelegate`, which treats a cgroup namespace as a delegation boundary. On the
+lima host systemd mounts it that way
+(`cgroup2 on /sys/fs/cgroup type cgroup2 (rw,...,nsdelegate,memory_recursiveprot)`).
+Without `nsdelegate` the box's only barrier is write permission on the common
+ancestor, which a box running as the daemon's uid has, and D3 collapses into
+D2. Two consequences: a guest where the daemon is pid 1 mounts cgroup2 itself
+and must pass `nsdelegate`; and the host's cgroup2 mount must not be visible
+inside the box's mount namespace, since the D3 probe reached the sibling only
+through mounts, and a fresh mount inside the namespace is rooted at the leaf
+while the host mount is not.
+
 **E. `reject` instead of `drop`.**
 
 ```
@@ -420,8 +433,23 @@ placement (a deny-all box under a `boxes/deny/` subtree matched by one static
 rule) or, for per-box allow lists inside the box host, a small privileged rule
 writer. Placement-only encoding cannot cut a box's established flows when its
 declaration tightens, so a re-declaration must also kill the box's sockets.
-Given these, T38 keeps both hosts; the VM-backed host is the easy case (the
-guest daemon is pid 1 and root, so it owns the tree and the ruleset).
+Given these, T38 keeps both hosts; the VM-backed host is the easier case (the
+guest daemon is pid 1 and root, so it owns the tree and the ruleset), with one
+duty systemd does natively and the guest must do itself: mount cgroup2 with
+`nsdelegate`, or the cgroup namespace stops being a barrier (finding D3).
+
+One gap on the native host that this run's scope claim understated. The
+"stub resolver" a host-address box reaches over loopback is the host's own
+resolver, so a deny-all box with a resolver carve-out resolves arbitrary
+upstream names through it, and design §5.3 assumes those queries are
+evaluated against the cohort's rules. Either the carve-out points at the
+host's answerer for the box zone (T9: held by the host's service manager,
+host-global across daemons, forwarding nothing) rather than at the host's
+resolver, or the cohort rules apply to what the resolver forwards on the
+box's behalf. The daemon can only choose where the carve-out points; it does
+not set the answerer's forwarding per box, so a per-box policy is the second
+remedy or a new channel to the answerer. The action items carry this to T38
+and T9.
 
 # Action items
 
@@ -437,12 +465,24 @@ guest daemon is pid 1 and root, so it owns the tree and the ruleset).
    timeout.
 4. Reconcile NET-079 with NET-003's "resolves the name and reaches nothing":
    a plain deny-all leaf also drops the box's loopback DNS to the stub
-   resolver, so the deny rule needs a carve-out for the local resolver path if
-   resolution is to succeed inside a deny-all host-address box.
+   resolver, so the deny rule needs a carve-out for the local resolver if
+   resolution is to succeed inside a deny-all host-address box. The carve-out
+   is the resolver's address and port only, never loopback-wide: the NET
+   spec's design reasoning already considered a loopback baseline exception
+   for every box and rejected it because it gives the shared-namespace lane
+   undeclared reach.
 5. In T38, place the box process in its leaf before hakoniwa's single
    `unshare()` at `runc.rs:124` (a pre-unshare self-placement or a barrier),
    because hakoniwa's own cgroup hook runs after the cgroup-namespace unshare
-   and would root the box's namespace at the daemon's cgroup.
+   and would root the box's namespace at the daemon's cgroup. The namespace
+   is a barrier only when cgroup2 is mounted with `nsdelegate`: check the
+   mount option on a native host and mount it that way in the guest where
+   the daemon is pid 1; and keep the host's cgroup2 mount out of the box's
+   mount namespace, so the only cgroup2 view the box has is one rooted at
+   its leaf. Fail closed when either cannot be had: the classifier is not
+   enabled, and a host-address box whose declaration needs it (deny-all, or
+   an allow list) is refused at activation with the reason, rather than run
+   behind a barrier that does not hold.
 6. In T38, treat a change of a box's declaration as a rule rewrite plus
    flow termination, since an established socket keeps the cgroup it was
    created in. Measure the rewrite half first, which this run did not:
@@ -459,6 +499,15 @@ guest daemon is pid 1 and root, so it owns the tree and the ruleset).
 9. Correct the plan's SP2 assumption line: the task that narrows to the
    VM-backed host is T38 (#1482) alone; T40 (#1492) is dynamic ingress and
    unrelated, and #1494 is T22.
+10. In T38 and T9 (#1460), close the native resolver gap: on a native host
+    the resolver a host-address box reaches is the host's own, so a deny-all
+    box with the item-4 carve-out can resolve arbitrary upstream names while
+    design §5.3 expects those queries evaluated against the cohort's rules.
+    Point the carve-out at the host's answerer for the box zone (T9), which
+    forwards nothing, or run the box's forwarded queries through the cohort
+    rules; T38 owns the rule and where the carve-out points, T9 owns the
+    answerer's forwarding behaviour, and a per-box forwarding policy would
+    need a new channel to the host-global answerer, which neither task has.
 
 # Artifacts
 
