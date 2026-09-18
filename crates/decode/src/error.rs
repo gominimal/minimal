@@ -208,12 +208,6 @@ impl Error {
             Label::primary(span.src_id, span.start.to_usize()..span.end.to_usize())
         }
 
-        /// Create a secondary label from a span.
-        #[allow(dead_code)]
-        fn secondary(span: &RawSpan) -> Label<FileId> {
-            Label::secondary(span.src_id, span.start.to_usize()..span.end.to_usize())
-        }
-
         match self {
             IO(e) => writeln!(writer, "IO Error: {}", e).unwrap(),
             Other(msg) => writeln!(writer, "Error: {}", msg).unwrap(),
