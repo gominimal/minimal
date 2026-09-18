@@ -5,6 +5,8 @@
   </picture>
 </p>
 
+<p align="center"><img src="docs/public/dash-demo.gif" alt="Three sessions of one repository, each on its own branch, listed by min dash" width="720"></p>
+
 <h1 align="center">Minimal</h1>
 
 <p align="center"><strong>Run your agent in a Minimal box. Ship and run software with isolation on your own computer.</strong></p>
