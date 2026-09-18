@@ -74,14 +74,14 @@ PAC recipe and `host_ip` cohort handling are later slices.
 
 Sign-in
 
-- **BEP-001** WHERE no Gatehouse is configured, WHEN `min auth login` is run with no flow flag or with `--device` THE SYSTEM SHALL complete the GitHub device flow under the Minimal-published GitHub App and report the signed-in account.
+- **BEP-001** WHERE no Gatehouse is configured, WHEN `min auth login` is run with `--device`, or with no flow flag while no browser flow is shipped, THE SYSTEM SHALL complete the GitHub device flow under the Minimal-published GitHub App and report the signed-in account.
   tier:     T0
   verify:   cargo nextest run -p minimal auth_login_completes_device_flow_and_reports_account
-  <!-- Gatehouse §6.10 un-enrolled bullet: device flow is the reference profile; the App's registration is the member's ceiling; the command tree's `--device` is accepted as the explicit spelling of this default (Design reasoning) -->
-  - WHEN `min auth login --browser` is run THE SYSTEM SHALL complete the authorization-code flow with PKCE under the same App and report the signed-in account.
+  <!-- Gatehouse §6.10 un-enrolled bullet: device flow is the reference profile; the App's registration is the member's ceiling; the verb keeps the command tree's shape, `--device` pinning the device flow, the bare verb the browser flow wherever one exists (Design reasoning) -->
+  - WHERE the browser flow is shipped, WHEN `min auth login` is run with no flow flag THE SYSTEM SHALL complete the authorization-code flow with PKCE under the same App and report the signed-in account.
     tier:   T0
     verify: cargo nextest run -p minimal auth_login_completes_browser_pkce_flow
-    <!-- additive; the embedded public client secret is a recorded decision, rationale in Gatehouse §6.10; `--browser` is this document's flag for the un-enrolled case, where the command tree's bare verb describes the enrolled default (Design reasoning) -->
+    <!-- additive, a later slice; the embedded public client secret is a recorded decision, rationale in Gatehouse §6.10; the bare verb moves to this flow when it lands, and a script that needs the device flow says `--device` -->
 
 - **BEP-002** WHEN a GitHub sign-in completes THE SYSTEM SHALL store the token and refresh material in the host keychain and in no file under the project or the box.
   tier:     T0
@@ -540,20 +540,17 @@ not have.
 **Sign-in and audit verbs.** `min auth login | logout | status` and the `min box
 audit` grammar follow the command tree; `login` is the tree's alias for `min
 auth login`, and NET retires the daemon-mTLS meaning the verb carries today.
-Un-enrolled, the bare verb runs the device flow and `--browser` selects the
-browser flow; the command tree's prose describes the enrolled default the other
-way round, browser flow bare and `--device` the opt-in. The decision follows
-Gatehouse §6.10, which makes the device flow the reference profile and the
-browser flow additive: the device flow needs no client secret, the first slice
-ships it alone, and a bare verb whose meaning changed when the additive flow
-landed would move under scripts. `--device` is accepted as the explicit spelling
-of the default so the tree's flag keeps working, and the tree gains `--browser`
-for the un-enrolled case. The embedded public secret and its rationale are
-Gatehouse §6.10's. `min box audit self` is refused un-enrolled in v1: there is
-no `identity.sock`, and a relay through minimald to the proxy is a new socket
-surface for one verb, so it waits for the local surface Gatehouse §14.4 item 7
-names. `--follow` and `--parent` are bound now and built in a later slice so the
-grammar does not change under scripts.
+`min auth login` keeps the command tree's shape un-enrolled: the bare verb is
+the browser flow wherever one exists, `--device` pins the device flow, and no
+other flag is added. Slice one's bare verb runs the device flow because it is
+the only flow shipped, and it moves to the browser flow when that lands; a
+script that needs the device flow says `--device`, which is what the flag is
+for. One verb, one default on both sides of enrollment. The embedded public
+secret and its rationale are Gatehouse §6.10's. `min box audit self` is refused
+un-enrolled in v1: there is no `identity.sock`, and a relay through minimald to
+the proxy is a new socket surface for one verb, so it waits for the local
+surface Gatehouse §14.4 item 7 names. `--follow` and `--parent` are bound now
+and built in a later slice so the grammar does not change under scripts.
 **The proxy is its own crate.** The verify lines name `bep`: a host-side crate
 beside the switch, with the shipped `:7654` router's head-parsing core shared
 or copied as the plan sees fit. Extending the router in place was rejected
