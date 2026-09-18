@@ -186,18 +186,20 @@ pub struct ListSessionsEntry {
     /// field so an older server still deserializes cleanly.
     #[serde(default)]
     pub status: sessions::SessionStatus,
-    /// Git context for the project path, probed at list time. `None` on
-    /// responses from daemons that predate this field, and whenever the
-    /// probe fails: not a repo, no git binary, or a timeout (a VM guest
-    /// without git lands here too). Boxed so the (usually `None`) field
-    /// stays small in the enums that wrap [`ListSessionsEntry`].
+    /// Git context for the project path, probed by the client at list time
+    /// (the daemon cannot probe it: on macOS it runs in the minvmd guest,
+    /// where the host's project paths do not exist and git is not on PATH).
+    /// `None` on responses from daemons that predate this field, and
+    /// whenever the client-side probe fails: not a repo, no git binary, or
+    /// a timeout. Boxed so the (usually `None`) field stays small in the
+    /// enums that wrap [`ListSessionsEntry`].
     #[serde(default)]
     pub git: Option<Box<GitInfo>>,
     pub attrs: Option<RunningSessionAttrs>,
 }
 
-/// The git state of a session's project path, as of the last
-/// [`ListSessions`] response.
+/// The git state of a session's project path, probed by the client on the
+/// host filesystem as of the last [`ListSessions`] response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitInfo {
     /// `git rev-parse --abbrev-ref HEAD` — the branch name, or `HEAD` when
@@ -205,8 +207,7 @@ pub struct GitInfo {
     pub branch: String,
     /// `git rev-parse --show-toplevel` — the working-tree root. For a
     /// linked worktree this is the worktree's root, not the main repo's.
-    /// On the listing daemon's own filesystem (the guest's for a VM
-    /// daemon).
+    /// On the host's own filesystem.
     pub repo_root: String,
     /// The checkout is a linked worktree (or submodule): its git directory
     /// lives outside `<toplevel>/.git`.
