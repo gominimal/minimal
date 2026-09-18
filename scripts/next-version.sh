@@ -229,8 +229,11 @@ if [ "$range_commits" -eq 0 ]; then
     IFS=. read -r base_major base_minor base_patch <<<"${base_version%%-*}"
     next="$base_major.$base_minor.$((base_patch + 1))"
 else
-    bumped="$( cd "$REPO" && "$CLIFF" --config "$cliff_config" "$base_tag..$REV" --bumped-version 2>/dev/null )" \
-        || die "git-cliff --bumped-version failed (is $CLIFF able to fetch the pinned binary?)"
+    # RUST_LOG=off swallows git-cliff's success INFO line but not its errors: a
+    # config or template parse failure prints its real reason to our stderr
+    # before the die, instead of dying with only a guess.
+    bumped="$( cd "$REPO" && RUST_LOG=off "$CLIFF" --config "$cliff_config" "$base_tag..$REV" --bumped-version )" \
+        || die "git-cliff --bumped-version failed"
     next="${bumped#v}"
 fi
 
@@ -265,7 +268,7 @@ emit_notes() {
     # git-cliff reads the repository from its working directory, so run it in
     # $REPO (which --repo may have pointed elsewhere) while --config and the
     # wrapper stay absolute. The awk trims git-cliff's leading/trailing blanks.
-    ( cd "$REPO" && "$CLIFF" --config "$cliff_config" "$base_tag..$REV" --tag "$next" ) \
+    ( cd "$REPO" && RUST_LOG=off "$CLIFF" --config "$cliff_config" "$base_tag..$REV" --tag "$next" ) \
         | awk '{ line[NR] = $0 } $0 != "" { if (!first) first = NR; last = NR }
                END { for (i = first; i <= last; i++) print line[i] }'
 }
