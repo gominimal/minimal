@@ -5,8 +5,6 @@
   </picture>
 </p>
 
-<p align="center"><img src="docs/public/dash-demo.gif" alt="Three sessions of one repository, each on its own branch, listed by min dash" width="720"></p>
-
 <h1 align="center">Minimal</h1>
 
 <p align="center"><strong>Run your agent in a Minimal box. Ship and run software with isolation on your own computer.</strong></p>
@@ -40,6 +38,17 @@ Each box is built from a `minimal.toml`, letting you compose the exact tools you
 Minimal's secure package manager delivers the executables inside a sandbox (git, claude, compilers, shells, and more) from a curated registry refreshed daily. The coding agents it packages today are claude, codex, opencode, and pi. Because packages are addressed by content rather than mutable version tags and builds are hermetic, the same blueprint resolves to the same environment, regardless of the machine you launch it from.
 
 > Full documentation lives at [minimal.dev/docs](https://minimal.dev/docs).
+
+<p align="center">
+  <img src="docs/public/dash-demo.gif" alt="Three sessions of one repository, each on its own branch, listed by min dash" width="720">
+</p>
+
+Three sessions of one repository, each on its own branch, and `min dash` listing them. To get there, activate a session from each checkout, then open the dash:
+
+```shell
+min session activate --name api   # run once in each checkout; no --attach, so it returns
+min dash
+```
 
 ## Supported Platforms
 
