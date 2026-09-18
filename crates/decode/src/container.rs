@@ -218,7 +218,6 @@ fn string_map_from_term(
 
 /// A container, a declared image assembled from packages.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct Container {
     /// The human-readable name declared on the container. Unique within a repo/layer.
     pub name: String,
