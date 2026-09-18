@@ -11,10 +11,6 @@
 
 [changelog]
 header = ""
-# git-cliff trims leading whitespace on every rendered line by default, which
-# flattens the two-space indent that continues a breaking-change footer under
-# its bullet. Off, so the notes keep the shape the shell script produced.
-trim = false
 body = """
 {% for group, commits in commits | group_by(attribute="group") %}### {{ group | striptags | trim }}
 
@@ -27,9 +23,11 @@ footer = ""
 
 # The 0.x rule: a feature is always a minor, and a breaking change is a minor
 # while the major is 0 (the shell script detected breaking changes and rendered
-# them first, but never let one move the number past what its type did). Set
-# breaking_always_bump_major = true at GA; next-version.sh's
-# NEXT_VERSION_ALLOW_MAJOR=1 does exactly that override.
+# them first, but never let one move the number past what its type did). The
+# flag gates only that window: from 1.0.0 on a breaking change always bumps the
+# major, so there is nothing to switch at GA. next-version.sh's
+# NEXT_VERSION_ALLOW_MAJOR=1 sed-flips it in a temp copy, which matters only
+# pre-GA — it previews what a 0.x range would become at 1.0.0.
 [bump]
 features_always_bump_minor = true
 breaking_always_bump_major = false
