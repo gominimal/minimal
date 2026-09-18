@@ -698,8 +698,8 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   unset E2E_INHERIT_MARKER
   (cd "$TASK_SEED_DIR" && mnl task run e2e-envprint >/dev/null 2>"$WORK/env-unset.err")
   rc=$?
-  if [ "$rc" -eq 0 ]; then
-    echo "::error::'min task run e2e-envprint' with unset inherited var unexpectedly succeeded"
+  if [ "$rc" -ne 1 ]; then
+    echo "::error::'min task run e2e-envprint' with unset inherited var exited $rc (expected 1)"
     fail
   fi
   grep -q 'E2E_INHERIT_MARKER is not set in this shell' "$WORK/env-unset.err" \
@@ -711,8 +711,8 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   rm -f "$XDG_CONFIG_HOME/minimal/user_policy.toml"
   (cd "$TASK_SEED_DIR" && export E2E_INHERIT_MARKER=hello-from-the-host && mnl task run e2e-envprint >/dev/null 2>"$WORK/env-ungranted.err")
   rc=$?
-  if [ "$rc" -eq 0 ]; then
-    echo "::error::'min task run e2e-envprint' with ungranted var unexpectedly succeeded"
+  if [ "$rc" -ne 1 ]; then
+    echo "::error::'min task run e2e-envprint' with ungranted var exited $rc (expected 1)"
     fail
   fi
   grep -Fq '[vars]' "$WORK/env-ungranted.err" \
