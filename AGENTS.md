@@ -187,16 +187,18 @@ Verified against the current tree; sources in parentheses.
 Canonical docs: [docs/ci-strategy.md](docs/ci-strategy.md) (design and
 rationale) and
 [docs/internal/release-pipeline.md](docs/internal/release-pipeline.md)
-(release/promotion mechanics). The 12 workflows on `main`:
+(release/promotion mechanics). The 14 workflows on `main`:
 
 | Workflow | One line |
 |---|---|
 | `ci` | Repo-wide checks: rustfmt, clippy, cargo-deny, a dogfood build smoke (Minimal building itself, reading prebuilt packages via the R2 mirror canary), `mip check`. |
+| `ci-kani` | Kani bounded-verification harnesses over the security-load-bearing cores (rcache's `index_file` untrusted-bytes parse, sessions' `PathDecision` lattice); path-scoped inside the workflow, advisory until the harnesses have soaked. |
 | `ci-linux-native` | Linux-native target lane: workspace tests, root-integration harnesses, session e2e against a host-native `minimald` (no VM). |
 | `ci-linux-kvm` | Linux/KVM target lane (hosted x86_64): build-once/test-on-KVM split, minvmd VM harnesses, VM-backed session e2e. |
 | `ci-macos` | macOS/HVF target lane: hosted arm64 unit/clippy tier (`minvmd` + `sessions`) plus the hypervisor e2e on the self-hosted Apple Silicon runner. |
 | `ci-shell-installer` | POSIX-sh gate for the shell installer and the AppArmor profile installer (shellcheck + harness under sh/dash/macOS sh). |
 | `commitlint` | Conventional Commits enforcement on PRs. |
+| `spec-lint` | Advisory spec-format lint on PRs touching `docs/specs/**`, using foundry's `spec_lint.py`; posts/updates a single PR comment, never blocks merge. |
 | `nightly-tests` | 06:00 UTC **test tier**: advisory re-checks, session-e2e soak, toolchain/dependency canaries, workflow hygiene; failures file tracking issues. |
 | `nightly` | 10:00 UTC **channel cut**: reuses `release.yml` to build/stage, then blesses the `nightly` channel after smoke tests. |
 | `release` | Manual build/sign/stage of all shipped artifacts; its verify-ci gate requires the five lane aggregators green on the commit. |
@@ -207,7 +209,10 @@ rationale) and
 The required-check vocabulary is the **five aggregators**: `ci-success`,
 `ci-linux-native-success`, `ci-linux-kvm-success`, `ci-macos-success`,
 `ci-shell-installer-success`. Each is green when its lane's jobs succeeded
-or were path-skipped. The two nightlies are distinct on purpose: `nightly-tests`
+or were path-skipped. `ci-kani-success` is not among them: the Kani lane is
+advisory until its harnesses have soaked, promoted by adding
+`ci-kani-success` to the branch-protection ruleset (no workflow change
+needed). The two nightlies are distinct on purpose: `nightly-tests`
 proves, `nightly` ships.
 
 ## Conventions and hard rules
