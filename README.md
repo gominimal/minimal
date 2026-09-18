@@ -41,10 +41,6 @@ Minimal's secure package manager delivers the executables inside a sandbox (git,
 
 > Full documentation lives at [minimal.dev/docs](https://minimal.dev/docs).
 
-<p align="center">
-  <img src="docs/public/loadout-demo.gif" alt="Activating the minimal dev loadout: packages, EDITOR=vim, a themed prompt, and a once-only MOTD banner" width="720">
-</p>
-
 ## Supported Platforms
 
 Minimal works on:
