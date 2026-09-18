@@ -21,6 +21,7 @@ op.workspace = true
 ot.workspace = true
 orchestrator.workspace = true
 remote-client.workspace = true
+sandbox2.workspace = true
 
 nickel-lang-core.workspace = true
 codespan-reporting.workspace = true

@@ -526,8 +526,10 @@ pub struct EnvArgs<'a> {
     /// The hostname to set, if any.
     pub hostname: Option<String>,
 
-    /// If set, overrides the network isolation mode for the sandbox.
-    pub override_network_mode: Option<sandbox2::NetworkMode>,
+    /// The sandbox's network provider. Decides the namespace, the tap and the
+    /// resolver the sandbox gets, and does any post-spawn wiring; see
+    /// [`sandbox2::Network`].
+    pub network: std::sync::Arc<dyn sandbox2::Network>,
     /// The operation tracker to use downstream, if applicable.
     pub ot: Option<OpTracker>,
 }
@@ -656,10 +658,9 @@ impl<'a> Env<'a> {
         let SetupForPackages {
             fs_mappings: mut patch,
             fs_mapping_packages,
-            needs_dns,
-            needs_internet,
             state_dirs,
             env_vars: mut pkg_env_vars,
+            ..
         } = SetupForPackages::build(graph, args.transitives.keys())
             .map_err(|e| Error::IO("package setup", "".into(), e))?;
 
@@ -727,18 +728,9 @@ impl<'a> Env<'a> {
                     .map(|ce| SandboxMapped::Dir(ce.path().to_path_buf())),
             )
             .with_state_dir(&args.state_base_dir)
-            .with_dns(
-                args.override_network_mode
-                    .map(|m| !matches!(m, sandbox2::NetworkMode::NoNet))
-                    .unwrap_or(needs_dns),
-            )
-            .with_network_mode(args.override_network_mode.unwrap_or(
-                if !needs_dns && !needs_internet {
-                    sandbox2::NetworkMode::NoNet
-                } else {
-                    sandbox2::NetworkMode::HostNet
-                },
-            ))
+            // The provider's plan names the resolver too, so the packages'
+            // own DNS need does not enter into it.
+            .with_network(args.network)
             .with_env_vars(pkg_env_vars.into_iter());
         if let Some(id) = ctx.daemon_id() {
             config = config.with_daemon_id(id);
@@ -828,10 +820,24 @@ impl<'a> Env<'a> {
         ))
     }
 
+    /// Step 1 of a launch: the provider's plan, with its release owed. See
+    /// [`sandbox2::Sandbox::plan_launch`].
     #[cfg(target_os = "linux")]
-    pub fn container(&mut self) -> Result<Container, Error> {
+    pub fn plan_launch(
+        &self,
+    ) -> impl std::future::Future<Output = Result<sandbox2::PlannedLaunch, Error>> + Send + 'static
+    {
+        let planned = self.sandbox.plan_launch();
+        async move { planned.await.map_err(Error::from) }
+    }
+
+    /// Builds the container this env's invocations run in, configured for
+    /// `plan`. One *spawn* is what gets a namespace, so a caller running
+    /// several invocations needs a container per plan.
+    #[cfg(target_os = "linux")]
+    pub fn container(&mut self, plan: &sandbox2::NetPlan) -> Result<Container, Error> {
         self.sandbox
-            .new_container()
+            .new_container(plan)
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
     }
 

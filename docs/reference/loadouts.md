@@ -111,6 +111,10 @@ VISUAL    = "hx"
 on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || true" }
 ```
 
+`[[lifecycle_hooks]]` is top-level here because this is a loadout; in a
+project `minimal.toml` the same hooks nest under `[session]`, written
+`[[session.lifecycle_hooks]]`.
+
 Saved as `<config>/minimal/loadouts/dev.toml`, this is applied with
 `min session activate --loadout dev`, or automatically via
 [`default_loadouts`](#client-config).
@@ -695,7 +699,8 @@ which five shells there are to choose from. Nothing fails either way.
 
 This is the loadout's `SHELL`, not the `$SHELL` of the terminal you ran
 `min` from: a session is a declared environment, and the shell it hands
-you is part of the declaration.
+you is part of the declaration. A project sets it the same way through its
+[`[session.vars]`](./minimal-dot-toml.md#session).
 
 Three things worth knowing:
 

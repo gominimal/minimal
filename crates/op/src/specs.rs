@@ -314,10 +314,14 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             .with_isolated_wd(inputs.into_iter())
             .with_rootfs(rootfs.into_iter())
             .with_dns(needs_dns)
-            .with_network_mode(if !needs_dns && !needs_internet {
-                sandbox2::NetworkMode::NoNet
+            // A build that needs neither DNS nor the internet runs in an empty
+            // network namespace; anything else shares the host's. Said as a plan
+            // rather than as a mode: a build is not a PTask and has never had
+            // one, and the sandbox layer acts on plans.
+            .with_plan(if !needs_dns && !needs_internet {
+                sandbox2::NetPlan::isolated()
             } else {
-                sandbox2::NetworkMode::HostNet
+                sandbox2::NetPlan::host()
             });
         if let Some(a) = &build.build_args {
             config = config.with_build_args(a.iter());

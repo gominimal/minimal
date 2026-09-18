@@ -1,4 +1,5 @@
 //! Top-level API for minimal tooling.
+#![recursion_limit = "256"]
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -840,9 +841,9 @@ impl Context {
 
     /// Constructs an environment from which executions can be run, based on the given parameters.
     #[allow(clippy::too_many_arguments)]
-    /// Builds an [`env::Env`] with the default `HostNet` sandbox network. Use
-    /// [`make_env_with_network`](Self::make_env_with_network) to run the sandbox
-    /// in another [`sandbox2::NetworkMode`] (e.g. a `NoNet`/`OwnIp` PTask).
+    /// Builds an [`env::Env`] whose sandbox shares the host network. Use
+    /// [`make_env_with_network`](Self::make_env_with_network) to run it under
+    /// another [`sandbox2::Network`] (e.g. an isolated PTask).
     pub async fn make_env<'a, S: PackageSelection>(
         &'a mut self,
         name: &'a str,
@@ -862,16 +863,17 @@ impl Context {
             patches,
             env_vars,
             packages,
-            sandbox2::NetworkMode::HostNet,
+            std::sync::Arc::new(sandbox2::HostNet),
             home,
         )
         .await
     }
 
-    /// Like [`make_env`](Self::make_env) but runs the sandbox in the given
-    /// [`sandbox2::NetworkMode`], so callers (e.g. the minimald task-exec path)
-    /// can give a task the same network isolation as its session rather than
-    /// always `HostNet`.
+    /// Like [`make_env`](Self::make_env) but runs the sandbox under the given
+    /// [`sandbox2::Network`], so callers (e.g. the minimald task-exec path) can
+    /// give a task the same network as its session rather than always the
+    /// host's. A provider, not a mode: the caller owns the mode and what it
+    /// means, and the sandbox layer acts on what the provider says to do.
     ///
     /// `home` is the directory `~/`-rooted patch paths expand against; see
     /// [`PatchHome`] for why every caller states it rather than letting
@@ -886,7 +888,7 @@ impl Context {
         patches: Option<&'a EnvPatches>,
         env_vars: Option<&'a BTreeMap<String, EnvVarValue>>,
         packages: S,
-        network_mode: sandbox2::NetworkMode,
+        network: std::sync::Arc<dyn sandbox2::Network>,
         home: PatchHome,
     ) -> Result<env::Env<'a>, Error> {
         let mfile = self.minimal_file();
@@ -961,7 +963,7 @@ impl Context {
                 home,
                 env_vars,
                 hostname: Some(name.to_string()),
-                override_network_mode: Some(network_mode),
+                network,
                 ot: self.daemon.config.ot.clone(),
             },
         )
@@ -1454,7 +1456,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let container = env.container().unwrap();
+            let planned = env.plan_launch().await.unwrap();
+            let container = env.container(planned.plan()).unwrap();
 
             // Smoketest: date command should succeed, and regardless of the time the output should contain a colon.
             let output = env

@@ -91,7 +91,7 @@ pub use capture::{
 };
 #[cfg(unix)]
 pub use disk::{DiskUsage, disk_usage};
-pub use listing::{Listing, listing};
+pub use listing::{Listing, listing, listing_pruned};
 pub use logs::{newest_matching, newest_rotated, try_newest_matching};
 pub use manifest::{
     CollectedEntry, CollectorError, Manifest, ProjectIdentity, ProjectScope, Redaction,

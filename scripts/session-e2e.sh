@@ -86,6 +86,7 @@ TASK_SEED_DIR="" # seeded by the `min task run` proof below; removed on teardown
 HOOK_SEED_DIR="" # seeded by the lifecycle-hooks proof below; removed on teardown
 PATCH_SRC_DIR="" # patch sources for the patch-modes proof; removed on teardown
 SKIP_SEED_DIR="" # seeded by the skip-lane scaffold proof below; removed on teardown
+OWNIP_SEED_DIR="" # seeded by the own-IP proof below; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -203,6 +204,7 @@ teardown() {
   [ -n "$HOOK_SEED_DIR" ] && rm -rf "$HOOK_SEED_DIR"
   [ -n "$PATCH_SRC_DIR" ] && rm -rf "$PATCH_SRC_DIR"
   [ -n "$SKIP_SEED_DIR" ] && rm -rf "$SKIP_SEED_DIR"
+  [ -n "$OWNIP_SEED_DIR" ] && rm -rf "$OWNIP_SEED_DIR"
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
   # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
@@ -369,6 +371,171 @@ if grep -q "unsupported command" "$lookalike_err"; then
 fi
 echo "session exec proof OK"
 echo "::endgroup::"
+
+# ---------------------------------------------------------------------------
+# Guest egress proof. Every VM lane wires the gvproxy switch for the guest's
+# egress (NAT + DNS), yet nothing else here asserts it works — and gvproxy
+# resolution is best-effort and never errors, so a lane that silently loses the
+# switch boots switchless, has no egress, and still reports green. The symptom
+# then reaches a user as a bogus "could not resolve host" that is not a DNS
+# problem. Prove reachability from inside the live session: the `shell` stack
+# composes curl, so no package is added. Gated on a seed we own, because only
+# then is the shell stack (and thus curl) guaranteed present.
+#
+# What is asserted is what the symptom is: THIS SESSION can reach the internet.
+# So the bar is one host answering, over several hosts and several attempts —
+# not every host answering first time. Two things taught that. A single attempt
+# per host made the lane depend on two third-party endpoints both being up, and
+# main went red on a docs-only commit when example.com returned HTTP:200 and
+# example.org then lost the TLS handshake (curl 35, HTTP:000) — the first host
+# had already proven DNS, NAT and TLS all worked, so the run failed on weather.
+# Requiring every host to answer has the same flaw at a longer timescale: an
+# endpoint down for the whole retry window still fails a session with provably
+# working egress. A switchless boot has no NAT and no DNS, so it fails every
+# host on every attempt and is caught exactly as before — that is the thing
+# this proof exists to catch, and one host answering cannot mask it.
+#
+# The cost is that a partial fault — one name resolving, another not — lands as
+# a warning rather than a failure. That is the intended trade: the lane is a
+# gate on the session, and no CI gate should turn red because example.org is
+# having a bad minute.
+if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
+  echo "::group::guest egress proof (curl from inside the session)"
+  egress_ok=0
+  egress_total=0
+  egress_failed=""
+  for egress_host in example.com example.org; do
+    egress_total=$((egress_total + 1))
+    egress_status=0
+    egress_out=""
+    for egress_try in 1 2 3; do
+      egress_out="$(mnl session exec "$sid" \
+        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 30 https://$egress_host" \
+        2>"$WORK/egress.err")"
+      egress_status=$?
+      if [ "$egress_status" -eq 0 ] && [ "$egress_out" = "HTTP:200" ]; then
+        break
+      fi
+      # Not ::error:: — a retried attempt is not a lane failure, and annotating
+      # it would put a red mark on a run that goes on to pass.
+      if [ "$egress_try" -lt 3 ]; then
+        echo "guest egress to https://$egress_host failed on attempt ${egress_try}/3 (exec status ${egress_status}, got '${egress_out:-<none>}'); retrying in $((egress_try * 3))s"
+        cat "$WORK/egress.err" 2>/dev/null || true
+        sleep "$((egress_try * 3))"
+      fi
+    done
+    if [ "$egress_status" -eq 0 ] && [ "$egress_out" = "HTTP:200" ]; then
+      egress_ok=$((egress_ok + 1))
+    else
+      egress_failed="${egress_failed} https://$egress_host (exec status ${egress_status}, got '${egress_out:-<none>}')"
+      # Warned, not failed: another host answering proves the session's egress,
+      # which makes this that endpoint's problem and not the lane's. Still
+      # surfaced, so a partial fault is visible instead of silently absorbed.
+      echo "::warning::guest egress to https://$egress_host failed all 3 attempts (exec status ${egress_status}, got '${egress_out:-<none>}', want HTTP:200); not fatal while another host still proves the session has egress."
+      echo "--- curl stderr ($egress_host) ---"; cat "$WORK/egress.err" 2>/dev/null || true
+    fi
+  done
+  if [ "$egress_ok" -eq 0 ]; then
+    echo "::error::guest egress failed every attempt against all ${egress_total} hosts —${egress_failed}: the session has no working egress. On a VM lane (E2E_VM='${E2E_VM:-}') a lost gvproxy switch is one hypothesis — a switchless boot has no NAT/DNS — but a nonzero exec status or a non-200 code can equally be a DNS, TLS/CA, or exec-transport failure; the per-host curl stderr is above and the guest boot console follows in the diagnostics."
+    fail
+  fi
+  echo "guest egress proof OK (DNS + HTTPS reachable from the session; ${egress_ok}/${egress_total} hosts answered)"
+  echo "::endgroup::"
+fi
+
+# ---------------------------------------------------------------------------
+# Own-IP proof: a `--network own-ip` session gets a tap of its own, relayed to
+# the gvproxy switch. Gated on MINVMD_GVPROXY_BIN, the one signal that a switch
+# exists (`just e2e` sets it; `just e2e-native` does not). The relay is
+# attached before `activate` returns, so a refused client fails there; the
+# namespace side is read from /proc and /etc (a session rootfs has no iproute2)
+# in ONE exec, checked at the top level so an exec hiccup is not a net result.
+if [ -n "${MINVMD_GVPROXY_BIN:-}" ]; then
+  echo "::group::own-IP session proof (--network own-ip)"
+  OWNIP_SEED_DIR="$(mktemp -d /tmp/mnlo.XXXXXX)"
+  OWNIP_SEED_DIR="$(cd "$OWNIP_SEED_DIR" && pwd -P)"
+  {
+    awk '
+      /^\[upstream\]/            { grab = 1; print; next }
+      grab && (/^$/ || /^\[/)    { exit }
+      grab                       { print }
+    ' "$ROOT/.minimal/minimal.toml"
+    printf '\n[stack]\nuse = "shell"\n'
+  } > "$OWNIP_SEED_DIR/minimal.toml"
+  # The `.git` marker the headless upload gate wants; its own directory, since
+  # a path that already has a session does not mint a second one.
+  mkdir "$OWNIP_SEED_DIR/.git"
+
+  ownip_sid="$(cd "$OWNIP_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-own-ip --network own-ip 2>"$WORK/ownip.err")" || {
+    echo "::error::'min session activate --network own-ip' failed"
+    echo "--- stderr ---"; cat "$WORK/ownip.err" 2>/dev/null || true
+    fail
+  }
+  ownip_sid="$(printf '%s\n' "$ownip_sid" | tail -n1 | tr -d '\r')"
+
+  if ! mnl session exec "$ownip_sid" sh -c \
+    'echo ---DEV---; cat /proc/net/dev; echo ---ROUTE---; cat /proc/net/route; echo ---RESOLV---; cat /etc/resolv.conf' \
+    >"$WORK/ownip-facts.out" 2>"$WORK/ownip-facts.err" || [ ! -s "$WORK/ownip-facts.out" ]; then
+    # The captured streams travel in the annotation, workflow-escaped.
+    ownip_body=""
+    for f in "$WORK/ownip-facts.err" "$WORK/ownip-facts.out" "$WORK/ownip.err"; do
+      [ -s "$f" ] || continue
+      ownip_body="$ownip_body%0A--- $(basename "$f") ---%0A$(head -c 1200 "$f" | sed 's/%/%25/g; s/\r/%0D/g' | awk '{printf "%s%%0A", $0}')"
+    done
+    echo "::error::could not read the own-IP session's network state — the probe failed, which says nothing about the tap${ownip_body}"
+    echo "--- stdout ---"; cat "$WORK/ownip-facts.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/ownip-facts.err" 2>/dev/null || true
+    echo "--- activate stderr ---"; cat "$WORK/ownip.err" 2>/dev/null || true
+    fail
+  fi
+  # Everything between one marker and the next.
+  ownip_section() {
+    awk -v want="---$1---" '
+      $0 == want   { grab = 1; next }
+      /^---.*---$/ { grab = 0 }
+      grab         { print }
+    ' "$WORK/ownip-facts.out"
+  }
+
+  # An interface besides `lo`: /proc/net/dev's two header lines carry `|`, every
+  # interface line carries `:`, so two or more colons means the tap is there.
+  ownip_dev="$(ownip_section DEV)"
+  if [ "$(printf '%s\n' "$ownip_dev" | grep -c ':')" -lt 2 ]; then
+    echo "::error::own-IP session has no interface besides lo; the tap never came up"
+    echo "--- all probed facts ---"; cat "$WORK/ownip-facts.out"
+    echo "--- activate stderr ---"; cat "$WORK/ownip.err" 2>/dev/null || true
+    fail
+  fi
+
+  # A default route on that interface: destination 0.0.0.0, eight zeroes in
+  # field 2 of /proc/net/route. Without it the tap would be up but reach nothing.
+  ownip_route="$(ownip_section ROUTE)"
+  if ! printf '%s\n' "$ownip_route" \
+    | awk 'NR > 1 && $2 == "00000000" && $1 != "lo" { found = 1 } END { exit !found }'; then
+    echo "::error::own-IP session has no default route off its tap"
+    echo "--- all probed facts ---"; cat "$WORK/ownip-facts.out"
+    fail
+  fi
+
+  # The resolver points at the switch (100.64/16, the default subnet), not at
+  # the host stub (127.0.0.53), which is unreachable from a fresh netns. Glob,
+  # not `printf | grep -q`: grep's early exit SIGPIPEs the printf under
+  # `pipefail` and would read as "not found".
+  ownip_resolv="$(ownip_section RESOLV)"
+  if [[ "$ownip_resolv" != *"nameserver 100.64."* ]]; then
+    echo "::error::own-IP session's resolver does not point at the switch"
+    echo "--- all probed facts ---"; cat "$WORK/ownip-facts.out"
+    fail
+  fi
+
+  mnl session destroy --force "$ownip_sid" >/dev/null 2>&1 || true
+  rm -rf "$OWNIP_SEED_DIR"; OWNIP_SEED_DIR=""
+  echo "own-IP session proof OK (tap up, default route, switch resolver)"
+  echo "::endgroup::"
+else
+  echo "own-IP session proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+fi
 
 # ---------------------------------------------------------------------------
 # `min task run` proof: a declared task runs in an ephemeral session — output

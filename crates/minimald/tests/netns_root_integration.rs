@@ -31,6 +31,8 @@
 //! `MINIMALD_NETNS_TEST=1 GVPROXY_BIN=... cargo test -p minimald --test netns_root_integration -- --include-ignored`
 #![cfg(target_os = "linux")]
 
+use sandbox2::Network as _;
+
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -79,9 +81,9 @@ fn sudo_ok(label: &str, args: &[&str]) {
 /// A no-network task cannot reach the internet.
 ///
 /// Drives the egress attempt through `unshare --net`, which calls the same
-/// `CLONE_NEWNET` syscall that `sandbox2::new_container` calls for
-/// `NetworkMode::NoNet`. If `new_container` stopped calling `CLONE_NEWNET`,
-/// the `isolates_network` assertion would no longer match the actual namespacing
+/// `CLONE_NEWNET` syscall that `sandbox2::new_container` calls for an
+/// isolating plan. If `new_container` stopped calling `CLONE_NEWNET`, the
+/// `isolates_netns` assertion would no longer match the actual namespacing
 /// behaviour; the `unshare --net` egress test guards the OS-level contract.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a network namespace; gated on MINIMALD_NETNS_TEST; runs in the ci-linux-native netns job"]
@@ -90,10 +92,10 @@ async fn netns_nonet_refuses_egress() {
         return;
     }
 
-    // The production decision under test: NoNet isolates the network namespace,
-    // HostNet shares it.
-    assert!(sandbox2::isolates_network(sandbox2::NetworkMode::NoNet));
-    assert!(!sandbox2::isolates_network(sandbox2::NetworkMode::HostNet));
+    // The production decision under test: `NoNet` plans an isolated network
+    // namespace, `HostNet` a shared one.
+    assert!(sandbox2::NoNet.plan().await.unwrap().isolates_netns());
+    assert!(!sandbox2::HostNet.plan().await.unwrap().isolates_netns());
 
     // Exercise the same OS primitive that sandbox2::new_container uses for NoNet
     // (CLONE_NEWNET via unshare): enter a fresh, empty network namespace and

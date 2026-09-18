@@ -12,9 +12,11 @@
 
 pub mod config;
 use config::Config;
-pub use config::NetworkMode;
 pub mod network;
-pub use network::{AttachFuture, HostNet, NetGuard, Network, NetworkError, NoNet};
+pub use network::{
+    AbandonFuture, AttachFuture, HostNet, NetGuard, NetPlan, Network, NetworkError, NoNet,
+    PlanFuture, Resolver, Spawned, TapSpec,
+};
 use std::fs::{self, Permissions};
 #[cfg(target_os = "linux")]
 use std::io::Read;
@@ -451,14 +453,45 @@ impl<C: Channel> Sandbox<C> {
         Ok(())
     }
 
-    /// Builds the hakoniwa [`Container`] for this sandbox.
+    /// The network plan this sandbox's own configuration implies: its
+    /// [`plan`](config::Config::plan), carrying the host resolver when
+    /// [`setup_dns_config`](config::Config::setup_dns_config) asks for one.
+    #[must_use]
+    pub fn built_in_plan(&self) -> network::NetPlan {
+        plan_from_config(&self.config)
+    }
+
+    /// Step 1 of a launch: ask the provider what this sandbox needs. A sandbox
+    /// with no provider is planned by its own configuration, through the same
+    /// sequence. From here the plan's release is owed; see [`PlannedLaunch`].
+    ///
+    /// Not an `async fn`: that would hold `&Sandbox<C>` across the await and
+    /// impose `C: Sync` on every caller's future, which the build path does
+    /// not satisfy.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the provider's planning failure.
+    pub fn plan_launch(
+        &self,
+    ) -> impl Future<Output = Result<PlannedLaunch, Error>> + Send + 'static {
+        let network = self
+            .config
+            .network
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(self.built_in_plan()));
+        PlannedLaunch::begin(network)
+    }
+
+    /// Builds the hakoniwa [`Container`] for this sandbox, configured for
+    /// `plan`.
     ///
     /// Spawning this container (`Command::spawn`) does a bare in-process `fork()`
     /// on the calling thread and arms `PR_SET_PDEATHSIG(SIGKILL)`, tying the
     /// child's lifetime to that thread. See [`run_with_cancel`](Self::run_with_cancel)
     /// for the thread-affinity constraints this imposes on callers.
     #[cfg(target_os = "linux")]
-    pub fn new_container(&self) -> Result<Container, Error> {
+    pub fn new_container(&self, plan: &network::NetPlan) -> Result<Container, Error> {
         let mut container = hakoniwa::Container::new();
         container
             .rootfs(self.rootfs())
@@ -473,61 +506,21 @@ impl<C: Channel> Sandbox<C> {
             .unshare(hakoniwa::Namespace::Cgroup)
             .runctl(hakoniwa::Runctl::IgnoreCgroupSetupFailed);
 
-        // Network isolation (R1.4/R1.7). `HostNet` keeps the host/VM network
-        // namespace (the current default). `NoNet` and `OwnIp` both run in a
-        // fresh network namespace, created identically here: a `NoNet` PTask is
-        // left with only a down `lo`, so every egress attempt fails with
-        // `ENETUNREACH` (UC1); an `OwnIp` PTask is given a tap device + gvproxy
-        // switch relay afterwards, but `sandbox2` does NOT do that wiring (it
-        // would be a dependency cycle: `minimald` depends on `sandbox2`, not the
-        // reverse, and `sandbox2` never references `minimald::net`). `sandbox2`'s
-        // only role for `OwnIp` is to unshare this namespace; the launched
-        // process's PID (`hakoniwa::Child::id()`, whose `/proc/<pid>/ns/net` is
-        // this namespace) is surfaced to the `minimald` session launcher, which
-        // moves a tap into it and attaches it to the host gvproxy switch (R1.5).
-        // Unlike the cgroup-setup fallback above (which degrades resource
-        // *accounting*), this is a *security* boundary: if a caller asks for
-        // `NoNet`/`OwnIp` but this host cannot create a network namespace, we
-        // fail closed rather than silently hand back full host networking, which
-        // would void the isolation the mode promises (spec R1.2).
-        // A custom `Network` decides isolation; otherwise fall back to the
-        // built-in `network_mode` mapping. Phase-B wiring (own-IP tap/switch) is
-        // applied post-spawn via `attach_network`, never here.
-        let isolate = match self.config.network.as_deref() {
-            Some(net) => net.isolate_netns(),
-            None => isolates_network(self.config.network_mode),
-        };
+        // Network isolation (R1.4/R1.7). An isolating plan gets a fresh network
+        // namespace with only a down `lo`; wiring it is the provider's job,
+        // after the process exists. Unlike the cgroup-setup fallback above this
+        // is a *security* boundary, so it fails closed when the host cannot
+        // make the namespace (spec R1.2).
+        let isolate = isolation_decision(plan, network_namespaces_available())?;
         if isolate {
-            if network_namespaces_available() {
-                container.unshare(hakoniwa::Namespace::Network);
-            } else {
-                return Err(Error::Execution(
-                    ExecutionError::NetworkIsolationUnavailable {
-                        mode: self.config.network_mode,
-                    },
-                ));
-            }
+            container.unshare(hakoniwa::Namespace::Network);
         }
 
-        // Own-IP (native/DM2): have hakoniwa create + configure the TAP inside the
-        // sandbox's user+net namespace (rootless — it enters the namespace as its
-        // container-root and needs no host `CAP_NET_ADMIN`). The tap fd comes back
-        // out post-spawn via `Child.rustslirp_tapfd` for the caller to relay to the
-        // gvproxy switch. `network()` does not imply the netns unshare, so it must
-        // follow the `unshare(Namespace::Network)` above (which `isolate` did).
-        if let Some(tap) = self.config.own_ip_tap {
-            // The tap only makes sense in an unshared netns: RustSlirp enters the
-            // sandbox's own network namespace to build it, and hakoniwa skips the
-            // setup entirely (leaving no tap fd) unless `Namespace::Network` was
-            // unshared. Configuring it against a shared netns would silently no-op,
-            // so reject the combination rather than hand back a sandbox with no tap.
-            if !isolate {
-                return Err(Error::Execution(
-                    ExecutionError::NetworkIsolationUnavailable {
-                        mode: self.config.network_mode,
-                    },
-                ));
-            }
+        // Have hakoniwa create + configure the TAP inside the sandbox's user+net
+        // namespace (rootless). `network()` does not imply the netns unshare,
+        // so it must follow the `unshare` above — which a tap-carrying plan
+        // guarantees, since `NetPlan` cannot describe a tap without isolation.
+        if let Some(tap) = plan.tap() {
             container.network(
                 hakoniwa::RustSlirp::default()
                     // L2: the gvproxy relay is HyperKit-framed Ethernet, not L3.
@@ -700,22 +693,10 @@ impl<C: Channel> Sandbox<C> {
             container.hostname(hn);
         }
 
-        // An own-IP sandbox runs in a fresh netns where the synth rootfs's host
-        // stub resolver (`127.0.0.53`) is unreachable, so point `/etc/resolv.conf`
-        // at the switch's DNS server (gvproxy, at the gateway) instead. Sourced
-        // from `own_ip_dns` — set for *every* own-IP sandbox, both the DM2 tap
-        // path and the DM1/3/4 shuttle path (which has no `own_ip_tap`) — so DNS
-        // is not tied to tap params. Written to the rootfs before spawn, like
+        // The resolver the plan names, written to the rootfs before spawn like
         // `/etc/hostname` above: hakoniwa binds `/etc` read-only from
         // `<rootfs>/etc`, so an in-sandbox write would hit a read-only fs.
-        // Overwrites unconditionally — `synth_dns_config` already populated it
-        // with the host resolver, so a create-only guard would leave the (dead)
-        // host stub in place.
-        if let Some(dns) = self.config.own_ip_dns {
-            let etc_resolv = self.rootfs().join("etc").join("resolv.conf");
-            std::fs::write(&etc_resolv, format!("nameserver {dns}\n"))
-                .map_err(|e| Error::IO("writing /etc/resolv.conf", etc_resolv.clone(), e))?;
-        }
+        write_resolv_conf(&self.rootfs(), plan.resolver())?;
 
         if let Some(s) = &self.config.cpu_weight
             && booted_with_systemd()
@@ -836,11 +817,15 @@ impl<C: Channel> Sandbox<C> {
         W1: tokio::io::AsyncWrite + Unpin + Send,
         W2: tokio::io::AsyncWrite + Unpin + Send,
     {
-        let container = self.new_container()?;
         for (i, exec) in invocations.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(Error::Execution(ExecutionError::Cancelled));
             }
+
+            // One launch per invocation: hakoniwa unshares per `spawn()`, so
+            // each invocation has its own netns and needs its own plan.
+            let planned = self.plan_launch().await?;
+            let container = self.new_container(planned.plan())?;
 
             let mut cmd = self.command(&container, &exec.executable, &exec.args, &exec.envs)?;
             cmd.stderr(hakoniwa::Stdio::MakePipe);
@@ -851,29 +836,22 @@ impl<C: Channel> Sandbox<C> {
                 .spawn()
                 .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
-            // Apply the configured per-sandbox network to this invocation's
-            // freshly-unshared netns (own-IP switch attach). No-op for
-            // HostNet/NoNet and when no custom `Network` is set, so existing
-            // build/task consumers are unaffected — this is what lets tasks, not
-            // just minimald sessions, get networking through the abstraction.
-            // Torn down explicitly once the invocation completes (both arms).
-            // Borrow only the `Network` (which is `Send + Sync`) across the await,
-            // not the whole `Sandbox<C>`, so this doesn't impose `C: Sync` on the
-            // run future.
-            let net_guard = match self.config.network.as_deref() {
-                Some(net) => match net.attach(child.id()).await {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        // Attach failed after spawn: kill+reap the child so it
-                        // doesn't outlive its sandbox (a `hakoniwa::Child` does
-                        // not terminate on drop). `wait` runs regardless of
-                        // `kill` (the process may have already exited).
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(Error::Network(e));
-                    }
-                },
-                None => network::noop_guard(),
+            // Step 3: wire this invocation's netns. Torn down explicitly once
+            // the invocation completes (both arms).
+            let net_guard = match planned
+                .attach(network::Spawned::from_child(&mut child))
+                .await
+            {
+                Ok(guard) => guard,
+                Err(e) => {
+                    // Attach failed after spawn: kill+reap the child so it
+                    // doesn't outlive its sandbox (a `hakoniwa::Child` does
+                    // not terminate on drop). `wait` runs regardless of
+                    // `kill` (the process may have already exited).
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e);
+                }
             };
 
             // Take pipes from the child so threads can stream them into the stdout/stderr
@@ -1313,18 +1291,143 @@ fn userns_restriction_from(
     (restricted && unconfined).then_some(UsernsRestriction::ApparmorUnconfined)
 }
 
-/// Whether `mode` runs the sandbox in its own network namespace rather than
-/// sharing the host's.
+/// A launch between its plan and its attach, owing the plan's release.
 ///
-/// [`NetworkMode::HostNet`] shares the host/VM network namespace (the default);
-/// every other mode — [`NetworkMode::NoNet`] and [`NetworkMode::OwnIp`] —
-/// isolates the sandbox in a fresh network namespace. This is the predicate
-/// `new_container` uses to decide whether to unshare the network namespace (and
-/// to fail closed when it cannot), and the contract a `NoNet` PTask's no-egress
-/// behaviour (UC1) rests on.
-#[must_use]
-pub fn isolates_network(mode: NetworkMode) -> bool {
-    mode != NetworkMode::HostNet
+/// A value rather than a closure, because the session path builds its
+/// environment asynchronously between the two steps. Every way out releases
+/// the plan exactly once: [`attach`](Self::attach) hands the obligation to the
+/// returned [`NetGuard`], [`abandon`](Self::abandon) releases it, and `Drop`
+/// releases it — which is what catches a cancelled launch.
+pub struct PlannedLaunch {
+    network: std::sync::Arc<dyn network::Network>,
+    plan: network::NetPlan,
+    /// Whether the release is still owed. Cleared by `attach` and `abandon`.
+    owed: bool,
+}
+
+impl std::fmt::Debug for PlannedLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlannedLaunch")
+            .field("plan", &self.plan)
+            .field("owed", &self.owed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PlannedLaunch {
+    /// Step 1: ask the provider for its plan, and take on its release. Split
+    /// from [`Sandbox::plan_launch`] so the sequence is reachable without a
+    /// `Sandbox`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the provider's planning failure; a plan that failed reserved
+    /// nothing.
+    pub async fn begin(network: std::sync::Arc<dyn network::Network>) -> Result<Self, Error> {
+        let plan = network.plan().await.map_err(Error::Network)?;
+        Ok(Self {
+            network,
+            plan,
+            owed: true,
+        })
+    }
+
+    /// What the sandbox needs; the container is built from it.
+    #[must_use]
+    pub fn plan(&self) -> &network::NetPlan {
+        &self.plan
+    }
+
+    /// The process exists: wire its namespace. The returned guard owns the
+    /// release from here, so no abandon follows.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the provider's attach failure; the plan's release stays owed
+    /// and the drop of `self` runs it.
+    pub async fn attach(mut self, spawned: network::Spawned) -> Result<Box<dyn NetGuard>, Error> {
+        let guard = self.network.attach(spawned).await.map_err(Error::Network)?;
+        self.owed = false;
+        Ok(guard)
+    }
+
+    /// Give up before the process exists, releasing the plan.
+    pub async fn abandon(mut self) {
+        self.owed = false;
+        self.network.abandon().await;
+    }
+}
+
+impl Drop for PlannedLaunch {
+    fn drop(&mut self) {
+        if !self.owed {
+            return;
+        }
+        let network = std::sync::Arc::clone(&self.network);
+        // `Drop` cannot `await`; with no runtime there is nothing to release to.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { network.abandon().await });
+        }
+    }
+}
+
+/// The network plan a sandbox's built-in configuration implies. See
+/// [`Sandbox::built_in_plan`].
+fn plan_from_config(config: &config::Config) -> network::NetPlan {
+    // A resolver the plan names wins; `setup_dns_config` fills in the host's
+    // only where the plan is silent.
+    if config.setup_dns_config && *config.plan.resolver() == network::Resolver::None {
+        return config.plan.clone().with_resolver(network::Resolver::Host);
+    }
+    config.plan.clone()
+}
+
+/// Whether to unshare the network namespace, or the error that says we will not
+/// hand back host networking instead. Takes what the probe found so 017-011 is
+/// provable on any host.
+#[cfg(target_os = "linux")]
+fn isolation_decision(plan: &network::NetPlan, netns_available: bool) -> Result<bool, Error> {
+    if plan.isolates_netns() && !netns_available {
+        return Err(Error::Execution(
+            ExecutionError::NetworkIsolationUnavailable,
+        ));
+    }
+    Ok(plan.isolates_netns())
+}
+
+/// Puts the plan's resolver into `<rootfs>/etc/resolv.conf`. The host's is
+/// synthesized only if the rootfs has none; named servers replace whatever is
+/// there, unlinking first because the rootfs is a hardlink farm over the
+/// package cache.
+fn write_resolv_conf(rootfs: &Path, resolver: &network::Resolver) -> Result<(), Error> {
+    let etc_resolv = rootfs.join("etc").join("resolv.conf");
+    match resolver {
+        network::Resolver::None => Ok(()),
+        network::Resolver::Host => {
+            if fs::exists(&etc_resolv)
+                .map_err(|e| Error::IO("checking for /etc/resolv.conf", etc_resolv.clone(), e))?
+            {
+                return Ok(());
+            }
+            common::synth_dns_config(rootfs)
+                .map_err(|e| Error::IO("synthesizing /etc/resolv.conf", etc_resolv, e))
+        }
+        network::Resolver::Nameservers(servers) => {
+            fs::create_dir_all(rootfs.join("etc"))
+                .map_err(|e| Error::IO("creating /etc", rootfs.join("etc"), e))?;
+            match fs::remove_file(&etc_resolv) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::IO("replacing /etc/resolv.conf", etc_resolv, e)),
+            }
+            let body: String = servers
+                .iter()
+                .map(|s| format!("nameserver {s}\n"))
+                .collect();
+            fs::write(&etc_resolv, body)
+                .map_err(|e| Error::IO("writing /etc/resolv.conf", etc_resolv, e))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1352,11 +1455,269 @@ mod tests {
         assert!(opts.is_empty());
     }
 
+    /// A provider that records which operations ran, in order, so the sequence
+    /// itself can be asserted rather than its effects.
+    #[derive(Debug, Default)]
+    struct Recorder {
+        events: std::sync::Mutex<Vec<&'static str>>,
+        /// When set, `attach` fails — the path that must still leave the plan's
+        /// release owed.
+        attach_fails: bool,
+    }
+
+    impl Recorder {
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().unwrap().clone()
+        }
+        fn push(&self, e: &'static str) {
+            self.events.lock().unwrap().push(e);
+        }
+    }
+
+    impl network::Network for Recorder {
+        fn plan(&self) -> network::PlanFuture<'_> {
+            self.push("plan");
+            Box::pin(std::future::ready(Ok(network::NetPlan::isolated())))
+        }
+        fn attach(&self, spawned: network::Spawned) -> network::AttachFuture<'_> {
+            self.push("attach");
+            if self.attach_fails {
+                return Box::pin(std::future::ready(Err(network::NetworkError::new(
+                    std::io::Error::other("attach refused"),
+                ))));
+            }
+            drop(spawned);
+            Box::pin(std::future::ready(Ok(network::noop_guard())))
+        }
+        fn abandon(&self) -> network::AbandonFuture<'_> {
+            self.push("abandon");
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    fn planned_with(rec: &std::sync::Arc<Recorder>) -> PlannedLaunch {
+        PlannedLaunch {
+            network: rec.clone(),
+            plan: network::NetPlan::isolated(),
+            owed: true,
+        }
+    }
+
+    /// 017-001. A full launch records `plan` then `attach`, nothing between.
+    /// The order is structural: `new_container` takes a `&NetPlan` and `attach`
+    /// takes a [`network::Spawned`], which only a spawned process yields.
+    #[tokio::test]
+    async fn network_phases_run_in_order() {
+        let rec = std::sync::Arc::new(Recorder::default());
+        let planned = PlannedLaunch::begin(rec.clone()).await.expect("planning");
+        assert_eq!(rec.events(), vec!["plan"]);
+        assert!(
+            planned.plan().isolates_netns(),
+            "the provider's plan is carried forward"
+        );
+
+        let guard = planned.attach(network::Spawned::new(4242)).await.unwrap();
+        assert_eq!(rec.events(), vec!["plan", "attach"]);
+        guard.teardown().await;
+    }
+
+    /// 017-002. A launch that gives up between plan and attach releases the
+    /// plan exactly once, and a failed attach still leaves the release owed.
+    #[tokio::test]
+    async fn abandoned_launch_releases_the_plan() {
+        let rec = std::sync::Arc::new(Recorder::default());
+        rec.push("plan");
+        planned_with(&rec).abandon().await;
+        // The explicit abandon consumes the launch; its drop must not release again.
+        assert_eq!(rec.events(), vec!["plan", "abandon"]);
+
+        let rec = std::sync::Arc::new(Recorder {
+            events: std::sync::Mutex::new(vec!["plan"]),
+            attach_fails: true,
+        });
+        assert!(
+            planned_with(&rec)
+                .attach(network::Spawned::new(1))
+                .await
+                .is_err()
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            rec.events(),
+            vec!["plan", "attach", "abandon"],
+            "a failed attach must still release the plan"
+        );
+    }
+
+    /// 017-002 sub-requirement: the launch future going away is the one exit a
+    /// caller cannot handle, so the release rides on `Drop`.
+    #[tokio::test]
+    async fn cancelled_launch_releases_the_plan() {
+        let rec = std::sync::Arc::new(Recorder::default());
+        rec.push("plan");
+        drop(planned_with(&rec));
+        tokio::task::yield_now().await;
+        assert_eq!(rec.events(), vec!["plan", "abandon"]);
+    }
+
+    /// 017-010. The descriptor reaches the provider once: a second take yields
+    /// nothing rather than a second owner of the same fd.
     #[test]
-    fn host_net_shares_the_network_namespace_others_isolate() {
-        assert!(!isolates_network(NetworkMode::HostNet));
-        assert!(isolates_network(NetworkMode::NoNet));
-        assert!(isolates_network(NetworkMode::OwnIp));
+    fn the_tap_descriptor_goes_to_the_provider_once() {
+        use std::os::fd::AsRawFd as _;
+        // A pipe end stands in for the tap; any real fd proves ownership moved.
+        let (read_end, _write_end) = std::io::pipe().expect("pipe");
+        let fd = std::os::fd::OwnedFd::from(read_end);
+        let raw = fd.as_raw_fd();
+
+        let mut spawned = network::Spawned::new(7).with_tap_fd(fd);
+        assert_eq!(spawned.take_tap_fd().expect("first take").as_raw_fd(), raw);
+        assert!(
+            spawned.take_tap_fd().is_none(),
+            "a second take gets nothing"
+        );
+        assert!(network::Spawned::new(7).take_tap_fd().is_none());
+    }
+
+    /// 017-004. Both ways a sandbox process starts — the invocation path
+    /// ([`Sandbox::plan_launch`]) and the caller-spawn path `minimald` uses
+    /// ([`PlannedLaunch::begin`]) — reach the same provider through one
+    /// sequence; with no provider, both plan from the sandbox's own config.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn both_spawn_paths_apply_the_network() {
+        let recorder = std::sync::Arc::new(Recorder::default());
+        let (_tmp, base) = make_base_with_synth();
+        let config = Config::new("test-both-paths")
+            .with_network(recorder.clone() as std::sync::Arc<dyn network::Network>);
+        let sandbox = Sandbox::new(base, config, ()).unwrap();
+
+        let from_invocation = sandbox.plan_launch().await.expect("plan");
+        let from_caller = PlannedLaunch::begin(recorder.clone()).await.expect("plan");
+        assert_eq!(
+            recorder.events(),
+            vec!["plan", "plan"],
+            "each path asks once"
+        );
+        assert_eq!(from_invocation.plan(), from_caller.plan());
+        from_invocation.abandon().await;
+        from_caller.abandon().await;
+        assert_eq!(
+            recorder.events(),
+            vec!["plan", "plan", "abandon", "abandon"]
+        );
+
+        let (_tmp, base) = make_base_with_synth();
+        let config = Config::new("test-both-paths-bare").with_plan(network::NetPlan::isolated());
+        let sandbox = Sandbox::new(base, config, ()).unwrap();
+        let from_invocation = sandbox.plan_launch().await.expect("plan");
+        let from_caller = PlannedLaunch::begin(std::sync::Arc::new(sandbox.built_in_plan()))
+            .await
+            .expect("plan");
+        assert!(from_invocation.plan().isolates_netns());
+        assert_eq!(from_invocation.plan(), from_caller.plan());
+    }
+
+    fn tap_spec() -> network::TapSpec {
+        network::TapSpec {
+            address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            netmask: std::net::Ipv4Addr::new(255, 255, 0, 0),
+            gateway: std::net::Ipv4Addr::new(100, 64, 0, 1),
+            mtu: 1500,
+        }
+    }
+
+    /// 017-007. A plan with tap parameters isolates, however it was built:
+    /// `NetPlan` has no constructor that pairs a tap with a shared namespace.
+    #[test]
+    fn a_tap_plan_always_isolates() {
+        assert!(network::NetPlan::isolated_with_tap(tap_spec()).isolates_netns());
+        assert!(
+            network::NetPlan::isolated_with_tap(tap_spec())
+                .with_resolver(network::Resolver::Host)
+                .isolates_netns()
+        );
+        assert!(network::NetPlan::host().tap().is_none());
+    }
+
+    /// 017-006, for the plans the sandbox layer handles by itself: a shared
+    /// namespace gets no tap and the host's resolver only when asked; an
+    /// isolated one gets no tap and no resolver; a resolver the plan names is
+    /// kept. The mode half is `minimald::net::provider`.
+    #[test]
+    fn the_mode_bounds_the_network_access() {
+        let plan_for = |plan, dns| {
+            let mut cfg = Config::new("t").with_plan(plan);
+            cfg.setup_dns_config = dns;
+            plan_from_config(&cfg)
+        };
+
+        let host = plan_for(network::NetPlan::host(), true);
+        assert!(!host.isolates_netns() && host.tap().is_none());
+        assert_eq!(host.resolver(), &network::Resolver::Host);
+        assert_eq!(
+            plan_for(network::NetPlan::host(), false).resolver(),
+            &network::Resolver::None
+        );
+
+        let isolated = plan_for(network::NetPlan::isolated(), false);
+        assert!(isolated.isolates_netns() && isolated.tap().is_none());
+        assert_eq!(isolated.resolver(), &network::Resolver::None);
+
+        let named = network::Resolver::Nameservers(vec![std::net::Ipv4Addr::new(100, 64, 0, 1)]);
+        let own_ip = network::NetPlan::isolated_with_tap(tap_spec()).with_resolver(named.clone());
+        assert_eq!(plan_for(own_ip, true).resolver(), &named);
+    }
+
+    /// The plan's resolver is what reaches `/etc/resolv.conf`.
+    #[test]
+    fn the_plan_names_the_resolver_the_rootfs_gets() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path();
+        let resolv = rootfs.join("etc").join("resolv.conf");
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+
+        write_resolv_conf(rootfs, &network::Resolver::None).unwrap();
+        assert!(!resolv.exists(), "None must write nothing");
+
+        write_resolv_conf(rootfs, &network::Resolver::Host).unwrap();
+        assert!(resolv.exists(), "Host must synthesize a resolver");
+
+        fs::write(&resolv, "nameserver 192.0.2.1\n").unwrap();
+        write_resolv_conf(rootfs, &network::Resolver::Host).unwrap();
+        assert_eq!(
+            fs::read_to_string(&resolv).unwrap(),
+            "nameserver 192.0.2.1\n",
+            "Host must not replace a resolver the rootfs already has"
+        );
+
+        let switch = std::net::Ipv4Addr::new(100, 64, 0, 1);
+        write_resolv_conf(rootfs, &network::Resolver::Nameservers(vec![switch])).unwrap();
+        assert_eq!(
+            fs::read_to_string(&resolv).unwrap(),
+            "nameserver 100.64.0.1\n",
+            "named servers must replace what is there"
+        );
+    }
+
+    /// 017-011. A host that cannot make the namespace the plan needs fails the
+    /// launch rather than handing back the host's network.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_namespace_support_fails_closed() {
+        let err = isolation_decision(&network::NetPlan::isolated(), false)
+            .expect_err("an isolating plan on a host without namespaces must fail");
+        assert!(
+            matches!(
+                err,
+                Error::Execution(ExecutionError::NetworkIsolationUnavailable)
+            ),
+            "expected NetworkIsolationUnavailable, got {err:?}"
+        );
+        assert!(
+            isolation_decision(&network::NetPlan::isolated_with_tap(tap_spec()), false,).is_err()
+        );
+        assert!(!isolation_decision(&network::NetPlan::host(), false).unwrap());
     }
 
     /// The Ubuntu 24.04+ default: restriction sysctl on, daemon unconfined —
