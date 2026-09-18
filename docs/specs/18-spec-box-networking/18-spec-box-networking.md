@@ -178,18 +178,18 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimald box_survives_without_client
   <!-- S1b-2c; prose 10; state-driven; interview decision -->
-  - IF an attached client is lost abruptly THEN THE SYSTEM SHALL keep the box's task running.
+  - IF the attached client of a PTY box is lost abruptly THEN THE SYSTEM SHALL keep the box's entrypoint running and accept a later attach.
     tier:   T0
     verify: cargo nextest run -p minimald abrupt_client_loss_keeps_task
-    <!-- S1b-2c; prose 10; unwanted -->
-  - IF a `min session exec` client is lost abruptly THEN THE SYSTEM SHALL end the command that exec spawned and keep the box running.
+    <!-- S1b-2c; prose 10; unwanted; client loss splits on the PTY, not on the verb: a lost PTY attach is a detach; in this tree the entrypoint is the session's shell -->
+  - IF the client of a non-PTY exec (`min session exec`, and the `min task run` or `min session run` command it carries) is lost abruptly THEN THE SYSTEM SHALL end the command that exec spawned and keep the box running.
     tier:   T0
     verify: cargo nextest run -p minimald lost_exec_client_kills_only_its_own_process
-    <!-- S1b-2c; unwanted; exec's per-command process is not the box: it is its own sandboxed process with its own lease, and nobody is left to read its output -->
-  - THE SYSTEM SHALL stop a box only when its client stops, destroys, or deletes it, or when the box host tears it down by force: daemon shutdown, an abandoned launch, or the host reclaiming the VM.
+    <!-- S1b-2c; unwanted; every exec in this tree is non-PTY (a pty-req on the exec channel is logged and ignored), so the rule as scoped is the shipped behaviour; the PTY exec the architecture defines is a re-attachable attach and falls under the sub-requirement above -->
+  - THE SYSTEM SHALL stop a box only when its client issues stop, destroy, or delete, when its entrypoint exits (subject to the exit prompt), or when the box host tears it down by force: daemon shutdown, an abandoned launch, or the host reclaiming the VM.
     tier:   T0
     verify: cargo nextest run -p minimald box_has_no_idle_stop
-    <!-- S1b-2c; ubiquitous within the WHILE; the idle and stop policy is the client's (Design reasoning) -->
+    <!-- S1b-2c; ubiquitous within the WHILE; the idle and stop policy is the client's (Design reasoning); a declared execution timeout is the client's policy, set at creation, and is not built here -->
 
 - **NET-016** WHILE a box is running, WHEN a process in it starts listening on a port its ingress rules permit and no declaration names THE SYSTEM SHALL publish that port on the box's address.
   tier:     T0
@@ -773,15 +773,23 @@ would have left the unattended-box story unsized; the second makes "the name
 works whether or not a client is attached" narrower than the epic wrote it. The
 chosen shape makes port publication unconditional and coheres with the
 closed-laptop story elsewhere. **Idle and stop are the client's.** A box ends
-only when its client stops, destroys, or deletes it, or when the box host tears
-it down by force: daemon shutdown, an abandoned launch, or the host reclaiming
-the VM. There is no daemon-side idle timeout. A daemon idle timeout was
+only when its client issues stop, destroy, or delete, when its entrypoint exits
+subject to the exit prompt, or when the box host tears it down by force: daemon
+shutdown, an abandoned launch, or the host reclaiming the VM. A declared
+execution ceiling is the client's policy, set at creation. There is no
+daemon-side idle timeout. A daemon idle timeout was
 considered and rejected: it stops a box nobody asked to stop, and it breaks the
 closed-laptop story, which composes with the chosen shape with no extra rule
-because a closed laptop issues no stop. A `min session exec` client is
-different from an attached client: each exec spawns its own sandboxed process
-with its own lease, so a lost exec client ends that process, which would
-otherwise block on a pipe nobody reads, and leaves the box untouched.
+because a closed laptop issues no stop. Client loss splits on the terminal,
+not on the verb: a lost PTY attach is a detach and the entrypoint keeps
+running; a lost non-PTY exec ends the command it spawned, which would otherwise
+block on a pipe nobody reads, and leaves the box untouched. In this tree each
+exec is its own sandboxed process with its own lease, and a single argument is
+reshelled; the architecture places an exec inside the box under the box's
+identity, ceilings, and network posture, argv only, with a re-attachable PTY
+form. Nothing bound here depends on the sibling-sandbox shape, and the exec
+requirement is worded for the non-PTY exec so the PTY exec does not contradict
+it when it lands.
 
 **The proxy keeps running after native resolution supersedes it.** NET-018 and
 NET-019 make tooling report native DNS as the live surface while the hostname
@@ -962,6 +970,13 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   naming and addressing to that host and now permits a node-local Box Egress
   Proxy inside its boundary at the advisory tier; it says nothing about the
   classifier.]
+- [NEEDS CLARIFICATION (MEDIUM): a `min task run` client creates a session,
+  execs the task into it, and destroys it afterwards; under NET-015 a client
+  lost mid-run leaves that session running with nothing to destroy it, since
+  the abandoned-launch reap covers only un-finalized sessions. The architecture
+  ends a box created for a non-detached run when the run ends, which moves the
+  destroy to the daemon side of the exec's exit; whether this tree adopts that
+  shape or accepts the leaked session as the interim is undecided.]
 - [NEEDS CLARIFICATION (LOW): are HTTP/2 and HTTP/3 through any proxy surface in
   scope? [Design §5.3][design] governs QUIC for egress and leaves the proxy
   surfaces unaddressed; the local Box Egress Proxy document needs the answer for
