@@ -2,7 +2,8 @@
 # Run after `sudo reboot` and a fresh login. No root needed.
 SP=docs/spikes/2026-09-22-macos-loopback-alias
 echo "## boot time";        sysctl -n kern.boottime
-echo "## launchd state";    launchctl print system/dev.minimal.loopback | grep -E "state|last exit|runs|program"
+echo "## launchd state (LaunchOnlyOnce: 'Could not find service' means it ran and exited)"
+launchctl print system/dev.minimal.loopback 2>&1 | grep -E "state|last exit|runs|Could not find"
 echo "## alias count";      ifconfig lo0 | grep -c 127.0.64
 echo "## daemon log";       cat /var/log/dev.minimal.loopback.log
 echo "## bind probe, every address in the range (expect 254 OK, plus 127.0.0.1 and ::1)"

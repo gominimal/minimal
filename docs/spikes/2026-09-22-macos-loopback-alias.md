@@ -338,6 +338,42 @@ reuses that shape (`nameserver 127.0.0.1`, `port 15353`, the arch working
 value). It is written by the same privileged step so that both halves of the
 advisory command land in one prompt, as design 7.1 requires.
 
+## Root run
+
+### 6. Install and immediate check (done, before reboot)
+
+Run from a terminal on 2026-09-18, one password prompt. `install.sh` as first
+committed checked too early: `launchctl print` showed `state = xpcproxy` while
+the 254 `ifconfig` calls were still running, the alias count read 0 and the
+probe 1. Two seconds later:
+
+```
+$ launchctl print system/dev.minimal.loopback
+Could not find service "dev.minimal.loopback" in domain for system
+$ ifconfig lo0 | grep -c 127.0.64
+254
+$ cat /var/log/dev.minimal.loopback.log
+dev.minimal.loopback: 2026-09-18T07:36:43Z since_boot=143946s added=254 present=254/254 on lo0
+$ python3 bind-probe.py $(seq -f "127.0.64.%g" 1 254) | grep -c " OK "
+254
+$ scutil --dns | grep -A4 min.internal
+  domain   : min.internal
+  nameserver[0] : 127.0.0.1
+  port     : 15353
+  flags    : Request A records, Request AAAA records
+  reach    : 0x00030002 (Reachable,Local Address,Directly Reachable Address)
+```
+
+The "applied immediately" half of design 7.1 holds: one `launchctl bootstrap`
+puts the whole range on `lo0`, every address binds, and the scoped resolver is
+registered with its port. The `launchctl print` miss is the plist's
+`LaunchOnlyOnce`: launchd drops the job after it exits, so the daemon's log
+line, not launchd state, is the evidence that it ran; the scripts now say so.
+`since_boot` on this run is the host's uptime and means nothing until the
+reboot.
+
+### 7. Reboot and after (pending)
+
 ## Left for a person with root
 
 Run from the repository root (Artifacts lists every file). The
@@ -352,7 +388,7 @@ sudo install -o root -g wheel -m 755 dev.minimal.loopback.sh /Library/Privileged
 sudo install -o root -g wheel -m 644 dev.minimal.loopback.plist /Library/LaunchDaemons/dev.minimal.loopback.plist
 sudo install -o root -g wheel -m 644 min.internal /etc/resolver/min.internal
 sudo launchctl bootstrap system /Library/LaunchDaemons/dev.minimal.loopback.plist
-launchctl print system/dev.minimal.loopback | grep -E "state|last exit|program"
+sleep 2   # the job is LaunchOnlyOnce; once it exits launchd drops it and `launchctl print` says "Could not find service"
 ifconfig lo0 | grep -c 127.0.64          # expect 254
 cat /var/log/dev.minimal.loopback.log    # expect present=254/254; this run's since_boot is meaningless
 python3 bind-probe.py $(seq -f "127.0.64.%g" 1 254) | grep -c " OK "   # expect 254
@@ -369,8 +405,8 @@ sudo reboot
 sh docs/spikes/2026-09-22-macos-loopback-alias/verify-after-reboot.sh
 ```
 
-Record from its output: `kern.boottime`; `launchctl print` state and last exit
-code (expect 0); `ifconfig lo0 | grep -c 127.0.64` (expect 254); the daemon
+Record from its output: `kern.boottime`; `launchctl print` (expect "Could not
+find service", the launch-once job has run and been dropped); `ifconfig lo0 | grep -c 127.0.64` (expect 254); the daemon
 log's `since_boot=Ns` (the hypothesis says N is small, seconds not minutes;
 record the number); the probe count (expect 254 OK); and whether `scutil --dns`
 lists a `min.internal` resolver with port 15353. The files live beside
@@ -575,7 +611,8 @@ print(f"total {len(addrs)} probes in {(time.perf_counter()-t_all)*1e3:.2f} ms")
 # Run after `sudo reboot` and a fresh login. No root needed.
 SP=docs/spikes/2026-09-22-macos-loopback-alias
 echo "## boot time";        sysctl -n kern.boottime
-echo "## launchd state";    launchctl print system/dev.minimal.loopback | grep -E "state|last exit|runs|program"
+echo "## launchd state (LaunchOnlyOnce: 'Could not find service' means it ran and exited)"
+launchctl print system/dev.minimal.loopback 2>&1 | grep -E "state|last exit|runs|Could not find"
 echo "## alias count";      ifconfig lo0 | grep -c 127.0.64
 echo "## daemon log";       cat /var/log/dev.minimal.loopback.log
 echo "## bind probe, every address in the range (expect 254 OK, plus 127.0.0.1 and ::1)"
