@@ -26,7 +26,16 @@ set -eu
 # scratch copy): CI's rust-cache persists ./target across runs and
 # local runs stay incremental — without this, every invocation
 # recompiles the whole dep tree from scratch.
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target/kani}"
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target/kani}"
+# Absolute, always: the vendored-backtrace [patch] below writes this path into
+# the SCRATCH copy's Cargo.toml, and cargo resolves a patch path against that
+# manifest's directory — a relative override would resolve inside $ws, where
+# nothing was ever created, and fail the lane as "vacuous" instead.
+case "$CARGO_TARGET_DIR" in
+    /*) ;;
+    *) CARGO_TARGET_DIR="$PWD/$CARGO_TARGET_DIR" ;;
+esac
+export CARGO_TARGET_DIR
 
 ws="$(mktemp -d "${TMPDIR:-/tmp}/kani-ws.XXXXXX")"
 cleanup() { rm -rf "$ws"; }
