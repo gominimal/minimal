@@ -122,10 +122,10 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald legacy_local_zone_routes_with_deprecation
   <!-- S1a/AC1; prose 2; event-driven; "for one release" is a plan fact -->
 
-- **NET-003** THE SYSTEM SHALL resolve `host.min.internal` from host-address, own-address, and VM-backed boxes to the address that reaches the host's loopback: `127.0.0.1` on the host, the switch's host-gateway address inside a VM-backed box.
+- **NET-003** THE SYSTEM SHALL resolve `host.min.internal` from host-address, own-address, and VM-backed boxes to the address that reaches the host's loopback: `127.0.0.1` on the host, the switch's host-gateway address inside boxes.
   tier:     T0
   verify:   cargo nextest run -p minimald host_min_internal_resolves_to_host_reach_address_per_mode
-  <!-- S1a/AC2; prose 3; ubiquitous; resolution only: reach over the name is local reach under the box's egress rules (NET-079; design §7.1 local names), so a deny-all box resolves it and reaches nothing -->
+  <!-- S1a/AC2; prose 3; ubiquitous; "inside boxes" per design §7.1 without qualification: an own-address box on a native host sits on the switch too; a host-address box on a native host shares the host's namespace and its answer; resolution only: reach over the name is local reach under the box's egress rules (NET-079; design §7.1 local names), so a deny-all box resolves it and reaches nothing -->
 
 - **NET-004** WHEN a box connects to the literal `100.64.255.254` THE SYSTEM SHALL route the connection as `host.min.internal` and emit a deprecation notice.
   tier:     T0
@@ -595,13 +595,13 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-123** WHEN a session starts THE SYSTEM SHALL verify by a bind probe that the reserved local range is present before publishing.
   tier:     T0
   verify:   cargo nextest run -p minimald session_start_probes_reserved_range
-  <!-- S1b-2a; design §7.1 (macOS per-box addresses, the privileged step); event-driven; on Linux the routing-domain link carries the range -->
+  <!-- S1b-2a; design §7.1 (macOS per-box addresses, the privileged step); event-driven; on Linux the range is always present on `lo` and the probe is a macOS concern; the routing-domain link carries the §4.2 hook carve-out address, not the range -->
   - IF the reserved range is absent THEN THE SYSTEM SHALL publish the box at `127.0.0.1`, re-surface the advisory of NET-122, and neither prompt nor hang.
     tier:   T0
     verify: cargo nextest run -p minimald absent_range_publishes_interim_and_readvises
     <!-- design §7.1; unwanted; the interim is a per-host state that the privileged step supersedes -->
 
-- **NET-124** WHEN a lookup asks for a record type other than A for a name in the box zone THE SYSTEM SHALL answer NODATA.
+- **NET-124** WHEN a lookup asks for a record type other than A for a name a box or node holds in the box zone THE SYSTEM SHALL answer NODATA.
   tier:     T0
   verify:   cargo nextest run -p minimald non_a_in_zone_query_is_nodata
   <!-- S1b-2b; design §7.1 (answer semantics); event-driven; never NXDOMAIN, since negative caching is name-wide and browsers pair A with HTTPS-type queries -->
@@ -616,10 +616,10 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald zone_answers_carry_short_ttl
   <!-- S1b-2b; design §7.1 working value; ubiquitous -->
 
-- **NET-127** THE SYSTEM SHALL answer A lookups in the box zone only with addresses in the reserved local range, the node's addresses, or `127.0.0.1`.
+- **NET-127** WHEN a lookup originates on the host OS THE SYSTEM SHALL answer an A lookup in the box zone only with addresses in the reserved local range, the node's addresses, or `127.0.0.1`.
   tier:     T0
-  verify:   cargo nextest run -p minimald zone_a_answers_confined_to_local_addresses
-  <!-- S1a/AC3; design §7.1; ubiquitous -->
+  verify:   cargo nextest run -p minimald host_zone_a_answers_confined_to_local_addresses
+  <!-- S1a/AC3; design §7.1 (host-OS resolution of the local zone): the host answerer's rule; event-driven; in-guest the node's DNS layer answers the zone with switch addresses, the host-gateway address for `host.min.internal` (NET-003) and sibling boxes' switch addresses (NET-072, NET-073) -->
 
 - **NET-128** WHILE a box published on a shared address is not running THE SYSTEM SHALL answer an A lookup of its name NODATA.
   tier:     T0
@@ -639,6 +639,10 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minvmd unenrolled_baseline_set_from_helper_enumeration
   <!-- S9b/AC2, S10a/AC4; design §5.1 (the set is carried in the feed) and §7.1 (no feed un-enrolled); optional-feature; NET-080 and NET-085 presuppose it -->
+  - THE SYSTEM SHALL keep the daemon's own registry and cache endpoints in the enumeration, configurable as to which registry and never absent.
+    tier:   T0
+    verify: cargo nextest run -p minvmd baseline_enumeration_always_carries_registry_and_cache
+    <!-- ubiquitous within the WHERE; NET-080's package fetch is node-plane traffic under a deny-all host-address box only because these endpoints are always members -->
   - WHEN a box's effective egress is shown THE SYSTEM SHALL show the baseline set beside it.
     tier:   T0
     verify: cargo nextest run -p minimal policy_shows_baseline_set
@@ -693,10 +697,10 @@ included, with every refusal logged (NET-001 to NET-004).
 - Release notes stating the install-size growth, and documentation naming the
   exact outbound destinations a box host needs: deliverables of the plan for the
   VM-stack slices.
-- Retiring `<name>.local.min.internal`, the literal host address, the legacy
-  flag spellings, and the deny-all opt-out after one release: ordering facts
-  recorded in the plan; the requirements here bind the compatibility behaviour
-  while it exists.
+- Retiring the `<name>.<host-id>.min.internal` zone (`<name>.local.min.internal`
+  by default), the literal host address, the legacy flag spellings, and the
+  deny-all opt-out after one release: ordering facts recorded in the plan; the
+  requirements here bind the compatibility behaviour while it exists.
 
 ## Design reasoning
 
@@ -922,8 +926,9 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   covered by: NET-043, NET-044, NET-046, NET-047
 - **Invariant:** THE SYSTEM SHALL keep local names out of every certificate
   and audit record and off every other host.
-  enforced by: the local answerer serves on-machine lookups only and answers
-  only local addresses
+  enforced by: the host answerer serves on-machine lookups only and answers
+  only local addresses; in-guest answers are switch addresses that never
+  leave the node
   covered by: NET-006, NET-007, NET-127
 
 ## Open questions
