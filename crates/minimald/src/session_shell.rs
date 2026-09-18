@@ -64,10 +64,11 @@ const KNOWN_SHELLS: &[KnownShell] = &[
         // hook has no shell-owned integration point to live in and must
         // be named on the argv — and bash consults `--rcfile` only for
         // an interactive *non-login* shell. `--noprofile` suppresses
-        // every file `-l` would have read, so a session bash reads
-        // nothing but the daemon's own rc (a user `~/.bashrc` stays
-        // unread, as it always has). `-i` is explicit rather than
-        // inferred from the pty.
+        // every file `-l` would have read, so the daemon's rc is the
+        // single entry point: it installs the hook and then sources the
+        // user's own startup file itself, in that order (see
+        // `crate::env::ATTACH_ENV_BASH_USER_RC`). `-i` is explicit
+        // rather than inferred from the pty.
         args: &[
             "--noprofile",
             "--rcfile",
@@ -81,9 +82,10 @@ const KNOWN_SHELLS: &[KnownShell] = &[
         binary: "zsh",
         package: "zsh",
         // The hook lives in `/etc/zsh/zshrc`, which zsh reads for an
-        // interactive shell on its own. No `--no-rcs` here: unlike bash
-        // — whose rc suppression predates this and is preserved — a user
-        // who asks for zsh is asking for their zsh, `~/.zshrc` included.
+        // interactive shell on its own. No `--no-rcs` here: a user who
+        // asks for zsh is asking for their zsh, `~/.zshrc` included —
+        // the same deal bash gets, except that bash's `~/.bashrc` is
+        // sourced by the daemon's rc rather than found by bash.
         args: &["-i"],
         // zsh does not speak bash's `\[…\]`/`\u@\h` prompt escapes —
         // handed the session default it prints them literally. Same

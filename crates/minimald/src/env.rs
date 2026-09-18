@@ -58,7 +58,10 @@ const ATTACH_ENV_HOOK_MARKER: &str = "minimal: per-attach environment";
 /// Directory and file name of the bash rc the session shell is started with
 /// (`--rcfile`). Not a shell-owned integration point like the others — this
 /// build of bash has no `/etc/bash.bashrc` — so the daemon names it on the
-/// shell's own argv; see [`install_attach_env_hooks`].
+/// shell's own argv; see [`install_attach_env_hooks`]. Because it is the
+/// *only* file a session bash reads, it does both jobs the other shells split
+/// between a system rc and a user one: the attach-env hook, then the user's
+/// own startup file ([`ATTACH_ENV_BASH_USER_RC`]).
 const ATTACH_ENV_BASH_RC_DIR: &str = "usr/share/minimal";
 const ATTACH_ENV_BASH_RC_NAME: &str = "attach-env.bash";
 
@@ -122,6 +125,44 @@ const ATTACH_ENV_HOOK_BASH: &str = constcat::concat!(
     crate::session_host::ATTACH_ENV_SH,
     "\n    return 0\n}\ntrap '__minimal_attach_env' DEBUG\n",
 );
+
+/// The second half of the bash rc: the user's own startup file.
+///
+/// A session bash is started `--noprofile --rcfile <this file>`, so this is
+/// the only place a `~/.bashrc` patched into the session home can be reached
+/// from. Without it bash is the one shell whose startup file a loadout patch
+/// cannot reach — zsh, fish, and nushell all read theirs out of the session
+/// home, which is where patches land, on their own.
+///
+/// Sourced *after* the hook above, which is the ordering every other shell
+/// gets from its own vendor integration point (`/etc/zsh/zshrc` runs before
+/// `~/.zshrc`, `vendor_conf.d` before `config.fish`): the refresh is in place
+/// before anything a loadout wrote can run, and a `DEBUG` trap set by the
+/// user's file is free to take over from there.
+///
+/// `~/.bashrc` and nothing else, because that is the file bash itself would
+/// have read here. The session shell is an interactive *non-login* bash —
+/// no `-l`, and an `argv[0]` of `/usr/bin/bash` with no leading `-`, which
+/// are the only two ways bash becomes a login shell — and `~/.bashrc` is
+/// what such a shell reads. `--rcfile` displaced it; this puts it back.
+///
+/// The login chain (`~/.bash_profile`, `~/.bash_login`, `~/.profile`) is
+/// deliberately NOT read. bash consults those only for a login shell, and it
+/// would consult exactly one of them; a shell that reports `shopt
+/// login_shell` as off has no business running files whose whole purpose is
+/// once-per-login setup (agent startup, unguarded `PATH` prepends). A
+/// dotfiles tree that keeps its bash setup in `~/.bash_profile` reaches this
+/// shell by naming the patch `dest = ".bashrc"` — the destination is the
+/// user's to choose, unlike the layout of a real home directory.
+const ATTACH_ENV_BASH_USER_RC: &str = r#"# minimal: user startup file
+if [ -n "${HOME:-}" ] && [ -r "$HOME/.bashrc" ]; then
+    . "$HOME/.bashrc"
+fi
+"#;
+
+/// The whole bash rc: the attach-env hook, then the user's startup file.
+const ATTACH_ENV_BASH_RC_BODY: &str =
+    constcat::concat!(ATTACH_ENV_HOOK_BASH, ATTACH_ENV_BASH_USER_RC);
 
 /// zsh: `precmd`, its per-prompt hook. Installed into the global rc, so it
 /// runs before any user `~/.zshrc`, which cannot unset a hook it never saw.
@@ -629,10 +670,14 @@ fn install_min_helpers(rootfs: &Path) -> std::io::Result<()> {
 /// makes the very first command typed at a prompt drawn *before* the attach
 /// see the new terminal, rather than the value that was in force when that
 /// prompt was drawn. bash needs only the `DEBUG` trap, which already fires
-/// before every command. bash is missing here on purpose — this build has no
-/// `/etc/bash.bashrc`, so the session shell is pointed at
-/// [`ATTACH_ENV_BASH_RC`] with `--rcfile` instead (which also keeps the
-/// session from reading a user `~/.bashrc` it never read before).
+/// before every command.
+///
+/// bash's file is the odd one: this build has no `/etc/bash.bashrc`, so there
+/// is no integration point bash reads by itself and the session shell is
+/// pointed at [`ATTACH_ENV_BASH_RC`] with `--rcfile` instead. That makes it
+/// the only startup file a session bash reads, so it carries the user's own
+/// too ([`ATTACH_ENV_BASH_USER_RC`]) — the file the *shell's* rc would have
+/// sourced, had bash been reading one.
 ///
 /// Every hook hard-codes the file path rather than reading
 /// `$MINIMAL_ATTACH_ENV`: the variable is a convenience for anyone scripting
@@ -644,7 +689,7 @@ fn install_attach_env_hooks(rootfs: &Path) -> std::io::Result<()> {
         (
             Path::new(ATTACH_ENV_BASH_RC_DIR),
             ATTACH_ENV_BASH_RC_NAME,
-            ATTACH_ENV_HOOK_BASH,
+            ATTACH_ENV_BASH_RC_BODY,
         ),
         (
             Path::new(ATTACH_ENV_BASH_RC_DIR),
@@ -1788,6 +1833,157 @@ mod tests {
                 "{rel} must not depend on a composed variable: {body}"
             );
         }
+    }
+
+    /// The bash rc carries both halves, hook first. A session bash reads
+    /// nothing else, so if the user's startup file were sourced before the
+    /// trap were set, a `~/.bashrc` could see a session without a `TERM`
+    /// refresh — the one ordering rule this file has.
+    #[test]
+    fn the_bash_rc_installs_the_hook_before_the_users_startup_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_min_helpers(tmp.path()).unwrap();
+
+        let body =
+            std::fs::read_to_string(tmp.path().join("usr/share/minimal/attach-env.bash")).unwrap();
+        let hook = body
+            .find("trap '__minimal_attach_env' DEBUG")
+            .expect("the rc must install the hook");
+        let user_rc = body
+            .find("$HOME/.bashrc")
+            .expect("the rc must reach the user's startup file");
+        assert!(hook < user_rc, "the hook must be installed first: {body}");
+    }
+
+    /// Runs a rootfs's bash rc the way an attach does — the argv
+    /// `crate::session_shell`'s table gives bash — with `home` standing in
+    /// for the session home, and returns the shell's stdout.
+    ///
+    /// `None` when the host has no bash to run it with: the caller skips,
+    /// matching the repo's self-skip-locally convention
+    /// (`crates/common/tests/shell_lint.rs`). The Linux lanes have bash, so
+    /// these run for real in CI.
+    fn run_session_bash(rootfs: &Path, home: &Path, command: &str) -> Option<String> {
+        let rc = rootfs
+            .join(ATTACH_ENV_BASH_RC_DIR)
+            .join(ATTACH_ENV_BASH_RC_NAME);
+        let out = std::process::Command::new("bash")
+            .args(["--noprofile", "--rcfile"])
+            .arg(&rc)
+            // `-i` is what makes bash read an `--rcfile` at all, and it is
+            // what a session bash is started with. Without a tty it warns
+            // about job control on stderr, which is why only stdout is read.
+            .args(["-i", "-c", command])
+            .env("HOME", home)
+            // The rc under test is the only startup file that may run: the
+            // developer's own environment must not reach it.
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .output()
+            .map_err(|e| eprintln!("no bash to run the session rc with — skipping: {e}"))
+            .ok()?;
+        assert!(
+            out.status.success(),
+            "the session rc should leave a usable shell: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// A rootfs plus an empty session home, ready for [`run_session_bash`].
+    fn rootfs_and_home() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        install_min_helpers(&rootfs).unwrap();
+        (tmp, rootfs, home)
+    }
+
+    /// The point of the whole file: a `~/.bashrc` patched into the session
+    /// home runs, and runs *after* the daemon's hook is in place — so the
+    /// same `dest = ".bashrc"` patch that works for `.zshrc` and
+    /// `config.fish` works for bash.
+    #[test]
+    fn a_patched_bashrc_is_sourced_after_the_hook() {
+        let (_tmp, rootfs, home) = rootfs_and_home();
+        std::fs::write(
+            home.join(".bashrc"),
+            // `declare -F` asks whether the hook's function is defined yet,
+            // which is only true if the first half of the rc has run.
+            "echo bashrc-ran\ndeclare -F __minimal_attach_env >/dev/null && echo hook-first\n",
+        )
+        .unwrap();
+
+        let Some(out) = run_session_bash(&rootfs, &home, "echo prompt-ready") else {
+            return;
+        };
+        assert!(out.contains("bashrc-ran"), "got: {out}");
+        assert!(out.contains("hook-first"), "got: {out}");
+        assert!(out.contains("prompt-ready"), "got: {out}");
+    }
+
+    /// The login chain stays unread, which is what bash does: those files
+    /// belong to a *login* shell, and this one is not one. A home carrying
+    /// all four gets `~/.bashrc` alone — sourcing a `~/.bash_profile` here
+    /// would run once-per-login setup in a shell reporting `login_shell` as
+    /// off, which happens nowhere else a bash user has been.
+    #[test]
+    fn the_login_chain_is_not_sourced() {
+        let (_tmp, rootfs, home) = rootfs_and_home();
+        std::fs::write(home.join(".bashrc"), "echo bashrc-ran\n").unwrap();
+        for file in [".bash_profile", ".bash_login", ".profile"] {
+            std::fs::write(home.join(file), format!("echo {file}-ran\n")).unwrap();
+        }
+
+        let Some(out) = run_session_bash(&rootfs, &home, "echo prompt-ready") else {
+            return;
+        };
+        assert_eq!(
+            out.matches("bashrc-ran").count(),
+            1,
+            "the rc should be sourced exactly once, got: {out}"
+        );
+        for file in [".bash_profile", ".bash_login", ".profile"] {
+            assert!(
+                !out.contains(&format!("{file}-ran")),
+                "{file} is a login shell's file and must stay unread, got: {out}"
+            );
+        }
+    }
+
+    /// And a home carrying *only* a login-chain file gets nothing — the same
+    /// silence `docker exec -it … bash` or a Linux terminal emulator gives
+    /// it. The fix is the patch's `dest`, which is the user's to name.
+    #[test]
+    fn a_login_chain_file_alone_is_not_a_bashrc() {
+        for file in [".bash_profile", ".bash_login", ".profile"] {
+            let (_tmp, rootfs, home) = rootfs_and_home();
+            std::fs::write(home.join(file), format!("echo {file}-ran\n")).unwrap();
+
+            let Some(out) = run_session_bash(&rootfs, &home, "echo prompt-ready") else {
+                return;
+            };
+            assert!(
+                !out.contains(&format!("{file}-ran")),
+                "{file} must not stand in for ~/.bashrc, got: {out}"
+            );
+            assert!(out.contains("prompt-ready"), "got: {out}");
+        }
+    }
+
+    /// The common case — a session home with no dotfiles at all — starts a
+    /// shell that is quiet and whose first command sees a zero status, not
+    /// the failed `-r` test of a file that was never there.
+    #[test]
+    fn a_home_with_no_startup_file_starts_cleanly() {
+        let (_tmp, rootfs, home) = rootfs_and_home();
+
+        let Some(out) = run_session_bash(&rootfs, &home, r"echo status=$?") else {
+            return;
+        };
+        assert_eq!(out.trim(), "status=0", "got: {out}");
     }
 
     /// A rootfs whose own packages ship a global zsh rc keeps it: the hook is
