@@ -665,9 +665,13 @@ The interim is a temporary per-host state and the open question closes.
 
 # Artifacts
 
-All files live in
+Seven files live in
 `docs/spikes/2026-09-22-macos-loopback-alias/`
-on this host and are reproduced here in full.
+on this host. Five are reproduced here in full: the three the privileged step
+installs, and the two verification scripts. The other two are not embedded
+twice — `install.sh` is the command list already reproduced under "The root
+procedure, as run", and `answerer.py` is described below rather than shown,
+being a stand-in for T9's answerer and no part of the mechanism under test.
 
 ## `dev.minimal.loopback.plist` (install to `/Library/LaunchDaemons/`, root:wheel 0644)
 

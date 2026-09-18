@@ -13,3 +13,4 @@ sleep 2
 launchctl print system/dev.minimal.loopback 2>&1 | grep -E "state|last exit|Could not find"
 ifconfig lo0 | grep -c 127.0.64
 cat /var/log/dev.minimal.loopback.log
+python3 bind-probe.py $(seq -f "127.0.64.%g" 1 254) | grep -c " OK "   # expect 254
