@@ -56,9 +56,9 @@ job then exports it as `MINIMAL_RELEASE_VERSION`, and
 `compute-version-string` asserts the built binary reports it. Without the
 override, `git describe` supplies only the commit count and hash on top of
 `package.version`, which is therefore the *declared next release* rather than
-a guess: `feat:` since the last tag means a minor, anything else a patch, and
-while the project is 0.x a breaking change is reported but never bumps the
-major. [`scripts/next-version.sh`](../../scripts/next-version.sh) runs
+a guess: `feat:` since the last tag means a minor, a breaking change under any
+type (a `!` or a BREAKING CHANGE footer) means a minor while the project is
+0.x, and anything else a patch. [`scripts/next-version.sh`](../../scripts/next-version.sh) runs
 [git-cliff](https://git-cliff.org) with [`cliff.toml`](../../cliff.toml) —
 through [`scripts/git-cliff.sh`](../../scripts/git-cliff.sh), which fetches
 and SHA-512-verifies the pinned binary — to derive the level and render the
