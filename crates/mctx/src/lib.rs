@@ -540,7 +540,10 @@ impl Context {
         let url = self.daemon.config.remote_cache_url();
         let gcs_storage = if matches!(url, AnyUrl::Gcs(_)) {
             let backend = if auth {
-                GcsStorage::builder().build().await.unwrap()
+                GcsStorage::builder()
+                    .build()
+                    .await
+                    .map_err(|e| RemoteError::Config(format!("initializing GCS storage: {e}")))?
             } else {
                 GcsStorage::builder()
                     .with_credentials(
@@ -548,7 +551,7 @@ impl Context {
                     )
                     .build()
                     .await
-                    .unwrap()
+                    .map_err(|e| RemoteError::Config(format!("initializing GCS storage: {e}")))?
             };
             Some(backend)
         } else {
@@ -617,7 +620,10 @@ impl Context {
                  or a bare bucket name"
                 )
             })?;
-        let backend = GcsStorage::builder().build().await.unwrap();
+        let backend = GcsStorage::builder()
+            .build()
+            .await
+            .map_err(|e| anyhow::anyhow!("initializing GCS storage: {e}"))?;
         let res = RemoteCacheWriter::new(backend, bucket, self.daemon.config.ot.clone()).await?;
         tracing::trace!("remote cache writer init took {:?}", start.elapsed());
         Ok(res)
@@ -670,7 +676,16 @@ impl Context {
             self.vcs_manager(),
             &mut graph::LayerCacheDir(self.daemon.config.layer_cache_dir()),
             LinkConfig::Dir {
-                dir: self.repo_dir().to_str().unwrap().to_string(),
+                dir: self
+                    .repo_dir()
+                    .to_str()
+                    .ok_or_else(|| {
+                        Error::Other(anyhow!(
+                            "repo path is not valid UTF-8: {}",
+                            self.repo_dir().display()
+                        ))
+                    })?
+                    .to_string(),
             },
             self.daemon.stdlib_dir.clone(),
             target,
@@ -722,7 +737,10 @@ impl Context {
     ) -> Result<(), Error> {
         let cache = self.local_cache();
         let rc = if self.daemon.config.use_remote_cache() {
-            Some(self.remote_cache(false, false).await.unwrap())
+            Some(self.remote_cache(false, false).await.map_err(|e| match e {
+                RemoteError::Config(msg) => Error::Other(anyhow::anyhow!("{msg}")),
+                other => Error::Other(anyhow::anyhow!("{other}")),
+            })?)
         } else {
             None
         };
@@ -902,7 +920,12 @@ impl Context {
         let state_base_dir = match state_key {
             Some(name) if !name.is_empty() => mfile
                 .state_dir(name, self.daemon.config.state_base_dir())
-                .unwrap(),
+                .ok_or_else(|| {
+                    Error::Other(anyhow!(
+                        "cannot determine state directory for state key {name:?}: \
+                         the location of the minimal file on disk is unknown"
+                    ))
+                })?,
             _ => {
                 let tmp = self.daemon.cache.temp_dir().map_err(|e| {
                     Error::Other(
@@ -1079,9 +1102,11 @@ impl Context {
         // to the cache as it is finished being staged
         while let Some(result) = task_set.join_next().await {
             let (pending_dir, meta) = result
-                .unwrap()
+                .map_err(|e| Error::Other(anyhow::anyhow!("package fetch task failed: {e}")))?
                 .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
-            pending_dir.finalize(meta).unwrap();
+            pending_dir
+                .finalize(meta)
+                .map_err(|e| Error::Other(e.into()))?;
         }
         tracing::trace!("package fetch took {:?}", fetch_start.elapsed());
 
