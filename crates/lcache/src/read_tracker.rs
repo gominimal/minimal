@@ -215,13 +215,13 @@ impl ReadTracker {
     }
 
     /// Returns a reference to the in-memory read records.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reads(&self) -> &BTreeMap<SpecHash, u64> {
         &self.reads
     }
 
     /// Flushes any pending writes to disk.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn flush(&mut self) -> io::Result<()> {
         self.writer().flush()?;
         self.pending = 0;
