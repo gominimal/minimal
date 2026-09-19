@@ -23,7 +23,11 @@ __pycache__/
 # netns proofs; never committed.
 /gvproxy
 
-# Vale prose-linting: the synced styles are rebuilt by `vale sync`, and the
-# sync-generated config lands under them. The rules live in
-# gominimal/prose-rules.
-/styles/
+# Vale prose-linting: synced packages and sync-generated config are rebuilt by
+# `vale sync`; the project vocabulary and the first-party inventory style are
+# tracked.
+/styles/*
+!/styles/config/
+/styles/config/*
+!/styles/config/vocabularies/
+!/styles/inventory/
