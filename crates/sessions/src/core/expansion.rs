@@ -259,6 +259,18 @@ fn expand_pattern(
     require_absolute: RequireAbsolute,
 ) -> Result<FileSet, ExpandError> {
     let mut out = String::with_capacity(raw.len());
+    // The same expansion with substituted values left *unescaped*.
+    // `out` is what `FileSet` receives (glob metacharacters in
+    // substituted values are bracket-escaped so they stay literal);
+    // `unescaped` is the real filesystem path, used only for the
+    // plain-directory detection below.
+    let mut unescaped = String::with_capacity(raw.len());
+    // Whether the *raw* pattern (the user's own text, before any
+    // substitution) contains active glob syntax. Substituted values
+    // are literal path bytes and never count here — their glob
+    // metacharacters are escaped in `out` and must not suppress the
+    // plain-directory rewrite.
+    let mut raw_has_glob_meta = false;
     let bytes = raw.as_bytes();
     let mut i = 0;
 
@@ -272,6 +284,7 @@ fn expand_pattern(
                 name: "HOME".into(),
             })?;
         escape_glob_metas(home, &mut out);
+        unescaped.push_str(home);
         i = 1;
     } else if bytes.first() == Some(&b'~') {
         // `~name/...`: we don't support per-user tilde expansion.
@@ -289,6 +302,7 @@ fn expand_pattern(
             // `$$` → literal `$`.
             if bytes.get(i + 1) == Some(&b'$') {
                 out.push('$');
+                unescaped.push('$');
                 i += 2;
                 continue;
             }
@@ -311,6 +325,7 @@ fn expand_pattern(
                     })?
             };
             escape_glob_metas(value, &mut out);
+            unescaped.push_str(value);
             i += consumed;
             continue;
         }
@@ -319,22 +334,59 @@ fn expand_pattern(
         // mangle non-ASCII content). Byte-indexed scanning above is
         // still safe because every control character we care about
         // (`$`, `{`, `}`, `~`, `/`) is single-byte ASCII.
+        //
+        // A glob metacharacter here is the user's own active glob
+        // syntax (unlike the bracket escapes `escape_glob_metas`
+        // emits for substituted values), so it marks the pattern as
+        // non-plain. The byte test is safe: `*`, `?`, `[`, `{` are
+        // ASCII and can never be a UTF-8 continuation byte.
+        if matches!(b, b'*' | b'?' | b'[' | b'{') {
+            raw_has_glob_meta = true;
+        }
         let ch_len = raw[i..]
             .chars()
             .next()
             .expect("non-empty slice has at least one char")
             .len_utf8();
         out.push_str(&raw[i..i + ch_len]);
+        unescaped.push_str(&raw[i..i + ch_len]);
         i += ch_len;
     }
 
     let normalized = normalize_path(&out)?;
+    let unescaped_normalized = normalize_path(&unescaped)?;
     if require_absolute == RequireAbsolute::Yes && !normalized.starts_with('/') {
         return Err(ExpandError::NotAbsolute {
             pattern: normalized,
         });
     }
-    FileSet::try_new(normalized).map_err(ExpandError::from)
+    // When the expanded pattern is a plain directory path with no glob
+    // metacharacters, the walker would match only the directory itself
+    // (not its contents) — a silent no-op. Append `/**/*` so it behaves
+    // identically to the explicit glob form the user would otherwise
+    // have to write.
+    //
+    // The directory check consults the *unescaped* path: a substituted
+    // value like `/tmp/a[b]` is a literal directory name, but `out`
+    // renders it as `/tmp/a[[]b[]]`, which `Path::is_dir` would not
+    // find. Active glob syntax is decided from the raw pattern alone
+    // (`raw_has_glob_meta`), so a raw `[X]` — genuine glob syntax —
+    // suppresses the rewrite while a substituted `[b]` does not.
+    let pattern = if require_absolute == RequireAbsolute::Yes
+        && !raw_has_glob_meta
+        && std::path::Path::new(&unescaped_normalized).is_dir()
+    {
+        let mut with_glob = normalized;
+        if with_glob.ends_with('/') {
+            with_glob.push_str("**/*");
+        } else {
+            with_glob.push_str("/**/*");
+        }
+        with_glob
+    } else {
+        normalized
+    };
+    FileSet::try_new(pattern).map_err(ExpandError::from)
 }
 
 /// Drop `.` and empty components, reject any `..` component.
@@ -1106,5 +1158,84 @@ mod tests {
             matches!(err, ExpandError::PathTraversal { .. }),
             "got: {err:?}",
         );
+    }
+
+    // ---- plain-directory source ----
+
+    /// A patch source that names an existing directory with no glob
+    /// metacharacters is treated as `<dir>/**/*`, so it delivers the
+    /// directory tree instead of silently matching nothing.
+    #[test]
+    fn plain_directory_source_appends_recursive_glob() {
+        let dir = std::env::temp_dir().join("minimal-expansion-plain-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let vars: [ResolvedVar; 0] = [];
+        let pat = expand(dir.to_str().unwrap(), vars.as_slice()).unwrap();
+        assert_eq!(pat, format!("{}/**/*", dir.to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A plain directory source with a trailing slash still appends the
+    /// recursive glob without doubling the separator.
+    #[test]
+    fn plain_directory_source_with_trailing_slash_appends_recursive_glob() {
+        let dir = std::env::temp_dir().join("minimal-expansion-plain-dir-slash");
+        std::fs::create_dir_all(&dir).unwrap();
+        let vars: [ResolvedVar; 0] = [];
+        let raw = format!("{}/", dir.to_str().unwrap());
+        let pat = expand(&raw, vars.as_slice()).unwrap();
+        assert_eq!(pat, format!("{}/**/*", dir.to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A plain path that is *not* an existing directory is left alone —
+    /// it may be a file, or a directory that doesn't exist on this host
+    /// (the walker already warns-and-drops those).
+    #[test]
+    fn plain_non_directory_source_is_left_alone() {
+        let vars: [ResolvedVar; 0] = [];
+        let pat = expand("/definitely/not/a/real/dir", vars.as_slice()).unwrap();
+        assert_eq!(pat, "/definitely/not/a/real/dir");
+    }
+
+    /// A pattern that already carries glob metacharacters is left alone,
+    /// even when it names a directory.
+    #[test]
+    fn globbed_source_is_left_alone() {
+        let vars: [ResolvedVar; 0] = [];
+        let pat = expand("/tmp/**/*.lua", vars.as_slice()).unwrap();
+        assert_eq!(pat, "/tmp/**/*.lua");
+    }
+
+    /// A substituted value that names a directory with a literal
+    /// bracket in its name is still treated as a plain directory: the
+    /// directory check consults the *unescaped* path, so `a[b]` is
+    /// found on disk even though the `FileSet` pattern escapes it to
+    /// `a[[]b[]]`.
+    #[test]
+    fn substituted_directory_with_bracket_name_appends_recursive_glob() {
+        let parent = std::env::temp_dir().join("minimal-expansion-bracket-dir");
+        let dir = parent.join("a[b]");
+        std::fs::create_dir_all(&dir).unwrap();
+        let vars = [sv("DIR", dir.to_str().unwrap())];
+        let pat = expand("$DIR", &vars).unwrap();
+        assert_eq!(pat, format!("{}/a[[]b[]]/**/*", parent.to_str().unwrap()));
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
+
+    /// A raw `[X]` is active glob syntax (a single-character class),
+    /// not a literal directory name. Even when a directory literally
+    /// named `[X]` exists, the pattern is left alone: appending
+    /// `/**/*` would produce `[X]/**/*`, which globset reads as "the
+    /// `X` directory", not the literal `[X]`.
+    #[test]
+    fn raw_bracket_class_is_not_treated_as_plain_directory() {
+        let parent = std::env::temp_dir().join("minimal-expansion-raw-bracket");
+        let dir = parent.join("[X]");
+        std::fs::create_dir_all(&dir).unwrap();
+        let vars: [ResolvedVar; 0] = [];
+        let pat = expand(dir.to_str().unwrap(), vars.as_slice()).unwrap();
+        assert_eq!(pat, dir.to_str().unwrap());
+        std::fs::remove_dir_all(&parent).unwrap();
     }
 }

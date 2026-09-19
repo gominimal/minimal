@@ -82,6 +82,11 @@ jobs:
               # Nextest profiles change how this lane's tests run.
               - ".config/nextest.toml"
               - "scripts/**"
+              # A workflow-only change to the Kani lane's path filter decides
+              # which pull requests run the proofs, and no other lane's filter
+              # names that file. Run the workspace suite on it, so a guard test
+              # over that filter has a lane that executes it.
+              - ".github/workflows/ci-kani.yml"
               - ".minimal/**"
               # The gvproxy pin: the netns job fetches + SHA-checks it, so a pin
               # bump must re-run this lane.
