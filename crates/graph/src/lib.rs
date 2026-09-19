@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// An error during construction or processing of the dependency graph.
 ///
-/// Left hand-rolled rather than converted to `thiserror` (Phase 3): its only
+/// Left hand-rolled rather than converted to `thiserror`: its only
 /// `Display`-like output is the bespoke terminal renderer in [`Error::report_to`],
 /// and it has no `Display`/`std::error::Error` impl to reproduce. `thiserror`'s
 /// required `#[error("...")]` strings would therefore *introduce* new observable
