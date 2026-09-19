@@ -44,5 +44,7 @@ resolv-conf.workspace = true
 
 ot.workspace = true
 
+codespan-reporting.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
