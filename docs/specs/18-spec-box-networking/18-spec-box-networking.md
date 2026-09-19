@@ -61,8 +61,8 @@ source-address check (NET-084), which on a VM-backed host is what lets the
 proxy attribute a box by its switch source address: each own-address box holds
 one lease there. On a co-resident host the host-address boxes share the host's
 address and are attributed as one cohort outside the box host (NET-078), while
-each box's own declaration is enforced inside it (NET-079); the classifier
-layout is the question below. HTTP/3 to a steered host is governed by the
+each box's own declaration is enforced inside it (NET-079) on the box's own
+cgroup ([design §4.1][design]). HTTP/3 to a steered host is governed by the
 `quic443` field ([design §5.3][design]), bound in that document; NET-064 covers
 the box that declared TCP only.
 
@@ -126,6 +126,10 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimald host_min_internal_resolves_to_host_reach_address_per_mode
   <!-- S1a/AC2; prose 3; ubiquitous; "inside boxes" per design §7.1 without qualification: an own-address box on a native host sits on the switch too; a host-address box on a native host shares the host's namespace and its answer; resolution only: reach over the name is local reach under the box's egress rules (NET-079; design §7.1 local names), so a deny-all box resolves it and reaches nothing -->
+  - WHILE a box is a host-address box THE SYSTEM SHALL resolve its lookups through the box zone's answerer and never through the host's own resolver.
+    tier:   T0
+    verify: cargo nextest run -p minimald host_ip_box_resolves_through_answerer
+    <!-- design §4.1 (the deny-all carve-out) and §5.3; state-driven; on a native host the stub a host-address box would otherwise reach is the host's resolver, which forwards any name upstream, so a deny-all box would resolve arbitrary names through the carve-out; the answerer forwards nothing and holds only the zone -->
 
 - **NET-004** WHEN a box connects to the literal `100.64.255.254` THE SYSTEM SHALL route the connection as `host.min.internal` and emit a deprecation notice.
   tier:     T0
@@ -507,7 +511,19 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-079** WHILE a host-address box is declared deny-all THE SYSTEM SHALL refuse every outbound connection it opens, deciding inside the box host on the box's own declaration.
   tier:     T0
   verify:   cargo nextest run -p minimald host_ip_deny_all_no_outbound
-  <!-- S9b/AC2; prose 50; state-driven; the per-box decision for host-address boxes is the box host's classifier (design §4.1, UC3); outside the box host the cohort is one identity (NET-078) and the resident union is the floor -->
+  <!-- S9b/AC2; prose 50; state-driven; the per-box decision for host-address boxes is the box host's classifier (design §4.1, UC3), matching the box's own cgroup before any source translation; outside the box host the cohort is one identity (NET-078) and the resident union is the floor -->
+  - WHILE a host-address box is declared deny-all THE SYSTEM SHALL admit the box's connections to the box zone's answerer at its address and port, and to no other loopback destination.
+    tier:   T0
+    verify: cargo nextest run -p minimald host_ip_deny_all_reaches_only_the_answerer
+    <!-- design §4.1; state-driven; the one carve-out from a deny-all verdict, by address and port, never loopback-wide: a loopback baseline exception for every box is rejected in the design reasoning; with NET-003's answerer rule the box resolves exactly the names the answerer holds and reaches nothing else -->
+  - THE SYSTEM SHALL keep every process of a host-address box inside the cgroup its verdict is decided on, so that no process in the box can move itself or a child out of it.
+    tier:   T0
+    verify: cargo nextest run -p minimald host_ip_box_cannot_leave_its_cgroup
+    <!-- design §4.1; ubiquitous; the box host's obligation, not a property of the kernel: the box is confined by a cgroup namespace rooted at its own placement on a mount that treats namespaces as delegation boundaries, with the host's cgroup mount kept out of the box's mount namespace; a box as the daemon's user with write access to a common ancestor can otherwise migrate itself -->
+  - WHERE the host is not VM-backed, WHILE the box host cannot decide per box, because the classifier's privileged install step is not installed or the host cannot confine a box as above, WHEN a session starts THE SYSTEM SHALL print an advisory naming the exact command that installs the step, with no privilege prompt, and record that host-address boxes have no per-box enforcement on that host.
+    tier:   T0
+    verify: cargo nextest run -p minimald native_host_advises_classifier_install_without_prompt
+    <!-- design §7.4; state+event; the ruleset needs a capability the native daemon lacks, so a native host takes one privileged install step in NET-122's advisory pattern; until then the host has no per-box host-address enforcement and says so at session start, visible to policy; refusing host-address egress declarations until then, and scoping the classifier to VM-backed hosts, are rejected in the design -->
 
 - **NET-080** WHILE a host-address box is declared deny-all THE SYSTEM SHALL complete the daemon's own package fetch on the same host and record it as node-plane traffic.
   tier:     T0
@@ -618,6 +634,10 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimald non_a_in_zone_query_is_nodata
   <!-- S1b-2b; design §7.1 (answer semantics); event-driven; never NXDOMAIN, since negative caching is name-wide and browsers pair A with HTTPS-type queries -->
+  - WHEN the answerer returns NODATA or NXDOMAIN THE SYSTEM SHALL carry the zone's authority record in the answer so that the host resolver can cache the negative.
+    tier:   T0
+    verify: cargo nextest run -p minimald negative_answers_carry_zone_authority
+    <!-- design §7.1; event-driven; a scoped answerer whose negatives the host resolver cannot cache stalls every lookup on a macOS host, scoped or not, for the resolver's timeout per query, and reloading the resolver does not clear it; the host resolver also asks for AAAA, HTTPS and its discovery names, so every such negative needs the record -->
 
 - **NET-125** WHEN a lookup asks for a name in the box zone that no box or node holds THE SYSTEM SHALL answer NXDOMAIN.
   tier:     T0
@@ -746,9 +766,14 @@ from a reserved local range (`127.0.64.0/24`), Linux uses a systemd-resolved
 routing domain on a dedicated link of routable scope, and macOS uses
 `/etc/resolver/min.internal` with a `port` directive, written once by the
 advisory command NET-122 names at session start. On macOS the same command
-reserves the local range, and NET-123's bind probe with its `127.0.0.1` interim
-is what holds until that step is installed on a host, so session start never
-prompts. NET-018 and NET-019 take their WHERE from the same ruling: the proxy
+reserves the local range: it installs a root-held boot step that re-applies
+exactly the reserved range at each start, at root-owned paths no user can
+write, so the range is present before any session starts and no daemon
+re-applies it. NET-123's bind probe with its `127.0.0.1` interim is what holds
+on a host until that step is installed, so session start never prompts. The
+answerer's negatives are cacheable by the host resolver (NET-124): an
+uncacheable negative stalls every lookup on a macOS host, not only the zone's.
+NET-018 and NET-019 take their WHERE from the same ruling: the proxy
 is superseded only when host-OS resolution and published addresses are both
 deployed on that host, and identity plays no part in the condition. Allocation
 from the reserved range is host-global, arbitrated through the answerer's
@@ -836,8 +861,20 @@ answers the address that reaches the host's loopback from where the box stands
 (NET-003): `127.0.0.1` on the host, the switch's host-gateway address inside a
 VM-backed box, where `127.0.0.1` is the box's own loopback. A host-address
 box's own declaration is enforced inside the box host by its classifier
-([design §4.1][design], UC3); outside the box host the cohort is one identity
-(NET-078) and the escape floor is the resident union. That is the split between
+([design §4.1][design], UC3): the box host places each host-address box in a
+cgroup leaf of its own, beside the daemon's own leaf, and the packet filter
+matches the box's cgroup before any source translation; the placement holds
+because the box is confined by a cgroup namespace on a mount that treats
+namespaces as delegation boundaries, which is the box host's obligation
+(NET-079), not the kernel's default. The one carve-out from a deny-all verdict
+is the answerer's address and port, and a host-address box resolves through
+the answerer rather than the host's resolver (NET-003), so a deny-all box
+resolves exactly the names the answerer holds and reaches none of them.
+Host-address boxes on a co-resident Linux host are in scope: the ruleset needs
+a capability the native daemon lacks, so a native host takes one privileged
+install step in the resolver advisory's pattern and has no per-box enforcement
+until then ([design §7.4][design]). Outside the box host the cohort is one
+identity (NET-078) and the escape floor is the resident union. That is the split between
 the first security invariant, per-box precision for traffic that leaves a box,
 and the third, the floor for anything inside the escape boundary; the
 invariants are not qualified by each other because the design splits them the
@@ -966,20 +1003,6 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   covered by: NET-006, NET-007, NET-127
 
 ## Open questions
-- [NEEDS CLARIFICATION (HIGH): the macOS mechanism for per-box loopback
-  addresses, a root-installed boot re-apply of the reserved range installed by
-  the same advisory command that writes the resolver file (NET-122), is proposed
-  in [design §7.1][design] pending the loopback-alias measurement (design §12
-  item 13). NET-123 binds the interim: until the step is installed on a host,
-  macOS publishes every box at `127.0.0.1`, and NET-010 binds distinct addresses
-  once it is; the interim is a per-host state, not a platform exception.]
-- [NEEDS CLARIFICATION (MEDIUM): what is the cgroup layout for the two-address
-  classifier that gives each host-address box its own identity inside the box
-  host (NET-079), and are host-address boxes on a co-resident Linux host in
-  scope of NET-078 to NET-080? [Design §7.4][design] applies the profile's
-  naming and addressing to that host and now permits a node-local Box Egress
-  Proxy inside its boundary at the advisory tier; it says nothing about the
-  classifier.]
 - [NEEDS CLARIFICATION (LOW): are HTTP/2 and HTTP/3 through any proxy surface in
   scope? [Design §5.3][design] governs QUIC for egress and leaves the proxy
   surfaces unaddressed; the local Box Egress Proxy document needs the answer for
