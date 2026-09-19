@@ -1,0 +1,11 @@
+# git-cliff pinned pre-built release, verified by SHA-512.
+# Source: https://github.com/orhun/git-cliff/releases/tag/v2.14.1
+# Digests are the upstream-published .sha512 sidecar for each release asset
+# (git-cliff publishes per-asset .sha512, not a checksums.txt).
+# scripts/git-cliff.sh reads this lock the same way scripts/package-nfpm.sh
+# reads vendor/nfpm/nfpm.lock.
+version=v2.14.1
+git-cliff-2.14.1-x86_64-unknown-linux-gnu.tar.gz=bb40f68e752db1a32526c43e0108e8eff785f7c24c67024cffe1c316e034372975fd78c9af8e9a48148235aad15c9a103f1a5b490c282f1db09a7a793794b69f
+git-cliff-2.14.1-aarch64-unknown-linux-gnu.tar.gz=5ffe5d7a9cd2868b4b4929141cb3da4a735bfe3ad241e06d0d45cda6b501ac805caf7d4443030dfa90aec8ca77eec72f88891f6c7e038bf423a82fad91fd1783
+git-cliff-2.14.1-x86_64-apple-darwin.tar.gz=b64a5e37bae3f7e9db1d772b3eec0d8b65517fa69b43cf95221deafab66236dc2b02f41392b1b8e8bc4ba4cb70b043f3f052dab9cfcf0157100ad99fa5a3feb9
+git-cliff-2.14.1-aarch64-apple-darwin.tar.gz=e241b704d6316e1eec348d56aaaddcd6e9c3beda4e47e6be3ede5eb476dd8c4a3dfce70f123bc8b00b4750fc2a671cb6dd12d4f8ad1479623760d458d6ccc219

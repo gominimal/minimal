@@ -52,10 +52,12 @@ package.rust-version = "1.95"
 # scripts/assert-release-version.sh), and a no-.git build (source tarball)
 # reports it verbatim. See crates/version/src/scheme.rs.
 # Bump it when the commits since the last tag require it: `feat:` -> minor,
-# anything else -> patch; while the project is 0.x no breaking change bumps the
-# major (scripts/next-version.sh). `scripts/next-version.sh --check` (the
-# workspace `package_version` test, `just check-version`) fails the PR that
-# leaves it stale or not strictly greater than the newest v* tag.
+# a breaking change under any type (a `!` or a BREAKING CHANGE footer) -> minor
+# while the project is 0.x, anything else -> patch (cliff.toml's [bump],
+# applied by scripts/next-version.sh).
+# `scripts/next-version.sh --check` (the workspace `package_version` test,
+# `just check-version`) fails the PR that leaves it stale or not strictly
+# greater than the newest v* tag.
 package.version = "0.6.0"
 
 [profile.release]

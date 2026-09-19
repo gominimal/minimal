@@ -864,11 +864,12 @@ jobs:
                     echo "tag=release-$SHORT_SHA" >> "$GITHUB_OUTPUT"
                   fi
             - name: Generate release notes
-              # One walk of the full commit bodies since the last released tag
-              # (scripts/next-version.sh), so a BREAKING CHANGE footer under a
-              # plain subject is rendered, not dropped. Titled with
-              # package.version — the versioned release's own number; on a
-              # nightly it names the release the commits are heading toward.
+              # git-cliff (cliff.toml, driven by scripts/next-version.sh)
+              # renders the grouped sections from the commits since the last
+              # released tag, so a BREAKING CHANGE footer under a plain subject
+              # is rendered, not dropped. Titled with package.version — the
+              # versioned release's own number; on a nightly it names the
+              # release the commits are heading toward.
               run: scripts/next-version.sh --notes "$RUNNER_TEMP/notes.md"
             - name: Upload release notes
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

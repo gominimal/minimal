@@ -3,12 +3,17 @@
 # next-version_test.sh — test harness for scripts/next-version.sh.
 #
 # Builds a throwaway git repo with a fixed tag topology and Conventional
-# Commit history (no network, no checkout of the real repo) and asserts the
-# derivation contract: feat -> minor, fix/perf and everything else -> patch,
-# breaking changes detected from `!` AND from body-only footers but never
-# moving the number while ALLOW_MAJOR is off, pre-release tags skipped over as
-# the range base yet counted by the strictly-greater lint, and --check's two
-# rules. Run directly or via `just test-shell`.
+# Commit history (no checkout of the real repo) and asserts the derivation
+# contract: feat -> minor, a breaking change under any type (bang or
+# body-only footer) -> minor while 0.x and never a major while ALLOW_MAJOR is
+# off, fix/perf and everything else -> patch, pre-release tags skipped over
+# as the range base yet counted by the strictly-greater lint, and --check's
+# two rules.
+#
+# The derivation itself is git-cliff's (cliff.toml), run through
+# scripts/git-cliff.sh, which fetches and SHA-512-verifies the pinned binary on
+# first use — so the first run needs network, or a GIT_CLIFF_BIN override
+# pointing at a local git-cliff. Run directly or via `just test-shell`.
 
 set -euo pipefail
 
@@ -148,8 +153,8 @@ commit "feat(sessions): add a thing (#123)"
 expect_out "0.6.0" "a feat makes the next a minor" -- nv
 expect_out "minor" "a feat makes the bump minor" -- nv --bump
 expect_notes "notes list the feature" "### Features" "- **sessions**: add a thing (#123) ("
-expect 1 "package.version 0.5.5 is behind the commits since v0.5.4, which require a minor bump to at least 0.6.0 (1 feat commit(s): " \
-    "check: a patch declared over a feat range fails, naming the feat" -- check 0.5.5
+expect 1 "which require a minor bump to at least 0.6.0 — bump" \
+    "check: a patch declared over a feat range fails" -- check 0.5.5
 expect 0 "package.version 0.6.0 satisfies" "check: the minor passes" -- check 0.6.0
 expect 0 "package.version 0.6.0-rc1 satisfies" "check: a pre-release of the minor passes (cores compared)" -- check 0.6.0-rc1
 expect 0 "package.version 0.7.0 satisfies" "check: over-declaring passes" -- check 0.7.0
@@ -167,8 +172,8 @@ expect_out "0.6.0" "a bang feat still bumps minor only (alpha: no major)" -- nv
 expect_out "minor" "bump stays minor under a breaking change" -- nv --bump
 expect_notes "breaking entry is rendered first with its footer paragraph" \
     "### Breaking changes" "- **minimald**: swap the wire contract (" \
-    "  BREAKING CHANGE: the exec-channel wire contract changed, so a client and" \
-    "  daemon from different builds cannot talk."
+    "BREAKING CHANGE: the exec-channel wire contract changed, so a client and" \
+    "daemon from different builds cannot talk."
 refute_notes "footers past the BREAKING CHANGE paragraph are dropped" "Refs: #1"
 n_listed="$(nv --notes --cargo-toml "$root/absent.toml" 2>/dev/null | grep -c -- '- \*\*minimald\*\*: swap the wire contract (' || true)"
 if [ "$n_listed" -eq 1 ]; then
@@ -185,19 +190,19 @@ chord.
 BREAKING CHANGE: the default detach chord changes from ctrl-w to ctrl-]"
 expect_notes "a body-only BREAKING CHANGE footer under a plain feat subject is caught" \
     "- **minimald**: move the detach chord off ctrl-w (" \
-    "  BREAKING CHANGE: the default detach chord changes from ctrl-w to ctrl-]"
+    "BREAKING CHANGE: the default detach chord changes from ctrl-w to ctrl-]"
 
 commit "fix: something
 
 BREAKING-CHANGE: the hyphenated spelling counts too"
-expect_notes "BREAKING-CHANGE (hyphen) is detected" "  BREAKING-CHANGE: the hyphenated spelling counts too"
+expect_notes "BREAKING-CHANGE (hyphen) is detected" "BREAKING-CHANGE: the hyphenated spelling counts too"
 expect_out "0.6.0" "three breaking changes: still a minor" -- nv
 expect_out "1.0.0" "the GA switch turns breaking into a major" -- \
     env NEXT_VERSION_ALLOW_MAJOR=1 "$script" --repo "$repo"
 expect_out "major" "the GA switch reports a major bump" -- \
     env NEXT_VERSION_ALLOW_MAJOR=1 "$script" --repo "$repo" --bump
 cargo_toml 0.6.0
-expect 1 "require a major bump to at least 1.0.0 (3 breaking change(s))" \
+expect 1 "which require a major bump to at least 1.0.0" \
     "the GA switch makes --check demand the major" -- \
     env NEXT_VERSION_ALLOW_MAJOR=1 "$script" --repo "$repo" --check --cargo-toml "$root/Cargo.toml"
 
@@ -267,6 +272,38 @@ printf '# package.version moved into a comment\n' >"$root/Cargo.toml"
 expect 1 "could not extract package.version" "--check with no package.version fails loudly" -- \
     nv --check --cargo-toml "$root/Cargo.toml"
 expect 1 "unknown argument" "unknown flags are rejected" -- nv --bogus
+
+# --- a lone non-feat breaking commit: minor, not patch -------------------------
+#
+# A `!` (or a BREAKING CHANGE footer) under a non-feat type is still a
+# breaking change: while 0.x it bumps minor, and a patch declaration is
+# stale. This is the bump rule the old docs got wrong.
+
+commit "chore: cut the final" v0.6.0
+commit "fix(lcache)!: drop the old cache format"
+expect_out "0.7.0" "a lone non-feat breaking commit bumps minor, not patch" -- nv
+expect_out "minor" "a lone non-feat breaking commit's bump is minor" -- nv --bump
+expect_notes "a non-feat breaking commit lands under Breaking changes" \
+    "since v0.6.0." "### Breaking changes" "- **lcache**: drop the old cache format ("
+refute_notes "the non-feat breaking commit is not misfiled under Fixes" "### Fixes"
+expect 0 "package.version 0.7.0 satisfies" \
+    "check: the minor over a lone non-feat breaking commit passes" -- check 0.7.0
+expect 1 "which require a minor bump to at least 0.7.0" \
+    "check: a patch declared over a lone non-feat breaking commit fails" -- check 0.6.1
+# Tag the bang commit so this range holds only the footer-only commit: with a
+# single commit in range its section is unambiguous, so a misgrouped footer
+# leaves no "### Breaking changes" heading at all (the bug a `footers` key, a
+# silent no-op in git-cliff, would reintroduce).
+commit "chore: cut the final" v0.7.0
+commit "fix(op): retire the legacy manifest
+
+BREAKING CHANGE: the manifest format is gone"
+expect_out "0.8.0" "a footer-only non-feat breaking commit still bumps minor" -- nv
+expect_out "minor" "a footer-only non-feat breaking commit's bump is minor" -- nv --bump
+expect_notes "the footer-only breaking entry renders under Breaking changes" \
+    "since v0.7.0." "### Breaking changes" "- **op**: retire the legacy manifest (" \
+    "BREAKING CHANGE: the manifest format is gone"
+refute_notes "the footer-only breaking commit is not misfiled under Fixes" "### Fixes"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
