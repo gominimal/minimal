@@ -79,10 +79,11 @@ pub enum Error {
 /// dedupe (set semantics, no value to disagree on) and hooks
 /// concatenate (both run, in declaration order).
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Conflict {
     /// Two or more contributors set the same variable name to
     /// different resolved values.
+    #[error("{}", VarValueMismatchDisplay { name: name.as_str(), disagreeing_values })]
     VarValueMismatch {
         /// The variable name in question.
         name: String,
@@ -94,6 +95,7 @@ pub enum Conflict {
     },
     /// Two or more contributors set the same patch destination to
     /// different sources.
+    #[error("{}", PatchSourceMismatchDisplay { dest, disagreeing_sources })]
     PatchSourceMismatch {
         /// The destination (sandbox-relative) that contributors
         /// disagreed on.
@@ -119,6 +121,14 @@ pub enum Conflict {
     /// contributors instead of a mid-Finalize `NotADirectory` /
     /// `IsADirectory` fault that leaves the session stuck in
     /// `Materializing`.
+    #[error(
+        "{}",
+        PatchDestPrefixCollisionDisplay {
+            shorter,
+            longer,
+            contributors
+        }
+    )]
     PatchDestPrefixCollision {
         /// The shorter destination — the one that would land as a
         /// file directly under `<home>`.
@@ -136,73 +146,96 @@ pub enum Conflict {
     },
 }
 
-impl fmt::Display for Conflict {
+/// Renders [`Conflict::VarValueMismatch`]'s multi-line message.
+///
+/// A wrapper type rather than an inline `#[error]` format string: the
+/// message loops over every disagreeing contributor and appends a hint.
+struct VarValueMismatchDisplay<'a> {
+    name: &'a str,
+    disagreeing_values: &'a Vec<(Source, String)>,
+}
+
+impl fmt::Display for VarValueMismatchDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::VarValueMismatch {
-                name,
-                disagreeing_values,
-            } => {
-                write!(f, "variable `{name}` set to conflicting values:")?;
-                for (source, value) in disagreeing_values {
-                    write!(f, "\n  - {value:?} (from {source})")?;
-                }
-                // No "set it in your loadout to override" hint:
-                // merge has no override semantics — adding another
-                // loadout value just adds another disagreeing
-                // contributor. Dropping all of them via the ignore
-                // list is the only working escape today.
-                write!(
-                    f,
-                    "\nhint: add `{name}` to your policy's ignore list \
-                     to drop all of these contributors"
-                )
-            }
-            Self::PatchSourceMismatch {
-                dest,
-                disagreeing_sources,
-            } => {
-                write!(f, "patch destination `{dest}` has conflicting sources:")?;
-                for (source, src) in disagreeing_sources {
-                    write!(f, "\n  - {src:?} (from {source})")?;
-                }
-                // PatchesPolicy matches against *source* paths, not
-                // destinations — the hint must steer the user to a
-                // pattern that matches the sources shown above, not
-                // the destination.
-                write!(
-                    f,
-                    "\nhint: add a pattern matching the conflicting source path(s) \
-                     above to your patch policy's ignore list to drop both, \
-                     or remove one of the contributors"
-                )
-            }
-            Self::PatchDestPrefixCollision {
-                shorter,
-                longer,
-                contributors,
-            } => {
-                write!(
-                    f,
-                    "patch destinations `{shorter}` and `{longer}` collide: \
-                     one wants a file where the other expects a directory"
-                )?;
-                for (source, dest) in contributors.iter() {
-                    write!(f, "\n  - `{dest}` (from {source})")?;
-                }
-                write!(
-                    f,
-                    "\nhint: pick destinations that don't nest — e.g. move the \
-                     file target under a distinct name, or add a pattern \
-                     matching one contributor's source to your patch policy's \
-                     ignore list to drop it"
-                )
-            }
+        let Self {
+            name,
+            disagreeing_values,
+        } = self;
+        write!(f, "variable `{name}` set to conflicting values:")?;
+        for (source, value) in *disagreeing_values {
+            write!(f, "\n  - {value:?} (from {source})")?;
         }
+        // No "set it in your loadout to override" hint: merge has no
+        // override semantics — adding another loadout value just adds
+        // another disagreeing contributor. Dropping all of them via the
+        // ignore list is the only working escape today.
+        write!(
+            f,
+            "\nhint: add `{name}` to your policy's ignore list \
+             to drop all of these contributors"
+        )
     }
 }
 
-impl std::error::Error for Conflict {}
+/// Renders [`Conflict::PatchSourceMismatch`]'s multi-line message.
+struct PatchSourceMismatchDisplay<'a> {
+    dest: &'a paths::SandboxRelPath,
+    disagreeing_sources: &'a Vec<(Source, String)>,
+}
+
+impl fmt::Display for PatchSourceMismatchDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            dest,
+            disagreeing_sources,
+        } = self;
+        write!(f, "patch destination `{dest}` has conflicting sources:")?;
+        for (source, src) in *disagreeing_sources {
+            write!(f, "\n  - {src:?} (from {source})")?;
+        }
+        // PatchesPolicy matches against *source* paths, not
+        // destinations — the hint must steer the user to a pattern
+        // that matches the sources shown above, not the destination.
+        write!(
+            f,
+            "\nhint: add a pattern matching the conflicting source path(s) \
+             above to your patch policy's ignore list to drop both, \
+             or remove one of the contributors"
+        )
+    }
+}
+
+/// Renders [`Conflict::PatchDestPrefixCollision`]'s multi-line message.
+struct PatchDestPrefixCollisionDisplay<'a> {
+    shorter: &'a paths::SandboxRelPath,
+    longer: &'a paths::SandboxRelPath,
+    contributors: &'a [(Source, paths::SandboxRelPath); 2],
+}
+
+impl fmt::Display for PatchDestPrefixCollisionDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            shorter,
+            longer,
+            contributors,
+        } = self;
+        write!(
+            f,
+            "patch destinations `{shorter}` and `{longer}` collide: \
+             one wants a file where the other expects a directory"
+        )?;
+        for (source, dest) in *contributors {
+            write!(f, "\n  - `{dest}` (from {source})")?;
+        }
+        write!(
+            f,
+            "\nhint: pick destinations that don't nest — e.g. move the \
+             file target under a distinct name, or add a pattern \
+             matching one contributor's source to your patch policy's \
+             ignore list to drop it"
+        )
+    }
+}
 
 // =====================================================================
 // Merge-time conflict detection helpers
