@@ -48,7 +48,6 @@ pub enum Auth {
 
 /// Represents the state variants of an SSH channel within a connection.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum ChannelInner {
     /// A channel has been created but not yet minted into a specific variant,
     /// namely an exec variant, shell, or subsystem variant.
@@ -60,7 +59,6 @@ pub enum ChannelInner {
 
 /// Represents the state of an SSH channel within a connection.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct Channel {
     pub id: ChannelId,
     pub inner: ChannelInner,
@@ -114,7 +112,6 @@ impl Channel {
 /// Represents the SSH connection. Lives for the
 /// lifetime of the connection.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct Connection {
     /// The current authentication state of this connection.
     pub auth: Auth,
@@ -226,7 +223,6 @@ impl ConnectionHandle {
 
 /// An error when handling the SSH connection.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum ConnectionError {
     /// A protocol error.
     Protocol(russh::Error),
