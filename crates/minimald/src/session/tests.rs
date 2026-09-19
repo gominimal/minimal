@@ -2242,3 +2242,102 @@ async fn materializing_patches_carries_their_modes_into_the_home() {
         );
     }
 }
+
+/// NET-015: a box/session must keep running when its PTY client detaches.
+/// Send the detach chord, confirm the channel closes, then confirm the
+/// session record is still active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_survives_without_client() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+
+    let mut channel = client.open_shell(session_id).await;
+    await_echo(&mut channel).await;
+
+    // Detach chord: leader then subcommand.
+    channel.data_bytes(vec![0x1d]).await.unwrap();
+    channel.data_bytes(vec![b'd']).await.unwrap();
+    let out = collect_to_close(&mut channel).await;
+    assert!(
+        out.contains("Detaching from session."),
+        "expected detach notice; got: {out:?}"
+    );
+
+    // The session must outlive the binding.
+    assert_eq!(
+        record_status(&mut client, session_id).await,
+        Some(sessions::SessionStatus::Active),
+        "session must stay active after a detach"
+    );
+}
+
+/// NET-015: abruptly losing the PTY client (connection dropped while the
+/// shell is still running) does not stop the box. A later client can
+/// re-attach and find the same running shell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abrupt_client_loss_keeps_task() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+
+    let mut first = client.open_shell(session_id).await;
+    await_echo(&mut first).await;
+
+    // Abruptly close the whole SSH connection. The host will shed the
+    // stalled binding after `HOST_PROBE_TIMEOUT` but must not tear down
+    // the session process with it.
+    drop(client);
+
+    // Wait long enough for the server to notice and shed the binding.
+    tokio::time::sleep(crate::session::HOST_PROBE_TIMEOUT + Duration::from_secs(1)).await;
+
+    let mut client = server.connect().await;
+    assert_eq!(
+        record_status(&mut client, session_id).await,
+        Some(sessions::SessionStatus::Active),
+        "session must survive an abrupt client loss"
+    );
+
+    // Re-attach proves the same session process is still running: the
+    // earlier terminal state is flushed on attach.
+    let mut second = client.open_shell(session_id).await;
+    let mut flushed = Vec::new();
+    while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(5), second.wait()).await {
+        if let ChannelMsg::Data { data } = msg {
+            flushed.extend_from_slice(&data);
+            if String::from_utf8_lossy(&flushed).contains("got:hello") {
+                break;
+            }
+        }
+    }
+    let flushed = String::from_utf8_lossy(&flushed);
+    assert!(
+        flushed.contains("got:hello"),
+        "reattaching should resume the still-live shell; got: {flushed:?}"
+    );
+}
+
+/// NET-015: there must be no idle timeout that stops the box. A session
+/// left alone with no attached client remains active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_has_no_idle_stop() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+
+    let mut channel = client.open_shell(session_id).await;
+    await_echo(&mut channel).await;
+    drop(client);
+
+    // Sleep a short but non-trivial interval. The harness has no idle
+    // teardown, so the session should still be active afterwards.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let mut client = server.connect().await;
+    assert_eq!(
+        record_status(&mut client, session_id).await,
+        Some(sessions::SessionStatus::Active),
+        "session must not stop from idleness"
+    );
+}
