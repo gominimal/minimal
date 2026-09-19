@@ -515,7 +515,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-079** WHILE a host-address box is declared deny-all THE SYSTEM SHALL refuse every outbound connection it opens, deciding inside the box host on the box's own declaration.
   tier:     T0
   verify:   cargo nextest run -p minimald host_ip_deny_all_no_outbound
-  <!-- S9b/AC2; prose 50; state-driven; the per-box decision for host-address boxes is the box host's classifier (design §4.1, UC3), matching the box's own cgroup before any source translation; outside the box host the cohort is one identity (NET-078) and the resident union is the floor -->
+  <!-- S9b/AC2; prose 50; state-driven; the per-box decision for host-address boxes is the box host's classifier (design §4.1, UC3), matching the box's own cgroup before any source translation; outside the box host the cohort is one identity (NET-078) and the resident union is the floor; the last sub-requirement below states the one host where no per-box decision exists and what the box does there -->
   - WHILE a host-address box is declared deny-all THE SYSTEM SHALL admit the box's connections to the resolver Minimal owns for it, at that resolver's address and port, and to no other loopback destination.
     tier:   T0
     verify: cargo nextest run -p minimald host_ip_deny_all_reaches_only_the_answerer
@@ -528,6 +528,10 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimald native_host_advises_classifier_install_without_prompt
     <!-- design §7.4; state+event; the causes are the privileged step not installed, or the host unable to confine a box as above (cgroup2 mounted without delegation-boundary namespaces, or the host's cgroup mount not keepable out of the box's mount namespace); installing the step clears only the first, so the command is named only for it; the ruleset needs a capability the native daemon lacks, so a native host takes one privileged install step in NET-122's advisory pattern; until then the host has no per-box host-address enforcement and says so at session start, visible to policy; refusing host-address egress declarations until then, and scoping the classifier to VM-backed hosts, are the shapes the architecture's ruling on the native install step rejected (design §7.4 and its v0.8 change history); the enforcement the host records covers addresses, never names, while the open question on native forwarding is open -->
+  - WHERE the host is not VM-backed, WHILE the box host cannot decide per box, WHILE a host-address box is declared deny-all or carries an `egress` section, THE SYSTEM SHALL run the box with no per-box verdict and its declaration unenforced, recorded as such, and never refuse the box or its connections on that ground.
+    tier:   T0
+    verify: cargo nextest run -p minimald unenforcing_native_host_runs_host_ip_box_unenforced
+    <!-- design §7.4; state-driven; the explicit exception to this requirement's deny and to NET-080's node-plane record: on that host there is no classifier, so there is no verdict to fail closed on, and the architecture's ruling on the native install step rejected turning the missing step into a hard failure for a mode whose chooser accepted the reduced tier; whether such a box may run there is policy's call on the recorded attribute, not the box host's; the box's declaration is enforced the moment the host can decide per box -->
 
 - **NET-080** WHILE a host-address box is declared deny-all THE SYSTEM SHALL complete the daemon's own package fetch on the same host and record it as node-plane traffic.
   tier:     T0
@@ -882,8 +886,10 @@ there: a native host-address box that is not deny-all, which is any without an
 `egress` section (NET-074) as much as one with a name allow list, has no
 Minimal component that resolves its upstream names today. The open question
 below names that gap and its interim: such a box resolves through the host's
-resolver, the classifier decides its address rules, its name rules are not
-enforced on that host, and the per-box enforcement the host records covers
+resolver, the classifier decides its address rules, a name rule admits nothing
+on that host, since admission comes only from resolution through the resolver
+Minimal owns and a direct-to-address flow is admitted by address rules alone
+([design §5.3][design]), and the per-box enforcement the host records covers
 addresses, never names.
 Host-address boxes on a co-resident Linux host are in scope: the ruleset needs
 a capability the native daemon lacks, so a native host takes one privileged
@@ -1027,9 +1033,11 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   native-host component forwards under cohort rules today. The deny-all case is
   settled: in-zone names resolve and nothing else does. The interim while this
   is open: a native host-address box that is not deny-all resolves through the
-  host's resolver; the classifier decides its address rules; its name rules
-  (NET-066) are not enforced on that host; and the per-box enforcement the host
-  records under NET-079 covers addresses, never names.]
+  host's resolver; the classifier decides its address rules; a name rule
+  (NET-066) admits nothing on that host, since admission comes only from
+  resolution through the resolver Minimal owns and a direct-to-address flow is
+  admitted by address rules alone ([design §5.3][design]); and the per-box
+  enforcement the host records under NET-079 covers addresses, never names.]
 - [NEEDS CLARIFICATION (LOW): are HTTP/2 and HTTP/3 through any proxy surface in
   scope? [Design §5.3][design] governs QUIC for egress and leaves the proxy
   surfaces unaddressed; the local Box Egress Proxy document needs the answer for
