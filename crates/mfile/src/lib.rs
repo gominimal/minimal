@@ -318,7 +318,7 @@ impl EnvPatches {
                 mappings.push(common::FsMapping {
                     host_path: Self::expand_home(path, home)?,
                     sandbox_path: None, // use host
-                    create_if_missing: true,
+                    create_if_missing: matches!(settings, PatchSetting::ReadWrite),
                     is_file,
                     read_only: matches!(settings, PatchSetting::ReadOnly),
                 });
@@ -1833,6 +1833,40 @@ mod tests {
         assert_eq!(
             toml::to_string(&forward).unwrap(),
             toml::to_string(&reverse).unwrap()
+        );
+    }
+
+    /// A read-only mapping consumes a source that must already exist, so it is
+    /// never fabricated; only read-write mappings may create a missing path.
+    #[test]
+    fn to_fs_mappings_derives_create_if_missing_from_the_mode() {
+        let patches = EnvPatches {
+            dir: [
+                ("/ro-dir".to_string(), PatchSetting::ReadOnly),
+                ("/rw-dir".to_string(), PatchSetting::ReadWrite),
+            ]
+            .into(),
+            file: [
+                ("/ro-file".to_string(), PatchSetting::ReadOnly),
+                ("/rw-file".to_string(), PatchSetting::ReadWrite),
+            ]
+            .into(),
+        };
+
+        let mappings = patches.to_fs_mappings(None).unwrap();
+        let flags = mappings
+            .iter()
+            .map(|m| (m.host_path.as_str(), m.create_if_missing))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            flags,
+            vec![
+                ("/ro-dir", false),
+                ("/rw-dir", true),
+                ("/ro-file", false),
+                ("/rw-file", true),
+            ]
         );
     }
 

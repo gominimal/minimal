@@ -6,7 +6,7 @@
 
 use common::{SpecOrigin, Target};
 use generational_arena::Arena;
-use mfile::{EnvPatches, EnvVarValue, PatchSetting, Upstream};
+use mfile::{EnvVarValue, Upstream};
 use nickel_lang_core::eval::value::{NickelValue, RecordData};
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::position::TermPos;
@@ -335,7 +335,6 @@ impl DeclAccumulator for () {
 
 /// Markers for the various objects that are being generated in Nickel.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[allow(dead_code)]
 pub enum ObjTy {
     Builder,
     OutputLib,
@@ -422,125 +421,6 @@ pub(crate) fn record_data_from_val(
 /// Returns true if the value is a record (including an empty one).
 pub(crate) fn is_record(val: &NickelValue) -> bool {
     val.as_record().is_some()
-}
-
-#[allow(dead_code)]
-pub(crate) fn patches_from_term(
-    rt: &NickelValue,
-    program: &mut Program<CacheImpl>,
-) -> Result<EnvPatches, Error> {
-    let patch_rt = eval_if_closure(rt, program)?;
-
-    let mut dirs: Option<BTreeMap<String, PatchSetting>> = None;
-    let mut files: Option<BTreeMap<String, PatchSetting>> = None;
-
-    let Some(r) = record_data_from_val(&patch_rt) else {
-        return Err(Error::unexpected_type(
-            "`patches`",
-            "a record with `dir`/`dirs` and `file`/`files` fields",
-            &patch_rt,
-            program,
-        ));
-    };
-
-    r.fields
-        .iter()
-        .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-            match ident_and_loc.label() {
-                "dir" | "dirs" => {
-                    let dir_rt = eval_if_closure(field.value.as_ref().unwrap(), program)?;
-
-                    let Some(r) = record_data_from_val(&dir_rt) else {
-                        return Err(Error::unexpected_type(
-                            format!("patch `{}`", ident_and_loc.label()),
-                            "a record of patch settings",
-                            &dir_rt,
-                            program,
-                        ));
-                    };
-                    if dirs.is_some() {
-                        todo!("error for both 'dirs' and 'dir' set");
-                    }
-                    dirs = Some(
-                        r.fields
-                            .iter()
-                            .map(
-                                |(ident_and_loc, field)| -> Result<(String, PatchSetting), Error> {
-                                    let val: String = deserialize_field(
-                                        format!("patch `dir.{}`", ident_and_loc.label()),
-                                        "a string",
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?;
-                                    Ok((
-                                        ident_and_loc.label().to_string(),
-                                        match val.as_str() {
-                                            "ReadOnly" | "read-only" | "ro" => {
-                                                PatchSetting::ReadOnly
-                                            }
-                                            "ReadWrite" | "read-write" | "rw" => {
-                                                PatchSetting::ReadWrite
-                                            }
-                                            _ => todo!("unexpected patch setting: {}", val),
-                                        },
-                                    ))
-                                },
-                            )
-                            .collect::<Result<BTreeMap<_, _>, Error>>()?,
-                    );
-                    Ok(())
-                }
-                "file" | "files" => {
-                    let file_rt = eval_if_closure(field.value.as_ref().unwrap(), program)?;
-
-                    let Some(r) = record_data_from_val(&file_rt) else {
-                        return Err(Error::unexpected_type(
-                            format!("patch `{}`", ident_and_loc.label()),
-                            "a record of patch settings",
-                            &file_rt,
-                            program,
-                        ));
-                    };
-                    if files.is_some() {
-                        todo!("error for both 'file' and 'files' set");
-                    }
-                    files = Some(
-                        r.fields
-                            .iter()
-                            .map(
-                                |(ident_and_loc, field)| -> Result<(String, PatchSetting), Error> {
-                                    let val: String = deserialize_field(
-                                        format!("patch `file.{}`", ident_and_loc.label()),
-                                        "a string",
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?;
-                                    Ok((
-                                        ident_and_loc.label().to_string(),
-                                        match val.as_str() {
-                                            "ReadOnly" | "read-only" | "ro" => {
-                                                PatchSetting::ReadOnly
-                                            }
-                                            "ReadWrite" | "read-write" | "rw" => {
-                                                PatchSetting::ReadWrite
-                                            }
-                                            _ => todo!("unexpected patch setting: {}", val),
-                                        },
-                                    ))
-                                },
-                            )
-                            .collect::<Result<BTreeMap<_, _>, Error>>()?,
-                    );
-                    Ok(())
-                }
-                _ => Ok(()),
-            }
-        })?;
-
-    Ok(EnvPatches {
-        file: files.unwrap_or_default(),
-        dir: dirs.unwrap_or_default(),
-    })
 }
 
 pub(crate) fn env_vars_from_term(
