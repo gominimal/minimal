@@ -226,8 +226,8 @@ proves, `nightly` ships.
   your branch touches (committed against main, staged, unstaged, untracked),
   `just lint-prose <file.md>` lints specific files, and `just lint-prose
   --all` lints the tree. Drive files you edit to zero, and leave untouched
-  files' alerts alone rather than mass-rewriting them. Project terms go in
-  `styles/config/vocabularies/Minimal/accept.txt`.
+  files' alerts alone rather than mass-rewriting them. The rules and the
+  project terms live in `gominimal/prose-rules`.
 - **`.github/workflows/` is frozen** and CODEOWNER-gated. Do not edit it.
   Extend CI coverage through convention-discovered tests, `scripts/`, and the
   `justfile`, per the test-extension contract in
