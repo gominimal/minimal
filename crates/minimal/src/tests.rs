@@ -65,16 +65,16 @@ fn every_daemon_connection_is_classified() {
     assert_eq!(
         connect_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
+            "cmd/admin.rs::cmd_ssh_forward = gated",
+            "cmd/admin.rs::cmd_version = ungated",
+            "cmd/list.rs::cmd_bare = gated",
+            "cmd/mod.rs::arm_activation_interrupt = ungated",
+            "cmd/mod.rs::connect_daemon_unchecked = ungated",
+            "cmd/session.rs::cmd_attach = gated",
+            "cmd/session.rs::cmd_exec = gated",
+            "cmd/session.rs::cmd_session_run = gated",
+            "cmd/session.rs::cmd_session_setup_zed = gated",
             "diag/net.rs::probe_socket = ungated",
-            "lib.rs::arm_activation_interrupt = ungated",
-            "lib.rs::cmd_attach = gated",
-            "lib.rs::cmd_bare = gated",
-            "lib.rs::cmd_exec = gated",
-            "lib.rs::cmd_session_run = gated",
-            "lib.rs::cmd_session_setup_zed = gated",
-            "lib.rs::cmd_ssh_forward = gated",
-            "lib.rs::cmd_version = ungated",
-            "lib.rs::connect_daemon_unchecked = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
         ]
     );
@@ -92,7 +92,7 @@ fn every_create_session_asserts_the_daemon_build() {
     assert_eq!(
         create_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
-            "lib.rs::activate_session = asserts",
+            "cmd/session.rs::activate_session = asserts",
             "task.rs::cmd_task_run = asserts",
         ]
     );
@@ -110,7 +110,7 @@ fn every_create_session_asserts_the_daemon_build() {
 fn the_activation_path_makes_no_version_round_trip() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
-        ("src/lib.rs", "activate_session"),
+        ("src/cmd/session.rs", "activate_session"),
         ("src/task.rs", "cmd_task_run"),
     ] {
         let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
@@ -1177,9 +1177,9 @@ fn composition_failure_leads_with_the_directory_not_the_daemon_step() {
 fn both_creators_share_the_composition_failure_message() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func, uses) in [
-        ("src/lib.rs", "activate_session", 2),
+        ("src/cmd/session.rs", "activate_session", 2),
         ("src/task.rs", "cmd_task_run", 2),
-        ("src/lib.rs", "drive_pending_to_active", 1),
+        ("src/cmd/mod.rs", "drive_pending_to_active", 1),
     ] {
         let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
         let body =
