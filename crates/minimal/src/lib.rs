@@ -4182,5 +4182,4 @@ pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
 }
 
 #[cfg(test)]
-#[path = "lib_tests.rs"]
 mod tests;

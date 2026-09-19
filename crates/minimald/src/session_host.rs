@@ -3595,5 +3595,4 @@ fn set_cloexec(fd: RawFd) -> io::Result<()> {
 }
 
 #[cfg(test)]
-#[path = "session_host_tests.rs"]
 mod tests;

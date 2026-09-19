@@ -2118,5 +2118,4 @@ pub(crate) fn contribution_to_pending(
 // =====================================================================
 
 #[cfg(test)]
-#[path = "compose_tests.rs"]
 mod tests;
