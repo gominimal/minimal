@@ -74,7 +74,6 @@ impl PartialOrd for SearchMatch {
 /// Fields are crate-visible so `loader.rs` can mutate them during ingest. External
 /// callers should go through the accessor methods below.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Graph {
     /// All the build-specs known to this dependency graph.
     pub(crate) builds: Arena<BuildSpec>,
