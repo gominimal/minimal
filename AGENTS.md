@@ -13,7 +13,7 @@ graph → sandboxed builds → content-addressed cache) and the **session plane*
 (long-lived isolated dev environments, natively on Linux or inside a libkrun
 microVM). Start with [docs/architecture.md](docs/architecture.md).
 
-Four binaries come out of this workspace:
+The workspace builds `min`, `mip`, `minimald`, and `minvmd`:
 
 | Binary | Role | Reference |
 |---|---|---|
@@ -26,48 +26,15 @@ The CLI reference overview is [docs/reference/cli.md](docs/reference/cli.md).
 
 ## Crate map
 
-31 crates. One line each; the long-form map with plane assignments is in
-[docs/architecture.md](docs/architecture.md) §3.
-
-| Crate | Role |
-|---|---|
-| `args` | Types for the argument schema of tasks and sideload parameters. |
-| `async-dialog` | Interactive terminal prompts over any async reader/writer (no TTY required). |
-| `check` | `mip check` linting of `minimal.toml`, packages, profiles, and stacks. |
-| `checkouts` | Git checkouts of upstream layer repositories at pinned versions. |
-| `common` | Common types and utilities (e.g. `SpecHash`) used across the codebase. |
-| `decode` | Evaluates a Nickel config layer into in-memory packages/profiles/stacks. |
-| `diagnostics` | App-agnostic machinery for diagnostic support bundles. |
-| `graph` | In-memory dependency graph; its `planner` module orders builds. |
-| `lcache` | Local cache of built artifacts, keyed by `SpecHash`. |
-| `mctx` | Top-level 'minimal context' API tying configuration, decoding, graph, and cache together. |
-| `mfile` | Finding and reading the `minimal.toml` file. |
-| `minimal` | The `min` session CLI, which pairs with and talks to `minimald`. |
-| `minimal-client` | SSH client transport to `minimald` over the UDS bridge, shared by `min` and the TUI. |
-| `minimal-tui` | `min dash`: the session-manager TUI (ratatui/crossterm, Elm-style loop). |
-| `minimald` | The session daemon: an SSH server hosting sessions and task/sandbox executions. |
-| `minimald-rpc` | Wire contract for `minimald`'s oneshot SSH RPCs and the exec channel's request vocabulary. |
-| `minvmd` | Host daemon that boots Linux microVMs via libkrun and bridges host UDS to in-VM vsock. |
-| `mip` | The Minimal package/build CLI. |
-| `mlog` | JSON file-log layer both `minimald` and `minvmd` write through; one definition of the on-disk log format. |
-| `op` | Complex operations over the graph and packages (builds, cache object construction). |
-| `orchestrator` | Runtime orchestration of builds behind a pluggable `Backend`. |
-| `ot` | Operation tracking for progress rendering (render-agnostic core + drivers). |
-| `paths` | Realm-tagged path types distinguishing host, sandbox, and daemon filesystems. |
-| `rcache` | Remote cache: fetch/upload build artifacts over the network. |
-| `remote-client` | Client for the Remote Execution Service, driving remote builds against the graph. |
-| `remote-proto` | Protobuf / wire types for the Remote Execution Service (RES). |
-| `sandbox2` | Low-level sandbox implementation (Linux user + mount namespaces). |
-| `sessions` | Session primitives: lifecycle hooks, loadouts, and the composition pipeline. |
-| `stdlib` | The embedded Minimal standard library. |
-| `switch` | gvproxy-switch primitives: subnet arithmetic, MAC derivation, vsock constants, config rendering. |
-| `version` | Shared build-time version identity for `min`, `mip`, `minimald`, and `minvmd`. |
+The crates are grouped by plane in
+[docs/architecture.md](docs/architecture.md) §0 and listed with roles in §3.
+`ls crates/` lists the current set.
 
 ## Platform matrix
 
 | Platform | What you can build and test |
 |---|---|
-| Linux amd64 / arm64 | Full workspace natively: `just ci` builds, lints, and tests everything; all four binaries. |
+| Linux amd64 / arm64 | Full workspace natively: `just ci` builds, lints, and tests everything, including every binary. |
 | macOS arm64 | Session stack natively (`just ci`); every Linux-only crate via `just test-cross`. |
 
 **Build and test only through `just`.** The recipes carry the per-OS scoping,
@@ -184,31 +151,16 @@ Verified against the current tree; sources in parentheses.
 
 ## CI lane map
 
-Canonical docs: [docs/ci-strategy.md](docs/ci-strategy.md) (design and
-rationale) and
-[docs/internal/release-pipeline.md](docs/internal/release-pipeline.md)
-(release/promotion mechanics). The 13 workflows on `main`:
+[docs/ci-strategy.md](docs/ci-strategy.md) covers the CI lanes and what runs
+where.
+[docs/internal/release-pipeline.md](docs/internal/release-pipeline.md) covers
+the release and promotion mechanics. `ls .github/workflows/` lists the
+workflows on `main`.
 
-| Workflow | One line |
-|---|---|
-| `ci` | Repo-wide checks: rustfmt, clippy, cargo-deny, a dogfood build smoke (Minimal building itself, reading prebuilt packages via the R2 mirror canary), `mip check`. |
-| `ci-linux-native` | Linux-native target lane: workspace tests, root-integration harnesses, session e2e against a host-native `minimald` (no VM). |
-| `ci-linux-kvm` | Linux/KVM target lane (hosted x86_64): build-once/test-on-KVM split, minvmd VM harnesses, VM-backed session e2e. |
-| `ci-macos` | macOS/HVF target lane: hosted arm64 unit/clippy tier (`minvmd` + `sessions`) plus the hypervisor e2e on the self-hosted Apple Silicon runner. |
-| `ci-shell-installer` | POSIX-sh gate for the shell installer and the AppArmor profile installer (shellcheck + harness under sh/dash/macOS sh). |
-| `commitlint` | Conventional Commits enforcement on PRs. |
-| `nightly-tests` | 06:00 UTC **test tier**: advisory re-checks, session-e2e soak, toolchain/dependency canaries, workflow hygiene; failures file tracking issues. |
-| `nightly` | 10:00 UTC **channel cut**: reuses `release.yml` to build/stage/smoke, then blesses the `nightly` channel. |
-| `release` | Manual (or nightly-called) build/sign/stage/smoke of all shipped artifacts; `versioned: true` builds with `MINIMAL_RELEASE_VERSION`, packages, stages `versions/<semver>/`, and parks a draft GitHub Release. Records smoke provenance on the staged row. Its verify-ci gate requires the five lane aggregators green on the commit. |
-| `promote` | Manual, gated pointer flip of the `stable`/`unstable` channels to a staged, smoked version; a stable promotion of a semver calls `publish-packages`. |
-| `publish-packages` | Reusable, called by `promote`: publishes the draft GitHub Release (which creates the `v<semver>` tag, last), then the AUR and Homebrew publishers. |
-| `docs-hotfix` | Manual: repoint the public docs on `gominimal/webapp` to a chosen `main` sha between releases, without cutting or promoting a binary release. |
-| `prune-releases` | Scheduled housekeeping: deletes aged auto-cut `release-<sha>` GitHub Releases (never tagged `vX.Y.Z` releases). |
-
-The required-check vocabulary is the **five aggregators**: `ci-success`,
+The required-check vocabulary is the **lane aggregators**: `ci-success`,
 `ci-linux-native-success`, `ci-linux-kvm-success`, `ci-macos-success`,
 `ci-shell-installer-success`. Each is green when its lane's jobs succeeded
-or were path-skipped. The two nightlies are distinct on purpose: `nightly-tests`
+or were path-skipped. The nightlies are distinct on purpose: `nightly-tests`
 proves, `nightly` ships.
 
 ## Conventions and hard rules
@@ -223,11 +175,23 @@ proves, `nightly` ships.
   `docs/specs/NN-spec-<slug>/NN-spec-<slug>.md`. Start from
   [docs/specs/TEMPLATE.md](docs/specs/TEMPLATE.md); requirements are written as
   EARS and the format is decided in gominimal/foundry.
+- **Prose**: markdown is Vale-linted: `just lint-prose` lints the markdown
+  your branch touches (committed against main, staged, unstaged, untracked),
+  `just lint-prose <file.md>` lints specific files, and `just lint-prose
+  --all` lints the tree. Drive files you edit to zero, and leave untouched
+  files' alerts alone rather than mass-rewriting them. `.vale.ini` pins the
+  third-party styles. The vocabulary and the first-party rules live under
+  `styles/`.
 - **`.github/workflows/` is frozen** and CODEOWNER-gated. Do not edit it.
   Extend CI coverage through convention-discovered tests, `scripts/`, and the
   `justfile`, per the test-extension contract in
   [CONTRIBUTING.md](CONTRIBUTING.md) and the design in
   [docs/ci-strategy.md](docs/ci-strategy.md).
+- **Do not restate an inventory.** Counts and lists of crates, workflows,
+  binaries, and recipes are wrong as soon as one changes. Link to the document
+  that owns the list, or give the command that prints it (`ls crates/`,
+  `ls .github/workflows/`, `just --list`). The prose rules reject a stated
+  count (`inventory.StatedCount`).
 
 ### Pre-PR verification
 
