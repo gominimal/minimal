@@ -298,21 +298,32 @@ impl CheckCache {
                         || name.ends_with(b"__librt_version_placeholder")
                 });
 
-                let mut symbols: HashSet<String> = export_names
-                    .iter()
-                    .map(|name| String::from_utf8(name.to_vec()).unwrap())
-                    .chain(elf.dynamic_symbols().map(|s| s.name().unwrap().to_string()))
-                    .collect();
+                let mut symbols: HashSet<String> = HashSet::new();
+                for name in &export_names {
+                    let name = String::from_utf8(name.to_vec()).map_err(|e| {
+                        anyhow!("non-UTF-8 export name in {}: {e}", full_path.display())
+                    })?;
+                    symbols.insert(name);
+                }
+                for s in elf.dynamic_symbols() {
+                    let name = s.name().map_err(|e| {
+                        anyhow!("reading dynamic symbol of {}: {e}", full_path.display())
+                    })?;
+                    symbols.insert(name.to_string());
+                }
 
                 if likely_glibc_stub_lib {
                     let libc_path = dep_path.join("usr/lib/libc.so.6");
                     let data = std::fs::read(&libc_path)
                         .map_err(|e| anyhow!("reading libc {}: {e}", libc_path.display()))?;
-                    let libc = object::File::parse(&*data).unwrap();
-                    symbols.extend(
-                        libc.dynamic_symbols()
-                            .map(|s| s.name().unwrap().to_string()),
-                    );
+                    let libc = object::File::parse(&*data)
+                        .map_err(|e| anyhow!("parsing {}: {e}", libc_path.display()))?;
+                    for s in libc.dynamic_symbols() {
+                        let name = s.name().map_err(|e| {
+                            anyhow!("reading dynamic symbol of {}: {e}", libc_path.display())
+                        })?;
+                        symbols.insert(name.to_string());
+                    }
                 }
 
                 Ok(Arc::new(symbols))
@@ -799,11 +810,20 @@ impl FileBasedChecker for ImportLineCheck {
         {
             let e =
                 e.map_err(|e| Error::IO("enumerating nickel file", pkg_dir.to_path_buf(), e))?;
-            if e.file_type().unwrap().is_dir() {
+            if e.file_type()
+                .map_err(|err| Error::IO("reading file type", e.path(), err))?
+                .is_dir()
+            {
                 continue;
             }
             let name = e.file_name();
-            if !name.to_str().unwrap().ends_with(".ncl") {
+            let Some(name) = name.to_str() else {
+                return Err(Error::Other(anyhow!(
+                    "nickel file name is not valid UTF-8: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            if !name.ends_with(".ncl") {
                 continue;
             }
 
@@ -830,11 +850,9 @@ impl FileBasedChecker for ImportLineCheck {
                     .filter_map(|ident| {
                         if !rest.contains(ident) {
                             if !fix {
-                                result.err.push(format!(
-                                    "{}: {} imported but not used",
-                                    name.to_str().unwrap(),
-                                    ident
-                                ));
+                                result
+                                    .err
+                                    .push(format!("{}: {} imported but not used", name, ident));
                             }
                             None
                         } else {
@@ -859,10 +877,9 @@ impl FileBasedChecker for ImportLineCheck {
                 });
 
                 if !fix && sorted_identifiers != used_identifiers {
-                    result.err.push(format!(
-                        "{}: identifiers not in canonical order",
-                        name.to_str().unwrap()
-                    ));
+                    result
+                        .err
+                        .push(format!("{}: identifiers not in canonical order", name));
                 }
                 if fix
                     && (sorted_identifiers != used_identifiers || identifiers != used_identifiers)
@@ -912,11 +929,20 @@ impl FileBasedChecker for FmtCheck {
         {
             let e =
                 e.map_err(|e| Error::IO("enumerating nickel file", pkg_dir.to_path_buf(), e))?;
-            if e.file_type().unwrap().is_dir() {
+            if e.file_type()
+                .map_err(|err| Error::IO("reading file type", e.path(), err))?
+                .is_dir()
+            {
                 continue;
             }
             let name = e.file_name();
-            if !name.to_str().unwrap().ends_with(".ncl") {
+            let Some(name) = name.to_str() else {
+                return Err(Error::Other(anyhow!(
+                    "nickel file name is not valid UTF-8: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            if !name.ends_with(".ncl") {
                 continue;
             }
 
@@ -926,11 +952,9 @@ impl FileBasedChecker for FmtCheck {
 
             match nickel_lang_core::format::format(&data[..], &mut out) {
                 Err(e) => {
-                    result.err.push(format!(
-                        "formatting {} failed: {:?}",
-                        name.to_str().unwrap(),
-                        e
-                    ));
+                    result
+                        .err
+                        .push(format!("formatting {} failed: {:?}", name, e));
                     result.verdict = CheckVerdict::Skip;
                 }
                 Ok(()) => {
@@ -1097,11 +1121,20 @@ impl FileBasedChecker for ImportsCheck {
         {
             let e =
                 e.map_err(|e| Error::IO("enumerating nickel file", pkg_dir.to_path_buf(), e))?;
-            if e.file_type().unwrap().is_dir() {
+            if e.file_type()
+                .map_err(|err| Error::IO("reading file type", e.path(), err))?
+                .is_dir()
+            {
                 continue;
             }
             let name = e.file_name();
-            if !name.to_str().unwrap().ends_with(".ncl") {
+            let Some(name) = name.to_str() else {
+                return Err(Error::Other(anyhow!(
+                    "nickel file name is not valid UTF-8: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            if !name.ends_with(".ncl") {
                 continue;
             }
 
@@ -1118,9 +1151,7 @@ impl FileBasedChecker for ImportsCheck {
                 if identifier != folder {
                     result.err.push(format!(
                         "{}: identifier '{}' doesn't match folder '{}' in import",
-                        name.to_str().unwrap(),
-                        identifier,
-                        folder
+                        name, identifier, folder
                     ));
                     result.verdict = CheckVerdict::Fail;
                 }
@@ -1130,8 +1161,7 @@ impl FileBasedChecker for ImportsCheck {
                 {
                     result.err.push(format!(
                         "{}: adjacent package '{}' imported but not used",
-                        name.to_str().unwrap(),
-                        identifier,
+                        name, identifier,
                     ));
                     result.verdict = CheckVerdict::Fail;
                 }

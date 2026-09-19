@@ -622,10 +622,15 @@ impl<C: Channel> Sandbox<C> {
             WdSetup::BoundDir {
                 path, read_only, ..
             } => {
-                let container_path = format!(
-                    "/{}",
-                    self.config.wd.bound_dir_sandbox_cwd().to_str().unwrap()
-                );
+                let sandbox_cwd = self.config.wd.bound_dir_sandbox_cwd();
+                let sandbox_cwd = sandbox_cwd.to_str().ok_or_else(|| {
+                    Error::IO(
+                        "bound-dir cwd is not valid UTF-8",
+                        sandbox_cwd.to_path_buf(),
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 path"),
+                    )
+                })?;
+                let container_path = format!("/{sandbox_cwd}");
                 let opts = BindOpts {
                     recursive: true,
                     read_only: *read_only,
@@ -744,8 +749,9 @@ impl<C: Channel> Sandbox<C> {
                 }
                 .join(&program),
             )
-            .unwrap()
-            && fs::exists(rootfs.join("usr/bin").join(&program)).unwrap()
+            .map_err(|e| Error::IO("checking program in cwd", rootfs.clone(), e))?
+            && fs::exists(rootfs.join("usr/bin").join(&program))
+                .map_err(|e| Error::IO("checking program in usr/bin", rootfs.clone(), e))?
         {
             program = format!("/usr/bin/{program}");
         }
