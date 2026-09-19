@@ -791,8 +791,11 @@ impl Binding {
         // shell is already gone, which is what ended the sandbox — so the
         // actor mints a host for it exactly as activation does. Awaited, so
         // the hooks are not racing this binding's teardown.
-        if session_outlives_us && let Some(control) = self.control.as_ref() {
-            control.detached().await;
+        if session_outlives_us {
+            tracing::info!(session = %self.name, "client detached or disconnected; session keeps running");
+            if let Some(control) = self.control.as_ref() {
+                control.detached().await;
+            }
         }
 
         let _ = ws.eof().await;

@@ -1922,6 +1922,8 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     use super::bridge;
@@ -2330,6 +2332,59 @@ mod tests {
         // The second process was never spawned, so its kill flag should
         // still be unset.
         assert!(!second.ctrl.was_killed());
+    }
+
+    /// NET-015: losing the exec client must kill only the spawned
+    /// command, not leave it running without a consumer. We model a client
+    /// that has gone away by closing the SSH-channel stdin reader and
+    /// dropping the stdout/stderr readers, so both reads and writes fail;
+    /// the bridge must call `start_kill` on the isolated process.
+    #[tokio::test]
+    async fn lost_exec_client_kills_only_its_own_process() {
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader: _stdin_reader,
+                mut stdout_writer,
+                stderr_writer: _stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+
+        // SSH stdin gone: bridge sees EOF.
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        // SSH stdout/stderr consumers gone: bridge writes fail.
+        let (broken_stdout_reader, mut bridge_stdout) = duplex(64);
+        drop(broken_stdout_reader);
+        let (broken_stderr_reader, mut bridge_stderr) = duplex(64);
+        drop(broken_stderr_reader);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+            )
+            .await
+        });
+
+        // Give the bridge a cycle to start reading, then make the child
+        // produce output so the bridge tries to forward it to the dead
+        // channel and discovers the client is gone.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stdout_writer.write_all(b"orphaned output").await.unwrap();
+        drop(stdout_writer);
+
+        let exit = bridge_task.await.unwrap();
+        // A killed mock returns Ok(None), which the bridge maps to 1.
+        assert_eq!(exit, 1, "client loss should report a non-zero exit");
+        assert!(
+            ctrl.was_killed(),
+            "the spawned command must be killed when its exec client is lost"
+        );
     }
 
     /// A two-process sequence where both children exit cleanly: the
