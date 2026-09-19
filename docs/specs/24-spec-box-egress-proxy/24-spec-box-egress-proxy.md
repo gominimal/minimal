@@ -46,10 +46,11 @@ refuse is readable per box.
 
 **First slice:** `proxy_env` steering, the GitHub v1 host set (Gatehouse §6.10
 Module host sets: `github.com`, `api.github.com`, `uploads.github.com`,
-`codeload.github.com`; `objects.githubusercontent.com` stays ordinary egress) as
-the one module, a sealed member minted by the device-flow `min auth login`,
-redemption with every check, the local audit log with its one-shot `min box
-audit <box>` read, and `min box spec` showing the CA and the upstream set. The
+`codeload.github.com`; pre-signed content hosts such as
+`release-assets.githubusercontent.com` stay ordinary egress) as the one
+module, a sealed member minted by the device-flow `min auth login`, redemption
+with every check, the local audit log with its one-shot `min box audit <box>`
+read, and `min box spec` showing the CA and the upstream set. The
 demo box declares `github:user-token`, the honest spelling of a `full` member,
 so the slice also exercises `min box spec`'s `full` marker (BEP-038). Keychain
 references with `min secret`, `dns` steering, the browser sign-in flow, `min box
