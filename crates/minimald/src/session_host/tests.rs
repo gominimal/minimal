@@ -190,17 +190,19 @@ fn teardown_from(rx: &mut mpsc::Receiver<BindingMsg>) -> Option<(TeardownCause, 
 async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
     let (mut host, _handle) = Host::build(
         MockLauncher,
-        "test-session".to_string(),
-        "user".to_string(),
-        test_paths(),
-        DEFAULT_SIZE,
-        None,
-        None,
-        None,
-        std::env::temp_dir(),
-        sessions::SessionId::nil(),
-        None,
-        ConnectionEnv::new(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths: test_paths(),
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            session_id: sessions::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+        },
     )
     .await
     .expect("failed to build host");
@@ -244,17 +246,19 @@ async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
 async fn a_stalled_binding_does_not_wedge_the_host_loop() {
     let (mut host, handle) = Host::build(
         MockLauncher,
-        "test-session".to_string(),
-        "user".to_string(),
-        test_paths(),
-        DEFAULT_SIZE,
-        None,
-        None,
-        None,
-        std::env::temp_dir(),
-        sessions::SessionId::nil(),
-        None,
-        ConnectionEnv::new(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths: test_paths(),
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            session_id: sessions::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+        },
     )
     .await
     .expect("failed to build host");
@@ -360,17 +364,19 @@ async fn await_forwarded(rx: &mut mpsc::Receiver<BindingMsg>, needle: &[u8]) {
 async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
     let (mut host, _handle) = Host::build(
         MockLauncher,
-        "test-session".to_string(),
-        "user".to_string(),
-        test_paths(),
-        DEFAULT_SIZE,
-        None,
-        None,
-        None,
-        std::env::temp_dir(),
-        sessions::SessionId::nil(),
-        None,
-        ConnectionEnv::new(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths: test_paths(),
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            session_id: sessions::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+        },
     )
     .await
     .expect("failed to build host");
@@ -418,17 +424,19 @@ async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
 async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
     let (host, _handle) = Host::build(
         MockLauncher,
-        "test-session".to_string(),
-        "user".to_string(),
-        test_paths(),
-        DEFAULT_SIZE,
-        None,
-        None,
-        None,
-        std::env::temp_dir(),
-        sessions::SessionId::nil(),
-        None,
-        ConnectionEnv::new(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths: test_paths(),
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            session_id: sessions::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+        },
     )
     .await
     .expect("failed to build host");
@@ -464,17 +472,19 @@ async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
 async fn a_kill_tells_the_binding_nothing() {
     let (mut host, handle) = Host::build(
         MockLauncher,
-        "test-session".to_string(),
-        "user".to_string(),
-        test_paths(),
-        DEFAULT_SIZE,
-        None,
-        None,
-        None,
-        std::env::temp_dir(),
-        sessions::SessionId::nil(),
-        None,
-        ConnectionEnv::new(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths: test_paths(),
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            session_id: sessions::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+        },
     )
     .await
     .expect("failed to build host");
@@ -852,23 +862,25 @@ async fn get_attrs_tracks_title_and_io_times() {
     // runtime loop on a background task.
     let (host, handle) = Host::build(
         MockLauncher,
-        "test-session".to_string(),
-        "user".to_string(),
-        SessionPaths {
-            working: DaemonAbsPath::root(),
-            cache: DaemonAbsPath::root(),
-            home: DaemonAbsPath::root(),
-            patches: DaemonAbsPath::root(),
-            hooks: DaemonAbsPath::root(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths: SessionPaths {
+                working: DaemonAbsPath::root(),
+                cache: DaemonAbsPath::root(),
+                home: DaemonAbsPath::root(),
+                patches: DaemonAbsPath::root(),
+                hooks: DaemonAbsPath::root(),
+            },
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            session_id: sessions::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
         },
-        DEFAULT_SIZE,
-        None,
-        None,
-        None,
-        std::env::temp_dir(),
-        sessions::SessionId::nil(),
-        None,
-        ConnectionEnv::new(),
     )
     .await
     .expect("failed to build host");
@@ -925,23 +937,25 @@ async fn get_attrs_tracks_title_and_io_times() {
 async fn kill_tears_down_host_and_reaps_process() {
     let (host, handle) = Host::build(
         MockLauncher,
-        "test-session".to_string(),
-        "user".to_string(),
-        SessionPaths {
-            working: DaemonAbsPath::root(),
-            cache: DaemonAbsPath::root(),
-            home: DaemonAbsPath::root(),
-            patches: DaemonAbsPath::root(),
-            hooks: DaemonAbsPath::root(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths: SessionPaths {
+                working: DaemonAbsPath::root(),
+                cache: DaemonAbsPath::root(),
+                home: DaemonAbsPath::root(),
+                patches: DaemonAbsPath::root(),
+                hooks: DaemonAbsPath::root(),
+            },
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            session_id: sessions::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
         },
-        DEFAULT_SIZE,
-        None,
-        None,
-        None,
-        std::env::temp_dir(),
-        sessions::SessionId::nil(),
-        None,
-        ConnectionEnv::new(),
     )
     .await
     .expect("failed to build host");
@@ -1077,17 +1091,19 @@ async fn exit_releases_the_network() {
         MockLauncherWithNet {
             torn_down: torn_down.clone(),
         },
-        "test-session".to_string(),
-        "user".to_string(),
-        test_paths(),
-        DEFAULT_SIZE,
-        None,
-        None,
-        None,
-        std::env::temp_dir(),
-        sessions::SessionId::nil(),
-        None,
-        ConnectionEnv::new(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths: test_paths(),
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            session_id: sessions::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+        },
     )
     .await
     .expect("failed to build host");
@@ -1128,17 +1144,19 @@ async fn detach_keystroke_holds_the_session_and_network() {
         MockLauncherWithNet {
             torn_down: torn_down.clone(),
         },
-        "test-session".to_string(),
-        "user".to_string(),
-        test_paths(),
-        DEFAULT_SIZE,
-        None,
-        None,
-        None,
-        std::env::temp_dir(),
-        sessions::SessionId::nil(),
-        None,
-        ConnectionEnv::new(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths: test_paths(),
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            session_id: sessions::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+        },
     )
     .await
     .expect("failed to build host");
@@ -1226,17 +1244,19 @@ fn queue_stdin_appends_after_unwritten_remainder() {
 async fn stale_binding_generation_input_is_discarded() {
     let (host, _handle) = Host::build(
         MockLauncher,
-        "test-session".to_string(),
-        "user".to_string(),
-        test_paths(),
-        DEFAULT_SIZE,
-        None,
-        None,
-        None,
-        std::env::temp_dir(),
-        sessions::SessionId::nil(),
-        None,
-        ConnectionEnv::new(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths: test_paths(),
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            session_id: sessions::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+        },
     )
     .await
     .expect("failed to build host");

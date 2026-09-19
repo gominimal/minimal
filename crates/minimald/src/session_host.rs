@@ -2612,6 +2612,25 @@ impl SessionLauncher for MockLauncher {
     }
 }
 
+/// The non-launcher inputs to [`Host::spawn`] and [`Host::build`].
+///
+/// Both entry points take the same set, and `spawn` forwards them verbatim to
+/// `build`, so the parameters travel as one named bundle rather than a long
+/// positional pass-through. `launcher` stays a separate generic argument.
+pub(crate) struct HostParams {
+    pub name: String,
+    pub username: String,
+    pub paths: SessionPaths,
+    pub sz: WinSize,
+    pub channel: Option<Channel<Msg>>,
+    pub control: Option<SessionControl>,
+    pub delta: Option<Arc<DeltaSource>>,
+    pub archives_dir: std::path::PathBuf,
+    pub session_id: sessions::SessionId,
+    pub composition: Option<Arc<sessions::core::compose::Composition>>,
+    pub connection_env: ConnectionEnv,
+}
+
 impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     /// The PID of hakoniwa's container supervisor for this session.
     ///
@@ -2755,26 +2774,26 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     /// Returns the [`HostHandle`] alongside the [`JoinHandle`] of the runtime
     /// loop, so the owner can await full teardown (process reaped, sandbox guard
     /// dropped) after issuing a [`HostHandle::kill`].
-    #[allow(clippy::too_many_arguments)]
     pub async fn spawn<L>(
         launcher: L,
-        name: String,
-        username: String,
-        paths: SessionPaths,
-        sz: WinSize,
-        channel: Option<Channel<Msg>>,
-        control: Option<SessionControl>,
-        delta: Option<Arc<DeltaSource>>,
-        archives_dir: std::path::PathBuf,
-        session_id: sessions::SessionId,
-        composition: Option<Arc<sessions::core::compose::Composition>>,
-        connection_env: ConnectionEnv,
+        params: HostParams,
     ) -> Result<(HostHandle, JoinHandle<Result<i32, std::io::Error>>), std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
     {
-        let (host, handle) = Self::build(
-            launcher,
+        let (host, handle) = Self::build(launcher, params).await?;
+        let task = tokio::spawn(host.mainloop());
+        Ok((handle, task))
+    }
+
+    /// Builds the host and its handle from a launcher without spawning the
+    /// runtime loop, so callers (notably tests) can drive [`Self::step`]
+    /// directly and observe the host's state.
+    async fn build<L>(launcher: L, params: HostParams) -> Result<(Self, HostHandle), std::io::Error>
+    where
+        L: SessionLauncher<Process = P, Guard = G>,
+    {
+        let HostParams {
             name,
             username,
             paths,
@@ -2786,33 +2805,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             session_id,
             composition,
             connection_env,
-        )
-        .await?;
-        let task = tokio::spawn(host.mainloop());
-        Ok((handle, task))
-    }
-
-    /// Builds the host and its handle from a launcher without spawning the
-    /// runtime loop, so callers (notably tests) can drive [`Self::step`]
-    /// directly and observe the host's state.
-    #[allow(clippy::too_many_arguments)]
-    async fn build<L>(
-        launcher: L,
-        name: String,
-        username: String,
-        paths: SessionPaths,
-        sz: WinSize,
-        channel: Option<Channel<Msg>>,
-        control: Option<SessionControl>,
-        delta: Option<Arc<DeltaSource>>,
-        archives_dir: std::path::PathBuf,
-        session_id: sessions::SessionId,
-        composition: Option<Arc<sessions::core::compose::Composition>>,
-        connection_env: ConnectionEnv,
-    ) -> Result<(Self, HostHandle), std::io::Error>
-    where
-        L: SessionLauncher<Process = P, Guard = G>,
-    {
+        } = params;
         // The change-detection baseline (`delta`) is armed once per session and
         // handed in, so a host rebuilt on reattach keeps the activation-time
         // reference point rather than re-snapshotting an already-modified

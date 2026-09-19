@@ -1986,20 +1986,22 @@ impl Session {
         };
         let spawn = Box::pin(session_host::Host::spawn(
             launcher,
-            registry_name(&record),
-            conn_username,
-            paths,
-            sz,
-            None,
-            // Mint a handle to this session ID in the sessions actor/manager.
-            Some(SessionControl::new(self.manager.clone(), record.id)),
-            delta,
-            archives_dir,
-            record.id,
-            // The host runs attach and detach itself: it owns the terminal
-            // they write to and the process whose namespaces they join.
-            self.composition(),
-            connection_env,
+            session_host::HostParams {
+                name: registry_name(&record),
+                username: conn_username,
+                paths,
+                sz,
+                channel: None,
+                // Mint a handle to this session ID in the sessions actor/manager.
+                control: Some(SessionControl::new(self.manager.clone(), record.id)),
+                delta,
+                archives_dir,
+                session_id: record.id,
+                // The host runs attach and detach itself: it owns the terminal
+                // they write to and the process whose namespaces they join.
+                composition: self.composition(),
+                connection_env,
+            },
         ));
 
         let (channel, spawned) = match progress {
