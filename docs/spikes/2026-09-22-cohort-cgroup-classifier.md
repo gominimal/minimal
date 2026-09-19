@@ -508,6 +508,10 @@ and T9.
     rules; T38 owns the rule and where the carve-out points, T9 owns the
     answerer's forwarding behaviour, and a per-box forwarding policy would
     need a new channel to the host-global answerer, which neither task has.
+    The architecture has since ruled it ([gominimal/arch#78][arch78], ruling
+    2): the node's resolver is the one carve-out, address and port only, and
+    host-address boxes resolve through Minimal's answerer, never the host's
+    resolver.
 
 # Artifacts
 
@@ -520,3 +524,4 @@ and T9.
   state (no `spike` tables, no `minimald.slice`, userns restriction restored).
 
 [design]: https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md
+[arch78]: https://github.com/gominimal/arch/issues/78
