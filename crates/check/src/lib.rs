@@ -352,6 +352,8 @@ pub struct CheckCtx {
 }
 
 impl CheckCtx {
+    // Left positional: a params type would exist only to feed this constructor
+    // (each field is copied straight into `Self`), so it is pure ceremony.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         filter_names: Vec<String>,

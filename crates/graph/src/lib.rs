@@ -5,6 +5,13 @@ use common::{SpecHash, SpecOrigin};
 use serde::{Deserialize, Serialize};
 
 /// An error during construction or processing of the dependency graph.
+///
+/// Left hand-rolled rather than converted to `thiserror`: its only
+/// `Display`-like output is the bespoke terminal renderer in [`Error::report_to`],
+/// and it has no `Display`/`std::error::Error` impl to reproduce. `thiserror`'s
+/// required `#[error("...")]` strings would therefore *introduce* new observable
+/// output instead of preserving existing bytes, and the lone `From<decode::Error>`
+/// below is not worth a derive on its own.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Error {
@@ -95,8 +102,7 @@ impl Error {
 
     /// Writes a human-friendly representation of the error to standard out.
     pub fn report_to_stderr(&self) {
-        use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
-        self.report_to(&mut StandardStream::stderr(ColorChoice::Auto).lock());
+        common::report_to_stderr(|w| self.report_to(w));
     }
 }
 

@@ -840,6 +840,8 @@ impl Context {
     }
 
     /// Constructs an environment from which executions can be run, based on the given parameters.
+    // Left positional: public library API with borrowed `'a` args; a params
+    // struct would reshape the interface without improving this forwarder.
     #[allow(clippy::too_many_arguments)]
     /// Builds an [`env::Env`] whose sandbox shares the host network. Use
     /// [`make_env_with_network`](Self::make_env_with_network) to run it under
@@ -878,6 +880,8 @@ impl Context {
     /// `home` is the directory `~/`-rooted patch paths expand against; see
     /// [`PatchHome`] for why every caller states it rather than letting
     /// the conversion read the ambient one.
+    // Left positional: public library API; `make_env` already forwards here, so
+    // a struct would only relocate the same argument list.
     #[allow(clippy::too_many_arguments)]
     pub async fn make_env_with_network<'a, S: PackageSelection>(
         &'a mut self,
