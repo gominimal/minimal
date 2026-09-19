@@ -136,13 +136,13 @@ struct PlanDisplay<'a>(&'a (Graph, PlanErr));
 impl fmt::Display for PlanDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (graph, PlanErr::Cycles(c)) = self.0;
-        write!(
+        writeln!(
             f,
             "Planning failed: unable to progress with unresolvable dependency cycles"
         )?;
-        write!(f, "Cycles:")?;
+        writeln!(f, "Cycles:")?;
         for c in c.iter() {
-            write!(
+            writeln!(
                 f,
                 "\t{}",
                 c.iter()

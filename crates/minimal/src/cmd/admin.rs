@@ -9,10 +9,13 @@ pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyho
         Some(socket_path) => socket_path,
         None => {
             ensure_daemon(global)?;
-            client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
-                .context("Failed to resolve daemon socket path")?
-                .to_str()
-                .unwrap()
+            let path =
+                client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+                    .context("Failed to resolve daemon socket path")?;
+            path.to_str()
+                .with_context(|| {
+                    format!("daemon socket path is not valid UTF-8: {}", path.display())
+                })?
                 .to_string()
         }
     };
@@ -321,6 +324,12 @@ pub async fn cmd_login(global: &GlobalArgs, args: LoginArgs) -> Result<(), anyho
         let mut f = opts
             .open(&client_key_path)
             .with_context(|| format!("writing {}", client_key_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("securing {}", client_key_path.display()))?;
+        }
         f.write_all(cert_resp.key_pem.as_bytes())
             .with_context(|| format!("writing {}", client_key_path.display()))?;
     }
