@@ -179,8 +179,9 @@ proves, `nightly` ships.
   your branch touches (committed against main, staged, unstaged, untracked),
   `just lint-prose <file.md>` lints specific files, and `just lint-prose
   --all` lints the tree. Drive files you edit to zero, and leave untouched
-  files' alerts alone rather than mass-rewriting them. The rules and the
-  project terms live in `gominimal/prose-rules`.
+  files' alerts alone rather than mass-rewriting them. `.vale.ini` pins the
+  third-party styles. The vocabulary and the first-party rules live under
+  `styles/`.
 - **`.github/workflows/` is frozen** and CODEOWNER-gated. Do not edit it.
   Extend CI coverage through convention-discovered tests, `scripts/`, and the
   `justfile`, per the test-extension contract in
@@ -189,8 +190,8 @@ proves, `nightly` ships.
 - **Do not restate an inventory.** Counts and lists of crates, workflows,
   binaries, and recipes are wrong as soon as one changes. Link to the document
   that owns the list, or give the command that prints it (`ls crates/`,
-  `ls .github/workflows/`, `just --list`). The shared prose rules reject a
-  stated count (`inventory.StatedCount`).
+  `ls .github/workflows/`, `just --list`). The prose rules reject a stated
+  count (`inventory.StatedCount`).
 
 ### Pre-PR verification
 

@@ -1,0 +1,22 @@
+# A count of things the repository owns: crates, workflows, recipes, binaries,
+# and the like. The number duplicates a directory listing or another document,
+# so the next pull request makes it wrong. Name the items, or link to where the
+# list lives, instead of counting them.
+#
+# Only three shapes fire, each an assertion about the current tree:
+#   - a spelled count opening a sentence ("Four binaries come out of ...")
+#   - a definite count ("the 13 workflows", "all four binaries")
+#   - a numeric count closed by a period ("31 crates.")
+# Estimates and hypotheticals stay silent: "order of 100 crates" matches no
+# shape, and a number inside a clause does not either.
+extends: existence
+message: "Stated inventory count: '%s'. The number is wrong after the list changes. Name the items or link to where the list lives."
+level: error
+ignorecase: true
+# nonword keeps the trailing `\.` in the last token working: with the default
+# word-boundary wrapping, `\b\.\b` never matches.
+nonword: true
+tokens:
+  - '(?:^|[.:]\s+|\*\*)(?:two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)[\s-]+(?:binaries|crates|workflows|recipes|aggregators|nightlies|subcommands)\b'
+  - '\b(?:the|all|both|these|those|its)\s+(?:\d+|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)[\s-]+(?:binaries|crates|workflows|recipes|aggregators|nightlies|subcommands)\b'
+  - '\b\d+\s+(?:binaries|crates|workflows|recipes|aggregators|nightlies|subcommands)\b\.'
