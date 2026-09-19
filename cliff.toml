@@ -59,7 +59,7 @@ commit_parsers = [
 
   # A `BREAKING CHANGE:`/`BREAKING-CHANGE:` footer under a plain subject — the
   # entry a subject-line filter drops.
-  { footers = "^BREAKING[ -]CHANGE", group = "<!-- 0 -->Breaking changes" },
+  { footer = "^BREAKING[ -]CHANGE", group = "<!-- 0 -->Breaking changes" },
 
   { message = "^feat", group = "<!-- 1 -->Features" },
 

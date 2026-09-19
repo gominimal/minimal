@@ -290,13 +290,20 @@ expect 0 "package.version 0.7.0 satisfies" \
     "check: the minor over a lone non-feat breaking commit passes" -- check 0.7.0
 expect 1 "which require a minor bump to at least 0.7.0" \
     "check: a patch declared over a lone non-feat breaking commit fails" -- check 0.6.1
+# Tag the bang commit so this range holds only the footer-only commit: with a
+# single commit in range its section is unambiguous, so a misgrouped footer
+# leaves no "### Breaking changes" heading at all (the bug a `footers` key, a
+# silent no-op in git-cliff, would reintroduce).
+commit "chore: cut the final" v0.7.0
 commit "fix(op): retire the legacy manifest
 
 BREAKING CHANGE: the manifest format is gone"
-expect_out "0.7.0" "a footer-only non-feat breaking commit still bumps minor" -- nv
+expect_out "0.8.0" "a footer-only non-feat breaking commit still bumps minor" -- nv
+expect_out "minor" "a footer-only non-feat breaking commit's bump is minor" -- nv --bump
 expect_notes "the footer-only breaking entry renders under Breaking changes" \
-    "### Breaking changes" "- **op**: retire the legacy manifest (" \
+    "since v0.7.0." "### Breaking changes" "- **op**: retire the legacy manifest (" \
     "BREAKING CHANGE: the manifest format is gone"
+refute_notes "the footer-only breaking commit is not misfiled under Fixes" "### Fixes"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
