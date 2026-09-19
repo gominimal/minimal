@@ -82,6 +82,11 @@ jobs:
               # Nextest profiles change how this lane's tests run.
               - ".config/nextest.toml"
               - "scripts/**"
+              # A workflow-only change to the Kani lane's path filter decides
+              # which pull requests run the proofs, and no other lane's filter
+              # names that file. Run the workspace suite on it, so a guard test
+              # over that filter has a lane that executes it.
+              - ".github/workflows/ci-kani.yml"
               - ".minimal/**"
               # The gvproxy pin: the netns job fetches + SHA-checks it, so a pin
               # bump must re-run this lane.
@@ -109,6 +114,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          # Full history + tags: the workspace suite's `package_version` lint
+          # (crates/common/tests/package_version.rs) walks the commits since
+          # the last v* tag and self-skips on a shallow clone — this is the
+          # lane where it runs for real, on every PR.
+          fetch-depth: 0
+          fetch-tags: true
       - name: Run core workspace tests
         uses: ./.github/actions/core-tests
 

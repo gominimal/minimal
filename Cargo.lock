@@ -797,6 +797,7 @@ dependencies = [
  "serde",
  "serde_json_lenient",
  "tempfile",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -991,6 +992,7 @@ dependencies = [
  "blake3",
  "bytes",
  "bzip2",
+ "codespan-reporting",
  "copy_dir",
  "either",
  "flate2",
@@ -3860,6 +3862,7 @@ dependencies = [
  "serial_test",
  "stdlib",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "toml",
@@ -3978,7 +3981,7 @@ dependencies = [
 
 [[package]]
 name = "minimal"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -4017,7 +4020,7 @@ dependencies = [
 
 [[package]]
 name = "minimal-client"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -4045,7 +4048,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "minimal-tui"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -4071,7 +4074,7 @@ dependencies = [
 
 [[package]]
 name = "minimald"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "args",
@@ -4172,7 +4175,7 @@ dependencies = [
 
 [[package]]
 name = "minvmd"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4214,7 +4217,7 @@ dependencies = [
 
 [[package]]
 name = "mip"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "args",
@@ -4749,6 +4752,7 @@ dependencies = [
  "smallvec",
  "tar",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "toml_edit",
@@ -4828,6 +4832,7 @@ dependencies = [
  "ot",
  "rcache",
  "sandbox2",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
@@ -6378,6 +6383,7 @@ dependencies = [
  "hakoniwa",
  "nix 0.31.3",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
@@ -8083,7 +8089,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "version"
-version = "0.5.5"
+version = "0.6.0"
 
 [[package]]
 name = "version_check"

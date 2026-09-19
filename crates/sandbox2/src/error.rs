@@ -1,64 +1,26 @@
 use std::{fmt, path::PathBuf};
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    Execution(ExecutionError),
-    Output(OutputError),
-    IO(&'static str, PathBuf, std::io::Error),
+    #[error(transparent)]
+    Execution(#[from] ExecutionError),
+    #[error(transparent)]
+    Output(#[from] OutputError),
+    #[error("{}: I/O error on path {}: {}", .0, .1.display(), .2)]
+    IO(&'static str, PathBuf, #[source] std::io::Error),
+    #[error(transparent)]
     HardlinkFailed(common::HardlinkError),
+    #[error("Mapped files in rootfs are not supported: {}", .0.display())]
     MappedFile(PathBuf),
     /// Post-spawn network wiring ([`Network::attach`](crate::Network::attach))
     /// failed (e.g. an own-IP switch attach).
-    Network(crate::network::NetworkError),
+    #[error("{0}")]
+    Network(#[source] crate::network::NetworkError),
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Execution(e) => e.fmt(f),
-            Self::Output(e) => e.fmt(f),
-            Self::HardlinkFailed(e) => e.fmt(f),
-            Self::IO(op, path, err) => {
-                write!(f, "{}: I/O error on path {}: {}", op, path.display(), err)
-            }
-            Self::MappedFile(path) => {
-                write!(
-                    f,
-                    "Mapped files in rootfs are not supported: {}",
-                    path.display()
-                )
-            }
-            Self::Network(e) => write!(f, "{}", e),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Execution(e) => e.source(),
-            Self::Output(e) => e.source(),
-            Self::HardlinkFailed(e) => e.source(),
-            Self::IO(_, _, err) => Some(err),
-            Self::MappedFile(_) => None,
-            Self::Network(e) => Some(e),
-        }
-    }
-}
-
-impl From<ExecutionError> for Error {
-    fn from(value: ExecutionError) -> Self {
-        Error::Execution(value)
-    }
-}
-impl From<OutputError> for Error {
-    fn from(value: OutputError) -> Self {
-        Error::Output(value)
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
+    #[error("{}", InvocationFailedDisplay { idx, code, reason, stderr, stdout })]
     InvocationFailed {
         idx: usize,
         code: i32,
@@ -70,114 +32,79 @@ pub enum ExecutionError {
         stdout: String,
     },
     #[cfg(target_os = "linux")]
-    SpawnFailed(hakoniwa::Error),
-    MountError {
-        msg: &'static str,
-        path: PathBuf,
-    },
+    #[error("Invocation spawn failed: {0}")]
+    SpawnFailed(#[source] hakoniwa::Error),
+    #[error("Failed to mount {}: {}", path.display(), msg)]
+    MountError { msg: &'static str, path: PathBuf },
     /// A plan that requires its own network namespace was given, but this host
     /// cannot create one. We fail closed rather than silently fall back to host
     /// networking, which would void the isolation the plan promises (spec R1.2).
     ///
     /// Carries no mode: the sandbox layer acts on plans, and the caller that
     /// chose the mode is the one that can name it.
+    #[error(
+        "this sandbox's network mode requires its own network \
+         namespace (only host-net shares the host's), but this host \
+         cannot create one"
+    )]
     NetworkIsolationUnavailable,
+    #[error("Execution cancelled")]
     Cancelled,
 }
 
-impl fmt::Display for ExecutionError {
+/// Renders [`ExecutionError::InvocationFailed`]'s multi-line message.
+struct InvocationFailedDisplay<'a> {
+    idx: &'a usize,
+    code: &'a i32,
+    reason: &'a String,
+    stderr: &'a String,
+    stdout: &'a String,
+}
+
+impl fmt::Display for InvocationFailedDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvocationFailed {
-                idx,
-                code,
-                reason,
-                stderr,
-                stdout,
-            } => {
-                write!(
-                    f,
-                    "Invocation {} failed with exit code {}: {}",
-                    idx, code, reason
-                )?;
-                if !stderr.is_empty() {
-                    write!(f, "\nstderr:\n{}", stderr)?;
-                }
-                if !stdout.is_empty() {
-                    write!(f, "\nstdout:\n{}", stdout)?;
-                }
-                Ok(())
-            }
-            #[cfg(target_os = "linux")]
-            Self::SpawnFailed(e) => {
-                write!(f, "Invocation spawn failed: {}", e)
-            }
-            Self::MountError { msg, path } => {
-                write!(f, "Failed to mount {}: {}", path.display(), msg)
-            }
-            Self::NetworkIsolationUnavailable => {
-                write!(
-                    f,
-                    "this sandbox's network mode requires its own network \
-                     namespace (only host-net shares the host's), but this host \
-                     cannot create one"
-                )
-            }
-            Self::Cancelled => {
-                write!(f, "Execution cancelled")
-            }
+        let Self {
+            idx,
+            code,
+            reason,
+            stderr,
+            stdout,
+        } = self;
+        write!(
+            f,
+            "Invocation {} failed with exit code {}: {}",
+            idx, code, reason
+        )?;
+        if !stderr.is_empty() {
+            write!(f, "\nstderr:\n{}", stderr)?;
         }
+        if !stdout.is_empty() {
+            write!(f, "\nstdout:\n{}", stdout)?;
+        }
+        Ok(())
     }
 }
 
-impl std::error::Error for ExecutionError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvocationFailed { .. } => None,
-            #[cfg(target_os = "linux")]
-            Self::SpawnFailed(e) => Some(e),
-            Self::MountError { .. } => None,
-            Self::NetworkIsolationUnavailable => None,
-            Self::Cancelled => None,
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum OutputError {
+    #[error(
+        "Missing output file: {} in staging directory {}",
+        path.display(),
+        staging_dir.display()
+    )]
     MissingOutput { path: PathBuf, staging_dir: PathBuf },
 
-    InvalidGlob { pattern: String, e: globset::Error },
+    #[error("Invalid output glob {pattern}: {e}")]
+    InvalidGlob {
+        pattern: String,
+        #[source]
+        e: globset::Error,
+    },
 
+    #[error(
+        "Symlink {} points outside output directory: {}",
+        symlink.display(),
+        target.display()
+    )]
     ExternalSymlink { symlink: PathBuf, target: PathBuf },
-}
-
-impl fmt::Display for OutputError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingOutput { path, staging_dir } => write!(
-                f,
-                "Missing output file: {} in staging directory {}",
-                path.display(),
-                staging_dir.display()
-            ),
-            Self::InvalidGlob { pattern, e } => write!(f, "Invalid output glob {}: {}", pattern, e),
-            Self::ExternalSymlink { symlink, target } => write!(
-                f,
-                "Symlink {} points outside output directory: {}",
-                symlink.display(),
-                target.display()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for OutputError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::MissingOutput { .. } => None,
-            Self::InvalidGlob { e, .. } => Some(e),
-            Self::ExternalSymlink { .. } => None,
-        }
-    }
 }

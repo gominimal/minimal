@@ -429,6 +429,8 @@ pub(crate) struct HookContext<'a> {
     pub(crate) workspace: DaemonAbsPath,
 }
 
+// Left positional: a private helper with a single call site, so a struct would
+// be single-use ceremony.
 #[allow(clippy::too_many_arguments)]
 async fn run_one<C: SessionCommands>(
     commands: &C,

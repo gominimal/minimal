@@ -1432,6 +1432,8 @@ fn exec_span(config: &ChannelConfig, session_id: SessionId, argv: &str) -> traci
 /// The fallback for every exec request the daemon does not service itself. It
 /// needs the session's sandbox up, which [`SessionExec`] arranges — launching a
 /// host for an idle session if there isn't one.
+// Left positional: a single call site that immediately packs the arguments into
+// an `ExecTask`, so a struct would be single-use ceremony.
 #[allow(clippy::too_many_arguments)]
 async fn run_in_session(
     serv: ServerStateHandle,
