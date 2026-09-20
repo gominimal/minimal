@@ -427,6 +427,16 @@ fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
 }
 
 async fn async_main() -> Result<(), MainError> {
+    // A build that pairs this daemon with `min` — what CI and a workspace build
+    // do — compiles two rustls crypto providers in: `ring`, which the egress
+    // proxy's configurations name through `bep`, and `aws-lc-rs`, which
+    // `google-cloud-auth` turns on by default. rustls picks neither for itself
+    // and panics the first time a configuration is built without a named
+    // provider — the remote-cache client `tonic` builds while a session host
+    // resolves its packages, on a worker thread, taking the session actor with
+    // it. Name ring here, before any of that runs; the call is idempotent.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Use hardcoded configuration if we are the init process (`argv[0] == "/init"`), which
     // would indicate we are operating in a single-purpose micro-vm.
     //

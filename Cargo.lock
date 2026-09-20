@@ -4163,6 +4163,7 @@ dependencies = [
  "rand_core 0.6.4",
  "russh",
  "russh-sftp",
+ "rustls",
  "sandbox2",
  "serde",
  "serde_json_lenient",
