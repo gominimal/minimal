@@ -18,6 +18,7 @@ pub mod doctor;
 pub mod git_remote;
 pub mod loadouts;
 pub mod prompt;
+pub mod secret;
 pub mod task;
 pub mod theme;
 pub mod zed;

@@ -55,6 +55,9 @@ pub enum Command {
     Auth(AuthArgs),
     /// Box credential review: what a box's spec asks for and is given
     Box(BoxArgs),
+    /// Stored values a box refers to: set, list, and remove them
+    #[command(visible_alias = "secrets")]
+    Secret(SecretArgs),
     /// Task subcommands: run declared project tasks in ephemeral sessions
     #[command(visible_alias = "tasks")]
     Task(TaskArgs),
@@ -379,6 +382,82 @@ pub enum AuditFormat {
     Text,
     /// The record's own JSON line, as the log holds it.
     Jsonl,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretArgs {
+    #[command(subcommand)]
+    pub command: SecretCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretCommand {
+    /// Store a value under an identifier, read from the terminal or stdin
+    ///
+    /// The value is read from the terminal, which does not echo it, or from
+    /// standard input when you pipe it — never from an argument or an
+    /// environment variable, which every process on this host can read. It is
+    /// stored in this host's keychain with an access entry for the box egress
+    /// proxy, so the proxy reads it without a prompt and every other
+    /// application prompts. A box refers to it by identifier and never holds
+    /// it.
+    Set(SecretSetArgs),
+    /// List the stored identifiers and what is registered for each
+    ///
+    /// One line per identifier: its store, the upstream authorities and the
+    /// injection form your `[secret-store-rules]` rule registers for it, the
+    /// consent rule, and whether the proxy's access entry is set on the item.
+    /// Never a value.
+    #[command(visible_alias = "ls")]
+    List(SecretListArgs),
+    /// Remove a stored value from its store
+    #[command(visible_alias = "remove")]
+    Rm(SecretRmArgs),
+}
+
+/// The store a `min secret` command names. `keychain` is this host's native
+/// store; `gatehouse` is the tenant-store deposit a configured Gatehouse
+/// makes, which shares this grammar and is refused here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SecretStoreArg {
+    /// This host's native store: the macOS Keychain.
+    Keychain,
+    /// A Gatehouse tenant store: outside this host's scope.
+    Gatehouse,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretSetArgs {
+    /// The identifier to store the value under
+    pub id: String,
+    /// The store to hold the value (default: this host's native store)
+    #[arg(long, value_enum)]
+    pub store: Option<SecretStoreArg>,
+    // Taken and refused rather than rejected by the parser, so the refusal
+    // names the terminal and standard input as the accepted sources instead
+    // of reading as an unknown argument. Hidden: neither is a way to do this.
+    #[arg(hide = true)]
+    pub value: Option<String>,
+    #[arg(long = "value", hide = true)]
+    pub value_flag: Option<String>,
+    #[arg(long = "from-env", value_name = "VAR", hide = true)]
+    pub from_env: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretListArgs {
+    /// The store to list (default: this host's native store)
+    #[arg(long, value_enum)]
+    pub store: Option<SecretStoreArg>,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretRmArgs {
+    /// The identifier to remove
+    pub id: String,
+    /// The store holding it (default: this host's native store)
+    #[arg(long, value_enum)]
+    pub store: Option<SecretStoreArg>,
 }
 
 #[derive(Debug, Args)]
