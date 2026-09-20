@@ -94,6 +94,7 @@ PATCH_SRC_DIR="" # patch sources for the patch-modes proof; removed on teardown
 SKIP_SEED_DIR="" # seeded by the skip-lane scaffold proof below; removed on teardown
 OWNIP_SEED_DIR="" # seeded by the own-IP proof below; removed on teardown
 BEP_SEED_DIR="" # seeded by the bep grant case below; removed on teardown
+BEP_REF_SEEDS="" # the bep reference cases' seeds, space-separated; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -213,6 +214,9 @@ teardown() {
   [ -n "$SKIP_SEED_DIR" ] && rm -rf "$SKIP_SEED_DIR"
   [ -n "$OWNIP_SEED_DIR" ] && rm -rf "$OWNIP_SEED_DIR"
   [ -n "$BEP_SEED_DIR" ] && rm -rf "$BEP_SEED_DIR"
+  # Word-splitting is intended: one seed dir per reference-case spec.
+  # shellcheck disable=SC2086
+  [ -n "$BEP_REF_SEEDS" ] && rm -rf $BEP_REF_SEEDS
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
   # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
@@ -977,6 +981,407 @@ case_bep_logout_refuses_all_members_within_60s() {
     echo "::error::a sign-in is still held after the logout"
     fail
   fi
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# The Keychain slice, end to end (BEP-032, BEP-035, BEP-036, BEP-038, BEP-050,
+# BEP-063): a value this host holds, referred to by identifier from a box spec,
+# with the box holding a short-lived handle and never the value.
+#
+# What runs on every lane: `min secret set` puts a value on the host or says
+# plainly that this host has no store to put it in, and never echoes it; a
+# reference no rule of the operator's registers is refused with exit 3 naming
+# it, before any box exists; a reference whose registered authority the box's
+# own egress does not admit is refused naming exactly the missing host; and,
+# with the rule and the egress agreeing, `min box spec` renders the reference
+# with the authorities registered for it and admits the spec.
+#
+# What a host holding the value adds: the box itself — the handle in the
+# variable the reference names, and the stored value nowhere in it.
+#
+# What NO lane proves yet, and what these cases therefore do not assert: the
+# injected request. The injection is the proxy's own (BEP-032, decided and
+# proved in `crates/bep`), but the proxy binary this host runs is started with
+# no `[secret-store-rules]` and no host store (`crates/bep/src/main.rs`), so a
+# box request carrying a handle is decided against no rule and refused. Handing
+# the running proxy the operator's rules and the host store is unbuilt work; the
+# cases say so out loud at the point they would test it rather than making a
+# request whose failure they would have to excuse.
+BEP_REF_ID="e2e-bep-reference"     # the identifier these cases store under
+BEP_REF_MCP_ID="e2e-bep-mcp-token" # the MCP client's identifier
+BEP_REF_VALUE=""                   # the value this run stores; never printed
+BEP_REF_STORED=""                  # set when this host's store took it
+
+# Writes the operator's own `[secret-store-rules]` — the blocks given as $@ —
+# into the hermetic client config this run uses. Never a project's: what a
+# stored value may reach is the operator's to say, not a project's (BEP-037).
+bep_write_store_rules() {
+  local block
+  mkdir -p "$XDG_CONFIG_HOME/minimal"
+  : >"$XDG_CONFIG_HOME/minimal/config.toml"
+  for block in "$@"; do
+    printf '%s\n' "$block" >>"$XDG_CONFIG_HOME/minimal/config.toml"
+  done
+}
+
+# The rule an operator registers for Claude Code's key: the Anthropic API
+# authority, injected as the `x-api-key` header that client already sends its
+# credential in.
+bep_anthropic_rule() {
+  cat <<RULE
+
+[[secret-store-rules]]
+store    = "keychain"
+id       = "$BEP_REF_ID"
+upstream = ["api.anthropic.com:443"]
+inject   = { header = "x-api-key" }
+action   = "allow"
+RULE
+}
+
+# Seeds a box spec in a fresh dir — echoed, and removed on teardown — that
+# refers to $BEP_REF_ID in the variable $1 and admits $2.. as its egress hosts.
+# `proxy_env` steering, as every box today declares: no host runs the box-zone
+# resolver the default `dns` needs.
+bep_seed_reference_box() {
+  local env_var="$1"; shift
+  local dir host hosts=""
+  dir="$(mktemp -d /tmp/mnlbep.XXXXXX)"
+  BEP_REF_SEEDS="$BEP_REF_SEEDS $dir"
+  cp "$PROJECT_DIR/minimal.toml" "$dir/minimal.toml"
+  mkdir "$dir/.git"
+  for host in "$@"; do
+    hosts="$hosts${hosts:+, }\"$host\""
+  done
+  cat >>"$dir/minimal.toml" <<SPEC
+
+[session.network.egress]
+allow_dns_hosts = [$hosts]
+
+[session.network.bep]
+steering = "proxy_env"
+
+[[session.references]]
+store  = "keychain"
+id     = "$BEP_REF_ID"
+env    = "$env_var"
+source = "store"
+SPEC
+  printf '%s\n' "$dir"
+}
+
+# Stores this run's value under $BEP_REF_ID, or reports that this host holds no
+# store to put it in. Either way the value is never echoed back (BEP-050).
+bep_store_the_value() {
+  BEP_REF_VALUE="e2e-bep-not-a-real-key-$(now_ms)"
+  BEP_REF_STORED=""
+  if printf '%s\n' "$BEP_REF_VALUE" \
+      | mnl secret set "$BEP_REF_ID" >"$WORK/bep-secret-set.out" 2>"$WORK/bep-secret-set.err"; then
+    BEP_REF_STORED=1
+    if ! grep -qF "$BEP_REF_ID" "$WORK/bep-secret-set.out"; then
+      echo "::error::min secret set did not name the identifier it stored"
+      cat "$WORK/bep-secret-set.out" 2>/dev/null || true
+      fail
+    fi
+    if grep -qF "$BEP_REF_VALUE" "$WORK/bep-secret-set.out" "$WORK/bep-secret-set.err"; then
+      echo "::error::min secret set echoed the value it stored"
+      fail
+    fi
+    echo "min secret set stored a value under \`$BEP_REF_ID\`, printing the identifier and no value OK"
+  elif grep -q "no keychain backend" "$WORK/bep-secret-set.err"; then
+    echo "::notice::this host holds no keychain, so nothing below that needs a stored value runs: min secret set named the missing backend, which is all it can prove here"
+  else
+    echo "::error::min secret set neither stored the value nor named the missing keychain backend"
+    echo "--- stderr ---"; cat "$WORK/bep-secret-set.err" 2>/dev/null || true
+    fail
+  fi
+}
+
+# Takes back out what `bep_store_the_value` put in, and the rules with it.
+bep_drop_the_value() {
+  local id
+  if [ -n "$BEP_REF_STORED" ]; then
+    for id in "$BEP_REF_ID" "$BEP_REF_MCP_ID"; do
+      mnl secret rm "$id" >/dev/null 2>&1 || true
+    done
+  fi
+  BEP_REF_STORED=""
+  rm -f "$XDG_CONFIG_HOME/minimal/config.toml"
+}
+
+# Refuses an activation of the box spec in $1, named $2: exit 3, every grep
+# pattern in $3.. on its stderr, and no box left behind. Stdin is closed, so a
+# prompt would die on EOF rather than hang the lane.
+bep_refuse_activation() {
+  local dir="$1" name="$2"; shift 2
+  local rc=0 out want
+  out="$(cd "$dir" \
+    && mnl session activate . --name "$name" --no-input </dev/null 2>"$WORK/$name.err")" || rc=$?
+  if [ "$rc" != 3 ]; then
+    echo "::error::activating $name exited $rc, not 3"
+    echo "--- stdout ---"; printf '%s\n' "$out"
+    echo "--- stderr ---"; cat "$WORK/$name.err" 2>/dev/null || true
+    fail
+  fi
+  for want in "$@"; do
+    if ! grep -qF -- "$want" "$WORK/$name.err"; then
+      echo "::error::the refusal of $name does not say '$want'"
+      echo "--- stderr ---"; cat "$WORK/$name.err" 2>/dev/null || true
+      fail
+    fi
+  done
+  if mnl ls 2>/dev/null | grep -q "$name"; then
+    echo "::error::a box was created despite the refusal of $name"
+    fail
+  fi
+}
+
+case_bep_store_reference_reaches_upstream_without_key_in_box() {
+  echo "::group::bep: a box refers to a stored key and holds a handle, never the key"
+  bep_store_the_value
+
+  # 1. No rule of the operator's registers the identifier: refused with exit 3
+  #    naming the reference, by the review and by the activation, with no box
+  #    created (BEP-035).
+  bep_write_store_rules ""
+  local unregistered rc=0
+  unregistered="$(bep_seed_reference_box ANTHROPIC_API_KEY api.anthropic.com)"
+  (cd "$unregistered" && mnl box spec .) \
+    >"$WORK/bep-ref-norule.out" 2>"$WORK/bep-ref-norule.err" || rc=$?
+  if [ "$rc" != 3 ] \
+      || ! grep -qF "keychain reference \`$BEP_REF_ID\`" "$WORK/bep-ref-norule.err" \
+      || ! grep -qF "matches no \`[secret-store-rules]\` rule" "$WORK/bep-ref-norule.err"; then
+    echo "::error::an unregistered reference was not refused with exit 3 naming it (exit $rc)"
+    echo "--- stdout ---"; cat "$WORK/bep-ref-norule.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/bep-ref-norule.err" 2>/dev/null || true
+    fail
+  fi
+  # The review still shows the reviewer what the spec declares, and says the
+  # reference reaches nothing rather than leaving a blank where its
+  # authorities go.
+  if ! grep -qF "keychain reference \`$BEP_REF_ID\`: authorities none registered" \
+      "$WORK/bep-ref-norule.out"; then
+    echo "::error::the review does not show the declared reference as registering nothing"
+    cat "$WORK/bep-ref-norule.out" 2>/dev/null || true
+    fail
+  fi
+  bep_refuse_activation "$unregistered" e2e-bep-ref-norule \
+    "keychain reference \`$BEP_REF_ID\`" "matches no \`[secret-store-rules]\` rule"
+  echo "an unregistered reference: exit 3 naming it from both surfaces, no box OK"
+
+  # 2. Registered, but the box's own egress does not admit the authority the
+  #    rule registers: refused naming exactly the missing host (BEP-036).
+  bep_write_store_rules "$(bep_anthropic_rule)"
+  local narrow
+  narrow="$(bep_seed_reference_box ANTHROPIC_API_KEY github.com)"
+  bep_refuse_activation "$narrow" e2e-bep-ref-narrow \
+    "keychain reference \`$BEP_REF_ID\`" "missing: api.anthropic.com"
+  echo "a reference the box's egress does not admit: exit 3 naming the missing host, no box OK"
+
+  # 3. The rule and the egress agree: the review renders the reference with the
+  #    authorities registered for it, steers the box to the proxy that will
+  #    inject the value, admits the spec, and shows no value (BEP-038).
+  local admitted
+  admitted="$(bep_seed_reference_box ANTHROPIC_API_KEY api.anthropic.com)"
+  if ! (cd "$admitted" && mnl box spec .) \
+      >"$WORK/bep-ref-spec.out" 2>"$WORK/bep-ref-spec.err"; then
+    echo "::error::a registered, admitted reference was refused by the review"
+    echo "--- stdout ---"; cat "$WORK/bep-ref-spec.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/bep-ref-spec.err" 2>/dev/null || true
+    fail
+  fi
+  local want
+  for want in \
+      "keychain reference \`$BEP_REF_ID\`: authorities api.anthropic.com:443" \
+      "HTTPS_PROXY=http://127.0.0.1:7655"; do
+    if ! grep -qF -- "$want" "$WORK/bep-ref-spec.out"; then
+      echo "::error::the review of an admitted reference does not show '$want'"
+      cat "$WORK/bep-ref-spec.out" 2>/dev/null || true
+      fail
+    fi
+  done
+  if grep -qF "$BEP_REF_VALUE" "$WORK/bep-ref-spec.out" "$WORK/bep-ref-spec.err"; then
+    echo "::error::the review printed the stored value"
+    fail
+  fi
+  echo "min box spec renders the reference's authorities, steers the box, shows no value OK"
+
+  # 4. The box, on a host that holds the value: the handle in the variable the
+  #    reference names, and the value nowhere in the box (BEP-032, BEP-063).
+  if [ -n "$BEP_REF_STORED" ]; then
+    local sid value
+    sid="$(cd "$admitted" \
+      && mnl session activate . --name e2e-bep-ref --no-input </dev/null \
+        2>"$WORK/bep-ref-activate.err" | tail -n1 | tr -d '\r')"
+    if [ -z "$sid" ]; then
+      echo "::error::the box referring to a stored value was not created"
+      echo "--- stderr ---"; cat "$WORK/bep-ref-activate.err" 2>/dev/null || true
+      fail
+    fi
+    value="$(mnl session exec "$sid" 'printenv ANTHROPIC_API_KEY' 2>"$WORK/bep-ref-env.err")" || {
+      echo "::error::the reference's variable is not set in the box"
+      echo "--- stderr ---"; cat "$WORK/bep-ref-env.err" 2>/dev/null || true
+      fail
+    }
+    case "$value" in
+      minsealed1.*) ;;
+      *) echo "::error::the reference's variable holds no sealed handle (no minsealed1. prefix)"; fail ;;
+    esac
+    if mnl session exec "$sid" 'env' 2>/dev/null | grep -qF "$BEP_REF_VALUE"; then
+      echo "::error::the stored value is present in the box environment"
+      fail
+    fi
+    echo "the box holds the sealed handle in ANTHROPIC_API_KEY and the stored value nowhere OK"
+    # The proxy's own trail for this box, which must carry no value whatever it
+    # decided. A trail that cannot be read is said so: an unread file proves
+    # nothing and must not pass for an empty one.
+    if mnl box audit e2e-bep-ref -o jsonl \
+        >"$WORK/bep-ref-audit.jsonl" 2>"$WORK/bep-ref-audit.err"; then
+      if grep -qF "$BEP_REF_VALUE" "$WORK/bep-ref-audit.jsonl"; then
+        echo "::error::the proxy's trail carries the stored value"
+        fail
+      fi
+      if [ -s "$WORK/bep-ref-audit.jsonl" ]; then
+        echo "the proxy recorded $(wc -l <"$WORK/bep-ref-audit.jsonl" | tr -d ' ') decision(s) for the box, none carrying the value OK"
+      else
+        echo "the proxy recorded nothing for this box (none is attached to it here)"
+      fi
+    else
+      echo "::warning::the proxy's trail for this box could not be read, so it was not examined"
+      cat "$WORK/bep-ref-audit.err" 2>/dev/null || true
+    fi
+    # The rest of this case's name — the request that reaches the upstream
+    # carrying the injected value — is not asserted, because nothing on any host
+    # can satisfy it yet: see the note above `BEP_REF_ID`. No request is made
+    # here rather than one whose refusal the case would have to accept.
+    echo "::notice::not asserted: the box's request to api.anthropic.com carrying the injected value. The proxy this host runs is started with no [secret-store-rules] and no host store (crates/bep/src/main.rs), so a request carrying a handle is refused, not injected. Handing the running proxy the rules and the store is unbuilt."
+    mnl session destroy --force "$sid" >/dev/null 2>&1 \
+      || { echo "::error::could not destroy the box referring to a stored value"; fail; }
+  else
+    echo "::notice::not asserted on this lane: the box half — the handle in the variable and the value nowhere in the box. This host holds no store to put a value in, so only the refusals and the review above ran."
+  fi
+
+  bep_drop_the_value
+  echo "::endgroup::"
+}
+
+# OQ2, BEP-034, BEP-038: the two client shapes this slice bets on — Claude
+# Code's `x-api-key` and an MCP client's `Authorization: Bearer` — are exactly
+# what an operator may register, so each client sends what it is given in the
+# variable it already reads, in the header its own requests already carry,
+# unmodified.
+#
+# On every lane: a rule naming a header the proxy owns is refused when the
+# configuration is read, and both client-shaped rules then load and both
+# references are admitted — so admitting these two is a decision and not a
+# rubber stamp. On a host holding the values the box is created too, and each
+# client's variable holds a single-line, header-safe handle: what the client
+# puts in the header the rule names is exactly what Minimal put in the variable.
+case_bep_claude_code_and_mcp_client_send_handle_unmodified() {
+  echo "::group::bep: Claude Code and an MCP client send the handle unmodified"
+  bep_store_the_value
+
+  # A rule naming a header that would reframe the request rather than
+  # authenticate it is refused when the configuration is read (BEP-034).
+  bep_write_store_rules "
+[[secret-store-rules]]
+store    = \"keychain\"
+id       = \"$BEP_REF_ID\"
+upstream = [\"api.anthropic.com:443\"]
+inject   = { header = \"Cookie\" }
+"
+  local reframing rc=0
+  reframing="$(bep_seed_reference_box ANTHROPIC_API_KEY api.anthropic.com)"
+  (cd "$reframing" && mnl box spec .) \
+    >"$WORK/bep-clients-denied.out" 2>"$WORK/bep-clients-denied.err" || rc=$?
+  if [ "$rc" = 0 ] || ! grep -qF "Cookie" "$WORK/bep-clients-denied.err"; then
+    echo "::error::a rule injecting into Cookie was not refused when the config was read (exit $rc)"
+    echo "--- stderr ---"; cat "$WORK/bep-clients-denied.err" 2>/dev/null || true
+    fail
+  fi
+  echo "a rule injecting into a header the proxy owns is refused when the config is read OK"
+
+  # The two client shapes, each registered for its own identifier, in one box.
+  bep_write_store_rules "$(bep_anthropic_rule)" "
+[[secret-store-rules]]
+store    = \"keychain\"
+id       = \"$BEP_REF_MCP_ID\"
+upstream = [\"mcp.example.com:443\"]
+inject   = { header = \"authorization\", prefix = \"Bearer \" }
+action   = \"allow\"
+"
+  local both
+  both="$(bep_seed_reference_box ANTHROPIC_API_KEY api.anthropic.com mcp.example.com)"
+  cat >>"$both/minimal.toml" <<SPEC
+
+[[session.references]]
+store  = "keychain"
+id     = "$BEP_REF_MCP_ID"
+env    = "MCP_SERVER_TOKEN"
+source = "store"
+SPEC
+  if ! (cd "$both" && mnl box spec .) \
+      >"$WORK/bep-clients-spec.out" 2>"$WORK/bep-clients-spec.err"; then
+    echo "::error::a box referring to both client shapes was refused by the review"
+    echo "--- stdout ---"; cat "$WORK/bep-clients-spec.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/bep-clients-spec.err" 2>/dev/null || true
+    fail
+  fi
+  local want
+  for want in \
+      "keychain reference \`$BEP_REF_ID\`: authorities api.anthropic.com:443" \
+      "keychain reference \`$BEP_REF_MCP_ID\`: authorities mcp.example.com:443"; do
+    if ! grep -qF -- "$want" "$WORK/bep-clients-spec.out"; then
+      echo "::error::the review does not show '$want'"
+      cat "$WORK/bep-clients-spec.out" 2>/dev/null || true
+      fail
+    fi
+  done
+  echo "both client shapes are registrable and both references are admitted OK"
+
+  # The box, on a host that holds the values: each client's own variable holds
+  # a handle it can put in a header untouched — one line, printable ASCII, no
+  # whitespace — which is the shape OQ2 bets every intended client passes
+  # through. The value itself is nowhere in the box.
+  if [ -n "$BEP_REF_STORED" ]; then
+    local sid var value
+    sid="$(cd "$both" \
+      && mnl session activate . --name e2e-bep-clients --no-input </dev/null \
+        2>"$WORK/bep-clients-activate.err" | tail -n1 | tr -d '\r')"
+    if [ -z "$sid" ]; then
+      echo "::error::the box referring to both client shapes was not created"
+      echo "--- stderr ---"; cat "$WORK/bep-clients-activate.err" 2>/dev/null || true
+      fail
+    fi
+    for var in ANTHROPIC_API_KEY MCP_SERVER_TOKEN; do
+      value="$(mnl session exec "$sid" "printenv $var" 2>"$WORK/bep-clients-env.err" | tr -d '\r')" || {
+        echo "::error::$var is not set in the box"
+        echo "--- stderr ---"; cat "$WORK/bep-clients-env.err" 2>/dev/null || true
+        fail
+      }
+      case "$value" in
+        minsealed1.*) ;;
+        *) echo "::error::$var holds no sealed handle (no minsealed1. prefix)"; fail ;;
+      esac
+      if [ "$(printf '%s' "$value" | wc -l | tr -d ' ')" != 0 ] \
+          || printf '%s' "$value" | LC_ALL=C grep -q '[^!-~]'; then
+        echo "::error::$var holds something no client could send as a header value unmodified"
+        fail
+      fi
+    done
+    if mnl session exec "$sid" 'env' 2>/dev/null | grep -qF "$BEP_REF_VALUE"; then
+      echo "::error::the stored value is present in the box environment"
+      fail
+    fi
+    echo "each client's variable holds a single-line, header-safe handle and no value OK"
+    mnl session destroy --force "$sid" >/dev/null 2>&1 \
+      || { echo "::error::could not destroy the box referring to both client shapes"; fail; }
+  else
+    echo "::notice::not asserted on this lane: the in-box half — each client's variable holding a header-safe handle. This host holds no store to put a value in, so only the refused Cookie rule and the two admitted references above ran."
+  fi
+
+  bep_drop_the_value
   echo "::endgroup::"
 }
 

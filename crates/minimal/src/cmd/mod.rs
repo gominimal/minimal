@@ -371,6 +371,16 @@ pub(crate) fn can_prompt_interactively() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
+/// Whether this invocation may put a question to the operator at all: a
+/// terminal on both sides *and* no flag forbidding the prompt. A decision
+/// taken before a prompt is reached — whether a `[secret-store-rules]` rule
+/// with `action = "ask"` is admitted, say — reads this rather than the
+/// terminal alone, so `--no-prompt` and `--no-input` cannot admit a question
+/// that would then be asked anyway.
+pub(crate) fn can_ask_operator(no_prompt: bool, no_input: bool, at_a_terminal: bool) -> bool {
+    !no_prompt && !no_input && at_a_terminal
+}
+
 /// Phase 3 gate: run the user policy + hooks over the daemon's
 /// pending items and produce the wire verdict (plus the final
 /// policy after any hook mutations). Does NOT talk to the daemon —
@@ -904,6 +914,20 @@ mod tests {
             }
         });
         seen
+    }
+
+    /// A question is admitted only where it could be put: a terminal on both
+    /// sides is not enough on its own, because `--no-prompt` and `--no-input`
+    /// say the operator is not there to answer one. A rule with
+    /// `action = "ask"` is admitted on this answer before the box exists, so a
+    /// flag that forbids the prompt has to deny the rule rather than let the
+    /// activation reach a question nobody can answer.
+    #[test]
+    fn a_flag_that_forbids_a_prompt_leaves_nothing_to_ask() {
+        assert!(can_ask_operator(false, false, true));
+        assert!(!can_ask_operator(true, false, true), "--no-prompt");
+        assert!(!can_ask_operator(false, true, true), "--no-input");
+        assert!(!can_ask_operator(false, false, false), "no terminal");
     }
 
     /// BEP-063: each store reference of a box yields one handle signed under

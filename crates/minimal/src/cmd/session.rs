@@ -22,28 +22,48 @@ pub(crate) fn session_announce_label(id: &sessions::SessionId, name: Option<&str
     }
 }
 
-/// An admitted box spec with grants: what the validation decided, carried
+/// An admitted box spec with credentials: what the validation decided, carried
 /// from before the session exists to the mint that runs once it does.
 struct GrantPlan {
     expansion: sessions::GrantExpansion,
     grants: Vec<sessions::Grant>,
+    /// The store references the operator's `[secret-store-rules]` admit: what
+    /// the handles are minted for (BEP-063).
+    references: Vec<PlannedReference>,
 }
 
-/// Validates the project's `[[session.grants]]` against its
-/// `[session.network]` table and the held sign-in, prints each validation
-/// warning, and returns the session's network mode — the spec's `mode` when
-/// declared, else `cli_mode` — with the plan for the grants when the spec
-/// declares any.
+/// One admitted store reference, owned: the rule in force for it is cloned out
+/// of the client configuration so the plan outlives the read that produced it,
+/// and [`sessions::AdmittedReference`] is rebuilt against it at mint time.
+struct PlannedReference {
+    reference: sessions::StoreReference,
+    rule: sessions::StoreRule,
+    /// Whether the operator is asked before the value is injected: the rule's
+    /// `action = "ask"`, with a terminal to ask at.
+    prompt: bool,
+}
+
+/// Validates the project's `[[session.grants]]` and `[[session.references]]`
+/// against its `[session.network]` table, the held sign-in and the operator's
+/// own `[secret-store-rules]`, prints each validation warning, and returns the
+/// session's network mode — the spec's `mode` when declared, else `cli_mode` —
+/// with the plan for the credentials when the spec declares any.
 ///
 /// A refusal surfaces as a [`sessions::GrantRefusal`], which `main` maps to
-/// exit 3. A project with no mfile, or one that does not parse, is not this
-/// function's problem — the activation has its own handling for both, as
-/// [`loadouts::check_project_hooks`] reasons.
+/// exit 3, and carries every cause of both halves: a reviewer fixes one round
+/// of causes, not one per credential kind. A project with no mfile, or one that
+/// does not parse, is not this function's problem — the activation has its own
+/// handling for both, as [`loadouts::check_project_hooks`] reasons.
+///
+/// `can_ask` is [`can_ask_operator`]'s answer for this invocation: a rule that
+/// asks is refused here when it holds, because the question comes after the
+/// session exists and a caller that cannot be asked must not reach it.
 fn expand_project_grants(
     project_root: &paths::HostAbsPath,
     box_name: &str,
     cli_mode: sessions::NetworkMode,
-    acknowledge_full_breadth: bool,
+    client: &sessions::client::config::Config,
+    can_ask: bool,
 ) -> Result<(sessions::NetworkMode, Option<GrantPlan>), anyhow::Error> {
     let Ok(mfile) = mfile::File::from_dir(project_root.as_utf8_path().as_std_path()) else {
         return Ok((cli_mode, None));
@@ -54,14 +74,14 @@ fn expand_project_grants(
     let mut network = session.network.clone().unwrap_or_default();
     let mode = network.mode.unwrap_or(cli_mode);
     network.mode = Some(mode);
-    if session.grants.is_empty() {
+    if session.grants.is_empty() && session.references.is_empty() {
         return Ok((mode, None));
     }
     // The full-breadth acknowledgement is the operator's, read from the
     // client configuration; a project that sets it is warned about and
     // ignored (BEP-057).
     let (full_breadth_acknowledged, ignored) = sessions::acknowledgement_in_force(
-        acknowledge_full_breadth,
+        client.secrets.acknowledge_full_breadth_unenrolled,
         &session.secrets.clone().unwrap_or_default(),
     );
     if let Some(warning) = &ignored {
@@ -77,7 +97,41 @@ fn expand_project_grants(
         resolver_present: false,
         full_breadth_acknowledged,
     };
-    let expansion = sessions::validate_grants(&network, &session.grants, &ctx)?;
+    // A box whose only credentials are references is steered all the same: the
+    // value is injected by the proxy, so the box has to reach it (BEP-011,
+    // BEP-012).
+    let expansion = if session.grants.is_empty() {
+        sessions::expand_for_references(&network, box_name, ctx.resolver_present)
+    } else {
+        sessions::validate_grants(&network, &session.grants, &ctx)
+    };
+    // What each reference may reach is the operator's `[secret-store-rules]`
+    // to say (BEP-035, BEP-036). A rule that asks is asked at once the box
+    // exists (see `deliver_box_grants`), so a reference is denied here when
+    // there would be no question to ask — `can_ask` is the caller's answer,
+    // and it counts the flags that forbid a prompt as well as the terminal.
+    let rules = client.secret_store_rules.as_slice();
+    let admitted = sessions::validate_references(
+        &network,
+        &session.references,
+        rules,
+        &sessions::ReferenceContext {
+            box_name,
+            has_tty: can_ask,
+        },
+    );
+    let causes: Vec<sessions::GrantRefusalCause> = expansion
+        .as_ref()
+        .err()
+        .into_iter()
+        .cloned()
+        .chain(admitted.as_ref().err().into_iter().cloned())
+        .flat_map(|refusal| refusal.causes)
+        .collect();
+    if !causes.is_empty() {
+        return Err(sessions::GrantRefusal { causes }.into());
+    }
+    let expansion = expansion.expect("a refusal was returned above");
     for warning in &expansion.warnings {
         eprintln!("warning: {warning}");
     }
@@ -86,6 +140,15 @@ fn expand_project_grants(
         Some(GrantPlan {
             expansion,
             grants: session.grants.clone(),
+            references: admitted
+                .expect("a refusal was returned above")
+                .into_iter()
+                .map(|candidate| PlannedReference {
+                    reference: candidate.reference,
+                    rule: candidate.rule.clone(),
+                    prompt: candidate.prompt,
+                })
+                .collect(),
         }),
     ))
 }
@@ -196,9 +259,53 @@ fn box_delivery(
     BoxDelivery { vars, patches }
 }
 
-/// Delivers the box spec's grants into the composition of the session named
-/// `box_name`: mints each member from the held sign-in, and pairs the sealed
-/// values with the proxy environment and the proxy's published root.
+/// Mints one handle per admitted store reference and pairs it with the variable
+/// the reference names (BEP-063): what the box receives is the envelope
+/// carrying the handle, and the value it refers to never leaves the host store.
+///
+/// A rule with `action = "ask"` is asked at here rather than at validation, so
+/// the question can name the box the value would be injected for; a reference
+/// the operator declines mints no handle and fails the activation, as
+/// `action = "deny"` would have.
+///
+/// # Errors
+///
+/// A declined reference, a host holding no store to sign the handle in, or a
+/// mint or registration [`mint_store_handles`] refuses.
+async fn mint_store_references<S: bep::KeyStore, K: bep::KeyStore>(
+    key_store: &S,
+    keys: &bep::Keys<K>,
+    control: &std::path::Path,
+    box_name: &str,
+    host: &str,
+    references: &[PlannedReference],
+    now: u64,
+) -> Result<Vec<(sessions::core::primitives::StrictVarName, bep::SealedValue)>, anyhow::Error> {
+    for planned in references.iter().filter(|planned| planned.prompt) {
+        let reference = &planned.reference;
+        let question = format!(
+            "Inject the {reference} into requests from box `{box_name}` to {}?",
+            planned.rule.upstream.join(", ")
+        );
+        if !confirm(&question, false)? {
+            bail!("the {reference} was declined: no handle for it was minted");
+        }
+    }
+    let admitted: Vec<sessions::AdmittedReference<'_>> = references
+        .iter()
+        .map(|planned| sessions::AdmittedReference {
+            reference: planned.reference.clone(),
+            rule: &planned.rule,
+            prompt: planned.prompt,
+        })
+        .collect();
+    mint_store_handles(key_store, keys, control, box_name, host, &admitted, now).await
+}
+
+/// Delivers the box spec's credentials into the composition of the session
+/// named `box_name`: mints each grant's member from the held sign-in and each
+/// reference's handle from the operator's rule, and pairs the sealed values
+/// with the proxy environment and the proxy's published root.
 ///
 /// Runs once the session exists, because the sealed context binds the box
 /// by name and an autogenerated name is final only after `CreateSession`.
@@ -209,20 +316,36 @@ async fn deliver_box_grants(
     plan: &GrantPlan,
 ) -> Result<BoxDelivery, anyhow::Error> {
     let minimal_dir = global.minimal_dir.as_deref();
-    let store = crate::auth::host_store()?;
-    let keys = crate::auth::host_keys()?;
     let control = crate::auth::control_socket_path(minimal_dir);
     let host = host_name()?;
-    let sealed = mint_grants(
-        &store,
-        &keys,
-        &control,
-        box_name,
-        &host,
-        &plan.grants,
-        crate::auth::unix_now(),
-    )
-    .await?;
+    let now = crate::auth::unix_now();
+    // Each half opens the host store only when the spec declares something for
+    // it: a box referring to a stored secret and declaring no grant needs no
+    // sign-in, and one declaring a grant and no reference mints no handle.
+    let mut sealed = Vec::new();
+    if !plan.grants.is_empty() {
+        let store = crate::auth::host_store()?;
+        let keys = crate::auth::host_keys()?;
+        sealed.extend(
+            mint_grants(&store, &keys, &control, box_name, &host, &plan.grants, now).await?,
+        );
+    }
+    if !plan.references.is_empty() {
+        let key_store = crate::auth::host_key_store()?;
+        let keys = crate::auth::host_keys()?;
+        sealed.extend(
+            mint_store_references(
+                &key_store,
+                &keys,
+                &control,
+                box_name,
+                &host,
+                &plan.references,
+                now,
+            )
+            .await?,
+        );
+    }
     let root_pem = if plan.expansion.inject_ca {
         let path = bep_root_pem_path(minimal_dir);
         if !path.is_file() {
@@ -312,13 +435,15 @@ pub(crate) async fn activate_session(
     // the session exists (see `deliver_box_grants`). The client config is
     // read here rather than with the loadouts below because the
     // full-breadth acknowledgement the validation reads lives in it
-    // (BEP-057).
+    // (BEP-057), as do the `[secret-store-rules]` that say what each
+    // `[[session.references]]` entry may reach (BEP-035, BEP-036).
     let cfg = config::read_client_config(global)?;
     let (network, grant_plan) = expand_project_grants(
         &abs_path,
         &session_name,
         args.network.into(),
-        cfg.secrets.acknowledge_full_breadth_unenrolled,
+        &cfg,
+        can_ask_operator(args.no_prompt, global.no_input, can_prompt_interactively()),
     )?;
 
     // The daemon sources `username` from the authenticated SSH
@@ -1824,8 +1949,9 @@ mod tests {
 
     const TOKEN: &str = "ghu_TESTTOKENfa2c1b0d8e7f6a5b4c3d2e1f0a9b8c7d";
 
-    /// A proxy's control socket that appends each submission to `log`, puts a
-    /// revocation it carries in force and answers with the record, the way the
+    /// A proxy's control socket that appends each audit submission to `log`,
+    /// puts a revocation it carries in force and answers with the record, and
+    /// holds a client's handle-signing key when one is registered — the way the
     /// real one does. The returned set is what the proxy would now refuse.
     async fn fake_proxy(
         socket: &std::path::Path,
@@ -1836,17 +1962,24 @@ mod tests {
         let revocations = Arc::new(Mutex::new(Revocations::default()));
         let in_force = Arc::clone(&revocations);
         tokio::spawn(async move {
+            let mut client_keys = bep::control::ClientKeys::new();
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (reader, mut writer) = stream.into_split();
                 let mut line = String::new();
                 BufReader::new(reader).read_line(&mut line).await.unwrap();
                 let submission: Submission = serde_json_lenient::from_str(&line).unwrap();
-                let reply = {
-                    let mut in_force = in_force.lock().unwrap();
-                    match bep::submit(&mut log, &mut in_force, &submission) {
-                        Ok(record) => serde_json_lenient::to_string(&record).unwrap(),
+                let reply = match &submission {
+                    Submission::RegisterKey(key) => match client_keys.register(key) {
+                        Ok(registered) => serde_json_lenient::to_string(&registered).unwrap(),
                         Err(error) => format!(r#"{{"error":"{error}"}}"#),
+                    },
+                    _ => {
+                        let mut in_force = in_force.lock().unwrap();
+                        match bep::submit(&mut log, &mut in_force, &submission) {
+                            Ok(record) => serde_json_lenient::to_string(&record).unwrap(),
+                            Err(error) => format!(r#"{{"error":"{error}"}}"#),
+                        }
                     }
                 };
                 writer
@@ -2010,6 +2143,83 @@ mod tests {
         let names: Vec<&str> = delivery.vars.iter().map(|v| v.var.name.as_str()).collect();
         assert_eq!(names, ["GITHUB_TOKEN"]);
         assert!(delivery.patches.is_empty());
+    }
+
+    /// BEP-012, BEP-032, BEP-063: a box whose only credential is a store
+    /// reference receives a handle in the variable the reference names —
+    /// sealed to this host, bound to the box, carrying the authorities and the
+    /// injection form the operator's rule registers, and never the value — and
+    /// is steered like any credentialed box, so its requests reach the proxy
+    /// that does the injecting.
+    #[tokio::test]
+    async fn activate_mints_a_handle_for_a_reference_and_delivers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let audit = dir.path().join("audit.jsonl");
+        let _revocations = fake_proxy(&socket, &audit).await;
+        let project = paths::HostAbsPath::try_new("/repo/web").unwrap();
+        let store = MemoryStore::new();
+        let keys = Keys::open(store.clone()).unwrap();
+        let now = crate::auth::unix_now();
+
+        let rule = sessions::StoreRule {
+            store: sessions::SecretStore::Keychain,
+            id: "anthropic-api-key".to_owned(),
+            upstream: vec!["api.anthropic.com:443".to_owned()],
+            inject: sessions::Injection::Header {
+                name: "x-api-key".to_owned(),
+                prefix: String::new(),
+            },
+            action: sessions::RuleAction::Allow,
+        };
+        let planned = [PlannedReference {
+            reference: sessions::StoreReference {
+                store: sessions::SecretStore::Keychain,
+                id: "anthropic-api-key".to_owned(),
+                env: StrictVarName::try_new("ANTHROPIC_API_KEY").unwrap(),
+                source: sessions::ReferenceSource::Store,
+            },
+            rule: rule.clone(),
+            prompt: false,
+        }];
+
+        let minted = mint_store_references(&store, &keys, &socket, "web", "mac-1", &planned, now)
+            .await
+            .unwrap();
+        assert_eq!(minted.len(), 1);
+        assert_eq!(minted[0].0.to_string(), "ANTHROPIC_API_KEY");
+        let unsealed = bep::unseal(&keys, minted[0].1.as_str()).unwrap();
+        assert_eq!(unsealed.context.box_id, "web");
+        assert_eq!(unsealed.context.host, "mac-1");
+        let handle = bep::mint::parse_store_handle(unsealed.member.expose()).unwrap();
+        assert_eq!(handle.claims.id, "anthropic-api-key");
+        assert_eq!(handle.claims.upstream, rule.upstream);
+        assert_eq!(
+            handle.claims.inject,
+            bep::mint::Inject::header("x-api-key".to_owned(), "")
+        );
+
+        // The hand-off: the reference's own variable holds the envelope, and
+        // the box is steered — the reference is redeemed at the proxy, so the
+        // box has to reach it.
+        let network = steered_network();
+        let expansion = sessions::expand_for_references(&network, "web", false).unwrap();
+        let delivery = box_delivery(&project, &expansion, &minted, None);
+        let names: Vec<&str> = delivery.vars.iter().map(|v| v.var.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["ANTHROPIC_API_KEY", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]
+        );
+        assert_eq!(delivery.vars[0].var.value, minted[0].1.as_str());
+        assert!(
+            delivery.vars[0].var.value.starts_with(bep::seal::PREFIX),
+            "{:?}",
+            delivery.vars[0].var
+        );
+        // The mint of a handle is no audit submission: the registration is
+        // all that reaches the proxy, and no value of any kind does.
+        let log = std::fs::read_to_string(&audit).unwrap_or_default();
+        assert!(log.is_empty(), "{log}");
     }
 
     /// The proxy publishes its root beside its control socket, under the

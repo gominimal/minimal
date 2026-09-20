@@ -110,6 +110,22 @@ pub(crate) fn host_keys() -> Result<Keys<bep::MemoryStore>, anyhow::Error> {
     )
 }
 
+/// The store [`host_keys`] holds them in, for the one key that is the
+/// client's rather than the proxy's: the handle-signing key a store reference
+/// is minted under (BEP-063), found or generated beside them.
+#[cfg(target_os = "macos")]
+pub(crate) fn host_key_store() -> Result<bep::keychain::MacosKeychain, anyhow::Error> {
+    Ok(bep::keychain::MacosKeychain)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn host_key_store() -> Result<bep::MemoryStore, anyhow::Error> {
+    bail!(
+        "the handle a box receives for a stored secret is signed under a key in the host \
+         keychain, and this host has no keychain backend yet (macOS only)"
+    )
+}
+
 /// Whether a GitHub sign-in is held on this host: what a box declaring a
 /// GitHub grant is checked against at creation (BEP-003). A host with no
 /// keychain backend, or a store that cannot be read, holds none.

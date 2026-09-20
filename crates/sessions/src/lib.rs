@@ -764,7 +764,9 @@ impl std::error::Error for GrantRefusal {}
 /// carries (BEP-012).
 ///
 /// A spec with no grants is admitted as it stands, sign-in or not, and
-/// delivers nothing: no CA, no proxy environment.
+/// delivers nothing: no CA, no proxy environment. A spec whose credentials are
+/// store references rather than grants is expanded with
+/// [`expand_for_references`], which steers it as this function steers a grant.
 ///
 /// # Errors
 ///
@@ -783,20 +785,9 @@ pub fn validate_grants(
             warnings: Vec::new(),
         });
     }
-    let steering = network.bep.resolved_steering();
-    let steering_off = steering == Steering::Off;
     let mut causes = Vec::new();
-    if steering_off && network.bep.proxy_env {
-        causes.push(GrantRefusalCause::SteeringOffWithProxyEnv);
-    }
-    if steering.steers_dns() && !ctx.resolver_present {
-        tracing::warn!(
-            box_name = ctx.box_name,
-            %steering,
-            "steering needs the box-zone resolver, which this host does not run"
-        );
-        causes.push(GrantRefusalCause::NoBoxZoneResolver { steering });
-    }
+    let steering = resolve_steering(network, ctx.box_name, ctx.resolver_present, &mut causes);
+    let steering_off = steering == Steering::Off;
     let mut warnings = Vec::new();
     for grant in grants {
         let before = causes.len();
@@ -858,10 +849,48 @@ pub fn validate_grants(
     if !causes.is_empty() {
         return Err(GrantRefusal { causes });
     }
+    Ok(steered_expansion(network, steering, warnings))
+}
+
+/// The steering the spec resolves to (BEP-016), and the causes that refuse it
+/// for every box declaring a credentialed upstream: `steering = "off"`
+/// together with `proxy_env = true` (BEP-010), and a resolved `dns` or `both`
+/// on a host running no box-zone resolver (BEP-017). Causes are appended to
+/// `causes`, so a caller collects them beside its own.
+fn resolve_steering(
+    network: &BoxNetwork,
+    box_name: &str,
+    resolver_present: bool,
+    causes: &mut Vec<GrantRefusalCause>,
+) -> Steering {
+    let steering = network.bep.resolved_steering();
+    if steering == Steering::Off && network.bep.proxy_env {
+        causes.push(GrantRefusalCause::SteeringOffWithProxyEnv);
+    }
+    if steering.steers_dns() && !resolver_present {
+        tracing::warn!(
+            box_name,
+            %steering,
+            "steering needs the box-zone resolver, which this host does not run"
+        );
+        causes.push(GrantRefusalCause::NoBoxZoneResolver { steering });
+    }
+    steering
+}
+
+/// What an admitted credentialed box is delivered: the interception root in
+/// its trust store unless steering is off (BEP-011), the proxy environment
+/// when the steering or the spec's own `proxy_env` asks for it, and what
+/// `NO_PROXY` carries (BEP-012).
+fn steered_expansion(
+    network: &BoxNetwork,
+    steering: Steering,
+    warnings: Vec<GrantWarning>,
+) -> GrantExpansion {
     let proxy_env = steering.steers_proxy_env() || network.bep.proxy_env;
-    Ok(GrantExpansion {
+    GrantExpansion {
         steering,
-        inject_ca: !steering_off,
+        inject_ca: steering != Steering::Off,
         proxy_env,
         no_proxy: if proxy_env {
             no_proxy_list(&network.bep)
@@ -869,7 +898,38 @@ pub fn validate_grants(
             Vec::new()
         },
         warnings,
-    })
+    }
+}
+
+/// Validates the `[session.network]` table of a box whose only credentials are
+/// `[[session.references]]`.
+///
+/// A referenced value is redeemed at the proxy exactly as a grant's member is,
+/// so a box declaring a reference declares a credentialed upstream: it is
+/// steered (BEP-016), refused when that steering needs a resolver this host
+/// does not run (BEP-017), given the interception root (BEP-011) and given the
+/// proxy environment (BEP-012) on the same terms. [`validate_grants`] reports
+/// "nothing to steer" for a spec with no grant, which is why a
+/// reference-declaring spec is expanded through this function instead.
+///
+/// What each reference may reach, and whether it may be reached at all, is
+/// [`validate_references`]'s to decide.
+///
+/// # Errors
+///
+/// [`GrantRefusal`], naming each cause.
+pub fn expand_for_references(
+    network: &BoxNetwork,
+    box_name: &str,
+    resolver_present: bool,
+) -> Result<GrantExpansion, GrantRefusal> {
+    let mut causes = Vec::new();
+    let steering = resolve_steering(network, box_name, resolver_present, &mut causes);
+    if causes.is_empty() {
+        Ok(steered_expansion(network, steering, Vec::new()))
+    } else {
+        Err(GrantRefusal { causes })
+    }
 }
 
 /// The hosts of `host_set` that `egress.allow_dns_hosts` does not admit, in
@@ -3226,6 +3286,64 @@ mod tests {
                     }
                 }
             }
+        }
+
+        /// BEP-011, BEP-012, BEP-017: a box whose only credential is a store
+        /// reference is steered like a box declaring a grant — the proxy
+        /// environment and the interception root, refused when the steering
+        /// needs a resolver this host does not run — because the value it
+        /// refers to is injected by the proxy its requests have to reach.
+        #[test]
+        fn a_reference_only_box_is_steered_like_a_credentialed_box() {
+            let steered = |steering| BoxNetwork {
+                bep: BepPolicy {
+                    steering: Some(steering),
+                    ..BepPolicy::default()
+                },
+                ..network(&["api.anthropic.com"])
+            };
+
+            let expansion = expand_for_references(&steered(Steering::ProxyEnv), "web", false)
+                .expect("a proxy_env box needs no resolver");
+            assert_eq!(expansion.steering, Steering::ProxyEnv);
+            assert!(expansion.inject_ca, "{expansion:?}");
+            assert!(expansion.proxy_env, "{expansion:?}");
+            assert!(
+                expansion
+                    .proxy_env_vars()
+                    .iter()
+                    .any(|(name, value)| name == "HTTPS_PROXY" && value == BEP_PROXY_URL),
+                "{expansion:?}"
+            );
+
+            // The same box with no grant declared delivers nothing, which is
+            // why a reference-declaring spec is expanded through
+            // `expand_for_references` rather than `validate_grants`.
+            let nothing = validate_grants(
+                &steered(Steering::ProxyEnv),
+                &[],
+                &GrantContext {
+                    box_name: "web",
+                    host_set: &GITHUB_HOST_SET,
+                    sign_in_held: true,
+                    resolver_present: false,
+                    full_breadth_acknowledged: false,
+                },
+            )
+            .expect("a spec with no grant is admitted as it stands");
+            assert!(!nothing.proxy_env, "{nothing:?}");
+            assert!(!nothing.inject_ca, "{nothing:?}");
+
+            // The default steering is `dns`, which this host cannot serve.
+            let refusal = expand_for_references(&network(&["api.anthropic.com"]), "web", false)
+                .expect_err("dns steering with no resolver is refused");
+            assert_eq!(
+                refusal.causes,
+                vec![GrantRefusalCause::NoBoxZoneResolver {
+                    steering: Steering::DEFAULT
+                }]
+            );
+            assert!(refusal.to_string().contains("exit 3"), "{refusal}");
         }
     }
 }

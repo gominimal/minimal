@@ -32,15 +32,26 @@ use crate::{AuditFormat, BoxAuditArgs, BoxSpecArgs, GlobalArgs};
 
 /// One store reference of a box spec: the identifier the box declares, its
 /// store, and the upstream authorities the client's `[secret-store-rules]`
-/// rule registers for it (BEP-038). The box spec grammar that declares a
-/// reference and the rules that register its authorities arrive with the
-/// Keychain slice; the rendering is here so the review surface is one
-/// surface, not one retrofitted per credential kind.
+/// rule registers for it (BEP-038).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReferenceView {
     store: String,
     id: String,
     authorities: Vec<String>,
+}
+
+impl ReferenceView {
+    /// The reference as the review shows it: the authorities its rule
+    /// registers, or a note that no rule of the operator's registers it — the
+    /// refusal below names it, and a blank list would read as "reaches
+    /// nothing".
+    fn registered(&self) -> String {
+        if self.authorities.is_empty() {
+            "none registered".to_owned()
+        } else {
+            self.authorities.join(", ")
+        }
+    }
 }
 
 /// One grant of a box spec: what it declares, and the upstream hosts the
@@ -190,7 +201,7 @@ fn render(view: &SpecView, out: &mut impl Write) -> Result<(), anyhow::Error> {
                 "    - {} reference `{}`: authorities {}",
                 reference.store,
                 reference.id,
-                reference.authorities.join(", ")
+                reference.registered()
             )?;
         }
     }
@@ -248,16 +259,17 @@ fn project_root(
 }
 
 /// The box spec of the project at `root`: its `[session.network]`,
-/// `[[session.grants]]` and `[session.secrets]` tables. A project with no
-/// `minimal.toml` declares no box spec and renders as such; a broken one is
-/// an error, because a review that reads nothing must not read as a review
-/// that found nothing.
+/// `[[session.grants]]`, `[[session.references]]` and `[session.secrets]`
+/// tables. A project with no `minimal.toml` declares no box spec and renders
+/// as such; a broken one is an error, because a review that reads nothing must
+/// not read as a review that found nothing.
 fn read_box_spec(
     root: &camino::Utf8Path,
 ) -> Result<
     (
         sessions::BoxNetwork,
         Vec<sessions::Grant>,
+        Vec<sessions::StoreReference>,
         sessions::BoxSecrets,
     ),
     anyhow::Error,
@@ -278,6 +290,7 @@ fn read_box_spec(
     Ok((
         session.network.clone().unwrap_or_default(),
         session.grants.clone(),
+        session.references.clone(),
         session.secrets.clone().unwrap_or_default(),
     ))
 }
@@ -291,7 +304,7 @@ fn read_box_spec(
 /// configuration, or a [`sessions::GrantRefusal`] naming every cause.
 pub fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> Result<(), anyhow::Error> {
     let project = project_root(global, args.path.as_deref())?;
-    let (network, grants, secrets) = read_box_spec(&project)?;
+    let (network, grants, references, secrets) = read_box_spec(&project)?;
     let client = crate::config::read_client_config(global)?;
     let (acknowledged, ignored) = sessions::acknowledgement_in_force(
         client.secrets.acknowledge_full_breadth_unenrolled,
@@ -309,12 +322,38 @@ pub fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> Result<(), anyhow
         resolver_present: false,
         full_breadth_acknowledged: acknowledged,
     };
-    let expansion = sessions::validate_grants(&network, &grants, &ctx);
+    // A spec whose credentials are references rather than grants is steered
+    // all the same — the box has to reach the proxy that injects the value —
+    // so it is expanded through the reference path when it declares no grant.
+    let expansion = if grants.is_empty() && !references.is_empty() {
+        sessions::expand_for_references(&network, box_name, ctx.resolver_present)
+    } else {
+        sessions::validate_grants(&network, &grants, &ctx)
+    };
     if let Ok(admitted) = &expansion {
         for warning in &admitted.warnings {
             eprintln!("warning: {warning}");
         }
     }
+    // The references the operator's own rules admit, and what each one may
+    // reach (BEP-035, BEP-036, BEP-038). The review is not a prompt, so a rule
+    // that asks is admitted only where this invocation could put the question:
+    // the same answer activation reads, or the review would admit what
+    // activation refuses.
+    let rules = client.secret_store_rules.as_slice();
+    let admitted_references = sessions::validate_references(
+        &network,
+        &references,
+        rules,
+        &sessions::ReferenceContext {
+            box_name,
+            has_tty: crate::cmd::can_ask_operator(
+                false,
+                global.no_input,
+                crate::cmd::can_prompt_interactively(),
+            ),
+        },
+    );
     let view = SpecView::of(
         &project,
         root_fingerprint(),
@@ -322,8 +361,7 @@ pub fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> Result<(), anyhow
         &grants,
         expansion.as_ref().ok(),
         acknowledged,
-        // The declared references, once the box spec grammar carries them.
-        Vec::new(),
+        reference_views(&references, rules),
     );
     render(&view, &mut std::io::stdout().lock())?;
     tracing::info!(
@@ -332,7 +370,40 @@ pub fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> Result<(), anyhow
         references = view.references.len(),
         "rendered the box spec"
     );
-    expansion.map(|_| ()).map_err(anyhow::Error::from)
+    // Every cause the spec has, from both halves: a reviewer fixes one round
+    // of causes, not one per credential kind.
+    let causes: Vec<sessions::GrantRefusalCause> = expansion
+        .err()
+        .into_iter()
+        .chain(admitted_references.err())
+        .flat_map(|refusal| refusal.causes)
+        .collect();
+    if causes.is_empty() {
+        Ok(())
+    } else {
+        Err(sessions::GrantRefusal { causes }.into())
+    }
+}
+
+/// The review's line per declared reference: the authorities the operator's
+/// rule registers for it, or none when no rule of theirs registers it
+/// (BEP-038).
+fn reference_views(
+    references: &[sessions::StoreReference],
+    rules: &[sessions::StoreRule],
+) -> Vec<ReferenceView> {
+    references
+        .iter()
+        .map(|reference| ReferenceView {
+            store: reference.store.to_string(),
+            id: reference.id.clone(),
+            authorities: rules
+                .iter()
+                .find(|rule| rule.registers(reference))
+                .map(|rule| rule.upstream.clone())
+                .unwrap_or_default(),
+        })
+        .collect()
 }
 
 /// The box `self` names: the box this command runs in.
