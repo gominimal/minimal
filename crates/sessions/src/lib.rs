@@ -299,9 +299,13 @@ pub struct IngressPolicy {
     /// Inclusive port range within which dynamic port-mapping requests are
     /// accepted; `None` means dynamic mapping is disallowed.
     ///
-    /// Stored on the [`Record`] and returned verbatim by `GetSessionPolicy`,
-    /// but **not yet enforced**: dynamic port-mapping is split to #553. Until
-    /// then a set range is recorded configuration only, with no runtime effect.
+    /// Stored on the [`Record`] and returned verbatim by `GetSessionPolicy`.
+    /// A set range is what the box permits beyond its declaration: it is read
+    /// by [`crate::core::net_verdict::IngressRules::permits`], so a process in
+    /// the box that begins listening on a port inside the range has that port
+    /// published on the box's address (NET-016). Dynamic port-mapping
+    /// *requests* — a client asking for a mapping inside the range — remain
+    /// unbuilt (#553).
     pub dynamic_allowed_range: Option<(u16, u16)>,
 }
 

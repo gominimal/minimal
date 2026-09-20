@@ -277,12 +277,19 @@ pub fn frame_verdict(frame: &FrameSummary, rules: &EgressRules) -> Verdict {
 /// declaration. One declaration, read where each surface meets it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngressRules {
-    /// The declared `(transport, port)` pairs, host-side. `None` for a box that
+    /// The declared `(transport, port)` pairs, in the spelling the surface
+    /// reading them meets: host-side for [`Self::for_own_address`], box-side
+    /// for [`Self::for_box_listeners`]. `None` for a box that
     /// carries the host's address: ingress declarations are own-address only
     /// (launch validation refuses them elsewhere), so such a box declares
     /// nothing of its own and a direct connection reaches its listeners like
     /// any other process on the host.
     declared: Option<Vec<(IpProto, u16)>>,
+    /// The inclusive port range the box permits beyond its declaration, from
+    /// `ingress.dynamic_allowed_range`: ports a process in the box may have
+    /// published by listening on one (NET-016). `None` permits nothing the
+    /// declaration does not name.
+    permitted: Option<(u16, u16)>,
 }
 
 impl IngressRules {
@@ -302,6 +309,29 @@ impl IngressRules {
                     })
                     .unwrap_or_default(),
             ),
+            permitted: ingress.and_then(|i| i.dynamic_allowed_range),
+        }
+    }
+
+    /// The same declaration read box-side: each mapping's internal port, which
+    /// is the port a process in the box listens on, rather than the host-side
+    /// port a connection from the host dials. What the listen-publication
+    /// decision reads, since it meets the declaration where the box's own
+    /// listeners do (NET-016).
+    #[must_use]
+    pub fn for_box_listeners(ingress: Option<&IngressPolicy>) -> Self {
+        Self {
+            declared: Some(
+                ingress
+                    .map(|i| {
+                        i.port_mappings
+                            .iter()
+                            .map(|m| (m.proto, m.internal_port))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            ),
+            permitted: ingress.and_then(|i| i.dynamic_allowed_range),
         }
     }
 
@@ -310,7 +340,10 @@ impl IngressRules {
     /// hostname-routing surface may reach too (NET-071).
     #[must_use]
     pub fn for_host_address() -> Self {
-        Self { declared: None }
+        Self {
+            declared: None,
+            permitted: None,
+        }
     }
 
     /// Whether the box declared `port` for the transport `proto` names (an IPv4
@@ -330,6 +363,70 @@ impl IngressRules {
             }
         }
     }
+
+    /// Whether a declaration names `port` for the transport `proto` names. A
+    /// box that carries the host's address declares nothing of its own, so it
+    /// names no port.
+    #[must_use]
+    pub fn declares(&self, proto: u8, port: u16) -> bool {
+        let carries_a_port = proto == IPPROTO_TCP || proto == IPPROTO_UDP;
+        self.declared.as_ref().is_some_and(|declared| {
+            carries_a_port && ip_proto(proto).is_some_and(|p| declared.contains(&(p, port)))
+        })
+    }
+
+    /// Whether the box's rules permit inbound on `port`: a port its
+    /// declaration names, or one inside the permit range it declared. A box
+    /// that carries the host's address permits every port that carries one, as
+    /// its own listeners answer them at the host's address already.
+    ///
+    /// Only TCP and UDP carry a port, so any other transport is permitted for
+    /// none — the same rule [`Self::admits`] applies.
+    #[must_use]
+    pub fn permits(&self, proto: u8, port: u16) -> bool {
+        let carries_a_port = proto == IPPROTO_TCP || proto == IPPROTO_UDP;
+        let in_range = self
+            .permitted
+            .is_some_and(|(low, high)| low <= port && port <= high);
+        carries_a_port && (self.declared.is_none() || in_range || self.declares(proto, port))
+    }
+}
+
+/// What a box's ingress rules say about a port a process in it has begun
+/// listening on (NET-016).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenPublication {
+    /// The rules permit the port and no declaration names it: publish it on
+    /// the box's address.
+    Publish,
+    /// A declaration names the port, so it was bound and published before the
+    /// box's name was registered (NET-121) and the listener adds nothing.
+    Declared,
+    /// The rules do not permit the port: leave it unpublished.
+    Unpermitted,
+}
+
+/// Decides one listening port of a box: whether it is published because the
+/// box's rules permit it and no declaration names it (NET-016).
+///
+/// Pure, like the frame verdict: the rules and the port decide, and nothing
+/// about the process that opened the listener does. A port the rules do not
+/// permit is never published, whatever listens on it.
+///
+/// A box that carries the host's address permits every port that carries one,
+/// so these rules answer `Publish` for each. Whether such a box's listeners are
+/// read at all is the daemon's decision and not the verdict's: a host-address
+/// box shares the host's socket table, where the host's own listeners cannot be
+/// told from the box's.
+#[must_use]
+pub fn ingress_permit_verdict(rules: &IngressRules, proto: u8, port: u16) -> ListenPublication {
+    if rules.declares(proto, port) {
+        return ListenPublication::Declared;
+    }
+    if rules.permits(proto, port) {
+        return ListenPublication::Publish;
+    }
+    ListenPublication::Unpermitted
 }
 
 /// One request a hostname-routing surface is asked to carry: who asked, the box
@@ -952,6 +1049,58 @@ mod tests {
                     Verdict::Drop(DropRule::UndeclaredPort) => {
                         unreachable!("the frame verdict names egress rules only")
                     }
+                }
+            }
+        }
+
+        proptest! {
+            /// NET-016 and its failure case: for every box and every port, the
+            /// listen-publication verdict publishes only a port the box's own
+            /// rules permit and no declaration names — so a port the rules do
+            /// not permit is never published, whatever listens on it. The
+            /// permit range is drawn unordered, as a reversed one reaches the
+            /// decision the same way; the conditions are restated here from
+            /// the declaration itself, independently of `IngressRules`.
+            #[test]
+            fn ingress_permit_verdict_admits_nothing_undeclared(
+                mappings in arb_mappings(),
+                range in proptest::option::of((any::<u16>(), any::<u16>())),
+                host_address in proptest::bool::weighted(0.2),
+                port in prop_oneof![Just(0u16), Just(3000), Just(9090), any::<u16>()],
+                proto in prop_oneof![
+                    Just(IPPROTO_TCP),
+                    Just(IPPROTO_UDP),
+                    Just(IPPROTO_ICMP),
+                    any::<u8>(),
+                ],
+            ) {
+                let policy = IngressPolicy {
+                    port_mappings: mappings,
+                    dynamic_allowed_range: range,
+                };
+                let rules = if host_address {
+                    IngressRules::for_host_address()
+                } else {
+                    IngressRules::for_box_listeners(Some(&policy))
+                };
+
+                let carries_a_port = proto == IPPROTO_TCP || proto == IPPROTO_UDP;
+                let named = !host_address
+                    && carries_a_port
+                    && policy.port_mappings.iter().any(|m| {
+                        m.internal_port == port && ip_proto(proto) == Some(m.proto)
+                    });
+                let in_range = !host_address
+                    && range.is_some_and(|(low, high)| low <= port && port <= high);
+                let permitted = carries_a_port && (host_address || named || in_range);
+
+                match ingress_permit_verdict(&rules, proto, port) {
+                    ListenPublication::Publish => {
+                        prop_assert!(permitted);
+                        prop_assert!(!named);
+                    }
+                    ListenPublication::Declared => prop_assert!(named),
+                    ListenPublication::Unpermitted => prop_assert!(!permitted),
                 }
             }
         }

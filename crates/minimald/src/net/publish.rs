@@ -30,6 +30,16 @@
 //! the name — so a name never answers ahead of the ports it promises, and a
 //! connection to a declared port nothing is listening on yet is refused by the
 //! box rather than timed out at the host (NET-014).
+//!
+//! A port no declaration names cannot be bound ahead of a listener, so there
+//! the publication follows the listener instead: a process in the box that
+//! begins listening on a port the box's rules permit has that port
+//! [published](PublishTable::publish_listened) at the box's own number
+//! (NET-016), and closing the listener
+//! [withdraws](PublishTable::withdraw_listened) it (NET-017). The
+//! published-port table marks each entry with its [`PortOrigin`], so a
+//! diagnostics bundle says which ports a declaration named and which a
+//! listener published, with the listener's pid.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -103,6 +113,20 @@ pub enum ForwarderState {
     Direct,
 }
 
+/// Why a port is published: the box's declaration named it, or a process in
+/// the box began listening on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PortOrigin {
+    /// An ingress declaration names the port, so its forwarder was bound
+    /// before the box's name was registered (NET-121).
+    Declared,
+    /// A process in the box began listening on the port and the box's rules
+    /// permit it, so it was published then (NET-016). Carries the listener's
+    /// pid as the daemon sees it.
+    Listened { pid: u32 },
+}
+
 /// One published port and what holds it: the published-port table the
 /// diagnostics bundle carries, where a revoked port stays visible as the
 /// revocation that closed it.
@@ -112,6 +136,8 @@ pub struct PublishedPort {
     pub port: u16,
     /// What holds it.
     pub state: ForwarderState,
+    /// Whether a declaration named the port or a listener published it.
+    pub origin: PortOrigin,
 }
 
 /// A declared port whose forwarder could not bind (NET-121). Reported with the
@@ -199,6 +225,7 @@ impl Forwarders {
                 forwarders.ports.push(PublishedPort {
                     port,
                     state: ForwarderState::Direct,
+                    origin: PortOrigin::Declared,
                 });
                 continue;
             };
@@ -236,6 +263,7 @@ impl Forwarders {
             forwarders.ports.push(PublishedPort {
                 port,
                 state: ForwarderState::Bound,
+                origin: PortOrigin::Declared,
             });
         }
         Ok(forwarders)
@@ -256,6 +284,7 @@ impl Forwarders {
                 .map(|port| PublishedPort {
                     port,
                     state: ForwarderState::Direct,
+                    origin: PortOrigin::Declared,
                 })
                 .collect(),
         }
@@ -301,6 +330,45 @@ impl Forwarders {
             "revoked a declared port's ingress: unbound its forwarder and ended its connections"
         );
         Some(unbinding)
+    }
+
+    /// Lists `port` as published because a process in the box began listening
+    /// on it (NET-016), in port order and with no forwarder interposed: the
+    /// box's own listener is what answers it, at the box's own port number.
+    ///
+    /// `false` when the port is already published — a declaration names it, or
+    /// an earlier listener published it — which leaves what holds it alone.
+    fn add_listened(&mut self, port: u16, pid: u32) -> bool {
+        if self.ports.iter().any(|p| p.port == port) {
+            return false;
+        }
+        let at = self.ports.partition_point(|p| p.port < port);
+        self.ports.insert(
+            at,
+            PublishedPort {
+                port,
+                state: ForwarderState::Direct,
+                origin: PortOrigin::Listened { pid },
+            },
+        );
+        true
+    }
+
+    /// Takes a listened port back out, as its listener closes (NET-017).
+    ///
+    /// `false` when no listened publication holds the port: a declared port is
+    /// never withdrawn here, because its forwarder is held for as long as the
+    /// box runs whether anything is listening behind it or not (NET-121).
+    fn remove_listened(&mut self, port: u16) -> bool {
+        let Some(index) = self
+            .ports
+            .iter()
+            .position(|p| p.port == port && matches!(p.origin, PortOrigin::Listened { .. }))
+        else {
+            return false;
+        };
+        self.ports.remove(index);
+        true
     }
 
     /// Unbinds every forwarder the box holds, as the box stops. The ports stay
@@ -674,6 +742,63 @@ impl PublishTable {
         let unbinding = entry.forwarders.revoke(port)?;
         self.changes.notify_one();
         Some(unbinding)
+    }
+
+    /// Publishes `port` on `session_name`'s box because the process `pid` in it
+    /// began listening there and the box's ingress rules permit the port
+    /// (NET-016). The port is published at the box's own number, with no
+    /// forwarder interposed: the listener behind it is what answers.
+    ///
+    /// `false` when nothing is published under the name, or when the port is
+    /// published already — a declaration names it (its forwarder was bound
+    /// before the name, NET-121), or an earlier listener published it.
+    ///
+    /// Logs one info line naming the port, the box and that the box's rules
+    /// permitted it.
+    pub fn publish_listened(&mut self, session_name: &str, port: u16, pid: u32) -> bool {
+        let hostname = hostname(session_name);
+        let Some(entry) = self.boxes.get_mut(&hostname) else {
+            return false;
+        };
+        if !entry.forwarders.add_listened(port, pid) {
+            return false;
+        }
+        entry.ports = entry.forwarders.ports();
+        self.changes.notify_one();
+        tracing::info!(
+            hostname = %hostname,
+            port,
+            pid,
+            permitted = true,
+            "published a port a process in the box began listening on"
+        );
+        true
+    }
+
+    /// Withdraws a listened port from `session_name`'s box as its listener
+    /// closes (NET-017).
+    ///
+    /// `false` when nothing is published under the name or no listened
+    /// publication holds the port; a declared port is never withdrawn here,
+    /// since its forwarder is held until the box stops (NET-121).
+    ///
+    /// Logs one info line naming the port and the box.
+    pub fn withdraw_listened(&mut self, session_name: &str, port: u16) -> bool {
+        let hostname = hostname(session_name);
+        let Some(entry) = self.boxes.get_mut(&hostname) else {
+            return false;
+        };
+        if !entry.forwarders.remove_listened(port) {
+            return false;
+        }
+        entry.ports = entry.forwarders.ports();
+        self.changes.notify_one();
+        tracing::info!(
+            hostname = %hostname,
+            port,
+            "withdrew a listened port's publication: its listener closed"
+        );
+        true
     }
 
     /// Records the publication and logs it, the tail every publish path
@@ -1128,7 +1253,8 @@ mod tests {
             table.entries()[0].forwarders,
             vec![PublishedPort {
                 port: PORT,
-                state: ForwarderState::Revoked
+                state: ForwarderState::Revoked,
+                origin: PortOrigin::Declared
             }]
         );
         assert_eq!(

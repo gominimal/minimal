@@ -2339,6 +2339,7 @@ impl Session {
             network_mode,
             net_switch: Arc::clone(&self.net_switch),
             ingress,
+            published: Arc::clone(&self.published),
             egress,
             composition: self.composition(),
             // A weak handle so in-sandbox `min build` can drive session

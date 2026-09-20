@@ -1968,6 +1968,10 @@ pub(crate) struct SandboxLauncher {
     /// `OwnIp` PTask attaches, removed on exit. `None` for other
     /// network modes.
     pub(crate) ingress: Option<sessions::IngressPolicy>,
+    /// The host's published-box table, for the watch on the box's listening
+    /// ports: a port the box's rules permit publishes itself the moment a
+    /// process in the box listens on it (NET-016).
+    pub(crate) published: std::sync::Arc<std::sync::RwLock<crate::net::publish::PublishTable>>,
     /// The box's declared egress rules, enforced on its relay once it
     /// attaches (NET-062 to NET-064). `None` for no `egress` section.
     pub(crate) egress: Option<sessions::EgressPolicy>,
@@ -2077,6 +2081,7 @@ impl SessionLauncher for SandboxLauncher {
         // Move the ingress policy out of `self` up front so it can be applied
         // after the switch attach below (the rest of `self` is consumed first).
         let ingress = self.ingress;
+        let published = self.published;
         let egress = self.egress;
         let network_mode = self.network_mode;
         let net_switch = self.net_switch;
@@ -2388,6 +2393,18 @@ impl SessionLauncher for SandboxLauncher {
             ),
             None => net_guard,
         };
+        // The box is attached and its declared ports are published; from here
+        // a port its rules permit publishes itself as soon as something in the
+        // box listens on it, and unpublishes itself when that listener closes
+        // (NET-016, NET-017). The guard ends the watch with the box.
+        let net_guard = crate::net::listen_watch::WatchGuard::start(
+            &session_name,
+            network_mode,
+            ingress.as_ref(),
+            process.get_mut().id(),
+            published,
+            net_guard,
+        );
 
         Ok(Launched {
             master,
