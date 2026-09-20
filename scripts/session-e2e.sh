@@ -70,6 +70,8 @@
 #     network_posture_from_stock_install
 #     escape_reaches_only_declared_union
 #     box_name_resolves_natively_without_proxy
+#     fresh_linux_kvm_activate_local_minvmd
+#     fresh_arm64_kvm_activate_local_minvmd
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -1365,6 +1367,137 @@ run_case_box_name_resolves_natively_without_proxy() {
   echo "::endgroup::"
 }
 
+# NET-049 (x86_64) / NET-051 (arm64): on a Linux host of that arch that can run
+# a microVM, `min --provider local-minvmd session activate` activates a session.
+# Everything the box needs is what the Linux install ships (NET-048/NET-050,
+# proved over the release table and the installer by
+# `just test-installer linux_<arch>_manifest_ships_vm_stack`): `minvmd` found on
+# PATH by name, the guest payload under the three stock file names, and the
+# switch minvmd spawns for the guest's egress. So the case invents none of them
+# — it requires each the way an install leaves it, SKIPs when this target has
+# none of it (a hosted runner with no /dev/kvm, or the other arch), and
+# otherwise boots the real thing.
+#
+# `--provider local-minvmd` is spelled out HERE rather than inherited from
+# E2E_MINIMAL_ARGS: the requirement names that flag, so the case must exercise
+# the flag and not a lane's default. That means bare `min`, not `mnl`, and the
+# case stops the daemon it spawned under that provider itself — the suite's
+# teardown only knows the lane's provider.
+#
+# "Fresh": $XDG_STATE_HOME is a per-run dir and a named case runs before
+# anything has spawned a daemon, so the CLI auto-spawns minvmd, which boots the
+# VM — the cold path a just-installed host takes.
+run_case_fresh_kvm_activate_local_minvmd() {
+  local arch_label="$1" want_uname="$2"
+  echo "::group::a fresh $arch_label Linux install with KVM activates a --provider local-minvmd box"
+
+  if [ "$(uname -s)" != Linux ]; then
+    echo "fresh-KVM activate SKIPPED (this proof is about the LINUX install; host is $(uname -s))"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ "$(uname -m)" != "$want_uname" ]; then
+    echo "fresh-KVM activate SKIPPED (this case proves the $arch_label install; host is $(uname -m))"
+    echo "::endgroup::"
+    return 0
+  fi
+  # The requirement says "with KVM", and that is a property of the HOST, not of
+  # this script: without a usable /dev/kvm minvmd cannot boot at all
+  # (crates/minvmd/src/cmd/mod.rs says so in as many words), so there is no
+  # fresh-install claim to make here.
+  if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+    echo "fresh-KVM activate SKIPPED (no usable /dev/kvm: this host cannot boot a microVM)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The VM host daemon, resolved the way the CLI resolves it: by NAME on PATH,
+  # which is where the install puts it (bin/minvmd -> ~/.local/bin).
+  local minvmd_bin
+  minvmd_bin="$(command -v minvmd || true)"
+  if [ -z "$minvmd_bin" ]; then
+    echo "fresh-KVM activate SKIPPED (no minvmd on PATH: this target has no VM host daemon)"
+    echo "::endgroup::"
+    return 0
+  fi
+  echo "VM host daemon on PATH: $minvmd_bin"
+
+  # The guest payload, under the three names the install places in its data dir
+  # ($XDG_DATA_HOME/minimal/{vmlinuz,rootfs.img,initramfs.cpio} — the defaults
+  # crates/minvmd/src/image.rs resolves). A lane that stages its own testbed
+  # payload points the MINVMD_* overrides at it instead; either way the files
+  # about to be booted must exist before the case claims a box can boot.
+  local data_dir kernel_path rootfs_path initramfs_path payload
+  data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/minimal"
+  kernel_path="${MINVMD_KERNEL_PATH:-$data_dir/vmlinuz}"
+  rootfs_path="${MINVMD_ROOTFS_PATH:-$data_dir/rootfs.img}"
+  initramfs_path="${MINVMD_INITRAMFS:-$data_dir/initramfs.cpio}"
+  for payload in "$kernel_path" "$rootfs_path" "$initramfs_path"; do
+    if [ ! -f "$payload" ]; then
+      echo "fresh-KVM activate SKIPPED (no guest payload at $payload: this target ships no VM stack)"
+      echo "::endgroup::"
+      return 0
+    fi
+  done
+  echo "guest payload: $kernel_path, $rootfs_path, $initramfs_path"
+
+  # The switch, the last shipped piece: minvmd spawns it for the guest's egress,
+  # and a session mint pulls packages over that egress. A target without one
+  # would fail the activate for want of a network rather than for want of the
+  # provider, which is not this requirement's claim.
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && ! command -v gvproxy-min >/dev/null 2>&1; then
+    echo "fresh-KVM activate SKIPPED (no switch: MINVMD_GVPROXY_BIN unset and no gvproxy-min on PATH)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  local out sid got
+  out="$(cd "$PROJECT_DIR" && min --provider local-minvmd session activate . --no-prompt \
+    --name "e2e-kvm-$arch_label" 2>"$WORK/kvm-activate.err")" || {
+    echo "::error::'min --provider local-minvmd session activate' failed on a fresh $arch_label Linux host with KVM"
+    cat "$WORK/kvm-activate.err" 2>/dev/null || true
+    fail
+  }
+  sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+  echo "local-minvmd session: $sid"
+
+  # Activated, not merely accepted: a trivial exec round-trips through the
+  # guest's daemon over the vsock bridge — the same non-interactive stand-in the
+  # session-exec proof uses.
+  got="$(min --provider local-minvmd session exec "$sid" echo mi-kvm-activate-ok \
+    2>"$WORK/kvm-exec.err")"
+  if [ "$got" != mi-kvm-activate-ok ]; then
+    echo "::error::the --provider local-minvmd box refused a trivial exec; got '${got:-<none>}'"
+    cat "$WORK/kvm-exec.err" 2>/dev/null || true
+    min --provider local-minvmd session destroy --force "$sid" >/dev/null 2>&1 || true
+    fail
+  fi
+
+  # And it is the VM backend that hosted it, not the host-native daemon wearing
+  # the flag: all local-minvmd state lives under the provider's own root
+  # (post-#690), which only a minvmd-backed activate creates.
+  local prov_dir="$XDG_STATE_HOME/minimal/providers/local-minvmd0"
+  if [ ! -d "$prov_dir" ]; then
+    echo "::error::no local-minvmd provider state at $prov_dir: the session was not hosted in a microVM"
+    min --provider local-minvmd session destroy --force "$sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  echo "OK: a fresh $arch_label Linux install with KVM activated $sid with --provider local-minvmd"
+
+  min --provider local-minvmd session destroy --force "$sid" >/dev/null 2>&1 || true
+  min --provider local-minvmd stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  echo "::endgroup::"
+}
+
+run_case_fresh_linux_kvm_activate_local_minvmd() {
+  run_case_fresh_kvm_activate_local_minvmd amd64 x86_64
+}
+
+run_case_fresh_arm64_kvm_activate_local_minvmd() {
+  run_case_fresh_kvm_activate_local_minvmd arm64 aarch64
+}
+
 E2E_CASE="${E2E_CASE:-${1:-}}"
 if [ -n "$E2E_CASE" ]; then
   case "$E2E_CASE" in
@@ -1378,8 +1511,12 @@ if [ -n "$E2E_CASE" ]; then
     escape_reaches_only_declared_union) run_case_escape_reaches_only_declared_union; exit $? ;;
     box_name_resolves_natively_without_proxy)
       run_case_box_name_resolves_natively_without_proxy; exit $? ;;
+    fresh_linux_kvm_activate_local_minvmd)
+      run_case_fresh_linux_kvm_activate_local_minvmd; exit $? ;;
+    fresh_arm64_kvm_activate_local_minvmd)
+      run_case_fresh_arm64_kvm_activate_local_minvmd; exit $? ;;
     *)
-      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy)" >&2
+      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy, fresh_linux_kvm_activate_local_minvmd, fresh_arm64_kvm_activate_local_minvmd)" >&2
       exit 2
       ;;
   esac

@@ -397,14 +397,143 @@ case_installer_switch_binary_executable() {
     want_err "no switch row when the manifest ships none" grep -q 'switch' "$OUT"
 }
 
+# release_rows <arch> — the components scripts/stage-release.sh stages for
+# linux/<arch>, one per line as `component|kind|dest|artifact`. That table is
+# the definition of what an install of a platform GETS, so the VM-stack case
+# below reads it instead of restating it: a row deleted there fails the case
+# here, and the installer is then driven with exactly the rows a real install
+# of that platform would be handed.
+release_rows() {
+    awk -v a="$1" '
+        /^[ \t]*"[a-z]/ {
+            row = $0
+            sub(/^[ \t]*"/, "", row)
+            sub(/".*$/, "", row)
+            if (split(row, f, "|") == 6 && f[2] == "linux" && f[3] == a)
+                printf "%s|%s|%s|%s\n", f[1], f[4], f[5], f[6]
+        }
+    ' "$here/stage-release.sh"
+}
+
+# rows_have <component> <dest> <rows-file> — true when the release stages that
+# component as a `file` at that exact dest (fields 1, 2 and 3 of a release_rows
+# line).
+rows_have() {
+    awk -F'|' -v c="$1" -v d="$2" \
+        '$1 == c && $2 == "file" && $3 == d { hit = 1 } END { exit !hit }' "$3"
+}
+
+# NET-048 (amd64) / NET-050 (arm64): a Linux install ships the VM host daemon
+# and the guest payload — the components a `--provider local-minvmd` box boots
+# from, and once a macOS-only privilege. "Ships" spans both scripts, so the case
+# has two halves: the release stages those rows for the arch, and the installer,
+# handed exactly the rows that table stages, places every one of them, marks the
+# daemon executable, reports each with its size, and records where it put it —
+# the row a diagnostic bundle reads back to say what this host got.
+case_linux_manifest_ships_vm_stack() {
+    _vm_arch="$1"
+    PLAT_S=Linux
+    PLAT_M="$2"
+    TEST_SHELL=
+    BIN_OVERRIDE=
+    TTY_FILE=
+    FORCE_STOP=
+    USERNS_SYSCTL=
+    APPARMOR_DIR=
+
+    _vm_rows="$root/release-rows.$_vm_arch"
+    release_rows "$_vm_arch" >"$_vm_rows"
+    want_ok "the release table stages components for linux/$_vm_arch" test -s "$_vm_rows"
+
+    # The stack, under the names the requirement gives it: the host daemon in the
+    # bin prefix, the kernel + initramfs + rootfs in the data prefix. The dest is
+    # what the installer resolves and what minvmd later looks for
+    # (crates/minvmd/src/image.rs resolves `<data-dir>/vmlinuz` and its two
+    # siblings when no override is set), so the (component, dest) pair is the
+    # shipping claim; the artifact's own file name is not.
+    for _vm_want in minvmd:bin/minvmd vmlinuz:data/vmlinuz \
+                    initramfs:data/initramfs.cpio rootfs:data/rootfs.img; do
+        _vm_comp="${_vm_want%%:*}"
+        _vm_dest="${_vm_want#*:}"
+        want_ok "the linux/$_vm_arch install ships $_vm_comp at $_vm_dest" \
+            rows_have "$_vm_comp" "$_vm_dest" "$_vm_rows"
+    done
+
+    # The mock bucket, rebuilt to carry that platform's rows verbatim, with one
+    # payload per artifact under a per-arch dir of its own: the shared mock
+    # bodies — and the hashes computed from them at start-up — stay untouched, so
+    # this case leaves nothing behind for the next. The CLI's payload must be
+    # RUNNABLE, because the installer executes the installed bin/min to generate
+    # completions (R9.3); every other body is opaque but component- and
+    # arch-distinct, so a payload landing at another component's dest would be
+    # visible rather than interchangeable.
+    _vm_src_dir="versions/v1/vmstack-$_vm_arch"
+    mkdir -p "$mock/$_vm_src_dir"
+    _vm_man="$mock/versions/v1/components"
+    {
+        printf '# format: 1\n'
+        printf '# component   os      arch    version   sha256   kind   dest   src\n'
+    } >"$_vm_man"
+    while IFS='|' read -r _vm_comp _vm_kind _vm_dest _vm_art; do
+        if [ "$_vm_kind" = symlink ]; then
+            printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+                "$_vm_comp" linux "$_vm_arch" v1 - symlink "$_vm_dest" "$_vm_art" >>"$_vm_man"
+            continue
+        fi
+        if [ "$_vm_dest" = bin/min ]; then
+            write_min_stub "$mock/$_vm_src_dir/$_vm_art" "linux-$_vm_arch"
+        else
+            printf 'mock-%s-%s-body\n' "$_vm_comp" "$_vm_arch" >"$mock/$_vm_src_dir/$_vm_art"
+        fi
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            "$_vm_comp" linux "$_vm_arch" v1 "$(hash_file "$mock/$_vm_src_dir/$_vm_art")" \
+            file "$_vm_dest" "$_vm_src_dir/$_vm_art" >>"$_vm_man"
+    done <"$_vm_rows"
+
+    _vm_home="$root/hvm.$_vm_arch"; mkdir -p "$_vm_home"
+    run "vmstack_$_vm_arch" "$_vm_home"
+    check 0 "$rc" "an install of the linux/$_vm_arch manifest exits 0"
+    want_ok "linux/$_vm_arch: the VM host daemon is executable" test -x "$_vm_home/bin/minvmd"
+
+    # Where each one has to have landed: the daemon in the bin prefix the CLI
+    # spawns it from by name, the payload in the data prefix minvmd resolves.
+    _vm_data="$_vm_home/xdg-data/minimal"
+    for _vm_want in "minvmd:$_vm_home/bin/minvmd" "vmlinuz:$_vm_data/vmlinuz" \
+                    "initramfs:$_vm_data/initramfs.cpio" "rootfs:$_vm_data/rootfs.img"; do
+        _vm_comp="${_vm_want%%:*}"
+        _vm_path="${_vm_want#*:}"
+        want_ok "linux/$_vm_arch: $_vm_comp is installed at ${_vm_path#"$_vm_home"/}" \
+            test -f "$_vm_path"
+        want_ok "linux/$_vm_arch: the run reports $_vm_comp with its size" \
+            grep -Eq "^ *$_vm_comp +installed +[0-9]+(\.[0-9])? (B|KB|MB)$" "$OUT"
+        want_ok "linux/$_vm_arch: the record names $_vm_comp at its installed path" \
+            record_has "$_vm_comp" "$_vm_path" "$_vm_home/xdg-state/minimal/installed"
+    done
+
+    # Leave the shared manifest as the sequence below expects to find it.
+    write_manifest 1
+}
+
+case_linux_amd64_manifest_ships_vm_stack() {
+    case_linux_manifest_ships_vm_stack amd64 x86_64
+}
+
+case_linux_arm64_manifest_ships_vm_stack() {
+    case_linux_manifest_ships_vm_stack arm64 aarch64
+}
+
 INSTALL_TEST_CASE="${INSTALL_TEST_CASE:-${1:-}}"
 if [ -n "$INSTALL_TEST_CASE" ]; then
     echo "# install.sh case $INSTALL_TEST_CASE (SH=$SH)"
     case "$INSTALL_TEST_CASE" in
         installer_switch_binary_executable) case_installer_switch_binary_executable ;;
+        linux_amd64_manifest_ships_vm_stack) case_linux_amd64_manifest_ships_vm_stack ;;
+        linux_arm64_manifest_ships_vm_stack) case_linux_arm64_manifest_ships_vm_stack ;;
         *)
             echo "install_test: unknown case '$INSTALL_TEST_CASE'" \
-                 "(known: installer_switch_binary_executable)" >&2
+                 "(known: installer_switch_binary_executable," \
+                 "linux_amd64_manifest_ships_vm_stack," \
+                 "linux_arm64_manifest_ships_vm_stack)" >&2
             exit 2
             ;;
     esac
@@ -1360,6 +1489,8 @@ want_ok "keeping it is announced" grep -q "modified since install" "$OUT"
 
 # --- Named cases (also run alone, by name) ---------------------------------
 case_installer_switch_binary_executable
+case_linux_amd64_manifest_ships_vm_stack
+case_linux_arm64_manifest_ships_vm_stack
 
 # ===========================================================================
 echo "# ---"
