@@ -516,6 +516,138 @@ case_bep_proxy_env_and_no_proxy_are_set() {
   echo "::endgroup::"
 }
 
+# The git/gh proof needs the two tools in the box, so it seeds its own spec:
+# the steered box above plus `git` and `gh` as PACKAGES. Packages are not
+# configuration — the box still gets no credential helper, no gh host file and
+# no token on disk, which is what BEP-015's "no tool configuration" names.
+bep_seed_github_box() {
+  BEP_SEED_DIR="$(mktemp -d /tmp/mnlbep.XXXXXX)"
+  cp "$PROJECT_DIR/minimal.toml" "$BEP_SEED_DIR/minimal.toml"
+  mkdir "$BEP_SEED_DIR/.git"
+  cat >>"$BEP_SEED_DIR/minimal.toml" <<'EOF'
+
+[session]
+packages = ["git", "gh"]
+
+[session.network.egress]
+allow_dns_hosts = ["github.com", "api.github.com", "uploads.github.com", "codeload.github.com"]
+
+[session.network.bep]
+steering = "proxy_env"
+
+[[session.grants]]
+module = "github"
+env = "GITHUB_TOKEN"
+source = "broker"
+EOF
+}
+
+# Runs one shell line in the box, failing the lane with "$1 failed in the box"
+# (plus both streams) on a non-zero exit. The command's stdout is left in
+# $WORK/bep-github.out for the caller to read.
+bep_in_box() {
+  local what="$1"
+  shift
+  if ! mnl session exec "$BEP_SID" "$*" >"$WORK/bep-github.out" 2>"$WORK/bep-github.err"; then
+    echo "::error::$what failed in the box"
+    echo "--- stdout ---"; cat "$WORK/bep-github.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/bep-github.err" 2>/dev/null || true
+    fail
+  fi
+}
+
+# BEP-015: with the proxy running beside gvproxy, `git clone`, `git push` and
+# `gh api` against a private repository of the signed-in account succeed from a
+# box that was given no tool configuration. Every request rides the sealed value
+# in GITHUB_TOKEN through the proxy the box's HTTPS_PROXY points at; the proxy
+# substitutes the real credential and forwards on its own validated leg, so
+# nothing in the box ever holds a GitHub token.
+#
+# Which half runs depends on the sign-in held on THIS host, as in the cases
+# above: with none (every CI lane) the refusal half is proved — exit 3,
+# `github_sign_in_required`, no box — and the git/gh half is reported as not
+# exercised; an operator signed in with `min auth login`, with the proxy up
+# beside gvproxy, proves it.
+case_bep_git_and_gh_against_private_repo() {
+  echo "::group::bep: git and gh reach a private repository from a box"
+  bep_seed_github_box
+  if bep_activate_steered_box e2e-bep-github; then
+    # The box starts from no tool configuration: no git config, no stored
+    # credentials, no gh host file. A marker distinguishes "nothing is there"
+    # from an exec that did not run at all.
+    local cfg_probe
+    # shellcheck disable=SC2016 # $HOME/$f must expand in the BOX, not here.
+    cfg_probe="$(mnl session exec "$BEP_SID" \
+      'for f in "$HOME/.gitconfig" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml"; do [ -e "$f" ] && { echo "CARRIES $f"; exit 0; }; done; echo CLEAN' \
+      2>"$WORK/bep-cfg.err")" || {
+      echo "::error::probing the box for tool configuration failed"
+      echo "--- stderr ---"; cat "$WORK/bep-cfg.err" 2>/dev/null || true
+      fail
+    }
+    if ! printf '%s\n' "$cfg_probe" | grep -q '^CLEAN$'; then
+      echo "::error::the box carries tool configuration the proof must start without"
+      printf '%s\n' "$cfg_probe"
+      fail
+    fi
+
+    # `gh api`: the account the held sign-in is for. gh sends the sealed value
+    # it finds in GITHUB_TOKEN and the proxy decides on it.
+    bep_in_box "gh api user" 'gh api user --jq .login'
+    local login
+    login="$(tail -n1 "$WORK/bep-github.out" | tr -d '\r')"
+    if [ -z "$login" ]; then
+      echo "::error::gh api user returned no login"
+      cat "$WORK/bep-github.out" 2>/dev/null || true
+      fail
+    fi
+    echo "gh api user OK ($login)"
+
+    # A private repository of that account for the clone and push proofs.
+    bep_in_box "gh api user/repos" \
+      'gh api "user/repos?visibility=private&affiliation=owner&per_page=1" --jq ".[0].full_name"'
+    local repo
+    repo="$(tail -n1 "$WORK/bep-github.out" | tr -d '\r')"
+    if [ -z "$repo" ] || [ "$repo" = null ]; then
+      echo "::error::the signed-in account ($login) owns no private repository, so the clone and push proof has no target"
+      fail
+    fi
+
+    # `git clone`: the sealed value rides as the Basic password, the idiom that
+    # needs no credential helper. GIT_TERMINAL_PROMPT=0 turns a refusal into an
+    # error instead of a prompt that would hang the lane.
+    bep_in_box "git clone of the private repo $repo" \
+      "set -e; export GIT_TERMINAL_PROMPT=0; rm -rf \"\$HOME/bep-proof\"; git clone -q --depth 1 \"https://x-access-token:\$GITHUB_TOKEN@github.com/$repo.git\" \"\$HOME/bep-proof\"; git -C \"\$HOME/bep-proof\" rev-parse HEAD"
+    if ! grep -qE '^[0-9a-f]{40}$' "$WORK/bep-github.out"; then
+      echo "::error::the clone of $repo produced no commit"
+      cat "$WORK/bep-github.out" 2>/dev/null || true
+      fail
+    fi
+    echo "git clone of the private repo $repo OK"
+
+    # `git push`: an empty commit on a throwaway branch, pushed and then
+    # deleted, so the proof leaves the account as it found it. `-c user.*` is
+    # commit metadata on the command line, not configuration left in the box.
+    local branch="minimal-e2e-bep-$$"
+    local push_line
+    push_line="set -e; export GIT_TERMINAL_PROMPT=0; cd \"\$HOME/bep-proof\"; git -c user.name=minimal-e2e -c user.email=e2e@minimal.invalid commit -q --allow-empty -m 'e2e: bep proxy proof'; git push -q origin \"HEAD:refs/heads/$branch\"; git push -q origin --delete \"$branch\""
+    if ! mnl session exec "$BEP_SID" "$push_line" \
+        >"$WORK/bep-push.out" 2>"$WORK/bep-push.err"; then
+      echo "::error::git push against $repo failed in the box"
+      echo "--- stdout ---"; cat "$WORK/bep-push.out" 2>/dev/null || true
+      echo "--- stderr ---"; cat "$WORK/bep-push.err" 2>/dev/null || true
+      # Never leave the throwaway branch behind on the account.
+      mnl session exec "$BEP_SID" \
+        "cd \"\$HOME/bep-proof\" && git push -q origin --delete \"$branch\"" \
+        >/dev/null 2>&1 || true
+      fail
+    fi
+    echo "git push and delete of $branch on $repo OK"
+    echo "git clone, git push and gh api against a private repo from a box with no tool configuration OK"
+  fi
+  bep_teardown_steered_box
+  echo "::endgroup::"
+}
+
 if [ -n "$E2E_CASE" ] && ! declare -F "case_$E2E_CASE" >/dev/null; then
   echo "::error::unknown e2e case '$E2E_CASE'"
   exit 2

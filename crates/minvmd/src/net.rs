@@ -31,9 +31,17 @@
 //! Supervision is async: [`GvproxyConfig::spawn`] and [`GvproxySupervisor::stop`]
 //! run within a tokio runtime (the async networking layer the spec mandates),
 //! so neither blocks a worker thread during teardown.
+//!
+//! The switch is not the only host process the VM's network needs. The box
+//! egress proxy ([`HostBep`], BEP-015) stands **beside** gvproxy, supervised the
+//! same way and for the same lifetime: gvproxy carries a box's ordinary egress,
+//! the proxy terminates its declared credentialed hosts so `git` and `gh` inside
+//! a box reach GitHub with only the sealed value the box was created with. It is
+//! a separate process with its own binary, listener and log lines — the two
+//! never share state (spec 24, BEP-047).
 
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
@@ -722,6 +730,480 @@ impl VmEgressPolicy {
     }
 }
 
+// ── The host box egress proxy (BEP-015) ─────────────────────────────────────
+
+/// The loopback port the box egress proxy's redemption listener binds. A box
+/// created under `proxy_env` steering gets `HTTPS_PROXY` pointing here
+/// (`sessions::BEP_PROXY_URL`), so the two definitions must agree — the tests
+/// assert they do.
+pub const DEFAULT_BEP_PORT: u16 = 7655;
+
+/// The directory the proxy keeps its files in, under the minimal state dir:
+/// the same `bep/` the `min` CLI reads the control socket and the published
+/// interception root from, so the host's two sides cannot drift on where the
+/// proxy's state lives.
+pub const BEP_DIR: &str = "bep";
+
+/// The audit log the proxy appends every decision to, inside [`BEP_DIR`].
+pub const BEP_AUDIT_LOG_FILE: &str = "audit.log";
+
+/// The box attachments the proxy attributes a connection's source address with,
+/// inside [`BEP_DIR`]. Box creation owns the contents; the supervisor only
+/// guarantees the file exists, because the proxy reads it at startup and will
+/// not run without one.
+pub const BEP_BOXES_FILE: &str = "boxes.json";
+
+/// The proxy binary's file name, as an install places it.
+const BEP_FILE: &str = "bep";
+
+/// System-wide install path for the proxy binary: the last resort when no
+/// override is set and no user-local install exists.
+const DEFAULT_BEP_BIN: &str = "/usr/lib/minimal/bin/bep";
+
+/// How long to wait for the proxy to answer on its redemption listener after
+/// spawn before reporting it ready (or failing the bring-up).
+const BEP_LISTENER_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `<state base>/bep`: where the proxy keeps its audit log and attachments,
+/// beside the control socket and published root the `min` CLI already uses.
+#[must_use]
+pub fn resolve_bep_dir() -> PathBuf {
+    crate::state::state_base_dir()
+        .as_utf8_path()
+        .as_std_path()
+        .join(BEP_DIR)
+}
+
+/// Resolve the box egress proxy binary: the `MINVMD_BEP_BIN` override, then the
+/// user-local install the curl|sh installer stamps (`$MINIMAL_BIN`, else
+/// `$HOME/.local/bin`), else [`DEFAULT_BEP_BIN`].
+///
+/// Like [`crate::image::resolve_gvproxy_path`] this never errors: a host that
+/// runs only boxes declaring no grant needs no proxy, so an absent binary is an
+/// ordinary case — the caller warns with the concrete path it probed.
+#[must_use]
+pub fn resolve_bep_path() -> PathBuf {
+    bep_binary_from(
+        std::env::var("MINVMD_BEP_BIN")
+            .ok()
+            .filter(|v| !v.is_empty()),
+        installer_bin_dir(),
+        Path::new(DEFAULT_BEP_BIN),
+    )
+}
+
+/// The user-local bin directory an install stamps into: `$MINIMAL_BIN`, else
+/// `$HOME/.local/bin`. Mirrors `scripts/install.sh`'s `bin` prefix, the same
+/// resolution `switch` makes for gvproxy (private to that crate).
+fn installer_bin_dir() -> Option<PathBuf> {
+    if let Some(bin) = std::env::var("MINIMAL_BIN").ok().filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(bin));
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|home| PathBuf::from(home).join(".local/bin"))
+}
+
+/// The resolution itself, with every probed location passed in so the tiers are
+/// testable without mutating the process environment.
+fn bep_binary_from(
+    override_path: Option<String>,
+    bin_dir: Option<PathBuf>,
+    system: &Path,
+) -> PathBuf {
+    if let Some(path) = override_path {
+        return PathBuf::from(path);
+    }
+    if let Some(local) = bin_dir.map(|dir| dir.join(BEP_FILE))
+        && local.exists()
+    {
+        return local;
+    }
+    system.to_path_buf()
+}
+
+/// Builder for the host box-egress-proxy process.
+#[derive(Debug, Clone)]
+pub struct BepConfig {
+    /// Path to the proxy binary.
+    binary: PathBuf,
+    /// The address the redemption listener binds.
+    listen: SocketAddr,
+    /// The audit log the proxy appends every decision to.
+    audit_log: PathBuf,
+    /// The box attachments the proxy attributes connections with.
+    boxes: PathBuf,
+    /// Grace period before SIGTERM escalates to SIGKILL on teardown.
+    term_timeout: Duration,
+}
+
+impl BepConfig {
+    /// Config for `binary`, keeping its audit log and attachments in `bep_dir`
+    /// and binding the default loopback redemption listener.
+    #[must_use]
+    pub fn new(binary: PathBuf, bep_dir: &Path) -> Self {
+        Self {
+            binary,
+            listen: SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_BEP_PORT)),
+            audit_log: bep_dir.join(BEP_AUDIT_LOG_FILE),
+            boxes: bep_dir.join(BEP_BOXES_FILE),
+            term_timeout: DEFAULT_TERM_TIMEOUT,
+        }
+    }
+
+    /// Override the address the redemption listener binds (the tests bind an
+    /// ephemeral port so a run never collides with a live proxy).
+    #[must_use]
+    pub fn with_listen(mut self, listen: SocketAddr) -> Self {
+        self.listen = listen;
+        self
+    }
+
+    /// The address the redemption listener binds.
+    #[must_use]
+    pub fn listen(&self) -> SocketAddr {
+        self.listen
+    }
+
+    /// The audit log the proxy appends every decision to.
+    #[must_use]
+    pub fn audit_log(&self) -> &Path {
+        &self.audit_log
+    }
+
+    /// The box attachments the proxy attributes connections with.
+    #[must_use]
+    pub fn boxes(&self) -> &Path {
+        &self.boxes
+    }
+
+    /// The argument vector passed to the proxy binary. The module host set and
+    /// its version are the proxy's own defaults (the GitHub v1 set).
+    #[must_use]
+    pub fn argv(&self) -> Vec<String> {
+        vec![
+            "--listen".to_string(),
+            self.listen.to_string(),
+            "--audit-log".to_string(),
+            self.audit_log.display().to_string(),
+            "--boxes".to_string(),
+            self.boxes.display().to_string(),
+        ]
+    }
+
+    /// Create the proxy's directory and, when it is not there yet, an empty
+    /// attachments list — the proxy reads that file at startup and will not run
+    /// without one.
+    ///
+    /// An existing file is never rewritten: its contents are box creation's,
+    /// not the supervisor's.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error if the directory or the attachments file cannot be
+    /// written.
+    pub fn ensure_files(&self) -> io::Result<()> {
+        if let Some(dir) = self.boxes.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        if !self.boxes.exists() {
+            std::fs::write(&self.boxes, b"[]\n")?;
+        }
+        Ok(())
+    }
+}
+
+/// A running, supervised host box egress proxy, on its own dedicated
+/// current-thread tokio runtime — the same shape as [`HostGvproxy`], because the
+/// proxy stands beside the switch for the VM's whole lifetime.
+///
+/// [`HostBep::stop`] (or `Drop`) tears the proxy down and joins the thread.
+#[derive(Debug)]
+#[must_use = "dropping HostBep stops the host box egress proxy"]
+pub struct HostBep {
+    /// Channel that tells the runtime thread to stop the proxy and exit.
+    stop_tx: Option<oneshot::Sender<()>>,
+    /// The runtime thread; joined on [`stop`](Self::stop) / `Drop`.
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// PID of the spawned proxy, surfaced for logging/diagnostics.
+    pid: u32,
+    /// The address its redemption listener answers on.
+    listen: SocketAddr,
+}
+
+impl HostBep {
+    /// Spawn and supervise the host box egress proxy on a dedicated runtime.
+    ///
+    /// Blocks until the proxy answers on its redemption listener: a box's
+    /// `HTTPS_PROXY` is set at creation, so a proxy that never bound would turn
+    /// every credentialed request into a connection refused instead of a
+    /// decision. Supervision continues on the background runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error if the runtime cannot be built, the proxy's files
+    /// cannot be laid down, the binary cannot be launched, or the redemption
+    /// listener does not answer within [`BEP_LISTENER_READY_TIMEOUT`].
+    pub fn spawn(config: BepConfig) -> io::Result<Self> {
+        config.ensure_files()?;
+        let listen = config.listen;
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u32>>();
+
+        let thread = std::thread::Builder::new()
+            .name("minvmd-bep".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                runtime.block_on(supervise_bep(config, stop_rx, ready_tx));
+            })?;
+
+        match ready_rx.recv() {
+            Ok(Ok(pid)) => Ok(Self {
+                stop_tx: Some(stop_tx),
+                thread: Some(thread),
+                pid,
+                listen,
+            }),
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(e)
+            }
+            // The runtime thread panicked before reporting; surface a clear error.
+            Err(_) => {
+                let _ = thread.join();
+                Err(io::Error::other(
+                    "host box egress proxy supervisor thread exited before reporting readiness",
+                ))
+            }
+        }
+    }
+
+    /// The PID of the supervised proxy process.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// The address the proxy's redemption listener answers on.
+    #[must_use]
+    pub fn listen(&self) -> SocketAddr {
+        self.listen
+    }
+
+    /// Stop the proxy and join the supervising runtime thread.
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            // A failed send means the runtime thread already exited (e.g. the
+            // proxy crashed); nothing more to signal.
+            let _ = stop_tx.send(());
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::warn!(
+                pid = self.pid,
+                "host box egress proxy supervisor thread panicked"
+            );
+        }
+    }
+}
+
+impl Drop for HostBep {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Bring the host box egress proxy up beside the gvproxy switch, or `None` when
+/// this host has no proxy to run (BEP-015).
+///
+/// Best-effort, exactly like the switch: a host with no proxy binary — or one
+/// whose proxy will not come up — still boots, because a box that declares no
+/// grant needs neither, and the reason is logged with the path that was probed.
+/// `binary` is [`resolve_bep_path`]'s answer, `bep_dir` [`resolve_bep_dir`]'s.
+pub fn spawn_host_bep(binary: PathBuf, bep_dir: &Path) -> Option<HostBep> {
+    if !binary.exists() {
+        tracing::warn!(
+            path = %binary.display(),
+            "box egress proxy binary not found; booting without the credential lane \
+             (set MINVMD_BEP_BIN to enable it)",
+        );
+        return None;
+    }
+    match HostBep::spawn(BepConfig::new(binary, bep_dir)) {
+        Ok(bep) => {
+            tracing::info!(
+                pid = bep.pid(),
+                listen = %bep.listen(),
+                "host box egress proxy up",
+            );
+            Some(bep)
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to bring up the host box egress proxy; booting without \
+                 the credential lane",
+            );
+            None
+        }
+    }
+}
+
+/// Supervision task body for the host box egress proxy: spawn it, wait for its
+/// redemption listener to answer, then wait for either an explicit stop or an
+/// unexpected exit. Every transition — spawn, ready, stop, unexpected exit — is
+/// one structured `tracing` event naming the listener address and, where there
+/// is one, the exit status. This task is the sole reaper of the child.
+async fn supervise_bep(
+    config: BepConfig,
+    stop_rx: oneshot::Receiver<()>,
+    ready_tx: std::sync::mpsc::Sender<io::Result<u32>>,
+) {
+    let mut child = match Command::new(&config.binary).args(config.argv()).spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = ready_tx.send(Err(error));
+            return;
+        }
+    };
+    let pid = child
+        .id()
+        .expect("a freshly spawned child always has a PID before it is awaited");
+    tracing::info!(
+        pid,
+        binary = %config.binary.display(),
+        listen = %config.listen,
+        audit_log = %config.audit_log.display(),
+        boxes = %config.boxes.display(),
+        "box egress proxy spawned",
+    );
+
+    if let Err(error) = wait_for_bep_listener(config.listen, BEP_LISTENER_READY_TIMEOUT).await {
+        stop_bep(&mut child, pid, config.term_timeout).await;
+        let _ = ready_tx.send(Err(error));
+        return;
+    }
+    tracing::info!(pid, listen = %config.listen, "box egress proxy ready");
+    if ready_tx.send(Ok(pid)).is_err() {
+        // Caller went away before learning the PID; tear down.
+        stop_bep(&mut child, pid, config.term_timeout).await;
+        return;
+    }
+
+    // Either an explicit stop or the proxy dying on its own. `child.wait()`
+    // borrows the child only for the select, so the teardown below can take it
+    // mutably again.
+    let stop_requested = tokio::select! {
+        _ = stop_rx => true,
+        exited = child.wait() => {
+            match exited {
+                Ok(status) => tracing::error!(
+                    pid,
+                    listen = %config.listen,
+                    code = status.code(),
+                    "box egress proxy exited unexpectedly",
+                ),
+                Err(error) => tracing::error!(
+                    pid,
+                    %error,
+                    "waiting on the box egress proxy failed",
+                ),
+            }
+            false
+        }
+    };
+    if stop_requested {
+        stop_bep(&mut child, pid, config.term_timeout).await;
+    }
+}
+
+/// Tear the proxy down: SIGTERM, wait up to `grace`, then SIGKILL. `child` is
+/// unreaped until this returns, so `pid` still names that exact process and a
+/// signal cannot land on a recycled PID. The exit is logged with its status.
+async fn stop_bep(child: &mut Child, pid: u32, grace: Duration) {
+    signal_bep(pid, libc::SIGTERM, "SIGTERM");
+    match tokio::time::timeout(grace, child.wait()).await {
+        Ok(Ok(status)) => {
+            tracing::info!(pid, code = status.code(), "box egress proxy stopped");
+        }
+        Ok(Err(error)) => {
+            tracing::error!(pid, %error, "waiting on the box egress proxy failed");
+        }
+        Err(_) => {
+            tracing::warn!(
+                pid,
+                "box egress proxy ignored SIGTERM; escalating to SIGKILL"
+            );
+            match child.kill().await {
+                Ok(()) => tracing::info!(pid, "box egress proxy killed"),
+                Err(error) => {
+                    tracing::error!(pid, %error, "killing the box egress proxy failed");
+                }
+            }
+        }
+    }
+}
+
+/// Deliver `signal` to the proxy's `pid` best-effort. The `Child` is unreaped
+/// while this runs, so the PID names that exact process; `ESRCH` (it exited on
+/// its own first) is the benign teardown race and is silenced, while any other
+/// errno is logged rather than swallowed.
+fn signal_bep(pid: u32, signal: libc::c_int, signal_name: &str) {
+    // SAFETY: `kill(2)` takes a pid and a signal number and touches no memory.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if rc != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            tracing::warn!(
+                pid,
+                signal = signal_name,
+                %error,
+                "signal delivery to the box egress proxy failed",
+            );
+        }
+    }
+}
+
+/// Poll-connect `listen` until the proxy's redemption listener accepts a
+/// connection or `timeout` elapses. A proxy that dies during startup never
+/// answers, so a timeout here means the credential lane is not usable —
+/// surfaced as an error rather than reporting a dead proxy as ready.
+async fn wait_for_bep_listener(listen: SocketAddr, timeout: Duration) -> io::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match tokio::net::TcpStream::connect(listen).await {
+            Ok(_) => return Ok(()),
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "the box egress proxy's redemption listener {listen} did not answer \
+                         within {timeout:?}: {e}"
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,6 +1468,223 @@ mod tests {
         let err = HostGvproxy::spawn(PathBuf::from("/nonexistent/definitely/not/gvproxy"), sock)
             .expect_err("spawning a missing binary must fail");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// Path to a stand-in "bep" that stays alive regardless of the argv
+    /// [`HostBep::spawn`] hands it, for the same reason as
+    /// [`stayalive_gvproxy`]: the real proxy runs until signalled, so the
+    /// liveness and teardown assertions must not race a stand-in that exits.
+    /// Its listener is stood up by the test itself (the script binds nothing),
+    /// exactly as the switch-socket stand-in is.
+    fn stayalive_bep(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("stayalive-bep.sh");
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 1000\n").expect("write stand-in bep");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stand-in bep");
+        path
+    }
+
+    /// The host's two network processes are supervised at once and
+    /// independently (BEP-015, BEP-047): gvproxy on its `-listen` switch socket
+    /// carries a box's ordinary egress, the box egress proxy on its redemption
+    /// listener carries its credentialed hosts. The proxy is reported ready only
+    /// once that listener answers — which is what makes `git` and `gh` in a box
+    /// reach a decision instead of a connection refused — its files are laid
+    /// down where the `min` CLI looks for them, and stopping either process
+    /// leaves the other running.
+    #[test]
+    fn bep_proxy_supervised_beside_gvproxy() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+
+        // The switch, as the other supervision tests stand it up.
+        let switch_sock = dir.path().join("gvproxy-switch.sock");
+        let _switch_listener = std::os::unix::net::UnixListener::bind(&switch_sock)
+            .expect("bind stand-in switch socket");
+        let gvproxy = HostGvproxy::spawn(stayalive_gvproxy(dir.path()), switch_sock)
+            .expect("spawn host gvproxy");
+
+        // The proxy, beside it. An ephemeral port so a run never collides with
+        // a live proxy on this host's 7655.
+        let proxy_listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind stand-in redemption listener");
+        let listen = proxy_listener.local_addr().expect("listener address");
+        let bep_dir = dir.path().join(BEP_DIR);
+        let bep =
+            HostBep::spawn(BepConfig::new(stayalive_bep(dir.path()), &bep_dir).with_listen(listen))
+                .expect("spawn host box egress proxy");
+
+        let (gvproxy_pid, bep_pid) = (gvproxy.pid(), bep.pid());
+        assert_ne!(
+            gvproxy_pid, bep_pid,
+            "the proxy must be its own process, not the switch",
+        );
+        assert!(
+            pid_is_alive(gvproxy_pid),
+            "the switch should be alive beside the proxy",
+        );
+        assert!(
+            pid_is_alive(bep_pid),
+            "the proxy should be alive beside the switch",
+        );
+
+        // Ready means the redemption listener answers at the address a steered
+        // box's HTTPS_PROXY was set to.
+        assert_eq!(bep.listen(), listen);
+        drop(
+            std::net::TcpStream::connect(listen)
+                .expect("the proxy's redemption listener must answer once it is reported ready"),
+        );
+        // The attachments file the proxy reads at startup exists, beside the
+        // audit log it appends to.
+        assert!(
+            bep_dir.join(BEP_BOXES_FILE).is_file(),
+            "the proxy cannot start without an attachments file",
+        );
+
+        // Independent lifecycles: stopping the proxy leaves the switch up.
+        bep.stop();
+        assert!(
+            !pid_is_alive(bep_pid),
+            "the proxy must be stopped after stop()"
+        );
+        assert!(
+            pid_is_alive(gvproxy_pid),
+            "stopping the proxy must not disturb the switch",
+        );
+
+        gvproxy.stop();
+        assert!(
+            !pid_is_alive(gvproxy_pid),
+            "the switch must be stopped after stop()",
+        );
+    }
+
+    #[test]
+    fn host_bep_drop_stops_the_proxy() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let proxy_listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind stand-in redemption listener");
+        let listen = proxy_listener.local_addr().expect("listener address");
+        let bep = HostBep::spawn(
+            BepConfig::new(stayalive_bep(dir.path()), &dir.path().join(BEP_DIR))
+                .with_listen(listen),
+        )
+        .expect("spawn host box egress proxy");
+        let pid = bep.pid();
+        assert!(pid_is_alive(pid));
+        drop(bep);
+        assert!(
+            !pid_is_alive(pid),
+            "dropping HostBep must stop the box egress proxy",
+        );
+    }
+
+    #[test]
+    fn host_bep_spawn_reports_launch_failure() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let err = HostBep::spawn(BepConfig::new(
+            PathBuf::from("/nonexistent/definitely/not/bep"),
+            &dir.path().join(BEP_DIR),
+        ))
+        .expect_err("spawning a missing binary must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A host with no proxy binary still boots: the bring-up warns and returns
+    /// `None`, and lays nothing down.
+    #[test]
+    fn spawn_host_bep_without_a_binary_is_none() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let bep_dir = dir.path().join(BEP_DIR);
+        assert!(
+            spawn_host_bep(PathBuf::from("/nonexistent/definitely/not/bep"), &bep_dir).is_none()
+        );
+        assert!(
+            !bep_dir.exists(),
+            "an absent proxy must not leave state behind",
+        );
+    }
+
+    #[test]
+    fn bep_argv_carries_the_listener_audit_log_and_attachments() {
+        let cfg = BepConfig::new(
+            PathBuf::from("/usr/lib/minimal/bin/bep"),
+            Path::new("/s/bep"),
+        );
+        assert_eq!(
+            cfg.argv(),
+            vec![
+                "--listen".to_string(),
+                "127.0.0.1:7655".to_string(),
+                "--audit-log".to_string(),
+                "/s/bep/audit.log".to_string(),
+                "--boxes".to_string(),
+                "/s/bep/boxes.json".to_string(),
+            ]
+        );
+        assert_eq!(cfg.audit_log(), Path::new("/s/bep/audit.log"));
+        assert_eq!(cfg.boxes(), Path::new("/s/bep/boxes.json"));
+    }
+
+    /// The attachments file is created empty so the proxy can start, and an
+    /// existing one is left alone: its contents are box creation's.
+    #[test]
+    fn bep_attachments_file_is_created_empty_and_never_clobbered() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let bep_dir = dir.path().join("nested").join(BEP_DIR);
+        let cfg = BepConfig::new(PathBuf::from("/usr/lib/minimal/bin/bep"), &bep_dir);
+        cfg.ensure_files().expect("lay down the proxy's files");
+        assert_eq!(
+            std::fs::read_to_string(cfg.boxes()).expect("read attachments"),
+            "[]\n"
+        );
+
+        let declared = r#"[{"source":"100.64.0.2","box":"b","addressing":"own_ip"}]"#;
+        std::fs::write(cfg.boxes(), declared).expect("write attachments");
+        cfg.ensure_files()
+            .expect("lay down the proxy's files again");
+        assert_eq!(
+            std::fs::read_to_string(cfg.boxes()).expect("read attachments"),
+            declared,
+            "declared attachments must survive a restart",
+        );
+    }
+
+    /// The listener minvmd binds is the one a steered box's `HTTPS_PROXY` is
+    /// pointed at, so the two definitions cannot drift (BEP-012, BEP-015).
+    #[test]
+    fn bep_default_listener_is_the_box_proxy_url() {
+        let listen = SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_BEP_PORT));
+        assert_eq!(format!("http://{listen}"), sessions::BEP_PROXY_URL);
+    }
+
+    #[test]
+    fn bep_binary_prefers_the_override_then_a_user_local_install() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let system = Path::new("/usr/lib/minimal/bin/bep");
+
+        // The override is honoured verbatim, without an existence check.
+        assert_eq!(
+            bep_binary_from(
+                Some("/custom/bep".to_string()),
+                Some(dir.path().into()),
+                system
+            ),
+            PathBuf::from("/custom/bep"),
+        );
+        // No override and no user-local install: the system path.
+        assert_eq!(
+            bep_binary_from(None, Some(dir.path().into()), system),
+            system.to_path_buf(),
+        );
+        // A user-local install wins over the system path.
+        let local = dir.path().join(BEP_FILE);
+        std::fs::write(&local, b"bep").expect("write user-local bep");
+        assert_eq!(
+            bep_binary_from(None, Some(dir.path().into()), system),
+            local,
+        );
     }
 
     #[test]

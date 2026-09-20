@@ -364,6 +364,19 @@ fn run_foreground() -> Result<()> {
         }
     };
 
+    // Spawn + supervise the host box egress proxy beside gvproxy (BEP-015). A
+    // box created under `proxy_env` steering has `HTTPS_PROXY` pointing at the
+    // proxy's redemption listener on this host, so `git` and `gh` inside the box
+    // reach GitHub through it carrying only the sealed value the box was created
+    // with. Like gvproxy the handle lives for the VM's lifetime and stops the
+    // proxy on drop (after the VMM child exits below); like gvproxy the
+    // bring-up is best-effort, because a box that declares no grant needs no
+    // proxy — `spawn_host_bep` logs why it stood none up.
+    let _bep = crate::net::spawn_host_bep(
+        crate::net::resolve_bep_path(),
+        &crate::net::resolve_bep_dir(),
+    );
+
     // R2.5: record whether the data volume image pre-exists this boot, before
     // the VMM child provisions it — a later boot failure is fatal for a
     // pre-existing image (may hold session data) and recoverable for a blank
