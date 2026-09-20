@@ -20,9 +20,9 @@ use std::sync::Arc;
 use sandbox2::NetGuard;
 use tokio::sync::Mutex;
 
-use crate::net::SwitchClient;
 use crate::net::policy::{ControlChannel, ExposedMapping};
 use crate::net::switch::SwitchRelay;
+use crate::net::{SwitchClient, SwitchSubnet};
 
 /// The own-IP attachment guard. Returned by [`complete_own_ip_attach`] and torn
 /// down explicitly via [`NetGuard::teardown`] at the end of the sandbox's life.
@@ -78,10 +78,11 @@ pub(crate) async fn complete_own_ip_attach(
     tap_fd: OwnedFd,
     control: ControlChannel,
     lease_ip: Ipv4Addr,
+    subnet: SwitchSubnet,
     session_name: &str,
     ingress: Option<&sessions::IngressPolicy>,
 ) -> io::Result<OwnIpGuard> {
-    let gate = crate::net::switch::IngressGate::for_session(lease_ip.to_string(), ingress);
+    let gate = crate::net::switch::IngressGate::for_session(lease_ip.to_string(), ingress, subnet);
     let relay = match &control {
         ControlChannel::Unix(sock) => {
             crate::net::switch::attach_to_switch(tap_fd, sock, Some(gate)).await?
@@ -90,21 +91,44 @@ pub(crate) async fn complete_own_ip_attach(
             crate::net::switch::attach_to_switch_vsock(tap_fd, *cid, *port, Some(gate)).await?
         }
     };
-    finish_own_ip_attach(switch, relay, control, lease_ip, session_name, ingress).await
+    finish_own_ip_attach(FinishAttach {
+        switch,
+        relay,
+        control,
+        lease_ip,
+        subnet,
+        session_name,
+        ingress,
+    })
+    .await
+}
+
+/// What [`finish_own_ip_attach`] needs, as one argument: the just-started relay
+/// plus the addressing and policy of the PTask it belongs to.
+struct FinishAttach<'a> {
+    switch: &'a Arc<Mutex<SwitchClient>>,
+    relay: SwitchRelay,
+    control: ControlChannel,
+    lease_ip: Ipv4Addr,
+    subnet: SwitchSubnet,
+    session_name: &'a str,
+    ingress: Option<&'a sessions::IngressPolicy>,
 }
 
 /// Tail of the own-IP attach: apply static ingress forwards (R2.3) over
 /// `control`, then build the [`OwnIpGuard`]. On an ingress failure the relay is
 /// dropped (closing the switch-side connection); the attach-count rollback is
 /// left to the launch, so the refcount is never double-decremented.
-async fn finish_own_ip_attach(
-    switch: &Arc<Mutex<SwitchClient>>,
-    relay: SwitchRelay,
-    control: ControlChannel,
-    lease_ip: Ipv4Addr,
-    session_name: &str,
-    ingress: Option<&sessions::IngressPolicy>,
-) -> io::Result<OwnIpGuard> {
+async fn finish_own_ip_attach(attach: FinishAttach<'_>) -> io::Result<OwnIpGuard> {
+    let FinishAttach {
+        switch,
+        relay,
+        control,
+        lease_ip,
+        subnet,
+        session_name,
+        ingress,
+    } = attach;
     let exposed = match ingress {
         Some(ingress) if !ingress.port_mappings.is_empty() => {
             match crate::net::policy::apply_ingress(&control, lease_ip, ingress).await {
@@ -125,6 +149,19 @@ async fn finish_own_ip_attach(
     // hiccup must not fail an otherwise-working attach.
     if let Err(e) = crate::net::policy::register_dns_name(&control, session_name, lease_ip).await {
         tracing::warn!(error = %e, session = session_name, "registering *.min.internal name on gvproxy");
+    }
+
+    // And `host.min.internal` → the switch's host-gateway address, so this box
+    // resolves the host it runs on (NET-003). Posted on every attach rather than
+    // once per process: the switch stops with its last PTask and takes its zones
+    // with it, and the record never varies. Best-effort for the same reason as
+    // the name above.
+    if let Err(e) = crate::net::policy::register_host_name(&control, subnet).await {
+        tracing::warn!(
+            error = %e,
+            name = crate::net::policy::HOST_HOSTNAME,
+            "registering the host's name on gvproxy"
+        );
     }
 
     Ok(OwnIpGuard {

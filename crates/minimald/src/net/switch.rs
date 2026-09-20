@@ -396,13 +396,11 @@ where
     let tap = Arc::new(AsyncFd::new(tap_file)?);
 
     // Share the UDP flow tracker with the egress leg so a reply to the PTask's own
-    // UDP egress is recognized as solicited by the inbound gate (finding #2, UDP).
-    let egress_conntrack = gate.as_ref().map(|g| Arc::clone(&g.conntrack));
-    let tap_to_switch = tokio::spawn(relay_tap_to_switch(
-        Arc::clone(&tap),
-        sock_tx,
-        egress_conntrack,
-    ));
+    // UDP egress is recognized as solicited by the inbound gate (finding #2, UDP),
+    // and give that leg the box's identity so it can notice a connection to the
+    // legacy literal host address (NET-004).
+    let egress = gate.as_ref().map(EgressWatch::for_gate);
+    let tap_to_switch = tokio::spawn(relay_tap_to_switch(Arc::clone(&tap), sock_tx, egress));
     let switch_to_tap = tokio::spawn(relay_switch_to_tap(sock_rx, tap, gate));
     Ok(SwitchRelay {
         tap_to_switch,
@@ -410,14 +408,15 @@ where
     })
 }
 
-/// tap → switch: read a raw Ethernet frame, record any outbound UDP flow (so its
-/// reply is allowed back in — finding #2, UDP), prepend its 2-byte LE length, and
-/// write the framed packet to the control socket. `conntrack` is `None` for the
-/// daemon relay, which has no ingress gate.
+/// tap → switch: read a raw Ethernet frame, let the egress watch read it (an
+/// outbound UDP flow to remember, a connection to the legacy host address to
+/// notice), prepend its 2-byte LE length, and write the framed packet to the
+/// control socket. `egress` is `None` for the daemon relay, which carries no
+/// box's traffic and has no ingress gate.
 async fn relay_tap_to_switch<W>(
     tap: Arc<AsyncFd<std::fs::File>>,
     mut sock: W,
-    conntrack: Option<Arc<UdpConntrack>>,
+    egress: Option<EgressWatch>,
 ) -> io::Result<()>
 where
     W: AsyncWriteExt + Unpin,
@@ -447,12 +446,10 @@ where
             );
             continue;
         }
-        // Track outbound UDP so the inbound gate recognizes its reply as solicited.
-        if let Some(ct) = &conntrack
-            && let Some(pkt) = parse_ipv4_l4(&buf[..n])
-            && pkt.proto == IPPROTO_UDP
-        {
-            ct.record_egress(&pkt);
+        // Read the frame on its way out; observation only, so it is relayed
+        // below either way.
+        if let Some(egress) = &egress {
+            egress.observe(&buf[..n]);
         }
         // One combined write keeps the length prefix and frame atomic even if
         // the socket closes between writes.
@@ -503,17 +500,81 @@ pub struct IngressGate {
     conntrack: Arc<UdpConntrack>,
     /// The target PTask's switch IP, carried as the R2.7 log's `session_id`.
     label: String,
+    /// The switch's host-gateway address: the literal a box was told to dial
+    /// before `host.min.internal` answered it, which the egress leg notices as
+    /// deprecated (NET-004). Carried here because this is the per-box relay
+    /// context both legs are built from.
+    legacy_host: Ipv4Addr,
     /// Rate-limited emitter for dropped-frame warnings (R2.7).
     limiter: PolicyWarnLimiter,
+}
+
+/// What the egress (tap → switch) leg reads on a box's own relay: the UDP flows
+/// whose replies the ingress gate must admit, and the box's use of the literal
+/// host address the name superseded (NET-004).
+#[derive(Clone)]
+struct EgressWatch {
+    /// Shared with the ingress leg's gate, so a reply to the box's own UDP egress
+    /// is recognized as solicited (finding #2, UDP).
+    conntrack: Arc<UdpConntrack>,
+    /// The box, as its gate labels it — the R2.7 `session_id`.
+    session_id: String,
+    /// The literal host address, as [`IngressGate::legacy_host`] holds it.
+    legacy_host: Ipv4Addr,
+}
+
+impl EgressWatch {
+    /// The egress-side view of a box's ingress gate.
+    fn for_gate(gate: &IngressGate) -> Self {
+        Self {
+            conntrack: Arc::clone(&gate.conntrack),
+            session_id: gate.label.clone(),
+            legacy_host: gate.legacy_host,
+        }
+    }
+
+    /// Reads one outbound frame: records an outbound UDP flow, and notices a new
+    /// connection to the literal host address.
+    ///
+    /// Observation only. The literal is the very address `host.min.internal`
+    /// answers a box on the switch ([`policy::host_reach_address`]), so the
+    /// connection routes as the name with nothing rewritten and keeps working;
+    /// what it gains is one notice naming the box and the name to use instead
+    /// (NET-004).
+    ///
+    /// [`policy::host_reach_address`]: super::policy::host_reach_address
+    fn observe(&self, frame: &[u8]) {
+        let Some(pkt) = parse_ipv4_l4(frame) else {
+            return;
+        };
+        if pkt.proto == IPPROTO_UDP {
+            self.conntrack.record_egress(&pkt);
+        }
+        if opens_connection(&pkt) && *pkt.dst.ip() == self.legacy_host {
+            tracing::info!(
+                session_id = self.session_id.as_str(),
+                literal = %self.legacy_host,
+                port = pkt.dst.port(),
+                name = super::policy::HOST_HOSTNAME,
+                "box connected to the deprecated literal host address; resolve the name instead"
+            );
+        }
+    }
 }
 
 impl IngressGate {
     /// Builds a gate from a PTask's ingress policy: the declared internal ports
     /// per transport (TCP and UDP separately), plus a fresh UDP flow tracker. A
     /// session with no ingress denies every new inbound connection/datagram while
-    /// still receiving replies to its own egress.
+    /// still receiving replies to its own egress. `subnet` is the switch this
+    /// PTask attaches to, whose host-gateway address the egress leg watches for
+    /// (NET-004).
     #[must_use]
-    pub fn for_session(label: String, ingress: Option<&sessions::IngressPolicy>) -> Self {
+    pub fn for_session(
+        label: String,
+        ingress: Option<&sessions::IngressPolicy>,
+        subnet: SwitchSubnet,
+    ) -> Self {
         let ports = |proto: sessions::IpProto| -> HashSet<u16> {
             ingress
                 .map(|i| {
@@ -530,6 +591,7 @@ impl IngressGate {
             udp_allowed: ports(sessions::IpProto::Udp),
             conntrack: Arc::new(UdpConntrack::default()),
             label,
+            legacy_host: subnet.host_alias(),
             limiter: PolicyWarnLimiter::new(),
         }
     }
@@ -609,17 +671,22 @@ fn parse_ipv4_l4(frame: &[u8]) -> Option<L4Packet> {
     })
 }
 
+/// Whether `pkt` opens a new connection: a bare TCP SYN (SYN set, ACK clear).
+/// One definition for both legs — the inbound gate drops a new connection to an
+/// undeclared port, the egress leg notices one to the legacy host address — so
+/// "a connection" means the same thing in each, once per connection rather than
+/// once per frame it carries.
+fn opens_connection(pkt: &L4Packet) -> bool {
+    pkt.proto == IPPROTO_TCP && pkt.tcp_flags & 0x02 != 0 && pkt.tcp_flags & 0x10 == 0
+}
+
 /// Returns `Some((dst_port, src))` iff `frame` is a bare TCP SYN (SYN set, ACK
 /// clear) to a port not in `allowed` — the one TCP case the ingress gate drops.
 /// `None` (pass) for non-TCP, declared ports, and any ACK-set segment (SYN-ACK,
 /// established, egress return).
 fn blocked_syn(frame: &[u8], allowed: &HashSet<u16>) -> Option<(u16, SocketAddrV4)> {
     let pkt = parse_ipv4_l4(frame)?;
-    if pkt.proto != IPPROTO_TCP {
-        return None;
-    }
-    let (syn, ack) = (pkt.tcp_flags & 0x02 != 0, pkt.tcp_flags & 0x10 != 0);
-    if !syn || ack || allowed.contains(&pkt.dst.port()) {
+    if !opens_connection(&pkt) || allowed.contains(&pkt.dst.port()) {
         return None;
     }
     Some((pkt.dst.port(), pkt.src))
@@ -880,15 +947,156 @@ mod tests {
             ],
             dynamic_allowed_range: None,
         };
-        let gate = IngressGate::for_session("100.64.0.9".into(), Some(&ingress));
+        let gate =
+            IngressGate::for_session("100.64.0.9".into(), Some(&ingress), SwitchSubnet::default());
         assert!(gate.allowed.contains(&80)); // TCP internal port
         assert!(!gate.allowed.contains(&53)); // the UDP mapping is not a TCP port
         assert!(!gate.allowed.contains(&18080)); // external port is not the listener
         assert!(gate.udp_allowed.contains(&53)); // UDP internal port
         assert!(!gate.udp_allowed.contains(&80)); // the TCP mapping is not a UDP port
         // A no-ingress own-IP session denies every new inbound connection/datagram.
-        let empty = IngressGate::for_session("x".into(), None);
+        let empty = IngressGate::for_session("x".into(), None, SwitchSubnet::default());
         assert!(empty.allowed.is_empty() && empty.udp_allowed.is_empty());
+    }
+
+    /// A `MakeWriter` accumulating everything written into a shared buffer, so a
+    /// test can assert on the structured fields a `tracing` event emitted.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl CaptureWriter {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A frame the box sends *out*: [`tcp_frame`]'s shape with the destination
+    /// address rewritten, which is what the egress leg reads.
+    fn egress_tcp_frame(dst: Ipv4Addr, dst_port: u16, flags: u8) -> Vec<u8> {
+        let mut f = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, flags, SRC, dst_port);
+        f[ETH_HDR + 16..ETH_HDR + 20].copy_from_slice(&dst.octets());
+        f
+    }
+
+    /// One frame as the relay writes it to the switch: a 2-byte LE length prefix
+    /// followed by the frame, unaltered.
+    fn framed(frame: &[u8]) -> Vec<u8> {
+        let mut out = (frame.len() as u16).to_le_bytes().to_vec();
+        out.extend_from_slice(frame);
+        out
+    }
+
+    /// NET-004. A box's connection to the literal host address still reaches the
+    /// switch byte-for-byte — the literal *is* the address `host.min.internal`
+    /// answers a box on the switch, so it routes as the name with nothing
+    /// rewritten — and it is announced once per connection, naming the box and the
+    /// name to use instead. Frames to anywhere else are silent, and the egress
+    /// leg's UDP bookkeeping is untouched.
+    #[tokio::test]
+    async fn legacy_host_literal_routes_with_deprecation() {
+        let subnet = SwitchSubnet::default();
+        // The literal NET-004 names, and what the name answers on the switch.
+        assert_eq!(subnet.host_alias(), Ipv4Addr::new(100, 64, 255, 254));
+        assert_eq!(
+            subnet.host_alias(),
+            crate::net::policy::host_reach_address(crate::net::policy::HostReach::Switch, subnet)
+        );
+
+        let gate = IngressGate::for_session(SRC.to_string(), None, subnet);
+        let watch = EgressWatch::for_gate(&gate);
+
+        // What the box sends: a connection to the literal, a segment of that same
+        // connection, a connection elsewhere, and a UDP datagram.
+        let resolver = Ipv4Addr::new(1, 1, 1, 1);
+        let outbound = [
+            egress_tcp_frame(subnet.host_alias(), 8080, SYN),
+            egress_tcp_frame(subnet.host_alias(), 8080, ACK),
+            egress_tcp_frame(Ipv4Addr::new(93, 184, 216, 34), 443, SYN),
+            udp_frame(SRC, 40000, resolver, 53),
+        ];
+
+        // A datagram socketpair stands in for the tap: frame-atomic reads, as a
+        // tap device gives. Everything is queued before the relay runs, and
+        // closing the box side ends it once the queue is drained.
+        let (box_side, tap_side) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        tap_side.set_nonblocking(true).unwrap();
+        // SAFETY: `into_raw_fd` yields a live, owned fd; `File` takes it
+        // exclusively and closes it on drop.
+        let tap_file = unsafe { std::fs::File::from_raw_fd(tap_side.into_raw_fd()) };
+        let tap = Arc::new(AsyncFd::new(tap_file).unwrap());
+        for frame in &outbound {
+            box_side.send(frame).unwrap();
+        }
+
+        let (switch_side, mut switch_rx) = tokio::io::duplex(64 * 1024);
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let expected: Vec<u8> = outbound.iter().flat_map(|f| framed(f)).collect();
+        let mut relayed = vec![0u8; expected.len()];
+        {
+            // Both futures run in this task, so the relay sees the thread-local
+            // subscriber. The relay only ever ends on a tap EOF, which a datagram
+            // socketpair does not deliver, so the read is what finishes here: it
+            // completes the moment every frame is through.
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tokio::select! {
+                ended = relay_tap_to_switch(tap, switch_side, Some(watch.clone())) =>
+                    panic!("the relay ended before the frames were through: {ended:?}"),
+                read = switch_rx.read_exact(&mut relayed) => read.unwrap(),
+            };
+        }
+
+        // Every frame reached the switch, in order and unaltered: the literal
+        // still works.
+        assert_eq!(relayed, expected);
+
+        // One notice, for the connection and not for its second segment, naming
+        // the box and the name it should have resolved.
+        let logged = capture.contents();
+        let notices = logged.matches("deprecated literal host address").count();
+        assert_eq!(notices, 1, "one notice per connection, got: {logged}");
+        assert!(
+            logged.contains(r#"name="host.min.internal""#),
+            "the notice must name the name to use, got: {logged}"
+        );
+        assert!(
+            logged.contains(&format!(r#"session_id="{SRC}""#)),
+            "the notice must name the box, got: {logged}"
+        );
+        assert!(
+            logged.contains("literal=")
+                && logged.contains(&subnet.host_alias().to_string())
+                && logged.contains("port=8080"),
+            "the notice must name what was dialled, got: {logged}"
+        );
+
+        // The egress leg still records outbound UDP, so the reply is admitted.
+        let reply = udp_frame(resolver, 53, SRC, 40000);
+        assert!(
+            watch
+                .conntrack
+                .allows_ingress(&parse_ipv4_l4(&reply).unwrap())
+        );
     }
 
     /// Builds an Ethernet II + IPv4 + UDP frame for the conntrack tests.
@@ -963,7 +1171,8 @@ mod tests {
             }],
             dynamic_allowed_range: None,
         };
-        let gate = IngressGate::for_session(LEASE.to_string(), Some(&ingress));
+        let gate =
+            IngressGate::for_session(LEASE.to_string(), Some(&ingress), SwitchSubnet::default());
         // New TCP connection to an undeclared port -> dropped, tagged Tcp.
         let tcp = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9999);
         assert_eq!(

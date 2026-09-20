@@ -31,6 +31,8 @@ use tokio_vsock::{VsockAddr, VsockStream};
 
 use sessions::{IngressPolicy, IpProto, PortMapping};
 
+use super::SwitchSubnet;
+
 /// The forwarder-expose request body gvproxy's `POST /services/forwarder/expose`
 /// expects: a host-side `local` listen address and the PTask-side `remote` it
 /// forwards to, plus the transport `protocol`.
@@ -228,6 +230,71 @@ fn dns_add_body(session_name: &str, lease_ip: Ipv4Addr) -> DnsZone {
         records: vec![DnsRecord {
             name: session_name.to_ascii_lowercase(),
             ip: lease_ip.to_string(),
+        }],
+    }
+}
+
+/// The label `host.min.internal` carries inside the `min.internal.` zone.
+pub const HOST_LABEL: &str = "host";
+
+/// The name a box resolves to reach the host its node runs on (NET-003), and the
+/// name a box still dialling the literal host address should use instead
+/// (NET-004).
+pub const HOST_HOSTNAME: &str =
+    constcat::concat!(HOST_LABEL, ".", crate::net::dns::HOSTNAME_SUFFIX);
+
+/// Where a box stands relative to the host whose loopback `host.min.internal`
+/// names (NET-003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostReach {
+    /// The box shares the host's own network namespace, so the host's loopback
+    /// is the box's own.
+    SharedNamespace,
+    /// The box reaches the host across the switch — an own-address box, or any
+    /// box inside a VM node — so the host's loopback sits behind the switch's
+    /// host-gateway address, which gvproxy NATs to it.
+    Switch,
+}
+
+/// The address `host.min.internal` answers a box with this reach: `127.0.0.1`
+/// where the box shares the host's namespace, the switch's host-gateway address
+/// where it stands on the switch (NET-003).
+///
+/// The one formula: the zone record [`register_host_name`] writes and the
+/// per-mode answer [`net::provider`](super::provider) decides both come from
+/// here, so a box cannot be promised one address and given another.
+#[must_use]
+pub fn host_reach_address(reach: HostReach, subnet: SwitchSubnet) -> Ipv4Addr {
+    match reach {
+        HostReach::SharedNamespace => Ipv4Addr::LOCALHOST,
+        HostReach::Switch => subnet.host_alias(),
+    }
+}
+
+/// Registers `host.min.internal` in gvproxy's `min.internal.` DNS zone, pointing
+/// at the switch's host-gateway address, so every box on the switch resolves the
+/// host it runs on (NET-003).
+///
+/// Idempotent by content — the record never varies for a subnet — and posted on
+/// each switch bring-up rather than once per process, because a switch that
+/// stopped with its last box took its zones with it.
+///
+/// # Errors
+///
+/// Returns the I/O error from the gvproxy control request (non-2xx or transport).
+pub async fn register_host_name(control: &ControlChannel, subnet: SwitchSubnet) -> io::Result<()> {
+    post_json(control, "/services/dns/add", &host_dns_body(subnet)).await
+}
+
+/// Builds the `/services/dns/add` zone body for `host.min.internal`. Split out so
+/// the wire shape is unit-testable without a live gvproxy, alongside
+/// [`dns_add_body`].
+fn host_dns_body(subnet: SwitchSubnet) -> DnsZone {
+    DnsZone {
+        name: format!("{}.", crate::net::dns::HOSTNAME_SUFFIX),
+        records: vec![DnsRecord {
+            name: HOST_LABEL.to_string(),
+            ip: host_reach_address(HostReach::Switch, subnet).to_string(),
         }],
     }
 }
@@ -517,6 +584,60 @@ mod tests {
         assert_eq!(
             json,
             r#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.5"}]}"#
+        );
+    }
+
+    /// NET-003. The address `host.min.internal` answers is decided per mode and
+    /// per host — a box that shares the host's namespace gets the host's own
+    /// loopback, a box standing on the switch gets the host-gateway address
+    /// gvproxy NATs to it — and the zone record the switch is given carries
+    /// exactly that address under exactly that name.
+    #[test]
+    fn host_min_internal_resolves_to_host_reach_address_per_mode() {
+        use crate::net::provider::host_reach;
+        use crate::net::{SwitchTransport, VSOCK_GVPROXY_SHUTTLE_PORT, VSOCK_HOST_CID};
+        use sessions::NetworkMode;
+
+        let subnet = SwitchSubnet::default();
+        let native = SwitchTransport::LocalSpawn;
+        let vm_backed = SwitchTransport::HostShuttle {
+            cid: VSOCK_HOST_CID,
+            port: VSOCK_GVPROXY_SHUTTLE_PORT,
+        };
+        let answer = |mode, transport| {
+            host_reach(mode, transport).map(|reach| host_reach_address(reach, subnet))
+        };
+
+        // A host-address box on a native host shares the host's namespace, so
+        // the host's loopback is its own.
+        assert_eq!(
+            answer(NetworkMode::HostNet, native),
+            Some(Ipv4Addr::LOCALHOST)
+        );
+        // Inside a VM-backed host the same box reaches the host across the
+        // switch, as an own-address box does on either host.
+        assert_eq!(
+            answer(NetworkMode::HostNet, vm_backed),
+            Some(subnet.host_alias())
+        );
+        assert_eq!(
+            answer(NetworkMode::OwnIp, native),
+            Some(subnet.host_alias())
+        );
+        assert_eq!(
+            answer(NetworkMode::OwnIp, vm_backed),
+            Some(subnet.host_alias())
+        );
+        // A `none` box has an empty namespace and no route to the host at all;
+        // NET-003 promises it nothing.
+        assert_eq!(answer(NetworkMode::NoNet, native), None);
+
+        // What the switch is actually told, so the promise and the answer cannot
+        // drift: the zone every box on the switch resolves against.
+        assert_eq!(HOST_HOSTNAME, "host.min.internal");
+        assert_eq!(
+            serde_json_lenient::to_string(&host_dns_body(subnet)).unwrap(),
+            r#"{"name":"min.internal.","records":[{"name":"host","ip":"100.64.255.254"}]}"#
         );
     }
 

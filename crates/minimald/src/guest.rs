@@ -1046,6 +1046,25 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     let relay =
         switch::attach_to_switch_vsock(tap_fd, VSOCK_HOST_CID, VSOCK_GVPROXY_SHUTTLE_PORT, None)
             .await?;
+
+    // Put `host.min.internal` in the switch's zone for this node (NET-003). Every
+    // box in the node resolves through the node's DNS layer, and a host-address
+    // box — which shares this namespace and takes no lease — never goes through an
+    // own-IP attach, so without this the name would answer only on a node that
+    // happens to run an own-address box. Best-effort: the node's egress is up
+    // either way.
+    let control = crate::net::policy::ControlChannel::Vsock {
+        cid: VSOCK_HOST_CID,
+        port: VSOCK_GVPROXY_SHUTTLE_PORT,
+    };
+    if let Err(e) = crate::net::policy::register_host_name(&control, DEFAULT_SUBNET).await {
+        tracing::warn!(
+            error = %e,
+            name = crate::net::policy::HOST_HOSTNAME,
+            "registering the host's name on the node's DNS layer"
+        );
+    }
+
     tracing::info!(%cidr, %gateway, "guest root egress up via host gvproxy shuttle");
     Ok(relay)
 }
