@@ -154,6 +154,11 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     );
     collect_step!(w, "config", collect::config(&mut w, &paths));
     collect_step!(w, "state", collect::state(&mut w, &paths));
+    // The box egress proxy: its audit tail, its box attachments, and whether
+    // its two sockets answer. Host-side throughout — the proxy runs beside the
+    // switch, not in a guest — so `--no-guest` does not scope it out.
+    collect_step!(w, "bep", collect::bep(&mut w, &paths, args.log_tail_bytes));
+    collect_step!(w, "bep.probe", bep_probe(&mut w, global));
     // Log prefixes that matched nothing on the host come back rather than
     // becoming skips here: whether "not under <state>/logs" also means "not in
     // this bundle" is not known until the provider loop below has run.
@@ -352,6 +357,24 @@ fn resolve_paths(global: &GlobalArgs) -> DiagPaths {
         mesh_enrolment: crate::mesh_enrolment_path(global),
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     }
+}
+
+/// The box egress proxy's reachability, captured as `bep/probe.json`.
+///
+/// The listener address is the one a steered box is created pointing at
+/// (`sessions::BEP_PROXY_URL`, the same port `minvmd` starts the proxy on), and
+/// the control socket is the one `min auth` submits its mint and revocation
+/// records over — both resolved from the shared constants rather than restated,
+/// so a bundle cannot probe an address no box ever used.
+async fn bep_probe(w: &mut BundleWriter, global: &GlobalArgs) -> Result<(), anyhow::Error> {
+    let listener =
+        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, minvmd::net::DEFAULT_BEP_PORT));
+    let probe = net::probe_bep(
+        listener,
+        &crate::auth::control_socket_path(global.minimal_dir.as_deref()),
+    )
+    .await;
+    net::add_bep_probe(w, &probe).await
 }
 
 /// The `min dirs` table, captured as `host/dirs.txt`.

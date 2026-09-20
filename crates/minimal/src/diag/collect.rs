@@ -255,6 +255,129 @@ pub async fn state(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow
     .await
 }
 
+// ── bep/ ─────────────────────────────────────────────────────────────────────
+
+/// Bundle path of the box egress proxy's audit tail.
+const BEP_AUDIT_DEST: &str = "bep/audit.log";
+
+/// Bundle path of the proxy's box attachments, redacted.
+const BEP_BOXES_DEST: &str = "bep/boxes.json.redacted";
+
+/// The box egress proxy's own directory: the tail of the audit log, the box
+/// attachments it attributes connections with, and what else the directory
+/// holds.
+///
+/// The audit tail ships verbatim under the same `--log-tail-bytes` cap every
+/// other log gets. A record is built from the decision the proxy made, never
+/// from a request's bytes, so it carries a member *identifier*
+/// (`github:user-token`) and no credential at all (BEP-039, BEP-040): masking
+/// that identifier would hide the one field that says which member a decision
+/// was made for while protecting nothing. The tail is the useful end — the
+/// decisions around an incident are the last ones appended.
+///
+/// The attachments file is the user's own box names, source addresses and
+/// declared egress hosts, so it goes through the key-based redaction pass the
+/// rest of the structured config gets: nothing in it is secret-shaped today,
+/// and a field a later slice adds (a store reference among them) is masked
+/// without this collector being revisited.
+///
+/// Runs whatever `--no-guest` says, like every other host collector: the proxy
+/// is a host process beside the switch, the reads below are of host files, and
+/// [`crate::diag::net::probe_bep`]'s two `connect()`s contact no provider's
+/// daemon and no guest.
+pub async fn bep(
+    w: &mut BundleWriter,
+    paths: &DiagPaths,
+    tail_bytes: u64,
+) -> Result<(), anyhow::Error> {
+    let dir = paths.state.join(minvmd::net::BEP_DIR);
+    // Absence and inaccessibility are different facts here too: only a real
+    // NotFound licenses "no proxy has run here".
+    match tokio::fs::metadata(&dir).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            w.skip(
+                "bep/",
+                "no proxy directory — no box egress proxy has run on this host",
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            w.skip("bep/", format!("unreadable: {e}"));
+            return Ok(());
+        }
+        Ok(_) => {}
+    }
+
+    // What the directory holds, names and sizes only. Segment rotation lands
+    // later, so a reader learns from here how many segments exist beside the
+    // one live log the tail above comes from.
+    let listing_dir = dir.clone();
+    let listing = tokio::task::spawn_blocking(move || {
+        diagnostics::listing(&listing_dir, LISTING_MAX_ENTRIES)
+    })
+    .await
+    .context("bep listing worker")?;
+    match listing {
+        Ok(listing) => {
+            w.add_bytes(
+                "bep/dir-listing.txt",
+                listing.text.as_bytes(),
+                Redaction::ListingOnly,
+            )
+            .await?
+        }
+        Err(e) => w.skip("bep/dir-listing.txt", format!("unreadable: {e:#}")),
+    }
+
+    let audit = dir.join(minvmd::net::BEP_AUDIT_LOG_FILE);
+    match w.add_file_tail(BEP_AUDIT_DEST, &audit, tail_bytes).await {
+        Ok(()) => {}
+        Err(e) if is_not_found(&e) => w.skip(
+            BEP_AUDIT_DEST,
+            "absent — the proxy has appended no record on this host",
+        ),
+        Err(e) => w.skip(BEP_AUDIT_DEST, format!("unreadable: {e:#}")),
+    }
+
+    // No-follow like every other content read: the attachments file ships as
+    // data, so a symlink planted here would steer an unrelated host file into
+    // a bundle meant for sharing.
+    let boxes = dir.join(minvmd::net::BEP_BOXES_FILE);
+    match read_string_nofollow(&boxes).await {
+        Ok(content) => match serde_json_lenient::from_str::<serde_json_lenient::Value>(&content) {
+            Ok(mut value) => {
+                diagnostics::redact::redact_json(&mut value);
+                let json = serde_json_lenient::to_vec_pretty(&value)
+                    .context("serializing box attachments")?;
+                w.add_bytes(BEP_BOXES_DEST, &json, Redaction::Keys).await?;
+            }
+            // Withheld rather than shipped raw: a file this collector could
+            // not parse is a file it could not redact.
+            Err(e) => w.skip(BEP_BOXES_DEST, format!("unparseable: {e}")),
+        },
+        Err(e) if is_not_found(&e) => w.skip(BEP_BOXES_DEST, "absent"),
+        Err(e) => w.skip(BEP_BOXES_DEST, format!("unreadable: {e:#}")),
+    }
+
+    // The two paths in here that are never collected as files. Neither is
+    // plain absence: the socket's reachability is a probe, and the proxy's own
+    // records reach the bundle by the route named below.
+    w.skip(
+        crate::auth::CONTROL_SOCKET,
+        format!(
+            "a unix socket, not a file — whether it answers is in {}",
+            crate::diag::net::BEP_PROBE_DEST
+        ),
+    );
+    w.skip(
+        "bep/proxy.log",
+        "the proxy writes no log file of its own: it inherits the stderr of the minvmd \
+         that supervises it, so its records are in providers/<name>/run.log (see \
+         logs/PROVENANCE.txt)",
+    );
+    Ok(())
+}
+
 // ── logs/ ────────────────────────────────────────────────────────────────────
 
 /// How many rotated files per log prefix make it into the bundle.
@@ -515,6 +638,25 @@ providers/<name>/guest/volume-logs/*
   source     the same on-volume appender, read straight off the ext4 image by
              the degraded-mode harvest when the daemon could not be reached
   lacks      the same as above, and may be torn mid-write
+
+bep/audit.log
+  source     the box egress proxy's own append-only audit log: one
+             hash-chained JSON line per decision and per identity event the
+             control socket submitted
+  retention  never rotated in this slice; the tail here is the last
+             --log-tail-bytes of the one live segment
+  format     JSON lines
+  holds      every request the proxy decided, by box, upstream authority,
+             member identifier, mapping, decision and marker
+  lacks      any credential, injected header value or request body — a record
+             is built from the decision, never from the request's bytes
+
+the box egress proxy's own tracing output
+  source     the proxy writes no log file: its stderr is the stderr of the
+             minvmd that supervises it, so its records are in
+             providers/<name>/run.log, not under bep/
+  lacks      nothing of the proxy's own output, but the file is truncated per
+             boot like the rest of that supervisor log
 
 An absent minimald.log* under logs/ is a fact about this host's state
 directory, not about the daemon: where minimald runs inside the microVM it
@@ -956,5 +1098,211 @@ mod tests {
                 "provenance note lacks {expected:?}"
             );
         }
+    }
+
+    /// A token-shaped value — the thing that must never reach a bundle —
+    /// planted in the proxy's attachments file under a sensitive key.
+    const PLANTED_TOKEN: &str = "ghu_plaintexttokenmustnotleak0000000";
+
+    /// Lays a proxy directory down under `state` the way a run of the proxy
+    /// leaves one: `records` real audit records written through the proxy's own
+    /// [`bep::Log`], so the chain and the line format are the writer's and not
+    /// this test's, and an attachments file carrying one planted token.
+    ///
+    /// Returns each record's marker, oldest first.
+    fn seed_bep_dir(state: &Path, records: usize) -> Vec<String> {
+        let dir = state.join(minvmd::net::BEP_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut log = bep::Log::open(dir.join(minvmd::net::BEP_AUDIT_LOG_FILE)).unwrap();
+        let markers: Vec<String> = (0..records).map(|i| format!("decision-{i}")).collect();
+        for marker in &markers {
+            log.append(&bep::Event {
+                kind: bep::Kind::Decision,
+                box_id: "e2e-box".to_owned(),
+                authority: "api.github.com".to_owned(),
+                credential: Some("github:user-token".to_owned()),
+                mapping: bep::Mapping::Unmapped,
+                decision: bep::audit::Decision::Admit,
+                marker: Some(marker.clone()),
+            })
+            .unwrap();
+        }
+        std::fs::write(
+            dir.join(minvmd::net::BEP_BOXES_FILE),
+            format!(
+                r#"[{{"source": "192.168.127.3", "box": "e2e-box", "addressing": "own_ip",
+                     "egress": ["github.com"], "token": "{PLANTED_TOKEN}"}}]"#
+            ),
+        )
+        .unwrap();
+        markers
+    }
+
+    /// Runs the proxy collector over `state` with `tail_bytes` and returns the
+    /// written bundle's files.
+    async fn collect_bep(state: &Path, tail_bytes: u64) -> BTreeMap<String, Vec<u8>> {
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+        bep(&mut w, &paths(state), tail_bytes).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        unpack(&out, "r").await
+    }
+
+    /// The bundle carries the proxy's audit trail — as its *tail*, the end an
+    /// incident is at — plus the box attachments that say which box each
+    /// record's source address was, and carries no credential while doing it.
+    ///
+    /// Without this a report about a box whose `git` or `gh` failed arrives
+    /// with the host's state and none of the proxy's decisions, and the one
+    /// question a reader has (was the request admitted, refused, or never
+    /// made?) is answerable only by asking the reporter to run another command.
+    #[tokio::test]
+    async fn bug_bundle_carries_proxy_audit_tail() {
+        let state = tempfile::TempDir::new().unwrap();
+        let markers = seed_bep_dir(state.path(), 40);
+        let (oldest, newest) = (markers.first().unwrap(), markers.last().unwrap());
+        let full = std::fs::metadata(
+            state
+                .path()
+                .join(minvmd::net::BEP_DIR)
+                .join(minvmd::net::BEP_AUDIT_LOG_FILE),
+        )
+        .unwrap()
+        .len();
+
+        // Under a cap the log outgrows, the newest records survive and the
+        // oldest are the ones dropped: a tail, not a head.
+        let files = collect_bep(state.path(), full / 4).await;
+        let tail = String::from_utf8(files[BEP_AUDIT_DEST].clone()).unwrap();
+        assert!(
+            tail.contains(newest),
+            "the newest record must be in the tail: {tail}"
+        );
+        assert!(
+            !tail.contains(oldest),
+            "a capped tail must drop the oldest records, not the newest: {tail}"
+        );
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let entry = manifest["collected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["path"] == BEP_AUDIT_DEST)
+            .unwrap_or_else(|| panic!("no collected entry for {BEP_AUDIT_DEST}"));
+        assert_eq!(
+            entry["redaction"], "tail-capped",
+            "a capped tail must say so, so a short log is not read as a short trail"
+        );
+
+        // With a cap the log fits under, every record is there.
+        let files = collect_bep(state.path(), diagnostics::LOG_TAIL_CAP).await;
+        let tail = String::from_utf8(files[BEP_AUDIT_DEST].clone()).unwrap();
+        for marker in &markers {
+            assert!(tail.contains(marker), "record {marker} is missing: {tail}");
+        }
+        assert_eq!(
+            tail.lines().count(),
+            markers.len(),
+            "the trail is one line per record"
+        );
+
+        // The attachments are there, and the redaction pass ran: the planted
+        // token is masked while the box's own identity survives.
+        let boxes = String::from_utf8(files[BEP_BOXES_DEST].clone()).unwrap();
+        assert!(
+            boxes.contains("e2e-box") && boxes.contains("github.com"),
+            "{boxes}"
+        );
+        assert!(
+            !boxes.contains(PLANTED_TOKEN),
+            "the attachments file was shipped unredacted: {boxes}"
+        );
+
+        // Nothing anywhere in the bundle holds the planted token — the
+        // invariant the whole slice rests on, asserted over the archive rather
+        // than over the one entry known to have carried it.
+        for (path, bytes) in &files {
+            assert!(
+                !String::from_utf8_lossy(bytes).contains(PLANTED_TOKEN),
+                "{path} carries a plaintext credential"
+            );
+        }
+
+        // The directory listing, and the two paths that are never files: each
+        // explained rather than silently absent, the proxy's own log by naming
+        // where it actually is.
+        assert!(files.contains_key("bep/dir-listing.txt"));
+        let skipped: BTreeMap<String, String> = manifest["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    s["what"].as_str().unwrap().to_owned(),
+                    s["reason"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert!(
+            skipped[crate::auth::CONTROL_SOCKET].contains(crate::diag::net::BEP_PROBE_DEST),
+            "the control socket's skip must point at the probe: {skipped:?}"
+        );
+        assert!(
+            skipped["bep/proxy.log"].contains("providers/<name>/run.log"),
+            "the proxy's own log must be located, not merely missed: {skipped:?}"
+        );
+    }
+
+    /// A host that has never run the proxy is the ordinary case, and it must
+    /// read as absence rather than as a broken collector.
+    #[tokio::test]
+    async fn a_host_with_no_proxy_directory_records_absence() {
+        let state = tempfile::TempDir::new().unwrap();
+        let files = collect_bep(state.path(), diagnostics::LOG_TAIL_CAP).await;
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let reason = manifest["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["what"] == "bep/")
+            .unwrap_or_else(|| panic!("no skip for bep/: {manifest}"))["reason"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(reason.contains("no box egress proxy has run"), "{reason}");
+        assert!(manifest["errors"].as_array().unwrap().is_empty());
+    }
+
+    /// A proxy directory whose audit log has not been created yet — the proxy
+    /// is up and has decided nothing — must not read as "no proxy here".
+    #[tokio::test]
+    async fn an_empty_proxy_directory_explains_the_missing_audit_log() {
+        let state = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(state.path().join(minvmd::net::BEP_DIR)).unwrap();
+        let files = collect_bep(state.path(), diagnostics::LOG_TAIL_CAP).await;
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let skipped: BTreeMap<String, String> = manifest["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    s["what"].as_str().unwrap().to_owned(),
+                    s["reason"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert!(skipped[BEP_AUDIT_DEST].contains("no record"), "{skipped:?}");
+        assert!(
+            !skipped.contains_key("bep/"),
+            "the directory is there: {skipped:?}"
+        );
+        assert!(files.contains_key("bep/dir-listing.txt"));
     }
 }

@@ -1,16 +1,19 @@
-//! The staged daemon-socket probe for `min bug`.
+//! The staged socket probes for `min bug`.
 //!
 //! The network *mechanics* — listening tables, interfaces, routes — live in
 //! [`diagnostics::net`] and are collected for the host as a whole. What lives
-//! here is the one network question only the CLI can ask: can this machine
-//! actually reach the daemon behind `providers/<name>/ssh.sock`, and if not,
-//! at which step does contact break?
+//! here are the reachability questions only the CLI can ask: can this machine
+//! actually reach the daemon behind `providers/<name>/ssh.sock`, and if not, at
+//! which step does contact break ([`probe_socket`]); and do the box egress
+//! proxy's redemption listener and control socket answer ([`probe_bep`])?
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use serde::Serialize;
+use tokio::net::TcpStream;
 
 use diagnostics::{BundleWriter, Redaction};
 
@@ -178,6 +181,93 @@ pub async fn add_probe(
     .await
 }
 
+/// Bundle path of the box egress proxy's socket probe.
+pub const BEP_PROBE_DEST: &str = "bep/probe.json";
+
+/// Deadline for one probe `connect()` at the proxy. Loopback either refuses at
+/// once or connects; this only bounds a filtered or half-open port.
+const BEP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether the box egress proxy's two sockets answer.
+///
+/// The redemption listener is the one a steered box's `HTTPS_PROXY` names, so
+/// a proxy that is not listening turns every credentialed request inside every
+/// box into a connection refused — a failure whose symptom (git and gh failing
+/// in the box) says nothing about its cause. The control socket is the other
+/// half: the client submits its mints and revocations over it, and a socket
+/// that does not answer means the audit log has no record of a value the box
+/// is nonetheless using.
+///
+/// Both stages are a bare `connect()` followed by a close. Nothing is written,
+/// so the probe cannot append to the log it is diagnosing.
+#[derive(Debug, Serialize)]
+pub struct BepProbe {
+    /// The redemption listener's address, as a steered box reaches it.
+    listener: String,
+    /// One `connect()` to the redemption listener.
+    listener_connect: Stage,
+    control_socket_path: String,
+    /// `stat()` the control socket file.
+    control_stat: Stage,
+    /// One `connect()` to the control socket; nothing is submitted over it.
+    control_connect: Stage,
+}
+
+/// Probes the proxy's redemption listener and control socket, never failing —
+/// every outcome is data.
+pub async fn probe_bep(listener: SocketAddr, control_socket: &Path) -> BepProbe {
+    let mut probe = BepProbe {
+        listener: listener.to_string(),
+        listener_connect: Stage::skipped(),
+        control_socket_path: control_socket.display().to_string(),
+        control_stat: Stage::skipped(),
+        control_connect: Stage::skipped(),
+    };
+
+    let t = Instant::now();
+    probe.listener_connect = Stage::run(
+        t,
+        match tokio::time::timeout(BEP_CONNECT_TIMEOUT, TcpStream::connect(listener)).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!("timed out after {BEP_CONNECT_TIMEOUT:?}")),
+        },
+    );
+
+    let t = Instant::now();
+    probe.control_stat = Stage::run(
+        t,
+        tokio::fs::metadata(control_socket)
+            .await
+            .map(drop)
+            .map_err(|e| e.to_string()),
+    );
+    if !probe.control_stat.is_ok() {
+        return probe;
+    }
+    let t = Instant::now();
+    probe.control_connect = Stage::run(
+        t,
+        match tokio::time::timeout(
+            BEP_CONNECT_TIMEOUT,
+            tokio::net::UnixStream::connect(control_socket),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!("timed out after {BEP_CONNECT_TIMEOUT:?}")),
+        },
+    );
+    probe
+}
+
+/// Records `probe` as [`BEP_PROBE_DEST`].
+pub async fn add_bep_probe(w: &mut BundleWriter, probe: &BepProbe) -> Result<(), anyhow::Error> {
+    let json = serde_json_lenient::to_vec_pretty(probe).context("serializing bep probe")?;
+    w.add_bytes(BEP_PROBE_DEST, &json, Redaction::None).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +314,75 @@ mod tests {
             probe.handshake.outcome
         );
         assert!(client.is_none());
+    }
+
+    /// A live proxy: both sockets answer, and the record says so. The bare
+    /// `connect()` is the whole probe — an accepted-and-closed connection is
+    /// all it claims, and it submits nothing to the control socket.
+    #[tokio::test]
+    async fn bep_probe_reports_both_sockets_answering() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let control = tmp.path().join("control.sock");
+        let _control = tokio::net::UnixListener::bind(&control).unwrap();
+
+        let probe = probe_bep(addr, &control).await;
+        assert!(
+            probe.listener_connect.is_ok(),
+            "got: {}",
+            probe.listener_connect.outcome
+        );
+        assert!(probe.control_stat.is_ok());
+        assert!(
+            probe.control_connect.is_ok(),
+            "got: {}",
+            probe.control_connect.outcome
+        );
+    }
+
+    /// The failure this probe exists for: nothing is listening on the port
+    /// every steered box's `HTTPS_PROXY` names, and the control socket is not
+    /// even there. Each half is reported independently — a dead listener must
+    /// not stop the socket from being probed, because "no proxy at all" and
+    /// "proxy up, control socket gone" are different faults.
+    #[tokio::test]
+    async fn bep_probe_reports_a_dead_listener_and_a_missing_control_socket() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A port that was bound and released: nothing is listening on it now.
+        let addr = {
+            let released = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            released.local_addr().unwrap()
+        };
+
+        let probe = probe_bep(addr, &tmp.path().join("nope.sock")).await;
+        assert!(
+            !probe.listener_connect.is_ok(),
+            "a released port must not read as a live listener"
+        );
+        assert!(!probe.control_stat.is_ok());
+        assert!(
+            probe.control_connect.outcome.starts_with("skipped"),
+            "got: {}",
+            probe.control_connect.outcome
+        );
+    }
+
+    /// A control socket file left behind by a dead proxy is the stale-socket
+    /// class: it stats but does not connect, and saying so is the diagnosis.
+    #[tokio::test]
+    async fn bep_probe_reports_a_stale_control_socket_at_the_connect_stage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let control = tmp.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&control).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let probe = probe_bep(listener.local_addr().unwrap(), &control).await;
+        assert!(probe.control_stat.is_ok());
+        assert!(
+            !probe.control_connect.is_ok(),
+            "got: {}",
+            probe.control_connect.outcome
+        );
     }
 }

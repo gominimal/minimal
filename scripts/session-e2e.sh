@@ -556,12 +556,91 @@ bep_in_box() {
   fi
 }
 
+# The proof body BEP-015 and the first-slice case share: with the box live,
+# assert it starts from no tool configuration, then drive `gh api`, `git
+# clone` and `git push` against a private repository of the signed-in
+# account. Every request rides the sealed value in GITHUB_TOKEN through the
+# proxy the box's HTTPS_PROXY points at; the proxy substitutes the real
+# credential and forwards on its own validated leg, so nothing in the box ever
+# holds a GitHub token. Leaves the account as it found it — the throwaway
+# branch is deleted on both paths.
+bep_prove_github_from_box() {
+  # The box starts from no tool configuration: no git config, no stored
+  # credentials, no gh host file. A marker distinguishes "nothing is there"
+  # from an exec that did not run at all.
+  local cfg_probe
+  # shellcheck disable=SC2016 # $HOME/$f must expand in the BOX, not here.
+  cfg_probe="$(mnl session exec "$BEP_SID" \
+    'for f in "$HOME/.gitconfig" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml"; do [ -e "$f" ] && { echo "CARRIES $f"; exit 0; }; done; echo CLEAN' \
+    2>"$WORK/bep-cfg.err")" || {
+    echo "::error::probing the box for tool configuration failed"
+    echo "--- stderr ---"; cat "$WORK/bep-cfg.err" 2>/dev/null || true
+    fail
+  }
+  if ! printf '%s\n' "$cfg_probe" | grep -q '^CLEAN$'; then
+    echo "::error::the box carries tool configuration the proof must start without"
+    printf '%s\n' "$cfg_probe"
+    fail
+  fi
+
+  # `gh api`: the account the held sign-in is for. gh sends the sealed value
+  # it finds in GITHUB_TOKEN and the proxy decides on it.
+  bep_in_box "gh api user" 'gh api user --jq .login'
+  local login
+  login="$(tail -n1 "$WORK/bep-github.out" | tr -d '\r')"
+  if [ -z "$login" ]; then
+    echo "::error::gh api user returned no login"
+    cat "$WORK/bep-github.out" 2>/dev/null || true
+    fail
+  fi
+  echo "gh api user OK ($login)"
+
+  # A private repository of that account for the clone and push proofs.
+  bep_in_box "gh api user/repos" \
+    'gh api "user/repos?visibility=private&affiliation=owner&per_page=1" --jq ".[0].full_name"'
+  local repo
+  repo="$(tail -n1 "$WORK/bep-github.out" | tr -d '\r')"
+  if [ -z "$repo" ] || [ "$repo" = null ]; then
+    echo "::error::the signed-in account ($login) owns no private repository, so the clone and push proof has no target"
+    fail
+  fi
+
+  # `git clone`: the sealed value rides as the Basic password, the idiom that
+  # needs no credential helper. GIT_TERMINAL_PROMPT=0 turns a refusal into an
+  # error instead of a prompt that would hang the lane.
+  bep_in_box "git clone of the private repo $repo" \
+    "set -e; export GIT_TERMINAL_PROMPT=0; rm -rf \"\$HOME/bep-proof\"; git clone -q --depth 1 \"https://x-access-token:\$GITHUB_TOKEN@github.com/$repo.git\" \"\$HOME/bep-proof\"; git -C \"\$HOME/bep-proof\" rev-parse HEAD"
+  if ! grep -qE '^[0-9a-f]{40}$' "$WORK/bep-github.out"; then
+    echo "::error::the clone of $repo produced no commit"
+    cat "$WORK/bep-github.out" 2>/dev/null || true
+    fail
+  fi
+  echo "git clone of the private repo $repo OK"
+
+  # `git push`: an empty commit on a throwaway branch, pushed and then
+  # deleted, so the proof leaves the account as it found it. `-c user.*` is
+  # commit metadata on the command line, not configuration left in the box.
+  local branch="minimal-e2e-bep-$$"
+  local push_line
+  push_line="set -e; export GIT_TERMINAL_PROMPT=0; cd \"\$HOME/bep-proof\"; git -c user.name=minimal-e2e -c user.email=e2e@minimal.invalid commit -q --allow-empty -m 'e2e: bep proxy proof'; git push -q origin \"HEAD:refs/heads/$branch\"; git push -q origin --delete \"$branch\""
+  if ! mnl session exec "$BEP_SID" "$push_line" \
+      >"$WORK/bep-push.out" 2>"$WORK/bep-push.err"; then
+    echo "::error::git push against $repo failed in the box"
+    echo "--- stdout ---"; cat "$WORK/bep-push.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/bep-push.err" 2>/dev/null || true
+    # Never leave the throwaway branch behind on the account.
+    mnl session exec "$BEP_SID" \
+      "cd \"\$HOME/bep-proof\" && git push -q origin --delete \"$branch\"" \
+      >/dev/null 2>&1 || true
+    fail
+  fi
+  echo "git push and delete of $branch on $repo OK"
+  echo "git clone, git push and gh api against a private repo from a box with no tool configuration OK"
+}
+
 # BEP-015: with the proxy running beside gvproxy, `git clone`, `git push` and
 # `gh api` against a private repository of the signed-in account succeed from a
-# box that was given no tool configuration. Every request rides the sealed value
-# in GITHUB_TOKEN through the proxy the box's HTTPS_PROXY points at; the proxy
-# substitutes the real credential and forwards on its own validated leg, so
-# nothing in the box ever holds a GitHub token.
+# box that was given no tool configuration.
 #
 # Which half runs depends on the sign-in held on THIS host, as in the cases
 # above: with none (every CI lane) the refusal half is proved — exit 3,
@@ -572,78 +651,193 @@ case_bep_git_and_gh_against_private_repo() {
   echo "::group::bep: git and gh reach a private repository from a box"
   bep_seed_github_box
   if bep_activate_steered_box e2e-bep-github; then
-    # The box starts from no tool configuration: no git config, no stored
-    # credentials, no gh host file. A marker distinguishes "nothing is there"
-    # from an exec that did not run at all.
-    local cfg_probe
-    # shellcheck disable=SC2016 # $HOME/$f must expand in the BOX, not here.
-    cfg_probe="$(mnl session exec "$BEP_SID" \
-      'for f in "$HOME/.gitconfig" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml"; do [ -e "$f" ] && { echo "CARRIES $f"; exit 0; }; done; echo CLEAN' \
-      2>"$WORK/bep-cfg.err")" || {
-      echo "::error::probing the box for tool configuration failed"
-      echo "--- stderr ---"; cat "$WORK/bep-cfg.err" 2>/dev/null || true
+    bep_prove_github_from_box
+  fi
+  bep_teardown_steered_box
+  echo "::endgroup::"
+}
+
+# Every shape a GitHub credential takes in the clear: the five token prefixes
+# GitHub issues (gho_ ghp_ ghr_ ghs_ ghu_) followed by its body. The sealed
+# value a box carries is `minsealed1.<...>` and matches none of them, which is
+# what makes this a usable sweep rather than a tautology.
+BEP_TOKEN_RE='gh[oprsu]_[A-Za-z0-9]{8,}'
+
+# The demo box of the first slice: the git/gh box plus `github:user-token` in
+# its declared scopes — the honest spelling of the `full` member an un-enrolled
+# host mints — so the spec review renders the `full` marker over a grant that
+# declared something rather than over one that declared nothing (BEP-038).
+bep_seed_first_slice_box() {
+  bep_seed_github_box
+  printf 'scopes = ["github:user-token"]\n' >>"$BEP_SEED_DIR/minimal.toml"
+}
+
+# Unpacks the .tar.zst bundle $1 into the fresh directory $2 with whichever
+# decompressor this host has, echoing the bundle root on success. Returns 1 when
+# the host has neither tar --zstd nor zstd, so the caller can say the sweep was
+# not exercised instead of failing on a missing tool.
+bep_unpack_bundle() {
+  local bundle="$1" dest="$2" manifest
+  mkdir -p "$dest"
+  tar --zstd -xf "$bundle" -C "$dest" 2>/dev/null \
+    || { command -v zstd >/dev/null 2>&1 \
+         && zstd -dc "$bundle" 2>/dev/null | tar -xf - -C "$dest" 2>/dev/null; } \
+    || return 1
+  manifest="$(find "$dest" -maxdepth 2 -name manifest.json 2>/dev/null | head -n1)"
+  [ -n "$manifest" ] || return 1
+  dirname "$manifest"
+}
+
+# The first slice, end to end (BEP-015, BEP-038, BEP-042) with the sweep the
+# whole slice rests on: no plaintext GitHub credential in the box, in the
+# proxy's own trail, or in a support bundle taken from this host.
+#
+# What runs on every lane: `min box spec` — which renders the review even when
+# it refuses the spec — shows this host's interception root, the resolved
+# `proxy_env` steering, the `full` marker for the declared `github:user-token`
+# and the GitHub v1 upstream host set; and `min bug` writes a bundle that
+# carries the proxy's socket probe, accounts for the audit trail, and holds no
+# token shape anywhere in it.
+#
+# What the held half adds, as in the cases above: the box itself — the sealed
+# value in GITHUB_TOKEN and no plaintext beside it, `git clone`, `git push` and
+# `gh api` against a private repository from a box given no tool configuration,
+# and `min box audit` reading the proxy's own records back for that box. With no
+# sign-in held (every CI lane) the refusal half is proved instead: exit 3 from
+# both the spec review and the activation, naming `github_sign_in_required`.
+case_bep_first_slice_no_plaintext_anywhere() {
+  echo "::group::bep: the first slice end to end, with no plaintext anywhere"
+  bep_seed_first_slice_box
+
+  # 1. The review surface. A refused spec still renders it, so this half runs
+  #    whatever sign-in the host holds; `spec_rc` carries which it was.
+  local spec_rc=0 want
+  (cd "$BEP_SEED_DIR" && mnl box spec .) \
+    >"$WORK/bep-spec.out" 2>"$WORK/bep-spec.err" || spec_rc=$?
+  for want in \
+      "interception root:" \
+      "steering: proxy_env" \
+      "declared github:user-token" \
+      "minted full" \
+      "upstreams: github.com, api.github.com, uploads.github.com, codeload.github.com"; do
+    if ! grep -qF -- "$want" "$WORK/bep-spec.out"; then
+      echo "::error::min box spec does not show '$want'"
+      echo "--- stdout ---"; cat "$WORK/bep-spec.out" 2>/dev/null || true
+      echo "--- stderr ---"; cat "$WORK/bep-spec.err" 2>/dev/null || true
+      fail
+    fi
+  done
+  if grep -qE "$BEP_TOKEN_RE" "$WORK/bep-spec.out" "$WORK/bep-spec.err"; then
+    echo "::error::min box spec printed something token-shaped"
+    fail
+  fi
+  echo "min box spec shows the root, proxy_env steering, the full marker and the v1 upstream set OK"
+
+  # 2. The box, when this host holds a sign-in.
+  if bep_activate_steered_box e2e-bep-slice; then
+    if [ "$spec_rc" != 0 ]; then
+      echo "::error::min box spec exited $spec_rc for a spec this host went on to honour"
+      echo "--- stderr ---"; cat "$WORK/bep-spec.err" 2>/dev/null || true
+      fail
+    fi
+    if ! grep -qF "HTTPS_PROXY=http://127.0.0.1:7655" "$WORK/bep-spec.out"; then
+      echo "::error::the admitted spec does not render the proxy environment the box is created with"
+      cat "$WORK/bep-spec.out" 2>/dev/null || true
+      fail
+    fi
+
+    # The delivered value is sealed, and nothing beside it is a token.
+    local value
+    value="$(mnl session exec "$BEP_SID" 'printenv GITHUB_TOKEN' 2>"$WORK/bep-slice.err")" || {
+      echo "::error::GITHUB_TOKEN is not set in the box"
+      echo "--- stderr ---"; cat "$WORK/bep-slice.err" 2>/dev/null || true
       fail
     }
-    if ! printf '%s\n' "$cfg_probe" | grep -q '^CLEAN$'; then
-      echo "::error::the box carries tool configuration the proof must start without"
-      printf '%s\n' "$cfg_probe"
+    case "$value" in
+      minsealed1.*) ;;
+      *) echo "::error::GITHUB_TOKEN does not hold a sealed value (no minsealed1. prefix)"; fail ;;
+    esac
+    if mnl session exec "$BEP_SID" 'env' 2>/dev/null | grep -qE "$BEP_TOKEN_RE"; then
+      echo "::error::a plaintext GitHub token is present in the box environment"
       fail
     fi
 
-    # `gh api`: the account the held sign-in is for. gh sends the sealed value
-    # it finds in GITHUB_TOKEN and the proxy decides on it.
-    bep_in_box "gh api user" 'gh api user --jq .login'
-    local login
-    login="$(tail -n1 "$WORK/bep-github.out" | tr -d '\r')"
-    if [ -z "$login" ]; then
-      echo "::error::gh api user returned no login"
-      cat "$WORK/bep-github.out" 2>/dev/null || true
-      fail
-    fi
-    echo "gh api user OK ($login)"
+    # The slice's own work: clone, push and the API call, through the proxy.
+    bep_prove_github_from_box
 
-    # A private repository of that account for the clone and push proofs.
-    bep_in_box "gh api user/repos" \
-      'gh api "user/repos?visibility=private&affiliation=owner&per_page=1" --jq ".[0].full_name"'
-    local repo
-    repo="$(tail -n1 "$WORK/bep-github.out" | tr -d '\r')"
-    if [ -z "$repo" ] || [ "$repo" = null ]; then
-      echo "::error::the signed-in account ($login) owns no private repository, so the clone and push proof has no target"
+    # The trail the proxy alone writes, read back for this box and no other.
+    # An empty trail is not a failure yet: nothing writes the proxy's box
+    # attachments until the own-IP attachment slice does, so a decision can be
+    # made for a box the proxy could not attribute.
+    if ! mnl box audit e2e-bep-slice -o jsonl \
+        >"$WORK/bep-audit.jsonl" 2>"$WORK/bep-audit.err"; then
+      echo "::error::min box audit could not read the box's trail"
+      echo "--- stderr ---"; cat "$WORK/bep-audit.err" 2>/dev/null || true
       fail
     fi
-
-    # `git clone`: the sealed value rides as the Basic password, the idiom that
-    # needs no credential helper. GIT_TERMINAL_PROMPT=0 turns a refusal into an
-    # error instead of a prompt that would hang the lane.
-    bep_in_box "git clone of the private repo $repo" \
-      "set -e; export GIT_TERMINAL_PROMPT=0; rm -rf \"\$HOME/bep-proof\"; git clone -q --depth 1 \"https://x-access-token:\$GITHUB_TOKEN@github.com/$repo.git\" \"\$HOME/bep-proof\"; git -C \"\$HOME/bep-proof\" rev-parse HEAD"
-    if ! grep -qE '^[0-9a-f]{40}$' "$WORK/bep-github.out"; then
-      echo "::error::the clone of $repo produced no commit"
-      cat "$WORK/bep-github.out" 2>/dev/null || true
+    if grep -qE "$BEP_TOKEN_RE" "$WORK/bep-audit.jsonl"; then
+      echo "::error::the audit trail carries a plaintext GitHub token"
       fail
     fi
-    echo "git clone of the private repo $repo OK"
-
-    # `git push`: an empty commit on a throwaway branch, pushed and then
-    # deleted, so the proof leaves the account as it found it. `-c user.*` is
-    # commit metadata on the command line, not configuration left in the box.
-    local branch="minimal-e2e-bep-$$"
-    local push_line
-    push_line="set -e; export GIT_TERMINAL_PROMPT=0; cd \"\$HOME/bep-proof\"; git -c user.name=minimal-e2e -c user.email=e2e@minimal.invalid commit -q --allow-empty -m 'e2e: bep proxy proof'; git push -q origin \"HEAD:refs/heads/$branch\"; git push -q origin --delete \"$branch\""
-    if ! mnl session exec "$BEP_SID" "$push_line" \
-        >"$WORK/bep-push.out" 2>"$WORK/bep-push.err"; then
-      echo "::error::git push against $repo failed in the box"
-      echo "--- stdout ---"; cat "$WORK/bep-push.out" 2>/dev/null || true
-      echo "--- stderr ---"; cat "$WORK/bep-push.err" 2>/dev/null || true
-      # Never leave the throwaway branch behind on the account.
-      mnl session exec "$BEP_SID" \
-        "cd \"\$HOME/bep-proof\" && git push -q origin --delete \"$branch\"" \
-        >/dev/null 2>&1 || true
+    if [ -s "$WORK/bep-audit.jsonl" ]; then
+      echo "min box audit read $(wc -l <"$WORK/bep-audit.jsonl" | tr -d ' ') record(s) for the box, none carrying a credential OK"
+    else
+      echo "the proxy recorded nothing for this box (no attachment is written for it yet)"
+    fi
+  else
+    if [ "$spec_rc" != 3 ]; then
+      echo "::error::min box spec exited $spec_rc, not 3, for a spec this host refuses"
+      echo "--- stderr ---"; cat "$WORK/bep-spec.err" 2>/dev/null || true
       fail
     fi
-    echo "git push and delete of $branch on $repo OK"
-    echo "git clone, git push and gh api against a private repo from a box with no tool configuration OK"
+    if ! grep -q "github_sign_in_required" "$WORK/bep-spec.err"; then
+      echo "::error::min box spec's refusal does not name github_sign_in_required"
+      cat "$WORK/bep-spec.err" 2>/dev/null || true
+      fail
+    fi
+    echo "min box spec refuses the spec with exit 3 and github_sign_in_required OK"
   fi
+
+  # 3. The support bundle, on every lane: a report about this slice has to carry
+  #    the proxy's side of it, and must never carry a credential.
+  local bundle="$WORK/bep-bundle.tar.zst" root
+  if ! mnl bug --no-guest --output "$bundle" >"$WORK/bep-bug.out" 2>"$WORK/bep-bug.err"; then
+    echo "::error::min bug wrote no bundle"
+    echo "--- stdout ---"; cat "$WORK/bep-bug.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/bep-bug.err" 2>/dev/null || true
+    fail
+  fi
+  if root="$(bep_unpack_bundle "$bundle" "$WORK/bep-bundle")"; then
+    if [ ! -f "$root/bep/probe.json" ]; then
+      echo "::error::the bundle does not carry the proxy's socket probe (bep/probe.json)"
+      find "$root" -maxdepth 2 | head -40
+      fail
+    fi
+    # The trail is either in the bundle or accounted for in the manifest —
+    # never silently missing, which is what teaches a reader to stop looking.
+    if [ -f "$root/bep/audit.log" ]; then
+      if grep -qE "$BEP_TOKEN_RE" "$root/bep/audit.log"; then
+        echo "::error::the bundled audit trail carries a plaintext GitHub token"
+        fail
+      fi
+      echo "the bundle carries the proxy's audit tail, with no credential in it OK"
+    elif grep -q '"bep/' "$root/manifest.json"; then
+      echo "the bundle has no audit trail to carry and the manifest says why OK"
+    else
+      echo "::error::the bundle neither carries bep/audit.log nor explains its absence"
+      cat "$root/manifest.json" 2>/dev/null || true
+      fail
+    fi
+    if grep -rIqE "$BEP_TOKEN_RE" "$root" 2>/dev/null; then
+      echo "::error::a plaintext GitHub token is present in the diagnostic bundle"
+      grep -rIlE "$BEP_TOKEN_RE" "$root" 2>/dev/null | head -10
+      fail
+    fi
+    echo "no plaintext GitHub token anywhere in the diagnostic bundle OK"
+  else
+    echo "::warning::this host has neither tar --zstd nor zstd; the bundle sweep was not exercised"
+  fi
+
   bep_teardown_steered_box
   echo "::endgroup::"
 }
