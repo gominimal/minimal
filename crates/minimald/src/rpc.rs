@@ -1,13 +1,13 @@
 use futures::StreamExt as _;
 use minimald_rpc::{
     AbortSession, AbortSessionResponse, CleanCacheRequest, CleanCacheUpdate, CreateSession,
-    DestroySession, DestroySessionResponse, Errorable, FinalizeSession, FinalizeSessionResponse,
-    GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
-    GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen, GetVersion,
-    GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse, NameSurface,
-    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool,
-    SessionDelta, SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest,
-    ShutdownResponse, SubmitVerdict,
+    DestroySession, DestroySessionResponse, Errorable, Expose, FinalizeSession,
+    FinalizeSessionResponse, GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest,
+    GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen,
+    GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse,
+    NameSurface, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse,
+    ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse, Shutdown,
+    ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -512,6 +512,39 @@ async fn serve_rename_session(
             .await;
             match res {
                 Ok(()) => Ok(Errorable::Ok(RenameSessionResponse)),
+                Err(e) => Ok(Errorable::Err {
+                    error: e.to_string(),
+                }),
+            }
+        })
+        .await
+}
+
+/// `Expose`: `min net expose <port>` on an un-enrolled host, served by the
+/// local daemon (NET-043). The session actor decides the request against
+/// the box's `dynamic_ingress` setting and publishes it under an allow; the
+/// answer carries the decision, typed, and the RPC's own error is reserved
+/// for a session that cannot be found or a record that cannot be written.
+async fn serve_expose(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    Expose
+        .handle_channel(c, async |req| {
+            let res = async {
+                match s
+                    .sessions_manager()
+                    .await
+                    .get_session(SessionKeyPredicate::Id(req.id))
+                    .await?
+                {
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no session with ID `{}`", req.id.as_ref()),
+                    )),
+                    Some(h) => h.expose(req.port, req.proto).await,
+                }
+            }
+            .await;
+            match res {
+                Ok(response) => Ok(Errorable::Ok(response)),
                 Err(e) => Ok(Errorable::Err {
                     error: e.to_string(),
                 }),
@@ -1634,6 +1667,7 @@ pub async fn handle_ssh_rpc(
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
+        | Expose::NAME
         | minimald_rpc::GetSessionHooks::NAME
         | SessionDelta::NAME
         | GetSessionScreen::NAME
@@ -1717,6 +1751,7 @@ pub async fn handle_ssh_rpc(
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
+        Expose::NAME => serve!(serve_expose(s, channel)),
         minimald_rpc::GetSessionHooks::NAME => serve!(serve_get_session_hooks(s, channel)),
         SessionDelta::NAME => serve!(serve_session_delta(s, channel)),
         GetSessionScreen::NAME => serve!(serve_get_session_screen(s, channel)),

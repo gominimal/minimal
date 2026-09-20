@@ -87,7 +87,11 @@ fn build_record(
         username,
         project_path: config.project_path,
         network: config.network,
-        policy: sessions::SessionPolicy::new(effective.policy, config.policy.ingress),
+        policy: sessions::SessionPolicy {
+            egress: effective.policy,
+            ingress: config.policy.ingress,
+            dynamic_ingress: config.policy.dynamic_ingress,
+        },
         status,
         hooks_enabled: config.hooks_enabled,
         attrs: config.attrs,

@@ -506,11 +506,13 @@ mod tests {
                     port: 8080,
                     state: ForwarderState::Direct,
                     origin: PortOrigin::Declared,
+                    admitted: None,
                 },
                 PublishedPort {
                     port: 9090,
                     state: ForwarderState::Direct,
                     origin: PortOrigin::Listened { pid: 4321 },
+                    admitted: None,
                 },
             ],
         );
@@ -561,6 +563,7 @@ mod tests {
                     port: 8080,
                     state: ForwarderState::Direct,
                     origin: PortOrigin::Declared,
+                    admitted: None,
                 }],
                 "a port the rules do not permit stays unpublished (range {range:?})"
             );
@@ -604,11 +607,13 @@ mod tests {
                     port: 8080,
                     state: ForwarderState::Direct,
                     origin: PortOrigin::Declared,
+                    admitted: None,
                 },
                 PublishedPort {
                     port: 9091,
                     state: ForwarderState::Direct,
                     origin: PortOrigin::Listened { pid: 4321 },
+                    admitted: None,
                 },
             ],
         );
@@ -622,6 +627,7 @@ mod tests {
                 port: 8080,
                 state: ForwarderState::Direct,
                 origin: PortOrigin::Declared,
+                admitted: None,
             }],
         );
 

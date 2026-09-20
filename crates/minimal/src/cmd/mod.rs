@@ -71,6 +71,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Net(NetArgs { command })) => match command {
             NetCommand::Forward(args) => net::cmd_net_forward(&cli.global_args, args).await,
             NetCommand::Setup(args) => net::cmd_net_setup(args),
+            NetCommand::Expose(args) => net::cmd_net_expose(&cli.global_args, args).await,
         },
         Some(Command::Task(TaskArgs { command })) => match command {
             TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,

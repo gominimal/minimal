@@ -39,7 +39,8 @@
 //! [withdraws](PublishTable::withdraw_listened) it (NET-017). The
 //! published-port table marks each entry with its [`PortOrigin`], so a
 //! diagnostics bundle says which ports a declaration named and which a
-//! listener published, with the listener's pid.
+//! listener published, with the listener's pid; a port published by
+//! `min net expose` carries the [`DynamicIngress`] decision that admitted it.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -49,7 +50,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use serde::Serialize;
 use sessions::core::loopback_alloc::{LoopbackAllocator, RangeExhausted};
-use sessions::{NetworkMode, SessionId};
+use sessions::{DynamicIngress, IpProto, NetworkMode, SessionId};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
@@ -100,6 +101,23 @@ pub struct DeclaredPort {
     pub answer: PortAnswer,
 }
 
+/// How a port mapped to host port `external_port` is answered at a box
+/// published at a `kind` address: forwarded to the host-side port the switch
+/// publishes for it on an own address over TCP, and answered directly
+/// everywhere else — on a shared address the box's own listeners answer its
+/// port numbers, so binding there would take the port from the box itself,
+/// and a UDP mapping's datagrams are carried by the switch forward rather
+/// than by a connection-oriented forwarder.
+#[must_use]
+pub fn port_answer(kind: AddressKind, proto: IpProto, external_port: u16) -> PortAnswer {
+    match (kind, proto) {
+        (AddressKind::Own, IpProto::Tcp) => {
+            PortAnswer::Forwarded(SocketAddr::from((Ipv4Addr::LOCALHOST, external_port)))
+        }
+        _ => PortAnswer::Direct,
+    }
+}
+
 /// What holds a published port, as the published-port table shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -138,6 +156,10 @@ pub struct PublishedPort {
     pub state: ForwarderState,
     /// Whether a declaration named the port or a listener published it.
     pub origin: PortOrigin,
+    /// The dynamic ingress decision that admitted the port, for one published
+    /// at runtime by `min net expose` (NET-044); `None` for a declared or
+    /// listened port.
+    pub admitted: Option<DynamicIngress>,
 }
 
 /// A declared port whose forwarder could not bind (NET-121). Reported with the
@@ -226,6 +248,7 @@ impl Forwarders {
                     port,
                     state: ForwarderState::Direct,
                     origin: PortOrigin::Declared,
+                    admitted: None,
                 });
                 continue;
             };
@@ -264,9 +287,50 @@ impl Forwarders {
                 port,
                 state: ForwarderState::Bound,
                 origin: PortOrigin::Declared,
+                admitted: None,
             });
         }
         Ok(forwarders)
+    }
+
+    /// Marks every port in the set as admitted by `decision`: what a set bound
+    /// for a `min net expose` request carries into the published-port table,
+    /// so a dynamic entry shows the decision that admitted it.
+    #[must_use]
+    pub fn admitted_by(mut self, decision: DynamicIngress) -> Self {
+        for published in &mut self.ports {
+            published.admitted = Some(decision);
+        }
+        self
+    }
+
+    /// Adds `other`'s forwarders and ports to this set, keeping the ports in
+    /// port order. A port already in the set is left as it was and `other`'s
+    /// forwarder for it is dropped, which unbinds it.
+    fn extend(&mut self, other: Self) {
+        let Self { mut bound, ports } = other;
+        for published in ports {
+            if self.ports.iter().any(|p| p.port == published.port) {
+                continue;
+            }
+            self.ports.push(published);
+            if let Some(index) = bound.iter().position(|f| f.port == published.port) {
+                self.bound.push(bound.remove(index));
+            }
+        }
+        self.ports.sort_unstable_by_key(|p| p.port);
+        // What is left in `bound` forwards a port this set already held; it
+        // drops here, which unbinds it.
+    }
+
+    /// Takes `port` out of the set altogether — its forwarder, if one is
+    /// bound, and its listing — as if it had never been published. What a
+    /// failed dynamic publication is rolled back with, so no partial mapping
+    /// is left (NET-047). Returns the teardown to await, or `None` when no
+    /// forwarder was bound for the port.
+    fn remove(&mut self, port: u16) -> Option<Unbinding> {
+        self.ports.retain(|p| p.port != port);
+        self.take(port)
     }
 
     /// The declared ports of a box whose published address answers them
@@ -285,6 +349,7 @@ impl Forwarders {
                     port,
                     state: ForwarderState::Direct,
                     origin: PortOrigin::Declared,
+                    admitted: None,
                 })
                 .collect(),
         }
@@ -300,6 +365,19 @@ impl Forwarders {
     #[must_use]
     pub fn published(&self) -> Vec<PublishedPort> {
         self.ports.clone()
+    }
+
+    /// Unbinds every forwarder in the set and waits until each is: the
+    /// rollback of a set bound for a request that was then refused, so
+    /// nothing of it is left at the address once the refusal is answered
+    /// (NET-047). A drop would unbind them too, but only once their accept
+    /// loops observe it.
+    pub async fn unbind(mut self) {
+        for port in self.ports() {
+            if let Some(unbinding) = self.take(port) {
+                unbinding.finished().await;
+            }
+        }
     }
 
     /// Cancels the forwarder bound for `port` and takes it out of the set,
@@ -349,6 +427,7 @@ impl Forwarders {
                 port,
                 state: ForwarderState::Direct,
                 origin: PortOrigin::Listened { pid },
+                admitted: None,
             },
         );
         true
@@ -729,6 +808,52 @@ impl PublishTable {
     ) -> Publication {
         self.withdraw(session_name);
         self.insert(session_id, session_name, lease, forwarders)
+    }
+
+    /// Where `session_name`'s box is published: its address and the kind of
+    /// address it is, or `None` when nothing is published under the name. What
+    /// a dynamic publication binds its forwarder on before the port is added.
+    #[must_use]
+    pub fn published_at(&self, session_name: &str) -> Option<(Ipv4Addr, AddressKind)> {
+        let entry = self.boxes.get(&hostname(session_name))?;
+        Some((entry.address, entry.kind))
+    }
+
+    /// Adds `forwarders`, already bound on the box's address, to
+    /// `session_name`'s publication: the ports they hold join the ports the
+    /// zone publishes for the box. A port the box already publishes is left
+    /// as it was. Returns `false` — dropping the forwarders, which unbinds
+    /// them — when nothing is published under the name any more.
+    pub fn add_ports(&mut self, session_name: &str, forwarders: Forwarders) -> bool {
+        let hostname = hostname(session_name);
+        let Some(entry) = self.boxes.get_mut(&hostname) else {
+            return false;
+        };
+        let added = forwarders.ports();
+        entry.forwarders.extend(forwarders);
+        entry.ports = entry.forwarders.ports();
+        self.changes.notify_one();
+        tracing::info!(
+            session_id = %entry.session_id,
+            hostname = %hostname,
+            address = %entry.address,
+            ports = ?added,
+            "published ports at a box's address"
+        );
+        true
+    }
+
+    /// Takes `port` out of `session_name`'s publication as if it had never
+    /// been published: unbinds its forwarder and drops its listing. The
+    /// rollback of a dynamic publication whose record could not be written
+    /// (NET-047). Returns the teardown to await with this table's lock
+    /// released, or `None` when no forwarder was bound for the port.
+    pub fn remove_port(&mut self, session_name: &str, port: u16) -> Option<Unbinding> {
+        let entry = self.boxes.get_mut(&hostname(session_name))?;
+        let unbinding = entry.forwarders.remove(port);
+        entry.ports = entry.forwarders.ports();
+        self.changes.notify_one();
+        unbinding
     }
 
     /// Revokes a declared port's ingress on `session_name`'s box: unbinds its
@@ -1254,7 +1379,8 @@ mod tests {
             vec![PublishedPort {
                 port: PORT,
                 state: ForwarderState::Revoked,
-                origin: PortOrigin::Declared
+                origin: PortOrigin::Declared,
+                admitted: None
             }]
         );
         assert_eq!(

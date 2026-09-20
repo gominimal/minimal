@@ -207,6 +207,7 @@ pub(crate) async fn activate_session(
             port_mappings,
             dynamic_allowed_range: None,
         }),
+        dynamic_ingress: args.dynamic_ingress.map(Into::into),
     };
 
     // A session with no `--name` still deserves a typable handle, so mint
@@ -878,6 +879,7 @@ pub(crate) async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), a
             sync: None,
             network: CliNetworkMode::HostNet,
             ingress: Vec::new(),
+            dynamic_ingress: None,
             loadout: Vec::new(),
             no_loadouts: false,
             no_hooks: false,

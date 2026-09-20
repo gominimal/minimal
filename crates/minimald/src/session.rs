@@ -363,6 +363,15 @@ enum SessionMessage {
     /// Rename the session: persist the new name through the record handle,
     /// refresh the in-memory snapshot, and relink the PTask hostname.
     Rename(String, oneshot::Sender<Result<(), std::io::Error>>),
+    /// Publish one of this box's ports at runtime, decided against its
+    /// `dynamic_ingress` setting (NET-043, NET-044, NET-047). Answered with
+    /// the daemon's decision; the error is the store's, for a record that
+    /// could not be read or written.
+    Expose(
+        u16,
+        sessions::IpProto,
+        oneshot::Sender<Result<minimald_rpc::ExposeResponse, std::io::Error>>,
+    ),
     /// Whether this session blocks an unforced daemon shutdown: a `Draft`
     /// holding compose state (a client is mid create flow, and stopping
     /// would strand it) or an `Active` with a minted host. A `Draft` that
@@ -760,6 +769,40 @@ impl Session {
         }
     }
 
+    /// Publish `port` of this box at runtime, as `min net expose` asks: the
+    /// request is decided against the box's `dynamic_ingress` setting and an
+    /// allow binds the port at the box's published address and records the
+    /// mapping in its policy (NET-043, NET-044, NET-047). The actor serves
+    /// it because the record write goes through its handle, like a rename.
+    #[cfg(target_os = "linux")]
+    async fn expose(
+        &self,
+        port: u16,
+        proto: sessions::IpProto,
+    ) -> Result<minimald_rpc::ExposeResponse, std::io::Error> {
+        crate::net::dynamic_ingress::expose(
+            &self.record,
+            &self.published,
+            &self.net_switch,
+            port,
+            proto,
+        )
+        .await
+    }
+
+    /// Without the box zone there is no address to publish a port at.
+    #[cfg(not(target_os = "linux"))]
+    async fn expose(
+        &self,
+        _port: u16,
+        _proto: sessions::IpProto,
+    ) -> Result<minimald_rpc::ExposeResponse, std::io::Error> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "dynamic ingress needs the box zone, which this host does not serve",
+        ))
+    }
+
     /// Withdraw this session's box from the host's zone (NET-012), releasing
     /// its own address if it held one. Gated like [`Self::deregister_hostname`]:
     /// the table is keyed by name alone, so an ungated withdraw from a `Draft`
@@ -994,6 +1037,9 @@ impl Session {
             },
             SessionMessage::Rename(new_name, r) => {
                 let _ = r.send(self.rename(new_name).await);
+            }
+            SessionMessage::Expose(port, proto, r) => {
+                let _ = r.send(self.expose(port, proto).await);
             }
             SessionMessage::IsBusy(r) => {
                 let _ = r.send(match &self.inner {
@@ -2848,6 +2894,25 @@ impl SessionHandle {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::Rename(new_name, send)).await;
+        recv.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "session actor is gone",
+            ))
+        })
+    }
+
+    /// Publishes `port` of this box at runtime, decided against its
+    /// `dynamic_ingress` setting; see [`SessionMessage::Expose`]. A dead
+    /// actor maps to `NotConnected`.
+    pub(crate) async fn expose(
+        &self,
+        port: u16,
+        proto: sessions::IpProto,
+    ) -> Result<minimald_rpc::ExposeResponse, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(SessionMessage::Expose(port, proto, send)).await;
         recv.await.unwrap_or_else(|_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,

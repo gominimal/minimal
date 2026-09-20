@@ -297,15 +297,17 @@ pub struct IngressPolicy {
     /// Static port mappings applied at `PTask` launch.
     pub port_mappings: Vec<PortMapping>,
     /// Inclusive port range within which dynamic port-mapping requests are
-    /// accepted; `None` means dynamic mapping is disallowed.
+    /// accepted; `None` leaves every unprivileged port to the box's
+    /// [`dynamic_ingress`](SessionPolicy::dynamic_ingress) decision alone.
     ///
     /// Stored on the [`Record`] and returned verbatim by `GetSessionPolicy`.
     /// A set range is what the box permits beyond its declaration: it is read
     /// by [`crate::core::net_verdict::IngressRules::permits`], so a process in
     /// the box that begins listening on a port inside the range has that port
-    /// published on the box's address (NET-016). Dynamic port-mapping
-    /// *requests* — a client asking for a mapping inside the range — remain
-    /// unbuilt (#553).
+    /// published on the box's address (NET-016). It is also the bound a
+    /// `min net expose <port>` request is checked against before the decision
+    /// is consulted: a port outside it is refused whatever the decision says,
+    /// and nothing is published for it (NET-047).
     pub dynamic_allowed_range: Option<(u16, u16)>,
 }
 
@@ -318,11 +320,43 @@ impl IngressPolicy {
     }
 }
 
+/// How a box answers a request, made at runtime from inside it, to publish
+/// one of its ports: the `dynamic_ingress` setting a `min net expose <port>`
+/// request is evaluated against (NET-043).
+///
+/// A box with no setting refuses every such request, the same fail-closed
+/// default as its static ingress.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicIngress {
+    /// Publish the port, within the box's `dynamic_allowed_range` if one is
+    /// set (NET-044).
+    Allow,
+    /// Refuse the request with a typed error (NET-044).
+    Deny,
+    /// Ask the attached human and apply their answer; refuse when nobody is
+    /// attached to answer (NET-045).
+    Ask,
+}
+
+impl fmt::Display for DynamicIngress {
+    /// Renders the lowercase setting name, matching the `snake_case` serde
+    /// representation so log fields agree with the config spelling.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Ask => "ask",
+        })
+    }
+}
+
 /// The networking policy for a session: its egress and ingress configuration.
 ///
 /// `None` for a dimension means it was not configured (allow-all egress; the
-/// deny-all-external ingress default). Stored on [`Record`] as the policy
-/// configured at launch and returned verbatim by the `GetSessionPolicy` RPC.
+/// deny-all-external ingress default; every dynamic ingress request refused).
+/// Stored on [`Record`] as the policy configured at launch and returned
+/// verbatim by the `GetSessionPolicy` RPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 // Every field is an `Option`, so without this an unrelated JSON object would
 // decode as an all-`None` policy. That matters because `GetSessionPolicy`'s
@@ -336,13 +370,21 @@ pub struct SessionPolicy {
     pub egress: Option<EgressPolicy>,
     /// Ingress policy; `None` when no explicit ingress config is present.
     pub ingress: Option<IngressPolicy>,
+    /// How a runtime request to publish a port is decided; `None` when the
+    /// box declares nothing, which refuses every such request.
+    pub dynamic_ingress: Option<DynamicIngress>,
 }
 
 impl SessionPolicy {
-    /// Builds a policy from its egress and ingress halves.
+    /// Builds a policy from its egress and ingress halves, with no dynamic
+    /// ingress setting.
     #[must_use]
     pub fn new(egress: Option<EgressPolicy>, ingress: Option<IngressPolicy>) -> Self {
-        Self { egress, ingress }
+        Self {
+            egress,
+            ingress,
+            dynamic_ingress: None,
+        }
     }
 }
 
@@ -1220,6 +1262,40 @@ mod tests {
             let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
             assert!(record.validate_policy().is_ok());
         }
+    }
+
+    /// NET-043: the `dynamic_ingress` setting parses in its three spellings,
+    /// is absent when the box declares nothing, and a spelling that names no
+    /// decision is refused rather than read as one.
+    #[test]
+    fn dynamic_ingress_field_parses() {
+        for (spelling, expected) in [
+            ("allow", DynamicIngress::Allow),
+            ("deny", DynamicIngress::Deny),
+            ("ask", DynamicIngress::Ask),
+        ] {
+            let policy: SessionPolicy =
+                serde_json_lenient::from_str(&format!(r#"{{"dynamic_ingress":"{spelling}"}}"#))
+                    .unwrap_or_else(|e| panic!("dynamic_ingress = {spelling} must parse: {e}"));
+            assert_eq!(policy.dynamic_ingress, Some(expected));
+            assert_eq!(expected.to_string(), spelling);
+            // The wire form round-trips through the same spelling.
+            let json = serde_json_lenient::to_string(&policy).unwrap();
+            assert!(
+                json.contains(&format!(r#""dynamic_ingress":"{spelling}""#)),
+                "{json}"
+            );
+        }
+
+        let absent: SessionPolicy = serde_json_lenient::from_str(r#"{"egress":null}"#).unwrap();
+        assert_eq!(absent.dynamic_ingress, None);
+        assert_eq!(SessionPolicy::new(None, None).dynamic_ingress, None);
+
+        assert!(
+            serde_json_lenient::from_str::<SessionPolicy>(r#"{"dynamic_ingress":"maybe"}"#)
+                .is_err(),
+            "a spelling that names no decision must not parse"
+        );
     }
 
     #[test]

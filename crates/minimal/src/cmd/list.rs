@@ -65,6 +65,7 @@ pub(crate) fn bare_activate_args() -> ActivateArgs {
         sync: None,
         network: CliNetworkMode::HostNet,
         ingress: Vec::new(),
+        dynamic_ingress: None,
         loadout: Vec::new(),
         no_loadouts: false,
         no_hooks: false,

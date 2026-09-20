@@ -151,6 +151,25 @@ min_check() {
     __min_rpc "check" "$@"
 }
 
+min_net() {
+    local subcmd="$1"
+    shift
+
+    case "$subcmd" in
+        expose)
+            if [[ -z "$1" ]]; then
+                echo "Usage: min net expose <port>" >&2
+                return 1
+            fi
+            __min_rpc "net-expose" "$1"
+            ;;
+        *)
+            echo "error: unknown subcommand '$subcmd'. Expected 'expose'" >&2
+            return 1
+            ;;
+    esac
+}
+
 min_materialize() {
     # The working directory leads the arguments so a relative --output
     # can be resolved.
@@ -183,10 +202,14 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         materialize)
             min_materialize "$@"
             ;;
+        net)
+            min_net "$@"
+            ;;
         *)
             echo "Usage: min <subcommand>" >&2
             echo "" >&2
             echo "Add packages: min add [--session|--build|--runtime] <packages>" >&2
+            echo "Publish a port of this box: min net expose <port>" >&2
             echo "Run a task: min task run <task name>" >&2
             echo "Search for packages: min package search <query>" >&2
             echo "Build packages: min package build <packages>" >&2

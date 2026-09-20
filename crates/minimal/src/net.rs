@@ -11,6 +11,12 @@
 //! answerer through the host's own resolver, so any process on the machine
 //! resolves `<name>.min.internal` with no proxy, PAC file or proxy variable
 //! (NET-009), and on macOS reserves the local range boxes are published from.
+//!
+//! `min net expose <port>`: the dynamic ingress request. One request shape
+//! goes to the local daemon, which decides it against the box's
+//! `dynamic_ingress` setting (NET-043): an allow publishes the port and
+//! lists it in `min session policy`, anything else is a typed refusal that
+//! publishes nothing (NET-044, NET-047).
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -22,7 +28,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, bail};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::{GlobalArgs, NetForwardArgs, NetSetupArgs, client, cmd};
+use crate::{GlobalArgs, NetExposeArgs, NetForwardArgs, NetSetupArgs, client, cmd};
 
 /// How often the forward re-checks that its session is still there.
 ///
@@ -198,6 +204,78 @@ async fn session_closed(mut lookup: client::Client, session_id: sessions::Sessio
                 return;
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `min net expose`
+
+/// The variable every box's shell carries its session's name in, seeded by
+/// the daemon's launcher baseline: how `min net expose` inside a box knows
+/// which box it is in without being told.
+const SESSION_NAME_ENV: &str = "MINIMAL_SESSION_NAME";
+
+/// `min net expose <port> [--session <box>]`: ask the daemon to publish a
+/// port of the box, subject to its `dynamic_ingress` setting.
+pub(crate) async fn cmd_net_expose(
+    global: &GlobalArgs,
+    args: NetExposeArgs,
+) -> Result<(), anyhow::Error> {
+    let session = match args.session {
+        Some(session) => session,
+        None => std::env::var(SESSION_NAME_ENV).ok().ok_or_else(|| {
+            anyhow::anyhow!(
+                "min net expose runs inside a box, where {SESSION_NAME_ENV} names it; outside \
+                 one, name the box with --session"
+            )
+        })?,
+    };
+    cmd::ensure_daemon(global)?;
+    let mut client = cmd::connect_daemon(global).await?;
+    let record = cmd::resolve_session(&mut client, &session).await?;
+    match send_expose(&mut client, record.id, args.port).await? {
+        minimald_rpc::ExposeResponse::Published {
+            hostname,
+            address,
+            mapping,
+        } => {
+            eprintln!(
+                "published {hostname}:{} at {address}:{}; `min session policy {session}` lists it",
+                mapping.internal_port, mapping.external_port
+            );
+            Ok(())
+        }
+        minimald_rpc::ExposeResponse::Refused { reason } => {
+            bail!("min net expose {} refused: {reason}", args.port)
+        }
+    }
+}
+
+/// Sends the one request shape the daemon decides (NET-043) for `port` of
+/// the box `session_id`, over TCP, and returns the decision as the daemon
+/// gave it: a publication or a typed refusal. The RPC's own error — no such
+/// session, a record that could not be written — is the error.
+///
+/// Split from the command so the request and the daemon's answer are
+/// assertable without capturing stderr.
+pub(crate) async fn send_expose(
+    client: &mut client::Client,
+    session_id: sessions::SessionId,
+    port: u16,
+) -> Result<minimald_rpc::ExposeResponse, anyhow::Error> {
+    use minimald_rpc::{Errorable, Expose, ExposeRequest};
+
+    let resp = client
+        .oneshot_rpc::<Expose>(ExposeRequest {
+            id: session_id,
+            port,
+            proto: sessions::IpProto::Tcp,
+        })
+        .await
+        .context("Expose RPC failed")?;
+    match resp {
+        Errorable::Ok(response) => Ok(response),
+        Errorable::Err { error } => bail!("{error}"),
     }
 }
 
@@ -744,6 +822,151 @@ mod tests {
                 .await
                 .is_err(),
             "localhost:{local_port} still answers after the session was destroyed"
+        );
+    }
+
+    /// An own-address box on the harness daemon with the given
+    /// `dynamic_ingress` setting: what `min net expose` is decided against.
+    async fn own_ip_box(
+        client: &mut minimald::test_harness::TestClient,
+        name: &str,
+        setting: sessions::DynamicIngress,
+    ) -> sessions::SessionId {
+        use minimald::test_harness::{create_session_req, unwrap_ready};
+        use minimald_rpc::{
+            ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+            FinalizeSessionRequest,
+        };
+        let mut req = create_session_req(name, "/tmp");
+        req.config.network = sessions::NetworkMode::OwnIp;
+        req.config.policy.dynamic_ingress = Some(setting);
+        let id = client.call::<CreateSession>(&req).await.unwrap().id;
+        unwrap_ready(
+            client
+                .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
+        match client
+            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .await
+        {
+            Errorable::Ok(_) => id,
+            Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+        }
+    }
+
+    /// NET-043, NET-044: `min net expose <port>` sends the one request shape
+    /// to the local daemon over its socket, and what comes back is the
+    /// daemon's decision against the box's `dynamic_ingress` setting: an
+    /// allow publishes the port and `min session policy` lists the mapping;
+    /// a deny reaches the operator as the typed refusal, naming the setting.
+    #[tokio::test]
+    async fn net_expose_sends_request_to_local_daemon() {
+        use minimald_rpc::{
+            ExposeRefusal, ExposeResponse, GetSessionPolicy, GetSessionPolicyRequest,
+        };
+
+        let mut daemon = daemon_with_session("expose-host").await;
+        let allowing = own_ip_box(
+            &mut daemon.admin,
+            "expose-allowing",
+            sessions::DynamicIngress::Allow,
+        )
+        .await;
+        let denying = own_ip_box(
+            &mut daemon.admin,
+            "expose-denying",
+            sessions::DynamicIngress::Deny,
+        )
+        .await;
+
+        // The command's own path to the daemon: the socket `GlobalArgs`
+        // resolves, as `cmd_net_expose` connects.
+        let mut client = cmd::connect_daemon(&daemon.global).await.unwrap();
+        let response = send_expose(&mut client, allowing, 18_480).await.unwrap();
+        let ExposeResponse::Published {
+            hostname, mapping, ..
+        } = response
+        else {
+            panic!("an allowing box must publish the port: {response:?}");
+        };
+        assert_eq!(hostname, "expose-allowing.min.internal");
+        assert_eq!(mapping.internal_port, 18_480);
+        let policy = client
+            .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(allowing))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            policy.ingress.map(|ingress| ingress.port_mappings),
+            Some(vec![mapping]),
+            "`min session policy` lists the published mapping"
+        );
+
+        assert_eq!(
+            send_expose(&mut client, denying, 18_480).await.unwrap(),
+            ExposeResponse::Refused {
+                reason: ExposeRefusal::Denied
+            }
+        );
+        let refused = cmd_net_expose(
+            &daemon.global,
+            NetExposeArgs {
+                port: 18_480,
+                session: Some("expose-denying".to_string()),
+            },
+        )
+        .await
+        .expect_err("a denied request fails the command");
+        assert!(
+            format!("{refused:#}").contains("dynamic_ingress"),
+            "the operator reads the typed refusal: {refused:#}"
+        );
+        let policy = client
+            .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(denying))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.ingress, None, "a refusal publishes nothing");
+
+        // Outside a box, with no box named, the command says what it needs
+        // rather than guessing a session.
+        assert!(std::env::var(SESSION_NAME_ENV).is_err(), "not inside a box");
+        let unnamed = cmd_net_expose(
+            &daemon.global,
+            NetExposeArgs {
+                port: 18_480,
+                session: None,
+            },
+        )
+        .await
+        .expect_err("no box to expose from");
+        assert!(format!("{unnamed:#}").contains("--session"), "{unnamed:#}");
+    }
+
+    /// The spec's spelling reaches the command with the port intact and
+    /// the box left to the environment, as inside a box.
+    #[test]
+    fn net_expose_parses_the_documented_spelling() {
+        use crate::{Cli, Command, NetArgs, NetCommand, Parser as _};
+
+        let cli = Cli::try_parse_from(["min", "net", "expose", "3000"])
+            .expect("`min net expose 3000` must parse");
+        let Some(Command::Net(NetArgs {
+            command: NetCommand::Expose(args),
+        })) = cli.command
+        else {
+            panic!("`min net expose` must reach the expose command");
+        };
+        assert_eq!(args.port, 3000);
+        assert_eq!(args.session, None);
+        assert!(
+            Cli::try_parse_from(["min", "net", "expose", "web"]).is_err(),
+            "the argument is a port"
         );
     }
 

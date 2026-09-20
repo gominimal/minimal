@@ -18,6 +18,7 @@
 
 pub mod answerer;
 pub mod dns;
+pub mod dynamic_ingress;
 pub mod host_cohort;
 pub mod listen_watch;
 pub mod policy;
@@ -226,6 +227,11 @@ pub struct SwitchClient {
     /// this is the one daemon-scoped object both sides already hold: a box's
     /// network, which learns its address and its rules, and the proxy startup.
     admissions: Arc<RwLock<policy::BoxAdmissions>>,
+    /// The boxes running on this switch, by name, each with the ingress it
+    /// can take a port into at runtime (NET-044). Here for the same reason
+    /// as the declarations: the box's network registers it, and the session
+    /// actor serving a dynamic ingress request reaches it through the switch.
+    live_boxes: Arc<gvproxy_network::LiveBoxes>,
 }
 
 impl SwitchClient {
@@ -254,7 +260,15 @@ impl SwitchClient {
             transport: SwitchTransport::default(),
             box_zone: Arc::new(policy::BoxZone::default()),
             admissions: Arc::new(RwLock::new(policy::BoxAdmissions::new())),
+            live_boxes: Arc::new(gvproxy_network::LiveBoxes::default()),
         }
+    }
+
+    /// The boxes running on this switch, for a dynamic ingress request to
+    /// find the one it publishes a port to (NET-044).
+    #[must_use]
+    pub(crate) fn live_boxes(&self) -> Arc<gvproxy_network::LiveBoxes> {
+        Arc::clone(&self.live_boxes)
     }
 
     /// The live box declarations this switch's boxes register into, shared with

@@ -400,6 +400,12 @@ impl ServerStateHandle {
         Arc::clone(&self.0.lock().await.box_zone)
     }
 
+    /// The daemon-scoped switch, for a test to register a running box on.
+    #[cfg(test)]
+    pub(crate) async fn net_switch(&self) -> Arc<Mutex<crate::net::SwitchClient>> {
+        Arc::clone(&self.0.lock().await.net_switch)
+    }
+
     /// The live box declarations, for the hostname proxy to decide requests
     /// against (NET-069 to NET-071).
     #[cfg(target_os = "linux")]

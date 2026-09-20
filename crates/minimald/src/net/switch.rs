@@ -21,7 +21,7 @@ use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use sessions::core::net_verdict::{self, DropRule, EgressRules, Verdict};
@@ -501,15 +501,10 @@ const IPPROTO_UDP: u8 = 17;
 ///
 /// ICMP and non-IPv4 traffic pass (out of scope).
 pub struct IngressGate {
-    /// TCP destination ports the target accepts new inbound connections on — the
-    /// *internal* ports of its TCP `port_mappings` (what the sandbox listens on,
-    /// and what both a peer session and the host-publish forwarder dial). An empty
-    /// set denies every inbound SYN (the own-IP default-block posture).
-    allowed: HashSet<u16>,
-    /// UDP destination ports the target accepts new inbound datagrams on (the
-    /// internal ports of its UDP `port_mappings`). Inbound UDP to any other port
-    /// passes only if it matches a live outbound flow in `conntrack`.
-    udp_allowed: HashSet<u16>,
+    /// The destination ports the target accepts new inbound TCP connections
+    /// and UDP datagrams on. Shared with the box's live ingress, which adds a
+    /// port a dynamic ingress request publishes while the box runs.
+    ports: Arc<AdmittedPorts>,
     /// Outbound-UDP flow tracker, shared with the egress relay leg so a reply to
     /// the PTask's own UDP egress (DNS, QUIC, …) is allowed back in.
     conntrack: Arc<UdpConntrack>,
@@ -526,6 +521,82 @@ pub struct IngressGate {
     /// so both legs of the relay are configured through one handle; `None`
     /// only for a relay with no box behind it.
     egress: Option<Arc<EgressGate>>,
+}
+
+/// The ports a box's ingress gate admits new inbound traffic on, per
+/// transport: the *internal* ports of its `port_mappings` (what the sandbox
+/// listens on, and what both a peer session and the host-publish forwarder
+/// dial). An empty set denies every inbound SYN and unsolicited datagram (the
+/// own-IP default-block posture). Inbound UDP to any other port passes only
+/// if it matches a live outbound flow in the gate's conntrack.
+///
+/// Editable while the relay runs: a port published at runtime by a dynamic
+/// ingress request (NET-044) is admitted here without relaunching the box,
+/// and taken back out when the publication is rolled back (NET-047).
+#[derive(Debug, Default)]
+pub struct AdmittedPorts {
+    tcp: RwLock<HashSet<u16>>,
+    udp: RwLock<HashSet<u16>>,
+}
+
+impl AdmittedPorts {
+    /// The ports `ingress` declares, per transport; a box with no ingress
+    /// admits none.
+    #[must_use]
+    pub fn for_ingress(ingress: Option<&sessions::IngressPolicy>) -> Self {
+        let ports = |proto: sessions::IpProto| -> HashSet<u16> {
+            ingress
+                .map(|i| {
+                    i.port_mappings
+                        .iter()
+                        .filter(|m| m.proto == proto)
+                        .map(|m| m.internal_port)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            tcp: RwLock::new(ports(sessions::IpProto::Tcp)),
+            udp: RwLock::new(ports(sessions::IpProto::Udp)),
+        }
+    }
+
+    /// Admits new inbound traffic on `port` over `proto` from now on. A
+    /// transport the gate does not decide by port admits nothing.
+    pub fn admit(&self, proto: sessions::IpProto, port: u16) {
+        if let Some(set) = self.set(proto) {
+            set.write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(port);
+        }
+    }
+
+    /// Stops admitting new inbound traffic on `port` over `proto`.
+    pub fn retract(&self, proto: sessions::IpProto, port: u16) {
+        if let Some(set) = self.set(proto) {
+            set.write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&port);
+        }
+    }
+
+    /// Whether `port` over `proto` is admitted.
+    #[must_use]
+    pub fn admits(&self, proto: sessions::IpProto, port: u16) -> bool {
+        self.set(proto).is_some_and(|set| {
+            set.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&port)
+        })
+    }
+
+    fn set(&self, proto: sessions::IpProto) -> Option<&RwLock<HashSet<u16>>> {
+        match proto {
+            sessions::IpProto::Tcp => Some(&self.tcp),
+            sessions::IpProto::Udp => Some(&self.udp),
+            _ => None,
+        }
+    }
 }
 
 /// What the egress (tap → switch) leg holds on a box's own relay: the box's
@@ -613,20 +684,8 @@ impl IngressGate {
         ingress: Option<&sessions::IngressPolicy>,
         subnet: SwitchSubnet,
     ) -> Self {
-        let ports = |proto: sessions::IpProto| -> HashSet<u16> {
-            ingress
-                .map(|i| {
-                    i.port_mappings
-                        .iter()
-                        .filter(|m| m.proto == proto)
-                        .map(|m| m.internal_port)
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
         Self {
-            allowed: ports(sessions::IpProto::Tcp),
-            udp_allowed: ports(sessions::IpProto::Udp),
+            ports: Arc::new(AdmittedPorts::for_ingress(ingress)),
             conntrack: Arc::new(UdpConntrack::default()),
             label,
             legacy_host: subnet.host_alias(),
@@ -644,14 +703,36 @@ impl IngressGate {
         self
     }
 
+    /// The ports this gate admits, shared so a dynamic ingress request can
+    /// admit one while the relay runs.
+    #[must_use]
+    pub fn ports(&self) -> Arc<AdmittedPorts> {
+        Arc::clone(&self.ports)
+    }
+
     /// The inbound-gate decision for one Ethernet frame: `Some((proto, dst_port,
     /// src))` when it must be dropped — a new TCP connection or an unsolicited UDP
     /// datagram to a port the target did not declare — else `None` (pass).
     fn inbound_drop(&self, frame: &[u8]) -> Option<(sessions::IpProto, u16, SocketAddrV4)> {
-        if let Some((dst_port, src)) = blocked_syn(frame, &self.allowed) {
+        if let Some((dst_port, src)) = blocked_syn(
+            frame,
+            &self
+                .ports
+                .tcp
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        ) {
             return Some((sessions::IpProto::Tcp, dst_port, src));
         }
-        if let Some((dst_port, src)) = blocked_udp(frame, &self.udp_allowed, &self.conntrack) {
+        if let Some((dst_port, src)) = blocked_udp(
+            frame,
+            &self
+                .ports
+                .udp
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+            &self.conntrack,
+        ) {
             return Some((sessions::IpProto::Udp, dst_port, src));
         }
         None
@@ -1400,14 +1481,23 @@ mod tests {
         };
         let gate =
             IngressGate::for_session("100.64.0.9".into(), Some(&ingress), SwitchSubnet::default());
-        assert!(gate.allowed.contains(&80)); // TCP internal port
-        assert!(!gate.allowed.contains(&53)); // the UDP mapping is not a TCP port
-        assert!(!gate.allowed.contains(&18080)); // external port is not the listener
-        assert!(gate.udp_allowed.contains(&53)); // UDP internal port
-        assert!(!gate.udp_allowed.contains(&80)); // the TCP mapping is not a UDP port
+        use sessions::IpProto::{Tcp, Udp};
+        assert!(gate.ports.admits(Tcp, 80)); // TCP internal port
+        assert!(!gate.ports.admits(Tcp, 53)); // the UDP mapping is not a TCP port
+        assert!(!gate.ports.admits(Tcp, 18080)); // external port is not the listener
+        assert!(gate.ports.admits(Udp, 53)); // UDP internal port
+        assert!(!gate.ports.admits(Udp, 80)); // the TCP mapping is not a UDP port
         // A no-ingress own-IP session denies every new inbound connection/datagram.
         let empty = IngressGate::for_session("x".into(), None, SwitchSubnet::default());
-        assert!(empty.allowed.is_empty() && empty.udp_allowed.is_empty());
+        assert!(!empty.ports.admits(Tcp, 80) && !empty.ports.admits(Udp, 53));
+        // A port admitted while the relay runs is admitted from then on, through
+        // the handle the gate shares, and retracted the same way.
+        let shared = empty.ports();
+        shared.admit(Tcp, 3000);
+        assert!(empty.ports.admits(Tcp, 3000));
+        assert!(!empty.ports.admits(Udp, 3000));
+        shared.retract(Tcp, 3000);
+        assert!(!empty.ports.admits(Tcp, 3000));
     }
 
     /// A `MakeWriter` accumulating everything written into a shared buffer, so a

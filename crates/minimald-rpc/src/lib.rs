@@ -879,40 +879,144 @@ impl OneshotSshRpc for GetSessionHooks {
     type Response = Errorable<Vec<sessions::wire::primitives::WireProvenancedHook>>;
 }
 
-/// An RPC for a process inside a PTask to request a dynamic ingress port
-/// mapping at runtime (R2.4).
-pub struct DynamicPortMap;
+/// The dynamic ingress request: `min net expose <port>` asking the daemon to
+/// publish one of a box's ports at runtime (NET-043). One request shape
+/// whoever evaluates it — the local daemon on an un-enrolled host today — so
+/// an enrolled path decides the same request.
+///
+/// The daemon evaluates the request against the box's `dynamic_ingress`
+/// setting and its `dynamic_allowed_range`: an allow publishes the port at
+/// the box's own port number and records the mapping in the box's ingress
+/// policy, where `min session policy` lists it (NET-044); anything else is a
+/// typed [`ExposeRefusal`] and publishes nothing (NET-047).
+pub struct Expose;
 
-/// Request for the [`DynamicPortMap`] RPC.
-#[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DynamicPortMapRequest {
+/// Request for the [`Expose`] RPC: the box and the port to publish, at the
+/// box's own port number.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExposeRequest {
     pub id: SessionId,
-    pub external_port: u16,
-    pub internal_port: u16,
+    /// The port the box's server listens on, published at the same number.
+    pub port: u16,
     pub proto: IpProto,
 }
 
-impl DynamicPortMapRequest {
-    pub fn new(id: SessionId, external_port: u16, internal_port: u16, proto: IpProto) -> Self {
-        Self {
-            id,
-            external_port,
-            internal_port,
-            proto,
+/// What the daemon decided for an [`Expose`] request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ExposeResponse {
+    /// The request was decided `allow`: the port is published at the box's
+    /// address and the mapping is in its policy.
+    Published {
+        /// The box's name in the zone: `<name>.min.internal`.
+        hostname: String,
+        /// The address the port is published at.
+        address: std::net::Ipv4Addr,
+        /// The mapping as `min session policy` now lists it.
+        mapping: PortMapping,
+    },
+    /// The request was refused; nothing was published and the box's policy
+    /// is as it was.
+    Refused { reason: ExposeRefusal },
+}
+
+/// Why an [`Expose`] request was refused: the typed error NET-044 and
+/// NET-047 name, so a caller can tell a policy decision from a misfit
+/// request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExposeRefusal {
+    /// The box's `dynamic_ingress` is `deny`.
+    Denied,
+    /// The box declares no `dynamic_ingress` setting, which refuses like
+    /// `deny`: nothing is published that was not permitted.
+    Unset,
+    /// The box's `dynamic_ingress` is `ask` and nobody is attached to answer
+    /// (NET-045).
+    NobodyToAsk,
+    /// The port is outside the box's `dynamic_allowed_range`.
+    OutOfRange { port: u16, lo: u16, hi: u16 },
+    /// The port is below 1024, which the daemon never publishes.
+    PrivilegedPort { port: u16 },
+    /// The box has no address of its own to publish the port at: a
+    /// host-address box's ports are already the host's, and a `none` box has
+    /// no network.
+    NoOwnAddress { mode: NetworkMode },
+    /// The transport is one the forwarder cannot carry.
+    UnsupportedProtocol { proto: IpProto },
+    /// The box's ingress policy already maps the port.
+    AlreadyPublished { port: u16 },
+    /// The box is not published in the zone, so there is no address to
+    /// publish the port at (a session not yet finalized).
+    NotPublished,
+    /// The port could not be bound at the box's address; nothing was
+    /// substituted for it.
+    PortHeld {
+        port: u16,
+        address: std::net::Ipv4Addr,
+        error: String,
+    },
+    /// The box is running, and the switch would not forward the port to it;
+    /// nothing was published.
+    NotForwarded { port: u16, error: String },
+}
+
+impl std::fmt::Display for ExposeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Denied => write!(
+                f,
+                "the box's dynamic_ingress setting denies it (activate with \
+                 --dynamic-ingress allow to permit it)"
+            ),
+            Self::Unset => write!(
+                f,
+                "the box declares no dynamic_ingress setting, which refuses it (activate \
+                 with --dynamic-ingress allow to permit it)"
+            ),
+            Self::NobodyToAsk => write!(
+                f,
+                "the box's dynamic_ingress setting is ask, and nobody is attached to answer"
+            ),
+            Self::OutOfRange { port, lo, hi } => write!(
+                f,
+                "port {port} is outside the box's dynamic_allowed_range {lo}-{hi}"
+            ),
+            Self::PrivilegedPort { port } => write!(
+                f,
+                "port {port} is privileged; the daemon publishes no port below 1024"
+            ),
+            Self::NoOwnAddress { mode } => write!(
+                f,
+                "the box has no address of its own to publish the port at (network mode \
+                 {mode:?}); only an own_ip box exposes ports"
+            ),
+            Self::UnsupportedProtocol { proto } => {
+                write!(f, "{proto} is not a transport the forwarder carries")
+            }
+            Self::AlreadyPublished { port } => {
+                write!(f, "port {port} is already in the box's ingress policy")
+            }
+            Self::NotPublished => write!(f, "the box is not published, so it has no address yet"),
+            Self::PortHeld {
+                port,
+                address,
+                error,
+            } => write!(f, "port {port} could not be bound at {address}: {error}"),
+            Self::NotForwarded { port, error } => {
+                write!(
+                    f,
+                    "the switch would not forward port {port} to the box: {error}"
+                )
+            }
         }
     }
 }
 
-/// Response for the [`DynamicPortMap`] RPC.
-#[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DynamicPortMapResponse;
-
-impl OneshotSshRpc for DynamicPortMap {
-    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "DynamicPortMap");
-    type Request<'a> = DynamicPortMapRequest;
-    type Response = Errorable<DynamicPortMapResponse>;
+impl OneshotSshRpc for Expose {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "Expose");
+    type Request<'a> = ExposeRequest;
+    type Response = Errorable<ExposeResponse>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1312,6 +1416,7 @@ mod tests {
         let policy = SessionPolicy {
             egress: None,
             ingress: Some(IngressPolicy::default()),
+            dynamic_ingress: None,
         };
         let json = serde_json_lenient::to_string(&policy).unwrap();
         assert!(json.contains("\"egress\":null"), "got: {json}");
@@ -1354,8 +1459,80 @@ mod tests {
             decoded,
             Errorable::Ok(SessionPolicy {
                 egress: None,
-                ingress: None
+                ingress: None,
+                dynamic_ingress: None,
             })
+        );
+    }
+
+    /// NET-043: the request `min net expose <port>` sends is one shape — the
+    /// box, the port at its own number, the transport — and each answer the
+    /// daemon gives decodes as what it is: a publication, a typed refusal, or
+    /// the RPC's own error (never a refusal read as a publication, nor an
+    /// error read as either).
+    #[test]
+    fn expose_request_wire_shape() {
+        let id = SessionId::nil();
+        let request = ExposeRequest {
+            id,
+            port: 3000,
+            proto: IpProto::Tcp,
+        };
+        let json = serde_json_lenient::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            format!(r#"{{"id":"{id}","port":3000,"proto":"tcp"}}"#),
+            "the request shape is what an evaluator on either path reads"
+        );
+        let decoded: ExposeRequest = serde_json_lenient::from_str(&json).unwrap();
+        assert_eq!(decoded, request);
+
+        let refused: Errorable<ExposeResponse> = serde_json_lenient::from_str(
+            r#"{"outcome":"refused","reason":{"kind":"out_of_range","port":9000,"lo":3000,"hi":4000}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            refused,
+            Errorable::Ok(ExposeResponse::Refused {
+                reason: ExposeRefusal::OutOfRange {
+                    port: 9000,
+                    lo: 3000,
+                    hi: 4000
+                }
+            })
+        );
+        let denied = serde_json_lenient::to_string(&ExposeResponse::Refused {
+            reason: ExposeRefusal::Denied,
+        })
+        .unwrap();
+        assert_eq!(
+            denied,
+            r#"{"outcome":"refused","reason":{"kind":"denied"}}"#
+        );
+
+        let published: Errorable<ExposeResponse> = serde_json_lenient::from_str(
+            r#"{"outcome":"published","hostname":"web.min.internal","address":"127.0.64.1","mapping":{"external_port":3000,"internal_port":3000,"proto":"tcp"}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                published,
+                Errorable::Ok(ExposeResponse::Published { ref hostname, address, ref mapping })
+                    if hostname == "web.min.internal"
+                        && address == std::net::Ipv4Addr::new(127, 0, 64, 1)
+                        && mapping.internal_port == 3000
+            ),
+            "{published:?}"
+        );
+
+        let error: Errorable<ExposeResponse> =
+            serde_json_lenient::from_str(r#"{"error":"no session found"}"#).unwrap();
+        assert_eq!(
+            error,
+            Errorable::Err {
+                error: "no session found".to_string()
+            },
+            "the RPC's own error must not read as an outcome"
         );
     }
 

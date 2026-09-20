@@ -346,6 +346,26 @@ impl IngressRules {
         }
     }
 
+    /// Adds `port` over `proto` to what an own-address box declares: a port
+    /// published at runtime by a dynamic ingress request is admitted like a
+    /// declared one from then on. A host-address box declares nothing of its
+    /// own, so this leaves it as it is.
+    pub fn declare(&mut self, proto: IpProto, port: u16) {
+        if let Some(declared) = &mut self.declared
+            && !declared.contains(&(proto, port))
+        {
+            declared.push((proto, port));
+        }
+    }
+
+    /// Takes `port` over `proto` back out of what the box declares: the
+    /// rollback of a dynamic publication that did not complete.
+    pub fn retract(&mut self, proto: IpProto, port: u16) {
+        if let Some(declared) = &mut self.declared {
+            declared.retain(|d| *d != (proto, port));
+        }
+    }
+
     /// Whether the box declared `port` for the transport `proto` names (an IPv4
     /// protocol number).
     ///

@@ -124,6 +124,15 @@ pub struct ExposedMapping {
     protocol: String,
 }
 
+impl ExposedMapping {
+    /// The host-side listen address the forward was exposed on, which
+    /// identifies it.
+    #[must_use]
+    pub fn local(&self) -> &str {
+        &self.local
+    }
+}
+
 /// Exposes every static port mapping in `ingress` on the switch's `control_sock`
 /// forwarding to `ptask_ip`, returning a handle per exposed forward for teardown
 /// (R2.3, R2.4-static). The dynamic range, if any, is not applied here — dynamic
@@ -143,12 +152,8 @@ pub async fn apply_ingress(
 ) -> io::Result<Vec<ExposedMapping>> {
     let mut exposed: Vec<ExposedMapping> = Vec::with_capacity(ingress.port_mappings.len());
     for mapping in &ingress.port_mappings {
-        let req = expose_request(mapping, ptask_ip);
-        match post_json(control, "/services/forwarder/expose", &req).await {
-            Ok(()) => exposed.push(ExposedMapping {
-                local: req.local,
-                protocol: req.protocol,
-            }),
+        match expose_mapping(control, ptask_ip, mapping).await {
+            Ok(forward) => exposed.push(forward),
             Err(e) => {
                 // Roll back what we managed to expose so a half-applied policy
                 // does not leave dangling forwards on the shared switch.
@@ -158,6 +163,27 @@ pub async fn apply_ingress(
         }
     }
     Ok(exposed)
+}
+
+/// Exposes one `mapping` on the switch's `control`, forwarding its host-side
+/// port to `ptask_ip`, and returns the handle that removes it again. One
+/// step of [`apply_ingress`], and on its own the forward a dynamic ingress
+/// request adds to a box that is already running.
+///
+/// # Errors
+///
+/// Returns the I/O error of the `expose` call.
+pub async fn expose_mapping(
+    control: &ControlChannel,
+    ptask_ip: Ipv4Addr,
+    mapping: &PortMapping,
+) -> io::Result<ExposedMapping> {
+    let req = expose_request(mapping, ptask_ip);
+    post_json(control, "/services/forwarder/expose", &req).await?;
+    Ok(ExposedMapping {
+        local: req.local,
+        protocol: req.protocol,
+    })
 }
 
 /// Removes every forward in `exposed` from the switch's `control_sock` (R2.3
@@ -375,6 +401,37 @@ impl BoxZone {
             .lock()
             .expect("BoxZone mutex poisoned")
             .remove(&session.to_ascii_lowercase());
+    }
+
+    /// Adds `port` over `proto` to what `session`'s entry declares: a port
+    /// published at runtime by a dynamic ingress request, which a sibling's
+    /// verdict then names as declared. Nothing changes for a name with no
+    /// live entry.
+    pub fn declare_port(&self, session: &str, proto: IpProto, port: u16) {
+        self.with_ports(session, proto, |ports| {
+            ports.insert(port);
+        });
+    }
+
+    /// Takes `port` over `proto` back out of what `session`'s entry declares:
+    /// the rollback of a dynamic publication that did not complete.
+    pub fn retract_port(&self, session: &str, proto: IpProto, port: u16) {
+        self.with_ports(session, proto, |ports| {
+            ports.remove(&port);
+        });
+    }
+
+    fn with_ports(&self, session: &str, proto: IpProto, edit: impl FnOnce(&mut BTreeSet<u16>)) {
+        let mut entries = self.entries.lock().expect("BoxZone mutex poisoned");
+        let Some(entry) = entries.get_mut(&session.to_ascii_lowercase()) else {
+            return;
+        };
+        match proto {
+            IpProto::Tcp => edit(&mut entry.tcp_ports),
+            IpProto::Udp => edit(&mut entry.udp_ports),
+            // A transport its mappings cannot name declares nothing.
+            _ => {}
+        }
     }
 
     /// The lease `name` resolves to inside boxes, or `None` for a name outside
@@ -967,6 +1024,24 @@ impl BoxAdmissions {
     /// Drops `session`'s declaration: the box is gone, and declares nothing.
     pub fn withdraw(&mut self, session: &str) {
         self.boxes.remove(session);
+    }
+
+    /// Adds `port` over `proto` to what `session` declared inbound: a port a
+    /// dynamic ingress request published at runtime, which a routed request
+    /// then reaches like a declared one. Nothing changes for a name with no
+    /// declaration behind it.
+    pub fn declare_port(&mut self, session: &str, proto: IpProto, port: u16) {
+        if let Some(declaration) = self.boxes.get_mut(session) {
+            declaration.ingress.declare(proto, port);
+        }
+    }
+
+    /// Takes `port` over `proto` back out of what `session` declared: the
+    /// rollback of a dynamic publication that did not complete.
+    pub fn retract_port(&mut self, session: &str, proto: IpProto, port: u16) {
+        if let Some(declaration) = self.boxes.get_mut(session) {
+            declaration.ingress.retract(proto, port);
+        }
     }
 
     /// The verdict on one TCP request the hostname proxy is asked to carry from

@@ -10,18 +10,20 @@
 //! or the `minvmd` host supervisor (DM1/3/4); this only wires an
 //! already-running switch into a sandbox's namespace (spec R1.4/R1.5).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::OwnedFd;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use sandbox2::NetGuard;
+use sessions::PortMapping;
 use tokio::sync::Mutex;
 
-use crate::net::policy::{BoxZone, ControlChannel, ExposedMapping};
-use crate::net::switch::SwitchRelay;
+use crate::net::policy::{BoxAdmissions, BoxZone, ControlChannel, ExposedMapping};
+use crate::net::switch::{AdmittedPorts, SwitchRelay};
 use crate::net::{SwitchClient, SwitchSubnet};
 
 /// The own-IP attachment guard. Returned by [`complete_own_ip_attach`] and torn
@@ -37,17 +39,174 @@ pub(crate) struct OwnIpGuard {
     _relay: SwitchRelay,
     /// The shared switch, locked on teardown to detach this PTask.
     switch: Arc<Mutex<SwitchClient>>,
-    /// gvproxy's control channel (local socket on DM2, host vsock on DM1/3/4),
-    /// used on teardown to remove this PTask's ingress forwards before detaching.
-    control: ControlChannel,
-    /// The static ingress forwards exposed for this PTask (R2.3), removed on
-    /// teardown. Empty when no ingress was configured.
-    exposed: Vec<ExposedMapping>,
+    /// This box's ingress as it stands while it runs: the forwards exposed on
+    /// the switch (the static ones from its policy, R2.3, and any a dynamic
+    /// ingress request added since), removed on teardown. Registered in
+    /// `live_boxes` under the box's name for as long as the box runs.
+    live: Arc<LiveIngress>,
+    live_boxes: Arc<LiveBoxes>,
     /// The switch's in-guest box zone, and this box's name in it: withdrawn on
     /// teardown so a sibling's verdict and the zone dump name live boxes only
     /// (NET-072, NET-073).
     box_zone: Arc<BoxZone>,
     session_name: String,
+}
+
+/// A running own-address box's ingress, as it can change while the box runs:
+/// what a dynamic ingress request decided `allow` adds a port to (NET-044),
+/// and what its rollback takes the port out of again (NET-047).
+///
+/// A port a box publishes at runtime must reach it the way a declared one
+/// does, and a declared port is admitted in four places fixed at attach: the
+/// switch's forwarder, which carries the host-side port to the box's lease;
+/// the relay's ingress gate, which admits the connection at the box's tap;
+/// the box zone, where a sibling's verdict names the port; and the box's
+/// declaration, which the daemon's hostname proxy decides routed requests
+/// against. [`Self::admit`] adds the port to all four, and [`Self::retract`]
+/// takes it out of them, so a running box needs no relaunch to serve it.
+pub(crate) struct LiveIngress {
+    /// gvproxy's control channel (local socket on DM2, host vsock on DM1/3/4):
+    /// where the forwarder verbs are posted.
+    control: ControlChannel,
+    /// The box's switch lease, where the forwarder delivers.
+    lease_ip: Ipv4Addr,
+    /// The ports the box's relay admits inbound, shared with its ingress gate.
+    ports: Arc<AdmittedPorts>,
+    /// Every forward exposed on the switch for this box, removed on teardown.
+    exposed: RwLock<Vec<ExposedMapping>>,
+    box_zone: Arc<BoxZone>,
+    admissions: Arc<RwLock<BoxAdmissions>>,
+    session_name: String,
+}
+
+impl LiveIngress {
+    /// The live ingress of the box named `session_name`, leased `lease_ip`,
+    /// reached over `control`: `ports` is what its relay's gate admits, and
+    /// `exposed` the forwards its static policy already put on the switch.
+    pub(crate) fn new(
+        control: ControlChannel,
+        lease_ip: Ipv4Addr,
+        ports: Arc<AdmittedPorts>,
+        exposed: Vec<ExposedMapping>,
+        box_zone: Arc<BoxZone>,
+        admissions: Arc<RwLock<BoxAdmissions>>,
+        session_name: &str,
+    ) -> Self {
+        Self {
+            control,
+            lease_ip,
+            ports,
+            exposed: RwLock::new(exposed),
+            box_zone,
+            admissions,
+            session_name: session_name.to_string(),
+        }
+    }
+
+    /// Exposes `mapping` on the switch and admits its port at the box's tap,
+    /// in its zone entry and in its declaration.
+    ///
+    /// # Errors
+    ///
+    /// The switch's error when the forward could not be exposed; nothing is
+    /// admitted then.
+    pub(crate) async fn admit(&self, mapping: &PortMapping) -> io::Result<()> {
+        let forward =
+            crate::net::policy::expose_mapping(&self.control, self.lease_ip, mapping).await?;
+        self.exposed
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(forward);
+        self.ports.admit(mapping.proto, mapping.internal_port);
+        self.box_zone
+            .declare_port(&self.session_name, mapping.proto, mapping.internal_port);
+        self.admissions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .declare_port(&self.session_name, mapping.proto, mapping.external_port);
+        Ok(())
+    }
+
+    /// Reverses [`Self::admit`] for `mapping`: the port is no longer admitted
+    /// anywhere, and its forward is removed from the switch. Best-effort on
+    /// the switch, like every unexpose: a forward that could not be removed is
+    /// logged, and nothing admits the port any more either way.
+    pub(crate) async fn retract(&self, mapping: &PortMapping) {
+        self.admissions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retract_port(&self.session_name, mapping.proto, mapping.external_port);
+        self.box_zone
+            .retract_port(&self.session_name, mapping.proto, mapping.internal_port);
+        self.ports.retract(mapping.proto, mapping.internal_port);
+        let local = crate::net::policy::expose_request(mapping, self.lease_ip).local;
+        let removed: Vec<ExposedMapping> = {
+            let mut exposed = self.exposed.write().unwrap_or_else(PoisonError::into_inner);
+            let (removed, kept) = std::mem::take(&mut *exposed)
+                .into_iter()
+                .partition(|forward| forward.local() == local);
+            *exposed = kept;
+            removed
+        };
+        crate::net::policy::remove_ingress(&self.control, &removed).await;
+    }
+
+    /// Every forward exposed for the box so far, for the teardown to remove.
+    fn exposed(&self) -> Vec<ExposedMapping> {
+        self.exposed
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// The running own-address boxes on the switch, by session name: what a
+/// dynamic ingress request looks its box up in to publish a port to a box
+/// that is already running. A box is registered as its attach completes and
+/// withdrawn as its guard tears down; a box not in here is not running, and
+/// a mapping recorded for it applies at its next attach.
+#[derive(Debug, Default)]
+pub(crate) struct LiveBoxes {
+    boxes: RwLock<HashMap<String, Arc<LiveIngress>>>,
+}
+
+impl LiveBoxes {
+    /// The live ingress of the running box named `session_name`, or `None`
+    /// when no such box is running.
+    #[must_use]
+    pub(crate) fn get(&self, session_name: &str) -> Option<Arc<LiveIngress>> {
+        self.boxes
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(session_name)
+            .cloned()
+    }
+
+    /// Registers `live` as the running box named `session_name`, replacing
+    /// any earlier registration under the name (a relaunch).
+    pub(crate) fn register(&self, session_name: &str, live: Arc<LiveIngress>) {
+        self.boxes
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(session_name.to_string(), live);
+    }
+
+    /// Withdraws the box named `session_name` as it stops running.
+    pub(crate) fn withdraw(&self, session_name: &str) {
+        self.boxes
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(session_name);
+    }
+}
+
+impl std::fmt::Debug for LiveIngress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveIngress")
+            .field("lease_ip", &self.lease_ip)
+            .field("session_name", &self.session_name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl NetGuard for OwnIpGuard {
@@ -56,8 +215,12 @@ impl NetGuard for OwnIpGuard {
             // Remove ingress forwards (R2.3 teardown) before detaching: detach
             // may stop gvproxy once the last PTask leaves, so the unexpose must
             // reach a still-running switch first.
-            if !self.exposed.is_empty() {
-                crate::net::policy::remove_ingress(&self.control, &self.exposed).await;
+            // Withdrawn first, so no dynamic request admits a port to a box
+            // that is going away.
+            self.live_boxes.withdraw(&self.session_name);
+            let exposed = self.live.exposed();
+            if !exposed.is_empty() {
+                crate::net::policy::remove_ingress(&self.live.control, &exposed).await;
             }
             // Withdrawn before the detach: from here the box answers nothing,
             // so nothing must resolve its name to a lease it no longer holds.
@@ -95,6 +258,7 @@ pub(crate) async fn complete_own_ip_attach(attach: OwnIpAttach<'_>) -> io::Resul
     } = attach;
     let gate = crate::net::switch::IngressGate::for_session(lease_ip.to_string(), ingress, subnet)
         .with_egress(egress);
+    let ports = gate.ports();
     let relay = match &control {
         ControlChannel::Unix(sock) => {
             crate::net::switch::attach_to_switch(tap_fd, sock, Some(gate)).await?
@@ -111,6 +275,7 @@ pub(crate) async fn complete_own_ip_attach(attach: OwnIpAttach<'_>) -> io::Resul
         subnet,
         session_name,
         ingress,
+        ports,
     })
     .await
 }
@@ -139,6 +304,8 @@ struct FinishAttach<'a> {
     subnet: SwitchSubnet,
     session_name: &'a str,
     ingress: Option<&'a sessions::IngressPolicy>,
+    /// The ports the relay's ingress gate admits, to admit a dynamic one into.
+    ports: Arc<AdmittedPorts>,
 }
 
 /// Tail of the own-IP attach: apply static ingress forwards (R2.3) over
@@ -154,6 +321,7 @@ async fn finish_own_ip_attach(attach: FinishAttach<'_>) -> io::Result<OwnIpGuard
         subnet,
         session_name,
         ingress,
+        ports,
     } = attach;
     let exposed = match ingress {
         Some(ingress) if !ingress.port_mappings.is_empty() => {
@@ -183,7 +351,10 @@ async fn finish_own_ip_attach(attach: FinishAttach<'_>) -> io::Result<OwnIpGuard
     // what the zone dump shows as the in-guest zone. Recorded whether or not the
     // post above reached gvproxy, because the box is on the switch either way —
     // a name that failed to register resolves nowhere, which the warning says.
-    let box_zone = switch.lock().await.box_zone();
+    let (box_zone, admissions, live_boxes) = {
+        let switch = switch.lock().await;
+        (switch.box_zone(), switch.admissions(), switch.live_boxes())
+    };
     box_zone.register(session_name, lease_ip, ingress);
 
     // And `host.min.internal` → the switch's host-gateway address, so this box
@@ -199,11 +370,24 @@ async fn finish_own_ip_attach(attach: FinishAttach<'_>) -> io::Result<OwnIpGuard
         );
     }
 
+    // The box runs from here: a dynamic ingress request finds it under its
+    // name and admits a port into the relay, the switch and both tables above.
+    let live = Arc::new(LiveIngress::new(
+        control,
+        lease_ip,
+        ports,
+        exposed,
+        Arc::clone(&box_zone),
+        admissions,
+        session_name,
+    ));
+    live_boxes.register(session_name, Arc::clone(&live));
+
     Ok(OwnIpGuard {
         _relay: relay,
         switch: Arc::clone(switch),
-        control,
-        exposed,
+        live,
+        live_boxes,
         box_zone,
         session_name: session_name.to_string(),
     })
