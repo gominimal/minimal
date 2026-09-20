@@ -273,6 +273,11 @@ TEST_SHELL=
 USERNS_SYSCTL=
 APPARMOR_DIR=
 
+# The dedicated VM user the installer looks for. Empty names an account no host
+# has, so every run takes the absent branch of the VM-user advisory; a
+# scenario sets it to a real account to drive the present branch.
+VM_USER=
+
 # Bin prefix the installer sees. Empty means the harness default ($hp/bin — a
 # custom MINIMAL_BIN, NOT one of the AppArmor tunable's stock attachment
 # paths); scenarios set it to $hp/.local/bin to exercise the default-prefix
@@ -308,6 +313,7 @@ run() {
         STUB_UNAME_M="$PLAT_M" \
         MINIMAL_OVERRIDE_USERNS_SYSCTL="${USERNS_SYSCTL:-$root/no-such-sysctl}" \
         MINIMAL_OVERRIDE_APPARMOR_DIR="${APPARMOR_DIR:-$root/no-such-apparmor.d}" \
+        MINIMAL_OVERRIDE_VM_USER="${VM_USER:-no-such-minimal-vm-user}" \
         MINIMAL_OVERRIDE_TTY="${TTY_FILE:-$root/no-such-tty}" \
         MINIMAL_INSTALL_FORCE_STOP="${FORCE_STOP:-}" \
         "$SH" "$installer" "$@" </dev/null >"$OUT" 2>&1
@@ -421,6 +427,31 @@ PLAT_S=Linux; PLAT_M=x86_64
 check 0 "$rc" "darwin install exits 0"
 want_err "apparmor components skipped on darwin" \
     test -e "$HAA_D/xdg-data/minimal/apparmor/minimald"
+
+# --- Host advisory: the dedicated VM user (spec 24, BEP-047) ---------------
+# Absent account: the note names it, carries the per-OS root command, and the
+# install still exits 0 (advice only; the installer never elevates). The
+# darwin run above took the same absent branch with the macOS command.
+want_ok "vm-user advisory names the absent account" \
+    grep -q "dedicated VM user 'no-such-minimal-vm-user' does not exist" "$OUT"
+want_ok "vm-user advisory carries sysadminctl on darwin" \
+    grep -q "sudo sysadminctl -addUser no-such-minimal-vm-user" "$OUT"
+want_card_last "the card follows the VM-user advisory (R10.4)"
+HVU="$root/hvu"; mkdir -p "$HVU"
+run vm_user_absent "$HVU"
+check 0 "$rc" "install without the VM user still exits 0 (advice only)"
+want_ok "vm-user advisory carries useradd on linux" \
+    grep -q "sudo useradd --system --no-create-home --shell /usr/sbin/nologin no-such-minimal-vm-user" "$OUT"
+want_ok "vm-user advisory points at the minvmd reference" \
+    grep -q "cli-minvmd#host-processes-and-users" "$OUT"
+# Present account (the harness's own): recorded with its uid, no note.
+VM_USER="$(id -un)"
+run vm_user_present "$HVU"
+VM_USER=
+want_ok "present VM user is recorded with its uid" \
+    grep -q "vm user: $(id -un) (uid $(id -u)) present" "$OUT"
+want_err "no advisory when the VM user is present" \
+    grep -q "dedicated VM user .* does not exist" "$OUT"
 
 # --- Uninstall: offer to remove the system AppArmor profile ----------------
 # A non-interactive uninstall (stdin is /dev/null, not a tty) advises the root

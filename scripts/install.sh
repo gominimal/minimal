@@ -1209,6 +1209,31 @@ if [ "$os" = linux ] && [ -r "$userns_sysctl" ] \
     fi
 fi
 
+# --- Host advisory: the dedicated VM user ----------------------------------
+
+# minvmd runs the gvproxy switch and the VM as a dedicated unprivileged user,
+# apart from the box egress proxy, which runs as the operator (spec 24,
+# BEP-047). Creating an account needs root and this installer never elevates,
+# so it records whether the account is present and, when it is not, says what
+# to run once — advice only, like the AppArmor note above; minvmd keeps
+# booting with everything on the login user until then, and says so in its
+# log. The name is overridable for install_test.sh and for a host that picks
+# another (MINVMD_VM_USER must then name the same account at run time).
+vm_user="${MINIMAL_OVERRIDE_VM_USER:-_minimalvm}"
+say ""
+if vm_uid="$(id -u "$vm_user" 2>/dev/null)"; then
+    say "  ${dim}vm user: $vm_user (uid $vm_uid) present$rst"
+else
+    say "note: the dedicated VM user '$vm_user' does not exist on this host, so"
+    say "  minvmd runs gvproxy and the VM as your login user until it does."
+    say "  Create it once (needs root):"
+    case "$os" in
+        darwin) say "      sudo sysadminctl -addUser $vm_user -fullName \"Minimal VM\" -roleAccount -UID 399" ;;
+        *)      say "      sudo useradd --system --no-create-home --shell /usr/sbin/nologin $vm_user" ;;
+    esac
+    say "  details: https://docs.minimal.dev/reference/cli-minvmd#host-processes-and-users"
+fi
+
 # --- The closing card ------------------------------------------------------
 
 # The last thing a `curl … | sh` user sees. It ends on what to run rather than

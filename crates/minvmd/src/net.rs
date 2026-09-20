@@ -39,7 +39,15 @@
 //! a box reach GitHub with only the sealed value the box was created with. It is
 //! a separate process with its own binary, listener and log lines — the two
 //! never share state (spec 24, BEP-047).
+//!
+//! Nor do they share a user. The proxy runs as the operator's login user (the
+//! keychain items it redeems are the operator's), while the switch and the VM
+//! run as one dedicated unprivileged account, switched to at spawn
+//! ([`HostUsers`], BEP-047). The plan is decided once per boot from the host's
+//! facts — whether the account exists and whether the supervisor may switch —
+//! and every spawn line names the user its process runs as.
 
+use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -107,6 +115,8 @@ pub struct GvproxyConfig {
     subnet: SwitchSubnet,
     /// Grace period before SIGTERM escalates to SIGKILL on teardown.
     term_timeout: Duration,
+    /// The user the switch runs as (BEP-047).
+    user: ProcessUser,
 }
 
 impl GvproxyConfig {
@@ -126,7 +136,21 @@ impl GvproxyConfig {
             config_path,
             subnet: SwitchSubnet::default(),
             term_timeout: DEFAULT_TERM_TIMEOUT,
+            user: ProcessUser::operator(),
         }
+    }
+
+    /// Run the switch as `user` (default: the operator).
+    #[must_use]
+    pub fn with_user(mut self, user: ProcessUser) -> Self {
+        self.user = user;
+        self
+    }
+
+    /// The user the switch runs as.
+    #[must_use]
+    pub fn user(&self) -> &ProcessUser {
+        &self.user
     }
 
     /// Override the path the gvproxy `-config` YAML is written to.
@@ -211,7 +235,10 @@ impl GvproxyConfig {
         leases: &[(Ipv4Addr, MacAddr)],
     ) -> io::Result<(GvproxySupervisor, SwitchExit)> {
         self.write_config(leases)?;
-        let child = Command::new(&self.binary).args(self.argv()).spawn()?;
+        let mut command = Command::new(&self.binary);
+        command.args(self.argv());
+        self.user.apply(&mut command);
+        let child = command.spawn()?;
         let (switch, exit) =
             GvproxySupervisor::supervise(child, self.term_timeout, self.switch_socket)?;
         tracing::info!(
@@ -219,6 +246,7 @@ impl GvproxyConfig {
             binary = %self.binary.display(),
             switch_socket = %switch.switch_socket().display(),
             config = %self.config_path.display(),
+            user = %self.user,
             "gvproxy switch spawned",
         );
         Ok((switch, exit))
@@ -550,7 +578,18 @@ impl HostGvproxy {
     /// Returns the I/O error if the runtime cannot be built, the config cannot
     /// be written, or the gvproxy binary cannot be launched.
     pub fn spawn(binary: PathBuf, switch_sock: PathBuf) -> io::Result<Self> {
-        let config = GvproxyConfig::new(binary, switch_sock);
+        Self::spawn_as(binary, switch_sock, ProcessUser::operator())
+    }
+
+    /// [`spawn`](Self::spawn) with the switch running as `user` (BEP-047): the
+    /// dedicated account [`HostUsers::resolve`] planned, or the operator.
+    ///
+    /// # Errors
+    ///
+    /// As [`spawn`](Self::spawn); a switch to a user the supervisor may not
+    /// become fails the launch with `EPERM`.
+    pub fn spawn_as(binary: PathBuf, switch_sock: PathBuf, user: ProcessUser) -> io::Result<Self> {
+        let config = GvproxyConfig::new(binary, switch_sock).with_user(user);
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u32>>();
 
@@ -730,6 +769,337 @@ impl VmEgressPolicy {
     }
 }
 
+// ── Process users (BEP-047) ─────────────────────────────────────────────────
+
+/// Env var naming the dedicated unprivileged user the gvproxy switch and the VM
+/// run as. Unset selects [`DEFAULT_VM_USER`]; set empty, it keeps the switch
+/// and the VM on the operator's login user.
+pub const VM_USER_ENV: &str = "MINVMD_VM_USER";
+
+/// The dedicated unprivileged account the installer advises creating for the
+/// switch and the VM. The leading underscore is the macOS role-account
+/// convention; Linux `useradd` accepts it too.
+pub const DEFAULT_VM_USER: &str = "_minimalvm";
+
+/// A host account as the passwd database names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    /// The login name.
+    pub name: String,
+    /// The user id.
+    pub uid: u32,
+    /// The primary group id.
+    pub gid: u32,
+}
+
+impl Account {
+    /// The account this process runs as, by real uid: the operator's login
+    /// user. A uid the passwd database does not know (a bare container) is
+    /// named by its number so it can still be logged.
+    #[must_use]
+    pub fn current() -> Self {
+        // SAFETY: `getuid`/`getgid` touch no memory and cannot fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        passwd_entry(|pwd, buf, len, result| {
+            // SAFETY: `pwd`, `buf` (of `len` bytes) and `result` are valid for
+            // the call, and `getpwuid_r` writes only into them.
+            unsafe { libc::getpwuid_r(uid, pwd, buf, len, result) }
+        })
+        .unwrap_or_else(|| Self {
+            name: format!("uid{uid}"),
+            uid,
+            gid,
+        })
+    }
+
+    /// Look `name` up in the passwd database; `None` when no such account
+    /// exists (or the name cannot be handed to libc).
+    #[must_use]
+    pub fn lookup(name: &str) -> Option<Self> {
+        let cname = std::ffi::CString::new(name).ok()?;
+        passwd_entry(|pwd, buf, len, result| {
+            // SAFETY: `cname` is NUL-terminated and outlives the call; the out
+            // parameters are valid for it, and `getpwnam_r` writes only into
+            // them.
+            unsafe { libc::getpwnam_r(cname.as_ptr(), pwd, buf, len, result) }
+        })
+    }
+
+    /// Make `path` this account's: its uid and gid, the path itself (a symlink
+    /// is not followed), mode untouched.
+    ///
+    /// # Errors
+    ///
+    /// The `chown` error — `EPERM` unless the caller is privileged or the
+    /// account is its own.
+    pub fn own(&self, path: &Path) -> io::Result<()> {
+        std::os::unix::fs::lchown(path, Some(self.uid), Some(self.gid))
+    }
+}
+
+impl fmt::Display for Account {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} (uid {})", self.name, self.uid)
+    }
+}
+
+/// One `getpw*_r` call, its buffer grown on `ERANGE`, read into an
+/// [`Account`]. `None` when there is no entry or the lookup fails.
+fn passwd_entry(
+    mut call: impl FnMut(
+        *mut libc::passwd,
+        *mut libc::c_char,
+        usize,
+        *mut *mut libc::passwd,
+    ) -> libc::c_int,
+) -> Option<Account> {
+    const MAX_BUF: usize = 64 * 1024;
+    let mut buf: Vec<libc::c_char> = vec![0; 1024];
+    loop {
+        // SAFETY: an all-zero `passwd` is a valid out-parameter — its pointer
+        // fields are null until libc fills them.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = call(&mut pwd, buf.as_mut_ptr(), buf.len(), &mut result);
+        if rc == libc::ERANGE && buf.len() < MAX_BUF {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null `result` means libc filled `pwd`, whose `pw_name`
+        // points at a NUL-terminated string inside `buf`, alive until return.
+        let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }
+            .to_string_lossy()
+            .into_owned();
+        return Some(Account {
+            name,
+            uid: pwd.pw_uid,
+            gid: pwd.pw_gid,
+        });
+    }
+}
+
+/// The user one of the host's processes runs as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessUser {
+    /// The operator's login user — the supervisor's real uid. The proxy always
+    /// runs this way: the keychain items it redeems are the operator's.
+    Operator(Account),
+    /// A dedicated unprivileged account, distinct from the operator's.
+    Dedicated(Account),
+}
+
+impl ProcessUser {
+    /// The operator's login user: this process's own account.
+    #[must_use]
+    pub fn operator() -> Self {
+        Self::Operator(Account::current())
+    }
+
+    /// The account.
+    #[must_use]
+    pub fn account(&self) -> &Account {
+        match self {
+            Self::Operator(account) | Self::Dedicated(account) => account,
+        }
+    }
+
+    /// Whether this is a user other than the operator's own.
+    #[must_use]
+    pub fn is_dedicated(&self) -> bool {
+        matches!(self, Self::Dedicated(_))
+    }
+
+    /// Make `cmd` run as this user: a uid/gid switch at exec for both
+    /// variants. The operator's is set explicitly rather than inherited
+    /// because the supervisor that switches at all holds an effective uid of
+    /// 0 (a setuid-style launcher, real uid the operator's) which a plain
+    /// spawn would pass on — the proxy, and the switch and the VM on a
+    /// fallback, would run as root. Setting one's own real uid is permitted
+    /// to any process, so an unprivileged boot is unchanged by it.
+    fn apply(&self, cmd: &mut Command) {
+        let account = self.account();
+        cmd.uid(account.uid).gid(account.gid);
+    }
+
+    /// [`apply`](Self::apply) for a synchronous [`std::process::Command`] (the
+    /// VMM child).
+    pub fn apply_std(&self, cmd: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt as _;
+        let account = self.account();
+        cmd.uid(account.uid).gid(account.gid);
+    }
+}
+
+impl fmt::Display for ProcessUser {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Operator(account) => write!(f, "{account}, operator"),
+            Self::Dedicated(account) => write!(f, "{account}, dedicated"),
+        }
+    }
+}
+
+/// Why the switch and the VM stay on the operator's user for this boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorFallback {
+    /// [`VM_USER_ENV`] is set empty: the operator opted out.
+    OptedOut,
+    /// The requested account does not exist on this host.
+    NoSuchUser,
+    /// The requested account is the operator's own.
+    IsOperator,
+    /// The supervisor holds no privilege to switch users (its effective uid
+    /// is not 0).
+    Unprivileged,
+}
+
+/// The users of the host's three processes, decided once per boot (BEP-047):
+/// the proxy is the operator; the switch and the VM share one account, the
+/// dedicated user when this host has it and the supervisor may switch, else
+/// the operator's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostUsers {
+    /// The box egress proxy: always the operator.
+    pub proxy: ProcessUser,
+    /// The gvproxy switch.
+    pub switch: ProcessUser,
+    /// The VMM child.
+    pub vm: ProcessUser,
+}
+
+impl HostUsers {
+    /// Decide this boot's users from [`VM_USER_ENV`], the passwd database and
+    /// the supervisor's own privilege, and log the plan — or the reason the
+    /// switch and the VM stay on the operator's user — once.
+    #[must_use]
+    pub fn resolve() -> Self {
+        let operator = Account::current();
+        let requested = std::env::var(VM_USER_ENV).unwrap_or_else(|_| DEFAULT_VM_USER.to_string());
+        let account = if requested.is_empty() {
+            None
+        } else {
+            Account::lookup(&requested)
+        };
+        // SAFETY: `geteuid` touches no memory and cannot fail.
+        let privileged = unsafe { libc::geteuid() } == 0;
+        let (users, fallback) = plan_host_users(&requested, account, operator, privileged);
+        match fallback {
+            // An unprivileged supervisor is every launcher in the tree today
+            // and an empty `MINVMD_VM_USER` is a choice: neither is a fault.
+            None | Some(OperatorFallback::Unprivileged | OperatorFallback::OptedOut) => {
+                tracing::info!(
+                    proxy = %users.proxy,
+                    switch = %users.switch,
+                    vm = %users.vm,
+                    ?fallback,
+                    "host process users",
+                );
+            }
+            // A privileged supervisor that still cannot switch was set up to
+            // and is not: the account is missing or is the operator's own.
+            Some(reason) => tracing::warn!(
+                proxy = %users.proxy,
+                switch = %users.switch,
+                vm = %users.vm,
+                requested,
+                ?reason,
+                "gvproxy switch and VM run as the operator, not a dedicated user",
+            ),
+        }
+        users
+    }
+
+    /// Hand the files the switch and the VM write to their user, before the
+    /// spawns (BEP-047): the provider dir the switch binds its socket in and
+    /// the VM binds the bridge in, the data volume and boot log a previous
+    /// boot left, the READY-marker socket the VM connects to, and the daemon
+    /// log the VM appends to. A no-op when the plan fell back to the operator,
+    /// whose files these already are; a missing path is skipped (the VM
+    /// creates it inside the dir it now owns).
+    ///
+    /// # Errors
+    ///
+    /// The first `chown` that fails, with its path.
+    pub fn grant_vm_files<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) -> io::Result<()> {
+        let ProcessUser::Dedicated(account) = &self.vm else {
+            return Ok(());
+        };
+        let mut granted = Vec::new();
+        for path in paths {
+            match account.own(path) {
+                Ok(()) => granted.push(path.display().to_string()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("handing {} to {account}: {e}", path.display()),
+                    ));
+                }
+            }
+        }
+        tracing::info!(user = %account, files = ?granted, "VM files handed to the dedicated user");
+        Ok(())
+    }
+
+    /// Hand the minimald bridge socket, which the VM bound as its user, to the
+    /// operator, whose `min` CLI is what connects to it: a socket connect is
+    /// checked against the file's owner and mode, and the supervisor tightens
+    /// the mode to 0600 right after. A no-op when the VM is the operator.
+    ///
+    /// # Errors
+    ///
+    /// The `chown` error.
+    pub fn hand_bridge_socket_to_operator(&self, sock: &Path) -> io::Result<()> {
+        if !self.vm.is_dedicated() {
+            return Ok(());
+        }
+        self.proxy.account().own(sock)
+    }
+}
+
+/// The decision itself, with every input passed in so it is testable without
+/// touching the environment or the passwd database. Returns the users and,
+/// when the switch and the VM stay on the operator's user, why.
+///
+/// Privilege is tested first: without it nothing else about the account
+/// matters, so every unprivileged boot reports the one reason that applies.
+fn plan_host_users(
+    requested: &str,
+    account: Option<Account>,
+    operator: Account,
+    privileged: bool,
+) -> (HostUsers, Option<OperatorFallback>) {
+    let fallback = |reason| {
+        let users = HostUsers {
+            proxy: ProcessUser::Operator(operator.clone()),
+            switch: ProcessUser::Operator(operator.clone()),
+            vm: ProcessUser::Operator(operator.clone()),
+        };
+        (users, Some(reason))
+    };
+    if !privileged {
+        return fallback(OperatorFallback::Unprivileged);
+    }
+    if requested.is_empty() {
+        return fallback(OperatorFallback::OptedOut);
+    }
+    let Some(account) = account else {
+        return fallback(OperatorFallback::NoSuchUser);
+    };
+    if account.uid == operator.uid {
+        return fallback(OperatorFallback::IsOperator);
+    }
+    let users = HostUsers {
+        proxy: ProcessUser::Operator(operator),
+        switch: ProcessUser::Dedicated(account.clone()),
+        vm: ProcessUser::Dedicated(account),
+    };
+    (users, None)
+}
+
 // ── The host box egress proxy (BEP-015) ─────────────────────────────────────
 
 /// The loopback port the box egress proxy's redemption listener binds. A box
@@ -836,6 +1206,10 @@ pub struct BepConfig {
     boxes: PathBuf,
     /// Grace period before SIGTERM escalates to SIGKILL on teardown.
     term_timeout: Duration,
+    /// The user the proxy runs as: always the operator (BEP-047). There is no
+    /// builder for it — the keychain items the proxy redeems are the
+    /// operator's, so no other user could serve.
+    user: ProcessUser,
 }
 
 impl BepConfig {
@@ -849,7 +1223,14 @@ impl BepConfig {
             audit_log: bep_dir.join(BEP_AUDIT_LOG_FILE),
             boxes: bep_dir.join(BEP_BOXES_FILE),
             term_timeout: DEFAULT_TERM_TIMEOUT,
+            user: ProcessUser::operator(),
         }
+    }
+
+    /// The user the proxy runs as: the operator.
+    #[must_use]
+    pub fn user(&self) -> &ProcessUser {
+        &self.user
     }
 
     /// Override the address the redemption listener binds (the tests bind an
@@ -1074,7 +1455,10 @@ async fn supervise_bep(
     stop_rx: oneshot::Receiver<()>,
     ready_tx: std::sync::mpsc::Sender<io::Result<u32>>,
 ) {
-    let mut child = match Command::new(&config.binary).args(config.argv()).spawn() {
+    let mut command = Command::new(&config.binary);
+    command.args(config.argv());
+    config.user.apply(&mut command);
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             let _ = ready_tx.send(Err(error));
@@ -1090,6 +1474,7 @@ async fn supervise_bep(
         listen = %config.listen,
         audit_log = %config.audit_log.display(),
         boxes = %config.boxes.display(),
+        user = %config.user,
         "box egress proxy spawned",
     );
 
@@ -1684,6 +2069,237 @@ mod tests {
         assert_eq!(
             bep_binary_from(None, Some(dir.path().into()), system),
             local,
+        );
+    }
+
+    /// The real uid a live process runs as, as the OS reports it.
+    fn process_uid(pid: u32) -> u32 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "uid=", "-p", &pid.to_string()])
+            .output()
+            .expect("run ps");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("ps reported no uid for pid {pid}: {e}"))
+    }
+
+    /// The uid owning `path`, as the filesystem reports it.
+    fn file_uid(path: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::symlink_metadata(path)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+            .uid()
+    }
+
+    /// The proxy runs as the operator's login user while the switch and the
+    /// VM run as one dedicated unprivileged user, as separate processes
+    /// sharing no writable state (BEP-047). The plan is decided from the
+    /// host's facts and applied at spawn as a real uid/gid switch — which an
+    /// unprivileged test can exercise only towards its own account, and can
+    /// see refused towards any other.
+    #[test]
+    fn bep_and_gvproxy_are_separate_processes_and_users() {
+        let operator = Account::current();
+        let vm_user = Account {
+            name: DEFAULT_VM_USER.to_string(),
+            uid: 399,
+            gid: 399,
+        };
+
+        // A host with the dedicated account and a supervisor that may switch:
+        // proxy = operator; switch = VM = the dedicated user, distinct from it.
+        let (users, reason) = plan_host_users(
+            DEFAULT_VM_USER,
+            Some(vm_user.clone()),
+            operator.clone(),
+            true,
+        );
+        assert_eq!(reason, None);
+        assert_eq!(users.proxy, ProcessUser::Operator(operator.clone()));
+        assert_eq!(users.switch, ProcessUser::Dedicated(vm_user.clone()));
+        assert_eq!(users.vm, ProcessUser::Dedicated(vm_user.clone()));
+        assert_ne!(
+            users.proxy.account().uid,
+            users.switch.account().uid,
+            "the proxy and the switch must not share a user",
+        );
+        assert_eq!(
+            users.switch, users.vm,
+            "the switch and the VM share one account"
+        );
+
+        // Every way a host falls short keeps all three on the operator, and
+        // says which way. The operator's own account is never "dedicated",
+        // and an unprivileged supervisor reports that alone, whatever else
+        // the host has.
+        for (requested, account, privileged, expected) in [
+            ("", None, true, OperatorFallback::OptedOut),
+            (DEFAULT_VM_USER, None, true, OperatorFallback::NoSuchUser),
+            (
+                DEFAULT_VM_USER,
+                Some(operator.clone()),
+                true,
+                OperatorFallback::IsOperator,
+            ),
+            (
+                DEFAULT_VM_USER,
+                Some(vm_user.clone()),
+                false,
+                OperatorFallback::Unprivileged,
+            ),
+            ("", None, false, OperatorFallback::Unprivileged),
+        ] {
+            let (users, reason) = plan_host_users(requested, account, operator.clone(), privileged);
+            assert_eq!(reason, Some(expected));
+            assert!(
+                !users.switch.is_dedicated() && !users.vm.is_dedicated(),
+                "{expected:?}: the switch and the VM must fall back to the operator",
+            );
+            assert_eq!(users.proxy, ProcessUser::Operator(operator.clone()));
+        }
+
+        // The proxy has no way to be anything but the operator.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let bep_dir = dir.path().join(BEP_DIR);
+        let bep_cfg = BepConfig::new(stayalive_bep(dir.path()), &bep_dir);
+        assert_eq!(bep_cfg.user(), &ProcessUser::Operator(operator.clone()));
+
+        // Separate processes, each spawned as its planned user. The one account
+        // an unprivileged test may switch to is its own, so the switch is
+        // planned as `Dedicated(operator)` and the proxy as `Operator`: both
+        // are real uid/gid switches at exec (the operator's too, so a
+        // privileged supervisor never passes its effective root on), and the
+        // OS reports each process under the expected uid. The switch keeps
+        // its files in a provider dir of its own, as on a host.
+        let provider = dir.path().join("provider");
+        std::fs::create_dir_all(&provider).expect("create stand-in provider dir");
+        let switch_sock = provider.join("gvproxy-switch.sock");
+        let _switch_listener = std::os::unix::net::UnixListener::bind(&switch_sock)
+            .expect("bind stand-in switch socket");
+        let gvproxy = HostGvproxy::spawn_as(
+            stayalive_gvproxy(dir.path()),
+            switch_sock.clone(),
+            ProcessUser::Dedicated(operator.clone()),
+        )
+        .expect("spawn host gvproxy as the planned user");
+        let proxy_listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind stand-in redemption listener");
+        let listen = proxy_listener.local_addr().expect("listener address");
+        let bep = HostBep::spawn(bep_cfg.with_listen(listen)).expect("spawn host box egress proxy");
+        assert_ne!(gvproxy.pid(), bep.pid(), "two processes, not one");
+        assert_eq!(process_uid(gvproxy.pid()), operator.uid);
+        assert_eq!(process_uid(bep.pid()), operator.uid);
+        bep.stop();
+        gvproxy.stop();
+
+        // A user the supervisor may not become is refused at spawn (EPERM),
+        // never silently ignored — the switch is real. Root may become anyone,
+        // so this half only holds for an unprivileged run.
+        // SAFETY: `geteuid` touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            let not_ours = Account {
+                name: "root".to_string(),
+                uid: 0,
+                gid: 0,
+            };
+            let err = HostGvproxy::spawn_as(
+                stayalive_gvproxy(dir.path()),
+                switch_sock.clone(),
+                ProcessUser::Dedicated(not_ours),
+            )
+            .expect_err("an unprivileged supervisor cannot switch to root");
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        }
+
+        // The supervisor hands the VM's files to the dedicated user before the
+        // spawns, and the bridge socket back to the operator after the boot:
+        // a real chown of each path that exists, a skip of each that does not.
+        // Towards the test's own account both are proved end to end; towards
+        // any other the grant is refused like the spawn, never skipped.
+        let users = HostUsers {
+            proxy: ProcessUser::Operator(operator.clone()),
+            switch: ProcessUser::Dedicated(operator.clone()),
+            vm: ProcessUser::Dedicated(operator.clone()),
+        };
+        let volume = provider.join("data-vol.raw");
+        std::fs::write(&volume, b"").expect("stand-in data volume");
+        let absent = provider.join("boot.log");
+        users
+            .grant_vm_files([provider.as_path(), volume.as_path(), absent.as_path()])
+            .expect("grant to the test's own account");
+        assert!(!absent.exists(), "a missing file is skipped, not created");
+        assert_eq!(file_uid(&provider), operator.uid);
+        assert_eq!(file_uid(&volume), operator.uid);
+        users
+            .hand_bridge_socket_to_operator(&switch_sock)
+            .expect("hand the socket to the operator");
+        assert_eq!(file_uid(&switch_sock), operator.uid);
+        // SAFETY: `geteuid` touches no memory and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            let to_root = HostUsers {
+                vm: ProcessUser::Dedicated(Account {
+                    name: "root".to_string(),
+                    uid: 0,
+                    gid: 0,
+                }),
+                ..users.clone()
+            };
+            let err = to_root
+                .grant_vm_files([volume.as_path()])
+                .expect_err("an unprivileged supervisor cannot hand a file to root");
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains("data-vol.raw"), "{err}");
+        }
+        // The operator plan touches nothing, even towards a path it could not.
+        let (operator_plan, _) = plan_host_users(DEFAULT_VM_USER, None, operator.clone(), true);
+        operator_plan
+            .grant_vm_files([Path::new("/no/such/dir/for/minvmd/tests")])
+            .expect("the operator plan grants nothing");
+
+        // No shared writable state: the proxy's files live under its own
+        // directory, the switch's beside its socket, and neither root contains
+        // the other — in the test layout and in the real one, where the proxy
+        // keeps `<state>/bep` and the switch and the VM keep the provider dir.
+        let switch_cfg = GvproxyConfig::new(stayalive_gvproxy(dir.path()), switch_sock);
+        let switch_root = switch_cfg
+            .config_path()
+            .parent()
+            .expect("the switch config has a parent");
+        assert!(!switch_cfg.config_path().starts_with(&bep_dir));
+        assert!(
+            !bep_cfg_paths(&bep_dir)
+                .iter()
+                .any(|p| p.starts_with(switch_root))
+        );
+        let real_bep_dir = resolve_bep_dir();
+        let real_switch_sock = resolve_switch_sock().expect("switch socket path");
+        let provider_dir = crate::state::provider_dir();
+        assert!(real_switch_sock.starts_with(&provider_dir));
+        assert!(!real_switch_sock.starts_with(&real_bep_dir));
+        assert!(!real_bep_dir.starts_with(&provider_dir));
+    }
+
+    /// The proxy's writable files for a `bep_dir`, as [`BepConfig`] lays them
+    /// down.
+    fn bep_cfg_paths(bep_dir: &Path) -> Vec<PathBuf> {
+        let cfg = BepConfig::new(PathBuf::from("/usr/lib/minimal/bin/bep"), bep_dir);
+        vec![cfg.audit_log().to_path_buf(), cfg.boxes().to_path_buf()]
+    }
+
+    /// The passwd lookups behind the plan: the operator's own account round
+    /// trips by name, and an absent name is `None` rather than an error.
+    #[test]
+    fn passwd_lookup_round_trips_the_operator_and_misses_an_absent_name() {
+        let operator = Account::current();
+        if !operator.name.starts_with("uid") {
+            assert_eq!(Account::lookup(&operator.name), Some(operator.clone()));
+        }
+        assert_eq!(Account::lookup("no-such-user-for-minvmd-tests"), None);
+        assert_eq!(Account::lookup("nul\0inside"), None);
+        assert_eq!(
+            format!("{}", ProcessUser::Dedicated(operator.clone())),
+            format!("{} (uid {}), dedicated", operator.name, operator.uid),
         );
     }
 
