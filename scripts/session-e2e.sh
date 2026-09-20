@@ -68,6 +68,7 @@
 #     native_resolution_without_proxy_env
 #     own_ip_egress_declared_and_enforced
 #     network_posture_from_stock_install
+#     escape_reaches_only_declared_union
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -1036,6 +1037,114 @@ run_case_network_posture_from_stock_install() {
   run_case_session_outbound_request
 }
 
+# NET-082/NET-083/NET-130, the three enforcement/observability pieces of the
+# escape bound (NET-085) this script can check end to end against a REAL
+# VM-backed box, over the shipped `min` CLI:
+#
+#   - NET-083: the box itself has no CAP_NET_RAW, so it cannot forge a
+#     source address locally in the first place.
+#   - NET-082: the guest boots with IPv6 disabled, so no netns in it --
+#     this box's own included -- ever has an IPv6 route.
+#   - NET-130: the box's effective policy (`min session policy`) shows the
+#     node-plane baseline set (registry, cache, resolver) beside its rules.
+#
+# NET-085's own bound -- that a spoofed source reaches only the union of
+# resident boxes' DECLARED egress plus that baseline set -- is proven as a
+# T0 system test against the real production filter/relay in
+# crates/minvmd/tests/escape_bound_integration.rs
+# (`cargo nextest run -p minvmd vm_escape_bounded_to_resident_union`): it
+# plays the root-in-VM spoofer directly against `HostFilter`, admitting only
+# the resident union and nothing to an address no box holds. Reproducing
+# that same forged-frame handshake here, from this script, needs a box with
+# a non-trivial DECLARED egress to bound the spoof against, and there is no
+# shipped way to declare one yet: `activate_session` hard-codes
+# `egress: None` (crates/minimal/src/cmd/session.rs), and NET-076 says the
+# deny-all default for an absent `egress` section is "announced but not yet
+# in force" -- every resident box's declared reach is "everything" until
+# that CLI/config surface lands, so a spoof-and-verify rerun here would
+# bound a forged address against nothing narrower than the three checks
+# below already establish. This case is honest about that gap rather than
+# faking a bound with no declaration behind it.
+run_case_escape_reaches_only_declared_union() {
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "escape-bound proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+    return 0
+  fi
+  echo "::group::escape into the VM reaches only the declared union (NET-082, NET-083, NET-130)"
+
+  ESCAPE_SEED_DIR="$(mktemp -d /tmp/mnlx.XXXXXX)"
+  ESCAPE_SEED_DIR="$(cd "$ESCAPE_SEED_DIR" && pwd -P)"
+  {
+    awk '
+      /^\[upstream\]/            { grab = 1; print; next }
+      grab && (/^$/ || /^\[/)    { exit }
+      grab                       { print }
+    ' "$ROOT/.minimal/minimal.toml"
+    printf '\n[stack]\nuse = "shell"\n'
+  } > "$ESCAPE_SEED_DIR/minimal.toml"
+  mkdir "$ESCAPE_SEED_DIR/.git"
+
+  local esc_out esc_sid
+  esc_out="$(cd "$ESCAPE_SEED_DIR" && mnl session activate . --no-prompt --name e2e-escape \
+    --network own_ip 2>"$WORK/mi-escape-activate.err")" || {
+    echo "::error::'min session activate --network own_ip' failed for the escape-bound case"
+    cat "$WORK/mi-escape-activate.err" 2>/dev/null || true
+    fail
+  }
+  esc_sid="$(printf '%s\n' "$esc_out" | tail -n1 | tr -d '\r')"
+  echo "escape-bound session: $esc_sid"
+
+  # NET-083: no CAP_NET_RAW in the box's own capability set.
+  local capeff
+  capeff="$(mnl session exec "$esc_sid" grep -m1 '^CapEff:' /proc/self/status \
+    2>"$WORK/mi-escape-caps.err" | awk '{print $2}')"
+  if [ -z "$capeff" ]; then
+    echo "::error::could not read the box's CapEff from /proc/self/status"
+    cat "$WORK/mi-escape-caps.err" 2>/dev/null || true
+    fail
+  fi
+  if (( (16#$capeff) & 0x2000 )); then
+    echo "::error::NET-083: the box's process retains CAP_NET_RAW (CapEff=$capeff)"
+    fail
+  fi
+  echo "NET-083 OK: the box has no CAP_NET_RAW (CapEff=$capeff)"
+
+  # NET-082: no IPv6 route anywhere in the guest, this box's own netns
+  # included -- `/proc/net/ipv6_route` is either absent or empty with
+  # `ipv6.disable=1` on the kernel command line.
+  local v6route
+  v6route="$(mnl session exec "$esc_sid" sh -c \
+    'if [ -e /proc/net/ipv6_route ]; then cat /proc/net/ipv6_route; fi' \
+    2>"$WORK/mi-escape-v6.err")"
+  if [ -n "$v6route" ]; then
+    echo "::error::NET-082: the guest has an IPv6 route (expected none): $v6route"
+    fail
+  fi
+  echo "NET-082 OK: no IPv6 route in the guest"
+
+  # NET-130: the baseline set (registry, cache, resolver -- BaselineCategory::ALL)
+  # is shown beside the box's effective rules.
+  local shown marker
+  shown="$(mnl session policy "$esc_sid" 2>"$WORK/mi-escape-policy.err")" || {
+    echo "::error::'min session policy' failed for the escape-bound case"
+    cat "$WORK/mi-escape-policy.err" 2>/dev/null || true
+    fail
+  }
+  for marker in '"baseline"' '"category":"registry"' '"category":"cache"' '"category":"resolver"'; do
+    if [[ "$shown" != *"$marker"* ]]; then
+      echo "::error::NET-130: the policy line is missing $marker: $shown"
+      fail
+    fi
+  done
+  echo "NET-130 OK: the baseline set (registry, cache, resolver) is shown beside the effective rules"
+
+  echo "::warning::NET-085's union-bound reach test (a spoofed source admitted only to the resident union plus the baseline set) is not reproduced live here: no shipped surface lets this script declare a box's egress yet, so there is no non-trivial declared reach to bound a spoof against on a real host today. cargo nextest run -p minvmd vm_escape_bounded_to_resident_union is the T0 system test proving that bound against the real filter; once a box can declare egress end to end, this case should replay it against a live session."
+
+  mnl session destroy --force "$esc_sid" >/dev/null 2>&1 || true
+  rm -rf "$ESCAPE_SEED_DIR"; ESCAPE_SEED_DIR=""
+  echo "::endgroup::"
+}
+
 E2E_CASE="${E2E_CASE:-${1:-}}"
 if [ -n "$E2E_CASE" ]; then
   case "$E2E_CASE" in
@@ -1046,8 +1155,9 @@ if [ -n "$E2E_CASE" ]; then
     native_resolution_without_proxy_env) run_case_native_resolution_without_proxy_env; exit $? ;;
     own_ip_egress_declared_and_enforced) run_case_own_ip_egress_declared_and_enforced; exit $? ;;
     network_posture_from_stock_install) run_case_network_posture_from_stock_install; exit $? ;;
+    escape_reaches_only_declared_union) run_case_escape_reaches_only_declared_union; exit $? ;;
     *)
-      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install)" >&2
+      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union)" >&2
       exit 2
       ;;
   esac
