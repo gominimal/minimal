@@ -247,6 +247,120 @@ async fn ls_raw_with_sessions() {
     assert!(lines.contains(&id2.to_string().as_str()));
 }
 
+// --- host-side hostname listener faults ---
+
+/// A listener that could not bind is reported through both entry points the
+/// user meets it at — `min session activate` and `min ls` — carrying the
+/// daemon's reason and what to do about it.
+#[tokio::test]
+async fn listener_failure_reported_with_remedy() {
+    let (daemon, args) = setup().await;
+    // The reason a daemon whose proxy port is held hands out.
+    let held = "the daemon could not bind 127.0.0.1:7654; another process is holding it. \
+                Check with: lsof -nP -iTCP:7654 -sTCP:LISTEN";
+    daemon
+        .server
+        .state
+        .set_proxy_unavailable(held.to_string())
+        .await;
+
+    // `min session activate` learns of it from the CreateSession reply.
+    let mut client = daemon.server.connect().await;
+    use minimald_rpc::{CreateSession, CreateSessionRequest, ListSessions};
+    let project_path =
+        camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
+    let created = match client
+        .call::<CreateSession>(&CreateSessionRequest {
+            config: minimald_rpc::SessionConfig {
+                name: Some("listener-fault".to_string()),
+                project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
+                network: sessions::NetworkMode::NoNet,
+                policy: Default::default(),
+                hooks_enabled: true,
+                attrs: Default::default(),
+            },
+            must_match_version: None,
+        })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(resp) => resp,
+        minimald_rpc::Errorable::Err { error } => panic!("CreateSession failed: {error}"),
+    };
+    let mut activate = Vec::new();
+    write_hostname_routing_warning(
+        &mut activate,
+        created.hostname_routing_unavailable.as_deref(),
+    )
+    .unwrap();
+
+    // `min ls` learns of it from the list.
+    let mut ls_client = connect_daemon(&args).await.unwrap();
+    let listed = ls_client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    let mut ls = Vec::new();
+    write_hostname_routing_warning(&mut ls, listed.hostname_routing_unavailable.as_deref())
+        .unwrap();
+
+    for (command, rendered) in [("activate", activate), ("ls", ls)] {
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(
+            text.contains("could not bind 127.0.0.1:7654"),
+            "{command} must print the reason: {text}"
+        );
+        assert!(
+            text.contains("lsof -nP -iTCP:7654"),
+            "{command} must keep the daemon's detail: {text}"
+        );
+        assert!(
+            text.contains("remedy:"),
+            "{command} must print a remedy: {text}"
+        );
+        assert!(
+            text.contains("no daemon restart needed"),
+            "{command}'s remedy must say a restart is not part of it: {text}"
+        );
+    }
+}
+
+/// The warning is not sticky: the daemon rebinds on its own, and the next `min
+/// ls` over the same connection prints nothing — no restart in between.
+#[tokio::test]
+async fn ls_warning_clears_on_recovery() {
+    let (daemon, args) = setup().await;
+    daemon
+        .server
+        .state
+        .set_proxy_unavailable("the daemon could not bind 127.0.0.1:7654".to_string())
+        .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::ListSessions;
+    let down = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    let mut warned = Vec::new();
+    write_hostname_routing_warning(&mut warned, down.hostname_routing_unavailable.as_deref())
+        .unwrap();
+    assert!(
+        !warned.is_empty(),
+        "a listener that cannot bind must warn in ls"
+    );
+
+    // The listener binds. Same daemon process, same client connection.
+    daemon.server.state.clear_proxy_unavailable().await;
+
+    let up = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    assert!(
+        up.hostname_routing_unavailable.is_none(),
+        "the daemon must stop reporting a fault it has recovered from"
+    );
+    let mut cleared = Vec::new();
+    write_hostname_routing_warning(&mut cleared, up.hostname_routing_unavailable.as_deref())
+        .unwrap();
+    assert!(
+        cleared.is_empty(),
+        "ls must print no warning once the listener is back: {}",
+        String::from_utf8_lossy(&cleared)
+    );
+}
+
 // --- activate + ls ---
 
 #[tokio::test]

@@ -318,8 +318,20 @@ impl ServerStateHandle {
     }
 
     /// Records why hostname routing is unavailable, so a client can be told.
-    pub(crate) async fn set_proxy_unavailable(&self, reason: String) {
+    ///
+    /// `pub` rather than `pub(crate)` because the test harness hands tests the
+    /// state handle to set up daemon conditions their CLI cannot induce — a
+    /// listener whose address is held being one of them.
+    pub async fn set_proxy_unavailable(&self, reason: String) {
         self.0.lock().await.proxy_unavailable = Some(reason);
+    }
+
+    /// Withdraws the hostname-routing fault: the listener is serving again.
+    ///
+    /// The next `ListSessions` reads the cleared state, which is what makes the
+    /// `min ls` warning disappear on recovery without a daemon restart.
+    pub async fn clear_proxy_unavailable(&self) {
+        self.0.lock().await.proxy_unavailable = None;
     }
 
     /// Why hostname routing is unavailable, or `None` if the proxy is up.
@@ -762,38 +774,44 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
     // state where `ListSessions` can reach them — a daemon that keeps serving
     // without its proxy looks identical to a healthy one otherwise.
     let egress_addr = SocketAddr::new(bind_base, proxy::EGRESS_PROXY_PORT);
-    let bound = proxy::bind_listener(egress_addr)
-        .await
-        .map(|listener| {
+    match proxy::bind_listener(egress_addr).await {
+        Some(listener) => {
             let router = Router::new(registry.clone());
             tokio::spawn(async move {
                 if let Err(error) = proxy::serve(listener, router).await {
                     tracing::error!(%error, "egress proxy accept loop exited");
                 }
-            })
-        })
-        .is_some();
-
-    if !bound {
-        // DM2: something else on the host holds the port.
-        state
-            .set_proxy_unavailable(format!(
-                "the daemon could not bind {egress_addr}; another process is \
-                 holding it. Check with: lsof -nP -iTCP:{} -sTCP:LISTEN",
-                proxy::EGRESS_PROXY_PORT
-            ))
-            .await;
-    } else if in_microvm {
-        // DM1: the guest bind cannot collide with a host process, so the
-        // failure moves to the publish instead. Only publish a port whose
-        // listener actually bound.
-        if let Some(reason) = expose_proxy_on_host(
-            crate::net::DEFAULT_SUBNET.daemon_ip(),
-            proxy::EGRESS_PROXY_PORT,
-        )
-        .await
-        {
-            state.set_proxy_unavailable(reason).await;
+            });
+            // DM1: the guest bind cannot collide with a host process, so the
+            // failure moves to the publish instead. Only publish a port whose
+            // listener actually bound.
+            if in_microvm
+                && let Some(reason) = expose_proxy_on_host(
+                    crate::net::DEFAULT_SUBNET.daemon_ip(),
+                    proxy::EGRESS_PROXY_PORT,
+                )
+                .await
+            {
+                state.set_proxy_unavailable(reason).await;
+                // The listener is serving; only its host-side publish is
+                // missing, so that alone is retried.
+                let state = state.clone();
+                tokio::spawn(async move {
+                    publish_on_host_retrying(proxy::EGRESS_PROXY_PORT).await;
+                    state.clear_proxy_unavailable().await;
+                });
+            }
+        }
+        None => {
+            // DM2: something else on the host holds the port.
+            state
+                .set_proxy_unavailable(format!(
+                    "the daemon could not bind {egress_addr}; another process is \
+                     holding it. Check with: lsof -nP -iTCP:{} -sTCP:LISTEN",
+                    proxy::EGRESS_PROXY_PORT
+                ))
+                .await;
+            recover_egress_listener(state.clone(), registry.clone(), egress_addr, in_microvm);
         }
     }
 
@@ -850,6 +868,62 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
                     .await;
             }
         }
+    }
+}
+
+/// Brings the host-side egress listener back after a failed bind, in the
+/// background, and clears the fault report once hostnames route again.
+///
+/// Rebinds on the [`rebind_delay`](crate::net::proxy::rebind_delay) backoff, in
+/// a microVM publishes the port on the host loopback the same way, and only then
+/// withdraws the reason `ListSessions` is handing out — so `min ls` stops
+/// warning exactly when `*.min.internal` works again, with no daemon restart
+/// (R3.4 recovery).
+#[cfg(target_os = "linux")]
+fn recover_egress_listener(
+    state: ServerStateHandle,
+    registry: Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
+    addr: std::net::SocketAddr,
+    in_microvm: bool,
+) {
+    use crate::net::proxy::{self, Router};
+
+    tokio::spawn(async move {
+        let listener = proxy::bind_listener_retrying(addr).await;
+        if in_microvm {
+            publish_on_host_retrying(addr.port()).await;
+        }
+        state.clear_proxy_unavailable().await;
+        let router = Router::new(registry);
+        if let Err(error) = proxy::serve(listener, router).await {
+            tracing::error!(%error, "egress proxy accept loop exited");
+        }
+    });
+}
+
+/// Keeps asking the host gvproxy forwarder to publish `port` on the host
+/// loopback until it accepts (DM1), on the same backoff a rebind uses.
+///
+/// A publish that never lands leaves a listener that is bound in the guest and
+/// unreachable from the host — the DM1 half of the same fault — so it is retried
+/// rather than reported once and left.
+#[cfg(target_os = "linux")]
+async fn publish_on_host_retrying(port: u16) {
+    let mut attempt: u32 = 0;
+    while let Some(reason) =
+        expose_proxy_on_host(crate::net::DEFAULT_SUBNET.daemon_ip(), port).await
+    {
+        attempt += 1;
+        let delay = crate::net::proxy::rebind_delay(attempt);
+        tracing::warn!(
+            component = "dns-proxy",
+            port,
+            attempt,
+            retry_in_ms = delay.as_millis() as u64,
+            %reason,
+            "retrying the host-loopback publish for the egress proxy"
+        );
+        tokio::time::sleep(delay).await;
     }
 }
 

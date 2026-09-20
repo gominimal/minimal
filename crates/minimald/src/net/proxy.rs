@@ -193,6 +193,62 @@ pub async fn bind_listener(addr: SocketAddr) -> Option<TcpListener> {
     }
 }
 
+/// Delay before the first rebind attempt after a failed bind.
+const REBIND_BASE_DELAY: Duration = Duration::from_millis(250);
+
+/// Ceiling on the rebind delay. A held address is freed by a process on its own
+/// schedule, so the backoff stops growing here and keeps probing at a fixed,
+/// cheap interval instead of drifting into hours.
+const REBIND_MAX_DELAY: Duration = Duration::from_secs(30);
+
+/// Delay before the `attempt`-th rebind (1-based): [`REBIND_BASE_DELAY`]
+/// doubling per attempt, capped at [`REBIND_MAX_DELAY`].
+#[must_use]
+pub fn rebind_delay(attempt: u32) -> Duration {
+    // Clamp the shift well inside `u32`: the cap is reached by attempt 8, so a
+    // large attempt count only needs to not overflow.
+    let doublings = attempt.saturating_sub(1).min(16);
+    REBIND_BASE_DELAY
+        .saturating_mul(1u32 << doublings)
+        .min(REBIND_MAX_DELAY)
+}
+
+/// Binds `addr`, retrying with backoff until it succeeds, and hands back the
+/// bound listener.
+///
+/// The caller has already made (and reported) the first failed attempt via
+/// [`bind_listener`], so this starts by waiting. It never gives up: the address
+/// is held by another process, which exits on its own schedule, and a daemon
+/// that stopped retrying would need a restart before `*.min.internal` hostnames
+/// routed again (R3.4 recovery). Each attempt logs the delay before the next
+/// one; the bind that finally succeeds logs the recovery.
+pub async fn bind_listener_retrying(addr: SocketAddr) -> TcpListener {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let delay = rebind_delay(attempt);
+        tracing::warn!(
+            component = "dns-proxy",
+            %addr,
+            status = "unavailable",
+            attempt,
+            retry_in_ms = delay.as_millis() as u64,
+            "retrying the host-side egress proxy bind"
+        );
+        tokio::time::sleep(delay).await;
+        if let Some(listener) = bind_listener(addr).await {
+            tracing::info!(
+                component = "dns-proxy",
+                %addr,
+                status = "recovered",
+                attempts = attempt,
+                "host-side egress proxy listener recovered"
+            );
+            return listener;
+        }
+    }
+}
+
 /// Serves the egress proxy on `listener`, spawning a task per connection that
 /// routes it through `router`. Runs until the listener errors.
 ///
@@ -1034,6 +1090,65 @@ mod tests {
         assert!(
             logged.contains(r#"status="unavailable""#),
             "expected the unavailable status field, got: {logged}"
+        );
+    }
+
+    /// A bind that fails does not stay failed: the daemon keeps retrying on a
+    /// growing, capped delay and comes up on its own once the address is free,
+    /// with no restart involved (NET-021).
+    #[tokio::test(start_paused = true)]
+    async fn listener_retries_with_backoff() {
+        // The schedule doubles from the base delay and then holds at the cap.
+        assert_eq!(rebind_delay(1), REBIND_BASE_DELAY);
+        assert_eq!(rebind_delay(2), REBIND_BASE_DELAY * 2);
+        assert_eq!(rebind_delay(3), REBIND_BASE_DELAY * 4);
+        assert_eq!(rebind_delay(1_000), REBIND_MAX_DELAY);
+
+        // Hold the address so every attempt fails until the holder lets go.
+        let held = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = held.local_addr().unwrap();
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let started = tokio::time::Instant::now();
+        let retrying = tokio::spawn(bind_listener_retrying(addr));
+
+        // Paused time auto-advances while every task is sleeping, so crossing
+        // the first backoff steps costs no real time.
+        tokio::time::sleep(REBIND_BASE_DELAY * 8).await;
+        assert!(
+            !retrying.is_finished(),
+            "must not report a listener while the address is held"
+        );
+        let logged = buf.contents();
+        assert!(
+            logged.contains("retry_in_ms=250") && logged.contains("retry_in_ms=500"),
+            "expected a growing retry delay per attempt, got: {logged}"
+        );
+
+        drop(held);
+        let bound = tokio::time::timeout(Duration::from_secs(120), retrying)
+            .await
+            .expect("the retry loop must bind once the address is free")
+            .expect("the retry task must not panic");
+        assert_eq!(bound.local_addr().unwrap(), addr);
+
+        // It backed off between attempts rather than spinning: at least the
+        // first three delays elapsed before the address came free.
+        assert!(
+            started.elapsed() >= rebind_delay(1) + rebind_delay(2) + rebind_delay(3),
+            "expected the loop to sleep between attempts, elapsed {:?}",
+            started.elapsed()
+        );
+        assert!(
+            buf.contents().contains(r#"status="recovered""#),
+            "recovery must be logged, got: {}",
+            buf.contents()
         );
     }
 
