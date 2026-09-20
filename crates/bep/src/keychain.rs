@@ -16,7 +16,10 @@
 //! ([`SecretItems`], [`MemorySecrets`], `KeychainSecrets`). Each item carries
 //! an access control ([`ItemAcl`]) with one entry created for the proxy's
 //! process identity, so the proxy reads the value without a prompt and every
-//! other application prompts (BEP-051).
+//! other application prompts (BEP-051). The proxy reads a referenced value
+//! through [`value_for_request`] — once per request that injects it, nothing
+//! held between two — so a replacement is injected from the next request on
+//! and a deletion refuses it (BEP-033, BEP-045, BEP-054).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -321,6 +324,37 @@ pub trait SecretItems {
     /// [`StoreError::Missing`] when the store holds none, or when the store
     /// refuses the deletion.
     fn delete(&self, id: &str) -> Result<(), StoreError>;
+}
+
+/// The value one request injects, read from `store` now (BEP-033): the store
+/// is asked on every request that redeems a reference, nothing is held
+/// between two, and the value lives only as long as the request that carries
+/// it — so an item replaced since the last request hands over the new value
+/// with no restart of the proxy (BEP-054).
+///
+/// `None` is every reason the value cannot be injected: the store holds no
+/// item under `id`, or holds one it will not hand over — a deleted item and
+/// one whose access control no longer admits the proxy alike — and the caller
+/// refuses the request for either (BEP-045).
+///
+/// Every read is logged with the identifier and whether a value was found.
+/// The value itself is written nowhere: it is returned, injected into the one
+/// request, and dropped with it.
+#[must_use]
+pub fn value_for_request<S>(store: &S, id: &str) -> Option<Secret>
+where
+    S: SecretItems + ?Sized,
+{
+    match store.read(id) {
+        Ok(value) => {
+            tracing::info!(id, found = value.is_some(), "read a stored value");
+            value
+        }
+        Err(error) => {
+            tracing::warn!(id, %error, "the store would not hand over a stored value");
+            None
+        }
+    }
 }
 
 /// An in-process secret store: items live in memory for the life of the store
@@ -983,9 +1017,260 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::{Arc, Mutex, PoisonError};
 
-    use super::{ItemAcl, MemorySecrets, SecretItems};
+    use super::{ItemAcl, MemorySecrets, SecretItem, SecretItems, StoreError, value_for_request};
     use crate::github::Secret;
+    use crate::redeem::store::header_value;
+
+    /// The identifier a store reference names, throughout these tests.
+    const ID: &str = "anthropic-api-key";
+
+    /// The prefix the reference's rule registers for the header form.
+    const PREFIX: &str = "Bearer ";
+
+    /// The access control `min secret set` puts on the item.
+    fn acl() -> ItemAcl {
+        ItemAcl::for_proxy(Path::new("/usr/lib/minimal/bin/bep"))
+    }
+
+    /// One request that redeems a reference to `id`, as the proxy runs it:
+    /// the store is read for this request and the value goes out in the
+    /// registered form, or there is nothing to inject and the request is
+    /// refused. The listener's own tests prove these two run in this order on
+    /// a real request; here they are the request.
+    fn injected<S>(store: &S, id: &str) -> Option<String>
+    where
+        S: SecretItems + ?Sized,
+    {
+        let value = value_for_request(store, id)?;
+        header_value(PREFIX, value.expose())
+    }
+
+    /// A store the test watches: it holds items exactly as [`MemorySecrets`]
+    /// does and records every call made through the seam, so a test can say
+    /// what the requests did to the store — and what they did not do. Every
+    /// clone shares both the items and the record, as the proxy's handle on
+    /// the store shares them with `min secret`'s.
+    #[derive(Clone, Default)]
+    struct WatchedSecrets {
+        held: MemorySecrets,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl WatchedSecrets {
+        /// Every call made through the seam so far, in order.
+        fn calls(&self) -> Vec<String> {
+            self.locked().clone()
+        }
+
+        fn record(&self, call: String) {
+            self.locked().push(call);
+        }
+
+        fn locked(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+            self.calls.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+
+    impl SecretItems for WatchedSecrets {
+        fn set(&self, id: &str, value: &Secret, acl: &ItemAcl) -> Result<(), StoreError> {
+            self.record(format!("set {id}"));
+            self.held.set(id, value, acl)
+        }
+
+        fn read(&self, id: &str) -> Result<Option<Secret>, StoreError> {
+            self.record(format!("read {id}"));
+            self.held.read(id)
+        }
+
+        fn items(&self) -> Result<Vec<SecretItem>, StoreError> {
+            self.record("items".to_owned());
+            self.held.items()
+        }
+
+        fn delete(&self, id: &str) -> Result<(), StoreError> {
+            self.record(format!("delete {id}"));
+            self.held.delete(id)
+        }
+    }
+
+    /// A store that holds the item and will not hand the value over: what a
+    /// read does when the item's access control no longer admits the proxy —
+    /// an item disabled rather than deleted (BEP-045).
+    struct RefusingSecrets;
+
+    impl SecretItems for RefusingSecrets {
+        fn set(&self, _: &str, _: &Secret, _: &ItemAcl) -> Result<(), StoreError> {
+            unreachable!("a request never writes to the store")
+        }
+
+        fn read(&self, id: &str) -> Result<Option<Secret>, StoreError> {
+            Err(StoreError::Backend {
+                op: "read the value",
+                message: format!("the access control on {id} does not admit this process"),
+            })
+        }
+
+        fn items(&self) -> Result<Vec<SecretItem>, StoreError> {
+            unreachable!("a request never lists the store")
+        }
+
+        fn delete(&self, _: &str) -> Result<(), StoreError> {
+            unreachable!("a request never deletes from the store")
+        }
+    }
+
+    /// BEP-033: the value is read from the store for the request that injects
+    /// it. Three successive requests make three reads, so nothing is held
+    /// between two of them and no request can carry a value the store no
+    /// longer holds; and a request makes no call on the store but that read,
+    /// so it writes the value back nowhere. Nor does the value reach a file
+    /// around the injection: the only form it renders in is redacted, so a
+    /// log line or an audit record written from it names the identifier and
+    /// never the value.
+    #[test]
+    fn store_value_read_per_request_never_written() {
+        let held = "sk-ant-api03-held";
+        let store = WatchedSecrets::default();
+        store
+            .set(ID, &Secret::new(held), &acl())
+            .expect("the store holds the value");
+
+        // The first request, spelled out: the read hands back the value, and
+        // what the value renders as is redacted.
+        let value = value_for_request(&store, ID).expect("the store holds the value");
+        assert_eq!(
+            format!("{value:?}"),
+            "Secret(<redacted>)",
+            "the value renders redacted, so nothing written out carries it"
+        );
+        assert_eq!(
+            header_value(PREFIX, value.expose()).as_deref(),
+            Some("Bearer sk-ant-api03-held")
+        );
+
+        // Two more requests, each reading the store again.
+        for request in 2..=3 {
+            assert_eq!(
+                injected(&store, ID).as_deref(),
+                Some("Bearer sk-ant-api03-held"),
+                "request {request} carries the stored value"
+            );
+        }
+
+        assert_eq!(
+            store.calls(),
+            [
+                format!("set {ID}"),
+                format!("read {ID}"),
+                format!("read {ID}"),
+                format!("read {ID}"),
+            ],
+            "one read per request, and no request writes anything"
+        );
+    }
+
+    /// BEP-045: an item the store no longer holds refuses the next request
+    /// that would inject it, and an item the store holds but will not hand
+    /// over refuses one just the same. Nothing stands between the removal and
+    /// the refusal: the handle the proxy has held since it started is the one
+    /// that now finds nothing, so no restart is needed for the deletion to
+    /// bite, and every refused request reads the store again rather than
+    /// answering from something kept.
+    #[test]
+    fn deleted_keychain_item_refuses_next_injection() {
+        let store = WatchedSecrets::default();
+        // The handle the proxy took at startup and never renews.
+        let proxy = store.clone();
+        store
+            .set(ID, &Secret::new("sk-ant-api03-live"), &acl())
+            .expect("the store holds the value");
+        assert_eq!(
+            injected(&proxy, ID).as_deref(),
+            Some("Bearer sk-ant-api03-live"),
+            "the request before the removal carries the value"
+        );
+
+        // What `min secret remove` does to the item.
+        store.delete(ID).expect("the store held the item");
+
+        assert_eq!(
+            injected(&proxy, ID),
+            None,
+            "the next request has nothing to inject and is refused"
+        );
+        assert_eq!(injected(&proxy, ID), None, "and so is the request after it");
+        assert_eq!(
+            store.calls(),
+            [
+                format!("set {ID}"),
+                format!("read {ID}"),
+                format!("delete {ID}"),
+                format!("read {ID}"),
+                format!("read {ID}"),
+            ],
+            "each refused request asked the store itself"
+        );
+
+        // An item still held, whose access control no longer admits the
+        // proxy: the read fails rather than coming back empty, and the
+        // request is refused for that too.
+        assert_eq!(
+            injected(&RefusingSecrets, ID),
+            None,
+            "a value the store will not hand over is injected into nothing"
+        );
+    }
+
+    /// BEP-054: a value written over an existing item is injected by the next
+    /// request that redeems a reference to it, through the handle the proxy
+    /// has held since it started — no restart of the proxy between the write
+    /// and the request — and the value held before it goes out on no later
+    /// request.
+    #[test]
+    fn replaced_secret_is_injected_on_next_request() {
+        let old = "sk-ant-api03-old";
+        let new = "sk-ant-api03-new";
+        let store = WatchedSecrets::default();
+        // The handle the proxy took at startup and never renews.
+        let proxy = store.clone();
+        store
+            .set(ID, &Secret::new(old), &acl())
+            .expect("the store holds the value");
+        assert_eq!(
+            injected(&proxy, ID).as_deref(),
+            Some("Bearer sk-ant-api03-old")
+        );
+
+        // What `min secret set <id>` does over an existing item.
+        store
+            .set(ID, &Secret::new(new), &acl())
+            .expect("the store replaces the value");
+
+        for request in 1..=2 {
+            let carried = injected(&proxy, ID).expect("the request injects the new value");
+            assert_eq!(
+                carried, "Bearer sk-ant-api03-new",
+                "request {request} after the replacement"
+            );
+            assert!(
+                !carried.contains(old),
+                "the replaced value went out: {carried}"
+            );
+        }
+        assert_eq!(
+            store.calls(),
+            [
+                format!("set {ID}"),
+                format!("read {ID}"),
+                format!("set {ID}"),
+                format!("read {ID}"),
+                format!("read {ID}"),
+            ],
+            "the requests after the replacement read the store again"
+        );
+    }
 
     /// The access control `min secret set` puts on an item names the proxy's
     /// process identity — the proxy binary's path — as the one application

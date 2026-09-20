@@ -67,7 +67,7 @@ use crate::ca::{Authority, Leaf};
 use crate::control::{
     self, ClientKey, ClientKeys, ControlError, Registered, Revocations, Submission,
 };
-use crate::keychain::{KeyStore, SecretItems};
+use crate::keychain::{self, KeyStore, SecretItems};
 use crate::keys::Keys;
 use crate::mint::{self, Inject, StoreClaims};
 use crate::redeem::{
@@ -1068,16 +1068,9 @@ where
         id: &str,
         inject: &Inject,
     ) -> Result<Substitution, &'static str> {
-        let value = match self.secrets.read(id) {
-            Ok(Some(value)) => value,
-            Ok(None) => {
-                tracing::warn!(id, "the store holds no value for an admitted handle");
-                return Err(STORE_VALUE_MISSING);
-            }
-            Err(error) => {
-                tracing::warn!(id, %error, "the store did not hand over an admitted handle's value");
-                return Err(STORE_VALUE_MISSING);
-            }
+        let Some(value) = keychain::value_for_request(&*self.secrets, id) else {
+            tracing::warn!(id, "no store value for an admitted handle");
+            return Err(STORE_VALUE_MISSING);
         };
         let carrying = carried.header().ok_or(INJECTION_INVALID)?;
         let (name, text) = match inject {
