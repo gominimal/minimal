@@ -227,6 +227,12 @@ pub struct Manager {
     /// `HostNet` PTasks register on launch and withdraw on teardown.
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+
+    /// The host's published-box table ([`crate::net::publish`]): the zone the
+    /// box-zone answerer serves. Each session actor publishes its box at
+    /// finalize and withdraws it at destroy.
+    #[cfg(target_os = "linux")]
+    published: Arc<RwLock<crate::net::publish::PublishTable>>,
 }
 
 impl Manager {
@@ -260,10 +266,14 @@ impl Manager {
         let hostnames = Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
             crate::net::dns::DEFAULT_HOST_ID,
         )));
+        #[cfg(target_os = "linux")]
+        let published = Arc::new(RwLock::new(crate::net::publish::PublishTable::default()));
         let handle = ManagerHandle {
             sender,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
+            #[cfg(target_os = "linux")]
+            published: Arc::clone(&published),
         };
         // A non-owning path back to this actor, handed to each spawned session
         // so its binding can request destruction (see `weak_self`).
@@ -280,6 +290,8 @@ impl Manager {
             net_switch,
             #[cfg(target_os = "linux")]
             hostnames,
+            #[cfg(target_os = "linux")]
+            published,
         };
 
         tokio::spawn(mngr.mainloop());
@@ -406,6 +418,8 @@ impl Manager {
             manager: self.weak_self.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
+            #[cfg(target_os = "linux")]
+            published: Arc::clone(&self.published),
         }
     }
 
@@ -724,6 +738,10 @@ pub struct ManagerHandle {
     /// through the actor mainloop.
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// A clone of the actor's shared published-box table, handed to the
+    /// box-zone answerer.
+    #[cfg(target_os = "linux")]
+    published: Arc<RwLock<crate::net::publish::PublishTable>>,
 }
 
 /// A non-owning handle to the [`Manager`] actor.
@@ -740,6 +758,9 @@ pub struct WeakManagerHandle {
     /// keep the actor alive (only live senders do).
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// Mirrors [`ManagerHandle::published`], for the same reason.
+    #[cfg(target_os = "linux")]
+    published: Arc<RwLock<crate::net::publish::PublishTable>>,
 }
 
 impl WeakManagerHandle {
@@ -751,6 +772,8 @@ impl WeakManagerHandle {
             sender: self.sender.upgrade()?,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
+            #[cfg(target_os = "linux")]
+            published: Arc::clone(&self.published),
         })
     }
 }
@@ -817,6 +840,8 @@ impl ManagerHandle {
             sender: self.sender.downgrade(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
+            #[cfg(target_os = "linux")]
+            published: Arc::clone(&self.published),
         }
     }
 
@@ -827,6 +852,14 @@ impl ManagerHandle {
     #[must_use]
     pub fn hostnames(&self) -> Arc<RwLock<crate::net::dns::HostnameRegistry>> {
         Arc::clone(&self.hostnames)
+    }
+
+    /// Returns a shared handle to the host's published-box table, for the
+    /// box-zone answerer ([`crate::net::answerer`]) to serve the zone from.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn published(&self) -> Arc<RwLock<crate::net::publish::PublishTable>> {
+        Arc::clone(&self.published)
     }
 
     /// Lists the sessions known to this (minimald) instance.

@@ -913,12 +913,12 @@ async fn start_zone_answerer(state: &ServerStateHandle) {
             return;
         }
     };
-    let registry = state.sessions_manager().await.hostnames();
+    let zone = state.sessions_manager().await.published();
     let daemon_id = state.daemon_id().await;
     let dump_path =
         answerer::zone_dump_path(state.minimal_state_dir().await.as_utf8_path().as_std_path());
     tokio::spawn(async move {
-        if let Err(error) = answerer::serve(listener, registry, daemon_id, dump_path).await {
+        if let Err(error) = answerer::serve(listener, zone, daemon_id, dump_path).await {
             tracing::error!(%error, "box-zone answerer exited");
         }
     });

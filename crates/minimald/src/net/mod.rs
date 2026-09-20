@@ -20,6 +20,7 @@ pub mod answerer;
 pub mod dns;
 pub mod policy;
 pub mod proxy;
+pub mod publish;
 pub mod switch;
 
 // The own-IP switch attach, and the mode-to-provider factory that reaches it.
