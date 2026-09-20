@@ -61,6 +61,12 @@ pub const DEFAULT_TERM_TIMEOUT: Duration = Duration::from_secs(3);
 /// before reporting the host switch ready (or failing the bring-up).
 const SWITCH_SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often the background datapath probe dials the switch's `-listen`
+/// socket to confirm it is still accepting connections (NET-023). Well under
+/// the one-minute warning bound the requirement sets, so a lost datapath is
+/// always caught with room to spare.
+const DATAPATH_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Poll-connect `sock` until gvproxy's `-listen` socket accepts a connection or
 /// `timeout` elapses. A gvproxy that exits during startup never binds the
 /// socket, so a timeout here means the switch is not usable — surfaced as an
@@ -84,6 +90,48 @@ async fn wait_for_switch_socket(sock: &Path, timeout: Duration) -> io::Result<()
             }
         }
     }
+}
+
+/// Background task (NET-023): every `interval`, dial `switch_socket` to check
+/// the switch is still accepting connections. Warns only on the
+/// healthy→unreachable transition — a switch that stays down after the first
+/// warning does not re-warn every tick — and stops probing once `stopping` is
+/// set, since an intentional teardown legitimately takes the socket away.
+///
+/// `interval` sits well under NET-023's one-minute bound
+/// ([`DATAPATH_PROBE_INTERVAL`] in production), so the switch being killed out
+/// from under a running VM is always caught with room to spare.
+///
+/// This covers the socket-level loss (gvproxy hung or the socket gone without
+/// the process exiting); [`HostGvproxy::spawn`]'s unexpected-exit path calls
+/// [`warn_datapath_lost`] directly for the process-exited case, since that
+/// path tears the supervisor down (aborting this probe) within milliseconds —
+/// long before the next tick here would fire.
+async fn probe_datapath(switch_socket: PathBuf, interval: Duration, stopping: Arc<AtomicBool>) {
+    let mut healthy = true;
+    loop {
+        tokio::time::sleep(interval).await;
+        if stopping.load(Ordering::Acquire) {
+            return;
+        }
+        let reachable = tokio::net::UnixStream::connect(&switch_socket)
+            .await
+            .is_ok();
+        if healthy && !reachable {
+            warn_datapath_lost(&switch_socket);
+        }
+        healthy = reachable;
+    }
+}
+
+/// Emit the NET-023 "datapath lost" warning naming `switch_socket`. Shared by
+/// [`probe_datapath`]'s periodic check and [`HostGvproxy::spawn`]'s
+/// unexpected-exit path.
+fn warn_datapath_lost(switch_socket: &Path) {
+    tracing::warn!(
+        switch_socket = %switch_socket.display(),
+        "gvproxy switch datapath lost",
+    );
 }
 
 /// Builder for the per-host gvproxy switch process.
@@ -243,6 +291,9 @@ pub struct GvproxySupervisor {
     ///
     /// [`stop`]: GvproxySupervisor::stop
     supervisor: Option<tokio::task::JoinHandle<()>>,
+    /// Handle to the background datapath probe (NET-023); `None` once
+    /// [`stop`](GvproxySupervisor::stop) has aborted it.
+    probe: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl GvproxySupervisor {
@@ -288,6 +339,11 @@ impl GvproxySupervisor {
         let stopping = Arc::new(AtomicBool::new(false));
         let (exit_tx, exit_rx) = oneshot::channel();
         let supervisor = tokio::spawn(supervise_switch(child, pid, Arc::clone(&stopping), exit_tx));
+        let probe = tokio::spawn(probe_datapath(
+            switch_socket.clone(),
+            DATAPATH_PROBE_INTERVAL,
+            Arc::clone(&stopping),
+        ));
         let switch = Self {
             pid,
             #[cfg(target_os = "linux")]
@@ -296,6 +352,7 @@ impl GvproxySupervisor {
             switch_socket,
             stopping,
             supervisor: Some(supervisor),
+            probe: Some(probe),
         };
         Ok((switch, SwitchExit { rx: exit_rx }))
     }
@@ -328,6 +385,9 @@ impl GvproxySupervisor {
         // `stop()` must not re-signal `pid` — it only awaits the supervisor for
         // the exit.
         let already_claimed = self.stopping.swap(true, Ordering::AcqRel);
+        if let Some(probe) = self.probe.take() {
+            probe.abort();
+        }
         let Some(mut supervisor) = self.supervisor.take() else {
             // Already stopped.
             return;
@@ -367,6 +427,9 @@ impl Drop for GvproxySupervisor {
         let Some(_supervisor) = self.supervisor.take() else {
             return;
         };
+        if let Some(probe) = self.probe.take() {
+            probe.abort();
+        }
         // Fire-and-forget fallback: `Drop` cannot await, so mark the exit
         // intentional and SIGKILL immediately, leaving the detached supervision
         // task to reap the child. No blocking poll runs here (the async
@@ -597,6 +660,12 @@ impl HostGvproxy {
                                 code = status.and_then(|s| s.code()),
                                 "host gvproxy switch exited unexpectedly",
                             );
+                            // The process is gone, so the datapath is
+                            // definitely lost (NET-023) — warn here rather
+                            // than relying on probe_datapath's next tick,
+                            // which dropping `switch` below aborts within
+                            // milliseconds, long before that tick would fire.
+                            warn_datapath_lost(switch.switch_socket());
                             // gvproxy is already gone; drop the handle (no signal).
                             drop(switch);
                         }
@@ -725,6 +794,37 @@ impl VmEgressPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// A `MakeWriter` accumulating everything written into a shared buffer, so a
+    /// test can assert on a `tracing` event without a real log sink.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl CaptureWriter {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     fn spawn_sleep() -> Child {
         // A long-lived child to stand in for gvproxy in supervision tests.
@@ -998,5 +1098,70 @@ mod tests {
         assert_eq!(policy.allow_subnets(), ["10.0.0.0/8"]);
         assert_eq!(policy.allow_protocols(), [IpProto::Tcp]);
         assert!(policy.allow_dns_hosts().is_empty());
+    }
+
+    /// NET-023: killing the switch under a running VM must warn within one
+    /// minute that its datapath is gone. Drives [`probe_datapath`] directly
+    /// against a stand-in switch socket at a test-scale interval — the
+    /// production interval ([`DATAPATH_PROBE_INTERVAL`]) is itself far under
+    /// the one-minute bound, so proving the healthy→lost transition warns
+    /// promptly at any interval proves the bound holds in production too.
+    ///
+    /// `flavor = "current_thread"` is pinned explicitly (it is already
+    /// `tokio::test`'s default): the `tracing::subscriber::set_default` guard
+    /// below is thread-local, so the spawned `probe_datapath` task only sees
+    /// it while running on this same thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lost_datapath_warns_within_one_minute() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let sock = dir.path().join("switch.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&sock).expect("bind stand-in switch socket");
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let stopping = Arc::new(AtomicBool::new(false));
+        let probe = tokio::spawn(probe_datapath(
+            sock.clone(),
+            Duration::from_millis(20),
+            Arc::clone(&stopping),
+        ));
+
+        // A couple of healthy ticks against the live socket must not warn.
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        assert!(
+            buf.contents().is_empty(),
+            "no warning while the switch is reachable"
+        );
+
+        // Kill the switch out from under the (simulated) running VM.
+        drop(listener);
+
+        let warned = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if buf.contents().contains("gvproxy switch datapath lost") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        probe.abort();
+        drop(guard);
+
+        assert!(
+            warned.is_ok(),
+            "expected a datapath-lost warning after the switch was killed"
+        );
+        let logged = buf.contents();
+        assert!(
+            logged.contains(&sock.display().to_string()),
+            "warning must name the switch socket, got: {logged}"
+        );
     }
 }
