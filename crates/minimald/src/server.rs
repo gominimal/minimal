@@ -557,6 +557,12 @@ impl Server {
         #[cfg(target_os = "linux")]
         if !in_microvm {
             start_zone_answerer(&state).await;
+            // The host-address classifier's tree (NET-078..NET-080): the
+            // daemon enters its own leaf before any box exists, and writes
+            // what the privileged install step needs.
+            crate::net::host_cohort::native_daemon_start(
+                state.minimal_state_dir().await.as_utf8_path().as_std_path(),
+            );
         }
 
         let russh_config = build_russh_config(&state)

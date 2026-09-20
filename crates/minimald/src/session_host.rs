@@ -959,6 +959,10 @@ pub(crate) struct Launched<P, G> {
     /// down explicitly via [`sandbox2::NetGuard::teardown`] at session end.
     /// `None` for `HostNet`/`NoNet` and for the mock launcher.
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
+    /// The `cgroup.procs` of the box's classifier leaf, when this host
+    /// decides per box: every process the daemon injects into the box joins
+    /// it there first (`crate::net::host_cohort`). `None` elsewhere.
+    cohort_procs: Option<std::path::PathBuf>,
     /// Path of the session PTY's slave side, so hooks can open the
     /// terminal briefly rather than the host retaining a descriptor.
     tty_path: std::path::PathBuf,
@@ -1406,6 +1410,8 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // down explicitly in `mainloop` when the session ends, before `_guard` (and
     // thus the sandbox files) is dropped. `None` for `HostNet`/`NoNet` and tests.
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
+    /// See [`Launched::cohort_procs`].
+    cohort_procs: Option<std::path::PathBuf>,
 
     /// Path of the session PTY's slave side. Attach and detach hooks
     /// open it briefly so their stdout is a real terminal; the host
@@ -1852,12 +1858,21 @@ const SESSION_WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_DE
 /// which stays correct across skipped uploads, an in-session `min init`,
 /// and attaches from unrelated host directories. TTY-gated, plain text —
 /// `NO_COLOR`-safe, no box drawing.
+///
+/// A session-start advisory about this host's host-address enforcement
+/// (`crate::net::host_cohort`) prints as one more line when the launcher
+/// seeded it: the banner is the surface a user reads, where a stderr line
+/// before the shell paints is not.
 const BASELINE_MOTD: &str = constcat::concat!(
     r#"[ -t 1 ] && { printf 'minimal · session %s · loadout %s\ndetach: %s' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-none}" "${MINIMAL_DETACH_HINT:-ctrl-] then d}"; [ -f "#,
     SESSION_WORKSPACE_ROOT,
     r#"/minimal.toml ] || [ -f "#,
     SESSION_WORKSPACE_ROOT,
-    r#"/.minimal/minimal.toml ] || printf ' · no minimal.toml here — min init to add one'; printf '\n'; }"#,
+    r#"/.minimal/minimal.toml ] || printf ' · no minimal.toml here — min init to add one'; printf '\n'; [ -z "${"#,
+    crate::net::host_cohort::ADVISORY_ENV,
+    r#":-}" ] || printf '%s\n' "$"#,
+    crate::net::host_cohort::ADVISORY_ENV,
+    r#""; }"#,
 );
 
 /// The launcher-baseline environment seeded beneath every other layer of
@@ -2011,6 +2026,20 @@ impl SpawnedProcessGuard {
     }
 }
 
+/// The box's classifier leaf between its creation and the handoff to the
+/// session's network guard: an abandoned launch removes it.
+#[cfg(not(test))]
+struct CohortLeaf(Option<crate::net::host_cohort::Leaf>);
+
+#[cfg(not(test))]
+impl Drop for CohortLeaf {
+    fn drop(&mut self) {
+        if let Some(leaf) = self.0.take() {
+            leaf.remove_now();
+        }
+    }
+}
+
 #[cfg(not(test))]
 impl Drop for SpawnedProcessGuard {
     fn drop(&mut self) {
@@ -2069,6 +2098,40 @@ impl SessionLauncher for SandboxLauncher {
         .await
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
+
+        // A host-address box on a native host: whether this host decides its
+        // declaration per box is decided, logged and recorded now, at session
+        // start (NET-079), and what it decides travels into the box's
+        // environment for the banner to say. Never a refusal: on a host that
+        // cannot decide per box the box runs with its declaration unenforced.
+        // On a host that does decide per box, the box's leaf is created
+        // here, before the spawn, and the process is moved into it right
+        // after; `CohortLeaf` removes the leaf if the launch is abandoned
+        // in between.
+        let host_cohort = if network_mode == NetworkMode::HostNet
+            && matches!(
+                net_switch.lock().await.transport(),
+                crate::net::SwitchTransport::LocalSpawn
+            ) {
+            crate::net::host_cohort::native_session_start(&session_name, egress.as_ref()).await
+        } else {
+            crate::net::host_cohort::SessionStart {
+                env: Vec::new(),
+                placement: None,
+            }
+        };
+        let host_cohort_env = host_cohort.env;
+        let mut cohort_leaf = CohortLeaf(
+            match (
+                &host_cohort.placement,
+                crate::net::host_cohort::native_host(),
+            ) {
+                (Some(placement), Some(host)) => Some(host.place(placement).map_err(|e| {
+                    io::Error::other(format!("placing the box in its classifier leaf: {e}"))
+                })?),
+                _ => None,
+            },
+        );
 
         // Step 1 (pre-spawn): the provider for this PTask's mode reserves what
         // the sandbox needs — for own-IP, a lease and a running gvproxy — and
@@ -2151,8 +2214,12 @@ impl SessionLauncher for SandboxLauncher {
             .as_ref()
             .map(|c| c.orientation().loadouts_display.as_str())
             .filter(|d| !d.is_empty());
+        // The host-cohort record and advisory sit in the baseline with the
+        // banner that prints them.
+        let mut baseline = session_baseline_env(&name, loadouts_display);
+        baseline.extend(host_cohort_env);
         let env_vars = layer_session_env(
-            session_baseline_env(&name, loadouts_display),
+            baseline,
             attach_env.inherited,
             composition_vars,
             attach_env.connection,
@@ -2290,6 +2357,18 @@ impl SessionLauncher for SandboxLauncher {
         // Until this returns, an own-IP PTask's egress isn't up yet, but a shell
         // PTask never probes the network in this window (the SSH layer dispatches
         // commands only after `Launched` is returned).
+        // Into its classifier leaf, before the shell can open a socket (the
+        // SSH layer dispatches nothing until `Launched` is returned): the
+        // box unshared its cgroup namespace at the daemon's leaf, so from
+        // inside, this leaf's siblings and the daemon's are out of reach. A
+        // failed move is a failed launch, never a box left in the daemon's
+        // leaf with the node-plane verdict.
+        if let Some(leaf) = cohort_leaf.0.as_ref() {
+            leaf.adopt(process.get_mut().id()).map_err(|e| {
+                io::Error::other(format!("moving the box into its classifier leaf: {e}"))
+            })?;
+        }
+
         let net_guard: Option<Box<dyn sandbox2::NetGuard>> = {
             let spawned = sandbox2::Spawned::from_child(process.get_mut());
             match planned.attach(spawned).await {
@@ -2298,6 +2377,16 @@ impl SessionLauncher for SandboxLauncher {
                 // The release stays with `planned`, which drops on this return.
                 Err(e) => return Err(io::Error::other(e)),
             }
+        };
+        // The leaf outlives the attachment: removed after the provider's own
+        // teardown, once the box has been reaped.
+        let cohort_procs = cohort_leaf.0.as_ref().map(|l| l.procs_file());
+        let net_guard = match cohort_leaf.0.take() {
+            Some(leaf) => Some(
+                Box::new(crate::net::host_cohort::LeafGuard::new(net_guard, leaf))
+                    as Box<dyn sandbox2::NetGuard>,
+            ),
+            None => net_guard,
         };
 
         Ok(Launched {
@@ -2308,6 +2397,7 @@ impl SessionLauncher for SandboxLauncher {
             },
             guard: env,
             net_guard,
+            cohort_procs,
             tty_path,
         })
     }
@@ -2430,6 +2520,7 @@ impl SessionLauncher for MockLauncher {
             },
             guard: (),
             net_guard: None,
+            cohort_procs: None,
             tty_path,
         })
     }
@@ -2509,6 +2600,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         crate::nsenter::Injection::new(self.session_leader_pid()?, program, args)
             .with_cwd(environment.cwd)
             .with_env(vars)
+            .with_cgroup(self.cohort_procs.clone())
             .command()
     }
 
@@ -2572,6 +2664,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             event,
             commands: crate::hooks::InjectedCommands {
                 leader_pid,
+                cgroup_procs: self.cohort_procs.clone(),
                 cwd: environment.cwd,
                 vars: environment.vars,
             },
@@ -2650,6 +2743,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             process,
             guard,
             net_guard,
+            cohort_procs,
             tty_path,
         } = launcher.launch(name, username, paths, sz).await?;
 
@@ -2686,6 +2780,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             stdout_buf: vec![0u8; 8 * 1024],
             stdin_buf: None,
             net_guard,
+            cohort_procs,
             tty_path,
             composition,
             session_id,

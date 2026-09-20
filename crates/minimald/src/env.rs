@@ -440,6 +440,9 @@ impl Env {
             .all(|bsr| cache.read_dir(&graph.spec_hash(bsr)).is_ok());
         if !all_built {
             tracing::trace!("missing local packages, building session env");
+            // The daemon's own fetch, from its own leaf: node-plane traffic,
+            // whatever the boxes on this host declare (NET-080).
+            crate::net::host_cohort::record_node_plane_fetch("session packages");
             ctx.build_graph(&graph, false, None)
                 .await
                 .map_err(err_to_io)?;
@@ -934,6 +937,9 @@ impl SessionChannel {
         // through the same `BuildRenderer` as `min build`, so both read
         // identically; a fully-cached add emits no events and stays quiet.
         let (log_tx, mut log_rx) = futures::channel::mpsc::unbounded();
+        // Fetched by the daemon on the box's behalf, from the daemon's own
+        // leaf: node-plane traffic, not the box's (NET-080).
+        crate::net::host_cohort::record_node_plane_fetch("min add");
         let build = async {
             // Reduce the `!Send` error (`mctx::Error` holds nickel `Rc`s) to a
             // string in the same poll it appears, so `join!` never buffers it

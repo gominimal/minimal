@@ -116,6 +116,9 @@ pub(crate) trait SessionCommands {
 /// `dyn NetGuard`, which would make the whole session future non-`Send`.
 pub(crate) struct InjectedCommands {
     pub(crate) leader_pid: u32,
+    /// The box's classifier leaf, joined before its namespaces; see
+    /// [`crate::nsenter::Injection::with_cgroup`].
+    pub(crate) cgroup_procs: Option<std::path::PathBuf>,
     pub(crate) cwd: String,
     pub(crate) vars: BTreeMap<String, String>,
 }
@@ -132,6 +135,7 @@ impl SessionCommands for InjectedCommands {
         crate::nsenter::Injection::new(self.leader_pid, program, args)
             .with_cwd(self.cwd.clone())
             .with_env(vars)
+            .with_cgroup(self.cgroup_procs.clone())
             .command()
             .map_err(std::io::Error::other)
     }
