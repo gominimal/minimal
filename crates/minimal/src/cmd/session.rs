@@ -262,6 +262,13 @@ pub(crate) async fn activate_session(
     args: ActivateArgs,
     offer_scaffold: bool,
 ) -> Result<(), anyhow::Error> {
+    // NET-037: a legacy `--network` spelling still parses, but earns a
+    // one-line hint naming the current spelling; nothing else about the
+    // run differs.
+    if let Some((old, new)) = args.network.legacy_hint() {
+        crate::notice::legacy_spelling_hint(&mut std::io::stderr(), "--network", old, new);
+    }
+
     ensure_daemon(global)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
@@ -494,7 +501,6 @@ pub(crate) async fn activate_session(
     // unfinalized for the daemon to reap when this connection drops.
     ensure_version_reported(created.daemon_version.as_deref())?;
     warn_if_hostname_routing_down(created.hostname_routing_unavailable.as_deref());
-    warn_if_mtls_proxy_down(created.mtls_proxy_unavailable.as_deref());
     let id = created.id;
 
     // From here the session exists on the daemon in an unfinalized state.
@@ -1107,6 +1113,21 @@ pub async fn cmd_session_policy(
     global: &GlobalArgs,
     args: PolicyArgs,
 ) -> Result<(), anyhow::Error> {
+    println!("{}", session_policy_json(global, args).await?);
+    Ok(())
+}
+
+/// Ask the daemon for a session's effective networking policy and render it as
+/// the JSON line [`cmd_session_policy`] prints: the egress rules the daemon
+/// parsed — every field of the box's `egress` section, including the subnets it
+/// denies — beside its ingress forwarding.
+///
+/// Split from the command so what the user reads is assertable without
+/// capturing stdout.
+pub async fn session_policy_json(
+    global: &GlobalArgs,
+    args: PolicyArgs,
+) -> Result<String, anyhow::Error> {
     ensure_daemon(global)?;
 
     let mut client = connect_daemon(global).await?;
@@ -1121,10 +1142,7 @@ pub async fn cmd_session_policy(
 
     match resp {
         minimald_rpc::Errorable::Ok(policy) => {
-            let json =
-                serde_json_lenient::to_string(&policy).context("Failed to serialize policy")?;
-            println!("{json}");
-            Ok(())
+            serde_json_lenient::to_string(&policy).context("Failed to serialize policy")
         }
         minimald_rpc::Errorable::Err { error } => {
             bail!("{error}")

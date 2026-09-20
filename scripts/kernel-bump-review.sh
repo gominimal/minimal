@@ -47,9 +47,8 @@
 #                           driver is never loaded on either side of our stack.
 #                           --wide includes it anyway as a cross-check, since a
 #                           vsock semantics change is often mirrored here.
-#   drivers/net/virtio_net.c  guest egress (gvproxy) rides it, but it is behind
-#                           the networking-proxy feature and off the control
-#                           plane. --wide includes it.
+#   drivers/net/virtio_net.c  guest egress (gvproxy) rides it, but it is off the
+#                           control plane. --wide includes it.
 #   fs/fuse/virtio_fs.c     not used: the rootfs is a raw ext4 disk, not virtiofs.
 #   arch/, mm/, sched/, …   real, but any bump touches thousands of these lines;
 #                           including them is how a report becomes wallpaper.

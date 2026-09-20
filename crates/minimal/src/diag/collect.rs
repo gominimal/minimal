@@ -378,6 +378,39 @@ pub async fn bep(
     Ok(())
 }
 
+// ── net/zone.json ────────────────────────────────────────────────────────────
+
+/// Where a native `minimald` mirrors the box zone its answerer serves, relative
+/// to the state dir: every `*.min.internal` name, its address, the daemon that
+/// owns it, and the listener's socket.
+const ZONE_DUMP: &str = "net/zone.json";
+
+/// The answerer's zone dump, verbatim. Absent on a host with no native
+/// daemon (macOS, where the daemon runs in the microVM and its own bundle
+/// carries the guest's view), which is recorded as a skip rather than an
+/// error.
+pub async fn zone(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow::Error> {
+    let src = paths.state.join(ZONE_DUMP);
+    match read_string_nofollow(&src).await {
+        Ok(dump) => {
+            w.add_bytes(ZONE_DUMP, dump.as_bytes(), Redaction::None)
+                .await
+        }
+        Err(e) if is_not_found(&e) => {
+            w.skip(
+                ZONE_DUMP,
+                format!(
+                    "no zone dump at {}: no native minimald answerer has written one on \
+                     this host",
+                    src.display()
+                ),
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 // ── logs/ ────────────────────────────────────────────────────────────────────
 
 /// How many rotated files per log prefix make it into the bundle.
@@ -606,7 +639,8 @@ pub fn explain_absent_log_prefixes(
 /// diffable without normalising format.
 const LOG_PROVENANCE: &str = "\
 Log provenance
-==============
+}
+
 
 Where each log in this bundle came from, how long it is kept, and what it is
 known to be missing. Two overlapping copies of the daemon's output can appear
@@ -1059,6 +1093,73 @@ mod tests {
             reason("logs/minimald.log*")
                 .contains("providers/local-minvmd0/guest/daemon-diag.tar.zst"),
             "the skip must name where the logs actually are"
+        );
+    }
+
+    /// The bundle carries the answerer's zone dump verbatim — every name, its
+    /// address, its owner daemon, and the listener's socket — and says so in
+    /// the manifest; without one it records the absence instead of guessing.
+    #[tokio::test]
+    async fn bug_bundle_carries_zone_dump() {
+        let state = tempfile::TempDir::new().unwrap();
+        let planted = br#"{
+  "zone": "min.internal",
+  "ttl_secs": 15,
+  "listener": {"address": "127.0.0.1", "port": 15353, "socket": "bound"},
+  "names": [
+    {"name": "web.min.internal", "address": "127.0.0.1", "owner": "d0"},
+    {"name": "api.min.internal", "address": "127.0.64.11", "owner": "d0"}
+  ]
+}
+"#;
+        std::fs::create_dir_all(state.path().join("net")).unwrap();
+        std::fs::write(state.path().join("net/zone.json"), planted).unwrap();
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+        zone(&mut w, &paths(state.path())).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        let files = unpack(&out, "r").await;
+        assert_eq!(files["net/zone.json"], planted, "carried verbatim");
+        let carried: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["net/zone.json"]).unwrap();
+        assert_eq!(carried["listener"]["port"], 15353);
+        assert_eq!(carried["names"][1]["owner"], "d0");
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let entry = manifest["collected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["path"] == "net/zone.json")
+            .expect("the manifest lists the dump");
+        assert_eq!(entry["redaction"], "none");
+        assert!(manifest["skipped"].as_array().unwrap().is_empty());
+
+        // No native daemon on this host: the absence is a recorded skip that
+        // names the path looked at, not an error and not silence.
+        let bare = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("bare.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+        zone(&mut w, &paths(bare.path())).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "r").await;
+        assert!(!files.contains_key("net/zone.json"));
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let skipped = manifest["skipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0]["what"], "net/zone.json");
+        let reason = skipped[0]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains(&bare.path().join("net/zone.json").display().to_string()),
+            "{reason}"
         );
     }
 

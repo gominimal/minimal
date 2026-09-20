@@ -1,15 +1,13 @@
 use futures::StreamExt as _;
-#[cfg(feature = "networking-proxy")]
-use minimald_rpc::IssueClientCertResponse;
 use minimald_rpc::{
     AbortSession, AbortSessionResponse, CleanCacheRequest, CleanCacheUpdate, CreateSession,
     DestroySession, DestroySessionResponse, Errorable, FinalizeSession, FinalizeSessionResponse,
     GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
     GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen, GetVersion,
-    GetVersionResponse, IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry,
-    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
-    RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
-    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
+    GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
+    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool, SessionDelta,
+    SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest, ShutdownResponse,
+    SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -128,7 +126,6 @@ async fn serve_list_sessions(
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
-                mtls_proxy_unavailable: s.mtls_unavailable().await,
                 resource_pool,
                 // The git probes run in parallel across sessions: each is
                 // one small process under a deadline, and serializing them
@@ -304,7 +301,6 @@ async fn serve_create_session(
                         id,
                         daemon_version: Some(OWN_VERSION.to_string()),
                         hostname_routing_unavailable: s.proxy_unavailable().await,
-                        mtls_proxy_unavailable: s.mtls_unavailable().await,
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
@@ -733,48 +729,6 @@ async fn serve_get_session_screen(
                 None => Errorable::Err {
                     error: "session is not active".to_string(),
                 },
-            })
-        })
-        .await
-}
-
-/// Signs a fresh client certificate for the `minimal login` flow and returns
-/// the cert PEM, key PEM, and CA cert PEM so the client can authenticate to
-/// the HTTPS reverse proxy. Only compiled when the `networking-proxy` feature
-/// is enabled.
-#[cfg(feature = "networking-proxy")]
-async fn serve_issue_client_cert(
-    s: ServerStateHandle,
-    c: RuChannel<Msg>,
-) -> Result<(), ConnectionError> {
-    IssueClientCert
-        .handle_channel(c, async |req: IssueClientCertRequest| {
-            let ca = s.cert_authority().await;
-            match ca.sign_client_cert(&req.subject_cn) {
-                Ok((cert_pem, key_pem)) => Ok(Errorable::Ok(IssueClientCertResponse {
-                    cert_pem,
-                    key_pem,
-                    ca_cert_pem: ca.ca_cert_pem.clone(),
-                })),
-                Err(e) => Ok(Errorable::Err {
-                    error: e.to_string(),
-                }),
-            }
-        })
-        .await
-}
-
-/// Replies to an `IssueClientCert` request with a readable error when the
-/// `networking-proxy` feature is compiled out, so the client sees "feature not
-/// enabled" instead of an opaque EOF/channel-close on the response stream.
-#[cfg(not(feature = "networking-proxy"))]
-async fn serve_issue_client_cert_unavailable(c: RuChannel<Msg>) -> Result<(), ConnectionError> {
-    IssueClientCert
-        .handle_channel(c, async |_req: IssueClientCertRequest| {
-            Ok(Errorable::Err {
-                error: "minimald was built without the networking-proxy feature; \
-                        client certificate issuance is unavailable"
-                    .to_string(),
             })
         })
         .await
@@ -1638,8 +1592,7 @@ pub async fn handle_ssh_rpc(
         | STREAM_WORKSPACE_PATCHES
         | STREAM_WORKSPACE_HOOK_SCRIPTS
         | minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
-        | minimald_rpc::CLEAN_CACHE_SUBSYSTEM
-        | IssueClientCert::NAME => {
+        | minimald_rpc::CLEAN_CACHE_SUBSYSTEM => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
                 None => {
@@ -1727,19 +1680,6 @@ pub async fn handle_ssh_rpc(
             serve!(crate::diag::serve_stream_diag_bundle(s, config, channel))
         }
         minimald_rpc::CLEAN_CACHE_SUBSYSTEM => serve!(serve_clean_cache(s, channel)),
-        IssueClientCert::NAME => {
-            #[cfg(feature = "networking-proxy")]
-            serve!(serve_issue_client_cert(s, channel));
-            #[cfg(not(feature = "networking-proxy"))]
-            {
-                tracing::warn!(
-                    "IssueClientCert RPC called but the networking-proxy \
-                     feature is not enabled; replying with an error"
-                );
-                drop(s);
-                serve!(serve_issue_client_cert_unavailable(channel));
-            }
-        }
         _ => unreachable!(),
     };
 
@@ -2694,7 +2634,7 @@ mod tests {
         assert_eq!(created.daemon_version.as_deref(), Some(OWN_VERSION));
     }
 
-    /// The two read RPCs the attach / exec / setup-zed / ssh-forward paths
+    /// The two read RPCs the attach / exec / setup-zed paths
     /// gate on must report the daemon's build, or those paths have nothing to
     /// assert against and would have to spend a `GetVersion` to find out.
     #[tokio::test]
@@ -2738,6 +2678,7 @@ mod tests {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             allow_dns_hosts: None,
             allow_protocols: None,
+            deny_subnets: None,
         };
         let created_id = client
             .call::<CreateSession>(&CreateSessionRequest {
@@ -2763,6 +2704,44 @@ mod tests {
         // The configured ingress was `None`, and the read reflects that rather
         // than the old hardcoded `Some(IngressPolicy::default())`.
         assert_eq!(policy.ingress, None);
+    }
+
+    /// `GetSessionPolicy` answers the box's effective egress rules: all four
+    /// declared fields, as the daemon parsed them, for a box carrying the host's
+    /// address — the mode whose `egress` section the daemon used to refuse
+    /// outright.
+    #[tokio::test]
+    async fn get_session_policy_returns_effective_egress() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let egress = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            allow_dns_hosts: Some(vec!["api.example.com".to_string()]),
+            allow_protocols: Some(vec![minimald_rpc::IpProto::Tcp]),
+            deny_subnets: Some(vec!["10.1.0.0/16".to_string()]),
+        };
+        let created_id = client
+            .call::<CreateSession>(&CreateSessionRequest {
+                config: minimald_rpc::SessionConfig {
+                    name: Some("host-address-egress".to_string()),
+                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                    network: NetworkMode::HostNet,
+                    policy: SessionPolicy::new(Some(egress.clone()), None),
+                    hooks_enabled: true,
+                    attrs: Default::default(),
+                },
+                must_match_version: None,
+            })
+            .await
+            .unwrap()
+            .id;
+
+        let policy = client
+            .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(created_id))
+            .await
+            .unwrap();
+        assert_eq!(policy.egress, Some(egress));
     }
 
     /// `ListSessions` answers each session's git context: branch and
@@ -2933,19 +2912,21 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        // R2.1: an egress policy on a non-`OwnIp` PTask is rejected at
-        // declaration time, so the invalid session is never stored.
+        // An egress policy on a `none` box is rejected at declaration time, so
+        // the invalid session is never stored. (A box carrying the host's
+        // address accepts one — see `get_session_policy_returns_effective_egress`.)
         let egress = EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             allow_dns_hosts: None,
             allow_protocols: None,
+            deny_subnets: None,
         };
         let resp = client
             .call::<CreateSession>(&CreateSessionRequest {
                 config: minimald_rpc::SessionConfig {
                     name: Some("bad-policy".to_string()),
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: NetworkMode::HostNet,
+                    network: NetworkMode::NoNet,
                     policy: SessionPolicy::new(Some(egress), None),
                     hooks_enabled: true,
                     attrs: Default::default(),
@@ -2956,7 +2937,10 @@ mod tests {
         assert_eq!(
             resp,
             Errorable::Err {
-                error: "egress policy is only valid for an own-IP PTask, not HostNet".to_string()
+                error: "egress policy is not valid on a no-net PTask: a none box has no network \
+                        for the rules to describe — drop the egress section, or give the box the \
+                        host's address or one of its own"
+                    .to_string()
             }
         );
 

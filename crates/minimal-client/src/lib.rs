@@ -157,6 +157,14 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// forever. Generous — a healthy daemon answers in milliseconds, so this
 /// only bounds the pathological case.
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+/// The SSH username every command authenticates with, bar a port forward:
+/// the daemon accepts any username on the local UDS and reads it only where
+/// it identifies something (a session, for [`Client::connect_as`]).
+const CLI_SSH_USER: &str = "minimal-cli";
+/// The originator a `direct-tcpip` request names. The daemon logs it and
+/// otherwise ignores it — the connection being forwarded starts on this
+/// machine's loopback, so that is what it is told.
+const FORWARD_ORIGINATOR: &str = "127.0.0.1";
 
 /// russh client handler that accepts any ephemeral host key.
 ///
@@ -192,6 +200,17 @@ impl Client {
     /// `vm-up` line, and bounds the handshake by [`HANDSHAKE_TIMEOUT`] so a
     /// wedged daemon behind an accepting socket fails instead of hanging.
     pub async fn connect(sock_path: &Path) -> Result<Self, anyhow::Error> {
+        Self::connect_as(sock_path, CLI_SSH_USER).await
+    }
+
+    /// [`Self::connect`], naming the SSH username to authenticate with.
+    ///
+    /// A port forward is the caller that needs this: a `direct-tcpip` channel
+    /// open carries no env handshake of its own, so the daemon reads the
+    /// session a forward speaks for off the connection's SSH username, and a
+    /// forward therefore needs a connection authenticated as its session
+    /// rather than as the CLI.
+    pub async fn connect_as(sock_path: &Path, username: &str) -> Result<Self, anyhow::Error> {
         let stream = {
             let mut conn = None;
             let mut last_err = None;
@@ -228,7 +247,7 @@ impl Client {
                 .context("ssh connect")?;
 
             let auth = handle
-                .authenticate_none("minimal-cli")
+                .authenticate_none(username)
                 .await
                 .context("authenticate")?;
 
@@ -354,6 +373,23 @@ impl Client {
         tokio::time::timeout(timeout, rpc)
             .await
             .map_err(|_| anyhow::anyhow!("{} RPC timed out after {timeout:?}", R::NAME))?
+    }
+
+    /// Open a `direct-tcpip` channel asking the daemon to connect to
+    /// `host:port` on its own side, the channel one forwarded connection is
+    /// relayed over — what `ssh -L` opens per accepted connection.
+    ///
+    /// Takes `&self` so a forward can open a channel per connection from
+    /// behind a handle it shares with every relay in flight.
+    pub async fn open_direct_tcpip(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
+        self.handle
+            .channel_open_direct_tcpip(host, u32::from(port), FORWARD_ORIGINATOR, 0)
+            .await
+            .with_context(|| format!("open a forward channel to {host}:{port}"))
     }
 
     /// Open a session channel and issue an `exec` request for `command`,

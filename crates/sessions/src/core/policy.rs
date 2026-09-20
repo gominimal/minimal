@@ -1487,6 +1487,36 @@ mod tests {
     }
 
     // =================================================================
+    // PathDecision property test (proptest)
+    // =================================================================
+    //
+    // Kani already proves `combine` exhaustively (see `kani_proofs`
+    // below); this is its proptest twin, checking one of the same laws
+    // — commutativity — under the ordinary `cargo test` run rather than
+    // a separate `cargo kani` invocation.
+
+    mod path_decision_property {
+        use super::PathDecision;
+        use proptest::prelude::*;
+
+        fn arb_path_decision() -> impl Strategy<Value = PathDecision> {
+            prop_oneof![
+                Just(PathDecision::Allowed),
+                Just(PathDecision::Ignored),
+                Just(PathDecision::Denied),
+                Just(PathDecision::NeedsApproval),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn path_decision_property_check_runs(a in arb_path_decision(), b in arb_path_decision()) {
+                prop_assert_eq!(a.combine(b), b.combine(a));
+            }
+        }
+    }
+
+    // =================================================================
     // user_policy.toml loading
     // =================================================================
 

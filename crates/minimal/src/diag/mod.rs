@@ -159,6 +159,7 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     // switch, not in a guest — so `--no-guest` does not scope it out.
     collect_step!(w, "bep", collect::bep(&mut w, &paths, args.log_tail_bytes));
     collect_step!(w, "bep.probe", bep_probe(&mut w, global));
+    collect_step!(w, "net.zone", collect::zone(&mut w, &paths));
     // Log prefixes that matched nothing on the host come back rather than
     // becoming skips here: whether "not under <state>/logs" also means "not in
     // this bundle" is not known until the provider loop below has run.

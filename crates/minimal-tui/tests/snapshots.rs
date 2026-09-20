@@ -212,6 +212,7 @@ fn detail_pane_with_policy() {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                     allow_dns_hosts: None,
                     allow_protocols: None,
+                    deny_subnets: None,
                 }),
                 Some(sessions::IngressPolicy {
                     port_mappings: vec![sessions::PortMapping {
@@ -227,6 +228,51 @@ fn detail_pane_with_policy() {
     // Focus the session.
     model.cursor = 1;
     insta::assert_snapshot!(render(&mut model));
+}
+
+/// The Policy section shows the subnets a box denies alongside the ones it
+/// allows, so the rule that overrides the allow list is visible rather than
+/// implied. A box that declares no deny list gets no row (see the
+/// `detail_pane_with_policy` snapshot).
+#[test]
+fn policy_lines_show_deny_subnets() {
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![entry(1, Some("api-staging"), "/src/api")],
+    )]);
+    let key = SessionKey {
+        provider: "host".to_string(),
+        id: id(1),
+    };
+    model.details.insert(
+        key,
+        Detail {
+            record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
+            policy: Some(sessions::SessionPolicy::new(
+                Some(sessions::EgressPolicy {
+                    allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                    allow_dns_hosts: None,
+                    allow_protocols: None,
+                    deny_subnets: Some(vec!["10.1.0.0/16".to_string()]),
+                }),
+                None,
+            )),
+        },
+    );
+    model.cursor = 1;
+    let rendered = render(&mut model);
+    assert!(
+        rendered.contains("deny subnets  10.1.0.0/16"),
+        "denied subnet missing from the Policy section:\n{rendered}"
+    );
+    // Below the allow rules it overrides, not above them.
+    let line_of = |needle: &str| {
+        rendered
+            .lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} missing:\n{rendered}"))
+    };
+    assert!(line_of("deny subnets") > line_of("subnets  10.0.0.0/8"));
 }
 
 /// Git info from the list RPC renders: the branch in the sidebar row

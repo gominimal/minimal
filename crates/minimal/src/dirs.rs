@@ -54,8 +54,7 @@ pub(crate) fn report(global: &GlobalArgs) -> String {
 /// [`build_dir_rows`] stays a pure function of its inputs (easy to
 /// snapshot-test without touching env or the filesystem).
 struct DirsLookup {
-    /// `<config>/minimal` — root for `config.toml`, `loadouts/`,
-    /// mTLS certs.
+    /// `<config>/minimal` — root for `config.toml` and `loadouts/`.
     config: PathBuf,
     /// The specific path `min mesh join` writes to. Kept separate
     /// so a `--minimal-dir` override that redirects the mesh file

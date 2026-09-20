@@ -65,7 +65,6 @@ fn every_daemon_connection_is_classified() {
     assert_eq!(
         connect_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
-            "cmd/admin.rs::cmd_ssh_forward = gated",
             "cmd/admin.rs::cmd_version = ungated",
             "cmd/list.rs::cmd_bare = gated",
             "cmd/mod.rs::arm_activation_interrupt = ungated",
@@ -1037,6 +1036,110 @@ fn ingress_spec_rejects_malformed_and_bad_proto() {
     assert!(parse_ingress_mapping("18080").is_err());
     assert!(parse_ingress_mapping("notaport:80").is_err());
     assert!(parse_ingress_mapping("18080:80/icmp").is_err());
+}
+
+/// NET-035: `min session activate --help` must show `--network` and
+/// `--ingress`, and list the current spellings `none`, `host_ip`, and
+/// `own_ip` — the pre-rename hidden state (gominimal/minimal#980) is gone.
+#[test]
+fn activate_help_shows_network_flags() {
+    use clap::CommandFactory as _;
+
+    let mut cli = Cli::command();
+    let session = cli
+        .find_subcommand_mut("session")
+        .expect("session subcommand");
+    let activate = session
+        .find_subcommand_mut("activate")
+        .expect("activate subcommand");
+
+    let network = activate
+        .get_arguments()
+        .find(|a| a.get_id().as_str() == "network")
+        .expect("--network must exist");
+    assert!(!network.is_hide_set(), "--network must be visible");
+    let possible_values = network.get_possible_values();
+    let names: Vec<&str> = possible_values
+        .iter()
+        .filter(|v| !v.is_hide_set())
+        .map(|v| v.get_name())
+        .collect();
+    assert_eq!(
+        names,
+        ["none", "host_ip", "own_ip"],
+        "only the current spellings are shown"
+    );
+
+    let ingress = activate
+        .get_arguments()
+        .find(|a| a.get_id().as_str() == "ingress")
+        .expect("--ingress must exist");
+    assert!(!ingress.is_hide_set(), "--ingress must be visible");
+
+    let help = activate.render_long_help().to_string();
+    for needle in ["--network", "--ingress", "none", "host_ip", "own_ip"] {
+        assert!(help.contains(needle), "--help must show {needle}: {help}");
+    }
+}
+
+/// NET-037: the pre-rename `--network` spellings (`no-net`, `host-net`,
+/// `own-ip`) still parse — to the same [`sessions::NetworkMode`] the
+/// current spelling produces — and each carries a hint naming the
+/// spelling to use going forward; the current spellings carry no hint.
+#[test]
+fn legacy_network_spellings_parse_with_hint() {
+    use clap::Parser as _;
+
+    let network_of = |args: &[&str]| -> CliNetworkMode {
+        match Cli::try_parse_from(args).unwrap().command {
+            Some(Command::Session(SessionArgs {
+                command: SessionCommand::Activate(a),
+            })) => a.network,
+            _ => panic!("expected `session activate` for {args:?}"),
+        }
+    };
+
+    for (legacy, current, mode) in [
+        ("no-net", "none", sessions::NetworkMode::NoNet),
+        ("host-net", "host_ip", sessions::NetworkMode::HostNet),
+        ("own-ip", "own_ip", sessions::NetworkMode::OwnIp),
+    ] {
+        let network = network_of(&["min", "session", "activate", "--network", legacy]);
+        assert_eq!(sessions::NetworkMode::from(network), mode);
+        assert_eq!(network.legacy_hint(), Some((legacy, current)));
+
+        let mut out = Vec::new();
+        crate::notice::legacy_spelling_hint(&mut out, "--network", legacy, current);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(legacy) && text.contains(current),
+            "hint must name both spellings: {text}"
+        );
+    }
+
+    // The current spellings carry no hint.
+    for current in ["none", "host_ip", "own_ip"] {
+        let network = network_of(&["min", "session", "activate", "--network", current]);
+        assert_eq!(network.legacy_hint(), None);
+    }
+}
+
+/// NET-036: `--network` and `--ingress` are documented in the CLI
+/// reference, not just discoverable via `--help`.
+#[test]
+fn cli_reference_documents_network_flags() {
+    // CARGO_MANIFEST_DIR is crates/minimal; the workspace root is two up.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root two levels above crates/minimal");
+    let path = repo_root.join("docs/reference/cli-min.md");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    for needle in ["--network", "--ingress", "none", "host_ip", "own_ip"] {
+        assert!(text.contains(needle), "cli-min.md must document {needle}");
+    }
 }
 
 /// Regression: a config in the `.minimal/` layout must be detected so

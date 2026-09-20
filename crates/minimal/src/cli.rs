@@ -55,6 +55,8 @@ pub enum Command {
     Auth(AuthArgs),
     /// Box credential review: what a box's spec asks for and is given
     Box(BoxArgs),
+    /// Box networking subcommands
+    Net(NetArgs),
     /// Task subcommands: run declared project tasks in ephemeral sessions
     #[command(visible_alias = "tasks")]
     Task(TaskArgs),
@@ -79,44 +81,6 @@ pub enum Command {
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
     #[command(hide = true)]
     Proxy(ProxyArgs),
-    /// Forward a local TCP port to a remote address inside a PTask via SSH
-    /// (R4.8, R4.9).
-    ///
-    /// Sets up an SSH `LocalForward` (`-L`) tunnel through the minimald SSH
-    /// server so traffic sent to `<local-port>` on the host is relayed to
-    /// `<remote-host>:<remote-port>` from inside the named PTask's network
-    /// namespace. Useful when WireGuard (`networking-wg` feature) is
-    /// unavailable (e.g., on corporate networks that block UDP).
-    ///
-    /// Examples:
-    ///
-    ///   # Forward host port 18080 to the webserver inside the "dev" session:
-    ///   min ssh-forward dev 18080:127.0.0.1:80
-    ///
-    ///   # Then access it from the host:
-    ///   curl http://localhost:18080/
-    #[cfg(feature = "remote-access")]
-    #[command(name = "ssh-forward", visible_alias = "forward")]
-    SshForward(SshForwardArgs),
-    /// Obtain an mTLS client certificate for the HTTPS reverse proxy
-    ///
-    /// Connects to minimald, generates a fresh client certificate signed by
-    /// the daemon's internal CA, and saves the certificate and
-    /// private key to `~/.config/minimal/client.pem` /
-    /// `~/.config/minimal/client.key`. Also saves the CA certificate to
-    /// `~/.config/minimal/ca.pem` so tools like `curl` can trust the HTTPS
-    /// proxy.
-    ///
-    /// Example:
-    ///
-    ///   min login
-    ///   curl --cacert ~/.config/minimal/ca.pem \
-    ///        --cert ~/.config/minimal/client.pem \
-    ///        --key  ~/.config/minimal/client.key \
-    ///        https://localhost:7655/
-    #[command(verbatim_doc_comment)]
-    #[command(hide = true)]
-    Login(LoginArgs),
     // `init`, `add`, and `update` are deliberate exceptions to the
     // `<noun> <verb>` convention (documented in docs/reference/cli.md): they
     // are passthroughs to the project-configuration commands of the same name
@@ -397,6 +361,40 @@ pub struct LoadoutListArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct NetArgs {
+    #[command(subcommand)]
+    pub command: NetCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NetCommand {
+    /// Forward a port inside a box to a port on this machine
+    ///
+    /// Binds `localhost:<local>` here and relays every connection it accepts
+    /// to `<port>` inside the box, over the session's own SSH connection —
+    /// one channel per connection, which is what `ssh -L` does with a host in
+    /// place of the session. Nothing has to be installed or configured in the
+    /// box. Runs until you stop it with Ctrl-C, or until the session goes
+    /// away, which closes the local port with it.
+    ///
+    /// Example:
+    ///
+    ///   min net forward web 8080:3000
+    #[command(verbatim_doc_comment)]
+    Forward(NetForwardArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct NetForwardArgs {
+    /// Session identifier (UUID or session name)
+    #[arg(add = completion::session_completer())]
+    pub session: String,
+    /// The port to bind here and the port the box's server listens on
+    #[arg(value_name = "LOCAL:PORT")]
+    pub ports: String,
+}
+
+#[derive(Debug, Args)]
 pub struct TaskArgs {
     #[command(subcommand)]
     pub command: TaskCommand,
@@ -567,25 +565,16 @@ pub struct ActivateArgs {
     /// are otherwise skipped without a prompt.
     #[arg(long, value_enum)]
     pub sync: Option<SyncMode>,
-    /// Network mode: no-net, host-net (default), or own-ip.
+    /// Network mode: none, host_ip (default), or own_ip.
     ///
-    /// Hidden from `--help` while `own-ip` is not usable on an installed host:
-    /// the daemon resolves a switch binary that no install ships yet
-    /// (gominimal/minimal#980), so advertising the flag offers a mode that
-    /// cannot work outside a dev checkout. Still accepted, and `host-net`
-    /// remains the default, so nothing that passes it today breaks. Unhide,
-    /// and restore the row in docs/reference/cli-min.md, once own-ip works
-    /// from an install.
+    /// The legacy spellings `no-net`, `host-net`, and `own-ip` are still
+    /// accepted and parse the same way, but print a one-line hint naming
+    /// the spelling above to switch to.
     #[arg(long, value_enum, default_value_t = CliNetworkMode::HostNet)]
-    #[clap(hide = true)]
     pub network: CliNetworkMode,
     /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
-    /// tcp). Repeatable. Requires `--network own-ip`.
-    ///
-    /// Hidden for the same reason as `--network`: it is only meaningful with
-    /// `--network own-ip`.
+    /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
-    #[clap(hide = true)]
     pub ingress: Vec<String>,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
     /// Repeatable. If any `--loadout` is specified, defaults from
@@ -642,19 +631,52 @@ pub enum SyncMode {
 
 /// CLI surface for [`sessions::NetworkMode`]. A local `ValueEnum` keeps the
 /// `sessions` crate free of a clap dependency.
+///
+/// The variant identifiers are unchanged from the pre-rename CLI (so
+/// `sessions::NetworkMode`'s own naming, and every existing construction
+/// site, stay put); only the value strings clap parses move to the current
+/// spellings via `#[value(name = ...)]`. The three hidden `Legacy*`
+/// variants keep the pre-rename spellings (`no-net`, `host-net`, `own-ip`)
+/// parseable for one release, with [`CliNetworkMode::legacy_hint`] naming
+/// the current spelling to switch to.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum CliNetworkMode {
+    #[value(name = "none")]
     NoNet,
+    #[value(name = "host_ip")]
     HostNet,
+    #[value(name = "own_ip")]
     OwnIp,
+    #[value(name = "no-net", hide = true)]
+    LegacyNoNet,
+    #[value(name = "host-net", hide = true)]
+    LegacyHostNet,
+    #[value(name = "own-ip", hide = true)]
+    LegacyOwnIp,
+}
+
+impl CliNetworkMode {
+    /// The legacy spelling this value was given under, paired with the
+    /// current spelling to hint toward; `None` when the value is already
+    /// spelled the current way.
+    pub(crate) fn legacy_hint(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::LegacyNoNet => Some(("no-net", "none")),
+            Self::LegacyHostNet => Some(("host-net", "host_ip")),
+            Self::LegacyOwnIp => Some(("own-ip", "own_ip")),
+            Self::NoNet | Self::HostNet | Self::OwnIp => None,
+        }
+    }
 }
 
 impl From<CliNetworkMode> for sessions::NetworkMode {
     fn from(m: CliNetworkMode) -> Self {
         match m {
-            CliNetworkMode::NoNet => sessions::NetworkMode::NoNet,
-            CliNetworkMode::HostNet => sessions::NetworkMode::HostNet,
-            CliNetworkMode::OwnIp => sessions::NetworkMode::OwnIp,
+            CliNetworkMode::NoNet | CliNetworkMode::LegacyNoNet => sessions::NetworkMode::NoNet,
+            CliNetworkMode::HostNet | CliNetworkMode::LegacyHostNet => {
+                sessions::NetworkMode::HostNet
+            }
+            CliNetworkMode::OwnIp | CliNetworkMode::LegacyOwnIp => sessions::NetworkMode::OwnIp,
         }
     }
 }
@@ -798,30 +820,6 @@ pub struct ProxyArgs {
     /// UDS socket path to connect to
     #[arg(long)]
     pub socket: Option<String>,
-}
-
-/// Arguments for `min ssh-forward`.
-#[cfg(feature = "remote-access")]
-#[derive(Debug, Args)]
-pub struct SshForwardArgs {
-    /// Session identifier (UUID or session name)
-    #[arg(add = completion::session_completer())]
-    pub session: String,
-    /// Port-forward specification: `<local-port>:<remote-host>:<remote-port>`
-    ///
-    /// Example: `18080:127.0.0.1:80` to forward local port 18080 to port 80
-    /// on the loopback address as seen from inside the session.
-    #[arg(value_name = "LOCAL:REMOTE_HOST:REMOTE_PORT")]
-    pub forward: String,
-}
-
-/// Arguments for `min login`.
-#[derive(Debug, Args)]
-pub struct LoginArgs {
-    /// Override the directory where client cert files are written
-    /// (default: `~/.config/minimal/`).
-    #[arg(long)]
-    pub cert_dir: Option<PathBuf>,
 }
 
 /// Arguments for the hidden `min complete-session-str`.

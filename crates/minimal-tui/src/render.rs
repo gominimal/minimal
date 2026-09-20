@@ -517,6 +517,14 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                                     .join(", ")
                             ))),
                         }
+                        // A deny list overrides the allow rules above it, so it
+                        // reads after them. Only shown when the box declares
+                        // one: an absent list denies nothing, and a "deny
+                        // nothing" row would be a line of noise on every box,
+                        // the way an unset dynamic port range earns no row.
+                        if let Some(denied) = &egress.deny_subnets {
+                            lines.push(Line::raw(format!("  deny subnets  {}", denied.join(", "))));
+                        }
                     }
                 }
                 lines.push(Line::styled(

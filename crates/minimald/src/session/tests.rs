@@ -175,6 +175,81 @@ async fn create_session(client: &mut TestClient) -> SessionId {
     create_configured_session(client, "shell-test", "/uwu").await
 }
 
+/// Like [`create_session`], but with `network` recorded on the session's
+/// config instead of the default `HostNet` — for tests that need a session
+/// configured for a different network mode than the one attach itself
+/// exercises.
+async fn session_with_network(
+    client: &mut TestClient,
+    name: &str,
+    network: sessions::NetworkMode,
+) -> SessionId {
+    use crate::test_harness::{create_session_req, unwrap_ready};
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+
+    let mut req = create_session_req(name, "/uwu");
+    req.config.network = network;
+    let id = client.call::<CreateSession>(&req).await.unwrap().id;
+    unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .await
+    {
+        Errorable::Ok(_) => id,
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+}
+
+/// NET-039. A session configured for `NetworkMode::NoNet` still accepts a
+/// client's attach through the real daemon path — `CreateSession` through
+/// `Host::build` minting the shell on the SSH channel the attach arrives on
+/// — the layer the plan names, rather than the sandbox network layer's
+/// same-named [`sandbox2::Network::attach`], which is a different, post-spawn
+/// wiring step (its default no-op can never refuse and proves nothing about
+/// whether a client's attach is accepted). The real network isolation a
+/// `none` box gets is wired by the production `SandboxLauncher`
+/// (`cfg(not(test))`); this proves the attach path itself never special-cases
+/// `none` into a refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn network_none_attach_works() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id =
+        session_with_network(&mut client, "none-attach", sessions::NetworkMode::NoNet).await;
+
+    let mut channel = client.open_shell(session_id).await;
+    channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    let mut stdout = Vec::new();
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { data }) => {
+                stdout.extend_from_slice(&data);
+                if String::from_utf8_lossy(&stdout).contains("got:hello") {
+                    break;
+                }
+            }
+            Some(_) => {}
+            None => {
+                let stdout = String::from_utf8_lossy(&stdout);
+                panic!(
+                    "attach to a `--network none` session should mint a working shell; got: {stdout:?}"
+                );
+            }
+        }
+    }
+}
+
 /// Attaching to a session whose loadout was never configured must not
 /// blow up: nothing is in flight on a bare `Draft`, so the attach
 /// configures it with an empty contribution on the way in and mints the
@@ -1088,6 +1163,169 @@ async fn detach_chord_detaches_channel_then_session_resumes_on_reattach() {
     assert!(
         flushed.contains("got:hello"),
         "reattaching should flush prior terminal state, got: {flushed:?}",
+    );
+}
+
+/// How long a box is left with nobody attached before it is asked whether
+/// it is still there. Long enough for a teardown already in flight to
+/// land, short enough not to pad the suite: what these tests pin is that
+/// *nothing* is armed to stop an idle box, and a stop that never gets
+/// scheduled cannot be waited out.
+const NO_CLIENT_WINDOW: Duration = Duration::from_millis(250);
+
+/// Resolves a live session's actor handle.
+async fn session_handle(server: &TestServer, session_id: SessionId) -> super::SessionHandle {
+    server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve")
+}
+
+/// NET-015. A box runs whether or not a client is attached. The case with
+/// no client at all is the one worth pinning: a session nobody has ever
+/// attached to has a host launched for it, that host keeps running and
+/// keeps answering with nothing bound to it, and the first client to arrive
+/// is served by that same box rather than by a fresh one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_survives_without_client() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let handle = session_handle(&server, session_id).await;
+
+    // A box with no client: nothing has attached, so the host is minted
+    // headlessly, exactly as an exec against an idle session mints it.
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session must be able to run a box with no client");
+
+    tokio::time::sleep(NO_CLIENT_WINDOW).await;
+    assert!(
+        host.is_alive(),
+        "a box with no client attached must keep running",
+    );
+    assert!(
+        handle.get_attrs().await.is_some(),
+        "a box with no client attached must keep answering",
+    );
+    assert!(
+        record_exists(&mut client, session_id).await,
+        "a box with no client attached must still exist",
+    );
+
+    // The first client to arrive gets that same box, and its shell — started
+    // before any client existed — answers.
+    let mut ch = client.open_shell(session_id).await;
+    ch.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    recv_until(&mut ch, "got:hello").await;
+    assert!(
+        handle
+            .ensure_host("tester".to_string())
+            .await
+            .expect("the running box must still serve")
+            .same_host(&host),
+        "attaching must bind the box that was already running, not mint a second one",
+    );
+}
+
+/// NET-015. A PTY client lost abruptly leaves the box's entrypoint running,
+/// and a later attach is accepted. Abrupt here means what killing `min`
+/// looks like from the daemon: no detach was ever asked for, the client's
+/// channel and then its whole connection simply stop existing, and the
+/// binding finds its channel gone. The proof that the entrypoint is the
+/// *same* one: the reattach is flushed the terminal state the lost client
+/// left behind, and a fresh line still round-trips through the process that
+/// produced it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abrupt_client_loss_keeps_task() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+
+    let mut first = client.open_shell(session_id).await;
+    first.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    recv_until(&mut first, "got:hello").await;
+
+    // The abrupt loss: no chord, no detach request — the channel goes, and
+    // the connection under it goes with it, so the server-side russh session
+    // ends and the binding's channel receiver closes.
+    drop(first);
+    drop(client);
+    tokio::time::sleep(NO_CLIENT_WINDOW).await;
+
+    let handle = session_handle(&server, session_id).await;
+    assert!(
+        handle.get_attrs().await.is_some(),
+        "losing the client must not end the box",
+    );
+
+    // A later attach, over a wholly new connection, is accepted and resumes
+    // the same entrypoint: the earlier `got:hello` is flushed to it.
+    let mut client = server.connect().await;
+    assert!(
+        record_exists(&mut client, session_id).await,
+        "the box must still exist after its client was lost",
+    );
+    let mut second = client.open_shell(session_id).await;
+    let flushed = recv_until(&mut second, "got:hello").await;
+    assert!(
+        flushed.contains("got:hello"),
+        "a reattach after a lost client must resume the same terminal, got: {flushed:?}",
+    );
+    second.data_bytes(b"again\n".to_vec()).await.unwrap();
+    recv_until(&mut second, "got:again").await;
+}
+
+/// NET-015. Nothing stops a box for being idle. Left with no client and no
+/// traffic it keeps running, keeps answering, and keeps its record; the only
+/// things that end it are the ones the requirement names, and a client's
+/// destroy is the one driven here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_has_no_idle_stop() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+
+    // Attach and detach, so the box is one that *had* a client and is now
+    // sitting idle — the shape an idle reaper would go after.
+    let mut ch = client.open_shell(session_id).await;
+    ch.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    recv_until(&mut ch, "got:hello").await;
+    ch.data_bytes(vec![0x1d]).await.unwrap();
+    ch.data_bytes(vec![b'd']).await.unwrap();
+    collect_to_close(&mut ch).await;
+
+    let handle = session_handle(&server, session_id).await;
+    tokio::time::sleep(NO_CLIENT_WINDOW).await;
+    assert!(
+        handle.get_attrs().await.is_some(),
+        "an idle box must keep running: no client and no traffic is not a stop",
+    );
+    assert_eq!(
+        record_status(&mut client, session_id).await,
+        Some(sessions::SessionStatus::Active),
+        "an idle box must stay Active",
+    );
+
+    // Still the same box, still able to serve — an idle window neither
+    // stopped it nor left it wedged.
+    let mut again = client.open_shell(session_id).await;
+    again.data_bytes(b"still-here\n".to_vec()).await.unwrap();
+    recv_until(&mut again, "got:still-here").await;
+    again.data_bytes(vec![0x1d]).await.unwrap();
+    again.data_bytes(vec![b'd']).await.unwrap();
+    collect_to_close(&mut again).await;
+
+    // And the enumerated cause does stop it: the client issues destroy.
+    destroy_session(&mut client, session_id).await;
+    assert!(
+        !record_exists(&mut client, session_id).await,
+        "a destroy from the client must stop the box",
     );
 }
 

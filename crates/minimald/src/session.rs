@@ -1455,7 +1455,7 @@ impl Session {
 
     /// Renames the session: persists the new name through the record handle
     /// (a name collision surfaces as the store's `AlreadyExists`), relinks
-    /// the PTask hostname so `<new>.local.min.internal` routes and the old name stops (R3.6).
+    /// the PTask hostname so `<new>.min.internal` routes and the old name stops (R3.6).
     async fn rename(&mut self, new_name: String) -> Result<(), std::io::Error> {
         let record = self.record.record().await?;
 
@@ -2147,6 +2147,7 @@ impl Session {
         // only carried for that mode; `validate_policy` has already rejected
         // ingress configured on any other mode.
         let ingress = record.policy.ingress.clone();
+        let egress = record.policy.egress.clone();
         Ok(session_host::SandboxLauncher {
             ctx: match phase {
                 LaunchPhase::Attached => self.context(true).await,
@@ -2164,6 +2165,7 @@ impl Session {
             network_mode,
             net_switch: Arc::clone(&self.net_switch),
             ingress,
+            egress,
             composition: self.composition(),
             // A weak handle so in-sandbox `min build` can drive session
             // side-ops without keeping the actor alive past teardown.

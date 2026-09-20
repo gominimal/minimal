@@ -20,9 +20,9 @@ use std::sync::Arc;
 use sandbox2::NetGuard;
 use tokio::sync::Mutex;
 
-use crate::net::SwitchClient;
 use crate::net::policy::{ControlChannel, ExposedMapping};
 use crate::net::switch::SwitchRelay;
+use crate::net::{SwitchClient, SwitchSubnet};
 
 /// The own-IP attachment guard. Returned by [`complete_own_ip_attach`] and torn
 /// down explicitly via [`NetGuard::teardown`] at the end of the sandbox's life.
@@ -63,7 +63,8 @@ impl NetGuard for OwnIpGuard {
 }
 
 /// Completes an own-IP attach on any deployment model: relay `tap_fd` to the
-/// running gvproxy over `control`, then apply any static ingress.
+/// running gvproxy over `control` under the box's `egress` gate, then apply
+/// any static ingress.
 ///
 /// [`ControlChannel::Unix`] reaches the gvproxy the daemon spawned (DM2),
 /// [`ControlChannel::Vsock`] the one `minvmd` owns on the host (DM1/3/4).
@@ -73,15 +74,19 @@ impl NetGuard for OwnIpGuard {
 /// here just propagates: the release of that lease stays with the launch
 /// (`sandbox2::PlannedLaunch`), and detaching as well would double-decrement
 /// gvproxy's attach count.
-pub(crate) async fn complete_own_ip_attach(
-    switch: &Arc<Mutex<SwitchClient>>,
-    tap_fd: OwnedFd,
-    control: ControlChannel,
-    lease_ip: Ipv4Addr,
-    session_name: &str,
-    ingress: Option<&sessions::IngressPolicy>,
-) -> io::Result<OwnIpGuard> {
-    let gate = crate::net::switch::IngressGate::for_session(lease_ip.to_string(), ingress);
+pub(crate) async fn complete_own_ip_attach(attach: OwnIpAttach<'_>) -> io::Result<OwnIpGuard> {
+    let OwnIpAttach {
+        switch,
+        tap_fd,
+        control,
+        lease_ip,
+        subnet,
+        session_name,
+        ingress,
+        egress,
+    } = attach;
+    let gate = crate::net::switch::IngressGate::for_session(lease_ip.to_string(), ingress, subnet)
+        .with_egress(egress);
     let relay = match &control {
         ControlChannel::Unix(sock) => {
             crate::net::switch::attach_to_switch(tap_fd, sock, Some(gate)).await?
@@ -90,21 +95,58 @@ pub(crate) async fn complete_own_ip_attach(
             crate::net::switch::attach_to_switch_vsock(tap_fd, *cid, *port, Some(gate)).await?
         }
     };
-    finish_own_ip_attach(switch, relay, control, lease_ip, session_name, ingress).await
+    finish_own_ip_attach(FinishAttach {
+        switch,
+        relay,
+        control,
+        lease_ip,
+        subnet,
+        session_name,
+        ingress,
+    })
+    .await
+}
+
+/// What [`complete_own_ip_attach`] needs, as one argument: the tap to relay,
+/// the control channel to relay it over, and the addressing and policy (both
+/// directions) of the PTask it belongs to.
+pub(crate) struct OwnIpAttach<'a> {
+    pub(crate) switch: &'a Arc<Mutex<SwitchClient>>,
+    pub(crate) tap_fd: OwnedFd,
+    pub(crate) control: ControlChannel,
+    pub(crate) lease_ip: Ipv4Addr,
+    pub(crate) subnet: SwitchSubnet,
+    pub(crate) session_name: &'a str,
+    pub(crate) ingress: Option<&'a sessions::IngressPolicy>,
+    pub(crate) egress: Arc<crate::net::switch::EgressGate>,
+}
+
+/// What [`finish_own_ip_attach`] needs, as one argument: the just-started relay
+/// plus the addressing and policy of the PTask it belongs to.
+struct FinishAttach<'a> {
+    switch: &'a Arc<Mutex<SwitchClient>>,
+    relay: SwitchRelay,
+    control: ControlChannel,
+    lease_ip: Ipv4Addr,
+    subnet: SwitchSubnet,
+    session_name: &'a str,
+    ingress: Option<&'a sessions::IngressPolicy>,
 }
 
 /// Tail of the own-IP attach: apply static ingress forwards (R2.3) over
 /// `control`, then build the [`OwnIpGuard`]. On an ingress failure the relay is
 /// dropped (closing the switch-side connection); the attach-count rollback is
 /// left to the launch, so the refcount is never double-decremented.
-async fn finish_own_ip_attach(
-    switch: &Arc<Mutex<SwitchClient>>,
-    relay: SwitchRelay,
-    control: ControlChannel,
-    lease_ip: Ipv4Addr,
-    session_name: &str,
-    ingress: Option<&sessions::IngressPolicy>,
-) -> io::Result<OwnIpGuard> {
+async fn finish_own_ip_attach(attach: FinishAttach<'_>) -> io::Result<OwnIpGuard> {
+    let FinishAttach {
+        switch,
+        relay,
+        control,
+        lease_ip,
+        subnet,
+        session_name,
+        ingress,
+    } = attach;
     let exposed = match ingress {
         Some(ingress) if !ingress.port_mappings.is_empty() => {
             match crate::net::policy::apply_ingress(&control, lease_ip, ingress).await {
@@ -118,20 +160,26 @@ async fn finish_own_ip_attach(
         _ => Vec::new(),
     };
 
-    // Register this PTask's `<name>.<host-id>.min.internal` → its current lease so
+    // Register this PTask's `<name>.min.internal` → its current lease so
     // peer sessions can resolve it (finding #3 / UC6). Done for *every* own-IP
     // PTask, even with no ingress: resolvable names are how peers find each other,
     // and the ingress gate independently governs reachability. Best-effort — a DNS
     // hiccup must not fail an otherwise-working attach.
-    if let Err(e) = crate::net::policy::register_dns_name(
-        &control,
-        crate::net::dns::DEFAULT_HOST_ID,
-        session_name,
-        lease_ip,
-    )
-    .await
-    {
+    if let Err(e) = crate::net::policy::register_dns_name(&control, session_name, lease_ip).await {
         tracing::warn!(error = %e, session = session_name, "registering *.min.internal name on gvproxy");
+    }
+
+    // And `host.min.internal` → the switch's host-gateway address, so this box
+    // resolves the host it runs on (NET-003). Posted on every attach rather than
+    // once per process: the switch stops with its last PTask and takes its zones
+    // with it, and the record never varies. Best-effort for the same reason as
+    // the name above.
+    if let Err(e) = crate::net::policy::register_host_name(&control, subnet).await {
+        tracing::warn!(
+            error = %e,
+            name = crate::net::policy::HOST_HOSTNAME,
+            "registering the host's name on gvproxy"
+        );
     }
 
     Ok(OwnIpGuard {

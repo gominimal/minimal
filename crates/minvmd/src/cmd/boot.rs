@@ -114,9 +114,7 @@ fn run_boot(foreground: bool) -> Result<()> {
     // a second appender on the same file would interleave with the
     // supervisor's. Its diagnostics ride the hvc0 console into boot.log.
     cmd.env_remove(crate::DETACHED_ENV);
-    if let Some(dir) = crate::state::state_dir_override() {
-        cmd.args(["--minimal-state-dir", dir.as_str()]);
-    }
+    cmd.args(crate::state::reexec_args());
     alive_lock.inherit_into(&mut cmd);
     let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)

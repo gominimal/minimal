@@ -146,14 +146,21 @@ impl Exec for TaskExec {
 /// The mode, not the identity: an own-IP task is a second PTask beside the
 /// session's, on the same switch at the same time, so it registers under its
 /// own name and carries none of the session's ingress — forwards a task
-/// applied would come down again at its teardown.
+/// applied would come down again at its teardown — but all of its egress:
+/// a task is not a way around the box's rules.
 pub(crate) fn task_network(
     record: &sessions::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
 ) -> std::sync::Arc<dyn sandbox2::Network> {
     let id = record.id.to_string();
     let session = record.name.as_deref().unwrap_or(&id);
-    crate::net::provider::network_for(record.network, switch, &format!("{session}-task"), None)
+    crate::net::provider::network_for(
+        record.network,
+        switch,
+        &format!("{session}-task"),
+        None,
+        record.policy.egress.clone(),
+    )
 }
 
 /// The slice of `hakoniwa::Child` the attach-failure arm needs, so the arm can
@@ -747,7 +754,11 @@ struct ExecTask<S: Exec> {
 }
 
 impl<S: Exec> ExecTask<S> {
-    pub async fn run(self, channel: Channel<Msg>) {
+    /// Drives the exec to completion and returns the SSH-encoded exit code
+    /// it reported, after the channel has been closed. Returned rather than
+    /// discarded because a run's exit is what ends a box created for it
+    /// (see [`end_run_box`]); callers with nothing to decide on it ignore it.
+    pub async fn run(self, channel: Channel<Msg>) -> u32 {
         let (mut rs, ws) = channel.split();
         // SSH_EXTENDED_DATA_STDERR (RFC 4254 §5.2) — selects the stderr
         // stream on the same channel as a separate extended-data type.
@@ -765,6 +776,7 @@ impl<S: Exec> ExecTask<S> {
         let _ = ws.eof().await;
         let _ = ws.exit_status(exit_status).await; // otherwise considered -1
         let _ = ws.close().await; // needed to release the remote
+        exit_status
     }
 }
 
@@ -1332,6 +1344,12 @@ pub(crate) async fn handle_exec(
             let drop_env = minimald_rpc::taskenv::drops_from_channel_env(&config.env_vars);
             session.channel_success(id)?;
             spawn(async move {
+                // Both outlive the exec: ending a box created for this run
+                // happens after the run, on the daemon's side of it, so
+                // neither the manager handle nor the task's name can be
+                // handed to the `ExecTask` that consumes them.
+                let end_serv = serv.clone();
+                let ran = task.clone();
                 let exec_task = ExecTask {
                     conn,
                     serv,
@@ -1344,7 +1362,8 @@ pub(crate) async fn handle_exec(
                         drop_env,
                     },
                 };
-                exec_task.run(channel).await;
+                let exit = exec_task.run(channel).await;
+                end_run_box(&end_serv, session_id, &ran, exit).await;
             });
         }
         ExecRequest::PackageBuild(args) => {
@@ -1364,6 +1383,61 @@ pub(crate) async fn handle_exec(
     }
 
     Ok(())
+}
+
+/// Ends a box that was created for this run, now that the run's command has
+/// exited (NET-131).
+///
+/// A box carrying [`minimald_rpc::RUN_BOX_ATTR`] exists for one run and
+/// nothing else: `min task run` creates it, execs the task into it, and the
+/// box has no purpose past the task's exit. Ending it *here* — after the
+/// channel has been closed, so the client already has its exit code — is
+/// what makes the end independent of the client: a `min` that was killed,
+/// or whose transport died mid-run, sends no `DestroySession` and used to
+/// strand the box until the next daemon restart (the connection-close reap
+/// covers only sessions that were never finalized).
+///
+/// Every other session is left alone, the attr being the only thing that
+/// says a box was made for a run: a task execed into a long-lived session
+/// (`min session run`) must not take that session down with it.
+///
+/// Best-effort, and never fatal — the exec is over and its exit code is
+/// already with the client. A record that is already gone (the client
+/// destroyed it first, on Ctrl-C) reads as nothing to do.
+async fn end_run_box(serv: &ServerStateHandle, session_id: SessionId, task: &str, exit: u32) {
+    let mngr = serv.sessions_manager().await;
+    let record = match mngr.get_record(SessionKeyPredicate::Id(session_id)).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                %session_id,
+                error = %e,
+                "could not read the session record to decide whether its run ends it",
+            );
+            return;
+        }
+    };
+    if !record.attrs.contains_key(minimald_rpc::RUN_BOX_ATTR) {
+        return;
+    }
+    let name = record.name.clone().unwrap_or_default();
+    match mngr.delete_session(session_id).await {
+        Ok(()) => tracing::info!(
+            %session_id,
+            session = %name,
+            %task,
+            exit_code = exit,
+            "run finished; ended the box it was created for",
+        ),
+        Err(e) => tracing::warn!(
+            %session_id,
+            session = %name,
+            %task,
+            error = %e,
+            "run finished but its box could not be ended",
+        ),
+    }
 }
 
 /// Accepts the channel and reports an exec request the daemon cannot serve on
@@ -2210,6 +2284,108 @@ mod tests {
         assert!(ctrl.was_killed());
     }
 
+    /// NET-015. An exec client lost abruptly ends the command *it* spawned
+    /// and nothing else. Two commands run in the same box; one client's
+    /// transport vanishes — its channel dead in both directions, which is
+    /// what a killed `min session exec` looks like from here — and its child
+    /// is killed, while the other command is left running, finishes on its
+    /// own, and reports its own exit code with its output intact.
+    ///
+    /// The scope is the point: a bridge owns nothing but the child it
+    /// spawned, so one lost exec client can take neither a sibling command
+    /// nor the box down with it.
+    #[tokio::test]
+    async fn lost_exec_client_kills_only_its_own_process() {
+        // The lost client. Its stdout write goes nowhere (the reader is
+        // dropped, so every write errors) and its stdin is already at EOF:
+        // a channel that no longer exists in either direction.
+        let (
+            lost_process,
+            MockEndpoints {
+                stdin_reader: _lost_stdin,
+                stdout_writer: mut lost_stdout,
+                stderr_writer: lost_stderr,
+                ctrl: lost,
+            },
+        ) = build_mock();
+        drop(lost_stderr);
+        let (gone_reader, mut lost_w) = duplex(64);
+        drop(gone_reader);
+        let (_unused_lost_stderr_peer, mut lost_e) = duplex(64);
+        let (gone_writer, mut lost_r) = duplex(64);
+        drop(gone_writer);
+
+        // The other command in the same box: a healthy channel throughout.
+        let (
+            live_process,
+            MockEndpoints {
+                stdin_reader: _live_stdin,
+                stdout_writer: mut live_stdout,
+                stderr_writer: live_stderr,
+                ctrl: live,
+            },
+        ) = build_mock();
+        drop(live_stderr);
+        let (mut live_client_stdout, mut live_w) = duplex(64 * 1024);
+        let (_unused_live_stderr_peer, mut live_e) = duplex(64 * 1024);
+        let (closed_live_stdin, mut live_r) = duplex(64);
+        drop(closed_live_stdin);
+
+        let lost_bridge = tokio::spawn(async move {
+            bridge(
+                "lost-client",
+                lost_process,
+                &mut lost_r,
+                &mut lost_w,
+                &mut lost_e,
+            )
+            .await
+        });
+        let live_bridge = tokio::spawn(async move {
+            bridge(
+                "live-client",
+                live_process,
+                &mut live_r,
+                &mut live_w,
+                &mut live_e,
+            )
+            .await
+        });
+
+        // The lost client's command produces output, which is what surfaces
+        // the dead channel; nothing is written for the live one, so its
+        // child is still running when the other is reaped.
+        lost_stdout.write_all(b"output").await.unwrap();
+        drop(lost_stdout);
+        assert_eq!(
+            lost_bridge.await.unwrap(),
+            1,
+            "a killed child has no exit code of its own, which the bridge reports as 1",
+        );
+        assert!(
+            lost.was_killed(),
+            "the lost client's own command must be ended",
+        );
+        assert!(
+            !live.was_killed(),
+            "the other command in the box must be untouched by a different client's loss",
+        );
+
+        // Left alone, it finishes normally — its exit code and its output
+        // both reach its own client.
+        live_stdout.write_all(b"still-running").await.unwrap();
+        drop(live_stdout);
+        live.signal_exit(0).await;
+        assert_eq!(
+            live_bridge.await.unwrap(),
+            0,
+            "the surviving command must report its own exit code",
+        );
+        let mut out = Vec::new();
+        live_client_stdout.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"still-running");
+    }
+
     /// A grandchild that inherited the child's stdout keeps the pipe
     /// open past the child's own exit — `sh -c 'sleep 20 & echo
     /// STARTED'`. The bridge must return on the *child's* exit, relay
@@ -2586,6 +2762,136 @@ mod tests {
                 out.stderr.is_empty(),
                 "echo task should produce no stderr: {:?}",
                 out.stderr,
+            );
+        }
+
+        /// An `Active` session whose workspace declares the `echo_ok` task,
+        /// created the way `min task run` creates a box for a run when
+        /// `run_box` is set (the [`minimald_rpc::RUN_BOX_ATTR`] marker) and
+        /// the way an ordinary activate does when it is not. Same sequence
+        /// as [`exec_runs_echo_task`] — create, seed the workspace,
+        /// configure, finalize — so the two boxes differ only in the marker.
+        async fn active_echo_session(
+            server: &TestServer,
+            client: &mut TestClient,
+            name: &str,
+            run_box: bool,
+        ) -> SessionId {
+            use minimald_rpc::{
+                ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
+                FinalizeSessionRequest,
+            };
+
+            let mut req = create_session_req(name, "/tmp");
+            if run_box {
+                req.config.attrs.insert(
+                    minimald_rpc::RUN_BOX_ATTR.to_string(),
+                    "echo_ok".to_string(),
+                );
+            }
+            let id = client.call::<CreateSession>(&req).await.unwrap().id;
+            server
+                .seed_workspace_mfile(id, "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n")
+                .await;
+            crate::test_harness::unwrap_ready(
+                client
+                    .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                        session_id: id,
+                        contribution: Default::default(),
+                    })
+                    .await
+                    .unwrap(),
+            );
+            match client
+                .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+                .await
+            {
+                minimald_rpc::Errorable::Ok(_) => {}
+                minimald_rpc::Errorable::Err { error } => {
+                    panic!("FinalizeSession failed: {error}");
+                }
+            }
+            id
+        }
+
+        /// Whether `id`'s record is gone, waiting up to `budget` for it.
+        /// The end of a run box is the daemon's own step *after* the exec
+        /// channel closed, so it can land a moment after the client's exec
+        /// call returned; polling is what keeps that from reading as a
+        /// failure to end it.
+        async fn record_gone(
+            client: &mut TestClient,
+            id: SessionId,
+            budget: std::time::Duration,
+        ) -> bool {
+            use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
+
+            let deadline = std::time::Instant::now() + budget;
+            loop {
+                let record = client
+                    .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(id))
+                    .await
+                    .record;
+                if record.is_none() {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+
+        /// NET-131. A box created for a run ends when the run's command
+        /// exits, and the daemon is what ends it — the destroy sits on this
+        /// side of the exec's exit, so it does not depend on the client that
+        /// asked for the run still being there to send one.
+        ///
+        /// The control box is the other half of the requirement: an ordinary
+        /// session a task is execed into (`min session run`) must survive
+        /// its task, so the marker — not the fact that a task ran — is what
+        /// ends a box.
+        #[tokio::test]
+        async fn run_box_ends_when_its_run_ends() {
+            use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
+
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+
+            let run_box = active_echo_session(&server, &mut client, "run-box", true).await;
+            let plain = active_echo_session(&server, &mut client, "plain-box", false).await;
+
+            for id in [run_box, plain] {
+                let session_str = id.to_string();
+                let out = client
+                    .exec(
+                        &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                        false,
+                        &ExecRequest::TaskRun("echo_ok".to_string()).encode(),
+                        &[],
+                    )
+                    .await
+                    .expect("a task/run request should be accepted");
+                assert_eq!(
+                    out.exit_status,
+                    Some(0),
+                    "the echo task should run clean in {id}; stderr was {:?}",
+                    String::from_utf8_lossy(&out.stderr),
+                );
+            }
+
+            assert!(
+                record_gone(&mut client, run_box, std::time::Duration::from_secs(10)).await,
+                "the box created for the run is still present after the run ended",
+            );
+
+            let survivor = client
+                .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(plain))
+                .await
+                .record;
+            assert!(
+                survivor.is_some(),
+                "a session that was not created for this run must survive it",
             );
         }
 

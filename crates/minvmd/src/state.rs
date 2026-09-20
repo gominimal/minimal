@@ -1,8 +1,11 @@
 //! State persistence for `minvmd` (R4.1, R4.6).
 //!
-//! All runtime files live in the minvmd provider-instance directory
-//! (`<minimal_state_dir>/providers/local-minvmd0/`, see
-//! [`paths::provider_instance_dir`]):
+//! All runtime files live in the VM's state directory (see
+//! [`paths::provider_vm_dir`]): the minvmd provider-instance directory
+//! `<minimal_state_dir>/providers/local-minvmd0/` for the `default` VM, or
+//! its per-name subdirectory `vms/<name>/` for a VM named with `--vm-name`.
+//! Each VM therefore has its own state file, locks, socket and daemon; the
+//! default VM's paths are exactly what they were before VMs had names:
 //!
 //! - `minvmd.toml` — serialised [`State`] (lifecycle, pid, timestamp).
 //! - `lifecycle.lock` — advisory lock guarding concurrent transitions (R4.6).
@@ -28,7 +31,7 @@ use std::{
 };
 
 use fd_lock::RwLock;
-use paths::DaemonAbsPath;
+use paths::{DaemonAbsPath, VmName};
 use serde::{Deserialize, Serialize};
 
 use crate::lifecycle::Lifecycle;
@@ -58,10 +61,47 @@ pub fn state_base_dir() -> DaemonAbsPath {
         .unwrap_or_else(paths::minimal_state_dir)
 }
 
-/// The provider-instance dir holding all minvmd runtime files:
-/// `<minimal_state_dir>/providers/local-minvmd0`.
+static VM_NAME: OnceLock<VmName> = OnceLock::new();
+
+/// Set the `--vm-name` this process serves. First call wins; must be called
+/// before any path resolution.
+pub fn set_vm_name(name: VmName) {
+    let _ = VM_NAME.set(name);
+}
+
+/// The VM this process serves: the `--vm-name` when set, else the `default`
+/// VM.
+pub fn vm_name() -> &'static VmName {
+    VM_NAME.get_or_init(VmName::default)
+}
+
+/// The arguments a re-exec'd minvmd (`run --detach`'s supervisor, the
+/// `__krun-vmm` child) needs to resolve the same paths as this process: the
+/// `--minimal-state-dir` override and the `--vm-name`, each only when set.
+pub fn reexec_args() -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(dir) = state_dir_override() {
+        args.extend(["--minimal-state-dir".to_owned(), dir.as_str().to_owned()]);
+    }
+    let name = vm_name();
+    if !name.is_default() {
+        args.extend(["--vm-name".to_owned(), name.as_str().to_owned()]);
+    }
+    args
+}
+
+/// The dir holding all of this process's VM's runtime files:
+/// [`provider_dir_for`] of the active state base and VM name.
 pub fn provider_dir() -> PathBuf {
-    paths::provider_instance_dir(&state_base_dir(), paths::ProviderKind::Minvmd, 0)
+    provider_dir_for(&state_base_dir(), vm_name())
+}
+
+/// The dir holding one VM's runtime files under `base`:
+/// `<base>/providers/local-minvmd0` for the `default` VM, else its per-name
+/// subdirectory `<base>/providers/local-minvmd0/vms/<name>`. Pure, for unit
+/// testing without touching the process-wide overrides.
+pub fn provider_dir_for(base: &DaemonAbsPath, name: &VmName) -> PathBuf {
+    paths::provider_vm_dir(base, paths::ProviderKind::Minvmd, 0, name)
         .as_utf8_path()
         .as_std_path()
         .to_path_buf()
@@ -386,6 +426,101 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    // ── Named VMs ────────────────────────────────────────────────────────────
+
+    fn base_of(tmp: &tempfile::TempDir) -> DaemonAbsPath {
+        DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn named_vm_has_own_state_socket_daemon() {
+        let tmp = temp_dir();
+        let base = base_of(&tmp);
+        let default_dir = provider_dir_for(&base, &VmName::default());
+        let alpha_dir = provider_dir_for(&base, &VmName::new("alpha").unwrap());
+        assert_ne!(default_dir, alpha_dir);
+
+        let default_sd = StateDir::new(default_dir.clone()).unwrap();
+        let alpha_sd = StateDir::new(alpha_dir.clone()).unwrap();
+
+        // Own state file and socket, each inside its own dir.
+        assert_eq!(alpha_sd.state_path(), alpha_dir.join("minvmd.toml"));
+        assert_ne!(alpha_sd.state_path(), default_sd.state_path());
+        assert_eq!(
+            crate::sock::uds_path_in(&alpha_dir),
+            alpha_dir.join(paths::SSH_SOCK_FILE)
+        );
+        assert_ne!(
+            crate::sock::uds_path_in(&alpha_dir),
+            crate::sock::uds_path_in(&default_dir)
+        );
+
+        // Own daemon: the named VM's alive lock is independent of the default
+        // VM's, so a daemon serving one is invisible to, and cannot block, the
+        // other.
+        let _alpha_lock = alpha_sd.try_acquire_alive_lock().unwrap().expect("acquire");
+        assert!(alpha_sd.daemon_alive().unwrap());
+        assert!(!default_sd.daemon_alive().unwrap());
+        let _default_lock = default_sd
+            .try_acquire_alive_lock()
+            .unwrap()
+            .expect("the default VM's daemon starts beside the named one");
+        assert!(default_sd.daemon_alive().unwrap());
+        alpha_sd
+            .write_state(&State {
+                lifecycle: Lifecycle::Running,
+                vmm_pid: Some(1),
+                ..State::stopped()
+            })
+            .unwrap();
+        assert_eq!(
+            default_sd.read_state().unwrap().lifecycle,
+            Lifecycle::NotProvisioned
+        );
+    }
+
+    #[test]
+    fn default_vm_paths_unchanged() {
+        let tmp = temp_dir();
+        let base = base_of(&tmp);
+        let dir = provider_dir_for(&base, &VmName::default());
+        // The pre-named-VM layout, byte for byte.
+        let expected = tmp.path().join("providers").join("local-minvmd0");
+        assert_eq!(dir, expected);
+        let sd = StateDir::new(dir.clone()).unwrap();
+        assert_eq!(sd.state_path(), expected.join("minvmd.toml"));
+        assert_eq!(sd.lock_path(), expected.join("lifecycle.lock"));
+        assert_eq!(sd.alive_lock_path(), expected.join("minvmd.lock"));
+        assert_eq!(crate::sock::uds_path_in(&dir), expected.join("ssh.sock"));
+        // Nothing of a named VM lands in the default VM's dir itself.
+        let named = provider_dir_for(&base, &VmName::new("alpha").unwrap());
+        assert!(named.starts_with(&expected));
+        assert_ne!(named.parent().unwrap(), expected);
+    }
+
+    #[test]
+    fn named_vm_under_per_name_subdirectory() {
+        let tmp = temp_dir();
+        let base = base_of(&tmp);
+        let instance = provider_dir_for(&base, &VmName::default());
+        for name in ["alpha", "beta-2"] {
+            let dir = provider_dir_for(&base, &VmName::new(name).unwrap());
+            assert_eq!(dir, instance.join(paths::VMS_SUBDIR).join(name));
+            assert_eq!(
+                dir.strip_prefix(&instance).unwrap(),
+                Path::new(paths::VMS_SUBDIR).join(name)
+            );
+            // Opening the VM's state dir creates the subdirectory on demand.
+            let sd = StateDir::new(dir.clone()).unwrap();
+            assert!(dir.is_dir());
+            assert!(sd.state_path().starts_with(&dir));
+        }
+        assert_ne!(
+            provider_dir_for(&base, &VmName::new("alpha").unwrap()),
+            provider_dir_for(&base, &VmName::new("beta-2").unwrap())
+        );
     }
 
     // ── Atomic write round-trip ──────────────────────────────────────────────

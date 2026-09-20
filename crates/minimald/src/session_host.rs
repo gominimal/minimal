@@ -422,7 +422,23 @@ impl Binding {
             tokio::select! {
                 // Remote (ssh channel) => session stdin.
                 res = rs.wait(), if remote_open => match res {
-                    None => remote_open = false,
+                    // The channel's own end is gone: a client that closed it, or
+                    // one whose transport died and took the whole connection
+                    // with it — a killed `min`, a dropped link. Neither is a
+                    // request to end anything, so the session process runs on
+                    // and the next attach re-binds it; this line is the only
+                    // account of the departure the daemon has, because a client
+                    // that vanished logged nothing itself.
+                    //
+                    // Once, not per read: the arm is disabled from here on.
+                    None => {
+                        remote_open = false;
+                        tracing::info!(
+                            session = %self.name,
+                            "client gone; the session's process keeps running \
+                             and a later attach re-binds it",
+                        );
+                    }
                     Some(msg) => {
                         match msg {
                             russh::ChannelMsg::Data{ data } => {
@@ -1972,6 +1988,9 @@ pub(crate) struct SandboxLauncher {
     /// `OwnIp` PTask attaches, removed on exit. `None` for other
     /// network modes.
     pub(crate) ingress: Option<sessions::IngressPolicy>,
+    /// The box's declared egress rules, enforced on its relay once it
+    /// attaches (NET-062 to NET-064). `None` for no `egress` section.
+    pub(crate) egress: Option<sessions::EgressPolicy>,
     /// Composition to merge into the launcher's baseline packages and
     /// vars. Patches and lifecycle hooks are ignored today.
     pub(crate) composition: Option<std::sync::Arc<sessions::core::compose::Composition>>,
@@ -2064,6 +2083,7 @@ impl SessionLauncher for SandboxLauncher {
         // Move the ingress policy out of `self` up front so it can be applied
         // after the switch attach below (the rest of `self` is consumed first).
         let ingress = self.ingress;
+        let egress = self.egress;
         let network_mode = self.network_mode;
         let net_switch = self.net_switch;
         // The session name, registered as this PTask's `*.min.internal` hostname on
@@ -2094,6 +2114,7 @@ impl SessionLauncher for SandboxLauncher {
             &net_switch,
             &session_name,
             ingress.clone(),
+            egress,
         ))
         .await
         .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;

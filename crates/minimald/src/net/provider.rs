@@ -13,11 +13,12 @@ use sandbox2::{
 use sessions::NetworkMode;
 use tokio::sync::Mutex;
 
-use crate::net::SwitchClient;
-use crate::net::policy::ControlChannel;
+use crate::net::policy::{ControlChannel, HostReach};
+use crate::net::{SwitchClient, SwitchSubnet, SwitchTransport};
 
-/// The network provider for `mode`. `HostNet` and `NoNet` are the sandbox
-/// layer's own; `OwnIp` needs a lease, a tap and a switch attach. An
+/// The network provider for `mode`. `NoNet` is the sandbox layer's own;
+/// `HostNet` shares the host's namespace but still has its resolver to decide
+/// (NET-003), and `OwnIp` needs a lease, a tap and a switch attach. An
 /// unrecognised mode (`NetworkMode` is `#[non_exhaustive]`) gets the empty
 /// namespace, the safe direction.
 pub(crate) fn network_for(
@@ -25,17 +26,85 @@ pub(crate) fn network_for(
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
     ingress: Option<sessions::IngressPolicy>,
+    egress: Option<sessions::EgressPolicy>,
 ) -> Arc<dyn Network> {
     match mode {
-        NetworkMode::HostNet => Arc::new(sandbox2::HostNet),
+        NetworkMode::HostNet => Arc::new(HostNetNetwork {
+            switch: Arc::clone(switch),
+        }),
         NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
             switch: Arc::clone(switch),
             identity: identity.to_string(),
             ingress,
+            egress,
             reserved: std::sync::Mutex::new(None),
         }),
         _ => Arc::new(sandbox2::NoNet),
     }
+}
+
+/// Which reach `mode` gives a box on a switch reached by `transport` — its route
+/// to the host's loopback, and so the address `host.min.internal` answers it
+/// (NET-003). `None` for a mode with no route to the host at all.
+///
+/// The transport is the same signal [`tap_mechanism`] reads: a `HostShuttle`
+/// switch belongs to a node inside a VM, where even a host-address box sharing
+/// that node's namespace reaches the host across the switch. Both enums are
+/// `#[non_exhaustive]`, so an unrecognised pairing promises nothing rather than
+/// guessing an address that does not reach the host.
+pub(crate) fn host_reach(mode: NetworkMode, transport: SwitchTransport) -> Option<HostReach> {
+    match (mode, transport) {
+        (NetworkMode::HostNet, SwitchTransport::LocalSpawn) => Some(HostReach::SharedNamespace),
+        (NetworkMode::HostNet, SwitchTransport::HostShuttle { .. }) => Some(HostReach::Switch),
+        (NetworkMode::OwnIp, _) => Some(HostReach::Switch),
+        _ => None,
+    }
+}
+
+/// A host-address box: it shares the host's (or its node's) network namespace, so
+/// there is nothing to reserve and nothing to wire after the spawn. What it does
+/// need decided is its resolver, which [`host_net_plan`] reads from the switch.
+struct HostNetNetwork {
+    switch: Arc<Mutex<SwitchClient>>,
+}
+
+impl std::fmt::Debug for HostNetNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostNetNetwork").finish_non_exhaustive()
+    }
+}
+
+impl Network for HostNetNetwork {
+    /// Reads the switch to learn which host this is — nothing is reserved, and
+    /// the default no-op `attach`/`abandon` stand.
+    fn plan(&self) -> PlanFuture<'_> {
+        Box::pin(async move {
+            let (transport, subnet) = {
+                let switch = self.switch.lock().await;
+                (switch.transport(), switch.subnet())
+            };
+            Ok(host_net_plan(subnet, transport))
+        })
+    }
+}
+
+/// The plan a host-address box launches with: the host's namespace, and the
+/// resolver its reach implies (NET-003). Pure, so both hosts are testable
+/// without a switch.
+///
+/// Inside a VM-backed host the host's own resolver is not this box's to use: it
+/// sits on the far side of the switch, and `Resolver::Host` would leave the box
+/// with whatever its rootfs shipped or a synthesized copy of the node's file. The
+/// node's DNS layer — gvproxy, answering at the switch gateway — is what answers
+/// the box zone and forwards what the box may resolve, so it is named outright.
+fn host_net_plan(subnet: SwitchSubnet, transport: SwitchTransport) -> NetPlan {
+    let resolver = match host_reach(NetworkMode::HostNet, transport) {
+        Some(HostReach::Switch) => Resolver::Nameservers(vec![subnet.dns_server()]),
+        // A native host: the box shares the host's namespace, and its resolver
+        // with it.
+        _ => Resolver::Host,
+    };
+    NetPlan::host().with_resolver(resolver)
 }
 
 /// Who builds the tap an own-IP PTask needs.
@@ -140,6 +209,10 @@ struct OwnIpNetwork {
     identity: String,
     /// Static ingress port mappings to apply once attached.
     ingress: Option<sessions::IngressPolicy>,
+    /// The box's declared egress rules, enforced on its relay from the moment
+    /// it attaches (NET-062 to NET-064); `None` (no `egress` section) allows
+    /// every destination, while the source check (NET-084) always applies.
+    egress: Option<sessions::EgressPolicy>,
     /// Taken by `plan`, taken back out by `attach` or `abandon`. A `std` mutex,
     /// never held across an await, so a cancelled launch cannot leak it.
     reserved: std::sync::Mutex<Option<Reserved>>,
@@ -221,13 +294,42 @@ impl Network for OwnIpNetwork {
                 }
             };
 
+            // The frame verdict's inputs, owned and parsed once here: the
+            // lease it must send from, its declared rules, and the resolver
+            // carve-out at the switch's DNS address (design §4.1).
+            let mut egress = crate::net::switch::EgressGate::for_box(
+                self.identity.clone(),
+                sessions::core::net_verdict::EgressRules::for_box(
+                    reserved.lease.ip,
+                    self.egress.as_ref(),
+                    Some(sessions::core::net_verdict::Endpoint {
+                        ip: reserved.subnet.dns_server(),
+                        port: 53,
+                    }),
+                ),
+            );
+            // A box allowing names reaches what they resolve to, less the
+            // denied ranges, which hold the switch's own addresses (NET-066,
+            // NET-067).
+            if let Some(hosts) = self.egress.as_ref().and_then(|e| e.allow_dns_hosts.clone()) {
+                let subnet = reserved.subnet;
+                egress = egress.with_dns_pinning(
+                    hosts,
+                    &[subnet.gateway(), subnet.host_alias(), subnet.daemon_ip()],
+                );
+            }
+            let egress = Arc::new(egress);
             let guard = crate::net::gvproxy_network::complete_own_ip_attach(
-                &self.switch,
-                tap_fd,
-                reserved.control,
-                reserved.lease.ip,
-                &self.identity,
-                self.ingress.as_ref(),
+                crate::net::gvproxy_network::OwnIpAttach {
+                    switch: &self.switch,
+                    tap_fd,
+                    control: reserved.control,
+                    lease_ip: reserved.lease.ip,
+                    subnet: reserved.subnet,
+                    session_name: &self.identity,
+                    ingress: self.ingress.as_ref(),
+                    egress,
+                },
             )
             .await
             .map_err(NetworkError::new)?;
@@ -277,25 +379,121 @@ mod tests {
     async fn every_mode_gets_its_provider() {
         let switch = counting_switch();
 
-        let host = network_for(NetworkMode::HostNet, &switch, "s", None)
+        let host = network_for(NetworkMode::HostNet, &switch, "s", None, None)
             .plan()
             .await
             .unwrap();
         assert!(!host.isolates_netns());
-        assert_eq!(host.resolver(), &Resolver::Host);
+        // This switch belongs to a node inside a VM, where a host-address box
+        // resolves through the node's DNS layer (NET-003);
+        // `host_ip_box_resolves_through_node_dns_layer` covers both hosts.
+        assert_eq!(
+            host.resolver(),
+            &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()])
+        );
 
-        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None)
+        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None, None)
             .plan()
             .await
             .unwrap();
         assert!(no_net.isolates_netns() && no_net.tap().is_none());
         assert_eq!(no_net.resolver(), &Resolver::None);
 
-        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None);
+        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None, None);
         assert!(own_ip.plan().await.unwrap().isolates_netns());
         assert_eq!(switch.lock().await.attached(), 1, "own-IP takes a lease");
         own_ip.abandon().await;
         assert_eq!(switch.lock().await.attached(), 0);
+    }
+
+    /// NET-038. `network_for` must route `NoNet` to its isolating, tapless
+    /// plan regardless of what a caller passes for identity or ingress — a
+    /// `none` PTask never picks up wiring meant for another mode. That plan
+    /// is what leaves the sandbox with only a down `lo`
+    /// ([`sandbox2::NoNet`]'s `no_net_plan_isolates_netns`), which is what
+    /// refuses every socket it opens to the outside.
+    #[tokio::test]
+    async fn network_none_blocks_all_outside_sockets() {
+        let switch = counting_switch();
+        let ingress = Some(sessions::IngressPolicy {
+            port_mappings: vec![sessions::PortMapping {
+                external_port: 8080,
+                internal_port: 80,
+                proto: sessions::IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+        });
+
+        let plan = network_for(NetworkMode::NoNet, &switch, "some-session", ingress, None)
+            .plan()
+            .await
+            .unwrap();
+
+        assert!(
+            plan.isolates_netns(),
+            "a none box must run in its own empty network namespace"
+        );
+        assert!(
+            plan.tap().is_none(),
+            "a none box gets no tap to relay outside traffic through"
+        );
+        assert_eq!(
+            plan.resolver(),
+            &Resolver::None,
+            "no resolver reaches an isolated box"
+        );
+    }
+
+    /// NET-003's VM-backed clause: inside a VM-backed host a host-address box's
+    /// lookups go to the node's DNS layer — gvproxy, answering at the switch
+    /// gateway — and never to the host's own resolver, which `Resolver::Host`
+    /// would otherwise leave it with (or leave to whatever its rootfs shipped).
+    /// On a native host the box keeps sharing the host's resolver.
+    #[tokio::test]
+    async fn host_ip_box_resolves_through_node_dns_layer() {
+        let subnet = crate::net::SwitchSubnet::default();
+
+        // A node's switch inside a VM: taps reach the host gvproxy over the
+        // vsock shuttle.
+        let vm_backed = counting_switch();
+        let plan = network_for(NetworkMode::HostNet, &vm_backed, "s", None, None)
+            .plan()
+            .await
+            .unwrap();
+        assert!(
+            !plan.isolates_netns(),
+            "a host-address box keeps the node's namespace"
+        );
+        assert_eq!(
+            plan.resolver(),
+            &Resolver::Nameservers(vec![subnet.dns_server()]),
+            "the node's DNS layer, named outright"
+        );
+        assert_ne!(
+            plan.resolver(),
+            &Resolver::Host,
+            "never the host's own resolver"
+        );
+        // That nameserver *is* the node's DNS layer: gvproxy answers DNS on the
+        // switch gateway.
+        assert_eq!(subnet.dns_server(), subnet.gateway());
+        // And sharing a namespace takes no lease: nothing is attached.
+        assert_eq!(vm_backed.lock().await.attached(), 0);
+
+        // A native host: the box shares the host's namespace, and its resolver.
+        let native = Arc::new(Mutex::new(SwitchClient::new(
+            "/usr/bin/gvproxy",
+            "/run/minimal/gvproxy",
+        )));
+        assert_eq!(
+            native.lock().await.transport(),
+            crate::net::SwitchTransport::LocalSpawn
+        );
+        let plan = network_for(NetworkMode::HostNet, &native, "s", None, None)
+            .plan()
+            .await
+            .unwrap();
+        assert_eq!(plan.resolver(), &Resolver::Host);
     }
 
     /// The privileged tap is used where the daemon is privileged by deployment,
@@ -362,7 +560,7 @@ mod tests {
         let switch = counting_switch();
         let before = switch.lock().await.attached();
 
-        let net = network_for(NetworkMode::OwnIp, &switch, "s", None);
+        let net = network_for(NetworkMode::OwnIp, &switch, "s", None, None);
         net.plan().await.expect("planning leases an address");
         assert_eq!(switch.lock().await.attached(), before + 1);
 
@@ -393,7 +591,7 @@ mod tests {
     async fn concurrent_own_ip_launches_do_not_serialize() {
         let switch = counting_switch();
         let launches: Vec<_> = (0..4)
-            .map(|i| network_for(NetworkMode::OwnIp, &switch, &format!("p{i}"), None))
+            .map(|i| network_for(NetworkMode::OwnIp, &switch, &format!("p{i}"), None, None))
             .collect();
         for net in &launches {
             net.plan().await.expect("planning leases an address");

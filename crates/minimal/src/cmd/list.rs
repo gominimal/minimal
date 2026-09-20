@@ -301,32 +301,46 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // is exactly what will go on using hostnames that no longer resolve — and
     // stdout stays clean for the parser either way.
     warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref());
-    warn_if_mtls_proxy_down(resp.mtls_proxy_unavailable.as_deref());
     format_ls(&mut std::io::stdout(), &args, &resp)?;
     Ok(())
 }
 
-/// Tells the user that `<name>.local.min.internal` will not resolve, and why.
+/// What the user can do about a hostname listener that is not serving.
+///
+/// The daemon retries the bind on its own, so the remedy is to free the address
+/// and look again; a restart is never part of it, and saying so stops the
+/// warning from reading like a daemon that has to be kicked.
+const HOSTNAME_ROUTING_REMEDY: &str = "remedy: free the listen address; the daemon keeps \
+     retrying the bind, so the next `min ls` stops warning once it succeeds — no daemon \
+     restart needed";
+
+/// Renders the hostname-routing warning for `reason`, and nothing at all when
+/// the daemon reports no fault.
+///
+/// Shared by `min ls` and `min session activate` so both print the same reason
+/// and the same remedy from the one place, and so a test can read the text a
+/// user would see.
+pub fn write_hostname_routing_warning(
+    out: &mut impl std::io::Write,
+    reason: Option<&str>,
+) -> std::io::Result<()> {
+    let Some(reason) = reason else {
+        return Ok(());
+    };
+    writeln!(out, "warning: session hostnames will not route: {reason}")?;
+    writeln!(out, "{HOSTNAME_ROUTING_REMEDY}")
+}
+
+/// Tells the user that `<name>.local.min.internal` will not resolve, why, and
+/// what to do about it.
 ///
 /// The daemon keeps serving without its host-side proxy, so nothing else the
 /// user sees is different: sessions activate, exec works, the list prints. The
 /// only other trace is a `warn!` in the daemon log, which is not where someone
 /// watching curl fail is looking (gominimal/inbox#560).
 pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>) {
-    if let Some(reason) = reason {
-        eprintln!("warning: session hostnames will not route: {reason}");
-    }
-}
-
-/// Tells the user the mTLS reverse proxy is not serving, and why.
-///
-/// Kept separate from [`warn_if_hostname_routing_down`] so the two faults read
-/// as what they are: hostnames failing to resolve and TLS termination being
-/// absent are different problems with different fixes.
-pub(crate) fn warn_if_mtls_proxy_down(reason: Option<&str>) {
-    if let Some(reason) = reason {
-        eprintln!("warning: the mTLS reverse proxy is not serving: {reason}");
-    }
+    // A stderr write that fails is not worth failing the command over.
+    let _ = write_hostname_routing_warning(&mut std::io::stderr().lock(), reason);
 }
 
 /// Format the session list for the given output mode. Split from

@@ -80,10 +80,11 @@ pub struct PortMapping {
     pub proto: IpProto,
 }
 
-/// Effective egress policy for an `OwnIp` `PTask`.
+/// Effective egress policy for a box with an address of its own (`OwnIp`) or
+/// the host's (`HostNet`).
 ///
-/// Each field is `None` to mean allow-all for that dimension. Absent `egress`
-/// config on a session is equivalent to all-`None` (allow-all).
+/// Each allow field is `None` to mean allow-all for that dimension. Absent
+/// `egress` config on a session is equivalent to all-`None` (allow-all).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct EgressPolicy {
     /// Allowed destination CIDR prefixes; `None` means allow-all subnets.
@@ -92,6 +93,10 @@ pub struct EgressPolicy {
     pub allow_dns_hosts: Option<Vec<String>>,
     /// Allowed IP protocols; `None` means allow all protocols.
     pub allow_protocols: Option<Vec<IpProto>>,
+    /// Denied destination CIDR prefixes; `None` means nothing is denied by the
+    /// box's own declaration. The box's half of the denied ranges: a destination
+    /// matched here is refused whatever the allow fields say.
+    pub deny_subnets: Option<Vec<String>>,
 }
 
 impl EgressPolicy {
@@ -106,6 +111,23 @@ impl EgressPolicy {
     #[must_use]
     pub fn first_invalid_subnet(&self) -> Option<&str> {
         self.allow_subnets
+            .as_deref()
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .find(|cidr| !is_valid_cidr(cidr))
+    }
+
+    /// Returns the first `deny_subnets` entry that is not a syntactically valid
+    /// CIDR prefix, or `None` when every entry parses (or none are configured).
+    ///
+    /// Separate from [`first_invalid_subnet`](Self::first_invalid_subnet) so the
+    /// error names the field the operator wrote. A deny entry that fails to parse
+    /// is the worse of the two misconfigurations — the rule it describes would
+    /// simply not be applied — so it is named at launch rather than dropped.
+    #[must_use]
+    pub fn first_invalid_deny_subnet(&self) -> Option<&str> {
+        self.deny_subnets
             .as_deref()
             .into_iter()
             .flatten()
@@ -171,9 +193,19 @@ impl SessionPolicy {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PolicyError {
-    /// An egress policy was set on a `PTask` that is not [`NetworkMode::OwnIp`].
-    #[error("egress policy is only valid for an own-IP PTask, not {mode:?}")]
-    EgressRequiresOwnIp { mode: NetworkMode },
+    /// An egress policy was declared on a [`NetworkMode::NoNet`] `PTask` — a
+    /// `none` box, which has no network for the declaration to describe.
+    ///
+    /// Own-address (`OwnIp`) and host-address (`HostNet`) boxes both accept an
+    /// `egress` section: the host-address cohort has an enforcement identity of
+    /// its own, so its declaration is meaningful even though it shares the host's
+    /// addresses. `NoNet` is the one mode where there is nothing to enforce.
+    #[error(
+        "egress policy is not valid on a no-net PTask: a none box has no \
+         network for the rules to describe — drop the egress section, or give \
+         the box the host's address or one of its own"
+    )]
+    EgressOnNoNetBox,
     /// An ingress policy was set on a `PTask` that is not [`NetworkMode::OwnIp`].
     #[error("ingress policy is only valid for an own-IP PTask, not {mode:?}")]
     IngressRequiresOwnIp { mode: NetworkMode },
@@ -201,6 +233,12 @@ pub enum PolicyError {
     /// when #553's egress-enforcement layer parses it.
     #[error("egress allow_subnets entry {cidr:?} is not a valid CIDR prefix")]
     InvalidSubnet { cidr: String },
+    /// An egress `deny_subnets` entry is not a syntactically valid CIDR prefix.
+    /// Rejected at launch for the same reason as [`Self::InvalidSubnet`], and
+    /// more urgently: an unparseable deny entry describes a rule that would not
+    /// be applied, so dropping it silently would widen the box's reach.
+    #[error("egress deny_subnets entry {cidr:?} is not a valid CIDR prefix")]
+    InvalidDenySubnet { cidr: String },
     /// An ingress `dynamic_allowed_range` was given with its lower bound above
     /// its upper bound (e.g. `(8443, 8000)`). The range is inclusive, so a
     /// reversed pair describes no ports; rejected at launch so the misconfig is
@@ -1021,23 +1059,27 @@ pub struct Record {
 
 impl Record {
     /// Validates that this record's networking policy is compatible with its
-    /// network mode (R2.1/R2.3): egress and ingress are only meaningful for an
-    /// [`NetworkMode::OwnIp`] `PTask`, since `NoNet` has no network and `HostNet`
-    /// shares the host's, neither of which minimald can apply per-session
-    /// policy to. Returns an error naming the first incompatible section.
+    /// network mode. An `egress` section is accepted on a box with an address of
+    /// its own ([`NetworkMode::OwnIp`]) and on one that carries the host's
+    /// ([`NetworkMode::HostNet`]), whose cohort the host classifies as a source
+    /// identity of its own; it is rejected on a `none` box
+    /// ([`NetworkMode::NoNet`]), which has no network for the rules to describe.
+    /// Ingress remains own-address only: forwarding into a box needs an address
+    /// to forward to. Returns an error naming the first incompatible section.
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyError::EgressRequiresOwnIp`] when an egress policy is set
-    /// on a non-`OwnIp` `PTask`, or [`PolicyError::IngressRequiresOwnIp`] when a
-    /// non-empty ingress policy is. Returns
+    /// Returns [`PolicyError::EgressOnNoNetBox`] when an egress policy is
+    /// declared on a `NoNet` `PTask`, or [`PolicyError::IngressRequiresOwnIp`]
+    /// when a non-empty ingress policy is set on a non-`OwnIp` one. Returns
     /// [`PolicyError::UnsupportedIngressProtocol`] for an ingress mapping whose
     /// transport gvproxy's forwarder cannot expose, or
     /// [`PolicyError::PrivilegedPort`] for one that publishes a host port below
-    /// 1024. For an `OwnIp` `PTask`, returns [`PolicyError::InvalidSubnet`] when
-    /// an egress `allow_subnets` entry is not a valid CIDR prefix,
-    /// [`PolicyError::InvalidDynamicRange`] when the ingress
-    /// `dynamic_allowed_range` lower bound exceeds its upper bound, or
+    /// 1024. Wherever an egress policy is accepted, returns
+    /// [`PolicyError::InvalidSubnet`] or [`PolicyError::InvalidDenySubnet`] when
+    /// an `allow_subnets` or `deny_subnets` entry is not a valid CIDR prefix. For
+    /// an `OwnIp` `PTask`, returns [`PolicyError::InvalidDynamicRange`] when the
+    /// ingress `dynamic_allowed_range` lower bound exceeds its upper bound, or
     /// [`PolicyError::PrivilegedDynamicRange`] when that lower bound is a
     /// privileged host port (< 1024).
     pub fn validate_policy(&self) -> Result<(), PolicyError> {
@@ -1067,21 +1109,27 @@ impl Record {
         }) {
             return Err(PolicyError::PrivilegedPort { external_port });
         }
-        // For an OwnIp PTask egress/ingress are allowed; the only remaining
-        // check is that each egress allow_subnets entry is a syntactically valid
-        // CIDR prefix, so a misconfigured subnet is named at launch rather than
-        // surfacing opaquely when #553's enforcement layer parses it.
-        if self.network == NetworkMode::OwnIp {
-            if let Some(bad) = self
-                .policy
-                .egress
-                .as_ref()
-                .and_then(EgressPolicy::first_invalid_subnet)
-            {
+        // An egress declaration is accepted on a box with an address of its own
+        // and on one carrying the host's, and rejected on a none box, which has
+        // no network for the rules to describe. Wherever it is accepted its
+        // subnet lists must parse, so a misconfigured CIDR is named at launch
+        // rather than surfacing opaquely when the enforcement layer parses it.
+        if let Some(egress) = self.policy.egress.as_ref() {
+            if self.network == NetworkMode::NoNet {
+                return Err(PolicyError::EgressOnNoNetBox);
+            }
+            if let Some(bad) = egress.first_invalid_subnet() {
                 return Err(PolicyError::InvalidSubnet {
                     cidr: bad.to_owned(),
                 });
             }
+            if let Some(bad) = egress.first_invalid_deny_subnet() {
+                return Err(PolicyError::InvalidDenySubnet {
+                    cidr: bad.to_owned(),
+                });
+            }
+        }
+        if self.network == NetworkMode::OwnIp {
             // A reversed dynamic range (lo > hi) describes no ports under the
             // inclusive semantics, and a privileged lower bound (< 1024) names a
             // host port the rootless switch cannot publish — the same constraint
@@ -1102,9 +1150,6 @@ impl Record {
                 }
             }
             return Ok(());
-        }
-        if self.policy.egress.is_some() {
-            return Err(PolicyError::EgressRequiresOwnIp { mode: self.network });
         }
         if self
             .policy
@@ -1170,31 +1215,143 @@ mod tests {
         assert!(!r.hooks_enabled);
     }
 
+    /// The four egress fields a box spec may declare, all populated, as the
+    /// acceptance tests read them back.
+    fn four_field_egress() -> EgressPolicy {
+        EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".into()]),
+            allow_dns_hosts: Some(vec!["api.example.com".into()]),
+            allow_protocols: Some(vec![IpProto::Tcp, IpProto::Udp]),
+            deny_subnets: Some(vec!["10.1.0.0/16".into()]),
+        }
+    }
+
+    /// A box spec's `egress` section carries all four fields —
+    /// `allow_subnets`, `allow_protocols`, `allow_dns_hosts` and
+    /// `deny_subnets` — and each one survives the parse. `deny_subnets` is
+    /// the field with no predecessor: before it existed the key parsed to
+    /// nothing at all, so a spec that wrote it got silence instead of the
+    /// rule it asked for.
     #[test]
-    fn egress_on_host_net_is_rejected() {
-        // R2.1: an egress section is only valid for an own-IP PTask.
+    fn spec_accepts_egress_fields() {
+        let spec = r#"{
+            "egress": {
+                "allow_subnets": ["10.0.0.0/8", "192.168.0.0/16"],
+                "allow_protocols": ["tcp", "udp"],
+                "allow_dns_hosts": ["api.example.com"],
+                "deny_subnets": ["10.1.0.0/16"]
+            },
+            "ingress": null
+        }"#;
+        let policy: SessionPolicy =
+            serde_json_lenient::from_str(spec).expect("a four-field egress section must parse");
+        let egress = policy.egress.as_ref().expect("egress section");
+        assert_eq!(
+            egress.allow_subnets.as_deref(),
+            Some(&["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()][..])
+        );
+        assert_eq!(
+            egress.allow_protocols.as_deref(),
+            Some(&[IpProto::Tcp, IpProto::Udp][..])
+        );
+        assert_eq!(
+            egress.allow_dns_hosts.as_deref(),
+            Some(&["api.example.com".to_string()][..])
+        );
+        assert_eq!(
+            egress.deny_subnets.as_deref(),
+            Some(&["10.1.0.0/16".to_string()][..])
+        );
+        // Declared on a box with an address of its own, the whole section is
+        // accepted: parsing it is not enough if launch then refuses it.
+        assert!(
+            record_with(NetworkMode::OwnIp, policy)
+                .validate_policy()
+                .is_ok()
+        );
+    }
+
+    /// A record written before `deny_subnets` existed — an `egress` section
+    /// with only the three allow fields — still loads, with no deny rule.
+    #[test]
+    fn egress_without_deny_subnets_still_parses() {
+        let spec = r#"{
+            "egress": { "allow_subnets": ["10.0.0.0/8"] },
+            "ingress": null
+        }"#;
+        let policy: SessionPolicy =
+            serde_json_lenient::from_str(spec).expect("a pre-deny_subnets section must parse");
+        let egress = policy.egress.expect("egress section");
+        assert_eq!(egress.deny_subnets, None);
+        assert_eq!(egress.allow_dns_hosts, None);
+    }
+
+    /// A `none` box has no network for egress rules to describe, so declaring
+    /// them on one is a validation error rather than a silently inert section.
+    #[test]
+    fn egress_on_none_box_is_validation_error() {
+        let record = record_with(
+            NetworkMode::NoNet,
+            SessionPolicy::new(Some(four_field_egress()), None),
+        );
+        assert_eq!(record.validate_policy(), Err(PolicyError::EgressOnNoNetBox));
+        // Even an empty section is a declaration, and still refused.
+        let record = record_with(
+            NetworkMode::NoNet,
+            SessionPolicy::new(Some(EgressPolicy::default()), None),
+        );
+        assert_eq!(record.validate_policy(), Err(PolicyError::EgressOnNoNetBox));
+    }
+
+    /// A box carrying the host's address accepts an `egress` section: the
+    /// host-address cohort is classified as a source identity of its own, so
+    /// the declaration is what the deny-all story for those boxes is built on.
+    /// This is the rule that used to reject it.
+    #[test]
+    fn egress_on_host_ip_box_accepted() {
         let record = record_with(
             NetworkMode::HostNet,
-            SessionPolicy::new(Some(EgressPolicy::default()), None),
+            SessionPolicy::new(Some(four_field_egress()), None),
+        );
+        assert!(
+            record.validate_policy().is_ok(),
+            "egress on a host-address box must be accepted, got {:?}",
+            record.validate_policy()
+        );
+        // Accepted, but still parsed: a malformed CIDR is named here too, not
+        // only on an own-address box.
+        let record = record_with(
+            NetworkMode::HostNet,
+            SessionPolicy::new(
+                Some(EgressPolicy {
+                    allow_subnets: Some(vec!["10.0.0/8".into()]),
+                    ..EgressPolicy::default()
+                }),
+                None,
+            ),
         );
         assert_eq!(
             record.validate_policy(),
-            Err(PolicyError::EgressRequiresOwnIp {
-                mode: NetworkMode::HostNet
+            Err(PolicyError::InvalidSubnet {
+                cidr: "10.0.0/8".into()
             })
         );
     }
 
     #[test]
-    fn egress_on_no_net_is_rejected() {
-        let record = record_with(
-            NetworkMode::NoNet,
-            SessionPolicy::new(Some(EgressPolicy::default()), None),
-        );
+    fn invalid_egress_deny_subnet_is_rejected() {
+        // An unparseable deny entry describes a rule that would not be applied,
+        // which would widen the box's reach; it is named at launch, and named as
+        // a deny entry so the operator knows which list to fix.
+        let egress = EgressPolicy {
+            deny_subnets: Some(vec!["10.0.0.0/8".into(), "nope".into()]),
+            ..EgressPolicy::default()
+        };
+        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(Some(egress), None));
         assert_eq!(
             record.validate_policy(),
-            Err(PolicyError::EgressRequiresOwnIp {
-                mode: NetworkMode::NoNet
+            Err(PolicyError::InvalidDenySubnet {
+                cidr: "nope".into()
             })
         );
     }

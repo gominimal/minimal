@@ -10,11 +10,10 @@
 //! `127.0.0.1:<port>`, an `OwnIp` PTask to its gvproxy switch IP reached through
 //! the switch relay ([`super::switch`]).
 //!
-//! [`Router`] is that routing core, factored so #502 (the B8 HTTPS/mTLS reverse
-//! proxy) extends it by terminating TLS in front of the same `Host:`-header →
-//! registry → target lookup rather than duplicating it. The host-side
-//! `*.min.internal` decision supersedes spike #485's systemd-resolved finding
-//! (spec Open Question 1).
+//! [`Router`] is that routing core, factored so another listener can reuse the
+//! same `Host:`-header → registry → target lookup rather than duplicating it.
+//! The host-side `*.min.internal` decision supersedes spike #485's
+//! systemd-resolved finding (spec Open Question 1).
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -24,14 +23,11 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::dns::HostnameRegistry;
+use super::dns::{HostnameRegistry, Route};
 
 /// Port the B5 host-side egress/DNS proxy listens on (TC3). Clients reach it
 /// via `HTTP(S)_PROXY`.
 pub const EGRESS_PROXY_PORT: u16 = 7654;
-
-/// Port the B8 mTLS reverse proxy listens on (TC7).
-pub const HTTPS_PROXY_PORT: u16 = 7655;
 
 /// Default address the egress proxy listens on: loopback, where every
 /// `*.min.internal` name is reachable. Clients reach it via `HTTP(S)_PROXY`.
@@ -52,19 +48,18 @@ const MAX_HEAD: usize = 8 * 1024;
 const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The host-side lookup the proxy performs for each request: a `Host:`-header
-/// host (with any `:port` already stripped) to the address its requests forward
-/// to, or `None` if no live PTask owns it. The host resolver is never consulted.
+/// host (with any `:port` already stripped) to where its requests forward, or
+/// `None` if no live box owns it. The host resolver is never consulted.
 ///
 /// Factored as a trait so the routing core is decoupled from how the table is
-/// shared (the sessions manager owns the live registry) and so #502 can drive
-/// the same lookup behind TLS termination.
+/// shared: the sessions manager owns the live registry.
 pub trait HostRoute: Send + Sync + 'static {
-    /// Resolves a `Host:`-header host to the address its requests forward to.
-    fn resolve_host(&self, host: &str) -> Option<IpAddr>;
+    /// Resolves a `Host:`-header host to where its requests forward.
+    fn resolve_host(&self, host: &str) -> Option<Route>;
 }
 
 impl HostRoute for HostnameRegistry {
-    fn resolve_host(&self, host: &str) -> Option<IpAddr> {
+    fn resolve_host(&self, host: &str) -> Option<Route> {
         self.resolve(host)
     }
 }
@@ -74,7 +69,7 @@ impl HostRoute for HostnameRegistry {
 // `.await` held). This lets `Router::new(Arc<RwLock<HostnameRegistry>>)` route
 // against the same table the manager registers PTasks into.
 impl HostRoute for std::sync::RwLock<HostnameRegistry> {
-    fn resolve_host(&self, host: &str) -> Option<IpAddr> {
+    fn resolve_host(&self, host: &str) -> Option<Route> {
         // Recover from a poisoned lock rather than mapping it to `None`: the
         // registry is two HashMaps with no cross-field invariant a panicked
         // writer could half-break, and silently returning `None` would make
@@ -87,8 +82,7 @@ impl HostRoute for std::sync::RwLock<HostnameRegistry> {
 }
 
 /// The shared routing core: maps an HTTP authority (`host` or `host:port`) to
-/// the upstream socket address a request forwards to. #502 extends this by
-/// terminating TLS/mTLS in front of the same lookup.
+/// the upstream socket address a request forwards to.
 pub struct Router<T> {
     table: Arc<T>,
 }
@@ -110,9 +104,9 @@ impl<T: HostRoute> Router<T> {
         Self { table }
     }
 
-    /// Routes an HTTP authority to its upstream socket address, or `None` if no
-    /// live PTask owns the host. The authority's optional `:port` selects the
-    /// upstream port; absent, [`DEFAULT_UPSTREAM_PORT`] is used.
+    /// Routes an HTTP authority to its upstream, or `None` if no live box owns
+    /// the host. The authority's optional `:port` selects the upstream port;
+    /// absent, [`DEFAULT_UPSTREAM_PORT`] is used.
     ///
     /// The registry gates on the host, not the port: the upstream port comes
     /// entirely from the client-supplied authority, so a registered `HostNet`
@@ -123,11 +117,25 @@ impl<T: HostRoute> Router<T> {
     /// follow-up. Where mutually-untrusted PTasks share loopback, this is a
     /// loopback-SSRF surface that the follow-up must close.
     #[must_use]
-    pub fn route(&self, authority: &str) -> Option<SocketAddr> {
+    pub fn route(&self, authority: &str) -> Option<Upstream> {
         let (host, port) = split_authority(authority);
-        let ip = self.table.resolve_host(host)?;
-        Some(SocketAddr::new(ip, port.unwrap_or(DEFAULT_UPSTREAM_PORT)))
+        let route = self.table.resolve_host(host)?;
+        Some(Upstream {
+            addr: SocketAddr::new(route.target, port.unwrap_or(DEFAULT_UPSTREAM_PORT)),
+            session: route.session,
+        })
     }
+}
+
+/// Where a routed request forwards to: the upstream address, and the box the
+/// authority resolved to. The session travels with the address so a refusal
+/// taken after routing names the box it resolved to (NET-001).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstream {
+    /// The address the request forwards to.
+    pub addr: SocketAddr,
+    /// The session whose name the authority resolved to.
+    pub session: String,
 }
 
 /// Splits an HTTP authority into its host and optional port, handling both the
@@ -179,6 +187,62 @@ pub async fn bind_listener(addr: SocketAddr) -> Option<TcpListener> {
     }
 }
 
+/// Delay before the first rebind attempt after a failed bind.
+const REBIND_BASE_DELAY: Duration = Duration::from_millis(250);
+
+/// Ceiling on the rebind delay. A held address is freed by a process on its own
+/// schedule, so the backoff stops growing here and keeps probing at a fixed,
+/// cheap interval instead of drifting into hours.
+const REBIND_MAX_DELAY: Duration = Duration::from_secs(30);
+
+/// Delay before the `attempt`-th rebind (1-based): [`REBIND_BASE_DELAY`]
+/// doubling per attempt, capped at [`REBIND_MAX_DELAY`].
+#[must_use]
+pub fn rebind_delay(attempt: u32) -> Duration {
+    // Clamp the shift well inside `u32`: the cap is reached by attempt 8, so a
+    // large attempt count only needs to not overflow.
+    let doublings = attempt.saturating_sub(1).min(16);
+    REBIND_BASE_DELAY
+        .saturating_mul(1u32 << doublings)
+        .min(REBIND_MAX_DELAY)
+}
+
+/// Binds `addr`, retrying with backoff until it succeeds, and hands back the
+/// bound listener.
+///
+/// The caller has already made (and reported) the first failed attempt via
+/// [`bind_listener`], so this starts by waiting. It never gives up: the address
+/// is held by another process, which exits on its own schedule, and a daemon
+/// that stopped retrying would need a restart before `*.min.internal` hostnames
+/// routed again (R3.4 recovery). Each attempt logs the delay before the next
+/// one; the bind that finally succeeds logs the recovery.
+pub async fn bind_listener_retrying(addr: SocketAddr) -> TcpListener {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let delay = rebind_delay(attempt);
+        tracing::warn!(
+            component = "dns-proxy",
+            %addr,
+            status = "unavailable",
+            attempt,
+            retry_in_ms = delay.as_millis() as u64,
+            "retrying the host-side egress proxy bind"
+        );
+        tokio::time::sleep(delay).await;
+        if let Some(listener) = bind_listener(addr).await {
+            tracing::info!(
+                component = "dns-proxy",
+                %addr,
+                status = "recovered",
+                attempts = attempt,
+                "host-side egress proxy listener recovered"
+            );
+            return listener;
+        }
+    }
+}
+
 /// Serves the egress proxy on `listener`, spawning a task per connection that
 /// routes it through `router`. Runs until the listener errors.
 ///
@@ -202,6 +266,44 @@ pub async fn serve<T: HostRoute>(listener: TcpListener, router: Router<T>) -> io
     }
 }
 
+/// One refused request: what the client is answered with, and why (NET-001).
+///
+/// `host`, `session` and `error` are absent where the request never got that
+/// far — a head that timed out carries no authority, a name no box owns has no
+/// session — and all three render as `-`, so every refusal line in the log
+/// carries the same fields and one grep finds them all.
+#[derive(Default)]
+struct Refusal<'a> {
+    /// The HTTP status the client is answered with.
+    status: &'a str,
+    /// A stable token naming why the request was refused.
+    reason: &'a str,
+    /// The authority the client asked for, when the head yielded one.
+    host: Option<&'a str>,
+    /// The box the authority resolved to, when it resolved to one.
+    session: Option<&'a str>,
+    /// The underlying error, when the refusal followed a failed connect.
+    error: Option<&'a str>,
+}
+
+/// Refuses a request: logs the refusal with its reason (NET-001), then answers
+/// the client with the refusal's status.
+async fn refuse<C: AsyncWrite + Unpin>(client: &mut C, refusal: Refusal<'_>) -> io::Result<()> {
+    // Rendered for a field this refusal has no value for.
+    const ABSENT: &str = "-";
+
+    tracing::warn!(
+        component = "dns-proxy",
+        host = refusal.host.unwrap_or(ABSENT),
+        reason = refusal.reason,
+        session = refusal.session.unwrap_or(ABSENT),
+        error = refusal.error.unwrap_or(ABSENT),
+        status = refusal.status,
+        "refused a proxied request"
+    );
+    write_status(client, refusal.status).await
+}
+
 /// Whether the client opened a raw `CONNECT` tunnel or a plain forward request
 /// whose buffered head must be replayed to the upstream.
 #[derive(Debug, Clone, Copy)]
@@ -219,8 +321,8 @@ struct ParsedRequest<'a> {
 /// Handles one client connection over any byte stream: read its request head,
 /// route it by authority, then either return a gateway error or splice it to
 /// the upstream PTask. Generic over the client transport so the same routing
-/// core serves both the plain egress proxy (`TcpStream`) and the TLS-terminated
-/// HTTPS proxy (`TlsStream<TcpStream>`) added by the `networking-proxy` feature.
+/// core serves any listener put in front of it, not only the plain egress
+/// proxy's `TcpStream`.
 async fn handle_connection_io<C, T>(mut client: C, router: &Router<T>) -> io::Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -230,22 +332,62 @@ where
     // head cannot occupy this task indefinitely.
     let head = match tokio::time::timeout(HEAD_READ_TIMEOUT, read_head(&mut client)).await {
         Ok(result) => result?,
-        Err(_elapsed) => return write_status(&mut client, "408 Request Timeout").await,
+        Err(_elapsed) => {
+            return refuse(
+                &mut client,
+                Refusal {
+                    status: "408 Request Timeout",
+                    reason: "no-request-head-before-timeout",
+                    ..Refusal::default()
+                },
+            )
+            .await;
+        }
     };
     let Some(request) = parse_request(&head) else {
-        return write_status(&mut client, "400 Bad Request").await;
+        return refuse(
+            &mut client,
+            Refusal {
+                status: "400 Bad Request",
+                reason: "no-authority-in-request-head",
+                ..Refusal::default()
+            },
+        )
+        .await;
     };
 
-    // No live PTask owns this hostname: a host-side proxy returns a clean
-    // gateway error rather than leaking the lookup to the host resolver.
-    let Some(upstream_addr) = router.route(request.authority) else {
-        return write_status(&mut client, "502 Bad Gateway").await;
+    // No live box owns this name: a host-side proxy returns a clean gateway
+    // error rather than leaking the lookup to the host resolver.
+    let Some(routed) = router.route(request.authority) else {
+        return refuse(
+            &mut client,
+            Refusal {
+                status: "502 Bad Gateway",
+                reason: "no-live-box-owns-the-name",
+                host: Some(request.authority),
+                ..Refusal::default()
+            },
+        )
+        .await;
     };
     let kind = request.kind;
 
-    let mut upstream = match TcpStream::connect(upstream_addr).await {
+    let mut upstream = match TcpStream::connect(routed.addr).await {
         Ok(upstream) => upstream,
-        Err(_) => return write_status(&mut client, "502 Bad Gateway").await,
+        Err(error) => {
+            let error = error.to_string();
+            return refuse(
+                &mut client,
+                Refusal {
+                    status: "502 Bad Gateway",
+                    reason: "upstream-unreachable",
+                    host: Some(request.authority),
+                    session: Some(&routed.session),
+                    error: Some(&error),
+                },
+            )
+            .await;
+        }
     };
 
     match kind {
@@ -333,262 +475,6 @@ async fn write_status<C: AsyncWrite + Unpin>(client: &mut C, status: &str) -> io
     client.write_all(response.as_bytes()).await
 }
 
-// ---------------------------------------------------------------------------
-// TLS/mTLS termination extension (R4.4–R4.7, feature = "networking-proxy").
-//
-// Wraps the shared `Router` with a rustls TLS layer that requires clients to
-// present a certificate signed by the daemon's internal CA. A missing or
-// invalid client certificate is rejected at the application layer with a
-// `401 Unauthorized` response whose body is empty (no PTask hostname, IP, or
-// any internal topology — R4.5). This keeps the TLS handshake itself from
-// revealing topology: only well-authenticated clients learn where their
-// requests routed.
-// ---------------------------------------------------------------------------
-
-/// The daemon's self-signed certificate authority and the TLS server
-/// certificate it issued. Manages the cryptographic material needed for the
-/// HTTPS reverse proxy: signing new client certificates (for `minimal login`)
-/// and terminating TLS for incoming connections.
-#[cfg(feature = "networking-proxy")]
-pub struct CertAuthority {
-    /// CA certificate in DER format; handed to clients by `minimal login` so
-    /// they can trust the daemon's server certificate.
-    pub ca_cert_der: rustls::pki_types::CertificateDer<'static>,
-    /// CA certificate in PEM format; returned by the `IssueClientCert` RPC
-    /// for use with `curl --cacert`.
-    pub ca_cert_pem: String,
-    /// Server certificate DER, presented to HTTPS clients during the
-    /// TLS handshake.
-    pub server_cert_der: rustls::pki_types::CertificateDer<'static>,
-    /// Raw PKCS#8 bytes of the server's private key.
-    server_key_bytes: Vec<u8>,
-    /// The CA issuer (parameters plus key pair), kept for signing server and
-    /// client certificates.
-    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
-}
-
-#[cfg(feature = "networking-proxy")]
-impl std::fmt::Debug for CertAuthority {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CertAuthority")
-            .field("ca_cert_der_len", &self.ca_cert_der.len())
-            .field("server_cert_der_len", &self.server_cert_der.len())
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(feature = "networking-proxy")]
-impl CertAuthority {
-    /// Generates a fresh self-signed CA and a server certificate signed by it.
-    ///
-    /// The CA is ECDSA P-256 / SHA-256. Both the CA and the server cert are
-    /// valid for the `localhost` SAN so a local curl can reach the proxy
-    /// without specifying an SNI override.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `rcgen::Error` if key-pair or cert generation fails.
-    pub fn generate() -> Result<Self, rcgen::Error> {
-        // CA — unconstrained so it can sign any cert.
-        let ca_key = rcgen::KeyPair::generate()?;
-        let mut ca_params = rcgen::CertificateParams::default();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "Minimal CA");
-        let ca_cert = ca_params.self_signed(&ca_key)?;
-        let ca_cert_der = rustls::pki_types::CertificateDer::from(ca_cert.der().to_vec());
-        let ca_cert_pem = ca_cert.pem();
-        // Retain the CA as an issuer so it can sign server and client certs.
-        let issuer = rcgen::Issuer::new(ca_params, ca_key);
-
-        // Server certificate signed by the CA.
-        let server_key = rcgen::KeyPair::generate()?;
-        let server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])?;
-        let server_cert = server_params.signed_by(&server_key, &issuer)?;
-        let server_cert_der = rustls::pki_types::CertificateDer::from(server_cert.der().to_vec());
-        let server_key_bytes = server_key.serialize_der();
-
-        Ok(Self {
-            ca_cert_der,
-            ca_cert_pem,
-            server_cert_der,
-            server_key_bytes,
-            issuer,
-        })
-    }
-
-    /// Signs a new client certificate for the given subject common name,
-    /// returning the cert PEM and key PEM. The key pair is generated
-    /// server-side and handed to the client via `IssueClientCert` so the
-    /// client can authenticate to the HTTPS proxy without a separate CSR
-    /// exchange.
-    ///
-    /// Returns `(cert_pem, key_pem)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `rcgen::Error` if key-pair or cert generation fails.
-    pub fn sign_client_cert(&self, subject_cn: &str) -> Result<(String, String), rcgen::Error> {
-        let client_key = rcgen::KeyPair::generate()?;
-        // The login username can be non-ASCII; rcgen parses SANs as DNS names
-        // and rejects those, which would break `minimal login`. The proxy
-        // authenticates on CA-signed cert presence (not the SAN/CN), so use a
-        // fixed ASCII SAN and carry the username in the subject CN instead.
-        let mut client_params = rcgen::CertificateParams::new(vec!["minimal-client".to_string()])?;
-        let mut client_dn = rcgen::DistinguishedName::new();
-        client_dn.push(rcgen::DnType::CommonName, subject_cn);
-        client_params.distinguished_name = client_dn;
-        client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-        let client_cert = client_params.signed_by(&client_key, &self.issuer)?;
-        Ok((client_cert.pem(), client_key.serialize_pem()))
-    }
-
-    /// Signs a new client certificate and also returns the cert in DER format
-    /// for in-process TLS use (e.g., test clients). Returns
-    /// `(cert_der, key_bytes, cert_pem, key_pem)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `rcgen::Error` if key-pair or cert generation fails.
-    #[allow(dead_code)]
-    pub(crate) fn sign_client_cert_der(
-        &self,
-        subject_cn: &str,
-    ) -> Result<(rustls::pki_types::CertificateDer<'static>, Vec<u8>), rcgen::Error> {
-        let client_key = rcgen::KeyPair::generate()?;
-        // The login username can be non-ASCII; rcgen parses SANs as DNS names
-        // and rejects those, which would break `minimal login`. The proxy
-        // authenticates on CA-signed cert presence (not the SAN/CN), so use a
-        // fixed ASCII SAN and carry the username in the subject CN instead.
-        let mut client_params = rcgen::CertificateParams::new(vec!["minimal-client".to_string()])?;
-        let mut client_dn = rcgen::DistinguishedName::new();
-        client_dn.push(rcgen::DnType::CommonName, subject_cn);
-        client_params.distinguished_name = client_dn;
-        client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-        let client_cert = client_params.signed_by(&client_key, &self.issuer)?;
-        let cert_der = rustls::pki_types::CertificateDer::from(client_cert.der().to_vec());
-        let key_bytes = client_key.serialize_der();
-        Ok((cert_der, key_bytes))
-    }
-
-    /// Builds a rustls `ServerConfig` for the HTTPS proxy.
-    ///
-    /// The verifier uses `allow_unauthenticated()` so a TLS handshake
-    /// succeeds even when no client certificate is presented — the
-    /// application layer then returns `401 Unauthorized`. A presented
-    /// certificate is validated against the CA trust store by rustls
-    /// before the handshake completes; an invalid certificate causes a
-    /// TLS-level failure (the client never gets an HTTP response).
-    ///
-    /// # Errors
-    ///
-    /// Returns an `io::Error` if the TLS configuration cannot be assembled
-    /// (malformed cert/key or unsupported crypto).
-    pub fn build_server_config(&self) -> io::Result<Arc<rustls::ServerConfig>> {
-        // Install ring as the process-default CryptoProvider if not already set.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store
-            .add(self.ca_cert_der.clone())
-            .map_err(io::Error::other)?;
-
-        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-            .allow_unauthenticated()
-            .build()
-            .map_err(io::Error::other)?;
-
-        let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(self.server_key_bytes.clone()),
-        );
-
-        let config = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(vec![self.server_cert_der.clone()], server_key)
-            .map_err(io::Error::other)?;
-
-        Ok(Arc::new(config))
-    }
-}
-
-/// Serves the HTTPS reverse proxy with mTLS on `listener`. Each accepted TCP
-/// connection is TLS-terminated using `tls_config`, then routed via `router`
-/// exactly as the plain proxy does — the shared routing core is reused
-/// (scope-coordination comment on #502).
-///
-/// A connection that arrives **without** a client certificate is answered with
-/// `401 Unauthorized` and an empty body (no PTask hostname or IP — R4.5). The
-/// rejection is logged as a `tracing::warn!` event with structured fields.
-///
-/// A valid client certificate (signed by the daemon's CA) passes through to
-/// the routing core.
-///
-/// # Errors
-///
-/// Returns the accept error if the listener fails.
-#[cfg(feature = "networking-proxy")]
-pub async fn serve_https<T: HostRoute>(
-    listener: TcpListener,
-    router: Router<T>,
-    tls_config: Arc<rustls::ServerConfig>,
-) -> io::Result<()> {
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-    loop {
-        let (tcp_stream, peer) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        let router = router.clone();
-        tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(tcp_stream).await {
-                Ok(s) => s,
-                Err(error) => {
-                    tracing::debug!(
-                        component = "https-proxy",
-                        %peer,
-                        %error,
-                        "TLS handshake failed"
-                    );
-                    return;
-                }
-            };
-
-            // Check whether the client presented a certificate. The verifier
-            // is configured with `allow_unauthenticated`, so a missing cert
-            // does NOT fail the TLS handshake — it fails here at the HTTP
-            // layer with a 401 that leaks no internal topology (R4.5).
-            let has_cert = tls_stream.get_ref().1.peer_certificates().is_some();
-
-            if !has_cert {
-                tracing::warn!(
-                    component = "https-proxy",
-                    %peer,
-                    reason = "no-client-cert",
-                    "mTLS authentication failed: no client certificate presented"
-                );
-                let mut stream = tls_stream;
-                // Body is intentionally empty — no PTask name or IP (R4.5).
-                let _ = write_status(&mut stream, "401 Unauthorized").await;
-                // Shut down cleanly so the peer receives the TLS close_notify
-                // and the 401 response before the TCP connection closes.
-                // Without this, the OS sends a TCP RST that can race with the
-                // client still completing the TLS handshake, causing
-                // ConnectionReset instead of the clean 401.
-                let _ = stream.shutdown().await;
-                return;
-            }
-
-            if let Err(error) = handle_connection_io(tls_stream, &router).await {
-                tracing::debug!(
-                    component = "https-proxy",
-                    %peer,
-                    %error,
-                    "HTTPS proxy connection closed with error"
-                );
-            }
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +482,8 @@ mod tests {
 
     use sessions::SessionId;
     use tracing_subscriber::fmt::MakeWriter;
+
+    use crate::net::dns::DEFAULT_HOST_ID;
 
     /// A `MakeWriter` accumulating everything written into a shared buffer, so a
     /// test can assert on the structured fields a `tracing` event emitted.
@@ -656,6 +544,191 @@ mod tests {
         String::from_utf8_lossy(&response).into_owned()
     }
 
+    /// Drives one connection over an in-memory pipe and returns the raw response
+    /// the client read back. Unlike [`proxy_get`] the connection is handled in
+    /// the test's own task, so a thread-local `tracing` subscriber captures the
+    /// events the request emits. The client half is shut down for writing right
+    /// after the head, which is what lets a *routed* request's bidirectional
+    /// splice finish instead of waiting on a client that never closes.
+    async fn drive_connection<T: HostRoute>(router: &Router<T>, request: &str) -> String {
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        handle_connection_io(server, router).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// NET-001: a box answers at its two-label `<name>.min.internal` name through
+    /// the proxy that already ships, own-address sessions on a VM host included.
+    ///
+    /// On a VM-backed host `minimald` runs in the guest, so the proxy binds the
+    /// unspecified address there (the DM1 bind base `server::start_host_proxies`
+    /// uses) and is reached through the port gvproxy publishes on the host
+    /// loopback; the box itself is reached through *its* published loopback port,
+    /// which is why an own-address session registers to loopback. Both halves are
+    /// exercised here: the listener is bound unspecified and reached on loopback,
+    /// and the target is an `OwnIp` registration.
+    #[tokio::test]
+    async fn proxy_routes_min_internal_for_own_ip_session_on_vm_host() {
+        let backend_port = spawn_backend().await;
+
+        let shared = Arc::new(RwLock::new(HostnameRegistry::new(DEFAULT_HOST_ID)));
+        let hostname = shared
+            .write()
+            .unwrap()
+            .register_own_ip(SessionId::nil(), "web");
+        assert_eq!(hostname.as_str(), "web.min.internal");
+        let router = Router::new(Arc::clone(&shared));
+
+        let proxy = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        tokio::spawn(serve(proxy, router));
+        let proxy_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, proxy_port));
+
+        let authority = format!("web.min.internal:{backend_port}");
+        let routed = proxy_get(proxy_addr, &authority).await;
+        assert!(
+            routed.contains("200 OK"),
+            "expected the two-label name to route, got: {routed}"
+        );
+
+        // The name is the session's: once the session is gone, so is the route.
+        shared.write().unwrap().deregister("web");
+        let withdrawn = proxy_get(proxy_addr, &authority).await;
+        assert!(
+            withdrawn.contains("502 Bad Gateway"),
+            "expected a gateway error once the session is gone, got: {withdrawn}"
+        );
+    }
+
+    /// NET-001 (unwanted case): every request the proxy refuses is logged with
+    /// its reason — a name no live box owns, a name that resolved to a box whose
+    /// address will not accept a connection (which also names the session it
+    /// resolved to), and a head that never yielded an authority.
+    #[tokio::test]
+    async fn proxy_refusal_is_logged_with_reason() {
+        let shared = Arc::new(RwLock::new(HostnameRegistry::new(DEFAULT_HOST_ID)));
+        shared
+            .write()
+            .unwrap()
+            .register_own_ip(SessionId::nil(), "web");
+        let router = Router::new(shared);
+
+        // A loopback port with nothing on it: bound only to learn a port the OS
+        // has free, then dropped, so the connect is refused rather than hanging.
+        let closed_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let unowned = drive_connection(
+            &router,
+            "GET / HTTP/1.1\r\nHost: ghost.min.internal:80\r\n\r\n",
+        )
+        .await;
+        let unreachable = drive_connection(
+            &router,
+            &format!("GET / HTTP/1.1\r\nHost: web.min.internal:{closed_port}\r\n\r\n"),
+        )
+        .await;
+        let headless = drive_connection(&router, "not-a-request-line\r\n\r\n").await;
+        drop(guard);
+
+        assert!(
+            unowned.contains("502 Bad Gateway"),
+            "expected a gateway error for an unowned name, got: {unowned}"
+        );
+        assert!(
+            unreachable.contains("502 Bad Gateway"),
+            "expected a gateway error for a dead upstream, got: {unreachable}"
+        );
+        assert!(
+            headless.contains("400 Bad Request"),
+            "expected a bad request for an unusable head, got: {headless}"
+        );
+
+        let logged = buf.contents();
+        // The name nobody owns: the host asked for, and why it was refused.
+        assert!(
+            logged.contains(r#"host="ghost.min.internal:80""#),
+            "expected the refused host, got: {logged}"
+        );
+        assert!(
+            logged.contains(r#"reason="no-live-box-owns-the-name""#),
+            "expected a reason for the unowned name, got: {logged}"
+        );
+        // The name that resolved: the reason, plus the session it resolved to.
+        assert!(
+            logged.contains(r#"reason="upstream-unreachable""#),
+            "expected a reason for the dead upstream, got: {logged}"
+        );
+        assert!(
+            logged.contains(r#"session="web""#),
+            "expected the session the name resolved to, got: {logged}"
+        );
+        // A head with no authority is refused with a reason of its own.
+        assert!(
+            logged.contains(r#"reason="no-authority-in-request-head""#),
+            "expected a reason for the unusable head, got: {logged}"
+        );
+    }
+
+    /// NET-002: a request in the deprecated `<name>.<host-id>.min.internal` zone
+    /// routes as the two-label name, and the notice in the log names the
+    /// two-label form to use instead.
+    #[tokio::test]
+    async fn legacy_local_zone_routes_with_deprecation() {
+        let backend_port = spawn_backend().await;
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID);
+        assert_eq!(
+            reg.register_host_net(SessionId::nil(), "web").as_str(),
+            "web.min.internal"
+        );
+        let router = Router::new(Arc::new(reg));
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let routed = drive_connection(
+            &router,
+            &format!("GET / HTTP/1.1\r\nHost: web.local.min.internal:{backend_port}\r\n\r\n"),
+        )
+        .await;
+        drop(guard);
+
+        assert!(
+            routed.contains("200 OK"),
+            "expected the deprecated name to route, got: {routed}"
+        );
+        let logged = buf.contents();
+        assert!(
+            logged.contains(r#"host="web.local.min.internal""#),
+            "expected the deprecated name in the notice, got: {logged}"
+        );
+        assert!(
+            logged.contains(r#"routed_as="web.min.internal""#),
+            "expected the notice to name the two-label form, got: {logged}"
+        );
+        assert!(
+            logged.contains("deprecated"),
+            "expected a deprecation notice, got: {logged}"
+        );
+    }
+
     /// Proof artifact 1 (registry/proxy routing contract): a `HostNet` PTask's
     /// `Host:` header routes through the proxy to its registered target; after
     /// `deregister` the proxy returns a gateway error instead of a stale route.
@@ -665,9 +738,9 @@ mod tests {
     async fn host_header_routes_through_proxy_then_not_found_after_deregister() {
         let backend_port = spawn_backend().await;
 
-        // `myservice.dev.min.internal` → 127.0.0.1 (HostNet, R3.6); the client's
+        // `myservice.min.internal` → 127.0.0.1 (HostNet, R3.6); the client's
         // `:port` selects the upstream port, so it reaches the backend.
-        let shared = Arc::new(RwLock::new(HostnameRegistry::new("dev")));
+        let shared = Arc::new(RwLock::new(HostnameRegistry::new(DEFAULT_HOST_ID)));
         shared
             .write()
             .unwrap()
@@ -678,7 +751,7 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(serve(proxy, router));
 
-        let authority = format!("myservice.dev.min.internal:{backend_port}");
+        let authority = format!("myservice.min.internal:{backend_port}");
         let routed = proxy_get(proxy_addr, &authority).await;
         assert!(
             routed.contains("200 OK"),
@@ -703,23 +776,29 @@ mod tests {
     #[test]
     fn own_ip_routes_to_its_published_loopback_port() {
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let mut reg = HostnameRegistry::new("dev");
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID);
         reg.register_own_ip(SessionId::nil(), "web");
         let router = Router::new(Arc::new(reg));
 
         // The published external port (e.g. an ingress 18080:8080 forward) is
         // carried in the authority and reached on loopback.
         assert_eq!(
-            router.route("web.dev.min.internal:18080"),
+            router.route("web.min.internal:18080").map(|u| u.addr),
             Some(SocketAddr::new(loopback, 18080))
         );
         // Absent an explicit port the default upstream port is used.
         assert_eq!(
-            router.route("web.dev.min.internal"),
+            router.route("web.min.internal").map(|u| u.addr),
             Some(SocketAddr::new(loopback, DEFAULT_UPSTREAM_PORT))
         );
+        // The upstream names the session, so a refusal after routing can say
+        // which box the authority resolved to.
+        assert_eq!(
+            router.route("web.min.internal").map(|u| u.session),
+            Some("web".to_string())
+        );
         // An unregistered host does not route.
-        assert_eq!(router.route("ghost.dev.min.internal"), None);
+        assert_eq!(router.route("ghost.min.internal"), None);
     }
 
     /// Proof artifact 3 (R3.4 supersession): when the listen address cannot be
@@ -752,22 +831,81 @@ mod tests {
         );
     }
 
+    /// A bind that fails does not stay failed: the daemon keeps retrying on a
+    /// growing, capped delay and comes up on its own once the address is free,
+    /// with no restart involved (NET-021).
+    #[tokio::test(start_paused = true)]
+    async fn listener_retries_with_backoff() {
+        // The schedule doubles from the base delay and then holds at the cap.
+        assert_eq!(rebind_delay(1), REBIND_BASE_DELAY);
+        assert_eq!(rebind_delay(2), REBIND_BASE_DELAY * 2);
+        assert_eq!(rebind_delay(3), REBIND_BASE_DELAY * 4);
+        assert_eq!(rebind_delay(1_000), REBIND_MAX_DELAY);
+
+        // Hold the address so every attempt fails until the holder lets go.
+        let held = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = held.local_addr().unwrap();
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let started = tokio::time::Instant::now();
+        let retrying = tokio::spawn(bind_listener_retrying(addr));
+
+        // Paused time auto-advances while every task is sleeping, so crossing
+        // the first backoff steps costs no real time.
+        tokio::time::sleep(REBIND_BASE_DELAY * 8).await;
+        assert!(
+            !retrying.is_finished(),
+            "must not report a listener while the address is held"
+        );
+        let logged = buf.contents();
+        assert!(
+            logged.contains("retry_in_ms=250") && logged.contains("retry_in_ms=500"),
+            "expected a growing retry delay per attempt, got: {logged}"
+        );
+
+        drop(held);
+        let bound = tokio::time::timeout(Duration::from_secs(120), retrying)
+            .await
+            .expect("the retry loop must bind once the address is free")
+            .expect("the retry task must not panic");
+        assert_eq!(bound.local_addr().unwrap(), addr);
+
+        // It backed off between attempts rather than spinning: at least the
+        // first three delays elapsed before the address came free.
+        assert!(
+            started.elapsed() >= rebind_delay(1) + rebind_delay(2) + rebind_delay(3),
+            "expected the loop to sleep between attempts, elapsed {:?}",
+            started.elapsed()
+        );
+        assert!(
+            buf.contents().contains(r#"status="recovered""#),
+            "recovery must be logged, got: {}",
+            buf.contents()
+        );
+    }
+
     /// `CONNECT` carries the authority in its request line; a plain method
     /// carries it in the `Host:` header. Both parse to the same authority.
     #[test]
     fn parse_request_reads_connect_and_host_authorities() {
-        let connect = parse_request(b"CONNECT web.dev.min.internal:443 HTTP/1.1\r\n\r\n").unwrap();
+        let connect = parse_request(b"CONNECT web.min.internal:443 HTTP/1.1\r\n\r\n").unwrap();
         assert!(matches!(connect.kind, RequestKind::Connect));
-        assert_eq!(connect.authority, "web.dev.min.internal:443");
+        assert_eq!(connect.authority, "web.min.internal:443");
 
         let forward =
-            parse_request(b"GET / HTTP/1.1\r\nHost: web.dev.min.internal:8080\r\n\r\n").unwrap();
+            parse_request(b"GET / HTTP/1.1\r\nHost: web.min.internal:8080\r\n\r\n").unwrap();
         assert!(matches!(forward.kind, RequestKind::Forward));
-        assert_eq!(forward.authority, "web.dev.min.internal:8080");
+        assert_eq!(forward.authority, "web.min.internal:8080");
     }
 
     /// A forward request from an `HTTP_PROXY`-configured client carries an
-    /// absolute-form request target (`GET http://web.dev.min.internal/path HTTP/1.1`).
+    /// absolute-form request target (`GET http://web.min.internal/path HTTP/1.1`).
     /// The proxy routes it by `Host:` header and replays the buffered head
     /// verbatim, so the upstream receives the absolute-form request line
     /// unchanged — RFC 9112 requires an origin server to accept it. Complements
@@ -790,7 +928,7 @@ mod tests {
                 .await;
         });
 
-        let mut reg = HostnameRegistry::new("dev");
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID);
         reg.register_host_net(SessionId::nil(), "web");
         let router = Router::new(Arc::new(reg));
 
@@ -798,11 +936,11 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(serve(proxy, router));
 
-        let request_line = format!("GET http://web.dev.min.internal:{backend_port}/path HTTP/1.1");
+        let request_line = format!("GET http://web.min.internal:{backend_port}/path HTTP/1.1");
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         client
             .write_all(
-                format!("{request_line}\r\nHost: web.dev.min.internal:{backend_port}\r\n\r\n")
+                format!("{request_line}\r\nHost: web.min.internal:{backend_port}\r\n\r\n")
                     .as_bytes(),
             )
             .await
@@ -820,125 +958,6 @@ mod tests {
         assert!(
             upstream_head.starts_with(&request_line),
             "expected absolute-form target replayed to upstream, got: {upstream_head}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // TLS / mTLS tests (feature = "networking-proxy").
-    // These drive the full stack from TCP connection through TLS handshake to
-    // the HTTP routing core, asserting the mTLS auth-failure and auth-success
-    // contracts (R4.5, proof artifacts 2 and 3).
-    // -----------------------------------------------------------------------
-
-    /// Proof artifact 2 (R4.5 auth-failure non-disclosure): a connection that
-    /// presents **no** client certificate is answered with `401 Unauthorized`
-    /// and an empty body — no PTask hostname, IP, or any internal topology.
-    #[cfg(feature = "networking-proxy")]
-    #[tokio::test]
-    async fn mtls_missing_cert_returns_401_with_no_topology() {
-        use tokio_rustls::TlsConnector;
-
-        let ca = CertAuthority::generate().expect("CA generation must not fail");
-        let tls_config = ca.build_server_config().expect("server config must build");
-
-        let backend_port = spawn_backend().await;
-        let mut reg = HostnameRegistry::new("dev");
-        reg.register_host_net(SessionId::nil(), "mysvc");
-        let router = Router::new(Arc::new(reg));
-
-        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve_https(proxy, router, tls_config));
-
-        // Build a TLS client that trusts the CA but presents no client cert.
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.add(ca.ca_cert_der.clone()).unwrap();
-        let client_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(client_config));
-
-        let tcp = TcpStream::connect(proxy_addr).await.unwrap();
-        let mut tls = connector
-            .connect("localhost".try_into().unwrap(), tcp)
-            .await
-            .expect("TLS handshake must succeed for anonymous connection");
-
-        let authority = format!("mysvc.dev.min.internal:{backend_port}");
-        tls.write_all(format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
-            .await
-            .unwrap();
-        let mut response = Vec::new();
-        tls.read_to_end(&mut response).await.unwrap();
-
-        let response_str = String::from_utf8_lossy(&response);
-        assert!(
-            response_str.contains("401"),
-            "expected 401 Unauthorized for no-cert, got: {response_str}"
-        );
-        // The 401 body must not reveal PTask hostnames or switch IPs (R4.5).
-        assert!(
-            !response_str.contains("min.internal"),
-            "response body must not contain a PTask hostname"
-        );
-        assert!(
-            !response_str.contains("100.64"),
-            "response body must not contain a switch IP"
-        );
-    }
-
-    /// Proof artifact 3 (UC2b remote browser access): a connection that
-    /// presents a **valid** client certificate signed by the daemon CA is
-    /// routed to the target PTask and receives a `200 OK`.
-    #[cfg(feature = "networking-proxy")]
-    #[tokio::test]
-    async fn mtls_valid_cert_routes_to_backend() {
-        use tokio_rustls::TlsConnector;
-
-        let ca = CertAuthority::generate().expect("CA generation must not fail");
-        let tls_config = ca.build_server_config().expect("server config must build");
-        let (client_cert_der, client_key_bytes) = ca
-            .sign_client_cert_der("test-client")
-            .expect("sign must succeed");
-
-        let backend_port = spawn_backend().await;
-        let mut reg = HostnameRegistry::new("dev");
-        reg.register_host_net(SessionId::nil(), "mysvc");
-        let router = Router::new(Arc::new(reg));
-
-        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve_https(proxy, router, tls_config));
-
-        // Build a TLS client with a valid client certificate.
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.add(ca.ca_cert_der.clone()).unwrap();
-        let client_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(client_key_bytes),
-        );
-        let client_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_client_auth_cert(vec![client_cert_der], client_key)
-            .expect("client auth config must build");
-        let connector = TlsConnector::from(Arc::new(client_config));
-
-        let tcp = TcpStream::connect(proxy_addr).await.unwrap();
-        let mut tls = connector
-            .connect("localhost".try_into().unwrap(), tcp)
-            .await
-            .expect("TLS handshake must succeed with valid client cert");
-
-        let authority = format!("mysvc.dev.min.internal:{backend_port}");
-        tls.write_all(format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
-            .await
-            .unwrap();
-        let mut response = Vec::new();
-        tls.read_to_end(&mut response).await.unwrap();
-
-        let response_str = String::from_utf8_lossy(&response);
-        assert!(
-            response_str.contains("200 OK"),
-            "expected 200 OK from backend via authenticated mTLS proxy, got: {response_str}"
         );
     }
 }

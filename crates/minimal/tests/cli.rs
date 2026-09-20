@@ -44,7 +44,6 @@ fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
-        mtls_proxy_unavailable: None,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -81,7 +80,6 @@ fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
-        mtls_proxy_unavailable: None,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -245,6 +243,120 @@ async fn ls_raw_with_sessions() {
     assert_eq!(lines.len(), 2, "raw output should be one line per session");
     assert!(lines.contains(&id1.to_string().as_str()));
     assert!(lines.contains(&id2.to_string().as_str()));
+}
+
+// --- host-side hostname listener faults ---
+
+/// A listener that could not bind is reported through both entry points the
+/// user meets it at — `min session activate` and `min ls` — carrying the
+/// daemon's reason and what to do about it.
+#[tokio::test]
+async fn listener_failure_reported_with_remedy() {
+    let (daemon, args) = setup().await;
+    // The reason a daemon whose proxy port is held hands out.
+    let held = "the daemon could not bind 127.0.0.1:7654; another process is holding it. \
+                Check with: lsof -nP -iTCP:7654 -sTCP:LISTEN";
+    daemon
+        .server
+        .state
+        .set_proxy_unavailable(held.to_string())
+        .await;
+
+    // `min session activate` learns of it from the CreateSession reply.
+    let mut client = daemon.server.connect().await;
+    use minimald_rpc::{CreateSession, CreateSessionRequest, ListSessions};
+    let project_path =
+        camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
+    let created = match client
+        .call::<CreateSession>(&CreateSessionRequest {
+            config: minimald_rpc::SessionConfig {
+                name: Some("listener-fault".to_string()),
+                project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
+                network: sessions::NetworkMode::NoNet,
+                policy: Default::default(),
+                hooks_enabled: true,
+                attrs: Default::default(),
+            },
+            must_match_version: None,
+        })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(resp) => resp,
+        minimald_rpc::Errorable::Err { error } => panic!("CreateSession failed: {error}"),
+    };
+    let mut activate = Vec::new();
+    write_hostname_routing_warning(
+        &mut activate,
+        created.hostname_routing_unavailable.as_deref(),
+    )
+    .unwrap();
+
+    // `min ls` learns of it from the list.
+    let mut ls_client = connect_daemon(&args).await.unwrap();
+    let listed = ls_client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    let mut ls = Vec::new();
+    write_hostname_routing_warning(&mut ls, listed.hostname_routing_unavailable.as_deref())
+        .unwrap();
+
+    for (command, rendered) in [("activate", activate), ("ls", ls)] {
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(
+            text.contains("could not bind 127.0.0.1:7654"),
+            "{command} must print the reason: {text}"
+        );
+        assert!(
+            text.contains("lsof -nP -iTCP:7654"),
+            "{command} must keep the daemon's detail: {text}"
+        );
+        assert!(
+            text.contains("remedy:"),
+            "{command} must print a remedy: {text}"
+        );
+        assert!(
+            text.contains("no daemon restart needed"),
+            "{command}'s remedy must say a restart is not part of it: {text}"
+        );
+    }
+}
+
+/// The warning is not sticky: the daemon rebinds on its own, and the next `min
+/// ls` over the same connection prints nothing — no restart in between.
+#[tokio::test]
+async fn ls_warning_clears_on_recovery() {
+    let (daemon, args) = setup().await;
+    daemon
+        .server
+        .state
+        .set_proxy_unavailable("the daemon could not bind 127.0.0.1:7654".to_string())
+        .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::ListSessions;
+    let down = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    let mut warned = Vec::new();
+    write_hostname_routing_warning(&mut warned, down.hostname_routing_unavailable.as_deref())
+        .unwrap();
+    assert!(
+        !warned.is_empty(),
+        "a listener that cannot bind must warn in ls"
+    );
+
+    // The listener binds. Same daemon process, same client connection.
+    daemon.server.state.clear_proxy_unavailable().await;
+
+    let up = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    assert!(
+        up.hostname_routing_unavailable.is_none(),
+        "the daemon must stop reporting a fault it has recovered from"
+    );
+    let mut cleared = Vec::new();
+    write_hostname_routing_warning(&mut cleared, up.hostname_routing_unavailable.as_deref())
+        .unwrap();
+    assert!(
+        cleared.is_empty(),
+        "ls must print no warning once the listener is back: {}",
+        String::from_utf8_lossy(&cleared)
+    );
 }
 
 // --- activate + ls ---
@@ -781,6 +893,157 @@ async fn session_policy_succeeds() {
     .unwrap();
 }
 
+/// `min session policy` shows the box's effective egress rules: every field of
+/// the `egress` section the daemon parsed, the denied subnets among them. The
+/// session carries the host's address, which is also where the daemon used to
+/// refuse the declaration outright.
+#[tokio::test]
+async fn policy_shows_effective_egress() {
+    let (daemon, args) = setup().await;
+
+    let project_path =
+        camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
+    let egress = sessions::EgressPolicy {
+        allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+        allow_dns_hosts: Some(vec!["api.example.com".to_string()]),
+        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+        deny_subnets: Some(vec!["10.1.0.0/16".to_string()]),
+    };
+    let session_id = create_session_with(
+        &daemon,
+        minimald_rpc::SessionConfig {
+            name: Some("egress-policy".to_string()),
+            project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
+            network: sessions::NetworkMode::HostNet,
+            policy: sessions::SessionPolicy::new(Some(egress.clone()), None),
+            hooks_enabled: true,
+            attrs: Default::default(),
+        },
+    )
+    .await;
+
+    let shown = session_policy_json(
+        &args,
+        PolicyArgs {
+            session: session_id.to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // What the user reads is the policy the daemon holds, field for field.
+    let parsed: sessions::SessionPolicy = serde_json_lenient::from_str(&shown).unwrap();
+    assert_eq!(parsed.egress, Some(egress));
+    // Each rule is legible in the line itself, not only after a round trip.
+    for rule in [
+        "allow_subnets",
+        "10.0.0.0/8",
+        "allow_dns_hosts",
+        "api.example.com",
+        "allow_protocols",
+        "tcp",
+        "deny_subnets",
+        "10.1.0.0/16",
+    ] {
+        assert!(shown.contains(rule), "{rule} missing from: {shown}");
+    }
+}
+
+// --- retired surfaces ---
+
+/// NET-109: the HTTPS reverse proxy, the client certificate the daemon used to
+/// issue for it, and `min ssh-forward` are gone, so the CLI offers no command
+/// for any of them — not hidden, not behind a feature, not under an alias.
+///
+/// Read off the clap tree rather than the source, because what a user can type
+/// is the surface being retired. The verbs themselves are not: `min login`
+/// becomes the GitHub sign-in, so what is asserted absent is the certificate
+/// and proxy *surface* — a `--cert-dir`, a port 7655, an mTLS mention — not the
+/// word.
+#[test]
+fn retired_surfaces_absent() {
+    use clap::CommandFactory as _;
+
+    /// Every command in the tree, as `min`-relative paths, with the text and
+    /// option names each one offers.
+    fn walk(command: &clap::Command, prefix: &str, found: &mut Vec<(String, String)>) {
+        for sub in command.get_subcommands() {
+            let path = if prefix.is_empty() {
+                sub.get_name().to_string()
+            } else {
+                format!("{prefix} {}", sub.get_name())
+            };
+            let mut text = String::new();
+            for alias in sub.get_all_aliases() {
+                text.push_str(alias);
+                text.push('\n');
+            }
+            for help in [sub.get_about(), sub.get_long_about()]
+                .into_iter()
+                .flatten()
+            {
+                text.push_str(&help.to_string());
+                text.push('\n');
+            }
+            for arg in sub.get_arguments() {
+                text.push_str(arg.get_id().as_str());
+                text.push('\n');
+                if let Some(long) = arg.get_long() {
+                    text.push_str(long);
+                    text.push('\n');
+                }
+            }
+            found.push((path.clone(), text));
+            walk(sub, &path, found);
+        }
+    }
+
+    let command = Cli::command();
+    let mut found = Vec::new();
+    walk(&command, "", &mut found);
+    assert!(!found.is_empty(), "the command tree must not be empty");
+
+    // The command itself, by name or alias.
+    for (path, text) in &found {
+        assert!(
+            path != "ssh-forward" && !text.lines().any(|line| line == "ssh-forward"),
+            "`ssh-forward` is retired but `min {path}` still offers it"
+        );
+    }
+
+    // The certificate and proxy surface, wherever it is spelled.
+    for (path, text) in &found {
+        for retired in ["cert-dir", "cert_dir", "7655", "mTLS", "reverse proxy"] {
+            assert!(
+                !text.contains(retired),
+                "`min {path}` still names the retired {retired} surface"
+            );
+        }
+    }
+}
+
+/// NET-111: the CLI reference documents no retired command.
+///
+/// Named surfaces, not the verbs: `min net forward` is a new command and
+/// `min login` is being rebound, so only the retired spellings are asserted
+/// absent.
+#[test]
+fn cli_reference_has_no_retired_commands() {
+    let reference = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference");
+    for page in ["cli.md", "cli-min.md"] {
+        let path = reference.join(page);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("the CLI reference {} must be readable: {e}", path.display())
+        });
+        for retired in ["ssh-forward", "7655", "mTLS", "reverse proxy"] {
+            assert!(
+                !text.contains(retired),
+                "{page} still documents the retired {retired} surface"
+            );
+        }
+    }
+}
+
 // --- helpers ---
 
 /// Creates a session whose workspace mfile declares a `[session.vars]`
@@ -843,8 +1106,6 @@ async fn create_session_at(
     name: &str,
     project_path: paths::HostAbsPath,
 ) -> SessionId {
-    let mut client = daemon.server.connect().await;
-
     let config = minimald_rpc::SessionConfig {
         name: Some(name.to_string()),
         project_path,
@@ -853,6 +1114,16 @@ async fn create_session_at(
         hooks_enabled: true,
         attrs: Default::default(),
     };
+    create_session_with(daemon, config).await
+}
+
+/// Like [`create_session_at`] but takes the whole [`minimald_rpc::SessionConfig`],
+/// so a test can give the session a network mode and a networking policy.
+async fn create_session_with(
+    daemon: &common::TestDaemon,
+    config: minimald_rpc::SessionConfig,
+) -> SessionId {
+    let mut client = daemon.server.connect().await;
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,

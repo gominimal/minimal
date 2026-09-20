@@ -5,6 +5,51 @@ use std::fs;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
+/// The uid a box's processes run as inside its user namespace, matching the
+/// `build` user in the passwd file synthesized into the rootfs.
+///
+/// Never zero, and that is a security property rather than a convention: the
+/// kernel hands the creator of a user namespace a full capability set inside
+/// it, and clears it at `execve` only for a process whose euid is not the
+/// namespace's root. A box that mapped uid 0 would therefore keep
+/// `CAP_NET_RAW` and could forge frames from another box's source address.
+pub const BOX_UID: u32 = 1000;
+
+/// The gid a box's processes run as inside its user namespace. See [`BOX_UID`].
+pub const BOX_GID: u32 = 1000;
+
+/// A Linux capability no box may hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeniedCapability {
+    /// The kernel's name for it, as `capabilities(7)` spells it.
+    pub name: &'static str,
+    /// Its bit position in a capability mask, e.g. the `Cap*` lines of
+    /// `/proc/<pid>/status`.
+    pub bit: u32,
+}
+
+impl DeniedCapability {
+    /// Whether `mask` — a capability mask as `/proc/<pid>/status` prints it —
+    /// carries this capability.
+    #[must_use]
+    pub fn held_in(&self, mask: u64) -> bool {
+        mask >> self.bit & 1 == 1
+    }
+}
+
+/// The capabilities a box never holds, whatever its network posture.
+///
+/// `CAP_NET_RAW` is the one the egress story turns on: with it a box could open
+/// a raw socket and put another box's source address on the wire, leaving the
+/// relay's source-address check as the only thing between a box and another
+/// box's lease. A box holds none of these because it execs as [`BOX_UID`] with
+/// `no_new_privs` set, so the kernel clears every capability at `execve` and no
+/// file capability can put one back.
+pub const DENIED_CAPABILITIES: &[DeniedCapability] = &[DeniedCapability {
+    name: "CAP_NET_RAW",
+    bit: 13,
+}];
+
 /// Something in the FS that needs to be mapped into the sandbox.
 #[derive(Debug)]
 pub enum SandboxMapped {

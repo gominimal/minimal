@@ -168,19 +168,6 @@ pub struct ServerState {
     /// macOS, which is the platform the failure was reported from.
     proxy_unavailable: Option<String>,
 
-    /// Why the mTLS reverse proxy is not serving, if it is not. Kept apart
-    /// from [`Self::proxy_unavailable`] so a client is not told its hostnames
-    /// are broken when only TLS termination is. Never set without the
-    /// `networking-proxy` feature, where there is no such proxy to lose.
-    mtls_unavailable: Option<String>,
-
-    /// The daemon's TLS certificate authority, used by the HTTPS proxy and the
-    /// `IssueClientCert` RPC. Generated once on daemon startup and held for the
-    /// daemon's lifetime; clients must call `minimal login` again after a
-    /// restart.
-    #[cfg(feature = "networking-proxy")]
-    pub cert_authority: Arc<crate::net::proxy::CertAuthority>,
-
     /// The running WireGuard mesh peer, when one is configured (Unit 4). Only
     /// present under the `networking-wg` feature; the `GetMeshStatus` RPC reads
     /// it through [`ServerStateHandle::mesh_status`].
@@ -221,13 +208,6 @@ impl ServerState {
             .with_transport(transport),
         ));
 
-        // Generate the TLS CA once at daemon startup so the HTTPS proxy and the
-        // IssueClientCert RPC share the same trust anchor for the lifetime of
-        // this daemon process.
-        #[cfg(feature = "networking-proxy")]
-        let cert_authority =
-            Arc::new(crate::net::proxy::CertAuthority::generate().map_err(std::io::Error::other)?);
-
         // Build a daemon-scoped mctx config from what the daemon
         // knows today (dirs). Additional flags (offline, stdlib
         // override, num-parallel-builds) will thread through from
@@ -262,9 +242,6 @@ impl ServerState {
             log_release,
             host_key: None,
             proxy_unavailable: None,
-            mtls_unavailable: None,
-            #[cfg(feature = "networking-proxy")]
-            cert_authority,
             #[cfg(feature = "networking-wg")]
             mesh: None,
         })
@@ -318,24 +295,25 @@ impl ServerStateHandle {
     }
 
     /// Records why hostname routing is unavailable, so a client can be told.
-    pub(crate) async fn set_proxy_unavailable(&self, reason: String) {
+    ///
+    /// `pub` rather than `pub(crate)` because the test harness hands tests the
+    /// state handle to set up daemon conditions their CLI cannot induce — a
+    /// listener whose address is held being one of them.
+    pub async fn set_proxy_unavailable(&self, reason: String) {
         self.0.lock().await.proxy_unavailable = Some(reason);
+    }
+
+    /// Withdraws the hostname-routing fault: the listener is serving again.
+    ///
+    /// The next `ListSessions` reads the cleared state, which is what makes the
+    /// `min ls` warning disappear on recovery without a daemon restart.
+    pub async fn clear_proxy_unavailable(&self) {
+        self.0.lock().await.proxy_unavailable = None;
     }
 
     /// Why hostname routing is unavailable, or `None` if the proxy is up.
     pub(crate) async fn proxy_unavailable(&self) -> Option<String> {
         self.0.lock().await.proxy_unavailable.clone()
-    }
-
-    /// Records why the mTLS reverse proxy is not serving.
-    #[cfg_attr(not(feature = "networking-proxy"), expect(dead_code))]
-    pub(crate) async fn set_mtls_unavailable(&self, reason: String) {
-        self.0.lock().await.mtls_unavailable = Some(reason);
-    }
-
-    /// Why the mTLS reverse proxy is not serving, or `None` if it is.
-    pub(crate) async fn mtls_unavailable(&self) -> Option<String> {
-        self.0.lock().await.mtls_unavailable.clone()
     }
 
     /// Returns the daemon-scoped mctx state.
@@ -397,13 +375,6 @@ impl ServerStateHandle {
     /// Returns the daemon ID.
     pub async fn daemon_id(&self) -> String {
         self.0.lock().await.daemon_id.clone()
-    }
-
-    /// Returns the daemon's TLS certificate authority (only with
-    /// `networking-proxy` feature). Used by the `IssueClientCert` RPC handler.
-    #[cfg(feature = "networking-proxy")]
-    pub async fn cert_authority(&self) -> Arc<crate::net::proxy::CertAuthority> {
-        Arc::clone(&self.0.lock().await.cert_authority)
     }
 
     /// Builds the current WireGuard mesh status for the `GetMeshStatus` RPC
@@ -521,12 +492,19 @@ impl Server {
         let in_microvm = config.in_microvm;
         let state = ServerStateHandle::new(config, log_release).await?;
 
-        // Start minimald's two host-side proxies (B5 egress :7654, B8 mTLS
-        // :7655) for the server's lifetime and, in a microVM (DM1), publish them
-        // on the macOS host loopback. minimald is Linux-only, and the PTask
-        // hostname registry they route against only exists on Linux.
+        // Start minimald's host-side egress proxy (B5, :7654) for the server's
+        // lifetime and, in a microVM (DM1), publish it on the macOS host
+        // loopback. minimald is Linux-only, and the PTask hostname registry it
+        // routes against only exists on Linux.
         #[cfg(target_os = "linux")]
         start_host_proxies(&state, in_microvm).await;
+        // The box-zone answerer (NET-006, NET-124..127) serves the host's own
+        // lookups of `*.min.internal`. Native hosts only: in a microVM the
+        // node's DNS layer answers the zone with switch addresses.
+        #[cfg(target_os = "linux")]
+        if !in_microvm {
+            start_zone_answerer(&state).await;
+        }
 
         let russh_config = build_russh_config(&state)
             .await
@@ -732,15 +710,15 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
     }
 }
 
-/// Binds and serves minimald's two host-side proxies for the daemon's lifetime
-/// and, in a microVM (DM1), publishes them on the macOS host loopback.
+/// Binds and serves minimald's host-side egress proxy for the daemon's lifetime
+/// and, in a microVM (DM1), publishes it on the macOS host loopback.
 ///
-/// Both proxies route by `Host:` header through the sessions manager's shared
-/// PTask hostname registry. In a microVM they bind the daemon's switch IP
+/// The proxy routes by `Host:` header through the sessions manager's shared
+/// PTask hostname registry. In a microVM it binds the daemon's switch IP
 /// ([`DEFAULT_SUBNET`](crate::net::DEFAULT_SUBNET)`.daemon_ip()`) so the host
-/// gvproxy forward can reach them; on native Linux (DM2) they bind host loopback
+/// gvproxy forward can reach it; on native Linux (DM2) it binds host loopback
 /// directly. A bind failure warns and is skipped — the daemon keeps serving. The
-/// serve loops run on detached tasks; this returns once the listeners are bound
+/// serve loop runs on a detached task; this returns once the listener is bound
 /// and (DM1) exposed.
 #[cfg(target_os = "linux")]
 async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
@@ -758,99 +736,139 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
     };
 
     // B5 egress/DNS proxy (:7654), always. Both ways this can fail end with
-    // `<name>.local.min.internal` not routing, so both are recorded on the
+    // `<name>.min.internal` not routing, so both are recorded on the
     // state where `ListSessions` can reach them — a daemon that keeps serving
     // without its proxy looks identical to a healthy one otherwise.
     let egress_addr = SocketAddr::new(bind_base, proxy::EGRESS_PROXY_PORT);
-    let bound = proxy::bind_listener(egress_addr)
-        .await
-        .map(|listener| {
+    match proxy::bind_listener(egress_addr).await {
+        Some(listener) => {
             let router = Router::new(registry.clone());
             tokio::spawn(async move {
                 if let Err(error) = proxy::serve(listener, router).await {
                     tracing::error!(%error, "egress proxy accept loop exited");
                 }
-            })
-        })
-        .is_some();
-
-    if !bound {
-        // DM2: something else on the host holds the port.
-        state
-            .set_proxy_unavailable(format!(
-                "the daemon could not bind {egress_addr}; another process is \
-                 holding it. Check with: lsof -nP -iTCP:{} -sTCP:LISTEN",
-                proxy::EGRESS_PROXY_PORT
-            ))
-            .await;
-    } else if in_microvm {
-        // DM1: the guest bind cannot collide with a host process, so the
-        // failure moves to the publish instead. Only publish a port whose
-        // listener actually bound.
-        if let Some(reason) = expose_proxy_on_host(
-            crate::net::DEFAULT_SUBNET.daemon_ip(),
-            proxy::EGRESS_PROXY_PORT,
-        )
-        .await
-        {
-            state.set_proxy_unavailable(reason).await;
+            });
+            // DM1: the guest bind cannot collide with a host process, so the
+            // failure moves to the publish instead. Only publish a port whose
+            // listener actually bound.
+            if in_microvm
+                && let Some(reason) = expose_proxy_on_host(
+                    crate::net::DEFAULT_SUBNET.daemon_ip(),
+                    proxy::EGRESS_PROXY_PORT,
+                )
+                .await
+            {
+                state.set_proxy_unavailable(reason).await;
+                // The listener is serving; only its host-side publish is
+                // missing, so that alone is retried.
+                let state = state.clone();
+                tokio::spawn(async move {
+                    publish_on_host_retrying(proxy::EGRESS_PROXY_PORT).await;
+                    state.clear_proxy_unavailable().await;
+                });
+            }
+        }
+        None => {
+            // DM2: something else on the host holds the port.
+            state
+                .set_proxy_unavailable(format!(
+                    "the daemon could not bind {egress_addr}; another process is \
+                     holding it. Check with: lsof -nP -iTCP:{} -sTCP:LISTEN",
+                    proxy::EGRESS_PROXY_PORT
+                ))
+                .await;
+            recover_egress_listener(state.clone(), registry.clone(), egress_addr, in_microvm);
         }
     }
+}
 
-    // B8 mTLS reverse proxy (:7655), under the networking-proxy feature.
-    #[cfg(feature = "networking-proxy")]
+/// Brings the host-side egress listener back after a failed bind, in the
+/// background, and clears the fault report once hostnames route again.
+///
+/// Rebinds on the [`rebind_delay`](crate::net::proxy::rebind_delay) backoff, in
+/// a microVM publishes the port on the host loopback the same way, and only then
+/// withdraws the reason `ListSessions` is handing out — so `min ls` stops
+/// warning exactly when `*.min.internal` works again, with no daemon restart
+/// (R3.4 recovery).
+#[cfg(target_os = "linux")]
+fn recover_egress_listener(
+    state: ServerStateHandle,
+    registry: Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
+    addr: std::net::SocketAddr,
+    in_microvm: bool,
+) {
+    use crate::net::proxy::{self, Router};
+
+    tokio::spawn(async move {
+        let listener = proxy::bind_listener_retrying(addr).await;
+        if in_microvm {
+            publish_on_host_retrying(addr.port()).await;
+        }
+        state.clear_proxy_unavailable().await;
+        let router = Router::new(registry);
+        if let Err(error) = proxy::serve(listener, router).await {
+            tracing::error!(%error, "egress proxy accept loop exited");
+        }
+    });
+}
+
+/// Keeps asking the host gvproxy forwarder to publish `port` on the host
+/// loopback until it accepts (DM1), on the same backoff a rebind uses.
+///
+/// A publish that never lands leaves a listener that is bound in the guest and
+/// unreachable from the host — the DM1 half of the same fault — so it is retried
+/// rather than reported once and left.
+#[cfg(target_os = "linux")]
+async fn publish_on_host_retrying(port: u16) {
+    let mut attempt: u32 = 0;
+    while let Some(reason) =
+        expose_proxy_on_host(crate::net::DEFAULT_SUBNET.daemon_ip(), port).await
     {
-        // Three ways this ends with nothing serving on :7655, and all three
-        // were silent: the TLS config failing to build, the bind failing, and
-        // the publish failing. The daemon carries on in every case, so only a
-        // reported reason distinguishes "no mTLS proxy configured" from "the
-        // mTLS proxy is broken".
-        let https_addr = SocketAddr::new(bind_base, proxy::HTTPS_PROXY_PORT);
-        match state.cert_authority().await.build_server_config() {
-            Ok(tls_config) => {
-                let bound = proxy::bind_listener(https_addr)
-                    .await
-                    .map(|listener| {
-                        let router = Router::new(registry.clone());
-                        tokio::spawn(async move {
-                            if let Err(error) =
-                                proxy::serve_https(listener, router, tls_config).await
-                            {
-                                tracing::error!(%error, "mTLS proxy accept loop exited");
-                            }
-                        })
-                    })
-                    .is_some();
-
-                if !bound {
-                    state
-                        .set_mtls_unavailable(format!(
-                            "the daemon could not bind {https_addr}; another process is \
-                             holding it. Check with: lsof -nP -iTCP:{} -sTCP:LISTEN",
-                            proxy::HTTPS_PROXY_PORT
-                        ))
-                        .await;
-                } else if in_microvm
-                    && let Some(reason) = expose_proxy_on_host(
-                        crate::net::DEFAULT_SUBNET.daemon_ip(),
-                        proxy::HTTPS_PROXY_PORT,
-                    )
-                    .await
-                {
-                    state.set_mtls_unavailable(reason).await;
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "could not build TLS config for the mTLS reverse proxy");
-                state
-                    .set_mtls_unavailable(format!(
-                        "the daemon could not build a TLS config for the mTLS reverse \
-                         proxy: {error}"
-                    ))
-                    .await;
-            }
-        }
+        attempt += 1;
+        let delay = crate::net::proxy::rebind_delay(attempt);
+        tracing::warn!(
+            component = "dns-proxy",
+            port,
+            attempt,
+            retry_in_ms = delay.as_millis() as u64,
+            %reason,
+            "retrying the host-loopback publish for the egress proxy"
+        );
+        tokio::time::sleep(delay).await;
     }
+}
+
+/// Opens the box-zone answerer's socket and serves the zone on a detached
+/// task for the daemon's lifetime ([`crate::net::answerer`]). The socket is
+/// the service manager's when one was passed, else a loopback bind. A socket
+/// failure warns and is skipped: the daemon keeps serving, and names in the
+/// zone keep routing through the proxies; only native resolution is lost.
+#[cfg(target_os = "linux")]
+async fn start_zone_answerer(state: &ServerStateHandle) {
+    use crate::net::answerer;
+
+    let listener = match answerer::listen().await {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                address = %answerer::BIND_ADDR,
+                "could not open the box-zone answerer socket; `*.min.internal` will not \
+                 resolve natively on this host. Check with: lsof -nP -iUDP:{}",
+                answerer::ANSWERER_PORT
+            );
+            return;
+        }
+    };
+    let registry = state.sessions_manager().await.hostnames();
+    let daemon_id = state.daemon_id().await;
+    let dump_path =
+        answerer::zone_dump_path(state.minimal_state_dir().await.as_utf8_path().as_std_path());
+    tokio::spawn(async move {
+        if let Err(error) = answerer::serve(listener, registry, daemon_id, dump_path).await {
+            tracing::error!(%error, "box-zone answerer exited");
+        }
+    });
 }
 
 /// Upper bound on the best-effort host-loopback publish in

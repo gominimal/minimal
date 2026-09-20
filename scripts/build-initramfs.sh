@@ -17,8 +17,8 @@
 # use `cross`.
 #
 # Set FEATURES to a comma-separated cargo feature list to compile the guest
-# minimald with extra features (e.g. FEATURES=networking-proxy,networking-wg for
-# the HTTPS reverse proxy and WireGuard mesh peer). Empty by default.
+# minimald with extra features (e.g. FEATURES=networking-wg for the WireGuard
+# mesh peer). Empty by default, and no recipe passes any today.
 #
 # Usage: scripts/build-initramfs.sh <dest-cpio> [rust-target]
 set -eu
