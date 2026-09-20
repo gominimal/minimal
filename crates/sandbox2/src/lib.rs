@@ -421,6 +421,15 @@ struct BindOpts {
     recursive: bool,
 }
 
+// The box ids [`new_container`](Sandbox::new_container) maps are what deny a box
+// the capabilities in [`config::DENIED_CAPABILITIES`], so mapping the user
+// namespace's root instead would silently hand every box `CAP_NET_RAW` back.
+// Fail the build rather than the boundary.
+const _: () = assert!(
+    config::BOX_UID != 0 && config::BOX_GID != 0,
+    "a box maps unprivileged ids: the kernel clears capabilities at execve only for a non-root euid"
+);
+
 // Sandbox usage
 #[cfg(target_os = "linux")]
 impl<C: Channel> Sandbox<C> {
@@ -496,11 +505,13 @@ impl<C: Channel> Sandbox<C> {
         container
             .rootfs(self.rootfs())
             .unwrap()
-            // By default hakoniwa sets UID and GID to the current ones
-            // We explicitly set it to 1000 here to match the user/group
-            // we create for the sandbox
-            .uidmap(1000)
-            .gidmap(1000)
+            // By default hakoniwa sets UID and GID to the current ones. We
+            // explicitly map the unprivileged pair here to match the user/group
+            // we create for the sandbox — and because an unprivileged box id is
+            // what makes the kernel clear the box's capabilities at `execve`
+            // (NET-083); see [`config::BOX_UID`].
+            .uidmap(config::BOX_UID)
+            .gidmap(config::BOX_GID)
             .devfsmount("/dev")
             .tmpfsmount("/tmp")
             .unshare(hakoniwa::Namespace::Cgroup)
@@ -711,6 +722,20 @@ impl<C: Channel> Sandbox<C> {
                 resources
             });
         }
+
+        // The capability policy this box launches under, on the launch line so a
+        // support bundle can say what a box was denied rather than infer it
+        // (NET-083). `no_new_privs` is hakoniwa's default — it sets the bit
+        // unless `Runctl::AllowNewPrivs` is asked for, which nothing here asks
+        // for — and it is what stops a file capability in the rootfs putting a
+        // denied capability back at `execve`.
+        tracing::debug!(
+            denied_capabilities = %denied_capability_names(),
+            box_uid = config::BOX_UID,
+            box_gid = config::BOX_GID,
+            no_new_privs = true,
+            "box capability policy"
+        );
 
         Ok(Container { container })
     }
@@ -1382,6 +1407,16 @@ fn plan_from_config(config: &config::Config) -> network::NetPlan {
     config.plan.clone()
 }
 
+/// The capabilities a box is denied, named for the launch log line.
+#[cfg(target_os = "linux")]
+fn denied_capability_names() -> String {
+    config::DENIED_CAPABILITIES
+        .iter()
+        .map(|c| c.name)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Whether to unshare the network namespace, or the error that says we will not
 /// hand back host networking instead. Takes what the probe found so 017-011 is
 /// provable on any host.
@@ -1908,5 +1943,251 @@ mod tests {
         let sock = sandbox.base_dir.join("run").join("minenv_sock");
         UnixStream::connect(&sock)
             .expect("minenv_sock should be connectable after a bound-dir Sandbox::new");
+    }
+
+    /// The env var that turns a run of this test binary into the in-box probe
+    /// [`boxes_lack_cap_net_raw`] drives. Its value is the path, inside the box,
+    /// the probe writes its findings to.
+    #[cfg(target_os = "linux")]
+    const CAP_PROBE_REPORT: &str = "MINIMAL_SANDBOX2_CAP_PROBE_REPORT";
+
+    /// NET-083. Runs this test binary inside a real box and judges what it found
+    /// there: none of [`config::DENIED_CAPABILITIES`] in any capability set the
+    /// box process holds, `no_new_privs` set so no file capability can put one
+    /// back, and a raw socket open that fails with `EPERM`.
+    ///
+    /// The box is the subject, not a stand-in for one: the probe is this same
+    /// binary re-entered inside the container [`Sandbox::new_container`] builds,
+    /// so the masks it reads out of `/proc/self/status` are a real box process's
+    /// credentials. Break the launch — map the user namespace's root, ask for
+    /// `Runctl::AllowNewPrivs` — and this fails.
+    ///
+    /// The bounding set is deliberately not asserted on. The kernel resets it to
+    /// full when it creates the box's user namespace, and lowering it afterwards
+    /// is only possible from inside the forked child, which hakoniwa gives no
+    /// hook for. It grants nothing while the four sets below are empty: `capset`
+    /// cannot raise a capability that is not already permitted, and
+    /// `no_new_privs` keeps `execve` from raising one from a file capability.
+    ///
+    /// Needs a host that lets an unconfined binary bring up a rootless box, like
+    /// the native lane's runner; a host that restricts unprivileged user
+    /// namespaces refuses the box itself, which is the position the justfile's
+    /// `test-root-integration` already takes for `minimald`'s namespace proofs.
+    /// On such a host this says so and stops rather than reporting a launch the
+    /// kernel never allowed as a capability failure.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn boxes_lack_cap_net_raw() {
+        // Inside the box this binary runs again with the report path set. That
+        // run is the probe; it records and judges nothing, the driver below does.
+        if let Ok(report) = std::env::var(CAP_PROBE_REPORT) {
+            write_capability_report(Path::new(&report));
+            return;
+        }
+
+        if let Some(restriction) = user_namespaces_restriction() {
+            eprintln!(
+                "boxes_lack_cap_net_raw: no box can be launched here, so none can hold a \
+                 capability: {restriction}"
+            );
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("this test binary's path");
+        let exe_dir = exe.parent().expect("this test binary's directory");
+        // Beside the test binary, not in the temp dir: the rootfs assembly
+        // hardlinks rather than copying a debug binary, and a `/tmp` tmpfs
+        // carries kernel-locked `nosuid,nodev` that hakoniwa's read-only rootfs
+        // remount does not reproduce, so the box would not come up at all.
+        let staging = tempfile::TempDir::new_in(exe_dir).expect("probe staging dir");
+        let lib_path = stage_probe(staging.path(), &exe);
+
+        let base_tmp = tempfile::TempDir::new_in(exe_dir).expect("sandbox base dir");
+        let base = base_tmp.path().to_path_buf();
+        fs::create_dir_all(base.join("synth").join("usr")).unwrap();
+
+        let plan = network::NetPlan::isolated();
+        let config = Config::new("test-cap-net-raw")
+            .with_plan(plan.clone())
+            .with_add_rootfs(SandboxMapped::Dir(staging.path().to_path_buf()));
+        let mut sandbox = Sandbox::new(base, config, ()).expect("a box to probe");
+        let container = sandbox.new_container(&plan).expect("the box's container");
+        let mut cmd = sandbox
+            .command(
+                &container,
+                "/probe/ld.so",
+                [
+                    "/probe/probe",
+                    "boxes_lack_cap_net_raw",
+                    "--nocapture",
+                    "--test-threads",
+                    "1",
+                ],
+                [
+                    (CAP_PROBE_REPORT, "/state/cap-probe"),
+                    ("LD_LIBRARY_PATH", lib_path.as_str()),
+                ],
+            )
+            .expect("the probe command");
+        let status = cmd
+            .spawn()
+            .expect("spawn the box")
+            .wait()
+            .expect("wait for the box");
+
+        // A bring-up the kernel refused: no program ran, so `exit_code` is None
+        // and the reason carries the refusal. The probe's part of the launch —
+        // the ids mapped, the privileges dropped — cannot produce this, so it is
+        // the host's answer and not a finding about the box.
+        if status.exit_code.is_none() && status.reason.contains("Operation not permitted") {
+            eprintln!(
+                "boxes_lack_cap_net_raw: this host refused the box's bring-up, so no box ran: {}",
+                status.reason
+            );
+            return;
+        }
+
+        let report_path = sandbox.state_dir.join("cap-probe");
+        let found = fs::read_to_string(&report_path).unwrap_or_else(|e| {
+            panic!(
+                "no report at {}: {e}; the box exited {:?} ({})",
+                report_path.display(),
+                status.exit_code,
+                status.reason
+            )
+        });
+        assert!(
+            status.success(),
+            "the in-box probe failed ({}): {found}",
+            status.reason
+        );
+
+        let mask = |set: &str| -> u64 {
+            let prefix = format!("{set}:");
+            let line = found
+                .lines()
+                .find(|l| l.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("no {set} in the probe report: {found}"));
+            let value = line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_else(|| panic!("no value on {line:?}"));
+            u64::from_str_radix(value, 16).expect("a hex capability mask")
+        };
+        for cap in config::DENIED_CAPABILITIES {
+            // Every set a box process holds: what it has, what it may take, and
+            // the two it could carry across an exec.
+            for set in ["CapEff", "CapPrm", "CapInh", "CapAmb"] {
+                assert!(
+                    !cap.held_in(mask(set)),
+                    "{} is in the box's {set}: {found}",
+                    cap.name
+                );
+            }
+        }
+        assert!(
+            found.contains("RawSocket:\tEPERM"),
+            "a raw socket open inside a box must fail with EPERM: {found}"
+        );
+        assert!(
+            found.contains("NoNewPrivs:\t1"),
+            "a box runs with no_new_privs, or a file capability can restore a denied one: {found}"
+        );
+        let uid = found
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|l| l.split_whitespace().next())
+            .expect("a Uid line in the probe report");
+        assert_eq!(
+            uid,
+            config::BOX_UID.to_string(),
+            "a box runs as the unprivileged box uid: {found}"
+        );
+    }
+
+    /// The in-box half of [`boxes_lack_cap_net_raw`]: records this process's
+    /// capability masks and what a raw socket open does, judging neither.
+    #[cfg(target_os = "linux")]
+    fn write_capability_report(path: &Path) {
+        let status = fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+        let mut report: String = status
+            .lines()
+            .filter(|l| {
+                l.starts_with("Cap") || l.starts_with("NoNewPrivs:") || l.starts_with("Uid:")
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        // The socket `ping` wants: ICMP rather than protocol 0, which the kernel
+        // refuses with EPROTONOSUPPORT before it ever reaches the capability
+        // check, and so would say nothing about CAP_NET_RAW.
+        let raw = nix::sys::socket::socket(
+            nix::sys::socket::AddressFamily::Inet,
+            nix::sys::socket::SockType::Raw,
+            nix::sys::socket::SockFlag::empty(),
+            nix::sys::socket::SockProtocol::Icmp,
+        );
+        report.push_str(&match raw {
+            Ok(fd) => {
+                drop(fd);
+                "RawSocket:\topened\n".to_string()
+            }
+            Err(e) => format!("RawSocket:\t{e:?}\n"),
+        });
+        fs::write(path, report).expect("write the probe report");
+    }
+
+    /// Stages what the in-box probe needs into `dir`, whose contents the rootfs
+    /// assembly hardlinks in at `/`: this test binary at `/probe/probe`, the
+    /// dynamic loader at `/probe/ld.so`, and every shared object this process has
+    /// mapped, at the path it has out here. Returns the `LD_LIBRARY_PATH` the
+    /// loader needs, the box having no `ld.so.cache`.
+    ///
+    /// The box execs the loader with the binary as its argument, which keeps the
+    /// probe off the `PT_INTERP` path baked into the binary — that path differs
+    /// per architecture and is a symlink on the hosts that have it.
+    #[cfg(target_os = "linux")]
+    fn stage_probe(dir: &Path, exe: &Path) -> String {
+        let probe_dir = dir.join("probe");
+        fs::create_dir_all(&probe_dir).expect("create the probe dir");
+        let probe = probe_dir.join("probe");
+        fs::hard_link(exe, &probe)
+            .or_else(|_| fs::copy(exe, &probe).map(|_| ()))
+            .expect("stage the probe binary");
+
+        let maps = fs::read_to_string("/proc/self/maps").expect("read /proc/self/maps");
+        let mut loader = None;
+        let mut lib_dirs = std::collections::BTreeSet::new();
+        for line in maps.lines() {
+            let Some(start) = line.find(" /") else {
+                continue;
+            };
+            if line.ends_with("(deleted)") {
+                continue;
+            }
+            let path = Path::new(line[start + 1..].trim());
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.contains(".so") {
+                continue;
+            }
+            let dest = dir.join(path.strip_prefix("/").expect("an absolute mapping path"));
+            fs::create_dir_all(dest.parent().expect("a parent for the mapping"))
+                .expect("create the library dir");
+            if !dest.exists() {
+                fs::copy(path, &dest).unwrap_or_else(|e| panic!("stage {}: {e}", path.display()));
+            }
+            lib_dirs.insert(path.parent().expect("a library directory").to_path_buf());
+            if name.starts_with("ld-") {
+                loader = Some(path.to_path_buf());
+            }
+        }
+        let loader = loader.expect("a dynamic loader among this process's mappings");
+        fs::copy(&loader, probe_dir.join("ld.so")).expect("stage the loader");
+        lib_dirs
+            .iter()
+            .map(|d| d.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(":")
     }
 }
