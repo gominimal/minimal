@@ -4028,6 +4028,7 @@ dependencies = [
  "anyhow",
  "async-compression",
  "async-tar",
+ "bep",
  "camino",
  "chrono",
  "clap",

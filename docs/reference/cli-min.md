@@ -380,6 +380,44 @@ min version
 
 Prints CLI and daemon version information.
 
+### `auth login`, `auth logout`, `auth status`
+
+```
+min auth login [--device]
+min auth logout
+min auth status
+```
+
+The GitHub sign-in on a host with no Gatehouse configured. `auth login`
+signs in under the Minimal-published GitHub App: the bare verb opens your
+browser for GitHub's authorization-code flow (with PKCE) and takes the grant
+back on a loopback redirect; `--device` runs the device flow instead,
+printing a code to enter at `github.com/login/device`, for a host with no
+browser or a script. Either way the command reports the signed-in account and
+holds the token and its refresh material in the host keychain (the macOS
+Keychain) and in no file under the project or a box. The App's registration
+is the ceiling of what a box minted from the sign-in can reach; install it on
+the account or organization whose repositories a box should see.
+
+`auth status` reports whether a sign-in is held, as whom, and until when,
+and never prints a token:
+
+```
+GitHub: signed in as octocat; expires 2027-01-15T16:00:00Z (in 7h 59m)
+  refresh material expires 2027-07-17T16:00:00Z (in 4391h 59m)
+```
+
+`auth logout` forgets the sign-in and records a revocation with the Box
+Egress Proxy, so every member minted from the sign-in is refused from then
+on; a box that outlives it is re-created to re-mint. When no proxy is running
+the revocation is reported as unrecorded on stderr and the sign-in is still
+forgotten.
+
+A box declaring a `source = "broker"` GitHub grant is minted a member from
+the held sign-in at creation — `mode = "user"`, `full` breadth, expiring at
+most eight hours later or when the token itself does, whichever is sooner —
+and the mint is recorded in the proxy's audit log alongside its decisions.
+
 ### `completions` (alias: `completion`)
 
 ```

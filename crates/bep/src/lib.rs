@@ -20,12 +20,18 @@
 //!   only, carrying no credential and no body.
 //! - [`control`] is the control socket's audit submissions: how a client's
 //!   mints and revocations reach the log the proxy alone writes.
+//! - [`github`] is the GitHub sign-in: the device and browser flows under
+//!   the Minimal-published App, and the host store the sign-in lives in.
+//! - [`mint`] mints a member from the held sign-in, sealed to this host,
+//!   and makes the identity events a mint and a logout record.
 
 pub mod audit;
 pub mod ca;
 pub mod control;
+pub mod github;
 pub mod keychain;
 pub mod keys;
+pub mod mint;
 pub mod redeem;
 pub mod seal;
 
@@ -34,7 +40,9 @@ pub mod seal;
 pub use audit::{AuditError, Event, Hash, Kind, Log, Mapping, Record};
 pub use ca::{Authority, CaError, DeclaredUnion, Leaf};
 pub use control::{ControlError, Submission, submit};
+pub use github::{GitHub, GitHubError, MemorySignIns, SignIn, SignInStore};
 pub use keychain::{KeyStore, MemoryStore, PrivateKey, StoreError};
 pub use keys::{Fingerprint, KeyRole, KeyStatus, Keys, KeysError, inspect};
+pub use mint::{MintError, MintRequest, Minted, mint, revocation_event};
 pub use redeem::{Check, Decision, Redemption, decide};
 pub use seal::{Member, Refusal, SealError, SealedContext, SealedValue, Unsealed, seal, unseal};

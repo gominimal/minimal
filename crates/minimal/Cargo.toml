@@ -26,6 +26,8 @@ remote-access = []
 anyhow.workspace = true
 async-compression.workspace = true
 async-tar.workspace = true
+# `min auth`: the GitHub sign-in, its keychain store, and the mint (`auth.rs`).
+bep.workspace = true
 clap.workspace = true
 # `unstable-dynamic` buys the completion engine behind `min`'s runtime session
 # completion. Three files depend on it:

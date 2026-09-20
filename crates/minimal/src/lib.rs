@@ -1,6 +1,7 @@
 //! The minimal CLI which pairs/talks-with minimald.
 
 mod attach;
+pub mod auth;
 pub mod autospawn;
 // The SSH client transport lives in the shared `minimal-client` crate (used
 // by the TUI as well); re-exported here so internal `crate::client::...`

@@ -14,10 +14,15 @@ hkdf.workspace = true
 p256.workspace = true
 rand.workspace = true
 rcgen.workspace = true
+# The GitHub sign-in's HTTP client (`github.rs`): `rustls` for the TLS to
+# github.com and api.github.com.
+reqwest = { workspace = true, features = ["rustls"] }
 serde.workspace = true
 serde_json_lenient.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+# The device flow's polling interval (`github.rs`).
+tokio.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
 
@@ -28,10 +33,8 @@ security-framework-sys.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-reqwest = { workspace = true, features = ["rustls"] }
 rustls.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
 
 [lints.rust]
 # `cfg(kani)` gates the proof harnesses in redeem/mod.rs; declare it so

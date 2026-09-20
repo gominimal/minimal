@@ -51,6 +51,8 @@ pub enum Command {
     /// Loadout management subcommands
     #[command(visible_alias = "loadouts")]
     Loadout(LoadoutArgs),
+    /// GitHub sign-in: log in, log out, and report the held sign-in
+    Auth(AuthArgs),
     /// Task subcommands: run declared project tasks in ephemeral sessions
     #[command(visible_alias = "tasks")]
     Task(TaskArgs),
@@ -285,6 +287,36 @@ pub struct PolicyArgs {
 pub struct LoadoutArgs {
     #[command(subcommand)]
     pub command: LoadoutCommand,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub command: AuthCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Sign in to GitHub under the Minimal GitHub App
+    ///
+    /// Opens your browser for GitHub's authorization-code flow (with PKCE)
+    /// and takes the grant back on a loopback redirect. `--device` runs the
+    /// device flow instead: a code to enter at github.com/login/device, for
+    /// a host with no browser or a script. Either way the sign-in is held in
+    /// the host keychain and in no file; `min auth status` reports it.
+    Login(AuthLoginArgs),
+    /// Forget the held GitHub sign-in and revoke every member minted from it
+    Logout,
+    /// Report whether a GitHub sign-in is held, as whom, and until when
+    Status,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthLoginArgs {
+    /// Use the device flow: print a code to enter at GitHub instead of
+    /// opening a browser
+    #[arg(long)]
+    pub device: bool,
 }
 
 #[derive(Debug, Subcommand)]
