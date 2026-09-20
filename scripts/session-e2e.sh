@@ -504,7 +504,7 @@ case_bep_proxy_env_and_no_proxy_are_set() {
     https_proxy="$(printf '%s\n' "$proxy_env" | sed -n 1p | tr -d '\r')"
     http_proxy="$(printf '%s\n' "$proxy_env" | sed -n 2p | tr -d '\r')"
     no_proxy="$(printf '%s\n' "$proxy_env" | sed -n 3p | tr -d '\r')"
-    if [ "$https_proxy" != "http://127.0.0.1:7655" ] || [ "$http_proxy" != "http://127.0.0.1:7655" ]; then
+    if [ "$https_proxy" != "http://127.0.0.1:7656" ] || [ "$http_proxy" != "http://127.0.0.1:7656" ]; then
       echo "::error::HTTPS_PROXY/HTTP_PROXY do not point at the proxy: '$https_proxy' / '$http_proxy'"
       fail
     fi
@@ -744,7 +744,7 @@ case_bep_first_slice_no_plaintext_anywhere() {
       echo "--- stderr ---"; cat "$WORK/bep-spec.err" 2>/dev/null || true
       fail
     fi
-    if ! grep -qF "HTTPS_PROXY=http://127.0.0.1:7655" "$WORK/bep-spec.out"; then
+    if ! grep -qF "HTTPS_PROXY=http://127.0.0.1:7656" "$WORK/bep-spec.out"; then
       echo "::error::the admitted spec does not render the proxy environment the box is created with"
       cat "$WORK/bep-spec.out" 2>/dev/null || true
       fail
@@ -1194,7 +1194,7 @@ case_bep_store_reference_reaches_upstream_without_key_in_box() {
   local want
   for want in \
       "keychain reference \`$BEP_REF_ID\`: authorities api.anthropic.com:443" \
-      "HTTPS_PROXY=http://127.0.0.1:7655"; do
+      "HTTPS_PROXY=http://127.0.0.1:7656"; do
     if ! grep -qF -- "$want" "$WORK/bep-ref-spec.out"; then
       echo "::error::the review of an admitted reference does not show '$want'"
       cat "$WORK/bep-ref-spec.out" 2>/dev/null || true

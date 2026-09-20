@@ -375,7 +375,11 @@ impl BepPolicy {
 /// shares with the host. An own-IP or VM-hosted box reaches the host at
 /// another address; that addressing arrives with the listener's own-IP
 /// attachment work and is not this constant's to guess.
-pub const BEP_PROXY_URL: &str = "http://127.0.0.1:7655";
+///
+/// The port mirrors `minvmd::net::DEFAULT_BEP_PORT`, which this crate cannot
+/// import (`minvmd` depends on `sessions`, not the other way round); `minvmd`'s
+/// `bep_default_listener_is_the_box_proxy_url` asserts the two agree.
+pub const BEP_PROXY_URL: &str = "http://127.0.0.1:7656";
 
 /// The local zone `NO_PROXY` always carries under `proxy_env` (BEP-012):
 /// peer boxes by name, the host, and loopback, so local traffic never
@@ -3141,8 +3145,8 @@ mod tests {
             for authority in [
                 "web.min.internal",
                 "min.internal",
-                "host.min.internal:7655",
-                "localhost:7655",
+                "host.min.internal:7656",
+                "localhost:7656",
                 "127.0.0.1",
             ] {
                 let refused = rule("anthropic-api-key", &[authority], RuleAction::Allow);

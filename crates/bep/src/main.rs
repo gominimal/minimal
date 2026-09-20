@@ -33,8 +33,10 @@ const GITHUB_HOST_SET: [&str; 4] = [
     about = "The Box Egress Proxy: terminates TLS for declared hosts, redeems sealed values and forwards on a validated upstream leg"
 )]
 struct Cli {
-    /// The address the redemption listener binds.
-    #[arg(long, default_value = "127.0.0.1:7655")]
+    /// The address the redemption listener binds. The default mirrors
+    /// `minvmd::net::DEFAULT_BEP_PORT` — the supervisor always passes
+    /// `--listen` explicitly, so this only serves a hand-started proxy.
+    #[arg(long, default_value = "127.0.0.1:7656")]
     listen: SocketAddr,
 
     /// The audit log, appended to and never rewritten.

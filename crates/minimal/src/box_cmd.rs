@@ -650,7 +650,7 @@ mod tests {
             text.contains("interception root in the box trust store"),
             "{text}"
         );
-        assert!(text.contains("HTTPS_PROXY=http://127.0.0.1:7655"), "{text}");
+        assert!(text.contains("HTTPS_PROXY=http://127.0.0.1:7656"), "{text}");
         assert!(
             text.contains(
                 "keychain reference `anthropic-api-key`: authorities \

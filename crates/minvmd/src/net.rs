@@ -1175,7 +1175,12 @@ fn plan_host_users(
 /// created under `proxy_env` steering gets `HTTPS_PROXY` pointing here
 /// (`sessions::BEP_PROXY_URL`), so the two definitions must agree — the tests
 /// assert they do.
-pub const DEFAULT_BEP_PORT: u16 = 7655;
+///
+/// The number sits beside the hostname proxy's `:7654` and skips the one after
+/// it: the architecture retired that port along with the listener that held it,
+/// so a diagnostic bundle's socket listing showing it again would contradict
+/// the retirement.
+pub const DEFAULT_BEP_PORT: u16 = 7656;
 
 /// The directory the proxy keeps its files in, under the minimal state dir:
 /// the same `bep/` the `min` CLI reads the control socket and the published
@@ -1990,7 +1995,7 @@ mod tests {
             .expect("spawn host gvproxy");
 
         // The proxy, beside it. An ephemeral port so a run never collides with
-        // a live proxy on this host's 7655.
+        // a live proxy on this host's 7656.
         let proxy_listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .expect("bind stand-in redemption listener");
         let listen = proxy_listener.local_addr().expect("listener address");
@@ -2101,7 +2106,7 @@ mod tests {
             cfg.argv(),
             vec![
                 "--listen".to_string(),
-                "127.0.0.1:7655".to_string(),
+                "127.0.0.1:7656".to_string(),
                 "--audit-log".to_string(),
                 "/s/bep/audit.log".to_string(),
                 "--boxes".to_string(),
