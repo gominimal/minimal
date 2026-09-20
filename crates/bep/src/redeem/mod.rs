@@ -9,6 +9,11 @@
 //! what lets the property tests drive it over arbitrary inputs and the Kani
 //! harnesses exhaust it over host sets of at most four authorities.
 //!
+//! - [`request`] holds the checks over the connection and the request, which
+//!   hold whether or not a sealed value is carried and so run first: that the
+//!   connection arrived on a `host:port` the module declares, that the sending
+//!   box's declared egress admits the connection authority, and that the
+//!   request's `Host` header and target name that authority itself.
 //! - [`member`] holds the checks over the sealed member itself: that the
 //!   value decrypted under this host's key, that the connection is attributed
 //!   to a box the value may be redeemed from, that the connection authority is
@@ -19,8 +24,10 @@
 use std::fmt;
 
 pub mod member;
+pub mod request;
 
 pub use member::{Attribution, Breadth, Mode, Revocation, SealedMember};
+pub use request::{Egress, Endpoint, HostId, Request};
 
 /// An authority (`host:port`), interned by the shell as a small id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,6 +61,14 @@ impl HostSet {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Check {
+    /// The connection arrived on a `host:port` the module declares (BEP-031).
+    OnDeclaredPort,
+    /// The sending box's declared egress admits the connection authority
+    /// (BEP-022).
+    EgressAdmitted,
+    /// The request's `Host` header and target name the connection authority
+    /// itself (BEP-023).
+    AuthorityPinned,
     /// The value decrypts under this host's proxy key (BEP-019).
     Decrypts,
     /// The connection source address resolves to a live box the value may be
@@ -79,6 +94,9 @@ impl Check {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
+            Self::OnDeclaredPort => "on_declared_port",
+            Self::EgressAdmitted => "egress_admitted",
+            Self::AuthorityPinned => "authority_pinned",
             Self::Decrypts => "decrypts",
             Self::Attributed => "attributed",
             Self::InBoundSet => "in_bound_set",
@@ -112,6 +130,9 @@ pub enum Decision {
 /// request carrying a sealed value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Redemption {
+    /// The connection the request arrived on and what the request said about
+    /// where it was going (BEP-022, BEP-023, BEP-031).
+    pub request: Request,
     /// The member the value unsealed to under this host's key, or `None`
     /// when it did not decrypt (BEP-019).
     pub member: Option<SealedMember>,
@@ -129,9 +150,13 @@ pub struct Redemption {
 
 /// Decides one redemption: [`Decision::Admit`] exactly when every check
 /// passes, [`Decision::Refuse`] naming the first failing check otherwise.
+///
+/// The connection and request checks run before the member checks, so a
+/// request refused for its port, its egress or its unpinned authority is
+/// refused as such whether or not it carries a sealed value.
 #[must_use]
 pub fn decide(redemption: &Redemption) -> Decision {
-    match member::first_failure(redemption) {
+    match request::first_failure(redemption).or_else(|| member::first_failure(redemption)) {
         Some(check) => Decision::Refuse(check),
         None => Decision::Admit,
     }
@@ -152,8 +177,61 @@ mod tests {
     /// enough that every property sees both of its arms.
     const IDS: u8 = 4;
 
+    /// Ports are drawn from these, so a connection and a declared authority
+    /// coincide on the port often enough that the port check sees both arms.
+    const PORTS: [u16; 4] = [443, 80, 8443, 22];
+
     fn arb_authority() -> impl Strategy<Value = AuthorityId> {
         (0..IDS).prop_map(AuthorityId)
+    }
+
+    fn arb_endpoint() -> impl Strategy<Value = Endpoint> {
+        ((0..IDS).prop_map(HostId), 0..PORTS.len()).prop_map(|(host, port)| Endpoint {
+            host,
+            port: PORTS[port],
+        })
+    }
+
+    fn arb_egress() -> impl Strategy<Value = Egress> {
+        prop::collection::vec(arb_authority(), 0..=4).prop_map(Egress)
+    }
+
+    /// The connection and request facts, drawn freely: the endpoint the
+    /// connection arrived on need not be declared, the egress need not admit
+    /// the connection authority, and the `Host` header and the target need not
+    /// name it.
+    fn arb_request() -> impl Strategy<Value = Request> {
+        (
+            arb_endpoint(),
+            prop::collection::vec(arb_endpoint(), 0..=4),
+            arb_egress(),
+            prop::option::weighted(0.8, arb_authority()),
+            prop::option::weighted(0.8, arb_authority()),
+        )
+            .prop_map(
+                |(endpoint, declared, egress, host_header, target)| Request {
+                    endpoint,
+                    declared,
+                    egress,
+                    host_header,
+                    target,
+                },
+            )
+    }
+
+    /// A request that passes every connection and request check against
+    /// `authority`: it arrived on a declared endpoint, the box's egress admits
+    /// the authority, and both the `Host` header and the target name it. The
+    /// member properties draw this, so the refusal each of them reads is its
+    /// own member check's.
+    fn admitting_request(authority: AuthorityId, endpoint: Endpoint) -> Request {
+        Request {
+            endpoint,
+            declared: vec![endpoint],
+            egress: Egress(vec![authority]),
+            host_header: Some(authority),
+            target: Some(authority),
+        }
     }
 
     fn arb_host_set() -> impl Strategy<Value = HostSet> {
@@ -204,17 +282,52 @@ mod tests {
             arb_host_set(),
             0..8u64,
             prop::collection::vec(arb_revocation(), 0..=2),
+            arb_endpoint(),
         )
             .prop_map(
-                |(member, attribution, authority, current_set, now, revocations)| Redemption {
-                    member,
-                    attribution,
-                    authority,
-                    current_set,
-                    now,
-                    revocations,
+                |(member, attribution, authority, current_set, now, revocations, endpoint)| {
+                    Redemption {
+                        request: admitting_request(authority, endpoint),
+                        member,
+                        attribution,
+                        authority,
+                        current_set,
+                        now,
+                        revocations,
+                    }
                 },
             )
+    }
+
+    /// `redemption` with every check repaired, so the decision admits it. The
+    /// request properties break exactly one dimension of it, and so read the
+    /// refusal their requirement names rather than an earlier check's.
+    fn admitting(redemption: &Redemption) -> Redemption {
+        let authority = redemption.authority;
+        let member = redemption.member.clone().unwrap_or_else(|| SealedMember {
+            box_id: BoxId(0),
+            module: ModuleId(0),
+            bound_set: HostSet(vec![authority]),
+            mode: None,
+            breadth: None,
+            expires_at: 0,
+        });
+        let member = SealedMember {
+            bound_set: HostSet(vec![authority]),
+            mode: Some(Mode::User),
+            breadth: Some(Breadth::Full),
+            expires_at: redemption.now + 1,
+            ..member
+        };
+        Redemption {
+            request: admitting_request(authority, redemption.request.endpoint),
+            attribution: Attribution::OwnIp(member.box_id),
+            member: Some(member),
+            authority,
+            current_set: HostSet(vec![authority]),
+            now: redemption.now,
+            revocations: Vec::new(),
+        }
     }
 
     /// This host's keys and another host's.
@@ -364,11 +477,115 @@ mod tests {
             }
         }
 
+        /// BEP-022: admitted only when the sending box's declared egress
+        /// admits the connection authority, whether or not the request carries
+        /// a sealed value: the check runs before the value is read, so the
+        /// refusal names the egress either way.
+        #[test]
+        fn prop_undeclared_egress_authority_is_refused(
+            redemption in arb_redemption(),
+            egress in arb_egress(),
+            sealed in any::<bool>(),
+        ) {
+            let base = admitting(&redemption);
+            prop_assert_eq!(decide(&base), Decision::Admit);
+
+            let admits = egress.admits(base.authority);
+            let request = Request { egress, ..base.request.clone() };
+            let member = base.member.clone().filter(|_| sealed);
+            let varied = Redemption { request, member, ..base };
+            let expected = if !admits {
+                Decision::Refuse(Check::EgressAdmitted)
+            } else if sealed {
+                Decision::Admit
+            } else {
+                Decision::Refuse(Check::Decrypts)
+            };
+            prop_assert_eq!(decide(&varied), expected);
+        }
+
+        /// BEP-023: substitution happens only when the `Host` header, the
+        /// request target and the connection authority are one and the same
+        /// authority; an origin-form target names the connection authority,
+        /// which the shell fills in.
+        #[test]
+        fn prop_host_header_mismatch_is_refused(
+            redemption in arb_redemption(),
+            host_header in prop::option::weighted(0.8, arb_authority()),
+            target in prop::option::weighted(0.8, arb_authority()),
+        ) {
+            let base = admitting(&redemption);
+            prop_assert_eq!(decide(&base), Decision::Admit);
+
+            let pinned = host_header == Some(base.authority)
+                && target == Some(base.authority);
+            let request = Request { host_header, target, ..base.request.clone() };
+            let varied = Redemption { request, ..base };
+            let expected = if pinned {
+                Decision::Admit
+            } else {
+                Decision::Refuse(Check::AuthorityPinned)
+            };
+            prop_assert_eq!(decide(&varied), expected);
+        }
+
+        /// BEP-031: a connection for a credentialed hostname is admitted only
+        /// when its `host:port` is one of the module's declared authorities,
+        /// so the same hostname on any other port is refused.
+        #[test]
+        fn prop_off_port_connection_is_refused(
+            redemption in arb_redemption(),
+            endpoint in arb_endpoint(),
+            declared in prop::collection::vec(arb_endpoint(), 0..=4),
+        ) {
+            let base = admitting(&redemption);
+            prop_assert_eq!(decide(&base), Decision::Admit);
+
+            let on_port = declared.contains(&endpoint);
+            let request = Request { endpoint, declared, ..base.request.clone() };
+            let varied = Redemption { request, ..base };
+            let expected = if on_port {
+                Decision::Admit
+            } else {
+                Decision::Refuse(Check::OnDeclaredPort)
+            };
+            prop_assert_eq!(decide(&varied), expected);
+        }
+
         /// BEP-025: the decision is `Admit` exactly when every check passes,
         /// and `Refuse` naming the first failing check, in order, otherwise.
-        /// The checks are restated here from the raw facts.
+        /// The checks are restated here from the raw facts. Half the cases
+        /// keep the admitting request the member properties draw, so every
+        /// member check is still reached; the other half draw the connection
+        /// and request facts freely too.
         #[test]
-        fn prop_admit_iff_every_check_passes(redemption in arb_redemption()) {
+        fn prop_admit_iff_every_check_passes(
+            redemption in arb_redemption(),
+            request in prop::option::weighted(0.5, arb_request()),
+        ) {
+            let redemption = match request {
+                Some(request) => Redemption { request, ..redemption },
+                None => redemption,
+            };
+            let request_checks = [
+                (
+                    Check::OnDeclaredPort,
+                    redemption.request.declared.contains(&redemption.request.endpoint),
+                ),
+                (
+                    Check::EgressAdmitted,
+                    redemption.request.egress.0.contains(&redemption.authority),
+                ),
+                (
+                    Check::AuthorityPinned,
+                    redemption.request.host_header == Some(redemption.authority)
+                        && redemption.request.target == Some(redemption.authority),
+                ),
+            ];
+            if let Some((check, _)) = request_checks.iter().find(|(_, passes)| !passes) {
+                prop_assert_eq!(decide(&redemption), Decision::Refuse(*check));
+                return Ok(());
+            }
             let expected = match &redemption.member {
                 None => Decision::Refuse(Check::Decrypts),
                 Some(member) => {
@@ -422,15 +639,44 @@ mod kani_proofs {
         }
     }
 
+    /// A request that passes every connection and request check against
+    /// `authority`, with the endpoint it arrived on left symbolic. The member
+    /// proofs hold this, so the refusal each of them reads is its own member
+    /// check's.
+    fn admitting_request(authority: AuthorityId) -> Request {
+        let endpoint: Endpoint = kani::any();
+        Request {
+            endpoint,
+            declared: vec![endpoint],
+            egress: Egress(vec![authority]),
+            host_header: Some(authority),
+            target: Some(authority),
+        }
+    }
+
+    /// The connection and request facts left symbolic: the declared endpoints
+    /// and the egress bounded as the host sets are.
+    fn any_request() -> Request {
+        Request {
+            endpoint: kani::any(),
+            declared: kani::vec::any_vec::<Endpoint, AUTHORITIES>(),
+            egress: Egress(kani::vec::any_vec::<AuthorityId, AUTHORITIES>()),
+            host_header: kani::any(),
+            target: kani::any(),
+        }
+    }
+
     fn any_redemption() -> Redemption {
+        let authority: AuthorityId = kani::any();
         Redemption {
+            request: admitting_request(authority),
             member: if kani::any() {
                 Some(any_member())
             } else {
                 None
             },
             attribution: kani::any(),
-            authority: kani::any(),
+            authority,
             current_set: any_host_set(),
             now: kani::any(),
             revocations: kani::vec::any_vec::<Revocation, REVOCATIONS>(),
@@ -542,12 +788,92 @@ mod kani_proofs {
         }
     }
 
+    /// BEP-022: admitted only when the sending box's declared egress admits
+    /// the connection authority, sealed value or not.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn kani_redeem_requires_egress_admission() {
+        let redemption = Redemption {
+            request: any_request(),
+            ..any_redemption()
+        };
+        let admits = redemption.request.egress.admits(redemption.authority);
+        match decide(&redemption) {
+            Decision::Admit => assert!(admits),
+            Decision::Refuse(Check::EgressAdmitted) => assert!(!admits),
+            Decision::Refuse(_) => {}
+        }
+    }
+
+    /// BEP-023: admitted only when the `Host` header, the request target and
+    /// the connection authority are one and the same authority.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn kani_redeem_pins_request_authority() {
+        let redemption = Redemption {
+            request: any_request(),
+            ..any_redemption()
+        };
+        let pinned = redemption.request.host_header == Some(redemption.authority)
+            && redemption.request.target == Some(redemption.authority);
+        match decide(&redemption) {
+            Decision::Admit => assert!(pinned),
+            Decision::Refuse(Check::AuthorityPinned) => assert!(!pinned),
+            Decision::Refuse(_) => {}
+        }
+    }
+
+    /// BEP-031: admitted only when the connection's `host:port` is one of the
+    /// module's declared authorities.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn kani_redeem_enforces_port_discipline() {
+        let redemption = Redemption {
+            request: any_request(),
+            ..any_redemption()
+        };
+        let on_port = redemption
+            .request
+            .declared
+            .contains(&redemption.request.endpoint);
+        match decide(&redemption) {
+            Decision::Admit => assert!(on_port),
+            Decision::Refuse(Check::OnDeclaredPort) => assert!(!on_port),
+            Decision::Refuse(_) => {}
+        }
+    }
+
     /// BEP-025: `Admit` exactly when every check passes, `Refuse` naming the
     /// first failing check, in order, otherwise.
     #[kani::proof]
     #[kani::unwind(9)]
     fn kani_redeem_admits_iff_all_checks_pass() {
-        let redemption = any_redemption();
+        let redemption = Redemption {
+            request: any_request(),
+            ..any_redemption()
+        };
+        let request_checks = [
+            (
+                Check::OnDeclaredPort,
+                redemption
+                    .request
+                    .declared
+                    .contains(&redemption.request.endpoint),
+            ),
+            (
+                Check::EgressAdmitted,
+                redemption.request.egress.0.contains(&redemption.authority),
+            ),
+            (
+                Check::AuthorityPinned,
+                redemption.request.host_header == Some(redemption.authority)
+                    && redemption.request.target == Some(redemption.authority),
+            ),
+        ];
+        if let Some((check, _)) = request_checks.iter().find(|(_, passes)| !passes) {
+            assert_eq!(decide(&redemption), Decision::Refuse(*check));
+            return;
+        }
         let expected = match &redemption.member {
             None => Decision::Refuse(Check::Decrypts),
             Some(member) => {
