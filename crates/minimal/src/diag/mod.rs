@@ -154,6 +154,7 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     );
     collect_step!(w, "config", collect::config(&mut w, &paths));
     collect_step!(w, "state", collect::state(&mut w, &paths));
+    collect_step!(w, "net.zone", collect::zone(&mut w, &paths));
     // Log prefixes that matched nothing on the host come back rather than
     // becoming skips here: whether "not under <state>/logs" also means "not in
     // this bundle" is not known until the provider loop below has run.

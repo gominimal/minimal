@@ -498,6 +498,13 @@ impl Server {
         // routes against only exists on Linux.
         #[cfg(target_os = "linux")]
         start_host_proxies(&state, in_microvm).await;
+        // The box-zone answerer (NET-006, NET-124..127) serves the host's own
+        // lookups of `*.min.internal`. Native hosts only: in a microVM the
+        // node's DNS layer answers the zone with switch addresses.
+        #[cfg(target_os = "linux")]
+        if !in_microvm {
+            start_zone_answerer(&state).await;
+        }
 
         let russh_config = build_russh_config(&state)
             .await
@@ -829,6 +836,39 @@ async fn publish_on_host_retrying(port: u16) {
         );
         tokio::time::sleep(delay).await;
     }
+}
+
+/// Opens the box-zone answerer's socket and serves the zone on a detached
+/// task for the daemon's lifetime ([`crate::net::answerer`]). The socket is
+/// the service manager's when one was passed, else a loopback bind. A socket
+/// failure warns and is skipped: the daemon keeps serving, and names in the
+/// zone keep routing through the proxies; only native resolution is lost.
+#[cfg(target_os = "linux")]
+async fn start_zone_answerer(state: &ServerStateHandle) {
+    use crate::net::answerer;
+
+    let listener = match answerer::listen().await {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                address = %answerer::BIND_ADDR,
+                "could not open the box-zone answerer socket; `*.min.internal` will not \
+                 resolve natively on this host. Check with: lsof -nP -iUDP:{}",
+                answerer::ANSWERER_PORT
+            );
+            return;
+        }
+    };
+    let registry = state.sessions_manager().await.hostnames();
+    let daemon_id = state.daemon_id().await;
+    let dump_path =
+        answerer::zone_dump_path(state.minimal_state_dir().await.as_utf8_path().as_std_path());
+    tokio::spawn(async move {
+        if let Err(error) = answerer::serve(listener, registry, daemon_id, dump_path).await {
+            tracing::error!(%error, "box-zone answerer exited");
+        }
+    });
 }
 
 /// Upper bound on the best-effort host-loopback publish in

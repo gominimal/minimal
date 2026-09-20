@@ -39,8 +39,10 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 
 use sessions::SessionId;
+use tokio::sync::Notify;
 
 /// The DNS suffix every PTask hostname carries (see the module docs).
 pub const HOSTNAME_SUFFIX: &str = "min.internal";
@@ -111,6 +113,9 @@ pub struct HostnameRegistry {
     by_host: HashMap<Hostname, Route>,
     /// session name → its live registration, for withdrawal on exit.
     by_session: HashMap<String, Registration>,
+    /// Pinged after every register/deregister so the box-zone answerer
+    /// ([`super::answerer`]) can rewrite its zone dump without polling.
+    changes: Arc<Notify>,
 }
 
 impl HostnameRegistry {
@@ -122,7 +127,24 @@ impl HostnameRegistry {
             legacy_host_id: legacy_host_id.into(),
             by_host: HashMap::new(),
             by_session: HashMap::new(),
+            changes: Arc::new(Notify::new()),
         }
+    }
+
+    /// A handle notified after every change to the table, for a reader that
+    /// mirrors it (the answerer's zone dump). `notify_one` stores a permit when
+    /// nobody is waiting, so a change is never lost between two waits.
+    #[must_use]
+    pub fn changes(&self) -> Arc<Notify> {
+        Arc::clone(&self.changes)
+    }
+
+    /// Every live hostname with the address it routes to, in no particular
+    /// order.
+    pub fn entries(&self) -> impl Iterator<Item = (&Hostname, IpAddr)> {
+        self.by_host
+            .iter()
+            .map(|(name, route)| (name, route.target))
     }
 
     /// Registers `session_name`'s hostname, routing it to `target`, and returns
@@ -151,6 +173,7 @@ impl HostnameRegistry {
                 session: session_name.to_string(),
             },
         );
+        self.changes.notify_one();
         tracing::info!(
             session_id = %session_id,
             session_name,
@@ -190,6 +213,7 @@ impl HostnameRegistry {
             .by_host
             .remove(&hostname)
             .expect("by_host is kept in sync with by_session by register");
+        self.changes.notify_one();
         tracing::info!(
             session_id = %id,
             session_name,
