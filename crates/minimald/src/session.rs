@@ -128,6 +128,10 @@ pub(crate) struct SessionConfig {
     /// route on spawn, relinks on rename, and withdraws on stop/destroy.
     #[cfg(target_os = "linux")]
     pub hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// The host's published-box table, the zone the answerer serves; the
+    /// actor publishes its box at finalize and withdraws it at destroy.
+    #[cfg(target_os = "linux")]
+    pub published: Arc<RwLock<crate::net::publish::PublishTable>>,
 }
 
 /// Lifecycle-dependent state of a session actor: the multi-step create flow
@@ -359,6 +363,15 @@ enum SessionMessage {
     /// Rename the session: persist the new name through the record handle,
     /// refresh the in-memory snapshot, and relink the PTask hostname.
     Rename(String, oneshot::Sender<Result<(), std::io::Error>>),
+    /// Publish one of this box's ports at runtime, decided against its
+    /// `dynamic_ingress` setting (NET-043, NET-044, NET-047). Answered with
+    /// the daemon's decision; the error is the store's, for a record that
+    /// could not be read or written.
+    Expose(
+        u16,
+        sessions::IpProto,
+        oneshot::Sender<Result<minimald_rpc::ExposeResponse, std::io::Error>>,
+    ),
     /// Whether this session blocks an unforced daemon shutdown: a `Draft`
     /// holding compose state (a client is mid create flow, and stopping
     /// would strand it) or an `Active` with a minted host. A `Draft` that
@@ -431,6 +444,12 @@ pub struct Session {
     /// synchronous register/deregister, never across an `.await`.
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+
+    /// The host's published-box table (see [`SessionSeed::published`]): where
+    /// this box's name answers, from finalize to destroy. Held for a
+    /// synchronous publish/withdraw only, never across an `.await`.
+    #[cfg(target_os = "linux")]
+    published: Arc<RwLock<crate::net::publish::PublishTable>>,
 
     /// The daemon-scoped gvproxy switch, injected into each `SandboxLauncher`
     /// this session mints so an `OwnIp` PTask attaches to the one per-host
@@ -524,6 +543,8 @@ impl Session {
             manager,
             #[cfg(target_os = "linux")]
             hostnames,
+            #[cfg(target_os = "linux")]
+            published,
         } = seed;
         Self {
             receiver,
@@ -545,6 +566,8 @@ impl Session {
             host_origin: HostOrigin::Interactive,
             #[cfg(target_os = "linux")]
             hostnames,
+            #[cfg(target_os = "linux")]
+            published,
         }
     }
 
@@ -624,21 +647,24 @@ impl Session {
         // (R3.1/R3.6). A `Draft` session has nothing to route to yet, so
         // `register_hostname` no-ops until its loadout finalizes.
         #[cfg(target_os = "linux")]
-        actor.register_hostname(obj.record());
+        actor.register_hostname(obj.record()).await;
 
         tokio::spawn(actor.mainloop());
         Ok(SessionHandle(sender))
     }
 
-    /// Register this session's PTask hostname (R3.1/R3.6). Both HostNet and
-    /// OwnIp resolve to loopback: a HostNet PTask's listeners are on host
+    /// Register this session's PTask hostname (R3.1/R3.6) and publish its
+    /// box (NET-010, NET-011, NET-129). Both HostNet and OwnIp route to
+    /// loopback through the proxy: a HostNet PTask's listeners are on host
     /// loopback; an OwnIp PTask is reached through a gvproxy-published
     /// loopback port (#542, the published-loopback model). A NoNet PTask
-    /// exposes no services, so it is not registered — and neither is a
-    /// `Draft` session, which has nothing to route to until its composition
-    /// finalizes.
+    /// exposes no services, so it is not routed — but it is published like
+    /// any box, at a loopback address of its own, so its name answers. A
+    /// `Draft` session is neither routed nor published: it has nothing to
+    /// answer for until its composition finalizes.
     #[cfg(target_os = "linux")]
-    fn register_hostname(&self, record: &Record) {
+    async fn register_hostname(&self, record: &Record) {
+        self.publish_box(record).await;
         if !self.owns_hostname_route(record) {
             return;
         }
@@ -656,6 +682,182 @@ impl Session {
             }
             _ => {}
         }
+    }
+
+    /// Whether this session is published in the box zone: `Active`, in any
+    /// network mode — exactly the condition under which [`Self::publish_box`]
+    /// published it.
+    #[cfg(target_os = "linux")]
+    fn is_published(&self) -> bool {
+        matches!(self.inner, SessionInner::Active { .. })
+    }
+
+    /// Publish this session's box in the host's zone: an own-address or
+    /// `none` box at a loopback address of its own, a host-address box at the
+    /// node's address, at the box's own port numbers (NET-010, NET-129). A
+    /// `Draft` session publishes nothing. An exhausted reserved range is
+    /// logged and the box goes unpublished; the session itself still runs.
+    ///
+    /// The address is leased, the box's declared ports are bound on it, and
+    /// only then is the name registered (NET-121), so the name never answers
+    /// ahead of the ports it promises. A declared port whose forwarder cannot
+    /// bind is reported with its reason and nothing is substituted for it:
+    /// no other port, no other address, and no name.
+    ///
+    /// NET-123: the reserved local range is bind-probed before the box is
+    /// published. While it is absent the box goes to the `127.0.0.1` interim,
+    /// whatever its mode, and the session start's advisory has already said
+    /// so; with the range present the mode's own publication applies.
+    #[cfg(target_os = "linux")]
+    async fn publish_box(&self, record: &Record) {
+        use crate::net::answerer::{interim_address, probe_reserved_range};
+        use crate::net::publish::Forwarders;
+
+        if !self.is_published() {
+            return;
+        }
+        let name = registry_name(record);
+        let probe = probe_reserved_range();
+        let lease = {
+            let mut table = self.published.write().expect("publish table lock poisoned");
+            match interim_address(&probe) {
+                Some(interim) => {
+                    tracing::info!(
+                        session_id = %record.id,
+                        %interim,
+                        range = ?probe,
+                        "reserved range absent; publishing the box at the interim address"
+                    );
+                    table.lease_interim(interim)
+                }
+                None => match table.lease(record.network) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        tracing::error!(
+                            session_id = %record.id,
+                            %error,
+                            "could not publish the box; its name will not resolve natively"
+                        );
+                        return;
+                    }
+                },
+            }
+        };
+        let declared = declared_ports(record, lease.kind());
+        match Forwarders::bind(lease.address(), &declared).await {
+            Ok(forwarders) => {
+                self.published
+                    .write()
+                    .expect("publish table lock poisoned")
+                    .register(record.id, &name, lease, forwarders);
+            }
+            Err(failure) => {
+                tracing::error!(
+                    session_id = %record.id,
+                    hostname = %name,
+                    port = failure.port,
+                    address = %failure.address,
+                    error = %failure.error,
+                    "a declared port's forwarder could not bind; the box is not published \
+                     and no substitute address is published for the port"
+                );
+                self.published
+                    .write()
+                    .expect("publish table lock poisoned")
+                    .release(lease);
+            }
+        }
+    }
+
+    /// Publish `port` of this box at runtime, as `min net expose` asks: the
+    /// request is decided against the box's `dynamic_ingress` setting and an
+    /// allow binds the port at the box's published address and records the
+    /// mapping in its policy (NET-043, NET-044, NET-047). The actor serves
+    /// it because the record write goes through its handle, like a rename.
+    ///
+    /// A box whose setting is `ask` is decided by the human attached to it
+    /// (NET-045), so the box's host rides along: it owns the terminal the
+    /// prompt renders on. A box with no live host is nobody to ask.
+    #[cfg(target_os = "linux")]
+    async fn expose(
+        &self,
+        port: u16,
+        proto: sessions::IpProto,
+    ) -> Result<minimald_rpc::ExposeResponse, std::io::Error> {
+        let asker = match &self.inner {
+            SessionInner::Active {
+                host: Some((host, _)),
+                ..
+            } if host.is_alive() => Some(host),
+            _ => None,
+        };
+        let audit_log = crate::audit::log_path(self.minimal_state_dir.as_utf8_path().as_std_path());
+        crate::net::dynamic_ingress::expose(
+            crate::net::dynamic_ingress::ExposeCtx {
+                record: &self.record,
+                published: &self.published,
+                switch: &self.net_switch,
+                asker,
+                audit_log: &audit_log,
+            },
+            port,
+            proto,
+        )
+        .await
+    }
+
+    /// Without the box zone there is no address to publish a port at.
+    #[cfg(not(target_os = "linux"))]
+    async fn expose(
+        &self,
+        _port: u16,
+        _proto: sessions::IpProto,
+    ) -> Result<minimald_rpc::ExposeResponse, std::io::Error> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "dynamic ingress needs the box zone, which this host does not serve",
+        ))
+    }
+
+    /// Withdraw this session's box from the host's zone (NET-012), releasing
+    /// its own address if it held one. Gated like [`Self::deregister_hostname`]:
+    /// the table is keyed by name alone, so an ungated withdraw from a `Draft`
+    /// session could take down an unrelated box under the same derived name.
+    ///
+    /// The forwarders the box held for its declared ports are unbound here and
+    /// awaited before returning (NET-121), so a rename — a withdraw followed
+    /// by a publish that leases the address just released — never binds its new
+    /// forwarders against the old ones.
+    #[cfg(target_os = "linux")]
+    async fn withdraw_box(&self) {
+        let record = self.record.record().await.unwrap();
+        if !self.is_published() {
+            return;
+        }
+        let withdrawn = self
+            .published
+            .write()
+            .expect("publish table lock poisoned")
+            .withdraw(&registry_name(&record));
+        if let Some(withdrawn) = withdrawn {
+            withdrawn.finished().await;
+        }
+    }
+
+    /// Record whether this session's box is running, for the zone: a
+    /// shared-address box answers its name only while it runs (NET-128).
+    #[cfg(target_os = "linux")]
+    async fn mark_running(&self, running: bool) {
+        if !self.is_published() {
+            return;
+        }
+        let Ok(record) = self.record.record().await else {
+            return;
+        };
+        self.published
+            .write()
+            .expect("publish table lock poisoned")
+            .set_running(&registry_name(&record), running);
     }
 
     /// Whether this session currently owns a PTask hostname route: `Active`
@@ -679,14 +881,26 @@ impl Session {
     /// that happens to share the same derived name.
     #[cfg(target_os = "linux")]
     async fn deregister_hostname(&self) {
+        self.withdraw_box().await;
         let record = self.record.record().await.unwrap();
         if !self.owns_hostname_route(&record) {
             return;
         }
+        let name = registry_name(&record);
         self.hostnames
             .write()
             .expect("hostname registry lock poisoned")
-            .deregister(&registry_name(&record));
+            .deregister(&name);
+        // The box is gone, so what it declared goes with its route: a name that
+        // no longer resolves declares no port and attributes no caller
+        // (NET-069, NET-070).
+        self.net_switch
+            .lock()
+            .await
+            .admissions()
+            .write()
+            .expect("box declarations lock poisoned")
+            .withdraw(&name);
     }
 
     /// The async task which handles interactions with the session.
@@ -839,6 +1053,9 @@ impl Session {
             },
             SessionMessage::Rename(new_name, r) => {
                 let _ = r.send(self.rename(new_name).await);
+            }
+            SessionMessage::Expose(port, proto, r) => {
+                let _ = r.send(self.expose(port, proto).await);
             }
             SessionMessage::IsBusy(r) => {
                 let _ = r.send(match &self.inner {
@@ -1321,7 +1538,7 @@ impl Session {
                 record.status = SessionStatus::Active;
                 self.record.write(record.clone()).await?;
                 #[cfg(target_os = "linux")]
-                self.register_hostname(&record);
+                self.register_hostname(&record).await;
                 Ok(ran)
             }
             SessionStatus::Pending => Err(std::io::Error::new(
@@ -1438,6 +1655,8 @@ impl Session {
             SessionInner::Active { host, sops, .. } => Some((host.take(), std::mem::take(sops))),
             SessionInner::Draft { .. } => None,
         };
+        #[cfg(target_os = "linux")]
+        self.mark_running(false).await;
         if let Some((host, mut sops)) = inner {
             for s in sops.drain(..) {
                 s.shutdown().await;
@@ -1476,7 +1695,18 @@ impl Session {
         self.register_hostname(match &written {
             Ok(_) => &new_record,
             Err(_) => &record,
-        });
+        })
+        .await;
+        // A fresh publication starts as not running; carry the live host
+        // over so a renamed shared-address box keeps answering.
+        #[cfg(target_os = "linux")]
+        {
+            let running = matches!(
+                &self.inner,
+                SessionInner::Active { host: Some((h, _)), .. } if h.is_alive()
+            );
+            self.mark_running(running).await;
+        }
 
         written
     }
@@ -1909,6 +2139,8 @@ impl Session {
         // Minted for an exec: a command is about to run in this sandbox, so a
         // later attach must not replace it. See [`HostOrigin::Exec`].
         self.host_origin = HostOrigin::Exec;
+        #[cfg(target_os = "linux")]
+        self.mark_running(true).await;
         Ok(host)
     }
 
@@ -1972,6 +2204,8 @@ impl Session {
         // Minted by an attach: its environment describes the terminal that is
         // here, so nothing may replace it out from under that client.
         self.host_origin = HostOrigin::Interactive;
+        #[cfg(target_os = "linux")]
+        self.mark_running(true).await;
         Ok(())
     }
 
@@ -2114,6 +2348,8 @@ impl Session {
         // attach may replace this shell rather than inherit its blank `TERM`.
         // See [`HostOrigin::Hooks`].
         self.host_origin = HostOrigin::Hooks;
+        #[cfg(target_os = "linux")]
+        self.mark_running(true).await;
         Ok(())
     }
 
@@ -2165,6 +2401,7 @@ impl Session {
             network_mode,
             net_switch: Arc::clone(&self.net_switch),
             ingress,
+            published: Arc::clone(&self.published),
             egress,
             composition: self.composition(),
             // A weak handle so in-sandbox `min build` can drive session
@@ -2681,6 +2918,25 @@ impl SessionHandle {
         })
     }
 
+    /// Publishes `port` of this box at runtime, decided against its
+    /// `dynamic_ingress` setting; see [`SessionMessage::Expose`]. A dead
+    /// actor maps to `NotConnected`.
+    pub(crate) async fn expose(
+        &self,
+        port: u16,
+        proto: sessions::IpProto,
+    ) -> Result<minimald_rpc::ExposeResponse, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(SessionMessage::Expose(port, proto, send)).await;
+        recv.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "session actor is gone",
+            ))
+        })
+    }
+
     /// Shutdown-stop: kills the host (if any), withdraws the hostname, and
     /// stops the actor — the on-disk record is kept. A dead actor is already
     /// stopped, so send/recv failures read as success.
@@ -2791,6 +3047,49 @@ impl WeakSessionHandle {
         drop(tx);
         Self(weak)
     }
+}
+
+/// The ports `record`'s ingress declaration names, and how the box answers
+/// each at its published address (NET-121).
+///
+/// A TCP mapping on an address of the box's own is answered by a forwarder
+/// minimald binds there, sending what it accepts to the host-side forward the
+/// box's switch publishes for the port (`127.0.0.1:<external>`). Every other
+/// declared port is published with no forwarder interposed: on a shared
+/// address — a host-address box, or the `127.0.0.1` interim — the box's own
+/// listeners answer its port numbers, so binding there would take the port
+/// from the box itself, and a UDP mapping's datagrams are carried by the
+/// switch forward rather than by a connection-oriented forwarder.
+#[cfg(target_os = "linux")]
+fn declared_ports(
+    record: &Record,
+    kind: crate::net::publish::AddressKind,
+) -> Vec<crate::net::publish::DeclaredPort> {
+    use crate::net::publish::{AddressKind, DeclaredPort, PortAnswer};
+
+    record
+        .policy
+        .ingress
+        .as_ref()
+        .map(|ingress| {
+            ingress
+                .port_mappings
+                .iter()
+                .map(|m| DeclaredPort {
+                    port: m.internal_port,
+                    answer: match (kind, m.proto) {
+                        (AddressKind::Own, sessions::IpProto::Tcp) => {
+                            PortAnswer::Forwarded(std::net::SocketAddr::from((
+                                std::net::Ipv4Addr::LOCALHOST,
+                                m.external_port,
+                            )))
+                        }
+                        _ => PortAnswer::Direct,
+                    },
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

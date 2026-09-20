@@ -18,8 +18,12 @@
 
 pub mod answerer;
 pub mod dns;
+pub mod dynamic_ingress;
+pub mod host_cohort;
+pub mod listen_watch;
 pub mod policy;
 pub mod proxy;
+pub mod publish;
 pub mod switch;
 
 // The own-IP switch attach, and the mode-to-provider factory that reaches it.
@@ -37,6 +41,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -212,6 +217,21 @@ pub struct SwitchClient {
     /// How PTask taps reach the switch: local spawn (DM2) or a
     /// vsock shuttle to the host gvproxy (DM1/3/4).
     transport: SwitchTransport,
+    /// The in-guest box zone this switch answers: one entry per attached box,
+    /// shared with every box's relay and with the zone dump. Held here because
+    /// the zone is the switch's — it lives as long as the address book that
+    /// leases the addresses in it.
+    box_zone: Arc<policy::BoxZone>,
+    /// What each live box declared, for the daemon's hostname-routing surfaces
+    /// to decide requests against (NET-069 to NET-071). It rides here because
+    /// this is the one daemon-scoped object both sides already hold: a box's
+    /// network, which learns its address and its rules, and the proxy startup.
+    admissions: Arc<RwLock<policy::BoxAdmissions>>,
+    /// The boxes running on this switch, by name, each with the ingress it
+    /// can take a port into at runtime (NET-044). Here for the same reason
+    /// as the declarations: the box's network registers it, and the session
+    /// actor serving a dynamic ingress request reaches it through the switch.
+    live_boxes: Arc<gvproxy_network::LiveBoxes>,
 }
 
 impl SwitchClient {
@@ -238,7 +258,25 @@ impl SwitchClient {
             child: None,
             exit_tx,
             transport: SwitchTransport::default(),
+            box_zone: Arc::new(policy::BoxZone::default()),
+            admissions: Arc::new(RwLock::new(policy::BoxAdmissions::new())),
+            live_boxes: Arc::new(gvproxy_network::LiveBoxes::default()),
         }
+    }
+
+    /// The boxes running on this switch, for a dynamic ingress request to
+    /// find the one it publishes a port to (NET-044).
+    #[must_use]
+    pub(crate) fn live_boxes(&self) -> Arc<gvproxy_network::LiveBoxes> {
+        Arc::clone(&self.live_boxes)
+    }
+
+    /// The live box declarations this switch's boxes register into, shared with
+    /// the daemon's hostname proxy so a routed request is decided against what
+    /// the target box declared (NET-069 to NET-071).
+    #[must_use]
+    pub fn admissions(&self) -> Arc<RwLock<policy::BoxAdmissions>> {
+        Arc::clone(&self.admissions)
     }
 
     /// Sets how PTask taps reach the switch. The DM2 default is
@@ -274,6 +312,14 @@ impl SwitchClient {
     #[must_use]
     pub fn subnet(&self) -> SwitchSubnet {
         self.allocator.subnet()
+    }
+
+    /// The in-guest box zone of this switch (NET-072, NET-073): what a box
+    /// resolves a sibling's name to, and each box's declared ingress. Shared, so
+    /// every box's relay and the zone dump read the one table.
+    #[must_use]
+    pub fn box_zone(&self) -> Arc<policy::BoxZone> {
+        Arc::clone(&self.box_zone)
     }
 
     fn config_path(&self) -> PathBuf {

@@ -234,6 +234,11 @@ pub enum NsenterError {
     )]
     ShimMissing { path: PathBuf },
 
+    /// The classifier leaf's `cgroup.procs` path holds a NUL byte, so it
+    /// cannot be opened from the forked child.
+    #[error("classifier cgroup path is not a C string: {path}")]
+    CgroupPath { path: PathBuf },
+
     /// `setns(2)` failed. `EPERM` on an otherwise sound setup means one of: the
     /// caller is multi-threaded (which the user namespace forbids), the set
     /// includes a namespace the sandbox never unshared (see
@@ -348,6 +353,7 @@ pub struct Injection {
     cwd: Option<PathBuf>,
     env: Option<BTreeMap<String, String>>,
     shim_exe: Option<PathBuf>,
+    cgroup_procs: Option<PathBuf>,
 }
 
 impl Injection {
@@ -367,7 +373,19 @@ impl Injection {
             cwd: None,
             env: None,
             shim_exe: None,
+            cgroup_procs: None,
         }
+    }
+
+    /// Joins the cgroup whose `cgroup.procs` is `procs` before joining the
+    /// session's namespaces, so the injected process opens its sockets from
+    /// the box's classifier leaf rather than the daemon's
+    /// (`crate::net::host_cohort`). Done by the forked child on itself, from
+    /// the daemon's own cgroup namespace: from inside the box's the leaf is
+    /// not reachable, which is the point of the leaf. `None` joins nothing.
+    pub fn with_cgroup(mut self, procs: Option<PathBuf>) -> Self {
+        self.cgroup_procs = procs;
+        self
     }
 
     /// Starts the program in `cwd`, a path inside the container (`/workbench`
@@ -435,6 +453,17 @@ impl Injection {
             return Err(NsenterError::ShimMissing { path: shim });
         }
 
+        let cgroup_procs = match &self.cgroup_procs {
+            Some(procs) => Some(
+                std::ffi::CString::new(procs.as_os_str().as_encoded_bytes()).map_err(|_| {
+                    NsenterError::CgroupPath {
+                        path: procs.clone(),
+                    }
+                })?,
+            ),
+            None => None,
+        };
+
         let mut cmd = Command::new(shim);
         cmd.arg(SUBCOMMAND).arg("--pidfd").arg(PIDFD_FD.to_string());
         if !namespaces.is_empty() {
@@ -458,14 +487,29 @@ impl Injection {
         cmd.arg("--").arg(&self.program).args(&self.args);
 
         // SAFETY: the closure runs in the forked child between `fork` and
-        // `exec`, where only async-signal-safe calls are legal. `dup2` and
-        // `fcntl` are both on that list, and the closure allocates nothing and
-        // touches no lock. It borrows only `pidfd`, which it owns.
+        // `exec`, where only async-signal-safe calls are legal. `dup2`,
+        // `fcntl`, `open`, `write` and `close` are all on that list, and the
+        // closure allocates nothing and touches no lock. It borrows only
+        // `pidfd` and the prepared cgroup path, which it owns.
         //
         // std installs the child's stdio before running pre_exec closures, so
         // fds 0-2 are already final and fd 3 is free to claim.
         unsafe {
             cmd.pre_exec(move || {
+                if let Some(procs) = &cgroup_procs {
+                    // "0" is the writer itself; the write moves this whole
+                    // process, which has one thread.
+                    let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                    if fd == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let written = libc::write(fd, c"0".as_ptr().cast(), 1);
+                    let err = std::io::Error::last_os_error();
+                    libc::close(fd);
+                    if written != 1 {
+                        return Err(err);
+                    }
+                }
                 let raw = pidfd.as_raw_fd();
                 if raw == PIDFD_FD {
                     // `dup2(fd, fd)` is a no-op that, unlike the copying case,

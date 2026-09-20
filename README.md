@@ -62,6 +62,8 @@ curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/stable' | sh
 
 This installs the stable channel of Minimal, adds `min` to your PATH, and sets up shell completions for bash, fish, and zsh.
 
+On Linux — both x86_64 and ARM64 — the install also carries the microVM stack: the `minvmd` host daemon and the guest payload it boots (kernel, root filesystem, and initramfs). So on a host with KVM, `min session activate --provider local-minvmd` runs a box in a libkrun microVM straight from the install, with no checkout and nothing further to fetch.
+
 Minimal can be uninstalled with:
 
 ```shell

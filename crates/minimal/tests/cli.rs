@@ -44,6 +44,7 @@ fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -55,7 +56,9 @@ fn ls_shows_shared_resource_pool() {
             status: sessions::SessionStatus::Active,
             git: None,
             attrs: None,
+            vm: None,
         }],
+        name_surface: None,
     };
     let mut out = Vec::new();
 
@@ -80,6 +83,7 @@ fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -88,7 +92,9 @@ fn ls_table_exposes_project_path_and_status() {
             status: sessions::SessionStatus::Active,
             git: None,
             attrs: None,
+            vm: None,
         }],
+        name_surface: None,
     };
     let mut out = Vec::new();
 
@@ -359,6 +365,56 @@ async fn ls_warning_clears_on_recovery() {
     );
 }
 
+/// NET-026: `min` learns the hostname-proxy port from the daemon it connected
+/// to and prints that port. The daemon here is serving on a port it selected —
+/// what a second daemon on the machine does — so a client that printed the
+/// standard port from a constant of its own would be printing a dead address.
+#[tokio::test]
+async fn min_prints_discovered_proxy_port() {
+    let (daemon, args) = setup().await;
+    // Stands in for the startup bind: a harness daemon runs no proxy, and the
+    // port a real one lands on is not something a client can induce.
+    let selected = 41_234;
+    daemon
+        .server
+        .state
+        .set_hostname_proxy_port(minimald::server::HostnameProxyPort {
+            port: selected,
+            chosen: "selected",
+        })
+        .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::ListSessions;
+    let listed = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    assert_eq!(
+        listed.hostname_proxy_port,
+        Some(selected),
+        "the daemon must report the port it is serving on"
+    );
+
+    let mut printed = Vec::new();
+    write_hostname_proxy_port(&mut printed, listed.hostname_proxy_port).unwrap();
+    let text = String::from_utf8(printed).unwrap();
+    assert!(
+        text.contains(&format!("127.0.0.1:{selected}")),
+        "min must print the discovered port: {text}"
+    );
+    assert!(
+        !text.contains("7654"),
+        "min must print the discovered port, not the standard one: {text}"
+    );
+
+    // A daemon that reports no port gets no line — better than a guess.
+    let mut silent = Vec::new();
+    write_hostname_proxy_port(&mut silent, None).unwrap();
+    assert!(
+        silent.is_empty(),
+        "nothing to print when the daemon reports no port: {}",
+        String::from_utf8_lossy(&silent)
+    );
+}
+
 // --- activate + ls ---
 
 #[tokio::test]
@@ -383,6 +439,7 @@ async fn activate_creates_session() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        dynamic_ingress: None,
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -426,6 +483,7 @@ async fn activate_uploads_project_files() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        dynamic_ingress: None,
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -508,6 +566,7 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        dynamic_ingress: None,
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -931,8 +990,11 @@ async fn policy_shows_effective_egress() {
     .await
     .unwrap();
 
-    // What the user reads is the policy the daemon holds, field for field.
-    let parsed: sessions::SessionPolicy = serde_json_lenient::from_str(&shown).unwrap();
+    // What the user reads is the policy the daemon holds, field for field
+    // (the baseline set shown beside it is NET-130's, asserted separately).
+    let mut parsed: Value = serde_json_lenient::from_str(&shown).unwrap();
+    parsed.as_object_mut().unwrap().remove("baseline");
+    let parsed: sessions::SessionPolicy = serde_json_lenient::from_value(parsed).unwrap();
     assert_eq!(parsed.egress, Some(egress));
     // Each rule is legible in the line itself, not only after a round trip.
     for rule in [
@@ -946,6 +1008,80 @@ async fn policy_shows_effective_egress() {
         "10.1.0.0/16",
     ] {
         assert!(shown.contains(rule), "{rule} missing from: {shown}");
+    }
+}
+
+/// NET-130: when a box's effective egress is shown, the node-plane baseline
+/// set — the host-side helper's enumeration of what the daemon's own traffic
+/// may reach, by category — is shown beside it, so a deny-all box's owner can
+/// see what still leaves the node and under which category.
+#[tokio::test]
+async fn policy_shows_baseline_set() {
+    let (daemon, args) = setup().await;
+
+    let project_path =
+        camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
+    // Deny-all: nothing the box declares reaches anywhere, so what the line
+    // shows beside its rules is exactly the baseline set.
+    let egress = sessions::EgressPolicy {
+        allow_subnets: Some(vec![]),
+        allow_dns_hosts: None,
+        allow_protocols: None,
+        deny_subnets: None,
+    };
+    let session_id = create_session_with(
+        &daemon,
+        minimald_rpc::SessionConfig {
+            name: Some("deny-all-policy".to_string()),
+            project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
+            network: sessions::NetworkMode::HostNet,
+            policy: sessions::SessionPolicy::new(Some(egress.clone()), None),
+            hooks_enabled: true,
+            attrs: Default::default(),
+        },
+    )
+    .await;
+
+    let shown = session_policy_json(
+        &args,
+        PolicyArgs {
+            session: session_id.to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let parsed: Value = serde_json_lenient::from_str(&shown).unwrap();
+    // The box's rules are still the line's own fields...
+    assert_eq!(
+        parsed["egress"]["allow_subnets"],
+        Value::Array(vec![]),
+        "{shown}"
+    );
+    // ...and the baseline set sits beside them: the helper's enumeration,
+    // every category with a member, the registry and cache never absent.
+    let baseline: minvmd::net::BaselineSet =
+        serde_json_lenient::from_value(parsed["baseline"].clone()).unwrap();
+    let categories: Vec<_> = baseline.entries.iter().map(|e| e.category).collect();
+    assert_eq!(categories, minvmd::net::BaselineCategory::ALL.to_vec());
+    for entry in &baseline.entries {
+        assert!(!entry.destination.is_empty(), "{entry:?}");
+    }
+    assert_eq!(
+        baseline
+            .members(minvmd::net::BaselineCategory::Registry)
+            .count(),
+        1
+    );
+    assert_eq!(
+        baseline
+            .members(minvmd::net::BaselineCategory::Cache)
+            .count(),
+        1
+    );
+    // Legible in the line itself: each category is named beside the rules.
+    for needle in ["\"baseline\"", "\"registry\"", "\"cache\"", "\"resolver\""] {
+        assert!(shown.contains(needle), "{needle} missing from: {shown}");
     }
 }
 

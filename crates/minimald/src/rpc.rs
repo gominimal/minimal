@@ -1,13 +1,13 @@
 use futures::StreamExt as _;
 use minimald_rpc::{
     AbortSession, AbortSessionResponse, CleanCacheRequest, CleanCacheUpdate, CreateSession,
-    DestroySession, DestroySessionResponse, Errorable, FinalizeSession, FinalizeSessionResponse,
-    GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
-    GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen, GetVersion,
-    GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
-    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool, SessionDelta,
-    SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest, ShutdownResponse,
-    SubmitVerdict,
+    DestroySession, DestroySessionResponse, Errorable, Expose, FinalizeSession,
+    FinalizeSessionResponse, GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest,
+    GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen,
+    GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse,
+    NameSurface, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse,
+    ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse, Shutdown,
+    ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -123,9 +123,15 @@ async fn serve_list_sessions(
                 .list()
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            let name_surface = host_name_surface(&s).await;
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
+                // The port this daemon settled on at startup — configured, the
+                // standard one, or a free one it selected — so the client prints
+                // what is actually serving (NET-026).
+                hostname_proxy_port: s.hostname_proxy_port().await.map(|p| p.port),
+                name_surface,
                 resource_pool,
                 // The git probes run in parallel across sessions: each is
                 // one small process under a deadline, and serializing them
@@ -156,6 +162,11 @@ async fn serve_list_sessions(
                                 last: t.into(),
                             }),
                         }),
+                        // The VM this box host serves is a host-side fact (the
+                        // `--vm-name` the VM host daemon was started with); a
+                        // daemon in the guest does not know it, so the client
+                        // that listed the boxes stamps it (NET-057).
+                        vm: None,
                     }
                 }))
                 .await,
@@ -284,6 +295,7 @@ async fn serve_create_session(
             // manager: the success record below needs it, and the reply
             // carries only the assigned id.
             let session_name = req.config.name.clone();
+            let resolver_advisory = host_resolution_advisory(&s).await;
 
             Ok(match mngr.create_session(req.config, ssh_username).await {
                 Ok(id) => {
@@ -301,6 +313,7 @@ async fn serve_create_session(
                         id,
                         daemon_version: Some(OWN_VERSION.to_string()),
                         hostname_routing_unavailable: s.proxy_unavailable().await,
+                        resolver_advisory,
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
@@ -316,6 +329,48 @@ async fn serve_create_session(
             })
         })
         .await
+}
+
+/// NET-122/NET-123: the host's native-resolution state at a session start —
+/// the resolver hook and the bind probe over the reserved range — as the
+/// advisory the reply carries, or `None` when nothing needs doing.
+///
+/// Judged only by a daemon on the host itself. Inside a VM the loopback the
+/// probe would bind is the guest's and the host's resolver is out of reach,
+/// so a guest daemon says nothing rather than something wrong, and the client
+/// on the host judges both halves itself. The one info line here is the
+/// session-start record of the probe and the surface chosen.
+async fn host_resolution_advisory(s: &ServerStateHandle) -> Option<minimald_rpc::ResolverAdvisory> {
+    if s.in_microvm().await {
+        return None;
+    }
+    let host = crate::net::answerer::HostResolution::probe();
+    tracing::info!(
+        resolver_configured = host.resolver_configured,
+        range = ?host.range,
+        surface = host.surface(),
+        "session start: native resolution state"
+    );
+    host.advisory()
+}
+
+/// NET-018: which surface serves box names on this host right now, for a
+/// `ListSessions` reply — `min ls`'s and `min dash`'s positive counterpart
+/// to [`host_resolution_advisory`]'s "what's wrong". Judged the same way and
+/// with the same microVM carve-out: a guest daemon cannot judge its own
+/// host, so it says nothing and leaves the client to judge itself
+/// ([`crate::net::answerer::HostResolution`] fields are public precisely so
+/// a caller here can read them without a dedicated accessor).
+async fn host_name_surface(s: &ServerStateHandle) -> Option<NameSurface> {
+    if s.in_microvm().await {
+        return None;
+    }
+    let host = crate::net::answerer::HostResolution::probe();
+    Some(if host.resolver_configured && host.range.is_present() {
+        NameSurface::Native
+    } else {
+        NameSurface::Proxy
+    })
 }
 
 /// `ConfigureLoadout`: composes a created session's loadout from the
@@ -462,6 +517,39 @@ async fn serve_rename_session(
             .await;
             match res {
                 Ok(()) => Ok(Errorable::Ok(RenameSessionResponse)),
+                Err(e) => Ok(Errorable::Err {
+                    error: e.to_string(),
+                }),
+            }
+        })
+        .await
+}
+
+/// `Expose`: `min net expose <port>` on an un-enrolled host, served by the
+/// local daemon (NET-043). The session actor decides the request against
+/// the box's `dynamic_ingress` setting and publishes it under an allow; the
+/// answer carries the decision, typed, and the RPC's own error is reserved
+/// for a session that cannot be found or a record that cannot be written.
+async fn serve_expose(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    Expose
+        .handle_channel(c, async |req| {
+            let res = async {
+                match s
+                    .sessions_manager()
+                    .await
+                    .get_session(SessionKeyPredicate::Id(req.id))
+                    .await?
+                {
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no session with ID `{}`", req.id.as_ref()),
+                    )),
+                    Some(h) => h.expose(req.port, req.proto).await,
+                }
+            }
+            .await;
+            match res {
+                Ok(response) => Ok(Errorable::Ok(response)),
                 Err(e) => Ok(Errorable::Err {
                     error: e.to_string(),
                 }),
@@ -1584,6 +1672,7 @@ pub async fn handle_ssh_rpc(
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
+        | Expose::NAME
         | minimald_rpc::GetSessionHooks::NAME
         | SessionDelta::NAME
         | GetSessionScreen::NAME
@@ -1667,6 +1756,7 @@ pub async fn handle_ssh_rpc(
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
+        Expose::NAME => serve!(serve_expose(s, channel)),
         minimald_rpc::GetSessionHooks::NAME => serve!(serve_get_session_hooks(s, channel)),
         SessionDelta::NAME => serve!(serve_session_delta(s, channel)),
         GetSessionScreen::NAME => serve!(serve_get_session_screen(s, channel)),
@@ -2577,6 +2667,7 @@ mod tests {
                 // /uwu is not a git repository, so the probe yields nothing.
                 git: None,
                 attrs: None,
+                vm: None,
             }]
         );
     }
@@ -2632,6 +2723,123 @@ mod tests {
             .ok()
             .expect("an unasserted create must behave as it always has");
         assert_eq!(created.daemon_version.as_deref(), Some(OWN_VERSION));
+    }
+
+    /// NET-123: a session start runs the bind probe over the whole reserved
+    /// range and the reply reports what it and the resolver-hook check found,
+    /// read afresh at every start rather than latched (NET-122).
+    #[tokio::test]
+    async fn session_start_probes_reserved_range() {
+        use crate::net::answerer::{self, HostResolution};
+
+        // The probe covers every address a box could be published at.
+        assert_eq!(answerer::reserved_range().count(), 254);
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // What this host shows right now, read the same way the create does.
+        let host = HostResolution::probe();
+        let created = client
+            .call::<CreateSession>(&req("first", "/uwu"))
+            .await
+            .unwrap();
+        assert_eq!(created.resolver_advisory, host.advisory());
+        // Linux carries all of 127/8 on `lo`, so the range is found and the
+        // only thing left to advise is the resolver hook; the reply says so
+        // rather than reporting an interim this host is not on.
+        #[cfg(target_os = "linux")]
+        {
+            assert!(host.range.is_present(), "{:?}", host.range);
+            match &created.resolver_advisory {
+                Some(advisory) => {
+                    assert!(advisory.range_present);
+                    assert_eq!(advisory.range_gap, None);
+                    assert!(!advisory.resolver_configured);
+                }
+                None => assert!(host.resolver_configured),
+            }
+        }
+
+        // Nothing is remembered from the first start: the second reply is
+        // the state as read again, not the first reply echoed.
+        let again = client
+            .call::<CreateSession>(&req("second", "/uwu"))
+            .await
+            .unwrap();
+        assert_eq!(again.resolver_advisory, HostResolution::probe().advisory());
+    }
+
+    /// NET-019: native resolution superseding the proxy as the *reported*
+    /// surface (NET-018) must not touch the proxy's own lifecycle — design
+    /// §7.1's "the proxy keeps running after native resolution supersedes
+    /// it." Supersession is represented directly (both `HostResolution`
+    /// halves in place) rather than by mutating this host's real resolver
+    /// state, and a request through the daemon's own egress-proxy wiring
+    /// still routes to a live box regardless.
+    #[tokio::test]
+    async fn proxy_keeps_serving_after_supersession() {
+        use crate::net::answerer::{HostResolution, RangeProbe};
+        use crate::net::proxy::{Router, serve};
+
+        let superseded = HostResolution {
+            resolver_configured: true,
+            range: RangeProbe::Present,
+        };
+        assert!(
+            superseded.advisory().is_none(),
+            "supersession must clear the advisory: {superseded:?}"
+        );
+
+        // A backend the proxy will forward to, and a live box registered
+        // in the same shared registry `ListSessions`/`CreateSession` read.
+        let backend = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = backend.accept().await {
+                let mut scratch = [0u8; 1024];
+                let _ = sock.read(&mut scratch).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let server = TestServer::new().await;
+        let registry = server.state.sessions_manager().await.hostnames();
+        let hostname = registry.write().unwrap().register(
+            SessionId::nil(),
+            "web",
+            std::net::Ipv4Addr::LOCALHOST.into(),
+        );
+
+        let proxy = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        // The box carries the host's address, so it declares no ingress of its
+        // own and every port a direct connection reaches routes (NET-071).
+        let admissions = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::net::policy::BoxAdmissions::new(),
+        ));
+        admissions.write().unwrap().declare(
+            "web",
+            crate::net::policy::BoxDeclaration::for_host_address(crate::net::DEFAULT_SUBNET),
+        );
+        tokio::spawn(serve(proxy, Router::new(registry, admissions)));
+
+        let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let request = format!("GET / HTTP/1.1\r\nHost: {hostname}:{backend_port}\r\n\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.contains("200 OK"),
+            "the proxy must keep routing a live box while native resolution supersedes it \
+             as the reported surface, got: {response}"
+        );
     }
 
     /// The two read RPCs the attach / exec / setup-zed paths

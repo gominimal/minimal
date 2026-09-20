@@ -11,6 +11,7 @@ use sandbox2::{
     Spawned, TapSpec,
 };
 use sessions::NetworkMode;
+use sessions::core::net_verdict::{EgressRules, Endpoint};
 use tokio::sync::Mutex;
 
 use crate::net::policy::{ControlChannel, HostReach};
@@ -49,6 +50,8 @@ pub(crate) fn network_for(
     match mode {
         NetworkMode::HostNet => Arc::new(HostNetNetwork {
             switch: Arc::clone(switch),
+            identity: identity.to_string(),
+            egress,
         }),
         NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
             switch: Arc::clone(switch),
@@ -82,45 +85,90 @@ pub(crate) fn host_reach(mode: NetworkMode, transport: SwitchTransport) -> Optio
 
 /// A host-address box: it shares the host's (or its node's) network namespace, so
 /// there is nothing to reserve and nothing to wire after the spawn. What it does
-/// need decided is its resolver, which [`host_net_plan`] reads from the switch.
+/// need decided is its resolver, which [`host_net_plan`] reads from the switch
+/// and from the box's own declaration.
 struct HostNetNetwork {
     switch: Arc<Mutex<SwitchClient>>,
+    /// The box's name, under which it declares itself to the hostname surfaces
+    /// (NET-071): a host-address box declares no ingress of its own, and its
+    /// egress is not attributable to it from outside (NET-078).
+    identity: String,
+    /// The box's declared egress rules. A deny-all declaration decides the
+    /// resolver on a native host (NET-003); its enforcement is the box host's
+    /// classifier, decided at session start (`crate::net::host_cohort`).
+    egress: Option<sessions::EgressPolicy>,
 }
 
 impl std::fmt::Debug for HostNetNetwork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostNetNetwork").finish_non_exhaustive()
+        f.debug_struct("HostNetNetwork")
+            .field(
+                "deny_all",
+                &crate::net::host_cohort::is_deny_all(self.egress.as_ref()),
+            )
+            .finish_non_exhaustive()
     }
 }
 
 impl Network for HostNetNetwork {
     /// Reads the switch to learn which host this is — nothing is reserved, and
     /// the default no-op `attach`/`abandon` stand.
+    ///
+    /// It is also where the box declares itself to the daemon's hostname
+    /// surfaces: a host-address box has no attach of its own to declare at, and
+    /// what it declares never changes — the host's address, no ingress of its
+    /// own, and no egress attributable to it from outside (NET-071, NET-078).
     fn plan(&self) -> PlanFuture<'_> {
         Box::pin(async move {
-            let (transport, subnet) = {
+            let (transport, subnet, admissions) = {
                 let switch = self.switch.lock().await;
-                (switch.transport(), switch.subnet())
+                (switch.transport(), switch.subnet(), switch.admissions())
             };
-            Ok(host_net_plan(subnet, transport))
+            admissions
+                .write()
+                .expect("box declarations lock poisoned")
+                .declare(
+                    &self.identity,
+                    crate::net::policy::BoxDeclaration::for_host_address(subnet),
+                );
+            Ok(host_net_plan(subnet, transport, self.egress.as_ref()))
         })
     }
 }
 
 /// The plan a host-address box launches with: the host's namespace, and the
-/// resolver its reach implies (NET-003). Pure, so both hosts are testable
-/// without a switch.
+/// resolver its reach and its declaration imply (NET-003). Pure, so both hosts
+/// are testable without a switch.
 ///
 /// Inside a VM-backed host the host's own resolver is not this box's to use: it
 /// sits on the far side of the switch, and `Resolver::Host` would leave the box
 /// with whatever its rootfs shipped or a synthesized copy of the node's file. The
 /// node's DNS layer — gvproxy, answering at the switch gateway — is what answers
 /// the box zone and forwards what the box may resolve, so it is named outright.
-fn host_net_plan(subnet: SwitchSubnet, transport: SwitchTransport) -> NetPlan {
+///
+/// On a native host the box shares the host's namespace, and a deny-all box
+/// resolves through the box zone's answerer, never the host's own resolver:
+/// the host's stub forwards any name upstream, so a deny-all box reaching it
+/// through the carve-out would resolve arbitrary names; the answerer forwards
+/// nothing and holds only the zone, which is the whole answer for a deny-all
+/// box. The box's `resolv.conf` names the answerer's address and no port
+/// (a `resolv.conf` cannot), while the answerer listens on its own port
+/// ([`crate::net::answerer::ANSWERER_PORT`]): until it also answers on 53,
+/// or a forwarder there does, a deny-all native box resolves nothing, which
+/// is the deny-all outcome for every name outside the zone and a gap for the
+/// zone's own names that the answerer's listener owns. A native host-address
+/// box that is not deny-all keeps the host's resolver, the interim of the
+/// open question on native forwarding.
+fn host_net_plan(
+    subnet: SwitchSubnet,
+    transport: SwitchTransport,
+    egress: Option<&sessions::EgressPolicy>,
+) -> NetPlan {
     let resolver = match host_reach(NetworkMode::HostNet, transport) {
         Some(HostReach::Switch) => Resolver::Nameservers(vec![subnet.dns_server()]),
-        // A native host: the box shares the host's namespace, and its resolver
-        // with it.
+        _ if crate::net::host_cohort::is_deny_all(egress) => {
+            Resolver::Nameservers(vec![crate::net::host_cohort::ANSWERER.ip])
+        }
         _ => Resolver::Host,
     };
     NetPlan::host().with_resolver(resolver)
@@ -320,17 +368,33 @@ impl Network for OwnIpNetwork {
             // The frame verdict's inputs, owned and parsed once here: the
             // lease it must send from, its declared rules, and the resolver
             // carve-out at the switch's DNS address (design §4.1).
-            let mut egress = crate::net::switch::EgressGate::for_box(
-                self.identity.clone(),
-                sessions::core::net_verdict::EgressRules::for_box(
-                    reserved.lease.ip,
-                    self.egress.as_ref(),
-                    Some(sessions::core::net_verdict::Endpoint {
-                        ip: reserved.subnet.dns_server(),
-                        port: 53,
-                    }),
-                ),
+            let rules = EgressRules::for_box(
+                reserved.lease.ip,
+                self.egress.as_ref(),
+                Some(Endpoint {
+                    ip: reserved.subnet.dns_server(),
+                    port: 53,
+                }),
             );
+            // The same rules, declared to the daemon's hostname surfaces with
+            // the lease that attributes them and the ports this box declared
+            // inbound: everything needed to refuse a routed request exactly as
+            // this box's relay refuses the frame (NET-069 to NET-071).
+            self.switch
+                .lock()
+                .await
+                .admissions()
+                .write()
+                .expect("box declarations lock poisoned")
+                .declare(
+                    &self.identity,
+                    crate::net::policy::BoxDeclaration::for_own_address(
+                        reserved.lease.ip,
+                        rules.clone(),
+                        self.ingress.as_ref(),
+                    ),
+                );
+            let mut egress = crate::net::switch::EgressGate::for_box(self.identity.clone(), rules);
             // A box allowing names reaches what they resolve to, less the
             // denied ranges, which hold the switch's own addresses (NET-066,
             // NET-067).
@@ -345,7 +409,11 @@ impl Network for OwnIpNetwork {
             // over QUIC: its datagrams to :443 are dropped (BEP-018).
             let egress =
                 egress.with_quic443(self.credentials.quic443, self.credentials.credentialed);
-            let egress = Arc::new(egress);
+            // The switch's box zone, so a connection to a sibling is accounted
+            // for by name and against the target's own ingress (NET-072,
+            // NET-073). It changes no verdict: the box's rules above decide a
+            // sibling's address as they decide any other.
+            let egress = Arc::new(egress.with_box_zone(self.switch.lock().await.box_zone()));
             let guard = crate::net::gvproxy_network::complete_own_ip_attach(
                 crate::net::gvproxy_network::OwnIpAttach {
                     switch: &self.switch,
@@ -563,6 +631,187 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(plan.resolver(), &Resolver::Host);
+    }
+
+    /// NET-003's native clause. On a native host a deny-all host-address box
+    /// resolves through the box zone's answerer, at the answerer's address,
+    /// and never through the host's own resolver; a native box that is not
+    /// deny-all keeps the host's resolver (the open question's interim), and
+    /// inside a VM-backed host the declaration changes nothing: the node's
+    /// DNS layer answers every host-address box.
+    #[tokio::test]
+    async fn host_ip_box_resolves_through_answerer() {
+        use crate::net::host_cohort::ANSWERER;
+
+        let deny_all = Some(sessions::EgressPolicy {
+            allow_subnets: Some(vec![]),
+            allow_dns_hosts: None,
+            allow_protocols: None,
+            deny_subnets: None,
+        });
+        let native = Arc::new(Mutex::new(SwitchClient::new(
+            "/usr/bin/gvproxy",
+            "/run/minimal/gvproxy",
+        )));
+        let plan = network_for(
+            NetworkMode::HostNet,
+            &native,
+            "s",
+            None,
+            deny_all.clone(),
+            BoxCredentials::default(),
+        )
+        .plan()
+        .await
+        .unwrap();
+        assert!(!plan.isolates_netns(), "still the host's namespace");
+        assert_eq!(
+            plan.resolver(),
+            &Resolver::Nameservers(vec![ANSWERER.ip]),
+            "the box zone's answerer, named outright"
+        );
+        assert_ne!(plan.resolver(), &Resolver::Host, "never the host's own");
+        // The answerer is on the host's loopback: reachable from the host's
+        // namespace, and exactly what the deny-all carve-out admits, at the
+        // address and port it binds.
+        assert!(ANSWERER.ip.is_loopback());
+        assert_eq!(
+            std::net::SocketAddr::from((ANSWERER.ip, ANSWERER.port)),
+            crate::net::answerer::BIND_ADDR
+        );
+
+        // Not deny-all: the host's resolver, until native forwarding is
+        // decided.
+        let open = network_for(
+            NetworkMode::HostNet,
+            &native,
+            "s",
+            None,
+            None,
+            BoxCredentials::default(),
+        )
+        .plan()
+        .await
+        .unwrap();
+        assert_eq!(open.resolver(), &Resolver::Host);
+        let listed = Some(sessions::EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".into()]),
+            ..sessions::EgressPolicy::default()
+        });
+        let plan = network_for(
+            NetworkMode::HostNet,
+            &native,
+            "s",
+            None,
+            listed,
+            BoxCredentials::default(),
+        )
+        .plan()
+        .await
+        .unwrap();
+        assert_eq!(plan.resolver(), &Resolver::Host);
+
+        // VM-backed: the node's DNS layer, deny-all or not.
+        let vm_backed = counting_switch();
+        let plan = network_for(
+            NetworkMode::HostNet,
+            &vm_backed,
+            "s",
+            None,
+            deny_all,
+            BoxCredentials::default(),
+        )
+        .plan()
+        .await
+        .unwrap();
+        assert_eq!(
+            plan.resolver(),
+            &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()])
+        );
+    }
+
+    /// NET-079's exception. On a native host that cannot decide per box, a
+    /// deny-all host-address box (or one carrying any `egress` section)
+    /// launches: its plan is the host's namespace as ever, nothing refuses
+    /// it, no leaf is placed, and what it carries into the box records the
+    /// host as having no per-box enforcement rather than pretending to a
+    /// verdict it has not got.
+    #[tokio::test]
+    async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
+        use crate::net::host_cohort::{
+            ADVISORY_ENV, ENFORCEMENT_ENV, HostProbe, InstallState, PerBoxEnforcement,
+            decide_session_start, install_command,
+        };
+
+        let deny_all = sessions::EgressPolicy {
+            allow_subnets: Some(vec![]),
+            ..sessions::EgressPolicy::default()
+        };
+        // The install step has not run here.
+        let probe = HostProbe {
+            install: InstallState::Missing,
+            install_command: install_command(std::path::Path::new("/state/net/host-classifier")),
+            delegated_root: Some(crate::net::host_cohort::Layout::new(
+                "user.slice/user-1000.slice/user@1000.service/minimald.slice",
+            )),
+            nsdelegate: Some(true),
+            daemon_in_leaf: true,
+            ruleset_loaded: false,
+        };
+        let enforcement = PerBoxEnforcement::decide(&probe);
+        assert!(!enforcement.per_box());
+        assert_eq!(enforcement.record(), "none");
+
+        // The box launches: the plan is the host's namespace, not an error.
+        let native = Arc::new(Mutex::new(SwitchClient::new(
+            "/usr/bin/gvproxy",
+            "/run/minimal/gvproxy",
+        )));
+        for policy in [
+            Some(deny_all.clone()),
+            Some(sessions::EgressPolicy::default()),
+        ] {
+            let net = network_for(
+                NetworkMode::HostNet,
+                &native,
+                "s",
+                None,
+                policy,
+                BoxCredentials::default(),
+            );
+            let plan = net.plan().await.expect("never refused on that ground");
+            assert!(!plan.isolates_netns());
+            // Attach is the no-op every host-address box gets.
+            let guard = net.attach(Spawned::new(1)).await.expect("nothing to wire");
+            guard.teardown().await;
+        }
+
+        // And it is recorded as unenforced, in the box's own environment,
+        // with no leaf to place it in.
+        let start = decide_session_start("s", Some(&deny_all), &probe);
+        assert!(start.placement.is_none());
+        assert!(
+            start
+                .env
+                .contains(&(ENFORCEMENT_ENV.to_string(), "none".to_string()))
+        );
+        let advisory = start
+            .env
+            .iter()
+            .find(|(k, _)| k == ADVISORY_ENV)
+            .map(|(_, v)| v.as_str())
+            .expect("session start says so");
+        assert!(
+            advisory.contains("no per-box egress enforcement"),
+            "{advisory}"
+        );
+
+        // This host, live: the test runner is not a daemon under its user
+        // manager's delegation with the step installed, so the decision is
+        // unenforced and says why rather than claiming otherwise.
+        let live = PerBoxEnforcement::decide(&HostProbe::live());
+        assert!(!live.per_box());
+        assert!(live.advisory().is_some());
     }
 
     /// The privileged tap is used where the daemon is privileged by deployment,

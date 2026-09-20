@@ -313,9 +313,13 @@ fn format_candidate(entry: &ListSessionsEntry, cwd: &paths::HostAbsPath) -> Stri
 /// A row in the attach picker: an existing session to attach to, or the
 /// trailing affordance that creates a fresh session for the cwd. `Display`
 /// renders the row the user sees and fuzzy-searches against.
+///
+/// The session row is boxed so the row stays the size of the create row:
+/// a listing entry is the larger part of a `min ls`-sized struct, and a
+/// picker holds one row per session.
 #[derive(Clone)]
 enum PickerRow {
-    Session(SessionCandidate),
+    Session(Box<SessionCandidate>),
     CreateNew(String),
 }
 
@@ -330,8 +334,9 @@ impl fmt::Display for PickerRow {
 
 /// The user's choice from the attach picker.
 pub(crate) enum Picked {
-    /// Attach to this existing session.
-    Session(ListSessionsEntry),
+    /// Attach to this existing session. Boxed for the same reason
+    /// [`PickerRow`] boxes its session row.
+    Session(Box<ListSessionsEntry>),
     /// The create row was chosen: activate a fresh session for the cwd and
     /// attach, exactly as `min session activate --attach .` would.
     CreateNew,
@@ -348,7 +353,7 @@ fn create_row_label(cwd: &paths::HostAbsPath) -> String {
 /// arm is unit-testable without a live terminal.
 fn resolve_pick(row: PickerRow) -> Picked {
     match row {
-        PickerRow::Session(c) => Picked::Session(c.entry),
+        PickerRow::Session(c) => Picked::Session(Box::new(c.entry)),
         PickerRow::CreateNew(_) => Picked::CreateNew,
     }
 }
@@ -375,10 +380,10 @@ pub(crate) fn pick_session(
     let mut items: Vec<PickerRow> = ordered
         .iter()
         .map(|e| {
-            PickerRow::Session(SessionCandidate {
+            PickerRow::Session(Box::new(SessionCandidate {
                 entry: (*e).clone(),
                 label: format_candidate(e, cwd),
-            })
+            }))
         })
         .collect();
     // Always last, so it never displaces an existing session.
@@ -445,6 +450,7 @@ mod tests {
             status,
             git: None,
             attrs: None,
+            vm: None,
         }
     }
 
@@ -458,6 +464,7 @@ mod tests {
             status,
             git: None,
             attrs: None,
+            vm: None,
         }
     }
 
@@ -841,10 +848,10 @@ mod tests {
             "/a",
             SessionStatus::Active,
         );
-        let row = PickerRow::Session(SessionCandidate {
+        let row = PickerRow::Session(Box::new(SessionCandidate {
             entry: e.clone(),
             label: format_candidate(&e, &cwd("/a")),
-        });
+        }));
         match resolve_pick(row) {
             Picked::Session(got) => assert_eq!(got.id, e.id),
             Picked::CreateNew => panic!("expected the existing session, got create"),

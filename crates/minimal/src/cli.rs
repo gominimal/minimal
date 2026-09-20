@@ -469,6 +469,53 @@ pub enum NetCommand {
     ///   min net forward web 8080:3000
     #[command(verbatim_doc_comment)]
     Forward(NetForwardArgs),
+    /// Make `<name>.min.internal` resolve natively on this machine (root)
+    ///
+    /// The one privileged step behind the advisory `min session activate`
+    /// prints: routes the box zone to the daemon's answerer on
+    /// 127.0.0.1:15353 (a systemd-resolved routing domain on Linux, an
+    /// /etc/resolver file on macOS) and, on macOS, installs the root-held
+    /// boot step that aliases the reserved local range 127.0.64.0/24 onto
+    /// lo0 so every box can be published at an address of its own. Run it
+    /// with sudo; nothing else prompts. The resolver hook is written only
+    /// once the answerer is listening. `--remove` undoes all of it.
+    ///
+    /// Example:
+    ///
+    ///   sudo min net setup
+    #[command(verbatim_doc_comment)]
+    Setup(NetSetupArgs),
+    /// Publish a port of the box you are in, subject to its policy
+    ///
+    /// Asks the daemon to publish `<port>` at the box's address, the way an
+    /// `--ingress` mapping given at activation would have. The daemon decides
+    /// the request against the box's `--dynamic-ingress` setting: allow
+    /// publishes it and lists it in `min session policy`, deny refuses it, ask
+    /// prompts whoever is attached. A refused request publishes nothing.
+    /// Inside a box the session is known; outside one, name it with
+    /// `--session`.
+    ///
+    /// Example:
+    ///
+    ///   min net expose 3000
+    #[command(verbatim_doc_comment)]
+    Expose(NetExposeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct NetExposeArgs {
+    /// The port the box's server listens on
+    pub port: u16,
+    /// The box to publish the port of (default: the box this runs inside)
+    #[arg(long, add = completion::session_completer())]
+    pub session: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct NetSetupArgs {
+    /// Undo the setup: remove the resolver hook and the boot step
+    #[arg(long)]
+    pub remove: bool,
 }
 
 #[derive(Debug, Args)]
@@ -663,6 +710,11 @@ pub struct ActivateArgs {
     /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
     pub ingress: Vec<String>,
+    /// How `min net expose <port>` from inside the box is decided: allow
+    /// publishes the port, deny refuses it, ask prompts whoever is attached.
+    /// Unset, every such request is refused. Requires `--network own_ip`.
+    #[arg(long, value_enum, value_name = "DECISION")]
+    pub dynamic_ingress: Option<CliDynamicIngress>,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
     /// Repeatable. If any `--loadout` is specified, defaults from
     /// `[loadouts].default_loadouts` in the client config are ignored.
@@ -764,6 +816,26 @@ impl From<CliNetworkMode> for sessions::NetworkMode {
                 sessions::NetworkMode::HostNet
             }
             CliNetworkMode::OwnIp | CliNetworkMode::LegacyOwnIp => sessions::NetworkMode::OwnIp,
+        }
+    }
+}
+
+/// CLI surface for [`sessions::DynamicIngress`], for the same reason as
+/// [`CliNetworkMode`]: the `sessions` crate stays free of clap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum CliDynamicIngress {
+    Allow,
+    Deny,
+    Ask,
+}
+
+impl From<CliDynamicIngress> for sessions::DynamicIngress {
+    fn from(d: CliDynamicIngress) -> Self {
+        match d {
+            CliDynamicIngress::Allow => sessions::DynamicIngress::Allow,
+            CliDynamicIngress::Deny => sessions::DynamicIngress::Deny,
+            CliDynamicIngress::Ask => sessions::DynamicIngress::Ask,
         }
     }
 }

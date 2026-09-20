@@ -219,6 +219,12 @@ fi
 # here and its guest is arm64, so it consumes the arm64 guest artifacts; Linux
 # ships both arches.
 #
+# This table is also READ as data: scripts/install_test.sh's
+# linux_<arch>_manifest_ships_vm_stack cases parse the linux rows out of it and
+# drive the installer with exactly them, so the VM stack's shipping claim is
+# checked against this list rather than restated. Keep a row one `|`-separated
+# string on its own line.
+#
 # minvmd carries NO lib/ component on Linux, unlike darwin's libkrun.1.dylib:
 # it links libkrun statically (scripts/build-libkrun-linux.sh) and dlopens
 # nothing, so there is no sibling library to place, no RUNPATH to rewrite, and

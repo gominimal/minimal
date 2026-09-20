@@ -37,6 +37,10 @@ minimald-rpc.workspace = true
 # The JSON file-log layer both daemons write through, so the on-disk log format
 # has one definition (Unit 4).
 mlog.workspace = true
+# The one pure frame verdict (`sessions::core::net_verdict`) the host-side
+# egress filter in `net` applies outside the VM, and the `EgressPolicy` it is
+# derived from.
+sessions.workspace = true
 # Shared gvproxy-switch primitives (subnet/MAC/`-config` rendering) used by `net`.
 switch.workspace = true
 # Async gvproxy switch supervision in `net`: the background exit-detection task
@@ -54,5 +58,6 @@ version.workspace = true
 [dev-dependencies]
 serial_test.workspace = true
 tempfile.workspace = true
-sessions.workspace = true
+# The unknown-source property of the host-side filter (NET-081's T2 twin).
+proptest.workspace = true
 russh-sftp.workspace = true

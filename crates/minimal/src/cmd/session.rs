@@ -369,9 +369,139 @@ async fn deliver_box_grants(
     ))
 }
 
+/// The exact command the resolver advisory names: this very binary, run as
+/// root. Spelled with the binary's full path because `sudo` resolves commands
+/// through its own secure path, on which a user-installed `min` may not be.
+pub(crate) fn resolver_setup_command(exe: &std::path::Path) -> String {
+    format!("sudo {} net setup", exe.display())
+}
+
+/// Renders the resolver advisory for `advisory` (NET-122, NET-123): why
+/// `<name>.min.internal` does not resolve natively on this host yet, what
+/// that means for where boxes are published, and the one command that fixes
+/// it. Writes nothing when there is nothing to advise.
+///
+/// A pointer only. It asks nothing and runs nothing privileged: the command
+/// it names is the privileged step, and the person runs it when they choose.
+/// It is printed at every session start until both halves are in place — a
+/// host still on the `127.0.0.1` interim is told again each time.
+pub(crate) fn write_resolver_advisory(
+    out: &mut impl std::io::Write,
+    advisory: &minimald_rpc::ResolverAdvisory,
+    command: &str,
+) -> std::io::Result<()> {
+    let mut reasons = Vec::new();
+    if !advisory.resolver_configured {
+        reasons.push("the host resolver is not configured for the box zone".to_string());
+    }
+    if !advisory.range_present {
+        let gap = advisory
+            .range_gap
+            .as_deref()
+            .map(|gap| format!(" ({gap})"))
+            .unwrap_or_default();
+        reasons.push(format!(
+            "the reserved local range {} is absent{gap}, so boxes are published at 127.0.0.1 \
+             for now",
+            minimald_rpc::RESERVED_RANGE
+        ));
+    }
+    writeln!(
+        out,
+        "notice: <name>.{} does not resolve natively on this host yet: {}.",
+        minimald_rpc::BOX_ZONE,
+        reasons.join("; ")
+    )?;
+    writeln!(
+        out,
+        "notice: set it up once with (asks for your password; nothing here prompts):"
+    )?;
+    writeln!(out, "  {command}")
+}
+
+/// Renders the NET-018 notice: native resolution is fully in place, so
+/// `<name>.min.internal` resolves without the proxy — and NET-019's other
+/// half, that the proxy keeps serving anyway, for anything already pointed
+/// at it. Shared by `min session activate` and `min ls` so both print the
+/// exact same line.
+pub(crate) fn write_native_surface_notice(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "notice: <name>.{} resolves natively on this host; that is the live surface. \
+         The hostname proxy keeps serving too, for anything already pointed at it.",
+        minimald_rpc::BOX_ZONE
+    )
+}
+
+/// Prints the resolver advisory on stderr: the daemon's when it sent one,
+/// otherwise this host's own judgement. A daemon inside a microVM (every
+/// daemon on macOS) or one that predates the field says nothing, and nothing
+/// from the daemon must not read as nothing to do: the resolver hook and the
+/// reserved range live on the host this binary runs on, so it reads them
+/// itself ([`crate::net::host_resolution_advisory`]).
+///
+/// `None` after that merge means native resolution is fully in place
+/// (NET-018): the positive notice prints instead of nothing.
+fn advise_resolver(advisory: Option<&minimald_rpc::ResolverAdvisory>) {
+    let merged = advisory
+        .cloned()
+        .or_else(crate::net::host_resolution_advisory);
+    let mut stderr = std::io::stderr().lock();
+    // A stderr write that fails is not worth failing the activation over.
+    let _ = match &merged {
+        Some(advisory) => {
+            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("min"));
+            let command = resolver_setup_command(&exe);
+            write_resolver_advisory(&mut stderr, advisory, &command)
+        }
+        None => write_native_surface_notice(&mut stderr),
+    };
+}
+
+/// `min ls`'s NET-018 counterpart to [`advise_resolver`]: prints the native
+/// surface notice once resolution is confirmed native, and nothing
+/// otherwise — `ls` does not repeat the "how to fix it" advisory an
+/// activation already gave. `name_surface` is the daemon's own judgement
+/// (absent from a daemon inside a microVM, or one that predates the field),
+/// with the same host self-check as `min session activate` falls back to.
+pub(crate) fn advise_native_surface(name_surface: Option<minimald_rpc::NameSurface>) {
+    let native = match name_surface {
+        Some(minimald_rpc::NameSurface::Native) => true,
+        Some(minimald_rpc::NameSurface::Proxy) => false,
+        None => crate::net::host_resolution_advisory().is_none(),
+    };
+    if native {
+        // A stderr write that fails is not worth failing the list over.
+        let _ = write_native_surface_notice(&mut std::io::stderr().lock());
+    }
+}
+
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     activate_session(global, args, true).await
+}
+
+/// Tells the user which port this daemon's hostname proxy is serving on, as the
+/// daemon reported it (NET-026), and nothing at all when it reported no port.
+///
+/// The port is discovered rather than assumed because it is not a constant: an
+/// unconfigured daemon takes the standard port while it is free and a free port
+/// otherwise, so on a machine running two daemons — a native one and a VM one —
+/// the second one's names are reachable on a port only that daemon knows. A
+/// daemon that reports nothing (it predates the field, or its listener has not
+/// bound and it is warning about that instead) gets no line: printing a guessed
+/// port would be worse than printing none.
+pub fn write_hostname_proxy_port(
+    out: &mut impl std::io::Write,
+    port: Option<u16>,
+) -> std::io::Result<()> {
+    let Some(port) = port else {
+        return Ok(());
+    };
+    writeln!(
+        out,
+        "box hostnames (*.min.internal) route through this daemon's proxy at 127.0.0.1:{port}"
+    )
 }
 
 /// The activation flow shared by [`cmd_activate`] and the bare-`min` router.
@@ -391,6 +521,11 @@ pub(crate) async fn activate_session(
     if let Some((old, new)) = args.network.legacy_hint() {
         crate::notice::legacy_spelling_hint(&mut std::io::stderr(), "--network", old, new);
     }
+
+    // NET-076: while the deny-all default for an absent `egress` section is
+    // announced but not yet in force, every activate says so — the change is
+    // coming, and this box still reaches everything until it lands.
+    announce_deny_all_default(&mut std::io::stderr(), sessions::DenyAllDefault::from_env());
 
     ensure_daemon(global)?;
 
@@ -419,6 +554,7 @@ pub(crate) async fn activate_session(
             port_mappings,
             dynamic_allowed_range: None,
         }),
+        dynamic_ingress: args.dynamic_ingress.map(Into::into),
     };
 
     // A session with no `--name` still deserves a typable handle, so mint
@@ -565,6 +701,13 @@ pub(crate) async fn activate_session(
             {
                 eprintln!("{warning}");
             }
+            // NET-026: the port comes from the daemon we just connected to, not
+            // from a constant here — a second daemon on this machine serves its
+            // names on a port of its own.
+            let _ = write_hostname_proxy_port(
+                &mut std::io::stderr().lock(),
+                existing_sessions.hostname_proxy_port,
+            );
         }
         Err(_) => {
             // The listing failed. A transport-level closure can leave the
@@ -626,6 +769,7 @@ pub(crate) async fn activate_session(
     // unfinalized for the daemon to reap when this connection drops.
     ensure_version_reported(created.daemon_version.as_deref())?;
     warn_if_hostname_routing_down(created.hostname_routing_unavailable.as_deref());
+    advise_resolver(created.resolver_advisory.as_ref());
     let id = created.id;
 
     // From here the session exists on the daemon in an unfinalized state.
@@ -945,8 +1089,16 @@ pub(crate) async fn activate_session(
 pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
 
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
-        .context("Failed to resolve daemon socket path")?;
+    // A named box is addressed by its name alone: with more than one VM on the
+    // machine, the VM holding it is resolved from the name rather than from a
+    // flag (NET-058). With no box named, the resolution below is the current
+    // directory's, on this machine's default box host — where a bare `min`
+    // creates one when it finds nothing.
+    let sock = match args.session {
+        Some(ref session) => resolve_box_host(global, session).await?.sock,
+        None => client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+            .context("Failed to resolve daemon socket path")?,
+    };
 
     let mut client = client::Client::connect(&sock)
         .await
@@ -1081,7 +1233,7 @@ pub(crate) fn resolve_smart_attach(
                     attach::created_from_suffix(&entry, &cwd)
                 );
             }
-            Ok(SmartAttach::Attach(entry))
+            Ok(SmartAttach::Attach(Box::new(entry)))
         }
         attach::SmartResolve::Pick(cands) => {
             if global.no_input || !attach::can_pick_interactively() {
@@ -1098,8 +1250,9 @@ pub(crate) fn resolve_smart_attach(
 
 /// Outcome of smart attach resolution when the user gave no explicit session.
 pub(crate) enum SmartAttach {
-    /// Attach to this resolved or picked session.
-    Attach(minimald_rpc::ListSessionsEntry),
+    /// Attach to this resolved or picked session. Boxed so the outcome stays
+    /// the size of its other two answers, which carry nothing.
+    Attach(Box<minimald_rpc::ListSessionsEntry>),
     /// The picker's create row was chosen: activate a fresh session for the
     /// cwd and attach, exactly as `min session activate --attach .` would.
     CreateForCwd,
@@ -1123,6 +1276,7 @@ pub(crate) async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), a
             sync: None,
             network: CliNetworkMode::HostNet,
             ingress: Vec::new(),
+            dynamic_ingress: None,
             loadout: Vec::new(),
             no_loadouts: false,
             no_hooks: false,
@@ -1233,19 +1387,68 @@ pub(crate) fn exit_code_of(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(1)
 }
 
+/// Announce the deny-all default for an absent `egress` section while it is
+/// announced but not yet in force (NET-076): the change is coming for a box with
+/// an address of its own that declares no destinations, and the opt-out flag
+/// keeps today's reach. Nothing is written once the window is in force — the
+/// default is then the box's actual posture, which `min session policy` names
+/// (NET-075) — or when the opt-out flag is already set, where nothing is coming.
+///
+/// Written through `out` rather than to stderr directly, so what activate prints
+/// is assertable without capturing the process's stderr.
+pub(crate) fn announce_deny_all_default(
+    out: &mut impl std::io::Write,
+    default: sessions::DenyAllDefault,
+) {
+    if default.window != sessions::DenyAllWindow::Announced || default.opted_out {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "note: a coming release makes deny-all the default for a box with an \
+         address of its own and no `egress` section — such a box will reach \
+         nothing until it declares the destinations it needs; set {}=1 to keep \
+         the current allow-all default",
+        sessions::DENY_ALL_OPT_OUT_VAR
+    );
+}
+
+/// The posture line `min session policy` writes beside the JSON when the box's
+/// effective egress reaches nothing (NET-075). Deny-all is the one posture the
+/// JSON states by omission — an `allow_subnets` list with no entry in it — so it
+/// is named in words, while stdout stays the machine-readable policy. `None` for
+/// a box that declares destinations, or declares no section at all.
+pub(crate) fn egress_posture_line(policy: &sessions::SessionPolicy) -> Option<String> {
+    policy
+        .egress
+        .as_ref()
+        .is_some_and(sessions::EgressPolicy::is_deny_all)
+        .then(|| {
+            "egress: deny-all — this box declares no destination, so it reaches nothing \
+             outside the resolver Minimal owns for it"
+                .to_string()
+        })
+}
+
 /// Print the effective networking policy for a session as JSON.
 pub async fn cmd_session_policy(
     global: &GlobalArgs,
     args: PolicyArgs,
 ) -> Result<(), anyhow::Error> {
-    println!("{}", session_policy_json(global, args).await?);
+    let policy = session_policy(global, args).await?;
+    println!("{}", policy_line(&policy)?);
+    if let Some(line) = egress_posture_line(&policy) {
+        eprintln!("{line}");
+    }
     Ok(())
 }
 
 /// Ask the daemon for a session's effective networking policy and render it as
 /// the JSON line [`cmd_session_policy`] prints: the egress rules the daemon
 /// parsed — every field of the box's `egress` section, including the subnets it
-/// denies — beside its ingress forwarding.
+/// denies — beside its ingress forwarding, and beside the node-plane baseline
+/// set the host-side helper enumerates (NET-130): what the daemon's own traffic
+/// may reach whatever the box declares, by category.
 ///
 /// Split from the command so what the user reads is assertable without
 /// capturing stdout.
@@ -1253,6 +1456,32 @@ pub async fn session_policy_json(
     global: &GlobalArgs,
     args: PolicyArgs,
 ) -> Result<String, anyhow::Error> {
+    policy_line(&session_policy(global, args).await?)
+}
+
+/// Render `policy` as the JSON line shown: the box's policy with the node-plane
+/// baseline set the host-side helper enumerates beside it (NET-130).
+fn policy_line(policy: &sessions::SessionPolicy) -> Result<String, anyhow::Error> {
+    /// The line as shown: the box's policy with the baseline set beside it.
+    #[derive(serde::Serialize)]
+    struct Shown<'a> {
+        #[serde(flatten)]
+        policy: &'a sessions::SessionPolicy,
+        baseline: minvmd::net::BaselineSet,
+    }
+
+    serde_json_lenient::to_string(&Shown {
+        policy,
+        baseline: minvmd::net::BaselineSet::from_host_env(),
+    })
+    .context("Failed to serialize policy")
+}
+
+/// The policy the daemon holds for the session `args` names.
+async fn session_policy(
+    global: &GlobalArgs,
+    args: PolicyArgs,
+) -> Result<sessions::SessionPolicy, anyhow::Error> {
     ensure_daemon(global)?;
 
     let mut client = connect_daemon(global).await?;
@@ -1266,9 +1495,7 @@ pub async fn session_policy_json(
         .context("GetSessionPolicy RPC failed")?;
 
     match resp {
-        minimald_rpc::Errorable::Ok(policy) => {
-            serde_json_lenient::to_string(&policy).context("Failed to serialize policy")
-        }
+        minimald_rpc::Errorable::Ok(policy) => Ok(policy),
         minimald_rpc::Errorable::Err { error } => {
             bail!("{error}")
         }
@@ -1952,12 +2179,221 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
     }
 }
 
+// ---------------------------------------------------------------------------
+// Box hosts across the machine's VMs (NET-057, NET-058)
+
+/// One box host on this machine: the VM it serves and the socket its daemon
+/// answers on.
+///
+/// A machine can run several. A VM started with `minvmd --vm-name <name>` has
+/// its own state directory, socket and box-host daemon under `vms/<name>/`,
+/// while the `default` VM's socket is the provider instance dir's own. The
+/// name is in the path, which is what lets the CLI find a box's VM from the
+/// box's name alone rather than from a flag naming the VM (NET-058).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoxHost {
+    /// The VM whose box host this is — `default` for the unnamed one.
+    pub(crate) vm: String,
+    /// The daemon socket that serves it.
+    pub(crate) sock: PathBuf,
+}
+
+/// Every box host on this machine: the `default` VM first, then each named VM
+/// in name order.
+///
+/// A VM is here when its socket is present — the CLI addresses box hosts over
+/// sockets, and a VM directory with none has no daemon to talk to. The
+/// `default` VM leads so that on a machine with one box host the answer is the
+/// socket the CLI always resolved, unchanged.
+pub(crate) fn box_hosts(global: &GlobalArgs) -> Result<Vec<BoxHost>, anyhow::Error> {
+    let provider_dir =
+        client::resolve_provider_dir(global.minimal_dir.as_deref(), global.use_minvmd())
+            .context("Failed to resolve the provider directory")?;
+    let mut hosts = vec![BoxHost {
+        vm: paths::DEFAULT_VM_NAME.to_string(),
+        sock: provider_dir.join(paths::SSH_SOCK_FILE),
+    }];
+    // A missing `vms/` dir is a machine that has only ever run the default VM,
+    // which is the ordinary case and not a fault.
+    let mut named: Vec<BoxHost> = std::fs::read_dir(provider_dir.join(paths::VMS_SUBDIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let vm = entry.file_name().into_string().ok()?;
+            // Only a directory `minvmd --vm-name` could have created: anything
+            // else under `vms/` names no VM this CLI can address.
+            paths::VmName::new(&vm).ok()?;
+            let sock = entry.path().join(paths::SSH_SOCK_FILE);
+            sock.exists().then_some(BoxHost { vm, sock })
+        })
+        .collect();
+    named.sort_by(|a, b| a.vm.cmp(&b.vm));
+    hosts.extend(named);
+    Ok(hosts)
+}
+
+/// `ListSessions` against one VM's box host, every entry stamped with that VM.
+///
+/// The connection is deliberately not version-gated: this reads another VM's
+/// listing rather than handing off into a session on it, and a VM running a
+/// different build must still be *visible* — its boxes are what a listing is
+/// for. The command that goes on to act on a box asserts the build on its own
+/// connection to that box's host.
+async fn list_one_vm(
+    host: &BoxHost,
+) -> Result<Vec<minimald_rpc::ListSessionsEntry>, anyhow::Error> {
+    let mut client = client::Client::connect(&host.sock)
+        .await
+        .with_context(|| format!("Failed to connect to the box host of VM '{}'", host.vm))?;
+    let resp = client
+        .oneshot_rpc::<minimald_rpc::ListSessions>(())
+        .await
+        .context("ListSessions RPC failed")?;
+    Ok(resp
+        .sessions
+        .into_iter()
+        .map(|mut entry| {
+            entry.vm = Some(host.vm.clone());
+            entry
+        })
+        .collect())
+}
+
+/// Adds the other VMs' boxes to `resp` and says which VM holds each box
+/// (NET-057).
+///
+/// A machine with one box host is left exactly as it was: there is no VM to
+/// tell apart, no entry is stamped, and the listing costs the one round trip it
+/// always did. A VM whose box host does not answer is reported on stderr and
+/// skipped — one VM being down must not take the whole listing with it. The
+/// rest of the response (the daemon's version, its proxy port, its
+/// hostname-routing fault) stays the primary box host's, which is the daemon
+/// the command connected to.
+pub(crate) async fn list_boxes_across_vms(
+    global: &GlobalArgs,
+    resp: &mut minimald_rpc::ListSessionsResponse,
+) {
+    let hosts = match box_hosts(global) {
+        Ok(hosts) => hosts,
+        Err(error) => {
+            eprintln!("warning: could not look for other VMs' boxes: {error:#}");
+            return;
+        }
+    };
+    let Some((primary, others)) = hosts.split_first() else {
+        return;
+    };
+    if others.is_empty() {
+        return;
+    }
+    for entry in &mut resp.sessions {
+        entry.vm = Some(primary.vm.clone());
+    }
+    for host in others {
+        match list_one_vm(host).await {
+            Ok(sessions) => resp.sessions.extend(sessions),
+            Err(error) => eprintln!(
+                "warning: could not list the boxes on VM '{}': {error:#}",
+                host.vm
+            ),
+        }
+    }
+}
+
+/// Whether `entry` is the box `lookup` names — by name, or by id.
+fn entry_is(entry: &minimald_rpc::ListSessionsEntry, lookup: &SessionLookup) -> bool {
+    match lookup {
+        SessionLookup::Id(id) => entry.id == *id,
+        SessionLookup::Name(name) => entry.name.as_deref() == Some(name.as_str()),
+    }
+}
+
+/// The box host holding the box `session` names, resolved from the name alone
+/// (NET-058).
+///
+/// With one box host on the machine nothing needs resolving: its socket is the
+/// answer and no listing is fetched, so the single-VM path is unchanged. With
+/// several, each VM's box host is asked whether it holds the name (or id) — the
+/// box's name is its address, and no global flag names the VM. A name two VMs
+/// both hold is reported as ambiguous, naming both, rather than resolved by an
+/// order nobody chose.
+pub(crate) async fn resolve_box_host(
+    global: &GlobalArgs,
+    session: &str,
+) -> Result<BoxHost, anyhow::Error> {
+    let hosts = box_hosts(global)?;
+    if let [single] = &hosts[..] {
+        return Ok(single.clone());
+    }
+    let lookup = SessionLookup::parse(session);
+    let mut holders = Vec::new();
+    for host in &hosts {
+        match list_one_vm(host).await {
+            Ok(sessions) => {
+                if sessions.iter().any(|entry| entry_is(entry, &lookup)) {
+                    holders.push(host.clone());
+                }
+            }
+            // A VM that cannot be listed cannot be shown to hold the box. Said
+            // at debug: the resolution below reports the outcome, and a VM that
+            // is down is not itself an error when another VM holds the box.
+            Err(error) => tracing::debug!(
+                vm = %host.vm,
+                error = %format!("{error:#}"),
+                "could not ask a VM's box host which boxes it holds"
+            ),
+        }
+    }
+    match holders.as_slice() {
+        [host] => {
+            tracing::debug!(box_name = session, vm = %host.vm, "resolved the box to a VM");
+            Ok(host.clone())
+        }
+        [] => bail!(
+            "No box named '{session}' on any VM of this machine ({}); `min ls` lists every box \
+             with the VM that holds it",
+            vm_names(&hosts)
+        ),
+        many => bail!(
+            "'{session}' names a box on more than one VM ({}); rename one so the name addresses \
+             a single box",
+            vm_names(many)
+        ),
+    }
+}
+
+/// The VMs' names, for a message that has to say which ones were looked at.
+fn vm_names(hosts: &[BoxHost]) -> String {
+    hosts
+        .iter()
+        .map(|host| host.vm.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// [`connect_daemon`] for a command that names a box: connects to the box host
+/// that holds it, on whichever VM that is (NET-058), with the same build
+/// assertion every acting command makes.
+pub(crate) async fn connect_box_host(
+    global: &GlobalArgs,
+    session: &str,
+) -> Result<client::Client, anyhow::Error> {
+    let host = resolve_box_host(global, session).await?;
+    let mut client = client::Client::connect(&host.sock)
+        .await
+        .with_context(|| format!("Failed to connect to the box host of VM '{}'", host.vm))?;
+    ensure_version_match(&mut client).await?;
+    Ok(client)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
     use bep::github::{MemorySignIns, Secret};
     use bep::{Keys, Log, MemoryStore, Revocations, SignIn, SignInStore as _, Submission};
+    use minimald::test_harness::{TestClient, TestServer, create_configured_session};
     use sessions::core::primitives::StrictVarName;
     use sessions::wire::primitives::WireSource;
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
@@ -2323,6 +2759,193 @@ mod tests {
             std::fs::read_to_string(&audit).unwrap().lines().count(),
             2,
             "a submission that went nowhere was recorded"
+        );
+    }
+
+    /// Two VMs on one machine, each with its own box-host daemon: the `default`
+    /// VM's on the provider dir's own socket, and a VM named `beta`'s under
+    /// `vms/beta/` — the paths `minvmd --vm-name` lays down and the CLI looks
+    /// for. The servers and the tempdir are held so the sockets stay live.
+    struct TwoVms {
+        _default_server: TestServer,
+        _beta_server: TestServer,
+        _dir: tempfile::TempDir,
+        global: GlobalArgs,
+        /// A connection to each VM's daemon, for creating that VM's boxes.
+        on_default: TestClient,
+        on_beta: TestClient,
+    }
+
+    async fn two_vms() -> TwoVms {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider = dir.path().join("providers/local-minimald0");
+        std::fs::create_dir_all(&provider).unwrap();
+        let default_server = TestServer::new().await;
+        default_server
+            .listen_on_uds(&provider.join(paths::SSH_SOCK_FILE))
+            .await;
+        let beta_dir = provider.join(paths::VMS_SUBDIR).join("beta");
+        std::fs::create_dir_all(&beta_dir).unwrap();
+        let beta_server = TestServer::new().await;
+        beta_server
+            .listen_on_uds(&beta_dir.join(paths::SSH_SOCK_FILE))
+            .await;
+        let on_default = default_server.connect().await;
+        let on_beta = beta_server.connect().await;
+        TwoVms {
+            _default_server: default_server,
+            _beta_server: beta_server,
+            global: GlobalArgs {
+                minimal_dir: Some(dir.path().to_path_buf()),
+                ..GlobalArgs::default()
+            },
+            _dir: dir,
+            on_default,
+            on_beta,
+        }
+    }
+
+    /// The `ls` table as the operator reads it.
+    fn ls_table(resp: &minimald_rpc::ListSessionsResponse) -> String {
+        let mut out = Vec::new();
+        format_ls(
+            &mut out,
+            &LsArgs {
+                raw: false,
+                json: false,
+            },
+            resp,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// NET-057: with two VMs running, the listing spans both VMs' box hosts and
+    /// every box says which VM holds it — in the entries `--json` carries and
+    /// in the table's own column. A single box host's listing is unchanged:
+    /// there is no VM to tell apart, so no VM is claimed and no column appears.
+    #[tokio::test]
+    async fn ls_shows_vm_per_box() {
+        let mut vms = two_vms().await;
+        create_configured_session(&mut vms.on_default, "on-default", "/tmp").await;
+        create_configured_session(&mut vms.on_beta, "on-beta", "/tmp").await;
+
+        // What the command has in hand before it looks for other VMs: the boxes
+        // of the one box host it connected to, naming no VM.
+        let mut client = connect_daemon(&vms.global).await.unwrap();
+        let mut resp = client
+            .oneshot_rpc::<minimald_rpc::ListSessions>(())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.sessions.len(),
+            1,
+            "one box host lists only its own boxes"
+        );
+        assert!(resp.sessions[0].vm.is_none());
+        assert!(
+            !ls_table(&resp).contains("VM  "),
+            "a listing naming no VM must not grow a VM column"
+        );
+
+        list_boxes_across_vms(&vms.global, &mut resp).await;
+
+        let mut listed: Vec<(String, String)> = resp
+            .sessions
+            .iter()
+            .map(|entry| {
+                (
+                    entry.name.clone().unwrap(),
+                    entry.vm.clone().expect("every box names its VM"),
+                )
+            })
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed,
+            [
+                ("on-beta".to_string(), "beta".to_string()),
+                ("on-default".to_string(), "default".to_string()),
+            ]
+        );
+
+        let table = ls_table(&resp);
+        assert!(
+            table.contains("VM  "),
+            "no VM column in the table:\n{table}"
+        );
+        for (box_name, vm) in [("on-default", "default"), ("on-beta", "beta")] {
+            let row = table
+                .lines()
+                .find(|line| line.contains(box_name))
+                .unwrap_or_else(|| panic!("{box_name} is missing from the table:\n{table}"));
+            assert!(
+                row.starts_with(vm),
+                "the row for {box_name} must name VM {vm}: {row:?}"
+            );
+        }
+    }
+
+    /// NET-058: with two VMs running, naming a box is enough to reach it —
+    /// attach and `min net expose` resolve the VM from the box's name, with no
+    /// global flag naming a VM anywhere. A name two VMs both hold is reported
+    /// as the ambiguity it is rather than resolved by an order nobody chose.
+    #[tokio::test]
+    async fn box_name_resolves_vm_without_flag() {
+        let mut vms = two_vms().await;
+        create_configured_session(&mut vms.on_default, "web", "/tmp").await;
+        let api = create_configured_session(&mut vms.on_beta, "api", "/tmp").await;
+        create_configured_session(&mut vms.on_default, "twin", "/tmp").await;
+        create_configured_session(&mut vms.on_beta, "twin", "/tmp").await;
+
+        // Nothing selects a VM: the only thing named below is the box.
+        assert!(vms.global.provider.is_none());
+        let hosts = box_hosts(&vms.global).unwrap();
+        assert_eq!(
+            hosts
+                .iter()
+                .map(|host| host.vm.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "beta"],
+            "both VMs' box hosts are found from their sockets alone"
+        );
+
+        assert_eq!(
+            resolve_box_host(&vms.global, "web").await.unwrap().vm,
+            "default"
+        );
+        let resolved = resolve_box_host(&vms.global, "api").await.unwrap();
+        assert_eq!(resolved.vm, "beta");
+        assert_eq!(resolved.sock, hosts[1].sock);
+        // By id too: `min session attach` and `min net expose` take either.
+        assert_eq!(
+            resolve_box_host(&vms.global, &api.to_string())
+                .await
+                .unwrap()
+                .vm,
+            "beta"
+        );
+
+        // And the connection a command acts through lands on that VM: the box
+        // is there to be looked up, which it would not be on the other one.
+        let mut client = connect_box_host(&vms.global, "api").await.unwrap();
+        assert_eq!(resolve_session(&mut client, "api").await.unwrap().id, api);
+
+        let ambiguous = format!(
+            "{:#}",
+            resolve_box_host(&vms.global, "twin").await.unwrap_err()
+        );
+        assert!(
+            ambiguous.contains("default") && ambiguous.contains("beta"),
+            "an ambiguous name must name both VMs: {ambiguous}"
+        );
+        let missing = format!(
+            "{:#}",
+            resolve_box_host(&vms.global, "ghost").await.unwrap_err()
+        );
+        assert!(
+            missing.contains("ghost") && missing.contains("beta"),
+            "a name no VM holds must say what was asked: {missing}"
         );
     }
 }

@@ -2,6 +2,7 @@ use ::paths::DaemonAbsPath;
 use russh::keys::key::safe_rng;
 use russh::keys::{PrivateKey, ssh_key::Error as KeyError};
 use serde::{Deserialize, Serialize};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -46,6 +47,13 @@ pub struct Config {
     /// `false` (DM2, native Linux) keeps the local-spawn + tap relay path.
     #[serde(default)]
     pub in_microvm: bool,
+    /// The port the host-side hostname proxy should listen on. `None` — the
+    /// default — lets the daemon pick: the standard
+    /// [`EGRESS_PROXY_PORT`](crate::net::proxy::EGRESS_PROXY_PORT) while it is
+    /// free, else a free port, so a second daemon on the same machine keeps a
+    /// working hostname surface (NET-024/NET-025/NET-027).
+    #[serde(default)]
+    pub hostname_proxy_port: Option<u16>,
     /// Whether the guest boot path actually mounted the writable data volume
     /// at `minimal_state_dir`. Gates the shutdown quiesce (R2.1/R2.2): only a
     /// filesystem this daemon mounted may be synced and unmounted — the vsock
@@ -70,7 +78,8 @@ impl Config {
     /// Returns the SSH host key to use.
     ///
     /// For [`HostKey`] variant `OnDisk{ create_on_missing: true, ..}`,
-    /// a new key will be generated and written if the file does not exist.
+    /// a new key will be generated and written if the file is missing — or
+    /// present but unreadable, which a hard kill of the VM can leave behind.
     pub fn host_key(&self) -> Result<PrivateKey, KeyError> {
         match &self.host_key {
             HostKey::Ephemeral => {
@@ -82,21 +91,72 @@ impl Config {
                 create_if_missing,
             } => match PrivateKey::read_openssh_file(path) {
                 Ok(k) => Ok(k),
-                Err(KeyError::Io(std::io::ErrorKind::NotFound)) => {
-                    if *create_if_missing {
-                        let key =
-                            PrivateKey::random(&mut safe_rng(), russh::keys::Algorithm::Ed25519)?;
-                        key.write_openssh_file(path, russh::keys::ssh_key::LineEnding::LF)?;
-                        Ok(key)
-                    } else {
-                        Err(KeyError::Io(std::io::ErrorKind::NotFound))
+                // Missing is the first-use case; any other failure means the
+                // file is there but unusable — a zero-filled key an unflushed
+                // write left behind a `kill -9` of the VMM, say. Either way a
+                // `create_if_missing` daemon replaces it rather than refusing
+                // to start. A permission error is the exception: the key may be
+                // perfectly good and is not this process's to overwrite.
+                Err(e)
+                    if *create_if_missing
+                        && !matches!(e, KeyError::Io(ErrorKind::PermissionDenied)) =>
+                {
+                    if !matches!(e, KeyError::Io(ErrorKind::NotFound)) {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "on-disk host key unreadable; regenerating"
+                        );
                     }
+                    let key = PrivateKey::random(&mut safe_rng(), russh::keys::Algorithm::Ed25519)?;
+                    write_host_key_atomically(&key, path)?;
+                    Ok(key)
                 }
                 Err(e) => Err(e),
             },
             HostKey::Raw(r) => Ok(PrivateKey::from_openssh(r.as_bytes())?),
         }
     }
+}
+
+/// Writes `key` to `path` as an OpenSSH PEM without ever exposing a partial
+/// file: the bytes land in a sibling `<path>.tmp`, are flushed with
+/// `sync_all`, and only then renamed over `path`. The parent directory is
+/// synced afterwards so the rename itself survives a hard kill — a plain
+/// create-and-write can be left zero-filled by ext4's delayed allocation,
+/// which is exactly the corrupt key the read path above has to recover from.
+fn write_host_key_atomically(key: &PrivateKey, path: &std::path::Path) -> Result<(), KeyError> {
+    let pem = key.to_openssh(russh::keys::ssh_key::LineEnding::LF)?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+
+    let written = (|| -> Result<(), std::io::Error> {
+        let mut options = std::fs::File::options();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // The mode `write_openssh_file` produced before.
+            options.mode(0o600);
+        }
+        let mut file = options.write(true).create(true).truncate(true).open(&tmp)?;
+        std::io::Write::write_all(&mut file, pem.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+
+    // Durability of the rename only; the key bytes are already on disk.
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 /// A one-shot closure that closes the daemon's file-log appender — reloading
@@ -126,6 +186,24 @@ impl std::fmt::Debug for DaemonLogRelease {
     }
 }
 
+/// The hostname proxy's live listen port and how that port was decided.
+///
+/// Recorded once the listener binds, and read back by `ListSessions` so `min`
+/// prints the port in use rather than assuming the default (NET-026), and by
+/// the diagnostic bundle so a support archive says which port each daemon on
+/// the machine took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostnameProxyPort {
+    /// The port the proxy is serving on.
+    pub port: u16,
+    /// A stable token naming how the port was decided: `configured`, `default`
+    /// or `selected` (see [`PortChoice`](crate::net::proxy::PortChoice)). A
+    /// `&'static str` rather than the enum itself so this type — held on the
+    /// server state, which every platform compiles — does not reach into the
+    /// Linux-only `net` module.
+    pub chosen: &'static str,
+}
+
 /// A container for the state of the server.
 #[derive(Debug)]
 pub struct ServerState {
@@ -138,6 +216,12 @@ pub struct ServerState {
     /// daemon-level work that belongs to no session — [`crate::maintenance`]'s
     /// cache clean — can reach the cache without a project mfile.
     daemon_ctx: Arc<mctx::DaemonContext>,
+
+    /// The daemon-scoped gvproxy switch, whose `Arc` the sessions manager also
+    /// holds. Kept here for what belongs to no session either: the hostname
+    /// proxy reads the box declarations it carries, so a routed request is
+    /// decided against what the target box declared (NET-069 to NET-071).
+    net_switch: Arc<Mutex<crate::net::SwitchClient>>,
 
     /// The housekeeping actor, installed by [`Server::run`] once the state
     /// exists (the actor holds a handle to it, so it can't be built in
@@ -158,6 +242,12 @@ pub struct ServerState {
     /// Memoized SSH host key, after first successful load.
     host_key: Option<PrivateKey>,
 
+    /// The in-guest box zone of the daemon's switch (NET-072, NET-073), held
+    /// here so the box-zone answerer can dump it beside the host's own zone.
+    /// The switch itself is the sessions manager's; this is the one table it
+    /// shares, behind the same `Arc` every box's relay reads.
+    box_zone: Arc<crate::net::policy::BoxZone>,
+
     /// Why the host-side egress proxy is not reachable, if it is not. Set by
     /// [`start_host_proxies`] and read by the `ListSessions` RPC.
     ///
@@ -167,6 +257,12 @@ pub struct ServerState {
     /// does not. A fix that surfaced only the first would stay silent on
     /// macOS, which is the platform the failure was reported from.
     proxy_unavailable: Option<String>,
+
+    /// The port the host-side hostname proxy is serving on, and how that port
+    /// was decided. Set by [`start_host_proxies`] once the listener binds, and
+    /// read by the `ListSessions` RPC and the diagnostic bundle. `None` before
+    /// the bind, and on a state built directly in a unit test.
+    hostname_proxy: Option<HostnameProxyPort>,
 
     /// The running WireGuard mesh peer, when one is configured (Unit 4). Only
     /// present under the `networking-wg` feature; the `GetMeshStatus` RPC reads
@@ -208,6 +304,8 @@ impl ServerState {
             .with_transport(transport),
         ));
 
+        let box_zone = net_switch.lock().await.box_zone();
+
         // Build a daemon-scoped mctx config from what the daemon
         // knows today (dirs). Additional flags (offline, stdlib
         // override, num-parallel-builds) will thread through from
@@ -231,17 +329,20 @@ impl ServerState {
                 minimal_state_dir,
                 minimal_cache_dir,
                 Arc::clone(&daemon_ctx),
-                net_switch,
+                Arc::clone(&net_switch),
             )
             .await?,
+            net_switch,
             config,
             daemon_id,
             daemon_ctx,
             maintenance: None,
+            box_zone,
             shutdown: CancellationToken::new(),
             log_release,
             host_key: None,
             proxy_unavailable: None,
+            hostname_proxy: None,
             #[cfg(feature = "networking-wg")]
             mesh: None,
         })
@@ -294,6 +395,27 @@ impl ServerStateHandle {
         self.0.lock().await.sessions.clone()
     }
 
+    /// The in-guest box zone of the daemon's switch, for the zone dump.
+    pub(crate) async fn box_zone(&self) -> Arc<crate::net::policy::BoxZone> {
+        Arc::clone(&self.0.lock().await.box_zone)
+    }
+
+    /// The daemon-scoped switch, for a test to register a running box on.
+    #[cfg(test)]
+    pub(crate) async fn net_switch(&self) -> Arc<Mutex<crate::net::SwitchClient>> {
+        Arc::clone(&self.0.lock().await.net_switch)
+    }
+
+    /// The live box declarations, for the hostname proxy to decide requests
+    /// against (NET-069 to NET-071).
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn box_admissions(
+        &self,
+    ) -> Arc<std::sync::RwLock<crate::net::policy::BoxAdmissions>> {
+        let switch = Arc::clone(&self.0.lock().await.net_switch);
+        switch.lock().await.admissions()
+    }
+
     /// Records why hostname routing is unavailable, so a client can be told.
     ///
     /// `pub` rather than `pub(crate)` because the test harness hands tests the
@@ -314,6 +436,24 @@ impl ServerStateHandle {
     /// Why hostname routing is unavailable, or `None` if the proxy is up.
     pub(crate) async fn proxy_unavailable(&self) -> Option<String> {
         self.0.lock().await.proxy_unavailable.clone()
+    }
+
+    /// Records the port the hostname proxy bound and how it was decided, so
+    /// `ListSessions` can hand it to `min` (NET-026) and the diagnostic bundle
+    /// can name it.
+    ///
+    /// `pub` for the same reason as [`Self::set_proxy_unavailable`]: a test is
+    /// handed the state handle to set up a daemon condition its CLI cannot
+    /// induce — a bound proxy port, on a harness server that never ran
+    /// [`Server::run`], being one of them.
+    pub async fn set_hostname_proxy_port(&self, proxy: HostnameProxyPort) {
+        self.0.lock().await.hostname_proxy = Some(proxy);
+    }
+
+    /// The port the hostname proxy is serving on and how it was decided, or
+    /// `None` before the listener has bound.
+    pub(crate) async fn hostname_proxy_port(&self) -> Option<HostnameProxyPort> {
+        self.0.lock().await.hostname_proxy
     }
 
     /// Returns the daemon-scoped mctx state.
@@ -487,23 +627,31 @@ impl Server {
         log_release: Option<DaemonLogRelease>,
     ) -> Result<(), std::io::Error> {
         // `config` is moved into the state below; capture the deployment-model
-        // flag the proxy startup needs first.
+        // flag and the configured proxy port the proxy startup needs first.
         #[cfg(target_os = "linux")]
         let in_microvm = config.in_microvm;
+        #[cfg(target_os = "linux")]
+        let hostname_proxy_port = config.hostname_proxy_port;
         let state = ServerStateHandle::new(config, log_release).await?;
 
-        // Start minimald's host-side egress proxy (B5, :7654) for the server's
-        // lifetime and, in a microVM (DM1), publish it on the macOS host
+        // Start minimald's host-side egress proxy (B5, :7654 by default) for the
+        // server's lifetime and, in a microVM (DM1), publish it on the macOS host
         // loopback. minimald is Linux-only, and the PTask hostname registry it
         // routes against only exists on Linux.
         #[cfg(target_os = "linux")]
-        start_host_proxies(&state, in_microvm).await;
+        start_host_proxies(&state, in_microvm, hostname_proxy_port).await;
         // The box-zone answerer (NET-006, NET-124..127) serves the host's own
         // lookups of `*.min.internal`. Native hosts only: in a microVM the
         // node's DNS layer answers the zone with switch addresses.
         #[cfg(target_os = "linux")]
         if !in_microvm {
             start_zone_answerer(&state).await;
+            // The host-address classifier's tree (NET-078..NET-080): the
+            // daemon enters its own leaf before any box exists, and writes
+            // what the privileged install step needs.
+            crate::net::host_cohort::native_daemon_start(
+                state.minimal_state_dir().await.as_utf8_path().as_std_path(),
+            );
         }
 
         let russh_config = build_russh_config(&state)
@@ -710,6 +858,125 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
     }
 }
 
+/// The host-side publish of the hostname proxy's port, behind a trait so the
+/// two-VM port policy below can be exercised against a stand-in host.
+///
+/// Only a daemon in a microVM publishes: a native one binds the host loopback
+/// itself and has nothing to hand to a forwarder.
+#[cfg(target_os = "linux")]
+trait HostPublish {
+    /// Publishes `port` on the host loopback, returning why it did not happen.
+    fn publish(&self, port: u16) -> impl std::future::Future<Output = Option<String>> + Send;
+}
+
+/// The real publisher: the host gvproxy forwarder, over the vsock shuttle.
+#[cfg(target_os = "linux")]
+struct GvproxyForwarder;
+
+#[cfg(target_os = "linux")]
+impl HostPublish for GvproxyForwarder {
+    async fn publish(&self, port: u16) -> Option<String> {
+        expose_proxy_on_host(crate::net::DEFAULT_SUBNET.daemon_ip(), port).await
+    }
+}
+
+/// A bound — and, in a VM, published — hostname proxy: the listener to serve,
+/// and the fault to report when the host-side publish did not land.
+#[cfg(target_os = "linux")]
+struct ProxySurface {
+    bound: crate::net::proxy::ProxyListener,
+    unavailable: Option<String>,
+}
+
+/// How many host ports a VM's daemon tries before it reports the publish as
+/// failed. The first collision is the other VM's daemon holding the port and
+/// every retry asks the OS for a port it says is free, so a handful is already
+/// generous; the bound is what stops a host with no forwarder at all from being
+/// walked through ports.
+#[cfg(target_os = "linux")]
+const HOST_PUBLISH_PORT_TRIES: u32 = 4;
+
+/// Whether a refused publish says the host loopback port is already published —
+/// the two-VM case (NET-059), where another VM's daemon got there first — rather
+/// than a fault that retrying the same port will clear (no host forwarder, a
+/// control request that timed out).
+#[cfg(target_os = "linux")]
+fn host_port_already_published(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("already in use") || reason.contains("address in use")
+}
+
+/// Binds the hostname proxy's listener and, in a microVM, publishes its port on
+/// the host loopback — taking a different port when that host port is already
+/// published by another VM's daemon (NET-059).
+///
+/// A guest bind cannot collide with another VM's: each VM has a network of its
+/// own, so both reach for the standard port and both get it. The collision
+/// appears one step later, on the host loopback the port is published to, where
+/// the second VM's publish is refused. Retrying it would leave that VM's box
+/// names unreachable from the machine for as long as the first VM lives, so the
+/// port is re-picked on both sides instead: the guest listener is rebound to a
+/// free port and that port is published, keeping the port a client dials and the
+/// port the daemon reports (NET-026) one number.
+///
+/// A configured port is never moved (NET-024): the operator named it, so a
+/// refusal is reported and retried exactly as before.
+#[cfg(target_os = "linux")]
+async fn bind_and_publish_proxy<P: HostPublish>(
+    bind_base: std::net::IpAddr,
+    configured_port: Option<u16>,
+    default_port: u16,
+    in_microvm: bool,
+    publisher: &P,
+) -> Option<ProxySurface> {
+    use crate::net::proxy::{self, PortChoice, ProxyListener};
+
+    let mut bound =
+        proxy::bind_proxy_listener_with_default(bind_base, configured_port, default_port).await?;
+    if !in_microvm {
+        return Some(ProxySurface {
+            bound,
+            unavailable: None,
+        });
+    }
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let Some(reason) = publisher.publish(bound.port).await else {
+            return Some(ProxySurface {
+                bound,
+                unavailable: None,
+            });
+        };
+        if configured_port.is_some()
+            || !host_port_already_published(&reason)
+            || attempt >= HOST_PUBLISH_PORT_TRIES
+        {
+            return Some(ProxySurface {
+                bound,
+                unavailable: Some(reason),
+            });
+        }
+        tracing::warn!(
+            component = "dns-proxy",
+            port = bound.port,
+            attempt,
+            %reason,
+            "another VM's daemon already publishes this port on the host loopback; taking another"
+        );
+        // Port 0: the OS hands back a free one. Assigning drops the listener
+        // bound a moment ago, so nothing is left listening on a port no client
+        // can reach.
+        let listener = proxy::bind_listener(std::net::SocketAddr::new(bind_base, 0)).await?;
+        let port = listener.local_addr().ok()?.port();
+        bound = ProxyListener {
+            listener,
+            port,
+            choice: PortChoice::Selected,
+        };
+    }
+}
+
 /// Binds and serves minimald's host-side egress proxy for the daemon's lifetime
 /// and, in a microVM (DM1), publishes it on the macOS host loopback.
 ///
@@ -720,12 +987,23 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
 /// directly. A bind failure warns and is skipped — the daemon keeps serving. The
 /// serve loop runs on a detached task; this returns once the listener is bound
 /// and (DM1) exposed.
+///
+/// `configured_port` is the operator's `--hostname-proxy-port`, bound as given;
+/// `None` lets [`bind_proxy_listener`](crate::net::proxy::bind_proxy_listener)
+/// prefer the default port and fall back to a free one, so two daemons on one
+/// machine both keep routing. Either way the port that bound is recorded on the
+/// state for `ListSessions` to hand to `min`.
 #[cfg(target_os = "linux")]
-async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
+async fn start_host_proxies(
+    state: &ServerStateHandle,
+    in_microvm: bool,
+    configured_port: Option<u16>,
+) {
     use crate::net::proxy::{self, Router};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     let registry = state.sessions_manager().await.hostnames();
+    let admissions = state.box_admissions().await;
     // DM1 (in-VM): bind 0.0.0.0 so the listener comes up regardless of whether
     // eth0 has finished coming up, then publish the port on the host loopback via
     // the gvproxy forwarder. DM2: bind host loopback directly, no host-expose.
@@ -735,49 +1013,71 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
         Ipv4Addr::LOCALHOST.into()
     };
 
-    // B5 egress/DNS proxy (:7654), always. Both ways this can fail end with
+    // B5 egress/DNS proxy, always. Both ways this can fail end with
     // `<name>.min.internal` not routing, so both are recorded on the
     // state where `ListSessions` can reach them — a daemon that keeps serving
     // without its proxy looks identical to a healthy one otherwise.
-    let egress_addr = SocketAddr::new(bind_base, proxy::EGRESS_PROXY_PORT);
-    match proxy::bind_listener(egress_addr).await {
-        Some(listener) => {
-            let router = Router::new(registry.clone());
+    match bind_and_publish_proxy(
+        bind_base,
+        configured_port,
+        proxy::EGRESS_PROXY_PORT,
+        in_microvm,
+        &GvproxyForwarder,
+    )
+    .await
+    {
+        Some(ProxySurface { bound, unavailable }) => {
+            let port = bound.port;
+            state
+                .set_hostname_proxy_port(HostnameProxyPort {
+                    port,
+                    chosen: bound.choice.as_str(),
+                })
+                .await;
+            let router = Router::new(registry.clone(), Arc::clone(&admissions));
             tokio::spawn(async move {
-                if let Err(error) = proxy::serve(listener, router).await {
+                if let Err(error) = proxy::serve(bound.listener, router).await {
                     tracing::error!(%error, "egress proxy accept loop exited");
                 }
             });
-            // DM1: the guest bind cannot collide with a host process, so the
-            // failure moves to the publish instead. Only publish a port whose
-            // listener actually bound.
-            if in_microvm
-                && let Some(reason) = expose_proxy_on_host(
-                    crate::net::DEFAULT_SUBNET.daemon_ip(),
-                    proxy::EGRESS_PROXY_PORT,
-                )
-                .await
-            {
+            if let Some(reason) = unavailable {
                 state.set_proxy_unavailable(reason).await;
                 // The listener is serving; only its host-side publish is
                 // missing, so that alone is retried.
                 let state = state.clone();
                 tokio::spawn(async move {
-                    publish_on_host_retrying(proxy::EGRESS_PROXY_PORT).await;
+                    publish_on_host_retrying(port).await;
                     state.clear_proxy_unavailable().await;
                 });
             }
         }
         None => {
-            // DM2: something else on the host holds the port.
+            // A configured port held by something else: reported and retried,
+            // never swapped for another — an unconfigured daemon would have
+            // selected a free port instead of landing here.
+            let egress_addr = SocketAddr::new(
+                bind_base,
+                configured_port.unwrap_or(proxy::EGRESS_PROXY_PORT),
+            );
             state
                 .set_proxy_unavailable(format!(
                     "the daemon could not bind {egress_addr}; another process is \
                      holding it. Check with: lsof -nP -iTCP:{} -sTCP:LISTEN",
-                    proxy::EGRESS_PROXY_PORT
+                    egress_addr.port()
                 ))
                 .await;
-            recover_egress_listener(state.clone(), registry.clone(), egress_addr, in_microvm);
+            recover_egress_listener(
+                state.clone(),
+                registry.clone(),
+                admissions,
+                egress_addr,
+                in_microvm,
+                if configured_port.is_some() {
+                    proxy::PortChoice::Configured
+                } else {
+                    proxy::PortChoice::Default
+                },
+            );
         }
     }
 }
@@ -794,8 +1094,10 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
 fn recover_egress_listener(
     state: ServerStateHandle,
     registry: Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
+    admissions: Arc<std::sync::RwLock<crate::net::policy::BoxAdmissions>>,
     addr: std::net::SocketAddr,
     in_microvm: bool,
+    chosen: crate::net::proxy::PortChoice,
 ) {
     use crate::net::proxy::{self, Router};
 
@@ -804,8 +1106,14 @@ fn recover_egress_listener(
         if in_microvm {
             publish_on_host_retrying(addr.port()).await;
         }
+        state
+            .set_hostname_proxy_port(HostnameProxyPort {
+                port: addr.port(),
+                chosen: chosen.as_str(),
+            })
+            .await;
         state.clear_proxy_unavailable().await;
-        let router = Router::new(registry);
+        let router = Router::new(registry, admissions);
         if let Err(error) = proxy::serve(listener, router).await {
             tracing::error!(%error, "egress proxy accept loop exited");
         }
@@ -860,12 +1168,20 @@ async fn start_zone_answerer(state: &ServerStateHandle) {
             return;
         }
     };
-    let registry = state.sessions_manager().await.hostnames();
+    let zone = state.sessions_manager().await.published();
+    // The steering table, for the names OUTSIDE the zone: a credentialed
+    // hostname a live box steers is answered with the proxy's address, and
+    // SERVFAIL while that listener is down (BEP-062). It is the same registry
+    // the hostname proxy routes through.
+    let steering = state.sessions_manager().await.hostnames();
+    let box_zone = state.box_zone().await;
     let daemon_id = state.daemon_id().await;
     let dump_path =
         answerer::zone_dump_path(state.minimal_state_dir().await.as_utf8_path().as_std_path());
     tokio::spawn(async move {
-        if let Err(error) = answerer::serve(listener, registry, daemon_id, dump_path).await {
+        if let Err(error) =
+            answerer::serve(listener, zone, steering, box_zone, daemon_id, dump_path).await
+        {
             tracing::error!(%error, "box-zone answerer exited");
         }
     });
@@ -951,6 +1267,7 @@ pub(crate) fn test_config(dir: &std::path::Path) -> Config {
         minimal_cache_dir: DaemonAbsPath::try_new(path).unwrap(),
         gvproxy_bin: None,
         in_microvm: false,
+        hostname_proxy_port: None,
         state_volume_mounted: false,
     }
 }
@@ -968,6 +1285,104 @@ mod tests {
     /// A `Config` backed by a fresh tempdir, mirroring `TestServer::new`.
     fn test_config(dir: &TempDir) -> Config {
         super::test_config(dir.path())
+    }
+
+    /// A `Config` whose host key lives at `path`.
+    fn on_disk_key_config(
+        dir: &TempDir,
+        path: &std::path::Path,
+        create_if_missing: bool,
+    ) -> Config {
+        Config {
+            host_key: HostKey::OnDisk {
+                path: path.to_path_buf(),
+                create_if_missing,
+            },
+            ..test_config(dir)
+        }
+    }
+
+    /// The names of every `*.tmp` sibling left in `dir`.
+    fn stray_temp_files(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect()
+    }
+
+    /// A persisted host key left zero-filled by a hard kill of the VM (ext4
+    /// delayed allocation drops the unflushed write) must not be fatal: a
+    /// `create_if_missing` daemon replaces it and boots, and the key it
+    /// returns is the one the next boot will read back.
+    #[test]
+    fn host_key_regenerates_a_corrupt_on_disk_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ssh_host_ed25519_key");
+        std::fs::write(&path, [0u8; 256]).unwrap();
+        assert!(
+            PrivateKey::read_openssh_file(&path).is_err(),
+            "the fixture must be unreadable before the call under test",
+        );
+
+        let key = on_disk_key_config(&dir, &path, true)
+            .host_key()
+            .expect("a corrupt on-disk key must be regenerated, not fatal");
+
+        let reread = PrivateKey::read_openssh_file(&path)
+            .expect("the replacement must be a readable OpenSSH key");
+        assert_eq!(
+            reread.public_key(),
+            key.public_key(),
+            "the key handed to the server must be the one persisted",
+        );
+    }
+
+    /// The key file is only ever observable whole: the write goes through a
+    /// sibling temp file that is renamed into place and never left behind.
+    /// With `create_if_missing: false` a corrupt key is still an error and the
+    /// bytes on disk are left exactly as they were.
+    #[test]
+    fn host_key_write_leaves_no_partial_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ssh_host_ed25519_key");
+
+        let key = on_disk_key_config(&dir, &path, true)
+            .host_key()
+            .expect("a missing key must be generated");
+        assert_eq!(
+            PrivateKey::read_openssh_file(&path).unwrap().public_key(),
+            key.public_key(),
+        );
+        let strays = stray_temp_files(dir.path());
+        assert!(
+            strays.is_empty(),
+            "no temp sibling may survive the write: {strays:?}",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the private key must stay owner-only");
+        }
+
+        // A daemon that did not ask for creation still refuses a corrupt key,
+        // and must not have touched it on the way out.
+        let corrupt = dir.path().join("corrupt_host_key");
+        std::fs::write(&corrupt, [0u8; 256]).unwrap();
+        assert!(
+            on_disk_key_config(&dir, &corrupt, false)
+                .host_key()
+                .is_err(),
+            "create_if_missing: false must propagate the read failure",
+        );
+        assert_eq!(
+            std::fs::read(&corrupt).unwrap(),
+            vec![0u8; 256],
+            "the key file must be left untouched",
+        );
+        let strays = stray_temp_files(dir.path());
+        assert!(strays.is_empty(), "no temp sibling may be left: {strays:?}");
     }
 
     /// The volume-log release must run exactly once no matter how many
@@ -1115,5 +1530,252 @@ mod tests {
             .call::<Shutdown>(&ShutdownRequest { force: false })
             .await;
         let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+    }
+
+    /// This machine's loopback standing in for the host gvproxy's forwarder:
+    /// `port` is published on `127.0.0.1` and relayed to `target` inside the VM
+    /// that published it, or refused in the forwarder's own words when another
+    /// VM already holds it. The host is shared by the two VMs below, which is
+    /// what makes the second VM's publish fail the way it does on a real
+    /// machine.
+    #[cfg(target_os = "linux")]
+    async fn publish_on_host_loopback(port: u16, target: std::net::SocketAddr) -> Option<String> {
+        use std::net::Ipv4Addr;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+            Ok(listener) => listener,
+            Err(error) => return Some(format!("listen tcp 127.0.0.1:{port}: bind: {error}")),
+        };
+        tokio::spawn(async move {
+            while let Ok((mut down, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(mut up) = TcpStream::connect(target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
+                    }
+                });
+            }
+        });
+        None
+    }
+
+    /// One VM's publisher: the address inside that VM a published host port has
+    /// to be relayed back to.
+    #[cfg(target_os = "linux")]
+    struct VmPublisher {
+        guest: std::net::IpAddr,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl HostPublish for VmPublisher {
+        async fn publish(&self, port: u16) -> Option<String> {
+            publish_on_host_loopback(port, std::net::SocketAddr::new(self.guest, port)).await
+        }
+    }
+
+    /// A box-host registry holding one box that carries its node's address, and
+    /// the declarations a routed request is decided against. A host-address box
+    /// declares no ports of its own, so every port a direct connection reaches
+    /// routes — what a test about *names* wants.
+    #[cfg(target_os = "linux")]
+    fn box_named(
+        name: &str,
+    ) -> (
+        Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
+        Arc<std::sync::RwLock<crate::net::policy::BoxAdmissions>>,
+    ) {
+        use crate::net::dns::{DEFAULT_HOST_ID, HostnameRegistry};
+        use crate::net::policy::{BoxAdmissions, BoxDeclaration};
+
+        let registry = Arc::new(std::sync::RwLock::new(HostnameRegistry::new(
+            DEFAULT_HOST_ID,
+        )));
+        registry
+            .write()
+            .unwrap()
+            .register_host_net(::sessions::SessionId::nil(), name);
+        let admissions = Arc::new(std::sync::RwLock::new(BoxAdmissions::new()));
+        admissions.write().unwrap().declare(
+            name,
+            BoxDeclaration::for_host_address(crate::net::SwitchSubnet::default()),
+        );
+        (registry, admissions)
+    }
+
+    /// A loopback backend answering every connection with `200 OK`, standing in
+    /// for the server inside a box. Returns the port it listens on.
+    #[cfg(target_os = "linux")]
+    async fn box_backend() -> u16 {
+        use std::net::Ipv4Addr;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = backend.accept().await {
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 1024];
+                    let _ = sock.read(&mut scratch).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        port
+    }
+
+    /// One `GET` through the host's published port, carrying `authority` as its
+    /// `Host:` header, and the raw response that came back.
+    #[cfg(target_os = "linux")]
+    async fn get_through_host(port: u16, authority: &str) -> String {
+        use std::net::Ipv4Addr;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut client = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let request = format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// A free loopback port: bound only to learn a port the OS had free, then
+    /// dropped. What the default hostname-proxy port stands in as, so the test
+    /// never depends on whatever holds the standard one on this machine.
+    #[cfg(target_os = "linux")]
+    async fn free_port() -> u16 {
+        tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// NET-059: with two VMs running, both VMs' box hostnames route through the
+    /// host's hostname surface at the same time.
+    ///
+    /// Each VM's daemon binds its hostname proxy inside its own VM, where the
+    /// standard port is always free, so the only place two VMs can collide is
+    /// the host loopback they publish that port on. Both VMs are stood up here
+    /// as their own addresses on this machine's loopback net, preferring one
+    /// default port, against a shared host that holds each port once and relays
+    /// it into the VM that published it — the forwarder's behaviour. The second
+    /// VM's publish is refused, it takes another port, and a request to each
+    /// published port then reaches that VM's own box and no other's.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn two_vms_hostnames_route_concurrently() {
+        use crate::net::proxy::{self, Router};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let default_port = free_port().await;
+        // Two VMs, each with an address of its own: inside a VM the daemon's
+        // bind can never meet the other VM's.
+        let alpha_guest = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let beta_guest = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3));
+
+        let alpha = bind_and_publish_proxy(
+            alpha_guest,
+            None,
+            default_port,
+            true,
+            &VmPublisher { guest: alpha_guest },
+        )
+        .await
+        .expect("the first VM's daemon binds and publishes");
+        let beta = bind_and_publish_proxy(
+            beta_guest,
+            None,
+            default_port,
+            true,
+            &VmPublisher { guest: beta_guest },
+        )
+        .await
+        .expect("the second VM's daemon binds and publishes");
+
+        assert_eq!(
+            alpha.unavailable, None,
+            "the first VM's publish must land: {:?}",
+            alpha.unavailable
+        );
+        assert_eq!(
+            beta.unavailable, None,
+            "the second VM must end up published too, not left reporting a held port: {:?}",
+            beta.unavailable
+        );
+        assert_eq!(alpha.bound.port, default_port);
+        assert_ne!(
+            alpha.bound.port, beta.bound.port,
+            "two VMs cannot share one host loopback port"
+        );
+        assert_eq!(
+            beta.bound.choice,
+            proxy::PortChoice::Selected,
+            "the second VM's port was selected after the first one's was held"
+        );
+
+        // Each VM serves its own box's name, and only that one.
+        let (alpha_registry, alpha_admissions) = box_named("alpha-web");
+        let (beta_registry, beta_admissions) = box_named("beta-web");
+        let alpha_port = alpha.bound.port;
+        let beta_port = beta.bound.port;
+        tokio::spawn(proxy::serve(
+            alpha.bound.listener,
+            Router::new(alpha_registry, alpha_admissions),
+        ));
+        tokio::spawn(proxy::serve(
+            beta.bound.listener,
+            Router::new(beta_registry, beta_admissions),
+        ));
+
+        // Both surfaces at once: one request per VM, in flight together, each
+        // for its own box, both through the host's published ports.
+        let backend = box_backend().await;
+        let alpha_authority = format!("alpha-web.min.internal:{backend}");
+        let beta_authority = format!("beta-web.min.internal:{backend}");
+        let (alpha_answer, beta_answer) = tokio::join!(
+            get_through_host(alpha_port, &alpha_authority),
+            get_through_host(beta_port, &beta_authority),
+        );
+        assert!(
+            alpha_answer.contains("200 OK"),
+            "the first VM's box must route through the host: {alpha_answer}"
+        );
+        assert!(
+            beta_answer.contains("200 OK"),
+            "the second VM's box must route through the host at the same time: {beta_answer}"
+        );
+
+        // Two surfaces, not one: neither VM answers for the other's boxes.
+        let crossed = get_through_host(alpha_port, &beta_authority).await;
+        assert!(
+            crossed.contains("502 Bad Gateway"),
+            "a VM must not route another VM's box names: {crossed}"
+        );
+    }
+
+    /// A publish refused because the host port is held is the one refusal a
+    /// daemon answers by taking another port; every other refusal is retried on
+    /// the port it has, so a host with no forwarder is not walked through ports.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_held_host_port_moves_the_proxy() {
+        assert!(host_port_already_published(
+            "the daemon could not publish port 7654 on the host loopback via the gvproxy \
+             forwarder: listen tcp 127.0.0.1:7654: bind: Address already in use (os error 98)"
+        ));
+        assert!(host_port_already_published("expose failed: address in use"));
+        assert!(!host_port_already_published(
+            "publishing port 7654 on the host loopback did not complete within 1s"
+        ));
+        assert!(!host_port_already_published(
+            "the daemon could not publish port 7654 on the host loopback via the gvproxy \
+             forwarder: connection refused"
+        ));
     }
 }

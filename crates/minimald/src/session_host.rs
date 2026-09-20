@@ -163,8 +163,43 @@ fn log_session_contents(
     }
 }
 
+/// How long a question put to the attached human is held open before the
+/// asker gives up on it ([`HostHandle::ask`]).
+///
+/// It bounds the *asker*, not the human: the session actor serves one message
+/// at a time, so an `ask` nobody answers would hold everything else that
+/// session owes anyone — a detach, a stop — for as long as the terminal sits
+/// unwatched. Long enough to read a line and press a key, short enough that a
+/// walked-away terminal does not wedge the session.
+const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What became of a yes/no question put to the human attached to a session
+/// ([`HostHandle::ask`]).
+///
+/// Three outcomes, not two: an answer is one thing, and *nobody having
+/// answered* is another — which is what a caller that must fail closed needs
+/// to tell apart from a "no".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// Nobody is attached to the session, so nobody could be asked. Also the
+    /// answer from a host whose runtime loop is gone or wedged: it has no
+    /// terminal to reach either.
+    NobodyAttached,
+    /// The attached human answered: `true` for yes, `false` for no.
+    Answered(bool),
+    /// A prompt reached the attached terminal and no answer came back within
+    /// [`ASK_TIMEOUT`], or the client left with it still up.
+    Unanswered,
+}
+
 enum BindingMsg {
     Stdin(Vec<u8>),
+    /// Put a yes/no question to the human on the other end of this binding,
+    /// over their terminal, alongside whatever their shell is doing. The
+    /// binding answers the `oneshot` from their keystroke; dropping it — a
+    /// binding that leaves with the prompt up — is
+    /// [`Answer::Unanswered`](Answer::Unanswered).
+    Ask(String, oneshot::Sender<Answer>),
     /// The session process ended, so the binding should tear down and raise the
     /// shell-exit prompt. See [`TeardownCause`] for what the binding surfaces.
     ///
@@ -360,6 +395,23 @@ struct Binding {
     /// Daemon-side directory the save-then-delete lane archives into
     /// (`<minimal_state_dir>/archives`). Created on demand at save time.
     archives_dir: std::path::PathBuf,
+    /// The out-of-band question currently on this terminal, waiting for a
+    /// keystroke to answer it. While it is held, keystrokes answer the prompt
+    /// instead of reaching the shell; dropping it answers
+    /// [`Answer::Unanswered`].
+    ask: Option<oneshot::Sender<Answer>>,
+}
+
+/// Reads one keystroke of `data` as an answer to a yes/no prompt: `y` accepts,
+/// `n`, `Enter`, `Escape`, `Ctrl-C` and `Ctrl-D` refuse, and anything else is
+/// no answer at all — a stray key must not decide a question about opening a
+/// port.
+fn answer_key(data: &[u8]) -> Option<bool> {
+    data.iter().find_map(|b| match b {
+        b'y' | b'Y' => Some(true),
+        b'n' | b'N' | b'\r' | b'\n' | 0x1b | 0x03 | 0x04 => Some(false),
+        _ => None,
+    })
 }
 
 impl Binding {
@@ -385,6 +437,7 @@ impl Binding {
             delta,
             name,
             archives_dir,
+            ask: None,
         };
 
         // The channel id ties every line this binding logs back to the
@@ -442,6 +495,32 @@ impl Binding {
                     Some(msg) => {
                         match msg {
                             russh::ChannelMsg::Data{ data } => {
+                                // A prompt on this terminal takes the keystroke
+                                // that answers it: forwarding it to the shell
+                                // instead would both leave the question
+                                // unanswered and type a stray `y` at whatever is
+                                // running. A key that answers nothing leaves the
+                                // prompt up and is dropped — it is not the
+                                // shell's either, since the human is being asked.
+                                if let Some(reply) = self.ask.take() {
+                                    match answer_key(&data) {
+                                        Some(yes) => {
+                                            let _ = w
+                                                .write_all(
+                                                    if yes { b"y\r\n" } else { b"n\r\n" },
+                                                )
+                                                .await;
+                                            tracing::info!(
+                                                session = %self.name,
+                                                answer = yes,
+                                                "the attached human answered a prompt",
+                                            );
+                                            let _ = reply.send(Answer::Answered(yes));
+                                        }
+                                        None => self.ask = Some(reply),
+                                    }
+                                    continue;
+                                }
                                 let _ = self
                                     .stdin_tx
                                     .send(StdinMsg::new(self.generation, StdinMsgKind::Bytes(data)))
@@ -506,6 +585,26 @@ impl Binding {
                     match msg {
                         BindingMsg::Stdin(b) => {
                             let _ = w.write_all(&b).await;
+                        },
+                        BindingMsg::Ask(question, reply) => {
+                            // Written and left: the loop keeps pumping the
+                            // shell's output while the question stands, so a
+                            // prompt never stalls this binding's mailbox (a
+                            // binding that stops draining is shed) and never
+                            // holds the host's loop. The keystroke that answers
+                            // it arrives in the stdin arm above.
+                            tracing::info!(
+                                session = %self.name,
+                                "prompting the attached human",
+                            );
+                            let _ = w
+                                .write_all(format!("\r\n{question} [y/N] ").as_bytes())
+                                .await;
+                            // A second question while one stands cannot happen
+                            // from one session actor, which decides one request
+                            // at a time; if it ever did, the older one is
+                            // unanswered rather than silently replaced.
+                            self.ask = Some(reply);
                         },
                         BindingMsg::TeardownDueToProcessExit { cause, unwind_codes } => {
                             // Before the notices below and before the
@@ -959,6 +1058,10 @@ pub(crate) struct Launched<P, G> {
     /// down explicitly via [`sandbox2::NetGuard::teardown`] at session end.
     /// `None` for `HostNet`/`NoNet` and for the mock launcher.
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
+    /// The `cgroup.procs` of the box's classifier leaf, when this host
+    /// decides per box: every process the daemon injects into the box joins
+    /// it there first (`crate::net::host_cohort`). `None` elsewhere.
+    cohort_procs: Option<std::path::PathBuf>,
     /// Path of the session PTY's slave side, so hooks can open the
     /// terminal briefly rather than the host retaining a descriptor.
     tty_path: std::path::PathBuf,
@@ -994,6 +1097,12 @@ enum Message {
     /// Snapshot the terminal screen for a read-only preview (`min dash`).
     /// Answered straight off the parser — no PTY resize, no I/O relay.
     GetScreen(oneshot::Sender<minimald_rpc::ScreenSnapshot>),
+
+    /// Put a yes/no question to the human attached to this session, and reply
+    /// with what became of it. Handed straight to the attached binding, never
+    /// awaited here: the human takes as long as they take, and this loop has a
+    /// pty to pump meanwhile.
+    Ask(String, oneshot::Sender<Answer>),
 
     SetTitleCallback(String),
     VisualBellCallback,
@@ -1216,6 +1325,38 @@ impl HostHandle {
         }
     }
 
+    /// Puts `question` to the human attached to this session, and reports what
+    /// became of it (NET-045).
+    ///
+    /// The prompt is rendered on their terminal alongside whatever their shell
+    /// is doing, and answered by one keystroke. Nothing here answers for them:
+    /// a session nobody is attached to, a host that cannot be reached, and a
+    /// prompt left unanswered are each reported as themselves, so a caller that
+    /// must fail closed can say which happened — and say so to the human's
+    /// face, rather than recording a "no" they never gave.
+    pub async fn ask(&self, question: String) -> Answer {
+        let (send, recv) = oneshot::channel();
+        // A host whose loop is gone or wedged has no terminal to reach, which
+        // is indistinguishable — to the asker — from nobody being attached.
+        if self
+            .sender
+            .send_timeout(
+                Message::Ask(question, send),
+                crate::session::HOST_PROBE_TIMEOUT,
+            )
+            .await
+            .is_err()
+        {
+            return Answer::NobodyAttached;
+        }
+        match tokio::time::timeout(ASK_TIMEOUT, recv).await {
+            Ok(Ok(answer)) => answer,
+            // The binding left with the prompt up, taking the reply with it.
+            Ok(Err(_)) => Answer::Unanswered,
+            Err(_) => Answer::Unanswered,
+        }
+    }
+
     /// Whether both handles address the same host.
     pub fn same_host(&self, other: &Self) -> bool {
         self.sender.same_channel(&other.sender)
@@ -1406,6 +1547,8 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // down explicitly in `mainloop` when the session ends, before `_guard` (and
     // thus the sandbox files) is dropped. `None` for `HostNet`/`NoNet` and tests.
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
+    /// See [`Launched::cohort_procs`].
+    cohort_procs: Option<std::path::PathBuf>,
 
     /// Path of the session PTY's slave side. Attach and detach hooks
     /// open it briefly so their stdout is a real terminal; the host
@@ -1852,12 +1995,21 @@ const SESSION_WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_DE
 /// which stays correct across skipped uploads, an in-session `min init`,
 /// and attaches from unrelated host directories. TTY-gated, plain text —
 /// `NO_COLOR`-safe, no box drawing.
+///
+/// A session-start advisory about this host's host-address enforcement
+/// (`crate::net::host_cohort`) prints as one more line when the launcher
+/// seeded it: the banner is the surface a user reads, where a stderr line
+/// before the shell paints is not.
 const BASELINE_MOTD: &str = constcat::concat!(
     r#"[ -t 1 ] && { printf 'minimal · session %s · loadout %s\ndetach: %s' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-none}" "${MINIMAL_DETACH_HINT:-ctrl-] then d}"; [ -f "#,
     SESSION_WORKSPACE_ROOT,
     r#"/minimal.toml ] || [ -f "#,
     SESSION_WORKSPACE_ROOT,
-    r#"/.minimal/minimal.toml ] || printf ' · no minimal.toml here — min init to add one'; printf '\n'; }"#,
+    r#"/.minimal/minimal.toml ] || printf ' · no minimal.toml here — min init to add one'; printf '\n'; [ -z "${"#,
+    crate::net::host_cohort::ADVISORY_ENV,
+    r#":-}" ] || printf '%s\n' "$"#,
+    crate::net::host_cohort::ADVISORY_ENV,
+    r#""; }"#,
 );
 
 /// The launcher-baseline environment seeded beneath every other layer of
@@ -2002,6 +2154,10 @@ pub(crate) struct SandboxLauncher {
     /// `OwnIp` PTask attaches, removed on exit. `None` for other
     /// network modes.
     pub(crate) ingress: Option<sessions::IngressPolicy>,
+    /// The host's published-box table, for the watch on the box's listening
+    /// ports: a port the box's rules permit publishes itself the moment a
+    /// process in the box listens on it (NET-016).
+    pub(crate) published: std::sync::Arc<std::sync::RwLock<crate::net::publish::PublishTable>>,
     /// The box's declared egress rules, enforced on its relay once it
     /// attaches (NET-062 to NET-064). `None` for no `egress` section.
     pub(crate) egress: Option<sessions::EgressPolicy>,
@@ -2060,6 +2216,20 @@ impl SpawnedProcessGuard {
     }
 }
 
+/// The box's classifier leaf between its creation and the handoff to the
+/// session's network guard: an abandoned launch removes it.
+#[cfg(not(test))]
+struct CohortLeaf(Option<crate::net::host_cohort::Leaf>);
+
+#[cfg(not(test))]
+impl Drop for CohortLeaf {
+    fn drop(&mut self) {
+        if let Some(leaf) = self.0.take() {
+            leaf.remove_now();
+        }
+    }
+}
+
 #[cfg(not(test))]
 impl Drop for SpawnedProcessGuard {
     fn drop(&mut self) {
@@ -2097,6 +2267,7 @@ impl SessionLauncher for SandboxLauncher {
         // Move the ingress policy out of `self` up front so it can be applied
         // after the switch attach below (the rest of `self` is consumed first).
         let ingress = self.ingress;
+        let published = self.published;
         let egress = self.egress;
         let network_mode = self.network_mode;
         let net_switch = self.net_switch;
@@ -2118,6 +2289,40 @@ impl SessionLauncher for SandboxLauncher {
         .await
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
+
+        // A host-address box on a native host: whether this host decides its
+        // declaration per box is decided, logged and recorded now, at session
+        // start (NET-079), and what it decides travels into the box's
+        // environment for the banner to say. Never a refusal: on a host that
+        // cannot decide per box the box runs with its declaration unenforced.
+        // On a host that does decide per box, the box's leaf is created
+        // here, before the spawn, and the process is moved into it right
+        // after; `CohortLeaf` removes the leaf if the launch is abandoned
+        // in between.
+        let host_cohort = if network_mode == NetworkMode::HostNet
+            && matches!(
+                net_switch.lock().await.transport(),
+                crate::net::SwitchTransport::LocalSpawn
+            ) {
+            crate::net::host_cohort::native_session_start(&session_name, egress.as_ref()).await
+        } else {
+            crate::net::host_cohort::SessionStart {
+                env: Vec::new(),
+                placement: None,
+            }
+        };
+        let host_cohort_env = host_cohort.env;
+        let mut cohort_leaf = CohortLeaf(
+            match (
+                &host_cohort.placement,
+                crate::net::host_cohort::native_host(),
+            ) {
+                (Some(placement), Some(host)) => Some(host.place(placement).map_err(|e| {
+                    io::Error::other(format!("placing the box in its classifier leaf: {e}"))
+                })?),
+                _ => None,
+            },
+        );
 
         // Step 1 (pre-spawn): the provider for this PTask's mode reserves what
         // the sandbox needs — for own-IP, a lease and a running gvproxy — and
@@ -2209,8 +2414,12 @@ impl SessionLauncher for SandboxLauncher {
             .as_ref()
             .map(|c| c.orientation().loadouts_display.as_str())
             .filter(|d| !d.is_empty());
+        // The host-cohort record and advisory sit in the baseline with the
+        // banner that prints them.
+        let mut baseline = session_baseline_env(&name, loadouts_display);
+        baseline.extend(host_cohort_env);
         let env_vars = layer_session_env(
-            session_baseline_env(&name, loadouts_display),
+            baseline,
             attach_env.inherited,
             composition_vars,
             attach_env.connection,
@@ -2372,6 +2581,18 @@ impl SessionLauncher for SandboxLauncher {
         // Until this returns, an own-IP PTask's egress isn't up yet, but a shell
         // PTask never probes the network in this window (the SSH layer dispatches
         // commands only after `Launched` is returned).
+        // Into its classifier leaf, before the shell can open a socket (the
+        // SSH layer dispatches nothing until `Launched` is returned): the
+        // box unshared its cgroup namespace at the daemon's leaf, so from
+        // inside, this leaf's siblings and the daemon's are out of reach. A
+        // failed move is a failed launch, never a box left in the daemon's
+        // leaf with the node-plane verdict.
+        if let Some(leaf) = cohort_leaf.0.as_ref() {
+            leaf.adopt(process.get_mut().id()).map_err(|e| {
+                io::Error::other(format!("moving the box into its classifier leaf: {e}"))
+            })?;
+        }
+
         let net_guard: Option<Box<dyn sandbox2::NetGuard>> = {
             let spawned = sandbox2::Spawned::from_child(process.get_mut());
             match planned.attach(spawned).await {
@@ -2381,6 +2602,28 @@ impl SessionLauncher for SandboxLauncher {
                 Err(e) => return Err(io::Error::other(e)),
             }
         };
+        // The leaf outlives the attachment: removed after the provider's own
+        // teardown, once the box has been reaped.
+        let cohort_procs = cohort_leaf.0.as_ref().map(|l| l.procs_file());
+        let net_guard = match cohort_leaf.0.take() {
+            Some(leaf) => Some(
+                Box::new(crate::net::host_cohort::LeafGuard::new(net_guard, leaf))
+                    as Box<dyn sandbox2::NetGuard>,
+            ),
+            None => net_guard,
+        };
+        // The box is attached and its declared ports are published; from here
+        // a port its rules permit publishes itself as soon as something in the
+        // box listens on it, and unpublishes itself when that listener closes
+        // (NET-016, NET-017). The guard ends the watch with the box.
+        let net_guard = crate::net::listen_watch::WatchGuard::start(
+            &session_name,
+            network_mode,
+            ingress.as_ref(),
+            process.get_mut().id(),
+            published,
+            net_guard,
+        );
 
         Ok(Launched {
             master,
@@ -2390,6 +2633,7 @@ impl SessionLauncher for SandboxLauncher {
             },
             guard: env,
             net_guard,
+            cohort_procs,
             tty_path,
         })
     }
@@ -2512,6 +2756,7 @@ impl SessionLauncher for MockLauncher {
             },
             guard: (),
             net_guard: None,
+            cohort_procs: None,
             tty_path,
         })
     }
@@ -2591,6 +2836,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         crate::nsenter::Injection::new(self.session_leader_pid()?, program, args)
             .with_cwd(environment.cwd)
             .with_env(vars)
+            .with_cgroup(self.cohort_procs.clone())
             .command()
     }
 
@@ -2654,6 +2900,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             event,
             commands: crate::hooks::InjectedCommands {
                 leader_pid,
+                cgroup_procs: self.cohort_procs.clone(),
                 cwd: environment.cwd,
                 vars: environment.vars,
             },
@@ -2732,6 +2979,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             process,
             guard,
             net_guard,
+            cohort_procs,
             tty_path,
         } = launcher.launch(name, username, paths, sz).await?;
 
@@ -2768,6 +3016,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             stdout_buf: vec![0u8; 8 * 1024],
             stdin_buf: None,
             net_guard,
+            cohort_procs,
             tty_path,
             composition,
             session_id,
@@ -3093,6 +3342,38 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         let (count, last) = &mut self.attrs.visual_bell;
                         *count += 1;
                         *last = Some(SystemTime::now());
+                    }
+                    Message::Ask(question, reply) => {
+                        match self.remote.as_mut() {
+                            // Bounded like every other send to a binding: a
+                            // binding that cannot take the question within the
+                            // probe deadline leaves it unasked, and dropping
+                            // `reply` with the message tells the asker so.
+                            Some((tx, _hnd)) => if let Err(e) = tx
+                                .send_timeout(
+                                    BindingMsg::Ask(question, reply),
+                                    crate::session::HOST_PROBE_TIMEOUT,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    session_id = %self.session_id,
+                                    error = %e,
+                                    "could not put a question to the attached binding",
+                                );
+                            },
+                            // Nothing attached: nobody to ask, and the asker
+                            // must hear that rather than a refusal it might
+                            // read as an answer.
+                            None => {
+                                tracing::info!(
+                                    session_id = %self.session_id,
+                                    session = %self.session_name,
+                                    "nothing attached to put a question to",
+                                );
+                                let _ = reply.send(Answer::NobodyAttached);
+                            }
+                        }
                     }
                     Message::GetAttrs(s) => {
                         let _ = s.send(self.attrs.clone());

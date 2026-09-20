@@ -440,6 +440,9 @@ impl Env {
             .all(|bsr| cache.read_dir(&graph.spec_hash(bsr)).is_ok());
         if !all_built {
             tracing::trace!("missing local packages, building session env");
+            // The daemon's own fetch, from its own leaf: node-plane traffic,
+            // whatever the boxes on this host declare (NET-080).
+            crate::net::host_cohort::record_node_plane_fetch("session packages");
             ctx.build_graph(&graph, false, None)
                 .await
                 .map_err(err_to_io)?;
@@ -867,6 +870,10 @@ impl SessionChannel {
                 self.run_build(stream, args).await;
                 None
             }
+            Some(("net-expose", port)) => {
+                self.run_net_expose(stream, port).await;
+                None
+            }
             // `<cwd>%<args>`: the helper's sandbox working directory, so a
             // relative `--output` resolves where the user typed it.
             Some(("materialize", request)) => {
@@ -882,6 +889,40 @@ impl SessionChannel {
         if let Some((mode, pkgs)) = add_dep {
             let bsrs: Vec<BuildSpecRef> = pkgs.into_iter().map(|(_n, bsr)| bsr).collect();
             if let Err(e) = self.ctx.add_deps(&self.graph, bsrs, mode) {
+                let _ = writeln!(stream, "error: {e}");
+            }
+        }
+    }
+
+    /// `min net expose <port>` from inside the box (NET-043): the request
+    /// goes to this session's actor, which decides it against the box's
+    /// `dynamic_ingress` setting and publishes it under an allow; the
+    /// decision is relayed as the daemon gave it, typed refusal included.
+    async fn run_net_expose(&mut self, stream: &mut UnixStream, port: &str) {
+        let Ok(port) = port.trim().parse::<u16>() else {
+            let _ = writeln!(stream, "error: usage: min net expose <port>");
+            return;
+        };
+        let Some(session) = self.session.upgrade() else {
+            let _ = writeln!(stream, "error: session is gone");
+            return;
+        };
+        match session.expose(port, sessions::IpProto::Tcp).await {
+            Ok(minimald_rpc::ExposeResponse::Published {
+                hostname,
+                address,
+                mapping,
+            }) => {
+                let _ = writeln!(
+                    stream,
+                    "msg:published {hostname}:{} at {address}:{}",
+                    mapping.internal_port, mapping.external_port
+                );
+            }
+            Ok(minimald_rpc::ExposeResponse::Refused { reason }) => {
+                let _ = writeln!(stream, "error: min net expose {port} refused: {reason}");
+            }
+            Err(e) => {
                 let _ = writeln!(stream, "error: {e}");
             }
         }
@@ -934,6 +975,9 @@ impl SessionChannel {
         // through the same `BuildRenderer` as `min build`, so both read
         // identically; a fully-cached add emits no events and stays quiet.
         let (log_tx, mut log_rx) = futures::channel::mpsc::unbounded();
+        // Fetched by the daemon on the box's behalf, from the daemon's own
+        // leaf: node-plane traffic, not the box's (NET-080).
+        crate::net::host_cohort::record_node_plane_fetch("min add");
         let build = async {
             // Reduce the `!Send` error (`mctx::Error` holds nickel `Rc`s) to a
             // string in the same poll it appears, so `join!` never buffers it

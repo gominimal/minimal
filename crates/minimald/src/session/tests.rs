@@ -2480,3 +2480,355 @@ async fn materializing_patches_carries_their_modes_into_the_home() {
         );
     }
 }
+
+/// The box zone from finalize to destroy (NET-010 to NET-013, NET-128,
+/// NET-129): what a native lookup of `<name>.min.internal` answers, read
+/// through the daemon's published-box table and the answerer that serves it.
+mod zone {
+    use std::net::Ipv4Addr;
+    use std::sync::{Arc, RwLock};
+    use std::time::{Duration, Instant};
+
+    use sessions::core::loopback_alloc::LoopbackAllocator;
+    use sessions::{IngressPolicy, IpProto, NetworkMode, PortMapping, SessionId};
+    use tokio::net::TcpStream;
+
+    use crate::net::answerer::{self, Verdict};
+    use crate::net::dns::NoSteering;
+    use crate::net::publish::{AddressKind, ForwarderState, PublishTable, PublishedBox};
+    use crate::test_harness::{TestClient, TestServer, create_session_req, unwrap_ready};
+
+    use super::{destroy_session, record_exists, session_handle};
+
+    /// The daemon's box zone: the table the answerer serves.
+    async fn zone(server: &TestServer) -> Arc<RwLock<PublishTable>> {
+        server.state.sessions_manager().await.published()
+    }
+    /// A standard `A` query for `<name>.min.internal`, as a resolver sends it.
+    fn a_query(name: &str) -> Vec<u8> {
+        let mut out = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in format!("{name}.min.internal").split('.') {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.extend_from_slice(&[0, 0, 1, 0, 1]);
+        out
+    }
+
+    /// What the answerer says for `<name>.min.internal`: the verdict, and
+    /// the `A` address when it answered one (the record's rdata is the last
+    /// four bytes of the reply).
+    fn resolve(zone: &RwLock<PublishTable>, name: &str) -> (Verdict, Option<Ipv4Addr>) {
+        let reply =
+            answerer::answer(zone, &NoSteering, &a_query(name)).expect("a query is answered");
+        let address = (reply.verdict == Verdict::Answer).then(|| {
+            let octets: [u8; 4] = reply.bytes[reply.bytes.len() - 4..].try_into().unwrap();
+            Ipv4Addr::from(octets)
+        });
+        (reply.verdict, address)
+    }
+
+    /// The address the answerer gives for `<name>.min.internal`, which it
+    /// must give one for.
+    fn address_of(zone: &RwLock<PublishTable>, name: &str) -> Ipv4Addr {
+        match resolve(zone, name) {
+            (Verdict::Answer, Some(address)) => address,
+            other => panic!("{name}.min.internal should answer an address, got {other:?}"),
+        }
+    }
+
+    fn entry(zone: &RwLock<PublishTable>, name: &str) -> PublishedBox {
+        zone.read()
+            .unwrap()
+            .entries()
+            .into_iter()
+            .find(|e| e.hostname == format!("{name}.min.internal"))
+            .unwrap_or_else(|| panic!("{name} is published"))
+    }
+
+    /// Creates, configures and finalizes a session in `network` mode whose
+    /// box publishes `ports` (its own port numbers, each mapped from a
+    /// distinct unprivileged host port).
+    async fn box_publishing(
+        client: &mut TestClient,
+        name: &str,
+        network: NetworkMode,
+        ports: &[u16],
+    ) -> SessionId {
+        use minimald_rpc::{
+            ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+            FinalizeSessionRequest,
+        };
+        let mut req = create_session_req(name, "/uwu");
+        req.config.network = network;
+        if !ports.is_empty() {
+            req.config.policy.ingress = Some(IngressPolicy {
+                port_mappings: ports
+                    .iter()
+                    .map(|port| PortMapping {
+                        external_port: 10_000 + port,
+                        internal_port: *port,
+                        proto: IpProto::Tcp,
+                    })
+                    .collect(),
+                dynamic_allowed_range: None,
+            });
+        }
+        let id = client.call::<CreateSession>(&req).await.unwrap().id;
+        unwrap_ready(
+            client
+                .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
+        match client
+            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .await
+        {
+            Errorable::Ok(_) => id,
+            Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+        }
+    }
+
+    /// NET-010. Two own-address boxes listening on the same port, and a
+    /// `none` box, each answer at a loopback address of their own from the
+    /// reserved range, with their ports published at their own numbers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_box_gets_own_loopback_address() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        box_publishing(&mut client, "web", NetworkMode::OwnIp, &[3000]).await;
+        box_publishing(&mut client, "api", NetworkMode::OwnIp, &[3000]).await;
+        box_publishing(&mut client, "quiet", NetworkMode::NoNet, &[]).await;
+        let zone = zone(&server).await;
+
+        let web = address_of(&zone, "web");
+        let api = address_of(&zone, "api");
+        let quiet = address_of(&zone, "quiet");
+        for (name, address) in [("web", web), ("api", api), ("quiet", quiet)] {
+            assert!(
+                LoopbackAllocator::in_range(address),
+                "{name} answers {address}, outside the reserved range"
+            );
+            assert_eq!(entry(&zone, name).kind, AddressKind::Own);
+        }
+        assert_ne!(web, api, "two boxes on port 3000 answer at two addresses");
+        assert_ne!(web, quiet);
+        assert_ne!(api, quiet);
+        assert_eq!(
+            entry(&zone, "web").ports,
+            vec![3000],
+            "the box's own port number"
+        );
+        assert_eq!(entry(&zone, "api").ports, vec![3000]);
+        assert!(
+            entry(&zone, "web").collisions.is_empty(),
+            "own addresses never collide"
+        );
+    }
+
+    /// NET-011. The name is registered when the session is finalised: a
+    /// created, even a configured, session answers NXDOMAIN, and the
+    /// finalize is what makes it answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn name_registered_at_finalize() {
+        use minimald_rpc::{
+            ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+            FinalizeSessionRequest,
+        };
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let zone = zone(&server).await;
+
+        let mut req = create_session_req("web", "/uwu");
+        req.config.network = NetworkMode::OwnIp;
+        let id = client.call::<CreateSession>(&req).await.unwrap().id;
+        assert_eq!(
+            resolve(&zone, "web").0,
+            Verdict::NxDomain,
+            "created, not finalised"
+        );
+
+        unwrap_ready(
+            client
+                .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            resolve(&zone, "web").0,
+            Verdict::NxDomain,
+            "configured, not finalised"
+        );
+
+        match client
+            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .await
+        {
+            Errorable::Ok(_) => {}
+            Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+        }
+        let address = address_of(&zone, "web");
+        assert!(LoopbackAllocator::in_range(address));
+        assert_eq!(entry(&zone, "web").session_id, id);
+    }
+
+    /// NET-012. Once a box is destroyed every later lookup of its name is
+    /// NXDOMAIN, and its address is released for the next box.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn destroyed_box_name_is_nxdomain() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = box_publishing(&mut client, "web", NetworkMode::OwnIp, &[]).await;
+        let zone = zone(&server).await;
+        let address = address_of(&zone, "web");
+
+        destroy_session(&mut client, id).await;
+        assert!(!record_exists(&mut client, id).await);
+        for _ in 0..3 {
+            assert_eq!(resolve(&zone, "web"), (Verdict::NxDomain, None));
+        }
+
+        // The lease went with the box: the next box takes the lowest free
+        // address, which is the one just released.
+        box_publishing(&mut client, "next", NetworkMode::OwnIp, &[]).await;
+        assert_eq!(address_of(&zone, "next"), address);
+        assert_eq!(resolve(&zone, "web").0, Verdict::NxDomain);
+    }
+
+    /// NET-013. A box's name answers whether or not a client is attached:
+    /// nothing has attached to this box, no host has been launched for it,
+    /// and its name answers its address all the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn name_answers_without_attached_client() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = box_publishing(&mut client, "web", NetworkMode::OwnIp, &[]).await;
+        let zone = zone(&server).await;
+        let handle = session_handle(&server, id).await;
+
+        assert!(
+            handle.get_attrs().await.is_none(),
+            "no client has attached and no host runs"
+        );
+        assert!(!entry(&zone, "web").running);
+        let address = address_of(&zone, "web");
+        assert!(LoopbackAllocator::in_range(address));
+        assert!(record_exists(&mut client, id).await);
+    }
+
+    /// NET-128. A box on the shared address answers NODATA while it is not
+    /// running — an empty NOERROR with the zone's SOA, never NXDOMAIN — and
+    /// its address once it runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopped_shared_address_box_is_nodata() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = box_publishing(&mut client, "shared", NetworkMode::HostNet, &[]).await;
+        let zone = zone(&server).await;
+        let handle = session_handle(&server, id).await;
+
+        let reply = answerer::answer(&*zone, &NoSteering, &a_query("shared")).unwrap();
+        assert_eq!(reply.verdict, Verdict::NoData, "published, not running");
+        assert_eq!(reply.bytes[3] & 0x0F, 0, "NOERROR");
+        assert_eq!(
+            &reply.bytes[6..10],
+            &[0, 0, 0, 1],
+            "no answer, the SOA in authority"
+        );
+        assert_eq!(entry(&zone, "shared").kind, AddressKind::Shared);
+        assert!(!entry(&zone, "shared").running);
+
+        let host = handle
+            .ensure_host("tester".to_string())
+            .await
+            .expect("the box runs");
+        assert!(host.is_alive());
+        assert!(entry(&zone, "shared").running);
+        assert_eq!(address_of(&zone, "shared"), Ipv4Addr::LOCALHOST);
+    }
+
+    /// NET-129. A host-address box answers its node's published loopback
+    /// address — `127.0.0.1` on this native node — while an own-address box
+    /// beside it answers an address of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_ip_box_answers_node_loopback_address() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let shared = box_publishing(&mut client, "shared", NetworkMode::HostNet, &[]).await;
+        box_publishing(&mut client, "own", NetworkMode::OwnIp, &[]).await;
+        let zone = zone(&server).await;
+        let node = zone.read().unwrap().node_address();
+        assert_eq!(node, Ipv4Addr::LOCALHOST, "a native node");
+
+        session_handle(&server, shared)
+            .await
+            .ensure_host("tester".to_string())
+            .await
+            .expect("the box runs");
+        assert_eq!(address_of(&zone, "shared"), node);
+        assert_eq!(entry(&zone, "shared").address, node);
+        assert_ne!(address_of(&zone, "own"), node);
+    }
+
+    /// NET-121. A box's declared ports are bound before its name is
+    /// registered: by the time the name answers an address, a forwarder is
+    /// holding every port the declaration names at that address, and it is
+    /// held for as long as the box is — no client has attached and no host has
+    /// launched — and released when the box goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn declared_ports_bound_before_name_registered() {
+        const DECLARED: [u16; 2] = [18_300, 18_301];
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = box_publishing(&mut client, "web", NetworkMode::OwnIp, &DECLARED).await;
+        let zone = zone(&server).await;
+
+        // The name answers, so every declared port is already bound on the
+        // address it answers: a connection is taken, not refused.
+        let address = address_of(&zone, "web");
+        for port in DECLARED {
+            TcpStream::connect((address, port))
+                .await
+                .unwrap_or_else(|error| panic!("{address}:{port} has no forwarder bound: {error}"));
+            assert_eq!(
+                entry(&zone, "web")
+                    .forwarders
+                    .iter()
+                    .find(|published| published.port == port)
+                    .map(|published| published.state),
+                Some(ForwarderState::Bound),
+                "the published-port table shows {port}'s forwarder bound"
+            );
+        }
+        assert_eq!(entry(&zone, "web").ports, DECLARED.to_vec());
+
+        // Held while the box exists, with nothing attached and no host run.
+        assert!(!entry(&zone, "web").running);
+        TcpStream::connect((address, DECLARED[0]))
+            .await
+            .expect("the forwarder is still held");
+
+        // And released with the box.
+        destroy_session(&mut client, id).await;
+        assert_eq!(resolve(&zone, "web").0, Verdict::NxDomain);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match TcpStream::connect((address, DECLARED[0])).await {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                outcome => assert!(
+                    Instant::now() < deadline,
+                    "{address}:{DECLARED:?} still answers after destroy: {outcome:?}"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}

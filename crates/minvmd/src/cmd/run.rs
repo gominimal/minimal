@@ -66,6 +66,7 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     // deep in the VMM child; catch it here with a clear error instead.
     crate::sock::check_uds_path_len(&crate::sock::resolve_uds_path()?)?;
     crate::sock::check_uds_path_len(&crate::net::resolve_switch_sock()?)?;
+    crate::sock::check_uds_path_len(&crate::net::resolve_switch_upstream_sock()?)?;
 
     if detach {
         return run_detach(timeout_secs);
@@ -336,11 +337,14 @@ fn run_foreground() -> Result<()> {
         .context("setting listener to blocking")?;
 
     // Spawn + supervise the host gvproxy switch before the VMM child boots, so
-    // its `-listen` switch socket exists when libkrun dials it for the guest
-    // shuttle. The guest's root netns (the daemon) attaches a primary tap for
-    // egress, and own-IP PTasks attach further taps; both
-    // are L2 clients on this one switch. The handle lives for the VM's lifetime
-    // and stops gvproxy on drop (after the VMM child exits below).
+    // the switch socket exists when libkrun dials it for the guest shuttle.
+    // The guest's root netns (the daemon) attaches a primary tap for egress,
+    // and own-IP PTasks attach further taps; both are L2 clients on this one
+    // switch. libkrun dials the host-side filter (NET-081), which decides
+    // every frame leaving the VM by its source address and relays what it
+    // admits to gvproxy on the upstream socket behind it. Both handles live
+    // for the VM's lifetime and stop on drop (after the VMM child exits
+    // below).
     //
     // Best-effort: when the gvproxy binary is absent (e.g. the boot/session e2e
     // lanes that exercise only the vsock bridge) we warn and boot without
@@ -359,26 +363,60 @@ fn run_foreground() -> Result<()> {
     users
         .grant_vm_files(vm_files(&marker_sock_path).iter().map(PathBuf::as_path))
         .context("handing the VM's files to its user")?;
-    let _gvproxy = match crate::image::resolve_gvproxy_path() {
+    let _switch = match crate::image::resolve_gvproxy_path() {
         binary if binary.exists() => {
             let switch_sock =
                 crate::net::resolve_switch_sock().context("resolving switch socket")?;
+            let upstream_sock = crate::net::resolve_switch_upstream_sock()
+                .context("resolving switch upstream socket")?;
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
-            match crate::net::HostGvproxy::spawn_as(binary, switch_sock, users.switch.clone()) {
-                Ok(gvproxy) => {
+            crate::sock::remove_stale_socket(&upstream_sock)
+                .context("removing stale switch upstream socket")?;
+            let uds_path = crate::sock::resolve_uds_path().context("resolving host UDS path")?;
+            // gvproxy now sits BEHIND the host-side filter (NET-081), so the
+            // socket it binds is the upstream one and the filter binds the one
+            // libkrun dials — but it is still the switch, so it still runs as
+            // the switch's user (BEP-047).
+            let spawned = crate::net::HostGvproxy::spawn_as(
+                binary,
+                upstream_sock.clone(),
+                users.switch.clone(),
+            )
+            .context("spawning host gvproxy switch")
+            .and_then(|gvproxy| {
+                let filter = crate::net::HostFilter::spawn(
+                    switch_sock.clone(),
+                    upstream_sock,
+                    crate::net::HostRules::new(switch::DEFAULT_SUBNET),
+                    crate::net::DaemonFeed::new(uds_path),
+                )
+                .context("spawning host-side egress filter")?;
+                // The filter binds the socket libkrun dials in the supervisor's
+                // OWN process, not in a child that could be spawned as another
+                // user — so when the VM runs as a dedicated account, hand it
+                // that socket too: a connect is checked against the file's
+                // owner and mode (BEP-047), and the VM could not dial the
+                // switch otherwise. A no-op when the VM is the operator.
+                users
+                    .grant_vm_files(std::iter::once(switch_sock.as_path()))
+                    .context("handing the switch socket to the VM's user")?;
+                Ok((gvproxy, filter))
+            });
+            match spawned {
+                Ok((gvproxy, filter)) => {
                     tracing::info!(
                         pid = gvproxy.pid(),
                         user = %users.switch,
-                        "host gvproxy switch up"
+                        "host gvproxy switch up behind filter"
                     );
-                    Some(gvproxy)
+                    Some((gvproxy, filter))
                 }
                 // An own-IP VM cannot work without the switch: fail loudly. A
                 // non-own-IP boot tolerates it (same as a missing binary below).
                 Err(error) if crate::cmd::own_ip_requested() => {
-                    return Err(error).context("spawning host gvproxy switch");
+                    return Err(error);
                 }
                 Err(error) => {
                     tracing::warn!(

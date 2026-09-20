@@ -64,18 +64,34 @@ type SessionsError = std::io::Error;
 /// The `CreateSession` handler always persists the record as
 /// `Pending`; the session actor's create flow promotes it to
 /// `Active` once composition finalizes.
+///
+/// `deny_all` is the deny-all default's state on this host, which decides what
+/// an absent `egress` section means (NET-074, NET-077); the caller reads it from
+/// the environment so a test can state the window it is describing.
 fn build_record(
     config: minimald_rpc::SessionConfig,
     username: Option<String>,
     status: sessions::SessionStatus,
+    deny_all: sessions::DenyAllDefault,
 ) -> Result<sessions::Record, std::io::Error> {
+    // What an absent `egress` section means is the deny-all default's to say:
+    // once its window is in force, a box with an address of its own and no
+    // declaration reaches nothing (NET-074), while the opt-out flag keeps the
+    // shipped allow-all (NET-077). Resolved here, before the record is written,
+    // so the policy the store holds — the one `GetSessionPolicy` returns
+    // (NET-075) and both enforcement paths read — is the one the box runs under.
+    let effective = deny_all.effective_egress(config.network, config.policy.egress);
     let record = sessions::Record {
         id: SessionId::nil(),
         name: config.name,
         username,
         project_path: config.project_path,
         network: config.network,
-        policy: config.policy,
+        policy: sessions::SessionPolicy {
+            egress: effective.policy,
+            ingress: config.policy.ingress,
+            dynamic_ingress: config.policy.dynamic_ingress,
+        },
         status,
         hooks_enabled: config.hooks_enabled,
         attrs: config.attrs,
@@ -84,14 +100,19 @@ fn build_record(
         .validate_policy()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     // One line per session start saying what the daemon made of the box's
-    // egress declaration, beside the network mode that decides how it is
+    // egress declaration — and what the deny-all default made of its absence,
+    // window and opt-out flag named so the posture can be read back to the
+    // state that produced it — beside the network mode that decides how it is
     // enforced: a count per field, so a rule list that arrived short — or a
     // section that never arrived at all — is visible in the log without the
     // record in hand. Counts, not values: destinations are the operator's.
     let egress = record.policy.egress.as_ref();
     tracing::info!(
         network = ?record.network,
-        egress_declared = egress.is_some(),
+        deny_all_window = ?deny_all.window,
+        deny_all_opt_out = deny_all.opted_out,
+        egress_posture = ?effective.posture,
+        egress_declared = effective.posture == sessions::EgressPosture::Declared,
         allow_subnets = ?egress.and_then(|e| e.allow_subnets.as_ref()).map(Vec::len),
         allow_dns_hosts = ?egress.and_then(|e| e.allow_dns_hosts.as_ref()).map(Vec::len),
         allow_protocols = ?egress.and_then(|e| e.allow_protocols.as_ref()).map(Vec::len),
@@ -210,6 +231,12 @@ pub struct Manager {
     /// `HostNet` PTasks register on launch and withdraw on teardown.
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+
+    /// The host's published-box table ([`crate::net::publish`]): the zone the
+    /// box-zone answerer serves. Each session actor publishes its box at
+    /// finalize and withdraws it at destroy.
+    #[cfg(target_os = "linux")]
+    published: Arc<RwLock<crate::net::publish::PublishTable>>,
 }
 
 impl Manager {
@@ -243,10 +270,14 @@ impl Manager {
         let hostnames = Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
             crate::net::dns::DEFAULT_HOST_ID,
         )));
+        #[cfg(target_os = "linux")]
+        let published = Arc::new(RwLock::new(crate::net::publish::PublishTable::default()));
         let handle = ManagerHandle {
             sender,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
+            #[cfg(target_os = "linux")]
+            published: Arc::clone(&published),
         };
         // A non-owning path back to this actor, handed to each spawned session
         // so its binding can request destruction (see `weak_self`).
@@ -263,6 +294,8 @@ impl Manager {
             net_switch,
             #[cfg(target_os = "linux")]
             hostnames,
+            #[cfg(target_os = "linux")]
+            published,
         };
 
         tokio::spawn(mngr.mainloop());
@@ -389,6 +422,8 @@ impl Manager {
             manager: self.weak_self.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
+            #[cfg(target_os = "linux")]
+            published: Arc::clone(&self.published),
         }
     }
 
@@ -418,7 +453,12 @@ impl Manager {
         }
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
-        let record = build_record(config, username, sessions::SessionStatus::Pending)?;
+        let record = build_record(
+            config,
+            username,
+            sessions::SessionStatus::Pending,
+            sessions::DenyAllDefault::from_env(),
+        )?;
         let handle = self.store.create(record).await?;
         let session_id = *handle.id();
 
@@ -702,6 +742,10 @@ pub struct ManagerHandle {
     /// through the actor mainloop.
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// A clone of the actor's shared published-box table, handed to the
+    /// box-zone answerer.
+    #[cfg(target_os = "linux")]
+    published: Arc<RwLock<crate::net::publish::PublishTable>>,
 }
 
 /// A non-owning handle to the [`Manager`] actor.
@@ -718,6 +762,9 @@ pub struct WeakManagerHandle {
     /// keep the actor alive (only live senders do).
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// Mirrors [`ManagerHandle::published`], for the same reason.
+    #[cfg(target_os = "linux")]
+    published: Arc<RwLock<crate::net::publish::PublishTable>>,
 }
 
 impl WeakManagerHandle {
@@ -729,6 +776,8 @@ impl WeakManagerHandle {
             sender: self.sender.upgrade()?,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
+            #[cfg(target_os = "linux")]
+            published: Arc::clone(&self.published),
         })
     }
 }
@@ -795,6 +844,8 @@ impl ManagerHandle {
             sender: self.sender.downgrade(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
+            #[cfg(target_os = "linux")]
+            published: Arc::clone(&self.published),
         }
     }
 
@@ -805,6 +856,14 @@ impl ManagerHandle {
     #[must_use]
     pub fn hostnames(&self) -> Arc<RwLock<crate::net::dns::HostnameRegistry>> {
         Arc::clone(&self.hostnames)
+    }
+
+    /// Returns a shared handle to the host's published-box table, for the
+    /// box-zone answerer ([`crate::net::answerer`]) to serve the zone from.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn published(&self) -> Arc<RwLock<crate::net::publish::PublishTable>> {
+        Arc::clone(&self.published)
     }
 
     /// Lists the sessions known to this (minimald) instance.
@@ -1109,6 +1168,155 @@ pub(crate) mod tests {
             policy: Default::default(),
             hooks_enabled: true,
             attrs: Default::default(),
+        }
+    }
+
+    /// A box with an address of its own and no `egress` section at all — the
+    /// shape the deny-all default speaks about.
+    fn undeclared_own_ip_config() -> minimald_rpc::SessionConfig {
+        let mut config = sample_config();
+        config.network = sessions::NetworkMode::OwnIp;
+        config.policy = sessions::SessionPolicy::default();
+        assert!(
+            config.policy.egress.is_none(),
+            "this box must declare no egress section"
+        );
+        config
+    }
+
+    /// The lease a defaulted box would hold and the resolver Minimal owns for
+    /// it: the two addresses its frame verdict is decided against.
+    fn lease_and_resolver() -> (std::net::Ipv4Addr, sessions::core::net_verdict::Endpoint) {
+        (
+            std::net::Ipv4Addr::new(100, 64, 0, 7),
+            sessions::core::net_verdict::Endpoint {
+                ip: std::net::Ipv4Addr::new(100, 64, 0, 1),
+                port: 53,
+            },
+        )
+    }
+
+    /// NET-074: an own-address box created with no `egress` section reaches no
+    /// external address once the deny-all default is in force. Proved where the
+    /// reach is decided — the record the daemon writes carries the deny-all
+    /// section, and the rules the egress relay reads off it drop a frame to an
+    /// external address whatever its transport, while the resolver Minimal owns
+    /// for the box, the one carve-out, still answers.
+    #[test]
+    fn own_ip_default_deny_all() {
+        use sessions::core::net_verdict::{
+            DropRule, EgressRules, FrameSummary, IPPROTO_TCP, IPPROTO_UDP, Verdict, frame_verdict,
+        };
+
+        let record = build_record(
+            undeclared_own_ip_config(),
+            None,
+            sessions::SessionStatus::Pending,
+            sessions::DenyAllDefault {
+                window: sessions::DenyAllWindow::InForce,
+                opted_out: false,
+            },
+        )
+        .expect("the deny-all section the default writes is valid on this box");
+
+        let egress = record
+            .policy
+            .egress
+            .as_ref()
+            .expect("the default declares the box a section");
+        assert!(egress.is_deny_all(), "got {egress:?}");
+
+        let (lease, resolver) = lease_and_resolver();
+        let rules = EgressRules::for_box(lease, Some(egress), Some(resolver));
+        for (dst, proto, dst_port) in [
+            (
+                std::net::Ipv4Addr::new(93, 184, 216, 34),
+                IPPROTO_TCP,
+                Some(443),
+            ),
+            // A resolver that is not the box's own is an external address like
+            // any other; the carve-out is by address and port, not by port.
+            (std::net::Ipv4Addr::new(1, 1, 1, 1), IPPROTO_UDP, Some(53)),
+            (std::net::Ipv4Addr::new(10, 0, 0, 5), IPPROTO_TCP, Some(22)),
+        ] {
+            let frame = FrameSummary {
+                src: lease,
+                dst,
+                proto,
+                dst_port,
+            };
+            assert_eq!(
+                frame_verdict(&frame, &rules),
+                Verdict::Drop(DropRule::Undeclared),
+                "a box defaulted to deny-all must not reach {dst}"
+            );
+        }
+        assert_eq!(
+            frame_verdict(
+                &FrameSummary {
+                    src: lease,
+                    dst: resolver.ip,
+                    proto: IPPROTO_UDP,
+                    dst_port: Some(resolver.port),
+                },
+                &rules
+            ),
+            Verdict::Admit,
+            "a deny-all box still resolves the names its own resolver holds"
+        );
+    }
+
+    /// NET-077: with the opt-out flag set, a box with no `egress` section keeps
+    /// the shipped allow-all default — no section on its record, and a frame to
+    /// an external address admitted — even with the window in force. The same
+    /// holds while the default is announced but not yet in force (NET-076's
+    /// window), which is what this release ships.
+    #[test]
+    fn deny_all_opt_out_keeps_prior_default() {
+        use sessions::core::net_verdict::{
+            EgressRules, FrameSummary, IPPROTO_TCP, Verdict, frame_verdict,
+        };
+
+        let (lease, resolver) = lease_and_resolver();
+        for (deny_all, why) in [
+            (
+                sessions::DenyAllDefault {
+                    window: sessions::DenyAllWindow::InForce,
+                    opted_out: true,
+                },
+                "the opt-out flag is set",
+            ),
+            (
+                sessions::DenyAllDefault::default(),
+                "the default is announced, not yet in force",
+            ),
+        ] {
+            let record = build_record(
+                undeclared_own_ip_config(),
+                None,
+                sessions::SessionStatus::Pending,
+                deny_all,
+            )
+            .expect("a box with no egress section is valid");
+            assert_eq!(
+                record.policy.egress, None,
+                "no section must be invented when {why}"
+            );
+
+            let rules = EgressRules::for_box(lease, record.policy.egress.as_ref(), Some(resolver));
+            assert_eq!(
+                frame_verdict(
+                    &FrameSummary {
+                        src: lease,
+                        dst: std::net::Ipv4Addr::new(93, 184, 216, 34),
+                        proto: IPPROTO_TCP,
+                        dst_port: Some(443),
+                    },
+                    &rules
+                ),
+                Verdict::Admit,
+                "the shipped allow-all default must stand when {why}"
+            );
         }
     }
 

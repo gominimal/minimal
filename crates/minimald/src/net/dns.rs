@@ -132,12 +132,30 @@ pub enum SteerVerdict {
 
 /// The steering view of a zone: what a credentialed hostname resolves to for a
 /// box under `dns` or `both` steering. Implemented by [`HostnameRegistry`] and
-/// by a lock around one — the shape the answerer holds it in — so the answerer
-/// reaches the steering table through the same handle it reads the zone from.
+/// by a lock around one — the shape the answerer holds it in.
+///
+/// The answerer takes this separately from the zone it answers `min.internal`
+/// from: a steered name is a real upstream hostname, outside the zone, so the
+/// published-box table has nothing to say about it and this registry has
+/// nothing to say about a box's name.
 pub trait Steered {
     /// The steering verdict for `name`, which need not be lower-cased or
     /// stripped of its trailing dot.
     fn steer(&self, name: &str) -> SteerVerdict;
+}
+
+/// A steering table no box steers through, for the tests that assert what the
+/// ZONE answers: every name they ask is inside `min.internal`, which steering
+/// never decides. BEP-062's steering itself is proved over a real
+/// [`HostnameRegistry`] in this module's own tests.
+#[cfg(test)]
+pub(crate) struct NoSteering;
+
+#[cfg(test)]
+impl Steered for NoSteering {
+    fn steer(&self, _name: &str) -> SteerVerdict {
+        SteerVerdict::NotSteered
+    }
 }
 
 /// A live registration: the hostname minted for a session, plus the stable
@@ -655,6 +673,7 @@ pub(crate) mod tests {
     #[test]
     fn steered_name_servfail_while_proxy_down() {
         use crate::net::answerer::{Verdict, answer};
+        use crate::net::publish::PublishTable;
 
         const PROXY: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
         const TYPE_AAAA: u16 = 28;
@@ -664,12 +683,21 @@ pub(crate) mod tests {
         reg.steer_names("web", vec!["github.com".into(), "api.github.com".into()]);
         // The state a daemon starts in: no listener anywhere.
         assert_eq!(reg.proxy_listener(), ProxyListener::Down);
-        let zone = std::sync::RwLock::new(reg);
+        let steering = std::sync::RwLock::new(reg);
+        // The zone half, which is a different table: the answerer answers
+        // `web.min.internal` from the published boxes, and steers only the
+        // names outside that zone.
+        let mut published = PublishTable::default();
+        published
+            .publish(SessionId::nil(), "web", sessions::NetworkMode::OwnIp, &[])
+            .unwrap();
+        published.set_running("web", true);
+        let zone = std::sync::RwLock::new(published);
 
         for qtype in [TYPE_A, TYPE_AAAA] {
             // The case is the resolver's, not the box's.
-            let reply =
-                answer(&zone, &dns_query("GitHub.com", qtype)).expect("a query is answered");
+            let reply = answer(&zone, &steering, &dns_query("GitHub.com", qtype))
+                .expect("a query is answered");
             assert_eq!(reply.verdict, Verdict::ServFail, "qtype {qtype}");
             assert_eq!(rcode(&reply.bytes), 2, "SERVFAIL for qtype {qtype}");
             assert_eq!(ancount(&reply.bytes), 0, "qtype {qtype}");
@@ -677,14 +705,17 @@ pub(crate) mod tests {
 
         // A name no box steers is not the steering's to answer: outside the box
         // zone, so it is refused and nothing is forwarded for it either.
-        let untouched = answer(&zone, &dns_query("example.com", TYPE_A)).expect("answered");
+        let untouched =
+            answer(&zone, &steering, &dns_query("example.com", TYPE_A)).expect("answered");
         assert_eq!(untouched.verdict, Verdict::Refused);
 
         // With the listener live, the steered name answers the proxy's address.
-        zone.write()
+        steering
+            .write()
             .unwrap()
             .set_proxy_listener(ProxyListener::Live(PROXY));
-        let reply = answer(&zone, &dns_query("api.github.com", TYPE_A)).expect("answered");
+        let reply =
+            answer(&zone, &steering, &dns_query("api.github.com", TYPE_A)).expect("answered");
         assert_eq!(reply.verdict, Verdict::Answer);
         assert_eq!(rcode(&reply.bytes), 0);
         let parsed = parse_resolved_name(&reply.bytes).expect("an A answer for the proxy");
@@ -692,7 +723,7 @@ pub(crate) mod tests {
         assert_eq!(parsed.addresses, vec![PROXY]);
         // A box's own zone name is unaffected by any of it.
         assert_eq!(
-            answer(&zone, &dns_query("web.min.internal", TYPE_A))
+            answer(&zone, &steering, &dns_query("web.min.internal", TYPE_A))
                 .expect("answered")
                 .verdict,
             Verdict::Answer
@@ -700,10 +731,10 @@ pub(crate) mod tests {
 
         // The steering goes with the box: once it exits, the name is nobody's
         // to steer, live listener or not.
-        assert!(zone.write().unwrap().deregister("web").is_some());
-        assert_eq!(zone.steer("github.com"), SteerVerdict::NotSteered);
+        assert!(steering.write().unwrap().deregister("web").is_some());
+        assert_eq!(steering.steer("github.com"), SteerVerdict::NotSteered);
         assert_eq!(
-            answer(&zone, &dns_query("github.com", TYPE_A))
+            answer(&zone, &steering, &dns_query("github.com", TYPE_A))
                 .expect("answered")
                 .verdict,
             Verdict::Refused

@@ -1064,6 +1064,7 @@ impl SessionLauncher for MockLauncherWithNet {
             },
             guard: (),
             tty_path,
+            cohort_procs: None,
             net_guard: Some(Box::new(RecordingNetGuard {
                 torn_down: self.torn_down,
             })),

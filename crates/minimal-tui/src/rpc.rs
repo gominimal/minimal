@@ -56,6 +56,9 @@ pub struct ProviderData {
     pub label: String,
     pub version: String,
     pub sessions: Vec<minimald_rpc::ListSessionsEntry>,
+    /// Which surface serves this daemon's box names right now (NET-018);
+    /// see [`crate::app::ProviderView::name_surface`].
+    pub name_surface: Option<minimald_rpc::NameSurface>,
 }
 
 /// The probe list as `(label, socket)` candidates. Two probes can resolve
@@ -158,14 +161,14 @@ pub async fn refresh(provider: &mut Provider) -> Result<ProviderData, anyhow::Er
     let version = timed::<GetVersion>(&mut provider.client, ())
         .await
         .context("GetVersion RPC failed")?;
-    let sessions = timed::<ListSessions>(&mut provider.client, ())
+    let listed = timed::<ListSessions>(&mut provider.client, ())
         .await
-        .context("ListSessions RPC failed")?
-        .sessions;
+        .context("ListSessions RPC failed")?;
     Ok(ProviderData {
         label: provider.label.to_string(),
         version: version.version,
-        sessions,
+        sessions: listed.sessions,
+        name_surface: listed.name_surface,
     })
 }
 

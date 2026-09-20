@@ -160,6 +160,13 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     collect_step!(w, "bep", collect::bep(&mut w, &paths, args.log_tail_bytes));
     collect_step!(w, "bep.probe", bep_probe(&mut w, global));
     collect_step!(w, "net.zone", collect::zone(&mut w, &paths));
+    // The daemon's own account of the ports it opened on request, and who said
+    // so: capped like a log tail, because that is what it is.
+    collect_step!(
+        w,
+        "audit",
+        collect::audit(&mut w, &paths, args.log_tail_bytes)
+    );
     // Log prefixes that matched nothing on the host come back rather than
     // becoming skips here: whether "not under <state>/logs" also means "not in
     // this bundle" is not known until the provider loop below has run.

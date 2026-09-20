@@ -21,6 +21,7 @@ fn entry(n: u128, name: Option<&str>, project: &str) -> minimald_rpc::ListSessio
         status: sessions::SessionStatus::Active,
         git: None,
         attrs: None,
+        vm: None,
     }
 }
 
@@ -46,6 +47,7 @@ fn provider(label: &str, sessions: Vec<minimald_rpc::ListSessionsEntry>) -> Prov
         label: label.to_string(),
         version: "0.1".to_string(),
         sessions,
+        name_surface: None,
     }
 }
 

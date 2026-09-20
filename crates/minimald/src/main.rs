@@ -239,6 +239,16 @@ pub struct ListenArgs {
     #[arg(long, default_value_t = false)]
     detach: bool,
 
+    /// Port for the host-side hostname proxy that routes `*.min.internal`.
+    ///
+    /// Bound as given: a port named here is never substituted, so a port
+    /// something else holds is reported (and retried) rather than silently
+    /// swapped. Unset, the daemon takes the standard port while it is free and
+    /// otherwise selects a free one, so a second daemon on this machine keeps
+    /// its hostname surface; `min` prints whichever port the daemon settled on.
+    #[arg(long)]
+    hostname_proxy_port: Option<u16>,
+
     /// Path to the gvproxy ("gvisor-tap-vsock") binary backing the per-host
     /// `OwnIp` switch. Defaults to the installed location when unset: the
     /// user-local `bin/gvproxy-min` the installer stamps, else the system
@@ -456,6 +466,9 @@ async fn async_main() -> Result<(), MainError> {
                 // minvmd. Always listen: the guest cannot see what the
                 // host runs.
                 timekeep_listener_port: Some(guest::TIMEKEEP_PORT),
+                // The guest's own listen port cannot collide with a host
+                // process, so the standard port is always free in here.
+                hostname_proxy_port: None,
                 // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
                 // vsock shuttle, so no in-guest gvproxy binary path is needed.
                 gvproxy_bin: None,
@@ -753,6 +766,7 @@ async fn async_main() -> Result<(), MainError> {
         // the R1.6 relocation above takes `&mut cli`, which ends the original
         // `listen_args` borrow, so it cannot be held across that mutation.
         gvproxy_bin: cli.listen_args().unwrap().gvproxy_bin.clone(),
+        hostname_proxy_port: cli.listen_args().unwrap().hostname_proxy_port,
         // The vsock listen path is exactly the libkrun-VM (DM1/3/4) case: an
         // `OwnIp` PTask must attach to the host gvproxy over the vsock shuttle,
         // not spawn gvproxy in-guest. The UDS path is DM2.
@@ -914,7 +928,11 @@ async fn async_main() -> Result<(), MainError> {
         // attached to the host gvproxy over the vsock shuttle. Held for the
         // server's lifetime (dropping `_egress` tears the relay down). Best
         // effort — if the host gvproxy is absent the daemon serves without
-        // network, the prior behaviour.
+        // network, the prior behaviour. Invariant: nothing between the READY
+        // marker above and `Server::run` below may block on the host answering —
+        // the listener is bound but unserved until the accept loop starts, so any
+        // wait here is a window where the bridge takes a connection and no daemon
+        // replies.
         let _egress = match guest::bring_up_root_egress().await {
             Ok(relay) => Some(relay),
             Err(e) => {

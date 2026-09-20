@@ -1069,6 +1069,35 @@ remove_renamed_gvproxy
 mkdir -p "$state_dir"
 mv -f "$records" "$prev_record"
 
+# --- The switch binary must be runnable ------------------------------------
+
+# The switch (`bin/gvproxy-min`, the gvproxy build minimald spawns to give an
+# own-IP box an address of its own) has to be executable, and installing it does
+# not guarantee that: a component whose on-disk hash already matches the
+# manifest is SKIPPED, and the skip path never runs the `chmod +x` a fresh
+# download gets. A switch binary left non-executable — by a restrictive umask, a
+# copy placed by hand, an interrupted run — therefore stays that way across
+# every rerun, and the failure surfaces far from here, as an own-IP session that
+# cannot reach the network. So check it once, when the install is otherwise
+# complete, against the record this run just wrote: the row's dest is the
+# resolved path, so no prefix is reconstructed, and a manifest that ships no
+# switch (a channel still on the pre-rename layout) has nothing to check and
+# gets no advisory. Advisory, not fatal: the rest of the install is sound and
+# only own-IP networking is affected, so say what broke and how to fix it.
+switch_dest="$(awk -F'\t' '$1 == "gvproxy-min" { print $2; exit }' "$prev_record")"
+if [ -n "$switch_dest" ]; then
+    if [ ! -f "$switch_dest" ]; then
+        say "  warning: the switch binary is missing: $(tilde "$switch_dest")"
+        say "  own-IP sessions cannot start without it; rerun this installer to replace it"
+    elif [ ! -x "$switch_dest" ]; then
+        say "  warning: the switch binary is not executable: $(tilde "$switch_dest")"
+        say "  own-IP sessions cannot start until it is; fix it with:"
+        say "      chmod +x \"$switch_dest\""
+    else
+        row switch verified "$(tilde "$switch_dest")"
+    fi
+fi
+
 # --- Hook the current shell's rc file --------------------------------------
 
 # Append one marker-fenced block sourcing the matching init file to the

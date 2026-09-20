@@ -5,6 +5,7 @@ pub mod expansion;
 pub mod hooks;
 pub mod lifecyclehook;
 pub mod loadout;
+pub mod loopback_alloc;
 pub mod net_verdict;
 pub mod policy;
 pub mod primitives;

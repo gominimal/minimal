@@ -21,7 +21,7 @@ use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use sessions::core::net_verdict::{self, DropRule, EgressRules, Verdict};
@@ -32,7 +32,8 @@ use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
 use super::policy::{
-    Direction, KeyedWarnLimiter, PinTable, PinnedAddress, PolicyWarnLimiter, admission_window,
+    BoxZone, BoxZoneTarget, Direction, KeyedWarnLimiter, PinTable, PinnedAddress,
+    PolicyWarnLimiter, admission_window,
 };
 use super::{DEFAULT_MTU, PtaskLease, SwitchSubnet};
 
@@ -500,15 +501,10 @@ const IPPROTO_UDP: u8 = 17;
 ///
 /// ICMP and non-IPv4 traffic pass (out of scope).
 pub struct IngressGate {
-    /// TCP destination ports the target accepts new inbound connections on — the
-    /// *internal* ports of its TCP `port_mappings` (what the sandbox listens on,
-    /// and what both a peer session and the host-publish forwarder dial). An empty
-    /// set denies every inbound SYN (the own-IP default-block posture).
-    allowed: HashSet<u16>,
-    /// UDP destination ports the target accepts new inbound datagrams on (the
-    /// internal ports of its UDP `port_mappings`). Inbound UDP to any other port
-    /// passes only if it matches a live outbound flow in `conntrack`.
-    udp_allowed: HashSet<u16>,
+    /// The destination ports the target accepts new inbound TCP connections
+    /// and UDP datagrams on. Shared with the box's live ingress, which adds a
+    /// port a dynamic ingress request publishes while the box runs.
+    ports: Arc<AdmittedPorts>,
     /// Outbound-UDP flow tracker, shared with the egress relay leg so a reply to
     /// the PTask's own UDP egress (DNS, QUIC, …) is allowed back in.
     conntrack: Arc<UdpConntrack>,
@@ -525,6 +521,82 @@ pub struct IngressGate {
     /// so both legs of the relay are configured through one handle; `None`
     /// only for a relay with no box behind it.
     egress: Option<Arc<EgressGate>>,
+}
+
+/// The ports a box's ingress gate admits new inbound traffic on, per
+/// transport: the *internal* ports of its `port_mappings` (what the sandbox
+/// listens on, and what both a peer session and the host-publish forwarder
+/// dial). An empty set denies every inbound SYN and unsolicited datagram (the
+/// own-IP default-block posture). Inbound UDP to any other port passes only
+/// if it matches a live outbound flow in the gate's conntrack.
+///
+/// Editable while the relay runs: a port published at runtime by a dynamic
+/// ingress request (NET-044) is admitted here without relaunching the box,
+/// and taken back out when the publication is rolled back (NET-047).
+#[derive(Debug, Default)]
+pub struct AdmittedPorts {
+    tcp: RwLock<HashSet<u16>>,
+    udp: RwLock<HashSet<u16>>,
+}
+
+impl AdmittedPorts {
+    /// The ports `ingress` declares, per transport; a box with no ingress
+    /// admits none.
+    #[must_use]
+    pub fn for_ingress(ingress: Option<&sessions::IngressPolicy>) -> Self {
+        let ports = |proto: sessions::IpProto| -> HashSet<u16> {
+            ingress
+                .map(|i| {
+                    i.port_mappings
+                        .iter()
+                        .filter(|m| m.proto == proto)
+                        .map(|m| m.internal_port)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            tcp: RwLock::new(ports(sessions::IpProto::Tcp)),
+            udp: RwLock::new(ports(sessions::IpProto::Udp)),
+        }
+    }
+
+    /// Admits new inbound traffic on `port` over `proto` from now on. A
+    /// transport the gate does not decide by port admits nothing.
+    pub fn admit(&self, proto: sessions::IpProto, port: u16) {
+        if let Some(set) = self.set(proto) {
+            set.write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(port);
+        }
+    }
+
+    /// Stops admitting new inbound traffic on `port` over `proto`.
+    pub fn retract(&self, proto: sessions::IpProto, port: u16) {
+        if let Some(set) = self.set(proto) {
+            set.write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&port);
+        }
+    }
+
+    /// Whether `port` over `proto` is admitted.
+    #[must_use]
+    pub fn admits(&self, proto: sessions::IpProto, port: u16) -> bool {
+        self.set(proto).is_some_and(|set| {
+            set.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&port)
+        })
+    }
+
+    fn set(&self, proto: sessions::IpProto) -> Option<&RwLock<HashSet<u16>>> {
+        match proto {
+            sessions::IpProto::Tcp => Some(&self.tcp),
+            sessions::IpProto::Udp => Some(&self.udp),
+            _ => None,
+        }
+    }
 }
 
 /// What the egress (tap → switch) leg holds on a box's own relay: the box's
@@ -612,20 +684,8 @@ impl IngressGate {
         ingress: Option<&sessions::IngressPolicy>,
         subnet: SwitchSubnet,
     ) -> Self {
-        let ports = |proto: sessions::IpProto| -> HashSet<u16> {
-            ingress
-                .map(|i| {
-                    i.port_mappings
-                        .iter()
-                        .filter(|m| m.proto == proto)
-                        .map(|m| m.internal_port)
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
         Self {
-            allowed: ports(sessions::IpProto::Tcp),
-            udp_allowed: ports(sessions::IpProto::Udp),
+            ports: Arc::new(AdmittedPorts::for_ingress(ingress)),
             conntrack: Arc::new(UdpConntrack::default()),
             label,
             legacy_host: subnet.host_alias(),
@@ -643,14 +703,36 @@ impl IngressGate {
         self
     }
 
+    /// The ports this gate admits, shared so a dynamic ingress request can
+    /// admit one while the relay runs.
+    #[must_use]
+    pub fn ports(&self) -> Arc<AdmittedPorts> {
+        Arc::clone(&self.ports)
+    }
+
     /// The inbound-gate decision for one Ethernet frame: `Some((proto, dst_port,
     /// src))` when it must be dropped — a new TCP connection or an unsolicited UDP
     /// datagram to a port the target did not declare — else `None` (pass).
     fn inbound_drop(&self, frame: &[u8]) -> Option<(sessions::IpProto, u16, SocketAddrV4)> {
-        if let Some((dst_port, src)) = blocked_syn(frame, &self.allowed) {
+        if let Some((dst_port, src)) = blocked_syn(
+            frame,
+            &self
+                .ports
+                .tcp
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        ) {
             return Some((sessions::IpProto::Tcp, dst_port, src));
         }
-        if let Some((dst_port, src)) = blocked_udp(frame, &self.udp_allowed, &self.conntrack) {
+        if let Some((dst_port, src)) = blocked_udp(
+            frame,
+            &self
+                .ports
+                .udp
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+            &self.conntrack,
+        ) {
             return Some((sessions::IpProto::Udp, dst_port, src));
         }
         None
@@ -680,6 +762,13 @@ impl IngressGate {
 /// its destination is pinned; a denied destination never is, because the
 /// verdict names the box's denies before it looks for a declaration and the
 /// intersection admits nothing in the infrastructure set.
+///
+/// A destination that is a sibling box's lease is decided by those same rules —
+/// a box-zone name resolves with no allow entry (NET-072) and the address it
+/// resolved to is then an address like any other (NET-073). What the
+/// [`BoxZone`] adds here is the account of it: one debug line per box-to-box
+/// connection naming both boxes and the verdict each side's rules give it, and
+/// a refusal counted as a box-to-box one rather than lost among external drops.
 pub struct EgressGate {
     rules: EgressRules,
     /// The session, carried as the warning's `session_id`.
@@ -696,6 +785,11 @@ pub struct EgressGate {
     /// resolved `quic443` applied to whether it holds a credentialed upstream
     /// (BEP-018), settled once when the gate is built.
     drop_udp_443: bool,
+    /// The in-guest box zone, shared with every other box's relay: the table
+    /// that names the sibling behind a destination address and carries its
+    /// declared ingress. `None` for a relay built without one, whose box-to-box
+    /// frames are then accounted for like any others.
+    zone: Option<Arc<BoxZone>>,
 }
 
 /// How a box's QUIC egress to port 443 is treated: the box spec's `quic443`
@@ -751,6 +845,11 @@ struct NameRules {
 pub struct EgressDropStats {
     /// Drops per rule name, as the warning's `rule_matched` spells it.
     pub by_rule: BTreeMap<&'static str, u64>,
+    /// The box-to-box refusals among them, per rule (NET-073): the drops whose
+    /// destination was a sibling box's lease. Counted separately so a bundle
+    /// tells a refused sibling from a refused external address, and included in
+    /// `by_rule` as well — the rule refused the frame either way.
+    pub box_zone_by_rule: BTreeMap<&'static str, u64>,
     /// The destination of the most recent drop that carried one.
     pub last_destination: Option<SocketAddrV4>,
 }
@@ -772,6 +871,32 @@ enum EgressDecision {
         destination: Option<SocketAddrV4>,
         proto: Option<sessions::IpProto>,
     },
+}
+
+impl EgressDecision {
+    /// The decision as the box-zone connection line spells it: `admit`, or the
+    /// rule that refused the frame.
+    fn verdict(self) -> &'static str {
+        match self {
+            Self::Admit => "admit",
+            Self::Drop { rule, .. } => rule,
+        }
+    }
+}
+
+/// A box-to-box frame as the egress leg sees it (NET-073): the sibling holding
+/// the destination address with its ingress verdict, where it was dialled, and
+/// whether this frame opens the connection.
+struct BoxZoneFrame {
+    /// The target box and what its own ingress rules say about the port.
+    target: BoxZoneTarget,
+    /// The `ip:port` dialled — the sibling's switch lease.
+    destination: SocketAddrV4,
+    /// The frame's transport.
+    proto: sessions::IpProto,
+    /// Whether the frame opens the connection (a bare TCP SYN), which is what
+    /// the connection line is emitted for.
+    opens: bool,
 }
 
 /// The sender protocol address of an Ethernet/IPv4 ARP frame, or `None` for
@@ -796,6 +921,7 @@ impl EgressGate {
             names: None,
             pins: Mutex::new(PinTable::default()),
             drop_udp_443: false,
+            zone: None,
         }
     }
 
@@ -808,6 +934,16 @@ impl EgressGate {
     #[must_use]
     pub fn with_quic443(mut self, quic443: Quic443, credentialed: bool) -> Self {
         self.drop_udp_443 = quic443.drops_udp_443(credentialed);
+        self
+    }
+
+    /// Adds the in-guest box zone, so this leg can name the sibling a frame is
+    /// addressed to and the verdict that box's own ingress rules give the port
+    /// (NET-073). Shared with every other box's relay; it changes no verdict of
+    /// this gate's own.
+    #[must_use]
+    pub fn with_box_zone(mut self, zone: Arc<BoxZone>) -> Self {
+        self.zone = Some(zone);
         self
     }
 
@@ -975,8 +1111,54 @@ impl EgressGate {
         self.admit_at(frame, Instant::now())
     }
 
+    /// The sibling `frame` is addressed to, or `None` when the relay holds no
+    /// box zone, the frame is not TCP/UDP over IPv4, or no live box holds the
+    /// destination address.
+    ///
+    /// `decision` is what the rules made of the frame: an admitted frame that
+    /// opens no connection is neither a connection to record nor a refusal to
+    /// count, so the zone is not consulted for it and an established flow pays
+    /// nothing for the account.
+    fn box_zone_frame(&self, frame: &[u8], decision: EgressDecision) -> Option<BoxZoneFrame> {
+        let zone = self.zone.as_ref()?;
+        let pkt = parse_ipv4_l4(frame)?;
+        let opens = opens_connection(&pkt);
+        if !opens && matches!(decision, EgressDecision::Admit) {
+            return None;
+        }
+        let proto = net_verdict::ip_proto(pkt.proto)?;
+        let target = zone.target_at(*pkt.dst.ip(), proto, pkt.dst.port())?;
+        Some(BoxZoneFrame {
+            target,
+            destination: pkt.dst,
+            proto,
+            opens,
+        })
+    }
+
     fn admit_at(&self, frame: &[u8], now: Instant) -> bool {
-        match self.decide(frame, now) {
+        let decision = self.decide(frame, now);
+        let sibling = self.box_zone_frame(frame, decision);
+        // One line per box-to-box connection (NET-073), naming both boxes and
+        // the verdict each side's rules give it: this gate's own, which decides
+        // the frame here, and the target's ingress, which decides it on the
+        // target's relay leg. A connection is a bare SYN, as it is for both
+        // gates, so the line lands once rather than once per frame it carries.
+        if let Some(sibling) = &sibling
+            && sibling.opens
+        {
+            tracing::debug!(
+                session_id = %self.label,
+                source = %self.label,
+                target = %sibling.target.session,
+                remote_addr = %sibling.destination,
+                proto = %sibling.proto,
+                egress = decision.verdict(),
+                ingress = sibling.target.ingress.as_str(),
+                "box-zone connection"
+            );
+        }
+        match decision {
             EgressDecision::Admit => true,
             EgressDecision::Drop {
                 rule,
@@ -986,6 +1168,9 @@ impl EgressGate {
                 {
                     let mut stats = self.stats.lock().expect("EgressGate stats mutex poisoned");
                     *stats.by_rule.entry(rule).or_insert(0) += 1;
+                    if sibling.is_some() {
+                        *stats.box_zone_by_rule.entry(rule).or_insert(0) += 1;
+                    }
                     if destination.is_some() {
                         stats.last_destination = destination;
                     }
@@ -1367,14 +1552,23 @@ mod tests {
         };
         let gate =
             IngressGate::for_session("100.64.0.9".into(), Some(&ingress), SwitchSubnet::default());
-        assert!(gate.allowed.contains(&80)); // TCP internal port
-        assert!(!gate.allowed.contains(&53)); // the UDP mapping is not a TCP port
-        assert!(!gate.allowed.contains(&18080)); // external port is not the listener
-        assert!(gate.udp_allowed.contains(&53)); // UDP internal port
-        assert!(!gate.udp_allowed.contains(&80)); // the TCP mapping is not a UDP port
+        use sessions::IpProto::{Tcp, Udp};
+        assert!(gate.ports.admits(Tcp, 80)); // TCP internal port
+        assert!(!gate.ports.admits(Tcp, 53)); // the UDP mapping is not a TCP port
+        assert!(!gate.ports.admits(Tcp, 18080)); // external port is not the listener
+        assert!(gate.ports.admits(Udp, 53)); // UDP internal port
+        assert!(!gate.ports.admits(Udp, 80)); // the TCP mapping is not a UDP port
         // A no-ingress own-IP session denies every new inbound connection/datagram.
         let empty = IngressGate::for_session("x".into(), None, SwitchSubnet::default());
-        assert!(empty.allowed.is_empty() && empty.udp_allowed.is_empty());
+        assert!(!empty.ports.admits(Tcp, 80) && !empty.ports.admits(Udp, 53));
+        // A port admitted while the relay runs is admitted from then on, through
+        // the handle the gate shares, and retracted the same way.
+        let shared = empty.ports();
+        shared.admit(Tcp, 3000);
+        assert!(empty.ports.admits(Tcp, 3000));
+        assert!(!empty.ports.admits(Udp, 3000));
+        shared.retract(Tcp, 3000);
+        assert!(!empty.ports.admits(Tcp, 3000));
     }
 
     /// A `MakeWriter` accumulating everything written into a shared buffer, so a
@@ -2188,6 +2382,212 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![LAN]
         );
+    }
+
+    // ---- the box zone: sibling resolution and reach (NET-072, NET-073) ----
+
+    /// The port the sibling box `api` declares, and one it does not.
+    const API_PORT: u16 = 8080;
+    const API_UNDECLARED_PORT: u16 = 9090;
+
+    /// The sibling's ingress: one TCP mapping, so [`API_PORT`] is the only port
+    /// it accepts a new connection on.
+    fn api_ingress() -> sessions::IngressPolicy {
+        sessions::IngressPolicy {
+            port_mappings: vec![sessions::PortMapping {
+                external_port: 18080,
+                internal_port: API_PORT,
+                proto: sessions::IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+        }
+    }
+
+    /// The switch's box zone with both boxes on it: `web` (the source, leased
+    /// [`LEASE`], declaring no ingress) and `api` (the target, leased [`PEER`]).
+    fn box_zone() -> Arc<BoxZone> {
+        let zone = Arc::new(BoxZone::default());
+        zone.register("web", LEASE, None);
+        zone.register("api", PEER, Some(&api_ingress()));
+        zone
+    }
+
+    /// The `web` box's gate on a switch carrying `zone`, wired as
+    /// `net::provider` wires it: the rules, the resolver carve-out, the box
+    /// zone, and name pinning when the policy declares names.
+    fn zoned_gate(policy: Option<sessions::EgressPolicy>, zone: &Arc<BoxZone>) -> Arc<EgressGate> {
+        let subnet = SwitchSubnet::default();
+        let resolver = Endpoint {
+            ip: GATEWAY,
+            port: 53,
+        };
+        let mut gate = EgressGate::for_box(
+            "web".into(),
+            EgressRules::for_box(LEASE, policy.as_ref(), Some(resolver)),
+        )
+        .with_box_zone(Arc::clone(zone));
+        if let Some(hosts) = policy.as_ref().and_then(|p| p.allow_dns_hosts.clone()) {
+            gate = gate.with_dns_pinning(
+                hosts,
+                &[subnet.gateway(), subnet.host_alias(), subnet.daemon_ip()],
+            );
+        }
+        Arc::new(gate)
+    }
+
+    /// NET-072. A box resolves a sibling's box-zone name with no
+    /// `egress.allow_dns_hosts` entry for it. The box here allows one name,
+    /// `github.com`, and no address at all: the sibling's name is in neither its
+    /// allow list nor its address rules, and it resolves regardless — the lookup
+    /// leaves through the resolver Minimal owns for the box, the answer comes
+    /// back down the ingress leg, and the zone is what answered it.
+    ///
+    /// Resolving is not reaching: an answer for a name the box did not allow
+    /// pins nothing, so the sibling's address stands or falls on the two boxes'
+    /// own rules (NET-073). A box with no name allow list at all — the deny-all
+    /// default — resolves the sibling the same way.
+    #[test]
+    fn box_zone_resolution_needs_no_allow_entry() {
+        let zone = box_zone();
+        let sibling = "api.min.internal";
+        let policy = github_only(&[]);
+        assert!(!crate::net::dns::name_allowed(
+            policy
+                .allow_dns_hosts
+                .as_deref()
+                .expect("a name allow list"),
+            sibling
+        ));
+        // The zone answers the name from the zone alone, with the sibling's
+        // switch lease, however the asking box spells it.
+        assert_eq!(zone.resolve(sibling), Some(PEER));
+        assert_eq!(zone.resolve("API.min.internal."), Some(PEER));
+
+        let gate = zoned_gate(Some(policy), &zone);
+        let ingress = IngressGate::for_session(LEASE.to_string(), None, SwitchSubnet::default())
+            .with_egress(Arc::clone(&gate));
+        let watch = EgressWatch::for_gate(&ingress);
+
+        // The lookup leaves through the carve-out, though the box declares no
+        // destination, and its answer comes back: solicited, so the ingress gate
+        // passes it to a box that declared no port.
+        assert!(watch.admit(&udp_frame(LEASE, QUERY_PORT, GATEWAY, 53)));
+        let answer = dns_answer_frame(sibling, &[(15, PEER)]);
+        assert!(ingress.inbound_drop(&answer).is_none());
+
+        // Resolution is all the name bought: nothing is pinned, and the
+        // sibling's address is refused by this box's rules like any other.
+        gate.observe_answer(&answer);
+        assert!(gate.pinned().is_empty());
+        assert!(!gate.admit(&egress_syn(LEASE, PEER, API_PORT)));
+
+        // The deny-all default: no `allow_dns_hosts` at all, and the lookup
+        // still leaves.
+        let deny_all = zoned_gate(Some(allow_only(&[], None)), &zone);
+        assert!(deny_all.admit(&udp_frame(LEASE, QUERY_PORT, GATEWAY, 53)));
+        assert!(!deny_all.admit(&egress_syn(LEASE, PEER, API_PORT)));
+    }
+
+    /// NET-073. A connection to a sibling's box-zone address opens only when
+    /// both sides' rules allow it: the source's egress gate decides it on the
+    /// source's relay leg and the target's ingress gate on the target's, and
+    /// either refusal is enough. Over the real relay, a declared address to a
+    /// declared port reaches the target; the same address to a port the target
+    /// did not declare reaches the switch and is refused there; and a box whose
+    /// own rules refuse the address sends nothing the target could refuse.
+    ///
+    /// Each attempt is recorded as one debug line naming both boxes and the
+    /// verdict from each side's rules, and a refused sibling is counted as a
+    /// box-to-box refusal under the rule that refused it — an external
+    /// destination refused by the same rule is not.
+    #[tokio::test]
+    async fn box_zone_connection_enforced_at_connect() {
+        let zone = box_zone();
+        let target = IngressGate::for_session(
+            PEER.to_string(),
+            Some(&api_ingress()),
+            SwitchSubnet::default(),
+        );
+        let syn = egress_syn(LEASE, PEER, API_PORT);
+        let undeclared = egress_syn(LEASE, PEER, API_UNDECLARED_PORT);
+
+        // Both sides allow it: the SYN leaves the source's relay intact and the
+        // target's ingress admits it.
+        let allowed = zoned_gate(Some(allow_only(&["100.64.0.0/24"], None)), &zone);
+        let (_relay, mut feed, mut switch) = relay_over_pipe(Arc::clone(&allowed));
+        feed.write_all(&syn).unwrap();
+        let delivered = next_frame(&mut switch).await;
+        assert_eq!(delivered, syn);
+        assert!(target.inbound_drop(&delivered).is_none());
+
+        // The target's half alone refuses: the source declared the address, so
+        // its gate admits the frame, and the target's ingress drops it.
+        feed.write_all(&undeclared).unwrap();
+        let delivered = next_frame(&mut switch).await;
+        assert_eq!(delivered, undeclared);
+        assert_eq!(
+            target
+                .inbound_drop(&delivered)
+                .map(|(proto, port, _)| (proto, port)),
+            Some((sessions::IpProto::Tcp, API_UNDECLARED_PORT))
+        );
+        assert_eq!(allowed.drop_stats().total(), 0);
+
+        // The source's half alone refuses: a deny-all box's SYN to the very port
+        // the sibling declared never reaches the switch, so the target never
+        // sees the connection at all.
+        let denied = zoned_gate(Some(allow_only(&[], None)), &zone);
+        let (_denied_relay, mut denied_feed, mut denied_switch) =
+            relay_over_pipe(Arc::clone(&denied));
+        denied_feed.write_all(&syn).unwrap();
+        assert_switch_quiet(&mut denied_switch).await;
+
+        // The account of it. Fresh gates, so the counters start clean, and the
+        // lines are emitted on this thread, where the capture is installed.
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let allowed = zoned_gate(Some(allow_only(&["100.64.0.0/24"], None)), &zone);
+        assert!(allowed.admit(&syn));
+        assert!(allowed.admit(&undeclared));
+        let denied = zoned_gate(Some(allow_only(&[], None)), &zone);
+        assert!(!denied.admit(&syn));
+        assert!(!denied.admit(&egress_syn(LEASE, OUTSIDE, 443)));
+        drop(guard);
+
+        // Both refusals were the same rule; only the one to a sibling is a
+        // box-to-box refusal.
+        let stats = denied.drop_stats();
+        assert_eq!(stats.by_rule.get("allow_subnets"), Some(&2));
+        assert_eq!(stats.box_zone_by_rule.get("allow_subnets"), Some(&1));
+
+        let log = capture.contents();
+        let lines: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("box-zone connection"))
+            .collect();
+        assert_eq!(lines.len(), 3, "got:\n{log}");
+        for field in [
+            "DEBUG",
+            "session_id=web",
+            "source=web",
+            "target=api",
+            "remote_addr=100.64.0.5:8080",
+            "proto=tcp",
+            "egress=\"admit\"",
+            "ingress=\"declared\"",
+        ] {
+            assert!(lines[0].contains(field), "missing {field} in: {}", lines[0]);
+        }
+        assert!(lines[1].contains("remote_addr=100.64.0.5:9090"));
+        assert!(lines[1].contains("egress=\"admit\""));
+        assert!(lines[1].contains("ingress=\"undeclared\""));
+        assert!(lines[2].contains("egress=\"allow_subnets\""));
+        assert!(lines[2].contains("ingress=\"declared\""));
     }
 
     /// NET-067's log: each answer refused as a denied range appears as one

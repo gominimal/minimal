@@ -54,6 +54,21 @@ pub fn resolve_switch_sock() -> io::Result<PathBuf> {
     Ok(switch_sock_beside(&crate::sock::resolve_uds_path()?))
 }
 
+/// Resolve the host UNIX socket path gvproxy itself listens on, behind the
+/// host-side filter.
+///
+/// libkrun dials [`resolve_switch_sock`]'s path, where the filter
+/// ([`crate::net::HostFilter`]) listens and decides every frame leaving the
+/// VM; the filter relays what it admits to gvproxy on this socket. Both sit
+/// in the bridge socket's 0700 parent dir.
+///
+/// # Errors
+///
+/// Propagates [`crate::sock::resolve_uds_path`]'s error.
+pub fn resolve_switch_upstream_sock() -> io::Result<PathBuf> {
+    Ok(upstream_sock_beside(&crate::sock::resolve_uds_path()?))
+}
+
 /// The gvproxy switch socket path beside a given minimald bridge UDS (same
 /// parent dir). Pure — derived only from `uds`, no env — so it is unit-testable
 /// without mutating process-global state.
@@ -61,6 +76,14 @@ fn switch_sock_beside(uds: &std::path::Path) -> PathBuf {
     uds.parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("gvproxy-switch.sock")
+}
+
+/// The gvproxy upstream socket path (the one behind the filter) beside a
+/// given minimald bridge UDS. Pure, like [`switch_sock_beside`].
+fn upstream_sock_beside(uds: &std::path::Path) -> PathBuf {
+    uds.parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("gvproxy-upstream.sock")
 }
 
 #[cfg(test)]
@@ -82,5 +105,15 @@ mod tests {
             switch_sock_beside(uds),
             PathBuf::from("/run/user/1000/minimal/gvproxy-switch.sock")
         );
+    }
+
+    #[test]
+    fn upstream_sock_sits_beside_the_switch_socket() {
+        let uds = std::path::Path::new("/run/user/1000/minimal/bridge.sock");
+        assert_eq!(
+            upstream_sock_beside(uds),
+            PathBuf::from("/run/user/1000/minimal/gvproxy-upstream.sock")
+        );
+        assert_ne!(upstream_sock_beside(uds), switch_sock_beside(uds));
     }
 }

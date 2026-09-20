@@ -4,9 +4,9 @@
 //! with a `port` directive on macOS, a systemd-resolved routing domain on
 //! Linux), so a browser or `curl` on the machine resolves `<box>.min.internal`
 //! natively. The answerer holds only the zone — the live
-//! [`HostnameRegistry`](super::dns::HostnameRegistry) the sessions manager
-//! registers boxes into — and forwards nothing upstream: a name outside the
-//! zone is `REFUSED`, never looked up.
+//! [`PublishTable`](super::publish::PublishTable) the session actors publish
+//! boxes into from finalize to destroy — and forwards nothing upstream: a
+//! name outside the zone is `REFUSED`, never looked up.
 //!
 //! ## Answer semantics
 //!
@@ -19,7 +19,11 @@
 //! - Any other type for a held name (`AAAA`, `HTTPS`, `SVCB`, …) is NODATA: an
 //!   empty `NOERROR` (NET-124). Never NXDOMAIN, since negative caching is
 //!   name-wide and browsers pair an `A` query with an `HTTPS` one.
-//! - A name in the zone that nothing holds is NXDOMAIN (NET-125).
+//! - A held name whose box answers no address right now — a shared-address
+//!   box that is not running (NET-128) — is NODATA too: the name stays in
+//!   the zone, so the resolver caches no name-wide negative for it.
+//! - A name in the zone that nothing holds is NXDOMAIN (NET-125), which is
+//!   what a destroyed box's name answers from then on (NET-012).
 //! - Every negative carries the zone's SOA in its authority section (RFC 2308).
 //!   The spike found that an answerer whose negatives lack it stalls every
 //!   lookup on a macOS host, scoped or not, for the resolver's timeout per
@@ -39,12 +43,23 @@
 //! loopback address is dropped unanswered either way, so a socket inherited
 //! from the service manager with a wider bind still serves nothing off-host.
 //!
+//! ## Host resolution state
+//!
+//! Whether the host actually routes the zone here is the host's business,
+//! not the answerer's, but the answerer is where the daemon reads it
+//! ([`HostResolution`]): the resolver hook's presence (the dedicated
+//! systemd-resolved link on Linux) and NET-123's bind probe over the reserved
+//! local range (`127.0.64.0/24`). A session start reports both to the client
+//! as the resolver advisory (NET-122); while the range is absent boxes are
+//! published at the `127.0.0.1` interim ([`interim_address`]).
+//!
 //! ## Zone dump
 //!
 //! The answerer mirrors the zone to `<state>/net/zone.json` (see
-//! [`zone_dump_path`]) on start and after every change to the registry: every
-//! name, its address, the daemon that owns it, and the listener's socket. The
-//! `min bug` bundle carries that file.
+//! [`zone_dump_path`]) on start and after every change to the table: every
+//! name, its address and lease state, its published ports with collisions
+//! marked, the daemon that owns it, the listener's socket, and the host
+//! resolution state above. The `min bug` bundle carries that file.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -52,15 +67,20 @@ use std::os::fd::{BorrowedFd, FromRawFd as _, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 
+use minimald_rpc::ResolverAdvisory;
 use serde::Serialize;
 use tokio::net::UdpSocket;
 
+use sessions::SessionId;
+
 use super::dns::{HOSTNAME_SUFFIX, HostnameRegistry, SteerVerdict, Steered};
-use super::proxy::HostRoute;
+use super::policy::BoxZone;
+use super::publish::{AddressKind, Lookup, PortCollision, PublishTable, PublishedPort, Zone};
 
 /// The port the box zone is answered on, the one the host resolver hook names
-/// (`port 15353` in the macOS resolver file the spike installed).
-pub const ANSWERER_PORT: u16 = 15353;
+/// (`port 15353` in the macOS resolver file the spike installed). The wire
+/// crate holds the number, since the client's setup command writes it.
+pub const ANSWERER_PORT: u16 = minimald_rpc::ANSWERER_PORT;
 
 /// Where the answerer binds when the service manager did not hand it a socket:
 /// loopback only, so nothing off the host can reach it (NET-006).
@@ -118,8 +138,9 @@ const SD_LISTEN_FDS_START: RawFd = 3;
 pub enum Verdict {
     /// A record was answered: an `A` for a held name, or the apex `SOA`.
     Answer,
-    /// The name exists but holds no record of the asked type: an empty
-    /// `NOERROR` with the zone's SOA in the authority section (NET-124).
+    /// The name exists but holds no record of the asked type (NET-124), or
+    /// its box answers no address while it is not running (NET-128): an
+    /// empty `NOERROR` with the zone's SOA in the authority section.
     NoData,
     /// No box or node holds the name: `NXDOMAIN` with the zone's SOA in the
     /// authority section (NET-125).
@@ -261,8 +282,8 @@ fn is_ddr_probe(name: &str) -> bool {
 
 /// NET-127: the host answerer gives out loopback addresses only — `127.0.0.1`,
 /// the reserved local range, and a node's allocated address are all loopback.
-/// Anything else a registry entry carries (a switch address, an IPv6 target)
-/// is withheld, and the name answers NODATA instead.
+/// Anything else a zone carries (a switch address, an IPv6 target) is
+/// withheld, and the name answers NODATA instead.
 fn local_answer(ip: IpAddr) -> Option<Ipv4Addr> {
     match ip {
         IpAddr::V4(v4) if v4.is_loopback() => Some(v4),
@@ -270,7 +291,7 @@ fn local_answer(ip: IpAddr) -> Option<Ipv4Addr> {
     }
 }
 
-fn decide(zone: &(impl HostRoute + Steered), q: &Question<'_>) -> (Verdict, Body) {
+fn decide(zone: &impl Zone, steering: &impl Steered, q: &Question<'_>) -> (Verdict, Body) {
     if q.flags & OPCODE_MASK != 0 {
         return (Verdict::NotImplemented, Body::Empty);
     }
@@ -293,7 +314,7 @@ fn decide(zone: &(impl HostRoute + Steered), q: &Question<'_>) -> (Verdict, Body
         // steers at the proxy (BEP-062) — decided here, ahead of the refusal,
         // which is what keeps a steered name from being resolved for real. The
         // zone itself is never shadowed: a name in it never reaches this arm.
-        return match zone.steer(name) {
+        return match steering.steer(name) {
             SteerVerdict::NotSteered => (Verdict::Refused, Body::Empty),
             SteerVerdict::ServFail => (Verdict::ServFail, Body::Empty),
             SteerVerdict::ToProxy(proxy) if q.qtype == TYPE_A => (Verdict::Answer, Body::A(proxy)),
@@ -304,13 +325,13 @@ fn decide(zone: &(impl HostRoute + Steered), q: &Question<'_>) -> (Verdict, Body
             SteerVerdict::ToProxy(_) => (Verdict::NoData, Body::Empty),
         };
     }
-    match zone.resolve_host(name) {
-        None => (Verdict::NxDomain, Body::NegativeSoa),
-        Some(route) if q.qtype == TYPE_A => match local_answer(route.target) {
+    match zone.lookup(name) {
+        Lookup::Unknown => (Verdict::NxDomain, Body::NegativeSoa),
+        Lookup::Address(ip) if q.qtype == TYPE_A => match local_answer(ip) {
             Some(v4) => (Verdict::Answer, Body::A(v4)),
             None => (Verdict::NoData, Body::NegativeSoa),
         },
-        Some(_) => (Verdict::NoData, Body::NegativeSoa),
+        Lookup::Address(_) | Lookup::Held => (Verdict::NoData, Body::NegativeSoa),
     }
 }
 
@@ -392,10 +413,16 @@ fn encode(id: u16, query_flags: u16, question: &[u8], verdict: Verdict, body: Bo
 }
 
 /// Answers one query datagram from the zone, or `None` when `msg` is not a
-/// query to answer at all (too short, or itself a response). Pure over the
-/// zone: the socket path and the tests both call this.
+/// query to answer at all (too short, or itself a response). Pure over both
+/// tables: the socket path and the tests both call this.
+///
+/// `zone` answers the names inside `min.internal`; `steering` decides the ones
+/// outside it, which is where a credentialed hostname steered at the Box
+/// Egress Proxy is answered (BEP-062). The two are separate tables because
+/// they hold separate facts: `zone` is the published-box table, `steering` the
+/// hostname registry the proxy routes through.
 #[must_use]
-pub fn answer(zone: &(impl HostRoute + Steered), msg: &[u8]) -> Option<Reply> {
+pub fn answer(zone: &impl Zone, steering: &impl Steered, msg: &[u8]) -> Option<Reply> {
     let q = match parse_question(msg) {
         Ok(q) => q,
         Err(Malformed::Drop) => return None,
@@ -408,7 +435,7 @@ pub fn answer(zone: &(impl HostRoute + Steered), msg: &[u8]) -> Option<Reply> {
             });
         }
     };
-    let (verdict, body) = decide(zone, &q);
+    let (verdict, body) = decide(zone, steering, &q);
     Some(Reply {
         bytes: encode(q.id, q.flags, q.wire, verdict, body),
         name: q.name,
@@ -426,6 +453,141 @@ pub fn on_host(peer: IpAddr) -> bool {
         IpAddr::V6(v6) => {
             v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
         }
+    }
+}
+
+/// The reserved local range's prefix: `127.0.64.0/24`
+/// ([`minimald_rpc::RESERVED_RANGE`], design §7.1).
+const RESERVED_RANGE_PREFIX: [u8; 3] = [127, 0, 64];
+
+/// Every address a box can be published at from the reserved local range:
+/// `127.0.64.1` to `127.0.64.254`.
+pub fn reserved_range() -> impl Iterator<Item = Ipv4Addr> {
+    let [a, b, c] = RESERVED_RANGE_PREFIX;
+    (1..=254).map(move |host| Ipv4Addr::new(a, b, c, host))
+}
+
+/// What the bind probe found of the reserved local range (NET-123).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum RangeProbe {
+    /// Every address in the range bound.
+    Present,
+    /// An address did not bind: the range is not on the host's loopback, in
+    /// full or in part.
+    Absent { address: Ipv4Addr, error: String },
+}
+
+impl RangeProbe {
+    #[must_use]
+    pub fn is_present(&self) -> bool {
+        matches!(self, Self::Present)
+    }
+
+    /// The gap the advisory names: `<address>: <error>`.
+    #[must_use]
+    pub fn gap(&self) -> Option<String> {
+        match self {
+            Self::Present => None,
+            Self::Absent { address, error } => Some(format!("{address}: {error}")),
+        }
+    }
+}
+
+/// NET-123's bind probe: binds an ephemeral TCP port on each address in turn
+/// and reports the first that refuses. Every address is probed rather than a
+/// sample — a partial alias set would otherwise let a box be published at an
+/// address that hangs — and it is cheap: an absent alias fails `bind` with
+/// `EADDRNOTAVAIL` in microseconds (the loopback spike measured 2.5 ms for
+/// the whole range). Each listener is dropped before the next bind, so
+/// nothing is held.
+pub fn probe_range(addrs: impl IntoIterator<Item = Ipv4Addr>) -> RangeProbe {
+    for address in addrs {
+        if let Err(error) = std::net::TcpListener::bind((address, 0)) {
+            return RangeProbe::Absent {
+                address,
+                error: error.to_string(),
+            };
+        }
+    }
+    RangeProbe::Present
+}
+
+/// The bind probe over the whole reserved local range.
+#[must_use]
+pub fn probe_reserved_range() -> RangeProbe {
+    probe_range(reserved_range())
+}
+
+/// The address a box is published at while the reserved range is absent
+/// (NET-123's failure case): `127.0.0.1`, the one loopback address every
+/// host has. `None` while the range is present, when a box takes an address
+/// of its own from it.
+#[must_use]
+pub fn interim_address(probe: &RangeProbe) -> Option<Ipv4Addr> {
+    match probe {
+        RangeProbe::Present => None,
+        RangeProbe::Absent { .. } => Some(Ipv4Addr::LOCALHOST),
+    }
+}
+
+/// Where the Linux resolver hook shows: the dedicated link the advisory's
+/// command creates and systemd-resolved routes the zone on
+/// ([`minimald_rpc::RESOLVER_LINK`]) appears here once it exists.
+const SYSFS_NET: &str = "/sys/class/net";
+
+/// Whether the host resolver routes the box zone to this answerer.
+#[must_use]
+pub fn resolver_hook_configured() -> bool {
+    resolver_hook_configured_in(Path::new(SYSFS_NET))
+}
+
+fn resolver_hook_configured_in(sysfs_net: &Path) -> bool {
+    sysfs_net.join(minimald_rpc::RESOLVER_LINK).exists()
+}
+
+/// What the box host knows of native resolution: read at every session start
+/// (NET-122, NET-123) and written into the zone dump.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HostResolution {
+    /// Whether the host resolver routes the zone to the answerer.
+    pub resolver_configured: bool,
+    /// The bind probe's result over the reserved local range.
+    pub range: RangeProbe,
+}
+
+impl HostResolution {
+    /// Reads both halves from the host now.
+    #[must_use]
+    pub fn probe() -> Self {
+        Self {
+            resolver_configured: resolver_hook_configured(),
+            range: probe_reserved_range(),
+        }
+    }
+
+    /// The surface boxes are published on under this state, for the log.
+    #[must_use]
+    pub fn surface(&self) -> &'static str {
+        if self.range.is_present() {
+            "reserved range"
+        } else {
+            "127.0.0.1 (interim)"
+        }
+    }
+
+    /// The advisory a session start reply carries: present whenever either
+    /// half is missing, every time it is asked — a host still on the
+    /// interim is told again at each start, there is no once-only latch —
+    /// and nothing when native resolution is in place.
+    #[must_use]
+    pub fn advisory(&self) -> Option<ResolverAdvisory> {
+        let range_present = self.range.is_present();
+        (!self.resolver_configured || !range_present).then(|| ResolverAdvisory {
+            resolver_configured: self.resolver_configured,
+            range_present,
+            range_gap: self.range.gap(),
+        })
     }
 }
 
@@ -510,7 +672,15 @@ struct ZoneDump {
     zone: &'static str,
     ttl_secs: u32,
     listener: ListenerInfo,
+    /// The resolver hook and the range probe as the bundle should see them.
+    host: HostResolution,
     names: Vec<ZoneEntry>,
+    /// The in-guest half of the same zone: what the node's DNS layer answers a
+    /// box with for a sibling (NET-072). Switch leases, so none of them is an
+    /// address this answerer would give a lookup on the host (NET-127) — the
+    /// two halves answer one name differently on purpose, and a box-to-box
+    /// refusal is read against these entries, not the host's.
+    in_guest: Vec<GuestEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -523,27 +693,67 @@ struct ListenerInfo {
 #[derive(Debug, Serialize)]
 struct ZoneEntry {
     name: String,
-    address: IpAddr,
-    /// The daemon that registered the name.
+    address: Ipv4Addr,
+    /// The daemon that published the name.
     owner: String,
+    session_id: SessionId,
+    /// Whether the address is the box's own lease or the node's shared one.
+    kind: AddressKind,
+    /// The lease state: a shared-address box answers only while running.
+    running: bool,
+    /// The box's own port numbers, published untranslated.
+    ports: Vec<u16>,
+    /// Each published port with what holds it: the forwarder bound for it, the
+    /// revocation that closed it, or the box's own listener (NET-121).
+    forwarders: Vec<PublishedPort>,
+    /// The ports another box on the same shared address also publishes.
+    collisions: Vec<PortCollision>,
+}
+
+/// One in-guest box-zone entry: the switch lease a sibling's name resolves to
+/// inside boxes, and the ports that box's ingress declares — the target half of
+/// a box-to-box verdict (NET-073), so a refused connection can be read here.
+#[derive(Debug, Serialize)]
+struct GuestEntry {
+    name: String,
+    address: Ipv4Addr,
+    tcp_ports: Vec<u16>,
+    udp_ports: Vec<u16>,
 }
 
 fn snapshot(
-    registry: &RwLock<HostnameRegistry>,
+    zone: &RwLock<PublishTable>,
+    box_zone: &BoxZone,
     daemon_id: &str,
     local: SocketAddr,
     source: SocketSource,
 ) -> ZoneDump {
-    let guard = registry.read().unwrap_or_else(PoisonError::into_inner);
-    let mut names: Vec<ZoneEntry> = guard
+    let guard = zone.read().unwrap_or_else(PoisonError::into_inner);
+    let names: Vec<ZoneEntry> = guard
         .entries()
-        .map(|(name, address)| ZoneEntry {
-            name: name.to_string(),
-            address,
+        .into_iter()
+        .map(|b| ZoneEntry {
+            name: b.hostname,
+            address: b.address,
             owner: daemon_id.to_string(),
+            session_id: b.session_id,
+            kind: b.kind,
+            running: b.running,
+            ports: b.ports,
+            forwarders: b.forwarders,
+            collisions: b.collisions,
         })
         .collect();
-    names.sort_by(|a, b| a.name.cmp(&b.name));
+    let in_guest = box_zone
+        .entries()
+        .into_iter()
+        .map(|entry| GuestEntry {
+            name: entry.name(),
+            address: entry.lease,
+            tcp_ports: entry.tcp_ports.into_iter().collect(),
+            udp_ports: entry.udp_ports.into_iter().collect(),
+        })
+        .collect();
     ZoneDump {
         zone: ZONE_APEX,
         ttl_secs: ZONE_TTL,
@@ -552,7 +762,9 @@ fn snapshot(
             port: local.port(),
             socket: source,
         },
+        host: HostResolution::probe(),
         names,
+        in_guest,
     }
 }
 
@@ -569,41 +781,53 @@ async fn write_dump(path: &Path, dump: &ZoneDump) -> io::Result<()> {
 }
 
 async fn refresh_dump(
-    registry: &RwLock<HostnameRegistry>,
+    zone: &RwLock<PublishTable>,
+    box_zone: &BoxZone,
     daemon_id: &str,
     local: SocketAddr,
     source: SocketSource,
     path: &Path,
 ) {
-    let dump = snapshot(registry, daemon_id, local, source);
+    let dump = snapshot(zone, box_zone, daemon_id, local, source);
     if let Err(error) = write_dump(path, &dump).await {
         tracing::warn!(%error, path = %path.display(), "could not write the zone dump");
     }
 }
 
 /// Serves the zone on `listener` until the socket errors: answers each on-host
-/// lookup from `registry`, drops off-host ones unanswered, and keeps the zone
-/// dump at `dump_path` current.
+/// lookup from `zone`, drops off-host ones unanswered, and keeps the zone dump
+/// at `dump_path` current.
+///
+/// `box_zone` is not answered from — a lookup on the host is answered from the
+/// published table alone, and only with a local address (NET-127) — but it is
+/// dumped beside it, so a bundle shows what a box resolves a sibling to as well
+/// as what the host does.
+///
+/// `steering` is the hostname registry, consulted only for names outside the
+/// zone: a credentialed hostname a live box steers answers the proxy's address
+/// there, and SERVFAIL while the proxy's listener is not live (BEP-062).
 pub async fn serve(
     listener: Listener,
-    registry: Arc<RwLock<HostnameRegistry>>,
+    zone: Arc<RwLock<PublishTable>>,
+    steering: Arc<RwLock<HostnameRegistry>>,
+    box_zone: Arc<BoxZone>,
     daemon_id: String,
     dump_path: PathBuf,
 ) -> io::Result<()> {
     let Listener { socket, source } = listener;
     let local = socket.local_addr()?;
-    let changes = registry
+    let changes = zone
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .changes();
     tracing::info!(address = %local, socket = ?source, "box-zone answerer listening");
-    refresh_dump(&registry, &daemon_id, local, source, &dump_path).await;
+    refresh_dump(&zone, &box_zone, &daemon_id, local, source, &dump_path).await;
 
     let mut buf = vec![0u8; MAX_MESSAGE];
     loop {
         tokio::select! {
             () = changes.notified() => {
-                refresh_dump(&registry, &daemon_id, local, source, &dump_path).await;
+                refresh_dump(&zone, &box_zone, &daemon_id, local, source, &dump_path).await;
             }
             received = socket.recv_from(&mut buf) => {
                 let (len, peer) = received?;
@@ -611,7 +835,7 @@ pub async fn serve(
                     tracing::warn!(%peer, "refused a box-zone lookup from off the host");
                     continue;
                 }
-                let Some(reply) = answer(&*registry, &buf[..len]) else {
+                let Some(reply) = answer(&*zone, &*steering, &buf[..len]) else {
                     continue;
                 };
                 tracing::debug!(
@@ -631,10 +855,13 @@ pub async fn serve(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::net::Ipv6Addr;
     use std::time::Duration;
 
-    use sessions::SessionId;
+    use sessions::NetworkMode;
+
+    use crate::net::dns::NoSteering;
 
     use super::*;
 
@@ -645,14 +872,30 @@ mod tests {
     const TYPE_ANY: u16 = 255;
     const RCODE_MASK: u16 = 0x000F;
 
-    /// A registry whose names are `<session>.min.internal`, routed to
-    /// the given addresses.
-    fn zone(entries: &[(&str, IpAddr)]) -> Arc<RwLock<HostnameRegistry>> {
-        let mut reg = HostnameRegistry::new("local");
-        for (session, ip) in entries {
-            reg.register(SessionId::nil(), session, *ip);
+    /// A zone holding `<session>.min.internal` for each box, published in
+    /// the given mode and running: a host-address box at `127.0.0.1`, an
+    /// own-address box at the next free address of the reserved range.
+    fn zone(boxes: &[(&str, NetworkMode)]) -> Arc<RwLock<PublishTable>> {
+        let mut table = PublishTable::default();
+        for (session, mode) in boxes {
+            table
+                .publish(SessionId::nil(), session, *mode, &[])
+                .unwrap();
+            table.set_running(session, true);
         }
-        Arc::new(RwLock::new(reg))
+        Arc::new(RwLock::new(table))
+    }
+
+    /// A zone answering fixed addresses, including ones the table can never
+    /// hold, for the answerer's own confinement rule.
+    struct FixedZone(HashMap<String, IpAddr>);
+
+    impl Zone for FixedZone {
+        fn lookup(&self, name: &str) -> Lookup {
+            self.0
+                .get(name)
+                .map_or(Lookup::Unknown, |ip| Lookup::Address(*ip))
+        }
     }
 
     fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
@@ -784,8 +1027,8 @@ mod tests {
         u32::from_be_bytes(rdata[off + 16..off + 20].try_into().unwrap())
     }
 
-    fn reply(zone: &RwLock<HostnameRegistry>, name: &str, qtype: u16) -> Parsed {
-        let reply = answer(zone, &query(name, qtype)).expect("a query is answered");
+    fn reply(zone: &RwLock<PublishTable>, name: &str, qtype: u16) -> Parsed {
+        let reply = answer(zone, &NoSteering, &query(name, qtype)).expect("a query is answered");
         parse_reply(&reply.bytes)
     }
 
@@ -827,10 +1070,15 @@ mod tests {
         buf
     }
 
-    /// Starts `serve` on an ephemeral loopback port with `zone` and a dump
-    /// under `state`; returns the address to query once the answerer has
-    /// answered a probe, which it does only after writing its first dump.
-    async fn spawn_answerer(zone: Arc<RwLock<HostnameRegistry>>, state: &Path) -> SocketAddr {
+    /// Starts `serve` on an ephemeral loopback port with `zone`, the in-guest
+    /// `box_zone` it dumps beside it, and a dump under `state`; returns the
+    /// address to query once the answerer has answered a probe, which it does
+    /// only after writing its first dump.
+    async fn spawn_answerer(
+        zone: Arc<RwLock<PublishTable>>,
+        box_zone: Arc<BoxZone>,
+        state: &Path,
+    ) -> SocketAddr {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         socket.set_nonblocking(true).unwrap();
         let socket = UdpSocket::from_std(socket).unwrap();
@@ -842,6 +1090,12 @@ mod tests {
         tokio::spawn(serve(
             listener,
             zone,
+            // Nothing steers here: these tests assert what the ZONE answers,
+            // and every name they ask is inside it.
+            Arc::new(RwLock::new(HostnameRegistry::new(
+                crate::net::dns::DEFAULT_HOST_ID,
+            ))),
+            box_zone,
             "d0".to_string(),
             zone_dump_path(state),
         ));
@@ -880,8 +1134,8 @@ mod tests {
         }
 
         let state = tempfile::TempDir::new().unwrap();
-        let zone = zone(&[("web", v4(127, 0, 0, 1))]);
-        let server = spawn_answerer(zone, state.path()).await;
+        let zone = zone(&[("web", NetworkMode::HostNet)]);
+        let server = spawn_answerer(zone, Arc::new(BoxZone::default()), state.path()).await;
         let parsed = parse_reply(&ask(server, &query("web.min.internal", TYPE_A)).await);
         assert_eq!(parsed.id, 0x1234);
         assert_eq!(parsed.rcode(), 0);
@@ -896,8 +1150,8 @@ mod tests {
     #[tokio::test]
     async fn min_internal_absent_from_certs_and_audit() {
         let state = tempfile::TempDir::new().unwrap();
-        let zone = zone(&[("web", v4(127, 0, 0, 1))]);
-        let server = spawn_answerer(zone, state.path()).await;
+        let zone = zone(&[("web", NetworkMode::HostNet)]);
+        let server = spawn_answerer(zone, Arc::new(BoxZone::default()), state.path()).await;
         let mut replies = Vec::new();
         for (name, qtype) in [
             ("web.min.internal", TYPE_A),
@@ -943,7 +1197,7 @@ mod tests {
     /// NOERROR with the zone's SOA — never NXDOMAIN, whatever the type.
     #[test]
     fn non_a_in_zone_query_is_nodata() {
-        let zone = zone(&[("web", v4(127, 0, 0, 1))]);
+        let zone = zone(&[("web", NetworkMode::HostNet)]);
         for qtype in [
             TYPE_AAAA, TYPE_HTTPS, TYPE_SVCB, TYPE_TXT, TYPE_ANY, TYPE_SOA,
         ] {
@@ -961,7 +1215,7 @@ mod tests {
     /// name whose box has since been withdrawn.
     #[test]
     fn unknown_in_zone_name_is_nxdomain() {
-        let zone = zone(&[("web", v4(127, 0, 0, 1))]);
+        let zone = zone(&[("web", NetworkMode::HostNet)]);
         for name in [
             "ghost.min.internal",
             "web.other.min.internal",
@@ -973,7 +1227,7 @@ mod tests {
         }
         assert_eq!(reply(&zone, "Web.MIN.internal", TYPE_A).rcode(), 0);
 
-        zone.write().unwrap().deregister("web");
+        zone.write().unwrap().withdraw("web");
         let parsed = reply(&zone, "web.min.internal", TYPE_A);
         assert_eq!(parsed.rcode(), 3, "a withdrawn name is NXDOMAIN");
         assert_zone_authority(&parsed, "withdrawn");
@@ -983,7 +1237,7 @@ mod tests {
     /// SOA advertises, is at most 15 s.
     #[test]
     fn zone_answers_carry_short_ttl() {
-        let zone = zone(&[("web", v4(127, 0, 0, 1))]);
+        let zone = zone(&[("web", NetworkMode::HostNet)]);
         let a = reply(&zone, "web.min.internal", TYPE_A);
         let nodata = reply(&zone, "web.min.internal", TYPE_AAAA);
         let nxdomain = reply(&zone, "ghost.min.internal", TYPE_A);
@@ -1004,19 +1258,28 @@ mod tests {
     }
 
     /// NET-127: on the host an `A` answer carries a loopback address only.
-    /// A name registered to a switch or IPv6 address is answered NODATA
-    /// rather than leaking an address the host cannot reach.
+    /// A name held at a switch or IPv6 address is answered NODATA rather
+    /// than leaking an address the host cannot reach.
     #[test]
     fn host_zone_a_answers_confined_to_local_addresses() {
-        let zone = zone(&[
-            ("web", v4(127, 0, 0, 1)),
-            ("box", v4(127, 0, 64, 10)),
-            ("switch", v4(10, 0, 2, 15)),
-            ("six", IpAddr::V6(Ipv6Addr::LOCALHOST)),
-        ]);
+        let zone = FixedZone(HashMap::from([
+            ("web.min.internal".to_string(), v4(127, 0, 0, 1)),
+            ("box.min.internal".to_string(), v4(127, 0, 64, 10)),
+            ("switch.min.internal".to_string(), v4(10, 0, 2, 15)),
+            (
+                "six.min.internal".to_string(),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ),
+        ]));
         let mut answered = Vec::new();
         for name in ["web", "box", "switch", "six"] {
-            let parsed = reply(&zone, &format!("{name}.min.internal"), TYPE_A);
+            let reply = answer(
+                &zone,
+                &NoSteering,
+                &query(&format!("{name}.min.internal"), TYPE_A),
+            )
+            .unwrap();
+            let parsed = parse_reply(&reply.bytes);
             assert_eq!(parsed.rcode(), 0, "{name}: in zone, NOERROR");
             for rr in &parsed.answers {
                 assert_eq!(rr.rtype, TYPE_A);
@@ -1044,7 +1307,7 @@ mod tests {
     /// it. Out of zone is REFUSED and forwarded nowhere.
     #[test]
     fn negative_answers_carry_zone_authority() {
-        let zone = zone(&[("web", v4(127, 0, 0, 1))]);
+        let zone = zone(&[("web", NetworkMode::HostNet)]);
         let negatives = [
             ("web.min.internal", TYPE_AAAA, 0),
             ("web.min.internal", TYPE_HTTPS, 0),
@@ -1072,9 +1335,13 @@ mod tests {
             assert!(parsed.answers.is_empty() && parsed.authority.is_empty());
         }
         let parsed = parse_reply(
-            &answer(&*zone, &query_in_class("web.min.internal", TYPE_A, 3))
-                .unwrap()
-                .bytes,
+            &answer(
+                &*zone,
+                &NoSteering,
+                &query_in_class("web.min.internal", TYPE_A, 3),
+            )
+            .unwrap()
+            .bytes,
         );
         assert_eq!(parsed.rcode(), 5, "class CH: REFUSED");
     }
@@ -1085,7 +1352,7 @@ mod tests {
     fn unreadable_queries_are_formerr_and_responses_are_dropped() {
         let zone = zone(&[]);
         let truncated = &query("web.min.internal", TYPE_A)[..20];
-        let reply = answer(&*zone, truncated).unwrap();
+        let reply = answer(&*zone, &NoSteering, truncated).unwrap();
         assert_eq!(reply.verdict, Verdict::FormErr);
         let parsed = parse_reply(&reply.bytes);
         assert_eq!(parsed.rcode(), 1);
@@ -1094,17 +1361,118 @@ mod tests {
 
         let mut response = query("web.min.internal", TYPE_A);
         response[2] |= 0x80;
-        assert!(answer(&*zone, &response).is_none());
-        assert!(answer(&*zone, &[0u8; 5]).is_none());
+        assert!(answer(&*zone, &NoSteering, &response).is_none());
+        assert!(answer(&*zone, &NoSteering, &[0u8; 5]).is_none());
     }
 
-    /// The zone dump names every entry with its owner and the listener, and
-    /// follows the registry: written on start, rewritten on change.
+    /// NET-123's failure case: with the reserved range absent the probe says
+    /// so at once, the box is published at `127.0.0.1` and answers there, and
+    /// the advisory is surfaced again at every session start — a configured
+    /// resolver does not silence it and there is no once-only latch. Nothing
+    /// prompts and nothing hangs.
+    #[test]
+    fn absent_range_publishes_interim_and_readvises() {
+        // TEST-NET-1 is on no host's loopback, so binding it meets exactly
+        // what a stock macOS host shows for `127.0.64.x`: an immediate
+        // refusal. `127.0.0.1` after it proves the probe stops at the first
+        // gap rather than reporting the last address.
+        let missing = Ipv4Addr::new(192, 0, 2, 1);
+        let started = std::time::Instant::now();
+        let probe = probe_range([missing, Ipv4Addr::LOCALHOST]);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the probe neither prompts nor hangs"
+        );
+        let RangeProbe::Absent { address, error } = &probe else {
+            panic!("{missing} is not bindable, so the range is absent: {probe:?}");
+        };
+        assert_eq!(*address, missing);
+        assert!(!error.is_empty(), "the gap carries the bind error");
+        assert_eq!(
+            probe.gap().as_deref(),
+            Some(format!("{missing}: {error}").as_str())
+        );
+        assert_eq!(probe_range([Ipv4Addr::LOCALHOST]), RangeProbe::Present);
+
+        // The interim: an own-address box is published at 127.0.0.1 as a
+        // shared-address box, nothing is leased from the range, and the zone
+        // answers it there while it runs.
+        assert_eq!(interim_address(&probe), Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(interim_address(&RangeProbe::Present), None);
+        let zone = zone(&[]);
+        let published = zone.write().unwrap().publish_interim(
+            SessionId::nil(),
+            "web",
+            interim_address(&probe).unwrap(),
+            &[3000],
+        );
+        assert_eq!(published.address, Ipv4Addr::LOCALHOST);
+        assert_eq!(published.kind, AddressKind::Shared);
+        zone.write().unwrap().set_running("web", true);
+        let parsed = reply(&zone, "web.min.internal", TYPE_A);
+        assert_eq!(parsed.rcode(), 0);
+        assert_eq!(parsed.answers.len(), 1);
+        assert_eq!(parsed.answers[0].rdata, Ipv4Addr::LOCALHOST.octets());
+
+        // Re-advised at each start, resolver configured or not.
+        let host = HostResolution {
+            resolver_configured: true,
+            range: probe.clone(),
+        };
+        assert_eq!(host.surface(), "127.0.0.1 (interim)");
+        for start in 1..=2 {
+            let advisory = host
+                .advisory()
+                .unwrap_or_else(|| panic!("session start {start} is advised"));
+            assert!(advisory.resolver_configured);
+            assert!(!advisory.range_present);
+            assert_eq!(advisory.range_gap, probe.gap());
+        }
+        let unhooked = HostResolution {
+            resolver_configured: false,
+            range: RangeProbe::Present,
+        };
+        assert_eq!(unhooked.surface(), "reserved range");
+        let advisory = unhooked.advisory().expect("a missing hook is advised");
+        assert!(!advisory.resolver_configured && advisory.range_present);
+        assert_eq!(advisory.range_gap, None);
+        let in_place = HostResolution {
+            resolver_configured: true,
+            range: RangeProbe::Present,
+        };
+        assert_eq!(in_place.advisory(), None, "nothing to advise");
+
+        // The hook check is the link's presence in sysfs.
+        let sysfs = tempfile::TempDir::new().unwrap();
+        assert!(!resolver_hook_configured_in(sysfs.path()));
+        std::fs::create_dir(sysfs.path().join(minimald_rpc::RESOLVER_LINK)).unwrap();
+        assert!(resolver_hook_configured_in(sysfs.path()));
+    }
+
+    /// The zone dump names every entry with its address and lease state, its
+    /// published ports with collisions marked, its owner and the listener,
+    /// and follows the table: written on start, rewritten on change. Beside
+    /// the host's half it carries the in-guest one — the sibling entries a box
+    /// resolves, with their switch leases and declared ports (NET-072,
+    /// NET-073) — which the host's own answers never give out (NET-127).
     #[tokio::test]
     async fn zone_dump_follows_the_registry() {
         let state = tempfile::TempDir::new().unwrap();
-        let zone = zone(&[("web", v4(127, 0, 0, 1))]);
-        let server = spawn_answerer(Arc::clone(&zone), state.path()).await;
+        let zone = zone(&[("web", NetworkMode::HostNet)]);
+        let box_zone = Arc::new(BoxZone::default());
+        box_zone.register(
+            "api",
+            Ipv4Addr::new(100, 64, 0, 5),
+            Some(&sessions::IngressPolicy {
+                port_mappings: vec![sessions::PortMapping {
+                    external_port: 18080,
+                    internal_port: 8080,
+                    proto: sessions::IpProto::Tcp,
+                }],
+                dynamic_allowed_range: None,
+            }),
+        );
+        let server = spawn_answerer(Arc::clone(&zone), Arc::clone(&box_zone), state.path()).await;
         let path = zone_dump_path(state.path());
 
         let dump = read_dump(&path).await;
@@ -1113,19 +1481,54 @@ mod tests {
         assert_eq!(dump["listener"]["address"], "127.0.0.1");
         assert_eq!(dump["listener"]["port"], u64::from(server.port()));
         assert_eq!(dump["listener"]["socket"], "bound");
+        // The host resolution state the bundle reads (NET-122/NET-123).
+        assert!(dump["host"]["resolver_configured"].is_boolean());
+        assert!(dump["host"]["range"]["state"].is_string());
         assert_eq!(dump["names"][0]["name"], "web.min.internal");
         assert_eq!(dump["names"][0]["address"], "127.0.0.1");
         assert_eq!(dump["names"][0]["owner"], "d0");
+        assert_eq!(dump["names"][0]["kind"], "shared");
+        assert_eq!(dump["names"][0]["running"], true);
+        assert_eq!(dump["in_guest"][0]["name"], "api.min.internal");
+        assert_eq!(dump["in_guest"][0]["address"], "100.64.0.5");
+        assert_eq!(dump["in_guest"][0]["tcp_ports"][0], 8080);
+        assert!(
+            dump["in_guest"][0]["udp_ports"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
 
-        zone.write()
-            .unwrap()
-            .register(SessionId::nil(), "api", v4(127, 0, 64, 11));
+        {
+            let mut table = zone.write().unwrap();
+            table
+                .publish(SessionId::nil(), "api", NetworkMode::OwnIp, &[3000])
+                .unwrap();
+            table
+                .publish(SessionId::nil(), "peer", NetworkMode::HostNet, &[8080])
+                .unwrap();
+            table
+                .publish(SessionId::nil(), "web", NetworkMode::HostNet, &[8080])
+                .unwrap();
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let dump = read_dump(&path).await;
-            if dump["names"].as_array().unwrap().len() == 2 {
-                assert_eq!(dump["names"][0]["name"], "api.min.internal");
-                assert_eq!(dump["names"][0]["address"], "127.0.64.11");
+            let names = dump["names"].as_array().unwrap();
+            if names.len() == 3
+                && names[2]["collisions"]
+                    .as_array()
+                    .is_some_and(|c| !c.is_empty())
+            {
+                assert_eq!(names[0]["name"], "api.min.internal");
+                assert_eq!(names[0]["address"], "127.0.64.1");
+                assert_eq!(names[0]["kind"], "own");
+                assert_eq!(names[0]["running"], false);
+                assert_eq!(names[0]["ports"][0], 3000);
+                assert_eq!(names[0]["collisions"].as_array().unwrap().len(), 0);
+                assert_eq!(names[2]["name"], "web.min.internal");
+                assert_eq!(names[2]["collisions"][0]["port"], 8080);
+                assert_eq!(names[2]["collisions"][0]["with"], "peer.min.internal");
                 break;
             }
             assert!(tokio::time::Instant::now() < deadline, "dump not rewritten");

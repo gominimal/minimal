@@ -406,8 +406,9 @@ ci: fmt-check check-version clippy deny test doctest test-ignored
 ci: fmt-check check-version clippy deny test doctest
     @echo "ci: local PR gates green"
 
-# Run the curl|sh installer's tests under every POSIX sh. CI: ci-shell-installer.yml.
-test-installer:
+# Run the curl|sh installer's tests under every POSIX sh; with CASE, only that
+# named case (`just test-installer installer_switch_binary_executable`). CI: ci-shell-installer.yml.
+test-installer case="":
     #!/usr/bin/env bash
     set -euo pipefail
     if command -v shellcheck >/dev/null 2>&1; then
@@ -419,7 +420,7 @@ test-installer:
     for sh in sh dash; do
         command -v "$sh" >/dev/null 2>&1 || { echo "== $sh not found, skipping =="; continue; }
         echo "== running install_test.sh under $sh =="
-        SH="$sh" "$sh" scripts/install_test.sh
+        SH="$sh" "$sh" scripts/install_test.sh "{{ case }}"
     done
 
 # The reviewed harness the frozen ci-shell-installer.yml can't widen to; CI runs
@@ -492,10 +493,10 @@ _kvm:
 
 # minvmd's VM harnesses (tests/*_integration.rs). CI: `test-kvm` / macOS `e2e`.
 [macos]
-test-vm: _nextest artifacts initramfs
+test-vm: _nextest artifacts initramfs gvproxy
     #!/usr/bin/env sh
     set -eu
-    export MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state"
+    export MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state" MINVMD_GVPROXY_BIN="{{gvproxy}}"
     # CI's archive pattern: build EVERYTHING, codesign minvmd LAST (a later
     # cargo call would relink it → entitlement lost), run from the archive.
     cargo nextest archive -p minvmd --locked --archive-file "{{scratch}}/nextest-archive.tar.zst"
@@ -518,8 +519,9 @@ test-vm: _nextest artifacts initramfs
 
 # minvmd's VM harnesses (tests/*_integration.rs). CI: ci-linux-kvm.yml `test-kvm`.
 [linux]
-test-vm: _nextest _kvm artifacts initramfs minvmd-build
+test-vm: _nextest _kvm artifacts initramfs minvmd-build gvproxy
     MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state" \
+      MINVMD_GVPROXY_BIN="{{gvproxy}}" \
       MINVMD_REQUIRE_LIBKRUN=static LIBKRUN_PREFIX="{{krun-static}}" \
       cargo nextest run -p minvmd --profile vm --target {{musl-target}} \
       --run-ignored all --no-tests=fail \

@@ -166,11 +166,26 @@ pub fn intersect(answers: &[Ipv4Addr], rules: &RebindRules) -> Intersection {
     split
 }
 
-/// Bounded verification of [`intersect`] (NET-067): exhaustive over at most
-/// four IPv4 answers and at most four prefixes per set. The harness restates
-/// the denied ranges independently of the function and checks both sides: an
-/// admitted address lies in no denied range, and a refused one lies in the
-/// range named.
+/// Bounded verification of [`intersect`] (NET-067): exhaustive over at most two
+/// IPv4 answers and two symbolic prefixes per set, every prefix length in
+/// `0..=32`. The harness restates the denied ranges independently of the
+/// function and checks both sides: an admitted address lies in no denied range,
+/// and a refused one lies in the range named.
+///
+/// The bounds are what they are because this harness carries FOUR symbolic
+/// prefix sets at once and matches every answer against each, and CBMC's cost
+/// here is linear in both. Measured on one machine, each run reporting
+/// `VERIFICATION:- SUCCESSFUL` except the first: at four answers and symbolic
+/// set lengths the solve did not finish and grew until a CI runner was taken
+/// down; at two answers with symbolic set lengths, 46 s and 10.0 GB of CBMC
+/// peak; with the set lengths concrete (see [`any_cidrs`]), 31 s and 2.8 GB;
+/// and with `kissat` in place of the default solver, 70 s and 1.2 GB, which is
+/// the shape checked in — it was runner memory that killed this proof, not the
+/// clock. Two levers were measured and rejected because they bought nothing:
+/// drawing the prefix lengths from a concrete menu instead of `0..=32`, and
+/// sizing the two output `Vec`s in [`intersect`] up front (that one doubled the
+/// memory, a symbolic-length allocation costing more than the reallocation it
+/// removes).
 ///
 /// Run: `cargo kani -p sessions` (or `just kani`). The count of harnesses in
 /// this crate is asserted by `scripts/kani.sh`.
@@ -178,16 +193,27 @@ pub fn intersect(answers: &[Ipv4Addr], rules: &RebindRules) -> Intersection {
 mod kani_proofs {
     use super::*;
 
-    /// At most this many answers, and this many prefixes per set. The unwind
-    /// bound below is one more, for each loop's exit check.
-    const BOUND: usize = 4;
+    /// At most this many answers, and exactly this many prefixes per set. The
+    /// unwind bound below is one more, for each loop's exit check. Two answers
+    /// still put one address on each side of the split at once, against every
+    /// set, which is the shape the property is about.
+    const BOUND: usize = 2;
 
+    /// A set of exactly [`BOUND`] symbolic prefixes — which is every set size
+    /// the property can tell apart. Nothing here asks a set anything but
+    /// `iter().any(|c| c.contains(addr))`, for the answers drawn below, so a set
+    /// whose entries contain none of those answers behaves as an empty set does
+    /// and one whose entries coincide behaves as a one-entry set does; the
+    /// symbolic networks cover both. Drawing a symbolic LENGTH instead, as this
+    /// harness first did, makes CBMC carry a symbolic bound and a symbolic slice
+    /// length through all four sets, which cost 7 of the 10 GB above.
+    ///
+    /// `with_capacity` is the exact bound on purpose: a `Vec` that grows makes
+    /// CBMC model a reallocation and a copy per push.
     fn any_cidrs() -> Vec<Cidr> {
-        let n: usize = kani::any();
-        kani::assume(n <= BOUND);
         let raw: [(u32, u8); BOUND] = kani::any();
         let mut cidrs = Vec::with_capacity(BOUND);
-        for (addr, prefix) in raw.iter().take(n) {
+        for (addr, prefix) in &raw {
             kani::assume(*prefix <= 32);
             cidrs.push(Cidr::new(Ipv4Addr::from(*addr), *prefix).unwrap());
         }
@@ -195,12 +221,20 @@ mod kani_proofs {
     }
 
     #[kani::proof]
-    #[kani::unwind(5)]
+    #[kani::unwind(3)]
+    // kissat rather than the default solver: the same proof, at 1.2 GB of CBMC
+    // peak instead of 2.8 GB for twice the wall time. `cadical` was measured
+    // too and matched the default on both counts. The binary ships in the Kani
+    // bundle the lane already installs and caches.
+    #[kani::solver(kissat)]
     fn kani_rebinding_intersection_admits_no_denied_address() {
         let n: usize = kani::any();
         kani::assume(n <= BOUND);
         let raw: [u32; BOUND] = kani::any();
-        let answers: Vec<Ipv4Addr> = raw.iter().take(n).map(|a| Ipv4Addr::from(*a)).collect();
+        let mut answers: Vec<Ipv4Addr> = Vec::with_capacity(BOUND);
+        for addr in raw.iter().take(n) {
+            answers.push(Ipv4Addr::from(*addr));
+        }
         let rules = RebindRules {
             allow_subnets: if kani::any() { Some(any_cidrs()) } else { None },
             deny_subnets: any_cidrs(),

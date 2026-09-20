@@ -73,6 +73,11 @@ fn every_daemon_connection_is_classified() {
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
             "cmd/session.rs::cmd_session_setup_zed = gated",
+            "cmd/session.rs::connect_box_host = gated",
+            // Reading another VM's listing, not acting on a box through it: a
+            // VM on a different build must still be visible, and the command
+            // that goes on to act asserts the build on its own connection.
+            "cmd/session.rs::list_one_vm = ungated",
             "diag/net.rs::probe_socket = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
         ]
@@ -326,6 +331,7 @@ fn twin_entry(
         status,
         git: None,
         attrs: None,
+        vm: None,
     }
 }
 
@@ -1124,6 +1130,90 @@ fn legacy_network_spellings_parse_with_hint() {
     }
 }
 
+/// NET-075: a box with an address of its own and no `egress` section is shown as
+/// `deny-all` by `min session policy` once the default is in force. The policy
+/// the daemon hands back is the one its deny-all default produced — the same
+/// `sessions` function decides it on both sides — and what the command prints of
+/// it says deny-all in both registers: an `allow_subnets` list with no entry in
+/// the JSON on stdout, and the posture named in words beside it.
+#[test]
+fn policy_shows_deny_all_default() {
+    let effective = sessions::DenyAllDefault {
+        window: sessions::DenyAllWindow::InForce,
+        opted_out: false,
+    }
+    .effective_egress(sessions::NetworkMode::OwnIp, None);
+    let policy = sessions::SessionPolicy::new(effective.policy, None);
+
+    let json = serde_json_lenient::to_string(&policy).expect("the policy serializes");
+    assert!(
+        json.contains("\"allow_subnets\":[]"),
+        "the box must declare no destination: {json}"
+    );
+
+    let line = egress_posture_line(&policy).expect("a deny-all box is named as one");
+    assert!(line.contains("deny-all"), "{line}");
+
+    // A box that declares destinations is not deny-all, and neither is one with
+    // no section at all — the shipped allow-all.
+    let declared = sessions::SessionPolicy::new(
+        Some(sessions::EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..sessions::EgressPolicy::default()
+        }),
+        None,
+    );
+    assert_eq!(egress_posture_line(&declared), None);
+    assert_eq!(
+        egress_posture_line(&sessions::SessionPolicy::default()),
+        None
+    );
+}
+
+/// NET-076: while the deny-all default is announced but not yet in force,
+/// activate prints the coming change — naming the opt-out that keeps today's
+/// allow-all. Once the default is in force there is nothing coming to announce,
+/// and neither is there once the opt-out flag is set.
+#[test]
+fn deny_all_announcement_printed() {
+    let printed = |default| {
+        let mut out = Vec::new();
+        announce_deny_all_default(&mut out, default);
+        String::from_utf8(out).expect("the notice is UTF-8")
+    };
+
+    // What this release ships: announced, not in force, no opt-out.
+    let text = printed(sessions::DenyAllDefault::default());
+    assert!(text.contains("deny-all"), "must name the change: {text}");
+    assert!(
+        text.contains(sessions::DENY_ALL_OPT_OUT_VAR),
+        "must name the opt-out: {text}"
+    );
+
+    for (default, why) in [
+        (
+            sessions::DenyAllDefault {
+                window: sessions::DenyAllWindow::InForce,
+                opted_out: false,
+            },
+            "the default is already in force",
+        ),
+        (
+            sessions::DenyAllDefault {
+                window: sessions::DenyAllWindow::Announced,
+                opted_out: true,
+            },
+            "the opt-out flag is set",
+        ),
+    ] {
+        assert_eq!(
+            printed(default),
+            "",
+            "nothing is coming when {why}, so nothing is announced"
+        );
+    }
+}
+
 /// NET-036: `--network` and `--ingress` are documented in the CLI
 /// reference, not just discoverable via `--help`.
 #[test]
@@ -1495,4 +1585,137 @@ async fn proxy_exits_when_the_daemon_closes_the_socket() {
     .await
     .expect("proxy must exit once the socket closes, not hang on open stdin")
     .expect("a bridge that ends on a closed socket is not an error");
+}
+
+/// NET-122: a session start whose daemon reports native resolution missing
+/// prints the exact command that configures it — this binary under sudo —
+/// and prompts for nothing: the advisory is a pure write, the command is the
+/// privileged step. NET-123's interim is named with its gap, and a host with
+/// nothing missing gets no line at all.
+#[test]
+fn session_start_advises_resolver_command_without_prompt() {
+    use minimald_rpc::ResolverAdvisory;
+
+    let command = resolver_setup_command(std::path::Path::new("/opt/minimal/bin/min"));
+    assert_eq!(command, "sudo /opt/minimal/bin/min net setup");
+
+    // Both halves missing: the resolver hook and the range, with the gap.
+    let mut out = Vec::new();
+    write_resolver_advisory(
+        &mut out,
+        &ResolverAdvisory {
+            resolver_configured: false,
+            range_present: false,
+            range_gap: Some("127.0.64.1: Can't assign requested address".into()),
+        },
+        &command,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.lines().any(|line| line.trim() == command),
+        "the advisory names the exact command on a line of its own:\n{text}"
+    );
+    assert!(text.contains("<name>.min.internal"), "{text}");
+    assert!(text.contains("host resolver is not configured"), "{text}");
+    assert!(text.contains("127.0.64.0/24 is absent"), "{text}");
+    assert!(
+        text.contains("127.0.64.1: Can't assign requested address"),
+        "{text}"
+    );
+    assert!(text.contains("published at 127.0.0.1"), "{text}");
+    assert!(text.contains("nothing here prompts"), "{text}");
+    assert!(!text.contains('?'), "an advisory asks nothing:\n{text}");
+
+    // The interim alone — the resolver is configured, the range is not —
+    // is still advised, without blaming the resolver.
+    let mut out = Vec::new();
+    write_resolver_advisory(
+        &mut out,
+        &ResolverAdvisory {
+            resolver_configured: true,
+            range_present: false,
+            range_gap: None,
+        },
+        &command,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains("host resolver is not configured"), "{text}");
+    assert!(text.contains("published at 127.0.0.1"), "{text}");
+    assert!(text.lines().any(|line| line.trim() == command), "{text}");
+
+    // A daemon that says nothing (every daemon on macOS is a guest, and an
+    // older daemon predates the field) does not silence the advisory: the
+    // host is judged from this side, with the same shape. Linux carries all
+    // of 127/8 on `lo`, so here only the hook can be missing.
+    let judged = crate::net::host_resolution_advisory();
+    #[cfg(target_os = "linux")]
+    match &judged {
+        Some(advisory) => {
+            assert!(advisory.range_present, "{advisory:?}");
+            assert_eq!(advisory.range_gap, None);
+            assert!(!advisory.resolver_configured);
+        }
+        None => assert!(std::path::Path::new("/sys/class/net/min0").exists()),
+    }
+    if let Some(advisory) = &judged {
+        let mut out = Vec::new();
+        write_resolver_advisory(&mut out, advisory, &command).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.lines().any(|line| line.trim() == command), "{text}");
+    }
+
+    // The command the advisory names is a real one.
+    let cli = Cli::try_parse_from(["min", "net", "setup"]).expect("`min net setup` must parse");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Setup(NetSetupArgs { remove: false })
+        }))
+    ));
+}
+
+/// NET-018: `min session activate` and `min ls` both report native DNS as
+/// the live surface once host-OS resolution and published addresses are
+/// both in place, from the one shared notice — so the wording cannot drift
+/// between the two commands — and NET-019: the notice says the proxy keeps
+/// serving too, rather than the daemon behaviour going unmentioned. Real
+/// host state (whether either command is on the healthy path right now) is
+/// not deterministic across test hosts, so this checks the notice's own
+/// text and, source-level, that both commands' code reaches it — the same
+/// technique `the_activation_path_makes_no_version_round_trip` uses.
+#[test]
+fn activate_and_ls_report_native_surface() {
+    let mut out = Vec::new();
+    write_native_surface_notice(&mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("<name>.min.internal"), "{text}");
+    assert!(text.contains("resolves natively"), "{text}");
+    assert!(text.contains("live surface"), "{text}");
+    assert!(text.contains("hostname proxy keeps serving"), "{text}");
+    assert!(!text.contains('?'), "a notice asks nothing:\n{text}");
+
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (file, func, needle) in [
+        (
+            "src/cmd/session.rs",
+            "advise_resolver",
+            "write_native_surface_notice",
+        ),
+        (
+            "src/cmd/session.rs",
+            "advise_native_surface",
+            "write_native_surface_notice",
+        ),
+        ("src/cmd/list.rs", "cmd_ls", "advise_native_surface"),
+    ] {
+        let source = std::fs::read_to_string(manifest.join(file)).expect("readable source");
+        let body = function_body(&source, func)
+            .unwrap_or_else(|| panic!("{file} no longer defines {func}"));
+        assert!(
+            body.contains(needle),
+            "{file}::{func} no longer reports the native surface (missing {needle})"
+        );
+    }
 }

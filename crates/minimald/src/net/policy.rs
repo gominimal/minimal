@@ -18,11 +18,11 @@
 //! `sessions`' pure verdict — not here. What R2.7 needs from this module is
 //! the warning plumbing ([`PolicyWarnLimiter`] and [`KeyedWarnLimiter`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::hash::Hash;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_vsock::{VsockAddr, VsockStream};
 
+use sessions::core::net_verdict::{
+    DropRule, EgressRules, IPPROTO_TCP, IngressRules, ProxiedRequest, Verdict, proxied_verdict,
+};
 use sessions::{IngressPolicy, IpProto, PortMapping};
 
 use super::SwitchSubnet;
@@ -121,6 +124,15 @@ pub struct ExposedMapping {
     protocol: String,
 }
 
+impl ExposedMapping {
+    /// The host-side listen address the forward was exposed on, which
+    /// identifies it.
+    #[must_use]
+    pub fn local(&self) -> &str {
+        &self.local
+    }
+}
+
 /// Exposes every static port mapping in `ingress` on the switch's `control_sock`
 /// forwarding to `ptask_ip`, returning a handle per exposed forward for teardown
 /// (R2.3, R2.4-static). The dynamic range, if any, is not applied here — dynamic
@@ -140,12 +152,8 @@ pub async fn apply_ingress(
 ) -> io::Result<Vec<ExposedMapping>> {
     let mut exposed: Vec<ExposedMapping> = Vec::with_capacity(ingress.port_mappings.len());
     for mapping in &ingress.port_mappings {
-        let req = expose_request(mapping, ptask_ip);
-        match post_json(control, "/services/forwarder/expose", &req).await {
-            Ok(()) => exposed.push(ExposedMapping {
-                local: req.local,
-                protocol: req.protocol,
-            }),
+        match expose_mapping(control, ptask_ip, mapping).await {
+            Ok(forward) => exposed.push(forward),
             Err(e) => {
                 // Roll back what we managed to expose so a half-applied policy
                 // does not leave dangling forwards on the shared switch.
@@ -155,6 +163,27 @@ pub async fn apply_ingress(
         }
     }
     Ok(exposed)
+}
+
+/// Exposes one `mapping` on the switch's `control`, forwarding its host-side
+/// port to `ptask_ip`, and returns the handle that removes it again. One
+/// step of [`apply_ingress`], and on its own the forward a dynamic ingress
+/// request adds to a box that is already running.
+///
+/// # Errors
+///
+/// Returns the I/O error of the `expose` call.
+pub async fn expose_mapping(
+    control: &ControlChannel,
+    ptask_ip: Ipv4Addr,
+    mapping: &PortMapping,
+) -> io::Result<ExposedMapping> {
+    let req = expose_request(mapping, ptask_ip);
+    post_json(control, "/services/forwarder/expose", &req).await?;
+    Ok(ExposedMapping {
+        local: req.local,
+        protocol: req.protocol,
+    })
 }
 
 /// Removes every forward in `exposed` from the switch's `control_sock` (R2.3
@@ -233,6 +262,224 @@ fn dns_add_body(session_name: &str, lease_ip: Ipv4Addr) -> DnsZone {
             name: session_name.to_ascii_lowercase(),
             ip: lease_ip.to_string(),
         }],
+    }
+}
+
+/// One box's place in the in-guest box zone: the lease the node's DNS layer
+/// answers its name with, and the ports its own ingress rules declare.
+///
+/// Both halves travel together because a box-to-box connection is decided on
+/// both (NET-073) — the source's egress rules on its own relay leg, the
+/// target's ingress rules on the target's — so the leg that sees the frame
+/// leave can name the box it is addressed to and the verdict waiting for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxZoneEntry {
+    /// The box's session name: the single label its box-zone name carries
+    /// (NET-001), lower-cased as the zone holds it.
+    pub session: String,
+    /// The switch lease `<session>.min.internal` resolves to inside boxes.
+    pub lease: Ipv4Addr,
+    /// The TCP ports its ingress declares — the internal ports of its TCP
+    /// mappings, what a sibling dials. Empty accepts no new inbound connection.
+    pub tcp_ports: BTreeSet<u16>,
+    /// The UDP ports its ingress declares.
+    pub udp_ports: BTreeSet<u16>,
+}
+
+impl BoxZoneEntry {
+    /// The box's two-label name (NET-001).
+    #[must_use]
+    pub fn name(&self) -> String {
+        format!("{}.{}", self.session, crate::net::dns::HOSTNAME_SUFFIX)
+    }
+
+    /// Whether the box's ingress rules declare `port` for `proto`. A transport
+    /// its mappings cannot name declares nothing: ingress is stated per
+    /// transport, and the target's gate gates exactly those two.
+    fn declares(&self, proto: IpProto, port: u16) -> bool {
+        match proto {
+            IpProto::Tcp => self.tcp_ports.contains(&port),
+            IpProto::Udp => self.udp_ports.contains(&port),
+            _ => false,
+        }
+    }
+}
+
+/// What the target box's own ingress rules say about the port a sibling dialled
+/// (NET-073): the half of the verdict decided on the target's relay leg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressVerdict {
+    /// The target declared the port; its ingress gate admits the connection.
+    Declared,
+    /// The target declared no such port; its ingress gate drops the connection.
+    Undeclared,
+}
+
+impl IngressVerdict {
+    /// The verdict as the box-zone connection line spells it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Undeclared => "undeclared",
+        }
+    }
+}
+
+impl fmt::Display for IngressVerdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The target side of a box-to-box connection: the box holding the address
+/// dialled, and what its own ingress rules say about the port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxZoneTarget {
+    /// The target box's session name.
+    pub session: String,
+    /// Its ingress rules' verdict on the port dialled.
+    pub ingress: IngressVerdict,
+}
+
+/// The in-guest box zone: the entries `minimald` registered with the node's DNS
+/// layer ([`register_dns_name`]), one per live own-address box, shared by every
+/// box's relay.
+///
+/// Resolution needs no `egress.allow_dns_hosts` entry (NET-072). A box's lookup
+/// reaches the resolver Minimal owns for it through the deny-all carve-out
+/// (design §4.1), and the answer comes from this zone — no box's allow list is
+/// read on the path, so a box with a name allow list naming only `github.com`,
+/// and a box with no reach at all, resolve a sibling's name alike.
+///
+/// Reach is the separate question, and stays with the two boxes' rules
+/// (NET-073): the source's egress gate decides the frame leaving it and the
+/// target's ingress gate decides it arriving, so a resolved name is an address
+/// like any other. This table is what lets either side be named when it does.
+#[derive(Debug, Default)]
+pub struct BoxZone {
+    /// Session name → what was registered for it.
+    entries: Mutex<HashMap<String, BoxZoneEntry>>,
+}
+
+impl BoxZone {
+    /// Records the entry registered for `session`: its `lease` and the ports
+    /// `ingress` declares.
+    ///
+    /// Replaces any earlier entry for the name — a box that re-attaches takes a
+    /// new lease, and gvproxy's newest-first merge means the newest record is
+    /// the one that answers, so the table agrees with the zone.
+    pub fn register(&self, session: &str, lease: Ipv4Addr, ingress: Option<&IngressPolicy>) {
+        let ports = |proto: IpProto| -> BTreeSet<u16> {
+            ingress
+                .map(|i| {
+                    i.port_mappings
+                        .iter()
+                        .filter(|m| m.proto == proto)
+                        .map(|m| m.internal_port)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let session = session.to_ascii_lowercase();
+        let entry = BoxZoneEntry {
+            session: session.clone(),
+            lease,
+            tcp_ports: ports(IpProto::Tcp),
+            udp_ports: ports(IpProto::Udp),
+        };
+        self.entries
+            .lock()
+            .expect("BoxZone mutex poisoned")
+            .insert(session, entry);
+    }
+
+    /// Withdraws `session`'s entry as its box goes away, so the zone dump and
+    /// the box-to-box verdicts name live boxes only.
+    pub fn withdraw(&self, session: &str) {
+        self.entries
+            .lock()
+            .expect("BoxZone mutex poisoned")
+            .remove(&session.to_ascii_lowercase());
+    }
+
+    /// Adds `port` over `proto` to what `session`'s entry declares: a port
+    /// published at runtime by a dynamic ingress request, which a sibling's
+    /// verdict then names as declared. Nothing changes for a name with no
+    /// live entry.
+    pub fn declare_port(&self, session: &str, proto: IpProto, port: u16) {
+        self.with_ports(session, proto, |ports| {
+            ports.insert(port);
+        });
+    }
+
+    /// Takes `port` over `proto` back out of what `session`'s entry declares:
+    /// the rollback of a dynamic publication that did not complete.
+    pub fn retract_port(&self, session: &str, proto: IpProto, port: u16) {
+        self.with_ports(session, proto, |ports| {
+            ports.remove(&port);
+        });
+    }
+
+    fn with_ports(&self, session: &str, proto: IpProto, edit: impl FnOnce(&mut BTreeSet<u16>)) {
+        let mut entries = self.entries.lock().expect("BoxZone mutex poisoned");
+        let Some(entry) = entries.get_mut(&session.to_ascii_lowercase()) else {
+            return;
+        };
+        match proto {
+            IpProto::Tcp => edit(&mut entry.tcp_ports),
+            IpProto::Udp => edit(&mut entry.udp_ports),
+            // A transport its mappings cannot name declares nothing.
+            _ => {}
+        }
+    }
+
+    /// The lease `name` resolves to inside boxes, or `None` for a name outside
+    /// the box zone or one no live box holds.
+    ///
+    /// No allow list is consulted (NET-072): the zone alone decides.
+    #[must_use]
+    pub fn resolve(&self, name: &str) -> Option<Ipv4Addr> {
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        let label = name
+            .strip_suffix(crate::net::dns::HOSTNAME_SUFFIX)?
+            .strip_suffix('.')?;
+        self.entries
+            .lock()
+            .expect("BoxZone mutex poisoned")
+            .get(label)
+            .map(|entry| entry.lease)
+    }
+
+    /// The box holding `address` and the verdict its ingress rules give `proto`
+    /// port `port` (NET-073), or `None` when no live box holds the address.
+    #[must_use]
+    pub fn target_at(&self, address: Ipv4Addr, proto: IpProto, port: u16) -> Option<BoxZoneTarget> {
+        let entries = self.entries.lock().expect("BoxZone mutex poisoned");
+        let entry = entries.values().find(|entry| entry.lease == address)?;
+        Some(BoxZoneTarget {
+            session: entry.session.clone(),
+            ingress: if entry.declares(proto, port) {
+                IngressVerdict::Declared
+            } else {
+                IngressVerdict::Undeclared
+            },
+        })
+    }
+
+    /// Every live entry, in session-name order: the in-guest half of the zone
+    /// dump the diagnostics bundle carries.
+    #[must_use]
+    pub fn entries(&self) -> Vec<BoxZoneEntry> {
+        let mut entries: Vec<BoxZoneEntry> = self
+            .entries
+            .lock()
+            .expect("BoxZone mutex poisoned")
+            .values()
+            .cloned()
+            .collect();
+        entries.sort_by(|a, b| a.session.cmp(&b.session));
+        entries
     }
 }
 
@@ -701,9 +948,212 @@ impl PinTable {
     }
 }
 
+/// What one live box declared, as a surface routing by hostname needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxDeclaration {
+    /// The box's own address: its switch lease when it has an address of its
+    /// own, the switch's host alias when it carries the host's. What a direct
+    /// connection to the box would dial, which is what the caller's egress
+    /// rules are read against — not the address a routing surface forwards to.
+    pub address: Ipv4Addr,
+    /// The box's declared egress, where its address attributes traffic to this
+    /// box alone (NET-084). `None` for a box carrying the host's address: that
+    /// cohort shares one address (NET-078) and each box's own declaration is
+    /// enforced inside it (NET-079), so no rules here are attributable to it.
+    pub egress: Option<EgressRules>,
+    /// The ports the box declared inbound.
+    pub ingress: IngressRules,
+}
+
+impl BoxDeclaration {
+    /// The declaration of a box with an address of its own: its lease, the
+    /// rules its relay decides frames with, and its declared ports.
+    #[must_use]
+    pub fn for_own_address(
+        lease: Ipv4Addr,
+        egress: EgressRules,
+        ingress: Option<&IngressPolicy>,
+    ) -> Self {
+        Self {
+            address: lease,
+            egress: Some(egress),
+            ingress: IngressRules::for_own_address(ingress),
+        }
+    }
+
+    /// The declaration of a box that carries the host's address on `subnet`:
+    /// the address a box on the switch dials to reach the host it runs on
+    /// ([`host_reach_address`]), and no ingress declaration of its own.
+    #[must_use]
+    pub fn for_host_address(subnet: SwitchSubnet) -> Self {
+        Self {
+            address: subnet.host_alias(),
+            egress: None,
+            ingress: IngressRules::for_host_address(),
+        }
+    }
+}
+
+/// Every live box's declarations, keyed by the session name its hostname is
+/// minted from, so a surface that resolved a name to a box can decide the
+/// request against what that box declared (NET-069 to NET-071).
+///
+/// Held behind an `RwLock` on the daemon-scoped switch client: the box's
+/// network is where its address and its rules are both known, and the switch is
+/// the one object every box's network and the daemon's hostname proxy already
+/// share. Writers are the network providers (declare) and the session actor
+/// (withdraw with the hostname route); the proxy only reads.
+#[derive(Debug, Default)]
+pub struct BoxAdmissions {
+    boxes: HashMap<String, BoxDeclaration>,
+}
+
+impl BoxAdmissions {
+    /// An empty table: no box has declared anything, so nothing is admitted.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records what the box named `session` declared, replacing any earlier
+    /// declaration under that name (a relaunch leases a new address).
+    pub fn declare(&mut self, session: &str, declaration: BoxDeclaration) {
+        self.boxes.insert(session.to_string(), declaration);
+    }
+
+    /// Drops `session`'s declaration: the box is gone, and declares nothing.
+    pub fn withdraw(&mut self, session: &str) {
+        self.boxes.remove(session);
+    }
+
+    /// Adds `port` over `proto` to what `session` declared inbound: a port a
+    /// dynamic ingress request published at runtime, which a routed request
+    /// then reaches like a declared one. Nothing changes for a name with no
+    /// declaration behind it.
+    pub fn declare_port(&mut self, session: &str, proto: IpProto, port: u16) {
+        if let Some(declaration) = self.boxes.get_mut(session) {
+            declaration.ingress.declare(proto, port);
+        }
+    }
+
+    /// Takes `port` over `proto` back out of what `session` declared: the
+    /// rollback of a dynamic publication that did not complete.
+    pub fn retract_port(&mut self, session: &str, proto: IpProto, port: u16) {
+        if let Some(declaration) = self.boxes.get_mut(session) {
+            declaration.ingress.retract(proto, port);
+        }
+    }
+
+    /// The verdict on one TCP request the hostname proxy is asked to carry from
+    /// `caller` to the box named `session` on `port`, decided as the direct
+    /// connection it stands in for (NET-069 to NET-071).
+    ///
+    /// A name with no declaration behind it — a box whose network never came
+    /// up, or one that has gone — declared no port, so the request is refused:
+    /// a routing surface admits only what a box declared.
+    #[must_use]
+    pub fn verdict(&self, caller: IpAddr, session: &str, port: u16) -> Verdict {
+        let Some(target) = self.boxes.get(session) else {
+            return Verdict::Drop(DropRule::UndeclaredPort);
+        };
+        let request = ProxiedRequest {
+            caller: match caller {
+                IpAddr::V4(v4) => v4,
+                // No box holds an IPv6 address on the IPv4-only switch, so such
+                // a caller is attributed to none and is decided by the target's
+                // declaration alone.
+                IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+            },
+            target: target.address,
+            port,
+            proto: IPPROTO_TCP,
+        };
+        proxied_verdict(&request, self.caller(caller), &target.ingress)
+    }
+
+    /// The declared egress of the box that holds `caller`, or `None` when the
+    /// address is not one box's: a process on the host, or the host-address
+    /// cohort. Leases are never reused for the daemon's lifetime, so an address
+    /// answers for at most one box.
+    fn caller(&self, caller: IpAddr) -> Option<&EgressRules> {
+        let IpAddr::V4(address) = caller else {
+            return None;
+        };
+        self.boxes
+            .values()
+            .find(|b| b.address == address)
+            .and_then(|b| b.egress.as_ref())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table attributes a caller by the lease it sends from, and a
+    /// withdrawn box declares nothing: neither as a target nor as a caller.
+    #[test]
+    fn admissions_attribute_a_caller_by_its_lease_until_it_is_withdrawn() {
+        const CALLER: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 5);
+        const TARGET: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 6);
+        let mut table = BoxAdmissions::new();
+        // A caller allowed nothing outside its own loopback.
+        table.declare(
+            "caller",
+            BoxDeclaration::for_own_address(
+                CALLER,
+                EgressRules::for_box(
+                    CALLER,
+                    Some(&sessions::EgressPolicy {
+                        allow_subnets: Some(vec!["127.0.0.0/8".to_string()]),
+                        ..sessions::EgressPolicy::default()
+                    }),
+                    None,
+                ),
+                None,
+            ),
+        );
+        table.declare(
+            "web",
+            BoxDeclaration::for_own_address(
+                TARGET,
+                EgressRules::for_box(TARGET, None, None),
+                Some(&IngressPolicy {
+                    port_mappings: vec![PortMapping {
+                        external_port: 18080,
+                        internal_port: 8080,
+                        proto: IpProto::Tcp,
+                    }],
+                    dynamic_allowed_range: None,
+                }),
+            ),
+        );
+
+        // The caller's own rules do not reach the target's address.
+        assert_eq!(
+            table.verdict(CALLER.into(), "web", 18080),
+            Verdict::Drop(DropRule::Undeclared)
+        );
+        // A caller the table holds no rules for reaches the declared port.
+        let host: IpAddr = Ipv4Addr::LOCALHOST.into();
+        assert_eq!(table.verdict(host, "web", 18080), Verdict::Admit);
+        assert_eq!(
+            table.verdict(host, "web", 9999),
+            Verdict::Drop(DropRule::UndeclaredPort)
+        );
+        // Withdrawn: the name declares no port, and the lease attributes nobody.
+        table.withdraw("web");
+        assert_eq!(
+            table.verdict(host, "web", 18080),
+            Verdict::Drop(DropRule::UndeclaredPort)
+        );
+        table.withdraw("caller");
+        table.declare(
+            "web",
+            BoxDeclaration::for_host_address(SwitchSubnet::default()),
+        );
+        assert_eq!(table.verdict(CALLER.into(), "web", 18080), Verdict::Admit);
+    }
 
     #[test]
     fn admission_window_is_the_ttl_held_between_the_bounds() {
@@ -762,6 +1212,75 @@ mod tests {
             json,
             r#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.5"}]}"#
         );
+    }
+
+    /// The in-guest zone table: a sibling's name resolves from the zone alone,
+    /// each entry carries the ports that box's ingress declares, and a
+    /// withdrawn box holds neither (NET-072, NET-073). Names are matched
+    /// case-insensitively and only under the box zone's apex.
+    #[test]
+    fn box_zone_holds_each_live_box_s_lease_and_declared_ports() {
+        let api = Ipv4Addr::new(100, 64, 0, 5);
+        let zone = BoxZone::default();
+        zone.register(
+            "API",
+            api,
+            Some(&IngressPolicy {
+                port_mappings: vec![
+                    PortMapping {
+                        external_port: 18080,
+                        internal_port: 8080,
+                        proto: IpProto::Tcp,
+                    },
+                    PortMapping {
+                        external_port: 19999,
+                        internal_port: 9999,
+                        proto: IpProto::Udp,
+                    },
+                ],
+                dynamic_allowed_range: None,
+            }),
+        );
+        zone.register("web", Ipv4Addr::new(100, 64, 0, 9), None);
+
+        assert_eq!(zone.resolve("Api.min.internal."), Some(api));
+        assert_eq!(zone.resolve("api.min.internal"), Some(api));
+        // Outside the zone, and a name no box holds.
+        assert_eq!(zone.resolve("api.example.com"), None);
+        assert_eq!(zone.resolve("min.internal"), None);
+        assert_eq!(zone.resolve("gone.min.internal"), None);
+
+        // The target's own ingress decides the port, per transport.
+        let declared = |proto, port| {
+            zone.target_at(api, proto, port)
+                .expect("the sibling holds the address")
+                .ingress
+        };
+        assert_eq!(declared(IpProto::Tcp, 8080), IngressVerdict::Declared);
+        assert_eq!(declared(IpProto::Tcp, 9999), IngressVerdict::Undeclared);
+        assert_eq!(declared(IpProto::Udp, 9999), IngressVerdict::Declared);
+        assert_eq!(declared(IpProto::Icmp, 8080), IngressVerdict::Undeclared);
+        // A box with no ingress section declares nothing.
+        assert_eq!(
+            zone.target_at(Ipv4Addr::new(100, 64, 0, 9), IpProto::Tcp, 8080)
+                .map(|t| t.ingress),
+            Some(IngressVerdict::Undeclared)
+        );
+        assert_eq!(
+            zone.target_at(Ipv4Addr::new(93, 184, 216, 34), IpProto::Tcp, 443),
+            None
+        );
+
+        let entries = zone.entries();
+        assert_eq!(
+            entries.iter().map(BoxZoneEntry::name).collect::<Vec<_>>(),
+            vec!["api.min.internal", "web.min.internal"]
+        );
+
+        zone.withdraw("Api");
+        assert_eq!(zone.resolve("api.min.internal"), None);
+        assert_eq!(zone.target_at(api, IpProto::Tcp, 8080), None);
+        assert_eq!(zone.entries().len(), 1);
     }
 
     /// NET-003. The address `host.min.internal` answers is decided per mode and

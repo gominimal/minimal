@@ -194,6 +194,18 @@ pub struct ListSessionsEntry {
     #[serde(default)]
     pub git: Option<Box<GitInfo>>,
     pub attrs: Option<RunningSessionAttrs>,
+    /// The VM whose box host holds this box (NET-057), so a listing that spans
+    /// the VMs on one machine says which one each box lives on.
+    ///
+    /// Filled by whoever knows the VM. A box host in a microVM does not: the
+    /// name is the `--vm-name` the VM host daemon was started with, a
+    /// host-side fact naming the socket the client dialled, and the guest sees
+    /// neither. So today the client that listed the boxes stamps it — leaving
+    /// the field for a box host that *does* know its own VM to fill instead.
+    /// `None` when the machine runs a single box host, in which case there is
+    /// no VM to tell apart, and from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm: Option<String>,
 }
 
 /// The git state of a session's project path, as of the last
@@ -220,6 +232,21 @@ pub struct ResourcePool {
     pub memory_bytes: u64,
 }
 
+/// Which surface serves box names on this host right now (NET-018): native
+/// host-OS resolution once the resolver hook and the reserved local range
+/// are both deployed, or the hostname proxy until then. The proxy keeps
+/// serving either way (NET-019) — this only says which one a client should
+/// point at.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NameSurface {
+    /// Host-OS resolution and published addresses are both deployed:
+    /// `<name>.min.internal` resolves natively.
+    Native,
+    /// Native resolution is not fully deployed on this host yet.
+    Proxy,
+}
+
 /// The response to the [`ListSessions`] RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListSessionsResponse {
@@ -244,6 +271,23 @@ pub struct ListSessionsResponse {
     /// daemon log, and the user is at a terminal watching curl fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_routing_unavailable: Option<String>,
+    /// The port this daemon's hostname proxy is serving on, so a client can
+    /// print the port in use rather than assume the standard one.
+    ///
+    /// A daemon with no port configured takes the standard port while it is free
+    /// and a free port otherwise — which is what lets a second daemon on the
+    /// machine keep routing — so the port is the daemon's to report and the
+    /// client's to discover. `None` from a daemon that predates the field, and
+    /// from one whose listener has not bound (its
+    /// [`Self::hostname_routing_unavailable`] says why).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname_proxy_port: Option<u16>,
+    /// Which surface serves box names right now (NET-018), from a daemon
+    /// that can judge its own host. `None` from a daemon inside a microVM
+    /// (it cannot judge its host — see [`CreateSessionResponse::resolver_advisory`]'s
+    /// doc for why) or one that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_surface: Option<NameSurface>,
 }
 
 impl OneshotSshRpc for ListSessions {
@@ -325,6 +369,47 @@ impl OneshotSshRpc for GetSessionScreen {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionScreen");
     type Request<'a> = SessionId;
     type Response = Errorable<ScreenSnapshot>;
+}
+
+/// The box zone every box name lives under: `<name>.min.internal`.
+pub const BOX_ZONE: &str = "min.internal";
+
+/// The loopback port the box-zone answerer listens on, and the one the host
+/// resolver hook names (`port 15353` in the macOS resolver file, the
+/// `127.0.0.1:15353` DNS server of the Linux routing-domain link).
+pub const ANSWERER_PORT: u16 = 15353;
+
+/// The reserved local range published boxes take their addresses from
+/// (design §7.1): `127.0.64.1` to `127.0.64.254`. Linux carries all of
+/// `127/8` on `lo`; macOS carries only `127.0.0.1` until the privileged step
+/// the resolver advisory names aliases the range onto `lo0`.
+pub const RESERVED_RANGE: &str = "127.0.64.0/24";
+
+/// The name of the dedicated link the Linux resolver hook routes the zone on.
+pub const RESOLVER_LINK: &str = "min0";
+
+/// Why native resolution of the box zone is not in place on the box host at
+/// this session start, carried on [`CreateSessionResponse::resolver_advisory`]
+/// (NET-122, NET-123).
+///
+/// The daemon reports the state; the client prints the advisory and names the
+/// exact command that clears it, since the command runs on the client's host
+/// and its spelling is per OS. Present whenever either half is missing, on
+/// every session start, so a host still on the `127.0.0.1` interim keeps
+/// being told (NET-123's failure case); absent when nothing needs doing, or
+/// from a daemon that cannot judge its host (one inside a VM), in which case
+/// the client reads both halves from the host itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolverAdvisory {
+    /// Whether the host resolver routes the box zone to the answerer.
+    pub resolver_configured: bool,
+    /// Whether the bind probe found every address of [`RESERVED_RANGE`]
+    /// bindable. `false` means boxes are published at `127.0.0.1` for now.
+    pub range_present: bool,
+    /// The first address the probe could not bind, with the error, when the
+    /// range is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_gap: Option<String>,
 }
 
 /// An RPC to create a new session.
@@ -445,6 +530,12 @@ pub struct CreateSessionResponse {
     /// looking healthy either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_routing_unavailable: Option<String>,
+    /// What keeps `<name>.min.internal` from resolving natively on the box
+    /// host, when something does — see [`ResolverAdvisory`]. Omitted when
+    /// native resolution is in place, and absent from a daemon that predates
+    /// the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver_advisory: Option<ResolverAdvisory>,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -800,40 +891,160 @@ impl OneshotSshRpc for GetSessionHooks {
     type Response = Errorable<Vec<sessions::wire::primitives::WireProvenancedHook>>;
 }
 
-/// An RPC for a process inside a PTask to request a dynamic ingress port
-/// mapping at runtime (R2.4).
-pub struct DynamicPortMap;
+/// The dynamic ingress request: `min net expose <port>` asking the daemon to
+/// publish one of a box's ports at runtime (NET-043). One request shape
+/// whoever evaluates it — the local daemon on an un-enrolled host today — so
+/// an enrolled path decides the same request.
+///
+/// The daemon evaluates the request against the box's `dynamic_ingress`
+/// setting and its `dynamic_allowed_range`: an allow publishes the port at
+/// the box's own port number and records the mapping in the box's ingress
+/// policy, where `min session policy` lists it (NET-044); anything else is a
+/// typed [`ExposeRefusal`] and publishes nothing (NET-047).
+pub struct Expose;
 
-/// Request for the [`DynamicPortMap`] RPC.
-#[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DynamicPortMapRequest {
+/// Request for the [`Expose`] RPC: the box and the port to publish, at the
+/// box's own port number.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExposeRequest {
     pub id: SessionId,
-    pub external_port: u16,
-    pub internal_port: u16,
+    /// The port the box's server listens on, published at the same number.
+    pub port: u16,
     pub proto: IpProto,
 }
 
-impl DynamicPortMapRequest {
-    pub fn new(id: SessionId, external_port: u16, internal_port: u16, proto: IpProto) -> Self {
-        Self {
-            id,
-            external_port,
-            internal_port,
-            proto,
+/// What the daemon decided for an [`Expose`] request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ExposeResponse {
+    /// The request was decided `allow`: the port is published at the box's
+    /// address and the mapping is in its policy.
+    Published {
+        /// The box's name in the zone: `<name>.min.internal`.
+        hostname: String,
+        /// The address the port is published at.
+        address: std::net::Ipv4Addr,
+        /// The mapping as `min session policy` now lists it.
+        mapping: PortMapping,
+    },
+    /// The request was refused; nothing was published and the box's policy
+    /// is as it was.
+    Refused { reason: ExposeRefusal },
+}
+
+/// Why an [`Expose`] request was refused: the typed error NET-044 and
+/// NET-047 name, so a caller can tell a policy decision from a misfit
+/// request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExposeRefusal {
+    /// The box's `dynamic_ingress` is `deny`.
+    Denied,
+    /// The box declares no `dynamic_ingress` setting, which refuses like
+    /// `deny`: nothing is published that was not permitted.
+    Unset,
+    /// The box's `dynamic_ingress` is `ask` and nobody is attached to answer
+    /// (NET-045).
+    NobodyToAsk,
+    /// The box's `dynamic_ingress` is `ask` and the attached human said no
+    /// (NET-045). Their answer, not a policy decision.
+    AskDeclined,
+    /// The box's `dynamic_ingress` is `ask`, the prompt reached the attached
+    /// terminal, and no answer came back — nobody was watching, or the client
+    /// left with the prompt up. Refused like every other unanswered request
+    /// (NET-045).
+    AskUnanswered,
+    /// The port is outside the box's `dynamic_allowed_range`.
+    OutOfRange { port: u16, lo: u16, hi: u16 },
+    /// The port is below 1024, which the daemon never publishes.
+    PrivilegedPort { port: u16 },
+    /// The box has no address of its own to publish the port at: a
+    /// host-address box's ports are already the host's, and a `none` box has
+    /// no network.
+    NoOwnAddress { mode: NetworkMode },
+    /// The transport is one the forwarder cannot carry.
+    UnsupportedProtocol { proto: IpProto },
+    /// The box's ingress policy already maps the port.
+    AlreadyPublished { port: u16 },
+    /// The box is not published in the zone, so there is no address to
+    /// publish the port at (a session not yet finalized).
+    NotPublished,
+    /// The port could not be bound at the box's address; nothing was
+    /// substituted for it.
+    PortHeld {
+        port: u16,
+        address: std::net::Ipv4Addr,
+        error: String,
+    },
+    /// The box is running, and the switch would not forward the port to it;
+    /// nothing was published.
+    NotForwarded { port: u16, error: String },
+}
+
+impl std::fmt::Display for ExposeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Denied => write!(
+                f,
+                "the box's dynamic_ingress setting denies it (activate with \
+                 --dynamic-ingress allow to permit it)"
+            ),
+            Self::Unset => write!(
+                f,
+                "the box declares no dynamic_ingress setting, which refuses it (activate \
+                 with --dynamic-ingress allow to permit it)"
+            ),
+            Self::NobodyToAsk => write!(
+                f,
+                "the box's dynamic_ingress setting is ask, and nobody is attached to answer"
+            ),
+            Self::AskDeclined => write!(
+                f,
+                "the human attached to the box was asked, and declined to publish the port"
+            ),
+            Self::AskUnanswered => write!(
+                f,
+                "the human attached to the box was asked, and the prompt went unanswered"
+            ),
+            Self::OutOfRange { port, lo, hi } => write!(
+                f,
+                "port {port} is outside the box's dynamic_allowed_range {lo}-{hi}"
+            ),
+            Self::PrivilegedPort { port } => write!(
+                f,
+                "port {port} is privileged; the daemon publishes no port below 1024"
+            ),
+            Self::NoOwnAddress { mode } => write!(
+                f,
+                "the box has no address of its own to publish the port at (network mode \
+                 {mode:?}); only an own_ip box exposes ports"
+            ),
+            Self::UnsupportedProtocol { proto } => {
+                write!(f, "{proto} is not a transport the forwarder carries")
+            }
+            Self::AlreadyPublished { port } => {
+                write!(f, "port {port} is already in the box's ingress policy")
+            }
+            Self::NotPublished => write!(f, "the box is not published, so it has no address yet"),
+            Self::PortHeld {
+                port,
+                address,
+                error,
+            } => write!(f, "port {port} could not be bound at {address}: {error}"),
+            Self::NotForwarded { port, error } => {
+                write!(
+                    f,
+                    "the switch would not forward port {port} to the box: {error}"
+                )
+            }
         }
     }
 }
 
-/// Response for the [`DynamicPortMap`] RPC.
-#[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DynamicPortMapResponse;
-
-impl OneshotSshRpc for DynamicPortMap {
-    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "DynamicPortMap");
-    type Request<'a> = DynamicPortMapRequest;
-    type Response = Errorable<DynamicPortMapResponse>;
+impl OneshotSshRpc for Expose {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "Expose");
+    type Request<'a> = ExposeRequest;
+    type Response = Errorable<ExposeResponse>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1233,6 +1444,7 @@ mod tests {
         let policy = SessionPolicy {
             egress: None,
             ingress: Some(IngressPolicy::default()),
+            dynamic_ingress: None,
         };
         let json = serde_json_lenient::to_string(&policy).unwrap();
         assert!(json.contains("\"egress\":null"), "got: {json}");
@@ -1275,8 +1487,80 @@ mod tests {
             decoded,
             Errorable::Ok(SessionPolicy {
                 egress: None,
-                ingress: None
+                ingress: None,
+                dynamic_ingress: None,
             })
+        );
+    }
+
+    /// NET-043: the request `min net expose <port>` sends is one shape — the
+    /// box, the port at its own number, the transport — and each answer the
+    /// daemon gives decodes as what it is: a publication, a typed refusal, or
+    /// the RPC's own error (never a refusal read as a publication, nor an
+    /// error read as either).
+    #[test]
+    fn expose_request_wire_shape() {
+        let id = SessionId::nil();
+        let request = ExposeRequest {
+            id,
+            port: 3000,
+            proto: IpProto::Tcp,
+        };
+        let json = serde_json_lenient::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            format!(r#"{{"id":"{id}","port":3000,"proto":"tcp"}}"#),
+            "the request shape is what an evaluator on either path reads"
+        );
+        let decoded: ExposeRequest = serde_json_lenient::from_str(&json).unwrap();
+        assert_eq!(decoded, request);
+
+        let refused: Errorable<ExposeResponse> = serde_json_lenient::from_str(
+            r#"{"outcome":"refused","reason":{"kind":"out_of_range","port":9000,"lo":3000,"hi":4000}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            refused,
+            Errorable::Ok(ExposeResponse::Refused {
+                reason: ExposeRefusal::OutOfRange {
+                    port: 9000,
+                    lo: 3000,
+                    hi: 4000
+                }
+            })
+        );
+        let denied = serde_json_lenient::to_string(&ExposeResponse::Refused {
+            reason: ExposeRefusal::Denied,
+        })
+        .unwrap();
+        assert_eq!(
+            denied,
+            r#"{"outcome":"refused","reason":{"kind":"denied"}}"#
+        );
+
+        let published: Errorable<ExposeResponse> = serde_json_lenient::from_str(
+            r#"{"outcome":"published","hostname":"web.min.internal","address":"127.0.64.1","mapping":{"external_port":3000,"internal_port":3000,"proto":"tcp"}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                published,
+                Errorable::Ok(ExposeResponse::Published { ref hostname, address, ref mapping })
+                    if hostname == "web.min.internal"
+                        && address == std::net::Ipv4Addr::new(127, 0, 64, 1)
+                        && mapping.internal_port == 3000
+            ),
+            "{published:?}"
+        );
+
+        let error: Errorable<ExposeResponse> =
+            serde_json_lenient::from_str(r#"{"error":"no session found"}"#).unwrap();
+        assert_eq!(
+            error,
+            Errorable::Err {
+                error: "no session found".to_string()
+            },
+            "the RPC's own error must not read as an outcome"
         );
     }
 
@@ -1401,8 +1685,67 @@ mod tests {
             id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: None,
+            resolver_advisory: None,
         };
         assert_eq!(round_trip(&resp), resp);
+    }
+
+    /// NET-122/NET-123: the activation reply carries the resolver advisory —
+    /// both halves of the state and the probe's gap — round-trips it, omits it
+    /// when native resolution is in place, and a reply from a daemon that
+    /// predates the field decodes as "said nothing", never as an advisory.
+    #[test]
+    fn create_session_response_carries_resolver_advisory() {
+        let advised = CreateSessionResponse {
+            id: SessionId::nil(),
+            daemon_version: Some("0.6.0".into()),
+            hostname_routing_unavailable: None,
+            resolver_advisory: Some(ResolverAdvisory {
+                resolver_configured: false,
+                range_present: false,
+                range_gap: Some("127.0.64.1: Cannot assign requested address".into()),
+            }),
+        };
+        assert_eq!(round_trip(&advised), advised);
+        let json = serde_json_lenient::to_string(&advised).unwrap();
+        assert!(
+            json.contains(r#""resolver_configured":false"#),
+            "got: {json}"
+        );
+        assert!(json.contains(r#""range_present":false"#), "got: {json}");
+        assert!(json.contains("127.0.64.1"), "got: {json}");
+
+        // The interim alone: the resolver is configured but the range is
+        // absent, which is still an advisory (the command reserves the range).
+        let interim = ResolverAdvisory {
+            resolver_configured: true,
+            range_present: false,
+            range_gap: None,
+        };
+        assert_eq!(round_trip(&interim), interim);
+
+        let healthy = CreateSessionResponse {
+            id: SessionId::nil(),
+            daemon_version: Some("0.6.0".into()),
+            hostname_routing_unavailable: None,
+            resolver_advisory: None,
+        };
+        let json = serde_json_lenient::to_string(&healthy).unwrap();
+        assert!(
+            !json.contains("resolver_advisory"),
+            "a healthy reply carries no advisory: {json}"
+        );
+
+        let legacy: Errorable<CreateSessionResponse> = serde_json_lenient::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000001","daemon_version":"0.5.0"}"#,
+        )
+        .expect("a pre-field CreateSession reply must still decode");
+        assert!(legacy.unwrap().resolver_advisory.is_none());
+
+        // The zone constants the advisory's command is built from.
+        assert_eq!(BOX_ZONE, "min.internal");
+        assert_eq!(ANSWERER_PORT, 15353);
+        assert_eq!(RESERVED_RANGE, "127.0.64.0/24");
     }
 
     /// A daemon that predates `hostname_routing_unavailable` must still decode,
@@ -1436,8 +1779,10 @@ mod tests {
         let resp = ListSessionsResponse {
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
             resource_pool: None,
             sessions: vec![],
+            name_surface: None,
         };
         let json = serde_json_lenient::to_string(&resp).expect("serializes");
         assert!(
@@ -1455,6 +1800,79 @@ mod tests {
             back.hostname_routing_unavailable.as_deref(),
             Some("port 7654 is held")
         );
+    }
+
+    /// NET-026: the list reply carries the hostname-proxy port the daemon is
+    /// serving on, so `min` prints the port in use instead of assuming the
+    /// standard one. A daemon that reports no port (it predates the field, or
+    /// its listener has not bound) is absence, not a port to guess at.
+    #[test]
+    fn list_sessions_carries_proxy_port() {
+        let resp = ListSessionsResponse {
+            daemon_version: Some("0.6.0".into()),
+            hostname_routing_unavailable: None,
+            // Not the standard port: a client reading this must have taken the
+            // daemon's word rather than a constant of its own.
+            hostname_proxy_port: Some(41_234),
+            resource_pool: None,
+            sessions: vec![],
+            name_surface: None,
+        };
+        let json = serde_json_lenient::to_string(&resp).expect("serializes");
+        let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
+        assert_eq!(back.hostname_proxy_port, Some(41_234));
+
+        // A daemon predating the field says nothing about a port.
+        let older: ListSessionsResponse =
+            serde_json_lenient::from_str(r#"{"sessions":[],"daemon_version":"0.5.0"}"#)
+                .expect("a pre-field reply must still decode");
+        assert!(older.hostname_proxy_port.is_none());
+
+        // And a daemon whose listener never bound omits it from the wire.
+        let unbound = ListSessionsResponse {
+            hostname_proxy_port: None,
+            ..resp
+        };
+        let json = serde_json_lenient::to_string(&unbound).expect("serializes");
+        assert!(
+            !json.contains("hostname_proxy_port"),
+            "a daemon with no bound port should omit the field, got {json}"
+        );
+    }
+
+    /// NET-018: `ListSessions` carries which surface serves box names right
+    /// now — round-trips both answers, and a daemon that predates the field
+    /// decodes as "did not judge" rather than as either answer.
+    #[test]
+    fn list_sessions_carries_name_surface() {
+        let native = ListSessionsResponse {
+            daemon_version: Some("0.6.0".into()),
+            hostname_routing_unavailable: None,
+            resource_pool: None,
+            sessions: vec![],
+            hostname_proxy_port: None,
+            name_surface: Some(NameSurface::Native),
+        };
+        let json = serde_json_lenient::to_string(&native).expect("serializes");
+        assert!(json.contains(r#""name_surface":"native""#), "got: {json}");
+        let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
+        assert_eq!(back.name_surface, Some(NameSurface::Native));
+
+        let proxy = ListSessionsResponse {
+            name_surface: Some(NameSurface::Proxy),
+            ..native
+        };
+        let json = serde_json_lenient::to_string(&proxy).expect("serializes");
+        let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
+        assert_eq!(back.name_surface, Some(NameSurface::Proxy));
+
+        // A daemon that predates the field (or one inside a microVM that
+        // said nothing because it cannot judge its own host) decodes as
+        // "did not judge" — never as either surface.
+        let legacy: ListSessionsResponse =
+            serde_json_lenient::from_str(r#"{"sessions":[],"daemon_version":"0.5.0"}"#)
+                .expect("a pre-field ListSessions reply must still decode");
+        assert!(legacy.name_surface.is_none());
     }
 
     /// NET-109: the daemon issues no client certificate, so this crate's wire
@@ -1487,11 +1905,14 @@ mod tests {
             sessions: vec![],
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: Some("port 7654 is held".into()),
+            hostname_proxy_port: None,
+            name_surface: None,
         };
         let created = CreateSessionResponse {
             id: SessionId::nil(),
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: Some("port 7654 is held".into()),
+            resolver_advisory: None,
         };
         for json in [
             serde_json_lenient::to_string(&listed).expect("serializes"),
@@ -1655,5 +2076,62 @@ mod tests {
             }))
         );
         assert_eq!(round_trip(&with), with);
+    }
+
+    /// NET-057: an entry says which VM's box host holds the box, so a listing
+    /// spanning two VMs can show it per box. A single box host has no VM to
+    /// tell apart, and a daemon that predates the field says nothing about
+    /// one: both are absence on the wire, never a guessed VM.
+    #[test]
+    fn list_sessions_entry_carries_vm() {
+        let entry = ListSessionsEntry {
+            id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            name: Some("api".to_string()),
+            project_path: None,
+            status: sessions::SessionStatus::Active,
+            git: None,
+            attrs: None,
+            vm: Some("beta".to_string()),
+        };
+        let json = serde_json_lenient::to_string(&entry).expect("serializes");
+        assert!(json.contains(r#""vm":"beta""#), "got: {json}");
+        assert_eq!(round_trip(&entry), entry);
+
+        // Two VMs, one listing: each entry keeps its own VM through the
+        // response it is carried in.
+        let resp = ListSessionsResponse {
+            resource_pool: None,
+            sessions: vec![
+                ListSessionsEntry {
+                    vm: Some("default".to_string()),
+                    ..entry.clone()
+                },
+                entry.clone(),
+            ],
+            daemon_version: None,
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            name_surface: None,
+        };
+        let json = serde_json_lenient::to_string(&resp).expect("serializes");
+        let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
+        assert_eq!(
+            back.sessions
+                .iter()
+                .map(|e| e.vm.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("default"), Some("beta")]
+        );
+
+        // No VM to name: omitted from the wire, and a pre-field payload
+        // decodes as "no VM named" rather than failing.
+        let unnamed = ListSessionsEntry { vm: None, ..entry };
+        let json = serde_json_lenient::to_string(&unnamed).expect("serializes");
+        assert!(!json.contains("vm"), "got: {json}");
+        let older: ListSessionsEntry = serde_json_lenient::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000001","name":"api","attrs":null}"#,
+        )
+        .expect("a pre-field entry must still decode");
+        assert!(older.vm.is_none());
     }
 }

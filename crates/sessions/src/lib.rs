@@ -134,6 +134,161 @@ impl EgressPolicy {
             .map(String::as_str)
             .find(|cidr| !is_valid_cidr(cidr))
     }
+
+    /// The deny-all egress: an `allow_subnets` list with no entry in it, so no
+    /// destination is declared and the box reaches nothing outside the resolver
+    /// carve-out its verdict keeps. What the deny-all default gives a box with
+    /// an address of its own that declared no `egress` section (NET-074).
+    ///
+    /// Distinct from an absent section, which is allow-all: the difference
+    /// between the two is present-and-empty, not empty-or-missing.
+    #[must_use]
+    pub fn deny_all() -> Self {
+        Self {
+            allow_subnets: Some(Vec::new()),
+            ..Self::default()
+        }
+    }
+
+    /// Whether this section declares no reachable destination at all — an
+    /// `allow_subnets` list that is present and empty. What `min session policy`
+    /// reads to name the box's posture `deny-all` (NET-075).
+    #[must_use]
+    pub fn is_deny_all(&self) -> bool {
+        self.allow_subnets
+            .as_deref()
+            .is_some_and(<[String]>::is_empty)
+    }
+}
+
+/// Where the deny-all default for an absent `egress` section stands in its
+/// rollout.
+///
+/// The default is announced before it is in force: while it is only announced a
+/// box with no `egress` section keeps the shipped allow-all of 03-spec R2.1 and
+/// `min session activate` prints the coming change (NET-076); the release that
+/// brings it into force is what makes [`InForce`](Self::InForce) the shipped
+/// value of this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DenyAllWindow {
+    /// Announced, not yet in force. The value this release ships.
+    #[default]
+    Announced,
+    /// In force: an absent `egress` section on a box with an address of its own
+    /// means deny-all (NET-074, NET-075), unless the opt-out flag is set.
+    InForce,
+}
+
+/// Environment variable naming where the deny-all default's rollout window
+/// stands: `in-force` brings it into force, anything else (including unset)
+/// leaves it [announced](DenyAllWindow::Announced). Read by the daemon, which
+/// applies the default, and by the CLI, which announces it, so both halves of
+/// one host agree on the window they are in.
+pub const DENY_ALL_WINDOW_VAR: &str = "MINIMAL_EGRESS_DENY_ALL_WINDOW";
+
+/// Environment variable holding the deny-all opt-out flag (NET-077): set to
+/// anything but `0` and a box with no `egress` section keeps the shipped
+/// allow-all default even once the window is in force. A host-level flag rather
+/// than a per-session one — the daemon decides what an absent section means, so
+/// the box host is where the opt-out has to be legible.
+pub const DENY_ALL_OPT_OUT_VAR: &str = "MINIMAL_EGRESS_DENY_ALL_OPT_OUT";
+
+/// The deny-all default's state on this host: where its rollout window stands,
+/// and whether the opt-out flag is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DenyAllDefault {
+    /// Where the rollout window stands.
+    pub window: DenyAllWindow,
+    /// Whether the opt-out flag is set (NET-077).
+    pub opted_out: bool,
+}
+
+/// Which rule decided a box's effective `egress` section, for the launch log
+/// line and the policy a session's diagnostics dump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressPosture {
+    /// The box declared an `egress` section; the default describes only what an
+    /// absent one means, so a declaration is never touched.
+    Declared,
+    /// The box declared none and the deny-all default applied (NET-074).
+    DenyAllDefault,
+    /// The box declared none and keeps the shipped allow-all: the window is not
+    /// in force, the opt-out flag is set, or the box has no address of its own.
+    ShippedAllowAll,
+}
+
+/// A box's `egress` section once the deny-all default has had its say, and
+/// which rule produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveEgress {
+    /// The section the box launches under and its record carries: what it
+    /// declared, the deny-all policy, or `None` for the shipped allow-all.
+    pub policy: Option<EgressPolicy>,
+    /// Which rule produced that section.
+    pub posture: EgressPosture,
+}
+
+impl DenyAllDefault {
+    /// The state these two values describe, as [`from_env`](Self::from_env)
+    /// reads them from the environment. An unset or unrecognised window value
+    /// is [`DenyAllWindow::Announced`], the shipped one, so a typo leaves a box
+    /// with the reach it has today rather than silently taking it away; the
+    /// opt-out is set by any value but `0` (an empty value counts as unset).
+    #[must_use]
+    pub fn from_values(window: Option<&str>, opt_out: Option<&str>) -> Self {
+        Self {
+            window: match window.map(str::trim) {
+                Some("in-force") => DenyAllWindow::InForce,
+                _ => DenyAllWindow::Announced,
+            },
+            opted_out: opt_out
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty() && value != "0"),
+        }
+    }
+
+    /// The state this process's environment describes ([`DENY_ALL_WINDOW_VAR`]
+    /// and [`DENY_ALL_OPT_OUT_VAR`]).
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::from_values(
+            std::env::var(DENY_ALL_WINDOW_VAR).ok().as_deref(),
+            std::env::var(DENY_ALL_OPT_OUT_VAR).ok().as_deref(),
+        )
+    }
+
+    /// The `egress` section a box in `mode` runs with, given the one it
+    /// `declared`.
+    ///
+    /// A declared section comes back untouched. An absent one becomes deny-all
+    /// only for a box with an address of its own, once the window is in force
+    /// and the opt-out flag is not set (NET-074); every other combination keeps
+    /// the shipped allow-all of 03-spec R2.1 (NET-077). A `none` box is left
+    /// alone whatever the window: it has no network for a rule to describe, and
+    /// [`Record::validate_policy`] refuses a section on one.
+    #[must_use]
+    pub fn effective_egress(
+        self,
+        mode: NetworkMode,
+        declared: Option<EgressPolicy>,
+    ) -> EffectiveEgress {
+        if let Some(policy) = declared {
+            return EffectiveEgress {
+                policy: Some(policy),
+                posture: EgressPosture::Declared,
+            };
+        }
+        if mode == NetworkMode::OwnIp && self.window == DenyAllWindow::InForce && !self.opted_out {
+            return EffectiveEgress {
+                policy: Some(EgressPolicy::deny_all()),
+                posture: EgressPosture::DenyAllDefault,
+            };
+        }
+        EffectiveEgress {
+            policy: None,
+            posture: EgressPosture::ShippedAllowAll,
+        }
+    }
 }
 
 /// Effective ingress policy for an `OwnIp` `PTask`.
@@ -144,11 +299,17 @@ pub struct IngressPolicy {
     /// Static port mappings applied at `PTask` launch.
     pub port_mappings: Vec<PortMapping>,
     /// Inclusive port range within which dynamic port-mapping requests are
-    /// accepted; `None` means dynamic mapping is disallowed.
+    /// accepted; `None` leaves every unprivileged port to the box's
+    /// [`dynamic_ingress`](SessionPolicy::dynamic_ingress) decision alone.
     ///
-    /// Stored on the [`Record`] and returned verbatim by `GetSessionPolicy`,
-    /// but **not yet enforced**: dynamic port-mapping is split to #553. Until
-    /// then a set range is recorded configuration only, with no runtime effect.
+    /// Stored on the [`Record`] and returned verbatim by `GetSessionPolicy`.
+    /// A set range is what the box permits beyond its declaration: it is read
+    /// by [`crate::core::net_verdict::IngressRules::permits`], so a process in
+    /// the box that begins listening on a port inside the range has that port
+    /// published on the box's address (NET-016). It is also the bound a
+    /// `min net expose <port>` request is checked against before the decision
+    /// is consulted: a port outside it is refused whatever the decision says,
+    /// and nothing is published for it (NET-047).
     pub dynamic_allowed_range: Option<(u16, u16)>,
 }
 
@@ -161,11 +322,43 @@ impl IngressPolicy {
     }
 }
 
+/// How a box answers a request, made at runtime from inside it, to publish
+/// one of its ports: the `dynamic_ingress` setting a `min net expose <port>`
+/// request is evaluated against (NET-043).
+///
+/// A box with no setting refuses every such request, the same fail-closed
+/// default as its static ingress.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicIngress {
+    /// Publish the port, within the box's `dynamic_allowed_range` if one is
+    /// set (NET-044).
+    Allow,
+    /// Refuse the request with a typed error (NET-044).
+    Deny,
+    /// Ask the attached human and apply their answer; refuse when nobody is
+    /// attached to answer (NET-045).
+    Ask,
+}
+
+impl fmt::Display for DynamicIngress {
+    /// Renders the lowercase setting name, matching the `snake_case` serde
+    /// representation so log fields agree with the config spelling.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Ask => "ask",
+        })
+    }
+}
+
 /// The networking policy for a session: its egress and ingress configuration.
 ///
 /// `None` for a dimension means it was not configured (allow-all egress; the
-/// deny-all-external ingress default). Stored on [`Record`] as the policy
-/// configured at launch and returned verbatim by the `GetSessionPolicy` RPC.
+/// deny-all-external ingress default; every dynamic ingress request refused).
+/// Stored on [`Record`] as the policy configured at launch and returned
+/// verbatim by the `GetSessionPolicy` RPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 // Every field is an `Option`, so without this an unrelated JSON object would
 // decode as an all-`None` policy. That matters because `GetSessionPolicy`'s
@@ -179,13 +372,21 @@ pub struct SessionPolicy {
     pub egress: Option<EgressPolicy>,
     /// Ingress policy; `None` when no explicit ingress config is present.
     pub ingress: Option<IngressPolicy>,
+    /// How a runtime request to publish a port is decided; `None` when the
+    /// box declares nothing, which refuses every such request.
+    pub dynamic_ingress: Option<DynamicIngress>,
 }
 
 impl SessionPolicy {
-    /// Builds a policy from its egress and ingress halves.
+    /// Builds a policy from its egress and ingress halves, with no dynamic
+    /// ingress setting.
     #[must_use]
     pub fn new(egress: Option<EgressPolicy>, ingress: Option<IngressPolicy>) -> Self {
-        Self { egress, ingress }
+        Self {
+            egress,
+            ingress,
+            dynamic_ingress: None,
+        }
     }
 }
 
@@ -2038,6 +2239,117 @@ mod tests {
         );
     }
 
+    /// What an absent `egress` section means, across the rollout window and the
+    /// opt-out flag: only a box with an address of its own, under a window in
+    /// force with the flag unset, defaults to deny-all (NET-074). Every other
+    /// cell keeps the shipped allow-all — while the default is merely announced
+    /// (NET-076), whenever the flag is set (NET-077), and for a box that has no
+    /// address of its own. A declared section is never touched by any of them.
+    #[test]
+    fn absent_egress_defaults_by_window_and_opt_out() {
+        let announced = DenyAllDefault {
+            window: DenyAllWindow::Announced,
+            opted_out: false,
+        };
+        let in_force = DenyAllDefault {
+            window: DenyAllWindow::InForce,
+            opted_out: false,
+        };
+
+        // The one cell that takes the box's reach away.
+        let effective = in_force.effective_egress(NetworkMode::OwnIp, None);
+        assert_eq!(effective.posture, EgressPosture::DenyAllDefault);
+        let egress = effective.policy.expect("the default declares a section");
+        assert!(egress.is_deny_all(), "got {egress:?}");
+        assert_eq!(egress.allow_subnets, Some(Vec::new()));
+        // Deny-all by declaring no destination, not by denying every one: the
+        // other three fields stay unset, so no rule is invented for the box.
+        assert_eq!(egress.deny_subnets, None);
+        assert_eq!(egress.allow_protocols, None);
+        assert_eq!(egress.allow_dns_hosts, None);
+        // The section it produces is a valid one for the mode it applies to.
+        assert!(
+            record_with(NetworkMode::OwnIp, SessionPolicy::new(Some(egress), None))
+                .validate_policy()
+                .is_ok()
+        );
+
+        // Every other cell keeps the shipped allow-all: an absent section.
+        for (default, mode, why) in [
+            (
+                announced,
+                NetworkMode::OwnIp,
+                "the window is only announced",
+            ),
+            (
+                DenyAllDefault {
+                    window: DenyAllWindow::InForce,
+                    opted_out: true,
+                },
+                NetworkMode::OwnIp,
+                "the opt-out flag is set",
+            ),
+            (
+                announced,
+                NetworkMode::HostNet,
+                "a host-address box is not in scope, announced",
+            ),
+            (
+                in_force,
+                NetworkMode::HostNet,
+                "a host-address box is not in scope, in force",
+            ),
+            (in_force, NetworkMode::NoNet, "a none box has no network"),
+        ] {
+            let effective = default.effective_egress(mode, None);
+            assert_eq!(
+                effective,
+                EffectiveEgress {
+                    policy: None,
+                    posture: EgressPosture::ShippedAllowAll,
+                },
+                "an absent section must keep the shipped allow-all when {why}"
+            );
+        }
+
+        // A declared section is the box's own, in every cell: the default
+        // describes what an absence means and nothing else.
+        for default in [announced, in_force] {
+            let effective = default.effective_egress(NetworkMode::OwnIp, Some(four_field_egress()));
+            assert_eq!(effective.posture, EgressPosture::Declared);
+            assert_eq!(effective.policy, Some(four_field_egress()));
+        }
+
+        // The two environment values the daemon and the CLI read them from:
+        // only `in-force` moves the window, and any value but `0` opts out, so
+        // a typo leaves a box the reach it has today.
+        assert_eq!(DenyAllDefault::from_values(None, None), announced);
+        assert_eq!(
+            DenyAllDefault::from_values(Some("in-force"), None),
+            in_force
+        );
+        assert_eq!(
+            DenyAllDefault::from_values(Some("enforced"), None),
+            announced
+        );
+        assert_eq!(
+            DenyAllDefault::from_values(Some(" in-force "), None),
+            in_force
+        );
+        for value in ["1", "true", "yes"] {
+            assert!(
+                DenyAllDefault::from_values(Some("in-force"), Some(value)).opted_out,
+                "{value} must set the opt-out flag"
+            );
+        }
+        for value in ["", "0"] {
+            assert!(
+                !DenyAllDefault::from_values(Some("in-force"), Some(value)).opted_out,
+                "{value:?} must leave the opt-out flag unset"
+            );
+        }
+    }
+
     #[test]
     fn invalid_egress_deny_subnet_is_rejected() {
         // An unparseable deny entry describes a rule that would not be applied,
@@ -2271,6 +2583,40 @@ mod tests {
             let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
             assert!(record.validate_policy().is_ok());
         }
+    }
+
+    /// NET-043: the `dynamic_ingress` setting parses in its three spellings,
+    /// is absent when the box declares nothing, and a spelling that names no
+    /// decision is refused rather than read as one.
+    #[test]
+    fn dynamic_ingress_field_parses() {
+        for (spelling, expected) in [
+            ("allow", DynamicIngress::Allow),
+            ("deny", DynamicIngress::Deny),
+            ("ask", DynamicIngress::Ask),
+        ] {
+            let policy: SessionPolicy =
+                serde_json_lenient::from_str(&format!(r#"{{"dynamic_ingress":"{spelling}"}}"#))
+                    .unwrap_or_else(|e| panic!("dynamic_ingress = {spelling} must parse: {e}"));
+            assert_eq!(policy.dynamic_ingress, Some(expected));
+            assert_eq!(expected.to_string(), spelling);
+            // The wire form round-trips through the same spelling.
+            let json = serde_json_lenient::to_string(&policy).unwrap();
+            assert!(
+                json.contains(&format!(r#""dynamic_ingress":"{spelling}""#)),
+                "{json}"
+            );
+        }
+
+        let absent: SessionPolicy = serde_json_lenient::from_str(r#"{"egress":null}"#).unwrap();
+        assert_eq!(absent.dynamic_ingress, None);
+        assert_eq!(SessionPolicy::new(None, None).dynamic_ingress, None);
+
+        assert!(
+            serde_json_lenient::from_str::<SessionPolicy>(r#"{"dynamic_ingress":"maybe"}"#)
+                .is_err(),
+            "a spelling that names no decision must not parse"
+        );
     }
 
     #[test]
