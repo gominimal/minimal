@@ -86,6 +86,25 @@ fn build_record(
     Ok(record)
 }
 
+fn log_egress_rule_counts(policy: &sessions::SessionPolicy) {
+    let (allow_subnets, allow_protocols, allow_dns_hosts, deny_subnets) = match &policy.egress {
+        Some(egress) => (
+            egress.allow_subnets.as_ref().map_or(0, Vec::len),
+            egress.allow_protocols.as_ref().map_or(0, Vec::len),
+            egress.allow_dns_hosts.as_ref().map_or(0, Vec::len),
+            egress.deny_subnets.as_ref().map_or(0, Vec::len),
+        ),
+        None => (0, 0, 0, 0),
+    };
+    tracing::info!(
+        allow_subnets,
+        allow_protocols,
+        allow_dns_hosts,
+        deny_subnets,
+        "session egress rules parsed"
+    );
+}
+
 /// Encapsulates the return channel for messages back from the actor.
 #[derive(Debug)]
 pub(crate) struct Responder<T>(oneshot::Sender<Result<T, SessionsError>>);
@@ -404,6 +423,7 @@ impl Manager {
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
         let record = build_record(config, username, sessions::SessionStatus::Pending)?;
+        log_egress_rule_counts(&record.policy);
         let handle = self.store.create(record).await?;
         let session_id = *handle.id();
 

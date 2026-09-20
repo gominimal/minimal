@@ -78,7 +78,8 @@ pub struct PortMapping {
     pub proto: IpProto,
 }
 
-/// Effective egress policy for an `OwnIp` `PTask`.
+/// Effective egress policy for a `PTask` with network policy (`OwnIp` or
+/// `HostNet`).
 ///
 /// Each field is `None` to mean allow-all for that dimension. Absent `egress`
 /// config on a session is equivalent to all-`None` (allow-all).
@@ -90,11 +91,16 @@ pub struct EgressPolicy {
     pub allow_dns_hosts: Option<Vec<String>>,
     /// Allowed IP protocols; `None` means allow all protocols.
     pub allow_protocols: Option<Vec<IpProto>>,
+    /// Denied destination CIDR prefixes; applied after the allow lists and the
+    /// node-plane baseline set. `None` means no extra denies beyond the
+    /// infrastructure deny set.
+    pub deny_subnets: Option<Vec<String>>,
 }
 
 impl EgressPolicy {
-    /// Returns the first `allow_subnets` entry that is not a syntactically valid
-    /// CIDR prefix, or `None` when every entry parses (or none are configured).
+    /// Returns the first subnet entry (allow or deny) that is not a
+    /// syntactically valid CIDR prefix, or `None` when every entry parses (or
+    /// none are configured).
     ///
     /// Used at launch to name a misconfigured destination subnet where it can be
     /// fixed — by [`Record::validate_policy`] for per-`PTask` egress and by
@@ -104,9 +110,9 @@ impl EgressPolicy {
     #[must_use]
     pub fn first_invalid_subnet(&self) -> Option<&str> {
         self.allow_subnets
-            .as_deref()
-            .into_iter()
-            .flatten()
+            .iter()
+            .chain(self.deny_subnets.iter())
+            .flat_map(std::vec::Vec::as_slice)
             .map(String::as_str)
             .find(|cidr| !is_valid_cidr(cidr))
     }
@@ -446,11 +452,11 @@ impl Record {
         }) {
             return Err(PolicyError::PrivilegedPort { external_port });
         }
-        // For an OwnIp PTask egress/ingress are allowed; the only remaining
-        // check is that each egress allow_subnets entry is a syntactically valid
-        // CIDR prefix, so a misconfigured subnet is named at launch rather than
-        // surfacing opaquely when #553's enforcement layer parses it.
-        if self.network == NetworkMode::OwnIp {
+        // For an OwnIp or HostNet PTask, egress and ingress declarations are
+        // allowed; the remaining checks are syntactic validation of the declared
+        // rules so misconfigs are named at launch rather than surfacing opaquely
+        // when #553's enforcement layer parses them.
+        if matches!(self.network, NetworkMode::OwnIp | NetworkMode::HostNet) {
             if let Some(bad) = self
                 .policy
                 .egress
@@ -550,22 +556,48 @@ mod tests {
     }
 
     #[test]
-    fn egress_on_host_net_is_rejected() {
-        // R2.1: an egress section is only valid for an own-IP PTask.
+    fn egress_on_host_ip_box_accepted() {
+        // NET-120: an egress section is now valid for a host-address (HostNet)
+        // PTask, so the host-side classifier can enforce the box's own
+        // declaration.
         let record = record_with(
             NetworkMode::HostNet,
             SessionPolicy::new(Some(EgressPolicy::default()), None),
         );
+        assert!(record.validate_policy().is_ok());
+    }
+
+    #[test]
+    fn egress_on_host_ip_box_with_deny_subnets_is_accepted() {
+        let egress = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".into()]),
+            allow_dns_hosts: Some(vec!["github.com".into()]),
+            allow_protocols: Some(vec![IpProto::Tcp]),
+            deny_subnets: Some(vec!["10.0.0.0/24".into()]),
+        };
+        let record = record_with(NetworkMode::HostNet, SessionPolicy::new(Some(egress), None));
+        assert!(record.validate_policy().is_ok());
+    }
+
+    #[test]
+    fn egress_on_host_ip_box_rejects_invalid_deny_subnet() {
+        let egress = EgressPolicy {
+            deny_subnets: Some(vec!["not-a-cidr".into()]),
+            ..EgressPolicy::default()
+        };
+        let record = record_with(NetworkMode::HostNet, SessionPolicy::new(Some(egress), None));
         assert_eq!(
             record.validate_policy(),
-            Err(PolicyError::EgressRequiresOwnIp {
-                mode: NetworkMode::HostNet
+            Err(PolicyError::InvalidSubnet {
+                cidr: "not-a-cidr".into()
             })
         );
     }
 
     #[test]
-    fn egress_on_no_net_is_rejected() {
+    fn egress_on_none_box_is_validation_error() {
+        // NET-065: a `none` (NoNet) PTask has no network, so an egress section
+        // is a validation error rather than silently ignored.
         let record = record_with(
             NetworkMode::NoNet,
             SessionPolicy::new(Some(EgressPolicy::default()), None),
@@ -846,6 +878,32 @@ mod tests {
     #[test]
     fn session_status_default_is_active() {
         assert_eq!(SessionStatus::default(), SessionStatus::Active);
+    }
+
+    /// NET-060: a box spec carrying all four egress fields deserializes into
+    /// `EgressPolicy` and round-trips through serde.
+    #[test]
+    fn spec_accepts_egress_fields() {
+        let json = serde_json_lenient::json!({
+            "egress": {
+                "allow_subnets": ["10.0.0.0/8"],
+                "allow_protocols": ["tcp", "udp"],
+                "allow_dns_hosts": ["github.com"],
+                "deny_subnets": ["10.0.0.0/24"],
+            }
+        });
+        let policy: SessionPolicy = serde_json_lenient::from_value(json).unwrap();
+        let egress = policy.egress.as_ref().expect("egress present");
+        assert_eq!(egress.allow_subnets, Some(vec!["10.0.0.0/8".into()]));
+        assert_eq!(
+            egress.allow_protocols,
+            Some(vec![IpProto::Tcp, IpProto::Udp])
+        );
+        assert_eq!(egress.allow_dns_hosts, Some(vec!["github.com".into()]));
+        assert_eq!(egress.deny_subnets, Some(vec!["10.0.0.0/24".into()]));
+
+        let round = serde_json_lenient::to_value(policy).unwrap();
+        assert!(round.get("egress").unwrap().get("deny_subnets").is_some());
     }
 
     /// Records persisted before the `Draft` → `Pending` rename used

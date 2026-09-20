@@ -35,6 +35,28 @@ pub const DEFAULT_SUBNET: SwitchSubnet = SwitchSubnet {
     prefix: 16,
 };
 
+/// Host enrollment state with the network plan it determines.
+///
+/// An unenrolled local host has no identity-plane policy feed; it falls back to
+/// the built-in default plan (NET-102). The enrolled variant is intentionally
+/// absent until the identity-plane work introduces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enrollment {
+    /// The host has not enrolled with an identity plane; it self-allocates
+    /// from the built-in default plan.
+    Unenrolled,
+}
+
+impl Enrollment {
+    /// Returns the switch subnet this enrollment uses for box addresses.
+    #[must_use]
+    pub fn switch_subnet(self) -> SwitchSubnet {
+        match self {
+            Self::Unenrolled => DEFAULT_SUBNET,
+        }
+    }
+}
+
 /// Filename the switch binary is installed under, in both the user-local `bin/`
 /// prefix and the system-wide path below.
 ///
@@ -318,6 +340,13 @@ pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[(Ipv4Addr, MacAddr)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unenrolled_self_allocates_default_plan() {
+        // NET-102: an unenrolled host self-allocates from the built-in default
+        // plan rather than asking an identity plane for a network assignment.
+        assert_eq!(Enrollment::Unenrolled.switch_subnet(), DEFAULT_SUBNET);
+    }
 
     #[test]
     fn default_is_cgnat_slash16() {

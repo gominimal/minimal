@@ -781,7 +781,141 @@ async fn session_policy_succeeds() {
     .unwrap();
 }
 
+/// NET-061: `min session policy` prints the effective egress rules, including
+/// all four fields, for both own-address and host-address boxes.
+#[tokio::test]
+async fn policy_shows_effective_egress() {
+    let (daemon, _args) = setup().await;
+
+    let egress = sessions::EgressPolicy {
+        allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+        allow_dns_hosts: Some(vec!["github.com".to_string()]),
+        allow_protocols: Some(vec![minimald_rpc::IpProto::Tcp]),
+        deny_subnets: Some(vec!["10.0.0.0/24".to_string()]),
+    };
+
+    for (name, network) in [
+        ("own-ip-policy-cli", sessions::NetworkMode::OwnIp),
+        ("host-ip-policy-cli", sessions::NetworkMode::HostNet),
+    ] {
+        let session_id =
+            create_session_with_policy(&daemon, name, network, Some(egress.clone())).await;
+
+        let args = daemon.global_args();
+        let json = run_session_policy(&args, session_id).await;
+        let parsed: serde_json_lenient::Value = serde_json_lenient::from_str(&json)
+            .unwrap_or_else(|_| panic!("policy output must be valid JSON: {json}"));
+        let egress_json = parsed
+            .get("egress")
+            .unwrap_or_else(|| panic!("policy output must contain egress: {json}"));
+        assert_eq!(
+            egress_json.get("allow_subnets").and_then(|v| v.as_array()),
+            Some(&vec![serde_json_lenient::json!("10.0.0.0/8")]),
+            "allow_subnets must round-trip for {network:?}"
+        );
+        assert_eq!(
+            egress_json
+                .get("allow_dns_hosts")
+                .and_then(|v| v.as_array()),
+            Some(&vec![serde_json_lenient::json!("github.com")]),
+            "allow_dns_hosts must round-trip for {network:?}"
+        );
+        assert_eq!(
+            egress_json
+                .get("allow_protocols")
+                .and_then(|v| v.as_array()),
+            Some(&vec![serde_json_lenient::json!("tcp")]),
+            "allow_protocols must round-trip for {network:?}"
+        );
+        assert_eq!(
+            egress_json.get("deny_subnets").and_then(|v| v.as_array()),
+            Some(&vec![serde_json_lenient::json!("10.0.0.0/24")]),
+            "deny_subnets must round-trip for {network:?}"
+        );
+    }
+}
+
+async fn run_session_policy(args: &GlobalArgs, session_id: SessionId) -> String {
+    let mut buf = Vec::new();
+    minimal::format_session_policy(
+        &mut buf,
+        &minimal::PolicyArgs {
+            session: session_id.to_string(),
+        },
+        args,
+    )
+    .await
+    .unwrap();
+    String::from_utf8(buf).unwrap()
+}
+
 // --- helpers ---
+
+/// Like [`create_session_at`], but sets an explicit network mode and policy.
+async fn create_session_with_policy(
+    daemon: &common::TestDaemon,
+    name: &str,
+    network: sessions::NetworkMode,
+    egress: Option<sessions::EgressPolicy>,
+) -> SessionId {
+    let mut client = daemon.server.connect().await;
+    let project_path = paths::HostAbsPath::try_new(
+        camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    let policy = sessions::SessionPolicy {
+        egress,
+        ingress: None,
+    };
+    let config = minimald_rpc::SessionConfig {
+        name: Some(name.to_string()),
+        project_path,
+        network,
+        policy: policy.into(),
+        hooks_enabled: true,
+        attrs: Default::default(),
+    };
+
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
+        FinalizeSession, FinalizeSessionRequest,
+    };
+    let id = match client
+        .call::<CreateSession>(&CreateSessionRequest {
+            config,
+            must_match_version: None,
+        })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(r) => r.id,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("CreateSession failed: {error}")
+        }
+    };
+    match client
+        .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+            session_id: id,
+            contribution: Default::default(),
+        })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(r) => unwrap_ready(r),
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("ConfigureLoadout failed: {error}")
+        }
+    }
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(_) => {}
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("FinalizeSession failed: {error}")
+        }
+    }
+    id
+}
 
 /// Creates a session whose workspace mfile declares a `[session.vars]`
 /// entry, which the daemon must route back to the client for gating — so

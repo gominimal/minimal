@@ -127,10 +127,11 @@ impl std::io::Write for DashLog {
 /// Whether the command's stdout is a data contract that tracing must not
 /// pollute, so its logs go to stderr instead. The `completions` handlers emit a
 /// shell shim on stdout, `session exec` carries only the exec'd
-/// command's output, and `task run` / `session run` stream the task's stdout —
-/// a log line in any of them would be read as content. A bare `min` (no subcommand) is
-/// one too: its non-TTY twin promises an empty stdout to pipelines, and its
-/// interactive activate path prints only the session id there.
+/// command's output, `task run` / `session run` stream the task's stdout, and
+/// `session policy` emits JSON on stdout — a log line in any of them would be
+/// read as content. A bare `min` (no subcommand) is one too: its non-TTY twin
+/// promises pipelines an empty stdout, and its interactive activate path prints
+/// only the session id there.
 fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
     matches!(
         command,
@@ -139,7 +140,8 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
                 | minimal::Command::Completions(_)
                 | minimal::Command::Session(minimal::SessionArgs {
                     command: minimal::SessionCommand::Exec(ExecArgs { .. })
-                        | minimal::SessionCommand::Run(_),
+                        | minimal::SessionCommand::Run(_)
+                        | minimal::SessionCommand::Policy(_),
                 })
                 | minimal::Command::Task(minimal::TaskArgs {
                     command: minimal::TaskCommand::Run(_),
@@ -182,6 +184,18 @@ mod tests {
                 task: "build".to_string(),
                 path: None,
                 keep: false,
+            }),
+        }));
+        assert!(stdout_is_data_contract(&cmd));
+    }
+
+    /// `min session policy` emits JSON on stdout, so tracing must route to
+    /// stderr to keep the output parseable.
+    #[test]
+    fn session_policy_is_a_stdout_contract() {
+        let cmd = Some(Command::Session(minimal::SessionArgs {
+            command: minimal::SessionCommand::Policy(minimal::PolicyArgs {
+                session: "web".to_string(),
             }),
         }));
         assert!(stdout_is_data_contract(&cmd));

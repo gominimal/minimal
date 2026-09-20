@@ -840,12 +840,28 @@ pub(crate) fn exit_code_of(status: std::process::ExitStatus) -> i32 {
 }
 
 /// Print the effective networking policy for a session as JSON.
+/// Print the effective networking policy for a session as JSON.
 pub async fn cmd_session_policy(
     global: &GlobalArgs,
     args: PolicyArgs,
 ) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
+    let mut out = tokio::io::stdout();
+    format_session_policy(&mut out, &args, global).await?;
+    Ok(())
+}
 
+/// Fetch a session's effective networking policy from the daemon and write it
+/// as JSON to `out`. Split from [`cmd_session_policy`] so tests can verify the
+/// emitted JSON without capturing the process stdout.
+pub async fn format_session_policy<W>(
+    out: &mut W,
+    args: &PolicyArgs,
+    global: &GlobalArgs,
+) -> Result<(), anyhow::Error>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut client = connect_daemon(global).await?;
 
     use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
@@ -860,7 +876,8 @@ pub async fn cmd_session_policy(
         minimald_rpc::Errorable::Ok(policy) => {
             let json =
                 serde_json_lenient::to_string(&policy).context("Failed to serialize policy")?;
-            println!("{json}");
+            out.write_all(json.as_bytes()).await?;
+            out.write_all(b"\n").await?;
             Ok(())
         }
         minimald_rpc::Errorable::Err { error } => {

@@ -517,6 +517,7 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                                     .join(", ")
                             ))),
                         }
+                        policy_list(&mut lines, "deny subnets", &egress.deny_subnets);
                     }
                 }
                 lines.push(Line::styled(

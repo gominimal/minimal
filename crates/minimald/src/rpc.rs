@@ -2736,8 +2736,9 @@ mod tests {
 
         let egress = EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-            allow_dns_hosts: None,
-            allow_protocols: None,
+            allow_dns_hosts: Some(vec!["github.com".to_string()]),
+            allow_protocols: Some(vec![minimald_rpc::IpProto::Tcp]),
+            deny_subnets: Some(vec!["10.0.0.0/24".to_string()]),
         };
         let created_id = client
             .call::<CreateSession>(&CreateSessionRequest {
@@ -2763,6 +2764,52 @@ mod tests {
         // The configured ingress was `None`, and the read reflects that rather
         // than the old hardcoded `Some(IngressPolicy::default())`.
         assert_eq!(policy.ingress, None);
+    }
+
+    /// NET-061/NET-120: GetSessionPolicy returns the effective egress rules,
+    /// including all four fields, for both own-address and host-address boxes.
+    #[tokio::test]
+    async fn get_session_policy_returns_effective_egress() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let egress = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            allow_dns_hosts: Some(vec!["github.com".to_string()]),
+            allow_protocols: Some(vec![minimald_rpc::IpProto::Tcp]),
+            deny_subnets: Some(vec!["10.0.0.0/24".to_string()]),
+        };
+
+        for (name, network) in [
+            ("own-ip-policy", NetworkMode::OwnIp),
+            ("host-ip-policy", NetworkMode::HostNet),
+        ] {
+            let created_id = client
+                .call::<CreateSession>(&CreateSessionRequest {
+                    config: minimald_rpc::SessionConfig {
+                        name: Some(name.to_string()),
+                        project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                        network,
+                        policy: SessionPolicy::new(Some(egress.clone()), None),
+                        hooks_enabled: true,
+                        attrs: Default::default(),
+                    },
+                    must_match_version: None,
+                })
+                .await
+                .unwrap()
+                .id;
+
+            let policy = client
+                .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(created_id))
+                .await
+                .unwrap();
+            assert_eq!(
+                policy.egress,
+                Some(egress.clone()),
+                "effective egress must round-trip for {network:?}"
+            );
+        }
     }
 
     /// `ListSessions` answers each session's git context: branch and
@@ -2933,19 +2980,20 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        // R2.1: an egress policy on a non-`OwnIp` PTask is rejected at
-        // declaration time, so the invalid session is never stored.
+        // NET-065: an egress policy on a `NoNet` PTask is rejected at
+        // declaration time, so an egress-declared `none` box is never stored.
         let egress = EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             allow_dns_hosts: None,
             allow_protocols: None,
+            deny_subnets: None,
         };
         let resp = client
             .call::<CreateSession>(&CreateSessionRequest {
                 config: minimald_rpc::SessionConfig {
                     name: Some("bad-policy".to_string()),
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: NetworkMode::HostNet,
+                    network: NetworkMode::NoNet,
                     policy: SessionPolicy::new(Some(egress), None),
                     hooks_enabled: true,
                     attrs: Default::default(),
@@ -2956,13 +3004,42 @@ mod tests {
         assert_eq!(
             resp,
             Errorable::Err {
-                error: "egress policy is only valid for an own-IP PTask, not HostNet".to_string()
+                error: "egress policy is only valid for an own-IP PTask, not NoNet".to_string()
             }
         );
 
-        // The rejected session left nothing behind in the store.
+        // NET-120: a host-address (HostNet) box now accepts an egress section,
+        // so this create succeeds rather than errors.
+        let hostnet_egress = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            allow_dns_hosts: None,
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        let hostnet_id = client
+            .call::<CreateSession>(&CreateSessionRequest {
+                config: minimald_rpc::SessionConfig {
+                    name: Some("hostnet-policy".to_string()),
+                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                    network: NetworkMode::HostNet,
+                    policy: SessionPolicy::new(Some(hostnet_egress.clone()), None),
+                    hooks_enabled: true,
+                    attrs: Default::default(),
+                },
+                must_match_version: None,
+            })
+            .await
+            .unwrap()
+            .id;
+
         let mngr = server.state.sessions_manager().await;
-        assert!(mngr.list().await.unwrap().is_empty());
+        assert_eq!(mngr.list().await.unwrap().len(), 1);
+
+        let policy = client
+            .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(hostnet_id))
+            .await
+            .unwrap();
+        assert_eq!(policy.egress, Some(hostnet_egress));
     }
 
     #[tokio::test]
