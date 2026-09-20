@@ -72,6 +72,7 @@
 #     box_name_resolves_natively_without_proxy
 #     fresh_linux_kvm_activate_local_minvmd
 #     fresh_arm64_kvm_activate_local_minvmd
+#     hostnames_recover_and_two_daemons_route
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -106,6 +107,10 @@ NATRES_REMOVE=""   # the `min net setup --remove` that undoes that proof's insta
 BOXID_SEED_DIR=""  # seeded by the box-identity proof's first box; removed on teardown
 BOXID_SEED_DIR2="" # seeded by the box-identity proof's second box; removed on teardown
 BOXID_REMOVE=""    # the `min net setup --remove` that undoes that proof's install
+HR_VM_SEED_DIR=""  # seeded by the two-daemons proof's VM session below; removed on teardown
+HR_OCCUPIER_PID=""       # the two-daemons proof's port-occupier; killed on teardown
+HR_NATIVE_SOCAT_PID=""   # the two-daemons proof's native responder; killed on teardown
+HR_VM_SOCAT_PID=""       # the two-daemons proof's VM responder; killed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -228,6 +233,14 @@ teardown() {
   [ -n "$NATRES_SEED_DIR" ] && rm -rf "$NATRES_SEED_DIR"
   [ -n "$BOXID_SEED_DIR" ] && rm -rf "$BOXID_SEED_DIR"
   [ -n "$BOXID_SEED_DIR2" ] && rm -rf "$BOXID_SEED_DIR2"
+  [ -n "$HR_VM_SEED_DIR" ] && rm -rf "$HR_VM_SEED_DIR"
+  # The two-daemons proof's port-occupier and responders: backgrounded, and
+  # only reaped on that proof's own happy path, so a `fail` partway through
+  # (occupier still up to 300s, socat responders up to their -T30 idle
+  # timeout) would otherwise outlive the case and hold the loopback port.
+  [ -n "$HR_OCCUPIER_PID" ] && kill "$HR_OCCUPIER_PID" 2>/dev/null || true
+  [ -n "$HR_NATIVE_SOCAT_PID" ] && kill "$HR_NATIVE_SOCAT_PID" 2>/dev/null || true
+  [ -n "$HR_VM_SOCAT_PID" ] && kill "$HR_VM_SOCAT_PID" 2>/dev/null || true
   # Undo the privileged resolver setup the native resolution proof installed,
   # so the runner is left as it was found (the hook would otherwise outlive
   # the daemon it points at).
@@ -1498,6 +1511,226 @@ run_case_fresh_arm64_kvm_activate_local_minvmd() {
   run_case_fresh_kvm_activate_local_minvmd arm64 aarch64
 }
 
+# NET-020..022 (recovery) + NET-024..027 (port choice / two daemons): the
+# hostname-proxy port mechanics land as unit proofs in crates/minimald/src/
+# net/proxy.rs; this stitches them into one end-to-end case. Gated on a
+# native `minimald` binary being on PATH — the whole case is unreachable on
+# macOS, which has no native daemon backend at all (AGENTS.md "Platform
+# matrix") — and the two-daemons half is additionally gated on
+# MINVMD_GVPROXY_BIN, the same signal the own-IP proofs above use for "this
+# target has no switch". Unlike the native-only cases above (e.g.
+# native_resolution_without_proxy_env), this one does NOT skip on E2E_VM:
+# the two-daemons half needs a native minimald *and* a VM-backed one live
+# at once, so on the Linux/KVM lane (E2E_VM=1, with a built native minimald
+# also on PATH) it deliberately starts that native daemon alongside the
+# VM-backed target under test.
+run_case_hostnames_recover_and_two_daemons_route() {
+  echo "::group::hostnames recover, and two daemons share a machine (NET-020..022, NET-024..027)"
+
+  if ! command -v minimald >/dev/null 2>&1; then
+    echo "hostnames-recover-and-two-daemons proof SKIPPED (no native minimald binary on PATH: this host runs minvmd only)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  mnl --provider local-minimald stop --force >/dev/null 2>&1 || true
+
+  # -- Occupy the proxy port, activate: see the reason and remedy (NET-020) -
+  # `min` autospawn never passes --hostname-proxy-port (it only ever starts a
+  # daemon with no port configured), so the only way to reach the fault an
+  # operator's flag can hit is to start the daemon ourselves, configured to a
+  # port we already hold: bound as given, never substituted (NET-024), so the
+  # bind fails exactly the way it would for that operator, rather than
+  # silently falling back to a free port the way an unconfigured daemon does
+  # (NET-025).
+  hr_port_file="$WORK/hr-occupied-port"
+  python3 -c '
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0))
+s.listen(1)
+print(s.getsockname()[1], flush=True)
+time.sleep(300)
+' >"$hr_port_file" 2>"$WORK/hr-occupier.err" &
+  HR_OCCUPIER_PID=$!
+  hr_port=""
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    hr_port="$(tr -d '[:space:]' <"$hr_port_file" 2>/dev/null)"
+    [ -n "$hr_port" ] && break
+    sleep 1
+  done
+  if [ -z "$hr_port" ]; then
+    echo "::error::could not occupy a loopback port to force the hostname-proxy bind to fail"
+    cat "$WORK/hr-occupier.err" 2>/dev/null || true
+    fail
+  fi
+  echo "occupied 127.0.0.1:$hr_port to force the native daemon's configured hostname-proxy bind to fail"
+
+  if ! minimald run --detach --instance-num 0 --hostname-proxy-port "$hr_port" \
+      >"$WORK/hr-minimald.out" 2>"$WORK/hr-minimald.err"; then
+    echo "::error::'minimald run --detach --hostname-proxy-port $hr_port' failed"
+    cat "$WORK/hr-minimald.err" 2>/dev/null || true
+    fail
+  fi
+
+  hr_out="$(cd "$PROJECT_DIR" && mnl --provider local-minimald session activate . --no-prompt \
+    --name e2e-hostrecover 2>"$WORK/hr-activate.err")" || {
+    echo "::error::'min session activate' (native, configured port held) failed"
+    cat "$WORK/hr-activate.err" 2>/dev/null || true
+    fail
+  }
+  hr_sid="$(printf '%s\n' "$hr_out" | tail -n1 | tr -d '\r')"
+  echo "native session (hostname-proxy port held): $hr_sid"
+
+  if ! grep -q "warning: session hostnames will not route:" "$WORK/hr-activate.err"; then
+    echo "::error::NET-020: activate did not report why box hostnames will not route"
+    cat "$WORK/hr-activate.err"
+    fail
+  fi
+  if ! grep -q "remedy: free the listen address" "$WORK/hr-activate.err"; then
+    echo "::error::NET-020: activate reported the reason but not the remedy"
+    cat "$WORK/hr-activate.err"
+    fail
+  fi
+  echo "NET-020 OK: activate printed why box hostnames will not route, and the remedy"
+
+  # -- Free it: ls clears without a restart (NET-021, NET-022) -------------
+  kill "$HR_OCCUPIER_PID" 2>/dev/null || true
+  wait "$HR_OCCUPIER_PID" 2>/dev/null || true
+  HR_OCCUPIER_PID=""
+  echo "freed 127.0.0.1:$hr_port"
+
+  # The daemon's retry loop started backing off (up to the 30s cap) from its
+  # very first failed bind at startup, not from when we free the port here,
+  # so the wait after freeing can span most of one full backoff cycle.
+  hr_cleared=0
+  for _ in $(seq 1 90); do
+    mnl --provider local-minimald ls >"$WORK/hr-ls.out" 2>"$WORK/hr-ls.err" || true
+    if ! grep -q "warning: session hostnames will not route:" "$WORK/hr-ls.err"; then
+      hr_cleared=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$hr_cleared" -ne 1 ]; then
+    echo "::error::NET-021/022: 'min ls' still warns that hostnames will not route, 90s after the port was freed with no daemon restart"
+    cat "$WORK/hr-ls.err" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-021/022 OK: the daemon rebound on its own; 'min ls' stopped warning with no restart"
+
+  # -- A native and a VM daemon both route names at once (NET-024..027) ----
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "two-daemons proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so a VM daemon cannot come up)"
+    mnl --provider local-minimald session destroy --force "$hr_sid" >/dev/null 2>&1 || true
+    mnl --provider local-minimald stop --force >/dev/null 2>&1 || true
+    echo "::endgroup::"
+    return 0
+  fi
+
+  hr_native_port="$hr_port"
+  echo "native daemon's hostname proxy: 127.0.0.1:$hr_native_port"
+
+  HR_VM_SEED_DIR="$(mktemp -d /tmp/mnlhr.XXXXXX)"
+  HR_VM_SEED_DIR="$(cd "$HR_VM_SEED_DIR" && pwd -P)"
+  {
+    awk '
+      /^\[upstream\]/            { grab = 1; print; next }
+      grab && (/^$/ || /^\[/)    { exit }
+      grab                       { print }
+    ' "$ROOT/.minimal/minimal.toml"
+    printf '\n[stack]\nuse = "shell"\n'
+  } > "$HR_VM_SEED_DIR/minimal.toml"
+  mkdir "$HR_VM_SEED_DIR/.git"
+
+  hr_vm_out="$(cd "$HR_VM_SEED_DIR" && mnl --provider local-minvmd session activate . --no-prompt \
+    --name e2e-hostrecover-vm 2>"$WORK/hr-vm-activate.err")" || {
+    echo "::error::'min session activate --provider local-minvmd' failed"
+    cat "$WORK/hr-vm-activate.err" 2>/dev/null || true
+    fail
+  }
+  hr_vm_sid="$(printf '%s\n' "$hr_vm_out" | tail -n1 | tr -d '\r')"
+  echo "VM session: $hr_vm_sid"
+
+  hr_vm_port="$(grep -o 'proxy at 127\.0\.0\.1:[0-9]\{1,5\}' "$WORK/hr-vm-activate.err" \
+    | tail -n1 | grep -o '[0-9]\{1,5\}$')"
+  if [ -z "$hr_vm_port" ]; then
+    echo "::error::NET-026: activate did not print the VM daemon's discovered hostname-proxy port"
+    cat "$WORK/hr-vm-activate.err"
+    fail
+  fi
+  echo "VM daemon's hostname proxy: 127.0.0.1:$hr_vm_port"
+
+  if [ "$hr_vm_port" = "$hr_native_port" ]; then
+    echo "::error::NET-027: the native and VM daemons ended up sharing one hostname-proxy port ($hr_vm_port)"
+    fail
+  fi
+  echo "NET-025/026 OK: the two daemons discovered different ports ($hr_native_port native, $hr_vm_port VM)"
+
+  # Retried the same way `proxy_status` above is: the target listener was
+  # just forked and may not have bound yet, and while it hasn't, the
+  # proxy's own "upstream-unreachable" 502 is itself a valid HTTP response
+  # curl returns immediately, so a `want` (when given) is retried past too.
+  hr_proxy_status() {
+    local proxy_port="$1" authority="$2" want="${3:-}" status=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+        --proxy "127.0.0.1:$proxy_port" "http://$authority/" 2>"$WORK/hr-curl.err")"
+      if [ -n "$status" ] && [ "$status" != "000" ] && { [ -z "$want" ] || [ "$status" = "$want" ]; }; then
+        break
+      fi
+      sleep 1
+    done
+    echo "GET http://$authority/ via proxy 127.0.0.1:$proxy_port -> ${status:-<no response>}" >&2
+    printf '%s' "$status"
+  }
+
+  mnl --provider local-minimald session exec "$hr_sid" \
+    'printf "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" > /tmp/hr-resp.http' \
+    || { echo "::error::could not seed the native responder's canned response"; fail; }
+  mnl --provider local-minimald session exec "$hr_sid" socat -T30 "TCP-LISTEN:18101,bind=127.0.0.1,reuseaddr,fork" \
+    'SYSTEM:cat /tmp/hr-resp.http' >"$WORK/hr-native-socat.log" 2>&1 &
+  HR_NATIVE_SOCAT_PID=$!
+
+  mnl --provider local-minvmd session exec "$hr_vm_sid" \
+    'printf "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" > /tmp/hr-resp.http' \
+    || { echo "::error::could not seed the VM responder's canned response"; fail; }
+  mnl --provider local-minvmd session exec "$hr_vm_sid" socat -T30 "TCP-LISTEN:18101,bind=127.0.0.1,reuseaddr,fork" \
+    'SYSTEM:cat /tmp/hr-resp.http' >"$WORK/hr-vm-socat.log" 2>&1 &
+  HR_VM_SOCAT_PID=$!
+
+  hr_native_status="$(hr_proxy_status "$hr_native_port" "e2e-hostrecover.min.internal:18101" 200)"
+  if [ "$hr_native_status" != "200" ]; then
+    echo "::error::NET-027: the native daemon did not route its own box while the VM daemon was also live"
+    fail
+  fi
+  hr_vm_status="$(hr_proxy_status "$hr_vm_port" "e2e-hostrecover-vm.min.internal:18101" 200)"
+  if [ "$hr_vm_status" != "200" ]; then
+    echo "::error::NET-027: the VM daemon did not route its own box while the native daemon was also live"
+    fail
+  fi
+  echo "NET-027 OK: the native and VM daemons both routed their own box's name at the same time"
+
+  hr_crossed_status="$(hr_proxy_status "$hr_native_port" "e2e-hostrecover-vm.min.internal:18101")"
+  if [ "$hr_crossed_status" != "502" ]; then
+    echo "::error::NET-027: the native daemon's proxy routed the VM daemon's box name (got $hr_crossed_status, want 502)"
+    fail
+  fi
+  echo "NET-027 (unwanted case) OK: each daemon answers for its own boxes only"
+
+  kill "$HR_NATIVE_SOCAT_PID" "$HR_VM_SOCAT_PID" 2>/dev/null || true
+  wait "$HR_NATIVE_SOCAT_PID" 2>/dev/null || true
+  wait "$HR_VM_SOCAT_PID" 2>/dev/null || true
+  HR_NATIVE_SOCAT_PID=""; HR_VM_SOCAT_PID=""
+  mnl --provider local-minvmd session destroy --force "$hr_vm_sid" >/dev/null 2>&1 || true
+  mnl --provider local-minimald session destroy --force "$hr_sid" >/dev/null 2>&1 || true
+  rm -rf "$HR_VM_SEED_DIR"; HR_VM_SEED_DIR=""
+  mnl --provider local-minvmd stop --force >/dev/null 2>&1 || true
+  mnl --provider local-minimald stop --force >/dev/null 2>&1 || true
+  echo "::endgroup::"
+}
+
 E2E_CASE="${E2E_CASE:-${1:-}}"
 if [ -n "$E2E_CASE" ]; then
   case "$E2E_CASE" in
@@ -1515,8 +1748,9 @@ if [ -n "$E2E_CASE" ]; then
       run_case_fresh_linux_kvm_activate_local_minvmd; exit $? ;;
     fresh_arm64_kvm_activate_local_minvmd)
       run_case_fresh_arm64_kvm_activate_local_minvmd; exit $? ;;
+    hostnames_recover_and_two_daemons_route) run_case_hostnames_recover_and_two_daemons_route; exit $? ;;
     *)
-      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy, fresh_linux_kvm_activate_local_minvmd, fresh_arm64_kvm_activate_local_minvmd)" >&2
+      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy, fresh_linux_kvm_activate_local_minvmd, fresh_arm64_kvm_activate_local_minvmd, hostnames_recover_and_two_daemons_route)" >&2
       exit 2
       ;;
   esac
