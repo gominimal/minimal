@@ -77,6 +77,7 @@
 #     port_publishes_on_listen_and_box_outlives_client
 #     github_only_allowlist
 #     expose_from_inside_box
+#     two_named_vms_on_one_machine
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -2488,6 +2489,278 @@ PY
   echo "::endgroup::"
 }
 
+# NET-052..059: two VM box hosts on one machine, end to end. `minvmd
+# --vm-name <name>` gives a second VM its own state, socket and daemon; `min
+# ls`/attach/`min net expose` then address boxes across both from the box
+# name alone, no global flag naming the VM. `min` itself has no flag yet that
+# PLACES a new box on a named VM (S7b/arch#45 tracks that CLI surface) —
+# activation always targets whatever `--minimal-dir` resolves to, which is
+# always the `default` VM — so this case reaches the SECOND VM's own,
+# already-running daemon by pointing `--minimal-dir` at a scratch root whose
+# provider-instance path IS that VM's real directory, via a symlink. The
+# named VM is already up by then, so this only ever CONNECTS; nothing here
+# spawns a second daemon at a divergent path. Every other command below (ls,
+# net expose, attach) runs with no override at all — the named VM is
+# discoverable there for real, the way NET-057/058 actually work.
+run_case_two_named_vms_on_one_machine() {
+  echo "::group::two named VMs on one machine, end to end (NET-052..059)"
+
+  local minvmd_bin
+  minvmd_bin="$(command -v minvmd || true)"
+  if [ -z "$minvmd_bin" ]; then
+    echo "two-named-VMs proof SKIPPED (no minvmd on PATH: this target has no VM host daemon)"
+    echo "::endgroup::"
+    return 0
+  fi
+  local data_dir kernel_path rootfs_path initramfs_path payload
+  data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/minimal"
+  kernel_path="${MINVMD_KERNEL_PATH:-$data_dir/vmlinuz}"
+  rootfs_path="${MINVMD_ROOTFS_PATH:-$data_dir/rootfs.img}"
+  initramfs_path="${MINVMD_INITRAMFS:-$data_dir/initramfs.cpio}"
+  for payload in "$kernel_path" "$rootfs_path" "$initramfs_path"; do
+    if [ ! -f "$payload" ]; then
+      echo "two-named-VMs proof SKIPPED (no guest payload at $payload: this target ships no VM stack)"
+      echo "::endgroup::"
+      return 0
+    fi
+  done
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && ! command -v gvproxy-min >/dev/null 2>&1; then
+    echo "two-named-VMs proof SKIPPED (no switch: MINVMD_GVPROXY_BIN unset and no gvproxy-min on PATH)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  local tnv_prov_dir tnv_beta_dir
+  tnv_prov_dir="$XDG_STATE_HOME/minimal/providers/local-minvmd0"
+  tnv_beta_dir="$tnv_prov_dir/vms/beta"
+  "$minvmd_bin" --vm-name beta stop >/dev/null 2>&1 || true
+
+  # -- 1. The default VM's own box -----------------------------------------
+  local default_out default_sid default_port
+  default_out="$(cd "$PROJECT_DIR" && mnl --provider local-minvmd session activate . --no-prompt \
+    --name e2e-tnv-default 2>"$WORK/tnv-default-activate.err")" || {
+    echo "::error::'min --provider local-minvmd session activate' failed for the default VM"
+    cat "$WORK/tnv-default-activate.err" 2>/dev/null || true
+    fail
+  }
+  default_sid="$(printf '%s\n' "$default_out" | tail -n1 | tr -d '\r')"
+  default_port="$(grep -o 'proxy at 127\.0\.0\.1:[0-9]\{1,5\}' "$WORK/tnv-default-activate.err" \
+    | tail -n1 | grep -o '[0-9]\{1,5\}$')"
+  echo "default VM's box: $default_sid (hostname proxy: 127.0.0.1:${default_port:-?})"
+
+  # -- 2. A second, NAMED VM: its own state, socket, daemon (NET-052..054) -
+  if ! "$minvmd_bin" --vm-name beta run --detach --timeout 150 \
+      >"$WORK/tnv-beta-run.out" 2>"$WORK/tnv-beta-run.err"; then
+    echo "::error::'minvmd --vm-name beta run --detach' failed to bring up the second named VM"
+    cat "$WORK/tnv-beta-run.err" 2>/dev/null || true
+    mnl --provider local-minvmd session destroy --force "$default_sid" >/dev/null 2>&1 || true
+    mnl --provider local-minvmd stop --force >/dev/null 2>&1 || true
+    fail
+  fi
+  if [ ! -S "$tnv_beta_dir/ssh.sock" ]; then
+    echo "::error::NET-052/054: VM 'beta' has no own socket at $tnv_beta_dir/ssh.sock"
+    "$minvmd_bin" --vm-name beta stop >/dev/null 2>&1 || true
+    mnl --provider local-minvmd session destroy --force "$default_sid" >/dev/null 2>&1 || true
+    mnl --provider local-minvmd stop --force >/dev/null 2>&1 || true
+    fail
+  fi
+  echo "NET-052/054 OK: VM 'beta' has its own state/socket/daemon under $tnv_beta_dir"
+  if [ ! -e "$tnv_prov_dir/ssh.sock" ] || [ ! -e "$tnv_prov_dir/minvmd.toml" ]; then
+    echo "::error::NET-053: the default VM's own paths moved when 'beta' was created"
+    "$minvmd_bin" --vm-name beta stop >/dev/null 2>&1 || true
+    mnl --provider local-minvmd session destroy --force "$default_sid" >/dev/null 2>&1 || true
+    mnl --provider local-minvmd stop --force >/dev/null 2>&1 || true
+    fail
+  fi
+  echo "NET-053 OK: the default VM's own paths ($tnv_prov_dir) are unchanged"
+
+  # -- 3. A box ON that named VM. `min` has no --vm flag yet (see the comment
+  #    above this case); reach beta's already-running daemon by pointing
+  #    --minimal-dir at a scratch root whose provider-instance path IS
+  #    beta's real directory. -------------------------------------------
+  local beta_client_dir beta_out beta_sid beta_port
+  beta_client_dir="$(mktemp -d "$WORK/tnv-beta-client.XXXXXX")"
+  mkdir -p "$beta_client_dir/providers"
+  ln -s "$tnv_beta_dir" "$beta_client_dir/providers/local-minvmd0"
+  beta_out="$(cd "$PROJECT_DIR" && mnl --minimal-dir "$beta_client_dir" --provider local-minvmd \
+    session activate . --no-prompt --name e2e-tnv-beta 2>"$WORK/tnv-beta-activate.err")" || {
+    echo "::error::'min session activate' against the named VM 'beta' failed"
+    cat "$WORK/tnv-beta-activate.err" 2>/dev/null || true
+    "$minvmd_bin" --vm-name beta stop >/dev/null 2>&1 || true
+    mnl --provider local-minvmd session destroy --force "$default_sid" >/dev/null 2>&1 || true
+    mnl --provider local-minvmd stop --force >/dev/null 2>&1 || true
+    fail
+  }
+  beta_sid="$(printf '%s\n' "$beta_out" | tail -n1 | tr -d '\r')"
+  beta_port="$(grep -o 'proxy at 127\.0\.0\.1:[0-9]\{1,5\}' "$WORK/tnv-beta-activate.err" \
+    | tail -n1 | grep -o '[0-9]\{1,5\}$')"
+  echo "beta VM's box: $beta_sid (hostname proxy: 127.0.0.1:${beta_port:-?})"
+
+  # From here on every failure branch shares this cleanup (both boxes, beta's
+  # own daemon, then the default provider) — `teardown`'s trap only ever
+  # knew the default VM. Factored out because it now repeats at every step,
+  # unlike this file's usual inline style.
+  tnv_cleanup() {
+    mnl --minimal-dir "$beta_client_dir" --provider local-minvmd \
+      session destroy --force "$beta_sid" >/dev/null 2>&1 || true
+    "$minvmd_bin" --vm-name beta stop >/dev/null 2>&1 || true
+    mnl --provider local-minvmd session destroy --force "$default_sid" >/dev/null 2>&1 || true
+    mnl --provider local-minvmd stop --force >/dev/null 2>&1 || true
+  }
+
+  if [ "$(mnl --provider local-minvmd session exec "$default_sid" echo tnv-default-ok \
+      2>/dev/null)" != tnv-default-ok ]; then
+    echo "::error::the default VM's box did not respond to a trivial exec"
+    tnv_cleanup; fail
+  fi
+  if [ "$(mnl --minimal-dir "$beta_client_dir" --provider local-minvmd session exec "$beta_sid" \
+      echo tnv-beta-ok 2>/dev/null)" != tnv-beta-ok ]; then
+    echo "::error::VM 'beta''s box did not respond to a trivial exec"
+    tnv_cleanup; fail
+  fi
+  echo "both boxes are live: $default_sid on 'default', $beta_sid on 'beta'"
+
+  # -- 4. 'min ls' shows the VM per box (NET-057) --------------------------
+  local ls_out
+  ls_out="$(mnl --provider local-minvmd ls 2>"$WORK/tnv-ls.err")" || {
+    echo "::error::'min ls' failed with two VMs running"
+    cat "$WORK/tnv-ls.err" 2>/dev/null || true
+    tnv_cleanup; fail
+  }
+  if ! printf '%s\n' "$ls_out" | grep -E '^default[[:space:]]' | grep -q e2e-tnv-default; then
+    echo "::error::NET-057: 'min ls' does not list e2e-tnv-default under VM 'default'"
+    printf '%s\n' "$ls_out"
+    tnv_cleanup; fail
+  fi
+  if ! printf '%s\n' "$ls_out" | grep -E '^beta[[:space:]]' | grep -q e2e-tnv-beta; then
+    echo "::error::NET-057: 'min ls' does not list e2e-tnv-beta under VM 'beta'"
+    printf '%s\n' "$ls_out"
+    tnv_cleanup; fail
+  fi
+  echo "NET-057 OK: 'min ls' names the VM holding each box"
+
+  # -- 5. 'min net expose' resolves the VM from the box name alone (NET-058) -
+  # Neither box declared --network own_ip, so the daemon that actually holds
+  # 'e2e-tnv-beta' refuses this for ITS OWN domain reason (no address of its
+  # own to publish at) rather than "no such session" — which is exactly the
+  # signal that resolution reached beta's daemon and not the default one,
+  # with no --vm flag naming it.
+  local expose_out
+  expose_out="$(mnl --provider local-minvmd net expose 18402 --session e2e-tnv-beta 2>&1)"
+  if ! printf '%s' "$expose_out" | grep -q "no address of its own"; then
+    echo "::error::NET-058: 'min net expose --session e2e-tnv-beta' did not resolve to VM 'beta': $expose_out"
+    tnv_cleanup; fail
+  fi
+  echo "NET-058 OK (expose): resolved 'e2e-tnv-beta' to VM 'beta' with no --vm flag ($expose_out)"
+
+  # -- 6. attach resolves the VM from the box name alone (NET-058) --------
+  # A real pty (a session is interactive by design): write a marker inside
+  # whichever box the name resolves to, then leave by the shipped detach
+  # chord. The marker is then read back through beta's own connection —
+  # present there proves the attach landed in VM 'beta''s box, which is the
+  # only box anywhere named 'e2e-tnv-beta'.
+  local attach_out
+  attach_out="$(E2E_PTY_COMMANDS="echo tnv-attach-marker-beta > /tmp/tnv-attach-marker" \
+    E2E_PTY_DETACH=1 python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+    min --provider local-minvmd session attach e2e-tnv-beta \
+    2>"$WORK/tnv-attach.err")" || {
+    echo "::error::the pty attach to 'e2e-tnv-beta' by name did not exit cleanly"
+    echo "--- transcript ---"; printf '%s\n' "$attach_out"
+    cat "$WORK/tnv-attach.err" 2>/dev/null || true
+    tnv_cleanup; fail
+  }
+  if [ "$(mnl --minimal-dir "$beta_client_dir" --provider local-minvmd session exec "$beta_sid" \
+      cat /tmp/tnv-attach-marker 2>/dev/null)" != tnv-attach-marker-beta ]; then
+    echo "::error::NET-058: attaching to 'e2e-tnv-beta' by name did not land in VM 'beta''s box"
+    tnv_cleanup; fail
+  fi
+  echo "NET-058 OK (attach): attaching to 'e2e-tnv-beta' by name resolved to VM 'beta' alone"
+
+  # -- 7. Both VMs' names route through the host's hostname surface at the
+  #    same time (NET-059) -------------------------------------------------
+  local tnv_port=18400
+  mnl --provider local-minvmd session exec "$default_sid" \
+    'printf "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" > /tmp/tnv-resp.http' \
+    || { echo "::error::could not seed the default box's canned responder"; tnv_cleanup; fail; }
+  mnl --provider local-minvmd session exec "$default_sid" socat -T30 \
+    "TCP-LISTEN:$tnv_port,bind=127.0.0.1,reuseaddr,fork" 'SYSTEM:cat /tmp/tnv-resp.http' \
+    >"$WORK/tnv-default-socat.log" 2>&1 &
+  local tnv_default_socat_pid=$!
+
+  mnl --minimal-dir "$beta_client_dir" --provider local-minvmd session exec "$beta_sid" \
+    'printf "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" > /tmp/tnv-resp.http' \
+    || {
+      echo "::error::could not seed the beta box's canned responder"
+      kill "$tnv_default_socat_pid" 2>/dev/null || true
+      tnv_cleanup; fail
+    }
+  mnl --minimal-dir "$beta_client_dir" --provider local-minvmd session exec "$beta_sid" socat -T30 \
+    "TCP-LISTEN:$tnv_port,bind=127.0.0.1,reuseaddr,fork" 'SYSTEM:cat /tmp/tnv-resp.http' \
+    >"$WORK/tnv-beta-socat.log" 2>&1 &
+  local tnv_beta_socat_pid=$!
+
+  tnv_proxy_status() {
+    local proxy_port="$1" authority="$2" status=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+        --proxy "127.0.0.1:$proxy_port" "http://$authority/" 2>"$WORK/tnv-curl.err")"
+      [ -n "$status" ] && [ "$status" != "000" ] && break
+      sleep 1
+    done
+    echo "GET http://$authority/ via proxy 127.0.0.1:$proxy_port -> ${status:-<no response>}" >&2
+    printf '%s' "$status"
+  }
+
+  local default_status beta_status
+  default_status="$(tnv_proxy_status "$default_port" "e2e-tnv-default.min.internal:$tnv_port")"
+  if [ "$default_status" != "200" ]; then
+    echo "::error::NET-059: the default VM's own proxy did not route its own box while beta was also live"
+    kill "$tnv_default_socat_pid" "$tnv_beta_socat_pid" 2>/dev/null || true
+    tnv_cleanup; fail
+  fi
+  beta_status="$(tnv_proxy_status "$beta_port" "e2e-tnv-beta.min.internal:$tnv_port")"
+  if [ "$beta_status" != "200" ]; then
+    echo "::error::NET-059: VM 'beta''s own proxy did not route its own box while the default VM was also live"
+    kill "$tnv_default_socat_pid" "$tnv_beta_socat_pid" 2>/dev/null || true
+    tnv_cleanup; fail
+  fi
+  echo "NET-059 OK: both VMs' names routed through their own daemon's proxy at the same time"
+
+  kill "$tnv_default_socat_pid" "$tnv_beta_socat_pid" 2>/dev/null || true
+  wait "$tnv_default_socat_pid" 2>/dev/null || true
+  wait "$tnv_beta_socat_pid" 2>/dev/null || true
+
+  # -- 8. Stopping one VM leaves the other running (NET-055) --------------
+  if ! "$minvmd_bin" --vm-name beta stop >"$WORK/tnv-beta-stop.out" 2>"$WORK/tnv-beta-stop.err"; then
+    echo "::error::'minvmd --vm-name beta stop' failed"
+    cat "$WORK/tnv-beta-stop.err" 2>/dev/null || true
+    tnv_cleanup; fail
+  fi
+  if "$minvmd_bin" --vm-name beta status >/dev/null 2>&1; then
+    echo "::error::NET-055: VM 'beta' still reports Running after its own stop"
+    tnv_cleanup; fail
+  fi
+  if ! "$minvmd_bin" status >/dev/null 2>&1; then
+    echo "::error::NET-055: the default VM stopped too when only 'beta' was told to"
+    mnl --provider local-minvmd session destroy --force "$default_sid" >/dev/null 2>&1 || true
+    mnl --provider local-minvmd stop --force >/dev/null 2>&1 || true
+    fail
+  fi
+  if [ "$(mnl --provider local-minvmd session exec "$default_sid" echo tnv-default-still-alive \
+      2>/dev/null)" != tnv-default-still-alive ]; then
+    echo "::error::NET-055: the default VM's box stopped answering after 'beta' alone was stopped"
+    mnl --provider local-minvmd session destroy --force "$default_sid" >/dev/null 2>&1 || true
+    mnl --provider local-minvmd stop --force >/dev/null 2>&1 || true
+    fail
+  fi
+  echo "NET-055 OK: stopping VM 'beta' left the default VM (and its box) running"
+
+  mnl --provider local-minvmd session destroy --force "$default_sid" >/dev/null 2>&1 || true
+  mnl --provider local-minvmd stop --force >/dev/null 2>&1 || true
+  rm -rf "$beta_client_dir"
+  echo "::endgroup::"
+}
+
 E2E_CASE="${E2E_CASE:-${1:-}}"
 if [ -n "$E2E_CASE" ]; then
   case "$E2E_CASE" in
@@ -2511,8 +2784,9 @@ if [ -n "$E2E_CASE" ]; then
       run_case_port_publishes_on_listen_and_box_outlives_client; exit $? ;;
     github_only_allowlist) run_case_github_only_allowlist; exit $? ;;
     expose_from_inside_box) run_case_expose_from_inside_box; exit $? ;;
+    two_named_vms_on_one_machine) run_case_two_named_vms_on_one_machine; exit $? ;;
     *)
-      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy, fresh_linux_kvm_activate_local_minvmd, fresh_arm64_kvm_activate_local_minvmd, hostnames_recover_and_two_daemons_route, proxy_refuses_like_direct, port_publishes_on_listen_and_box_outlives_client, github_only_allowlist, expose_from_inside_box)" >&2
+      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy, fresh_linux_kvm_activate_local_minvmd, fresh_arm64_kvm_activate_local_minvmd, hostnames_recover_and_two_daemons_route, proxy_refuses_like_direct, port_publishes_on_listen_and_box_outlives_client, github_only_allowlist, expose_from_inside_box, two_named_vms_on_one_machine)" >&2
       exit 2
       ;;
   esac
