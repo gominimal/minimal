@@ -17,7 +17,10 @@
 //!   signing certificate constrained to the names the host's boxes declare,
 //!   and the leaves issued under it.
 //! - [`audit`] is the log: one hash-chained JSONL record per decision, append
-//!   only, carrying no credential and no body.
+//!   only, carrying no credential and no body, rotated at a size bound with
+//!   the chain continued.
+//! - [`chain`] is that chain as pure functions over bytes: what the writer
+//!   links, what `min doctor` walks, and where a walk breaks.
 //! - [`control`] is the control socket's audit submissions: how a client's
 //!   mints and revocations reach the log the proxy alone writes, and the
 //!   revocations they put in force.
@@ -34,6 +37,7 @@
 
 pub mod audit;
 pub mod ca;
+pub mod chain;
 pub mod control;
 pub mod github;
 pub mod keychain;

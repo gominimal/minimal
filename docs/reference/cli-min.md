@@ -294,6 +294,45 @@ min dirs
 
 Prints important directories and file paths for debugging.
 
+### `doctor`
+
+```
+min doctor
+```
+
+Runs the checks this host can make on its own state and reports what does not
+hold. Today that is the Box Egress Proxy's audit chain: every record of every
+retained segment, oldest first, against the hash the record before it hashes
+to. The verdict names each segment with the records it holds, and the hash the
+chain ends on:
+
+```console
+$ min doctor
+audit chain: verified — 41 records across 2 segments
+  ~/.local/state/minimal/bep/audit.log.1: 29 records
+  ~/.local/state/minimal/bep/audit.log: 12 records
+  head: 6f0d4b2c9a1e…
+```
+
+A record altered or removed without recomputing the hashes that follow breaks
+the chain, and `min doctor` names the segment and the record that no longer
+follows the one before it, exiting non-zero:
+
+```console
+$ min doctor
+audit chain: FAILED — 41 records across 2 segments
+  ~/.local/state/minimal/bep/audit.log.1: 29 records
+  ~/.local/state/minimal/bep/audit.log: 12 records
+  break: ~/.local/state/minimal/bep/audit.log.1: record 8 of the segment — record 8 carries 1a2b… where the record before it hashes to 9f8e…
+```
+
+Whole-log verification lives here rather than as a flag on `min box audit`: a
+read of one box's trail says nothing about the records of the other boxes the
+chain runs through. What the chain shows is an edit the hashes after it were
+not recomputed for; a host root that rewrites the log and re-chains all of it
+is outside what a bare chain can detect. A host whose proxy has written no
+record has no chain to check, and says so.
+
 ### `bug`
 
 ```
@@ -505,6 +544,13 @@ each line still names its own box.
 The log is the proxy's, not part of a box's record: a box that has been
 stopped or removed still has its trail, and `min box audit` prints it. The
 records carry no credential, no injected header value and no request body.
+
+The log rotates: when the active segment reaches its size bound the proxy
+renames it `audit.log.<n>` and opens a fresh one, whose first record carries
+the final hash of the segment before it, so the hash chain runs unbroken
+across the segments. `min box audit` reads every retained segment, oldest
+first, so a trail that crossed a rotation still prints as one trail;
+`min doctor` verifies the chain across them.
 
 `min box audit self` is refused while this host is not enrolled — a box has no
 identity surface of its own to read the trail through — with the defined error

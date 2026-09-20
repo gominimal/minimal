@@ -80,6 +80,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         },
         Some(Command::Run(args)) => task::cmd_run(&args),
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
+        Some(Command::Doctor) => doctor::cmd_doctor(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         #[cfg(feature = "remote-access")]
         Some(Command::Mesh(MeshArgs { command })) => match command {

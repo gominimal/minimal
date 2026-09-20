@@ -65,6 +65,14 @@ pub enum Command {
     Run(RunArgs),
     /// Print important directories and file paths for debugging
     Dirs,
+    /// Check this host's own state and report what does not hold
+    ///
+    /// Verifies the box egress proxy's audit chain: every record of every
+    /// retained segment, oldest first, against the hash the record before it
+    /// hashes to. A record altered or removed without recomputing the hashes
+    /// that follow is reported as a failing chain, naming the segment and the
+    /// record, and exits non-zero.
+    Doctor,
     /// Collect a diagnostic bundle (logs, state, config) to send to the
     /// minimal dev team.
     ///
