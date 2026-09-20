@@ -384,6 +384,18 @@ fn default_hooks_enabled() -> bool {
     true
 }
 
+/// [`SessionConfig::attrs`] key marking a box created for a single run,
+/// which the daemon ends when that run's command exits. The value names
+/// the task the box was created for; the daemon reads only the key's
+/// presence, so the name is there for whoever reads the record.
+///
+/// `min task run` sets it (and `--keep`, which asks for an attachable box,
+/// does not), so the end belongs to the daemon rather than to the client
+/// that asked for the run: a client killed mid-run strands nothing.
+/// Referenced by both sides — client and exec dispatch — so the name
+/// cannot skew, exactly as [`taskenv::TASK_ENV_PREFIX`] is.
+pub const RUN_BOX_ATTR: &str = "run-box";
+
 /// The request for a [`CreateSession`] RPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateSessionRequest {

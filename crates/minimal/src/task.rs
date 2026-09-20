@@ -4,9 +4,16 @@
 //! The activate→exec→destroy loop as one command: create a session for the
 //! project (named `task-<task>-<hex>`), upload the project per the normal
 //! activate rules, exec the canonical in-box `min task run <task>` over the
-//! native SSH exec channel with the task's output streamed through, exit
-//! with the task's exit code, and destroy the session afterwards — success,
-//! failure, or Ctrl-C — unless `--keep` retains it as an attachable session.
+//! native SSH exec channel with the task's output streamed through, and exit
+//! with the task's exit code — unless `--keep` retains the box as an
+//! attachable session.
+//!
+//! The box's end is the daemon's, not this process's: the session is created
+//! carrying [`minimald_rpc::RUN_BOX_ATTR`], and the daemon ends it when the
+//! run's command exits (NET-131). A `min` killed mid-run therefore strands
+//! nothing, and a normal run sends no destroy of its own. Ctrl-C is still
+//! answered here, because interrupting means "stop now" rather than "stop
+//! when the task happens to finish".
 //!
 //! Deliberately composed from the same client/RPC primitives `cmd_activate`
 //! uses (`SessionConfig`, `CreateSession`, the upload gates,
@@ -59,6 +66,41 @@ fn exit_outcome(code: Option<u32>) -> Result<(), anyhow::Error> {
 /// can re-mint with fresh entropy.
 fn task_session_name(task: &str, hex: &str) -> String {
     format!("task-{}-{hex}", crate::sanitize_name_component(task))
+}
+
+/// The config a run's box is created from: the same fields an activate with
+/// no flags sends, plus the marker that decides who ends the box.
+///
+/// Without `--keep` the box exists for this one run, so it carries
+/// [`minimald_rpc::RUN_BOX_ATTR`] naming the task and the daemon ends it on
+/// the run's exit (NET-131) — the end cannot depend on this process, which
+/// may be killed mid-run. `--keep` asks for an attachable box instead: no
+/// marker, and the box outlives the run like any activated session.
+fn task_session_config(
+    name: String,
+    project_path: paths::HostAbsPath,
+    task: &str,
+    keep: bool,
+) -> minimald_rpc::SessionConfig {
+    minimald_rpc::SessionConfig {
+        name: Some(name),
+        project_path,
+        network: sessions::NetworkMode::HostNet,
+        policy: sessions::SessionPolicy::default(),
+        // Same default as an activate with no flags, matching the
+        // loadout handling below. `min task run` has no `--no-hooks` of
+        // its own; a `--keep` session is attachable later, so its hooks
+        // should behave like any other session's.
+        hooks_enabled: true,
+        attrs: if keep {
+            Default::default()
+        } else {
+            std::collections::BTreeMap::from([(
+                minimald_rpc::RUN_BOX_ATTR.to_string(),
+                task.to_string(),
+            )])
+        },
+    }
 }
 
 /// The hidden top-level `min run` muscle-memory catch: always errors, naming
@@ -577,18 +619,12 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     crate::ensure_daemon(global)?;
 
-    let config = minimald_rpc::SessionConfig {
-        name: Some(task_session_name(&args.task, &crate::random_hex4())),
-        project_path: abs_path.clone(),
-        network: sessions::NetworkMode::HostNet,
-        policy: sessions::SessionPolicy::default(),
-        // Same default as an activate with no flags, matching the
-        // loadout handling below. `min task run` has no `--no-hooks` of
-        // its own; a `--keep` session is attachable later, so its hooks
-        // should behave like any other session's.
-        hooks_enabled: true,
-        attrs: Default::default(),
-    };
+    let config = task_session_config(
+        task_session_name(&args.task, &crate::random_hex4()),
+        abs_path.clone(),
+        &args.task,
+        args.keep,
+    );
 
     // Loadouts and user policy: the same defaults as an activate with no
     // loadout flags — the config's `default_loadouts` apply. Resolved before
@@ -825,24 +861,33 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     eprintln!("Running task {} in session {session_name}...", args.task);
 
-    let outcome = match client
+    let opened = client
         .open_session_exec_channel(
             id,
             &minimald_rpc::exec::ExecRequest::TaskRun(args.task.clone()).encode(),
             &task_env,
         )
-        .await
-    {
+        .await;
+    let outcome = match opened {
         Ok(channel) => bridge_exec(channel).await,
-        Err(e) => Err(e),
+        Err(e) => {
+            // No run ever started, so no run's exit will end the box: the
+            // daemon-side end has nothing to fire on. This is the one path
+            // where the box is still the client's to clean up.
+            if !args.keep {
+                crate::best_effort_destroy(&mut client, id).await;
+            }
+            Err(e)
+        }
     };
 
-    // Resolve the box — success, failure, or exec error alike — before the
-    // exit code (or error) propagates.
+    // Nothing to resolve on the box itself: the run has exited, so the
+    // daemon has already ended it (NET-131) — success, failure, or a
+    // transport that died mid-stream alike. A destroy from here would only
+    // race a box that is going anyway, and would be missing exactly when it
+    // mattered, from a client that did not survive the run.
     if args.keep {
         eprintln!("Session {session_name} kept — attach with: min session attach {session_name}");
-    } else {
-        crate::best_effort_destroy(&mut client, id).await;
     }
     drop(run_guard);
 
@@ -860,6 +905,49 @@ mod tests {
     fn task_session_name_sanitizes_the_task_stem() {
         assert_eq!(task_session_name("build", "9c1e"), "task-build-9c1e");
         assert_eq!(task_session_name("My Task!", "4f2a"), "task-mytask-4f2a");
+    }
+
+    /// NET-131, the client's half: a run's box is created already marked as
+    /// one, so ending it is the daemon's job and not this process's.
+    ///
+    /// That marker is the whole reason a client lost mid-run leaves no
+    /// session behind — a killed `min` sends no `DestroySession`, and the
+    /// run path deliberately sends none either, so a box the daemon cannot
+    /// recognise as a run's would live until the next daemon restart. The
+    /// `--keep` box is the opposite request and must carry no marker.
+    #[test]
+    fn task_run_leaves_no_session_when_client_is_lost() {
+        let project = paths::HostAbsPath::try_new("/home/dev/proj").unwrap();
+
+        let run = task_session_config(
+            "task-build-9c1e".to_string(),
+            project.clone(),
+            "build",
+            false,
+        );
+        assert_eq!(
+            run.attrs
+                .get(minimald_rpc::RUN_BOX_ATTR)
+                .map(String::as_str),
+            Some("build"),
+            "a run's box must name the run it was created for, got {:?}",
+            run.attrs,
+        );
+
+        let kept = task_session_config("task-build-9c1e".to_string(), project, "build", true);
+        assert!(
+            !kept.attrs.contains_key(minimald_rpc::RUN_BOX_ATTR),
+            "a --keep box outlives the run and must not be ended by it, got {:?}",
+            kept.attrs,
+        );
+
+        // The marker is the only difference: a kept box is composed exactly
+        // as a run's is, so `--keep` changes who ends it and nothing else.
+        assert_eq!(run.name, kept.name);
+        assert_eq!(run.project_path, kept.project_path);
+        assert_eq!(run.network, kept.network);
+        assert_eq!(run.policy, kept.policy);
+        assert_eq!(run.hooks_enabled, kept.hooks_enabled);
     }
 
     /// The hidden `min run` redirect names both canonical forms — the host
