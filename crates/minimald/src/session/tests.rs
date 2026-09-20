@@ -175,6 +175,81 @@ async fn create_session(client: &mut TestClient) -> SessionId {
     create_configured_session(client, "shell-test", "/uwu").await
 }
 
+/// Like [`create_session`], but with `network` recorded on the session's
+/// config instead of the default `HostNet` — for tests that need a session
+/// configured for a different network mode than the one attach itself
+/// exercises.
+async fn session_with_network(
+    client: &mut TestClient,
+    name: &str,
+    network: sessions::NetworkMode,
+) -> SessionId {
+    use crate::test_harness::{create_session_req, unwrap_ready};
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+
+    let mut req = create_session_req(name, "/uwu");
+    req.config.network = network;
+    let id = client.call::<CreateSession>(&req).await.unwrap().id;
+    unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .await
+    {
+        Errorable::Ok(_) => id,
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+}
+
+/// NET-039. A session configured for `NetworkMode::NoNet` still accepts a
+/// client's attach through the real daemon path — `CreateSession` through
+/// `Host::build` minting the shell on the SSH channel the attach arrives on
+/// — the layer the plan names, rather than the sandbox network layer's
+/// same-named [`sandbox2::Network::attach`], which is a different, post-spawn
+/// wiring step (its default no-op can never refuse and proves nothing about
+/// whether a client's attach is accepted). The real network isolation a
+/// `none` box gets is wired by the production `SandboxLauncher`
+/// (`cfg(not(test))`); this proves the attach path itself never special-cases
+/// `none` into a refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn network_none_attach_works() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id =
+        session_with_network(&mut client, "none-attach", sessions::NetworkMode::NoNet).await;
+
+    let mut channel = client.open_shell(session_id).await;
+    channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    let mut stdout = Vec::new();
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { data }) => {
+                stdout.extend_from_slice(&data);
+                if String::from_utf8_lossy(&stdout).contains("got:hello") {
+                    break;
+                }
+            }
+            Some(_) => {}
+            None => {
+                let stdout = String::from_utf8_lossy(&stdout);
+                panic!(
+                    "attach to a `--network none` session should mint a working shell; got: {stdout:?}"
+                );
+            }
+        }
+    }
+}
+
 /// Attaching to a session whose loadout was never configured must not
 /// blow up: nothing is in flight on a bare `Draft`, so the attach
 /// configures it with an empty contribution on the way in and mints the

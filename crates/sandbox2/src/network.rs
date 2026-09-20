@@ -295,3 +295,20 @@ pub(crate) fn noop_guard() -> Box<dyn NetGuard> {
     }
     Box::new(NoopGuard)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NET-038. `NoNet`'s plan is what `new_container` builds a sandbox's
+    /// network namespace from: isolated, with no tap to relay traffic
+    /// through. That combination is what leaves only a down `lo` behind, so
+    /// every socket the sandbox opens to the outside is refused.
+    #[tokio::test]
+    async fn no_net_plan_isolates_netns() {
+        let plan = NoNet.plan().await.unwrap();
+        assert!(plan.isolates_netns());
+        assert!(plan.tap().is_none());
+        assert_eq!(plan.resolver(), &Resolver::None);
+    }
+}

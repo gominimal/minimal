@@ -298,6 +298,44 @@ mod tests {
         assert_eq!(switch.lock().await.attached(), 0);
     }
 
+    /// NET-038. `network_for` must route `NoNet` to its isolating, tapless
+    /// plan regardless of what a caller passes for identity or ingress — a
+    /// `none` PTask never picks up wiring meant for another mode. That plan
+    /// is what leaves the sandbox with only a down `lo`
+    /// ([`sandbox2::NoNet`]'s `no_net_plan_isolates_netns`), which is what
+    /// refuses every socket it opens to the outside.
+    #[tokio::test]
+    async fn network_none_blocks_all_outside_sockets() {
+        let switch = counting_switch();
+        let ingress = Some(sessions::IngressPolicy {
+            port_mappings: vec![sessions::PortMapping {
+                external_port: 8080,
+                internal_port: 80,
+                proto: sessions::IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+        });
+
+        let plan = network_for(NetworkMode::NoNet, &switch, "some-session", ingress)
+            .plan()
+            .await
+            .unwrap();
+
+        assert!(
+            plan.isolates_netns(),
+            "a none box must run in its own empty network namespace"
+        );
+        assert!(
+            plan.tap().is_none(),
+            "a none box gets no tap to relay outside traffic through"
+        );
+        assert_eq!(
+            plan.resolver(),
+            &Resolver::None,
+            "no resolver reaches an isolated box"
+        );
+    }
+
     /// The privileged tap is used where the daemon is privileged by deployment,
     /// and nowhere else.
     #[test]
