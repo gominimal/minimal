@@ -2,6 +2,7 @@ use ::paths::DaemonAbsPath;
 use russh::keys::key::safe_rng;
 use russh::keys::{PrivateKey, ssh_key::Error as KeyError};
 use serde::{Deserialize, Serialize};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -70,7 +71,8 @@ impl Config {
     /// Returns the SSH host key to use.
     ///
     /// For [`HostKey`] variant `OnDisk{ create_on_missing: true, ..}`,
-    /// a new key will be generated and written if the file does not exist.
+    /// a new key will be generated and written if the file is missing — or
+    /// present but unreadable, which a hard kill of the VM can leave behind.
     pub fn host_key(&self) -> Result<PrivateKey, KeyError> {
         match &self.host_key {
             HostKey::Ephemeral => {
@@ -82,21 +84,72 @@ impl Config {
                 create_if_missing,
             } => match PrivateKey::read_openssh_file(path) {
                 Ok(k) => Ok(k),
-                Err(KeyError::Io(std::io::ErrorKind::NotFound)) => {
-                    if *create_if_missing {
-                        let key =
-                            PrivateKey::random(&mut safe_rng(), russh::keys::Algorithm::Ed25519)?;
-                        key.write_openssh_file(path, russh::keys::ssh_key::LineEnding::LF)?;
-                        Ok(key)
-                    } else {
-                        Err(KeyError::Io(std::io::ErrorKind::NotFound))
+                // Missing is the first-use case; any other failure means the
+                // file is there but unusable — a zero-filled key an unflushed
+                // write left behind a `kill -9` of the VMM, say. Either way a
+                // `create_if_missing` daemon replaces it rather than refusing
+                // to start. A permission error is the exception: the key may be
+                // perfectly good and is not this process's to overwrite.
+                Err(e)
+                    if *create_if_missing
+                        && !matches!(e, KeyError::Io(ErrorKind::PermissionDenied)) =>
+                {
+                    if !matches!(e, KeyError::Io(ErrorKind::NotFound)) {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "on-disk host key unreadable; regenerating"
+                        );
                     }
+                    let key = PrivateKey::random(&mut safe_rng(), russh::keys::Algorithm::Ed25519)?;
+                    write_host_key_atomically(&key, path)?;
+                    Ok(key)
                 }
                 Err(e) => Err(e),
             },
             HostKey::Raw(r) => Ok(PrivateKey::from_openssh(r.as_bytes())?),
         }
     }
+}
+
+/// Writes `key` to `path` as an OpenSSH PEM without ever exposing a partial
+/// file: the bytes land in a sibling `<path>.tmp`, are flushed with
+/// `sync_all`, and only then renamed over `path`. The parent directory is
+/// synced afterwards so the rename itself survives a hard kill — a plain
+/// create-and-write can be left zero-filled by ext4's delayed allocation,
+/// which is exactly the corrupt key the read path above has to recover from.
+fn write_host_key_atomically(key: &PrivateKey, path: &std::path::Path) -> Result<(), KeyError> {
+    let pem = key.to_openssh(russh::keys::ssh_key::LineEnding::LF)?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+
+    let written = (|| -> Result<(), std::io::Error> {
+        let mut options = std::fs::File::options();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // The mode `write_openssh_file` produced before.
+            options.mode(0o600);
+        }
+        let mut file = options.write(true).create(true).truncate(true).open(&tmp)?;
+        std::io::Write::write_all(&mut file, pem.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+
+    // Durability of the rename only; the key bytes are already on disk.
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 /// A one-shot closure that closes the daemon's file-log appender — reloading
@@ -968,6 +1021,104 @@ mod tests {
     /// A `Config` backed by a fresh tempdir, mirroring `TestServer::new`.
     fn test_config(dir: &TempDir) -> Config {
         super::test_config(dir.path())
+    }
+
+    /// A `Config` whose host key lives at `path`.
+    fn on_disk_key_config(
+        dir: &TempDir,
+        path: &std::path::Path,
+        create_if_missing: bool,
+    ) -> Config {
+        Config {
+            host_key: HostKey::OnDisk {
+                path: path.to_path_buf(),
+                create_if_missing,
+            },
+            ..test_config(dir)
+        }
+    }
+
+    /// The names of every `*.tmp` sibling left in `dir`.
+    fn stray_temp_files(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect()
+    }
+
+    /// A persisted host key left zero-filled by a hard kill of the VM (ext4
+    /// delayed allocation drops the unflushed write) must not be fatal: a
+    /// `create_if_missing` daemon replaces it and boots, and the key it
+    /// returns is the one the next boot will read back.
+    #[test]
+    fn host_key_regenerates_a_corrupt_on_disk_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ssh_host_ed25519_key");
+        std::fs::write(&path, [0u8; 256]).unwrap();
+        assert!(
+            PrivateKey::read_openssh_file(&path).is_err(),
+            "the fixture must be unreadable before the call under test",
+        );
+
+        let key = on_disk_key_config(&dir, &path, true)
+            .host_key()
+            .expect("a corrupt on-disk key must be regenerated, not fatal");
+
+        let reread = PrivateKey::read_openssh_file(&path)
+            .expect("the replacement must be a readable OpenSSH key");
+        assert_eq!(
+            reread.public_key(),
+            key.public_key(),
+            "the key handed to the server must be the one persisted",
+        );
+    }
+
+    /// The key file is only ever observable whole: the write goes through a
+    /// sibling temp file that is renamed into place and never left behind.
+    /// With `create_if_missing: false` a corrupt key is still an error and the
+    /// bytes on disk are left exactly as they were.
+    #[test]
+    fn host_key_write_leaves_no_partial_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ssh_host_ed25519_key");
+
+        let key = on_disk_key_config(&dir, &path, true)
+            .host_key()
+            .expect("a missing key must be generated");
+        assert_eq!(
+            PrivateKey::read_openssh_file(&path).unwrap().public_key(),
+            key.public_key(),
+        );
+        let strays = stray_temp_files(dir.path());
+        assert!(
+            strays.is_empty(),
+            "no temp sibling may survive the write: {strays:?}",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the private key must stay owner-only");
+        }
+
+        // A daemon that did not ask for creation still refuses a corrupt key,
+        // and must not have touched it on the way out.
+        let corrupt = dir.path().join("corrupt_host_key");
+        std::fs::write(&corrupt, [0u8; 256]).unwrap();
+        assert!(
+            on_disk_key_config(&dir, &corrupt, false)
+                .host_key()
+                .is_err(),
+            "create_if_missing: false must propagate the read failure",
+        );
+        assert_eq!(
+            std::fs::read(&corrupt).unwrap(),
+            vec![0u8; 256],
+            "the key file must be left untouched",
+        );
+        let strays = stray_temp_files(dir.path());
+        assert!(strays.is_empty(), "no temp sibling may be left: {strays:?}");
     }
 
     /// The volume-log release must run exactly once no matter how many
