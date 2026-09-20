@@ -87,6 +87,7 @@ HOOK_SEED_DIR="" # seeded by the lifecycle-hooks proof below; removed on teardow
 PATCH_SRC_DIR="" # patch sources for the patch-modes proof; removed on teardown
 SKIP_SEED_DIR="" # seeded by the skip-lane scaffold proof below; removed on teardown
 OWNIP_SEED_DIR="" # seeded by the own-IP proof below; removed on teardown
+OUTBOUND_SEED_DIR="" # seeded by the outbound-reach case below; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -205,6 +206,7 @@ teardown() {
   [ -n "$PATCH_SRC_DIR" ] && rm -rf "$PATCH_SRC_DIR"
   [ -n "$SKIP_SEED_DIR" ] && rm -rf "$SKIP_SEED_DIR"
   [ -n "$OWNIP_SEED_DIR" ] && rm -rf "$OWNIP_SEED_DIR"
+  [ -n "$OUTBOUND_SEED_DIR" ] && rm -rf "$OUTBOUND_SEED_DIR"
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
   # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
@@ -507,12 +509,192 @@ run_case_min_internal_names_through_proxy() {
   echo "::endgroup::"
 }
 
+# NET-107: one outbound request from inside a live session, asserted on any
+# lane. Every VM lane wires the gvproxy switch for the guest's egress (NAT +
+# DNS), yet nothing else here asserts it works — and gvproxy resolution is
+# best-effort and never errors, so a lane that silently loses the switch boots
+# switchless, has no egress, and still reports green. The symptom then reaches a
+# user as a bogus "could not resolve host" that is not a DNS problem. The
+# `shell` stack composes curl, so no package is added; the caller is responsible
+# for handing over a session whose project seed we control (and thus has curl).
+#
+# What is asserted is what the symptom is: THIS SESSION can reach the internet.
+# So the bar is one host answering, over several hosts and several attempts —
+# not every host answering first time. Two things taught that. A single attempt
+# per host made the lane depend on two third-party endpoints both being up, and
+# main went red on a docs-only commit when example.com returned HTTP:200 and
+# example.org then lost the TLS handshake (curl 35, HTTP:000) — the first host
+# had already proven DNS, NAT and TLS all worked, so the run failed on weather.
+# Requiring every host to answer has the same flaw at a longer timescale: an
+# endpoint down for the whole retry window still fails a session with provably
+# working egress. A switchless boot has no NAT and no DNS, so it fails every
+# host on every attempt and is caught exactly as before — that is the thing
+# this proof exists to catch, and one host answering cannot mask it.
+#
+# The cost is that a partial fault — one name resolving, another not — lands as
+# a warning rather than a failure. That is the intended trade: the lane is a
+# gate on the session, and no CI gate should turn red because example.org is
+# having a bad minute.
+assert_session_outbound_reach() {
+  local sid="$1"
+  echo "::group::guest egress proof (curl from inside the session)"
+  local egress_ok=0 egress_total=0 egress_failed="" egress_host egress_status egress_out egress_try
+  for egress_host in example.com example.org; do
+    egress_total=$((egress_total + 1))
+    egress_status=0
+    egress_out=""
+    for egress_try in 1 2 3; do
+      egress_out="$(mnl session exec "$sid" \
+        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 30 https://$egress_host" \
+        2>"$WORK/egress.err")"
+      egress_status=$?
+      if [ "$egress_status" -eq 0 ] && [ "$egress_out" = "HTTP:200" ]; then
+        break
+      fi
+      # Not ::error:: — a retried attempt is not a lane failure, and annotating
+      # it would put a red mark on a run that goes on to pass.
+      if [ "$egress_try" -lt 3 ]; then
+        echo "guest egress to https://$egress_host failed on attempt ${egress_try}/3 (exec status ${egress_status}, got '${egress_out:-<none>}'); retrying in $((egress_try * 3))s"
+        cat "$WORK/egress.err" 2>/dev/null || true
+        sleep "$((egress_try * 3))"
+      fi
+    done
+    if [ "$egress_status" -eq 0 ] && [ "$egress_out" = "HTTP:200" ]; then
+      egress_ok=$((egress_ok + 1))
+    else
+      egress_failed="${egress_failed} https://$egress_host (exec status ${egress_status}, got '${egress_out:-<none>}')"
+      # Warned, not failed: another host answering proves the session's egress,
+      # which makes this that endpoint's problem and not the lane's. Still
+      # surfaced, so a partial fault is visible instead of silently absorbed.
+      echo "::warning::guest egress to https://$egress_host failed all 3 attempts (exec status ${egress_status}, got '${egress_out:-<none>}', want HTTP:200); not fatal while another host still proves the session has egress."
+      echo "--- curl stderr ($egress_host) ---"; cat "$WORK/egress.err" 2>/dev/null || true
+    fi
+  done
+  if [ "$egress_ok" -eq 0 ]; then
+    echo "::error::guest egress failed every attempt against all ${egress_total} hosts —${egress_failed}: the session has no working egress. On a VM lane (E2E_VM='${E2E_VM:-}') a lost gvproxy switch is one hypothesis — a switchless boot has no NAT/DNS — but a nonzero exec status or a non-200 code can equally be a DNS, TLS/CA, or exec-transport failure; the per-host curl stderr is above and the guest boot console follows in the diagnostics."
+    fail
+  fi
+  echo "guest egress proof OK (DNS + HTTPS reachable from the session; ${egress_ok}/${egress_total} hosts answered)"
+  echo "::endgroup::"
+}
+
+# NET-107 as a named case: its own session, so the `test:` line stands alone
+# instead of depending on the sequence below having reached the egress group.
+# Its own project seed too, rather than $PROJECT_DIR: curl reaches the box only
+# through the `shell` stack this seeds, which is why the inline proof below runs
+# for a seed we own and no other. Against a caller-provided E2E_PROJECT_DIR that
+# carries its own minimal.toml, the case would otherwise fail for want of curl
+# rather than for want of egress.
+run_case_session_outbound_request() {
+  local out sid
+  OUTBOUND_SEED_DIR="$(mktemp -d /tmp/mnlb.XXXXXX)"
+  OUTBOUND_SEED_DIR="$(cd "$OUTBOUND_SEED_DIR" && pwd -P)"
+  {
+    awk '
+      /^\[upstream\]/            { grab = 1; print; next }
+      grab && (/^$/ || /^\[/)    { exit }
+      grab                       { print }
+    ' "$ROOT/.minimal/minimal.toml"
+    printf '\n[stack]\nuse = "shell"\n'
+  } > "$OUTBOUND_SEED_DIR/minimal.toml"
+  mkdir "$OUTBOUND_SEED_DIR/.git"
+  out="$(cd "$OUTBOUND_SEED_DIR" && mnl session activate . --no-prompt --name e2e-outbound \
+    2>"$WORK/outbound-activate.err")" || {
+    echo "::error::'min session activate' failed for the outbound-reach case"
+    cat "$WORK/outbound-activate.err" 2>/dev/null || true
+    fail
+  }
+  sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+  echo "outbound-reach session: $sid"
+  assert_session_outbound_reach "$sid"
+  mnl session destroy --force "$sid" >/dev/null 2>&1 || true
+  rm -rf "$OUTBOUND_SEED_DIR"; OUTBOUND_SEED_DIR=""
+}
+
+# NET-040: `min session activate --network own_ip --ingress 8080:8080` publishes
+# the box's port on HOST loopback, so a request to 127.0.0.1:8080 comes back
+# with what the server INSIDE the box wrote. Staged as close to a fresh install
+# as a lane gets: the state dir is fresh per run and a case runs before anything
+# has spawned a daemon, so the CLI auto-spawns the target's daemon, the daemon
+# spawns the switch, and the forward is asked for at activate time
+# (crates/minimald/src/net/policy.rs apply_ingress -> gvproxy's
+# /services/forwarder/expose, which binds 127.0.0.1 only). Gated on
+# MINVMD_GVPROXY_BIN, the one signal that a switch exists — a target without one
+# has no own-IP mode to publish from, same as the own-IP proof below.
+run_case_fresh_install_own_ip_ingress_publishes_loopback() {
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "own-IP ingress proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+    return 0
+  fi
+  echo "::group::own-IP --ingress publishes on host loopback (NET-040)"
+
+  # The requirement names 8080:8080 literally, the host side included, so the
+  # port is not a free choice here: a listener already on it would answer in the
+  # box's place (and the switch's own bind would fail). That is a host problem
+  # worth saying out loud rather than papering over with a different port.
+  local port=8080 marker="INGRESS_E2E_OK"
+  if curl -sS -o /dev/null --max-time 2 "http://127.0.0.1:$port/" 2>/dev/null; then
+    echo "::error::something already answers on 127.0.0.1:$port; NET-040 publishes exactly that address and needs it free"
+    fail
+  fi
+
+  local out sid body=""
+  out="$(cd "$PROJECT_DIR" && mnl session activate . --no-prompt --name e2e-ingress \
+    --network own_ip --ingress "$port:$port" 2>"$WORK/ingress-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --ingress $port:$port' failed"
+    cat "$WORK/ingress-activate.err" 2>/dev/null || true
+    fail
+  }
+  sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+  echo "own-IP ingress session: $sid"
+
+  # The server INSIDE the box, on the mapping's internal port. Bound on all the
+  # box's addresses (no `bind=`): the switch forwards to the box's tap address,
+  # not to its loopback. `socat` is in the launcher baseline
+  # (base/coreutils/socat), so nothing has to be added first. The body carries a
+  # marker, because a bare 200 from something else on the host must not pass for
+  # the box's answer; the response is close-delimited, so the canned bytes need
+  # no Content-Length arithmetic.
+  mnl session exec "$sid" \
+    "printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n$marker\n' > /tmp/ingress-resp.http" \
+    || { echo "::error::could not seed the in-box responder's canned response"; fail; }
+  mnl session exec "$sid" socat -T30 "TCP-LISTEN:$port,reuseaddr,fork" \
+    'SYSTEM:cat /tmp/ingress-resp.http' >"$WORK/ingress-socat.log" 2>&1 &
+  local socat_pid=$!
+
+  # The published address, read from the HOST. Retried: the responder was just
+  # forked and the forward is live before it binds, so early attempts can be
+  # refused for reasons that say nothing about the mapping.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    body="$(curl -sS --max-time 10 "http://127.0.0.1:$port/" 2>"$WORK/ingress-curl.err")"
+    [[ "$body" == *"$marker"* ]] && break
+    sleep 1
+  done
+  if [[ "$body" != *"$marker"* ]]; then
+    echo "::error::NET-040: GET http://127.0.0.1:$port/ did not return the in-box server's response (want '$marker', got '${body:-<no response>}')"
+    echo "--- curl stderr ---"; cat "$WORK/ingress-curl.err" 2>/dev/null || true
+    echo "--- in-box responder log ---"; cat "$WORK/ingress-socat.log" 2>/dev/null || true
+    echo "--- activate stderr ---"; cat "$WORK/ingress-activate.err" 2>/dev/null || true
+    kill "$socat_pid" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-040 OK: 127.0.0.1:$port answered with the in-box server's response"
+
+  kill "$socat_pid" 2>/dev/null || true
+  wait "$socat_pid" 2>/dev/null || true
+  mnl session destroy --force "$sid" >/dev/null 2>&1 || true
+  echo "::endgroup::"
+}
+
 E2E_CASE="${E2E_CASE:-${1:-}}"
 if [ -n "$E2E_CASE" ]; then
   case "$E2E_CASE" in
     min_internal_names_through_proxy) run_case_min_internal_names_through_proxy; exit $? ;;
+    fresh_install_own_ip_ingress_publishes_loopback)
+      run_case_fresh_install_own_ip_ingress_publishes_loopback; exit $? ;;
+    session_outbound_request) run_case_session_outbound_request; exit $? ;;
     *)
-      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy)" >&2
+      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request)" >&2
       exit 2
       ;;
   esac
@@ -611,74 +793,12 @@ echo "session exec proof OK"
 echo "::endgroup::"
 
 # ---------------------------------------------------------------------------
-# Guest egress proof. Every VM lane wires the gvproxy switch for the guest's
-# egress (NAT + DNS), yet nothing else here asserts it works — and gvproxy
-# resolution is best-effort and never errors, so a lane that silently loses the
-# switch boots switchless, has no egress, and still reports green. The symptom
-# then reaches a user as a bogus "could not resolve host" that is not a DNS
-# problem. Prove reachability from inside the live session: the `shell` stack
-# composes curl, so no package is added. Gated on a seed we own, because only
-# then is the shell stack (and thus curl) guaranteed present.
-#
-# What is asserted is what the symptom is: THIS SESSION can reach the internet.
-# So the bar is one host answering, over several hosts and several attempts —
-# not every host answering first time. Two things taught that. A single attempt
-# per host made the lane depend on two third-party endpoints both being up, and
-# main went red on a docs-only commit when example.com returned HTTP:200 and
-# example.org then lost the TLS handshake (curl 35, HTTP:000) — the first host
-# had already proven DNS, NAT and TLS all worked, so the run failed on weather.
-# Requiring every host to answer has the same flaw at a longer timescale: an
-# endpoint down for the whole retry window still fails a session with provably
-# working egress. A switchless boot has no NAT and no DNS, so it fails every
-# host on every attempt and is caught exactly as before — that is the thing
-# this proof exists to catch, and one host answering cannot mask it.
-#
-# The cost is that a partial fault — one name resolving, another not — lands as
-# a warning rather than a failure. That is the intended trade: the lane is a
-# gate on the session, and no CI gate should turn red because example.org is
-# having a bad minute.
+# Guest egress proof (NET-107), the same assertion the `session_outbound_request`
+# case runs — see assert_session_outbound_reach above for what it proves and why
+# one host answering is the bar. Gated on a seed we own, because only then is the
+# shell stack (and thus curl) guaranteed present in the session.
 if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
-  echo "::group::guest egress proof (curl from inside the session)"
-  egress_ok=0
-  egress_total=0
-  egress_failed=""
-  for egress_host in example.com example.org; do
-    egress_total=$((egress_total + 1))
-    egress_status=0
-    egress_out=""
-    for egress_try in 1 2 3; do
-      egress_out="$(mnl session exec "$sid" \
-        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 30 https://$egress_host" \
-        2>"$WORK/egress.err")"
-      egress_status=$?
-      if [ "$egress_status" -eq 0 ] && [ "$egress_out" = "HTTP:200" ]; then
-        break
-      fi
-      # Not ::error:: — a retried attempt is not a lane failure, and annotating
-      # it would put a red mark on a run that goes on to pass.
-      if [ "$egress_try" -lt 3 ]; then
-        echo "guest egress to https://$egress_host failed on attempt ${egress_try}/3 (exec status ${egress_status}, got '${egress_out:-<none>}'); retrying in $((egress_try * 3))s"
-        cat "$WORK/egress.err" 2>/dev/null || true
-        sleep "$((egress_try * 3))"
-      fi
-    done
-    if [ "$egress_status" -eq 0 ] && [ "$egress_out" = "HTTP:200" ]; then
-      egress_ok=$((egress_ok + 1))
-    else
-      egress_failed="${egress_failed} https://$egress_host (exec status ${egress_status}, got '${egress_out:-<none>}')"
-      # Warned, not failed: another host answering proves the session's egress,
-      # which makes this that endpoint's problem and not the lane's. Still
-      # surfaced, so a partial fault is visible instead of silently absorbed.
-      echo "::warning::guest egress to https://$egress_host failed all 3 attempts (exec status ${egress_status}, got '${egress_out:-<none>}', want HTTP:200); not fatal while another host still proves the session has egress."
-      echo "--- curl stderr ($egress_host) ---"; cat "$WORK/egress.err" 2>/dev/null || true
-    fi
-  done
-  if [ "$egress_ok" -eq 0 ]; then
-    echo "::error::guest egress failed every attempt against all ${egress_total} hosts —${egress_failed}: the session has no working egress. On a VM lane (E2E_VM='${E2E_VM:-}') a lost gvproxy switch is one hypothesis — a switchless boot has no NAT/DNS — but a nonzero exec status or a non-200 code can equally be a DNS, TLS/CA, or exec-transport failure; the per-host curl stderr is above and the guest boot console follows in the diagnostics."
-    fail
-  fi
-  echo "guest egress proof OK (DNS + HTTPS reachable from the session; ${egress_ok}/${egress_total} hosts answered)"
-  echo "::endgroup::"
+  assert_session_outbound_reach "$sid"
 fi
 
 # ---------------------------------------------------------------------------

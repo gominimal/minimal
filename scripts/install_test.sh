@@ -315,6 +315,105 @@ run() {
     set -e
 }
 
+# --- Named cases -----------------------------------------------------------
+#
+# A spec `verify:` line names ONE installer case (`just test-installer <case>`),
+# but this harness was a single flat sequence with nothing to select, so the
+# name had no effect and every assertion ran regardless of it. A named case is a
+# function here: `INSTALL_TEST_CASE` (or the first positional argument) runs
+# exactly that one and nothing else, an unknown name is a hard error rather
+# than a silent full run, and with no name every named case still runs at the
+# end of the sequence below. Reusable by later cases: add a `case_<name>`
+# function here and an arm to the dispatch.
+#
+# A case runs both ways — alone and after the whole sequence — so it sets the
+# harness globals it depends on rather than inheriting whatever the scenario
+# above it left behind, and restores the mock bucket it changed.
+
+# NET-041: when the run finishes, the switch binary (`bin/gvproxy-min`, what
+# minimald spawns for an own-IP box) must be present and executable. Installing
+# it does not imply it: a component whose hash already matches is skipped, and
+# the skip path never chmods, so a switch binary that lost its mode bits stays
+# unexecutable across every rerun.
+case_installer_switch_binary_executable() {
+    PLAT_S=Linux
+    PLAT_M=x86_64
+    TEST_SHELL=
+    BIN_OVERRIDE=
+    TTY_FILE=
+    FORCE_STOP=
+    USERNS_SYSCTL=
+    APPARMOR_DIR=
+
+    # A manifest that ships the switch, as every real platform's does
+    # (scripts/stage-release.sh: gvproxy-min -> bin/gvproxy-min).
+    printf 'mock-gvproxy-min-body\n' >"$mock/versions/v1/gvproxy-min-linux-amd64"
+    h_gvmin="$(hash_file "$mock/versions/v1/gvproxy-min-linux-amd64")"
+    {
+        cat "$mock/versions/v1/components"
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            gvproxy-min linux amd64 v1 "$h_gvmin" file bin/gvproxy-min versions/v1/gvproxy-min-linux-amd64
+    } >"$mock/versions/v1/components.new"
+    mv "$mock/versions/v1/components.new" "$mock/versions/v1/components"
+
+    HSW="$root/hsw"; mkdir -p "$HSW"
+    run switch_fresh "$HSW"
+    check 0 "$rc" "install shipping the switch exits 0"
+    want_ok "switch binary is present" test -f "$HSW/bin/gvproxy-min"
+    want_ok "switch binary is executable" test -x "$HSW/bin/gvproxy-min"
+    # tilde() rewrites the dest against the run's HOME ($HSW), so the reported
+    # path is the installed one read back from the record, not a reconstructed
+    # prefix.
+    want_ok "the run reports the verified switch at its installed path" \
+        grep -q 'switch  *verified  *~/bin/gvproxy-min' "$OUT"
+    want_ok "record names the switch" \
+        record_has gvproxy-min "$HSW/bin/gvproxy-min" "$HSW/xdg-state/minimal/installed"
+
+    # The case the check exists for: a switch binary that lost its +x. The
+    # rerun SKIPS the component (its hash still matches), so nothing re-chmods
+    # it — the install is otherwise complete, so this warns and still exits 0.
+    chmod -x "$HSW/bin/gvproxy-min"
+    run switch_unexec "$HSW"
+    check 0 "$rc" "rerun with a non-executable switch exits 0"
+    want_ok "the rerun says the switch is not executable" \
+        grep -q 'switch binary is not executable' "$OUT"
+    want_ok "the rerun names the chmod that fixes it" grep -q 'chmod +x' "$OUT"
+    want_err "no verified row while it is unexecutable" grep -q 'switch  *verified' "$OUT"
+
+    # A switch binary deleted after install: the component is re-downloaded and
+    # comes back executable, so the run verifies it rather than warning.
+    rm -f "$HSW/bin/gvproxy-min"
+    run switch_regain "$HSW"
+    check 0 "$rc" "rerun after deleting the switch exits 0"
+    want_ok "the deleted switch is reinstalled executable" test -x "$HSW/bin/gvproxy-min"
+    want_ok "the rerun verifies it again" grep -q 'switch  *verified' "$OUT"
+
+    # A manifest that ships no switch — a channel still on the pre-rename
+    # layout — has nothing to verify and must not invent an advisory.
+    write_manifest 1
+    HNS="$root/hns"; mkdir -p "$HNS"
+    run switch_absent "$HNS"
+    check 0 "$rc" "install from a manifest without the switch exits 0"
+    want_err "no switch row when the manifest ships none" grep -q 'switch' "$OUT"
+}
+
+INSTALL_TEST_CASE="${INSTALL_TEST_CASE:-${1:-}}"
+if [ -n "$INSTALL_TEST_CASE" ]; then
+    echo "# install.sh case $INSTALL_TEST_CASE (SH=$SH)"
+    case "$INSTALL_TEST_CASE" in
+        installer_switch_binary_executable) case_installer_switch_binary_executable ;;
+        *)
+            echo "install_test: unknown case '$INSTALL_TEST_CASE'" \
+                 "(known: installer_switch_binary_executable)" >&2
+            exit 2
+            ;;
+    esac
+    echo "# ---"
+    printf '# %d passed, %d failed\n' "$pass" "$fail"
+    [ "$fail" -eq 0 ] || exit 1
+    exit 0
+fi
+
 # ===========================================================================
 echo "# install.sh tests (SH=$SH)"
 
@@ -1258,6 +1357,9 @@ check 0 "$rc" "rename-keep install exits 0"
 want_ok "a user-replaced gvproxy is kept" test -f "$H16/bin/gvproxy"
 want_ok "kept content is untouched" grep -q 'the-users-own-gvproxy' "$H16/bin/gvproxy"
 want_ok "keeping it is announced" grep -q "modified since install" "$OUT"
+
+# --- Named cases (also run alone, by name) ---------------------------------
+case_installer_switch_binary_executable
 
 # ===========================================================================
 echo "# ---"

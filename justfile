@@ -406,8 +406,9 @@ ci: fmt-check check-version clippy deny test doctest test-ignored
 ci: fmt-check check-version clippy deny test doctest
     @echo "ci: local PR gates green"
 
-# Run the curl|sh installer's tests under every POSIX sh. CI: ci-shell-installer.yml.
-test-installer:
+# Run the curl|sh installer's tests under every POSIX sh; with CASE, only that
+# named case (`just test-installer installer_switch_binary_executable`). CI: ci-shell-installer.yml.
+test-installer case="":
     #!/usr/bin/env bash
     set -euo pipefail
     if command -v shellcheck >/dev/null 2>&1; then
@@ -419,7 +420,7 @@ test-installer:
     for sh in sh dash; do
         command -v "$sh" >/dev/null 2>&1 || { echo "== $sh not found, skipping =="; continue; }
         echo "== running install_test.sh under $sh =="
-        SH="$sh" "$sh" scripts/install_test.sh
+        SH="$sh" "$sh" scripts/install_test.sh "{{ case }}"
     done
 
 # The reviewed harness the frozen ci-shell-installer.yml can't widen to; CI runs
