@@ -75,6 +75,7 @@
 #     hostnames_recover_and_two_daemons_route
 #     proxy_refuses_like_direct
 #     port_publishes_on_listen_and_box_outlives_client
+#     github_only_allowlist
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -110,6 +111,7 @@ BOXID_SEED_DIR=""  # seeded by the box-identity proof's first box; removed on te
 BOXID_SEED_DIR2="" # seeded by the box-identity proof's second box; removed on teardown
 BOXID_REMOVE=""    # the `min net setup --remove` that undoes that proof's install
 HR_VM_SEED_DIR=""  # seeded by the two-daemons proof's VM session below; removed on teardown
+GHA_SEED_DIRS=""   # seeded dirs (space-separated) for the box-to-box allowlist proof; removed on teardown
 HR_OCCUPIER_PID=""       # the two-daemons proof's port-occupier; killed on teardown
 HR_NATIVE_SOCAT_PID=""   # the two-daemons proof's native responder; killed on teardown
 HR_VM_SOCAT_PID=""       # the two-daemons proof's VM responder; killed on teardown
@@ -238,6 +240,8 @@ teardown() {
   [ -n "$BOXID_SEED_DIR2" ] && rm -rf "$BOXID_SEED_DIR2"
   [ -n "$HR_VM_SEED_DIR" ] && rm -rf "$HR_VM_SEED_DIR"
   [ -n "$PRD_SEED_DIR" ] && rm -rf "$PRD_SEED_DIR"
+  # shellcheck disable=SC2086 # a space-separated list of dirs on purpose.
+  [ -n "$GHA_SEED_DIRS" ] && rm -rf $GHA_SEED_DIRS
   # The two-daemons proof's port-occupier and responders: backgrounded, and
   # only reaped on that proof's own happy path, so a `fail` partway through
   # (occupier still up to 300s, socat responders up to their -T30 idle
@@ -1984,6 +1988,235 @@ socat -T300 TCP-LISTEN:$pl_port,reuseaddr,fork SYSTEM:'cat /tmp/pl-resp.http'" \
   echo "::endgroup::"
 }
 
+# NET-072, NET-073: a box resolves a sibling's box-zone name with no
+# `allow_dns_hosts` entry naming it, and a connection to that name opens only
+# when BOTH sides' rules allow it. This needs no CLI change to reach live:
+# `gvproxy_network.rs` registers every own-IP session's lease into the shared
+# box zone at activation regardless of what it declares, so two ordinary
+# own-IP boxes are already siblings the moment both exist.
+#
+# NET-066, NET-067, and NET-068 — a hostname-only `allow_dns_hosts` letting
+# apt/git/npm/pip/a container pull complete, and an allowed name that
+# resolves into a denied range refused and logged — are NOT reproduced live
+# below: no shipped `min` surface lets this script declare a session's egress
+# allowlist at all yet (`activate_session`, crates/minimal/src/cmd/
+# session.rs, hardcodes `egress: None`; the box spec's `[network]` field
+# schema is an explicit non-goal of this spec, deferred to
+# gominimal/inbox#570). `cargo nextest run -p minvmd
+# hostname_allowlist_toolchain_completes` (T29) and `cargo nextest run -p
+# minimald denied_range_resolution_refused denied_range_resolution_logged`
+# (T27) are the real system/unit proofs of those two clauses today; once
+# `min session activate` can declare `egress.allow_dns_hosts`, this case
+# should replay them against a live session instead of a warning.
+run_case_github_only_allowlist() {
+  echo "::group::box-to-box reach under both boxes' rules (NET-072, NET-073)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "box-to-box proof SKIPPED (no MINVMD_GVPROXY_BIN: own-IP boxes need a real switch)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  local port=18300 undeclared_port=18301
+  local marker=GHA_TARGET_OK
+  local target_dir source_dir target2_dir source2_dir
+  local target_sid source_sid target2_sid source2_sid target_socat_pid
+  local target_undeclared_socat_pid
+  local status rc
+
+  # A fresh, self-seeded dir per session — a path that already has a session
+  # does not mint a second one (same reasoning as the own-IP proof's seed).
+  seed_gha_dir() {
+    local d
+    d="$(mktemp -d /tmp/mnlg.XXXXXX)"
+    d="$(cd "$d" && pwd -P)"
+    {
+      awk '
+        /^\[upstream\]/            { grab = 1; print; next }
+        grab && (/^$/ || /^\[/)    { exit }
+        grab                       { print }
+      ' "$ROOT/.minimal/minimal.toml"
+      printf '\n[stack]\nuse = "shell"\n'
+    } > "$d/minimal.toml"
+    mkdir "$d/.git"
+    printf '%s' "$d"
+  }
+
+  # -- Both sides allow it, and the target's half alone refuses --------------
+  unset MINIMAL_EGRESS_DENY_ALL_WINDOW
+  target_dir="$(seed_gha_dir)"; GHA_SEED_DIRS="$GHA_SEED_DIRS $target_dir"
+  target_sid="$(cd "$target_dir" && mnl session activate . --no-prompt \
+    --name e2e-gha-target --network own_ip --ingress "$port:$port" \
+    2>"$WORK/gha-target-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --ingress $port:$port' failed for the box-to-box target"
+    cat "$WORK/gha-target-activate.err" 2>/dev/null || true
+    fail
+  }
+  target_sid="$(printf '%s\n' "$target_sid" | tail -n1 | tr -d '\r')"
+  echo "box-to-box target: $target_sid (e2e-gha-target, declares port $port)"
+
+  source_dir="$(seed_gha_dir)"; GHA_SEED_DIRS="$GHA_SEED_DIRS $source_dir"
+  source_sid="$(cd "$source_dir" && mnl session activate . --no-prompt \
+    --name e2e-gha-source --network own_ip 2>"$WORK/gha-source-activate.err")" || {
+    echo "::error::'min session activate --network own_ip' failed for the box-to-box source"
+    cat "$WORK/gha-source-activate.err" 2>/dev/null || true
+    fail
+  }
+  source_sid="$(printf '%s\n' "$source_sid" | tail -n1 | tr -d '\r')"
+  echo "box-to-box source: $source_sid (e2e-gha-source, declares nothing)"
+
+  mnl session exec "$target_sid" \
+    "printf 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n$marker\n' > /tmp/gha-target.http" \
+    || { echo "::error::could not seed the target box's canned response"; fail; }
+  mnl session exec "$target_sid" socat -T30 "TCP-LISTEN:$port,reuseaddr,fork" \
+    'SYSTEM:cat /tmp/gha-target.http' >"$WORK/gha-target-socat.log" 2>&1 &
+  target_socat_pid=$!
+
+  # NET-072: the source resolves the target's box-zone name and reaches its
+  # declared port with no `allow_dns_hosts` entry anywhere naming it — box-
+  # zone resolution and reach need none.
+  status=""
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    status="$(mnl session exec "$source_sid" curl -sS -o /dev/null -w '%{http_code}' \
+      --max-time 10 "http://e2e-gha-target.min.internal:$port/" 2>"$WORK/gha-source-curl.err")"
+    [ "$status" = "200" ] && break
+    sleep 1
+  done
+  echo "(inside $source_sid) GET http://e2e-gha-target.min.internal:$port/ -> ${status:-<no response>}"
+  if [ "$status" != "200" ]; then
+    echo "::error::NET-072/NET-073: the source box did not reach the target's box-zone name at its declared port"
+    cat "$WORK/gha-source-curl.err" 2>/dev/null || true
+    cat "$WORK/gha-target-socat.log" 2>/dev/null || true
+    kill "$target_socat_pid" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-072/NET-073 OK: the source box resolved and reached the target's box-zone name (both sides allowed it)"
+
+  # NET-073, the target's half alone refuses: the same name, a port the
+  # target never declared. The source's egress still admits it (nothing is
+  # denied here yet), so only the target's ingress gate stands in the way.
+  # A live-but-undeclared responder backs this: without one, "refused"
+  # would just as well mean "nothing is listening there", proving nothing
+  # about the ingress gate itself.
+  mnl session exec "$target_sid" socat -T10 "TCP-LISTEN:$undeclared_port,reuseaddr,fork" \
+    'SYSTEM:cat /tmp/gha-target.http' >"$WORK/gha-target-undeclared-socat.log" 2>&1 &
+  target_undeclared_socat_pid=$!
+
+  # Positive control: loopback inside the target box itself bypasses the
+  # ingress gate under test, so it proves the responder is actually up
+  # before the cross-box refusal below is read as policy rather than a
+  # race against socat's startup.
+  status=""
+  for _ in 1 2 3 4 5; do
+    status="$(mnl session exec "$target_sid" curl -sS -o /dev/null -w '%{http_code}' \
+      --max-time 5 "http://127.0.0.1:$undeclared_port/" 2>"$WORK/gha-undeclared-ready.err")"
+    [ "$status" = "200" ] && break
+    sleep 1
+  done
+  if [ "$status" != "200" ]; then
+    echo "::error::the undeclared-port responder never became ready (loopback check inside the target)"
+    cat "$WORK/gha-undeclared-ready.err" 2>/dev/null || true
+    kill "$target_socat_pid" "$target_undeclared_socat_pid" 2>/dev/null || true
+    fail
+  fi
+  echo "undeclared-port responder is up (loopback positive control): http://127.0.0.1:$undeclared_port/ -> 200"
+
+  status="$(mnl session exec "$source_sid" curl -sS -o /dev/null -w '%{http_code}' \
+    --max-time 8 "http://e2e-gha-target.min.internal:$undeclared_port/" 2>"$WORK/gha-undeclared-curl.err")"
+  rc=$?
+  echo "(inside $source_sid) GET http://e2e-gha-target.min.internal:$undeclared_port/ -> rc=$rc status=${status:-<none>}"
+  if [ "$rc" -eq 0 ] || [ "$status" = "200" ]; then
+    echo "::error::NET-073: the target answered on a port it never declared as ingress"
+    kill "$target_socat_pid" "$target_undeclared_socat_pid" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-073 OK: an undeclared port refused the connection (the target's half of the rule alone, even with a live responder behind it)"
+
+  kill "$target_socat_pid" "$target_undeclared_socat_pid" 2>/dev/null || true
+  wait "$target_socat_pid" 2>/dev/null || true
+  wait "$target_undeclared_socat_pid" 2>/dev/null || true
+  mnl session destroy --force "$target_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$source_sid" >/dev/null 2>&1 || true
+
+  # -- The source's half alone refuses ---------------------------------------
+  # A running daemon keeps the environment it was launched with (same
+  # reasoning as the own-IP egress proof above), so forcing the deny-all
+  # default needs a fresh daemon: stop, export the var, and let the next
+  # activate respawn one that inherits it. Both boxes below are new — a box
+  # never survives the daemon that hosts it going away.
+  mnl stop --force >/dev/null 2>"$WORK/gha-stop.err" || {
+    echo "::error::'min stop' before the forced-window box-to-box activate failed"
+    cat "$WORK/gha-stop.err" 2>/dev/null || true
+    fail
+  }
+  export MINIMAL_EGRESS_DENY_ALL_WINDOW=in-force
+
+  target2_dir="$(seed_gha_dir)"; GHA_SEED_DIRS="$GHA_SEED_DIRS $target2_dir"
+  target2_sid="$(cd "$target2_dir" && mnl session activate . --no-prompt \
+    --name e2e-gha-target2 --network own_ip --ingress "$port:$port" \
+    2>"$WORK/gha-target2-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --ingress $port:$port' (deny-all in force) failed for the box-to-box target"
+    cat "$WORK/gha-target2-activate.err" 2>/dev/null || true
+    fail
+  }
+  target2_sid="$(printf '%s\n' "$target2_sid" | tail -n1 | tr -d '\r')"
+
+  source2_dir="$(seed_gha_dir)"; GHA_SEED_DIRS="$GHA_SEED_DIRS $source2_dir"
+  source2_sid="$(cd "$source2_dir" && mnl session activate . --no-prompt \
+    --name e2e-gha-source2 --network own_ip 2>"$WORK/gha-source2-activate.err")" || {
+    echo "::error::'min session activate --network own_ip' (deny-all in force) failed for the box-to-box source"
+    cat "$WORK/gha-source2-activate.err" 2>/dev/null || true
+    fail
+  }
+  source2_sid="$(printf '%s\n' "$source2_sid" | tail -n1 | tr -d '\r')"
+
+  mnl session exec "$target2_sid" \
+    "printf 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n$marker\n' > /tmp/gha-target.http" \
+    || { echo "::error::could not seed the second target box's canned response"; fail; }
+  mnl session exec "$target2_sid" socat -T20 "TCP-LISTEN:$port,reuseaddr,fork" \
+    'SYSTEM:cat /tmp/gha-target.http' >"$WORK/gha-target2-socat.log" 2>&1 &
+  target_socat_pid=$!
+
+  # Positive control: loopback inside target2 itself bypasses the deny-all
+  # policy under test, so it proves the responder is actually up before the
+  # refusal below is read as the source's egress rule rather than a race
+  # against socat's startup (the happy-path proof above needs up to ten
+  # such retries for its first 200; this box gets no less).
+  status=""
+  for _ in 1 2 3 4 5; do
+    status="$(mnl session exec "$target2_sid" curl -sS -o /dev/null -w '%{http_code}' \
+      --max-time 5 "http://127.0.0.1:$port/" 2>"$WORK/gha-target2-ready.err")"
+    [ "$status" = "200" ] && break
+    sleep 1
+  done
+  if [ "$status" != "200" ]; then
+    echo "::error::the second target box's canned responder never became ready (loopback check)"
+    cat "$WORK/gha-target2-ready.err" 2>/dev/null || true
+    kill "$target_socat_pid" 2>/dev/null || true
+    fail
+  fi
+  echo "second target's responder is up (loopback positive control): http://127.0.0.1:$port/ -> 200"
+
+  status="$(mnl session exec "$source2_sid" curl -sS -o /dev/null -w '%{http_code}' \
+    --max-time 8 "http://e2e-gha-target2.min.internal:$port/" 2>"$WORK/gha-denied-curl.err")"
+  rc=$?
+  echo "(inside $source2_sid) GET http://e2e-gha-target2.min.internal:$port/ -> rc=$rc status=${status:-<none>}"
+  if [ "$rc" -eq 0 ] || [ "$status" = "200" ]; then
+    echo "::error::NET-073: a deny-all source box reached the target's box-zone name anyway"
+    kill "$target_socat_pid" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-073 OK: a deny-all source box's own rules refused the box-zone name too (the source's half of the rule alone), even though the target still declares the same port and its responder was confirmed live"
+
+  echo "::warning::NET-066/NET-067/NET-068's other two-thirds of this task's proof (a hostname-only allow_dns_hosts letting apt/git/npm/pip/a container pull complete, and an allowed name resolving into a denied range refused and logged) is not reproduced live above: no shipped 'min' surface lets this script declare a session's egress allowlist yet (activate_session, crates/minimal/src/cmd/session.rs, hardcodes egress: None). cargo nextest run -p minvmd hostname_allowlist_toolchain_completes and cargo nextest run -p minimald denied_range_resolution_refused denied_range_resolution_logged are the real proofs of those two clauses today; once 'min session activate' can declare egress.allow_dns_hosts, this case should replay them against a live session instead of a warning."
+
+  kill "$target_socat_pid" 2>/dev/null || true
+  wait "$target_socat_pid" 2>/dev/null || true
+  mnl session destroy --force "$target2_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$source2_sid" >/dev/null 2>&1 || true
+  unset MINIMAL_EGRESS_DENY_ALL_WINDOW
+  echo "::endgroup::"
+}
+
 E2E_CASE="${E2E_CASE:-${1:-}}"
 if [ -n "$E2E_CASE" ]; then
   case "$E2E_CASE" in
@@ -2005,8 +2238,9 @@ if [ -n "$E2E_CASE" ]; then
     proxy_refuses_like_direct) run_case_proxy_refuses_like_direct; exit $? ;;
     port_publishes_on_listen_and_box_outlives_client)
       run_case_port_publishes_on_listen_and_box_outlives_client; exit $? ;;
+    github_only_allowlist) run_case_github_only_allowlist; exit $? ;;
     *)
-      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy, fresh_linux_kvm_activate_local_minvmd, fresh_arm64_kvm_activate_local_minvmd, hostnames_recover_and_two_daemons_route, proxy_refuses_like_direct, port_publishes_on_listen_and_box_outlives_client)" >&2
+      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy, fresh_linux_kvm_activate_local_minvmd, fresh_arm64_kvm_activate_local_minvmd, hostnames_recover_and_two_daemons_route, proxy_refuses_like_direct, port_publishes_on_listen_and_box_outlives_client, github_only_allowlist)" >&2
       exit 2
       ;;
   esac
