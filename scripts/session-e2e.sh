@@ -58,11 +58,17 @@
 #   E2E_VM              set to 1 for VM-backed targets (extra teardown +
 #                       diagnostics: minvmd stop, guest boot log)
 #
-# Usage: scripts/session-e2e.sh
+#   E2E_CASE            run ONE named case (a `case_<name>` function below)
+#                       alone after the shared setup, instead of the whole
+#                       sequence; the first positional argument means the
+#                       same. An unknown name exits 2.
+#
+# Usage: scripts/session-e2e.sh [<case>]
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 E2E_VM="${E2E_VM:-}"
+E2E_CASE="${E2E_CASE:-${1:-}}"
 
 # The non-baseline package the sandbox proof adds and then runs. It must be a
 # real upstream package that is genuinely ABSENT from a fresh shell-stack
@@ -87,6 +93,7 @@ HOOK_SEED_DIR="" # seeded by the lifecycle-hooks proof below; removed on teardow
 PATCH_SRC_DIR="" # patch sources for the patch-modes proof; removed on teardown
 SKIP_SEED_DIR="" # seeded by the skip-lane scaffold proof below; removed on teardown
 OWNIP_SEED_DIR="" # seeded by the own-IP proof below; removed on teardown
+BEP_SEED_DIR="" # seeded by the bep grant case below; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -205,6 +212,7 @@ teardown() {
   [ -n "$PATCH_SRC_DIR" ] && rm -rf "$PATCH_SRC_DIR"
   [ -n "$SKIP_SEED_DIR" ] && rm -rf "$SKIP_SEED_DIR"
   [ -n "$OWNIP_SEED_DIR" ] && rm -rf "$OWNIP_SEED_DIR"
+  [ -n "$BEP_SEED_DIR" ] && rm -rf "$BEP_SEED_DIR"
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
   # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
@@ -259,6 +267,100 @@ fail() {
   exit 1
 }
 
+# ---------------------------------------------------------------------------
+# Named cases: each is a `case_<name>` function selected by E2E_CASE and run
+# alone after the shared setup (workdir, seed, hermetic config). The legacy
+# sequence below runs only when no case is selected.
+# ---------------------------------------------------------------------------
+
+# BEP-003: a box declaring a GitHub grant is created while a sign-in is held
+# without any sign-in prompt, and fails with the defined error
+# `github_sign_in_required` — again with no prompt — while none is held.
+# Which half runs depends on `min auth status` on THIS host: CI holds no
+# sign-in (a Linux host has no keychain backend at all), so it proves the
+# refusal half and says the held half was not exercised; an operator signed
+# in with `min auth login` proves the held half. Both halves close stdin, so
+# a prompt would die on EOF instead of hanging the lane.
+case_bep_second_box_needs_no_sign_in() {
+  echo "::group::bep: a box declaring a GitHub grant needs no sign-in prompt"
+  BEP_SEED_DIR="$(mktemp -d /tmp/mnlbep.XXXXXX)"
+  cp "$PROJECT_DIR/minimal.toml" "$BEP_SEED_DIR/minimal.toml"
+  mkdir "$BEP_SEED_DIR/.git"
+  # The grant, with the GitHub host set admitted and explicit `proxy_env`
+  # steering (the default `dns` is refused until the box-zone resolver
+  # exists). `mode` is left to the CLI's default, so the box needs no
+  # own-IP networking on lanes without gvproxy.
+  cat >>"$BEP_SEED_DIR/minimal.toml" <<'EOF'
+
+[session.network.egress]
+allow_dns_hosts = ["github.com", "api.github.com", "uploads.github.com", "codeload.github.com"]
+
+[session.network.bep]
+steering = "proxy_env"
+
+[[session.grants]]
+module = "github"
+env = "GITHUB_TOKEN"
+source = "broker"
+EOF
+  local held=""
+  if mnl auth status >"$WORK/auth-status.out" 2>&1 \
+      && grep -q "signed in as" "$WORK/auth-status.out"; then
+    held=1
+  fi
+  if [ -n "$held" ]; then
+    # Held: the first box AND a second one, each created with no prompt.
+    local n bep_out bep_sid
+    for n in 1 2; do
+      bep_out="$(cd "$BEP_SEED_DIR" \
+        && mnl session activate . --name "e2e-bep-$n" --no-input </dev/null 2>"$WORK/bep-activate-$n.err")" || {
+        echo "::error::box $n declaring a GitHub grant was not created while a sign-in is held"
+        echo "--- stdout ---"; printf '%s\n' "$bep_out"
+        echo "--- stderr ---"; cat "$WORK/bep-activate-$n.err" 2>/dev/null || true
+        fail
+      }
+      bep_sid="$(printf '%s\n' "$bep_out" | tail -n1 | tr -d '\r')"
+      if grep -q -i -E 'sign.in|min auth login' "$WORK/bep-activate-$n.err"; then
+        echo "::error::box $n's activation raised the sign-in while one is held"
+        echo "--- stderr ---"; cat "$WORK/bep-activate-$n.err"
+        fail
+      fi
+      mnl session destroy --force "$bep_sid" >/dev/null 2>&1 \
+        || { echo "::error::could not destroy box $n ($bep_sid)"; fail; }
+    done
+    echo "two boxes declaring a GitHub grant created with no sign-in prompt OK"
+  else
+    echo "no GitHub sign-in is held on this host: the held half is not exercised here"
+    # Not held: exit 3, the defined error on stderr, no prompt, no box.
+    local bep_rc=0 bep_out
+    bep_out="$(cd "$BEP_SEED_DIR" \
+      && mnl session activate . --name e2e-bep-refused --no-input </dev/null 2>"$WORK/bep-refused.err")" || bep_rc=$?
+    if [ "$bep_rc" != 3 ]; then
+      echo "::error::a box declaring a GitHub grant with no sign-in held exited $bep_rc, not 3"
+      echo "--- stdout ---"; printf '%s\n' "$bep_out"
+      echo "--- stderr ---"; cat "$WORK/bep-refused.err" 2>/dev/null || true
+      fail
+    fi
+    if ! grep -q "github_sign_in_required" "$WORK/bep-refused.err"; then
+      echo "::error::the refusal does not name the defined error github_sign_in_required"
+      echo "--- stderr ---"; cat "$WORK/bep-refused.err" 2>/dev/null || true
+      fail
+    fi
+    if mnl ls 2>/dev/null | grep -q "e2e-bep-refused"; then
+      echo "::error::a box was created despite the refusal"
+      fail
+    fi
+    echo "grant with no sign-in held: exit 3, github_sign_in_required, no prompt, no box OK"
+  fi
+  rm -rf "$BEP_SEED_DIR"; BEP_SEED_DIR=""
+  echo "::endgroup::"
+}
+
+if [ -n "$E2E_CASE" ] && ! declare -F "case_$E2E_CASE" >/dev/null; then
+  echo "::error::unknown e2e case '$E2E_CASE'"
+  exit 2
+fi
+
 # The sandbox proof below forks a real session sandbox, which needs
 # unprivileged user namespaces. On Ubuntu 24.04+ the AppArmor restriction
 # (kernel.apparmor_restrict_unprivileged_userns=1) denies those to the
@@ -278,6 +380,14 @@ if [ -z "$E2E_VM" ] && [ "$(uname -s)" = Linux ] \
   else
     echo "::warning::this host restricts unprivileged user namespaces and the minimald AppArmor profile could not be loaded; the sandbox proof will fail — see docs/reference/linux-host-setup.md"
   fi
+fi
+
+# A selected case runs alone on the shared setup; the sequence below is the
+# no-case run.
+if [ -n "$E2E_CASE" ]; then
+  "case_$E2E_CASE"
+  echo "session e2e case $E2E_CASE OK"
+  exit 0
 fi
 
 # Cold: `min session activate` must auto-spawn the target's daemon and print the

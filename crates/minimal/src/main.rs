@@ -105,9 +105,19 @@ async fn run() -> ExitCode {
             return ExitCode::from(code);
         }
         eprintln!("error: {e:#}");
-        return ExitCode::FAILURE;
+        return ExitCode::from(exit_code_for(&e));
     }
     ExitCode::SUCCESS
+}
+
+/// The exit code a printed error carries: 3 for a box spec whose grants the
+/// host cannot honour (a refused expansion names each cause on stderr),
+/// 1 for everything else.
+fn exit_code_for(e: &anyhow::Error) -> u8 {
+    if e.downcast_ref::<sessions::GrantRefusal>().is_some() {
+        return sessions::GrantRefusal::EXIT_CODE;
+    }
+    1
 }
 
 /// A cheaply clonable writer over the dash log file: every clone writes
@@ -171,6 +181,30 @@ mod tests {
             }),
         }));
         assert!(stdout_is_data_contract(&cmd));
+    }
+
+    /// A refused box-spec expansion — here a grant under
+    /// `network.mode = "none"` — exits 3, where any other error exits 1.
+    #[test]
+    fn expansion_refusal_exits_3() {
+        let grant = sessions::Grant {
+            module: sessions::GrantModule::Github,
+            env: sessions::core::primitives::StrictVarName::try_new("GITHUB_TOKEN").unwrap(),
+            source: sessions::GrantSource::Broker,
+            mode: sessions::GrantMode::User,
+        };
+        let network = sessions::BoxNetwork {
+            mode: Some(sessions::NetworkMode::NoNet),
+            ..sessions::BoxNetwork::default()
+        };
+        let ctx = sessions::GrantContext {
+            box_name: "web",
+            host_set: &sessions::GITHUB_HOST_SET,
+            sign_in_held: true,
+        };
+        let refusal = sessions::validate_grants(&network, &[grant], &ctx).unwrap_err();
+        assert_eq!(exit_code_for(&anyhow::Error::from(refusal)), 3);
+        assert_eq!(exit_code_for(&anyhow::anyhow!("anything else")), 1);
     }
 
     /// `min task run` streams the task's stdout, so tracing must route to

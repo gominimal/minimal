@@ -215,6 +215,69 @@ so it never reads — or fails over — an `env_vars` declaration. And
 environment rather than your shell. Both are covered in
 [Tasks](./tasks.md#env_vars).
 
+#### `[session.network]` and `[[session.grants]]` - Networking and credentials {#session-network}
+
+A session's networking and the credentials it receives are declared beside
+its primitives. A grant asks for a credential the session gets as a sealed
+value in an environment variable; the value is redeemed only by the host's
+Box Egress Proxy, so no token enters the session.
+
+```toml
+[session.network]
+mode = "own_ip"                 # none | host_net | own_ip; unset: the CLI's --network
+
+[session.network.egress]
+allow_dns_hosts = ["github.com", "api.github.com", "uploads.github.com", "codeload.github.com"]
+
+[session.network.bep]
+steering  = "proxy_env"         # dns | proxy_env | both | off
+proxy_env = false               # set the proxy environment whatever the steering
+no_proxy  = ["release-assets.githubusercontent.com"]
+
+[[session.grants]]
+module = "github"
+env    = "GITHUB_TOKEN"         # the variable the sealed value lands in
+source = "broker"               # minted from the sign-in `min auth login` holds
+mode   = "user"                 # user (default) | installation
+```
+
+- **`network.mode`**: the session's network mode. When set it is the mode
+  the session is created with; when unset, `min session activate
+  --network` decides.
+- **`network.egress.allow_dns_hosts`**: the hostnames the session may
+  resolve and reach. A grant's module has a host set — GitHub's is
+  `github.com`, `api.github.com`, `uploads.github.com` and
+  `codeload.github.com` — and every host of it must be listed here. An
+  absent list admits every host.
+- **`network.bep`**: how the session's credentialed traffic is steered to
+  the proxy. `steering = "off"` steers nothing: a grant declared under it is
+  honoured with a warning naming the grant, and no interception CA is
+  injected into the session.
+- **`grants`**: one entry per credential. `module` and `source` are
+  required; `env` must be a POSIX-shaped variable name; `mode` defaults to
+  `user`. A table with a field this version does not know is refused
+  rather than ignored.
+
+A grant needs a GitHub sign-in held on this host. Without one, activation
+fails with the defined error `github_sign_in_required` and never prompts:
+
+```console
+$ min session activate
+error: refused the box spec's grants (exit 3)
+  - github_sign_in_required: github grant `GITHUB_TOKEN` needs a held GitHub sign-in; run `min auth login` first (the box was not created, and no sign-in was prompted for)
+```
+
+Activation is refused with **exit 3**, naming every cause, when the spec
+declares a grant the host cannot honour:
+
+- `network.mode = "none"` together with a grant;
+- `network.bep.steering = "off"` together with `proxy_env = true` (nothing
+  injects the CA an environment pointing at the proxy would need);
+- a grant with `mode = "installation"` on a host that is not enrolled (no
+  App private key exists locally);
+- an `allow_dns_hosts` that does not admit every host of the grant's
+  module host set — the refusal lists exactly the missing hosts.
+
 
 
 ### `[tasks.*]` - Run tasks, scripts, & dev tooling {#tasks}

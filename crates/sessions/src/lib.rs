@@ -26,6 +26,8 @@ pub mod wire;
 #[serde(rename_all = "snake_case")]
 pub enum NetworkMode {
     /// No network namespace; all network syscalls fail or see no interfaces.
+    /// A box spec spells it `mode = "none"`.
+    #[serde(alias = "none")]
     NoNet,
     /// Share the host (or VM) network namespace. Current default.
     #[default]
@@ -239,6 +241,378 @@ fn is_valid_cidr(s: &str) -> bool {
         Ok(std::net::IpAddr::V6(_)) => prefix <= 128,
         Err(_) => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Box spec: the `[session.network]` table and the `[[session.grants]]` a
+// project's `minimal.toml` declares, and the expansion that validates the
+// GitHub grants against them on an un-enrolled host (box egress proxy spec:
+// BEP-003, BEP-008, BEP-009, BEP-010, BEP-056). Like the policy types above,
+// these are constructed by literal at the config sites, so they are not
+// `#[non_exhaustive]`.
+// ---------------------------------------------------------------------------
+
+/// How a box's credentialed traffic reaches the Box Egress Proxy: the
+/// `[session.network.bep] steering` field.
+///
+/// `Off` steers nothing: the box's requests go direct, no interception CA is
+/// injected and a sealed value is never redeemed, so a grant declared under
+/// it is honoured with a warning rather than refused.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Steering {
+    /// The box-zone resolver answers the credentialed hostnames with the
+    /// proxy's address.
+    Dns,
+    /// `HTTPS_PROXY`/`HTTP_PROXY` in the box environment point at the proxy.
+    ProxyEnv,
+    /// Both of the above.
+    Both,
+    /// Nothing is steered.
+    Off,
+}
+
+impl fmt::Display for Steering {
+    /// Renders the `snake_case` spelling a box spec uses, so a refusal or a
+    /// warning names the value as the operator wrote it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Dns => "dns",
+            Self::ProxyEnv => "proxy_env",
+            Self::Both => "both",
+            Self::Off => "off",
+        })
+    }
+}
+
+/// The `[session.network.bep]` table of a box spec.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BepPolicy {
+    /// The steering mode; `None` is resolved to the architecture's default
+    /// when the box is created.
+    pub steering: Option<Steering>,
+    /// Set the proxy environment whatever the steering mode. Unbuildable
+    /// together with `steering = "off"`, which also disables CA injection.
+    #[serde(default)]
+    pub proxy_env: bool,
+    /// Hosts the proxy environment excludes, added to the local zone.
+    #[serde(default)]
+    pub no_proxy: Vec<String>,
+}
+
+/// The `[session.network]` table of a box spec.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BoxNetwork {
+    /// `mode = "none" | "host_net" | "own_ip"`. `None` leaves the mode to
+    /// the CLI's `--network`.
+    pub mode: Option<NetworkMode>,
+    /// The `[session.network.egress]` table.
+    pub egress: Option<EgressPolicy>,
+    /// The `[session.network.bep]` table.
+    #[serde(default)]
+    pub bep: BepPolicy,
+}
+
+/// The upstream module a grant is for.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantModule {
+    /// GitHub, over the v1 host set [`GITHUB_HOST_SET`].
+    Github,
+}
+
+impl fmt::Display for GrantModule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Github => "github",
+        })
+    }
+}
+
+/// Where a grant's member comes from.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantSource {
+    /// Minted from the held sign-in by the host's broker: `min` itself on an
+    /// un-enrolled host, Gatehouse on an enrolled one. The grammar is the
+    /// same on both sides of enrollment.
+    Broker,
+}
+
+/// The kind of member a GitHub grant asks for.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantMode {
+    /// A user token minted from the signed-in account's sign-in.
+    #[default]
+    User,
+    /// An installation token, minted under the App's private key — which
+    /// only an enrolled host holds.
+    Installation,
+}
+
+impl fmt::Display for GrantMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::User => "user",
+            Self::Installation => "installation",
+        })
+    }
+}
+
+/// One `[[session.grants]]` entry: a credential the box receives as a sealed
+/// value in the named environment variable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Grant {
+    /// The upstream module the member is for.
+    pub module: GrantModule,
+    /// The environment variable the box receives the sealed value in.
+    pub env: crate::core::primitives::StrictVarName,
+    /// Where the member comes from.
+    pub source: GrantSource,
+    /// The kind of member; `user` unless declared.
+    #[serde(default)]
+    pub mode: GrantMode,
+}
+
+impl fmt::Display for Grant {
+    /// "github grant `GITHUB_TOKEN`": how a refusal, a warning or a log line
+    /// names the grant.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} grant `{}`", self.module, self.env)
+    }
+}
+
+/// The GitHub module's v1 host set (Gatehouse §6.10, Module host sets): the
+/// hosts a box declaring a GitHub grant must admit in its
+/// `egress.allow_dns_hosts`.
+pub const GITHUB_HOST_SET: [&str; 4] = [
+    "github.com",
+    "api.github.com",
+    "uploads.github.com",
+    "codeload.github.com",
+];
+
+/// What the grant validation runs against, beyond the spec itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrantContext<'a> {
+    /// The box the spec is being expanded for, as the log lines name it.
+    pub box_name: &'a str,
+    /// The module's host set the grants are validated against.
+    pub host_set: &'a [&'a str],
+    /// Whether a GitHub sign-in is held on this host.
+    pub sign_in_held: bool,
+}
+
+/// The outcome of an admitted expansion: what the box is created with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantExpansion {
+    /// Whether the host's interception root CA is injected into the box's
+    /// trust store; `false` under `steering = "off"`.
+    pub inject_ca: bool,
+    /// Validation warnings, one per grant declared under `steering = "off"`.
+    pub warnings: Vec<GrantWarning>,
+}
+
+/// A validation warning: the spec is honoured, and the operator is told what
+/// that means.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GrantWarning {
+    /// A grant under `steering = "off"`: nothing reaches the proxy, so the
+    /// sealed value is delivered but never redeemed and no CA is injected.
+    #[error(
+        "{grant} is declared under `[session.network.bep] steering = \"off\"`: nothing is \
+         steered to the proxy, so no interception CA is injected and the sealed value is \
+         never redeemed"
+    )]
+    SteeringOff { grant: Grant },
+}
+
+/// One reason an expansion is refused.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GrantRefusalCause {
+    /// `network.mode = "none"` with a grant: a box with no network has
+    /// nothing to reach with the credential.
+    #[error("`[session.network] mode = \"none\"` gives {grant} no network to reach GitHub over")]
+    NoneModeWithGrant { grant: Grant },
+    /// `steering = "off"` with `proxy_env = true`: `off` injects no CA, so an
+    /// environment pointing at the proxy would fail every TLS handshake.
+    #[error(
+        "`[session.network.bep] steering = \"off\"` and `proxy_env = true` cannot be built \
+         together: `off` injects no interception CA, so an environment pointing at the proxy \
+         would fail every TLS handshake"
+    )]
+    SteeringOffWithProxyEnv,
+    /// `mode = "installation"` on an un-enrolled host, which holds no App
+    /// private key to mint one with.
+    #[error(
+        "{grant} declares `mode = \"installation\"`, which this host cannot mint: it is not \
+         enrolled and holds no App private key"
+    )]
+    InstallationModeUnenrolled { grant: Grant },
+    /// The box's `egress.allow_dns_hosts` does not admit every host of the
+    /// module's host set; `missing` names exactly the absent hosts.
+    #[error(
+        "{grant} needs `[session.network.egress] allow_dns_hosts` to admit every host of the \
+         {} host set; missing: {}",
+        .grant.module,
+        .missing.join(", ")
+    )]
+    HostsOutsideEgress { grant: Grant, missing: Vec<String> },
+    /// No GitHub sign-in is held: the defined error `github_sign_in_required`
+    /// (BEP-003). The creation fails; nothing prompts for a sign-in.
+    #[error(
+        "github_sign_in_required: {grant} needs a held GitHub sign-in; run `min auth login` \
+         first (the box was not created, and no sign-in was prompted for)"
+    )]
+    SignInRequired { grant: Grant },
+}
+
+/// A box spec whose GitHub grants the un-enrolled host cannot honour. The
+/// expansion is refused with exit [`GrantRefusal::EXIT_CODE`], and the
+/// message names every cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRefusal {
+    /// Every cause found, in spec order; never empty.
+    pub causes: Vec<GrantRefusalCause>,
+}
+
+impl GrantRefusal {
+    /// The process exit code of a refused expansion.
+    pub const EXIT_CODE: u8 = 3;
+}
+
+impl fmt::Display for GrantRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "refused the box spec's grants (exit {})",
+            Self::EXIT_CODE
+        )?;
+        for cause in &self.causes {
+            write!(f, "\n  - {cause}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for GrantRefusal {}
+
+/// Validates a box spec's grants against its `[session.network]` table and
+/// the host, on an un-enrolled host.
+///
+/// Refused, with every cause named: a grant under `mode = "none"` (BEP-009),
+/// `steering = "off"` together with `proxy_env = true` (BEP-010), a grant
+/// asking for `mode = "installation"` (BEP-056), and a grant whose module
+/// host set `egress.allow_dns_hosts` does not admit in full — an absent
+/// `allow_dns_hosts` admits every host (BEP-008). A spec that passes those
+/// is then refused with `github_sign_in_required` when no sign-in is held
+/// (BEP-003). A grant under `steering = "off"` is admitted with a warning,
+/// and the expansion injects no CA (BEP-010).
+///
+/// A spec with no grants is admitted as it stands, sign-in or not.
+///
+/// # Errors
+///
+/// [`GrantRefusal`], naming each cause.
+pub fn validate_grants(
+    network: &BoxNetwork,
+    grants: &[Grant],
+    ctx: &GrantContext<'_>,
+) -> Result<GrantExpansion, GrantRefusal> {
+    if grants.is_empty() {
+        return Ok(GrantExpansion {
+            inject_ca: false,
+            warnings: Vec::new(),
+        });
+    }
+    let steering_off = network.bep.steering == Some(Steering::Off);
+    let mut causes = Vec::new();
+    if steering_off && network.bep.proxy_env {
+        causes.push(GrantRefusalCause::SteeringOffWithProxyEnv);
+    }
+    let mut warnings = Vec::new();
+    for grant in grants {
+        let before = causes.len();
+        if network.mode == Some(NetworkMode::NoNet) {
+            causes.push(GrantRefusalCause::NoneModeWithGrant {
+                grant: grant.clone(),
+            });
+        }
+        if grant.mode == GrantMode::Installation {
+            causes.push(GrantRefusalCause::InstallationModeUnenrolled {
+                grant: grant.clone(),
+            });
+        }
+        let missing = hosts_outside_egress(network.egress.as_ref(), ctx.host_set);
+        if !missing.is_empty() {
+            causes.push(GrantRefusalCause::HostsOutsideEgress {
+                grant: grant.clone(),
+                missing,
+            });
+        }
+        let verdict = if causes.len() == before {
+            "admitted"
+        } else {
+            "refused"
+        };
+        tracing::info!(
+            box_name = ctx.box_name,
+            grant = %grant,
+            verdict,
+            "validated a box spec grant"
+        );
+        if steering_off {
+            tracing::warn!(
+                box_name = ctx.box_name,
+                grant = %grant,
+                "grant declared under steering = \"off\": no CA injected, value never redeemed"
+            );
+            warnings.push(GrantWarning::SteeringOff {
+                grant: grant.clone(),
+            });
+        }
+    }
+    if causes.is_empty() && !ctx.sign_in_held {
+        causes.extend(
+            grants
+                .iter()
+                .map(|grant| GrantRefusalCause::SignInRequired {
+                    grant: grant.clone(),
+                }),
+        );
+    }
+    if !causes.is_empty() {
+        return Err(GrantRefusal { causes });
+    }
+    Ok(GrantExpansion {
+        inject_ca: !steering_off,
+        warnings,
+    })
+}
+
+/// The hosts of `host_set` that `egress.allow_dns_hosts` does not admit, in
+/// host-set order. An absent egress table or `allow_dns_hosts` admits every
+/// host (the allow-all reading [`EgressPolicy`] documents). Hostnames compare
+/// case-insensitively.
+fn hosts_outside_egress(egress: Option<&EgressPolicy>, host_set: &[&str]) -> Vec<String> {
+    let Some(allowed) = egress.and_then(|e| e.allow_dns_hosts.as_deref()) else {
+        return Vec::new();
+    };
+    host_set
+        .iter()
+        .filter(|host| !allowed.iter().any(|a| a.eq_ignore_ascii_case(host)))
+        .map(|host| (*host).to_owned())
+        .collect()
 }
 
 /// A session ID, a newtype over a UUID.
@@ -896,6 +1270,297 @@ mod tests {
                     ..EgressPolicy::default()
                 };
                 prop_assert_eq!(policy.first_invalid_subnet(), None);
+            }
+        }
+    }
+
+    // =================================================================
+    // Box spec grants: expansion validation on an un-enrolled host
+    // (BEP-003, BEP-008, BEP-009, BEP-010, BEP-056)
+    // =================================================================
+
+    mod grants {
+        use super::super::*;
+        use crate::core::primitives::StrictVarName;
+        use proptest::prelude::*;
+
+        fn grant(env: &str, mode: GrantMode) -> Grant {
+            Grant {
+                module: GrantModule::Github,
+                env: StrictVarName::try_new(env).unwrap(),
+                source: GrantSource::Broker,
+                mode,
+            }
+        }
+
+        fn user_grant() -> Grant {
+            grant("GITHUB_TOKEN", GrantMode::User)
+        }
+
+        /// A spec every check admits: own-IP, the whole GitHub host set
+        /// admitted, `proxy_env` steering.
+        fn admitted_network() -> BoxNetwork {
+            BoxNetwork {
+                mode: Some(NetworkMode::OwnIp),
+                egress: Some(EgressPolicy {
+                    allow_dns_hosts: Some(
+                        GITHUB_HOST_SET.iter().map(|h| (*h).to_owned()).collect(),
+                    ),
+                    ..EgressPolicy::default()
+                }),
+                bep: BepPolicy {
+                    steering: Some(Steering::ProxyEnv),
+                    ..BepPolicy::default()
+                },
+            }
+        }
+
+        fn ctx(sign_in_held: bool) -> GrantContext<'static> {
+            GrantContext {
+                box_name: "web",
+                host_set: &GITHUB_HOST_SET,
+                sign_in_held,
+            }
+        }
+
+        /// The grammar the reference documents parses to these types:
+        /// `[session.network]` with its `egress` and `bep` tables, and a
+        /// `[[session.grants]]` entry with `mode` defaulting to `user`.
+        #[test]
+        fn box_spec_grammar_parses() {
+            let network: BoxNetwork = toml::from_str(
+                r#"
+                mode = "none"
+                [egress]
+                allow_dns_hosts = ["github.com"]
+                [bep]
+                steering = "off"
+                proxy_env = true
+                no_proxy = ["release-assets.githubusercontent.com"]
+                "#,
+            )
+            .unwrap();
+            assert_eq!(network.mode, Some(NetworkMode::NoNet));
+            assert_eq!(
+                network.egress.unwrap().allow_dns_hosts,
+                Some(vec!["github.com".to_owned()])
+            );
+            assert_eq!(network.bep.steering, Some(Steering::Off));
+            assert!(network.bep.proxy_env);
+            assert_eq!(network.bep.no_proxy.len(), 1);
+
+            let parsed: Grant = toml::from_str(
+                r#"
+                module = "github"
+                env = "GITHUB_TOKEN"
+                source = "broker"
+                "#,
+            )
+            .unwrap();
+            assert_eq!(parsed, user_grant());
+            assert_eq!(parsed.to_string(), "github grant `GITHUB_TOKEN`");
+
+            // A typo in a security-relevant table is refused, not dropped.
+            assert!(toml::from_str::<BepPolicy>("proxyenv = true").is_err());
+        }
+
+        /// BEP-003: with no sign-in held, a box declaring a GitHub grant
+        /// fails with the defined error `github_sign_in_required` and
+        /// nothing else; the same spec is admitted once a sign-in is held,
+        /// and a spec with no grant never asks.
+        #[test]
+        fn creation_without_sign_in_fails_with_defined_error() {
+            let network = admitted_network();
+            let grants = [user_grant()];
+
+            let refusal = validate_grants(&network, &grants, &ctx(false)).unwrap_err();
+            assert_eq!(
+                refusal.causes,
+                vec![GrantRefusalCause::SignInRequired {
+                    grant: user_grant()
+                }]
+            );
+            assert!(refusal.to_string().contains("github_sign_in_required"));
+            assert!(refusal.to_string().contains("github grant `GITHUB_TOKEN`"));
+            assert_eq!(GrantRefusal::EXIT_CODE, 3);
+
+            let expansion = validate_grants(&network, &grants, &ctx(true)).unwrap();
+            assert!(expansion.inject_ca);
+            assert!(expansion.warnings.is_empty());
+
+            assert!(validate_grants(&network, &[], &ctx(false)).is_ok());
+        }
+
+        /// BEP-010: `steering = "off"` with a grant is admitted, with a
+        /// warning naming the grant, and the box gets no interception CA.
+        #[test]
+        fn steering_off_with_grant_warns_and_injects_no_ca() {
+            let mut network = admitted_network();
+            network.bep.steering = Some(Steering::Off);
+
+            let expansion = validate_grants(&network, &[user_grant()], &ctx(true)).unwrap();
+            assert!(!expansion.inject_ca);
+            assert_eq!(
+                expansion.warnings,
+                vec![GrantWarning::SteeringOff {
+                    grant: user_grant()
+                }]
+            );
+            assert!(
+                expansion.warnings[0]
+                    .to_string()
+                    .contains("github grant `GITHUB_TOKEN`")
+            );
+        }
+
+        /// BEP-010: `steering = "off"` and `proxy_env = true` is unbuildable
+        /// and refused with exit 3 naming both fields.
+        #[test]
+        fn steering_off_with_proxy_env_is_refused() {
+            let mut network = admitted_network();
+            network.bep.steering = Some(Steering::Off);
+            network.bep.proxy_env = true;
+
+            let refusal = validate_grants(&network, &[user_grant()], &ctx(true)).unwrap_err();
+            assert_eq!(
+                refusal.causes,
+                vec![GrantRefusalCause::SteeringOffWithProxyEnv]
+            );
+            let text = refusal.to_string();
+            assert!(text.contains("steering = \"off\""), "{text}");
+            assert!(text.contains("proxy_env = true"), "{text}");
+            assert!(text.contains("exit 3"), "{text}");
+        }
+
+        /// A pool of hostnames a host set and an allow list are drawn from.
+        const HOST_POOL: [&str; 6] = [
+            "github.com",
+            "api.github.com",
+            "uploads.github.com",
+            "codeload.github.com",
+            "example.com",
+            "objects.githubusercontent.com",
+        ];
+
+        fn arb_hosts(min: usize) -> impl Strategy<Value = Vec<&'static str>> {
+            prop::collection::btree_set(0..HOST_POOL.len(), min..=HOST_POOL.len())
+                .prop_map(|idx| idx.into_iter().map(|i| HOST_POOL[i]).collect())
+        }
+
+        proptest! {
+            /// BEP-008: for every host set and every `allow_dns_hosts`,
+            /// expansion refuses iff some host of the set is absent from
+            /// the allow list, and the refusal names exactly the absent
+            /// hosts. An absent `allow_dns_hosts` admits every host.
+            #[test]
+            fn prop_grant_host_set_outside_egress_is_exit_3(
+                host_set in arb_hosts(1),
+                allowed in prop::option::of(arb_hosts(0)),
+                upper in any::<bool>(),
+            ) {
+                let mut network = admitted_network();
+                network.egress = Some(EgressPolicy {
+                    allow_dns_hosts: allowed.as_ref().map(|hosts| {
+                        hosts
+                            .iter()
+                            .map(|h| if upper { h.to_ascii_uppercase() } else { (*h).to_owned() })
+                            .collect()
+                    }),
+                    ..EgressPolicy::default()
+                });
+                let context = GrantContext { host_set: &host_set, ..ctx(true) };
+
+                let expected_missing: Vec<String> = match &allowed {
+                    None => Vec::new(),
+                    Some(allowed) => host_set
+                        .iter()
+                        .filter(|h| !allowed.contains(*h))
+                        .map(|h| (*h).to_owned())
+                        .collect(),
+                };
+
+                let result = validate_grants(&network, &[user_grant()], &context);
+                prop_assert_eq!(result.is_err(), !expected_missing.is_empty());
+                if let Err(refusal) = result {
+                    prop_assert_eq!(GrantRefusal::EXIT_CODE, 3);
+                    let text = refusal.to_string();
+                    prop_assert_eq!(
+                        refusal.causes,
+                        vec![GrantRefusalCause::HostsOutsideEgress {
+                            grant: user_grant(),
+                            missing: expected_missing.clone(),
+                        }]
+                    );
+                    for host in &expected_missing {
+                        prop_assert!(text.contains(host.as_str()), "{}", text);
+                    }
+                }
+            }
+
+            /// BEP-009: for every box spec, expansion refuses iff
+            /// `network.mode` is `none` and at least one grant is declared.
+            #[test]
+            fn prop_none_mode_with_grant_is_exit_3(
+                mode in prop_oneof![
+                    Just(None),
+                    Just(Some(NetworkMode::NoNet)),
+                    Just(Some(NetworkMode::HostNet)),
+                    Just(Some(NetworkMode::OwnIp)),
+                ],
+                grant_count in 0usize..3,
+            ) {
+                let mut network = admitted_network();
+                network.mode = mode;
+                let grants: Vec<Grant> = (0..grant_count)
+                    .map(|i| grant(&format!("TOKEN_{i}"), GrantMode::User))
+                    .collect();
+
+                let result = validate_grants(&network, &grants, &ctx(true));
+                let none_with_grant = mode == Some(NetworkMode::NoNet) && grant_count > 0;
+                prop_assert_eq!(result.is_err(), none_with_grant);
+                if let Err(refusal) = result {
+                    prop_assert_eq!(GrantRefusal::EXIT_CODE, 3);
+                    prop_assert!(refusal.to_string().contains("mode = \"none\""));
+                    prop_assert_eq!(
+                        refusal.causes,
+                        grants
+                            .iter()
+                            .map(|g| GrantRefusalCause::NoneModeWithGrant { grant: g.clone() })
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+
+            /// BEP-056: on an un-enrolled host, expansion refuses iff a
+            /// GitHub grant declares `mode = "installation"`, naming each
+            /// such grant.
+            #[test]
+            fn prop_installation_mode_unenrolled_is_exit_3(
+                modes in prop::collection::vec(
+                    prop_oneof![Just(GrantMode::User), Just(GrantMode::Installation)],
+                    1..4,
+                ),
+            ) {
+                let network = admitted_network();
+                let grants: Vec<Grant> = modes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, mode)| grant(&format!("TOKEN_{i}"), *mode))
+                    .collect();
+
+                let result = validate_grants(&network, &grants, &ctx(true));
+                let any_installation = modes.contains(&GrantMode::Installation);
+                prop_assert_eq!(result.is_err(), any_installation);
+                if let Err(refusal) = result {
+                    prop_assert_eq!(GrantRefusal::EXIT_CODE, 3);
+                    let expected: Vec<GrantRefusalCause> = grants
+                        .iter()
+                        .filter(|g| g.mode == GrantMode::Installation)
+                        .map(|g| GrantRefusalCause::InstallationModeUnenrolled { grant: g.clone() })
+                        .collect();
+                    prop_assert!(refusal.to_string().contains("mode = \"installation\""));
+                    prop_assert_eq!(refusal.causes, expected);
+                }
             }
         }
     }

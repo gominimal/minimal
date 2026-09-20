@@ -483,6 +483,14 @@ pub struct Session {
     /// client's loadout).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_hooks: Vec<sessions::core::lifecyclehook::LifecycleHook>,
+    /// The box's networking: `[session.network]` with its `egress` and
+    /// `bep` tables. Not a composition primitive; the CLI validates the
+    /// grants below against it at activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<sessions::BoxNetwork>,
+    /// Credentials the box receives as sealed values: `[[session.grants]]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<sessions::Grant>,
 
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
@@ -502,7 +510,8 @@ impl Session {
     /// [`Session`] has anything worth materializing.
     ///
     /// `extra` is ignored — unknown fields don't count as
-    /// contributions.
+    /// contributions — and so are `network` and `grants`, which
+    /// describe the box rather than contribute to its composition.
     ///
     /// The exhaustive `let Self { ... } = self` destructure in the
     /// body is what makes this drift-proof: if a sixth primitive
@@ -518,6 +527,8 @@ impl Session {
             vars_lenient,
             patches,
             lifecycle_hooks,
+            network: _,
+            grants: _,
             extra: _,
         } = self;
         packages.is_empty()

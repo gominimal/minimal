@@ -93,6 +93,14 @@ fn host_store() -> Result<bep::MemorySignIns, anyhow::Error> {
     )
 }
 
+/// Whether a GitHub sign-in is held on this host: what a box declaring a
+/// GitHub grant is checked against at creation (BEP-003). A host with no
+/// keychain backend, or a store that cannot be read, holds none.
+#[must_use]
+pub fn sign_in_held() -> bool {
+    host_store().is_ok_and(|store| matches!(store.load(), Ok(Some(_))))
+}
+
 /// Opens `url` in the operator's browser.
 fn open_browser(url: &Url) -> Result<(), anyhow::Error> {
     let opener = if cfg!(target_os = "macos") {

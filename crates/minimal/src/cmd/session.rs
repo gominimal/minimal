@@ -22,6 +22,44 @@ pub(crate) fn session_announce_label(id: &sessions::SessionId, name: Option<&str
     }
 }
 
+/// Validates the project's `[[session.grants]]` against its
+/// `[session.network]` table and the held sign-in, prints each validation
+/// warning, and returns the session's network mode: the spec's `mode` when
+/// declared, else `cli_mode`.
+///
+/// A refusal surfaces as a [`sessions::GrantRefusal`], which `main` maps to
+/// exit 3. A project with no mfile, or one that does not parse, is not this
+/// function's problem — the activation has its own handling for both, as
+/// [`loadouts::check_project_hooks`] reasons.
+fn expand_project_grants(
+    project_root: &paths::HostAbsPath,
+    box_name: &str,
+    cli_mode: sessions::NetworkMode,
+) -> Result<sessions::NetworkMode, anyhow::Error> {
+    let Ok(mfile) = mfile::File::from_dir(project_root.as_utf8_path().as_std_path()) else {
+        return Ok(cli_mode);
+    };
+    let Some(session) = mfile.session.as_ref() else {
+        return Ok(cli_mode);
+    };
+    let mut network = session.network.clone().unwrap_or_default();
+    let mode = network.mode.unwrap_or(cli_mode);
+    network.mode = Some(mode);
+    if session.grants.is_empty() {
+        return Ok(mode);
+    }
+    let ctx = sessions::GrantContext {
+        box_name,
+        host_set: &sessions::GITHUB_HOST_SET,
+        sign_in_held: crate::auth::sign_in_held(),
+    };
+    let expansion = sessions::validate_grants(&network, &session.grants, &ctx)?;
+    for warning in &expansion.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(mode)
+}
+
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     activate_session(global, args, true).await
@@ -78,12 +116,20 @@ pub(crate) async fn activate_session(
         .clone()
         .unwrap_or_else(|| autogen_session_name(&utf8_path, &random_hex4()));
 
+    // The box spec's GitHub grants, validated before a session exists: a
+    // spec the un-enrolled host cannot honour is refused with exit 3 naming
+    // each cause, and a grant with no held sign-in fails with
+    // `github_sign_in_required` — never a prompt (BEP-003, BEP-008, BEP-009,
+    // BEP-010, BEP-056). A spec-declared `network.mode` is the session's
+    // mode; `--network` fills in when the spec is silent.
+    let network = expand_project_grants(&abs_path, &session_name, args.network.into())?;
+
     // The daemon sources `username` from the authenticated SSH
     // connection context; the client doesn't send it.
     let config = minimald_rpc::SessionConfig {
         name: Some(session_name),
         project_path: abs_path.clone(),
-        network: args.network.into(),
+        network,
         policy,
         hooks_enabled: !args.no_hooks,
         attrs: Default::default(),
