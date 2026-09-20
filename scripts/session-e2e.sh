@@ -280,6 +280,244 @@ if [ -z "$E2E_VM" ] && [ "$(uname -s)" = Linux ] \
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# Case selection: a `test:` line names one proof
+# (`./scripts/session-e2e.sh <case>`), but the script took no argument — every
+# group below ran unconditionally regardless of it. `E2E_CASE` (or the first
+# positional arg) now selects exactly one named case and skips the whole
+# lifecycle+sandbox sequence below; an unrecognised name is a hard error
+# rather than a silent no-op, so a typo in a `test:` line fails loudly instead
+# of "passing" by running everything. Reusable by later tasks: add a
+# `run_case_<name>` function above the dispatch below and a matching arm in it.
+
+# NET-001..004: `<name>.min.internal` / `host.min.internal` through the B5
+# host-side egress proxy that already ships (crates/minimald/src/net/{dns,
+# proxy,switch}.rs). The HostNet half (NET-001's core + unwanted-case clauses,
+# NET-002) runs on every lane: the proxy's own outbound connect for a
+# `target=loopback` registration always lands wherever `minimald` itself
+# runs — this host natively, or the guest on a VM lane — and a HostNet box
+# shares exactly that namespace, so a listener started inside it is "the box"
+# the name routes to. The own-IP half (NET-001's VM-host clause, NET-003,
+# NET-004) needs a real switch and is gated on MINVMD_GVPROXY_BIN, same as the
+# own-IP proof below.
+run_case_min_internal_names_through_proxy() {
+  echo "::group::min.internal names through the proxy (NET-001..004)"
+
+  # The registration/deprecation notices this case asserts on are logged at
+  # INFO (crates/minimald/src/net/{dns,switch}.rs); the suite's default
+  # RUST_LOG=warn would drop them. Scoped to the net module so everything else
+  # stays as quiet as the rest of the script expects. Safe here: nothing has
+  # spawned a daemon yet, and this case spawns its own.
+  export RUST_LOG="warn,minimald::net=info"
+
+  # Greps the daemon's own file log for a pattern, reporting SKIPPED instead
+  # of failing on a VM lane: minimald runs in-guest there and logs to guest
+  # tmpfs, which no host path reaches (same rationale as the lifecycle-hooks
+  # proof's hook_log_has/hook_log_readable further down).
+  assert_log_has() {
+    if [ -z "$E2E_VM" ] && find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+        -exec grep -q -- "$1" {} + 2>/dev/null; then
+      echo "daemon log: found '$1' ($2)"
+      return 0
+    fi
+    if [ -n "$E2E_VM" ]; then
+      echo "daemon log check SKIPPED for $2 (E2E_VM: minimald's log is in guest tmpfs, unreachable from here)"
+      return 0
+    fi
+    echo "::error::daemon log has no record matching '$1' ($2)"
+    fail
+  }
+
+  # One request through the 7654 proxy: prints it, returns its HTTP status.
+  # Retried up to 10x (1s apart) while the status doesn't match `want` — the
+  # target listener was just forked and may not have bound yet, and while it
+  # hasn't, the proxy's own "upstream-unreachable" 502 is itself a valid HTTP
+  # response curl returns immediately, so a retry loop that only re-tries on
+  # curl-level failure (empty/"000") never actually waits out that race. A
+  # caller with no `want` (an intentionally-negative check) still gets that
+  # baseline connectivity retry, then returns on the first real response.
+  proxy_status() {
+    local authority="$1" want="${2:-}" status=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+        --proxy 127.0.0.1:7654 "http://$authority/" 2>"$WORK/mi-curl.err")"
+      if [ -n "$status" ] && [ "$status" != "000" ] && { [ -z "$want" ] || [ "$status" = "$want" ]; }; then
+        break
+      fi
+      sleep 1
+    done
+    echo "GET http://$authority/ via proxy 127.0.0.1:7654 -> ${status:-<no response>}" >&2
+    printf '%s' "$status"
+  }
+
+  # Same, but issued from inside a session (`min session exec`), for the
+  # switch-mediated NET-003/NET-004 checks below.
+  exec_status() {
+    local sid="$1" url="$2" status=""
+    for _ in 1 2 3; do
+      status="$(mnl session exec "$sid" curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url" \
+        2>"$WORK/mi-curl.err")"
+      [ -n "$status" ] && [ "$status" != "000" ] && break
+      sleep 1
+    done
+    echo "(inside $sid) GET $url -> ${status:-<no response>}" >&2
+    printf '%s' "$status"
+  }
+
+  # -- NET-001 (HostNet) + NET-002 (deprecated 3-label zone) -----------------
+  hn_name="e2e-min-internal"
+  hn_port=18099
+  hn_out="$(cd "$PROJECT_DIR" && mnl session activate . --name "$hn_name" 2>"$WORK/mi-hn-activate.err")" || {
+    echo "::error::'min session activate --name $hn_name' failed"
+    cat "$WORK/mi-hn-activate.err" 2>/dev/null || true
+    fail
+  }
+  hn_sid="$(printf '%s\n' "$hn_out" | tail -n1 | tr -d '\r')"
+  echo "hostnet session: $hn_sid"
+
+  # A responder inside the box's OWN netns. HostNet shares minimald's own
+  # netns (native: this host's; VM lane: the guest's), which is exactly where
+  # the proxy's outbound connect for a `target=127.0.0.1` registration lands
+  # — so a listener started here IS "the box" the name routes to. `socat` is
+  # in the launcher baseline (base/coreutils/socat), needing no `min add`.
+  mnl session exec "$hn_sid" \
+    'printf "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" > /tmp/mi-resp.http' \
+    || { echo "::error::could not seed the HostNet responder's canned response"; fail; }
+  mnl session exec "$hn_sid" socat -T30 "TCP-LISTEN:$hn_port,bind=127.0.0.1,reuseaddr,fork" \
+    'SYSTEM:cat /tmp/mi-resp.http' >"$WORK/mi-hn-socat.log" 2>&1 &
+  hn_socat_pid=$!
+
+  core_status="$(proxy_status "$hn_name.min.internal:$hn_port" 200)"
+  if [ "$core_status" != "200" ]; then
+    echo "::error::NET-001: routing $hn_name.min.internal through the proxy got '$core_status', want 200"
+    cat "$WORK/mi-curl.err" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-001 OK: $hn_name.min.internal routed through the proxy to the HostNet box"
+
+  legacy_status="$(proxy_status "$hn_name.local.min.internal:$hn_port" 200)"
+  if [ "$legacy_status" != "200" ]; then
+    echo "::error::NET-002: the deprecated <name>.local.min.internal zone got '$legacy_status', want 200"
+    fail
+  fi
+  assert_log_has "routed a deprecated three-label box name" "NET-002 deprecation notice"
+  echo "NET-002 OK: the deprecated 3-label zone routed with a deprecation notice"
+
+  ghost_status="$(proxy_status "e2e-min-internal-ghost.min.internal:$hn_port")"
+  if [ "$ghost_status" != "502" ]; then
+    echo "::error::NET-001 (unwanted case): an unregistered name got '$ghost_status', want 502"
+    fail
+  fi
+  assert_log_has "no-live-box-owns-the-name" "NET-001 refusal reason"
+  echo "NET-001 (unwanted case) OK: an unregistered name was refused and the refusal was logged"
+
+  kill "$hn_socat_pid" 2>/dev/null || true
+  wait "$hn_socat_pid" 2>/dev/null || true
+  mnl session destroy --force "$hn_sid" >/dev/null 2>&1 || true
+
+  # -- NET-001 (own-IP, VM host) + NET-003 + NET-004 -------------------------
+  if [ -n "${MINVMD_GVPROXY_BIN:-}" ]; then
+    oi_name="e2e-min-internal-ownip"
+    oi_ext=18100
+    oi_int=8080
+    host_port=18199
+
+    # Mirrors the own-IP proof's own seed: a separate dir, since a path that
+    # already has a session does not mint a second one.
+    OWNIP_SEED_DIR="$(mktemp -d /tmp/mnlo.XXXXXX)"
+    OWNIP_SEED_DIR="$(cd "$OWNIP_SEED_DIR" && pwd -P)"
+    {
+      awk '
+        /^\[upstream\]/            { grab = 1; print; next }
+        grab && (/^$/ || /^\[/)    { exit }
+        grab                       { print }
+      ' "$ROOT/.minimal/minimal.toml"
+      printf '\n[stack]\nuse = "shell"\n'
+    } > "$OWNIP_SEED_DIR/minimal.toml"
+    mkdir "$OWNIP_SEED_DIR/.git"
+
+    oi_out="$(cd "$OWNIP_SEED_DIR" && mnl session activate . --no-prompt \
+      --name "$oi_name" --network own_ip --ingress "$oi_ext:$oi_int" 2>"$WORK/mi-oi-activate.err")" || {
+      echo "::error::'min session activate --network own_ip --ingress' failed"
+      cat "$WORK/mi-oi-activate.err" 2>/dev/null || true
+      fail
+    }
+    oi_sid="$(printf '%s\n' "$oi_out" | tail -n1 | tr -d '\r')"
+    echo "own-IP session: $oi_sid"
+
+    mnl session exec "$oi_sid" \
+      'printf "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" > /tmp/mi-resp.http' \
+      || { echo "::error::could not seed the own-IP responder's canned response"; fail; }
+    mnl session exec "$oi_sid" socat -T30 "TCP-LISTEN:$oi_int,reuseaddr,fork" \
+      'SYSTEM:cat /tmp/mi-resp.http' >"$WORK/mi-oi-socat.log" 2>&1 &
+    oi_socat_pid=$!
+
+    oi_route_status="$(proxy_status "$oi_name.min.internal:$oi_ext" 200)"
+    if [ "$oi_route_status" != "200" ]; then
+      echo "::error::NET-001: an own-IP session's name did not route through the proxy on a VM host"
+      cat "$WORK/mi-curl.err" 2>/dev/null || true
+      fail
+    fi
+    echo "NET-001 OK: an own-IP session's name routed through the proxy (VM host included)"
+
+    # A responder on THIS machine's real loopback: gvproxy NATs a box's
+    # connection to its host-gateway alias (100.64.255.254, `host.min.internal`
+    # per NET-003) to wherever gvproxy itself runs — this host natively, or the
+    # true outer host on a VM lane (crates/minimald/src/net/policy.rs
+    # host_reach_address / HostReach::Switch).
+    python3 -m http.server "$host_port" --bind 127.0.0.1 --directory "$WORK" \
+      >"$WORK/mi-host-responder.log" 2>&1 &
+    host_resp_pid=$!
+    host_ready=0
+    for _ in 1 2 3 4 5; do
+      curl -sS -o /dev/null --max-time 2 "http://127.0.0.1:$host_port/" 2>/dev/null && { host_ready=1; break; }
+      sleep 1
+    done
+    if [ "$host_ready" -ne 1 ]; then
+      echo "::error::the host-loopback responder for NET-003/NET-004 never came up on 127.0.0.1:$host_port"
+      fail
+    fi
+
+    net003_status="$(exec_status "$oi_sid" "http://host.min.internal:$host_port/")"
+    if [ "$net003_status" != "200" ]; then
+      echo "::error::NET-003: host.min.internal did not reach the host's loopback from an own-IP box"
+      cat "$WORK/mi-curl.err" 2>/dev/null || true
+      fail
+    fi
+    echo "NET-003 OK: host.min.internal resolved and reached the host's loopback"
+
+    net004_status="$(exec_status "$oi_sid" "http://100.64.255.254:$host_port/")"
+    if [ "$net004_status" != "200" ]; then
+      echo "::error::NET-004: the legacy literal host address did not route as host.min.internal"
+      cat "$WORK/mi-curl.err" 2>/dev/null || true
+      fail
+    fi
+    assert_log_has "deprecated literal host address" "NET-004 deprecation notice"
+    echo "NET-004 OK: the legacy literal routed as host.min.internal, with a deprecation notice"
+
+    kill "$oi_socat_pid" "$host_resp_pid" 2>/dev/null || true
+    wait "$oi_socat_pid" 2>/dev/null || true
+    wait "$host_resp_pid" 2>/dev/null || true
+    mnl session destroy --force "$oi_sid" >/dev/null 2>&1 || true
+    rm -rf "$OWNIP_SEED_DIR"; OWNIP_SEED_DIR=""
+  else
+    echo "own-IP / host.min.internal proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+  fi
+
+  echo "::endgroup::"
+}
+
+E2E_CASE="${E2E_CASE:-${1:-}}"
+if [ -n "$E2E_CASE" ]; then
+  case "$E2E_CASE" in
+    min_internal_names_through_proxy) run_case_min_internal_names_through_proxy; exit $? ;;
+    *)
+      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy)" >&2
+      exit 2
+      ;;
+  esac
+fi
+
 # Cold: `min session activate` must auto-spawn the target's daemon and print the
 # new session id on stdout. The id is the LAST stdout line (any log lines
 # that slip through the RUST_LOG filter precede it), validated as a UUID.
