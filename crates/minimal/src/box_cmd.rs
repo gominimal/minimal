@@ -1,4 +1,5 @@
-//! `min box spec`: what a box's spec asks for and what the box is given.
+//! `min box spec` and `min box audit`: what a box's spec asks for and what the
+//! box is given, and what the proxy has since done for it.
 //!
 //! The review surface for a box's credentials (BEP-038): the fingerprint of
 //! the host's interception root, each grant with the upstream hosts its
@@ -10,12 +11,23 @@
 //! host cannot honour is refused with exit 3 naming every cause — including a
 //! grant declaring scopes narrower than the `full` member an un-enrolled host
 //! mints, until the operator acknowledges the widening (BEP-057).
+//!
+//! `min box audit <box>` is the read side (BEP-042): the proxy's own records
+//! for that box and no other's, from the log beside its control socket.
+//! `--parent` merges every box under one onto a single stream, `--follow`
+//! tails what the proxy appends next, and `-o jsonl` prints the log's own
+//! lines. `self` is refused while the host is not enrolled — a box has no
+//! identity surface to read its trail through — naming the host command that
+//! reads it.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::Context as _;
+use anyhow::{Context as _, bail};
+use bep::audit::{Reader, Record, Subject};
 
-use crate::{BoxSpecArgs, GlobalArgs};
+use crate::{AuditFormat, BoxAuditArgs, BoxSpecArgs, GlobalArgs};
 
 /// One store reference of a box spec: the identifier the box declares, its
 /// store, and the upstream authorities the client's `[secret-store-rules]`
@@ -322,6 +334,161 @@ pub fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> Result<(), anyhow
     expansion.map(|_| ()).map_err(anyhow::Error::from)
 }
 
+/// The box `self` names: the box this command runs in.
+const SELF: &str = "self";
+
+/// The defined error `min box audit self` is refused with while the host is
+/// not enrolled (BEP-042).
+const SELF_UNSUPPORTED: &str = "audit_self_unsupported_unenrolled";
+
+/// The variable a session carries its own name in, seeded by the daemon
+/// (`minimald`'s session baseline environment): what a box's own name is,
+/// when this command runs inside one.
+const SESSION_NAME_ENV: &str = "MINIMAL_SESSION_NAME";
+
+/// How long a `--follow` read waits before polling the log again.
+const FOLLOW_POLL: Duration = Duration::from_millis(250);
+
+/// A tailing read: how long to wait between polls, and what tells the read it
+/// has what it came for. `min box audit --follow` never has enough — an
+/// interrupt ends it — so only the tests ever answer `true`.
+#[derive(Debug, Clone, Copy)]
+struct Tail {
+    poll: Duration,
+    enough: fn(records: usize, polls: u32) -> bool,
+}
+
+/// What `--follow` answers when asked whether it has enough.
+fn never_enough(_records: usize, _polls: u32) -> bool {
+    false
+}
+
+/// The proxy's audit log: `<minimal_dir>/bep/audit.log`, beside the control
+/// socket ([`crate::auth::control_socket_path`]), named by the constant
+/// `minvmd` starts the proxy with so the reader and the writer cannot drift.
+fn audit_log_path(minimal_dir: Option<&Path>) -> PathBuf {
+    crate::auth::control_socket_path(minimal_dir).with_file_name(minvmd::net::BEP_AUDIT_LOG_FILE)
+}
+
+/// The defined error `self` is refused with: an un-enrolled host has no
+/// `identity.sock` for a box to read its own trail through, so the trail is
+/// read on the host by name. `in_box` names the box when this process runs in
+/// one, so the refusal can print the command to run.
+fn self_refusal(in_box: Option<&str>) -> String {
+    let box_id = in_box.unwrap_or("<box>");
+    format!(
+        "{SELF_UNSUPPORTED}: `self` needs the box's own identity surface, which this host does \
+         not have while it is not enrolled; run `min box audit {box_id}` on the host instead"
+    )
+}
+
+/// The records `args` asks for: one box's, or every box under one.
+/// `in_box` is the box this process runs in, when it runs in one.
+fn subject_of(args: &BoxAuditArgs, in_box: Option<&str>) -> Result<Subject, anyhow::Error> {
+    let (named, children) = match (args.box_id.as_deref(), args.parent.as_deref()) {
+        (Some(box_id), None) => (box_id, false),
+        (None, Some(parent)) => (parent, true),
+        // The argument group admits exactly one of the two; a build that
+        // loses it says so rather than guessing which was meant.
+        _ => bail!("name one box to read, or one parent with `--parent <box>`"),
+    };
+    if named == SELF {
+        bail!(self_refusal(in_box));
+    }
+    Ok(if children {
+        Subject::Children(named.to_owned())
+    } else {
+        Subject::Box(named.to_owned())
+    })
+}
+
+/// One record as a line of the default output: its own box first, so a merged
+/// `--parent` read names the box of every record on the stream.
+fn render_record(record: &Record) -> String {
+    let marker = if record.marker.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", record.marker)
+    };
+    format!(
+        "{sub}  {kind} {decision}  {authority}  {credential}  {resource} {permission}{marker}",
+        sub = record.sub,
+        kind = record.kind,
+        decision = record.decision,
+        authority = record.authority,
+        credential = record.credential,
+        resource = record.resource,
+        permission = record.permission,
+    )
+}
+
+/// Writes every record `subject` wants and, with `tail` set, keeps polling for
+/// the records appended after the replay (BEP-042). Returns how many records
+/// were written.
+fn stream(
+    reader: &mut Reader,
+    subject: &Subject,
+    format: AuditFormat,
+    out: &mut impl Write,
+    tail: Option<Tail>,
+) -> Result<usize, anyhow::Error> {
+    let mut written = 0;
+    let mut polls = 0;
+    loop {
+        for record in reader.read(subject)? {
+            match format {
+                AuditFormat::Text => writeln!(out, "{}", render_record(&record))?,
+                AuditFormat::Jsonl => writeln!(out, "{}", record.line())?,
+            }
+            written += 1;
+        }
+        out.flush()?;
+        let Some(tail) = tail else {
+            return Ok(written);
+        };
+        polls += 1;
+        if (tail.enough)(written, polls) {
+            return Ok(written);
+        }
+        std::thread::sleep(tail.poll);
+    }
+}
+
+/// Prints one box's audit trail, or every box's under one, from the proxy's
+/// log (BEP-042). `--follow` tails the log until the command is interrupted.
+///
+/// # Errors
+///
+/// A `self` subject while the host is not enrolled, an unreadable log, or a
+/// log line that is no record.
+pub fn cmd_box_audit(global: &GlobalArgs, args: BoxAuditArgs) -> Result<(), anyhow::Error> {
+    let in_box = std::env::var(SESSION_NAME_ENV).ok();
+    let subject = subject_of(&args, in_box.as_deref())?;
+    let log = audit_log_path(global.minimal_dir.as_deref());
+    // One segment today; segment rotation extends the list, and the reader
+    // already reads across whatever it is given.
+    let mut reader = Reader::open([log]);
+    let segments = reader.segments();
+    let tail = args.follow.then_some(Tail {
+        poll: FOLLOW_POLL,
+        enough: never_enough,
+    });
+    let records = stream(
+        &mut reader,
+        &subject,
+        args.output,
+        &mut std::io::stdout().lock(),
+        tail,
+    )?;
+    tracing::info!(
+        box_id = %subject,
+        segments,
+        records,
+        "read the box audit trail"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,5 +687,254 @@ mod tests {
             })) => assert_eq!(args.path.as_deref(), Some("/repo/web")),
             _ => panic!("expected `box spec` with a path"),
         }
+    }
+
+    /// An event the proxy records for `box_id`, with the authority varying per
+    /// record so one record is told from another in the output.
+    fn audit_event(box_id: &str, authority: &str) -> bep::Event {
+        bep::Event {
+            kind: bep::Kind::Decision,
+            box_id: box_id.to_owned(),
+            authority: authority.to_owned(),
+            credential: Some("github:user-token".to_owned()),
+            mapping: bep::Mapping::mapped("repo:acme/web", "contents:write"),
+            decision: bep::audit::Decision::Admit,
+            marker: None,
+        }
+    }
+
+    /// Appends `events` to the log at `path`, in order, as the proxy would.
+    fn log_with(path: &Path, events: &[bep::Event]) {
+        let mut log = bep::Log::open(path).expect("the log opens for append");
+        for event in events {
+            log.append(event).expect("the log takes an append");
+        }
+    }
+
+    /// The arguments `argv` parses to, as the command receives them.
+    fn audit_args(argv: &[&str]) -> BoxAuditArgs {
+        use clap::Parser as _;
+
+        match crate::Cli::try_parse_from(argv)
+            .expect("the audit form parses")
+            .command
+        {
+            Some(crate::Command::Box(crate::BoxArgs {
+                command: crate::BoxCommand::Audit(args),
+            })) => args,
+            _ => panic!("expected `box audit`"),
+        }
+    }
+
+    /// One read of the log at `path`, with no tailing: what it printed, and
+    /// how many records it wrote.
+    fn read(path: &Path, args: &BoxAuditArgs) -> (String, usize) {
+        let subject = subject_of(args, None).expect("the subject is a box");
+        let mut reader = Reader::open([path.to_path_buf()]);
+        let mut out = Vec::new();
+        let written = stream(&mut reader, &subject, args.output, &mut out, None)
+            .expect("the read prints the trail");
+        (
+            String::from_utf8(out).expect("the output is UTF-8"),
+            written,
+        )
+    }
+
+    /// BEP-042: the command prints the records whose subject is the named box
+    /// and no other's — a box that no longer exists included, since the log is
+    /// the proxy's — in either output form.
+    #[test]
+    fn box_audit_filters_to_one_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let mut off_module = audit_event("api", "packages.example");
+        off_module.credential = None;
+        off_module.mapping = bep::Mapping::Unmapped;
+        off_module.marker = Some("off_module".to_owned());
+        off_module.decision = bep::audit::Decision::Refuse;
+        log_with(
+            &path,
+            &[
+                audit_event("web", "api.github.com"),
+                off_module,
+                audit_event("web", "codeload.github.com"),
+                // A box that has since been removed: its records stay.
+                audit_event("gone-9f2c", "uploads.github.com"),
+            ],
+        );
+
+        let (text, written) = read(&path, &audit_args(&["min", "box", "audit", "web"]));
+        assert_eq!(written, 2, "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines.iter().all(|line| line.starts_with("web  ")), "{text}");
+        assert!(lines[0].contains("api.github.com"), "{text}");
+        assert!(lines[1].contains("codeload.github.com"), "{text}");
+        // Nothing of another box reaches the output: not its name, not its
+        // authority, not its marker.
+        for absent in ["packages.example", "off_module", "gone-9f2c"] {
+            assert!(!text.contains(absent), "{absent} reached:\n{text}");
+        }
+        // Each line carries what the proxy decided for that box.
+        assert!(lines[0].contains("decision admit"), "{text}");
+        assert!(lines[0].contains("github:user-token"), "{text}");
+        assert!(lines[0].contains("repo:acme/web contents:write"), "{text}");
+
+        // `-o jsonl` prints the log's own lines for that box and no other's.
+        let (jsonl, written) = read(
+            &path,
+            &audit_args(&["min", "box", "audit", "web", "-o", "jsonl"]),
+        );
+        assert_eq!(written, 2);
+        let held: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        for line in jsonl.lines() {
+            let record: Record = serde_json_lenient::from_str(line).expect("a record per line");
+            assert_eq!(record.sub, "web");
+            assert!(
+                held.iter().any(|line_of_log| line_of_log == line),
+                "{line} is not a line of the log"
+            );
+        }
+
+        // A removed box's trail reads the same: nothing consults the session
+        // store, so `min box rm` never takes the records away.
+        let (reaped, written) = read(&path, &audit_args(&["min", "box", "audit", "gone-9f2c"]));
+        assert_eq!(written, 1, "{reaped}");
+        assert!(reaped.starts_with("gone-9f2c  "), "{reaped}");
+
+        // The grammar names a box or a parent; neither names a read.
+        use clap::Parser as _;
+        assert!(crate::Cli::try_parse_from(["min", "box", "audit"]).is_err());
+    }
+
+    /// BEP-042: `--follow` replays the box's records and then prints the ones
+    /// the proxy appends after the replay, in that order.
+    #[test]
+    fn box_audit_follow_replays_then_tails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        log_with(
+            &path,
+            &[
+                audit_event("web", "api.github.com"),
+                audit_event("other", "github.com"),
+                audit_event("web", "codeload.github.com"),
+            ],
+        );
+
+        // Appended while the read is already tailing.
+        let appending = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(50));
+                log_with(&path, &[audit_event("web", "uploads.github.com")]);
+            }
+        });
+
+        let args = audit_args(&["min", "box", "audit", "web", "--follow"]);
+        assert!(args.follow);
+        let subject = subject_of(&args, None).expect("the subject is a box");
+        let mut reader = Reader::open([path.clone()]);
+        let mut out = Vec::new();
+        let written = stream(
+            &mut reader,
+            &subject,
+            args.output,
+            &mut out,
+            // Three of the box's records, or five seconds of polling: the
+            // bound keeps a failure a failure instead of a hang.
+            Some(Tail {
+                poll: Duration::from_millis(10),
+                enough: |records, polls| records >= 3 || polls >= 500,
+            }),
+        )
+        .expect("the follow read prints the trail");
+        appending.join().expect("the appending thread");
+
+        let text = String::from_utf8(out).expect("the output is UTF-8");
+        assert_eq!(written, 3, "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        // The replay first, in log order, then what was appended after it.
+        assert!(lines[0].contains("api.github.com"), "{text}");
+        assert!(lines[1].contains("codeload.github.com"), "{text}");
+        assert!(lines[2].contains("uploads.github.com"), "{text}");
+        assert!(lines.iter().all(|line| line.starts_with("web  ")), "{text}");
+    }
+
+    /// BEP-042: `--parent` merges the records of every box under the named one
+    /// onto one stream, each record naming its own box.
+    #[test]
+    fn box_audit_parent_merges_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        log_with(
+            &path,
+            &[
+                audit_event("web/agent-1", "api.github.com"),
+                audit_event("other/agent-1", "github.com"),
+                audit_event("web", "codeload.github.com"),
+                audit_event("web/task-build", "uploads.github.com"),
+                audit_event("web/agent-1", "github.com"),
+            ],
+        );
+
+        let args = audit_args(&["min", "box", "audit", "--parent", "web"]);
+        assert_eq!(args.box_id, None);
+        let (text, written) = read(&path, &args);
+        assert_eq!(written, 3, "{text}");
+        let boxes: Vec<&str> = text
+            .lines()
+            .map(|line| {
+                line.split_whitespace()
+                    .next()
+                    .expect("each line names a box")
+            })
+            .collect();
+        // Both children, in log order, each naming itself — never the
+        // parent's own records, and never another parent's child.
+        assert_eq!(boxes, ["web/agent-1", "web/task-build", "web/agent-1"]);
+        assert!(!text.contains("other/agent-1"), "{text}");
+        assert!(!text.contains("codeload.github.com"), "{text}");
+    }
+
+    /// BEP-042: `self` is refused with the defined error
+    /// `audit_self_unsupported_unenrolled`, naming the box the host reads by
+    /// name instead — the box's own name when the command runs inside one.
+    #[test]
+    fn box_audit_self_unenrolled_refused_with_error() {
+        let inside = subject_of(
+            &audit_args(&["min", "box", "audit", "self"]),
+            Some("web-4f21"),
+        )
+        .expect_err("`self` is refused while the host is not enrolled")
+        .to_string();
+        assert!(inside.starts_with(SELF_UNSUPPORTED), "{inside}");
+        assert!(inside.contains("min box audit web-4f21"), "{inside}");
+        assert!(inside.contains("not enrolled"), "{inside}");
+
+        // Outside a box the command is still named, with the box left to the
+        // reader to fill in.
+        let outside = subject_of(&audit_args(&["min", "box", "audit", "self"]), None)
+            .expect_err("`self` is refused off a box too")
+            .to_string();
+        assert!(outside.contains("min box audit <box>"), "{outside}");
+
+        // `--parent self` is the same refusal: it names `self` too.
+        let parent = subject_of(
+            &audit_args(&["min", "box", "audit", "--parent", "self"]),
+            Some("web-4f21"),
+        )
+        .expect_err("`--parent self` is refused as well")
+        .to_string();
+        assert!(parent.starts_with(SELF_UNSUPPORTED), "{parent}");
+
+        // Any other name is read, not refused.
+        let named = subject_of(&audit_args(&["min", "box", "audit", "myself"]), None)
+            .expect("a box named otherwise is read");
+        assert_eq!(named, Subject::Box("myself".to_owned()));
     }
 }

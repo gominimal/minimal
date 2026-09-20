@@ -20,6 +20,11 @@
 //! The log is opened for append only and no record in it is ever modified or
 //! removed (BEP-041): [`Log::open`] finds the chain head by reading the last
 //! line, and from then on the file only grows.
+//!
+//! Reading is [`Reader`], which `min box audit` renders: the records one
+//! [`Subject`] wants — one box's, or every box under one — across the retained
+//! segments, resumable so a `--follow` read tails what is appended after the
+//! replay (BEP-042).
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -295,6 +300,20 @@ pub enum AuditError {
         #[source]
         source: io::Error,
     },
+    /// A segment a read covers could not be read.
+    #[error("reading the audit log {}: {source}", path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// A segment holds a line that is no record.
+    #[error("the audit log {} holds a line that is no record: {source}", path.display())]
+    Malformed {
+        path: PathBuf,
+        #[source]
+        source: serde_json_lenient::Error,
+    },
 }
 
 /// The one way the audit log is ever opened: for append, created when absent,
@@ -395,6 +414,128 @@ impl Log {
             "appended audit record"
         );
         Ok(record)
+    }
+}
+
+/// What separates a parent box from a child in a record's subject. A box's own
+/// name never carries it — session names are alphanumerics, `-`, `_` and `.` —
+/// so a subject holding one names a box under another.
+pub const CHILD_SEPARATOR: char = '/';
+
+/// Which records a read of the log wants (BEP-042).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Subject {
+    /// One box's records and no other's, whether or not the box still
+    /// exists: the log is the proxy's, so a reaped box's trail stays in it.
+    Box(String),
+    /// The records of every box under one, merged onto the one stream each
+    /// record names its own box on.
+    Children(String),
+}
+
+impl Subject {
+    /// Whether a record whose subject is `sub` belongs in this read.
+    #[must_use]
+    pub fn admits(&self, sub: &str) -> bool {
+        match self {
+            Self::Box(box_id) => sub == box_id,
+            Self::Children(parent) => sub
+                .strip_prefix(parent.as_str())
+                .and_then(|under| under.strip_prefix(CHILD_SEPARATOR))
+                .is_some_and(|child| !child.is_empty()),
+        }
+    }
+}
+
+impl fmt::Display for Subject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Box(box_id) => f.write_str(box_id),
+            Self::Children(parent) => write!(f, "{parent}{CHILD_SEPARATOR}*"),
+        }
+    }
+}
+
+/// A read of the audit log: the records one [`Subject`] wants, across every
+/// retained segment, oldest first (BEP-042).
+///
+/// A reader remembers how far into each segment it has read, so reading again
+/// returns only what was appended since — which is what `min box audit
+/// --follow` tails with. Only whole lines are ever taken: a line the proxy
+/// has not finished writing is left for the next read. A segment that is not
+/// there reads as empty, because a host whose proxy has never run has no log.
+#[derive(Debug)]
+pub struct Reader {
+    /// The segments, oldest first.
+    segments: Vec<PathBuf>,
+    /// The bytes of each segment already returned, parallel to `segments`.
+    read: Vec<u64>,
+}
+
+impl Reader {
+    /// A read over `segments`, oldest first.
+    #[must_use]
+    pub fn open(segments: impl IntoIterator<Item = PathBuf>) -> Self {
+        let segments: Vec<PathBuf> = segments.into_iter().collect();
+        Self {
+            read: vec![0; segments.len()],
+            segments,
+        }
+    }
+
+    /// How many segments the read covers.
+    #[must_use]
+    pub fn segments(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// The records `subject` wants that this reader has not returned yet, in
+    /// the order the log holds them.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Read`] when a segment cannot be read, or
+    /// [`AuditError::Malformed`] when one holds a line that is no record.
+    pub fn read(&mut self, subject: &Subject) -> Result<Vec<Record>, AuditError> {
+        let mut records = Vec::new();
+        for (segment, read) in self.segments.iter().zip(&mut self.read) {
+            let bytes = match std::fs::read(segment) {
+                Ok(bytes) => bytes,
+                Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(AuditError::Read {
+                        path: segment.clone(),
+                        source,
+                    });
+                }
+            };
+            let from = usize::try_from(*read)
+                .unwrap_or(usize::MAX)
+                .min(bytes.len());
+            let mut taken = 0;
+            for line in bytes[from..].split_inclusive(|byte| *byte == b'\n') {
+                // A line with no newline yet is still being written: leave it.
+                if !line.ends_with(b"\n") {
+                    break;
+                }
+                taken += line.len();
+                let text = String::from_utf8_lossy(&line[..line.len() - 1]);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let record: Record = serde_json_lenient::from_str(&text).map_err(|source| {
+                    AuditError::Malformed {
+                        path: segment.clone(),
+                        source,
+                    }
+                })?;
+                if subject.admits(&record.sub) {
+                    records.push(record);
+                }
+            }
+            *read = u64::try_from(from + taken).unwrap_or(u64::MAX);
+        }
+        Ok(records)
     }
 }
 
@@ -613,6 +754,104 @@ mod tests {
             "a reopened log rewrote a record"
         );
         assert_eq!(lines(&path).len(), 4);
+    }
+
+    /// BEP-042: a read returns the records of the subject it names and no
+    /// other's — one box, or every box under one — takes only whole lines, and
+    /// returns each record once, so a later read carries only what was
+    /// appended since.
+    #[test]
+    fn audit_reader_filters_by_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut log = Log::open(&path).unwrap();
+        for event in [
+            decision("web", "api.github.com", Decision::Admit),
+            decision("api", "github.com", Decision::Admit),
+            decision("web/agent-1", "api.github.com", Decision::Refuse),
+            decision("web", "codeload.github.com", Decision::Admit),
+            decision("web/task-build", "uploads.github.com", Decision::Admit),
+            decision("api/agent-1", "api.github.com", Decision::Admit),
+        ] {
+            log.append(&event).unwrap();
+        }
+
+        // One box: its own records, in log order, and nothing of the box whose
+        // name it is a prefix of.
+        let mut reader = Reader::open([path.clone()]);
+        assert_eq!(reader.segments(), 1);
+        let web = reader.read(&Subject::Box("web".to_owned())).unwrap();
+        assert_eq!(
+            web.iter()
+                .map(|record| record.authority.as_str())
+                .collect::<Vec<_>>(),
+            ["api.github.com", "codeload.github.com"]
+        );
+        assert!(web.iter().all(|record| record.sub == "web"));
+
+        // Read again and the same records do not come back; a record appended
+        // after the first read does.
+        assert!(
+            reader
+                .read(&Subject::Box("web".to_owned()))
+                .unwrap()
+                .is_empty()
+        );
+        log.append(&decision("web", "github.com", Decision::Refuse))
+            .unwrap();
+        let tailed = reader.read(&Subject::Box("web".to_owned())).unwrap();
+        assert_eq!(tailed.len(), 1);
+        assert_eq!(tailed[0].authority, "github.com");
+
+        // Every box under one, merged onto one stream in log order, each
+        // record naming its own box — never the parent's own records, and
+        // never another parent's children.
+        let mut children = Reader::open([path.clone()]);
+        let under_web = children.read(&Subject::Children("web".to_owned())).unwrap();
+        assert_eq!(
+            under_web
+                .iter()
+                .map(|record| record.sub.as_str())
+                .collect::<Vec<_>>(),
+            ["web/agent-1", "web/task-build"]
+        );
+
+        // A line still being written is left for the next read.
+        let mut partial = Reader::open([path.clone()]);
+        let full = std::fs::read_to_string(&path).unwrap();
+        partial.read(&Subject::Box("web".to_owned())).unwrap();
+        let half = decision("web", "api.github.com", Decision::Admit);
+        let held = Record::new(&half, Hash::ZERO).line();
+        std::fs::write(&path, format!("{full}{held}")).unwrap();
+        assert!(
+            partial
+                .read(&Subject::Box("web".to_owned()))
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(&path, format!("{full}{held}\n")).unwrap();
+        assert_eq!(
+            partial.read(&Subject::Box("web".to_owned())).unwrap().len(),
+            1
+        );
+
+        // A segment that is not there reads as empty: a host whose proxy has
+        // never run has no log, not an error.
+        let mut absent = Reader::open([dir.path().join("rotated.jsonl")]);
+        assert!(
+            absent
+                .read(&Subject::Box("web".to_owned()))
+                .unwrap()
+                .is_empty()
+        );
+
+        // A line that is no record is named, not skipped.
+        std::fs::write(&path, format!("{full}not a record\n")).unwrap();
+        let mut broken = Reader::open([path.clone()]);
+        let error = broken
+            .read(&Subject::Box("web".to_owned()))
+            .expect_err("a line that is no record is an error");
+        assert!(matches!(error, AuditError::Malformed { .. }), "{error}");
     }
 
     /// A request as the proxy handles it: the fields it may record, and the

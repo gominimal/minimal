@@ -329,6 +329,14 @@ pub enum BoxCommand {
     /// the authorities registered for it. A spec this host cannot honour is
     /// refused with exit 3 naming every cause, as activation would.
     Spec(BoxSpecArgs),
+    /// Print one box's audit trail from the box egress proxy's log
+    ///
+    /// Every decision the proxy made for the box, in the order it made them,
+    /// and the mints and revocations recorded for it. The log is the proxy's,
+    /// so a box that has been stopped or removed still has its trail.
+    /// `--parent` merges the records of every box under one instead, each
+    /// record naming its own box.
+    Audit(BoxAuditArgs),
 }
 
 #[derive(Debug, Args)]
@@ -336,6 +344,33 @@ pub struct BoxSpecArgs {
     /// Project path. Defaults to the directory set by `-C`/`--repo-dir`,
     /// or the current working directory when neither is given.
     pub path: Option<String>,
+}
+
+#[derive(Debug, Args)]
+#[command(group(ArgGroup::new("audit-subject").args(["box_id", "parent"]).required(true).multiple(false)))]
+pub struct BoxAuditArgs {
+    /// The box whose records to print
+    #[arg(value_name = "BOX")]
+    pub box_id: Option<String>,
+    /// Merge the records of every box under this one onto one stream
+    #[arg(long, value_name = "BOX")]
+    pub parent: Option<String>,
+    /// Replay the records and then keep printing new ones until interrupted
+    #[arg(long)]
+    pub follow: bool,
+    /// Output format: one line per record (`text`, the default), or the
+    /// log's own JSON lines (`jsonl`)
+    #[arg(short = 'o', long = "output", value_enum, default_value_t = AuditFormat::Text)]
+    pub output: AuditFormat,
+}
+
+/// How `min box audit` renders a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum AuditFormat {
+    /// One line per record.
+    Text,
+    /// The record's own JSON line, as the log holds it.
+    Jsonl,
 }
 
 #[derive(Debug, Args)]

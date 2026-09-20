@@ -476,6 +476,45 @@ The acknowledgement is yours, never a project's: a `minimal.toml` that sets
 warning, so the scopes it declares are honoured unchanged the moment the host
 enrolls.
 
+### `box audit`
+
+```
+min box audit <BOX> [--follow] [-o <FORMAT>]
+min box audit --parent <BOX> [--follow] [-o <FORMAT>]
+```
+
+Prints one box's audit trail: every decision the Box Egress Proxy made for
+that box — admitted or refused, with the upstream authority, the member or
+store identifier, what the module mapped the request to and any marker — plus
+the mints and revocations recorded for it, in the order the proxy recorded
+them. One line per record, the box first:
+
+```console
+$ min box audit web
+web  decision admit  api.github.com  github:user-token  repo:acme/web contents:write
+web  decision refuse  packages.example  none  module_unmapped module_unmapped (off_module)
+web  mint admit  api.github.com  github:user-token  module_unmapped module_unmapped
+```
+
+`-o jsonl` prints the log's own JSON lines instead, for `jq` and for scripts;
+`-o text` is the default. `--follow` replays the box's records and then keeps
+printing the ones the proxy appends, until you interrupt it. `--parent <BOX>`
+merges the records of every box under that one onto a single stream, where
+each line still names its own box.
+
+The log is the proxy's, not part of a box's record: a box that has been
+stopped or removed still has its trail, and `min box audit` prints it. The
+records carry no credential, no injected header value and no request body.
+
+`min box audit self` is refused while this host is not enrolled — a box has no
+identity surface of its own to read the trail through — with the defined error
+`audit_self_unsupported_unenrolled`, naming the command to run on the host:
+
+```console
+$ min box audit self
+Error: audit_self_unsupported_unenrolled: `self` needs the box's own identity surface, which this host does not have while it is not enrolled; run `min box audit web-4f21` on the host instead
+```
+
 ### `completions` (alias: `completion`)
 
 ```
