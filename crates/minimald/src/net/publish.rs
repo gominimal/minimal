@@ -23,15 +23,27 @@
 //! [`HostnameRegistry`](super::dns::HostnameRegistry): that one routes a
 //! `Host:` header to where the proxy forwards, this one says what a native
 //! lookup of the name answers.
+//!
+//! A box's declared ports are bound before its name is registered (NET-121):
+//! the caller [leases](PublishTable::lease) the address first, binds a
+//! [`Forwarders`] set on it, and only then [registers](PublishTable::register)
+//! the name — so a name never answers ahead of the ports it promises, and a
+//! connection to a declared port nothing is listening on yet is refused by the
+//! box rather than timed out at the host (NET-014).
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::fmt;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use serde::Serialize;
 use sessions::core::loopback_alloc::{LoopbackAllocator, RangeExhausted};
 use sessions::{NetworkMode, SessionId};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::sync::CancellationToken;
 
 use super::dns::HOSTNAME_SUFFIX;
 
@@ -52,6 +64,358 @@ pub struct PortCollision {
     pub port: u16,
     /// The other box's name.
     pub with: String,
+}
+
+/// How a declared port is answered at the box's published address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortAnswer {
+    /// A forwarder bound on the box's own address, sending what it accepts to
+    /// this upstream — the host-side forward the box's switch publishes for
+    /// the port.
+    Forwarded(SocketAddr),
+    /// Published with no forwarder interposed: on a shared address the box's
+    /// own listeners answer its port numbers, so binding there would take the
+    /// port from the box itself, and a UDP mapping's datagrams are carried by
+    /// the switch forward rather than by a connection-oriented forwarder.
+    Direct,
+}
+
+/// One port a box's ingress declaration names: the box's own port number, as
+/// the zone publishes it, and how the box answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclaredPort {
+    /// The box's own port number.
+    pub port: u16,
+    /// How the port is answered at the box's published address.
+    pub answer: PortAnswer,
+}
+
+/// What holds a published port, as the published-port table shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ForwarderState {
+    /// A forwarder is bound on the box's address and holding it.
+    Bound,
+    /// The port's ingress was revoked: its forwarder is unbound and the
+    /// connections it held were terminated.
+    Revoked,
+    /// The box's own listener answers the port; no forwarder was interposed.
+    Direct,
+}
+
+/// One published port and what holds it: the published-port table the
+/// diagnostics bundle carries, where a revoked port stays visible as the
+/// revocation that closed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PublishedPort {
+    /// The box's own port number.
+    pub port: u16,
+    /// What holds it.
+    pub state: ForwarderState,
+}
+
+/// A declared port whose forwarder could not bind (NET-121). Reported with the
+/// reason; nothing is substituted for it — not another port, not another
+/// address, and not the box's name.
+#[derive(Debug)]
+pub struct BindFailure {
+    /// The declared port whose forwarder could not bind.
+    pub port: u16,
+    /// The box's published address, which the forwarder would have bound on.
+    pub address: Ipv4Addr,
+    /// Why the bind failed.
+    pub error: io::Error,
+}
+
+impl fmt::Display for BindFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "could not bind the forwarder for declared port {} on {}: {}",
+            self.port, self.address, self.error
+        )
+    }
+}
+
+/// One bound forwarder: the accept loop owning the listener and every
+/// connection through it, and the token that ends both.
+#[derive(Debug)]
+struct Forwarder {
+    port: u16,
+    cancel: CancellationToken,
+    serving: JoinHandle<()>,
+}
+
+impl Drop for Forwarder {
+    /// Unbinds the port and ends its connections when the publication goes
+    /// away without an explicit revocation — the box stopped, the name was
+    /// re-published, or a later port in the same set failed to bind. The
+    /// accept loop owns the listener and the connection tasks, so cancelling
+    /// it releases both.
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// A box's declared ports, with a forwarder bound for each one a forwarder is
+/// interposed on (NET-121).
+///
+/// A box is registered in the table with this in hand, so no name is
+/// registered before its declared ports are bound. The set holds its
+/// forwarders until it is dropped — at withdraw, when the box stops — or until
+/// a port's ingress is [revoked](PublishTable::revoke_port).
+#[derive(Debug, Default)]
+pub struct Forwarders {
+    /// The forwarders bound, one per [`PortAnswer::Forwarded`] port.
+    bound: Vec<Forwarder>,
+    /// Every declared port and what holds it, in port order.
+    ports: Vec<PublishedPort>,
+}
+
+impl Forwarders {
+    /// Binds a forwarder on `address` for each declared port answered by one,
+    /// in port order, and records the rest as published directly.
+    ///
+    /// A held port is reported, never swapped for another: no second address
+    /// and no OS-chosen port is tried, and the forwarders already bound are
+    /// released before the failure returns, so a half-bound box is never
+    /// published.
+    ///
+    /// Logs one info line per bind and one error line per failed bind, each
+    /// naming the port.
+    ///
+    /// # Errors
+    ///
+    /// [`BindFailure`] for the first declared port whose forwarder cannot
+    /// bind, carrying the reason.
+    pub async fn bind(address: Ipv4Addr, declared: &[DeclaredPort]) -> Result<Self, BindFailure> {
+        let mut declared = declared.to_vec();
+        declared.sort_unstable_by_key(|d| d.port);
+        declared.dedup_by_key(|d| d.port);
+
+        let mut forwarders = Self::default();
+        for DeclaredPort { port, answer } in declared {
+            let PortAnswer::Forwarded(upstream) = answer else {
+                forwarders.ports.push(PublishedPort {
+                    port,
+                    state: ForwarderState::Direct,
+                });
+                continue;
+            };
+            let listener = match TcpListener::bind(SocketAddr::new(IpAddr::V4(address), port)).await
+            {
+                Ok(listener) => listener,
+                Err(error) => {
+                    tracing::error!(
+                        %address,
+                        port,
+                        %error,
+                        "could not bind a declared port's forwarder"
+                    );
+                    // `forwarders` drops here, unbinding what it had bound.
+                    return Err(BindFailure {
+                        port,
+                        address,
+                        error,
+                    });
+                }
+            };
+            let cancel = CancellationToken::new();
+            let serving = tokio::spawn(serve_forward(listener, upstream, port, cancel.clone()));
+            tracing::info!(
+                %address,
+                port,
+                %upstream,
+                "bound a declared port's forwarder"
+            );
+            forwarders.bound.push(Forwarder {
+                port,
+                cancel,
+                serving,
+            });
+            forwarders.ports.push(PublishedPort {
+                port,
+                state: ForwarderState::Bound,
+            });
+        }
+        Ok(forwarders)
+    }
+
+    /// The declared ports of a box whose published address answers them
+    /// itself, with no forwarder interposed: a host-address box, and the
+    /// `127.0.0.1` interim (NET-123), where every box shares the one address.
+    #[must_use]
+    pub fn direct(ports: &[u16]) -> Self {
+        let mut ports = ports.to_vec();
+        ports.sort_unstable();
+        ports.dedup();
+        Self {
+            bound: Vec::new(),
+            ports: ports
+                .into_iter()
+                .map(|port| PublishedPort {
+                    port,
+                    state: ForwarderState::Direct,
+                })
+                .collect(),
+        }
+    }
+
+    /// The box's own port numbers, in order: what the zone publishes.
+    #[must_use]
+    pub fn ports(&self) -> Vec<u16> {
+        self.ports.iter().map(|p| p.port).collect()
+    }
+
+    /// Every declared port with what holds it, for the published-port table.
+    #[must_use]
+    pub fn published(&self) -> Vec<PublishedPort> {
+        self.ports.clone()
+    }
+
+    /// Cancels the forwarder bound for `port` and takes it out of the set,
+    /// which unbinds the port and terminates the connections it held. The half
+    /// a revocation and a withdrawal share.
+    fn take(&mut self, port: u16) -> Option<Unbinding> {
+        let index = self.bound.iter().position(|f| f.port == port)?;
+        let forwarder = self.bound.remove(index);
+        // Cancelled here, not left to the drop: [`Unbinding::finished`] waits
+        // for the accept loop, which only ends once it is cancelled.
+        forwarder.cancel.cancel();
+        Some(Unbinding(forwarder))
+    }
+
+    /// Revokes `port`'s ingress: unbinds its forwarder, terminates the
+    /// connections it held, and marks the port revoked in the published-port
+    /// table. Returns the teardown to await, or `None` when no bound forwarder
+    /// held the port.
+    fn revoke(&mut self, port: u16) -> Option<Unbinding> {
+        let unbinding = self.take(port)?;
+        for published in &mut self.ports {
+            if published.port == port {
+                published.state = ForwarderState::Revoked;
+            }
+        }
+        tracing::info!(
+            port,
+            "revoked a declared port's ingress: unbound its forwarder and ended its connections"
+        );
+        Some(unbinding)
+    }
+
+    /// Unbinds every forwarder the box holds, as the box stops. The ports stay
+    /// listed as they were — nothing revoked them, the box went away — and
+    /// each unbind is logged with its port.
+    fn unbind_all(&mut self) -> Vec<Unbinding> {
+        let ports: Vec<u16> = self.bound.iter().map(|f| f.port).collect();
+        ports
+            .into_iter()
+            .filter_map(|port| {
+                let unbinding = self.take(port)?;
+                tracing::info!(port, "unbound a declared port's forwarder with its box");
+                Some(unbinding)
+            })
+            .collect()
+    }
+}
+
+/// A revoked forwarder's teardown, handed back so the caller can wait for the
+/// port to be unbound with the table's lock released.
+#[derive(Debug)]
+#[must_use]
+pub struct Unbinding(Forwarder);
+
+impl Unbinding {
+    /// Waits until the forwarder's accept loop has ended, which is when its
+    /// listener is unbound and the connections it held are dropped.
+    pub async fn finished(mut self) {
+        let _ = (&mut self.0.serving).await;
+    }
+}
+
+/// What withdrawing a box released: the address it was published at, and the
+/// teardown of the forwarders it held.
+#[derive(Debug)]
+pub struct Withdrawn {
+    /// The address the box was published at.
+    pub address: Ipv4Addr,
+    unbinding: Vec<Unbinding>,
+}
+
+impl Withdrawn {
+    /// Waits until every forwarder the box held is unbound, so a box
+    /// re-published at the address just released never races the listeners of
+    /// the publication that held it.
+    pub async fn finished(self) {
+        for unbinding in self.unbinding {
+            unbinding.finished().await;
+        }
+    }
+}
+
+/// Serves one declared port's forwarder: accepts on `listener` and sends each
+/// connection to `upstream`, until `cancel` fires.
+///
+/// Cancellation drops the listener, which unbinds the port, and the set of
+/// connection tasks, which terminates every connection the forwarder held.
+async fn serve_forward(
+    listener: TcpListener,
+    upstream: SocketAddr,
+    port: u16,
+    cancel: CancellationToken,
+) {
+    let mut held = JoinSet::new();
+    loop {
+        // Reap the connections that finished on their own, so a long-lived
+        // forwarder holds only live ones.
+        while held.try_join_next().is_some() {}
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((client, peer)) => {
+                    held.spawn(forward_connection(client, upstream, port, peer));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        port,
+                        %error,
+                        "a declared port's forwarder stopped accepting"
+                    );
+                    break;
+                }
+            },
+        }
+    }
+}
+
+/// Forwards one accepted connection to the box.
+///
+/// A box with nothing listening on the port refuses the connect, and the
+/// refusal is passed straight on by closing the connection rather than holding
+/// it open, so a client sees the box refuse rather than a host-side timeout
+/// (NET-014).
+async fn forward_connection(
+    mut client: TcpStream,
+    upstream: SocketAddr,
+    port: u16,
+    peer: SocketAddr,
+) {
+    match TcpStream::connect(upstream).await {
+        Ok(mut box_side) => {
+            if let Err(error) = tokio::io::copy_bidirectional(&mut client, &mut box_side).await {
+                tracing::debug!(port, %peer, %error, "a forwarded connection ended with an error");
+            }
+        }
+        Err(error) => {
+            tracing::debug!(
+                port,
+                %peer,
+                %upstream,
+                %error,
+                "the box refused a connection to a declared port"
+            );
+        }
+    }
 }
 
 /// What [`PublishTable::publish`] settled for a box.
@@ -78,6 +442,9 @@ pub struct PublishedBox {
     /// address either way; a shared-address box answers only while running.
     pub running: bool,
     pub ports: Vec<u16>,
+    /// Each published port with what holds it: the forwarder bound for it, the
+    /// revocation that closed it, or the box's own listener.
+    pub forwarders: Vec<PublishedPort>,
     pub collisions: Vec<PortCollision>,
 }
 
@@ -99,13 +466,43 @@ pub trait Zone: Send + Sync + 'static {
     fn lookup(&self, name: &str) -> Lookup;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Entry {
     session_id: SessionId,
     address: Ipv4Addr,
     kind: AddressKind,
     ports: Vec<u16>,
     running: bool,
+    /// The box's declared-port forwarders, held for as long as the entry is:
+    /// dropping it unbinds them (NET-121).
+    forwarders: Forwarders,
+}
+
+/// The address a box will be published at, leased before its name is
+/// registered so its declared ports can be bound on it first (NET-121).
+///
+/// Spent by [`PublishTable::register`], or handed back by
+/// [`PublishTable::release`] when a forwarder cannot bind.
+#[derive(Debug)]
+#[must_use]
+pub struct Lease {
+    address: Ipv4Addr,
+    kind: AddressKind,
+}
+
+impl Lease {
+    /// The leased address, which the box's forwarders bind on.
+    #[must_use]
+    pub fn address(&self) -> Ipv4Addr {
+        self.address
+    }
+
+    /// Whether the address is the box's own or its node's shared one, which
+    /// decides whether a forwarder is interposed on its ports at all.
+    #[must_use]
+    pub fn kind(&self) -> AddressKind {
+        self.kind
+    }
 }
 
 /// The table of published boxes: the host-wide address allocator plus every
@@ -182,11 +579,8 @@ impl PublishTable {
         ports: &[u16],
     ) -> Result<Publication, RangeExhausted> {
         self.withdraw(session_name);
-        let (address, kind) = match mode {
-            NetworkMode::HostNet => (self.node_address, AddressKind::Shared),
-            _ => (self.allocator.allocate()?, AddressKind::Own),
-        };
-        Ok(self.insert(session_id, session_name, address, kind, ports))
+        let lease = self.lease(mode)?;
+        Ok(self.insert(session_id, session_name, lease, Forwarders::direct(ports)))
     }
 
     /// Publishes `session_name`'s box at `interim`, the `127.0.0.1` the host
@@ -202,29 +596,98 @@ impl PublishTable {
         ports: &[u16],
     ) -> Publication {
         self.withdraw(session_name);
-        self.insert(
-            session_id,
-            session_name,
-            interim,
-            AddressKind::Shared,
-            ports,
-        )
+        let lease = self.lease_interim(interim);
+        self.insert(session_id, session_name, lease, Forwarders::direct(ports))
     }
 
-    /// Records the publication and logs it, the tail both publish paths
-    /// share.
+    /// Leases the address a box in `mode` will be published at — one of its
+    /// own for an own-address or `none` box, its node's for a host-address box
+    /// — without registering any name for it.
+    ///
+    /// The lease comes first so the box's declared ports can be bound on the
+    /// address before its name is registered (NET-121). The caller spends it
+    /// with [`Self::register`], or hands it back with [`Self::release`] when a
+    /// forwarder cannot bind.
+    ///
+    /// # Errors
+    ///
+    /// [`RangeExhausted`] when an own address is needed and the reserved
+    /// range has none free.
+    pub fn lease(&mut self, mode: NetworkMode) -> Result<Lease, RangeExhausted> {
+        Ok(match mode {
+            NetworkMode::HostNet => Lease {
+                address: self.node_address,
+                kind: AddressKind::Shared,
+            },
+            _ => Lease {
+                address: self.allocator.allocate()?,
+                kind: AddressKind::Own,
+            },
+        })
+    }
+
+    /// Leases `interim`, the `127.0.0.1` every box shares while the reserved
+    /// local range is absent (NET-123), as a shared address.
+    pub fn lease_interim(&mut self, interim: Ipv4Addr) -> Lease {
+        Lease {
+            address: interim,
+            kind: AddressKind::Shared,
+        }
+    }
+
+    /// Hands a lease back unspent, releasing an own address to the range. What
+    /// a caller does when its box's declared ports could not be bound, so no
+    /// name is registered for it.
+    pub fn release(&mut self, lease: Lease) {
+        if lease.kind == AddressKind::Own {
+            self.allocator.release(lease.address);
+        }
+    }
+
+    /// Registers `session_name`'s box at `lease`, with the forwarders already
+    /// bound for its declared ports (NET-121), and records those ports (the
+    /// box's own port numbers) untranslated. A box already published under the
+    /// name is withdrawn first, so a re-publish never leaks a lease and never
+    /// leaves the old publication's forwarders bound.
+    ///
+    /// Logs one info line for the publication and one warn line per
+    /// shared-address port collision.
+    pub fn register(
+        &mut self,
+        session_id: SessionId,
+        session_name: &str,
+        lease: Lease,
+        forwarders: Forwarders,
+    ) -> Publication {
+        self.withdraw(session_name);
+        self.insert(session_id, session_name, lease, forwarders)
+    }
+
+    /// Revokes a declared port's ingress on `session_name`'s box: unbinds its
+    /// forwarder and terminates the connections it holds, leaving the port in
+    /// the published-port table marked as the revocation that closed it.
+    ///
+    /// Returns the teardown for the caller to await with this table's lock
+    /// released, or `None` when no bound forwarder held the port.
+    pub fn revoke_port(&mut self, session_name: &str, port: u16) -> Option<Unbinding> {
+        let entry = self.boxes.get_mut(&hostname(session_name))?;
+        let unbinding = entry.forwarders.revoke(port)?;
+        self.changes.notify_one();
+        Some(unbinding)
+    }
+
+    /// Records the publication and logs it, the tail every publish path
+    /// shares.
     fn insert(
         &mut self,
         session_id: SessionId,
         session_name: &str,
-        address: Ipv4Addr,
-        kind: AddressKind,
-        ports: &[u16],
+        lease: Lease,
+        forwarders: Forwarders,
     ) -> Publication {
         let hostname = hostname(session_name);
-        let mut ports = ports.to_vec();
-        ports.sort_unstable();
-        ports.dedup();
+        let Lease { address, kind } = lease;
+        let ports = forwarders.ports();
         self.boxes.insert(
             hostname.clone(),
             Entry {
@@ -233,6 +696,7 @@ impl PublishTable {
                 kind,
                 ports: ports.clone(),
                 running: false,
+                forwarders,
             },
         );
         self.changes.notify_one();
@@ -264,15 +728,22 @@ impl PublishTable {
     }
 
     /// Withdraws `session_name`'s box, releasing its own address if it held
-    /// one. Returns the address it was published at, or `None` when nothing
-    /// was published under the name. Logs one info line for a released
-    /// lease.
-    pub fn withdraw(&mut self, session_name: &str) -> Option<Ipv4Addr> {
+    /// one and unbinding the forwarders it held for its declared ports — a
+    /// forwarder is held until the box stops and no longer (NET-121). Returns
+    /// what it released, or `None` when nothing was published under the name.
+    /// Logs one info line for a released lease.
+    ///
+    /// The forwarders are cancelled here and torn down by their own tasks; a
+    /// caller about to re-publish at the address just released awaits
+    /// [`Withdrawn::finished`] first, so the new bind does not race the old
+    /// listeners.
+    pub fn withdraw(&mut self, session_name: &str) -> Option<Withdrawn> {
         let hostname = hostname(session_name);
-        let entry = self.boxes.remove(&hostname)?;
+        let mut entry = self.boxes.remove(&hostname)?;
         if entry.kind == AddressKind::Own {
             self.allocator.release(entry.address);
         }
+        let unbinding = entry.forwarders.unbind_all();
         self.changes.notify_one();
         tracing::info!(
             session_id = %entry.session_id,
@@ -281,7 +752,10 @@ impl PublishTable {
             kind = ?entry.kind,
             "released a box's published address"
         );
-        Some(entry.address)
+        Some(Withdrawn {
+            address: entry.address,
+            unbinding,
+        })
     }
 
     /// Records whether `session_name`'s box is running. Returns `false` when
@@ -336,6 +810,7 @@ impl PublishTable {
                 kind: e.kind,
                 running: e.running,
                 ports: e.ports.clone(),
+                forwarders: e.forwarders.published(),
                 collisions: self.collisions_of(hostname),
             })
             .collect();
@@ -369,6 +844,10 @@ impl Zone for RwLock<PublishTable> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
 
     fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
@@ -425,7 +904,10 @@ mod tests {
 
         // Withdrawing releases the lease; a later box may take the address,
         // but never while the first is live.
-        assert_eq!(table.withdraw("web"), Some(web.address));
+        assert_eq!(
+            table.withdraw("web").map(|withdrawn| withdrawn.address),
+            Some(web.address)
+        );
         assert_eq!(table.lookup("web.min.internal"), Lookup::Unknown);
         let again = table
             .publish(SessionId::nil(), "again", NetworkMode::OwnIp, &[])
@@ -455,7 +937,10 @@ mod tests {
             // Its lease is the node's, so withdrawing releases nothing from
             // the range and the next own-address box still gets the first
             // free address.
-            assert_eq!(table.withdraw("shared"), Some(node));
+            assert_eq!(
+                table.withdraw("shared").map(|withdrawn| withdrawn.address),
+                Some(node)
+            );
             let own = table
                 .publish(SessionId::nil(), "own", NetworkMode::OwnIp, &[])
                 .unwrap();
@@ -547,5 +1032,220 @@ mod tests {
         // Gone once one side withdraws.
         table.withdraw("first");
         assert!(table.entries().iter().all(|e| e.collisions.is_empty()));
+    }
+
+    /// A loopback backend standing in for the box's own listener, echoing
+    /// everything sent to it: what a declared port's forwarder reaches while
+    /// the box is listening.
+    async fn echo_backend() -> SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => {
+                                if stream.write_all(&buf[..read]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        address
+    }
+
+    /// Connects until `address:port` refuses, which an unbound port does at
+    /// once. A forwarder's teardown runs in its own task, so an unbind is
+    /// followed by the refusal rather than containing it.
+    async fn wait_until_refused(address: Ipv4Addr, port: u16) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match TcpStream::connect((address, port)).await {
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => return,
+                outcome => assert!(
+                    Instant::now() < deadline,
+                    "{address}:{port} still answers: {outcome:?}"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// NET-121. Revoking a declared port's ingress unbinds its forwarder and
+    /// terminates the connection it held, and the port stays in the
+    /// published-port table as the revocation that closed it.
+    #[tokio::test]
+    async fn ingress_revocation_unbinds_forwarder_and_terminates_connections() {
+        const PORT: u16 = 18_310;
+
+        let upstream = echo_backend().await;
+        let mut table = PublishTable::default();
+        let lease = table.lease(NetworkMode::OwnIp).unwrap();
+        let address = lease.address();
+        let forwarders = Forwarders::bind(
+            address,
+            &[DeclaredPort {
+                port: PORT,
+                answer: PortAnswer::Forwarded(upstream),
+            }],
+        )
+        .await
+        .expect("the declared port binds");
+        table.register(SessionId::nil(), "web", lease, forwarders);
+
+        // A connection through the forwarder reaches the box.
+        let mut held = TcpStream::connect((address, PORT)).await.unwrap();
+        held.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        held.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+
+        // Revoking unbinds the port and ends the connection it held.
+        table
+            .revoke_port("web", PORT)
+            .expect("the port had a forwarder")
+            .finished()
+            .await;
+        let ended = tokio::time::timeout(Duration::from_secs(5), held.read(&mut echoed))
+            .await
+            .expect("the connection the forwarder held ends");
+        match ended {
+            Ok(0) => {}
+            Ok(passed) => panic!("the revoked forwarder passed {passed} more bytes"),
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::ConnectionReset, "{error}"),
+        }
+        wait_until_refused(address, PORT).await;
+
+        // The table shows the revocation that closed the port, and the box
+        // keeps the name it was published under.
+        assert_eq!(
+            table.entries()[0].forwarders,
+            vec![PublishedPort {
+                port: PORT,
+                state: ForwarderState::Revoked
+            }]
+        );
+        assert_eq!(
+            table.lookup("web.min.internal"),
+            Lookup::Address(IpAddr::V4(address))
+        );
+        assert!(
+            table.revoke_port("web", PORT).is_none(),
+            "nothing left to revoke"
+        );
+    }
+
+    /// NET-121. A declared port whose forwarder cannot bind is reported with
+    /// the reason, and nothing is substituted for it: no other port, no other
+    /// address, and no name — the forwarders already bound for the box are
+    /// released rather than left standing for a box nothing resolves.
+    #[tokio::test]
+    async fn failed_forwarder_bind_is_reported_not_substituted() {
+        const ROLLED_BACK: u16 = 18_311;
+        const TAKEN: u16 = 18_312;
+
+        let upstream = echo_backend().await;
+        let mut table = PublishTable::default();
+        let lease = table.lease(NetworkMode::OwnIp).unwrap();
+        let address = lease.address();
+        // Something else already holds one of the two declared ports.
+        let squatter = TcpListener::bind((address, TAKEN)).await.unwrap();
+
+        let failure = Forwarders::bind(
+            address,
+            &[
+                DeclaredPort {
+                    port: ROLLED_BACK,
+                    answer: PortAnswer::Forwarded(upstream),
+                },
+                DeclaredPort {
+                    port: TAKEN,
+                    answer: PortAnswer::Forwarded(upstream),
+                },
+            ],
+        )
+        .await
+        .expect_err("the held port cannot be bound");
+
+        // Reported with the port and the reason.
+        assert_eq!(failure.port, TAKEN);
+        assert_eq!(failure.address, address);
+        assert_eq!(failure.error.kind(), io::ErrorKind::AddrInUse);
+        let reported = failure.to_string();
+        assert!(reported.contains(&TAKEN.to_string()), "{reported}");
+        assert!(reported.contains(&failure.error.to_string()), "{reported}");
+
+        // No name is published for the box and no substitute address answers
+        // for it; the lease goes back to the range unspent.
+        table.release(lease);
+        assert_eq!(table.lookup("web.min.internal"), Lookup::Unknown);
+        assert!(table.entries().is_empty());
+        assert_eq!(table.lease(NetworkMode::OwnIp).unwrap().address(), address);
+
+        // Nor is the port that did bind left standing, while the port that
+        // failed is still only the squatter's.
+        wait_until_refused(address, ROLLED_BACK).await;
+        assert_eq!(
+            squatter.local_addr().unwrap(),
+            SocketAddr::new(IpAddr::V4(address), TAKEN)
+        );
+    }
+
+    /// NET-014. A port the box has not published refuses the connection, and
+    /// refuses it at once rather than leaving it to time out, while the
+    /// declared port beside it is bound and carries the connection through to
+    /// the box.
+    #[tokio::test]
+    async fn unpublished_port_connection_refused() {
+        const DECLARED: u16 = 18_313;
+        const UNPUBLISHED: u16 = 18_314;
+
+        let upstream = echo_backend().await;
+        let mut table = PublishTable::default();
+        let lease = table.lease(NetworkMode::OwnIp).unwrap();
+        let address = lease.address();
+        let forwarders = Forwarders::bind(
+            address,
+            &[DeclaredPort {
+                port: DECLARED,
+                answer: PortAnswer::Forwarded(upstream),
+            }],
+        )
+        .await
+        .expect("the declared port binds");
+        let published = table.register(SessionId::nil(), "web", lease, forwarders);
+        assert_eq!(published.ports, vec![DECLARED]);
+
+        // The declared port is bound, and carries bytes to the box.
+        let mut declared = TcpStream::connect((address, DECLARED))
+            .await
+            .expect("the declared port is bound");
+        declared.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        declared.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+
+        // The port the box never published answers nothing: a refusal, taken
+        // far inside the time a timeout would need.
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            TcpStream::connect((address, UNPUBLISHED)),
+        )
+        .await
+        .expect("the connect settles rather than timing out");
+        let error = outcome.expect_err("an unpublished port answers nothing");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refused after {:?}",
+            started.elapsed()
+        );
     }
 }

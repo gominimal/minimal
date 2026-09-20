@@ -2487,12 +2487,14 @@ async fn materializing_patches_carries_their_modes_into_the_home() {
 mod zone {
     use std::net::Ipv4Addr;
     use std::sync::{Arc, RwLock};
+    use std::time::{Duration, Instant};
 
     use sessions::core::loopback_alloc::LoopbackAllocator;
     use sessions::{IngressPolicy, IpProto, NetworkMode, PortMapping, SessionId};
+    use tokio::net::TcpStream;
 
     use crate::net::answerer::{self, Verdict};
-    use crate::net::publish::{AddressKind, PublishTable, PublishedBox};
+    use crate::net::publish::{AddressKind, ForwarderState, PublishTable, PublishedBox};
     use crate::test_harness::{TestClient, TestServer, create_session_req, unwrap_ready};
 
     use super::{destroy_session, record_exists, session_handle};
@@ -2772,5 +2774,60 @@ mod zone {
         assert_eq!(address_of(&zone, "shared"), node);
         assert_eq!(entry(&zone, "shared").address, node);
         assert_ne!(address_of(&zone, "own"), node);
+    }
+
+    /// NET-121. A box's declared ports are bound before its name is
+    /// registered: by the time the name answers an address, a forwarder is
+    /// holding every port the declaration names at that address, and it is
+    /// held for as long as the box is — no client has attached and no host has
+    /// launched — and released when the box goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn declared_ports_bound_before_name_registered() {
+        const DECLARED: [u16; 2] = [18_300, 18_301];
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = box_publishing(&mut client, "web", NetworkMode::OwnIp, &DECLARED).await;
+        let zone = zone(&server).await;
+
+        // The name answers, so every declared port is already bound on the
+        // address it answers: a connection is taken, not refused.
+        let address = address_of(&zone, "web");
+        for port in DECLARED {
+            TcpStream::connect((address, port))
+                .await
+                .unwrap_or_else(|error| panic!("{address}:{port} has no forwarder bound: {error}"));
+            assert_eq!(
+                entry(&zone, "web")
+                    .forwarders
+                    .iter()
+                    .find(|published| published.port == port)
+                    .map(|published| published.state),
+                Some(ForwarderState::Bound),
+                "the published-port table shows {port}'s forwarder bound"
+            );
+        }
+        assert_eq!(entry(&zone, "web").ports, DECLARED.to_vec());
+
+        // Held while the box exists, with nothing attached and no host run.
+        assert!(!entry(&zone, "web").running);
+        TcpStream::connect((address, DECLARED[0]))
+            .await
+            .expect("the forwarder is still held");
+
+        // And released with the box.
+        destroy_session(&mut client, id).await;
+        assert_eq!(resolve(&zone, "web").0, Verdict::NxDomain);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match TcpStream::connect((address, DECLARED[0])).await {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                outcome => assert!(
+                    Instant::now() < deadline,
+                    "{address}:{DECLARED:?} still answers after destroy: {outcome:?}"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }

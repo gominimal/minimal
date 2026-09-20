@@ -638,7 +638,7 @@ impl Session {
         // (R3.1/R3.6). A `Draft` session has nothing to route to yet, so
         // `register_hostname` no-ops until its loadout finalizes.
         #[cfg(target_os = "linux")]
-        actor.register_hostname(obj.record());
+        actor.register_hostname(obj.record()).await;
 
         tokio::spawn(actor.mainloop());
         Ok(SessionHandle(sender))
@@ -654,8 +654,8 @@ impl Session {
     /// `Draft` session is neither routed nor published: it has nothing to
     /// answer for until its composition finalizes.
     #[cfg(target_os = "linux")]
-    fn register_hostname(&self, record: &Record) {
-        self.publish_box(record);
+    async fn register_hostname(&self, record: &Record) {
+        self.publish_box(record).await;
         if !self.owns_hostname_route(record) {
             return;
         }
@@ -689,50 +689,74 @@ impl Session {
     /// `Draft` session publishes nothing. An exhausted reserved range is
     /// logged and the box goes unpublished; the session itself still runs.
     ///
+    /// The address is leased, the box's declared ports are bound on it, and
+    /// only then is the name registered (NET-121), so the name never answers
+    /// ahead of the ports it promises. A declared port whose forwarder cannot
+    /// bind is reported with its reason and nothing is substituted for it:
+    /// no other port, no other address, and no name.
+    ///
     /// NET-123: the reserved local range is bind-probed before the box is
     /// published. While it is absent the box goes to the `127.0.0.1` interim,
     /// whatever its mode, and the session start's advisory has already said
     /// so; with the range present the mode's own publication applies.
     #[cfg(target_os = "linux")]
-    fn publish_box(&self, record: &Record) {
+    async fn publish_box(&self, record: &Record) {
         use crate::net::answerer::{interim_address, probe_reserved_range};
+        use crate::net::publish::Forwarders;
 
         if !self.is_published() {
             return;
         }
-        let ports: Vec<u16> = record
-            .policy
-            .ingress
-            .as_ref()
-            .map(|ingress| {
-                ingress
-                    .port_mappings
-                    .iter()
-                    .map(|m| m.internal_port)
-                    .collect()
-            })
-            .unwrap_or_default();
         let name = registry_name(record);
         let probe = probe_reserved_range();
-        let mut table = self.published.write().expect("publish table lock poisoned");
-        let outcome = match interim_address(&probe) {
-            Some(interim) => {
-                tracing::info!(
-                    session_id = %record.id,
-                    %interim,
-                    range = ?probe,
-                    "reserved range absent; publishing the box at the interim address"
-                );
-                Ok(table.publish_interim(record.id, &name, interim, &ports))
+        let lease = {
+            let mut table = self.published.write().expect("publish table lock poisoned");
+            match interim_address(&probe) {
+                Some(interim) => {
+                    tracing::info!(
+                        session_id = %record.id,
+                        %interim,
+                        range = ?probe,
+                        "reserved range absent; publishing the box at the interim address"
+                    );
+                    table.lease_interim(interim)
+                }
+                None => match table.lease(record.network) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        tracing::error!(
+                            session_id = %record.id,
+                            %error,
+                            "could not publish the box; its name will not resolve natively"
+                        );
+                        return;
+                    }
+                },
             }
-            None => table.publish(record.id, &name, record.network, &ports),
         };
-        if let Err(error) = outcome {
-            tracing::error!(
-                session_id = %record.id,
-                %error,
-                "could not publish the box; its name will not resolve natively"
-            );
+        let declared = declared_ports(record, lease.kind());
+        match Forwarders::bind(lease.address(), &declared).await {
+            Ok(forwarders) => {
+                self.published
+                    .write()
+                    .expect("publish table lock poisoned")
+                    .register(record.id, &name, lease, forwarders);
+            }
+            Err(failure) => {
+                tracing::error!(
+                    session_id = %record.id,
+                    hostname = %name,
+                    port = failure.port,
+                    address = %failure.address,
+                    error = %failure.error,
+                    "a declared port's forwarder could not bind; the box is not published \
+                     and no substitute address is published for the port"
+                );
+                self.published
+                    .write()
+                    .expect("publish table lock poisoned")
+                    .release(lease);
+            }
         }
     }
 
@@ -740,16 +764,25 @@ impl Session {
     /// its own address if it held one. Gated like [`Self::deregister_hostname`]:
     /// the table is keyed by name alone, so an ungated withdraw from a `Draft`
     /// session could take down an unrelated box under the same derived name.
+    ///
+    /// The forwarders the box held for its declared ports are unbound here and
+    /// awaited before returning (NET-121), so a rename — a withdraw followed
+    /// by a publish that leases the address just released — never binds its new
+    /// forwarders against the old ones.
     #[cfg(target_os = "linux")]
     async fn withdraw_box(&self) {
         let record = self.record.record().await.unwrap();
         if !self.is_published() {
             return;
         }
-        self.published
+        let withdrawn = self
+            .published
             .write()
             .expect("publish table lock poisoned")
             .withdraw(&registry_name(&record));
+        if let Some(withdrawn) = withdrawn {
+            withdrawn.finished().await;
+        }
     }
 
     /// Record whether this session's box is running, for the zone: a
@@ -1432,7 +1465,7 @@ impl Session {
                 record.status = SessionStatus::Active;
                 self.record.write(record.clone()).await?;
                 #[cfg(target_os = "linux")]
-                self.register_hostname(&record);
+                self.register_hostname(&record).await;
                 Ok(ran)
             }
             SessionStatus::Pending => Err(std::io::Error::new(
@@ -1589,7 +1622,8 @@ impl Session {
         self.register_hostname(match &written {
             Ok(_) => &new_record,
             Err(_) => &record,
-        });
+        })
+        .await;
         // A fresh publication starts as not running; carry the live host
         // over so a renamed shared-address box keeps answering.
         #[cfg(target_os = "linux")]
@@ -2920,6 +2954,49 @@ impl WeakSessionHandle {
         drop(tx);
         Self(weak)
     }
+}
+
+/// The ports `record`'s ingress declaration names, and how the box answers
+/// each at its published address (NET-121).
+///
+/// A TCP mapping on an address of the box's own is answered by a forwarder
+/// minimald binds there, sending what it accepts to the host-side forward the
+/// box's switch publishes for the port (`127.0.0.1:<external>`). Every other
+/// declared port is published with no forwarder interposed: on a shared
+/// address — a host-address box, or the `127.0.0.1` interim — the box's own
+/// listeners answer its port numbers, so binding there would take the port
+/// from the box itself, and a UDP mapping's datagrams are carried by the
+/// switch forward rather than by a connection-oriented forwarder.
+#[cfg(target_os = "linux")]
+fn declared_ports(
+    record: &Record,
+    kind: crate::net::publish::AddressKind,
+) -> Vec<crate::net::publish::DeclaredPort> {
+    use crate::net::publish::{AddressKind, DeclaredPort, PortAnswer};
+
+    record
+        .policy
+        .ingress
+        .as_ref()
+        .map(|ingress| {
+            ingress
+                .port_mappings
+                .iter()
+                .map(|m| DeclaredPort {
+                    port: m.internal_port,
+                    answer: match (kind, m.proto) {
+                        (AddressKind::Own, sessions::IpProto::Tcp) => {
+                            PortAnswer::Forwarded(std::net::SocketAddr::from((
+                                std::net::Ipv4Addr::LOCALHOST,
+                                m.external_port,
+                            )))
+                        }
+                        _ => PortAnswer::Direct,
+                    },
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

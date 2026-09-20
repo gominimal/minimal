@@ -71,7 +71,7 @@ use sessions::SessionId;
 
 use super::dns::HOSTNAME_SUFFIX;
 use super::policy::BoxZone;
-use super::publish::{AddressKind, Lookup, PortCollision, PublishTable, Zone};
+use super::publish::{AddressKind, Lookup, PortCollision, PublishTable, PublishedPort, Zone};
 
 /// The port the box zone is answered on, the one the host resolver hook names
 /// (`port 15353` in the macOS resolver file the spike installed). The wire
@@ -675,6 +675,9 @@ struct ZoneEntry {
     running: bool,
     /// The box's own port numbers, published untranslated.
     ports: Vec<u16>,
+    /// Each published port with what holds it: the forwarder bound for it, the
+    /// revocation that closed it, or the box's own listener (NET-121).
+    forwarders: Vec<PublishedPort>,
     /// The ports another box on the same shared address also publishes.
     collisions: Vec<PortCollision>,
 }
@@ -709,6 +712,7 @@ fn snapshot(
             kind: b.kind,
             running: b.running,
             ports: b.ports,
+            forwarders: b.forwarders,
             collisions: b.collisions,
         })
         .collect();
