@@ -250,9 +250,9 @@ teardown() {
   # only reaped on that proof's own happy path, so a `fail` partway through
   # (occupier still up to 300s, socat responders up to their -T30 idle
   # timeout) would otherwise outlive the case and hold the loopback port.
-  [ -n "$HR_OCCUPIER_PID" ] && kill "$HR_OCCUPIER_PID" 2>/dev/null || true
-  [ -n "$HR_NATIVE_SOCAT_PID" ] && kill "$HR_NATIVE_SOCAT_PID" 2>/dev/null || true
-  [ -n "$HR_VM_SOCAT_PID" ] && kill "$HR_VM_SOCAT_PID" 2>/dev/null || true
+  [ -n "$HR_OCCUPIER_PID" ] && { kill "$HR_OCCUPIER_PID" 2>/dev/null || true; }
+  [ -n "$HR_NATIVE_SOCAT_PID" ] && { kill "$HR_NATIVE_SOCAT_PID" 2>/dev/null || true; }
+  [ -n "$HR_VM_SOCAT_PID" ] && { kill "$HR_VM_SOCAT_PID" 2>/dev/null || true; }
   # Undo the privileged resolver setup the native resolution proof installed,
   # so the runner is left as it was found (the hook would otherwise outlive
   # the daemon it points at).
