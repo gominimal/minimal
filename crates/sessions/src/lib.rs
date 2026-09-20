@@ -664,6 +664,14 @@ pub enum GrantWarning {
          organization client configuration alone"
     )]
     ProjectAcknowledgement { declared: bool },
+    /// The project supplied `[secret-store-rules]`. The rules bound what a
+    /// referenced value may reach, which is the operator's to decide, so the
+    /// project's rules are ignored (BEP-037).
+    #[error(
+        "the project sets `[secret-store-rules]` ({count} rule(s)), which is ignored: the rules \
+         are the operator's, read from the user or organization client configuration alone"
+    )]
+    ProjectStoreRules { count: usize },
 }
 
 /// One reason an expansion is refused.
@@ -725,6 +733,23 @@ pub enum GrantRefusalCause {
          first (the box was not created, and no sign-in was prompted for)"
     )]
     SignInRequired { grant: Grant },
+    /// A store reference the client's `[secret-store-rules]` do not admit:
+    /// no rule registers it, its rule denies it, or its rule asks and there
+    /// is no terminal to ask at (BEP-035).
+    #[error("{denial}")]
+    ReferenceDenied { denial: ReferenceDenial },
+    /// The box's `egress.allow_dns_hosts` does not admit every upstream the
+    /// reference's rule registers; `missing` names exactly the absent hosts
+    /// (BEP-036).
+    #[error(
+        "{reference} is registered for upstreams `[session.network.egress] allow_dns_hosts` does \
+         not admit; missing: {}",
+        .missing.join(", ")
+    )]
+    ReferenceUpstreamOutsideEgress {
+        reference: StoreReference,
+        missing: Vec<String>,
+    },
 }
 
 /// A box spec whose GitHub grants the un-enrolled host cannot honour. The
@@ -898,6 +923,617 @@ fn hosts_outside_egress(egress: Option<&EgressPolicy>, host_set: &[&str]) -> Vec
         .filter(|host| !allowed.iter().any(|a| a.eq_ignore_ascii_case(host)))
         .map(|host| (*host).to_owned())
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Box spec: the `[[session.references]]` a project declares, and the
+// client-owned `[secret-store-rules]` that register what each reference may
+// reach and how its value is put on the wire (box egress proxy spec: BEP-034
+// to BEP-037). A reference names a value the box never holds; the rules are
+// the operator's, so a project that supplies them is ignored with a warning,
+// exactly as the full-breadth acknowledgement is.
+// ---------------------------------------------------------------------------
+
+/// A store this host reads referenced secrets from.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretStore {
+    /// The host's native store: the macOS Keychain here.
+    Keychain,
+}
+
+impl fmt::Display for SecretStore {
+    /// Renders the `snake_case` spelling a rule and a reference use, so a
+    /// refusal names the store as the operator wrote it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Keychain => "keychain",
+        })
+    }
+}
+
+/// Where a `[[session.references]]` entry's value comes from: the entry's
+/// `source` field, spelled out as a grant's is, so the grammar is unchanged
+/// when a tenant-store deposit becomes a second value.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceSource {
+    /// A value held in one of this host's stores, named by identifier.
+    Store,
+}
+
+/// One `[[session.references]]` entry: a stored value the box refers to by
+/// identifier and never holds. The box receives a short-lived signed handle
+/// in `env`; the proxy injects the value itself into the box's requests to
+/// the upstream the operator's rule registers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StoreReference {
+    /// The store the value is read from.
+    pub store: SecretStore,
+    /// The identifier the value is stored under.
+    pub id: String,
+    /// The environment variable the box receives the handle in.
+    pub env: crate::core::primitives::StrictVarName,
+    /// Where the value comes from.
+    pub source: ReferenceSource,
+}
+
+impl fmt::Display for StoreReference {
+    /// "keychain reference `anthropic-api-key`": how a refusal, a warning, a
+    /// log line and `min box spec` name the reference.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} reference `{}`", self.store, self.id)
+    }
+}
+
+/// What a rule does with a request matching it: the rule's `action`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleAction {
+    /// Inject the value without asking. The action a rule that declares none
+    /// carries.
+    #[default]
+    Allow,
+    /// Ask the operator at the terminal first; with no terminal to ask at,
+    /// the reference is denied rather than admitted unasked (BEP-035).
+    Ask,
+    /// Never inject the value.
+    Deny,
+}
+
+impl fmt::Display for RuleAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        })
+    }
+}
+
+/// Which field of an HTTP basic-authentication credential a value fills.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BasicAuthField {
+    /// The user field, what the upstream reads as the username.
+    User,
+    /// The password field.
+    Password,
+}
+
+impl fmt::Display for BasicAuthField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::User => "user",
+            Self::Password => "password",
+        })
+    }
+}
+
+/// How a registered value is put on the wire: the rule's `inject` table.
+///
+/// The proxy emits exactly the registered prefix followed by the value, or
+/// fills one basic-authentication field with it; nothing else of the request
+/// is rewritten.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "InjectionRepr", into = "InjectionRepr")]
+pub enum Injection {
+    /// `inject = { header = "x-api-key", prefix = "" }`: the prefix followed
+    /// by the value, as the named header's whole value.
+    Header {
+        /// The header the value is written to.
+        name: String,
+        /// What precedes the value in the header's value.
+        prefix: String,
+    },
+    /// `inject = { basic_auth = "password" }`: the value as one field of a
+    /// basic-authentication credential.
+    BasicAuth {
+        /// The field the value fills.
+        field: BasicAuthField,
+    },
+}
+
+impl fmt::Display for Injection {
+    /// "header `x-api-key`" / "`basic_auth` `password`": how a refusal and
+    /// `min secret list` name the injection form.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Header { name, .. } => write!(f, "header `{name}`"),
+            Self::BasicAuth { field } => write!(f, "basic_auth `{field}`"),
+        }
+    }
+}
+
+/// The on-disk shape of an [`Injection`].
+///
+/// A struct with `deny_unknown_fields` rather than an untagged enum, for the
+/// reason [`crate::core::lifecyclehook::HookScript`]'s repr is one: a typo in
+/// a security-relevant table must be an error, not a key skipped in silence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InjectionRepr {
+    /// The header the value is written to, for the header form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// What precedes the value in that header; empty when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// The credential field the value fills, for the basic-auth form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basic_auth: Option<BasicAuthField>,
+}
+
+/// Why an `inject` table is not one injection form.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InjectionError {
+    /// Neither `header` nor `basic_auth` is declared, so nothing says where
+    /// the value goes.
+    #[error("an `inject` table declares neither `header` nor `basic_auth`")]
+    NoForm,
+    /// Both are declared: one value, one place.
+    #[error(
+        "an `inject` table declares both `header` and `basic_auth`; a value is injected in one \
+         form"
+    )]
+    TwoForms,
+    /// A `prefix` beside `basic_auth`, which carries no prefix.
+    #[error(
+        "an `inject` table declares `prefix` beside `basic_auth`; a prefix belongs to the header \
+         form"
+    )]
+    PrefixWithoutHeader,
+}
+
+impl TryFrom<InjectionRepr> for Injection {
+    type Error = InjectionError;
+
+    fn try_from(repr: InjectionRepr) -> Result<Self, Self::Error> {
+        match (repr.header, repr.basic_auth) {
+            (Some(_), Some(_)) => Err(InjectionError::TwoForms),
+            (None, None) => Err(InjectionError::NoForm),
+            (Some(name), None) => Ok(Self::Header {
+                name,
+                prefix: repr.prefix.unwrap_or_default(),
+            }),
+            (None, Some(field)) if repr.prefix.is_none() => Ok(Self::BasicAuth { field }),
+            (None, Some(_)) => Err(InjectionError::PrefixWithoutHeader),
+        }
+    }
+}
+
+impl From<Injection> for InjectionRepr {
+    fn from(injection: Injection) -> Self {
+        match injection {
+            Injection::Header { name, prefix } => Self {
+                header: Some(name),
+                // Round-trip an undeclared prefix as undeclared.
+                prefix: (!prefix.is_empty()).then_some(prefix),
+                basic_auth: None,
+            },
+            Injection::BasicAuth { field } => Self {
+                header: None,
+                prefix: None,
+                basic_auth: Some(field),
+            },
+        }
+    }
+}
+
+/// One `[[secret-store-rules]]` rule of the client configuration: the stored
+/// identifier it registers, the upstream authorities its value may be
+/// injected into, how it is injected, and whether the operator is asked
+/// first.
+///
+/// Client-owned by design: the rule is what bounds a reference, so a project
+/// never supplies one (BEP-037).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StoreRule {
+    /// The store holding the value.
+    pub store: SecretStore,
+    /// The identifier this rule registers.
+    pub id: String,
+    /// The authorities the value may be injected into, each `host` or
+    /// `host:port`.
+    pub upstream: Vec<String>,
+    /// How the value is put on the wire.
+    pub inject: Injection,
+    /// Whether the value is injected outright, only after the operator is
+    /// asked, or never. `allow` when omitted.
+    #[serde(default)]
+    pub action: RuleAction,
+}
+
+impl StoreRule {
+    /// Whether this rule registers `reference`'s store and identifier.
+    #[must_use]
+    pub fn registers(&self, reference: &StoreReference) -> bool {
+        self.store == reference.store && self.id == reference.id
+    }
+
+    /// The hosts of this rule's `upstream` authorities, each once, in
+    /// declared order: what a box's `allow_dns_hosts` is read against, since
+    /// it lists hostnames rather than authorities.
+    #[must_use]
+    pub fn upstream_hosts(&self) -> Vec<&str> {
+        self.upstream
+            .iter()
+            .map(|authority| authority_host(authority))
+            .fold(Vec::new(), |mut hosts, host| {
+                if !hosts.iter().any(|seen| host.eq_ignore_ascii_case(seen)) {
+                    hosts.push(host);
+                }
+                hosts
+            })
+    }
+}
+
+impl fmt::Display for StoreRule {
+    /// "keychain rule `anthropic-api-key`": how a refusal and a log line
+    /// name the rule.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} rule `{}`", self.store, self.id)
+    }
+}
+
+/// The host part of an authority written `host` or `host:port`, for
+/// comparison against `egress.allow_dns_hosts` and a module's host set,
+/// which name hosts alone. A bracketed IPv6 literal loses its brackets:
+/// `[::1]:443` is `::1`.
+#[must_use]
+pub fn authority_host(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split_once(']').map_or(rest, |(host, _)| host);
+    }
+    authority
+        .rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(authority, |(host, _)| host)
+}
+
+/// The headers a `[secret-store-rules]` rule may not inject into (BEP-034):
+/// the request's authority, the cookie jar, and the framing and hop-by-hop
+/// headers, each of which would redirect or reframe the request the proxy
+/// pinned rather than authenticate it. Compared case-insensitively; every
+/// `Proxy-*` header is denied by [`INJECTION_HEADER_DENY_PREFIX`].
+pub const INJECTION_HEADER_DENY_SET: [&str; 6] = [
+    "host",
+    ":authority",
+    "cookie",
+    "transfer-encoding",
+    "connection",
+    "upgrade",
+];
+
+/// The header-name prefix [`INJECTION_HEADER_DENY_SET`] denies as a family.
+pub const INJECTION_HEADER_DENY_PREFIX: &str = "proxy-";
+
+/// Whether `header` is one a rule may not inject into (BEP-034).
+#[must_use]
+pub fn is_denied_injection_header(header: &str) -> bool {
+    let header = header.trim().to_ascii_lowercase();
+    header.starts_with(INJECTION_HEADER_DENY_PREFIX)
+        || INJECTION_HEADER_DENY_SET.contains(&header.as_str())
+}
+
+/// Whether `host` is Minimal's own infrastructure rather than an upstream
+/// (BEP-034): the local zone a box never proxies
+/// ([`BEP_NO_PROXY_LOCAL_ZONE`]) — peer boxes by name, the host itself, and
+/// loopback. One list, so the hosts a rule may not register and the hosts
+/// `NO_PROXY` carries cannot drift apart.
+#[must_use]
+pub fn is_minimal_infrastructure(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    BEP_NO_PROXY_LOCAL_ZONE.iter().any(|entry| {
+        let entry = entry.to_ascii_lowercase();
+        // A suffix entry (`.min.internal`) covers the apex and every name
+        // under it; the others are hosts, matched whole.
+        match entry.strip_prefix('.') {
+            Some(apex) => host == apex || host.ends_with(entry.as_str()),
+            None => host == entry,
+        }
+    })
+}
+
+/// Why a `[secret-store-rules]` rule is refused when the configuration is
+/// read (BEP-034). The rule is never partly honoured: the configuration
+/// fails to load, naming the rule and what it named.
+///
+/// The rule is boxed so the refusal stays small enough to return by value.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StoreRuleError {
+    /// The rule registers a host of a configured module's host set, where
+    /// the module's own sealed member governs the credential.
+    #[error(
+        "{rule} registers `{authority}`, a host of a configured module's host set: those hosts \
+         carry the module's own sealed member, never a store value"
+    )]
+    ModuleHost {
+        /// The refused rule.
+        rule: Box<StoreRule>,
+        /// The authority it registered, as the rule wrote it.
+        authority: String,
+    },
+    /// The rule registers one of Minimal's own hostnames, which no upstream
+    /// answers.
+    #[error(
+        "{rule} registers `{authority}`, which is Minimal's own infrastructure: a store value is \
+         injected into upstream requests alone"
+    )]
+    MinimalInfrastructure {
+        /// The refused rule.
+        rule: Box<StoreRule>,
+        /// The authority it registered, as the rule wrote it.
+        authority: String,
+    },
+    /// The rule injects into a header that would redirect or reframe the
+    /// request rather than authenticate it.
+    #[error(
+        "{rule} injects into the `{header}` header, which a rule may not name: it would redirect \
+         or reframe the request the proxy pinned rather than authenticate it"
+    )]
+    DeniedHeader {
+        /// The refused rule.
+        rule: Box<StoreRule>,
+        /// The header it named.
+        header: String,
+    },
+}
+
+/// Refuses a `[secret-store-rules]` rule that names a configured module's
+/// host, Minimal's own infrastructure, or a denied injection header
+/// (BEP-034).
+///
+/// `module_hosts` is the union of the configured modules' host sets — the
+/// GitHub v1 set [`GITHUB_HOST_SET`] today. A module host is denied on every
+/// port, since a store value has no business on it at all.
+///
+/// # Errors
+///
+/// [`StoreRuleError`], naming the rule and the host or header it named.
+pub fn check_store_rule(rule: &StoreRule, module_hosts: &[&str]) -> Result<(), StoreRuleError> {
+    let refusal = rule
+        .upstream
+        .iter()
+        .find_map(|authority| {
+            let host = authority_host(authority);
+            if module_hosts.iter().any(|m| host.eq_ignore_ascii_case(m)) {
+                Some(StoreRuleError::ModuleHost {
+                    rule: Box::new(rule.clone()),
+                    authority: authority.clone(),
+                })
+            } else if is_minimal_infrastructure(host) {
+                Some(StoreRuleError::MinimalInfrastructure {
+                    rule: Box::new(rule.clone()),
+                    authority: authority.clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .or_else(|| match &rule.inject {
+            Injection::Header { name, .. } if is_denied_injection_header(name) => {
+                Some(StoreRuleError::DeniedHeader {
+                    rule: Box::new(rule.clone()),
+                    header: name.clone(),
+                })
+            }
+            _ => None,
+        });
+    tracing::info!(
+        store = %rule.store,
+        id = %rule.id,
+        inject = %rule.inject,
+        action = %rule.action,
+        verdict = if refusal.is_some() { "refused" } else { "accepted" },
+        "read a secret store rule"
+    );
+    refusal.map_or(Ok(()), Err)
+}
+
+/// The `[secret-store-rules]` in force for a box spec: the client
+/// configuration's rules, and a warning when the project's `minimal.toml`
+/// supplies the section too (BEP-037).
+///
+/// `project` is that section as the project's file carried it, never read as
+/// configuration: what a rule permits is the operator's to decide, so the
+/// project's rules are dropped rather than merged.
+#[must_use]
+pub fn store_rules_in_force<'r>(
+    client: &'r [StoreRule],
+    project: Option<&toml::Value>,
+) -> (&'r [StoreRule], Option<GrantWarning>) {
+    let warning = project.map(|section| {
+        let count = section.as_array().map_or(1, Vec::len);
+        tracing::warn!(
+            count,
+            in_force = client.len(),
+            "the project set `[secret-store-rules]`; it is ignored"
+        );
+        GrantWarning::ProjectStoreRules { count }
+    });
+    (client, warning)
+}
+
+/// What the reference validation runs against, beyond the spec itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceContext<'a> {
+    /// The box the spec is being expanded for, as the log lines name it.
+    pub box_name: &'a str,
+    /// Whether the client has a terminal to ask the operator at: a rule with
+    /// `action = "ask"` denies the reference without one (BEP-035).
+    pub has_tty: bool,
+}
+
+/// A store reference the client's rules admit: the rule in force for it, and
+/// whether the operator is asked before its value is injected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedReference<'r> {
+    /// The reference as the box spec declares it.
+    pub reference: StoreReference,
+    /// The rule that registers it: the authorities and the injection form
+    /// the handle is minted for.
+    pub rule: &'r StoreRule,
+    /// Whether the operator is asked before the value is injected
+    /// (`action = "ask"` with a terminal to ask at).
+    pub prompt: bool,
+}
+
+/// Why a store reference is denied (BEP-035).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReferenceDenial {
+    /// No rule registers the reference's store and identifier, so nothing
+    /// says what it may reach or how it is injected.
+    #[error(
+        "{reference} matches no `[secret-store-rules]` rule: register the identifier in the user \
+         or organization client configuration before a box references it"
+    )]
+    NoRule {
+        /// The denied reference.
+        reference: StoreReference,
+    },
+    /// The rule registering it denies it.
+    #[error("{reference} matches a `[secret-store-rules]` rule with `action = \"deny\"`")]
+    RuleDenies {
+        /// The denied reference.
+        reference: StoreReference,
+    },
+    /// The rule asks, and this client has no terminal to ask at, so the
+    /// reference is denied rather than admitted unasked.
+    #[error(
+        "{reference} matches a `[secret-store-rules]` rule with `action = \"ask\"`, and this \
+         client has no terminal to ask at: run the command from a terminal, or set the rule's \
+         `action` to `allow`"
+    )]
+    AskWithoutTty {
+        /// The denied reference.
+        reference: StoreReference,
+    },
+}
+
+/// The rule in force for one store reference, and whether the operator is
+/// asked before its value is injected.
+///
+/// A reference no rule registers is denied, as is one whose rule denies it,
+/// and one whose rule asks while the client has no terminal to ask at
+/// (BEP-035). The first rule registering the store and identifier decides.
+///
+/// # Errors
+///
+/// [`ReferenceDenial`], naming the reference and why it is denied.
+pub fn decide_reference<'r>(
+    reference: &StoreReference,
+    rules: &'r [StoreRule],
+    has_tty: bool,
+) -> Result<AdmittedReference<'r>, ReferenceDenial> {
+    let rule = rules
+        .iter()
+        .find(|rule| rule.registers(reference))
+        .ok_or_else(|| ReferenceDenial::NoRule {
+            reference: reference.clone(),
+        })?;
+    match rule.action {
+        RuleAction::Deny => Err(ReferenceDenial::RuleDenies {
+            reference: reference.clone(),
+        }),
+        RuleAction::Ask if !has_tty => Err(ReferenceDenial::AskWithoutTty {
+            reference: reference.clone(),
+        }),
+        RuleAction::Ask | RuleAction::Allow => Ok(AdmittedReference {
+            reference: reference.clone(),
+            rule,
+            prompt: rule.action == RuleAction::Ask,
+        }),
+    }
+}
+
+/// Validates a box spec's `[[session.references]]` against the client's
+/// `[secret-store-rules]` and the box's own egress.
+///
+/// Refused, with every cause named: a reference the rules do not admit
+/// (BEP-035), and a reference whose rule registers an upstream the box's
+/// `egress.allow_dns_hosts` does not admit — naming exactly the absent hosts
+/// (BEP-036). An absent `allow_dns_hosts` admits every host, the allow-all
+/// reading [`EgressPolicy`] documents.
+///
+/// A spec with no reference is admitted as it stands.
+///
+/// # Errors
+///
+/// [`GrantRefusal`], naming each cause; refused with exit
+/// [`GrantRefusal::EXIT_CODE`].
+pub fn validate_references<'r>(
+    network: &BoxNetwork,
+    references: &[StoreReference],
+    rules: &'r [StoreRule],
+    ctx: &ReferenceContext<'_>,
+) -> Result<Vec<AdmittedReference<'r>>, GrantRefusal> {
+    let mut causes = Vec::new();
+    let mut admitted = Vec::with_capacity(references.len());
+    for reference in references {
+        let verdict = match decide_reference(reference, rules, ctx.has_tty) {
+            Err(denial) => {
+                causes.push(GrantRefusalCause::ReferenceDenied { denial });
+                "denied"
+            }
+            Ok(candidate) => {
+                let missing =
+                    hosts_outside_egress(network.egress.as_ref(), &candidate.rule.upstream_hosts());
+                if missing.is_empty() {
+                    admitted.push(candidate);
+                    "admitted"
+                } else {
+                    causes.push(GrantRefusalCause::ReferenceUpstreamOutsideEgress {
+                        reference: candidate.reference,
+                        missing,
+                    });
+                    "refused"
+                }
+            }
+        };
+        tracing::info!(
+            box_name = ctx.box_name,
+            store = %reference.store,
+            id = %reference.id,
+            verdict,
+            "validated a box spec store reference"
+        );
+    }
+    if causes.is_empty() {
+        Ok(admitted)
+    } else {
+        Err(GrantRefusal { causes })
+    }
 }
 
 /// A session ID, a newtype over a UUID.
@@ -2252,6 +2888,501 @@ mod tests {
         fn arb_scopes() -> impl Strategy<Value = Vec<String>> {
             prop::collection::vec(0..SCOPE_POOL.len(), 0..3)
                 .prop_map(|idx| idx.into_iter().map(|i| SCOPE_POOL[i].to_owned()).collect())
+        }
+    }
+
+    // =================================================================
+    // Box spec store references, validated against the client's
+    // `[secret-store-rules]` (BEP-034, BEP-035, BEP-036, BEP-037)
+    // =================================================================
+
+    mod references {
+        use super::super::*;
+        use crate::core::primitives::StrictVarName;
+        use proptest::prelude::*;
+
+        /// A box spec's reference to a Keychain identifier.
+        fn reference(id: &str) -> StoreReference {
+            StoreReference {
+                store: SecretStore::Keychain,
+                id: id.to_owned(),
+                env: StrictVarName::try_new("ANTHROPIC_API_KEY").unwrap(),
+                source: ReferenceSource::Store,
+            }
+        }
+
+        /// A rule registering `id` for `upstream`, injected into `x-api-key`.
+        fn rule(id: &str, upstream: &[&str], action: RuleAction) -> StoreRule {
+            StoreRule {
+                store: SecretStore::Keychain,
+                id: id.to_owned(),
+                upstream: upstream.iter().map(|a| (*a).to_owned()).collect(),
+                inject: Injection::Header {
+                    name: "x-api-key".to_owned(),
+                    prefix: String::new(),
+                },
+                action,
+            }
+        }
+
+        /// A box admitting `hosts` and nothing else.
+        fn network(hosts: &[&str]) -> BoxNetwork {
+            BoxNetwork {
+                mode: Some(NetworkMode::OwnIp),
+                egress: Some(EgressPolicy {
+                    allow_dns_hosts: Some(hosts.iter().map(|h| (*h).to_owned()).collect()),
+                    ..EgressPolicy::default()
+                }),
+                bep: BepPolicy::default(),
+            }
+        }
+
+        /// A client with a terminal to ask the operator at.
+        fn ctx() -> ReferenceContext<'static> {
+            ReferenceContext {
+                box_name: "web",
+                has_tty: true,
+            }
+        }
+
+        /// The grammar the reference documents parses to these types: a
+        /// `[[session.references]]` entry, and a `[[secret-store-rules]]`
+        /// rule whose `inject` table names exactly one form.
+        #[test]
+        fn store_reference_grammar_parses() {
+            let parsed: StoreReference = toml::from_str(
+                r#"
+                store  = "keychain"
+                id     = "anthropic-api-key"
+                env    = "ANTHROPIC_API_KEY"
+                source = "store"
+                "#,
+            )
+            .unwrap();
+            assert_eq!(parsed, reference("anthropic-api-key"));
+            assert_eq!(parsed.to_string(), "keychain reference `anthropic-api-key`");
+
+            let parsed_rule: StoreRule = toml::from_str(
+                r#"
+                store    = "keychain"
+                id       = "anthropic-api-key"
+                upstream = ["api.anthropic.com:443"]
+                inject   = { header = "x-api-key" }
+                "#,
+            )
+            .unwrap();
+            assert_eq!(
+                parsed_rule,
+                rule(
+                    "anthropic-api-key",
+                    &["api.anthropic.com:443"],
+                    RuleAction::Allow
+                )
+            );
+            assert_eq!(parsed_rule.action, RuleAction::Allow);
+            assert_eq!(parsed_rule.to_string(), "keychain rule `anthropic-api-key`");
+            assert_eq!(parsed_rule.inject.to_string(), "header `x-api-key`");
+
+            // The basic-auth form carries no prefix; the header form's
+            // prefix round-trips, and an omitted one stays omitted.
+            let basic: Injection = toml::from_str("basic_auth = \"password\"").unwrap();
+            assert_eq!(
+                basic,
+                Injection::BasicAuth {
+                    field: BasicAuthField::Password
+                }
+            );
+            assert_eq!(basic.to_string(), "basic_auth `password`");
+            let bearer: Injection =
+                toml::from_str("header = \"authorization\"\nprefix = \"Bearer \"").unwrap();
+            for form in [&bearer, &basic] {
+                let written = toml::to_string(form).unwrap();
+                assert_eq!(&toml::from_str::<Injection>(&written).unwrap(), form);
+            }
+            // An undeclared prefix stays undeclared.
+            let written = toml::to_string(&Injection::Header {
+                name: "x-api-key".to_owned(),
+                prefix: String::new(),
+            })
+            .unwrap();
+            assert!(!written.contains("prefix"), "{written}");
+
+            // One value, one place: both forms, neither, or a prefix beside
+            // `basic_auth` is refused — and so is a typo, rather than the key
+            // being dropped from a security-relevant table.
+            for table in [
+                "header = \"x-api-key\"\nbasic_auth = \"password\"",
+                "",
+                "basic_auth = \"password\"\nprefix = \"Bearer \"",
+                "heder = \"x-api-key\"",
+            ] {
+                assert!(
+                    toml::from_str::<Injection>(table).is_err(),
+                    "`{table}` must be refused"
+                );
+            }
+        }
+
+        /// An authority is compared by its host: `allow_dns_hosts` and a
+        /// module's host set both name hosts alone.
+        #[test]
+        fn authority_host_reads_the_host_alone() {
+            assert_eq!(authority_host("api.anthropic.com:443"), "api.anthropic.com");
+            assert_eq!(authority_host("api.anthropic.com"), "api.anthropic.com");
+            assert_eq!(authority_host("[::1]:443"), "::1");
+            // Not a port: the whole string is the host.
+            assert_eq!(
+                authority_host("api.example.com:http"),
+                "api.example.com:http"
+            );
+            assert_eq!(
+                rule(
+                    "id",
+                    &[
+                        "api.example.com:443",
+                        "API.EXAMPLE.COM",
+                        "other.example.com"
+                    ],
+                    RuleAction::Allow
+                )
+                .upstream_hosts(),
+                vec!["api.example.com", "other.example.com"]
+            );
+        }
+
+        /// BEP-034: a rule naming a configured module's host, Minimal's own
+        /// infrastructure, or a denied injection header is refused when the
+        /// configuration is read, naming the rule and what it named.
+        #[test]
+        fn store_rule_in_deny_set_is_refused() {
+            // A module host, on any port: the module's own sealed member
+            // governs those hosts.
+            for authority in [
+                "api.github.com:443",
+                "GITHUB.COM",
+                "codeload.github.com:8443",
+            ] {
+                let refused = rule("anthropic-api-key", &[authority], RuleAction::Allow);
+                let err = check_store_rule(&refused, &GITHUB_HOST_SET).unwrap_err();
+                assert_eq!(
+                    err,
+                    StoreRuleError::ModuleHost {
+                        rule: Box::new(refused),
+                        authority: authority.to_owned(),
+                    }
+                );
+                let text = err.to_string();
+                assert!(text.contains("keychain rule `anthropic-api-key`"), "{text}");
+                assert!(text.contains(authority), "{text}");
+            }
+
+            // Minimal's own infrastructure: peer boxes by name, the host,
+            // and loopback.
+            for authority in [
+                "web.min.internal",
+                "min.internal",
+                "host.min.internal:7655",
+                "localhost:7655",
+                "127.0.0.1",
+            ] {
+                let refused = rule("anthropic-api-key", &[authority], RuleAction::Allow);
+                let err = check_store_rule(&refused, &GITHUB_HOST_SET).unwrap_err();
+                assert!(
+                    matches!(err, StoreRuleError::MinimalInfrastructure { .. }),
+                    "`{authority}` must be refused as Minimal's own: {err:?}"
+                );
+                assert!(err.to_string().contains(authority), "{err}");
+            }
+
+            // An injection header that would redirect or reframe the request
+            // rather than authenticate it, in any casing, and every
+            // `Proxy-*` header.
+            for header in [
+                "Host",
+                ":authority",
+                "Cookie",
+                "Proxy-Authorization",
+                "proxy-connection",
+                "Transfer-Encoding",
+                "connection",
+                "Upgrade",
+            ] {
+                let refused = StoreRule {
+                    inject: Injection::Header {
+                        name: header.to_owned(),
+                        prefix: String::new(),
+                    },
+                    ..rule(
+                        "anthropic-api-key",
+                        &["api.anthropic.com:443"],
+                        RuleAction::Allow,
+                    )
+                };
+                let err = check_store_rule(&refused, &GITHUB_HOST_SET).unwrap_err();
+                assert_eq!(
+                    err,
+                    StoreRuleError::DeniedHeader {
+                        rule: Box::new(refused),
+                        header: header.to_owned(),
+                    }
+                );
+                assert!(err.to_string().contains(header), "{err}");
+            }
+
+            // An ordinary rule is accepted, in either injection form.
+            let allowed = rule(
+                "anthropic-api-key",
+                &["api.anthropic.com:443"],
+                RuleAction::Allow,
+            );
+            assert_eq!(check_store_rule(&allowed, &GITHUB_HOST_SET), Ok(()));
+            let basic = StoreRule {
+                inject: Injection::BasicAuth {
+                    field: BasicAuthField::Password,
+                },
+                ..allowed
+            };
+            assert_eq!(check_store_rule(&basic, &GITHUB_HOST_SET), Ok(()));
+        }
+
+        /// BEP-035: a reference matching an `ask` rule is denied when the
+        /// client has no terminal to ask at, and admitted-with-a-prompt when
+        /// it has one. A `deny` rule, and a reference no rule registers, are
+        /// denied either way.
+        #[test]
+        fn ask_rule_without_tty_denies() {
+            let rules = [rule(
+                "anthropic-api-key",
+                &["api.anthropic.com:443"],
+                RuleAction::Ask,
+            )];
+            let declared = reference("anthropic-api-key");
+
+            let admitted = decide_reference(&declared, &rules, true).unwrap();
+            assert!(admitted.prompt, "a terminal is asked before the injection");
+            assert_eq!(admitted.rule, &rules[0]);
+
+            let denial = decide_reference(&declared, &rules, false).unwrap_err();
+            assert_eq!(
+                denial,
+                ReferenceDenial::AskWithoutTty {
+                    reference: declared.clone()
+                }
+            );
+            let text = denial.to_string();
+            assert!(
+                text.contains("keychain reference `anthropic-api-key`"),
+                "{text}"
+            );
+            assert!(text.contains("action = \"ask\""), "{text}");
+
+            // The expansion carries the same denial, refused with exit 3.
+            let refusal = validate_references(
+                &network(&["api.anthropic.com"]),
+                std::slice::from_ref(&declared),
+                &rules,
+                &ReferenceContext {
+                    box_name: "web",
+                    has_tty: false,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                refusal.causes,
+                vec![GrantRefusalCause::ReferenceDenied { denial }]
+            );
+            assert!(refusal.to_string().contains("exit 3"), "{refusal}");
+            assert_eq!(GrantRefusal::EXIT_CODE, 3);
+
+            // `deny`, and no rule at all, deny with a terminal too.
+            let denying = [rule(
+                "anthropic-api-key",
+                &["api.anthropic.com"],
+                RuleAction::Deny,
+            )];
+            assert_eq!(
+                decide_reference(&declared, &denying, true).unwrap_err(),
+                ReferenceDenial::RuleDenies {
+                    reference: declared.clone()
+                }
+            );
+            assert_eq!(
+                decide_reference(&declared, &[], true).unwrap_err(),
+                ReferenceDenial::NoRule {
+                    reference: declared.clone()
+                }
+            );
+
+            // `allow` needs no terminal and asks nothing.
+            let allowing = [rule(
+                "anthropic-api-key",
+                &["api.anthropic.com"],
+                RuleAction::Allow,
+            )];
+            assert!(
+                !decide_reference(&declared, &allowing, false)
+                    .unwrap()
+                    .prompt
+            );
+
+            // A spec with no reference is admitted as it stands.
+            assert_eq!(
+                validate_references(&network(&[]), &[], &rules, &ctx()),
+                Ok(Vec::new())
+            );
+        }
+
+        /// BEP-037: the `[secret-store-rules]` a project's `minimal.toml`
+        /// supplies are ignored — the client configuration's rules are the
+        /// ones in force — and the operator is warned that they were
+        /// dropped.
+        #[test]
+        fn project_store_rules_are_ignored_with_warning() {
+            let client = [rule(
+                "anthropic-api-key",
+                &["api.anthropic.com:443"],
+                RuleAction::Allow,
+            )];
+            // A project widening the same identifier to another upstream, in
+            // another injection form.
+            let project: toml::Value = toml::from_str(indoc::indoc! {r#"
+                [[secret-store-rules]]
+                store    = "keychain"
+                id       = "anthropic-api-key"
+                upstream = ["exfil.example.com"]
+                inject   = { header = "authorization", prefix = "Bearer " }
+
+                [[secret-store-rules]]
+                store    = "keychain"
+                id       = "registry-password"
+                upstream = ["registry.example.com"]
+                inject   = { basic_auth = "password" }
+            "#})
+            .unwrap();
+
+            let (in_force, warning) =
+                store_rules_in_force(&client, project.get("secret-store-rules"));
+            assert_eq!(in_force, &client[..], "a project cannot register a rule");
+            let text = warning
+                .expect("the dropped section is warned about")
+                .to_string();
+            assert!(text.contains("[secret-store-rules]"), "{text}");
+            assert!(text.contains("2 rule(s)"), "{text}");
+            assert!(text.contains("ignored"), "{text}");
+
+            // A project that says nothing is not warned about, and the
+            // reference stays bounded by the operator's rule alone.
+            assert_eq!(store_rules_in_force(&client, None), (&client[..], None));
+            let admitted =
+                decide_reference(&reference("anthropic-api-key"), in_force, true).unwrap();
+            assert_eq!(admitted.rule.upstream_hosts(), vec!["api.anthropic.com"]);
+            assert_eq!(
+                admitted.rule.inject,
+                Injection::Header {
+                    name: "x-api-key".to_owned(),
+                    prefix: String::new(),
+                }
+            );
+            // The identifier the project alone registers is registered
+            // nowhere.
+            assert_eq!(
+                decide_reference(&reference("registry-password"), in_force, true).unwrap_err(),
+                ReferenceDenial::NoRule {
+                    reference: reference("registry-password")
+                }
+            );
+        }
+
+        /// The upstreams a rule registers, drawn from hosts that are neither
+        /// a module's nor Minimal's own — those are refused when the
+        /// configuration is read (BEP-034), never here.
+        const UPSTREAM_POOL: [&str; 5] = [
+            "api.anthropic.com",
+            "registry.example.com",
+            "api.openai.example",
+            "files.example.net",
+            "mcp.example.org",
+        ];
+
+        fn arb_upstreams(min: usize) -> impl Strategy<Value = Vec<&'static str>> {
+            prop::collection::btree_set(0..UPSTREAM_POOL.len(), min..=UPSTREAM_POOL.len())
+                .prop_map(|idx| idx.into_iter().map(|i| UPSTREAM_POOL[i]).collect())
+        }
+
+        proptest! {
+            /// BEP-036: for every registered upstream set and every
+            /// `allow_dns_hosts`, expansion refuses with exit 3 iff some
+            /// registered upstream is absent from the egress declaration,
+            /// naming exactly the absent hosts. An absent `allow_dns_hosts`
+            /// admits every host.
+            #[test]
+            fn prop_store_upstream_outside_egress_is_exit_3(
+                upstream in arb_upstreams(1),
+                allowed in prop::option::of(arb_upstreams(0)),
+                port in prop::option::of(1u16..=65535),
+                upper in any::<bool>(),
+            ) {
+                let rules = [StoreRule {
+                    upstream: upstream
+                        .iter()
+                        .map(|host| port.map_or_else(
+                            || (*host).to_owned(),
+                            |port| format!("{host}:{port}"),
+                        ))
+                        .collect(),
+                    ..rule("anthropic-api-key", &[], RuleAction::Allow)
+                }];
+                let declaring_box = BoxNetwork {
+                    egress: Some(EgressPolicy {
+                        allow_dns_hosts: allowed.as_ref().map(|hosts| hosts
+                            .iter()
+                            .map(|h| if upper { h.to_ascii_uppercase() } else { (*h).to_owned() })
+                            .collect()),
+                        ..EgressPolicy::default()
+                    }),
+                    ..network(&[])
+                };
+                let references = [reference("anthropic-api-key")];
+
+                let expected_missing: Vec<String> = match &allowed {
+                    None => Vec::new(),
+                    Some(allowed) => upstream
+                        .iter()
+                        .filter(|host| !allowed.contains(*host))
+                        .map(|host| (*host).to_owned())
+                        .collect(),
+                };
+
+                let result = validate_references(&declaring_box, &references, &rules, &ctx());
+                prop_assert_eq!(result.is_err(), !expected_missing.is_empty());
+                match result {
+                    Err(refusal) => {
+                        prop_assert_eq!(GrantRefusal::EXIT_CODE, 3);
+                        let text = refusal.to_string();
+                        prop_assert_eq!(
+                            refusal.causes,
+                            vec![GrantRefusalCause::ReferenceUpstreamOutsideEgress {
+                                reference: reference("anthropic-api-key"),
+                                missing: expected_missing.clone(),
+                            }]
+                        );
+                        prop_assert!(text.contains("exit 3"), "{}", text);
+                        prop_assert!(
+                            text.contains("keychain reference `anthropic-api-key`"),
+                            "{}",
+                            text
+                        );
+                        for host in &expected_missing {
+                            prop_assert!(text.contains(host.as_str()), "{}", text);
+                        }
+                    }
+                    Ok(admitted) => {
+                        prop_assert_eq!(admitted.len(), 1);
+                        prop_assert_eq!(admitted[0].rule, &rules[0]);
+                        prop_assert!(!admitted[0].prompt);
+                    }
+                }
+            }
         }
     }
 }

@@ -842,6 +842,144 @@ case_bep_first_slice_no_plaintext_anywhere() {
   echo "::endgroup::"
 }
 
+# BEP-043: removing a box refuses every sealed value that named it, inside a
+# minute of the removal completing.
+#
+# The box declares no grant on purpose. What BEP-043 turns on is the revocation
+# the removal submits for the box it removes, and a box with no grant submits the
+# same one — so this runs on every lane instead of only where a sign-in is held,
+# and the values a grant box carries stay the first slice's case.
+#
+# Every lane proves the command path: the box is created and removed, the removal
+# accounts for its revocation — recorded with the proxy, or said plainly not to
+# be, never silently dropped — and prints nothing token-shaped. Where a proxy is
+# running, its own trail for that box carries the revocation record, and the
+# removal's own elapsed time is what the sixty seconds is measured against.
+case_bep_stopped_box_values_refused_within_60s() {
+  echo "::group::bep: a removed box's values are refused within 60 s"
+  BEP_SEED_DIR="$(mktemp -d /tmp/mnlbep.XXXXXX)"
+  cp "$PROJECT_DIR/minimal.toml" "$BEP_SEED_DIR/minimal.toml"
+  mkdir "$BEP_SEED_DIR/.git"
+
+  local name=e2e-bep-stopped sid started elapsed
+  sid="$(cd "$BEP_SEED_DIR" \
+    && mnl session activate . --name "$name" --no-input </dev/null 2>"$WORK/bep-stopped.err")" || {
+    echo "::error::the box to remove was not created"
+    echo "--- stderr ---"; cat "$WORK/bep-stopped.err" 2>/dev/null || true
+    fail
+  }
+  sid="$(printf '%s\n' "$sid" | tail -n1 | tr -d '\r')"
+
+  started="$(date +%s)"
+  mnl session destroy --force "$sid" >"$WORK/bep-rm.out" 2>"$WORK/bep-rm.err" || {
+    echo "::error::removing the box failed"
+    echo "--- stdout ---"; cat "$WORK/bep-rm.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/bep-rm.err" 2>/dev/null || true
+    fail
+  }
+  elapsed=$(( $(date +%s) - started ))
+
+  if mnl ls --raw 2>/dev/null | grep -Fqx "$sid"; then
+    echo "::error::the box is still listed after its removal"
+    fail
+  fi
+  if grep -qE "$BEP_TOKEN_RE" "$WORK/bep-rm.out" "$WORK/bep-rm.err"; then
+    echo "::error::the removal printed something token-shaped"
+    fail
+  fi
+
+  if mnl box audit "$name" -o jsonl >"$WORK/bep-rm-audit.jsonl" 2>"$WORK/bep-rm-audit.err" \
+      && grep -q '"kind":"revocation"' "$WORK/bep-rm-audit.jsonl"; then
+    if [ "$elapsed" -gt 60 ]; then
+      echo "::error::the removal took ${elapsed}s, so its revocation was not in force within 60s"
+      fail
+    fi
+    echo "the proxy's trail carries the removal's revocation for $name (${elapsed}s) OK"
+  elif grep -q "did not record the revocation" "$WORK/bep-rm.err"; then
+    echo "no proxy took the revocation on this host: the removal said so and still completed OK"
+  else
+    echo "::error::the removal neither recorded a revocation nor said why it could not"
+    echo "--- stderr ---"; cat "$WORK/bep-rm.err" 2>/dev/null || true
+    echo "--- trail ---"; cat "$WORK/bep-rm-audit.jsonl" 2>/dev/null || true
+    fail
+  fi
+
+  rm -rf "$BEP_SEED_DIR"; BEP_SEED_DIR=""
+  echo "::endgroup::"
+}
+
+# BEP-044: `min auth logout` refuses every sealed GitHub member on this host,
+# inside a minute of the logout completing.
+#
+# Never run against a held sign-in: signing an operator's own machine out is not
+# this script's to do, so with one held the case says so and exercises nothing.
+# With none held — every CI lane — the logout still proves what the requirement
+# turns on: the command completes, accounts for its revocation (recorded with the
+# proxy, or said plainly not to be) and prints nothing token-shaped; where a
+# proxy is running, its trail carries the revocation whose subject is every box.
+# A host with no keychain backend at all (every Linux lane) refuses the command
+# naming that, which is the honest outcome there — it holds no sign-in to revoke
+# members of either.
+case_bep_logout_refuses_all_members_within_60s() {
+  echo "::group::bep: a logout refuses every member within 60 s"
+  if mnl auth status >"$WORK/bep-logout-status.out" 2>&1 \
+      && grep -q "signed in as" "$WORK/bep-logout-status.out"; then
+    echo "a GitHub sign-in is held on this host: not exercised, because this case would sign it out"
+    echo "::endgroup::"
+    return
+  fi
+
+  local started elapsed logout_rc=0
+  started="$(date +%s)"
+  mnl auth logout >"$WORK/bep-logout.out" 2>"$WORK/bep-logout.err" || logout_rc=$?
+  elapsed=$(( $(date +%s) - started ))
+  if grep -qE "$BEP_TOKEN_RE" "$WORK/bep-logout.out" "$WORK/bep-logout.err"; then
+    echo "::error::the logout printed something token-shaped"
+    fail
+  fi
+  if [ "$logout_rc" != 0 ]; then
+    if grep -q "no keychain backend" "$WORK/bep-logout.err"; then
+      echo "this host has no keychain backend: the logout is refused naming it, and no member was ever minted here OK"
+      echo "::endgroup::"
+      return
+    fi
+    echo "::error::min auth logout failed for a reason other than a missing keychain backend"
+    echo "--- stdout ---"; cat "$WORK/bep-logout.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/bep-logout.err" 2>/dev/null || true
+    fail
+  fi
+  if ! grep -q "no sign-in was held" "$WORK/bep-logout.out"; then
+    echo "::error::the logout does not report that this host held no sign-in"
+    echo "--- stdout ---"; cat "$WORK/bep-logout.out" 2>/dev/null || true
+    fail
+  fi
+
+  # The revocation covers every box, so its subject is `*` — one record, read
+  # back through the same trail a box's own records are read from.
+  if mnl box audit '*' -o jsonl >"$WORK/bep-logout-audit.jsonl" 2>"$WORK/bep-logout-audit.err" \
+      && grep -q '"kind":"revocation"' "$WORK/bep-logout-audit.jsonl"; then
+    if [ "$elapsed" -gt 60 ]; then
+      echo "::error::the logout took ${elapsed}s, so its revocation was not in force within 60s"
+      fail
+    fi
+    echo "the proxy's trail carries the logout's revocation over every box (${elapsed}s) OK"
+  elif grep -q "did not record the revocation" "$WORK/bep-logout.err"; then
+    echo "no proxy took the revocation on this host: the logout said so and still completed OK"
+  else
+    echo "::error::the logout neither recorded a revocation nor said why it could not"
+    echo "--- stderr ---"; cat "$WORK/bep-logout.err" 2>/dev/null || true
+    echo "--- trail ---"; cat "$WORK/bep-logout-audit.jsonl" 2>/dev/null || true
+    fail
+  fi
+
+  # And no sign-in is held afterwards: a logout never leaves one behind.
+  if mnl auth status 2>&1 | grep -q "signed in as"; then
+    echo "::error::a sign-in is still held after the logout"
+    fail
+  fi
+  echo "::endgroup::"
+}
+
 if [ -n "$E2E_CASE" ] && ! declare -F "case_$E2E_CASE" >/dev/null; then
   echo "::error::unknown e2e case '$E2E_CASE'"
   exit 2

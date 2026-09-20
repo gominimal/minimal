@@ -278,6 +278,45 @@ declares a grant the host cannot honour:
 - an `allow_dns_hosts` that does not admit every host of the grant's
   module host set — the refusal lists exactly the missing hosts.
 
+#### `[[session.references]]` - Stored secrets the session never holds {#session-references}
+
+A **reference** names a secret held in one of your host's stores. The session
+receives a short-lived handle in `env`, never the value: the proxy reads the
+value per request and injects it into the session's requests to the upstream
+your own rule registers for that identifier.
+
+```toml
+[[session.references]]
+store  = "keychain"             # the host store holding the value
+id     = "anthropic-api-key"    # the identifier it is stored under
+env    = "ANTHROPIC_API_KEY"    # the variable the handle lands in
+source = "store"                # a value held in one of this host's stores
+```
+
+- **`store`** and **`id`** name the stored value; **`env`** must be a
+  POSIX-shaped variable name. All four fields are required, and a table with
+  a field this version does not know is refused rather than ignored.
+- What a reference may reach, and how the value is put on the wire, is **not**
+  the project's to declare. That lives in your own
+  [`[secret-store-rules]`](./user-policy.md#secret-store-rules), and a
+  `minimal.toml` that carries a `[secret-store-rules]` section is ignored with
+  a warning.
+
+Activation is refused with **exit 3**, naming every cause, when a reference
+cannot be honoured:
+
+- no rule of yours registers the reference's store and identifier;
+- its rule sets `action = "deny"`, or sets `action = "ask"` while the command
+  runs with no terminal to ask at;
+- an `allow_dns_hosts` that does not admit every upstream its rule registers
+  — the refusal lists exactly the missing hosts:
+
+```console
+$ min session activate
+error: refused the box spec's grants (exit 3)
+  - keychain reference `anthropic-api-key` is registered for upstreams `[session.network.egress] allow_dns_hosts` does not admit; missing: api.anthropic.com
+```
+
 
 
 ### `[tasks.*]` - Run tasks, scripts, & dev tooling {#tasks}

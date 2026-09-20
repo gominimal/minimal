@@ -1370,9 +1370,12 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
     ensure_daemon(global)?;
 
     let mut client = connect_daemon(global).await?;
+    // Removing a box revokes its sealed values with the proxy (BEP-043), so
+    // every destroy path carries the control socket.
+    let control = crate::auth::control_socket_path(global.minimal_dir.as_deref());
 
     if args.all {
-        return destroy_all_sessions(&mut client, args.force).await;
+        return destroy_all_sessions(&mut client, &control, args.force).await;
     }
 
     let session = args
@@ -1412,7 +1415,7 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
         }
     }
 
-    destroy_session(&mut client, record.id, record.name.as_deref()).await
+    destroy_session(&mut client, &control, record.id, record.name.as_deref()).await
 }
 
 /// What the daemon's at-risk report means for the destroy gate.
@@ -1549,6 +1552,7 @@ pub(crate) async fn session_delta(
 
 pub(crate) async fn destroy_all_sessions(
     client: &mut client::Client,
+    control: &std::path::Path,
     force: bool,
 ) -> Result<(), anyhow::Error> {
     use minimald_rpc::ListSessions;
@@ -1577,7 +1581,9 @@ pub(crate) async fn destroy_all_sessions(
     let session_count = sessions.len();
     let mut failures = 0;
     for session in sessions {
-        if let Err(error) = destroy_session(client, session.id, session.name.as_deref()).await {
+        if let Err(error) =
+            destroy_session(client, control, session.id, session.name.as_deref()).await
+        {
             failures += 1;
             eprintln!(
                 "Failed to destroy session {} ({}): {error:#}",
@@ -1596,6 +1602,7 @@ pub(crate) async fn destroy_all_sessions(
 
 pub(crate) async fn destroy_session(
     client: &mut client::Client,
+    control: &std::path::Path,
     id: sessions::SessionId,
     name: Option<&str>,
 ) -> Result<(), anyhow::Error> {
@@ -1611,8 +1618,35 @@ pub(crate) async fn destroy_session(
     } else {
         bail!("DestroySession returned an error from the daemon");
     }
+    if let Some(box_name) = name {
+        revoke_box_values(control, box_name).await;
+    }
 
     Ok(())
+}
+
+/// Refuses every sealed value naming `box_name` from here on: the box is gone,
+/// so the revocation goes to the proxy over its control socket, the record and
+/// the set moving together on the proxy's side (BEP-043).
+///
+/// The box a sealed context names is the session's name — what the mint bound
+/// the member to — so a session that never had one has no value to revoke.
+///
+/// Best-effort for the same reason `min auth logout`'s submission is: a proxy
+/// that is not running redeems nothing meanwhile, so its absence is a warning,
+/// never a destroy that failed after the box is already gone.
+async fn revoke_box_values(control: &std::path::Path, box_name: &str) {
+    let submission = bep::Submission::Audit(bep::box_revocation_event(box_name));
+    match crate::auth::submit_audit(control, &submission).await {
+        Ok(record) => tracing::info!(
+            box_id = box_name,
+            previous_hash = %record.previous_hash,
+            "the proxy recorded the box's revocation"
+        ),
+        Err(error) => {
+            eprintln!("warning: the proxy did not record the revocation for {box_name}: {error:#}")
+        }
+    }
 }
 
 /// Shut down the minimald daemon via the `Shutdown` RPC.
@@ -1795,8 +1829,10 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use bep::github::{MemorySignIns, Secret};
-    use bep::{Keys, Log, MemoryStore, SignIn, SignInStore as _, Submission};
+    use bep::{Keys, Log, MemoryStore, Revocations, SignIn, SignInStore as _, Submission};
     use sessions::core::primitives::StrictVarName;
     use sessions::wire::primitives::WireSource;
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
@@ -1806,11 +1842,17 @@ mod tests {
 
     const TOKEN: &str = "ghu_TESTTOKENfa2c1b0d8e7f6a5b4c3d2e1f0a9b8c7d";
 
-    /// A proxy's control socket that appends each submission to `log` and
-    /// answers with the record, the way the real one does.
-    async fn fake_proxy(socket: &std::path::Path, log: &std::path::Path) {
+    /// A proxy's control socket that appends each submission to `log`, puts a
+    /// revocation it carries in force and answers with the record, the way the
+    /// real one does. The returned set is what the proxy would now refuse.
+    async fn fake_proxy(
+        socket: &std::path::Path,
+        log: &std::path::Path,
+    ) -> Arc<Mutex<Revocations>> {
         let listener = UnixListener::bind(socket).unwrap();
         let mut log = Log::open(log).unwrap();
+        let revocations = Arc::new(Mutex::new(Revocations::default()));
+        let in_force = Arc::clone(&revocations);
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -1818,9 +1860,12 @@ mod tests {
                 let mut line = String::new();
                 BufReader::new(reader).read_line(&mut line).await.unwrap();
                 let submission: Submission = serde_json_lenient::from_str(&line).unwrap();
-                let reply = match bep::submit(&mut log, &submission) {
-                    Ok(record) => serde_json_lenient::to_string(&record).unwrap(),
-                    Err(error) => format!(r#"{{"error":"{error}"}}"#),
+                let reply = {
+                    let mut in_force = in_force.lock().unwrap();
+                    match bep::submit(&mut log, &mut in_force, &submission) {
+                        Ok(record) => serde_json_lenient::to_string(&record).unwrap(),
+                        Err(error) => format!(r#"{{"error":"{error}"}}"#),
+                    }
                 };
                 writer
                     .write_all(format!("{reply}\n").as_bytes())
@@ -1828,6 +1873,7 @@ mod tests {
                     .unwrap();
             }
         });
+        revocations
     }
 
     fn github_grant() -> sessions::Grant {
@@ -1882,7 +1928,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
         let audit = dir.path().join("audit.jsonl");
-        fake_proxy(&socket, &audit).await;
+        let _revocations = fake_proxy(&socket, &audit).await;
         let root_pem = dir.path().join("root.pem");
         std::fs::write(&root_pem, "-----BEGIN CERTIFICATE-----\n").unwrap();
         let root_pem =
@@ -1996,6 +2042,77 @@ mod tests {
         assert_eq!(
             bep_root_pem_path(Some(dir)).parent(),
             crate::auth::control_socket_path(Some(dir)).parent()
+        );
+    }
+
+    /// BEP-043: removing a box sends the proxy the revocation that refuses
+    /// every sealed value naming it — the box the mint bound the member to, and
+    /// no other box — and a proxy that is not there does not turn the removal
+    /// into a failure.
+    #[tokio::test]
+    async fn box_removal_sends_box_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let audit = dir.path().join("audit.jsonl");
+        let revocations = fake_proxy(&socket, &audit).await;
+
+        let store = MemorySignIns::new();
+        let now = crate::auth::unix_now();
+        store
+            .store(&SignIn {
+                account: "octocat".into(),
+                token: Secret::new(TOKEN),
+                expires_at: Some(now + 28_800),
+                refresh_token: None,
+                refresh_expires_at: None,
+            })
+            .unwrap();
+        let keys = Keys::open(MemoryStore::new()).unwrap();
+        mint_grants(
+            &store,
+            &keys,
+            &socket,
+            "web",
+            "mac-1",
+            &[github_grant()],
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(revocations.lock().unwrap().is_empty());
+
+        revoke_box_values(&socket, "web").await;
+        let (removed, other_box, module) = {
+            let in_force = revocations.lock().unwrap();
+            (
+                in_force.covers_box("web"),
+                in_force.covers_box("api"),
+                in_force.covers_module("github"),
+            )
+        };
+        assert!(removed);
+        assert!(!other_box, "another box was revoked with it");
+        assert!(!module, "a box's removal is not a logout");
+
+        // The record the proxy appended for it: a revocation naming the box,
+        // chained onto the mint, and no token in the log.
+        let log = std::fs::read_to_string(&audit).unwrap();
+        let records: Vec<bep::Record> = log
+            .lines()
+            .map(|line| serde_json_lenient::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2, "{log}");
+        assert_eq!(records[1].kind, bep::Kind::Revocation);
+        assert_eq!(records[1].sub, "web");
+        assert_eq!(records[1].previous_hash, records[0].line_hash());
+        assert!(!log.contains(TOKEN), "{log}");
+
+        // No proxy listening: a warning, and nothing appended.
+        revoke_box_values(&dir.path().join("absent.sock"), "web").await;
+        assert_eq!(
+            std::fs::read_to_string(&audit).unwrap().lines().count(),
+            2,
+            "a submission that went nowhere was recorded"
         );
     }
 }

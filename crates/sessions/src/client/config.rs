@@ -34,6 +34,14 @@ pub struct Config {
     /// credentials this host mints for a box.
     #[serde(default)]
     pub secrets: SecretsConfig,
+    /// `[[secret-store-rules]]`: one rule per stored identifier a box may
+    /// reference, registering the upstream authorities its value may be
+    /// injected into, the injection form, and whether the operator is asked
+    /// first. Client-owned by design — a project never supplies these, and
+    /// one that does is ignored with a warning (BEP-034, BEP-037). Kebab
+    /// spelling like `[session-keys]`, since that is the on-disk form.
+    #[serde(default, rename = "secret-store-rules")]
+    pub secret_store_rules: Vec<crate::StoreRule>,
 }
 
 /// The `[secrets]` section: the operator's standing decisions about the
@@ -144,6 +152,16 @@ pub enum ConfigError {
         #[source]
         source: keys::KeyError,
     },
+    /// A `[[secret-store-rules]]` rule names a configured module's host,
+    /// Minimal's own infrastructure, or a denied injection header (BEP-034).
+    /// The rule is refused when the configuration is read, so no box is ever
+    /// created under it.
+    #[error("invalid config `{path}`: {source}")]
+    StoreRule {
+        path: PathBuf,
+        #[source]
+        source: crate::StoreRuleError,
+    },
 }
 
 /// Parse and validate the config at `path`.
@@ -153,7 +171,9 @@ pub enum ConfigError {
 /// See [`ConfigError`]. A missing file returns [`ConfigError::Io`] —
 /// use [`read_config_or_default`] if you want the default config in
 /// that case. A file that parses but fails section validation (e.g.
-/// an unsafe session-key leader) returns [`ConfigError::Validation`].
+/// an unsafe session-key leader) returns [`ConfigError::Validation`];
+/// a `[[secret-store-rules]]` rule in the deny set returns
+/// [`ConfigError::StoreRule`].
 pub fn read_config_file(path: &Path) -> Result<Config, ConfigError> {
     let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
@@ -167,6 +187,11 @@ pub fn read_config_file(path: &Path) -> Result<Config, ConfigError> {
         path: path.to_path_buf(),
         source,
     })?;
+    cfg.validate_store_rules()
+        .map_err(|source| ConfigError::StoreRule {
+            path: path.to_path_buf(),
+            source,
+        })?;
     Ok(cfg)
 }
 
@@ -199,6 +224,24 @@ impl Config {
     /// Returns [`keys::KeyError`] when a section is invalid.
     pub fn validate(&self) -> Result<(), keys::KeyError> {
         self.session_keys.to_session_keys().map(|_| ())
+    }
+
+    /// Read every `[[secret-store-rules]]` rule, refusing one that names a
+    /// configured module's host, Minimal's own infrastructure, or a denied
+    /// injection header (BEP-034). The module host set is the GitHub v1 set
+    /// [`crate::GITHUB_HOST_SET`], the only module configured today.
+    ///
+    /// Separate from [`Self::validate`] because it fails with a different
+    /// error; [`read_config_file`] runs both.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::StoreRuleError`] for the first refused rule, naming
+    /// the rule and the host or header it named.
+    pub fn validate_store_rules(&self) -> Result<(), crate::StoreRuleError> {
+        self.secret_store_rules
+            .iter()
+            .try_for_each(|rule| crate::check_store_rule(rule, &crate::GITHUB_HOST_SET))
     }
 }
 
@@ -300,6 +343,105 @@ mod tests {
                 .secrets
                 .acknowledge_full_breadth_unenrolled
         );
+    }
+
+    /// `[[secret-store-rules]]` round-trips in both injection forms, `action`
+    /// defaults to `allow`, and a config carrying no section registers
+    /// nothing.
+    #[test]
+    fn read_config_file_secret_store_rules() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(
+            dir.path(),
+            "config.toml",
+            indoc::indoc! {r#"
+                [[secret-store-rules]]
+                store    = "keychain"
+                id       = "anthropic-api-key"
+                upstream = ["api.anthropic.com:443"]
+                inject   = { header = "x-api-key" }
+
+                [[secret-store-rules]]
+                store    = "keychain"
+                id       = "registry-password"
+                upstream = ["registry.example.com"]
+                inject   = { basic_auth = "password" }
+                action   = "ask"
+            "#},
+        );
+        let cfg = read_config_file(&path).unwrap();
+        let [key, registry] = cfg.secret_store_rules.as_slice() else {
+            panic!("both rules must parse: {:?}", cfg.secret_store_rules)
+        };
+        assert_eq!(key.store, crate::SecretStore::Keychain);
+        assert_eq!(key.upstream_hosts(), vec!["api.anthropic.com"]);
+        assert_eq!(
+            key.inject,
+            crate::Injection::Header {
+                name: "x-api-key".to_owned(),
+                prefix: String::new(),
+            }
+        );
+        assert_eq!(key.action, crate::RuleAction::Allow);
+        assert_eq!(
+            registry.inject,
+            crate::Injection::BasicAuth {
+                field: crate::BasicAuthField::Password,
+            }
+        );
+        assert_eq!(registry.action, crate::RuleAction::Ask);
+        assert!(Config::default().secret_store_rules.is_empty());
+    }
+
+    /// BEP-034: a rule naming a module host is refused when the
+    /// configuration is read, naming the rule — the config does not load at
+    /// all, so no box is ever created under it.
+    #[test]
+    fn read_config_file_refuses_denied_store_rule() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(
+            dir.path(),
+            "config.toml",
+            indoc::indoc! {r#"
+                [[secret-store-rules]]
+                store    = "keychain"
+                id       = "anthropic-api-key"
+                upstream = ["api.github.com:443"]
+                inject   = { header = "x-api-key" }
+            "#},
+        );
+        let err = read_config_file(&path).unwrap_err();
+        let ConfigError::StoreRule { source, .. } = &err else {
+            panic!("expected StoreRule, got {err:?}")
+        };
+        assert!(matches!(source, crate::StoreRuleError::ModuleHost { .. }));
+        assert!(
+            err.to_string()
+                .contains("keychain rule `anthropic-api-key`"),
+            "{err}"
+        );
+    }
+
+    /// A typo in a rule is refused rather than dropped: the table is
+    /// security-relevant, so an unknown key fails the load.
+    #[test]
+    fn read_config_file_store_rule_typo_errors() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(
+            dir.path(),
+            "config.toml",
+            indoc::indoc! {r#"
+                [[secret-store-rules]]
+                store    = "keychain"
+                id       = "anthropic-api-key"
+                upstream = ["api.anthropic.com:443"]
+                inject   = { heder = "x-api-key" }
+            "#},
+        );
+        assert!(matches!(
+            read_config_file(&path).unwrap_err(),
+            ConfigError::Parse { .. }
+        ));
     }
 
     /// An empty config file parses to `Config::default()`.

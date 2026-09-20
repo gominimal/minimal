@@ -23,6 +23,12 @@
 //! way the upstream leg is opened and validated against the host's trust
 //! store first, and nothing is forwarded, and no credential substituted,
 //! before it is (BEP-055). Every decision appends one audit record (BEP-039).
+//!
+//! The listener also holds the revocations in force ([`Revocations`]) and
+//! reads them for every value it unseals, so a box's removal or a logout
+//! refuses what it covers from the next request on (BEP-043, BEP-044).
+//! [`Proxy::submit`] is the intake behind the control socket that carries
+//! them.
 
 use std::convert::Infallible;
 use std::io;
@@ -50,8 +56,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tracing::Instrument as _;
 
-use crate::audit::{self, Event, Kind, Log, Mapping};
+use crate::audit::{self, AuditError, Event, Kind, Log, Mapping, Record};
 use crate::ca::{Authority, Leaf};
+use crate::control::{self, ControlError, Revocations, Submission};
 use crate::keychain::KeyStore;
 use crate::keys::Keys;
 use crate::redeem::{
@@ -154,6 +161,10 @@ pub enum ListenerError {
     /// More authorities are declared than the decision's ids can name.
     #[error("{declared} authorities are declared; the decision interns at most 255")]
     TooManyAuthorities { declared: usize },
+    /// The revocations already in force could not be read back from the log.
+    /// A proxy that cannot tell what is revoked must not start redeeming.
+    #[error(transparent)]
+    Audit(#[from] AuditError),
 }
 
 /// A `host:port` the proxy knows: one of the union of the modules' host sets
@@ -173,6 +184,17 @@ struct Flow {
     /// The index of the module whose host set holds the authority, or `None`
     /// for a store authority.
     module: Option<usize>,
+}
+
+/// What a sealed value presented on a flow unseals to: the member as the
+/// decision sees it, the credential the substitution puts in the value's
+/// place, the identifier the audit record names it by, and the revocations in
+/// force that cover it.
+struct Redeemed {
+    member: SealedMember,
+    credential: Member,
+    id: String,
+    revocations: Vec<redeem::Revocation>,
 }
 
 /// What a request's `Authorization` header carries.
@@ -269,6 +291,9 @@ where
     keys: &'static Keys<S>,
     authority: Authority<'static, S::Key>,
     log: Mutex<Log>,
+    /// The revocations in force, read for every value unsealed and advanced
+    /// by every submission the control socket carries (BEP-043, BEP-044).
+    revocations: Mutex<Revocations>,
     modules: Vec<Module>,
     /// The union of the modules' host sets and the store authorities, sorted:
     /// the authorities the decision interns, each at its index (BEP-029).
@@ -294,11 +319,16 @@ where
     /// A listener over `keys`, presenting leaves from `authority`, appending
     /// every decision to `log`.
     ///
+    /// The revocations already recorded in `log` are read back as the set in
+    /// force, so a proxy that restarts still refuses what was revoked before
+    /// it did.
+    ///
     /// # Errors
     ///
     /// [`ListenerError::Authority`] when a configured authority is not
-    /// `host:port`, or [`ListenerError::TooManyAuthorities`] when more are
-    /// declared than the decision's ids can name.
+    /// `host:port`, [`ListenerError::TooManyAuthorities`] when more are
+    /// declared than the decision's ids can name, or [`ListenerError::Audit`]
+    /// when the log's own revocations cannot be read.
     pub fn new(
         keys: &'static Keys<S>,
         authority: Authority<'static, S::Key>,
@@ -332,9 +362,11 @@ where
         hosts.sort();
         hosts.dedup();
 
+        let revocations = Revocations::in_log(log.path())?;
         let mut proxy = Self {
             keys,
             authority,
+            revocations: Mutex::new(revocations),
             log: Mutex::new(log),
             modules: config.modules,
             known,
@@ -363,6 +395,11 @@ where
         tracing::info!(
             authorities = proxy.known.len(),
             modules = proxy.modules.len(),
+            revoked = !proxy
+                .revocations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
             "configured the redemption listener"
         );
         Ok(proxy)
@@ -593,11 +630,11 @@ where
         }
 
         let carried = Carried::in_headers(request.headers());
-        let member = carried.sealed().and_then(|value| self.unseal(flow, value));
-        let credential = member.as_ref().map(|(_, _, id)| id.clone());
+        let redeemed = carried.sealed().and_then(|value| self.unseal(flow, value));
+        let credential = redeemed.as_ref().map(|redeemed| redeemed.id.clone());
         let redemption = Redemption {
             request: self.facts(flow, &request),
-            member: member.as_ref().map(|(member, _, _)| member.clone()),
+            member: redeemed.as_ref().map(|redeemed| redeemed.member.clone()),
             attribution: match flow.sender.addressing {
                 Addressing::OwnIp => Attribution::OwnIp(SENDER),
                 Addressing::HostIp => Attribution::HostIp(SENDER),
@@ -608,8 +645,11 @@ where
                 |module| self.module_sets[module].1.clone(),
             ),
             now: now(),
-            // Revocation intake is a later slice's; none is in force yet.
-            revocations: Vec::new(),
+            // Read for this request, never cached: a revocation submitted a
+            // moment ago is in force for this one (BEP-043, BEP-044).
+            revocations: redeemed
+                .as_ref()
+                .map_or_else(Vec::new, |redeemed| redeemed.revocations.clone()),
         };
         let decision = redeem::decide(&redemption);
         tracing::info!(
@@ -618,9 +658,9 @@ where
             "decided a request"
         );
         let substitution = match decision {
-            redeem::Decision::Admit => member
+            redeem::Decision::Admit => redeemed
                 .as_ref()
-                .and_then(|(_, member, _)| carried.substitute(member.expose())),
+                .and_then(|redeemed| carried.substitute(redeemed.credential.expose())),
             // No sealed value and every connection and request check passed:
             // the request rides through as sent (BEP-030).
             redeem::Decision::Refuse(Check::Decrypts) if carried.sealed().is_none() => None,
@@ -666,10 +706,9 @@ where
         }
     }
 
-    /// The member a sealed value unseals to under this host's key, interned
-    /// for the decision, with its credential and its audit identifier; `None`
-    /// when the value does not unseal here (BEP-019).
-    fn unseal(&self, flow: &Flow, value: &str) -> Option<(SealedMember, Member, String)> {
+    /// What a sealed value unseals to under this host's key, interned for the
+    /// decision; `None` when the value does not unseal here (BEP-019).
+    fn unseal(&self, flow: &Flow, value: &str) -> Option<Redeemed> {
         let unsealed = seal::unseal(self.keys, value)
             .inspect_err(|error| {
                 tracing::warn!(%error, "a sealed value did not unseal under this host's key");
@@ -698,7 +737,61 @@ where
             expires_at: context.expires_at,
         };
         let id = format!("{}:{}-token", context.module, context.mode);
-        Some((member, unsealed.member, id))
+        let revocations = self.revocations_in_force(&context, &member);
+        Some(Redeemed {
+            member,
+            credential: unsealed.member,
+            id,
+            revocations,
+        })
+    }
+
+    /// The revocations in force that cover `context`'s member, in the terms
+    /// the decision reads: the set holds the box and module names a sealed
+    /// context carries, the decision the ids the shell interned for this
+    /// request (BEP-043, BEP-044).
+    fn revocations_in_force(
+        &self,
+        context: &seal::SealedContext,
+        member: &SealedMember,
+    ) -> Vec<redeem::Revocation> {
+        let revoked = self
+            .revocations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut in_force = Vec::new();
+        if revoked.covers_box(&context.box_id) {
+            in_force.push(redeem::Revocation::Box(member.box_id));
+        }
+        if revoked.covers_module(&context.module) {
+            in_force.push(redeem::Revocation::Module(member.module));
+        }
+        if !in_force.is_empty() {
+            tracing::info!(
+                box_id = %context.box_id,
+                module = %context.module,
+                "a revocation covers the value this request carries"
+            );
+        }
+        in_force
+    }
+
+    /// Appends one client submission the control socket carried to the log and
+    /// puts a revocation it names in force: the proxy is the log's sole
+    /// writer, and the set it reads per request is its own (BEP-067, BEP-043,
+    /// BEP-044).
+    ///
+    /// # Errors
+    ///
+    /// A [`ControlError`]: the submission claims a kind only the proxy
+    /// records, or the log refuses the append.
+    pub fn submit(&self, submission: &Submission) -> Result<Record, ControlError> {
+        let mut log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut revocations = self
+            .revocations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        control::submit(&mut log, &mut revocations, submission)
     }
 
     /// The connection and request facts of `request` on `flow` (BEP-022,
@@ -907,7 +1000,9 @@ mod tests {
     };
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, RootCertStore};
-    use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+    use tokio::io::{
+        AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _,
+    };
     use tokio::net::TcpSocket;
     use tokio::sync::oneshot;
     use tokio_rustls::TlsConnector;
@@ -1625,5 +1720,158 @@ mod tests {
         let rest = read_all(&mut tls).await;
         assert!(rest.contains("second-chunk"), "{rest}");
         assert_eq!(h.last().decision, audit::Decision::Admit);
+    }
+
+    /// Stands the proxy's control socket up at `path`: one JSON-line
+    /// submission per connection into the proxy's own intake, the record it
+    /// appended — or the refusal — back on the same line.
+    ///
+    /// The production socket, owned by the operator's user at mode `0600`, is
+    /// BEP-063's; the accept loop here is what stands in for it, so a
+    /// submission still reaches the proxy over the wire the client speaks.
+    fn control_socket(proxy: Arc<Proxy<MemoryStore>>, path: &std::path::Path) {
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let proxy = Arc::clone(&proxy);
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut line = String::new();
+                    tokio::io::BufReader::new(reader)
+                        .read_line(&mut line)
+                        .await
+                        .unwrap();
+                    let submission: Submission = serde_json_lenient::from_str(&line).unwrap();
+                    let reply = match proxy.submit(&submission) {
+                        Ok(record) => serde_json_lenient::to_string(&record).unwrap(),
+                        Err(error) => format!(r#"{{"error":"{error}"}}"#),
+                    };
+                    writer
+                        .write_all(format!("{reply}\n").as_bytes())
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+    }
+
+    /// Submits `event` over the control socket at `path` the way the client
+    /// does — one JSON line out, the record back — and returns the record.
+    async fn submit_over(path: &std::path::Path, event: Event) -> Record {
+        let stream = tokio::net::UnixStream::connect(path).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut line = serde_json_lenient::to_string(&Submission::Audit(event)).unwrap();
+        line.push('\n');
+        writer.write_all(line.as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        tokio::io::BufReader::new(reader)
+            .read_line(&mut reply)
+            .await
+            .unwrap();
+        serde_json_lenient::from_str(reply.trim()).unwrap()
+    }
+
+    /// Redeems a value minted for `box_id` from that box itself: one request
+    /// carrying it on a terminated flow to `api.github.com`, answered with the
+    /// whole response the proxy returned.
+    async fn redeem_from(h: &Harness, box_id: &str) -> String {
+        let mut context = context();
+        context.box_id = box_id.to_owned();
+        let value = seal::seal(h.proxy.keys, &context, &Member::new(CREDENTIAL))
+            .unwrap()
+            .to_string();
+        let sender = Sender {
+            box_id: box_id.to_owned(),
+            addressing: Addressing::OwnIp,
+            egress: None,
+        };
+        let tcp = attach(h, Some(sender)).await;
+        let mut tls = tunnel(h, tcp, "api.github.com:443").await.unwrap();
+        let request = get("/user", "api.github.com", Some(&format!("token {value}")));
+        exchange(&mut tls, &request).await
+    }
+
+    /// BEP-043 and BEP-044: a box's removal, and a logout, are each one
+    /// revocation submitted over the control socket, and from the next request
+    /// on the proxy refuses every sealed value they cover — well inside the
+    /// sixty seconds the requirements allow, because the set is read per
+    /// request rather than polled. The refused request reaches no upstream and
+    /// is recorded `unrevoked`.
+    #[tokio::test]
+    async fn revocation_over_control_socket_refuses_within_60s() {
+        let h = Harness::start().await;
+        let (chain, key) = h.chain("api.github.com", Chain::Valid);
+        let up = Upstream::serve(chain, key, Respond::Whole("{\"login\":\"octocat\"}")).await;
+        h.route(up.addr);
+        let control = tempfile::tempdir().unwrap();
+        let socket = control.path().join("control.sock");
+        control_socket(Arc::clone(&h.proxy), &socket);
+
+        // Both boxes redeem what was minted for them before anything is
+        // revoked, and the member itself is what goes upstream.
+        for box_id in ["box-a1", "box-b2"] {
+            let response = redeem_from(&h, box_id).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{box_id}: {response}");
+            assert_eq!(h.last().decision, audit::Decision::Admit);
+        }
+        assert!(
+            up.received().contains(CREDENTIAL),
+            "the member was not sent"
+        );
+
+        // `min box rm box-a1`: one revocation record, chained onto the proxy's
+        // own decisions.
+        let started = std::time::Instant::now();
+        let revoked = submit_over(&socket, crate::mint::box_revocation_event("box-a1")).await;
+        assert_eq!(revoked.kind, Kind::Revocation);
+        assert_eq!(revoked.sub, "box-a1");
+        let records = h.records();
+        assert_eq!(
+            revoked.previous_hash,
+            records[records.len() - 2].line_hash(),
+            "the revocation did not chain onto the proxy's last decision"
+        );
+
+        // That box's values are refused from the next request on, and nothing
+        // of the request reaches the upstream.
+        let sent = up.received().len();
+        let response = redeem_from(&h, "box-a1").await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        let record = h.last();
+        assert_eq!(record.decision, audit::Decision::Refuse);
+        assert_eq!(record.marker, Check::Unrevoked.name());
+        assert_eq!(record.sub, "box-a1");
+        assert_eq!(
+            up.received().len(),
+            sent,
+            "a revoked value reached the upstream"
+        );
+        assert!(
+            started.elapsed().as_secs() < crate::control::REVOCATION_DEADLINE_SECS,
+            "the revocation took longer than the requirement allows"
+        );
+
+        // The other box is untouched by it: that revocation names one box.
+        let response = redeem_from(&h, "box-b2").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        // `min auth logout`: every GitHub member on this host, the other box's
+        // included.
+        let started = std::time::Instant::now();
+        let logout = submit_over(&socket, crate::mint::revocation_event()).await;
+        assert_eq!(logout.kind, Kind::Revocation);
+        assert_eq!(logout.sub, crate::mint::EVERY_BOX);
+        let response = redeem_from(&h, "box-b2").await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert_eq!(h.last().marker, Check::Unrevoked.name());
+        assert!(
+            started.elapsed().as_secs() < crate::control::REVOCATION_DEADLINE_SECS,
+            "the logout revocation took longer than the requirement allows"
+        );
+
+        // What a proxy restarted on this log starts from: both revocations.
+        let replayed = Revocations::in_log(&h.log_path).unwrap();
+        assert!(replayed.covers_box("box-a1"));
+        assert!(replayed.covers_module("github"));
     }
 }

@@ -2897,8 +2897,31 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         if let Some(net_guard) = self.net_guard.take() {
             net_guard.teardown().await;
         }
+        self.notify_revocation_due();
 
         result
+    }
+
+    /// The daemon's account of a box that has stopped: every sealed value the
+    /// box egress proxy holds for it must be refused from here on (BEP-043).
+    ///
+    /// The daemon says it rather than does it. The proxy's control socket is
+    /// the operator's own user's on the host, and on a VM host this daemon runs
+    /// in the guest, so the submission belongs to the client that ran the
+    /// command — `min box rm` (and its `min session destroy` alias) revoke the
+    /// box, `min auth logout` every member. This line is what a support bundle
+    /// carries for a stop no command drove, such as a shell that exited and was
+    /// answered with "Delete" at the exit prompt.
+    ///
+    /// The box a sealed value names is the session's name, which is what
+    /// `revoke_box` carries.
+    fn notify_revocation_due(&self) {
+        tracing::info!(
+            session_id = %self.session_id,
+            session = %self.session_name,
+            revoke_box = %self.session_name,
+            "box stopped; every sealed value naming it must be refused",
+        );
     }
 
     /// Logs a pty-master failure and stashes it for [`Self::mainloop`] to hand

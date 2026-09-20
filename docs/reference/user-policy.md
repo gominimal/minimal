@@ -1,6 +1,6 @@
 ---
 title: User policy
-description: "The user_policy.toml reference: the vars/patches allow-deny-ignore schema, where the file lives, how min gates loadout and project contributions against it, and how interactive prompts write rules back."
+description: "The user_policy.toml reference: the vars/patches allow-deny-ignore schema, where the file lives, how min gates loadout and project contributions against it, how interactive prompts write rules back, and the [[secret-store-rules]] that register what a stored secret may reach."
 ---
 
 # User policy
@@ -251,6 +251,71 @@ ready-to-paste `user_policy.toml` snippet listing what to add. Add the rules
 and re-run. When the policy already decides every item, a non-interactive
 activation proceeds normally.
 
+## Secret store rules {#secret-store-rules}
+
+Your policy's other half governs secrets rather than contributions: which
+upstream a value held in one of your host's stores may be injected into, and
+how. These rules live in your client
+[`config.toml`](./loadouts.md#client-config), beside the policy file, under a
+`[[secret-store-rules]]` array:
+
+```
+<config>/minimal/config.toml
+```
+
+```toml
+[[secret-store-rules]]
+store    = "keychain"                   # the host store holding the value
+id       = "anthropic-api-key"          # the identifier it is stored under
+upstream = ["api.anthropic.com:443"]    # the authorities it may be injected into
+inject   = { header = "x-api-key" }     # how it goes on the wire
+action   = "allow"                      # allow (default) | ask | deny
+
+[[secret-store-rules]]
+store    = "keychain"
+id       = "registry-password"
+upstream = ["registry.example.com"]
+inject   = { basic_auth = "password" }  # or { basic_auth = "user" }
+action   = "ask"
+```
+
+A project references the identifier with
+[`[[session.references]]`](./minimal-dot-toml.md#session-references) and never
+sees the value: the session receives a short-lived handle, and the proxy reads
+the value from the store per request and injects it into requests to the
+`upstream` this rule registers.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `store` | required | The store holding the value; `keychain` is the host's native store |
+| `id` | required | The identifier the value is stored under, as `min secret` names it |
+| `upstream` | required | The authorities the value may be injected into, each `host` or `host:port`. A session referencing this identifier must also admit every one of these hosts in its own [`allow_dns_hosts`](./minimal-dot-toml.md#session-network), or activation is refused |
+| `inject` | required | Either `{ header = "<name>", prefix = "<text>" }` — exactly the prefix followed by the value, as that header's whole value — or `{ basic_auth = "user" \| "password" }`. One form per rule; `prefix` belongs to the header form |
+| `action` | `allow` | `allow` injects without asking. `ask` asks you at the terminal first, and **denies** the reference when there is no terminal to ask at (`--no-prompt`, CI, pipes, agents), for the same reason a non-interactive activation never guesses. `deny` never injects |
+
+A rule is refused **when the config is read**, so no session is ever created
+under it, if it names:
+
+- a host of a configured module's host set (`github.com`, `api.github.com`,
+  `uploads.github.com`, `codeload.github.com`) on any port — those hosts carry
+  the module's own sealed member, never a store value;
+- one of Minimal's own hostnames (`*.min.internal`, `host.min.internal`,
+  `localhost`, `127.0.0.1`);
+- an injection header among `Host`, `:authority`, `Cookie`, `Proxy-*`,
+  `Transfer-Encoding`, `Connection` and `Upgrade`, each of which would
+  redirect or reframe the request rather than authenticate it.
+
+```console
+$ min session activate
+error: invalid config `/home/you/.config/minimal/config.toml`: keychain rule `anthropic-api-key` registers `api.github.com:443`, a host of a configured module's host set: those hosts carry the module's own sealed member, never a store value
+```
+
+These rules are yours, never a project's: a `minimal.toml` carrying a
+`[secret-store-rules]` section is ignored with a warning, so what a stored
+value may reach is decided in one place. Editing a rule bites a running
+session — a handle whose rule has since narrowed, or changed its injection
+form, is refused at the proxy.
+
 ## Interactions and notes
 
 - **Client-only enforcement.** The daemon never sees or runs your policy. `min`
@@ -264,6 +329,7 @@ activation proceeds normally.
   policy's `ignore` list to drop all contributors of it. See
   [Composition, conflicts, and policy](./loadouts.md#composition-conflicts-and-policy).
 - **Diagnostics.** `min` support bundles include a **redacted**
-  `config/user_policy.toml.redacted` copy of the file.
+  `config/user_policy.toml.redacted` copy of the file, and a redacted
+  `config/config.toml.redacted` carrying your `[[secret-store-rules]]`.
 - Only the `min` CLI consumes `user_policy.toml`; `mip`, `minimald`, and
   `minvmd` do not.

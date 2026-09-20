@@ -14,6 +14,7 @@ pub mod completions;
 pub mod config;
 pub mod diag;
 pub mod dirs;
+pub mod doctor;
 pub mod git_remote;
 pub mod loadouts;
 mod net;

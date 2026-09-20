@@ -12,6 +12,11 @@
 //! inside the union is narrower still, bounded by its egress declaration and by
 //! its sealed values' host sets.
 //!
+//! The signing certificate rotates freely under an unchanged root (BEP-061): a
+//! rotation issues another certificate, with another serial, over the same
+//! store-held signing key. The root a box was given at creation stays its
+//! anchor, so nothing inside the box is touched by a rotation.
+//!
 //! Both CA private keys stay in the host key store: rcgen encodes the
 //! certificate and hands the bytes to be signed back through
 //! [`PrivateKey`](crate::keychain::PrivateKey), so nothing but a signature
@@ -19,13 +24,15 @@
 //! since the proxy terminates TLS with it.
 
 use std::fmt;
+use std::time::SystemTime;
 
 use p256::PublicKey;
 use p256::elliptic_curve::sec1::ToSec1Point;
+use rand::Rng as _;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
     GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose, NameConstraints, PublicKeyData,
-    SignatureAlgorithm, SigningKey,
+    SerialNumber, SignatureAlgorithm, SigningKey,
 };
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -151,6 +158,15 @@ impl<'k, K> StoreKey<'k, K> {
     }
 }
 
+impl<K> Clone for StoreKey<'_, K> {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key,
+            point: self.point.clone(),
+        }
+    }
+}
+
 impl<K> PublicKeyData for StoreKey<'_, K> {
     fn der_bytes(&self) -> &[u8] {
         &self.point
@@ -218,13 +234,22 @@ impl fmt::Debug for Leaf {
     }
 }
 
+/// The signing certificate as it stands: the one thing a rotation replaces.
+struct Signing<'k, K: PrivateKey> {
+    der: Vec<u8>,
+    serial: String,
+    issued_at: SystemTime,
+    issuer: Issuer<'static, StoreKey<'k, K>>,
+}
+
 /// The host's interception certificates, open over the host's keys.
 pub struct Authority<'k, K: PrivateKey> {
     union: DeclaredUnion,
     version: String,
     root_der: Vec<u8>,
-    signing_der: Vec<u8>,
-    signing: Issuer<'static, StoreKey<'k, K>>,
+    root: Issuer<'static, StoreKey<'k, K>>,
+    signing_key: StoreKey<'k, K>,
+    signing: Signing<'k, K>,
 }
 
 impl<'k, K: PrivateKey> Authority<'k, K> {
@@ -251,24 +276,19 @@ impl<'k, K: PrivateKey> Authority<'k, K> {
         );
 
         // One intermediate under the root, no CA under the signing
-        // certificate: the only thing it may issue is a leaf.
+        // certificate: the only thing it may issue is a leaf. The root carries
+        // no serial of its own, so rcgen derives one from the root public key
+        // and a restart re-derives the very anchor bytes the boxes hold.
         let root_params = ca_params("Minimal box egress proxy root", 1, None);
         let root_cert = root_params.self_signed(&root_key).map_err(issue("root"))?;
-        let root_issuer = Issuer::new(root_params, root_key);
-
-        let signing_params = ca_params(
-            "Minimal box egress proxy signing",
-            0,
-            Some(permitted_subtrees(&union)),
-        );
-        let signing_cert = signing_params
-            .signed_by(&signing_key, &root_issuer)
-            .map_err(issue("signing"))?;
+        let root = Issuer::new(root_params, root_key);
 
         let version = union.version();
+        let signing = Self::issue_signing(&root, &signing_key, &union)?;
         tracing::info!(
             root = %keys.fingerprint(KeyRole::Root),
             signing = %keys.fingerprint(KeyRole::Signing),
+            serial = %signing.serial,
             names = union.names().len(),
             constraint = %version,
             "issued the host signing certificate"
@@ -276,11 +296,63 @@ impl<'k, K: PrivateKey> Authority<'k, K> {
 
         Ok(Self {
             root_der: root_cert.der().to_vec(),
-            signing_der: signing_cert.der().to_vec(),
-            signing: Issuer::new(signing_params, signing_key),
+            root,
+            signing_key,
+            signing,
             union,
             version,
         })
+    }
+
+    /// Issues a signing certificate under `root`, constrained to `union`, with
+    /// a serial of its own so one issuance is distinguishable from the next
+    /// over the same store-held key.
+    fn issue_signing(
+        root: &Issuer<'static, StoreKey<'k, K>>,
+        signing_key: &StoreKey<'k, K>,
+        union: &DeclaredUnion,
+    ) -> Result<Signing<'k, K>, CaError> {
+        let serial = fresh_serial();
+        let mut params = ca_params(
+            "Minimal box egress proxy signing",
+            0,
+            Some(permitted_subtrees(union)),
+        );
+        params.serial_number = Some(serial.clone());
+        let cert = params
+            .signed_by(signing_key, root)
+            .map_err(issue("signing"))?;
+        Ok(Signing {
+            der: cert.der().to_vec(),
+            serial: serial.to_string(),
+            issued_at: SystemTime::now(),
+            issuer: Issuer::new(params, signing_key.clone()),
+        })
+    }
+
+    /// Rotates the signing certificate: another certificate with another
+    /// serial, under the unchanged root, over the same store-held signing key
+    /// and the same permitted names.
+    ///
+    /// Flows terminated from now on present the new certificate. The root the
+    /// box was given at creation is still its anchor, and a leaf already
+    /// presented under the previous signing certificate still chains to that
+    /// root, so a running box keeps working and nothing inside it changes
+    /// (BEP-061).
+    ///
+    /// # Errors
+    ///
+    /// [`CaError::Issue`] when the store refuses to sign the new certificate.
+    pub fn rotate(&mut self) -> Result<(), CaError> {
+        let signing = Self::issue_signing(&self.root, &self.signing_key, &self.union)?;
+        let previous = std::mem::replace(&mut self.signing, signing);
+        tracing::info!(
+            previous = %previous.serial,
+            serial = %self.signing.serial,
+            constraint = %self.version,
+            "rotated the host signing certificate under the unchanged root"
+        );
+        Ok(())
     }
 
     /// The root certificate, DER: the trust anchor injected into a box.
@@ -293,7 +365,20 @@ impl<'k, K: PrivateKey> Authority<'k, K> {
     /// leaves.
     #[must_use]
     pub fn signing_der(&self) -> &[u8] {
-        &self.signing_der
+        &self.signing.der
+    }
+
+    /// The serial the signing certificate in use carries: what a rotation
+    /// changes, reported beside the root's fingerprint.
+    #[must_use]
+    pub fn signing_serial(&self) -> &str {
+        &self.signing.serial
+    }
+
+    /// When the signing certificate in use was issued.
+    #[must_use]
+    pub fn signing_issued_at(&self) -> SystemTime {
+        self.signing.issued_at
     }
 
     /// The union the signing certificate's permitted names were derived from.
@@ -336,12 +421,14 @@ impl<'k, K: PrivateKey> Authority<'k, K> {
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         params.use_authority_key_identifier_extension = true;
-        let cert = params.signed_by(&key, &self.signing).map_err(issue(host))?;
+        let cert = params
+            .signed_by(&key, &self.signing.issuer)
+            .map_err(issue(host))?;
         tracing::info!(host, constraint = %self.version, "issued a leaf certificate");
         Ok(Leaf {
             host: host.to_owned(),
             cert_der: cert.der().to_vec(),
-            signing_der: self.signing_der.clone(),
+            signing_der: self.signing.der.clone(),
             key_der: Zeroizing::new(key.serialize_der()),
         })
     }
@@ -365,6 +452,19 @@ fn ca_params(
     params.use_authority_key_identifier_extension = true;
     params.name_constraints = name_constraints;
     params
+}
+
+/// A serial number for a newly issued signing certificate: sixteen random
+/// bytes with the top bit clear, X.509 wanting a positive integer (RFC 5280
+/// §4.1.2.2). The serial is what makes one issuance distinguishable from the
+/// next: rcgen derives an absent serial from the subject public key, so a
+/// rotation over the same store-held key would otherwise reissue the very same
+/// certificate.
+fn fresh_serial() -> SerialNumber {
+    let mut serial = [0u8; 16];
+    rand::rng().fill_bytes(&mut serial);
+    serial[0] &= 0x7f;
+    SerialNumber::from_slice(&serial)
 }
 
 /// The permitted `dNSName` subtrees for `union`. Excluded subtrees stay empty:
@@ -581,6 +681,89 @@ mod tests {
                     candidate
                 );
             }
+        }
+    }
+
+    /// BEP-061: rotating the signing certificate under the same root is
+    /// invisible to a box. The root it was given at creation is byte-identical
+    /// afterwards, the leaf it was already presented still chains to that
+    /// root, every leaf issued after the rotation validates against the same
+    /// anchor, and a restart — itself a reissue — leaves the anchor alone too.
+    #[test]
+    fn signing_ca_rotation_invisible_to_boxes() {
+        let keys = Keys::open(MemoryStore::new()).unwrap();
+        let union = DeclaredUnion::of([DECLARABLE]);
+        let mut authority = Authority::open(&keys, union.clone()).unwrap();
+
+        // The box's trust store as the box holds it: taken once, before the
+        // rotation, and never touched again.
+        let injected_root = authority.root_der().to_vec();
+        let verifier = verifier(&injected_root);
+        let presented = authority.issue_leaf("api.github.com").unwrap();
+        assert!(validates(&verifier, &presented, "api.github.com"));
+
+        let mut serials = vec![authority.signing_serial().to_owned()];
+        let issued = authority.signing_issued_at();
+        let previous_signing = authority.signing_der().to_vec();
+
+        authority.rotate().unwrap();
+
+        // The rotation is a new signing certificate: a new serial, a later
+        // issue time, new bytes.
+        assert!(
+            !serials
+                .iter()
+                .any(|serial| serial == authority.signing_serial()),
+            "the rotation reissued the serial {}",
+            authority.signing_serial()
+        );
+        assert_ne!(authority.signing_der(), previous_signing.as_slice());
+        assert!(authority.signing_issued_at() >= issued);
+        serials.push(authority.signing_serial().to_owned());
+
+        // Under the unchanged root, with the same permitted names.
+        assert_eq!(authority.root_der(), injected_root.as_slice());
+        assert_eq!(
+            permitted_dns_names(authority.signing_der()),
+            union.names().to_vec()
+        );
+        assert_eq!(authority.constraint_version(), union.version());
+
+        // Nothing inside the box changed: the anchor it already holds still
+        // validates the leaf presented before the rotation, and validates
+        // every leaf issued under the new signing certificate.
+        assert!(
+            validates(&verifier, &presented, "api.github.com"),
+            "a leaf presented before the rotation stopped validating"
+        );
+        assert_eq!(presented.chain_der()[1], previous_signing.as_slice());
+        for name in union.names() {
+            let leaf = authority.issue_leaf(name).unwrap();
+            assert_eq!(leaf.chain_der()[1], authority.signing_der());
+            assert!(
+                validates(&verifier, &leaf, name),
+                "a leaf issued after the rotation does not validate for {name}"
+            );
+        }
+
+        // A second rotation, and a proxy restart against the same store, are
+        // the same story: another signing certificate, the same anchor.
+        authority.rotate().unwrap();
+        for authority in [authority, Authority::open(&keys, union.clone()).unwrap()] {
+            assert!(
+                !serials
+                    .iter()
+                    .any(|serial| serial == authority.signing_serial()),
+                "the serial {} came round again",
+                authority.signing_serial()
+            );
+            serials.push(authority.signing_serial().to_owned());
+            assert_eq!(authority.root_der(), injected_root.as_slice());
+            let leaf = authority.issue_leaf("github.com").unwrap();
+            assert!(
+                validates(&verifier, &leaf, "github.com"),
+                "the box's anchor stopped validating leaves"
+            );
         }
     }
 

@@ -13,12 +13,13 @@
 //! mints, until the operator acknowledges the widening (BEP-057).
 //!
 //! `min box audit <box>` is the read side (BEP-042): the proxy's own records
-//! for that box and no other's, from the log beside its control socket.
-//! `--parent` merges every box under one onto a single stream, `--follow`
-//! tails what the proxy appends next, and `-o jsonl` prints the log's own
-//! lines. `self` is refused while the host is not enrolled — a box has no
-//! identity surface to read its trail through — naming the host command that
-//! reads it.
+//! for that box and no other's, from the log beside its control socket — every
+//! retained segment of it, oldest first, so a trail that crossed a rotation
+//! reads as one trail (BEP-068). `--parent` merges every box under one onto a
+//! single stream, `--follow` tails what the proxy appends next, and `-o jsonl`
+//! prints the log's own lines. `self` is refused while the host is not
+//! enrolled — a box has no identity surface to read its trail through — naming
+//! the host command that reads it.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -366,7 +367,9 @@ fn never_enough(_records: usize, _polls: u32) -> bool {
 /// The proxy's audit log: `<minimal_dir>/bep/audit.log`, beside the control
 /// socket ([`crate::auth::control_socket_path`]), named by the constant
 /// `minvmd` starts the proxy with so the reader and the writer cannot drift.
-fn audit_log_path(minimal_dir: Option<&Path>) -> PathBuf {
+/// The active segment; the rotated ones sit beside it as `audit.log.<n>`
+/// ([`bep::audit::segments`]).
+pub(crate) fn audit_log_path(minimal_dir: Option<&Path>) -> PathBuf {
     crate::auth::control_socket_path(minimal_dir).with_file_name(minvmd::net::BEP_AUDIT_LOG_FILE)
 }
 
@@ -465,9 +468,8 @@ pub fn cmd_box_audit(global: &GlobalArgs, args: BoxAuditArgs) -> Result<(), anyh
     let in_box = std::env::var(SESSION_NAME_ENV).ok();
     let subject = subject_of(&args, in_box.as_deref())?;
     let log = audit_log_path(global.minimal_dir.as_deref());
-    // One segment today; segment rotation extends the list, and the reader
-    // already reads across whatever it is given.
-    let mut reader = Reader::open([log]);
+    // Every retained segment, oldest first, then the active one (BEP-068).
+    let mut reader = Reader::open(bep::audit::segments(&log)?);
     let segments = reader.segments();
     let tail = args.follow.then_some(Tail {
         poll: FOLLOW_POLL,
@@ -727,10 +729,11 @@ mod tests {
     }
 
     /// One read of the log at `path`, with no tailing: what it printed, and
-    /// how many records it wrote.
+    /// how many records it wrote. Over the same segment list the command reads,
+    /// so a rotated log reads here as it does there.
     fn read(path: &Path, args: &BoxAuditArgs) -> (String, usize) {
         let subject = subject_of(args, None).expect("the subject is a box");
-        let mut reader = Reader::open([path.to_path_buf()]);
+        let mut reader = Reader::open(bep::audit::segments(path).expect("the segments list"));
         let mut out = Vec::new();
         let written = stream(&mut reader, &subject, args.output, &mut out, None)
             .expect("the read prints the trail");
@@ -809,6 +812,104 @@ mod tests {
         // The grammar names a box or a parent; neither names a read.
         use clap::Parser as _;
         assert!(crate::Cli::try_parse_from(["min", "box", "audit"]).is_err());
+    }
+
+    /// BEP-068: a read covers every retained segment, oldest first — a box's
+    /// trail that crossed a rotation reads as one trail, with the same filter
+    /// applied across the segments.
+    #[test]
+    fn box_audit_reads_across_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        // The proxy's own rotation, at a bound small enough that these records
+        // span more than one segment.
+        let mut log = bep::Log::open(&path)
+            .expect("the log opens for append")
+            .with_segment_bytes(500);
+        let appended = [
+            ("web", "api.github.com"),
+            ("web", "github.com"),
+            // Another box's records ride along, so the filter is still doing
+            // its work on either side of the rotation.
+            ("api", "codeload.github.com"),
+            ("web", "uploads.github.com"),
+            ("web", "api.github.com"),
+            ("api", "github.com"),
+        ];
+        for (box_id, authority) in appended {
+            log.append(&audit_event(box_id, authority))
+                .expect("the log takes an append");
+        }
+        drop(log);
+
+        let segments = bep::audit::segments(&path).expect("the segments list");
+        assert!(segments.len() > 1, "the log rotated: {segments:?}");
+        // The box's records are spread over the segments, so a read that covers
+        // one of them cannot be complete.
+        let spread: Vec<usize> = segments
+            .iter()
+            .map(|segment| {
+                std::fs::read_to_string(segment)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| line.contains(r#""sub":"web""#))
+                    .count()
+            })
+            .collect();
+        assert_eq!(spread.iter().sum::<usize>(), 4, "{spread:?}");
+        assert!(
+            spread.iter().filter(|held| **held > 0).count() > 1,
+            "one segment holds all of the box's records: {spread:?}"
+        );
+
+        let (text, written) = read(&path, &audit_args(&["min", "box", "audit", "web"]));
+        assert_eq!(written, 4, "{text}");
+        let authorities: Vec<&str> = text
+            .lines()
+            .map(|line| {
+                line.split_whitespace()
+                    .nth(3)
+                    .expect("each line names the authority")
+            })
+            .collect();
+        // Every record of the box, in the order the proxy appended them, the
+        // rotated segments' first.
+        assert_eq!(
+            authorities,
+            [
+                "api.github.com",
+                "github.com",
+                "uploads.github.com",
+                "api.github.com"
+            ],
+            "{text}"
+        );
+        assert!(text.lines().all(|line| line.starts_with("web  ")), "{text}");
+        assert!(!text.contains("codeload.github.com"), "{text}");
+
+        // `-o jsonl` prints the lines the segments hold, whichever segment each
+        // came from.
+        let (jsonl, written) = read(
+            &path,
+            &audit_args(&["min", "box", "audit", "web", "-o", "jsonl"]),
+        );
+        assert_eq!(written, 4);
+        let held: Vec<String> = segments
+            .iter()
+            .flat_map(|segment| {
+                std::fs::read_to_string(segment)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for line in jsonl.lines() {
+            assert!(
+                held.iter().any(|line_of_log| line_of_log == line),
+                "{line} is no line of any segment"
+            );
+        }
     }
 
     /// BEP-042: `--follow` replays the box's records and then prints the ones

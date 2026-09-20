@@ -21,6 +21,12 @@
 //! removed (BEP-041): [`Log::open`] finds the chain head by reading the last
 //! line, and from then on the file only grows.
 //!
+//! A log that only grows would fill a laptop disk, so the active segment
+//! rotates at [`SEGMENT_BYTES`]: the active file is renamed `<name>.<n>` and a
+//! fresh one opened, with the chain head kept, so the first record of the new
+//! segment carries the last record of the old one (BEP-068). [`segments`] is
+//! the list a reader and a verifier walk, oldest first.
+//!
 //! Reading is [`Reader`], which `min box audit` renders: the records one
 //! [`Subject`] wants — one box's, or every box under one — across the retained
 //! segments, resumable so a `--follow` read tails what is appended after the
@@ -45,6 +51,11 @@ pub const NONE: &str = "none";
 /// What the resource and permission read when the module maps the request to
 /// neither (BEP-039).
 pub const UNMAPPED: &str = "module_unmapped";
+
+/// The size the active segment rotates at (BEP-068): 8 MiB, some tens of
+/// thousands of records, which keeps one segment small enough to read and ship
+/// in a support bundle while a busy host still rotates rarely.
+pub const SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The SHA-256 of a record's line: what the next record carries as its
 /// `previous_hash`.
@@ -300,6 +311,14 @@ pub enum AuditError {
         #[source]
         source: io::Error,
     },
+    /// The active segment could not be rotated at its size bound.
+    #[error("rotating the audit log {} to {}: {source}", path.display(), segment.display())]
+    Rotate {
+        path: PathBuf,
+        segment: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     /// A segment a read covers could not be read.
     #[error("reading the audit log {}: {source}", path.display())]
     Read {
@@ -344,6 +363,81 @@ fn head_of(path: &Path) -> Result<Hash, AuditError> {
         .map_or(Hash::ZERO, Hash::of_line))
 }
 
+/// The hash the next record of the log appends onto: the last record's line
+/// hash from the newest segment holding a record, or [`Hash::ZERO`] when no
+/// segment holds one.
+///
+/// The walk back past an empty active segment is what keeps the chain
+/// continuous when a rotation was the last thing that happened to the log
+/// (BEP-068): a proxy restarting then would otherwise read an empty active
+/// segment as the start of a log and chain the next record onto nothing.
+fn head_of_log(active: &Path) -> Result<Hash, AuditError> {
+    for segment in segments(active)?.iter().rev() {
+        let head = head_of(segment)?;
+        if head != Hash::ZERO {
+            return Ok(head);
+        }
+    }
+    Ok(Hash::ZERO)
+}
+
+/// The index of a rotated segment of the log named `active`: `<active>.<n>`,
+/// with `n` a decimal index, or `None` for any other name.
+fn rotated_index(path: &Path, active: &str) -> Option<u32> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix(active)?
+        .strip_prefix('.')?
+        .parse()
+        .ok()
+}
+
+/// The log's segments, oldest first: the rotated `<name>.<n>` segments in index
+/// order, then the active `<name>` (BEP-068).
+///
+/// The active segment is always last and always named, whether or not it
+/// exists: a host whose proxy has never run has no file, which a read takes as
+/// empty rather than as an error.
+///
+/// # Errors
+///
+/// [`AuditError::Read`] when the directory holding the log cannot be read.
+pub fn segments(active: &Path) -> Result<Vec<PathBuf>, AuditError> {
+    let mut rotated: Vec<(u32, PathBuf)> = Vec::new();
+    let name = active.file_name().and_then(|name| name.to_str());
+    if let (Some(dir), Some(name)) = (active.parent(), name) {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry
+                        .map_err(|source| AuditError::Read {
+                            path: dir.to_path_buf(),
+                            source,
+                        })?
+                        .path();
+                    if let Some(index) = rotated_index(&path, name) {
+                        rotated.push((index, path));
+                    }
+                }
+            }
+            // No directory yet is no segment yet, as an absent log is.
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(AuditError::Read {
+                    path: dir.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+    rotated.sort_unstable();
+    Ok(rotated
+        .into_iter()
+        .map(|(_, path)| path)
+        .chain([active.to_path_buf()])
+        .collect())
+}
+
 /// The audit log, open for append.
 ///
 /// The proxy holds one and is the log's sole writer, so the head read, the
@@ -354,11 +448,15 @@ pub struct Log {
     path: PathBuf,
     file: File,
     head: Hash,
+    /// The bytes the active segment holds.
+    size: u64,
+    /// The size the active segment rotates at (BEP-068).
+    bound: u64,
 }
 
 impl Log {
     /// Opens the log at `path` for append, creating it when absent, and reads
-    /// its last line as the chain head.
+    /// the chain head from the newest segment holding a record.
     ///
     /// # Errors
     ///
@@ -372,8 +470,29 @@ impl Log {
                 path: path.clone(),
                 source,
             })?;
-        let head = head_of(&path)?;
-        Ok(Self { path, file, head })
+        let size = file
+            .metadata()
+            .map_err(|source| AuditError::Head {
+                path: path.clone(),
+                source,
+            })?
+            .len();
+        let head = head_of_log(&path)?;
+        Ok(Self {
+            path,
+            file,
+            head,
+            size,
+            bound: SEGMENT_BYTES,
+        })
+    }
+
+    /// The same log rotating at `bound` bytes instead of [`SEGMENT_BYTES`]. A
+    /// bound of zero rotates after every record.
+    #[must_use]
+    pub fn with_segment_bytes(mut self, bound: u64) -> Self {
+        self.bound = bound;
+        self
     }
 
     /// The hash the next record will carry: the last record's, or
@@ -389,12 +508,16 @@ impl Log {
         &self.path
     }
 
-    /// Appends the one record `event` makes and returns it.
+    /// Appends the one record `event` makes and returns it, rotating the active
+    /// segment first when it has reached its size bound (BEP-068).
     ///
     /// # Errors
     ///
-    /// When the record cannot be written.
+    /// When the segment cannot be rotated, or the record cannot be written.
     pub fn append(&mut self, event: &Event) -> Result<Record, AuditError> {
+        if self.size >= self.bound {
+            self.rotate()?;
+        }
         let record = Record::new(event, self.head);
         let mut line = record.line().into_bytes();
         let hash = Hash::of_line(&line);
@@ -406,6 +529,7 @@ impl Log {
                 source,
             })?;
         self.head = hash;
+        self.size += u64::try_from(line.len()).unwrap_or(u64::MAX);
         tracing::info!(
             kind = %record.kind,
             box_id = %record.sub,
@@ -414,6 +538,42 @@ impl Log {
             "appended audit record"
         );
         Ok(record)
+    }
+
+    /// Renames the active segment to the next `<name>.<n>` and opens a fresh
+    /// one, keeping the chain head so the first record of the new segment
+    /// carries the final hash of the segment before it (BEP-068).
+    fn rotate(&mut self) -> Result<(), AuditError> {
+        let name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let next = segments(&self.path)?
+            .iter()
+            .filter_map(|segment| rotated_index(segment, name))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let segment = self.path.with_file_name(format!("{name}.{next}"));
+        std::fs::rename(&self.path, &segment).map_err(|source| AuditError::Rotate {
+            path: self.path.clone(),
+            segment: segment.clone(),
+            source,
+        })?;
+        self.file = append_options()
+            .open(&self.path)
+            .map_err(|source| AuditError::Open {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.size = 0;
+        tracing::info!(
+            segment = %segment.display(),
+            previous_hash = %self.head,
+            "rotated the audit log",
+        );
+        Ok(())
     }
 }
 
@@ -754,6 +914,94 @@ mod tests {
             "a reopened log rewrote a record"
         );
         assert_eq!(lines(&path).len(), 4);
+    }
+
+    /// BEP-068: the active segment rotates when it reaches its size bound, the
+    /// first record of the new segment carries the final hash of the segment
+    /// before it, and the whole log stays one chain — across a reopen, and
+    /// across a reopen that finds the active segment empty because a rotation
+    /// was the last thing that happened.
+    #[test]
+    fn segment_rotation_continues_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        // A one-byte bound rotates at every append after the first, so each
+        // segment holds one record: the boundary, not the size, is what the
+        // chain has to survive.
+        let mut log = Log::open(&path).unwrap().with_segment_bytes(1);
+        let mut appended = Vec::new();
+        for authority in ["api.github.com", "github.com", "codeload.github.com"] {
+            appended.push(
+                log.append(&decision("web", authority, Decision::Admit))
+                    .unwrap(),
+            );
+        }
+
+        // Three records, three segments: the rotated ones oldest first, then
+        // the active segment last.
+        let held = segments(&path).unwrap();
+        assert_eq!(
+            held,
+            vec![
+                dir.path().join("audit.log.1"),
+                dir.path().join("audit.log.2"),
+                path.clone(),
+            ]
+        );
+        for segment in &held {
+            assert_eq!(lines(segment).len(), 1, "{}", segment.display());
+        }
+
+        // Every boundary is chained: the first record of each new segment
+        // carries the hash of the last line of the one before it.
+        for pair in held.windows(2) {
+            let opening: Record = serde_json_lenient::from_str(&lines(&pair[1])[0]).unwrap();
+            assert_eq!(
+                opening.previous_hash,
+                Hash::of_line(lines(&pair[0]).last().unwrap().as_bytes()),
+                "{} does not continue {}",
+                pair[1].display(),
+                pair[0].display()
+            );
+        }
+        assert_eq!(appended[0].previous_hash, Hash::ZERO);
+        assert_eq!(appended[2].previous_hash, appended[1].line_hash());
+
+        // A reopen continues the chain from the active segment.
+        drop(log);
+        let mut reopened = Log::open(&path).unwrap();
+        let fourth = reopened
+            .append(&decision("web", "uploads.github.com", Decision::Admit))
+            .unwrap();
+        assert_eq!(fourth.previous_hash, appended[2].line_hash());
+        drop(reopened);
+
+        // And from the newest rotated segment when the active one is empty: a
+        // rotation with nothing appended after it is not the start of a log.
+        std::fs::rename(&path, dir.path().join("audit.log.3")).unwrap();
+        let mut rotated = Log::open(&path).unwrap();
+        assert_eq!(rotated.head(), fourth.line_hash());
+        let fifth = rotated
+            .append(&decision("web", "github.com", Decision::Refuse))
+            .unwrap();
+        assert_eq!(fifth.previous_hash, fourth.line_hash());
+
+        // End to end: every record of every segment, oldest first, is one
+        // chain from the zero hash.
+        let bytes: Vec<Vec<u8>> = segments(&path)
+            .unwrap()
+            .iter()
+            .map(|segment| std::fs::read(segment).unwrap_or_default())
+            .collect();
+        let mut links = Vec::new();
+        for segment in &bytes {
+            links.extend(crate::chain::links(segment).unwrap());
+        }
+        assert_eq!(links.len(), 5);
+        assert_eq!(
+            crate::chain::verify(links.iter().copied(), Hash::ZERO).unwrap(),
+            fifth.line_hash()
+        );
     }
 
     /// BEP-042: a read returns the records of the subject it names and no

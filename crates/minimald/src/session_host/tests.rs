@@ -1132,6 +1132,105 @@ async fn exit_releases_the_network() {
     );
 }
 
+/// A `MakeWriter` accumulating everything written into a shared buffer, so a
+/// test can assert on the structured fields a `tracing` event emitted. The same
+/// shape `net/proxy.rs` captures its warnings with.
+#[derive(Clone, Default)]
+struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CaptureWriter {
+    fn contents(&self) -> String {
+        let written = self.0.lock().unwrap();
+        String::from_utf8_lossy(&written).into_owned()
+    }
+}
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// BEP-043: a box that stops says so, naming itself, so nothing about a stop is
+/// silent — the sealed values the proxy holds for that box must be refused from
+/// here on, and this is the daemon's own account of the moment. The submission
+/// itself is the client's (`min box rm`, `min auth logout`): the proxy's control
+/// socket is the operator's user's on the host, which a guest daemon cannot
+/// reach.
+///
+/// The notice is asserted through a process-wide subscriber rather than a
+/// thread-local default because the host loop is polled on a worker thread of
+/// its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_stop_notifies_revocation() {
+    let buf = CaptureWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .finish();
+    // Only this test installs one, and nextest gives each test its own process.
+    let _ = tracing::subscriber::set_global_default(subscriber);
+
+    let (host, _handle) = Host::build(
+        MockLauncher,
+        HostParams {
+            name: "revoked-box".to_string(),
+            username: "user".to_string(),
+            paths: test_paths(),
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            session_id: sessions::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+        },
+    )
+    .await
+    .expect("failed to build host");
+    let stdin = host.remote_tx.clone();
+    let task = tokio::spawn(host.mainloop());
+
+    // A live box has not stopped, so nothing is due yet.
+    assert!(
+        !buf.contents().contains("revoke_box"),
+        "a live box was reported as stopped: {}",
+        buf.contents()
+    );
+
+    stdin
+        .send(stdin_bytes(format!("{MOCK_EXIT_LINE}\n").into_bytes()))
+        .await
+        .expect("failed to send exit line");
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("mainloop should terminate after the shell exits")
+        .expect("host task should not panic during teardown")
+        .expect("mainloop should return the reaped exit status");
+
+    let logged = buf.contents();
+    assert!(
+        logged.contains("revoke_box=revoked-box"),
+        "the stop did not name the box whose values must be refused: {logged}"
+    );
+    assert!(
+        logged.contains("every sealed value naming it must be refused"),
+        "the stop notice does not say what is due: {logged}"
+    );
+}
+
 /// The other half of "detach != exit": the detach chord (leader then `d`)
 /// is swallowed as a detach signal — never forwarded to the shell — and does
 /// not end the session or release the network. The shell keeps running (a
