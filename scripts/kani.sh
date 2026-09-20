@@ -154,4 +154,4 @@ expect() { # crate expected_count
 }
 expect sessions 6
 expect rcache 3
-expect bep 10
+expect bep 11

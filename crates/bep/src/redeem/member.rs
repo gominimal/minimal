@@ -131,7 +131,7 @@ pub(super) fn first_failure(redemption: &Redemption) -> Option<Check> {
 
 /// BEP-020: the connection is attributed to a live box the value may be
 /// redeemed from.
-fn attributed(member: &SealedMember, redemption: &Redemption) -> bool {
+pub(super) fn attributed(member: &SealedMember, redemption: &Redemption) -> bool {
     match redemption.attribution {
         Attribution::NoBox => false,
         Attribution::OwnIp(box_id) => box_id == member.box_id,
@@ -140,7 +140,7 @@ fn attributed(member: &SealedMember, redemption: &Redemption) -> bool {
 }
 
 /// BEP-021: the connection authority is in the value's bound host set.
-fn in_bound_set(member: &SealedMember, redemption: &Redemption) -> bool {
+pub(super) fn in_bound_set(member: &SealedMember, redemption: &Redemption) -> bool {
     member.bound_set.contains(redemption.authority)
 }
 
@@ -150,12 +150,12 @@ fn in_current_set(_: &SealedMember, redemption: &Redemption) -> bool {
 }
 
 /// BEP-024: the clock is before the value's expiry.
-fn unexpired(member: &SealedMember, redemption: &Redemption) -> bool {
+pub(super) fn unexpired(member: &SealedMember, redemption: &Redemption) -> bool {
     redemption.now < member.expires_at
 }
 
 /// BEP-024: no revocation in force covers the value.
-fn unrevoked(member: &SealedMember, redemption: &Redemption) -> bool {
+pub(super) fn unrevoked(member: &SealedMember, redemption: &Redemption) -> bool {
     !redemption
         .revocations
         .iter()

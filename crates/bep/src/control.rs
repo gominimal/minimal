@@ -441,7 +441,7 @@ mod tests {
     use super::*;
     use crate::audit::{Decision, Hash, Mapping};
     use crate::ca::{Authority, DeclaredUnion};
-    use crate::keychain::{MemoryStore, PrivateKey as _};
+    use crate::keychain::{MemorySecrets, MemoryStore, PrivateKey as _};
     use crate::keys::Keys;
     use crate::listener::{Addressing, Config, Module, Proxy, Sender};
     use crate::upstream::Trust;
@@ -688,6 +688,8 @@ mod tests {
                 version: 1,
             }],
             store_authorities: Vec::new(),
+            store_rules: Arc::new(|_: &str, _: &str| None),
+            secrets: Arc::new(MemorySecrets::new()),
             attachments: Arc::new(move |source: SocketAddr| {
                 table.lock().unwrap().get(&source).cloned()
             }),
