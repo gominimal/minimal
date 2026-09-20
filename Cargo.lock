@@ -4141,6 +4141,7 @@ dependencies = [
  "minimald-rpc",
  "mlog",
  "paths",
+ "proptest",
  "russh",
  "russh-sftp",
  "serde",

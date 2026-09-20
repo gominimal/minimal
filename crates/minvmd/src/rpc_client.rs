@@ -58,19 +58,34 @@ pub(crate) fn call_oneshot_blocking<R: OneshotSshRpc>(
         .enable_all()
         .build()
         .context("building RPC client runtime")?;
-    rt.block_on(async {
-        let mut handle = tokio::time::timeout(connect_timeout, connect(uds_path))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "no live minimald behind {} after {connect_timeout:?}",
-                    uds_path.display()
-                )
-            })??;
-        tokio::time::timeout(rpc_timeout, call_oneshot::<R>(&mut handle, request))
-            .await
-            .map_err(|_| anyhow::anyhow!("RPC {} timed out after {rpc_timeout:?}", R::NAME))?
-    })
+    rt.block_on(call_oneshot::<R>(
+        uds_path,
+        request,
+        connect_timeout,
+        rpc_timeout,
+    ))
+}
+
+/// The async form of [`call_oneshot_blocking`], for a caller already on a
+/// runtime (the host-side filter's policy feed): the same two deadlines over
+/// the same connect-then-exchange flow.
+pub(crate) async fn call_oneshot<R: OneshotSshRpc>(
+    uds_path: &Path,
+    request: R::Request<'_>,
+    connect_timeout: Duration,
+    rpc_timeout: Duration,
+) -> anyhow::Result<R::Response> {
+    let mut handle = tokio::time::timeout(connect_timeout, connect(uds_path))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "no live minimald behind {} after {connect_timeout:?}",
+                uds_path.display()
+            )
+        })??;
+    tokio::time::timeout(rpc_timeout, exchange::<R>(&mut handle, request))
+        .await
+        .map_err(|_| anyhow::anyhow!("RPC {} timed out after {rpc_timeout:?}", R::NAME))?
 }
 
 /// Ask the in-VM minimald to shut down: drain sessions and quiesce the state
@@ -110,7 +125,7 @@ async fn connect(uds_path: &Path) -> anyhow::Result<russh::client::Handle<AnyHos
     Ok(handle)
 }
 
-async fn call_oneshot<R: OneshotSshRpc>(
+async fn exchange<R: OneshotSshRpc>(
     handle: &mut russh::client::Handle<AnyHostKey>,
     request: R::Request<'_>,
 ) -> anyhow::Result<R::Response> {

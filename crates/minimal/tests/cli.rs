@@ -931,8 +931,11 @@ async fn policy_shows_effective_egress() {
     .await
     .unwrap();
 
-    // What the user reads is the policy the daemon holds, field for field.
-    let parsed: sessions::SessionPolicy = serde_json_lenient::from_str(&shown).unwrap();
+    // What the user reads is the policy the daemon holds, field for field
+    // (the baseline set shown beside it is NET-130's, asserted separately).
+    let mut parsed: Value = serde_json_lenient::from_str(&shown).unwrap();
+    parsed.as_object_mut().unwrap().remove("baseline");
+    let parsed: sessions::SessionPolicy = serde_json_lenient::from_value(parsed).unwrap();
     assert_eq!(parsed.egress, Some(egress));
     // Each rule is legible in the line itself, not only after a round trip.
     for rule in [
@@ -946,6 +949,80 @@ async fn policy_shows_effective_egress() {
         "10.1.0.0/16",
     ] {
         assert!(shown.contains(rule), "{rule} missing from: {shown}");
+    }
+}
+
+/// NET-130: when a box's effective egress is shown, the node-plane baseline
+/// set — the host-side helper's enumeration of what the daemon's own traffic
+/// may reach, by category — is shown beside it, so a deny-all box's owner can
+/// see what still leaves the node and under which category.
+#[tokio::test]
+async fn policy_shows_baseline_set() {
+    let (daemon, args) = setup().await;
+
+    let project_path =
+        camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
+    // Deny-all: nothing the box declares reaches anywhere, so what the line
+    // shows beside its rules is exactly the baseline set.
+    let egress = sessions::EgressPolicy {
+        allow_subnets: Some(vec![]),
+        allow_dns_hosts: None,
+        allow_protocols: None,
+        deny_subnets: None,
+    };
+    let session_id = create_session_with(
+        &daemon,
+        minimald_rpc::SessionConfig {
+            name: Some("deny-all-policy".to_string()),
+            project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
+            network: sessions::NetworkMode::HostNet,
+            policy: sessions::SessionPolicy::new(Some(egress.clone()), None),
+            hooks_enabled: true,
+            attrs: Default::default(),
+        },
+    )
+    .await;
+
+    let shown = session_policy_json(
+        &args,
+        PolicyArgs {
+            session: session_id.to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let parsed: Value = serde_json_lenient::from_str(&shown).unwrap();
+    // The box's rules are still the line's own fields...
+    assert_eq!(
+        parsed["egress"]["allow_subnets"],
+        Value::Array(vec![]),
+        "{shown}"
+    );
+    // ...and the baseline set sits beside them: the helper's enumeration,
+    // every category with a member, the registry and cache never absent.
+    let baseline: minvmd::net::BaselineSet =
+        serde_json_lenient::from_value(parsed["baseline"].clone()).unwrap();
+    let categories: Vec<_> = baseline.entries.iter().map(|e| e.category).collect();
+    assert_eq!(categories, minvmd::net::BaselineCategory::ALL.to_vec());
+    for entry in &baseline.entries {
+        assert!(!entry.destination.is_empty(), "{entry:?}");
+    }
+    assert_eq!(
+        baseline
+            .members(minvmd::net::BaselineCategory::Registry)
+            .count(),
+        1
+    );
+    assert_eq!(
+        baseline
+            .members(minvmd::net::BaselineCategory::Cache)
+            .count(),
+        1
+    );
+    // Legible in the line itself: each category is named beside the rules.
+    for needle in ["\"baseline\"", "\"registry\"", "\"cache\"", "\"resolver\""] {
+        assert!(shown.contains(needle), "{needle} missing from: {shown}");
     }
 }
 

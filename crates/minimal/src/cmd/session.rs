@@ -899,10 +899,7 @@ pub async fn cmd_session_policy(
     args: PolicyArgs,
 ) -> Result<(), anyhow::Error> {
     let policy = session_policy(global, args).await?;
-    println!(
-        "{}",
-        serde_json_lenient::to_string(&policy).context("Failed to serialize policy")?
-    );
+    println!("{}", policy_line(&policy)?);
     if let Some(line) = egress_posture_line(&policy) {
         eprintln!("{line}");
     }
@@ -912,7 +909,9 @@ pub async fn cmd_session_policy(
 /// Ask the daemon for a session's effective networking policy and render it as
 /// the JSON line [`cmd_session_policy`] prints: the egress rules the daemon
 /// parsed — every field of the box's `egress` section, including the subnets it
-/// denies — beside its ingress forwarding.
+/// denies — beside its ingress forwarding, and beside the node-plane baseline
+/// set the host-side helper enumerates (NET-130): what the daemon's own traffic
+/// may reach whatever the box declares, by category.
 ///
 /// Split from the command so what the user reads is assertable without
 /// capturing stdout.
@@ -920,8 +919,25 @@ pub async fn session_policy_json(
     global: &GlobalArgs,
     args: PolicyArgs,
 ) -> Result<String, anyhow::Error> {
-    serde_json_lenient::to_string(&session_policy(global, args).await?)
-        .context("Failed to serialize policy")
+    policy_line(&session_policy(global, args).await?)
+}
+
+/// Render `policy` as the JSON line shown: the box's policy with the node-plane
+/// baseline set the host-side helper enumerates beside it (NET-130).
+fn policy_line(policy: &sessions::SessionPolicy) -> Result<String, anyhow::Error> {
+    /// The line as shown: the box's policy with the baseline set beside it.
+    #[derive(serde::Serialize)]
+    struct Shown<'a> {
+        #[serde(flatten)]
+        policy: &'a sessions::SessionPolicy,
+        baseline: minvmd::net::BaselineSet,
+    }
+
+    serde_json_lenient::to_string(&Shown {
+        policy,
+        baseline: minvmd::net::BaselineSet::from_host_env(),
+    })
+    .context("Failed to serialize policy")
 }
 
 /// The policy the daemon holds for the session `args` names.

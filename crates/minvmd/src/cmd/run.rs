@@ -66,6 +66,7 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     // deep in the VMM child; catch it here with a clear error instead.
     crate::sock::check_uds_path_len(&crate::sock::resolve_uds_path()?)?;
     crate::sock::check_uds_path_len(&crate::net::resolve_switch_sock()?)?;
+    crate::sock::check_uds_path_len(&crate::net::resolve_switch_upstream_sock()?)?;
 
     if detach {
         return run_detach(timeout_secs);
@@ -304,32 +305,52 @@ fn run_foreground() -> Result<()> {
         .context("setting listener to blocking")?;
 
     // Spawn + supervise the host gvproxy switch before the VMM child boots, so
-    // its `-listen` switch socket exists when libkrun dials it for the guest
-    // shuttle. The guest's root netns (the daemon) attaches a primary tap for
-    // egress, and own-IP PTasks attach further taps; both
-    // are L2 clients on this one switch. The handle lives for the VM's lifetime
-    // and stops gvproxy on drop (after the VMM child exits below).
+    // the switch socket exists when libkrun dials it for the guest shuttle.
+    // The guest's root netns (the daemon) attaches a primary tap for egress,
+    // and own-IP PTasks attach further taps; both are L2 clients on this one
+    // switch. libkrun dials the host-side filter (NET-081), which decides
+    // every frame leaving the VM by its source address and relays what it
+    // admits to gvproxy on the upstream socket behind it. Both handles live
+    // for the VM's lifetime and stop on drop (after the VMM child exits
+    // below).
     //
     // Best-effort: when the gvproxy binary is absent (e.g. the boot/session e2e
     // lanes that exercise only the vsock bridge) we warn and boot without
     // egress rather than failing the VM — the daemon then has no network, the
     // pre-existing behaviour.
-    let _gvproxy = match crate::image::resolve_gvproxy_path() {
+    let _switch = match crate::image::resolve_gvproxy_path() {
         binary if binary.exists() => {
             let switch_sock =
                 crate::net::resolve_switch_sock().context("resolving switch socket")?;
+            let upstream_sock = crate::net::resolve_switch_upstream_sock()
+                .context("resolving switch upstream socket")?;
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
-            match crate::net::HostGvproxy::spawn(binary, switch_sock) {
-                Ok(gvproxy) => {
-                    tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");
-                    Some(gvproxy)
+            crate::sock::remove_stale_socket(&upstream_sock)
+                .context("removing stale switch upstream socket")?;
+            let uds_path = crate::sock::resolve_uds_path().context("resolving host UDS path")?;
+            let spawned = crate::net::HostGvproxy::spawn(binary, upstream_sock.clone())
+                .context("spawning host gvproxy switch")
+                .and_then(|gvproxy| {
+                    let filter = crate::net::HostFilter::spawn(
+                        switch_sock,
+                        upstream_sock,
+                        crate::net::HostRules::new(switch::DEFAULT_SUBNET),
+                        crate::net::DaemonFeed::new(uds_path),
+                    )
+                    .context("spawning host-side egress filter")?;
+                    Ok((gvproxy, filter))
+                });
+            match spawned {
+                Ok((gvproxy, filter)) => {
+                    tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up behind filter");
+                    Some((gvproxy, filter))
                 }
                 // An own-IP VM cannot work without the switch: fail loudly. A
                 // non-own-IP boot tolerates it (same as a missing binary below).
                 Err(error) if crate::cmd::own_ip_requested() => {
-                    return Err(error).context("spawning host gvproxy switch");
+                    return Err(error);
                 }
                 Err(error) => {
                     tracing::warn!(

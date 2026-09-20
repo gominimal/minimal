@@ -50,8 +50,13 @@ pub use switch::{DEFAULT_MTU, MacAddr, SwitchSubnet, render_gvproxy_config};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
+mod filter;
 mod shuttle;
-pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_switch_sock};
+pub use filter::{
+    BASELINE_CACHE_ENV, BASELINE_REGISTRY_ENV, BaselineCategory, BaselineEntry, BaselineSet,
+    DaemonFeed, DropCounters, HostDrop, HostFilter, HostRules, HostVerdict, PolicyFeed,
+};
+pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_switch_sock, resolve_switch_upstream_sock};
 
 /// Default time to wait for gvproxy to exit on SIGTERM before escalating to
 /// SIGKILL.
