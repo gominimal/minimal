@@ -175,7 +175,8 @@ impl SessionPolicy {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PolicyError {
-    /// An egress policy was set on a `PTask` that is not [`NetworkMode::OwnIp`].
+    /// An egress policy was set on a `PTask` that has no network policy
+    /// surface ([`NetworkMode::NoNet`]).
     #[error("egress policy is only valid for an own-IP PTask, not {mode:?}")]
     EgressRequiresOwnIp { mode: NetworkMode },
     /// An ingress policy was set on a `PTask` that is not [`NetworkMode::OwnIp`].
@@ -406,21 +407,21 @@ pub struct Record {
 
 impl Record {
     /// Validates that this record's networking policy is compatible with its
-    /// network mode (R2.1/R2.3): egress and ingress are only meaningful for an
-    /// [`NetworkMode::OwnIp`] `PTask`, since `NoNet` has no network and `HostNet`
-    /// shares the host's, neither of which minimald can apply per-session
-    /// policy to. Returns an error naming the first incompatible section.
+    /// network mode: `NoNet` has no network, `HostNet` can carry an egress
+    /// declaration but not ingress port forwarding, and `OwnIp` can carry both.
+    /// Returns an error naming the first incompatible section.
     ///
     /// # Errors
     ///
     /// Returns [`PolicyError::EgressRequiresOwnIp`] when an egress policy is set
-    /// on a non-`OwnIp` `PTask`, or [`PolicyError::IngressRequiresOwnIp`] when a
-    /// non-empty ingress policy is. Returns
+    /// on a `NoNet` `PTask`, or [`PolicyError::IngressRequiresOwnIp`] when a
+    /// non-empty ingress policy is set on a non-`OwnIp` `PTask`. Returns
     /// [`PolicyError::UnsupportedIngressProtocol`] for an ingress mapping whose
     /// transport gvproxy's forwarder cannot expose, or
     /// [`PolicyError::PrivilegedPort`] for one that publishes a host port below
-    /// 1024. For an `OwnIp` `PTask`, returns [`PolicyError::InvalidSubnet`] when
-    /// an egress `allow_subnets` entry is not a valid CIDR prefix,
+    /// 1024. For an `OwnIp` or `HostNet` `PTask`, returns
+    /// [`PolicyError::InvalidSubnet`] when an egress `allow_subnets` entry is not
+    /// a valid CIDR prefix. For an `OwnIp` `PTask`, returns
     /// [`PolicyError::InvalidDynamicRange`] when the ingress
     /// `dynamic_allowed_range` lower bound exceeds its upper bound, or
     /// [`PolicyError::PrivilegedDynamicRange`] when that lower bound is a
@@ -452,54 +453,73 @@ impl Record {
         }) {
             return Err(PolicyError::PrivilegedPort { external_port });
         }
-        // For an OwnIp or HostNet PTask, egress and ingress declarations are
-        // allowed; the remaining checks are syntactic validation of the declared
-        // rules so misconfigs are named at launch rather than surfacing opaquely
-        // when #553's enforcement layer parses them.
-        if matches!(self.network, NetworkMode::OwnIp | NetworkMode::HostNet) {
-            if let Some(bad) = self
+        // Egress syntax is checked for any networked PTask so misconfigs are
+        // named at launch rather than surfacing opaquely when the enforcement
+        // layer parses them. Ingress port forwarding is only valid on OwnIp;
+        // HostNet shares its node's address, so static mappings and dynamic
+        // ranges there are rejected rather than colliding on the shared address.
+        if matches!(self.network, NetworkMode::OwnIp | NetworkMode::HostNet)
+            && let Some(bad) = self
                 .policy
                 .egress
                 .as_ref()
                 .and_then(EgressPolicy::first_invalid_subnet)
-            {
-                return Err(PolicyError::InvalidSubnet {
-                    cidr: bad.to_owned(),
-                });
-            }
-            // A reversed dynamic range (lo > hi) describes no ports under the
-            // inclusive semantics, and a privileged lower bound (< 1024) names a
-            // host port the rootless switch cannot publish — the same constraint
-            // the static-mapping privileged-port check enforces. Reject either at
-            // launch rather than letting a misconfig persist on the Record until
-            // #553's dynamic port-mapping layer consumes it.
-            if let Some((lo, hi)) = self
-                .policy
-                .ingress
-                .as_ref()
-                .and_then(|ingress| ingress.dynamic_allowed_range)
-            {
-                if lo > hi {
-                    return Err(PolicyError::InvalidDynamicRange { lo, hi });
-                }
-                if lo < 1024 {
-                    return Err(PolicyError::PrivilegedDynamicRange { lo });
-                }
-            }
-            return Ok(());
-        }
-        if self.policy.egress.is_some() {
-            return Err(PolicyError::EgressRequiresOwnIp { mode: self.network });
-        }
-        if self
-            .policy
-            .ingress
-            .as_ref()
-            .is_some_and(|ingress| !ingress.is_empty())
         {
-            return Err(PolicyError::IngressRequiresOwnIp { mode: self.network });
+            return Err(PolicyError::InvalidSubnet {
+                cidr: bad.to_owned(),
+            });
         }
-        Ok(())
+
+        match self.network {
+            NetworkMode::OwnIp => {
+                // A reversed dynamic range (lo > hi) describes no ports under the
+                // inclusive semantics, and a privileged lower bound (< 1024)
+                // names a host port the rootless switch cannot publish — the same
+                // constraint the static-mapping privileged-port check enforces.
+                // Reject either at launch rather than letting a misconfig persist
+                // on the Record until #553's dynamic port-mapping layer consumes
+                // it.
+                if let Some((lo, hi)) = self
+                    .policy
+                    .ingress
+                    .as_ref()
+                    .and_then(|ingress| ingress.dynamic_allowed_range)
+                {
+                    if lo > hi {
+                        return Err(PolicyError::InvalidDynamicRange { lo, hi });
+                    }
+                    if lo < 1024 {
+                        return Err(PolicyError::PrivilegedDynamicRange { lo });
+                    }
+                }
+                Ok(())
+            }
+            NetworkMode::HostNet => {
+                if self
+                    .policy
+                    .ingress
+                    .as_ref()
+                    .is_some_and(|ingress| !ingress.is_empty())
+                {
+                    return Err(PolicyError::IngressRequiresOwnIp { mode: self.network });
+                }
+                Ok(())
+            }
+            NetworkMode::NoNet => {
+                if self.policy.egress.is_some() {
+                    return Err(PolicyError::EgressRequiresOwnIp { mode: self.network });
+                }
+                if self
+                    .policy
+                    .ingress
+                    .as_ref()
+                    .is_some_and(|ingress| !ingress.is_empty())
+                {
+                    return Err(PolicyError::IngressRequiresOwnIp { mode: self.network });
+                }
+                Ok(())
+            }
+        }
     }
 }
 
