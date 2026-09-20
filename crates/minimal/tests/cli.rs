@@ -872,7 +872,7 @@ async fn create_session_with_policy(
         name: Some(name.to_string()),
         project_path,
         network,
-        policy: policy.into(),
+        policy,
         hooks_enabled: true,
         attrs: Default::default(),
     };
