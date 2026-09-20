@@ -466,6 +466,7 @@ dependencies = [
  "hex",
  "hkdf",
  "p256",
+ "proptest",
  "rand 0.10.2",
  "reqwest",
  "security-framework",

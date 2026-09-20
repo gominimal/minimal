@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # Run the Kani bounded-verification harnesses (#1109) over the proved
-# crates: rcache (index_file untrusted-bytes parse path) and sessions
-# (PathDecision combination lattice).
+# crates: rcache (index_file untrusted-bytes parse path), sessions
+# (PathDecision combination lattice) and bep (the redemption decision).
 #
 # Install: cargo install --locked kani-verifier --version 0.68.0
 #          && cargo kani setup
@@ -153,3 +153,4 @@ expect() { # crate expected_count
 }
 expect sessions 6
 expect rcache 3
+expect bep 6

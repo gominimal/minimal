@@ -10,11 +10,16 @@
 //!   command.
 //! - [`mod@seal`] is the envelope: seal a member to this host, unseal it under
 //!   this host's key alone.
+//! - [`redeem`] is the redemption decision: one pure function that admits a
+//!   request carrying a sealed value exactly when every check passes, and
+//!   names the first failing check otherwise.
 
 pub mod keychain;
 pub mod keys;
+pub mod redeem;
 pub mod seal;
 
 pub use keychain::{KeyStore, MemoryStore, PrivateKey, StoreError};
 pub use keys::{Fingerprint, KeyRole, KeyStatus, Keys, KeysError, inspect};
+pub use redeem::{Check, Decision, Redemption, decide};
 pub use seal::{Member, Refusal, SealError, SealedContext, SealedValue, Unsealed, seal, unseal};

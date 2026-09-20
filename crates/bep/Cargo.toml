@@ -26,9 +26,15 @@ security-framework.workspace = true
 security-framework-sys.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 reqwest = { workspace = true, features = ["rustls"] }
 tempfile.workspace = true
 tokio.workspace = true
+
+[lints.rust]
+# `cfg(kani)` gates the proof harnesses in redeem/mod.rs; declare it so
+# stable rustc's unexpected_cfgs lint accepts the attribute.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
