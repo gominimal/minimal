@@ -51,6 +51,8 @@ pub enum Command {
     /// Loadout management subcommands
     #[command(visible_alias = "loadouts")]
     Loadout(LoadoutArgs),
+    /// Box networking subcommands
+    Net(NetArgs),
     /// Task subcommands: run declared project tasks in ephemeral sessions
     #[command(visible_alias = "tasks")]
     Task(TaskArgs),
@@ -262,6 +264,40 @@ pub struct LoadoutListArgs {
     /// `<config>/minimal/loadouts` per platform, e.g. `~/.config/minimal/loadouts` on Linux)
     #[arg(long)]
     pub dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct NetArgs {
+    #[command(subcommand)]
+    pub command: NetCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NetCommand {
+    /// Forward a port inside a box to a port on this machine
+    ///
+    /// Binds `localhost:<local>` here and relays every connection it accepts
+    /// to `<port>` inside the box, over the session's own SSH connection —
+    /// one channel per connection, which is what `ssh -L` does with a host in
+    /// place of the session. Nothing has to be installed or configured in the
+    /// box. Runs until you stop it with Ctrl-C, or until the session goes
+    /// away, which closes the local port with it.
+    ///
+    /// Example:
+    ///
+    ///   min net forward web 8080:3000
+    #[command(verbatim_doc_comment)]
+    Forward(NetForwardArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct NetForwardArgs {
+    /// Session identifier (UUID or session name)
+    #[arg(add = completion::session_completer())]
+    pub session: String,
+    /// The port to bind here and the port the box's server listens on
+    #[arg(value_name = "LOCAL:PORT")]
+    pub ports: String,
 }
 
 #[derive(Debug, Args)]

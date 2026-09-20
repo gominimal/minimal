@@ -685,4 +685,58 @@ mod tests {
             "a forward naming no live session must be rejected"
         );
     }
+
+    /// NET-104's daemon half: `min net forward` holds one connection open and
+    /// opens a channel per connection its local listener accepts, so the
+    /// daemon has to relay each one on its own — half-close included, which is
+    /// what a request read to EOF and answered depends on.
+    #[tokio::test]
+    async fn direct_tcpip_relays_for_net_forward() {
+        use crate::test_harness::{TestServer, create_configured_session};
+        use tokio::net::TcpListener;
+
+        // The server "inside the box": reads a whole request up to EOF, then
+        // answers it uppercased and closes, as a request/response server does.
+        let backend = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = u32::from(backend.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = backend.accept().await {
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    sock.read_to_end(&mut request).await.unwrap();
+                    sock.write_all(&request.to_ascii_uppercase()).await.unwrap();
+                    sock.shutdown().await.unwrap();
+                });
+            }
+        });
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_configured_session(&mut client, "net-forward", "/tmp").await;
+
+        // One connection, authenticated as the session the forward speaks for,
+        // carrying a channel per forwarded connection.
+        let mut forwarder = server.connect_as(&session_id.to_string()).await;
+        for request in ["first", "second"] {
+            let channel = forwarder
+                .open_direct_tcpip("127.0.0.1", port)
+                .await
+                .expect("the daemon must serve a channel per forwarded connection");
+            let mut stream = channel.into_stream();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            // The half-close the box's server reads to; without it relayed,
+            // the read below never returns.
+            stream.shutdown().await.unwrap();
+            let mut answer = Vec::new();
+            stream.read_to_end(&mut answer).await.unwrap();
+            assert_eq!(
+                answer,
+                request.to_ascii_uppercase().into_bytes(),
+                "the forward relayed back {:?} for {request:?}",
+                String::from_utf8_lossy(&answer)
+            );
+        }
+    }
 }

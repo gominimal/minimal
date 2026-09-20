@@ -13,6 +13,7 @@ pub mod diag;
 pub mod dirs;
 pub mod git_remote;
 pub mod loadouts;
+mod net;
 mod notice;
 pub mod prompt;
 pub mod task;
