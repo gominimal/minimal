@@ -301,7 +301,6 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // is exactly what will go on using hostnames that no longer resolve — and
     // stdout stays clean for the parser either way.
     warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref());
-    warn_if_mtls_proxy_down(resp.mtls_proxy_unavailable.as_deref());
     format_ls(&mut std::io::stdout(), &args, &resp)?;
     Ok(())
 }
@@ -342,17 +341,6 @@ pub fn write_hostname_routing_warning(
 pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>) {
     // A stderr write that fails is not worth failing the command over.
     let _ = write_hostname_routing_warning(&mut std::io::stderr().lock(), reason);
-}
-
-/// Tells the user the mTLS reverse proxy is not serving, and why.
-///
-/// Kept separate from [`warn_if_hostname_routing_down`] so the two faults read
-/// as what they are: hostnames failing to resolve and TLS termination being
-/// absent are different problems with different fixes.
-pub(crate) fn warn_if_mtls_proxy_down(reason: Option<&str>) {
-    if let Some(reason) = reason {
-        eprintln!("warning: the mTLS reverse proxy is not serving: {reason}");
-    }
 }
 
 /// Format the session list for the given output mode. Split from

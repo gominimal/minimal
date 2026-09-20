@@ -15,8 +15,6 @@ krun-prefix  := env('HOME') / ".krun"
 # Prefix for the STATIC libkrun the dev stack links (Linux). Built from the
 # vendored pin, not fetched; `just clean` removes it.
 krun-static  := scratch / "libkrun-static" / musl-target
-# Guest networking features baked into the initramfs (networking-wg deferred).
-features     := "networking-proxy"
 kernel       := scratch / "vmlinuz"
 rootfs       := scratch / "rootfs.img"
 initramfs    := scratch / "initramfs.cpio"
@@ -101,9 +99,9 @@ gvproxy:
     @mkdir -p {{scratch}}
     @[ -x {{gvproxy}} ] || scripts/fetch-gvproxy.sh {{gvproxy}}
 
-# Cross-compile minimald → initramfs /init with the networking features.
+# Cross-compile minimald → initramfs /init.
 initramfs:
-    FEATURES={{features}} scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
+    scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
 
 # Compiles the guest minimald here, then hands the binary to
 # scripts/build-initramfs.sh via MINIMALD_BIN (its prebuilt mode), so the script
@@ -120,7 +118,7 @@ initramfs:
 # Build minimald → initramfs /init using the cross toolchain on PATH (no container).
 initramfs-nodocker:
     cargo zigbuild -p minimald --profile initramfs \
-      --target {{musl-target}} --features {{features}}
+      --target {{musl-target}}
     MINIMALD_BIN="{{justfile_directory()}}/target/{{musl-target}}/initramfs/minimald" \
       scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
 
@@ -147,10 +145,10 @@ minvmd-build: libkrun-static
 minimal-cli:
     cargo build -p minimal --locked
 
-# Build a host-native (glibc) minimald with the networking features (for `just up`).
+# Build a host-native (glibc) minimald (for `just up`).
 [linux]
 minimald-build:
-    cargo build -p minimald --features {{features}} --locked
+    cargo build -p minimald --locked
 
 # THE single build entrypoint for a shippable build: the four release binaries
 # for a target triple, built exactly the way release.yml's build jobs build

@@ -168,19 +168,6 @@ pub struct ServerState {
     /// macOS, which is the platform the failure was reported from.
     proxy_unavailable: Option<String>,
 
-    /// Why the mTLS reverse proxy is not serving, if it is not. Kept apart
-    /// from [`Self::proxy_unavailable`] so a client is not told its hostnames
-    /// are broken when only TLS termination is. Never set without the
-    /// `networking-proxy` feature, where there is no such proxy to lose.
-    mtls_unavailable: Option<String>,
-
-    /// The daemon's TLS certificate authority, used by the HTTPS proxy and the
-    /// `IssueClientCert` RPC. Generated once on daemon startup and held for the
-    /// daemon's lifetime; clients must call `minimal login` again after a
-    /// restart.
-    #[cfg(feature = "networking-proxy")]
-    pub cert_authority: Arc<crate::net::proxy::CertAuthority>,
-
     /// The running WireGuard mesh peer, when one is configured (Unit 4). Only
     /// present under the `networking-wg` feature; the `GetMeshStatus` RPC reads
     /// it through [`ServerStateHandle::mesh_status`].
@@ -221,13 +208,6 @@ impl ServerState {
             .with_transport(transport),
         ));
 
-        // Generate the TLS CA once at daemon startup so the HTTPS proxy and the
-        // IssueClientCert RPC share the same trust anchor for the lifetime of
-        // this daemon process.
-        #[cfg(feature = "networking-proxy")]
-        let cert_authority =
-            Arc::new(crate::net::proxy::CertAuthority::generate().map_err(std::io::Error::other)?);
-
         // Build a daemon-scoped mctx config from what the daemon
         // knows today (dirs). Additional flags (offline, stdlib
         // override, num-parallel-builds) will thread through from
@@ -262,9 +242,6 @@ impl ServerState {
             log_release,
             host_key: None,
             proxy_unavailable: None,
-            mtls_unavailable: None,
-            #[cfg(feature = "networking-proxy")]
-            cert_authority,
             #[cfg(feature = "networking-wg")]
             mesh: None,
         })
@@ -339,17 +316,6 @@ impl ServerStateHandle {
         self.0.lock().await.proxy_unavailable.clone()
     }
 
-    /// Records why the mTLS reverse proxy is not serving.
-    #[cfg_attr(not(feature = "networking-proxy"), expect(dead_code))]
-    pub(crate) async fn set_mtls_unavailable(&self, reason: String) {
-        self.0.lock().await.mtls_unavailable = Some(reason);
-    }
-
-    /// Why the mTLS reverse proxy is not serving, or `None` if it is.
-    pub(crate) async fn mtls_unavailable(&self) -> Option<String> {
-        self.0.lock().await.mtls_unavailable.clone()
-    }
-
     /// Returns the daemon-scoped mctx state.
     pub(crate) async fn daemon_context(&self) -> Arc<mctx::DaemonContext> {
         Arc::clone(&self.0.lock().await.daemon_ctx)
@@ -409,13 +375,6 @@ impl ServerStateHandle {
     /// Returns the daemon ID.
     pub async fn daemon_id(&self) -> String {
         self.0.lock().await.daemon_id.clone()
-    }
-
-    /// Returns the daemon's TLS certificate authority (only with
-    /// `networking-proxy` feature). Used by the `IssueClientCert` RPC handler.
-    #[cfg(feature = "networking-proxy")]
-    pub async fn cert_authority(&self) -> Arc<crate::net::proxy::CertAuthority> {
-        Arc::clone(&self.0.lock().await.cert_authority)
     }
 
     /// Builds the current WireGuard mesh status for the `GetMeshStatus` RPC
@@ -533,10 +492,10 @@ impl Server {
         let in_microvm = config.in_microvm;
         let state = ServerStateHandle::new(config, log_release).await?;
 
-        // Start minimald's two host-side proxies (B5 egress :7654, B8 mTLS
-        // :7655) for the server's lifetime and, in a microVM (DM1), publish them
-        // on the macOS host loopback. minimald is Linux-only, and the PTask
-        // hostname registry they route against only exists on Linux.
+        // Start minimald's host-side egress proxy (B5, :7654) for the server's
+        // lifetime and, in a microVM (DM1), publish it on the macOS host
+        // loopback. minimald is Linux-only, and the PTask hostname registry it
+        // routes against only exists on Linux.
         #[cfg(target_os = "linux")]
         start_host_proxies(&state, in_microvm).await;
 
@@ -744,15 +703,15 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
     }
 }
 
-/// Binds and serves minimald's two host-side proxies for the daemon's lifetime
-/// and, in a microVM (DM1), publishes them on the macOS host loopback.
+/// Binds and serves minimald's host-side egress proxy for the daemon's lifetime
+/// and, in a microVM (DM1), publishes it on the macOS host loopback.
 ///
-/// Both proxies route by `Host:` header through the sessions manager's shared
-/// PTask hostname registry. In a microVM they bind the daemon's switch IP
+/// The proxy routes by `Host:` header through the sessions manager's shared
+/// PTask hostname registry. In a microVM it binds the daemon's switch IP
 /// ([`DEFAULT_SUBNET`](crate::net::DEFAULT_SUBNET)`.daemon_ip()`) so the host
-/// gvproxy forward can reach them; on native Linux (DM2) they bind host loopback
+/// gvproxy forward can reach it; on native Linux (DM2) it binds host loopback
 /// directly. A bind failure warns and is skipped — the daemon keeps serving. The
-/// serve loops run on detached tasks; this returns once the listeners are bound
+/// serve loop runs on a detached task; this returns once the listener is bound
 /// and (DM1) exposed.
 #[cfg(target_os = "linux")]
 async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
@@ -812,61 +771,6 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
                 ))
                 .await;
             recover_egress_listener(state.clone(), registry.clone(), egress_addr, in_microvm);
-        }
-    }
-
-    // B8 mTLS reverse proxy (:7655), under the networking-proxy feature.
-    #[cfg(feature = "networking-proxy")]
-    {
-        // Three ways this ends with nothing serving on :7655, and all three
-        // were silent: the TLS config failing to build, the bind failing, and
-        // the publish failing. The daemon carries on in every case, so only a
-        // reported reason distinguishes "no mTLS proxy configured" from "the
-        // mTLS proxy is broken".
-        let https_addr = SocketAddr::new(bind_base, proxy::HTTPS_PROXY_PORT);
-        match state.cert_authority().await.build_server_config() {
-            Ok(tls_config) => {
-                let bound = proxy::bind_listener(https_addr)
-                    .await
-                    .map(|listener| {
-                        let router = Router::new(registry.clone());
-                        tokio::spawn(async move {
-                            if let Err(error) =
-                                proxy::serve_https(listener, router, tls_config).await
-                            {
-                                tracing::error!(%error, "mTLS proxy accept loop exited");
-                            }
-                        })
-                    })
-                    .is_some();
-
-                if !bound {
-                    state
-                        .set_mtls_unavailable(format!(
-                            "the daemon could not bind {https_addr}; another process is \
-                             holding it. Check with: lsof -nP -iTCP:{} -sTCP:LISTEN",
-                            proxy::HTTPS_PROXY_PORT
-                        ))
-                        .await;
-                } else if in_microvm
-                    && let Some(reason) = expose_proxy_on_host(
-                        crate::net::DEFAULT_SUBNET.daemon_ip(),
-                        proxy::HTTPS_PROXY_PORT,
-                    )
-                    .await
-                {
-                    state.set_mtls_unavailable(reason).await;
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "could not build TLS config for the mTLS reverse proxy");
-                state
-                    .set_mtls_unavailable(format!(
-                        "the daemon could not build a TLS config for the mTLS reverse \
-                         proxy: {error}"
-                    ))
-                    .await;
-            }
         }
     }
 }

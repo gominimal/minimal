@@ -101,6 +101,14 @@ impl TestServer {
     /// The server-side task is detached; it stays alive as long as the
     /// returned [`TestClient`] keeps its half of the pair open.
     pub async fn connect(&self) -> TestClient {
+        self.connect_as("test").await
+    }
+
+    /// [`Self::connect`], naming the SSH username the connection authenticates
+    /// with. A port forward carries its session id there rather than in a
+    /// per-channel env handshake, so a test that drives one has to be able to
+    /// say which session the connection speaks for.
+    pub async fn connect_as(&self, username: &str) -> TestClient {
         let (server_side, client_side) = UnixStream::pair().unwrap();
 
         // `russh::server::run_stream` (called inside `Connection::from_socket`)
@@ -127,7 +135,7 @@ impl TestServer {
 
         let (_, handle) = tokio::join!(server_setup, client_setup);
         let mut handle = handle.unwrap();
-        let auth = handle.authenticate_none("test").await.unwrap();
+        let auth = handle.authenticate_none(username).await.unwrap();
         assert!(auth.success(), "auth_none should succeed on local UDS");
 
         TestClient { handle }
@@ -256,6 +264,20 @@ impl TestClient {
         }
 
         serde_json_lenient::from_slice(&resp_buf).expect("response deserializes")
+    }
+
+    /// Requests a `direct-tcpip` channel to `host:port`, as an `ssh -L` local
+    /// forward does. `Err` is the server's channel-open rejection — the only
+    /// thing that distinguishes a daemon that serves forwards from one that
+    /// refuses them.
+    pub async fn open_direct_tcpip(
+        &mut self,
+        host: &str,
+        port: u32,
+    ) -> Result<russh::Channel<russh::client::Msg>, russh::Error> {
+        self.handle
+            .channel_open_direct_tcpip(host, port, "127.0.0.1", 0)
+            .await
     }
 
     /// Opens an SFTP session attached to the given minimald session.

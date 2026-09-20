@@ -44,7 +44,6 @@ fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
-        mtls_proxy_unavailable: None,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -81,7 +80,6 @@ fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
-        mtls_proxy_unavailable: None,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -948,6 +946,101 @@ async fn policy_shows_effective_egress() {
         "10.1.0.0/16",
     ] {
         assert!(shown.contains(rule), "{rule} missing from: {shown}");
+    }
+}
+
+// --- retired surfaces ---
+
+/// NET-109: the HTTPS reverse proxy, the client certificate the daemon used to
+/// issue for it, and `min ssh-forward` are gone, so the CLI offers no command
+/// for any of them — not hidden, not behind a feature, not under an alias.
+///
+/// Read off the clap tree rather than the source, because what a user can type
+/// is the surface being retired. The verbs themselves are not: `min login`
+/// becomes the GitHub sign-in, so what is asserted absent is the certificate
+/// and proxy *surface* — a `--cert-dir`, a port 7655, an mTLS mention — not the
+/// word.
+#[test]
+fn retired_surfaces_absent() {
+    use clap::CommandFactory as _;
+
+    /// Every command in the tree, as `min`-relative paths, with the text and
+    /// option names each one offers.
+    fn walk(command: &clap::Command, prefix: &str, found: &mut Vec<(String, String)>) {
+        for sub in command.get_subcommands() {
+            let path = if prefix.is_empty() {
+                sub.get_name().to_string()
+            } else {
+                format!("{prefix} {}", sub.get_name())
+            };
+            let mut text = String::new();
+            for alias in sub.get_all_aliases() {
+                text.push_str(alias);
+                text.push('\n');
+            }
+            for help in [sub.get_about(), sub.get_long_about()]
+                .into_iter()
+                .flatten()
+            {
+                text.push_str(&help.to_string());
+                text.push('\n');
+            }
+            for arg in sub.get_arguments() {
+                text.push_str(arg.get_id().as_str());
+                text.push('\n');
+                if let Some(long) = arg.get_long() {
+                    text.push_str(long);
+                    text.push('\n');
+                }
+            }
+            found.push((path.clone(), text));
+            walk(sub, &path, found);
+        }
+    }
+
+    let command = Cli::command();
+    let mut found = Vec::new();
+    walk(&command, "", &mut found);
+    assert!(!found.is_empty(), "the command tree must not be empty");
+
+    // The command itself, by name or alias.
+    for (path, text) in &found {
+        assert!(
+            path != "ssh-forward" && !text.lines().any(|line| line == "ssh-forward"),
+            "`ssh-forward` is retired but `min {path}` still offers it"
+        );
+    }
+
+    // The certificate and proxy surface, wherever it is spelled.
+    for (path, text) in &found {
+        for retired in ["cert-dir", "cert_dir", "7655", "mTLS", "reverse proxy"] {
+            assert!(
+                !text.contains(retired),
+                "`min {path}` still names the retired {retired} surface"
+            );
+        }
+    }
+}
+
+/// NET-111: the CLI reference documents no retired command.
+///
+/// Named surfaces, not the verbs: `min net forward` is a new command and
+/// `min login` is being rebound, so only the retired spellings are asserted
+/// absent.
+#[test]
+fn cli_reference_has_no_retired_commands() {
+    let reference = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference");
+    for page in ["cli.md", "cli-min.md"] {
+        let path = reference.join(page);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("the CLI reference {} must be readable: {e}", path.display())
+        });
+        for retired in ["ssh-forward", "7655", "mTLS", "reverse proxy"] {
+            assert!(
+                !text.contains(retired),
+                "{page} still documents the retired {retired} surface"
+            );
+        }
     }
 }
 

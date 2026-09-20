@@ -65,7 +65,6 @@ fn every_daemon_connection_is_classified() {
     assert_eq!(
         connect_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
-            "cmd/admin.rs::cmd_ssh_forward = gated",
             "cmd/admin.rs::cmd_version = ungated",
             "cmd/list.rs::cmd_bare = gated",
             "cmd/mod.rs::arm_activation_interrupt = ungated",

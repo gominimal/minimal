@@ -3,20 +3,16 @@ use russh::{
     server::{ChannelOpenHandle, Config as RuConfig, Msg, RunningSession, Session},
 };
 use sessions::SessionId;
+use std::time::Duration;
 use std::{
     collections::BTreeMap,
     sync::{Arc, LazyLock},
 };
-// Used only by the `ssh-forward` direct-tcpip handler.
-#[cfg(feature = "ssh-forward")]
-use std::time::Duration;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
     sync::{Mutex, MutexGuard},
 };
-// Used only by the `ssh-forward` direct-tcpip handler.
-#[cfg(feature = "ssh-forward")]
-use tokio::net::TcpStream;
 
 use crate::{
     ChannelConfig, RequestedPty, exec,
@@ -444,20 +440,26 @@ impl russh::server::Handler for ConnectionHandler {
         self.0.0.lock().await.handle_channel_close(id)
     }
 
-    /// SSH `LocalForward` / `direct-tcpip` handler (R4.9).
+    /// SSH `LocalForward` / `direct-tcpip` handler.
     ///
-    /// When an authenticated client runs `ssh -L local:remote_host:remote_port`,
-    /// OpenSSH opens a `direct-tcpip` channel requesting a TCP connection from
-    /// the server side to `(host_to_connect, port_to_connect)`. This handler
-    /// accepts the request, connects to the target, and relays bytes
-    /// bidirectionally between the SSH channel and the upstream TCP connection.
+    /// When an authenticated client opens a local forward, OpenSSH (and
+    /// `min net forward`) opens a `direct-tcpip` channel requesting a TCP
+    /// connection from the server side to `(host_to_connect, port_to_connect)`.
+    /// This handler accepts the request, connects to the target, and relays
+    /// bytes bidirectionally between the SSH channel and the upstream TCP
+    /// connection.
     ///
-    /// Only authenticated (local) connections may forward ports; unauthenticated
-    /// connections are rejected by returning `false`.
+    /// Served in every build: a forward is how a port inside a box is reached
+    /// from the host, so a release daemon that rejected the channel would leave
+    /// the client with no path to it at all.
+    ///
+    /// Only authenticated (local) connections may forward ports; an
+    /// unauthenticated one is rejected. Every open is logged once with the
+    /// session it is scoped to, the target port, and how it ended, so a forward
+    /// that never carries bytes can be told from one that was refused.
     ///
     /// The connection attempt times out after 10 seconds; a failure rejects the
     /// channel so the SSH client receives a clean error rather than hanging.
-    #[cfg(feature = "ssh-forward")]
     async fn channel_open_direct_tcpip(
         &mut self,
         channel: RuChannel<Msg>,
@@ -483,6 +485,7 @@ impl russh::server::Handler for ConnectionHandler {
         };
 
         if !is_local {
+            tracing::warn!("direct-tcpip rejected: connection is not authenticated");
             reply
                 .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
                 .await;
@@ -577,36 +580,25 @@ impl russh::server::Handler for ConnectionHandler {
 
         reply.accept().await;
 
+        // One record per accepted open, naming the session and the target port:
+        // this is the only trace a forward leaves, and a forward that relays no
+        // bytes is otherwise indistinguishable from one that never opened.
+        tracing::info!(
+            %session_id,
+            %host,
+            port,
+            outcome = "accepted",
+            "direct-tcpip channel open"
+        );
+
         // Relay bytes bidirectionally: SSH channel ↔ upstream TCP.
         tokio::spawn(relay_streams(channel.into_stream(), upstream));
 
         Ok(())
     }
-
-    /// With the `ssh-forward` feature disabled, port-forwarding is compiled out.
-    /// Reject every `direct-tcpip` channel so forwarding fails **closed**, rather
-    /// than relying on whatever russh's default handler does (finding #4 / the
-    /// user decision to disable ssh-forward for now).
-    #[cfg(not(feature = "ssh-forward"))]
-    async fn channel_open_direct_tcpip(
-        &mut self,
-        _channel: RuChannel<Msg>,
-        _host_to_connect: &str,
-        _port_to_connect: u32,
-        _originator_address: &str,
-        _originator_port: u32,
-        reply: ChannelOpenHandle,
-        _session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        reply
-            .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
-            .await;
-        Ok(())
-    }
 }
 
 /// Relay bytes bidirectionally between two async streams, logging any relay error.
-#[cfg(feature = "ssh-forward")]
 async fn relay_streams<A, B>(mut a: A, mut b: B)
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -617,10 +609,7 @@ where
     }
 }
 
-// The only test here exercises `relay_streams`, which is itself behind
-// `ssh-forward`; gate the whole module so it (and its imports) compile out with
-// the feature.
-#[cfg(all(test, feature = "ssh-forward"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -641,5 +630,59 @@ mod tests {
         let mut buf2 = [0u8; 5];
         client.read_exact(&mut buf2).await.unwrap();
         assert_eq!(&buf2, b"world");
+    }
+
+    /// NET-110: a `direct-tcpip` channel is served by a daemon built with no
+    /// extra features — the shape a release binary has.
+    ///
+    /// The handler used to sit behind an off-by-default `ssh-forward` feature,
+    /// so a shipped daemon rejected every forward and there was nothing for a
+    /// local forward to relay over. This drives a real forward end to end: a
+    /// listener stands in for a server inside the box, and the bytes go out
+    /// over the SSH channel and come back.
+    #[tokio::test]
+    async fn direct_tcpip_served_in_release() {
+        use crate::test_harness::{TestServer, create_configured_session};
+        use tokio::net::TcpListener;
+
+        // The target "inside the box": answers what it is sent, uppercased.
+        let backend = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = u32::from(backend.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            let (mut sock, _) = backend.accept().await.unwrap();
+            let mut received = [0u8; 5];
+            sock.read_exact(&mut received).await.unwrap();
+            sock.write_all(&received.to_ascii_uppercase())
+                .await
+                .unwrap();
+        });
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_configured_session(&mut client, "forward-test", "/tmp").await;
+
+        // A forward names its session in the SSH username, which is what the
+        // handler's auth gate reads.
+        let mut forwarder = server.connect_as(&session_id.to_string()).await;
+        let channel = forwarder
+            .open_direct_tcpip("127.0.0.1", port)
+            .await
+            .expect("a build with no extra features must serve direct-tcpip");
+
+        let mut stream = channel.into_stream();
+        stream.write_all(b"hello").await.unwrap();
+        let mut relayed = [0u8; 5];
+        stream.read_exact(&mut relayed).await.unwrap();
+        assert_eq!(&relayed, b"HELLO", "the forward relayed nothing back");
+
+        // Serving the channel is not serving it to anyone: a forward naming no
+        // live session is still refused.
+        let mut stranger = server.connect_as(&SessionId::nil().to_string()).await;
+        assert!(
+            stranger.open_direct_tcpip("127.0.0.1", port).await.is_err(),
+            "a forward naming no live session must be rejected"
+        );
     }
 }
