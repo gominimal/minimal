@@ -30,6 +30,9 @@ impl RemoteStorage {
         with_gcloud_auth: bool,
         offline: bool,
     ) -> Result<Self> {
+        // The `Storage` client below builds a rustls configuration without
+        // naming a provider, which panics while two are compiled in.
+        crate::install_crypto_provider();
         let cache = file_cache::FileCache::new_with_offline(cache_dir, offline)?;
 
         let client = if with_gcloud_auth {
@@ -50,6 +53,7 @@ impl RemoteStorage {
         sha256: &str,
         op: &OpTracker,
     ) -> Result<PathBuf> {
+        crate::install_crypto_provider();
         let client = reqwest::Client::new();
         let backend = (&client, &self.cache);
         backend

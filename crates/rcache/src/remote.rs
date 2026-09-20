@@ -132,6 +132,7 @@ impl RemoteCache<Client> {
         index_dir: Option<PathBuf>,
         ot: Option<OpTracker>,
     ) -> Result<Self, Error<ReqwestError>> {
+        common::install_crypto_provider();
         let backend = Client::builder()
             .user_agent("minimal/remote-cache")
             .build()?;
@@ -197,6 +198,10 @@ impl RemoteCache<AnyBackend> {
         ot: Option<OpTracker>,
         source: IndexSource,
     ) -> Result<Self, Error<AnyRespError>> {
+        // The HTTPS arm builds a reqwest client below, whose rustls
+        // configuration names no provider. (A GCS `Storage` arrives already
+        // built; whoever built it installed the provider first.)
+        common::install_crypto_provider();
         let backend = match &url {
             AnyUrl::Gcs(_) => AnyBackend::Gcs(Box::new(
                 gcs_storage.expect("new_any: a GCS url requires a Storage client"),

@@ -9,6 +9,12 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 /// Custom main: handle shell completion requests before launching the async world.
 fn main() -> ExitCode {
+    // Two rustls crypto providers are compiled in; name ring before anything
+    // this binary reaches builds a TLS client — `min auth`'s GitHub client and
+    // the package paths' remote cache alike (see
+    // `common::install_crypto_provider`).
+    common::install_crypto_provider();
+
     clap_complete::CompleteEnv::with_factory(minimal::Cli::command)
         .var(minimal::COMPLETE_VAR)
         .complete();

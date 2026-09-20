@@ -183,6 +183,10 @@ async fn main() -> Result<(), Error> {
         .with(filter)
         .init();
 
+    // Two rustls crypto providers are compiled in; name ring before any
+    // subcommand builds a TLS client (see `common::install_crypto_provider`).
+    common::install_crypto_provider();
+
     let cli = Cli::parse();
 
     let result = run_cli(cli).await;

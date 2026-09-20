@@ -1,6 +1,8 @@
 //! Common types and utilities used across the minimal codebase.
 
 pub mod archive;
+mod crypto;
+pub use crypto::install_crypto_provider;
 pub mod fetchers;
 pub mod file_cache;
 pub mod fuzzy_search;

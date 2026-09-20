@@ -34,6 +34,9 @@ nickel-lang-core.workspace = true
 
 bytes.workspace = true
 reqwest.workspace = true
+# `install_crypto_provider`: naming ring as the process-level provider, because
+# google-cloud's default features unify a second one into every build.
+rustls.workspace = true
 futures.workspace = true
 tokio.workspace = true
 url.workspace = true

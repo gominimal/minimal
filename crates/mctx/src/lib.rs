@@ -539,6 +539,9 @@ impl Context {
         // egress just the same.
         let url = self.daemon.config.remote_cache_url();
         let gcs_storage = if matches!(url, AnyUrl::Gcs(_)) {
+            // The `Storage` client builds a rustls configuration that names no
+            // provider, and the workspace compiles in two.
+            common::install_crypto_provider();
             let backend = if auth {
                 GcsStorage::builder().build().await.unwrap()
             } else {
@@ -617,6 +620,7 @@ impl Context {
                  or a bare bucket name"
                 )
             })?;
+        common::install_crypto_provider();
         let backend = GcsStorage::builder().build().await.unwrap();
         let res = RemoteCacheWriter::new(backend, bucket, self.daemon.config.ot.clone()).await?;
         tracing::trace!("remote cache writer init took {:?}", start.elapsed());

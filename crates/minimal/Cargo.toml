@@ -45,6 +45,9 @@ clap.workspace = true
 clap_complete = { workspace = true, features = ["unstable-dynamic"] }
 camino.workspace = true
 chrono.workspace = true
+# `common::install_crypto_provider` in `main.rs`: this binary links two rustls
+# crypto providers and must name one before anything builds a TLS client.
+common.workspace = true
 diagnostics.workspace = true
 dirs.workspace = true
 nix.workspace = true
