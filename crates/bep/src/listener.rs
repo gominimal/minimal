@@ -62,6 +62,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tracing::Instrument as _;
 
+use crate::attribution;
 use crate::audit::{self, AuditError, Event, Kind, Log, Mapping, Record};
 use crate::ca::{Authority, Leaf};
 use crate::control::{
@@ -843,16 +844,18 @@ where
         let carried = Carried::in_headers(request.headers());
         let redeemed = carried.sealed().and_then(|value| self.unseal(flow, value));
         let credential = redeemed.as_ref().map(|redeemed| redeemed.id.clone());
+        let attribution = match flow.sender.addressing {
+            Addressing::OwnIp => Attribution::OwnIp(SENDER),
+            Addressing::HostIp => Attribution::HostIp(SENDER),
+        };
+        let attributed = attribution::Kind::of(attribution);
         let redemption = Redemption {
             request: self.facts(flow, &request),
             member: redeemed.as_ref().map(|redeemed| redeemed.member.clone()),
             store: redeemed
                 .as_ref()
                 .and_then(|redeemed| redeemed.store.clone()),
-            attribution: match flow.sender.addressing {
-                Addressing::OwnIp => Attribution::OwnIp(SENDER),
-                Addressing::HostIp => Attribution::HostIp(SENDER),
-            },
+            attribution,
             authority: flow.id,
             current_set: flow.module.map_or_else(
                 || self.stores.1.clone(),
@@ -869,6 +872,7 @@ where
         tracing::info!(
             ?decision,
             sealed = carried.sealed().is_some(),
+            attribution = attributed.map_or("none", attribution::Kind::name),
             "decided a request"
         );
         let substitution = match decision {
@@ -903,8 +907,17 @@ where
         let forwarded = rewrite(request, substitution);
         match send(validated, forwarded).await {
             Ok(response) => {
-                let marker =
-                    matches!(carried, Carried::Foreign).then(|| FOREIGN_CREDENTIAL.to_owned());
+                let marker = match &carried {
+                    Carried::Foreign => Some(FOREIGN_CREDENTIAL.to_owned()),
+                    // BEP-028: the value was redeemed from a box the source
+                    // address names only as one of its cohort, so the record
+                    // says the cohort is what the connection was attributed
+                    // to.
+                    Carried::Sealed { .. } => attributed
+                        .and_then(attribution::Kind::marker)
+                        .map(str::to_owned),
+                    Carried::Nothing => None,
+                };
                 self.record(&Event {
                     kind: Kind::Decision,
                     box_id: box_id.clone(),
@@ -1635,7 +1648,14 @@ mod tests {
 
         /// A value sealed under this host's keys for `box-a1`.
         fn sealed_value(&self) -> String {
-            seal::seal(self.proxy.keys, &context(), &Member::new(CREDENTIAL))
+            self.sealed_for("box-a1")
+        }
+
+        /// A value sealed under this host's keys for `box_id`.
+        fn sealed_for(&self, box_id: &str) -> String {
+            let mut context = context();
+            context.box_id = box_id.to_owned();
+            seal::seal(self.proxy.keys, &context, &Member::new(CREDENTIAL))
                 .unwrap()
                 .to_string()
         }
@@ -2218,6 +2238,96 @@ mod tests {
             received.contains(&format!("x-api-key: Key {SECRET_VALUE}\r\n")),
             "{received}"
         );
+    }
+
+    /// BEP-028: a `host_ip` box shares the host's address with its cohort, so
+    /// a value naming a live `host_ip` box of this host is redeemed from any
+    /// box of that cohort, and every such admit is recorded
+    /// `cohort_attributed` — the cohort, and not one box inside it, is what
+    /// the connection was attributed to. The same value sent from a box
+    /// addressed on its own is another box's and is refused (BEP-020), and a
+    /// box redeeming its own value at an address of its own is marked as
+    /// nothing.
+    #[tokio::test]
+    async fn host_ip_redemption_is_cohort_attributed() {
+        let h = Harness::start().await;
+        let (chain, key) = h.chain("api.github.com", Chain::Valid);
+        let up = Upstream::serve(chain, key, Respond::Whole("{\"login\":\"octocat\"}")).await;
+        h.route(up.addr);
+
+        // The value names `box-h1`, which is up and attached as a `host_ip`
+        // box of this host: a live box of the cohort, holding its attachment
+        // with no request of its own in flight.
+        let named = Sender {
+            box_id: "box-h1".to_owned(),
+            addressing: Addressing::HostIp,
+            egress: None,
+        };
+        h.attachments
+            .lock()
+            .unwrap()
+            .insert("127.0.0.1:1".parse().unwrap(), named.clone());
+        let sealed = format!("token {}", h.sealed_for("box-h1"));
+
+        // `box-h2` shares the host's address with it, so the source address
+        // names the cohort no further than that: the value is redeemed from
+        // the sibling and the member goes upstream in its place.
+        let sibling = Sender {
+            box_id: "box-h2".to_owned(),
+            ..named.clone()
+        };
+        let tcp = attach(&h, Some(sibling)).await;
+        let mut tls = tunnel(&h, tcp, "api.github.com:443").await.unwrap();
+        let response = exchange(&mut tls, &get("/user", "api.github.com", Some(&sealed))).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let received = up.received();
+        assert!(
+            received.contains(&format!("token {CREDENTIAL}")),
+            "{received}"
+        );
+        assert!(!received.contains(PREFIX), "a sealed value was forwarded");
+        let record = h.last();
+        assert_eq!(record.decision, audit::Decision::Admit);
+        assert_eq!(record.marker, attribution::COHORT_ATTRIBUTED);
+        assert_eq!(record.sub, "box-h2");
+        assert_eq!(record.credential, "github:user-token");
+
+        // A box addressed on its own is told apart from the box the value
+        // names, so the value is not its to redeem (BEP-020).
+        let own = Sender {
+            box_id: "box-c3".to_owned(),
+            addressing: Addressing::OwnIp,
+            egress: None,
+        };
+        let tcp = attach(&h, Some(own)).await;
+        let mut tls = tunnel(&h, tcp, "api.github.com:443").await.unwrap();
+        let response = exchange(&mut tls, &get("/user", "api.github.com", Some(&sealed))).await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert_eq!(h.last().marker, Check::Attributed.name());
+
+        // The box the value names, at the address it shares: admitted, and
+        // marked the same, because the cohort is all its source address says.
+        let tcp = attach(&h, Some(named)).await;
+        let mut tls = tunnel(&h, tcp, "api.github.com:443").await.unwrap();
+        let response = exchange(&mut tls, &get("/user", "api.github.com", Some(&sealed))).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let record = h.last();
+        assert_eq!(record.decision, audit::Decision::Admit);
+        assert_eq!(record.marker, attribution::COHORT_ATTRIBUTED);
+        assert_eq!(record.sub, "box-h1");
+
+        // A box with an address of its own, redeeming the value that names
+        // it: an admit with no cohort marker at all.
+        let own_value = format!("token {}", h.sealed_value());
+        let tcp = attach(&h, Some(box_a())).await;
+        let mut tls = tunnel(&h, tcp, "api.github.com:443").await.unwrap();
+        let response = exchange(&mut tls, &get("/user", "api.github.com", Some(&own_value))).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let record = h.last();
+        assert_eq!(record.decision, audit::Decision::Admit);
+        assert_eq!(record.marker, "");
+        assert_eq!(record.sub, "box-a1");
+        assert_eq!(h.records().len(), 4);
     }
 
     /// The runtime the property drives its proxies on.

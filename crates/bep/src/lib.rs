@@ -13,6 +13,9 @@
 //! - [`redeem`] is the redemption decision: one pure function that admits a
 //!   request carrying a sealed value exactly when every check passes, and
 //!   names the first failing check otherwise.
+//! - [`attribution`] is what the box attribution the decision reads says about
+//!   the sending box's addressing, and the marker an admit attributed to a
+//!   `host_ip` cohort records.
 //! - [`ca`] is the interception certificates: the root a box trusts, the one
 //!   signing certificate constrained to the names the host's boxes declare,
 //!   and the leaves issued under it.
@@ -35,6 +38,7 @@
 //! - [`upstream`] is the upstream leg of a terminated flow, validated against
 //!   the host's trust store before anything is forwarded on it.
 
+pub mod attribution;
 pub mod audit;
 pub mod ca;
 pub mod chain;
