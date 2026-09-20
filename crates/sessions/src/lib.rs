@@ -867,4 +867,36 @@ mod tests {
         let s = serde_json_lenient::to_string(&SessionStatus::Pending).expect("serialize");
         assert_eq!(s, "\"pending\"");
     }
+
+    // =================================================================
+    // EgressPolicy property test (proptest)
+    // =================================================================
+    //
+    // Enablement: the workspace's first property test, run under the
+    // ordinary `cargo test`/`cargo nextest` recipe rather than a
+    // separate lane, ahead of the redemption-decision property tests
+    // the box egress proxy spec plans over this policy.
+
+    mod egress_policy_property {
+        use super::EgressPolicy;
+        use proptest::prelude::*;
+
+        /// Any syntactically well-formed IPv4 CIDR: four dotted octets and a
+        /// prefix length in the valid 0..=32 range.
+        fn arb_ipv4_cidr() -> impl Strategy<Value = String> {
+            (0u8..=255, 0u8..=255, 0u8..=255, 0u8..=255, 0u8..=32u8)
+                .prop_map(|(a, b, c, d, prefix)| format!("{a}.{b}.{c}.{d}/{prefix}"))
+        }
+
+        proptest! {
+            #[test]
+            fn egress_policy_property_check_runs(subnets in prop::collection::vec(arb_ipv4_cidr(), 0..8)) {
+                let policy = EgressPolicy {
+                    allow_subnets: Some(subnets),
+                    ..EgressPolicy::default()
+                };
+                prop_assert_eq!(policy.first_invalid_subnet(), None);
+            }
+        }
+    }
 }
