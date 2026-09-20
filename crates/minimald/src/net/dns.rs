@@ -35,14 +35,29 @@
 //! registration). The former systemd-resolved startup probe (R3.4) is removed by
 //! the re-scope; an egress-proxy reachability check
 //! ([`super::proxy::bind_listener`]) replaces it.
+//!
+//! ## Steered credentialed names
+//!
+//! A box under `dns` or `both` steering has its credentialed hostnames — its
+//! modules' host sets — answered with the Box Egress Proxy's address instead
+//! of their real ones, so its requests reach the proxy by name
+//! ([`HostnameRegistry::steer_names`]). Those names live in this registry
+//! beside the box zone because the box-zone answerer ([`super::answerer`]) is
+//! what serves them, and they are withdrawn with the box that steered them.
+//! While the proxy's listener is not live every steered name answers SERVFAIL
+//! rather than falling back to real DNS, so the box never reaches the upstream
+//! with the proxy's egress re-check and audit record skipped (BEP-062).
 
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
+use std::time::Instant;
 
 use sessions::SessionId;
 use tokio::sync::Notify;
+
+use super::policy::KeyedWarnLimiter;
 
 /// The DNS suffix every PTask hostname carries (see the module docs).
 pub const HOSTNAME_SUFFIX: &str = "min.internal";
@@ -90,6 +105,41 @@ pub struct Route {
     pub session: String,
 }
 
+/// The Box Egress Proxy's redemption listener, as the DNS layer sees it
+/// (BEP-062).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProxyListener {
+    /// Not live: nothing would terminate a steered name's traffic, so every
+    /// steered name answers SERVFAIL. The state a daemon starts in.
+    #[default]
+    Down,
+    /// Live at this address: a steered name answers it.
+    Live(Ipv4Addr),
+}
+
+/// What a lookup of one name means to a box steering its credentialed
+/// hostnames at the proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerVerdict {
+    /// No live box steers the name: the zone answers it as it would any other.
+    NotSteered,
+    /// A steered name, answered with the proxy's address.
+    ToProxy(Ipv4Addr),
+    /// A steered name while the proxy's listener is not live: SERVFAIL, and
+    /// nothing is forwarded (BEP-062).
+    ServFail,
+}
+
+/// The steering view of a zone: what a credentialed hostname resolves to for a
+/// box under `dns` or `both` steering. Implemented by [`HostnameRegistry`] and
+/// by a lock around one — the shape the answerer holds it in — so the answerer
+/// reaches the steering table through the same handle it reads the zone from.
+pub trait Steered {
+    /// The steering verdict for `name`, which need not be lower-cased or
+    /// stripped of its trailing dot.
+    fn steer(&self, name: &str) -> SteerVerdict;
+}
+
 /// A live registration: the hostname minted for a session, plus the stable
 /// `SessionId` carried in its R3.5 tracing events. The id is captured at
 /// registration so `deregister` (keyed by the mutable session name) emits the
@@ -113,6 +163,15 @@ pub struct HostnameRegistry {
     by_host: HashMap<Hostname, Route>,
     /// session name → its live registration, for withdrawal on exit.
     by_session: HashMap<String, Registration>,
+    /// session name → the credentialed hostnames that box steers at the proxy
+    /// (BEP-062). Keyed by session so they are withdrawn with the box, like
+    /// its own name.
+    steered: HashMap<String, Vec<String>>,
+    /// Where a steered name is answered, or that nothing is listening for it.
+    proxy: ProxyListener,
+    /// One SERVFAIL line per steered name per window: a box whose tooling
+    /// retries a lookup in a loop must not bury the rest of the log.
+    servfail_warned: KeyedWarnLimiter<String>,
     /// Pinged after every register/deregister so the box-zone answerer
     /// ([`super::answerer`]) can rewrite its zone dump without polling.
     changes: Arc<Notify>,
@@ -127,6 +186,9 @@ impl HostnameRegistry {
             legacy_host_id: legacy_host_id.into(),
             by_host: HashMap::new(),
             by_session: HashMap::new(),
+            steered: HashMap::new(),
+            proxy: ProxyListener::Down,
+            servfail_warned: KeyedWarnLimiter::new(),
             changes: Arc::new(Notify::new()),
         }
     }
@@ -202,12 +264,68 @@ impl HostnameRegistry {
         self.register(session_id, session_name, LOOPBACK)
     }
 
+    /// Steers `names` — the credentialed hostnames of `session_name`'s box,
+    /// the host sets of the modules it holds a member for — at the proxy for
+    /// as long as the box lives (BEP-062). Replaces whatever that box steered
+    /// before; [`Self::deregister`] withdraws them.
+    ///
+    /// Only a box whose resolved steering is `dns` or `both` steers anything:
+    /// under `proxy_env` the box's tooling reaches the proxy by environment
+    /// and its lookups are ordinary, and under `off` nothing is steered at
+    /// all.
+    pub fn steer_names(&mut self, session_name: &str, names: Vec<String>) {
+        let names: Vec<String> = names
+            .iter()
+            .map(|name| name.trim_end_matches('.').to_ascii_lowercase())
+            .collect();
+        tracing::info!(
+            session_name,
+            names = ?names,
+            listener = ?self.proxy,
+            action = "steered",
+            "steered a box's credentialed names at the box egress proxy"
+        );
+        self.steered.insert(session_name.to_string(), names);
+    }
+
+    /// Records where the proxy's redemption listener is, or that it is not
+    /// live. While it is down every steered name answers SERVFAIL (BEP-062).
+    pub fn set_proxy_listener(&mut self, listener: ProxyListener) {
+        if self.proxy == listener {
+            return;
+        }
+        tracing::info!(
+            was = ?self.proxy,
+            now = ?listener,
+            steering = self.steered.len(),
+            "the box egress proxy's listener changed state"
+        );
+        self.proxy = listener;
+    }
+
+    /// Where a steered name is answered, or that nothing is listening.
+    #[must_use]
+    pub fn proxy_listener(&self) -> ProxyListener {
+        self.proxy
+    }
+
     /// Withdraws `session_name`'s hostname, returning it if one was registered.
     /// Emits the R3.5 `deregistered` tracing event only when an entry is
     /// actually removed, so calling it for an unregistered session is a silent
     /// no-op. The event carries the same stable `session_id` the matching
     /// `registered` event did, and formats `ip` with `Display` to match it.
     pub fn deregister(&mut self, session_name: &str) -> Option<Hostname> {
+        // The steered names go first and unconditionally: a box that steered
+        // names must stop steering them the moment it is gone, whether or not
+        // it also held a zone name (BEP-062).
+        if let Some(names) = self.steered.remove(session_name) {
+            tracing::info!(
+                session_name,
+                names = ?names,
+                action = "unsteered",
+                "withdrew a box's steered credentialed names"
+            );
+        }
         let Registration { id, hostname } = self.by_session.remove(session_name)?;
         let route = self
             .by_host
@@ -268,6 +386,58 @@ impl HostnameRegistry {
             .strip_suffix('.')
             .filter(|label| !label.is_empty())?;
         Some(format!("{label}.{HOSTNAME_SUFFIX}"))
+    }
+}
+
+impl Steered for HostnameRegistry {
+    /// A name a live box steers answers the proxy's address while the
+    /// listener is live, and SERVFAIL while it is not (BEP-062). A name no
+    /// box steers is not this table's to answer.
+    ///
+    /// The SERVFAIL is logged once per name per window, with the box that
+    /// steered it: a steered name that stops resolving is the first thing a
+    /// developer asks about, and the reason is the listener, not the name.
+    fn steer(&self, name: &str) -> SteerVerdict {
+        let asked = name.trim_end_matches('.').to_ascii_lowercase();
+        let Some(session) = self
+            .steered
+            .iter()
+            .find(|(_, names)| names.contains(&asked))
+            .map(|(session, _)| session.as_str())
+        else {
+            return SteerVerdict::NotSteered;
+        };
+        match self.proxy {
+            ProxyListener::Live(proxy) => SteerVerdict::ToProxy(proxy),
+            ProxyListener::Down => {
+                if self
+                    .servfail_warned
+                    .should_warn_at(asked.clone(), Instant::now())
+                {
+                    tracing::warn!(
+                        session_name = session,
+                        name = asked.as_str(),
+                        rcode = "SERVFAIL",
+                        "answered SERVFAIL for a steered name: the box egress proxy's \
+                         listener is not live, and a steered name is never answered from \
+                         real DNS"
+                    );
+                }
+                SteerVerdict::ServFail
+            }
+        }
+    }
+}
+
+// The shape the answerer and the router hold the registry in (a lock, shared
+// with the sessions manager that writes it). Mirrors the `HostRoute` impl in
+// [`super::proxy`]: the guard is dropped inside the call, and a poisoned lock
+// still answers from the table it holds.
+impl Steered for std::sync::RwLock<HostnameRegistry> {
+    fn steer(&self, name: &str) -> SteerVerdict {
+        self.read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .steer(name)
     }
 }
 
@@ -449,6 +619,95 @@ pub(crate) mod tests {
             m.extend_from_slice(&addr.octets());
         }
         m
+    }
+
+    /// A standard query (RD set) for `name`/`qtype` in class IN: what a box's
+    /// resolver sends the box-zone answerer.
+    fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
+        let mut m = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.') {
+            m.push(label.len() as u8);
+            m.extend_from_slice(label.as_bytes());
+        }
+        m.push(0);
+        m.extend_from_slice(&qtype.to_be_bytes());
+        m.extend_from_slice(&CLASS_IN.to_be_bytes());
+        m
+    }
+
+    /// The response code a reply carries.
+    fn rcode(reply: &[u8]) -> u16 {
+        u16::from_be_bytes([reply[2], reply[3]]) & 0x000f
+    }
+
+    /// How many answer records a reply carries.
+    fn ancount(reply: &[u8]) -> u16 {
+        u16::from_be_bytes([reply[6], reply[7]])
+    }
+
+    /// BEP-062: a box under `dns` steering looks up one of its credentialed
+    /// hostnames. While the proxy's listener is not live the answer is
+    /// SERVFAIL — for every type it asks, with nothing in the answer section —
+    /// so the box fails closed instead of resolving the name for real and
+    /// reaching the upstream with the proxy's egress re-check and audit record
+    /// skipped. Once the listener is live the same name answers the proxy's
+    /// address, and the steering is withdrawn with the box that declared it.
+    #[test]
+    fn steered_name_servfail_while_proxy_down() {
+        use crate::net::answerer::{Verdict, answer};
+
+        const PROXY: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+        const TYPE_AAAA: u16 = 28;
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID);
+        reg.register_own_ip(SessionId::nil(), "web");
+        reg.steer_names("web", vec!["github.com".into(), "api.github.com".into()]);
+        // The state a daemon starts in: no listener anywhere.
+        assert_eq!(reg.proxy_listener(), ProxyListener::Down);
+        let zone = std::sync::RwLock::new(reg);
+
+        for qtype in [TYPE_A, TYPE_AAAA] {
+            // The case is the resolver's, not the box's.
+            let reply =
+                answer(&zone, &dns_query("GitHub.com", qtype)).expect("a query is answered");
+            assert_eq!(reply.verdict, Verdict::ServFail, "qtype {qtype}");
+            assert_eq!(rcode(&reply.bytes), 2, "SERVFAIL for qtype {qtype}");
+            assert_eq!(ancount(&reply.bytes), 0, "qtype {qtype}");
+        }
+
+        // A name no box steers is not the steering's to answer: outside the box
+        // zone, so it is refused and nothing is forwarded for it either.
+        let untouched = answer(&zone, &dns_query("example.com", TYPE_A)).expect("answered");
+        assert_eq!(untouched.verdict, Verdict::Refused);
+
+        // With the listener live, the steered name answers the proxy's address.
+        zone.write()
+            .unwrap()
+            .set_proxy_listener(ProxyListener::Live(PROXY));
+        let reply = answer(&zone, &dns_query("api.github.com", TYPE_A)).expect("answered");
+        assert_eq!(reply.verdict, Verdict::Answer);
+        assert_eq!(rcode(&reply.bytes), 0);
+        let parsed = parse_resolved_name(&reply.bytes).expect("an A answer for the proxy");
+        assert_eq!(parsed.name, "api.github.com");
+        assert_eq!(parsed.addresses, vec![PROXY]);
+        // A box's own zone name is unaffected by any of it.
+        assert_eq!(
+            answer(&zone, &dns_query("web.min.internal", TYPE_A))
+                .expect("answered")
+                .verdict,
+            Verdict::Answer
+        );
+
+        // The steering goes with the box: once it exits, the name is nobody's
+        // to steer, live listener or not.
+        assert!(zone.write().unwrap().deregister("web").is_some());
+        assert_eq!(zone.steer("github.com"), SteerVerdict::NotSteered);
+        assert_eq!(
+            answer(&zone, &dns_query("github.com", TYPE_A))
+                .expect("answered")
+                .verdict,
+            Verdict::Refused
+        );
     }
 
     /// NET-066: a resolver answer yields the question name, every A record

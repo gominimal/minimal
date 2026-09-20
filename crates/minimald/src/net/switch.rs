@@ -692,7 +692,51 @@ pub struct EgressGate {
     names: Option<NameRules>,
     /// The addresses its allowed names resolved to, each for its window.
     pins: Mutex<PinTable>,
+    /// Whether the box's UDP datagrams to [`QUIC_PORT`] are dropped: its
+    /// resolved `quic443` applied to whether it holds a credentialed upstream
+    /// (BEP-018), settled once when the gate is built.
+    drop_udp_443: bool,
 }
+
+/// How a box's QUIC egress to port 443 is treated: the box spec's `quic443`
+/// field as the daemon resolves it (BEP-018).
+///
+/// A box that speaks HTTP/3 to a host the proxy terminates reaches it over
+/// UDP, presenting no sealed value and passing no egress re-check, so a
+/// credentialed box's QUIC is dropped and its client falls back to TLS over
+/// TCP through the proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Quic443 {
+    /// Dropped while the box holds a credentialed upstream, passed otherwise.
+    /// What an undeclared field resolves to.
+    #[default]
+    Auto,
+    /// Dropped whether or not the box holds a credentialed upstream.
+    Block,
+    /// Never dropped: the box's QUIC leaves like any other datagram.
+    Allow,
+}
+
+impl Quic443 {
+    /// Whether a box in this posture has its UDP datagrams to
+    /// [`QUIC_PORT`] dropped (BEP-018): `auto` for a box holding a
+    /// credentialed upstream, `block` for every box, `allow` for none.
+    #[must_use]
+    pub fn drops_udp_443(self, credentialed: bool) -> bool {
+        match self {
+            Self::Auto => credentialed,
+            Self::Block => true,
+            Self::Allow => false,
+        }
+    }
+}
+
+/// The port QUIC carries HTTPS on, and the one [`Quic443`] is named for.
+const QUIC_PORT: u16 = 443;
+
+/// The rule name a datagram dropped by [`Quic443`] is counted and warned
+/// under, as the R2.7 warning's `rule_matched` spells it.
+const QUIC443_RULE: &str = "quic443";
 
 /// A box's `egress.allow_dns_hosts` and the ranges an answer for one of those
 /// names is intersected against.
@@ -751,7 +795,20 @@ impl EgressGate {
             stats: Mutex::new(EgressDropStats::default()),
             names: None,
             pins: Mutex::new(PinTable::default()),
+            drop_udp_443: false,
         }
+    }
+
+    /// Applies the box's `quic443` posture (BEP-018). Under `auto` while the
+    /// box holds a credentialed upstream, or under `block`, every UDP
+    /// datagram it sends to [`QUIC_PORT`] is dropped — including one to a
+    /// destination its own rules or a pinned name admit, because the point is
+    /// that a credentialed upstream is reached through the proxy and not over
+    /// QUIC.
+    #[must_use]
+    pub fn with_quic443(mut self, quic443: Quic443, credentialed: bool) -> Self {
+        self.drop_udp_443 = quic443.drops_udp_443(credentialed);
+        self
     }
 
     /// Adds the box's `egress.allow_dns_hosts`: an answer for one of `hosts`
@@ -865,6 +922,20 @@ impl EgressGate {
                 let Some(summary) = net_verdict::summarize_ipv4(&frame[ETH_HDR..]) else {
                     return malformed;
                 };
+                // BEP-018, ahead of the box's own rules: a credentialed box's
+                // QUIC to :443 is dropped even where its declarations — or a
+                // name it resolved — admit the destination, since that
+                // destination is the very upstream the proxy terminates.
+                if self.drop_udp_443
+                    && summary.proto == IPPROTO_UDP
+                    && summary.dst_port == Some(QUIC_PORT)
+                {
+                    return EgressDecision::Drop {
+                        rule: QUIC443_RULE,
+                        destination: Some(SocketAddrV4::new(summary.dst, QUIC_PORT)),
+                        proto: net_verdict::ip_proto(summary.proto),
+                    };
+                }
                 match net_verdict::frame_verdict(&summary, &self.rules) {
                     Verdict::Admit => EgressDecision::Admit,
                     // Undeclared by address, but resolved from an allowed name
@@ -1757,6 +1828,60 @@ mod tests {
         let stats = gate.drop_stats();
         assert_eq!(stats.by_rule.get("allow_protocols"), Some(&2));
         assert_eq!(stats.last_destination, Some(SocketAddrV4::new(GATEWAY, 53)));
+    }
+
+    /// BEP-018: a box holding a credentialed upstream whose `quic443` resolves
+    /// to `auto` has every UDP datagram to port 443 dropped — even to a
+    /// destination its own `allow_subnets` admit, because reaching the
+    /// credentialed upstream over QUIC would pass neither the proxy's
+    /// substitution nor its egress re-check — while its TLS leg over TCP and
+    /// its lookups are untouched. The same `auto` leaves a box with no
+    /// credentialed upstream its QUIC.
+    #[test]
+    fn quic443_auto_drops_udp_443_for_credentialed_box() {
+        let gate_with = |quic443: Quic443, credentialed: bool| {
+            EgressGate::for_box(
+                "web".into(),
+                EgressRules::for_box(
+                    LEASE,
+                    Some(&allow_only(&["0.0.0.0/0"], None)),
+                    Some(Endpoint {
+                        ip: GATEWAY,
+                        port: 53,
+                    }),
+                ),
+            )
+            .with_quic443(quic443, credentialed)
+        };
+
+        let credentialed = gate_with(Quic443::Auto, true);
+        let quic = udp_frame(LEASE, 40000, OUTSIDE, 443);
+        assert!(
+            !credentialed.admit(&quic),
+            "a credentialed box's QUIC drops"
+        );
+        // The proxied path and the box's lookups still leave.
+        assert!(credentialed.admit(&egress_syn(LEASE, OUTSIDE, 443)));
+        assert!(credentialed.admit(&udp_frame(LEASE, 40000, GATEWAY, 53)));
+        // UDP to another port is not QUIC to 443 and is left alone.
+        assert!(credentialed.admit(&udp_frame(LEASE, 40000, OUTSIDE, 4433)));
+        let stats = credentialed.drop_stats();
+        assert_eq!(stats.by_rule.get(QUIC443_RULE), Some(&1));
+        assert_eq!(stats.total(), 1);
+        assert_eq!(
+            stats.last_destination,
+            Some(SocketAddrV4::new(OUTSIDE, 443))
+        );
+
+        // `auto` on a box with no credentialed upstream: nothing to protect,
+        // so its QUIC passes.
+        let plain = gate_with(Quic443::Auto, false);
+        assert!(plain.admit(&quic));
+        assert_eq!(plain.drop_stats().total(), 0);
+        // `block` drops it whether the box is credentialed or not; `allow`
+        // never does.
+        assert!(!gate_with(Quic443::Block, false).admit(&quic));
+        assert!(gate_with(Quic443::Allow, true).admit(&quic));
     }
 
     /// NET-084: a frame whose source is not the box's lease never leaves the

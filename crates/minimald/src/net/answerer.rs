@@ -27,6 +27,10 @@
 //! - The resolver's discovery probe (`_dns.resolver.arpa`, RFC 9462) is
 //!   answered NODATA like any other non-`A` lookup, so the probe resolves at
 //!   once instead of timing out.
+//! - A credentialed hostname a live box steers at the Box Egress Proxy
+//!   ([`HostnameRegistry::steer_names`]) is answered with the proxy's address,
+//!   and SERVFAIL while the proxy's listener is not live — never from real DNS
+//!   (BEP-062). Such a name is outside the zone, so nothing else here changes.
 //!
 //! ## Who is answered
 //!
@@ -51,7 +55,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 use serde::Serialize;
 use tokio::net::UdpSocket;
 
-use super::dns::{HOSTNAME_SUFFIX, HostnameRegistry};
+use super::dns::{HOSTNAME_SUFFIX, HostnameRegistry, SteerVerdict, Steered};
 use super::proxy::HostRoute;
 
 /// The port the box zone is answered on, the one the host resolver hook names
@@ -123,6 +127,10 @@ pub enum Verdict {
     /// The name is outside the zone, or the class is not `IN`: `REFUSED`, and
     /// nothing is forwarded.
     Refused,
+    /// A steered credentialed name while the proxy's listener is not live:
+    /// `SERVFAIL`, so the box fails closed rather than resolving the name for
+    /// real and reaching the upstream around the proxy (BEP-062).
+    ServFail,
     /// An opcode other than a standard query.
     NotImplemented,
     /// The message could not be parsed as a single-question query.
@@ -134,6 +142,7 @@ impl Verdict {
         match self {
             Self::Answer | Self::NoData => 0,
             Self::FormErr => 1,
+            Self::ServFail => 2,
             Self::NxDomain => 3,
             Self::NotImplemented => 4,
             Self::Refused => 5,
@@ -261,7 +270,7 @@ fn local_answer(ip: IpAddr) -> Option<Ipv4Addr> {
     }
 }
 
-fn decide(zone: &impl HostRoute, q: &Question<'_>) -> (Verdict, Body) {
+fn decide(zone: &(impl HostRoute + Steered), q: &Question<'_>) -> (Verdict, Body) {
     if q.flags & OPCODE_MASK != 0 {
         return (Verdict::NotImplemented, Body::Empty);
     }
@@ -280,7 +289,20 @@ fn decide(zone: &impl HostRoute, q: &Question<'_>) -> (Verdict, Body) {
         return (Verdict::NoData, Body::NegativeSoa);
     }
     if !in_zone(name) {
-        return (Verdict::Refused, Body::Empty);
+        // Outside the zone, but possibly a credentialed hostname a live box
+        // steers at the proxy (BEP-062) — decided here, ahead of the refusal,
+        // which is what keeps a steered name from being resolved for real. The
+        // zone itself is never shadowed: a name in it never reaches this arm.
+        return match zone.steer(name) {
+            SteerVerdict::NotSteered => (Verdict::Refused, Body::Empty),
+            SteerVerdict::ServFail => (Verdict::ServFail, Body::Empty),
+            SteerVerdict::ToProxy(proxy) if q.qtype == TYPE_A => (Verdict::Answer, Body::A(proxy)),
+            // The box reaches the proxy over IPv4, so any other type its
+            // client pairs the `A` lookup with holds no record. An empty
+            // `NOERROR` with no authority record: this zone's SOA is not the
+            // steered name's to quote.
+            SteerVerdict::ToProxy(_) => (Verdict::NoData, Body::Empty),
+        };
     }
     match zone.resolve_host(name) {
         None => (Verdict::NxDomain, Body::NegativeSoa),
@@ -373,7 +395,7 @@ fn encode(id: u16, query_flags: u16, question: &[u8], verdict: Verdict, body: Bo
 /// query to answer at all (too short, or itself a response). Pure over the
 /// zone: the socket path and the tests both call this.
 #[must_use]
-pub fn answer(zone: &impl HostRoute, msg: &[u8]) -> Option<Reply> {
+pub fn answer(zone: &(impl HostRoute + Steered), msg: &[u8]) -> Option<Reply> {
     let q = match parse_question(msg) {
         Ok(q) => q,
         Err(Malformed::Drop) => return None,

@@ -160,6 +160,10 @@ pub(crate) fn task_network(
         &format!("{session}-task"),
         None,
         record.policy.egress.clone(),
+        // The session record carries no `[network.bep]`, so a task's own relay
+        // takes the default posture; a credentialed box's session relay is
+        // gated from its own home (BEP-018).
+        crate::net::provider::BoxCredentials::default(),
     )
 }
 

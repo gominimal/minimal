@@ -14,19 +14,37 @@ use sessions::NetworkMode;
 use tokio::sync::Mutex;
 
 use crate::net::policy::{ControlChannel, HostReach};
+use crate::net::switch::Quic443;
 use crate::net::{SwitchClient, SwitchSubnet, SwitchTransport};
+
+/// What a box's credentials mean for its network: whether it holds a
+/// credentialed upstream at all, and the `quic443` its spec resolves to
+/// (BEP-018). Default: no credentialed upstream, `quic443` as an undeclared
+/// field resolves.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BoxCredentials {
+    /// Whether the box holds a credentialed upstream the proxy terminates.
+    pub(crate) credentialed: bool,
+    /// The box spec's `quic443`, resolved.
+    pub(crate) quic443: Quic443,
+}
 
 /// The network provider for `mode`. `NoNet` is the sandbox layer's own;
 /// `HostNet` shares the host's namespace but still has its resolver to decide
 /// (NET-003), and `OwnIp` needs a lease, a tap and a switch attach. An
 /// unrecognised mode (`NetworkMode` is `#[non_exhaustive]`) gets the empty
 /// namespace, the safe direction.
+///
+/// `credentials` reaches the own-IP egress gate, where the box's `quic443`
+/// decides its QUIC (BEP-018). A host-address box has no relay to gate, so
+/// its credentials change nothing here.
 pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
     ingress: Option<sessions::IngressPolicy>,
     egress: Option<sessions::EgressPolicy>,
+    credentials: BoxCredentials,
 ) -> Arc<dyn Network> {
     match mode {
         NetworkMode::HostNet => Arc::new(HostNetNetwork {
@@ -37,6 +55,7 @@ pub(crate) fn network_for(
             identity: identity.to_string(),
             ingress,
             egress,
+            credentials,
             reserved: std::sync::Mutex::new(None),
         }),
         _ => Arc::new(sandbox2::NoNet),
@@ -213,6 +232,9 @@ struct OwnIpNetwork {
     /// it attaches (NET-062 to NET-064); `None` (no `egress` section) allows
     /// every destination, while the source check (NET-084) always applies.
     egress: Option<sessions::EgressPolicy>,
+    /// What the box's credentials mean for its relay: its `quic443` posture
+    /// and whether it holds a credentialed upstream (BEP-018).
+    credentials: BoxCredentials,
     /// Taken by `plan`, taken back out by `attach` or `abandon`. A `std` mutex,
     /// never held across an await, so a cancelled launch cannot leak it.
     reserved: std::sync::Mutex<Option<Reserved>>,
@@ -223,6 +245,7 @@ impl std::fmt::Debug for OwnIpNetwork {
         f.debug_struct("OwnIpNetwork")
             .field("identity", &self.identity)
             .field("has_ingress", &self.ingress.is_some())
+            .field("credentials", &self.credentials)
             .finish_non_exhaustive()
     }
 }
@@ -318,6 +341,10 @@ impl Network for OwnIpNetwork {
                     &[subnet.gateway(), subnet.host_alias(), subnet.daemon_ip()],
                 );
             }
+            // A credentialed box reaches its upstream through the proxy, not
+            // over QUIC: its datagrams to :443 are dropped (BEP-018).
+            let egress =
+                egress.with_quic443(self.credentials.quic443, self.credentials.credentialed);
             let egress = Arc::new(egress);
             let guard = crate::net::gvproxy_network::complete_own_ip_attach(
                 crate::net::gvproxy_network::OwnIpAttach {
@@ -379,10 +406,17 @@ mod tests {
     async fn every_mode_gets_its_provider() {
         let switch = counting_switch();
 
-        let host = network_for(NetworkMode::HostNet, &switch, "s", None, None)
-            .plan()
-            .await
-            .unwrap();
+        let host = network_for(
+            NetworkMode::HostNet,
+            &switch,
+            "s",
+            None,
+            None,
+            BoxCredentials::default(),
+        )
+        .plan()
+        .await
+        .unwrap();
         assert!(!host.isolates_netns());
         // This switch belongs to a node inside a VM, where a host-address box
         // resolves through the node's DNS layer (NET-003);
@@ -392,14 +426,28 @@ mod tests {
             &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()])
         );
 
-        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None, None)
-            .plan()
-            .await
-            .unwrap();
+        let no_net = network_for(
+            NetworkMode::NoNet,
+            &switch,
+            "s",
+            None,
+            None,
+            BoxCredentials::default(),
+        )
+        .plan()
+        .await
+        .unwrap();
         assert!(no_net.isolates_netns() && no_net.tap().is_none());
         assert_eq!(no_net.resolver(), &Resolver::None);
 
-        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None, None);
+        let own_ip = network_for(
+            NetworkMode::OwnIp,
+            &switch,
+            "s",
+            None,
+            None,
+            BoxCredentials::default(),
+        );
         assert!(own_ip.plan().await.unwrap().isolates_netns());
         assert_eq!(switch.lock().await.attached(), 1, "own-IP takes a lease");
         own_ip.abandon().await;
@@ -424,10 +472,17 @@ mod tests {
             dynamic_allowed_range: None,
         });
 
-        let plan = network_for(NetworkMode::NoNet, &switch, "some-session", ingress, None)
-            .plan()
-            .await
-            .unwrap();
+        let plan = network_for(
+            NetworkMode::NoNet,
+            &switch,
+            "some-session",
+            ingress,
+            None,
+            BoxCredentials::default(),
+        )
+        .plan()
+        .await
+        .unwrap();
 
         assert!(
             plan.isolates_netns(),
@@ -456,10 +511,17 @@ mod tests {
         // A node's switch inside a VM: taps reach the host gvproxy over the
         // vsock shuttle.
         let vm_backed = counting_switch();
-        let plan = network_for(NetworkMode::HostNet, &vm_backed, "s", None, None)
-            .plan()
-            .await
-            .unwrap();
+        let plan = network_for(
+            NetworkMode::HostNet,
+            &vm_backed,
+            "s",
+            None,
+            None,
+            BoxCredentials::default(),
+        )
+        .plan()
+        .await
+        .unwrap();
         assert!(
             !plan.isolates_netns(),
             "a host-address box keeps the node's namespace"
@@ -489,10 +551,17 @@ mod tests {
             native.lock().await.transport(),
             crate::net::SwitchTransport::LocalSpawn
         );
-        let plan = network_for(NetworkMode::HostNet, &native, "s", None, None)
-            .plan()
-            .await
-            .unwrap();
+        let plan = network_for(
+            NetworkMode::HostNet,
+            &native,
+            "s",
+            None,
+            None,
+            BoxCredentials::default(),
+        )
+        .plan()
+        .await
+        .unwrap();
         assert_eq!(plan.resolver(), &Resolver::Host);
     }
 
@@ -560,7 +629,14 @@ mod tests {
         let switch = counting_switch();
         let before = switch.lock().await.attached();
 
-        let net = network_for(NetworkMode::OwnIp, &switch, "s", None, None);
+        let net = network_for(
+            NetworkMode::OwnIp,
+            &switch,
+            "s",
+            None,
+            None,
+            BoxCredentials::default(),
+        );
         net.plan().await.expect("planning leases an address");
         assert_eq!(switch.lock().await.attached(), before + 1);
 
@@ -591,7 +667,16 @@ mod tests {
     async fn concurrent_own_ip_launches_do_not_serialize() {
         let switch = counting_switch();
         let launches: Vec<_> = (0..4)
-            .map(|i| network_for(NetworkMode::OwnIp, &switch, &format!("p{i}"), None, None))
+            .map(|i| {
+                network_for(
+                    NetworkMode::OwnIp,
+                    &switch,
+                    &format!("p{i}"),
+                    None,
+                    None,
+                    BoxCredentials::default(),
+                )
+            })
             .collect();
         for net in &launches {
             net.plan().await.expect("planning leases an address");

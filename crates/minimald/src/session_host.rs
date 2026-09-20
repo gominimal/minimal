@@ -1972,6 +1972,20 @@ fn install_trust_root(
     Ok(Some(dest))
 }
 
+/// Whether the box holds a credentialed upstream, as the daemon sees it: the
+/// CLI delivered the host's interception root into the session home, which it
+/// does for a box declaring one under any steering but `off` (BEP-011). The
+/// same file [`install_trust_root`] installs, read before the launch rather
+/// than after, because the box's network is planned first.
+///
+/// This is the whole of what the daemon is told about `[network.bep]` today:
+/// the table itself does not travel to it, so a box's `quic443` resolves to
+/// its default here, which is the `auto` BEP-018 names.
+#[cfg(not(test))]
+fn holds_credentialed_upstream(home: &std::path::Path) -> bool {
+    home.join(sessions::BEP_ROOT_PATCH_DEST).is_file()
+}
+
 /// The real [`SessionLauncher`]: evaluates a minimal context into a graph,
 /// builds a sandboxed `/bin/bash`, and wires it to a freshly opened PTY.
 #[cfg(not(test))]
@@ -2109,12 +2123,21 @@ impl SessionLauncher for SandboxLauncher {
         // the sandbox needs — for own-IP, a lease and a running gvproxy — and
         // says what it is. `PlannedLaunch` owns the release from here: an early
         // `Err` return or a cancelled launch gives the lease back.
+        // What the box's credentials mean for its relay (BEP-018): a box the
+        // CLI delivered the interception root to holds a credentialed upstream,
+        // and its QUIC to :443 is dropped so the upstream is reached through
+        // the proxy.
+        let credentials = crate::net::provider::BoxCredentials {
+            credentialed: holds_credentialed_upstream(paths.home.as_utf8_path().as_std_path()),
+            ..Default::default()
+        };
         let planned = sandbox2::PlannedLaunch::begin(crate::net::provider::network_for(
             network_mode,
             &net_switch,
             &session_name,
             ingress.clone(),
             egress,
+            credentials,
         ))
         .await
         .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;
