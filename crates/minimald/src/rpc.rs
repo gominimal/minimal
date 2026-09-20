@@ -284,6 +284,7 @@ async fn serve_create_session(
             // manager: the success record below needs it, and the reply
             // carries only the assigned id.
             let session_name = req.config.name.clone();
+            let resolver_advisory = host_resolution_advisory(&s).await;
 
             Ok(match mngr.create_session(req.config, ssh_username).await {
                 Ok(id) => {
@@ -301,6 +302,7 @@ async fn serve_create_session(
                         id,
                         daemon_version: Some(OWN_VERSION.to_string()),
                         hostname_routing_unavailable: s.proxy_unavailable().await,
+                        resolver_advisory,
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
@@ -316,6 +318,29 @@ async fn serve_create_session(
             })
         })
         .await
+}
+
+/// NET-122/NET-123: the host's native-resolution state at a session start —
+/// the resolver hook and the bind probe over the reserved range — as the
+/// advisory the reply carries, or `None` when nothing needs doing.
+///
+/// Judged only by a daemon on the host itself. Inside a VM the loopback the
+/// probe would bind is the guest's and the host's resolver is out of reach,
+/// so a guest daemon says nothing rather than something wrong, and the client
+/// on the host judges both halves itself. The one info line here is the
+/// session-start record of the probe and the surface chosen.
+async fn host_resolution_advisory(s: &ServerStateHandle) -> Option<minimald_rpc::ResolverAdvisory> {
+    if s.in_microvm().await {
+        return None;
+    }
+    let host = crate::net::answerer::HostResolution::probe();
+    tracing::info!(
+        resolver_configured = host.resolver_configured,
+        range = ?host.range,
+        surface = host.surface(),
+        "session start: native resolution state"
+    );
+    host.advisory()
 }
 
 /// `ConfigureLoadout`: composes a created session's loadout from the
@@ -2632,6 +2657,50 @@ mod tests {
             .ok()
             .expect("an unasserted create must behave as it always has");
         assert_eq!(created.daemon_version.as_deref(), Some(OWN_VERSION));
+    }
+
+    /// NET-123: a session start runs the bind probe over the whole reserved
+    /// range and the reply reports what it and the resolver-hook check found,
+    /// read afresh at every start rather than latched (NET-122).
+    #[tokio::test]
+    async fn session_start_probes_reserved_range() {
+        use crate::net::answerer::{self, HostResolution};
+
+        // The probe covers every address a box could be published at.
+        assert_eq!(answerer::reserved_range().count(), 254);
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // What this host shows right now, read the same way the create does.
+        let host = HostResolution::probe();
+        let created = client
+            .call::<CreateSession>(&req("first", "/uwu"))
+            .await
+            .unwrap();
+        assert_eq!(created.resolver_advisory, host.advisory());
+        // Linux carries all of 127/8 on `lo`, so the range is found and the
+        // only thing left to advise is the resolver hook; the reply says so
+        // rather than reporting an interim this host is not on.
+        #[cfg(target_os = "linux")]
+        {
+            assert!(host.range.is_present(), "{:?}", host.range);
+            match &created.resolver_advisory {
+                Some(advisory) => {
+                    assert!(advisory.range_present);
+                    assert_eq!(advisory.range_gap, None);
+                    assert!(!advisory.resolver_configured);
+                }
+                None => assert!(host.resolver_configured),
+            }
+        }
+
+        // Nothing is remembered from the first start: the second reply is
+        // the state as read again, not the first reply echoed.
+        let again = client
+            .call::<CreateSession>(&req("second", "/uwu"))
+            .await
+            .unwrap();
+        assert_eq!(again.resolver_advisory, HostResolution::probe().advisory());
     }
 
     /// The two read RPCs the attach / exec / setup-zed paths

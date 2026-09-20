@@ -688,8 +688,15 @@ impl Session {
     /// node's address, at the box's own port numbers (NET-010, NET-129). A
     /// `Draft` session publishes nothing. An exhausted reserved range is
     /// logged and the box goes unpublished; the session itself still runs.
+    ///
+    /// NET-123: the reserved local range is bind-probed before the box is
+    /// published. While it is absent the box goes to the `127.0.0.1` interim,
+    /// whatever its mode, and the session start's advisory has already said
+    /// so; with the range present the mode's own publication applies.
     #[cfg(target_os = "linux")]
     fn publish_box(&self, record: &Record) {
+        use crate::net::answerer::{interim_address, probe_reserved_range};
+
         if !self.is_published() {
             return;
         }
@@ -705,11 +712,21 @@ impl Session {
                     .collect()
             })
             .unwrap_or_default();
-        let outcome = self
-            .published
-            .write()
-            .expect("publish table lock poisoned")
-            .publish(record.id, &registry_name(record), record.network, &ports);
+        let name = registry_name(record);
+        let probe = probe_reserved_range();
+        let mut table = self.published.write().expect("publish table lock poisoned");
+        let outcome = match interim_address(&probe) {
+            Some(interim) => {
+                tracing::info!(
+                    session_id = %record.id,
+                    %interim,
+                    range = ?probe,
+                    "reserved range absent; publishing the box at the interim address"
+                );
+                Ok(table.publish_interim(record.id, &name, interim, &ports))
+            }
+            None => table.publish(record.id, &name, record.network, &ports),
+        };
         if let Err(error) = outcome {
             tracing::error!(
                 session_id = %record.id,

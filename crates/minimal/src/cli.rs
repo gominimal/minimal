@@ -288,6 +288,29 @@ pub enum NetCommand {
     ///   min net forward web 8080:3000
     #[command(verbatim_doc_comment)]
     Forward(NetForwardArgs),
+    /// Make `<name>.min.internal` resolve natively on this machine (root)
+    ///
+    /// The one privileged step behind the advisory `min session activate`
+    /// prints: routes the box zone to the daemon's answerer on
+    /// 127.0.0.1:15353 (a systemd-resolved routing domain on Linux, an
+    /// /etc/resolver file on macOS) and, on macOS, installs the root-held
+    /// boot step that aliases the reserved local range 127.0.64.0/24 onto
+    /// lo0 so every box can be published at an address of its own. Run it
+    /// with sudo; nothing else prompts. The resolver hook is written only
+    /// once the answerer is listening. `--remove` undoes all of it.
+    ///
+    /// Example:
+    ///
+    ///   sudo min net setup
+    #[command(verbatim_doc_comment)]
+    Setup(NetSetupArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct NetSetupArgs {
+    /// Undo the setup: remove the resolver hook and the boot step
+    #[arg(long)]
+    pub remove: bool,
 }
 
 #[derive(Debug, Args)]

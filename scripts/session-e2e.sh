@@ -58,7 +58,14 @@
 #   E2E_VM              set to 1 for VM-backed targets (extra teardown +
 #                       diagnostics: minvmd stop, guest boot log)
 #
-# Usage: scripts/session-e2e.sh
+# Usage: scripts/session-e2e.sh [<case>]
+#   With no case: the whole proof. With a case (or E2E_CASE=<case>): only that
+#   case, which activates its own session, and the script exits with its
+#   result. An unknown case exits 2. Known cases:
+#     min_internal_names_through_proxy
+#     fresh_install_own_ip_ingress_publishes_loopback
+#     session_outbound_request
+#     native_resolution_without_proxy_env
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -88,6 +95,8 @@ PATCH_SRC_DIR="" # patch sources for the patch-modes proof; removed on teardown
 SKIP_SEED_DIR="" # seeded by the skip-lane scaffold proof below; removed on teardown
 OWNIP_SEED_DIR="" # seeded by the own-IP proof below; removed on teardown
 OUTBOUND_SEED_DIR="" # seeded by the outbound-reach case below; removed on teardown
+NATRES_SEED_DIR="" # seeded by the native resolution proof below; removed on teardown
+NATRES_REMOVE=""   # the `min net setup --remove` that undoes that proof's install
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -207,6 +216,12 @@ teardown() {
   [ -n "$SKIP_SEED_DIR" ] && rm -rf "$SKIP_SEED_DIR"
   [ -n "$OWNIP_SEED_DIR" ] && rm -rf "$OWNIP_SEED_DIR"
   [ -n "$OUTBOUND_SEED_DIR" ] && rm -rf "$OUTBOUND_SEED_DIR"
+  [ -n "$NATRES_SEED_DIR" ] && rm -rf "$NATRES_SEED_DIR"
+  # Undo the privileged resolver setup the native resolution proof installed,
+  # so the runner is left as it was found (the hook would otherwise outlive
+  # the daemon it points at).
+  # shellcheck disable=SC2086 # the remove command is a word list on purpose.
+  [ -n "$NATRES_REMOVE" ] && { sudo -n $NATRES_REMOVE >/dev/null 2>&1 || true; }
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
   # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
@@ -686,6 +701,103 @@ run_case_fresh_install_own_ip_ingress_publishes_loopback() {
   echo "::endgroup::"
 }
 
+# Native resolution proof (NET-009, NET-122, NET-123): a session start's
+# stderr carries the resolver advisory naming the exact setup command, and
+# asks nothing (stdin is never a tty); running that command — root, once —
+# makes `<name>.min.internal` resolve through the host's own resolver for any
+# process with every proxy variable unset; and a session start afterwards
+# prints no advisory. Native Linux only: a VM-backed target's daemon lives in
+# the guest and judges nothing about the host, and the privileged step needs
+# passwordless sudo, exactly as the AppArmor remediation above does.
+run_case_native_resolution_without_proxy_env() {
+  local natres_name natres_sid setup_cmd setup_argv resolved
+  echo "::group::native resolution proof (min net setup, then resolve with no proxy env)"
+  if [ -n "$E2E_VM" ]; then
+    echo "native resolution proof SKIPPED (VM-backed target: the host-side answerer is not part of this proof)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ "$(uname -s)" != Linux ] || ! sudo -n true 2>/dev/null; then
+    echo "native resolution proof SKIPPED (needs Linux with passwordless sudo for the privileged setup step)"
+    echo "::endgroup::"
+    return 0
+  fi
+  # The session whose start is advised and whose name the host then resolves.
+  # A `none` box: it is published at a loopback address of its own, which the
+  # zone answers whether or not the box runs, whereas a host-address box on
+  # the shared address answers NODATA until something runs in it (NET-128) —
+  # and nothing attaches to this one.
+  NATRES_SEED_DIR="$(mktemp -d /tmp/mnlr.XXXXXX)"
+  {
+    awk '
+      /^\[upstream\]/            { grab = 1; print; next }
+      grab && (/^$/ || /^\[/)    { exit }
+      grab                       { print }
+    ' "$ROOT/.minimal/minimal.toml"
+    printf '\n[stack]\nuse = "shell"\n'
+  } > "$NATRES_SEED_DIR/minimal.toml"
+  mkdir "$NATRES_SEED_DIR/.git"
+  natres_name="e2e-natres"
+  natres_sid="$(cd "$NATRES_SEED_DIR" && mnl session activate . --no-prompt \
+    --network none --name "$natres_name" 2>"$WORK/natres-advise.err")" || {
+    echo "::error::'min session activate' failed for the native resolution case"
+    echo "--- stderr ---"; cat "$WORK/natres-advise.err" 2>/dev/null || true
+    fail
+  }
+  natres_sid="$(printf '%s\n' "$natres_sid" | tail -n1 | tr -d '\r')"
+  echo "native resolution session: $natres_sid"
+  # NET-122: the advisory names the exact command, on a line of its own.
+  setup_cmd="$(grep -E '^ *sudo .* net setup$' "$WORK/natres-advise.err" | head -n1 | sed 's/^ *//')"
+  if [ -z "$setup_cmd" ]; then
+    echo "::error::activate printed no resolver advisory naming 'sudo ... net setup'"
+    echo "--- activate stderr ---"; cat "$WORK/natres-advise.err" 2>/dev/null || true
+    fail
+  fi
+  echo "advisory command: $setup_cmd"
+  # Run it exactly as advised, minus the `sudo` the runner's own `sudo -n`
+  # supplies so a missing password can never turn into a prompt here.
+  setup_argv="${setup_cmd#sudo }"
+  NATRES_REMOVE="$setup_argv --remove"
+  # shellcheck disable=SC2086,SC2024 # a word list on purpose; the output file is ours, not root's.
+  if ! sudo -n $setup_argv >"$WORK/setup.out" 2>&1; then
+    echo "::error::'$setup_cmd' failed"
+    echo "--- output ---"; cat "$WORK/setup.out"
+    fail
+  fi
+  cat "$WORK/setup.out"
+
+  # NET-009: the host resolver answers the box name for an ordinary process
+  # — no proxy, no PAC, no proxy variable — with a host loopback address.
+  resolved="$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
+    getent hosts "$natres_name.min.internal" 2>&1)"
+  if ! printf '%s\n' "$resolved" | grep -Eq '^127\.'; then
+    echo "::error::'$natres_name.min.internal' did not resolve natively to a loopback address: '$resolved'"
+    echo "--- resolvectl status ---"; resolvectl status 2>&1 | tail -30 || true
+    fail
+  fi
+  echo "resolved natively: $resolved"
+
+  # NET-122's WHILE: with the hook in place a session start advises nothing.
+  mnl session destroy --force "$natres_sid" >/dev/null 2>&1 || true
+  natres_sid="$(cd "$NATRES_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-natres-hooked 2>"$WORK/natres.err")" || {
+    echo "::error::'min session activate' after the resolver setup failed"
+    echo "--- stderr ---"; cat "$WORK/natres.err" 2>/dev/null || true
+    fail
+  }
+  natres_sid="$(printf '%s\n' "$natres_sid" | tail -n1 | tr -d '\r')"
+  if grep -q 'net setup' "$WORK/natres.err"; then
+    echo "::error::a session start after the resolver setup still printed the advisory"
+    echo "--- stderr ---"; cat "$WORK/natres.err"
+    fail
+  fi
+  mnl session destroy --force "$natres_sid" >/dev/null 2>&1 || true
+  rm -rf "$NATRES_SEED_DIR"; NATRES_SEED_DIR=""
+  echo "native resolution proof OK (advised, set up, resolved with no proxy env, no re-advisory)"
+  echo "::endgroup::"
+}
+
 E2E_CASE="${E2E_CASE:-${1:-}}"
 if [ -n "$E2E_CASE" ]; then
   case "$E2E_CASE" in
@@ -693,8 +805,9 @@ if [ -n "$E2E_CASE" ]; then
     fresh_install_own_ip_ingress_publishes_loopback)
       run_case_fresh_install_own_ip_ingress_publishes_loopback; exit $? ;;
     session_outbound_request) run_case_session_outbound_request; exit $? ;;
+    native_resolution_without_proxy_env) run_case_native_resolution_without_proxy_env; exit $? ;;
     *)
-      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request)" >&2
+      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env)" >&2
       exit 2
       ;;
   esac

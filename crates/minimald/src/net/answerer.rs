@@ -39,13 +39,23 @@
 //! loopback address is dropped unanswered either way, so a socket inherited
 //! from the service manager with a wider bind still serves nothing off-host.
 //!
+//! ## Host resolution state
+//!
+//! Whether the host actually routes the zone here is the host's business,
+//! not the answerer's, but the answerer is where the daemon reads it
+//! ([`HostResolution`]): the resolver hook's presence (the dedicated
+//! systemd-resolved link on Linux) and NET-123's bind probe over the reserved
+//! local range (`127.0.64.0/24`). A session start reports both to the client
+//! as the resolver advisory (NET-122); while the range is absent boxes are
+//! published at the `127.0.0.1` interim ([`interim_address`]).
+//!
 //! ## Zone dump
 //!
 //! The answerer mirrors the zone to `<state>/net/zone.json` (see
 //! [`zone_dump_path`]) on start and after every change to the table: every
 //! name, its address and lease state, its published ports with collisions
-//! marked, the daemon that owns it, and the listener's socket. The `min bug`
-//! bundle carries that file.
+//! marked, the daemon that owns it, the listener's socket, and the host
+//! resolution state above. The `min bug` bundle carries that file.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -53,6 +63,7 @@ use std::os::fd::{BorrowedFd, FromRawFd as _, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 
+use minimald_rpc::ResolverAdvisory;
 use serde::Serialize;
 use tokio::net::UdpSocket;
 
@@ -63,8 +74,9 @@ use super::policy::BoxZone;
 use super::publish::{AddressKind, Lookup, PortCollision, PublishTable, Zone};
 
 /// The port the box zone is answered on, the one the host resolver hook names
-/// (`port 15353` in the macOS resolver file the spike installed).
-pub const ANSWERER_PORT: u16 = 15353;
+/// (`port 15353` in the macOS resolver file the spike installed). The wire
+/// crate holds the number, since the client's setup command writes it.
+pub const ANSWERER_PORT: u16 = minimald_rpc::ANSWERER_PORT;
 
 /// Where the answerer binds when the service manager did not hand it a socket:
 /// loopback only, so nothing off the host can reach it (NET-006).
@@ -416,6 +428,141 @@ pub fn on_host(peer: IpAddr) -> bool {
     }
 }
 
+/// The reserved local range's prefix: `127.0.64.0/24`
+/// ([`minimald_rpc::RESERVED_RANGE`], design §7.1).
+const RESERVED_RANGE_PREFIX: [u8; 3] = [127, 0, 64];
+
+/// Every address a box can be published at from the reserved local range:
+/// `127.0.64.1` to `127.0.64.254`.
+pub fn reserved_range() -> impl Iterator<Item = Ipv4Addr> {
+    let [a, b, c] = RESERVED_RANGE_PREFIX;
+    (1..=254).map(move |host| Ipv4Addr::new(a, b, c, host))
+}
+
+/// What the bind probe found of the reserved local range (NET-123).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum RangeProbe {
+    /// Every address in the range bound.
+    Present,
+    /// An address did not bind: the range is not on the host's loopback, in
+    /// full or in part.
+    Absent { address: Ipv4Addr, error: String },
+}
+
+impl RangeProbe {
+    #[must_use]
+    pub fn is_present(&self) -> bool {
+        matches!(self, Self::Present)
+    }
+
+    /// The gap the advisory names: `<address>: <error>`.
+    #[must_use]
+    pub fn gap(&self) -> Option<String> {
+        match self {
+            Self::Present => None,
+            Self::Absent { address, error } => Some(format!("{address}: {error}")),
+        }
+    }
+}
+
+/// NET-123's bind probe: binds an ephemeral TCP port on each address in turn
+/// and reports the first that refuses. Every address is probed rather than a
+/// sample — a partial alias set would otherwise let a box be published at an
+/// address that hangs — and it is cheap: an absent alias fails `bind` with
+/// `EADDRNOTAVAIL` in microseconds (the loopback spike measured 2.5 ms for
+/// the whole range). Each listener is dropped before the next bind, so
+/// nothing is held.
+pub fn probe_range(addrs: impl IntoIterator<Item = Ipv4Addr>) -> RangeProbe {
+    for address in addrs {
+        if let Err(error) = std::net::TcpListener::bind((address, 0)) {
+            return RangeProbe::Absent {
+                address,
+                error: error.to_string(),
+            };
+        }
+    }
+    RangeProbe::Present
+}
+
+/// The bind probe over the whole reserved local range.
+#[must_use]
+pub fn probe_reserved_range() -> RangeProbe {
+    probe_range(reserved_range())
+}
+
+/// The address a box is published at while the reserved range is absent
+/// (NET-123's failure case): `127.0.0.1`, the one loopback address every
+/// host has. `None` while the range is present, when a box takes an address
+/// of its own from it.
+#[must_use]
+pub fn interim_address(probe: &RangeProbe) -> Option<Ipv4Addr> {
+    match probe {
+        RangeProbe::Present => None,
+        RangeProbe::Absent { .. } => Some(Ipv4Addr::LOCALHOST),
+    }
+}
+
+/// Where the Linux resolver hook shows: the dedicated link the advisory's
+/// command creates and systemd-resolved routes the zone on
+/// ([`minimald_rpc::RESOLVER_LINK`]) appears here once it exists.
+const SYSFS_NET: &str = "/sys/class/net";
+
+/// Whether the host resolver routes the box zone to this answerer.
+#[must_use]
+pub fn resolver_hook_configured() -> bool {
+    resolver_hook_configured_in(Path::new(SYSFS_NET))
+}
+
+fn resolver_hook_configured_in(sysfs_net: &Path) -> bool {
+    sysfs_net.join(minimald_rpc::RESOLVER_LINK).exists()
+}
+
+/// What the box host knows of native resolution: read at every session start
+/// (NET-122, NET-123) and written into the zone dump.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HostResolution {
+    /// Whether the host resolver routes the zone to the answerer.
+    pub resolver_configured: bool,
+    /// The bind probe's result over the reserved local range.
+    pub range: RangeProbe,
+}
+
+impl HostResolution {
+    /// Reads both halves from the host now.
+    #[must_use]
+    pub fn probe() -> Self {
+        Self {
+            resolver_configured: resolver_hook_configured(),
+            range: probe_reserved_range(),
+        }
+    }
+
+    /// The surface boxes are published on under this state, for the log.
+    #[must_use]
+    pub fn surface(&self) -> &'static str {
+        if self.range.is_present() {
+            "reserved range"
+        } else {
+            "127.0.0.1 (interim)"
+        }
+    }
+
+    /// The advisory a session start reply carries: present whenever either
+    /// half is missing, every time it is asked — a host still on the
+    /// interim is told again at each start, there is no once-only latch —
+    /// and nothing when native resolution is in place.
+    #[must_use]
+    pub fn advisory(&self) -> Option<ResolverAdvisory> {
+        let range_present = self.range.is_present();
+        (!self.resolver_configured || !range_present).then(|| ResolverAdvisory {
+            resolver_configured: self.resolver_configured,
+            range_present,
+            range_gap: self.range.gap(),
+        })
+    }
+}
+
 /// Where the answerer's socket came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -497,6 +644,8 @@ struct ZoneDump {
     zone: &'static str,
     ttl_secs: u32,
     listener: ListenerInfo,
+    /// The resolver hook and the range probe as the bundle should see them.
+    host: HostResolution,
     names: Vec<ZoneEntry>,
     /// The in-guest half of the same zone: what the node's DNS layer answers a
     /// box with for a sibling (NET-072). Switch leases, so none of them is an
@@ -581,6 +730,7 @@ fn snapshot(
             port: local.port(),
             socket: source,
         },
+        host: HostResolution::probe(),
         names,
         in_guest,
     }
@@ -1162,6 +1312,90 @@ mod tests {
         assert!(answer(&*zone, &[0u8; 5]).is_none());
     }
 
+    /// NET-123's failure case: with the reserved range absent the probe says
+    /// so at once, the box is published at `127.0.0.1` and answers there, and
+    /// the advisory is surfaced again at every session start — a configured
+    /// resolver does not silence it and there is no once-only latch. Nothing
+    /// prompts and nothing hangs.
+    #[test]
+    fn absent_range_publishes_interim_and_readvises() {
+        // TEST-NET-1 is on no host's loopback, so binding it meets exactly
+        // what a stock macOS host shows for `127.0.64.x`: an immediate
+        // refusal. `127.0.0.1` after it proves the probe stops at the first
+        // gap rather than reporting the last address.
+        let missing = Ipv4Addr::new(192, 0, 2, 1);
+        let started = std::time::Instant::now();
+        let probe = probe_range([missing, Ipv4Addr::LOCALHOST]);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the probe neither prompts nor hangs"
+        );
+        let RangeProbe::Absent { address, error } = &probe else {
+            panic!("{missing} is not bindable, so the range is absent: {probe:?}");
+        };
+        assert_eq!(*address, missing);
+        assert!(!error.is_empty(), "the gap carries the bind error");
+        assert_eq!(
+            probe.gap().as_deref(),
+            Some(format!("{missing}: {error}").as_str())
+        );
+        assert_eq!(probe_range([Ipv4Addr::LOCALHOST]), RangeProbe::Present);
+
+        // The interim: an own-address box is published at 127.0.0.1 as a
+        // shared-address box, nothing is leased from the range, and the zone
+        // answers it there while it runs.
+        assert_eq!(interim_address(&probe), Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(interim_address(&RangeProbe::Present), None);
+        let zone = zone(&[]);
+        let published = zone.write().unwrap().publish_interim(
+            SessionId::nil(),
+            "web",
+            interim_address(&probe).unwrap(),
+            &[3000],
+        );
+        assert_eq!(published.address, Ipv4Addr::LOCALHOST);
+        assert_eq!(published.kind, AddressKind::Shared);
+        zone.write().unwrap().set_running("web", true);
+        let parsed = reply(&zone, "web.min.internal", TYPE_A);
+        assert_eq!(parsed.rcode(), 0);
+        assert_eq!(parsed.answers.len(), 1);
+        assert_eq!(parsed.answers[0].rdata, Ipv4Addr::LOCALHOST.octets());
+
+        // Re-advised at each start, resolver configured or not.
+        let host = HostResolution {
+            resolver_configured: true,
+            range: probe.clone(),
+        };
+        assert_eq!(host.surface(), "127.0.0.1 (interim)");
+        for start in 1..=2 {
+            let advisory = host
+                .advisory()
+                .unwrap_or_else(|| panic!("session start {start} is advised"));
+            assert!(advisory.resolver_configured);
+            assert!(!advisory.range_present);
+            assert_eq!(advisory.range_gap, probe.gap());
+        }
+        let unhooked = HostResolution {
+            resolver_configured: false,
+            range: RangeProbe::Present,
+        };
+        assert_eq!(unhooked.surface(), "reserved range");
+        let advisory = unhooked.advisory().expect("a missing hook is advised");
+        assert!(!advisory.resolver_configured && advisory.range_present);
+        assert_eq!(advisory.range_gap, None);
+        let in_place = HostResolution {
+            resolver_configured: true,
+            range: RangeProbe::Present,
+        };
+        assert_eq!(in_place.advisory(), None, "nothing to advise");
+
+        // The hook check is the link's presence in sysfs.
+        let sysfs = tempfile::TempDir::new().unwrap();
+        assert!(!resolver_hook_configured_in(sysfs.path()));
+        std::fs::create_dir(sysfs.path().join(minimald_rpc::RESOLVER_LINK)).unwrap();
+        assert!(resolver_hook_configured_in(sysfs.path()));
+    }
+
     /// The zone dump names every entry with its address and lease state, its
     /// published ports with collisions marked, its owner and the listener,
     /// and follows the table: written on start, rewritten on change. Beside
@@ -1194,6 +1428,9 @@ mod tests {
         assert_eq!(dump["listener"]["address"], "127.0.0.1");
         assert_eq!(dump["listener"]["port"], u64::from(server.port()));
         assert_eq!(dump["listener"]["socket"], "bound");
+        // The host resolution state the bundle reads (NET-122/NET-123).
+        assert!(dump["host"]["resolver_configured"].is_boolean());
+        assert!(dump["host"]["range"]["state"].is_string());
         assert_eq!(dump["names"][0]["name"], "web.min.internal");
         assert_eq!(dump["names"][0]["address"], "127.0.0.1");
         assert_eq!(dump["names"][0]["owner"], "d0");

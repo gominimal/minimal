@@ -181,12 +181,47 @@ impl PublishTable {
         mode: NetworkMode,
         ports: &[u16],
     ) -> Result<Publication, RangeExhausted> {
-        let hostname = hostname(session_name);
         self.withdraw(session_name);
         let (address, kind) = match mode {
             NetworkMode::HostNet => (self.node_address, AddressKind::Shared),
             _ => (self.allocator.allocate()?, AddressKind::Own),
         };
+        Ok(self.insert(session_id, session_name, address, kind, ports))
+    }
+
+    /// Publishes `session_name`'s box at `interim`, the `127.0.0.1` the host
+    /// falls back to while the reserved local range is absent (NET-123).
+    /// Every box shares that one address whatever its mode, so it is
+    /// published as a shared-address box: the same port-collision rule and
+    /// the same running gate apply, and nothing is leased from the range.
+    pub fn publish_interim(
+        &mut self,
+        session_id: SessionId,
+        session_name: &str,
+        interim: Ipv4Addr,
+        ports: &[u16],
+    ) -> Publication {
+        self.withdraw(session_name);
+        self.insert(
+            session_id,
+            session_name,
+            interim,
+            AddressKind::Shared,
+            ports,
+        )
+    }
+
+    /// Records the publication and logs it, the tail both publish paths
+    /// share.
+    fn insert(
+        &mut self,
+        session_id: SessionId,
+        session_name: &str,
+        address: Ipv4Addr,
+        kind: AddressKind,
+        ports: &[u16],
+    ) -> Publication {
+        let hostname = hostname(session_name);
         let mut ports = ports.to_vec();
         ports.sort_unstable();
         ports.dedup();
@@ -219,13 +254,13 @@ impl PublishTable {
                 "two boxes on the shared address publish the same port; neither is translated"
             );
         }
-        Ok(Publication {
+        Publication {
             hostname,
             address,
             kind,
             ports,
             collisions,
-        })
+        }
     }
 
     /// Withdraws `session_name`'s box, releasing its own address if it held

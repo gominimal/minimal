@@ -327,6 +327,47 @@ impl OneshotSshRpc for GetSessionScreen {
     type Response = Errorable<ScreenSnapshot>;
 }
 
+/// The box zone every box name lives under: `<name>.min.internal`.
+pub const BOX_ZONE: &str = "min.internal";
+
+/// The loopback port the box-zone answerer listens on, and the one the host
+/// resolver hook names (`port 15353` in the macOS resolver file, the
+/// `127.0.0.1:15353` DNS server of the Linux routing-domain link).
+pub const ANSWERER_PORT: u16 = 15353;
+
+/// The reserved local range published boxes take their addresses from
+/// (design §7.1): `127.0.64.1` to `127.0.64.254`. Linux carries all of
+/// `127/8` on `lo`; macOS carries only `127.0.0.1` until the privileged step
+/// the resolver advisory names aliases the range onto `lo0`.
+pub const RESERVED_RANGE: &str = "127.0.64.0/24";
+
+/// The name of the dedicated link the Linux resolver hook routes the zone on.
+pub const RESOLVER_LINK: &str = "min0";
+
+/// Why native resolution of the box zone is not in place on the box host at
+/// this session start, carried on [`CreateSessionResponse::resolver_advisory`]
+/// (NET-122, NET-123).
+///
+/// The daemon reports the state; the client prints the advisory and names the
+/// exact command that clears it, since the command runs on the client's host
+/// and its spelling is per OS. Present whenever either half is missing, on
+/// every session start, so a host still on the `127.0.0.1` interim keeps
+/// being told (NET-123's failure case); absent when nothing needs doing, or
+/// from a daemon that cannot judge its host (one inside a VM), in which case
+/// the client reads both halves from the host itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolverAdvisory {
+    /// Whether the host resolver routes the box zone to the answerer.
+    pub resolver_configured: bool,
+    /// Whether the bind probe found every address of [`RESERVED_RANGE`]
+    /// bindable. `false` means boxes are published at `127.0.0.1` for now.
+    pub range_present: bool,
+    /// The first address the probe could not bind, with the error, when the
+    /// range is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_gap: Option<String>,
+}
+
 /// An RPC to create a new session.
 ///
 /// Allocates the session's record and brings its actor up; the
@@ -445,6 +486,12 @@ pub struct CreateSessionResponse {
     /// looking healthy either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_routing_unavailable: Option<String>,
+    /// What keeps `<name>.min.internal` from resolving natively on the box
+    /// host, when something does — see [`ResolverAdvisory`]. Omitted when
+    /// native resolution is in place, and absent from a daemon that predates
+    /// the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver_advisory: Option<ResolverAdvisory>,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -1401,8 +1448,67 @@ mod tests {
             id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: None,
+            resolver_advisory: None,
         };
         assert_eq!(round_trip(&resp), resp);
+    }
+
+    /// NET-122/NET-123: the activation reply carries the resolver advisory —
+    /// both halves of the state and the probe's gap — round-trips it, omits it
+    /// when native resolution is in place, and a reply from a daemon that
+    /// predates the field decodes as "said nothing", never as an advisory.
+    #[test]
+    fn create_session_response_carries_resolver_advisory() {
+        let advised = CreateSessionResponse {
+            id: SessionId::nil(),
+            daemon_version: Some("0.6.0".into()),
+            hostname_routing_unavailable: None,
+            resolver_advisory: Some(ResolverAdvisory {
+                resolver_configured: false,
+                range_present: false,
+                range_gap: Some("127.0.64.1: Cannot assign requested address".into()),
+            }),
+        };
+        assert_eq!(round_trip(&advised), advised);
+        let json = serde_json_lenient::to_string(&advised).unwrap();
+        assert!(
+            json.contains(r#""resolver_configured":false"#),
+            "got: {json}"
+        );
+        assert!(json.contains(r#""range_present":false"#), "got: {json}");
+        assert!(json.contains("127.0.64.1"), "got: {json}");
+
+        // The interim alone: the resolver is configured but the range is
+        // absent, which is still an advisory (the command reserves the range).
+        let interim = ResolverAdvisory {
+            resolver_configured: true,
+            range_present: false,
+            range_gap: None,
+        };
+        assert_eq!(round_trip(&interim), interim);
+
+        let healthy = CreateSessionResponse {
+            id: SessionId::nil(),
+            daemon_version: Some("0.6.0".into()),
+            hostname_routing_unavailable: None,
+            resolver_advisory: None,
+        };
+        let json = serde_json_lenient::to_string(&healthy).unwrap();
+        assert!(
+            !json.contains("resolver_advisory"),
+            "a healthy reply carries no advisory: {json}"
+        );
+
+        let legacy: Errorable<CreateSessionResponse> = serde_json_lenient::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000001","daemon_version":"0.5.0"}"#,
+        )
+        .expect("a pre-field CreateSession reply must still decode");
+        assert!(legacy.unwrap().resolver_advisory.is_none());
+
+        // The zone constants the advisory's command is built from.
+        assert_eq!(BOX_ZONE, "min.internal");
+        assert_eq!(ANSWERER_PORT, 15353);
+        assert_eq!(RESERVED_RANGE, "127.0.64.0/24");
     }
 
     /// A daemon that predates `hostname_routing_unavailable` must still decode,
@@ -1492,6 +1598,7 @@ mod tests {
             id: SessionId::nil(),
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: Some("port 7654 is held".into()),
+            resolver_advisory: None,
         };
         for json in [
             serde_json_lenient::to_string(&listed).expect("serializes"),

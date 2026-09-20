@@ -22,6 +22,75 @@ pub(crate) fn session_announce_label(id: &sessions::SessionId, name: Option<&str
     }
 }
 
+/// The exact command the resolver advisory names: this very binary, run as
+/// root. Spelled with the binary's full path because `sudo` resolves commands
+/// through its own secure path, on which a user-installed `min` may not be.
+pub(crate) fn resolver_setup_command(exe: &std::path::Path) -> String {
+    format!("sudo {} net setup", exe.display())
+}
+
+/// Renders the resolver advisory for `advisory` (NET-122, NET-123): why
+/// `<name>.min.internal` does not resolve natively on this host yet, what
+/// that means for where boxes are published, and the one command that fixes
+/// it. Writes nothing when there is nothing to advise.
+///
+/// A pointer only. It asks nothing and runs nothing privileged: the command
+/// it names is the privileged step, and the person runs it when they choose.
+/// It is printed at every session start until both halves are in place — a
+/// host still on the `127.0.0.1` interim is told again each time.
+pub(crate) fn write_resolver_advisory(
+    out: &mut impl std::io::Write,
+    advisory: &minimald_rpc::ResolverAdvisory,
+    command: &str,
+) -> std::io::Result<()> {
+    let mut reasons = Vec::new();
+    if !advisory.resolver_configured {
+        reasons.push("the host resolver is not configured for the box zone".to_string());
+    }
+    if !advisory.range_present {
+        let gap = advisory
+            .range_gap
+            .as_deref()
+            .map(|gap| format!(" ({gap})"))
+            .unwrap_or_default();
+        reasons.push(format!(
+            "the reserved local range {} is absent{gap}, so boxes are published at 127.0.0.1 \
+             for now",
+            minimald_rpc::RESERVED_RANGE
+        ));
+    }
+    writeln!(
+        out,
+        "notice: <name>.{} does not resolve natively on this host yet: {}.",
+        minimald_rpc::BOX_ZONE,
+        reasons.join("; ")
+    )?;
+    writeln!(
+        out,
+        "notice: set it up once with (asks for your password; nothing here prompts):"
+    )?;
+    writeln!(out, "  {command}")
+}
+
+/// Prints the resolver advisory on stderr: the daemon's when it sent one,
+/// otherwise this host's own judgement. A daemon inside a microVM (every
+/// daemon on macOS) or one that predates the field says nothing, and nothing
+/// from the daemon must not read as nothing to do: the resolver hook and the
+/// reserved range live on the host this binary runs on, so it reads them
+/// itself ([`crate::net::host_resolution_advisory`]).
+fn advise_resolver(advisory: Option<&minimald_rpc::ResolverAdvisory>) {
+    let Some(advisory) = advisory
+        .cloned()
+        .or_else(crate::net::host_resolution_advisory)
+    else {
+        return;
+    };
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("min"));
+    let command = resolver_setup_command(&exe);
+    // A stderr write that fails is not worth failing the activation over.
+    let _ = write_resolver_advisory(&mut std::io::stderr().lock(), &advisory, &command);
+}
+
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     activate_session(global, args, true).await
@@ -264,6 +333,7 @@ pub(crate) async fn activate_session(
     // unfinalized for the daemon to reap when this connection drops.
     ensure_version_reported(created.daemon_version.as_deref())?;
     warn_if_hostname_routing_down(created.hostname_routing_unavailable.as_deref());
+    advise_resolver(created.resolver_advisory.as_ref());
     let id = created.id;
 
     // From here the session exists on the daemon in an unfinalized state.

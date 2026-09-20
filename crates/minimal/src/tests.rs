@@ -1580,3 +1580,92 @@ async fn proxy_exits_when_the_daemon_closes_the_socket() {
     .expect("proxy must exit once the socket closes, not hang on open stdin")
     .expect("a bridge that ends on a closed socket is not an error");
 }
+
+/// NET-122: a session start whose daemon reports native resolution missing
+/// prints the exact command that configures it — this binary under sudo —
+/// and prompts for nothing: the advisory is a pure write, the command is the
+/// privileged step. NET-123's interim is named with its gap, and a host with
+/// nothing missing gets no line at all.
+#[test]
+fn session_start_advises_resolver_command_without_prompt() {
+    use minimald_rpc::ResolverAdvisory;
+
+    let command = resolver_setup_command(std::path::Path::new("/opt/minimal/bin/min"));
+    assert_eq!(command, "sudo /opt/minimal/bin/min net setup");
+
+    // Both halves missing: the resolver hook and the range, with the gap.
+    let mut out = Vec::new();
+    write_resolver_advisory(
+        &mut out,
+        &ResolverAdvisory {
+            resolver_configured: false,
+            range_present: false,
+            range_gap: Some("127.0.64.1: Can't assign requested address".into()),
+        },
+        &command,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.lines().any(|line| line.trim() == command),
+        "the advisory names the exact command on a line of its own:\n{text}"
+    );
+    assert!(text.contains("<name>.min.internal"), "{text}");
+    assert!(text.contains("host resolver is not configured"), "{text}");
+    assert!(text.contains("127.0.64.0/24 is absent"), "{text}");
+    assert!(
+        text.contains("127.0.64.1: Can't assign requested address"),
+        "{text}"
+    );
+    assert!(text.contains("published at 127.0.0.1"), "{text}");
+    assert!(text.contains("nothing here prompts"), "{text}");
+    assert!(!text.contains('?'), "an advisory asks nothing:\n{text}");
+
+    // The interim alone — the resolver is configured, the range is not —
+    // is still advised, without blaming the resolver.
+    let mut out = Vec::new();
+    write_resolver_advisory(
+        &mut out,
+        &ResolverAdvisory {
+            resolver_configured: true,
+            range_present: false,
+            range_gap: None,
+        },
+        &command,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains("host resolver is not configured"), "{text}");
+    assert!(text.contains("published at 127.0.0.1"), "{text}");
+    assert!(text.lines().any(|line| line.trim() == command), "{text}");
+
+    // A daemon that says nothing (every daemon on macOS is a guest, and an
+    // older daemon predates the field) does not silence the advisory: the
+    // host is judged from this side, with the same shape. Linux carries all
+    // of 127/8 on `lo`, so here only the hook can be missing.
+    let judged = crate::net::host_resolution_advisory();
+    #[cfg(target_os = "linux")]
+    match &judged {
+        Some(advisory) => {
+            assert!(advisory.range_present, "{advisory:?}");
+            assert_eq!(advisory.range_gap, None);
+            assert!(!advisory.resolver_configured);
+        }
+        None => assert!(std::path::Path::new("/sys/class/net/min0").exists()),
+    }
+    if let Some(advisory) = &judged {
+        let mut out = Vec::new();
+        write_resolver_advisory(&mut out, advisory, &command).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.lines().any(|line| line.trim() == command), "{text}");
+    }
+
+    // The command the advisory names is a real one.
+    let cli = Cli::try_parse_from(["min", "net", "setup"]).expect("`min net setup` must parse");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Setup(NetSetupArgs { remove: false })
+        }))
+    ));
+}
