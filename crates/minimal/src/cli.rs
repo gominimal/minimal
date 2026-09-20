@@ -473,25 +473,16 @@ pub struct ActivateArgs {
     /// are otherwise skipped without a prompt.
     #[arg(long, value_enum)]
     pub sync: Option<SyncMode>,
-    /// Network mode: no-net, host-net (default), or own-ip.
+    /// Network mode: none, host_ip (default), or own_ip.
     ///
-    /// Hidden from `--help` while `own-ip` is not usable on an installed host:
-    /// the daemon resolves a switch binary that no install ships yet
-    /// (gominimal/minimal#980), so advertising the flag offers a mode that
-    /// cannot work outside a dev checkout. Still accepted, and `host-net`
-    /// remains the default, so nothing that passes it today breaks. Unhide,
-    /// and restore the row in docs/reference/cli-min.md, once own-ip works
-    /// from an install.
+    /// The legacy spellings `no-net`, `host-net`, and `own-ip` are still
+    /// accepted and parse the same way, but print a one-line hint naming
+    /// the spelling above to switch to.
     #[arg(long, value_enum, default_value_t = CliNetworkMode::HostNet)]
-    #[clap(hide = true)]
     pub network: CliNetworkMode,
     /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
-    /// tcp). Repeatable. Requires `--network own-ip`.
-    ///
-    /// Hidden for the same reason as `--network`: it is only meaningful with
-    /// `--network own-ip`.
+    /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
-    #[clap(hide = true)]
     pub ingress: Vec<String>,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
     /// Repeatable. If any `--loadout` is specified, defaults from
@@ -548,19 +539,52 @@ pub enum SyncMode {
 
 /// CLI surface for [`sessions::NetworkMode`]. A local `ValueEnum` keeps the
 /// `sessions` crate free of a clap dependency.
+///
+/// The variant identifiers are unchanged from the pre-rename CLI (so
+/// `sessions::NetworkMode`'s own naming, and every existing construction
+/// site, stay put); only the value strings clap parses move to the current
+/// spellings via `#[value(name = ...)]`. The three hidden `Legacy*`
+/// variants keep the pre-rename spellings (`no-net`, `host-net`, `own-ip`)
+/// parseable for one release, with [`CliNetworkMode::legacy_hint`] naming
+/// the current spelling to switch to.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum CliNetworkMode {
+    #[value(name = "none")]
     NoNet,
+    #[value(name = "host_ip")]
     HostNet,
+    #[value(name = "own_ip")]
     OwnIp,
+    #[value(name = "no-net", hide = true)]
+    LegacyNoNet,
+    #[value(name = "host-net", hide = true)]
+    LegacyHostNet,
+    #[value(name = "own-ip", hide = true)]
+    LegacyOwnIp,
+}
+
+impl CliNetworkMode {
+    /// The legacy spelling this value was given under, paired with the
+    /// current spelling to hint toward; `None` when the value is already
+    /// spelled the current way.
+    pub(crate) fn legacy_hint(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::LegacyNoNet => Some(("no-net", "none")),
+            Self::LegacyHostNet => Some(("host-net", "host_ip")),
+            Self::LegacyOwnIp => Some(("own-ip", "own_ip")),
+            Self::NoNet | Self::HostNet | Self::OwnIp => None,
+        }
+    }
 }
 
 impl From<CliNetworkMode> for sessions::NetworkMode {
     fn from(m: CliNetworkMode) -> Self {
         match m {
-            CliNetworkMode::NoNet => sessions::NetworkMode::NoNet,
-            CliNetworkMode::HostNet => sessions::NetworkMode::HostNet,
-            CliNetworkMode::OwnIp => sessions::NetworkMode::OwnIp,
+            CliNetworkMode::NoNet | CliNetworkMode::LegacyNoNet => sessions::NetworkMode::NoNet,
+            CliNetworkMode::HostNet | CliNetworkMode::LegacyHostNet => {
+                sessions::NetworkMode::HostNet
+            }
+            CliNetworkMode::OwnIp | CliNetworkMode::LegacyOwnIp => sessions::NetworkMode::OwnIp,
         }
     }
 }

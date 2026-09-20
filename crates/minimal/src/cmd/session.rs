@@ -38,6 +38,13 @@ pub(crate) async fn activate_session(
     args: ActivateArgs,
     offer_scaffold: bool,
 ) -> Result<(), anyhow::Error> {
+    // NET-037: a legacy `--network` spelling still parses, but earns a
+    // one-line hint naming the current spelling; nothing else about the
+    // run differs.
+    if let Some((old, new)) = args.network.legacy_hint() {
+        crate::notice::legacy_spelling_hint(&mut std::io::stderr(), "--network", old, new);
+    }
+
     ensure_daemon(global)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
