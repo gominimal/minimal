@@ -370,6 +370,12 @@ struct Meta {
     in_microvm: bool,
     state_volume_mounted: bool,
     state_dir: String,
+    /// The port this daemon's hostname proxy is serving on, and how that port
+    /// was decided (`configured`, `default`, or `selected` when another daemon
+    /// on the machine held the default). Both `None` on a daemon whose listener
+    /// has not bound — two daemons' bundles are told apart by these.
+    hostname_proxy_port: Option<u16>,
+    hostname_proxy_port_chosen: Option<&'static str>,
     /// `/proc/version` verbatim — the guest kernel's identity, which nothing
     /// else in any bundle carries. `diagnostics::system_info` has a `kernel`
     /// field, but it is a *host* collector and shells out to `uname`, a binary
@@ -387,6 +393,7 @@ async fn meta<W: BundleSink>(
 ) -> Result<(), anyhow::Error> {
     let uptime = tokio::fs::read_to_string("/proc/uptime").await.ok();
     let kernel = proc_line("/proc/version").await;
+    let proxy_port = s.hostname_proxy_port().await;
     let info = Meta {
         version: version::VERSION,
         long_version: version::LONG_VERSION,
@@ -396,6 +403,8 @@ async fn meta<W: BundleSink>(
         in_microvm: s.in_microvm().await,
         state_volume_mounted: s.state_volume_mounted().await,
         state_dir: s.minimal_state_dir().await.to_string(),
+        hostname_proxy_port: proxy_port.map(|p| p.port),
+        hostname_proxy_port_chosen: proxy_port.map(|p| p.chosen),
         kernel_release: kernel
             .as_deref()
             .and_then(kernel_release)

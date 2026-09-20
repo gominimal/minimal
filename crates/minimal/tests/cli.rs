@@ -44,6 +44,7 @@ fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -80,6 +81,7 @@ fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -356,6 +358,56 @@ async fn ls_warning_clears_on_recovery() {
         cleared.is_empty(),
         "ls must print no warning once the listener is back: {}",
         String::from_utf8_lossy(&cleared)
+    );
+}
+
+/// NET-026: `min` learns the hostname-proxy port from the daemon it connected
+/// to and prints that port. The daemon here is serving on a port it selected —
+/// what a second daemon on the machine does — so a client that printed the
+/// standard port from a constant of its own would be printing a dead address.
+#[tokio::test]
+async fn min_prints_discovered_proxy_port() {
+    let (daemon, args) = setup().await;
+    // Stands in for the startup bind: a harness daemon runs no proxy, and the
+    // port a real one lands on is not something a client can induce.
+    let selected = 41_234;
+    daemon
+        .server
+        .state
+        .set_hostname_proxy_port(minimald::server::HostnameProxyPort {
+            port: selected,
+            chosen: "selected",
+        })
+        .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::ListSessions;
+    let listed = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    assert_eq!(
+        listed.hostname_proxy_port,
+        Some(selected),
+        "the daemon must report the port it is serving on"
+    );
+
+    let mut printed = Vec::new();
+    write_hostname_proxy_port(&mut printed, listed.hostname_proxy_port).unwrap();
+    let text = String::from_utf8(printed).unwrap();
+    assert!(
+        text.contains(&format!("127.0.0.1:{selected}")),
+        "min must print the discovered port: {text}"
+    );
+    assert!(
+        !text.contains("7654"),
+        "min must print the discovered port, not the standard one: {text}"
+    );
+
+    // A daemon that reports no port gets no line — better than a guess.
+    let mut silent = Vec::new();
+    write_hostname_proxy_port(&mut silent, None).unwrap();
+    assert!(
+        silent.is_empty(),
+        "nothing to print when the daemon reports no port: {}",
+        String::from_utf8_lossy(&silent)
     );
 }
 

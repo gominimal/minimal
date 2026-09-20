@@ -96,6 +96,29 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     activate_session(global, args, true).await
 }
 
+/// Tells the user which port this daemon's hostname proxy is serving on, as the
+/// daemon reported it (NET-026), and nothing at all when it reported no port.
+///
+/// The port is discovered rather than assumed because it is not a constant: an
+/// unconfigured daemon takes the standard port while it is free and a free port
+/// otherwise, so on a machine running two daemons — a native one and a VM one —
+/// the second one's names are reachable on a port only that daemon knows. A
+/// daemon that reports nothing (it predates the field, or its listener has not
+/// bound and it is warning about that instead) gets no line: printing a guessed
+/// port would be worse than printing none.
+pub fn write_hostname_proxy_port(
+    out: &mut impl std::io::Write,
+    port: Option<u16>,
+) -> std::io::Result<()> {
+    let Some(port) = port else {
+        return Ok(());
+    };
+    writeln!(
+        out,
+        "box hostnames (*.min.internal) route through this daemon's proxy at 127.0.0.1:{port}"
+    )
+}
+
 /// The activation flow shared by [`cmd_activate`] and the bare-`min` router.
 /// `offer_scaffold` gates the `minimal.toml` scaffold offer: `cmd_activate`
 /// keeps it (its long-standing behavior, unchanged), while bare `min`
@@ -272,6 +295,13 @@ pub(crate) async fn activate_session(
             {
                 eprintln!("{warning}");
             }
+            // NET-026: the port comes from the daemon we just connected to, not
+            // from a constant here — a second daemon on this machine serves its
+            // names on a port of its own.
+            let _ = write_hostname_proxy_port(
+                &mut std::io::stderr().lock(),
+                existing_sessions.hostname_proxy_port,
+            );
         }
         Err(_) => {
             // The listing failed. A transport-level closure can leave the

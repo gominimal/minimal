@@ -187,6 +187,110 @@ pub async fn bind_listener(addr: SocketAddr) -> Option<TcpListener> {
     }
 }
 
+/// How the hostname proxy's listen port was decided, for the startup log line
+/// and the port report `min` and the diagnostic bundle read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortChoice {
+    /// The operator named the port (`minimald run --hostname-proxy-port`).
+    Configured,
+    /// No port was configured and [`EGRESS_PROXY_PORT`] was free.
+    Default,
+    /// No port was configured and the default was taken — by another daemon on
+    /// this host — so the OS picked a free one.
+    Selected,
+}
+
+impl PortChoice {
+    /// Stable token for the log line, the wire, and the diagnostic bundle.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Default => "default",
+            Self::Selected => "selected",
+        }
+    }
+}
+
+/// A bound hostname-proxy listener: the socket, the port it actually listens
+/// on, and how that port was decided.
+#[derive(Debug)]
+pub struct ProxyListener {
+    /// The bound listener, for the caller to [`serve`].
+    pub listener: TcpListener,
+    /// The port it listens on — the OS-assigned one when the port was selected,
+    /// so nothing downstream has to re-read the socket to learn it.
+    pub port: u16,
+    /// How that port was decided.
+    pub choice: PortChoice,
+}
+
+/// Binds the hostname proxy's listener on `bind_base`, honouring a configured
+/// port and otherwise selecting a free one.
+///
+/// A configured port is bound and nothing else (NET-024): a port the operator
+/// named is not silently swapped for another, so a held one returns `None` and
+/// is reported and retried by the caller, exactly as before this choice
+/// existed. With no port configured (NET-025) the default [`EGRESS_PROXY_PORT`]
+/// is preferred — every recipe, `HTTP_PROXY` line and e2e case that names it
+/// keeps working — and when another daemon on this host already holds it, the
+/// OS picks a free port instead, so the second daemon to start keeps a working
+/// hostname surface rather than losing routing (NET-027). `min` learns the port
+/// from the daemon (NET-026), so nothing but the default itself is hardcoded.
+pub async fn bind_proxy_listener(
+    bind_base: IpAddr,
+    configured: Option<u16>,
+) -> Option<ProxyListener> {
+    bind_proxy_listener_with_default(bind_base, configured, EGRESS_PROXY_PORT).await
+}
+
+/// [`bind_proxy_listener`] with the preferred default port spelled out, so a
+/// test can drive both the "default is free" and "default is taken" paths
+/// against a port it controls rather than against whatever holds
+/// [`EGRESS_PROXY_PORT`] on the machine running the test.
+async fn bind_proxy_listener_with_default(
+    bind_base: IpAddr,
+    configured: Option<u16>,
+    default_port: u16,
+) -> Option<ProxyListener> {
+    let chosen = if let Some(port) = configured {
+        let listener = bind_listener(SocketAddr::new(bind_base, port)).await?;
+        ProxyListener {
+            listener,
+            port,
+            choice: PortChoice::Configured,
+        }
+    } else if let Ok(listener) = TcpListener::bind(SocketAddr::new(bind_base, default_port)).await {
+        ProxyListener {
+            listener,
+            port: default_port,
+            choice: PortChoice::Default,
+        }
+    } else {
+        // Port 0: the OS hands back a free port. Not `bind_listener` for the
+        // default attempt above either — a taken default is the ordinary
+        // two-daemon case, not the reachability fault its warning describes.
+        let listener = bind_listener(SocketAddr::new(bind_base, ANY_PORT)).await?;
+        let port = listener.local_addr().ok()?.port();
+        ProxyListener {
+            listener,
+            port,
+            choice: PortChoice::Selected,
+        }
+    };
+    tracing::info!(
+        component = "dns-proxy",
+        port = chosen.port,
+        chosen = chosen.choice.as_str(),
+        default_port,
+        "host-side egress proxy port decided"
+    );
+    Some(chosen)
+}
+
+/// Asks the OS for a free port.
+const ANY_PORT: u16 = 0;
+
 /// Delay before the first rebind attempt after a failed bind.
 const REBIND_BASE_DELAY: Duration = Duration::from_millis(250);
 
@@ -558,6 +662,178 @@ mod tests {
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// A loopback port nothing is listening on: bound only to learn a port the
+    /// OS had free, then dropped, so a bind to it succeeds and a connect to it
+    /// is refused.
+    async fn free_port() -> u16 {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Installs a `tracing` subscriber capturing into `buf` for as long as the
+    /// returned guard lives, so a test can read the fields a startup event
+    /// emitted.
+    fn capture_events(buf: &CaptureWriter) -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    /// NET-024: a daemon started with a configured hostname-proxy port listens
+    /// on exactly that port — and a configured port that is held is reported
+    /// (the caller's retry path) rather than silently swapped for another, which
+    /// would leave `min` printing a port the operator never asked for.
+    #[tokio::test]
+    async fn proxy_listens_on_configured_port() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let configured = free_port().await;
+
+        let bound = bind_proxy_listener(loopback, Some(configured))
+            .await
+            .expect("a free configured port must bind");
+        assert_eq!(
+            bound.port, configured,
+            "the configured port is the one used"
+        );
+        assert_eq!(
+            bound.listener.local_addr().unwrap().port(),
+            configured,
+            "the listener itself must be on the configured port"
+        );
+        assert_eq!(bound.choice, PortChoice::Configured);
+
+        // Held by something else: no substitution, so the caller reports it.
+        let held = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let held_port = held.local_addr().unwrap().port();
+        assert!(
+            bind_proxy_listener(loopback, Some(held_port))
+                .await
+                .is_none(),
+            "a held configured port must be reported, never substituted"
+        );
+    }
+
+    /// NET-025: with no hostname-proxy port configured the daemon selects a free
+    /// port. The default is preferred while it is free — every recipe and e2e
+    /// case naming `:7654` keeps working — and once another daemon on the host
+    /// holds it, the OS picks a free port instead of the daemon losing its
+    /// hostname surface. One info line at startup says which port and how it was
+    /// chosen.
+    #[tokio::test]
+    async fn proxy_auto_selects_free_port() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        // Stands in for `EGRESS_PROXY_PORT`, which the machine running this test
+        // may well have taken by a real daemon.
+        let default_port = free_port().await;
+
+        let buf = CaptureWriter::default();
+        let guard = capture_events(&buf);
+        let first = bind_proxy_listener_with_default(loopback, None, default_port)
+            .await
+            .expect("a free default port must bind");
+        let second = bind_proxy_listener_with_default(loopback, None, default_port)
+            .await
+            .expect("a taken default must fall back to a free port");
+        drop(guard);
+
+        assert_eq!(
+            first.port, default_port,
+            "the default is preferred while it is free"
+        );
+        assert_eq!(first.choice, PortChoice::Default);
+
+        assert_ne!(
+            second.port, default_port,
+            "the second daemon cannot have the port the first holds"
+        );
+        assert_ne!(second.port, ANY_PORT, "a selected port is a real port");
+        assert_eq!(second.choice, PortChoice::Selected);
+        assert_eq!(
+            second.listener.local_addr().unwrap().port(),
+            second.port,
+            "the reported port must be the one bound"
+        );
+
+        let logged = buf.contents();
+        assert!(
+            logged.contains(&format!("port={} chosen=\"default\"", first.port)),
+            "the default choice must be logged with its port, got: {logged}"
+        );
+        assert!(
+            logged.contains(&format!("port={} chosen=\"selected\"", second.port)),
+            "the selected port must be logged with how it was chosen, got: {logged}"
+        );
+    }
+
+    /// NET-027: two daemons on one machine — a native one and a VM one, say —
+    /// each keep their own hostname surface. The second to start takes a free
+    /// port instead of the default the first holds, and both route their own
+    /// boxes' names at the same time, each refusing the other's names because
+    /// each serves its own registry.
+    #[tokio::test]
+    async fn two_daemons_route_hostnames_concurrently() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let default_port = free_port().await;
+
+        // Daemon one: a box named `web`. Daemon two: a box named `api`.
+        let first_registry = Arc::new(RwLock::new(HostnameRegistry::new(DEFAULT_HOST_ID)));
+        first_registry
+            .write()
+            .unwrap()
+            .register_host_net(SessionId::nil(), "web");
+        let second_registry = Arc::new(RwLock::new(HostnameRegistry::new(DEFAULT_HOST_ID)));
+        second_registry
+            .write()
+            .unwrap()
+            .register_host_net(SessionId::nil(), "api");
+
+        let first = bind_proxy_listener_with_default(loopback, None, default_port)
+            .await
+            .expect("the first daemon binds the default port");
+        let second = bind_proxy_listener_with_default(loopback, None, default_port)
+            .await
+            .expect("the second daemon selects a free port");
+        assert_ne!(
+            first.port, second.port,
+            "two daemons on one host must not share a listen port"
+        );
+        let first_addr = SocketAddr::new(loopback, first.port);
+        let second_addr = SocketAddr::new(loopback, second.port);
+        tokio::spawn(serve(first.listener, Router::new(first_registry)));
+        tokio::spawn(serve(second.listener, Router::new(second_registry)));
+
+        // Both surfaces are live at the same time: one request to each daemon
+        // for its own box, in flight together.
+        let backend = spawn_backend().await;
+        let web_authority = format!("web.min.internal:{backend}");
+        let api_authority = format!("api.min.internal:{backend}");
+        let (web, api) = tokio::join!(
+            proxy_get(first_addr, &web_authority),
+            proxy_get(second_addr, &api_authority),
+        );
+        assert!(
+            web.contains("200 OK"),
+            "the first daemon must route its own box, got: {web}"
+        );
+        assert!(
+            api.contains("200 OK"),
+            "the second daemon must route its own box, got: {api}"
+        );
+
+        // Each daemon answers for its own boxes only — two surfaces, not one.
+        let crossed = proxy_get(first_addr, &api_authority).await;
+        assert!(
+            crossed.contains("502 Bad Gateway"),
+            "a daemon must not route the other daemon's names, got: {crossed}"
+        );
     }
 
     /// NET-001: a box answers at its two-label `<name>.min.internal` name through

@@ -37,6 +37,7 @@ Runs the minimald server in the foreground.
 | `--vsock` | Host the SSH socket over vsock instead of UDS; the vsock port is the default port base plus `instance_num` |
 | `--detach` | Daemonize: spawn minimald in a new session (setsid) and return once the SSH socket accepts connections, or an 8s timeout elapses. Used by the `min` CLI to auto-start a native daemon on Linux |
 | `--gvproxy-bin <PATH>` | Path to the gvproxy ("gvisor-tap-vsock") binary used for networking. Defaults to the installed location: the user-local `bin/gvproxy-min` the installer stamps, else the system install path. |
+| `--hostname-proxy-port <PORT>` | Port for the host-side proxy that routes `*.min.internal` box hostnames. Bound as given: a port something else holds is reported and retried, never substituted. Unset, the daemon takes the standard port while it is free and otherwise selects a free one, so a second daemon on the machine keeps routing; `min` prints the port the daemon settled on. |
 
 ### `completions`
 

@@ -244,6 +244,17 @@ pub struct ListSessionsResponse {
     /// daemon log, and the user is at a terminal watching curl fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_routing_unavailable: Option<String>,
+    /// The port this daemon's hostname proxy is serving on, so a client can
+    /// print the port in use rather than assume the standard one.
+    ///
+    /// A daemon with no port configured takes the standard port while it is free
+    /// and a free port otherwise — which is what lets a second daemon on the
+    /// machine keep routing — so the port is the daemon's to report and the
+    /// client's to discover. `None` from a daemon that predates the field, and
+    /// from one whose listener has not bound (its
+    /// [`Self::hostname_routing_unavailable`] says why).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname_proxy_port: Option<u16>,
 }
 
 impl OneshotSshRpc for ListSessions {
@@ -1542,6 +1553,7 @@ mod tests {
         let resp = ListSessionsResponse {
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
             resource_pool: None,
             sessions: vec![],
         };
@@ -1560,6 +1572,43 @@ mod tests {
         assert_eq!(
             back.hostname_routing_unavailable.as_deref(),
             Some("port 7654 is held")
+        );
+    }
+
+    /// NET-026: the list reply carries the hostname-proxy port the daemon is
+    /// serving on, so `min` prints the port in use instead of assuming the
+    /// standard one. A daemon that reports no port (it predates the field, or
+    /// its listener has not bound) is absence, not a port to guess at.
+    #[test]
+    fn list_sessions_carries_proxy_port() {
+        let resp = ListSessionsResponse {
+            daemon_version: Some("0.6.0".into()),
+            hostname_routing_unavailable: None,
+            // Not the standard port: a client reading this must have taken the
+            // daemon's word rather than a constant of its own.
+            hostname_proxy_port: Some(41_234),
+            resource_pool: None,
+            sessions: vec![],
+        };
+        let json = serde_json_lenient::to_string(&resp).expect("serializes");
+        let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
+        assert_eq!(back.hostname_proxy_port, Some(41_234));
+
+        // A daemon predating the field says nothing about a port.
+        let older: ListSessionsResponse =
+            serde_json_lenient::from_str(r#"{"sessions":[],"daemon_version":"0.5.0"}"#)
+                .expect("a pre-field reply must still decode");
+        assert!(older.hostname_proxy_port.is_none());
+
+        // And a daemon whose listener never bound omits it from the wire.
+        let unbound = ListSessionsResponse {
+            hostname_proxy_port: None,
+            ..resp
+        };
+        let json = serde_json_lenient::to_string(&unbound).expect("serializes");
+        assert!(
+            !json.contains("hostname_proxy_port"),
+            "a daemon with no bound port should omit the field, got {json}"
         );
     }
 
@@ -1593,6 +1642,7 @@ mod tests {
             sessions: vec![],
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: Some("port 7654 is held".into()),
+            hostname_proxy_port: None,
         };
         let created = CreateSessionResponse {
             id: SessionId::nil(),

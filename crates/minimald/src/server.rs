@@ -47,6 +47,13 @@ pub struct Config {
     /// `false` (DM2, native Linux) keeps the local-spawn + tap relay path.
     #[serde(default)]
     pub in_microvm: bool,
+    /// The port the host-side hostname proxy should listen on. `None` — the
+    /// default — lets the daemon pick: the standard
+    /// [`EGRESS_PROXY_PORT`](crate::net::proxy::EGRESS_PROXY_PORT) while it is
+    /// free, else a free port, so a second daemon on the same machine keeps a
+    /// working hostname surface (NET-024/NET-025/NET-027).
+    #[serde(default)]
+    pub hostname_proxy_port: Option<u16>,
     /// Whether the guest boot path actually mounted the writable data volume
     /// at `minimal_state_dir`. Gates the shutdown quiesce (R2.1/R2.2): only a
     /// filesystem this daemon mounted may be synced and unmounted — the vsock
@@ -179,6 +186,24 @@ impl std::fmt::Debug for DaemonLogRelease {
     }
 }
 
+/// The hostname proxy's live listen port and how that port was decided.
+///
+/// Recorded once the listener binds, and read back by `ListSessions` so `min`
+/// prints the port in use rather than assuming the default (NET-026), and by
+/// the diagnostic bundle so a support archive says which port each daemon on
+/// the machine took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostnameProxyPort {
+    /// The port the proxy is serving on.
+    pub port: u16,
+    /// A stable token naming how the port was decided: `configured`, `default`
+    /// or `selected` (see [`PortChoice`](crate::net::proxy::PortChoice)). A
+    /// `&'static str` rather than the enum itself so this type — held on the
+    /// server state, which every platform compiles — does not reach into the
+    /// Linux-only `net` module.
+    pub chosen: &'static str,
+}
+
 /// A container for the state of the server.
 #[derive(Debug)]
 pub struct ServerState {
@@ -226,6 +251,12 @@ pub struct ServerState {
     /// does not. A fix that surfaced only the first would stay silent on
     /// macOS, which is the platform the failure was reported from.
     proxy_unavailable: Option<String>,
+
+    /// The port the host-side hostname proxy is serving on, and how that port
+    /// was decided. Set by [`start_host_proxies`] once the listener binds, and
+    /// read by the `ListSessions` RPC and the diagnostic bundle. `None` before
+    /// the bind, and on a state built directly in a unit test.
+    hostname_proxy: Option<HostnameProxyPort>,
 
     /// The running WireGuard mesh peer, when one is configured (Unit 4). Only
     /// present under the `networking-wg` feature; the `GetMeshStatus` RPC reads
@@ -304,6 +335,7 @@ impl ServerState {
             log_release,
             host_key: None,
             proxy_unavailable: None,
+            hostname_proxy: None,
             #[cfg(feature = "networking-wg")]
             mesh: None,
         })
@@ -381,6 +413,24 @@ impl ServerStateHandle {
     /// Why hostname routing is unavailable, or `None` if the proxy is up.
     pub(crate) async fn proxy_unavailable(&self) -> Option<String> {
         self.0.lock().await.proxy_unavailable.clone()
+    }
+
+    /// Records the port the hostname proxy bound and how it was decided, so
+    /// `ListSessions` can hand it to `min` (NET-026) and the diagnostic bundle
+    /// can name it.
+    ///
+    /// `pub` for the same reason as [`Self::set_proxy_unavailable`]: a test is
+    /// handed the state handle to set up a daemon condition its CLI cannot
+    /// induce — a bound proxy port, on a harness server that never ran
+    /// [`Server::run`], being one of them.
+    pub async fn set_hostname_proxy_port(&self, proxy: HostnameProxyPort) {
+        self.0.lock().await.hostname_proxy = Some(proxy);
+    }
+
+    /// The port the hostname proxy is serving on and how it was decided, or
+    /// `None` before the listener has bound.
+    pub(crate) async fn hostname_proxy_port(&self) -> Option<HostnameProxyPort> {
+        self.0.lock().await.hostname_proxy
     }
 
     /// Returns the daemon-scoped mctx state.
@@ -554,17 +604,19 @@ impl Server {
         log_release: Option<DaemonLogRelease>,
     ) -> Result<(), std::io::Error> {
         // `config` is moved into the state below; capture the deployment-model
-        // flag the proxy startup needs first.
+        // flag and the configured proxy port the proxy startup needs first.
         #[cfg(target_os = "linux")]
         let in_microvm = config.in_microvm;
+        #[cfg(target_os = "linux")]
+        let hostname_proxy_port = config.hostname_proxy_port;
         let state = ServerStateHandle::new(config, log_release).await?;
 
-        // Start minimald's host-side egress proxy (B5, :7654) for the server's
-        // lifetime and, in a microVM (DM1), publish it on the macOS host
+        // Start minimald's host-side egress proxy (B5, :7654 by default) for the
+        // server's lifetime and, in a microVM (DM1), publish it on the macOS host
         // loopback. minimald is Linux-only, and the PTask hostname registry it
         // routes against only exists on Linux.
         #[cfg(target_os = "linux")]
-        start_host_proxies(&state, in_microvm).await;
+        start_host_proxies(&state, in_microvm, hostname_proxy_port).await;
         // The box-zone answerer (NET-006, NET-124..127) serves the host's own
         // lookups of `*.min.internal`. Native hosts only: in a microVM the
         // node's DNS layer answers the zone with switch addresses.
@@ -793,8 +845,18 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
 /// directly. A bind failure warns and is skipped — the daemon keeps serving. The
 /// serve loop runs on a detached task; this returns once the listener is bound
 /// and (DM1) exposed.
+///
+/// `configured_port` is the operator's `--hostname-proxy-port`, bound as given;
+/// `None` lets [`bind_proxy_listener`](crate::net::proxy::bind_proxy_listener)
+/// prefer the default port and fall back to a free one, so two daemons on one
+/// machine both keep routing. Either way the port that bound is recorded on the
+/// state for `ListSessions` to hand to `min`.
 #[cfg(target_os = "linux")]
-async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
+async fn start_host_proxies(
+    state: &ServerStateHandle,
+    in_microvm: bool,
+    configured_port: Option<u16>,
+) {
     use crate::net::proxy::{self, Router};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -808,16 +870,22 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
         Ipv4Addr::LOCALHOST.into()
     };
 
-    // B5 egress/DNS proxy (:7654), always. Both ways this can fail end with
+    // B5 egress/DNS proxy, always. Both ways this can fail end with
     // `<name>.min.internal` not routing, so both are recorded on the
     // state where `ListSessions` can reach them — a daemon that keeps serving
     // without its proxy looks identical to a healthy one otherwise.
-    let egress_addr = SocketAddr::new(bind_base, proxy::EGRESS_PROXY_PORT);
-    match proxy::bind_listener(egress_addr).await {
-        Some(listener) => {
+    match proxy::bind_proxy_listener(bind_base, configured_port).await {
+        Some(bound) => {
+            let port = bound.port;
+            state
+                .set_hostname_proxy_port(HostnameProxyPort {
+                    port,
+                    chosen: bound.choice.as_str(),
+                })
+                .await;
             let router = Router::new(registry.clone());
             tokio::spawn(async move {
-                if let Err(error) = proxy::serve(listener, router).await {
+                if let Err(error) = proxy::serve(bound.listener, router).await {
                     tracing::error!(%error, "egress proxy accept loop exited");
                 }
             });
@@ -825,32 +893,45 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
             // failure moves to the publish instead. Only publish a port whose
             // listener actually bound.
             if in_microvm
-                && let Some(reason) = expose_proxy_on_host(
-                    crate::net::DEFAULT_SUBNET.daemon_ip(),
-                    proxy::EGRESS_PROXY_PORT,
-                )
-                .await
+                && let Some(reason) =
+                    expose_proxy_on_host(crate::net::DEFAULT_SUBNET.daemon_ip(), port).await
             {
                 state.set_proxy_unavailable(reason).await;
                 // The listener is serving; only its host-side publish is
                 // missing, so that alone is retried.
                 let state = state.clone();
                 tokio::spawn(async move {
-                    publish_on_host_retrying(proxy::EGRESS_PROXY_PORT).await;
+                    publish_on_host_retrying(port).await;
                     state.clear_proxy_unavailable().await;
                 });
             }
         }
         None => {
-            // DM2: something else on the host holds the port.
+            // A configured port held by something else: reported and retried,
+            // never swapped for another — an unconfigured daemon would have
+            // selected a free port instead of landing here.
+            let egress_addr = SocketAddr::new(
+                bind_base,
+                configured_port.unwrap_or(proxy::EGRESS_PROXY_PORT),
+            );
             state
                 .set_proxy_unavailable(format!(
                     "the daemon could not bind {egress_addr}; another process is \
                      holding it. Check with: lsof -nP -iTCP:{} -sTCP:LISTEN",
-                    proxy::EGRESS_PROXY_PORT
+                    egress_addr.port()
                 ))
                 .await;
-            recover_egress_listener(state.clone(), registry.clone(), egress_addr, in_microvm);
+            recover_egress_listener(
+                state.clone(),
+                registry.clone(),
+                egress_addr,
+                in_microvm,
+                if configured_port.is_some() {
+                    proxy::PortChoice::Configured
+                } else {
+                    proxy::PortChoice::Default
+                },
+            );
         }
     }
 }
@@ -869,6 +950,7 @@ fn recover_egress_listener(
     registry: Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
     addr: std::net::SocketAddr,
     in_microvm: bool,
+    chosen: crate::net::proxy::PortChoice,
 ) {
     use crate::net::proxy::{self, Router};
 
@@ -877,6 +959,12 @@ fn recover_egress_listener(
         if in_microvm {
             publish_on_host_retrying(addr.port()).await;
         }
+        state
+            .set_hostname_proxy_port(HostnameProxyPort {
+                port: addr.port(),
+                chosen: chosen.as_str(),
+            })
+            .await;
         state.clear_proxy_unavailable().await;
         let router = Router::new(registry);
         if let Err(error) = proxy::serve(listener, router).await {
@@ -1025,6 +1113,7 @@ pub(crate) fn test_config(dir: &std::path::Path) -> Config {
         minimal_cache_dir: DaemonAbsPath::try_new(path).unwrap(),
         gvproxy_bin: None,
         in_microvm: false,
+        hostname_proxy_port: None,
         state_volume_mounted: false,
     }
 }

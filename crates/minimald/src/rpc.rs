@@ -126,6 +126,10 @@ async fn serve_list_sessions(
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
+                // The port this daemon settled on at startup — configured, the
+                // standard one, or a free one it selected — so the client prints
+                // what is actually serving (NET-026).
+                hostname_proxy_port: s.hostname_proxy_port().await.map(|p| p.port),
                 resource_pool,
                 // The git probes run in parallel across sessions: each is
                 // one small process under a deadline, and serializing them
