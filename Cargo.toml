@@ -119,6 +119,10 @@ hakoniwa = { features = ["cgroups", "rustslirp"], git = "https://github.com/souk
 http-body = "1"
 hex = "0.4"
 hkdf = "0.13"
+# The bep listener's HTTP/1.1 server and client (crates/bep/src/listener.rs).
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
 indicatif = "0.18"
 indoc = "^2.0"
 inquire = { version = "0.9", default-features = false, features = ["crossterm", "fuzzy"] }
@@ -154,6 +158,8 @@ ratatui = "0.30"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 regex = "1" # keep in sync with nickel-lang-core
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
+# The host's trust store, which the bep upstream leg validates against (BEP-055).
+rustls-native-certs = "0.8"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
 reqwest = { version = "0.13.4", features = ["stream"], default-features = false } # keep in sync with google-cloud-gax
 rustc-hash = "2.1.3"

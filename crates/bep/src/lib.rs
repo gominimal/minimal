@@ -24,6 +24,11 @@
 //!   the Minimal-published App, and the host store the sign-in lives in.
 //! - [`mint`] mints a member from the held sign-in, sealed to this host,
 //!   and makes the identity events a mint and a logout record.
+//! - [`listener`] is the shell around the decision: it accepts a box's
+//!   connections, terminates TLS for the declared hosts, decides each request
+//!   and forwards it with the substitution the decision allows.
+//! - [`upstream`] is the upstream leg of a terminated flow, validated against
+//!   the host's trust store before anything is forwarded on it.
 
 pub mod audit;
 pub mod ca;
@@ -31,9 +36,11 @@ pub mod control;
 pub mod github;
 pub mod keychain;
 pub mod keys;
+pub mod listener;
 pub mod mint;
 pub mod redeem;
 pub mod seal;
+pub mod upstream;
 
 // `Decision` stays module-qualified on both sides: the audit log's admit or
 // refuse is not the redemption outcome.
@@ -43,6 +50,8 @@ pub use control::{ControlError, Submission, submit};
 pub use github::{GitHub, GitHubError, MemorySignIns, SignIn, SignInStore};
 pub use keychain::{KeyStore, MemoryStore, PrivateKey, StoreError};
 pub use keys::{Fingerprint, KeyRole, KeyStatus, Keys, KeysError, inspect};
+pub use listener::{Addressing, Attachments, Config, ListenerError, Module, Proxy, Sender};
 pub use mint::{MintError, MintRequest, Minted, mint, revocation_event};
 pub use redeem::{Check, Decision, Redemption, decide};
 pub use seal::{Member, Refusal, SealError, SealedContext, SealedValue, Unsealed, seal, unseal};
+pub use upstream::{Resolver, Trust, TrustError, UpstreamError, Validated};

@@ -9,21 +9,29 @@ license.workspace = true
 [dependencies]
 aes-gcm.workspace = true
 base64.workspace = true
+clap.workspace = true
 hex.workspace = true
 hkdf.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 p256.workspace = true
 rand.workspace = true
 rcgen.workspace = true
 # The GitHub sign-in's HTTP client (`github.rs`): `rustls` for the TLS to
 # github.com and api.github.com.
 reqwest = { workspace = true, features = ["rustls"] }
+rustls.workspace = true
+rustls-native-certs.workspace = true
 serde.workspace = true
 serde_json_lenient.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-# The device flow's polling interval (`github.rs`).
+# The device flow's polling interval (`github.rs`) and the listener's runtime.
 tokio.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -33,7 +41,6 @@ security-framework-sys.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-rustls.workspace = true
 tempfile.workspace = true
 
 [lints.rust]
