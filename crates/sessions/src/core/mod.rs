@@ -8,4 +8,5 @@ pub mod loadout;
 pub mod net_verdict;
 pub mod policy;
 pub mod primitives;
+pub mod rebind;
 pub mod source;

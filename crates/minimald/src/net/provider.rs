@@ -297,7 +297,7 @@ impl Network for OwnIpNetwork {
             // The frame verdict's inputs, owned and parsed once here: the
             // lease it must send from, its declared rules, and the resolver
             // carve-out at the switch's DNS address (design §4.1).
-            let egress = Arc::new(crate::net::switch::EgressGate::for_box(
+            let mut egress = crate::net::switch::EgressGate::for_box(
                 self.identity.clone(),
                 sessions::core::net_verdict::EgressRules::for_box(
                     reserved.lease.ip,
@@ -307,7 +307,18 @@ impl Network for OwnIpNetwork {
                         port: 53,
                     }),
                 ),
-            ));
+            );
+            // A box allowing names reaches what they resolve to, less the
+            // denied ranges, which hold the switch's own addresses (NET-066,
+            // NET-067).
+            if let Some(hosts) = self.egress.as_ref().and_then(|e| e.allow_dns_hosts.clone()) {
+                let subnet = reserved.subnet;
+                egress = egress.with_dns_pinning(
+                    hosts,
+                    &[subnet.gateway(), subnet.host_alias(), subnet.daemon_ip()],
+                );
+            }
+            let egress = Arc::new(egress);
             let guard = crate::net::gvproxy_network::complete_own_ip_attach(
                 crate::net::gvproxy_network::OwnIpAttach {
                     switch: &self.switch,

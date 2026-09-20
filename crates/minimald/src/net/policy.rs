@@ -613,9 +613,132 @@ impl<K: Eq + Hash> KeyedWarnLimiter<K> {
     }
 }
 
+/// The shortest admission window (NET-066): an answer with a shorter TTL, zero
+/// included, still admits its addresses long enough for the connection that
+/// follows the lookup to open.
+pub const ADMISSION_WINDOW_MIN: Duration = Duration::from_secs(30);
+/// The longest admission window: an answer with a longer TTL is re-admitted
+/// by the next lookup, so a stale pin cannot outlive the name by more than
+/// this.
+pub const ADMISSION_WINDOW_MAX: Duration = Duration::from_secs(300);
+
+/// The window an answer's addresses are admitted for: its TTL, held between
+/// [`ADMISSION_WINDOW_MIN`] and [`ADMISSION_WINDOW_MAX`]. The working value
+/// for design §5.3's admission window.
+#[must_use]
+pub fn admission_window(ttl_secs: u32) -> Duration {
+    Duration::from_secs(u64::from(ttl_secs)).clamp(ADMISSION_WINDOW_MIN, ADMISSION_WINDOW_MAX)
+}
+
+/// One admitted address in a box's table: the name it was answered for, the
+/// answer it arrived in, and when its window ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedAddress {
+    /// The admitted address.
+    pub address: Ipv4Addr,
+    /// The allowed name it was answered for.
+    pub name: String,
+    /// Every address that answer carried, refused ones included.
+    pub answer: Vec<Ipv4Addr>,
+    /// When the admission window ends.
+    pub expires: Instant,
+}
+
+/// A box's admitted-address table (NET-066): the addresses its allowed names
+/// resolved to, each for its window. A later answer for the same address
+/// replaces the entry, so the window is always the newest answer's. Expired
+/// entries are dropped whenever the table is read or written, so it never
+/// holds more than the live answers.
+#[derive(Debug, Default)]
+pub struct PinTable {
+    entries: HashMap<Ipv4Addr, PinnedAddress>,
+}
+
+impl PinTable {
+    /// Admits `addresses` for `name` until `now + window`, recording `answer`
+    /// as their source.
+    pub fn admit(
+        &mut self,
+        name: &str,
+        addresses: &[Ipv4Addr],
+        answer: &[Ipv4Addr],
+        window: Duration,
+        now: Instant,
+    ) {
+        self.entries.retain(|_, pin| pin.expires > now);
+        for &address in addresses {
+            self.entries.insert(
+                address,
+                PinnedAddress {
+                    address,
+                    name: name.to_string(),
+                    answer: answer.to_vec(),
+                    expires: now + window,
+                },
+            );
+        }
+    }
+
+    /// Whether `address` is admitted at `now`.
+    #[must_use]
+    pub fn admits(&self, address: Ipv4Addr, now: Instant) -> bool {
+        self.entries
+            .get(&address)
+            .is_some_and(|pin| pin.expires > now)
+    }
+
+    /// The live entries at `now`, in address order.
+    #[must_use]
+    pub fn live(&self, now: Instant) -> Vec<PinnedAddress> {
+        let mut live: Vec<PinnedAddress> = self
+            .entries
+            .values()
+            .filter(|pin| pin.expires > now)
+            .cloned()
+            .collect();
+        live.sort_by_key(|pin| pin.address);
+        live
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_window_is_the_ttl_held_between_the_bounds() {
+        assert_eq!(admission_window(0), ADMISSION_WINDOW_MIN);
+        assert_eq!(admission_window(60), Duration::from_secs(60));
+        assert_eq!(admission_window(86400), ADMISSION_WINDOW_MAX);
+    }
+
+    #[test]
+    fn pin_table_admits_for_the_window_and_the_newest_answer_wins() {
+        let a = Ipv4Addr::new(140, 82, 112, 3);
+        let b = Ipv4Addr::new(140, 82, 112, 4);
+        let t0 = Instant::now();
+        let mut table = PinTable::default();
+        table.admit("github.com", &[a], &[a, b], Duration::from_secs(60), t0);
+        assert!(table.admits(a, t0));
+        assert!(!table.admits(b, t0));
+        assert!(table.admits(a, t0 + Duration::from_secs(59)));
+        assert!(!table.admits(a, t0 + Duration::from_secs(60)));
+
+        // Re-answered at t0+50 with a fresh window: admitted past the first.
+        table.admit(
+            "github.com",
+            &[a],
+            &[a],
+            Duration::from_secs(60),
+            t0 + Duration::from_secs(50),
+        );
+        assert!(table.admits(a, t0 + Duration::from_secs(100)));
+        let live = table.live(t0 + Duration::from_secs(100));
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].name, "github.com");
+        assert_eq!(live[0].answer, vec![a]);
+        assert!(table.live(t0 + Duration::from_secs(110)).is_empty());
+    }
 
     #[test]
     fn keyed_limiter_windows_each_key_on_its_own() {

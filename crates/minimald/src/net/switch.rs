@@ -24,13 +24,16 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use sessions::core::net_verdict::{self, EgressRules, Verdict};
+use sessions::core::net_verdict::{self, DropRule, EgressRules, Verdict};
+use sessions::core::rebind::{self, RebindRules};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
-use super::policy::{Direction, KeyedWarnLimiter, PolicyWarnLimiter};
+use super::policy::{
+    Direction, KeyedWarnLimiter, PinTable, PinnedAddress, PolicyWarnLimiter, admission_window,
+};
 use super::{DEFAULT_MTU, PtaskLease, SwitchSubnet};
 
 /// `ioctl` request number for `TUNSETIFF` (set the tap/tun interface a fd backs).
@@ -668,6 +671,15 @@ impl IngressGate {
 /// finds the gateway's MAC, and its sender address is held to the lease like
 /// an IPv4 source; anything else (IPv6, VLAN-tagged) is undeclared by
 /// construction and dropped.
+///
+/// A box declaring `egress.allow_dns_hosts` also reaches the addresses those
+/// names resolved to (NET-066): the `switch → tap` leg hands every resolver
+/// answer to [`Self::observe_answer`], which intersects it with the denied
+/// ranges ([`rebind::intersect`], NET-067) and pins what survives for the
+/// answer's window. A frame the verdict finds undeclared is then admitted when
+/// its destination is pinned; a denied destination never is, because the
+/// verdict names the box's denies before it looks for a declaration and the
+/// intersection admits nothing in the infrastructure set.
 pub struct EgressGate {
     rules: EgressRules,
     /// The session, carried as the warning's `session_id`.
@@ -676,6 +688,17 @@ pub struct EgressGate {
     /// the first drop by another.
     limiter: KeyedWarnLimiter<&'static str>,
     stats: Mutex<EgressDropStats>,
+    /// The box's name rules, when it declares `egress.allow_dns_hosts`.
+    names: Option<NameRules>,
+    /// The addresses its allowed names resolved to, each for its window.
+    pins: Mutex<PinTable>,
+}
+
+/// A box's `egress.allow_dns_hosts` and the ranges an answer for one of those
+/// names is intersected against.
+struct NameRules {
+    hosts: Vec<String>,
+    rebind: RebindRules,
 }
 
 /// What a box's egress gate has dropped so far, for the diagnostics bundle:
@@ -726,11 +749,100 @@ impl EgressGate {
             label,
             limiter: KeyedWarnLimiter::new(),
             stats: Mutex::new(EgressDropStats::default()),
+            names: None,
+            pins: Mutex::new(PinTable::default()),
         }
     }
 
-    /// The decision on `frame`, with no side effects.
-    fn decide(&self, frame: &[u8]) -> EgressDecision {
+    /// Adds the box's `egress.allow_dns_hosts`: an answer for one of `hosts`
+    /// admits its addresses for the answer's window, less the box's own
+    /// denies and the infrastructure deny set, which holds `gateway_addresses`
+    /// (the switch gateway and the other addresses the node answers on).
+    #[must_use]
+    pub fn with_dns_pinning(mut self, hosts: Vec<String>, gateway_addresses: &[Ipv4Addr]) -> Self {
+        let rebind = RebindRules::for_box(
+            self.rules.allow_subnets.clone(),
+            self.rules.deny_subnets.clone(),
+            gateway_addresses,
+        );
+        self.names = Some(NameRules { hosts, rebind });
+        self
+    }
+
+    /// Reads one inbound frame for a resolver answer (NET-066, NET-067): a UDP
+    /// datagram from the resolver carve-out to the lease that answers a name
+    /// the box's `allow_dns_hosts` matches. The answer's addresses are
+    /// intersected with the denied ranges; what survives is admitted for the
+    /// answer's window, and each refused address is logged with the name and
+    /// the answer. Anything else is not read.
+    pub fn observe_answer(&self, frame: &[u8]) {
+        self.observe_answer_at(frame, Instant::now());
+    }
+
+    fn observe_answer_at(&self, frame: &[u8], now: Instant) {
+        let Some(names) = &self.names else {
+            return;
+        };
+        let Some(pkt) = parse_ipv4_l4(frame) else {
+            return;
+        };
+        let from_resolver = self.rules.resolver.is_some_and(|r| {
+            pkt.proto == IPPROTO_UDP && pkt.src == SocketAddrV4::new(r.ip, r.port)
+        });
+        if !from_resolver || *pkt.dst.ip() != self.rules.lease {
+            return;
+        }
+        let Some(answer) = super::dns::parse_resolved_name(pkt.payload) else {
+            return;
+        };
+        if !super::dns::name_allowed(&names.hosts, &answer.name) {
+            return;
+        }
+        let split = rebind::intersect(&answer.addresses, &names.rebind);
+        for (address, why) in &split.refused {
+            tracing::warn!(
+                session_id = %self.label,
+                name = answer.name.as_str(),
+                answer = %address,
+                rule_matched = why.as_str(),
+                "refused a resolved address in a denied range"
+            );
+        }
+        if split.admitted.is_empty() {
+            return;
+        }
+        let window = admission_window(answer.ttl);
+        tracing::debug!(
+            session_id = %self.label,
+            name = answer.name.as_str(),
+            addresses = ?split.admitted,
+            window_secs = window.as_secs(),
+            "admitted a resolved name's addresses"
+        );
+        self.pins
+            .lock()
+            .expect("EgressGate pins mutex poisoned")
+            .admit(
+                &answer.name,
+                &split.admitted,
+                &answer.addresses,
+                window,
+                now,
+            );
+    }
+
+    /// The box's admitted-address table as it stands now, for the diagnostics
+    /// bundle: each entry's name, source answer and expiry.
+    #[must_use]
+    pub fn pinned(&self) -> Vec<PinnedAddress> {
+        self.pins
+            .lock()
+            .expect("EgressGate pins mutex poisoned")
+            .live(Instant::now())
+    }
+
+    /// The decision on `frame` at `now`, with no side effects.
+    fn decide(&self, frame: &[u8], now: Instant) -> EgressDecision {
         let malformed = EgressDecision::Drop {
             rule: "malformed",
             destination: None,
@@ -755,6 +867,19 @@ impl EgressGate {
                 };
                 match net_verdict::frame_verdict(&summary, &self.rules) {
                     Verdict::Admit => EgressDecision::Admit,
+                    // Undeclared by address, but resolved from an allowed name
+                    // inside its window (NET-066). The verdict has already
+                    // refused the box's denies, and the intersection never
+                    // pinned the infrastructure set.
+                    Verdict::Drop(DropRule::Undeclared)
+                        if self
+                            .pins
+                            .lock()
+                            .expect("EgressGate pins mutex poisoned")
+                            .admits(summary.dst, now) =>
+                    {
+                        EgressDecision::Admit
+                    }
                     Verdict::Drop(rule) => EgressDecision::Drop {
                         rule: rule.as_str(),
                         destination: Some(SocketAddrV4::new(
@@ -776,7 +901,11 @@ impl EgressGate {
     /// Whether `frame` may leave the box. On a drop, counts it and emits the
     /// R2.7 warning if this rule's window has elapsed.
     fn admit(&self, frame: &[u8]) -> bool {
-        match self.decide(frame) {
+        self.admit_at(frame, Instant::now())
+    }
+
+    fn admit_at(&self, frame: &[u8], now: Instant) -> bool {
+        match self.decide(frame, now) {
             EgressDecision::Admit => true,
             EgressDecision::Drop {
                 rule,
@@ -790,7 +919,7 @@ impl EgressGate {
                         stats.last_destination = destination;
                     }
                 }
-                if self.limiter.should_warn_at(rule, Instant::now()) {
+                if self.limiter.should_warn_at(rule, now) {
                     tracing::warn!(
                         session_id = %self.label,
                         direction = %Direction::Egress,
@@ -817,7 +946,7 @@ impl EgressGate {
 
 /// The L4 addressing of a TCP/UDP-over-IPv4 frame, as extracted by
 /// [`parse_ipv4_l4`]. `tcp_flags` is meaningful only when `proto == IPPROTO_TCP`.
-struct L4Packet {
+struct L4Packet<'a> {
     /// Source `ip:port`.
     src: SocketAddrV4,
     /// Destination `ip:port`.
@@ -826,13 +955,17 @@ struct L4Packet {
     proto: u8,
     /// TCP flags byte; `0` for UDP.
     tcp_flags: u8,
+    /// The bytes after the transport header: a UDP datagram's body (a DNS
+    /// message, when the datagram is a resolver answer). Empty for TCP, whose
+    /// options are not walked.
+    payload: &'a [u8],
 }
 
 /// Parses an Ethernet II + IPv4 + TCP/UDP frame into its L4 addressing, or `None`
 /// for non-IPv4 (ARP/IPv6/VLAN), non-TCP/UDP, IP fragments, and short/malformed
 /// frames. Length-checked at every step and allocation-free, so a truncated or
 /// hostile frame yields `None` rather than an out-of-bounds read.
-fn parse_ipv4_l4(frame: &[u8]) -> Option<L4Packet> {
+fn parse_ipv4_l4(frame: &[u8]) -> Option<L4Packet<'_>> {
     // Ethernet header + minimum (20-byte) IPv4 header.
     if frame.len() < ETH_HDR + 20 {
         return None;
@@ -873,6 +1006,7 @@ fn parse_ipv4_l4(frame: &[u8]) -> Option<L4Packet> {
         ),
         proto,
         tcp_flags: if proto == IPPROTO_TCP { l4[13] } else { 0 },
+        payload: if proto == IPPROTO_UDP { &l4[8..] } else { &[] },
     })
 }
 
@@ -881,7 +1015,7 @@ fn parse_ipv4_l4(frame: &[u8]) -> Option<L4Packet> {
 /// undeclared port, the egress leg notices one to the legacy host address — so
 /// "a connection" means the same thing in each, once per connection rather than
 /// once per frame it carries.
-fn opens_connection(pkt: &L4Packet) -> bool {
+fn opens_connection(pkt: &L4Packet<'_>) -> bool {
     pkt.proto == IPPROTO_TCP && pkt.tcp_flags & 0x02 != 0 && pkt.tcp_flags & 0x10 == 0
 }
 
@@ -921,7 +1055,7 @@ struct UdpConntrack {
 impl UdpConntrack {
     /// Records an outbound UDP datagram (`pkt.src` = local lease, `pkt.dst` =
     /// remote) so its reply may return.
-    fn record_egress(&self, pkt: &L4Packet) {
+    fn record_egress(&self, pkt: &L4Packet<'_>) {
         let key = (*pkt.dst.ip(), pkt.dst.port(), pkt.src.port());
         let now = Instant::now();
         let mut flows = self.flows.lock().expect("UdpConntrack mutex poisoned");
@@ -933,7 +1067,7 @@ impl UdpConntrack {
 
     /// Whether an inbound UDP datagram (`pkt.src` = remote, `pkt.dst` = local
     /// lease) matches a live outbound flow — i.e. is a reply the PTask solicited.
-    fn allows_ingress(&self, pkt: &L4Packet) -> bool {
+    fn allows_ingress(&self, pkt: &L4Packet<'_>) -> bool {
         let key = (*pkt.src.ip(), pkt.src.port(), pkt.dst.port());
         let flows = self.flows.lock().expect("UdpConntrack mutex poisoned");
         flows
@@ -1014,6 +1148,14 @@ where
                 &format!("no ingress mapping for {proto} dst port {dst_port}"),
             );
             continue;
+        }
+        // A resolver answer for one of the box's allowed names admits its
+        // addresses for the answer's window (NET-066, NET-067). Read after the
+        // inbound gate, so only an answer to the box's own lookup counts.
+        if let Some(gate) = &gate
+            && let Some(egress) = &gate.egress
+        {
+            egress.observe_answer(&frame[..n]);
         }
         loop {
             let mut guard = tap.writable().await?;
@@ -1306,13 +1448,25 @@ mod tests {
 
     /// Builds an Ethernet II + IPv4 + UDP frame for the conntrack tests.
     fn udp_frame(src_ip: Ipv4Addr, src_port: u16, dst_ip: Ipv4Addr, dst_port: u16) -> Vec<u8> {
+        udp_datagram(src_ip, src_port, dst_ip, dst_port, &[])
+    }
+
+    /// [`udp_frame`] carrying `payload` as the datagram's body.
+    fn udp_datagram(
+        src_ip: Ipv4Addr,
+        src_port: u16,
+        dst_ip: Ipv4Addr,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let udp_len = 8 + payload.len() as u16;
         let mut f = Vec::new();
         f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x01]); // dst MAC
         f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // src MAC
         f.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
         f.push(0x45); // IPv4, IHL 5
         f.push(0x00);
-        f.extend_from_slice(&28u16.to_be_bytes()); // total length
+        f.extend_from_slice(&(20 + udp_len).to_be_bytes()); // total length
         f.extend_from_slice(&0u16.to_be_bytes()); // identification
         f.extend_from_slice(&0u16.to_be_bytes()); // flags + fragment offset
         f.push(64); // TTL
@@ -1322,8 +1476,9 @@ mod tests {
         f.extend_from_slice(&dst_ip.octets());
         f.extend_from_slice(&src_port.to_be_bytes());
         f.extend_from_slice(&dst_port.to_be_bytes());
-        f.extend_from_slice(&8u16.to_be_bytes()); // UDP length
+        f.extend_from_slice(&udp_len.to_be_bytes()); // UDP length
         f.extend_from_slice(&0u16.to_be_bytes()); // UDP checksum
+        f.extend_from_slice(payload);
         f
     }
 
@@ -1351,8 +1506,8 @@ mod tests {
     fn conntrack_allows_only_the_matching_reply() {
         let ct = UdpConntrack::default();
         // The PTask sends a DNS query out: lease:40000 -> 1.1.1.1:53.
-        let egress =
-            parse_ipv4_l4(&udp_frame(LEASE, 40000, Ipv4Addr::new(1, 1, 1, 1), 53)).unwrap();
+        let query = udp_frame(LEASE, 40000, Ipv4Addr::new(1, 1, 1, 1), 53);
+        let egress = parse_ipv4_l4(&query).unwrap();
         ct.record_egress(&egress);
         // The reply (1.1.1.1:53 -> lease:40000) is solicited, so it passes even to
         // the undeclared ephemeral port.
@@ -1681,5 +1836,273 @@ mod tests {
         }
         assert!(lines[1].contains("rule_matched=\"source-not-lease\""));
         assert_eq!(gate.drop_stats().total(), 4);
+    }
+
+    // ---- DNS-pinned admission (NET-066, NET-067) ----
+
+    const GITHUB: Ipv4Addr = Ipv4Addr::new(140, 82, 112, 3);
+    const GITHUB_ALT: Ipv4Addr = Ipv4Addr::new(140, 82, 112, 4);
+    const PAGES: Ipv4Addr = Ipv4Addr::new(185, 199, 108, 153);
+    const METADATA: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
+    const LAN: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+    /// The port the box's lookup went out from.
+    const QUERY_PORT: u16 = 40000;
+
+    /// A resolver answer as it arrives on the `switch → tap` leg: from the
+    /// gateway's port 53 to the port the box's lookup went out from.
+    fn dns_answer_frame(question: &str, records: &[(u32, Ipv4Addr)]) -> Vec<u8> {
+        udp_datagram(
+            GATEWAY,
+            53,
+            LEASE,
+            QUERY_PORT,
+            &crate::net::dns::tests::dns_response(question, records),
+        )
+    }
+
+    /// A box that allows `github.com` and nothing else by address, denying
+    /// `deny` on top.
+    fn github_only(deny: &[&str]) -> sessions::EgressPolicy {
+        sessions::EgressPolicy {
+            allow_subnets: Some(vec![]),
+            allow_dns_hosts: Some(vec!["github.com".into()]),
+            allow_protocols: None,
+            deny_subnets: Some(deny.iter().map(ToString::to_string).collect()),
+        }
+    }
+
+    /// [`egress_gate`] with the policy's name rules attached, on the default
+    /// switch.
+    fn pinning_gate(policy: sessions::EgressPolicy) -> Arc<EgressGate> {
+        let subnet = SwitchSubnet::default();
+        let resolver = Endpoint {
+            ip: GATEWAY,
+            port: 53,
+        };
+        Arc::new(
+            EgressGate::for_box(
+                "web".into(),
+                EgressRules::for_box(LEASE, Some(&policy), Some(resolver)),
+            )
+            .with_dns_pinning(
+                policy.allow_dns_hosts.clone().unwrap_or_default(),
+                &[subnet.gateway(), subnet.host_alias(), subnet.daemon_ip()],
+            ),
+        )
+    }
+
+    /// NET-066. A box allowing `github.com` reaches the addresses the resolver
+    /// answered for it, once the answer has come back through the real
+    /// `switch → tap` leg, and nothing else; the pin lasts the answer's window
+    /// and no longer. One debug line records the admission with the name, the
+    /// addresses and the window.
+    #[tokio::test]
+    async fn dns_pinned_admission_window() {
+        let gate = pinning_gate(github_only(&[]));
+        let ingress = IngressGate::for_session(LEASE.to_string(), None, SwitchSubnet::default())
+            .with_egress(Arc::clone(&gate));
+        let watch = EgressWatch::for_gate(&ingress);
+
+        // Before any lookup the name admits nothing: address rules alone decide.
+        assert!(!gate.admit(&egress_syn(LEASE, GITHUB, 443)));
+        // The box's lookup leaves through the resolver carve-out.
+        assert!(watch.admit(&udp_frame(LEASE, QUERY_PORT, GATEWAY, 53)));
+
+        // The answer comes back down the real relay leg, reaches the box
+        // unaltered, and is read on the way.
+        let (box_side, tap_side) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        box_side.set_nonblocking(true).unwrap();
+        tap_side.set_nonblocking(true).unwrap();
+        let box_side = tokio::net::UnixDatagram::from_std(box_side).unwrap();
+        // SAFETY: `into_raw_fd` yields a live, owned fd; `File` takes it
+        // exclusively and closes it on drop.
+        let tap_file = unsafe { std::fs::File::from_raw_fd(tap_side.into_raw_fd()) };
+        let tap = Arc::new(AsyncFd::new(tap_file).unwrap());
+        let (mut switch_tx, switch_rx) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(relay_switch_to_tap(switch_rx, tap, Some(ingress)));
+
+        let answer = dns_answer_frame("github.com", &[(60, GITHUB), (60, GITHUB_ALT)]);
+        switch_tx.write_all(&framed(&answer)).await.unwrap();
+        let mut delivered = vec![0u8; max_frame()];
+        let n = tokio::time::timeout(Duration::from_secs(5), box_side.recv(&mut delivered))
+            .await
+            .expect("the answer reaches the box")
+            .unwrap();
+        assert_eq!(&delivered[..n], &answer[..]);
+        drop(switch_tx);
+        relay.await.unwrap().unwrap();
+
+        // The answered addresses, and only those.
+        assert!(gate.admit(&egress_syn(LEASE, GITHUB, 443)));
+        assert!(gate.admit(&egress_syn(LEASE, GITHUB_ALT, 22)));
+        assert!(!gate.admit(&egress_syn(LEASE, PAGES, 443)));
+        let pinned = gate.pinned();
+        assert_eq!(
+            pinned.iter().map(|p| p.address).collect::<Vec<_>>(),
+            vec![GITHUB, GITHUB_ALT]
+        );
+        assert!(pinned.iter().all(|p| p.name == "github.com"));
+        assert!(pinned.iter().all(|p| p.answer == vec![GITHUB, GITHUB_ALT]));
+
+        // The window: the answer's TTL, held between the bounds, from the
+        // moment the answer was read.
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let t0 = Instant::now();
+        let gate = pinning_gate(github_only(&[]));
+        gate.observe_answer_at(&dns_answer_frame("github.com", &[(60, GITHUB)]), t0);
+        let syn = egress_syn(LEASE, GITHUB, 443);
+        assert!(gate.admit_at(&syn, t0));
+        assert!(gate.admit_at(&syn, t0 + Duration::from_secs(59)));
+        assert!(!gate.admit_at(&syn, t0 + Duration::from_secs(60)));
+        // A zero TTL still admits for the floor; a day's TTL only the ceiling.
+        gate.observe_answer_at(&dns_answer_frame("github.com", &[(0, GITHUB_ALT)]), t0);
+        let alt = egress_syn(LEASE, GITHUB_ALT, 443);
+        assert!(gate.admit_at(
+            &alt,
+            t0 + crate::net::policy::ADMISSION_WINDOW_MIN - Duration::from_secs(1)
+        ));
+        assert!(!gate.admit_at(&alt, t0 + crate::net::policy::ADMISSION_WINDOW_MIN));
+        gate.observe_answer_at(&dns_answer_frame("github.com", &[(86400, PAGES)]), t0);
+        let pages = egress_syn(LEASE, PAGES, 443);
+        assert!(gate.admit_at(
+            &pages,
+            t0 + crate::net::policy::ADMISSION_WINDOW_MAX - Duration::from_secs(1)
+        ));
+        assert!(!gate.admit_at(&pages, t0 + crate::net::policy::ADMISSION_WINDOW_MAX));
+        // An answer for a name the box did not allow admits nothing.
+        gate.observe_answer_at(&dns_answer_frame("evil.example", &[(60, OUTSIDE)]), t0);
+        assert!(!gate.admit_at(&egress_syn(LEASE, OUTSIDE, 443), t0));
+        drop(guard);
+
+        let log = capture.contents();
+        let admissions: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("admitted a resolved name's addresses"))
+            .collect();
+        assert_eq!(admissions.len(), 3, "got:\n{log}");
+        for field in [
+            "DEBUG",
+            "session_id=web",
+            "name=\"github.com\"",
+            "addresses=[140.82.112.3]",
+            "window_secs=60",
+        ] {
+            assert!(
+                admissions[0].contains(field),
+                "missing {field} in: {}",
+                admissions[0]
+            );
+        }
+        assert!(admissions[1].contains("window_secs=30"));
+        assert!(admissions[2].contains("window_secs=300"));
+    }
+
+    /// A resolver answer for `github.com` whose addresses land in every
+    /// denied range: the box's own deny, the metadata address, loopback, the
+    /// gateway, a private network, plus one public address.
+    fn mixed_answer() -> Vec<u8> {
+        dns_answer_frame(
+            "github.com",
+            &[
+                (60, GITHUB),
+                (60, METADATA),
+                (60, Ipv4Addr::LOCALHOST),
+                (60, GATEWAY),
+                (60, LAN),
+                (60, PAGES),
+            ],
+        )
+    }
+
+    /// NET-067. An allowed name that resolves into the box's `deny_subnets`
+    /// or the infrastructure deny set is refused: no connection to such an
+    /// answer opens, while the same answer's public address is reached.
+    #[test]
+    fn denied_range_resolution_refused() {
+        let gate = pinning_gate(github_only(&["140.82.112.0/24"]));
+        gate.observe_answer(&mixed_answer());
+
+        for refused in [GITHUB, METADATA, Ipv4Addr::LOCALHOST, GATEWAY, LAN] {
+            assert!(
+                !gate.admit(&egress_syn(LEASE, refused, 443)),
+                "{refused} must be refused"
+            );
+        }
+        assert!(gate.admit(&egress_syn(LEASE, PAGES, 443)));
+
+        // Only the public address was ever pinned; the box's own deny is what
+        // refused its address, the others were never declared.
+        assert_eq!(
+            gate.pinned().iter().map(|p| p.address).collect::<Vec<_>>(),
+            vec![PAGES]
+        );
+        let stats = gate.drop_stats();
+        assert_eq!(stats.by_rule.get("deny_subnets"), Some(&1));
+        assert_eq!(stats.by_rule.get("allow_subnets"), Some(&4));
+
+        // A private answer is admitted once the box declares that network.
+        let lan_box = pinning_gate(sessions::EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".into()]),
+            ..github_only(&[])
+        });
+        lan_box.observe_answer(&dns_answer_frame(
+            "github.com",
+            &[(60, LAN), (60, METADATA)],
+        ));
+        assert_eq!(
+            lan_box
+                .pinned()
+                .iter()
+                .map(|p| p.address)
+                .collect::<Vec<_>>(),
+            vec![LAN]
+        );
+    }
+
+    /// NET-067's log: each answer refused as a denied range appears as one
+    /// warning naming the box, the name, the answer and the range that
+    /// refused it; admitted addresses are not warned about.
+    #[test]
+    fn denied_range_resolution_logged() {
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let gate = pinning_gate(github_only(&["140.82.112.0/24"]));
+        gate.observe_answer(&mixed_answer());
+        drop(guard);
+
+        let log = buf.contents();
+        let refusals: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("refused a resolved address in a denied range"))
+            .collect();
+        assert_eq!(refusals.len(), 5, "got:\n{log}");
+        for (line, answer, rule) in [
+            (refusals[0], GITHUB, "deny_subnets"),
+            (refusals[1], METADATA, "infrastructure"),
+            (refusals[2], Ipv4Addr::LOCALHOST, "infrastructure"),
+            (refusals[3], GATEWAY, "infrastructure"),
+            (refusals[4], LAN, "private-range"),
+        ] {
+            for field in [
+                "WARN".to_string(),
+                "session_id=web".to_string(),
+                "name=\"github.com\"".to_string(),
+                format!("answer={answer}"),
+                format!("rule_matched=\"{rule}\""),
+            ] {
+                assert!(line.contains(&field), "missing {field} in: {line}");
+            }
+        }
+        assert!(!log.contains(&format!("answer={PAGES}")), "got:\n{log}");
     }
 }

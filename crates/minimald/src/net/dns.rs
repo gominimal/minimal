@@ -268,9 +268,234 @@ pub(crate) fn host_component(host_header: &str) -> &str {
     }
 }
 
+/// What the relay reads from one resolver answer (NET-066): the name the box
+/// asked for, the IPv4 addresses the answer section holds for it, and the
+/// shortest of their TTLs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedName {
+    /// The question name, lower-cased and without its trailing dot.
+    pub name: String,
+    /// Every A record in the answer section, in wire order. The owner names
+    /// are not checked against the question: a CNAME chain leaves the A
+    /// records under another owner, and what the resolver answered for the
+    /// question is what the box will connect to.
+    pub addresses: Vec<Ipv4Addr>,
+    /// The shortest TTL among those records, in seconds.
+    pub ttl: u32,
+}
+
+/// The A record type and the IN class, as a DNS answer spells them.
+const TYPE_A: u16 = 1;
+const CLASS_IN: u16 = 1;
+/// How many compression pointers one name may follow; a hostile answer that
+/// loops its pointers is cut off here rather than spun on.
+const MAX_POINTER_HOPS: usize = 16;
+
+/// Parses a DNS message `payload` (the UDP body) as a successful response
+/// carrying at least one A record, or `None` for anything else: a query, an
+/// error rcode, a message cut short, or an answer with no address in it.
+/// Length-checked at every step so a truncated or hostile message yields
+/// `None` rather than an out-of-bounds read.
+#[must_use]
+pub fn parse_resolved_name(payload: &[u8]) -> Option<ResolvedName> {
+    if payload.len() < 12 {
+        return None;
+    }
+    let flags = u16::from_be_bytes([payload[2], payload[3]]);
+    let is_response = flags & 0x8000 != 0;
+    let rcode = flags & 0x000f;
+    if !is_response || rcode != 0 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
+    let ancount = u16::from_be_bytes([payload[6], payload[7]]);
+    if qdcount == 0 || ancount == 0 {
+        return None;
+    }
+
+    let (name, next) = read_name(payload, 12)?;
+    // The question's type and class, then any further questions (skipped).
+    let mut pos = next + 4;
+    for _ in 1..qdcount {
+        let (_, next) = read_name(payload, pos)?;
+        pos = next + 4;
+    }
+
+    let mut addresses = Vec::new();
+    let mut ttl = u32::MAX;
+    for _ in 0..ancount {
+        let (_, next) = read_name(payload, pos)?;
+        let fixed = payload.get(next..next + 10)?;
+        let rtype = u16::from_be_bytes([fixed[0], fixed[1]]);
+        let rclass = u16::from_be_bytes([fixed[2], fixed[3]]);
+        let rttl = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
+        let rdlength = usize::from(u16::from_be_bytes([fixed[8], fixed[9]]));
+        let rdata = payload.get(next + 10..next + 10 + rdlength)?;
+        if rtype == TYPE_A && rclass == CLASS_IN && rdlength == 4 {
+            addresses.push(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]));
+            ttl = ttl.min(rttl);
+        }
+        pos = next + 10 + rdlength;
+    }
+    if addresses.is_empty() {
+        return None;
+    }
+    Some(ResolvedName {
+        name,
+        addresses,
+        ttl,
+    })
+}
+
+/// Reads the name at `pos`, following compression pointers, and returns it
+/// lower-cased with the position just past the name's bytes at `pos` (a
+/// pointer ends the name in place). `None` for a name that runs off the
+/// message, a label that is neither plain nor a pointer, or a pointer chain
+/// past [`MAX_POINTER_HOPS`].
+fn read_name(payload: &[u8], mut pos: usize) -> Option<(String, usize)> {
+    let mut labels: Vec<String> = Vec::new();
+    let mut after: Option<usize> = None;
+    let mut hops = 0;
+    loop {
+        let len = *payload.get(pos)?;
+        match len {
+            0 => {
+                let end = after.unwrap_or(pos + 1);
+                return Some((labels.join("."), end));
+            }
+            l if l & 0xc0 == 0xc0 => {
+                let low = *payload.get(pos + 1)?;
+                if after.is_none() {
+                    after = Some(pos + 2);
+                }
+                hops += 1;
+                if hops > MAX_POINTER_HOPS {
+                    return None;
+                }
+                pos = usize::from(u16::from_be_bytes([l & 0x3f, low]));
+            }
+            l if l & 0xc0 == 0 => {
+                let label = payload.get(pos + 1..pos + 1 + usize::from(l))?;
+                labels.push(String::from_utf8_lossy(label).to_ascii_lowercase());
+                pos += 1 + usize::from(l);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Whether `name` is matched by one of a box's `egress.allow_dns_hosts`
+/// entries. An entry matches its own name exactly, and an entry written
+/// `*.example.com` matches every name below `example.com` (not the apex);
+/// both are compared case-insensitively and without a trailing dot.
+#[must_use]
+pub fn name_allowed(rules: &[String], name: &str) -> bool {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    rules.iter().any(|rule| {
+        let rule = rule.trim_end_matches('.').to_ascii_lowercase();
+        match rule.strip_prefix("*.") {
+            Some(suffix) => name
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.len() > 1 && prefix.ends_with('.')),
+            None => name == rule,
+        }
+    })
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A response for `question` whose answer section holds `records`
+    /// (`(ttl, address)`), each owned by a pointer back to the question name.
+    pub(crate) fn dns_response(question: &str, records: &[(u32, Ipv4Addr)]) -> Vec<u8> {
+        let mut m = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0];
+        m[6..8].copy_from_slice(&(records.len() as u16).to_be_bytes());
+        for label in question.split('.') {
+            m.push(label.len() as u8);
+            m.extend_from_slice(label.as_bytes());
+        }
+        m.push(0);
+        m.extend_from_slice(&[0, 1, 0, 1]); // A, IN
+        for (ttl, addr) in records {
+            m.extend_from_slice(&[0xc0, 0x0c]); // pointer to the question name
+            m.extend_from_slice(&[0, 1, 0, 1]);
+            m.extend_from_slice(&ttl.to_be_bytes());
+            m.extend_from_slice(&[0, 4]);
+            m.extend_from_slice(&addr.octets());
+        }
+        m
+    }
+
+    /// NET-066: a resolver answer yields the question name, every A record
+    /// and the shortest TTL; a CNAME ahead of the A record is skipped by its
+    /// length, not misread.
+    #[test]
+    fn parse_resolved_name_reads_question_addresses_and_shortest_ttl() {
+        let a = Ipv4Addr::new(140, 82, 112, 3);
+        let b = Ipv4Addr::new(140, 82, 112, 4);
+        let parsed = parse_resolved_name(&dns_response("GitHub.com", &[(60, a), (30, b)])).unwrap();
+        assert_eq!(
+            parsed,
+            ResolvedName {
+                name: "github.com".into(),
+                addresses: vec![a, b],
+                ttl: 30,
+            }
+        );
+
+        let mut chained = dns_response("www.example.com", &[]);
+        chained[6..8].copy_from_slice(&2u16.to_be_bytes());
+        // CNAME www.example.com -> "x" (rdata: one label, root), TTL 10.
+        chained.extend_from_slice(&[0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 10, 0, 3, 1, b'x', 0]);
+        let x = chained.len() - 3;
+        // A record owned by "x" (a pointer to the CNAME's rdata), TTL 20.
+        chained.extend_from_slice(&[0xc0, x as u8, 0, 1, 0, 1, 0, 0, 0, 20, 0, 4, 1, 2, 3, 4]);
+        let parsed = parse_resolved_name(&chained).unwrap();
+        assert_eq!(parsed.name, "www.example.com");
+        assert_eq!(parsed.addresses, vec![Ipv4Addr::new(1, 2, 3, 4)]);
+        assert_eq!(parsed.ttl, 20);
+    }
+
+    /// A query, an error, a message cut short, a looping pointer and an answer
+    /// with no A record all parse to nothing.
+    #[test]
+    fn parse_resolved_name_rejects_what_is_not_a_usable_answer() {
+        let good = dns_response("github.com", &[(60, Ipv4Addr::new(140, 82, 112, 3))]);
+        let mut query = good.clone();
+        query[2] = 0x01;
+        assert!(parse_resolved_name(&query).is_none());
+        let mut nxdomain = good.clone();
+        nxdomain[3] = 0x83;
+        assert!(parse_resolved_name(&nxdomain).is_none());
+        for cut in [0, 11, 20, good.len() - 1] {
+            assert!(parse_resolved_name(&good[..cut]).is_none(), "len {cut}");
+        }
+        // The answer's owner pointer made to point at itself.
+        let mut looping = good.clone();
+        let owner = 12 + "github.com".len() + 2 + 4;
+        assert_eq!(looping[owner], 0xc0);
+        looping[owner + 1] = owner as u8;
+        assert!(parse_resolved_name(&looping).is_none());
+        assert!(parse_resolved_name(&dns_response("github.com", &[])).is_none());
+    }
+
+    #[test]
+    fn name_allowed_matches_exactly_or_below_a_wildcard() {
+        let rules = vec![
+            "github.com".to_string(),
+            "*.githubusercontent.com".to_string(),
+        ];
+        assert!(name_allowed(&rules, "github.com"));
+        assert!(name_allowed(&rules, "GitHub.COM."));
+        assert!(!name_allowed(&rules, "api.github.com"));
+        assert!(!name_allowed(&rules, "notgithub.com"));
+        assert!(name_allowed(&rules, "raw.githubusercontent.com"));
+        assert!(name_allowed(&rules, "a.b.githubusercontent.com"));
+        assert!(!name_allowed(&rules, "githubusercontent.com"));
+        assert!(!name_allowed(&rules, "xgithubusercontent.com"));
+        assert!(!name_allowed(&[], "github.com"));
+    }
 
     /// Proof artifact 1 (registry/proxy contract): registering a `HostNet`
     /// PTask makes the host-side proxy route its two-label `Host:` header to
