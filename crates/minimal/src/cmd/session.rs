@@ -72,23 +72,61 @@ pub(crate) fn write_resolver_advisory(
     writeln!(out, "  {command}")
 }
 
+/// Renders the NET-018 notice: native resolution is fully in place, so
+/// `<name>.min.internal` resolves without the proxy — and NET-019's other
+/// half, that the proxy keeps serving anyway, for anything already pointed
+/// at it. Shared by `min session activate` and `min ls` so both print the
+/// exact same line.
+pub(crate) fn write_native_surface_notice(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "notice: <name>.{} resolves natively on this host; that is the live surface. \
+         The hostname proxy keeps serving too, for anything already pointed at it.",
+        minimald_rpc::BOX_ZONE
+    )
+}
+
 /// Prints the resolver advisory on stderr: the daemon's when it sent one,
 /// otherwise this host's own judgement. A daemon inside a microVM (every
 /// daemon on macOS) or one that predates the field says nothing, and nothing
 /// from the daemon must not read as nothing to do: the resolver hook and the
 /// reserved range live on the host this binary runs on, so it reads them
 /// itself ([`crate::net::host_resolution_advisory`]).
+///
+/// `None` after that merge means native resolution is fully in place
+/// (NET-018): the positive notice prints instead of nothing.
 fn advise_resolver(advisory: Option<&minimald_rpc::ResolverAdvisory>) {
-    let Some(advisory) = advisory
+    let merged = advisory
         .cloned()
-        .or_else(crate::net::host_resolution_advisory)
-    else {
-        return;
-    };
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("min"));
-    let command = resolver_setup_command(&exe);
+        .or_else(crate::net::host_resolution_advisory);
+    let mut stderr = std::io::stderr().lock();
     // A stderr write that fails is not worth failing the activation over.
-    let _ = write_resolver_advisory(&mut std::io::stderr().lock(), &advisory, &command);
+    let _ = match &merged {
+        Some(advisory) => {
+            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("min"));
+            let command = resolver_setup_command(&exe);
+            write_resolver_advisory(&mut stderr, advisory, &command)
+        }
+        None => write_native_surface_notice(&mut stderr),
+    };
+}
+
+/// `min ls`'s NET-018 counterpart to [`advise_resolver`]: prints the native
+/// surface notice once resolution is confirmed native, and nothing
+/// otherwise — `ls` does not repeat the "how to fix it" advisory an
+/// activation already gave. `name_surface` is the daemon's own judgement
+/// (absent from a daemon inside a microVM, or one that predates the field),
+/// with the same host self-check as `min session activate` falls back to.
+pub(crate) fn advise_native_surface(name_surface: Option<minimald_rpc::NameSurface>) {
+    let native = match name_surface {
+        Some(minimald_rpc::NameSurface::Native) => true,
+        Some(minimald_rpc::NameSurface::Proxy) => false,
+        None => crate::net::host_resolution_advisory().is_none(),
+    };
+    if native {
+        // A stderr write that fails is not worth failing the list over.
+        let _ = write_native_surface_notice(&mut std::io::stderr().lock());
+    }
 }
 
 /// Create a new session via the `CreateSession` RPC.

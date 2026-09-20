@@ -136,6 +136,12 @@ fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
                 // The dot is the group's health mark: green while the last
                 // refresh reached the daemon, red once it drops.
                 let (status, dot) = match provider.reachable {
+                    // NET-018: a daemon that confirmed native resolution
+                    // gets an explicit marker; the proxy fallback and "the
+                    // daemon didn't say" both render as before, unclaimed.
+                    true if provider.name_surface == Some(minimald_rpc::NameSurface::Native) => {
+                        (format!("v{} · native", provider.version), Color::Green)
+                    }
                     true => (format!("v{}", provider.version), Color::Green),
                     false => ("unreachable".to_string(), Color::Red),
                 };
@@ -887,6 +893,7 @@ mod tests {
             collapsed,
             reachable: true,
             sessions,
+            name_surface: None,
         }
     }
 
@@ -967,6 +974,34 @@ mod tests {
         assert!(
             !out.contains("hidden-sess"),
             "collapsed session leaked:\n{out}"
+        );
+    }
+
+    /// NET-018: a provider whose daemon confirmed native resolution shows a
+    /// "native" marker; one that reported the proxy, or said nothing at all
+    /// (a VM daemon, or one that predates the field), claims nothing.
+    #[test]
+    fn sidebar_shows_name_surface() {
+        let mut native = provider_view("host", false, vec![]);
+        native.name_surface = Some(minimald_rpc::NameSurface::Native);
+        let mut model = sidebar_model(vec![native]);
+        let out = draw_sidebar(&mut model, 40, 12);
+        assert!(out.contains("native"), "native surface not shown:\n{out}");
+
+        let mut proxied = provider_view("vm", false, vec![]);
+        proxied.name_surface = Some(minimald_rpc::NameSurface::Proxy);
+        let mut model = sidebar_model(vec![proxied]);
+        let out = draw_sidebar(&mut model, 40, 12);
+        assert!(
+            !out.contains("native"),
+            "the proxy surface must not claim native:\n{out}"
+        );
+
+        let mut model = sidebar_model(vec![provider_view("vm", false, vec![])]);
+        let out = draw_sidebar(&mut model, 40, 12);
+        assert!(
+            !out.contains("native"),
+            "an unreported surface must not claim native:\n{out}"
         );
     }
 }

@@ -57,6 +57,7 @@ fn ls_shows_shared_resource_pool() {
             git: None,
             attrs: None,
         }],
+        name_surface: None,
     };
     let mut out = Vec::new();
 
@@ -91,6 +92,7 @@ fn ls_table_exposes_project_path_and_status() {
             git: None,
             attrs: None,
         }],
+        name_surface: None,
     };
     let mut out = Vec::new();
 

@@ -4,10 +4,10 @@ use minimald_rpc::{
     DestroySession, DestroySessionResponse, Errorable, FinalizeSession, FinalizeSessionResponse,
     GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
     GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen, GetVersion,
-    GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
-    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool, SessionDelta,
-    SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest, ShutdownResponse,
-    SubmitVerdict,
+    GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse, NameSurface,
+    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool,
+    SessionDelta, SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest,
+    ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -123,6 +123,7 @@ async fn serve_list_sessions(
                 .list()
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            let name_surface = host_name_surface(&s).await;
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
@@ -130,6 +131,7 @@ async fn serve_list_sessions(
                 // standard one, or a free one it selected — so the client prints
                 // what is actually serving (NET-026).
                 hostname_proxy_port: s.hostname_proxy_port().await.map(|p| p.port),
+                name_surface,
                 resource_pool,
                 // The git probes run in parallel across sessions: each is
                 // one small process under a deadline, and serializing them
@@ -345,6 +347,25 @@ async fn host_resolution_advisory(s: &ServerStateHandle) -> Option<minimald_rpc:
         "session start: native resolution state"
     );
     host.advisory()
+}
+
+/// NET-018: which surface serves box names on this host right now, for a
+/// `ListSessions` reply — `min ls`'s and `min dash`'s positive counterpart
+/// to [`host_resolution_advisory`]'s "what's wrong". Judged the same way and
+/// with the same microVM carve-out: a guest daemon cannot judge its own
+/// host, so it says nothing and leaves the client to judge itself
+/// ([`crate::net::answerer::HostResolution`] fields are public precisely so
+/// a caller here can read them without a dedicated accessor).
+async fn host_name_surface(s: &ServerStateHandle) -> Option<NameSurface> {
+    if s.in_microvm().await {
+        return None;
+    }
+    let host = crate::net::answerer::HostResolution::probe();
+    Some(if host.resolver_configured && host.range.is_present() {
+        NameSurface::Native
+    } else {
+        NameSurface::Proxy
+    })
 }
 
 /// `ConfigureLoadout`: composes a created session's loadout from the
@@ -2705,6 +2726,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again.resolver_advisory, HostResolution::probe().advisory());
+    }
+
+    /// NET-019: native resolution superseding the proxy as the *reported*
+    /// surface (NET-018) must not touch the proxy's own lifecycle — design
+    /// §7.1's "the proxy keeps running after native resolution supersedes
+    /// it." Supersession is represented directly (both `HostResolution`
+    /// halves in place) rather than by mutating this host's real resolver
+    /// state, and a request through the daemon's own egress-proxy wiring
+    /// still routes to a live box regardless.
+    #[tokio::test]
+    async fn proxy_keeps_serving_after_supersession() {
+        use crate::net::answerer::{HostResolution, RangeProbe};
+        use crate::net::proxy::{Router, serve};
+
+        let superseded = HostResolution {
+            resolver_configured: true,
+            range: RangeProbe::Present,
+        };
+        assert!(
+            superseded.advisory().is_none(),
+            "supersession must clear the advisory: {superseded:?}"
+        );
+
+        // A backend the proxy will forward to, and a live box registered
+        // in the same shared registry `ListSessions`/`CreateSession` read.
+        let backend = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = backend.accept().await {
+                let mut scratch = [0u8; 1024];
+                let _ = sock.read(&mut scratch).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let server = TestServer::new().await;
+        let registry = server.state.sessions_manager().await.hostnames();
+        let hostname = registry.write().unwrap().register(
+            SessionId::nil(),
+            "web",
+            std::net::Ipv4Addr::LOCALHOST.into(),
+        );
+
+        let proxy = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve(proxy, Router::new(registry)));
+
+        let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let request = format!("GET / HTTP/1.1\r\nHost: {hostname}:{backend_port}\r\n\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.contains("200 OK"),
+            "the proxy must keep routing a live box while native resolution supersedes it \
+             as the reported surface, got: {response}"
+        );
     }
 
     /// The two read RPCs the attach / exec / setup-zed paths

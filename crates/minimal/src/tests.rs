@@ -1669,3 +1669,47 @@ fn session_start_advises_resolver_command_without_prompt() {
         }))
     ));
 }
+
+/// NET-018: `min session activate` and `min ls` both report native DNS as
+/// the live surface once host-OS resolution and published addresses are
+/// both in place, from the one shared notice — so the wording cannot drift
+/// between the two commands — and NET-019: the notice says the proxy keeps
+/// serving too, rather than the daemon behaviour going unmentioned. Real
+/// host state (whether either command is on the healthy path right now) is
+/// not deterministic across test hosts, so this checks the notice's own
+/// text and, source-level, that both commands' code reaches it — the same
+/// technique `the_activation_path_makes_no_version_round_trip` uses.
+#[test]
+fn activate_and_ls_report_native_surface() {
+    let mut out = Vec::new();
+    write_native_surface_notice(&mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("<name>.min.internal"), "{text}");
+    assert!(text.contains("resolves natively"), "{text}");
+    assert!(text.contains("live surface"), "{text}");
+    assert!(text.contains("hostname proxy keeps serving"), "{text}");
+    assert!(!text.contains('?'), "a notice asks nothing:\n{text}");
+
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (file, func, needle) in [
+        (
+            "src/cmd/session.rs",
+            "advise_resolver",
+            "write_native_surface_notice",
+        ),
+        (
+            "src/cmd/session.rs",
+            "advise_native_surface",
+            "write_native_surface_notice",
+        ),
+        ("src/cmd/list.rs", "cmd_ls", "advise_native_surface"),
+    ] {
+        let source = std::fs::read_to_string(manifest.join(file)).expect("readable source");
+        let body = function_body(&source, func)
+            .unwrap_or_else(|| panic!("{file} no longer defines {func}"));
+        assert!(
+            body.contains(needle),
+            "{file}::{func} no longer reports the native surface (missing {needle})"
+        );
+    }
+}

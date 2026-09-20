@@ -49,6 +49,10 @@ pub struct ProviderView {
     /// aren't actionable) so it can rejoin when the daemon comes back.
     pub reachable: bool,
     pub sessions: Vec<minimald_rpc::ListSessionsEntry>,
+    /// Which surface serves this daemon's box names right now (NET-018).
+    /// `None` from a daemon inside a microVM (it cannot judge its own host)
+    /// or one that predates the field.
+    pub name_surface: Option<minimald_rpc::NameSurface>,
 }
 
 /// The record + policy behind the detail pane, cached per session.
@@ -430,9 +434,11 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                         collapsed: false,
                         reachable: true,
                         sessions: Vec::new(),
+                        name_surface: None,
                     });
                 view.version = data.version;
                 view.sessions = data.sessions;
+                view.name_surface = data.name_surface;
                 view.reachable = true;
             }
             for label in &failed {
@@ -1201,6 +1207,7 @@ mod tests {
             label: label.to_string(),
             version: "0.1".to_string(),
             sessions,
+            name_surface: None,
         }
     }
 

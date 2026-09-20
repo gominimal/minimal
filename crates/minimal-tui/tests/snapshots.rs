@@ -46,6 +46,7 @@ fn provider(label: &str, sessions: Vec<minimald_rpc::ListSessionsEntry>) -> Prov
         label: label.to_string(),
         version: "0.1".to_string(),
         sessions,
+        name_surface: None,
     }
 }
 

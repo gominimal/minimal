@@ -220,6 +220,21 @@ pub struct ResourcePool {
     pub memory_bytes: u64,
 }
 
+/// Which surface serves box names on this host right now (NET-018): native
+/// host-OS resolution once the resolver hook and the reserved local range
+/// are both deployed, or the hostname proxy until then. The proxy keeps
+/// serving either way (NET-019) — this only says which one a client should
+/// point at.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NameSurface {
+    /// Host-OS resolution and published addresses are both deployed:
+    /// `<name>.min.internal` resolves natively.
+    Native,
+    /// Native resolution is not fully deployed on this host yet.
+    Proxy,
+}
+
 /// The response to the [`ListSessions`] RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListSessionsResponse {
@@ -255,6 +270,12 @@ pub struct ListSessionsResponse {
     /// [`Self::hostname_routing_unavailable`] says why).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_proxy_port: Option<u16>,
+    /// Which surface serves box names right now (NET-018), from a daemon
+    /// that can judge its own host. `None` from a daemon inside a microVM
+    /// (it cannot judge its host — see [`CreateSessionResponse::resolver_advisory`]'s
+    /// doc for why) or one that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_surface: Option<NameSurface>,
 }
 
 impl OneshotSshRpc for ListSessions {
@@ -1556,6 +1577,7 @@ mod tests {
             hostname_proxy_port: None,
             resource_pool: None,
             sessions: vec![],
+            name_surface: None,
         };
         let json = serde_json_lenient::to_string(&resp).expect("serializes");
         assert!(
@@ -1589,6 +1611,7 @@ mod tests {
             hostname_proxy_port: Some(41_234),
             resource_pool: None,
             sessions: vec![],
+            name_surface: None,
         };
         let json = serde_json_lenient::to_string(&resp).expect("serializes");
         let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
@@ -1610,6 +1633,41 @@ mod tests {
             !json.contains("hostname_proxy_port"),
             "a daemon with no bound port should omit the field, got {json}"
         );
+    }
+
+    /// NET-018: `ListSessions` carries which surface serves box names right
+    /// now — round-trips both answers, and a daemon that predates the field
+    /// decodes as "did not judge" rather than as either answer.
+    #[test]
+    fn list_sessions_carries_name_surface() {
+        let native = ListSessionsResponse {
+            daemon_version: Some("0.6.0".into()),
+            hostname_routing_unavailable: None,
+            resource_pool: None,
+            sessions: vec![],
+            hostname_proxy_port: None,
+            name_surface: Some(NameSurface::Native),
+        };
+        let json = serde_json_lenient::to_string(&native).expect("serializes");
+        assert!(json.contains(r#""name_surface":"native""#), "got: {json}");
+        let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
+        assert_eq!(back.name_surface, Some(NameSurface::Native));
+
+        let proxy = ListSessionsResponse {
+            name_surface: Some(NameSurface::Proxy),
+            ..native
+        };
+        let json = serde_json_lenient::to_string(&proxy).expect("serializes");
+        let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
+        assert_eq!(back.name_surface, Some(NameSurface::Proxy));
+
+        // A daemon that predates the field (or one inside a microVM that
+        // said nothing because it cannot judge its own host) decodes as
+        // "did not judge" — never as either surface.
+        let legacy: ListSessionsResponse =
+            serde_json_lenient::from_str(r#"{"sessions":[],"daemon_version":"0.5.0"}"#)
+                .expect("a pre-field ListSessions reply must still decode");
+        assert!(legacy.name_surface.is_none());
     }
 
     /// NET-109: the daemon issues no client certificate, so this crate's wire
@@ -1643,6 +1701,7 @@ mod tests {
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: Some("port 7654 is held".into()),
             hostname_proxy_port: None,
+            name_surface: None,
         };
         let created = CreateSessionResponse {
             id: SessionId::nil(),
