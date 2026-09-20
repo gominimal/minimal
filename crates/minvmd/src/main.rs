@@ -18,6 +18,12 @@ struct Cli {
     /// Runtime files live under `<dir>/providers/local-minvmd0/`.
     #[arg(long, global = true)]
     minimal_state_dir: Option<paths::CwdRelative<paths::Daemon>>,
+
+    /// The VM to operate on. The `default` VM keeps its runtime files in
+    /// `<dir>/providers/local-minvmd0/` itself; any other name gets its own
+    /// state, socket and daemon under `<dir>/providers/local-minvmd0/vms/<NAME>/`.
+    #[arg(long, global = true, value_name = "NAME", default_value_t)]
+    vm_name: paths::VmName,
 }
 
 #[derive(Subcommand)]
@@ -94,6 +100,7 @@ fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("resolving --minimal-state-dir: {e}"))?;
         minvmd::state::set_state_dir_override(dir);
     }
+    minvmd::state::set_vm_name(cli.vm_name);
 
     let _log_guard = init_tracing()?;
 
@@ -176,5 +183,18 @@ mod tests {
     fn start_is_an_alias_for_run() {
         let cli = Cli::try_parse_from(["minvmd", "start"]).expect("`start` should parse as `run`");
         assert!(matches!(cli.command, Command::Run { .. }));
+    }
+
+    /// `--vm-name` is global, defaults to the `default` VM, and refuses a name
+    /// that is not a single path component.
+    #[test]
+    fn vm_name_is_global_and_defaults_to_default() {
+        let cli = Cli::try_parse_from(["minvmd", "status"]).unwrap();
+        assert!(cli.vm_name.is_default());
+        let cli = Cli::try_parse_from(["minvmd", "status", "--vm-name", "alpha"]).unwrap();
+        assert_eq!(cli.vm_name.as_str(), "alpha");
+        let cli = Cli::try_parse_from(["minvmd", "--vm-name", "alpha", "stop"]).unwrap();
+        assert_eq!(cli.vm_name.as_str(), "alpha");
+        assert!(Cli::try_parse_from(["minvmd", "stop", "--vm-name", "a/b"]).is_err());
     }
 }

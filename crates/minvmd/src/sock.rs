@@ -1,11 +1,12 @@
 //! Host UDS path resolution and socket-directory management for the
 //! minimald bridge (R3.2).
 //!
-//! The bridge socket lives beside the minvmd state files in the minvmd
-//! provider-instance dir:
-//! `<minimal_state_dir>/providers/local-minvmd0/ssh.sock`. It mirrors the
-//! `ssh.sock` name native minimald binds under its own `local-minimald<N>`
-//! dir; the client selects the dir matching the requested backend.
+//! The bridge socket lives beside the minvmd state files in the VM's state
+//! dir ([`crate::state::provider_dir`]):
+//! `<minimal_state_dir>/providers/local-minvmd0/ssh.sock` for the `default`
+//! VM, `.../local-minvmd0/vms/<name>/ssh.sock` for a named one. It mirrors
+//! the `ssh.sock` name native minimald binds under its own `local-minimald<N>`
+//! dir; the client selects the dir matching the requested backend and VM.
 
 use std::io;
 use std::path::PathBuf;
@@ -30,7 +31,12 @@ pub const VSOCK_BRIDGE_PORT: u32 = 2222;
 /// Resolve the host UDS path for the minimald bridge (R3.2):
 /// `<provider dir>/ssh.sock`.
 pub fn resolve_uds_path() -> io::Result<PathBuf> {
-    Ok(crate::state::provider_dir().join(paths::SSH_SOCK_FILE))
+    Ok(uds_path_in(&crate::state::provider_dir()))
+}
+
+/// `<provider_dir>/ssh.sock`. Pure, for unit testing.
+pub fn uds_path_in(provider_dir: &std::path::Path) -> PathBuf {
+    provider_dir.join(paths::SSH_SOCK_FILE)
 }
 
 /// Usable bytes in `sockaddr_un.sun_path` (excluding the NUL terminator).

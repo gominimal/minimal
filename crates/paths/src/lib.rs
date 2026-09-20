@@ -202,6 +202,105 @@ pub fn provider_instance_dir(
     sub_path!(state_dir, "providers").sub_path_unchecked(&provider_instance_name(kind, instance))
 }
 
+/// Subdirectory of a provider instance dir holding the named VMs' state, one
+/// per-name subdirectory each (`vms/<name>/`). Nested one level down so a VM
+/// name can never collide with the default VM's own files (`ssh.sock`,
+/// `minvmd.toml`, `data-vol.raw`, ...) beside it.
+pub const VMS_SUBDIR: &str = "vms";
+
+/// A VM name: one DNS label (ASCII letters, digits and `-`, starting with a
+/// letter or digit, at most 63 bytes). The shape is a single path component
+/// with no traversal, so joining it under a provider dir is safe, and it is
+/// hostname-safe for the day the name appears in one.
+///
+/// [`VmName::default`] is the `default` VM, whose paths are the provider
+/// instance dir itself, unchanged from before VMs had names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VmName(String);
+
+/// The name of the VM every provider-instance path resolves to when no name
+/// is given.
+pub const DEFAULT_VM_NAME: &str = "default";
+
+/// A string that is not a usable VM name (see [`VmName`]).
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "invalid VM name {0:?}: use 1-63 ASCII letters, digits or `-`, starting with a letter or digit"
+)]
+pub struct InvalidVmName(pub String);
+
+impl VmName {
+    /// Validate `name` as a VM name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidVmName`] when `name` is empty, longer than 63 bytes,
+    /// starts with `-`, or contains anything but ASCII letters, digits and `-`.
+    pub fn new(name: &str) -> Result<Self, InvalidVmName> {
+        let ok = !name.is_empty()
+            && name.len() <= 63
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && name.as_bytes()[0].is_ascii_alphanumeric();
+        if ok {
+            Ok(Self(name.to_owned()))
+        } else {
+            Err(InvalidVmName(name.to_owned()))
+        }
+    }
+
+    /// The name as a string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether this is the `default` VM.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.0 == DEFAULT_VM_NAME
+    }
+}
+
+impl Default for VmName {
+    fn default() -> Self {
+        Self(DEFAULT_VM_NAME.to_owned())
+    }
+}
+
+impl fmt::Display for VmName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for VmName {
+    type Err = InvalidVmName;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
+/// The directory holding one VM's state, socket and locks: the provider
+/// instance dir itself for the `default` VM (every path it had before VMs
+/// were named), else the per-name subdirectory
+/// `<state_dir>/providers/local-<kind><instance>/vms/<name>`.
+pub fn provider_vm_dir(
+    state_dir: &DaemonAbsPath,
+    kind: ProviderKind,
+    instance: u32,
+    name: &VmName,
+) -> DaemonAbsPath {
+    let instance_dir = provider_instance_dir(state_dir, kind, instance);
+    if name.is_default() {
+        instance_dir
+    } else {
+        instance_dir
+            .sub_path_unchecked(VMS_SUBDIR)
+            .sub_path_unchecked(name.as_str())
+    }
+}
+
 /// Migrate legacy `providers/local-<N>` instance dirs — the pre-split naming,
 /// from before the native minimald and minvmd backends had distinct identities
 /// — to the kind-tagged scheme (`local-minimald<N>` / `local-minvmd<N>`), so
@@ -1871,6 +1970,52 @@ mod tests {
         assert_eq!(
             provider_instance_dir(&state, ProviderKind::Minvmd, 0).as_str(),
             "/state/minimal/providers/local-minvmd0",
+        );
+    }
+
+    #[test]
+    fn provider_instance_dir_accepts_a_name() {
+        let state = DaemonAbsPath::try_new("/state/minimal").unwrap();
+        let instance = provider_instance_dir(&state, ProviderKind::Minvmd, 0);
+
+        // The default VM is the instance dir itself: nothing moved.
+        let default = provider_vm_dir(&state, ProviderKind::Minvmd, 0, &VmName::default());
+        assert_eq!(default.as_str(), instance.as_str());
+        assert_eq!(default.as_str(), "/state/minimal/providers/local-minvmd0");
+        assert_eq!(
+            VmName::new(DEFAULT_VM_NAME).unwrap(),
+            VmName::default(),
+            "spelling `default` out is the default VM"
+        );
+
+        // A named VM sits in its own per-name subdirectory of that dir.
+        let alpha = VmName::new("alpha").unwrap();
+        let named = provider_vm_dir(&state, ProviderKind::Minvmd, 0, &alpha);
+        assert_eq!(
+            named.as_str(),
+            "/state/minimal/providers/local-minvmd0/vms/alpha"
+        );
+        assert_eq!(
+            named.parent().unwrap().parent().unwrap().as_str(),
+            instance.as_str(),
+            "named VM state is nested under the instance dir"
+        );
+        assert_eq!(
+            provider_vm_dir(&state, ProviderKind::Minvmd, 0, &"beta-2".parse().unwrap()).as_str(),
+            "/state/minimal/providers/local-minvmd0/vms/beta-2"
+        );
+
+        // A name is one DNS label; anything that could leave the subdirectory
+        // or name a hidden file is refused before it reaches a path.
+        for bad in ["", "-x", "a/b", "..", ".", ".hidden", "a b", "a_b", "é"] {
+            assert!(VmName::new(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(VmName::new(&"a".repeat(63)).is_ok());
+        assert!(VmName::new(&"a".repeat(64)).is_err());
+        assert_eq!(
+            VmName::new("a/b").unwrap_err().to_string(),
+            "invalid VM name \"a/b\": use 1-63 ASCII letters, digits or `-`, starting with a \
+             letter or digit"
         );
     }
 

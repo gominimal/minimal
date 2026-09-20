@@ -8,6 +8,10 @@
 //! The command is idempotent: if the daemon is already stopped (or has never
 //! been provisioned), it returns successfully with no action. Stale active
 //! state from a dead daemon is repaired to `Stopped`.
+//!
+//! Everything it reads and signals belongs to one VM's state dir (the
+//! `--vm-name` one), so stopping one VM leaves every other VM on the host
+//! running.
 
 use anyhow::{Context as _, Result};
 
@@ -77,7 +81,11 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()
             .context("writing Stopped state")?;
     }
 
-    tracing::info!("minvmd stopped");
+    tracing::info!(
+        vm = %crate::state::vm_name(),
+        state_dir = %state_dir.dir().display(),
+        "minvmd stopped"
+    );
     Ok(())
 }
 
@@ -243,6 +251,162 @@ mod tests {
         run_with_state_dir(tmp.path().to_path_buf(), false).unwrap();
         let s = sd.read_state().unwrap();
         assert_eq!(s.lifecycle, Lifecycle::Stopped);
+    }
+
+    /// A stand-in VMM: a `sleep` child holding `sd`'s alive lock, recorded in
+    /// `sd` as the running daemon's `vmm_pid`, exactly as `run` records the
+    /// real one. Returns its pid, its supervisor (a thread that reaps it the
+    /// moment it exits, as the real `run` supervisor does — otherwise the
+    /// zombie would still answer `kill(pid, 0)` and `stop` would sit out its
+    /// full SIGTERM grace), and the lock.
+    fn fake_running_vm(
+        sd: &StateDir,
+    ) -> (
+        u32,
+        std::thread::JoinHandle<std::process::ExitStatus>,
+        crate::state::AliveLock,
+    ) {
+        let lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        lock.inherit_into(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id();
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Running,
+            vmm_pid: Some(pid),
+            started_at: Some(1),
+            ..State::stopped()
+        })
+        .unwrap();
+        let supervisor = std::thread::spawn(move || child.wait().expect("wait"));
+        (pid, supervisor, lock)
+    }
+
+    /// Poll for up to 5 s; `true` once `done()` holds.
+    fn eventually(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if done() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn stop_one_vm_leaves_other_running() {
+        use paths::VmName;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = paths::DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap();
+        let default_dir = crate::state::provider_dir_for(&base, &VmName::default());
+        let alpha_dir = crate::state::provider_dir_for(&base, &VmName::new("alpha").unwrap());
+        let default_sd = StateDir::new(default_dir.clone()).unwrap();
+        let alpha_sd = StateDir::new(alpha_dir.clone()).unwrap();
+
+        // Two VMs up on one host: the default one and a named one nested
+        // under its provider dir.
+        let (default_pid, default_vm, _default_lock) = fake_running_vm(&default_sd);
+        let (_alpha_pid, alpha_vm, alpha_lock) = fake_running_vm(&alpha_sd);
+
+        // Stop the named VM only.
+        run_with_state_dir(alpha_dir, false).unwrap();
+        drop(alpha_lock);
+
+        assert_eq!(alpha_sd.read_state().unwrap().lifecycle, Lifecycle::Stopped);
+        assert!(
+            eventually(|| alpha_vm.is_finished()),
+            "the stopped VM's VMM is gone"
+        );
+        assert!(!alpha_vm.join().unwrap().success(), "signalled, not exited");
+
+        // The other VM is untouched: still Running, its VMM alive, its lock held.
+        let s = default_sd.read_state().unwrap();
+        assert_eq!(s.lifecycle, Lifecycle::Running);
+        assert_eq!(s.vmm_pid, Some(default_pid));
+        assert!(
+            !default_vm.is_finished(),
+            "the other VM's VMM must still be running"
+        );
+        assert!(default_sd.daemon_alive().unwrap());
+
+        // And the converse: stopping the default VM leaves nothing of the
+        // named VM's (already Stopped) state disturbed — its dir persists.
+        run_with_state_dir(default_dir, false).unwrap();
+        assert!(eventually(|| default_vm.is_finished()));
+        default_vm.join().unwrap();
+        assert_eq!(
+            default_sd.read_state().unwrap().lifecycle,
+            Lifecycle::Stopped
+        );
+        assert!(alpha_sd.state_path().exists());
+    }
+
+    /// `scripts/reap-vms.sh` kills only the VM host processes of the checkout
+    /// it is run from: a leftover from another checkout survives it. The
+    /// script scopes its `pkill -f` by the absolute checkout path in the
+    /// cmdline, which is what a real minvmd / `__krun-vmm` carries (they
+    /// re-exec via `current_exe()`), so a shell script at
+    /// `<checkout>/target/debug/minvmd` that idles until signalled stands in
+    /// for one (its cmdline is `/bin/sh <that path>`).
+    #[test]
+    fn reap_scoped_per_checkout() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/reap-vms.sh")
+            .canonicalize()
+            .expect("scripts/reap-vms.sh exists");
+
+        // Two fake checkouts, each with a "minvmd" whose cmdline carries the
+        // checkout path; the script under test is installed into the first.
+        let spawn_vm = |root: &std::path::Path| {
+            let bin = root.join("target/debug");
+            std::fs::create_dir_all(&bin).unwrap();
+            let fake = bin.join("minvmd");
+            // Idle in a child so SIGTERM (what `pkill` sends) is handled
+            // promptly and takes the child down too; `exec sleep` would
+            // replace the cmdline the reaper matches on.
+            std::fs::write(
+                &fake,
+                "#!/bin/sh\ntrap 'kill $! 2>/dev/null; exit 0' TERM\nsleep 30 &\nwait\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::process::Command::new(&fake)
+                .spawn()
+                .expect("spawn fake minvmd")
+        };
+        let mine = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let mine = mine.path().canonicalize().unwrap();
+        let other = other.path().canonicalize().unwrap();
+        std::fs::create_dir_all(mine.join("scripts")).unwrap();
+        std::fs::copy(&script, mine.join("scripts/reap-vms.sh")).unwrap();
+        let mut my_vm = spawn_vm(&mine);
+        let mut other_vm = spawn_vm(&other);
+
+        let status = std::process::Command::new("bash")
+            .arg(mine.join("scripts/reap-vms.sh"))
+            .status()
+            .expect("run reap-vms.sh");
+        assert!(status.success(), "reap-vms.sh exited {status}");
+
+        assert!(
+            eventually(|| my_vm.try_wait().unwrap().is_some()),
+            "this checkout's VM host process must be reaped"
+        );
+        assert!(
+            other_vm.try_wait().unwrap().is_none(),
+            "another checkout's VM host process must survive"
+        );
+        // SIGTERM, not `kill()` (SIGKILL): the stand-in's trap takes its
+        // `sleep` child down with it, so nothing outlives the test.
+        // SAFETY: signalling our own child by the pid we spawned.
+        unsafe { libc::kill(other_vm.id() as libc::pid_t, libc::SIGTERM) };
+        other_vm.wait().unwrap();
     }
 
     #[test]

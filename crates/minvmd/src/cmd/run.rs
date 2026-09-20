@@ -121,9 +121,7 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("run");
-    if let Some(dir) = crate::state::state_dir_override() {
-        cmd.args(["--minimal-state-dir", dir.as_str()]);
-    }
+    cmd.args(crate::state::reexec_args());
     // Mark the child as detached so it routes tracing to the daily-rotated
     // log file (`<state>/logs/minvmd.log`) instead of stdout.
     cmd.env(crate::DETACHED_ENV, "1");
@@ -374,9 +372,7 @@ fn run_foreground() -> Result<()> {
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("__krun-vmm");
-    if let Some(dir) = crate::state::state_dir_override() {
-        cmd.args(["--minimal-state-dir", dir.as_str()]);
-    }
+    cmd.args(crate::state::reexec_args());
     alive_lock.inherit_into(&mut cmd);
     let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
@@ -484,7 +480,12 @@ fn run_foreground() -> Result<()> {
             .context("writing Running state")?;
     }
     guard.commit();
-    tracing::info!(pid = child_pid, "VM is up; supervisor is running");
+    tracing::info!(
+        vm = %crate::state::vm_name(),
+        state_dir = %state_dir.dir().display(),
+        pid = child_pid,
+        "VM is up; supervisor is running"
+    );
 
     // Tighten + verify the bridge socket permissions (R3.2): libkrun creates
     // it with default perms, and the shared provider dir is not 0700.
@@ -507,7 +508,12 @@ fn run_foreground() -> Result<()> {
 
     // ── Phase 3: Supervise until VMM child exits ─────────────────────────────
     let status = child.wait().context("waiting for VMM child")?;
-    tracing::info!(success = status.success(), "VMM child exited");
+    tracing::info!(
+        vm = %crate::state::vm_name(),
+        state_dir = %state_dir.dir().display(),
+        success = status.success(),
+        "VMM child exited"
+    );
 
     // ── Phase 4: Running → Stopped (under lock) ─────────────────────────────
     {
