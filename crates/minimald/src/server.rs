@@ -211,6 +211,12 @@ pub struct ServerState {
     /// Memoized SSH host key, after first successful load.
     host_key: Option<PrivateKey>,
 
+    /// The in-guest box zone of the daemon's switch (NET-072, NET-073), held
+    /// here so the box-zone answerer can dump it beside the host's own zone.
+    /// The switch itself is the sessions manager's; this is the one table it
+    /// shares, behind the same `Arc` every box's relay reads.
+    box_zone: Arc<crate::net::policy::BoxZone>,
+
     /// Why the host-side egress proxy is not reachable, if it is not. Set by
     /// [`start_host_proxies`] and read by the `ListSessions` RPC.
     ///
@@ -261,6 +267,8 @@ impl ServerState {
             .with_transport(transport),
         ));
 
+        let box_zone = net_switch.lock().await.box_zone();
+
         // Build a daemon-scoped mctx config from what the daemon
         // knows today (dirs). Additional flags (offline, stdlib
         // override, num-parallel-builds) will thread through from
@@ -291,6 +299,7 @@ impl ServerState {
             daemon_id,
             daemon_ctx,
             maintenance: None,
+            box_zone,
             shutdown: CancellationToken::new(),
             log_release,
             host_key: None,
@@ -345,6 +354,11 @@ impl ServerStateHandle {
     /// Returns a handle to the sessions manager.
     pub async fn sessions_manager(&self) -> sessions::ManagerHandle {
         self.0.lock().await.sessions.clone()
+    }
+
+    /// The in-guest box zone of the daemon's switch, for the zone dump.
+    pub(crate) async fn box_zone(&self) -> Arc<crate::net::policy::BoxZone> {
+        Arc::clone(&self.0.lock().await.box_zone)
     }
 
     /// Records why hostname routing is unavailable, so a client can be told.
@@ -920,11 +934,12 @@ async fn start_zone_answerer(state: &ServerStateHandle) {
         }
     };
     let zone = state.sessions_manager().await.published();
+    let box_zone = state.box_zone().await;
     let daemon_id = state.daemon_id().await;
     let dump_path =
         answerer::zone_dump_path(state.minimal_state_dir().await.as_utf8_path().as_std_path());
     tokio::spawn(async move {
-        if let Err(error) = answerer::serve(listener, zone, daemon_id, dump_path).await {
+        if let Err(error) = answerer::serve(listener, zone, box_zone, daemon_id, dump_path).await {
             tracing::error!(%error, "box-zone answerer exited");
         }
     });

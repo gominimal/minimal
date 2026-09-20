@@ -39,6 +39,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -214,6 +215,11 @@ pub struct SwitchClient {
     /// How PTask taps reach the switch: local spawn (DM2) or a
     /// vsock shuttle to the host gvproxy (DM1/3/4).
     transport: SwitchTransport,
+    /// The in-guest box zone this switch answers: one entry per attached box,
+    /// shared with every box's relay and with the zone dump. Held here because
+    /// the zone is the switch's — it lives as long as the address book that
+    /// leases the addresses in it.
+    box_zone: Arc<policy::BoxZone>,
 }
 
 impl SwitchClient {
@@ -240,6 +246,7 @@ impl SwitchClient {
             child: None,
             exit_tx,
             transport: SwitchTransport::default(),
+            box_zone: Arc::new(policy::BoxZone::default()),
         }
     }
 
@@ -276,6 +283,14 @@ impl SwitchClient {
     #[must_use]
     pub fn subnet(&self) -> SwitchSubnet {
         self.allocator.subnet()
+    }
+
+    /// The in-guest box zone of this switch (NET-072, NET-073): what a box
+    /// resolves a sibling's name to, and each box's declared ingress. Shared, so
+    /// every box's relay and the zone dump read the one table.
+    #[must_use]
+    pub fn box_zone(&self) -> Arc<policy::BoxZone> {
+        Arc::clone(&self.box_zone)
     }
 
     fn config_path(&self) -> PathBuf {

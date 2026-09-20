@@ -59,6 +59,7 @@ use tokio::net::UdpSocket;
 use sessions::SessionId;
 
 use super::dns::HOSTNAME_SUFFIX;
+use super::policy::BoxZone;
 use super::publish::{AddressKind, Lookup, PortCollision, PublishTable, Zone};
 
 /// The port the box zone is answered on, the one the host resolver hook names
@@ -497,6 +498,12 @@ struct ZoneDump {
     ttl_secs: u32,
     listener: ListenerInfo,
     names: Vec<ZoneEntry>,
+    /// The in-guest half of the same zone: what the node's DNS layer answers a
+    /// box with for a sibling (NET-072). Switch leases, so none of them is an
+    /// address this answerer would give a lookup on the host (NET-127) — the
+    /// two halves answer one name differently on purpose, and a box-to-box
+    /// refusal is read against these entries, not the host's.
+    in_guest: Vec<GuestEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -523,8 +530,20 @@ struct ZoneEntry {
     collisions: Vec<PortCollision>,
 }
 
+/// One in-guest box-zone entry: the switch lease a sibling's name resolves to
+/// inside boxes, and the ports that box's ingress declares — the target half of
+/// a box-to-box verdict (NET-073), so a refused connection can be read here.
+#[derive(Debug, Serialize)]
+struct GuestEntry {
+    name: String,
+    address: Ipv4Addr,
+    tcp_ports: Vec<u16>,
+    udp_ports: Vec<u16>,
+}
+
 fn snapshot(
     zone: &RwLock<PublishTable>,
+    box_zone: &BoxZone,
     daemon_id: &str,
     local: SocketAddr,
     source: SocketSource,
@@ -544,6 +563,16 @@ fn snapshot(
             collisions: b.collisions,
         })
         .collect();
+    let in_guest = box_zone
+        .entries()
+        .into_iter()
+        .map(|entry| GuestEntry {
+            name: entry.name(),
+            address: entry.lease,
+            tcp_ports: entry.tcp_ports.into_iter().collect(),
+            udp_ports: entry.udp_ports.into_iter().collect(),
+        })
+        .collect();
     ZoneDump {
         zone: ZONE_APEX,
         ttl_secs: ZONE_TTL,
@@ -553,6 +582,7 @@ fn snapshot(
             socket: source,
         },
         names,
+        in_guest,
     }
 }
 
@@ -570,12 +600,13 @@ async fn write_dump(path: &Path, dump: &ZoneDump) -> io::Result<()> {
 
 async fn refresh_dump(
     zone: &RwLock<PublishTable>,
+    box_zone: &BoxZone,
     daemon_id: &str,
     local: SocketAddr,
     source: SocketSource,
     path: &Path,
 ) {
-    let dump = snapshot(zone, daemon_id, local, source);
+    let dump = snapshot(zone, box_zone, daemon_id, local, source);
     if let Err(error) = write_dump(path, &dump).await {
         tracing::warn!(%error, path = %path.display(), "could not write the zone dump");
     }
@@ -584,9 +615,15 @@ async fn refresh_dump(
 /// Serves the zone on `listener` until the socket errors: answers each on-host
 /// lookup from `zone`, drops off-host ones unanswered, and keeps the zone dump
 /// at `dump_path` current.
+///
+/// `box_zone` is not answered from — a lookup on the host is answered from the
+/// published table alone, and only with a local address (NET-127) — but it is
+/// dumped beside it, so a bundle shows what a box resolves a sibling to as well
+/// as what the host does.
 pub async fn serve(
     listener: Listener,
     zone: Arc<RwLock<PublishTable>>,
+    box_zone: Arc<BoxZone>,
     daemon_id: String,
     dump_path: PathBuf,
 ) -> io::Result<()> {
@@ -597,13 +634,13 @@ pub async fn serve(
         .unwrap_or_else(PoisonError::into_inner)
         .changes();
     tracing::info!(address = %local, socket = ?source, "box-zone answerer listening");
-    refresh_dump(&zone, &daemon_id, local, source, &dump_path).await;
+    refresh_dump(&zone, &box_zone, &daemon_id, local, source, &dump_path).await;
 
     let mut buf = vec![0u8; MAX_MESSAGE];
     loop {
         tokio::select! {
             () = changes.notified() => {
-                refresh_dump(&zone, &daemon_id, local, source, &dump_path).await;
+                refresh_dump(&zone, &box_zone, &daemon_id, local, source, &dump_path).await;
             }
             received = socket.recv_from(&mut buf) => {
                 let (len, peer) = received?;
@@ -844,10 +881,15 @@ mod tests {
         buf
     }
 
-    /// Starts `serve` on an ephemeral loopback port with `zone` and a dump
-    /// under `state`; returns the address to query once the answerer has
-    /// answered a probe, which it does only after writing its first dump.
-    async fn spawn_answerer(zone: Arc<RwLock<PublishTable>>, state: &Path) -> SocketAddr {
+    /// Starts `serve` on an ephemeral loopback port with `zone`, the in-guest
+    /// `box_zone` it dumps beside it, and a dump under `state`; returns the
+    /// address to query once the answerer has answered a probe, which it does
+    /// only after writing its first dump.
+    async fn spawn_answerer(
+        zone: Arc<RwLock<PublishTable>>,
+        box_zone: Arc<BoxZone>,
+        state: &Path,
+    ) -> SocketAddr {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         socket.set_nonblocking(true).unwrap();
         let socket = UdpSocket::from_std(socket).unwrap();
@@ -859,6 +901,7 @@ mod tests {
         tokio::spawn(serve(
             listener,
             zone,
+            box_zone,
             "d0".to_string(),
             zone_dump_path(state),
         ));
@@ -898,7 +941,7 @@ mod tests {
 
         let state = tempfile::TempDir::new().unwrap();
         let zone = zone(&[("web", NetworkMode::HostNet)]);
-        let server = spawn_answerer(zone, state.path()).await;
+        let server = spawn_answerer(zone, Arc::new(BoxZone::default()), state.path()).await;
         let parsed = parse_reply(&ask(server, &query("web.min.internal", TYPE_A)).await);
         assert_eq!(parsed.id, 0x1234);
         assert_eq!(parsed.rcode(), 0);
@@ -914,7 +957,7 @@ mod tests {
     async fn min_internal_absent_from_certs_and_audit() {
         let state = tempfile::TempDir::new().unwrap();
         let zone = zone(&[("web", NetworkMode::HostNet)]);
-        let server = spawn_answerer(zone, state.path()).await;
+        let server = spawn_answerer(zone, Arc::new(BoxZone::default()), state.path()).await;
         let mut replies = Vec::new();
         for (name, qtype) in [
             ("web.min.internal", TYPE_A),
@@ -1121,12 +1164,28 @@ mod tests {
 
     /// The zone dump names every entry with its address and lease state, its
     /// published ports with collisions marked, its owner and the listener,
-    /// and follows the table: written on start, rewritten on change.
+    /// and follows the table: written on start, rewritten on change. Beside
+    /// the host's half it carries the in-guest one — the sibling entries a box
+    /// resolves, with their switch leases and declared ports (NET-072,
+    /// NET-073) — which the host's own answers never give out (NET-127).
     #[tokio::test]
     async fn zone_dump_follows_the_registry() {
         let state = tempfile::TempDir::new().unwrap();
         let zone = zone(&[("web", NetworkMode::HostNet)]);
-        let server = spawn_answerer(Arc::clone(&zone), state.path()).await;
+        let box_zone = Arc::new(BoxZone::default());
+        box_zone.register(
+            "api",
+            Ipv4Addr::new(100, 64, 0, 5),
+            Some(&sessions::IngressPolicy {
+                port_mappings: vec![sessions::PortMapping {
+                    external_port: 18080,
+                    internal_port: 8080,
+                    proto: sessions::IpProto::Tcp,
+                }],
+                dynamic_allowed_range: None,
+            }),
+        );
+        let server = spawn_answerer(Arc::clone(&zone), Arc::clone(&box_zone), state.path()).await;
         let path = zone_dump_path(state.path());
 
         let dump = read_dump(&path).await;
@@ -1140,6 +1199,15 @@ mod tests {
         assert_eq!(dump["names"][0]["owner"], "d0");
         assert_eq!(dump["names"][0]["kind"], "shared");
         assert_eq!(dump["names"][0]["running"], true);
+        assert_eq!(dump["in_guest"][0]["name"], "api.min.internal");
+        assert_eq!(dump["in_guest"][0]["address"], "100.64.0.5");
+        assert_eq!(dump["in_guest"][0]["tcp_ports"][0], 8080);
+        assert!(
+            dump["in_guest"][0]["udp_ports"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
 
         {
             let mut table = zone.write().unwrap();

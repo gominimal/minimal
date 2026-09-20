@@ -348,7 +348,11 @@ impl Network for OwnIpNetwork {
                     &[subnet.gateway(), subnet.host_alias(), subnet.daemon_ip()],
                 );
             }
-            let egress = Arc::new(egress);
+            // The switch's box zone, so a connection to a sibling is accounted
+            // for by name and against the target's own ingress (NET-072,
+            // NET-073). It changes no verdict: the box's rules above decide a
+            // sibling's address as they decide any other.
+            let egress = Arc::new(egress.with_box_zone(self.switch.lock().await.box_zone()));
             let guard = crate::net::gvproxy_network::complete_own_ip_attach(
                 crate::net::gvproxy_network::OwnIpAttach {
                     switch: &self.switch,

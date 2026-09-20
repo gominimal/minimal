@@ -20,7 +20,7 @@ use std::sync::Arc;
 use sandbox2::NetGuard;
 use tokio::sync::Mutex;
 
-use crate::net::policy::{ControlChannel, ExposedMapping};
+use crate::net::policy::{BoxZone, ControlChannel, ExposedMapping};
 use crate::net::switch::SwitchRelay;
 use crate::net::{SwitchClient, SwitchSubnet};
 
@@ -43,6 +43,11 @@ pub(crate) struct OwnIpGuard {
     /// The static ingress forwards exposed for this PTask (R2.3), removed on
     /// teardown. Empty when no ingress was configured.
     exposed: Vec<ExposedMapping>,
+    /// The switch's in-guest box zone, and this box's name in it: withdrawn on
+    /// teardown so a sibling's verdict and the zone dump name live boxes only
+    /// (NET-072, NET-073).
+    box_zone: Arc<BoxZone>,
+    session_name: String,
 }
 
 impl NetGuard for OwnIpGuard {
@@ -54,6 +59,9 @@ impl NetGuard for OwnIpGuard {
             if !self.exposed.is_empty() {
                 crate::net::policy::remove_ingress(&self.control, &self.exposed).await;
             }
+            // Withdrawn before the detach: from here the box answers nothing,
+            // so nothing must resolve its name to a lease it no longer holds.
+            self.box_zone.withdraw(&self.session_name);
             if let Err(e) = self.switch.lock().await.detach().await {
                 tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
             }
@@ -169,6 +177,15 @@ async fn finish_own_ip_attach(attach: FinishAttach<'_>) -> io::Result<OwnIpGuard
         tracing::warn!(error = %e, session = session_name, "registering *.min.internal name on gvproxy");
     }
 
+    // The daemon's own record of that registration, with the ports this box's
+    // ingress declares: what a sibling's egress leg reads to name the box behind
+    // an address and the verdict its rules give a port (NET-072, NET-073), and
+    // what the zone dump shows as the in-guest zone. Recorded whether or not the
+    // post above reached gvproxy, because the box is on the switch either way —
+    // a name that failed to register resolves nowhere, which the warning says.
+    let box_zone = switch.lock().await.box_zone();
+    box_zone.register(session_name, lease_ip, ingress);
+
     // And `host.min.internal` → the switch's host-gateway address, so this box
     // resolves the host it runs on (NET-003). Posted on every attach rather than
     // once per process: the switch stops with its last PTask and takes its zones
@@ -187,5 +204,7 @@ async fn finish_own_ip_attach(attach: FinishAttach<'_>) -> io::Result<OwnIpGuard
         switch: Arc::clone(switch),
         control,
         exposed,
+        box_zone,
+        session_name: session_name.to_string(),
     })
 }
