@@ -493,10 +493,10 @@ _kvm:
 
 # minvmd's VM harnesses (tests/*_integration.rs). CI: `test-kvm` / macOS `e2e`.
 [macos]
-test-vm: _nextest artifacts initramfs
+test-vm: _nextest artifacts initramfs gvproxy
     #!/usr/bin/env sh
     set -eu
-    export MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state"
+    export MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state" MINVMD_GVPROXY_BIN="{{gvproxy}}"
     # CI's archive pattern: build EVERYTHING, codesign minvmd LAST (a later
     # cargo call would relink it → entitlement lost), run from the archive.
     cargo nextest archive -p minvmd --locked --archive-file "{{scratch}}/nextest-archive.tar.zst"
@@ -519,8 +519,9 @@ test-vm: _nextest artifacts initramfs
 
 # minvmd's VM harnesses (tests/*_integration.rs). CI: ci-linux-kvm.yml `test-kvm`.
 [linux]
-test-vm: _nextest _kvm artifacts initramfs minvmd-build
+test-vm: _nextest _kvm artifacts initramfs minvmd-build gvproxy
     MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state" \
+      MINVMD_GVPROXY_BIN="{{gvproxy}}" \
       MINVMD_REQUIRE_LIBKRUN=static LIBKRUN_PREFIX="{{krun-static}}" \
       cargo nextest run -p minvmd --profile vm --target {{musl-target}} \
       --run-ignored all --no-tests=fail \
