@@ -69,6 +69,7 @@
 #     own_ip_egress_declared_and_enforced
 #     network_posture_from_stock_install
 #     escape_reaches_only_declared_union
+#     box_name_resolves_natively_without_proxy
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -100,6 +101,9 @@ OWNIP_SEED_DIR="" # seeded by the own-IP proof below; removed on teardown
 OUTBOUND_SEED_DIR="" # seeded by the outbound-reach case below; removed on teardown
 NATRES_SEED_DIR="" # seeded by the native resolution proof below; removed on teardown
 NATRES_REMOVE=""   # the `min net setup --remove` that undoes that proof's install
+BOXID_SEED_DIR=""  # seeded by the box-identity proof's first box; removed on teardown
+BOXID_SEED_DIR2="" # seeded by the box-identity proof's second box; removed on teardown
+BOXID_REMOVE=""    # the `min net setup --remove` that undoes that proof's install
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -220,11 +224,15 @@ teardown() {
   [ -n "$OWNIP_SEED_DIR" ] && rm -rf "$OWNIP_SEED_DIR"
   [ -n "$OUTBOUND_SEED_DIR" ] && rm -rf "$OUTBOUND_SEED_DIR"
   [ -n "$NATRES_SEED_DIR" ] && rm -rf "$NATRES_SEED_DIR"
+  [ -n "$BOXID_SEED_DIR" ] && rm -rf "$BOXID_SEED_DIR"
+  [ -n "$BOXID_SEED_DIR2" ] && rm -rf "$BOXID_SEED_DIR2"
   # Undo the privileged resolver setup the native resolution proof installed,
   # so the runner is left as it was found (the hook would otherwise outlive
   # the daemon it points at).
   # shellcheck disable=SC2086 # the remove command is a word list on purpose.
   [ -n "$NATRES_REMOVE" ] && { sudo -n $NATRES_REMOVE >/dev/null 2>&1 || true; }
+  # shellcheck disable=SC2086 # the remove command is a word list on purpose.
+  [ -n "$BOXID_REMOVE" ] && { sudo -n $BOXID_REMOVE >/dev/null 2>&1 || true; }
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
   # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
@@ -1145,6 +1153,218 @@ run_case_escape_reaches_only_declared_union() {
   echo "::endgroup::"
 }
 
+# NET-009, NET-010, NET-018, NET-019, NET-122: the whole "names resolve
+# natively, by identity" story, composed into one proof — each requirement
+# above already has its own unit-level verify command; this is what breaks
+# when the pieces do not compose. The one advisory command from a session
+# start; running it once; two own-address boxes on the SAME port resolving
+# natively to two DIFFERENT loopback addresses with no proxy, PAC file, or
+# proxy environment variable anywhere; `activate` and `ls` both reporting
+# native DNS as the live surface; and the hostname proxy still routing the
+# first box by name. The one TCP reachability check rides that proxy leg,
+# landing on the box's `--ingress`-published port: NET-121 (a forwarder
+# onto a box's OWN leased address, bound before its name is registered) is
+# not yet implemented on this branch, so nothing on the host serves that
+# leased address directly yet — an own-IP box's name resolves to a real,
+# distinct address today, but only its `--ingress`-published port answers a
+# connection. Gated exactly like the native resolution proof above (Linux,
+# passwordless sudo for the privileged setup step) plus the own-IP proof's
+# switch gate (own-IP boxes need a real switch, VM-backed or not).
+run_case_box_name_resolves_natively_without_proxy() {
+  echo "::group::box names resolve natively, by identity (min net setup, two own-address boxes, no proxy)"
+  if [ -n "$E2E_VM" ]; then
+    echo "native box-identity proof SKIPPED (VM-backed target: the host-side answerer is not part of this proof)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ "$(uname -s)" != Linux ] || ! sudo -n true 2>/dev/null; then
+    echo "native box-identity proof SKIPPED (needs Linux with passwordless sudo for the privileged setup step)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "native box-identity proof SKIPPED (no MINVMD_GVPROXY_BIN: own-IP boxes need a real switch)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  local port=3000 web_name=e2e-boxid-web api_name=e2e-boxid-api
+  local web_marker=BOXID_WEB_OK
+  local web_sid api_sid web_resolved api_resolved web_addr api_addr
+  local setup_cmd setup_argv web_socat_pid
+  local proxy_status=""
+
+  BOXID_SEED_DIR="$(mktemp -d /tmp/mnlbw.XXXXXX)"
+  BOXID_SEED_DIR="$(cd "$BOXID_SEED_DIR" && pwd -P)"
+  {
+    awk '
+      /^\[upstream\]/            { grab = 1; print; next }
+      grab && (/^$/ || /^\[/)    { exit }
+      grab                       { print }
+    ' "$ROOT/.minimal/minimal.toml"
+    printf '\n[stack]\nuse = "shell"\n'
+  } > "$BOXID_SEED_DIR/minimal.toml"
+  mkdir "$BOXID_SEED_DIR/.git"
+
+  # A second, SEPARATE seed dir: a path that already has a session does not
+  # mint a second one (same reasoning as the own-IP proof's own seed above).
+  BOXID_SEED_DIR2="$(mktemp -d /tmp/mnlba.XXXXXX)"
+  BOXID_SEED_DIR2="$(cd "$BOXID_SEED_DIR2" && pwd -P)"
+  {
+    awk '
+      /^\[upstream\]/            { grab = 1; print; next }
+      grab && (/^$/ || /^\[/)    { exit }
+      grab                       { print }
+    ' "$ROOT/.minimal/minimal.toml"
+    printf '\n[stack]\nuse = "shell"\n'
+  } > "$BOXID_SEED_DIR2/minimal.toml"
+  mkdir "$BOXID_SEED_DIR2/.git"
+
+  # The first box, started BEFORE the setup step: its activate stderr is
+  # where the NET-122 advisory (naming the exact command) is captured. It
+  # also declares `--ingress`: the box's own leased address answers no
+  # connection yet (NET-121's forwarder onto it is not implemented on this
+  # branch), and `register_own_ip` (dns.rs) always routes the hostname
+  # proxy's own-IP boxes to loopback, not to the lease — the published port
+  # is the one address anything outside the box can actually reach today.
+  web_sid="$(cd "$BOXID_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$web_name" --network own_ip --ingress "$port:$port" \
+    2>"$WORK/boxid-web-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --ingress $port:$port --name $web_name' failed"
+    cat "$WORK/boxid-web-activate.err" 2>/dev/null || true
+    fail
+  }
+  web_sid="$(printf '%s\n' "$web_sid" | tail -n1 | tr -d '\r')"
+  echo "own-address session: $web_sid ($web_name)"
+
+  setup_cmd="$(grep -E '^ *sudo .* net setup$' "$WORK/boxid-web-activate.err" | head -n1 | sed 's/^ *//')"
+  if [ -z "$setup_cmd" ]; then
+    echo "::error::activate printed no resolver advisory naming 'sudo ... net setup'"
+    echo "--- activate stderr ---"; cat "$WORK/boxid-web-activate.err" 2>/dev/null || true
+    fail
+  fi
+  echo "advisory command: $setup_cmd"
+  # Run it exactly as advised, minus the `sudo` the runner's own `sudo -n`
+  # supplies so a missing password can never turn into a prompt here.
+  setup_argv="${setup_cmd#sudo }"
+  BOXID_REMOVE="$setup_argv --remove"
+  # shellcheck disable=SC2086,SC2024 # a word list on purpose; the output file is ours, not root's.
+  if ! sudo -n $setup_argv >"$WORK/boxid-setup.out" 2>&1; then
+    echo "::error::'$setup_cmd' failed"
+    echo "--- output ---"; cat "$WORK/boxid-setup.out"
+    fail
+  fi
+  cat "$WORK/boxid-setup.out"
+
+  # The second box, started AFTER the setup step: NET-018's "activate
+  # reports the native surface" half lives on THIS box's stderr. It
+  # declares no `--ingress`: it exists only to prove NET-010's per-box
+  # address, so it needs no listener of its own.
+  api_sid="$(cd "$BOXID_SEED_DIR2" && mnl session activate . --no-prompt \
+    --name "$api_name" --network own_ip 2>"$WORK/boxid-api-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --name $api_name' failed"
+    cat "$WORK/boxid-api-activate.err" 2>/dev/null || true
+    fail
+  }
+  api_sid="$(printf '%s\n' "$api_sid" | tail -n1 | tr -d '\r')"
+  echo "own-address session: $api_sid ($api_name)"
+  if ! grep -q "resolves natively on this host; that is the live surface" "$WORK/boxid-api-activate.err"; then
+    echo "::error::NET-018: 'min session activate' did not report native DNS as the live surface"
+    cat "$WORK/boxid-api-activate.err"
+    fail
+  fi
+  if ! grep -q "hostname proxy keeps serving too" "$WORK/boxid-api-activate.err"; then
+    echo "::error::NET-019: 'min session activate' did not say the hostname proxy keeps serving"
+    cat "$WORK/boxid-api-activate.err"
+    fail
+  fi
+  echo "NET-018/NET-019 OK: activate reported native DNS as the live surface, proxy still serving"
+
+  # NET-009: the host resolver answers each box's name for an ordinary
+  # process — no proxy, no PAC, no proxy variable anywhere. The unset list
+  # matches the native resolution proof above.
+  web_resolved="$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
+    getent hosts "$web_name.min.internal" 2>&1)"
+  if ! printf '%s\n' "$web_resolved" | grep -Eq '^127\.'; then
+    echo "::error::'$web_name.min.internal' did not resolve natively to a loopback address: '$web_resolved'"
+    fail
+  fi
+  api_resolved="$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
+    getent hosts "$api_name.min.internal" 2>&1)"
+  if ! printf '%s\n' "$api_resolved" | grep -Eq '^127\.'; then
+    echo "::error::'$api_name.min.internal' did not resolve natively to a loopback address: '$api_resolved'"
+    fail
+  fi
+  web_addr="$(printf '%s\n' "$web_resolved" | awk '{print $1; exit}')"
+  api_addr="$(printf '%s\n' "$api_resolved" | awk '{print $1; exit}')"
+  echo "resolved natively: $web_name -> $web_addr, $api_name -> $api_addr"
+
+  # NET-010: two boxes on the SAME port answer at two DIFFERENT addresses —
+  # no translation, no collision.
+  if [ "$web_addr" = "$api_addr" ]; then
+    echo "::error::NET-010: two own-address boxes answered the same loopback address ($web_addr)"
+    fail
+  fi
+  echo "NET-010 OK: each box has its own loopback address ($web_addr != $api_addr)"
+
+  # A responder inside the web box (`mnl session exec`) — `socat` is in the
+  # launcher baseline, needing no `min add`. No `bind=`: like the own-IP
+  # ingress proof above, the switch forwards to the box's own tap address,
+  # not to a host loopback address, so the responder listens on all of the
+  # box's addresses rather than the leased one nothing outside it can reach.
+  mnl session exec "$web_sid" \
+    "printf 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n$web_marker\n' > /tmp/boxid-web.http" \
+    || { echo "::error::could not seed the web box's canned response"; fail; }
+  mnl session exec "$web_sid" socat -T30 "TCP-LISTEN:$port,reuseaddr,fork" \
+    'SYSTEM:cat /tmp/boxid-web.http' >"$WORK/boxid-web-socat.log" 2>&1 &
+  web_socat_pid=$!
+
+  # NET-018's other half: `min ls` reports the same native-surface notice.
+  mnl ls >/dev/null 2>"$WORK/boxid-ls.err" || {
+    echo "::error::'min ls' failed"
+    cat "$WORK/boxid-ls.err" 2>/dev/null || true
+    kill "$web_socat_pid" 2>/dev/null || true
+    fail
+  }
+  if ! grep -q "resolves natively on this host; that is the live surface" "$WORK/boxid-ls.err"; then
+    echo "::error::NET-018: 'min ls' did not report native DNS as the live surface"
+    cat "$WORK/boxid-ls.err"
+    kill "$web_socat_pid" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-018 OK: 'min ls' reported native DNS as the live surface too"
+
+  # NET-019: the hostname proxy keeps serving the same box anyway, for
+  # anything already pointed at it — native resolution is additive, not a
+  # replacement. `register_own_ip` (dns.rs) always routes an own-IP box's
+  # name to loopback, so this doubles as the case's one real reachability
+  # check: it lands on the web box's `--ingress`-published port.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    proxy_status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+      --proxy 127.0.0.1:7654 "http://$web_name.min.internal:$port/" 2>"$WORK/boxid-proxy-curl.err")"
+    [ "$proxy_status" = "200" ] && break
+    sleep 1
+  done
+  if [ "$proxy_status" != "200" ]; then
+    echo "::error::NET-019: the hostname proxy no longer routes $web_name.min.internal:$port (got '${proxy_status:-<no response>}')"
+    cat "$WORK/boxid-proxy-curl.err" 2>/dev/null || true
+    cat "$WORK/boxid-web-socat.log" 2>/dev/null || true
+    kill "$web_socat_pid" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-019 OK: the hostname proxy still routes $web_name.min.internal"
+
+  kill "$web_socat_pid" 2>/dev/null || true
+  wait "$web_socat_pid" 2>/dev/null || true
+  mnl session destroy --force "$web_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$api_sid" >/dev/null 2>&1 || true
+  rm -rf "$BOXID_SEED_DIR" "$BOXID_SEED_DIR2"; BOXID_SEED_DIR=""; BOXID_SEED_DIR2=""
+  echo "native box-identity proof OK (advised, set up, two own-address boxes resolve natively to distinct addresses, activate/ls agree, and the hostname proxy still reaches the published one)"
+  echo "::endgroup::"
+}
+
 E2E_CASE="${E2E_CASE:-${1:-}}"
 if [ -n "$E2E_CASE" ]; then
   case "$E2E_CASE" in
@@ -1156,8 +1376,10 @@ if [ -n "$E2E_CASE" ]; then
     own_ip_egress_declared_and_enforced) run_case_own_ip_egress_declared_and_enforced; exit $? ;;
     network_posture_from_stock_install) run_case_network_posture_from_stock_install; exit $? ;;
     escape_reaches_only_declared_union) run_case_escape_reaches_only_declared_union; exit $? ;;
+    box_name_resolves_natively_without_proxy)
+      run_case_box_name_resolves_natively_without_proxy; exit $? ;;
     *)
-      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union)" >&2
+      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy)" >&2
       exit 2
       ;;
   esac
