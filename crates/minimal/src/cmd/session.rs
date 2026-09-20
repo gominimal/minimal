@@ -45,6 +45,11 @@ pub(crate) async fn activate_session(
         crate::notice::legacy_spelling_hint(&mut std::io::stderr(), "--network", old, new);
     }
 
+    // NET-076: while the deny-all default for an absent `egress` section is
+    // announced but not yet in force, every activate says so — the change is
+    // coming, and this box still reaches everything until it lands.
+    announce_deny_all_default(&mut std::io::stderr(), sessions::DenyAllDefault::from_env());
+
     ensure_daemon(global)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
@@ -845,12 +850,62 @@ pub(crate) fn exit_code_of(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(1)
 }
 
+/// Announce the deny-all default for an absent `egress` section while it is
+/// announced but not yet in force (NET-076): the change is coming for a box with
+/// an address of its own that declares no destinations, and the opt-out flag
+/// keeps today's reach. Nothing is written once the window is in force — the
+/// default is then the box's actual posture, which `min session policy` names
+/// (NET-075) — or when the opt-out flag is already set, where nothing is coming.
+///
+/// Written through `out` rather than to stderr directly, so what activate prints
+/// is assertable without capturing the process's stderr.
+pub(crate) fn announce_deny_all_default(
+    out: &mut impl std::io::Write,
+    default: sessions::DenyAllDefault,
+) {
+    if default.window != sessions::DenyAllWindow::Announced || default.opted_out {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "note: a coming release makes deny-all the default for a box with an \
+         address of its own and no `egress` section — such a box will reach \
+         nothing until it declares the destinations it needs; set {}=1 to keep \
+         the current allow-all default",
+        sessions::DENY_ALL_OPT_OUT_VAR
+    );
+}
+
+/// The posture line `min session policy` writes beside the JSON when the box's
+/// effective egress reaches nothing (NET-075). Deny-all is the one posture the
+/// JSON states by omission — an `allow_subnets` list with no entry in it — so it
+/// is named in words, while stdout stays the machine-readable policy. `None` for
+/// a box that declares destinations, or declares no section at all.
+pub(crate) fn egress_posture_line(policy: &sessions::SessionPolicy) -> Option<String> {
+    policy
+        .egress
+        .as_ref()
+        .is_some_and(sessions::EgressPolicy::is_deny_all)
+        .then(|| {
+            "egress: deny-all — this box declares no destination, so it reaches nothing \
+             outside the resolver Minimal owns for it"
+                .to_string()
+        })
+}
+
 /// Print the effective networking policy for a session as JSON.
 pub async fn cmd_session_policy(
     global: &GlobalArgs,
     args: PolicyArgs,
 ) -> Result<(), anyhow::Error> {
-    println!("{}", session_policy_json(global, args).await?);
+    let policy = session_policy(global, args).await?;
+    println!(
+        "{}",
+        serde_json_lenient::to_string(&policy).context("Failed to serialize policy")?
+    );
+    if let Some(line) = egress_posture_line(&policy) {
+        eprintln!("{line}");
+    }
     Ok(())
 }
 
@@ -865,6 +920,15 @@ pub async fn session_policy_json(
     global: &GlobalArgs,
     args: PolicyArgs,
 ) -> Result<String, anyhow::Error> {
+    serde_json_lenient::to_string(&session_policy(global, args).await?)
+        .context("Failed to serialize policy")
+}
+
+/// The policy the daemon holds for the session `args` names.
+async fn session_policy(
+    global: &GlobalArgs,
+    args: PolicyArgs,
+) -> Result<sessions::SessionPolicy, anyhow::Error> {
     ensure_daemon(global)?;
 
     let mut client = connect_daemon(global).await?;
@@ -878,9 +942,7 @@ pub async fn session_policy_json(
         .context("GetSessionPolicy RPC failed")?;
 
     match resp {
-        minimald_rpc::Errorable::Ok(policy) => {
-            serde_json_lenient::to_string(&policy).context("Failed to serialize policy")
-        }
+        minimald_rpc::Errorable::Ok(policy) => Ok(policy),
         minimald_rpc::Errorable::Err { error } => {
             bail!("{error}")
         }

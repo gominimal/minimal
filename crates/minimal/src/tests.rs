@@ -1124,6 +1124,90 @@ fn legacy_network_spellings_parse_with_hint() {
     }
 }
 
+/// NET-075: a box with an address of its own and no `egress` section is shown as
+/// `deny-all` by `min session policy` once the default is in force. The policy
+/// the daemon hands back is the one its deny-all default produced — the same
+/// `sessions` function decides it on both sides — and what the command prints of
+/// it says deny-all in both registers: an `allow_subnets` list with no entry in
+/// the JSON on stdout, and the posture named in words beside it.
+#[test]
+fn policy_shows_deny_all_default() {
+    let effective = sessions::DenyAllDefault {
+        window: sessions::DenyAllWindow::InForce,
+        opted_out: false,
+    }
+    .effective_egress(sessions::NetworkMode::OwnIp, None);
+    let policy = sessions::SessionPolicy::new(effective.policy, None);
+
+    let json = serde_json_lenient::to_string(&policy).expect("the policy serializes");
+    assert!(
+        json.contains("\"allow_subnets\":[]"),
+        "the box must declare no destination: {json}"
+    );
+
+    let line = egress_posture_line(&policy).expect("a deny-all box is named as one");
+    assert!(line.contains("deny-all"), "{line}");
+
+    // A box that declares destinations is not deny-all, and neither is one with
+    // no section at all — the shipped allow-all.
+    let declared = sessions::SessionPolicy::new(
+        Some(sessions::EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..sessions::EgressPolicy::default()
+        }),
+        None,
+    );
+    assert_eq!(egress_posture_line(&declared), None);
+    assert_eq!(
+        egress_posture_line(&sessions::SessionPolicy::default()),
+        None
+    );
+}
+
+/// NET-076: while the deny-all default is announced but not yet in force,
+/// activate prints the coming change — naming the opt-out that keeps today's
+/// allow-all. Once the default is in force there is nothing coming to announce,
+/// and neither is there once the opt-out flag is set.
+#[test]
+fn deny_all_announcement_printed() {
+    let printed = |default| {
+        let mut out = Vec::new();
+        announce_deny_all_default(&mut out, default);
+        String::from_utf8(out).expect("the notice is UTF-8")
+    };
+
+    // What this release ships: announced, not in force, no opt-out.
+    let text = printed(sessions::DenyAllDefault::default());
+    assert!(text.contains("deny-all"), "must name the change: {text}");
+    assert!(
+        text.contains(sessions::DENY_ALL_OPT_OUT_VAR),
+        "must name the opt-out: {text}"
+    );
+
+    for (default, why) in [
+        (
+            sessions::DenyAllDefault {
+                window: sessions::DenyAllWindow::InForce,
+                opted_out: false,
+            },
+            "the default is already in force",
+        ),
+        (
+            sessions::DenyAllDefault {
+                window: sessions::DenyAllWindow::Announced,
+                opted_out: true,
+            },
+            "the opt-out flag is set",
+        ),
+    ] {
+        assert_eq!(
+            printed(default),
+            "",
+            "nothing is coming when {why}, so nothing is announced"
+        );
+    }
+}
+
 /// NET-036: `--network` and `--ingress` are documented in the CLI
 /// reference, not just discoverable via `--help`.
 #[test]
