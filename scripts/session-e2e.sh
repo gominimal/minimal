@@ -73,6 +73,7 @@
 #     fresh_linux_kvm_activate_local_minvmd
 #     fresh_arm64_kvm_activate_local_minvmd
 #     hostnames_recover_and_two_daemons_route
+#     proxy_refuses_like_direct
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -111,6 +112,7 @@ HR_VM_SEED_DIR=""  # seeded by the two-daemons proof's VM session below; removed
 HR_OCCUPIER_PID=""       # the two-daemons proof's port-occupier; killed on teardown
 HR_NATIVE_SOCAT_PID=""   # the two-daemons proof's native responder; killed on teardown
 HR_VM_SOCAT_PID=""       # the two-daemons proof's VM responder; killed on teardown
+PRD_SEED_DIR=""    # seeded by the proxy-honours-the-same-rules proof below; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -234,6 +236,7 @@ teardown() {
   [ -n "$BOXID_SEED_DIR" ] && rm -rf "$BOXID_SEED_DIR"
   [ -n "$BOXID_SEED_DIR2" ] && rm -rf "$BOXID_SEED_DIR2"
   [ -n "$HR_VM_SEED_DIR" ] && rm -rf "$HR_VM_SEED_DIR"
+  [ -n "$PRD_SEED_DIR" ] && rm -rf "$PRD_SEED_DIR"
   # The two-daemons proof's port-occupier and responders: backgrounded, and
   # only reaped on that proof's own happy path, so a `fail` partway through
   # (occupier still up to 300s, socat responders up to their -T30 idle
@@ -1731,6 +1734,156 @@ time.sleep(300)
   echo "::endgroup::"
 }
 
+# NET-069, NET-071: a request through the hostname proxy is decided by the
+# SAME admission rule a direct connection to the target box would trip — a
+# port the box did not declare is refused on both surfaces, and the one it
+# did declare routes on both, so the proxy is never a second, looser way in.
+# Needs a real switch (own-IP addressing), same gate as the own-IP proofs
+# above.
+#
+# NET-070 (a caller whose own egress rules deny the target) is not
+# reproduced live in this case: being decided as a registered box's OWN
+# caller through the proxy needs a peer with a custom egress declaration,
+# and session-e2e has no shipped surface to give one a rule set narrower
+# than the deny-all default (the same gap
+# run_case_escape_reaches_only_declared_union notes for NET-085) — a
+# ::warning:: below points at the unit test that already proves that half.
+run_case_proxy_refuses_like_direct() {
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "hostname-proxy parity proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+    return 0
+  fi
+  echo "::group::the hostname proxy honours the same rules as a direct connection (NET-069, NET-071)"
+
+  PRD_SEED_DIR="$(mktemp -d /tmp/mnlpd.XXXXXX)"
+  PRD_SEED_DIR="$(cd "$PRD_SEED_DIR" && pwd -P)"
+  {
+    awk '
+      /^\[upstream\]/            { grab = 1; print; next }
+      grab && (/^$/ || /^\[/)    { exit }
+      grab                       { print }
+    ' "$ROOT/.minimal/minimal.toml"
+    printf '\n[stack]\nuse = "shell"\n'
+  } > "$PRD_SEED_DIR/minimal.toml"
+  mkdir "$PRD_SEED_DIR/.git"
+
+  local prd_name=e2e-proxy-parity declared_port=18160 undeclared_port=18161
+  for p in "$declared_port" "$undeclared_port"; do
+    if curl -sS -o /dev/null --max-time 2 "http://127.0.0.1:$p/" 2>/dev/null; then
+      echo "::error::something already answers on 127.0.0.1:$p; this case needs it free"
+      fail
+    fi
+  done
+
+  local prd_out prd_sid
+  prd_out="$(cd "$PRD_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$prd_name" --network own_ip --ingress "$declared_port:$declared_port" \
+    2>"$WORK/prd-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --ingress' failed"
+    cat "$WORK/prd-activate.err" 2>/dev/null || true
+    fail
+  }
+  prd_sid="$(printf '%s\n' "$prd_out" | tail -n1 | tr -d '\r')"
+  echo "proxy-parity session: $prd_sid"
+
+  # A live responder on the ONE port this box declares. Nothing ever listens
+  # on undeclared_port, inside the box or on the host: reaching it would
+  # prove only that nothing answered, not that the request was refused, so
+  # the proxy must refuse it before ever attempting to connect (proxy.rs
+  # decides the verdict before the upstream connect).
+  mnl session exec "$prd_sid" \
+    'printf "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" > /tmp/prd-resp.http' \
+    || { echo "::error::could not seed the proxy-parity responder's canned response"; fail; }
+  mnl session exec "$prd_sid" socat -T30 "TCP-LISTEN:$declared_port,reuseaddr,fork" \
+    'SYSTEM:cat /tmp/prd-resp.http' >"$WORK/prd-socat.log" 2>&1 &
+  local prd_socat_pid=$!
+
+  # Greps the daemon's own file log, SKIPPED on a VM lane (guest tmpfs, same
+  # rationale as the min.internal proof above).
+  assert_log_has() {
+    if [ -z "$E2E_VM" ] && find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+        -exec grep -q -- "$1" {} + 2>/dev/null; then
+      echo "daemon log: found '$1' ($2)"
+      return 0
+    fi
+    if [ -n "$E2E_VM" ]; then
+      echo "daemon log check SKIPPED for $2 (E2E_VM: minimald's log is in guest tmpfs, unreachable from here)"
+      return 0
+    fi
+    echo "::error::daemon log has no record matching '$1' ($2)"
+    fail
+  }
+
+  # The direct-connection side of each pair: the host loopback address a
+  # direct connection would dial — the declared port's forwarder (NET T19:
+  # bound before the box's name is registered), or nothing at all for the
+  # undeclared one. Retried like proxy_status below: the responder was just
+  # forked and the forward can be live before it binds.
+  direct_status() {
+    local port="$1" want="${2:-}" status=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+        "http://127.0.0.1:$port/" 2>"$WORK/prd-direct.err")"
+      if [ -n "$status" ] && [ "$status" != "000" ] && { [ -z "$want" ] || [ "$status" = "$want" ]; }; then
+        break
+      fi
+      sleep 1
+    done
+    echo "GET http://127.0.0.1:$port/ direct -> ${status:-<no response>}" >&2
+    printf '%s' "$status"
+  }
+
+  # One request through the 7654 proxy, same shape as the min.internal proof.
+  proxy_status() {
+    local authority="$1" want="${2:-}" status=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+        --proxy 127.0.0.1:7654 "http://$authority/" 2>"$WORK/prd-proxy.err")"
+      if [ -n "$status" ] && [ "$status" != "000" ] && { [ -z "$want" ] || [ "$status" = "$want" ]; }; then
+        break
+      fi
+      sleep 1
+    done
+    echo "GET http://$authority/ via proxy 127.0.0.1:7654 -> ${status:-<no response>}" >&2
+    printf '%s' "$status"
+  }
+
+  # -- The declared port: both surfaces reach the same box, the same way ----
+  local direct_declared proxy_declared
+  direct_declared="$(direct_status "$declared_port" 200)"
+  proxy_declared="$(proxy_status "$prd_name.min.internal:$declared_port" 200)"
+  echo "declared port $declared_port: direct -> ${direct_declared:-<none>}, proxied -> ${proxy_declared:-<none>}"
+  if [ "$direct_declared" != "200" ] || [ "$proxy_declared" != "200" ]; then
+    echo "::error::NET-071: the declared port must route on both surfaces alike (direct=$direct_declared, proxied=$proxy_declared)"
+    fail
+  fi
+  echo "NET-071 OK: the declared port routes the same way, direct and proxied"
+
+  # -- The undeclared port: both surfaces refuse it, side by side -----------
+  local direct_undeclared proxy_undeclared
+  direct_undeclared="$(direct_status "$undeclared_port")"
+  proxy_undeclared="$(proxy_status "$prd_name.min.internal:$undeclared_port")"
+  echo "undeclared port $undeclared_port: direct -> ${direct_undeclared:-refused}, proxied -> ${proxy_undeclared:-<none>}"
+  if [ "$direct_undeclared" = "200" ]; then
+    echo "::error::the undeclared port answered a direct connection; nothing should be listening there"
+    fail
+  fi
+  if [ "$proxy_undeclared" != "403" ]; then
+    echo "::error::NET-069: an undeclared port through the proxy got '$proxy_undeclared', want 403 (direct got '$direct_undeclared')"
+    fail
+  fi
+  echo "NET-069 OK: the undeclared port is refused on both surfaces, exactly as a direct connection is (direct: ${direct_undeclared:-refused}, proxied: 403 Forbidden)"
+  assert_log_has "target-box-did-not-declare-the-port" "NET-069 refusal reason"
+
+  echo "::warning::NET-070 (a caller whose own egress rules deny the target) is not reproduced live in this case: being decided as a registered box's own caller through the proxy needs a peer with a custom egress declaration, and session-e2e has no shipped surface to give one a rule set narrower than the deny-all default (the same gap run_case_escape_reaches_only_declared_union notes for NET-085 above) — cargo nextest run -p minimald proxy_caller_egress_denied proves that half directly, at Tier T2, and proxy_parity_across_network_modes proves the two network modes agree given the same rules."
+
+  kill "$prd_socat_pid" 2>/dev/null || true
+  wait "$prd_socat_pid" 2>/dev/null || true
+  mnl session destroy --force "$prd_sid" >/dev/null 2>&1 || true
+  rm -rf "$PRD_SEED_DIR"; PRD_SEED_DIR=""
+  echo "::endgroup::"
+}
+
 E2E_CASE="${E2E_CASE:-${1:-}}"
 if [ -n "$E2E_CASE" ]; then
   case "$E2E_CASE" in
@@ -1749,8 +1902,9 @@ if [ -n "$E2E_CASE" ]; then
     fresh_arm64_kvm_activate_local_minvmd)
       run_case_fresh_arm64_kvm_activate_local_minvmd; exit $? ;;
     hostnames_recover_and_two_daemons_route) run_case_hostnames_recover_and_two_daemons_route; exit $? ;;
+    proxy_refuses_like_direct) run_case_proxy_refuses_like_direct; exit $? ;;
     *)
-      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy, fresh_linux_kvm_activate_local_minvmd, fresh_arm64_kvm_activate_local_minvmd, hostnames_recover_and_two_daemons_route)" >&2
+      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy, fresh_linux_kvm_activate_local_minvmd, fresh_arm64_kvm_activate_local_minvmd, hostnames_recover_and_two_daemons_route, proxy_refuses_like_direct)" >&2
       exit 2
       ;;
   esac
