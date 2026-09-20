@@ -1953,6 +1953,9 @@ pub(crate) struct SandboxLauncher {
     /// `OwnIp` PTask attaches, removed on exit. `None` for other
     /// network modes.
     pub(crate) ingress: Option<sessions::IngressPolicy>,
+    /// The box's declared egress rules, enforced on its relay once it
+    /// attaches (NET-062 to NET-064). `None` for no `egress` section.
+    pub(crate) egress: Option<sessions::EgressPolicy>,
     /// Composition to merge into the launcher's baseline packages and
     /// vars. Patches and lifecycle hooks are ignored today.
     pub(crate) composition: Option<std::sync::Arc<sessions::core::compose::Composition>>,
@@ -2045,6 +2048,7 @@ impl SessionLauncher for SandboxLauncher {
         // Move the ingress policy out of `self` up front so it can be applied
         // after the switch attach below (the rest of `self` is consumed first).
         let ingress = self.ingress;
+        let egress = self.egress;
         let network_mode = self.network_mode;
         let net_switch = self.net_switch;
         // The session name, registered as this PTask's `*.min.internal` hostname on
@@ -2075,6 +2079,7 @@ impl SessionLauncher for SandboxLauncher {
             &net_switch,
             &session_name,
             ingress.clone(),
+            egress,
         ))
         .await
         .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;

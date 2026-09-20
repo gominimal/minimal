@@ -26,6 +26,7 @@ pub(crate) fn network_for(
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
     ingress: Option<sessions::IngressPolicy>,
+    egress: Option<sessions::EgressPolicy>,
 ) -> Arc<dyn Network> {
     match mode {
         NetworkMode::HostNet => Arc::new(HostNetNetwork {
@@ -35,6 +36,7 @@ pub(crate) fn network_for(
             switch: Arc::clone(switch),
             identity: identity.to_string(),
             ingress,
+            egress,
             reserved: std::sync::Mutex::new(None),
         }),
         _ => Arc::new(sandbox2::NoNet),
@@ -207,6 +209,10 @@ struct OwnIpNetwork {
     identity: String,
     /// Static ingress port mappings to apply once attached.
     ingress: Option<sessions::IngressPolicy>,
+    /// The box's declared egress rules, enforced on its relay from the moment
+    /// it attaches (NET-062 to NET-064); `None` (no `egress` section) allows
+    /// every destination, while the source check (NET-084) always applies.
+    egress: Option<sessions::EgressPolicy>,
     /// Taken by `plan`, taken back out by `attach` or `abandon`. A `std` mutex,
     /// never held across an await, so a cancelled launch cannot leak it.
     reserved: std::sync::Mutex<Option<Reserved>>,
@@ -288,14 +294,31 @@ impl Network for OwnIpNetwork {
                 }
             };
 
+            // The frame verdict's inputs, owned and parsed once here: the
+            // lease it must send from, its declared rules, and the resolver
+            // carve-out at the switch's DNS address (design §4.1).
+            let egress = Arc::new(crate::net::switch::EgressGate::for_box(
+                self.identity.clone(),
+                sessions::core::net_verdict::EgressRules::for_box(
+                    reserved.lease.ip,
+                    self.egress.as_ref(),
+                    Some(sessions::core::net_verdict::Endpoint {
+                        ip: reserved.subnet.dns_server(),
+                        port: 53,
+                    }),
+                ),
+            ));
             let guard = crate::net::gvproxy_network::complete_own_ip_attach(
-                &self.switch,
-                tap_fd,
-                reserved.control,
-                reserved.lease.ip,
-                reserved.subnet,
-                &self.identity,
-                self.ingress.as_ref(),
+                crate::net::gvproxy_network::OwnIpAttach {
+                    switch: &self.switch,
+                    tap_fd,
+                    control: reserved.control,
+                    lease_ip: reserved.lease.ip,
+                    subnet: reserved.subnet,
+                    session_name: &self.identity,
+                    ingress: self.ingress.as_ref(),
+                    egress,
+                },
             )
             .await
             .map_err(NetworkError::new)?;
@@ -345,7 +368,7 @@ mod tests {
     async fn every_mode_gets_its_provider() {
         let switch = counting_switch();
 
-        let host = network_for(NetworkMode::HostNet, &switch, "s", None)
+        let host = network_for(NetworkMode::HostNet, &switch, "s", None, None)
             .plan()
             .await
             .unwrap();
@@ -358,14 +381,14 @@ mod tests {
             &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()])
         );
 
-        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None)
+        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None, None)
             .plan()
             .await
             .unwrap();
         assert!(no_net.isolates_netns() && no_net.tap().is_none());
         assert_eq!(no_net.resolver(), &Resolver::None);
 
-        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None);
+        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None, None);
         assert!(own_ip.plan().await.unwrap().isolates_netns());
         assert_eq!(switch.lock().await.attached(), 1, "own-IP takes a lease");
         own_ip.abandon().await;
@@ -390,7 +413,7 @@ mod tests {
             dynamic_allowed_range: None,
         });
 
-        let plan = network_for(NetworkMode::NoNet, &switch, "some-session", ingress)
+        let plan = network_for(NetworkMode::NoNet, &switch, "some-session", ingress, None)
             .plan()
             .await
             .unwrap();
@@ -422,7 +445,7 @@ mod tests {
         // A node's switch inside a VM: taps reach the host gvproxy over the
         // vsock shuttle.
         let vm_backed = counting_switch();
-        let plan = network_for(NetworkMode::HostNet, &vm_backed, "s", None)
+        let plan = network_for(NetworkMode::HostNet, &vm_backed, "s", None, None)
             .plan()
             .await
             .unwrap();
@@ -455,7 +478,7 @@ mod tests {
             native.lock().await.transport(),
             crate::net::SwitchTransport::LocalSpawn
         );
-        let plan = network_for(NetworkMode::HostNet, &native, "s", None)
+        let plan = network_for(NetworkMode::HostNet, &native, "s", None, None)
             .plan()
             .await
             .unwrap();
@@ -526,7 +549,7 @@ mod tests {
         let switch = counting_switch();
         let before = switch.lock().await.attached();
 
-        let net = network_for(NetworkMode::OwnIp, &switch, "s", None);
+        let net = network_for(NetworkMode::OwnIp, &switch, "s", None, None);
         net.plan().await.expect("planning leases an address");
         assert_eq!(switch.lock().await.attached(), before + 1);
 
@@ -557,7 +580,7 @@ mod tests {
     async fn concurrent_own_ip_launches_do_not_serialize() {
         let switch = counting_switch();
         let launches: Vec<_> = (0..4)
-            .map(|i| network_for(NetworkMode::OwnIp, &switch, &format!("p{i}"), None))
+            .map(|i| network_for(NetworkMode::OwnIp, &switch, &format!("p{i}"), None, None))
             .collect();
         for net in &launches {
             net.plan().await.expect("planning leases an address");

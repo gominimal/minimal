@@ -63,7 +63,8 @@ impl NetGuard for OwnIpGuard {
 }
 
 /// Completes an own-IP attach on any deployment model: relay `tap_fd` to the
-/// running gvproxy over `control`, then apply any static ingress.
+/// running gvproxy over `control` under the box's `egress` gate, then apply
+/// any static ingress.
 ///
 /// [`ControlChannel::Unix`] reaches the gvproxy the daemon spawned (DM2),
 /// [`ControlChannel::Vsock`] the one `minvmd` owns on the host (DM1/3/4).
@@ -73,16 +74,19 @@ impl NetGuard for OwnIpGuard {
 /// here just propagates: the release of that lease stays with the launch
 /// (`sandbox2::PlannedLaunch`), and detaching as well would double-decrement
 /// gvproxy's attach count.
-pub(crate) async fn complete_own_ip_attach(
-    switch: &Arc<Mutex<SwitchClient>>,
-    tap_fd: OwnedFd,
-    control: ControlChannel,
-    lease_ip: Ipv4Addr,
-    subnet: SwitchSubnet,
-    session_name: &str,
-    ingress: Option<&sessions::IngressPolicy>,
-) -> io::Result<OwnIpGuard> {
-    let gate = crate::net::switch::IngressGate::for_session(lease_ip.to_string(), ingress, subnet);
+pub(crate) async fn complete_own_ip_attach(attach: OwnIpAttach<'_>) -> io::Result<OwnIpGuard> {
+    let OwnIpAttach {
+        switch,
+        tap_fd,
+        control,
+        lease_ip,
+        subnet,
+        session_name,
+        ingress,
+        egress,
+    } = attach;
+    let gate = crate::net::switch::IngressGate::for_session(lease_ip.to_string(), ingress, subnet)
+        .with_egress(egress);
     let relay = match &control {
         ControlChannel::Unix(sock) => {
             crate::net::switch::attach_to_switch(tap_fd, sock, Some(gate)).await?
@@ -101,6 +105,20 @@ pub(crate) async fn complete_own_ip_attach(
         ingress,
     })
     .await
+}
+
+/// What [`complete_own_ip_attach`] needs, as one argument: the tap to relay,
+/// the control channel to relay it over, and the addressing and policy (both
+/// directions) of the PTask it belongs to.
+pub(crate) struct OwnIpAttach<'a> {
+    pub(crate) switch: &'a Arc<Mutex<SwitchClient>>,
+    pub(crate) tap_fd: OwnedFd,
+    pub(crate) control: ControlChannel,
+    pub(crate) lease_ip: Ipv4Addr,
+    pub(crate) subnet: SwitchSubnet,
+    pub(crate) session_name: &'a str,
+    pub(crate) ingress: Option<&'a sessions::IngressPolicy>,
+    pub(crate) egress: Arc<crate::net::switch::EgressGate>,
 }
 
 /// What [`finish_own_ip_attach`] needs, as one argument: the just-started relay

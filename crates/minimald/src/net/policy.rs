@@ -13,12 +13,14 @@
 //!   forwards.
 //!
 //! The same spike established that gvproxy v0.8.9 has **no per-client egress
-//! ACL API**, so egress *enforcement* (R2.2) is deliberately not implemented
-//! here — it is split to #553 (relay-layer frame inspection). What R2.7 needs
-//! from this Unit is the warning plumbing ([`PolicyWarnLimiter`]); the call
-//! site that fires it on a real dropped frame lands with that enforcement.
+//! ACL API**, so egress *enforcement* (R2.2) lives in the relay — the
+//! [`switch`](super::switch) module's `EgressGate`, deciding each frame with
+//! `sessions`' pure verdict — not here. What R2.7 needs from this module is
+//! the warning plumbing ([`PolicyWarnLimiter`] and [`KeyedWarnLimiter`]).
 
+use std::collections::HashMap;
 use std::fmt;
+use std::hash::Hash;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
@@ -570,9 +572,61 @@ impl PolicyWarnLimiter {
     }
 }
 
+/// The per-key twin of [`PolicyWarnLimiter`]: R2.2's window is "first drop
+/// per PTask per rule per minute", so the egress gate keys its limiter by the
+/// rule a frame tripped, and a flood dropped by one rule cannot silence the
+/// first drop by another. Keys are a small closed set (the rule names), so
+/// the table never needs sweeping.
+#[derive(Debug)]
+pub struct KeyedWarnLimiter<K> {
+    last: Mutex<HashMap<K, Instant>>,
+}
+
+impl<K: Eq + Hash> Default for KeyedWarnLimiter<K> {
+    fn default() -> Self {
+        Self {
+            last: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K: Eq + Hash> KeyedWarnLimiter<K> {
+    /// A fresh limiter that has never emitted for any key.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether enough time has elapsed since the last emission for `key` to
+    /// warn again at `now`, recording `now` as that key's last emission when
+    /// it returns `true`.
+    #[must_use]
+    pub fn should_warn_at(&self, key: K, now: Instant) -> bool {
+        let mut last = self.last.lock().expect("KeyedWarnLimiter mutex poisoned");
+        match last.get(&key) {
+            Some(prev) if now.duration_since(*prev) < WARN_MIN_INTERVAL => false,
+            _ => {
+                last.insert(key, now);
+                true
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyed_limiter_windows_each_key_on_its_own() {
+        let limiter = KeyedWarnLimiter::new();
+        let t0 = Instant::now();
+        assert!(limiter.should_warn_at("allow_subnets", t0));
+        assert!(!limiter.should_warn_at("allow_subnets", t0 + Duration::from_secs(1)));
+        // Another rule inside the first's window still gets its first warning.
+        assert!(limiter.should_warn_at("source-not-lease", t0 + Duration::from_secs(1)));
+        assert!(limiter.should_warn_at("allow_subnets", t0 + WARN_MIN_INTERVAL));
+    }
 
     #[test]
     fn dns_add_body_matches_gvproxy_zone_shape() {

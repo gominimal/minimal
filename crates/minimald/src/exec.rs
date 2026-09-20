@@ -146,14 +146,21 @@ impl Exec for TaskExec {
 /// The mode, not the identity: an own-IP task is a second PTask beside the
 /// session's, on the same switch at the same time, so it registers under its
 /// own name and carries none of the session's ingress — forwards a task
-/// applied would come down again at its teardown.
+/// applied would come down again at its teardown — but all of its egress:
+/// a task is not a way around the box's rules.
 pub(crate) fn task_network(
     record: &sessions::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
 ) -> std::sync::Arc<dyn sandbox2::Network> {
     let id = record.id.to_string();
     let session = record.name.as_deref().unwrap_or(&id);
-    crate::net::provider::network_for(record.network, switch, &format!("{session}-task"), None)
+    crate::net::provider::network_for(
+        record.network,
+        switch,
+        &format!("{session}-task"),
+        None,
+        record.policy.egress.clone(),
+    )
 }
 
 /// The slice of `hakoniwa::Child` the attach-failure arm needs, so the arm can
