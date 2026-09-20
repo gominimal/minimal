@@ -66,6 +66,7 @@
 #     fresh_install_own_ip_ingress_publishes_loopback
 #     session_outbound_request
 #     native_resolution_without_proxy_env
+#     own_ip_egress_declared_and_enforced
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -798,6 +799,167 @@ run_case_native_resolution_without_proxy_env() {
   echo "::endgroup::"
 }
 
+# NET T18: an own-address box's egress is declared and enforced, end to end.
+# Gated on MINVMD_GVPROXY_BIN like the own-IP proof above — own-IP needs a
+# real switch, VM-backed or not.
+#
+# The `min` CLI has no flag yet for a bespoke allow list (NET-060 is proven at
+# the `sessions` crate's own unit level, `spec_accepts_egress_fields`), so
+# this proves the one declaration reachable end to end today: the deny-all
+# default for a box with no `egress` section at all (NET-074/075/076). That
+# default declares an empty `allow_subnets` list — `min session policy` names
+# it — which reaches nothing outside the resolver carve-out
+# (crates/sessions/src/core/net_verdict.rs), while a box activated before the
+# window is in force still reaches everywhere, and the CLI says the change is
+# coming before it lands.
+run_case_own_ip_egress_declared_and_enforced() {
+  echo "::group::own-IP egress: declared and enforced (NET T18)"
+
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "own-IP egress proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # Same shape as the own-IP proof's own seed above: a separate dir with the
+  # repo's [upstream] plus the shell stack (curl, needed below).
+  OWNIP_SEED_DIR="$(mktemp -d /tmp/mnleg.XXXXXX)"
+  OWNIP_SEED_DIR="$(cd "$OWNIP_SEED_DIR" && pwd -P)"
+  {
+    awk '
+      /^\[upstream\]/            { grab = 1; print; next }
+      grab && (/^$/ || /^\[/)    { exit }
+      grab                       { print }
+    ' "$ROOT/.minimal/minimal.toml"
+    printf '\n[stack]\nuse = "shell"\n'
+  } > "$OWNIP_SEED_DIR/minimal.toml"
+  mkdir "$OWNIP_SEED_DIR/.git"
+
+  # Greps whichever host log this lane actually writes the drop to: native
+  # minimald enforces in its own process (crates/minimald/src/net/switch.rs,
+  # "network policy violation"), while a VM-backed host decides on minvmd
+  # instead (crates/minvmd/src/net/filter.rs, "frame leaving the VM dropped by
+  # the host-side filter") because minimald runs inside the guest there.
+  # Checking both patterns against both log globs needs no E2E_VM branch.
+  assert_egress_drop_logged() {
+    if find "$XDG_STATE_HOME/minimal/logs" -type f \
+        \( -name 'minimald.log.*' -o -name 'minvmd.log.*' \) \
+        -exec grep -q -e "network policy violation" \
+                      -e "frame leaving the VM dropped by the host-side filter" {} + \
+        2>/dev/null; then
+      echo "daemon log: found the egress-drop warning"
+      return 0
+    fi
+    echo "::error::no daemon log recorded the disallowed connection's drop"
+    fail
+  }
+
+  # -- Announced, not yet in force: activate says the change is coming ------
+  # The note (crates/minimal/src/cmd/session.rs) is printed client-side
+  # before the daemon is even contacted, so this is the CLI's own decision —
+  # nothing has spawned a daemon yet, and this case spawns its own.
+  unset MINIMAL_EGRESS_DENY_ALL_WINDOW MINIMAL_EGRESS_DENY_ALL_OPT_OUT
+  pre_sid="$(cd "$OWNIP_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-egress-pre --network own-ip 2>"$WORK/egress-pre.err")" || {
+    echo "::error::'min session activate --network own-ip' (window announced) failed"
+    cat "$WORK/egress-pre.err" 2>/dev/null || true
+    fail
+  }
+  pre_sid="$(printf '%s\n' "$pre_sid" | tail -n1 | tr -d '\r')"
+  if ! grep -q "deny-all the default" "$WORK/egress-pre.err"; then
+    echo "::error::activate did not announce the coming deny-all default"
+    cat "$WORK/egress-pre.err"
+    fail
+  fi
+  echo "NET-076 OK: activate announced the coming deny-all default before it was in force"
+
+  # -- An allowed connection completes: no default in force, nothing denied -
+  pre_status=""
+  for _ in 1 2 3; do
+    pre_status="$(mnl session exec "$pre_sid" curl -sS -o /dev/null -w '%{http_code}' \
+      --max-time 30 https://example.com 2>"$WORK/egress-pre-curl.err")"
+    [ "$pre_status" = "200" ] && break
+    sleep 1
+  done
+  if [ "$pre_status" != "200" ]; then
+    echo "::error::an allowed connection did not complete before the deny-all default was in force (got '$pre_status')"
+    cat "$WORK/egress-pre-curl.err" 2>/dev/null || true
+    fail
+  fi
+  echo "allowed-connection OK: a box that declares nothing reaches out before the default lands"
+  mnl session destroy --force "$pre_sid" >/dev/null 2>&1 || true
+
+  # -- Force the window: an already-running daemon keeps the environment it
+  # was launched with, so trying the forced window against it would just
+  # re-read the same "announced" state. Stop it and let the next activate
+  # respawn one that inherits MINIMAL_EGRESS_DENY_ALL_WINDOW=in-force.
+  mnl stop --force >/dev/null 2>"$WORK/egress-stop.err" || {
+    echo "::error::'min stop' before the forced-window activate failed"
+    cat "$WORK/egress-stop.err" 2>/dev/null || true
+    fail
+  }
+  export MINIMAL_EGRESS_DENY_ALL_WINDOW=in-force
+
+  sid="$(cd "$OWNIP_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-egress --network own-ip 2>"$WORK/egress-activate.err")" || {
+    echo "::error::'min session activate --network own-ip' (window in force) failed"
+    cat "$WORK/egress-activate.err" 2>/dev/null || true
+    fail
+  }
+  sid="$(printf '%s\n' "$sid" | tail -n1 | tr -d '\r')"
+  echo "own-IP session (deny-all default in force): $sid"
+  if grep -q "deny-all the default" "$WORK/egress-activate.err"; then
+    echo "::error::activate still announced the coming change once the window was in force"
+    cat "$WORK/egress-activate.err"
+    fail
+  fi
+
+  # -- Declared: an undeclared box's egress is the deny-all allow_subnets=[] -
+  policy_json="$(mnl session policy "$sid" 2>"$WORK/egress-policy.err")" || {
+    echo "::error::'min session policy' failed"
+    cat "$WORK/egress-policy.err" 2>/dev/null || true
+    fail
+  }
+  if [[ "$policy_json" != *'"allow_subnets":[]'* ]]; then
+    echo "::error::NET-074: the box's declared egress is not the empty (deny-all) allow_subnets list"
+    echo "$policy_json"
+    fail
+  fi
+  if ! grep -q "deny-all" "$WORK/egress-policy.err"; then
+    echo "::error::NET-075: 'min session policy' did not name the box's posture deny-all"
+    cat "$WORK/egress-policy.err"
+    fail
+  fi
+  echo "NET-074/075 OK: no egress section declared no destination, and is named deny-all"
+
+  # -- A disallowed connection drops silently: no reset, so curl hangs to its
+  # own timeout rather than failing fast (a reset would take seconds, not this).
+  deny_start_ms="$(now_ms)"
+  mnl session exec "$sid" curl -sS -o /dev/null -w '%{http_code}' --max-time 10 https://example.com \
+    >"$WORK/egress-deny.out" 2>"$WORK/egress-deny.err"
+  deny_rc=$?
+  deny_elapsed_ms=$(( $(now_ms) - deny_start_ms ))
+  deny_status="$(cat "$WORK/egress-deny.out" 2>/dev/null)"
+  echo "(inside $sid) GET https://example.com -> rc=$deny_rc status=${deny_status:-<none>} elapsed=${deny_elapsed_ms}ms"
+  if [ "$deny_rc" -eq 0 ] || [ "$deny_status" = "200" ]; then
+    echo "::error::NET-062: a disallowed connection completed; the deny-all default did not enforce"
+    fail
+  fi
+  if [ "$deny_elapsed_ms" -lt 6000 ]; then
+    echo "::error::NET-062: a disallowed connection failed in ${deny_elapsed_ms}ms — that is a fast refusal, not a silent drop"
+    cat "$WORK/egress-deny.err" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-062 OK: a disallowed connection dropped silently (timed out, not reset)"
+  assert_egress_drop_logged
+  echo "NET-062 (rate-limited warning) OK: the drop is logged"
+
+  mnl session destroy --force "$sid" >/dev/null 2>&1 || true
+  rm -rf "$OWNIP_SEED_DIR"; OWNIP_SEED_DIR=""
+  unset MINIMAL_EGRESS_DENY_ALL_WINDOW
+  echo "::endgroup::"
+}
+
 E2E_CASE="${E2E_CASE:-${1:-}}"
 if [ -n "$E2E_CASE" ]; then
   case "$E2E_CASE" in
@@ -806,8 +968,9 @@ if [ -n "$E2E_CASE" ]; then
       run_case_fresh_install_own_ip_ingress_publishes_loopback; exit $? ;;
     session_outbound_request) run_case_session_outbound_request; exit $? ;;
     native_resolution_without_proxy_env) run_case_native_resolution_without_proxy_env; exit $? ;;
+    own_ip_egress_declared_and_enforced) run_case_own_ip_egress_declared_and_enforced; exit $? ;;
     *)
-      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env)" >&2
+      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced)" >&2
       exit 2
       ;;
   esac
