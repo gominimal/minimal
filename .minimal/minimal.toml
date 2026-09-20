@@ -97,7 +97,7 @@ inherit_cwd = true
 bash = """
 set -e
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --locked -- -D warnings
 
 # Crate names out of `crates/<name>/...`, deduplicated; other paths ignored.
 crates=$(printf '%s\\n' "${MINIMAL_CHANGED_PATHS:-}" \\
@@ -108,7 +108,7 @@ if [ -n "$crates" ]; then
   args=""
   for c in $crates; do args="$args -p $c"; done
   # shellcheck disable=SC2086 - the package flags are meant to split
-  cargo nextest run $args
+  cargo nextest run --locked $args
 fi
 """
 
@@ -122,7 +122,7 @@ inherit_cwd = true
 bash = """
 set -e
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --locked -- -D warnings
 """
 
 [outputs.bash-img]
