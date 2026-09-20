@@ -16,14 +16,24 @@
 //! - [`ca`] is the interception certificates: the root a box trusts, the one
 //!   signing certificate constrained to the names the host's boxes declare,
 //!   and the leaves issued under it.
+//! - [`audit`] is the log: one hash-chained JSONL record per decision, append
+//!   only, carrying no credential and no body.
+//! - [`control`] is the control socket's audit submissions: how a client's
+//!   mints and revocations reach the log the proxy alone writes.
 
+pub mod audit;
 pub mod ca;
+pub mod control;
 pub mod keychain;
 pub mod keys;
 pub mod redeem;
 pub mod seal;
 
+// `Decision` stays module-qualified on both sides: the audit log's admit or
+// refuse is not the redemption outcome.
+pub use audit::{AuditError, Event, Hash, Kind, Log, Mapping, Record};
 pub use ca::{Authority, CaError, DeclaredUnion, Leaf};
+pub use control::{ControlError, Submission, submit};
 pub use keychain::{KeyStore, MemoryStore, PrivateKey, StoreError};
 pub use keys::{Fingerprint, KeyRole, KeyStatus, Keys, KeysError, inspect};
 pub use redeem::{Check, Decision, Redemption, decide};
