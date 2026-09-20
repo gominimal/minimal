@@ -192,8 +192,9 @@ struct DnsRecord {
     ip: String,
 }
 
-/// Registers `<session_name>.<host_id>` in gvproxy's `min.internal.` DNS zone,
-/// pointing at the PTask's current switch lease (finding #3 / UC6).
+/// Registers `<session_name>` in gvproxy's `min.internal.` DNS zone, pointing at
+/// the PTask's current switch lease (finding #3 / UC6). A box's name is
+/// two-label (NET-001), so the record is the session name alone.
 ///
 /// gvproxy's resolver is the switch gateway (`100.64.0.1`) that every own-IP
 /// sandbox's `resolv.conf` already targets, so this makes a PTask's
@@ -207,14 +208,13 @@ struct DnsRecord {
 /// Returns the I/O error from the gvproxy control request (non-2xx or transport).
 pub async fn register_dns_name(
     control: &ControlChannel,
-    host_id: &str,
     session_name: &str,
     lease_ip: Ipv4Addr,
 ) -> io::Result<()> {
     post_json(
         control,
         "/services/dns/add",
-        &dns_add_body(host_id, session_name, lease_ip),
+        &dns_add_body(session_name, lease_ip),
     )
     .await
 }
@@ -222,11 +222,11 @@ pub async fn register_dns_name(
 /// Builds the `/services/dns/add` zone body for a PTask. Split out so the exact
 /// wire shape (trailing-dot zone, lowercased label, dotted-quad IP) is unit-testable
 /// without a live gvproxy.
-fn dns_add_body(host_id: &str, session_name: &str, lease_ip: Ipv4Addr) -> DnsZone {
+fn dns_add_body(session_name: &str, lease_ip: Ipv4Addr) -> DnsZone {
     DnsZone {
         name: format!("{}.", crate::net::dns::HOSTNAME_SUFFIX),
         records: vec![DnsRecord {
-            name: format!("{session_name}.{host_id}").to_ascii_lowercase(),
+            name: session_name.to_ascii_lowercase(),
             ip: lease_ip.to_string(),
         }],
     }
@@ -512,11 +512,11 @@ mod tests {
         // The zone Name carries a trailing dot (gvproxy matches DNS queries, which
         // are trailing-dotted, against it); the record label is lowercased
         // (gvproxy matches labels case-sensitively); the IP is dotted-quad.
-        let body = dns_add_body("Local", "Web", Ipv4Addr::new(100, 64, 0, 5));
+        let body = dns_add_body("Web", Ipv4Addr::new(100, 64, 0, 5));
         let json = serde_json_lenient::to_string(&body).unwrap();
         assert_eq!(
             json,
-            r#"{"name":"min.internal.","records":[{"name":"web.local","ip":"100.64.0.5"}]}"#
+            r#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.5"}]}"#
         );
     }
 

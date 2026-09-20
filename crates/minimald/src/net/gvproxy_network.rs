@@ -118,19 +118,12 @@ async fn finish_own_ip_attach(
         _ => Vec::new(),
     };
 
-    // Register this PTask's `<name>.<host-id>.min.internal` → its current lease so
+    // Register this PTask's `<name>.min.internal` → its current lease so
     // peer sessions can resolve it (finding #3 / UC6). Done for *every* own-IP
     // PTask, even with no ingress: resolvable names are how peers find each other,
     // and the ingress gate independently governs reachability. Best-effort — a DNS
     // hiccup must not fail an otherwise-working attach.
-    if let Err(e) = crate::net::policy::register_dns_name(
-        &control,
-        crate::net::dns::DEFAULT_HOST_ID,
-        session_name,
-        lease_ip,
-    )
-    .await
-    {
+    if let Err(e) = crate::net::policy::register_dns_name(&control, session_name, lease_ip).await {
         tracing::warn!(error = %e, session = session_name, "registering *.min.internal name on gvproxy");
     }
 

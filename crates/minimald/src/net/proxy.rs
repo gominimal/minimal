@@ -24,7 +24,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::dns::HostnameRegistry;
+use super::dns::{HostnameRegistry, Route};
 
 /// Port the B5 host-side egress/DNS proxy listens on (TC3). Clients reach it
 /// via `HTTP(S)_PROXY`.
@@ -52,19 +52,19 @@ const MAX_HEAD: usize = 8 * 1024;
 const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The host-side lookup the proxy performs for each request: a `Host:`-header
-/// host (with any `:port` already stripped) to the address its requests forward
-/// to, or `None` if no live PTask owns it. The host resolver is never consulted.
+/// host (with any `:port` already stripped) to where its requests forward, or
+/// `None` if no live box owns it. The host resolver is never consulted.
 ///
 /// Factored as a trait so the routing core is decoupled from how the table is
 /// shared (the sessions manager owns the live registry) and so #502 can drive
 /// the same lookup behind TLS termination.
 pub trait HostRoute: Send + Sync + 'static {
-    /// Resolves a `Host:`-header host to the address its requests forward to.
-    fn resolve_host(&self, host: &str) -> Option<IpAddr>;
+    /// Resolves a `Host:`-header host to where its requests forward.
+    fn resolve_host(&self, host: &str) -> Option<Route>;
 }
 
 impl HostRoute for HostnameRegistry {
-    fn resolve_host(&self, host: &str) -> Option<IpAddr> {
+    fn resolve_host(&self, host: &str) -> Option<Route> {
         self.resolve(host)
     }
 }
@@ -74,7 +74,7 @@ impl HostRoute for HostnameRegistry {
 // `.await` held). This lets `Router::new(Arc<RwLock<HostnameRegistry>>)` route
 // against the same table the manager registers PTasks into.
 impl HostRoute for std::sync::RwLock<HostnameRegistry> {
-    fn resolve_host(&self, host: &str) -> Option<IpAddr> {
+    fn resolve_host(&self, host: &str) -> Option<Route> {
         // Recover from a poisoned lock rather than mapping it to `None`: the
         // registry is two HashMaps with no cross-field invariant a panicked
         // writer could half-break, and silently returning `None` would make
@@ -110,9 +110,9 @@ impl<T: HostRoute> Router<T> {
         Self { table }
     }
 
-    /// Routes an HTTP authority to its upstream socket address, or `None` if no
-    /// live PTask owns the host. The authority's optional `:port` selects the
-    /// upstream port; absent, [`DEFAULT_UPSTREAM_PORT`] is used.
+    /// Routes an HTTP authority to its upstream, or `None` if no live box owns
+    /// the host. The authority's optional `:port` selects the upstream port;
+    /// absent, [`DEFAULT_UPSTREAM_PORT`] is used.
     ///
     /// The registry gates on the host, not the port: the upstream port comes
     /// entirely from the client-supplied authority, so a registered `HostNet`
@@ -123,11 +123,25 @@ impl<T: HostRoute> Router<T> {
     /// follow-up. Where mutually-untrusted PTasks share loopback, this is a
     /// loopback-SSRF surface that the follow-up must close.
     #[must_use]
-    pub fn route(&self, authority: &str) -> Option<SocketAddr> {
+    pub fn route(&self, authority: &str) -> Option<Upstream> {
         let (host, port) = split_authority(authority);
-        let ip = self.table.resolve_host(host)?;
-        Some(SocketAddr::new(ip, port.unwrap_or(DEFAULT_UPSTREAM_PORT)))
+        let route = self.table.resolve_host(host)?;
+        Some(Upstream {
+            addr: SocketAddr::new(route.target, port.unwrap_or(DEFAULT_UPSTREAM_PORT)),
+            session: route.session,
+        })
     }
+}
+
+/// Where a routed request forwards to: the upstream address, and the box the
+/// authority resolved to. The session travels with the address so a refusal
+/// taken after routing names the box it resolved to (NET-001).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstream {
+    /// The address the request forwards to.
+    pub addr: SocketAddr,
+    /// The session whose name the authority resolved to.
+    pub session: String,
 }
 
 /// Splits an HTTP authority into its host and optional port, handling both the
@@ -202,6 +216,44 @@ pub async fn serve<T: HostRoute>(listener: TcpListener, router: Router<T>) -> io
     }
 }
 
+/// One refused request: what the client is answered with, and why (NET-001).
+///
+/// `host`, `session` and `error` are absent where the request never got that
+/// far — a head that timed out carries no authority, a name no box owns has no
+/// session — and all three render as `-`, so every refusal line in the log
+/// carries the same fields and one grep finds them all.
+#[derive(Default)]
+struct Refusal<'a> {
+    /// The HTTP status the client is answered with.
+    status: &'a str,
+    /// A stable token naming why the request was refused.
+    reason: &'a str,
+    /// The authority the client asked for, when the head yielded one.
+    host: Option<&'a str>,
+    /// The box the authority resolved to, when it resolved to one.
+    session: Option<&'a str>,
+    /// The underlying error, when the refusal followed a failed connect.
+    error: Option<&'a str>,
+}
+
+/// Refuses a request: logs the refusal with its reason (NET-001), then answers
+/// the client with the refusal's status.
+async fn refuse<C: AsyncWrite + Unpin>(client: &mut C, refusal: Refusal<'_>) -> io::Result<()> {
+    // Rendered for a field this refusal has no value for.
+    const ABSENT: &str = "-";
+
+    tracing::warn!(
+        component = "dns-proxy",
+        host = refusal.host.unwrap_or(ABSENT),
+        reason = refusal.reason,
+        session = refusal.session.unwrap_or(ABSENT),
+        error = refusal.error.unwrap_or(ABSENT),
+        status = refusal.status,
+        "refused a proxied request"
+    );
+    write_status(client, refusal.status).await
+}
+
 /// Whether the client opened a raw `CONNECT` tunnel or a plain forward request
 /// whose buffered head must be replayed to the upstream.
 #[derive(Debug, Clone, Copy)]
@@ -230,22 +282,62 @@ where
     // head cannot occupy this task indefinitely.
     let head = match tokio::time::timeout(HEAD_READ_TIMEOUT, read_head(&mut client)).await {
         Ok(result) => result?,
-        Err(_elapsed) => return write_status(&mut client, "408 Request Timeout").await,
+        Err(_elapsed) => {
+            return refuse(
+                &mut client,
+                Refusal {
+                    status: "408 Request Timeout",
+                    reason: "no-request-head-before-timeout",
+                    ..Refusal::default()
+                },
+            )
+            .await;
+        }
     };
     let Some(request) = parse_request(&head) else {
-        return write_status(&mut client, "400 Bad Request").await;
+        return refuse(
+            &mut client,
+            Refusal {
+                status: "400 Bad Request",
+                reason: "no-authority-in-request-head",
+                ..Refusal::default()
+            },
+        )
+        .await;
     };
 
-    // No live PTask owns this hostname: a host-side proxy returns a clean
-    // gateway error rather than leaking the lookup to the host resolver.
-    let Some(upstream_addr) = router.route(request.authority) else {
-        return write_status(&mut client, "502 Bad Gateway").await;
+    // No live box owns this name: a host-side proxy returns a clean gateway
+    // error rather than leaking the lookup to the host resolver.
+    let Some(routed) = router.route(request.authority) else {
+        return refuse(
+            &mut client,
+            Refusal {
+                status: "502 Bad Gateway",
+                reason: "no-live-box-owns-the-name",
+                host: Some(request.authority),
+                ..Refusal::default()
+            },
+        )
+        .await;
     };
     let kind = request.kind;
 
-    let mut upstream = match TcpStream::connect(upstream_addr).await {
+    let mut upstream = match TcpStream::connect(routed.addr).await {
         Ok(upstream) => upstream,
-        Err(_) => return write_status(&mut client, "502 Bad Gateway").await,
+        Err(error) => {
+            let error = error.to_string();
+            return refuse(
+                &mut client,
+                Refusal {
+                    status: "502 Bad Gateway",
+                    reason: "upstream-unreachable",
+                    host: Some(request.authority),
+                    session: Some(&routed.session),
+                    error: Some(&error),
+                },
+            )
+            .await;
+        }
     };
 
     match kind {
@@ -597,6 +689,8 @@ mod tests {
     use sessions::SessionId;
     use tracing_subscriber::fmt::MakeWriter;
 
+    use crate::net::dns::DEFAULT_HOST_ID;
+
     /// A `MakeWriter` accumulating everything written into a shared buffer, so a
     /// test can assert on the structured fields a `tracing` event emitted.
     #[derive(Clone, Default)]
@@ -656,6 +750,191 @@ mod tests {
         String::from_utf8_lossy(&response).into_owned()
     }
 
+    /// Drives one connection over an in-memory pipe and returns the raw response
+    /// the client read back. Unlike [`proxy_get`] the connection is handled in
+    /// the test's own task, so a thread-local `tracing` subscriber captures the
+    /// events the request emits. The client half is shut down for writing right
+    /// after the head, which is what lets a *routed* request's bidirectional
+    /// splice finish instead of waiting on a client that never closes.
+    async fn drive_connection<T: HostRoute>(router: &Router<T>, request: &str) -> String {
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        handle_connection_io(server, router).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// NET-001: a box answers at its two-label `<name>.min.internal` name through
+    /// the proxy that already ships, own-address sessions on a VM host included.
+    ///
+    /// On a VM-backed host `minimald` runs in the guest, so the proxy binds the
+    /// unspecified address there (the DM1 bind base `server::start_host_proxies`
+    /// uses) and is reached through the port gvproxy publishes on the host
+    /// loopback; the box itself is reached through *its* published loopback port,
+    /// which is why an own-address session registers to loopback. Both halves are
+    /// exercised here: the listener is bound unspecified and reached on loopback,
+    /// and the target is an `OwnIp` registration.
+    #[tokio::test]
+    async fn proxy_routes_min_internal_for_own_ip_session_on_vm_host() {
+        let backend_port = spawn_backend().await;
+
+        let shared = Arc::new(RwLock::new(HostnameRegistry::new(DEFAULT_HOST_ID)));
+        let hostname = shared
+            .write()
+            .unwrap()
+            .register_own_ip(SessionId::nil(), "web");
+        assert_eq!(hostname.as_str(), "web.min.internal");
+        let router = Router::new(Arc::clone(&shared));
+
+        let proxy = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        tokio::spawn(serve(proxy, router));
+        let proxy_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, proxy_port));
+
+        let authority = format!("web.min.internal:{backend_port}");
+        let routed = proxy_get(proxy_addr, &authority).await;
+        assert!(
+            routed.contains("200 OK"),
+            "expected the two-label name to route, got: {routed}"
+        );
+
+        // The name is the session's: once the session is gone, so is the route.
+        shared.write().unwrap().deregister("web");
+        let withdrawn = proxy_get(proxy_addr, &authority).await;
+        assert!(
+            withdrawn.contains("502 Bad Gateway"),
+            "expected a gateway error once the session is gone, got: {withdrawn}"
+        );
+    }
+
+    /// NET-001 (unwanted case): every request the proxy refuses is logged with
+    /// its reason — a name no live box owns, a name that resolved to a box whose
+    /// address will not accept a connection (which also names the session it
+    /// resolved to), and a head that never yielded an authority.
+    #[tokio::test]
+    async fn proxy_refusal_is_logged_with_reason() {
+        let shared = Arc::new(RwLock::new(HostnameRegistry::new(DEFAULT_HOST_ID)));
+        shared
+            .write()
+            .unwrap()
+            .register_own_ip(SessionId::nil(), "web");
+        let router = Router::new(shared);
+
+        // A loopback port with nothing on it: bound only to learn a port the OS
+        // has free, then dropped, so the connect is refused rather than hanging.
+        let closed_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let unowned = drive_connection(
+            &router,
+            "GET / HTTP/1.1\r\nHost: ghost.min.internal:80\r\n\r\n",
+        )
+        .await;
+        let unreachable = drive_connection(
+            &router,
+            &format!("GET / HTTP/1.1\r\nHost: web.min.internal:{closed_port}\r\n\r\n"),
+        )
+        .await;
+        let headless = drive_connection(&router, "not-a-request-line\r\n\r\n").await;
+        drop(guard);
+
+        assert!(
+            unowned.contains("502 Bad Gateway"),
+            "expected a gateway error for an unowned name, got: {unowned}"
+        );
+        assert!(
+            unreachable.contains("502 Bad Gateway"),
+            "expected a gateway error for a dead upstream, got: {unreachable}"
+        );
+        assert!(
+            headless.contains("400 Bad Request"),
+            "expected a bad request for an unusable head, got: {headless}"
+        );
+
+        let logged = buf.contents();
+        // The name nobody owns: the host asked for, and why it was refused.
+        assert!(
+            logged.contains(r#"host="ghost.min.internal:80""#),
+            "expected the refused host, got: {logged}"
+        );
+        assert!(
+            logged.contains(r#"reason="no-live-box-owns-the-name""#),
+            "expected a reason for the unowned name, got: {logged}"
+        );
+        // The name that resolved: the reason, plus the session it resolved to.
+        assert!(
+            logged.contains(r#"reason="upstream-unreachable""#),
+            "expected a reason for the dead upstream, got: {logged}"
+        );
+        assert!(
+            logged.contains(r#"session="web""#),
+            "expected the session the name resolved to, got: {logged}"
+        );
+        // A head with no authority is refused with a reason of its own.
+        assert!(
+            logged.contains(r#"reason="no-authority-in-request-head""#),
+            "expected a reason for the unusable head, got: {logged}"
+        );
+    }
+
+    /// NET-002: a request in the deprecated `<name>.<host-id>.min.internal` zone
+    /// routes as the two-label name, and the notice in the log names the
+    /// two-label form to use instead.
+    #[tokio::test]
+    async fn legacy_local_zone_routes_with_deprecation() {
+        let backend_port = spawn_backend().await;
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID);
+        assert_eq!(
+            reg.register_host_net(SessionId::nil(), "web").as_str(),
+            "web.min.internal"
+        );
+        let router = Router::new(Arc::new(reg));
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let routed = drive_connection(
+            &router,
+            &format!("GET / HTTP/1.1\r\nHost: web.local.min.internal:{backend_port}\r\n\r\n"),
+        )
+        .await;
+        drop(guard);
+
+        assert!(
+            routed.contains("200 OK"),
+            "expected the deprecated name to route, got: {routed}"
+        );
+        let logged = buf.contents();
+        assert!(
+            logged.contains(r#"host="web.local.min.internal""#),
+            "expected the deprecated name in the notice, got: {logged}"
+        );
+        assert!(
+            logged.contains(r#"routed_as="web.min.internal""#),
+            "expected the notice to name the two-label form, got: {logged}"
+        );
+        assert!(
+            logged.contains("deprecated"),
+            "expected a deprecation notice, got: {logged}"
+        );
+    }
+
     /// Proof artifact 1 (registry/proxy routing contract): a `HostNet` PTask's
     /// `Host:` header routes through the proxy to its registered target; after
     /// `deregister` the proxy returns a gateway error instead of a stale route.
@@ -665,9 +944,9 @@ mod tests {
     async fn host_header_routes_through_proxy_then_not_found_after_deregister() {
         let backend_port = spawn_backend().await;
 
-        // `myservice.dev.min.internal` → 127.0.0.1 (HostNet, R3.6); the client's
+        // `myservice.min.internal` → 127.0.0.1 (HostNet, R3.6); the client's
         // `:port` selects the upstream port, so it reaches the backend.
-        let shared = Arc::new(RwLock::new(HostnameRegistry::new("dev")));
+        let shared = Arc::new(RwLock::new(HostnameRegistry::new(DEFAULT_HOST_ID)));
         shared
             .write()
             .unwrap()
@@ -678,7 +957,7 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(serve(proxy, router));
 
-        let authority = format!("myservice.dev.min.internal:{backend_port}");
+        let authority = format!("myservice.min.internal:{backend_port}");
         let routed = proxy_get(proxy_addr, &authority).await;
         assert!(
             routed.contains("200 OK"),
@@ -703,23 +982,29 @@ mod tests {
     #[test]
     fn own_ip_routes_to_its_published_loopback_port() {
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let mut reg = HostnameRegistry::new("dev");
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID);
         reg.register_own_ip(SessionId::nil(), "web");
         let router = Router::new(Arc::new(reg));
 
         // The published external port (e.g. an ingress 18080:8080 forward) is
         // carried in the authority and reached on loopback.
         assert_eq!(
-            router.route("web.dev.min.internal:18080"),
+            router.route("web.min.internal:18080").map(|u| u.addr),
             Some(SocketAddr::new(loopback, 18080))
         );
         // Absent an explicit port the default upstream port is used.
         assert_eq!(
-            router.route("web.dev.min.internal"),
+            router.route("web.min.internal").map(|u| u.addr),
             Some(SocketAddr::new(loopback, DEFAULT_UPSTREAM_PORT))
         );
+        // The upstream names the session, so a refusal after routing can say
+        // which box the authority resolved to.
+        assert_eq!(
+            router.route("web.min.internal").map(|u| u.session),
+            Some("web".to_string())
+        );
         // An unregistered host does not route.
-        assert_eq!(router.route("ghost.dev.min.internal"), None);
+        assert_eq!(router.route("ghost.min.internal"), None);
     }
 
     /// Proof artifact 3 (R3.4 supersession): when the listen address cannot be
@@ -756,18 +1041,18 @@ mod tests {
     /// carries it in the `Host:` header. Both parse to the same authority.
     #[test]
     fn parse_request_reads_connect_and_host_authorities() {
-        let connect = parse_request(b"CONNECT web.dev.min.internal:443 HTTP/1.1\r\n\r\n").unwrap();
+        let connect = parse_request(b"CONNECT web.min.internal:443 HTTP/1.1\r\n\r\n").unwrap();
         assert!(matches!(connect.kind, RequestKind::Connect));
-        assert_eq!(connect.authority, "web.dev.min.internal:443");
+        assert_eq!(connect.authority, "web.min.internal:443");
 
         let forward =
-            parse_request(b"GET / HTTP/1.1\r\nHost: web.dev.min.internal:8080\r\n\r\n").unwrap();
+            parse_request(b"GET / HTTP/1.1\r\nHost: web.min.internal:8080\r\n\r\n").unwrap();
         assert!(matches!(forward.kind, RequestKind::Forward));
-        assert_eq!(forward.authority, "web.dev.min.internal:8080");
+        assert_eq!(forward.authority, "web.min.internal:8080");
     }
 
     /// A forward request from an `HTTP_PROXY`-configured client carries an
-    /// absolute-form request target (`GET http://web.dev.min.internal/path HTTP/1.1`).
+    /// absolute-form request target (`GET http://web.min.internal/path HTTP/1.1`).
     /// The proxy routes it by `Host:` header and replays the buffered head
     /// verbatim, so the upstream receives the absolute-form request line
     /// unchanged — RFC 9112 requires an origin server to accept it. Complements
@@ -790,7 +1075,7 @@ mod tests {
                 .await;
         });
 
-        let mut reg = HostnameRegistry::new("dev");
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID);
         reg.register_host_net(SessionId::nil(), "web");
         let router = Router::new(Arc::new(reg));
 
@@ -798,11 +1083,11 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(serve(proxy, router));
 
-        let request_line = format!("GET http://web.dev.min.internal:{backend_port}/path HTTP/1.1");
+        let request_line = format!("GET http://web.min.internal:{backend_port}/path HTTP/1.1");
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         client
             .write_all(
-                format!("{request_line}\r\nHost: web.dev.min.internal:{backend_port}\r\n\r\n")
+                format!("{request_line}\r\nHost: web.min.internal:{backend_port}\r\n\r\n")
                     .as_bytes(),
             )
             .await
@@ -842,7 +1127,7 @@ mod tests {
         let tls_config = ca.build_server_config().expect("server config must build");
 
         let backend_port = spawn_backend().await;
-        let mut reg = HostnameRegistry::new("dev");
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID);
         reg.register_host_net(SessionId::nil(), "mysvc");
         let router = Router::new(Arc::new(reg));
 
@@ -864,7 +1149,7 @@ mod tests {
             .await
             .expect("TLS handshake must succeed for anonymous connection");
 
-        let authority = format!("mysvc.dev.min.internal:{backend_port}");
+        let authority = format!("mysvc.min.internal:{backend_port}");
         tls.write_all(format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
             .await
             .unwrap();
@@ -902,7 +1187,7 @@ mod tests {
             .expect("sign must succeed");
 
         let backend_port = spawn_backend().await;
-        let mut reg = HostnameRegistry::new("dev");
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID);
         reg.register_host_net(SessionId::nil(), "mysvc");
         let router = Router::new(Arc::new(reg));
 
@@ -928,7 +1213,7 @@ mod tests {
             .await
             .expect("TLS handshake must succeed with valid client cert");
 
-        let authority = format!("mysvc.dev.min.internal:{backend_port}");
+        let authority = format!("mysvc.min.internal:{backend_port}");
         tls.write_all(format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
             .await
             .unwrap();

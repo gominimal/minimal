@@ -758,7 +758,7 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
     };
 
     // B5 egress/DNS proxy (:7654), always. Both ways this can fail end with
-    // `<name>.local.min.internal` not routing, so both are recorded on the
+    // `<name>.min.internal` not routing, so both are recorded on the
     // state where `ListSessions` can reach them — a daemon that keeps serving
     // without its proxy looks identical to a healthy one otherwise.
     let egress_addr = SocketAddr::new(bind_base, proxy::EGRESS_PROXY_PORT);

@@ -1455,7 +1455,7 @@ impl Session {
 
     /// Renames the session: persists the new name through the record handle
     /// (a name collision surfaces as the store's `AlreadyExists`), relinks
-    /// the PTask hostname so `<new>.local.min.internal` routes and the old name stops (R3.6).
+    /// the PTask hostname so `<new>.min.internal` routes and the old name stops (R3.6).
     async fn rename(&mut self, new_name: String) -> Result<(), std::io::Error> {
         let record = self.record.record().await?;
 
