@@ -422,7 +422,23 @@ impl Binding {
             tokio::select! {
                 // Remote (ssh channel) => session stdin.
                 res = rs.wait(), if remote_open => match res {
-                    None => remote_open = false,
+                    // The channel's own end is gone: a client that closed it, or
+                    // one whose transport died and took the whole connection
+                    // with it — a killed `min`, a dropped link. Neither is a
+                    // request to end anything, so the session process runs on
+                    // and the next attach re-binds it; this line is the only
+                    // account of the departure the daemon has, because a client
+                    // that vanished logged nothing itself.
+                    //
+                    // Once, not per read: the arm is disabled from here on.
+                    None => {
+                        remote_open = false;
+                        tracing::info!(
+                            session = %self.name,
+                            "client gone; the session's process keeps running \
+                             and a later attach re-binds it",
+                        );
+                    }
                     Some(msg) => {
                         match msg {
                             russh::ChannelMsg::Data{ data } => {

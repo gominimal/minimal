@@ -2210,6 +2210,108 @@ mod tests {
         assert!(ctrl.was_killed());
     }
 
+    /// NET-015. An exec client lost abruptly ends the command *it* spawned
+    /// and nothing else. Two commands run in the same box; one client's
+    /// transport vanishes — its channel dead in both directions, which is
+    /// what a killed `min session exec` looks like from here — and its child
+    /// is killed, while the other command is left running, finishes on its
+    /// own, and reports its own exit code with its output intact.
+    ///
+    /// The scope is the point: a bridge owns nothing but the child it
+    /// spawned, so one lost exec client can take neither a sibling command
+    /// nor the box down with it.
+    #[tokio::test]
+    async fn lost_exec_client_kills_only_its_own_process() {
+        // The lost client. Its stdout write goes nowhere (the reader is
+        // dropped, so every write errors) and its stdin is already at EOF:
+        // a channel that no longer exists in either direction.
+        let (
+            lost_process,
+            MockEndpoints {
+                stdin_reader: _lost_stdin,
+                stdout_writer: mut lost_stdout,
+                stderr_writer: lost_stderr,
+                ctrl: lost,
+            },
+        ) = build_mock();
+        drop(lost_stderr);
+        let (gone_reader, mut lost_w) = duplex(64);
+        drop(gone_reader);
+        let (_unused_lost_stderr_peer, mut lost_e) = duplex(64);
+        let (gone_writer, mut lost_r) = duplex(64);
+        drop(gone_writer);
+
+        // The other command in the same box: a healthy channel throughout.
+        let (
+            live_process,
+            MockEndpoints {
+                stdin_reader: _live_stdin,
+                stdout_writer: mut live_stdout,
+                stderr_writer: live_stderr,
+                ctrl: live,
+            },
+        ) = build_mock();
+        drop(live_stderr);
+        let (mut live_client_stdout, mut live_w) = duplex(64 * 1024);
+        let (_unused_live_stderr_peer, mut live_e) = duplex(64 * 1024);
+        let (closed_live_stdin, mut live_r) = duplex(64);
+        drop(closed_live_stdin);
+
+        let lost_bridge = tokio::spawn(async move {
+            bridge(
+                "lost-client",
+                lost_process,
+                &mut lost_r,
+                &mut lost_w,
+                &mut lost_e,
+            )
+            .await
+        });
+        let live_bridge = tokio::spawn(async move {
+            bridge(
+                "live-client",
+                live_process,
+                &mut live_r,
+                &mut live_w,
+                &mut live_e,
+            )
+            .await
+        });
+
+        // The lost client's command produces output, which is what surfaces
+        // the dead channel; nothing is written for the live one, so its
+        // child is still running when the other is reaped.
+        lost_stdout.write_all(b"output").await.unwrap();
+        drop(lost_stdout);
+        assert_eq!(
+            lost_bridge.await.unwrap(),
+            1,
+            "a killed child has no exit code of its own, which the bridge reports as 1",
+        );
+        assert!(
+            lost.was_killed(),
+            "the lost client's own command must be ended",
+        );
+        assert!(
+            !live.was_killed(),
+            "the other command in the box must be untouched by a different client's loss",
+        );
+
+        // Left alone, it finishes normally — its exit code and its output
+        // both reach its own client.
+        live_stdout.write_all(b"still-running").await.unwrap();
+        drop(live_stdout);
+        live.signal_exit(0).await;
+        assert_eq!(
+            live_bridge.await.unwrap(),
+            0,
+            "the surviving command must report its own exit code",
+        );
+        let mut out = Vec::new();
+        live_client_stdout.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"still-running");
+    }
+
     /// A grandchild that inherited the child's stdout keeps the pipe
     /// open past the child's own exit — `sh -c 'sleep 20 & echo
     /// STARTED'`. The bridge must return on the *child's* exit, relay
