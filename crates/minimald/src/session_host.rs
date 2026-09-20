@@ -1921,6 +1921,41 @@ fn layer_session_env(
     env
 }
 
+/// Installs the host's interception root CA into the box trust store
+/// (BEP-011): the root the CLI delivered into the session home at
+/// [`sessions::BEP_ROOT_PATCH_DEST`] — a composition patch, materialized at
+/// `FinalizeSession` like every other — is copied to
+/// `<rootfs>/{BEP_TRUST_STORE_DIR}/{BEP_TRUST_STORE_FILE}`, world-readable,
+/// where OpenSSL-linked tools look for anchors. Returns the installed path,
+/// or `None` when the home carries no root: a box with no grant, or one under
+/// `steering = "off"`, whose CLI delivered none.
+///
+/// Runs at launch rather than at finalize because the rootfs does not exist
+/// before the launcher builds it; the home does, so the root is read back
+/// from there.
+///
+/// [`BEP_TRUST_STORE_DIR`]: sessions::BEP_TRUST_STORE_DIR
+/// [`BEP_TRUST_STORE_FILE`]: sessions::BEP_TRUST_STORE_FILE
+fn install_trust_root(
+    home: &std::path::Path,
+    rootfs: &std::path::Path,
+) -> io::Result<Option<std::path::PathBuf>> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let source = home.join(sessions::BEP_ROOT_PATCH_DEST);
+    if !source.is_file() {
+        return Ok(None);
+    }
+    let dir = rootfs.join(sessions::BEP_TRUST_STORE_DIR);
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join(sessions::BEP_TRUST_STORE_FILE);
+    std::fs::copy(&source, &dest)?;
+    // A trust anchor is public by nature and every process in the box reads
+    // it; the delivered patch's own bits are whatever the upload carried.
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644))?;
+    Ok(Some(dest))
+}
+
 /// The real [`SessionLauncher`]: evaluates a minimal context into a graph,
 /// builds a sandboxed `/bin/bash`, and wires it to a freshly opened PTY.
 #[cfg(not(test))]
@@ -2150,6 +2185,10 @@ impl SessionLauncher for SandboxLauncher {
         // For the log line on the fallback path, which fires after
         // `name` has moved into `EnvArgs`.
         let session_label = name.clone();
+        // The session home, kept for the trust-root install below: `paths`
+        // moves into `EnvArgs` and the home is only read back once the rootfs
+        // it is copied into exists.
+        let session_home = paths.home.clone();
         // Log every item that will (or would) end up in the session,
         // tagged with its provenance. Patches and lifecycle hooks are
         // included even though the launcher can't act on them yet —
@@ -2182,6 +2221,26 @@ impl SessionLauncher for SandboxLauncher {
                     .with_username(username),
             ))
             .await?;
+
+            // The box trust store (BEP-011): the root the box spec's grants
+            // delivered into the home goes into the rootfs before anything
+            // runs in it. Logged with its provenance like the other session
+            // contents; a box with no root installs nothing.
+            match install_trust_root(session_home.as_utf8_path().as_std_path(), &env.rootfs()) {
+                Ok(Some(dest)) => tracing::info!(
+                    session = %session_label,
+                    domain = "trust_store",
+                    sandbox_dest = %dest.display(),
+                    source = sessions::BEP_ROOT_PATCH_DEST,
+                    "session content (trust store: host root CA installed from the box spec's root patch)",
+                ),
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(io::Error::other(format!(
+                        "installing the host root CA into the box trust store: {e}"
+                    )));
+                }
+            }
 
             let mut container = env
                 .container(&plan)

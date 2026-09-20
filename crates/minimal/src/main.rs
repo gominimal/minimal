@@ -201,6 +201,7 @@ mod tests {
             box_name: "web",
             host_set: &sessions::GITHUB_HOST_SET,
             sign_in_held: true,
+            resolver_present: false,
         };
         let refusal = sessions::validate_grants(&network, &[grant], &ctx).unwrap_err();
         assert_eq!(exit_code_for(&anyhow::Error::from(refusal)), 3);

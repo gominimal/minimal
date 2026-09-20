@@ -356,6 +356,166 @@ EOF
   echo "::endgroup::"
 }
 
+# The three proxy-steered proofs below (BEP-007, BEP-011, BEP-012) share one
+# box: a GitHub grant under `proxy_env` steering with one `no_proxy` entry of
+# its own. As in the case above, which half runs depends on the sign-in held
+# on THIS host: with none (every CI lane) the refusal half is proved — exit 3,
+# `github_sign_in_required`, no box — and the box half is reported as not
+# exercised; an operator signed in with `min auth login`, with the proxy
+# running (the mint is recorded over its control socket and the root it
+# publishes seeds the trust store), proves the box half.
+BEP_SID="" # the steered box, when a sign-in is held; destroyed by the case
+bep_seed_steered_box() {
+  BEP_SEED_DIR="$(mktemp -d /tmp/mnlbep.XXXXXX)"
+  cp "$PROJECT_DIR/minimal.toml" "$BEP_SEED_DIR/minimal.toml"
+  mkdir "$BEP_SEED_DIR/.git"
+  cat >>"$BEP_SEED_DIR/minimal.toml" <<'EOF'
+
+[session.network.egress]
+allow_dns_hosts = ["github.com", "api.github.com", "uploads.github.com", "codeload.github.com"]
+
+[session.network.bep]
+steering = "proxy_env"
+no_proxy = ["release-assets.githubusercontent.com"]
+
+[[session.grants]]
+module = "github"
+env = "GITHUB_TOKEN"
+source = "broker"
+EOF
+}
+# Activates the seeded box as `$1` when a sign-in is held, setting BEP_SID
+# (returns 0); with none held, proves the refusal half and returns 1. Stdin
+# is closed either way, so a prompt would die on EOF instead of hanging.
+bep_activate_steered_box() {
+  local name="$1" bep_out
+  BEP_SID=""
+  if mnl auth status >"$WORK/auth-status.out" 2>&1 \
+      && grep -q "signed in as" "$WORK/auth-status.out"; then
+    bep_out="$(cd "$BEP_SEED_DIR" \
+      && mnl session activate . --name "$name" --no-input </dev/null 2>"$WORK/$name.err")" || {
+      echo "::error::the steered box $name was not created while a sign-in is held"
+      echo "--- stdout ---"; printf '%s\n' "$bep_out"
+      echo "--- stderr ---"; cat "$WORK/$name.err" 2>/dev/null || true
+      fail
+    }
+    BEP_SID="$(printf '%s\n' "$bep_out" | tail -n1 | tr -d '\r')"
+    return 0
+  fi
+  echo "no GitHub sign-in is held on this host: the box half is not exercised here"
+  local bep_rc=0
+  bep_out="$(cd "$BEP_SEED_DIR" \
+    && mnl session activate . --name "$name" --no-input </dev/null 2>"$WORK/$name.err")" || bep_rc=$?
+  if [ "$bep_rc" != 3 ]; then
+    echo "::error::the steered box $name with no sign-in held exited $bep_rc, not 3"
+    echo "--- stdout ---"; printf '%s\n' "$bep_out"
+    echo "--- stderr ---"; cat "$WORK/$name.err" 2>/dev/null || true
+    fail
+  fi
+  if ! grep -q "github_sign_in_required" "$WORK/$name.err"; then
+    echo "::error::the refusal does not name the defined error github_sign_in_required"
+    echo "--- stderr ---"; cat "$WORK/$name.err" 2>/dev/null || true
+    fail
+  fi
+  if mnl ls 2>/dev/null | grep -q "$name"; then
+    echo "::error::a box was created despite the refusal"
+    fail
+  fi
+  echo "grant with no sign-in held: exit 3, github_sign_in_required, no box OK"
+  return 1
+}
+bep_teardown_steered_box() {
+  if [ -n "$BEP_SID" ]; then
+    mnl session destroy --force "$BEP_SID" >/dev/null 2>&1 \
+      || { echo "::error::could not destroy the steered box ($BEP_SID)"; fail; }
+    BEP_SID=""
+  fi
+  rm -rf "$BEP_SEED_DIR"; BEP_SEED_DIR=""
+}
+
+# BEP-007: inside the box the grant's variable holds the sealed value
+# (`minsealed1.…`) and nothing in the environment is a plaintext GitHub token.
+case_bep_box_env_holds_sealed_value_only() {
+  echo "::group::bep: the grant variable holds the sealed value only"
+  bep_seed_steered_box
+  if bep_activate_steered_box e2e-bep-sealed; then
+    local value
+    value="$(mnl session exec "$BEP_SID" 'printenv GITHUB_TOKEN' 2>"$WORK/bep-sealed.err")" || {
+      echo "::error::GITHUB_TOKEN is not set in the box"
+      echo "--- stderr ---"; cat "$WORK/bep-sealed.err" 2>/dev/null || true
+      fail
+    }
+    case "$value" in
+      minsealed1.*) ;;
+      *) echo "::error::GITHUB_TOKEN does not hold a sealed value (no minsealed1. prefix)"; fail ;;
+    esac
+    # GitHub's token prefixes (ghu_ gho_ ghp_ ghs_ ghr_) appear nowhere in
+    # the box environment: the sealed value is all the box gets.
+    if mnl session exec "$BEP_SID" 'env' 2>/dev/null | grep -q -E 'gh[oprsu]_[A-Za-z0-9]{8,}'; then
+      echo "::error::a plaintext GitHub token is present in the box environment"
+      fail
+    fi
+    echo "GITHUB_TOKEN holds the sealed value and no plaintext token OK"
+  fi
+  bep_teardown_steered_box
+  echo "::endgroup::"
+}
+
+# BEP-011: the host's interception root is in the box trust store.
+case_bep_root_ca_present_in_box_trust_store() {
+  echo "::group::bep: the interception root is in the box trust store"
+  bep_seed_steered_box
+  if bep_activate_steered_box e2e-bep-root; then
+    local anchors
+    anchors="$(mnl session exec "$BEP_SID" \
+      'grep -c "BEGIN CERTIFICATE" /etc/ssl/certs/minimal-bep-root.pem' 2>"$WORK/bep-root.err")" || {
+      echo "::error::/etc/ssl/certs/minimal-bep-root.pem is missing from the box trust store"
+      echo "--- stderr ---"; cat "$WORK/bep-root.err" 2>/dev/null || true
+      fail
+    }
+    if [ "$(printf '%s' "$anchors" | tr -d '[:space:]')" -lt 1 ] 2>/dev/null; then
+      echo "::error::the trust store file carries no certificate"
+      fail
+    fi
+    echo "interception root present in /etc/ssl/certs OK"
+  fi
+  bep_teardown_steered_box
+  echo "::endgroup::"
+}
+
+# BEP-012: HTTPS_PROXY and HTTP_PROXY point at the proxy, and NO_PROXY carries
+# the local zone plus the spec's own entry.
+case_bep_proxy_env_and_no_proxy_are_set() {
+  echo "::group::bep: the proxy environment and NO_PROXY are set"
+  bep_seed_steered_box
+  if bep_activate_steered_box e2e-bep-proxy; then
+    local proxy_env https_proxy http_proxy no_proxy host
+    # shellcheck disable=SC2016 # the variables must expand in the SESSION.
+    proxy_env="$(mnl session exec "$BEP_SID" \
+      'printf "%s\n%s\n%s\n" "$HTTPS_PROXY" "$HTTP_PROXY" "$NO_PROXY"' 2>"$WORK/bep-proxy.err")" || {
+      echo "::error::reading the proxy environment in the box failed"
+      echo "--- stderr ---"; cat "$WORK/bep-proxy.err" 2>/dev/null || true
+      fail
+    }
+    https_proxy="$(printf '%s\n' "$proxy_env" | sed -n 1p | tr -d '\r')"
+    http_proxy="$(printf '%s\n' "$proxy_env" | sed -n 2p | tr -d '\r')"
+    no_proxy="$(printf '%s\n' "$proxy_env" | sed -n 3p | tr -d '\r')"
+    if [ "$https_proxy" != "http://127.0.0.1:7655" ] || [ "$http_proxy" != "http://127.0.0.1:7655" ]; then
+      echo "::error::HTTPS_PROXY/HTTP_PROXY do not point at the proxy: '$https_proxy' / '$http_proxy'"
+      fail
+    fi
+    for host in .min.internal host.min.internal localhost 127.0.0.1 release-assets.githubusercontent.com; do
+      case ",$no_proxy," in
+        *",$host,"*) ;;
+        *) echo "::error::NO_PROXY lacks $host: '$no_proxy'"; fail ;;
+      esac
+    done
+    echo "proxy environment set, NO_PROXY carries the local zone and the spec's entry OK"
+  fi
+  bep_teardown_steered_box
+  echo "::endgroup::"
+}
+
 if [ -n "$E2E_CASE" ] && ! declare -F "case_$E2E_CASE" >/dev/null; then
   echo "::error::unknown e2e case '$E2E_CASE'"
   exit 2

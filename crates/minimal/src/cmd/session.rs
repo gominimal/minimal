@@ -22,10 +22,18 @@ pub(crate) fn session_announce_label(id: &sessions::SessionId, name: Option<&str
     }
 }
 
+/// An admitted box spec with grants: what the validation decided, carried
+/// from before the session exists to the mint that runs once it does.
+struct GrantPlan {
+    expansion: sessions::GrantExpansion,
+    grants: Vec<sessions::Grant>,
+}
+
 /// Validates the project's `[[session.grants]]` against its
 /// `[session.network]` table and the held sign-in, prints each validation
-/// warning, and returns the session's network mode: the spec's `mode` when
-/// declared, else `cli_mode`.
+/// warning, and returns the session's network mode — the spec's `mode` when
+/// declared, else `cli_mode` — with the plan for the grants when the spec
+/// declares any.
 ///
 /// A refusal surfaces as a [`sessions::GrantRefusal`], which `main` maps to
 /// exit 3. A project with no mfile, or one that does not parse, is not this
@@ -35,29 +43,195 @@ fn expand_project_grants(
     project_root: &paths::HostAbsPath,
     box_name: &str,
     cli_mode: sessions::NetworkMode,
-) -> Result<sessions::NetworkMode, anyhow::Error> {
+) -> Result<(sessions::NetworkMode, Option<GrantPlan>), anyhow::Error> {
     let Ok(mfile) = mfile::File::from_dir(project_root.as_utf8_path().as_std_path()) else {
-        return Ok(cli_mode);
+        return Ok((cli_mode, None));
     };
     let Some(session) = mfile.session.as_ref() else {
-        return Ok(cli_mode);
+        return Ok((cli_mode, None));
     };
     let mut network = session.network.clone().unwrap_or_default();
     let mode = network.mode.unwrap_or(cli_mode);
     network.mode = Some(mode);
     if session.grants.is_empty() {
-        return Ok(mode);
+        return Ok((mode, None));
     }
     let ctx = sessions::GrantContext {
         box_name,
         host_set: &sessions::GITHUB_HOST_SET,
         sign_in_held: crate::auth::sign_in_held(),
+        // No host runs the box-zone resolver yet, so the default `dns`
+        // steering is refused naming it (BEP-017) and every box today
+        // declares `proxy_env`. The flag flips when the resolver lands.
+        resolver_present: false,
     };
     let expansion = sessions::validate_grants(&network, &session.grants, &ctx)?;
     for warning in &expansion.warnings {
         eprintln!("warning: {warning}");
     }
-    Ok(mode)
+    Ok((
+        mode,
+        Some(GrantPlan {
+            expansion,
+            grants: session.grants.clone(),
+        }),
+    ))
+}
+
+/// The file the proxy publishes its root certificate in, PEM, beside its
+/// control socket: what the box's trust store is seeded from (BEP-011).
+const BEP_ROOT_PEM: &str = "root.pem";
+
+/// `<minimal_dir>/bep/root.pem`, with `--minimal-dir` honoured: the control
+/// socket's directory ([`crate::auth::control_socket_path`]).
+fn bep_root_pem_path(minimal_dir: Option<&std::path::Path>) -> PathBuf {
+    crate::auth::control_socket_path(minimal_dir).with_file_name(BEP_ROOT_PEM)
+}
+
+/// This host's name, as the sealed context records it.
+fn host_name() -> Result<String, anyhow::Error> {
+    let name = nix::unistd::gethostname().context("reading this host's name")?;
+    Ok(name.to_string_lossy().into_owned())
+}
+
+/// Mints one member per grant from the held sign-in, sealed to this host's
+/// keys and bound to `box_name`, recording each mint with the proxy
+/// (BEP-005, BEP-006). Every grant of the v1 module is a GitHub user token,
+/// so each gets its own mint and its own audit record.
+async fn mint_grants<S: bep::SignInStore, K: bep::KeyStore>(
+    store: &S,
+    keys: &bep::Keys<K>,
+    control: &std::path::Path,
+    box_name: &str,
+    host: &str,
+    grants: &[sessions::Grant],
+    now: u64,
+) -> Result<Vec<(sessions::core::primitives::StrictVarName, bep::SealedValue)>, anyhow::Error> {
+    let mut sealed = Vec::with_capacity(grants.len());
+    for grant in grants {
+        let request = bep::MintRequest {
+            box_id: box_name,
+            host,
+            host_set_version: sessions::GITHUB_HOST_SET_VERSION,
+            now,
+        };
+        let value = crate::auth::mint_member(store, keys, control, &request)
+            .await
+            .with_context(|| format!("minting the {grant}"))?;
+        sealed.push((grant.env.clone(), value));
+    }
+    Ok(sealed)
+}
+
+/// What the box spec adds to the session's composition beyond the loadouts:
+/// the sealed values in their grants' variables, the proxy environment, and
+/// the root patch. Provenance is the project — the box spec is the project's
+/// `[session]` table — so the daemon's session-content log names each item
+/// under it.
+#[derive(Debug, PartialEq, Eq)]
+struct BoxDelivery {
+    vars: Vec<sessions::wire::primitives::WireSessionVar>,
+    patches: Vec<sessions::wire::primitives::WireSessionPatch>,
+}
+
+/// Lays out the delivery for an admitted expansion: `sealed` in the grants'
+/// variables — the sealed value and nothing else (BEP-007) — the proxy
+/// environment when the expansion sets it (BEP-012), and `root_pem` as a
+/// patch at [`sessions::BEP_ROOT_PATCH_DEST`] when the expansion injects the
+/// CA (BEP-011).
+fn box_delivery(
+    project_root: &paths::HostAbsPath,
+    expansion: &sessions::GrantExpansion,
+    sealed: &[(sessions::core::primitives::StrictVarName, bep::SealedValue)],
+    root_pem: Option<&paths::HostAbsPath>,
+) -> BoxDelivery {
+    use sessions::wire::primitives::{
+        WireResolvedPatch, WireResolvedVar, WireSessionPatch, WireSessionVar, WireSource,
+    };
+    let source = WireSource::Project {
+        path: project_root.clone().into(),
+    };
+    let var = |name: String, value: String| WireSessionVar {
+        var: WireResolvedVar {
+            name,
+            value,
+            carries_user_data: false,
+        },
+        source: source.clone(),
+    };
+    let mut vars: Vec<WireSessionVar> = sealed
+        .iter()
+        .map(|(env, value)| var(env.to_string(), value.as_str().to_owned()))
+        .collect();
+    vars.extend(
+        expansion
+            .proxy_env_vars()
+            .into_iter()
+            .map(|(name, value)| var(name, value)),
+    );
+    let patches = root_pem
+        .filter(|_| expansion.inject_ca)
+        .map(|pem| WireSessionPatch {
+            patch: WireResolvedPatch {
+                host_path: pem.clone(),
+                destination: paths::SandboxRelPath::try_new(sessions::BEP_ROOT_PATCH_DEST)
+                    .expect("BEP_ROOT_PATCH_DEST is a relative sandbox path"),
+            },
+            source: source.clone(),
+        })
+        .into_iter()
+        .collect();
+    BoxDelivery { vars, patches }
+}
+
+/// Delivers the box spec's grants into the composition of the session named
+/// `box_name`: mints each member from the held sign-in, and pairs the sealed
+/// values with the proxy environment and the proxy's published root.
+///
+/// Runs once the session exists, because the sealed context binds the box
+/// by name and an autogenerated name is final only after `CreateSession`.
+async fn deliver_box_grants(
+    global: &GlobalArgs,
+    project_root: &paths::HostAbsPath,
+    box_name: &str,
+    plan: &GrantPlan,
+) -> Result<BoxDelivery, anyhow::Error> {
+    let minimal_dir = global.minimal_dir.as_deref();
+    let store = crate::auth::host_store()?;
+    let keys = crate::auth::host_keys()?;
+    let control = crate::auth::control_socket_path(minimal_dir);
+    let host = host_name()?;
+    let sealed = mint_grants(
+        &store,
+        &keys,
+        &control,
+        box_name,
+        &host,
+        &plan.grants,
+        crate::auth::unix_now(),
+    )
+    .await?;
+    let root_pem = if plan.expansion.inject_ca {
+        let path = bep_root_pem_path(minimal_dir);
+        if !path.is_file() {
+            bail!(
+                "the box egress proxy has not published its root certificate at {}, so the \
+                 box's trust store cannot be seeded; start the proxy and re-create the box",
+                path.display()
+            );
+        }
+        let utf8 = camino::Utf8PathBuf::from_path_buf(path)
+            .map_err(|p| anyhow::anyhow!("{} is not valid UTF-8", p.display()))?;
+        Some(paths::HostAbsPath::try_new(utf8).context("the proxy root's path")?)
+    } else {
+        None
+    };
+    Ok(box_delivery(
+        project_root,
+        &plan.expansion,
+        &sealed,
+        root_pem.as_ref(),
+    ))
 }
 
 /// Create a new session via the `CreateSession` RPC.
@@ -121,8 +295,11 @@ pub(crate) async fn activate_session(
     // each cause, and a grant with no held sign-in fails with
     // `github_sign_in_required` — never a prompt (BEP-003, BEP-008, BEP-009,
     // BEP-010, BEP-056). A spec-declared `network.mode` is the session's
-    // mode; `--network` fills in when the spec is silent.
-    let network = expand_project_grants(&abs_path, &session_name, args.network.into())?;
+    // mode; `--network` fills in when the spec is silent. An admitted spec
+    // with grants comes back as a plan, minted into the composition once
+    // the session exists (see `deliver_box_grants`).
+    let (network, grant_plan) =
+        expand_project_grants(&abs_path, &session_name, args.network.into())?;
 
     // The daemon sources `username` from the authenticated SSH
     // connection context; the client doesn't send it.
@@ -183,7 +360,7 @@ pub(crate) async fn activate_session(
     // timeouts, computed here while the loadouts are still in hand.
     let finalize_hook_budget = loadouts::activate_hook_budget(&active, &utf8_path, !args.no_hooks);
 
-    let (contribution, user_policy) =
+    let (mut contribution, user_policy) =
         loadouts::compose_user_contribution(active, user_policy, compose_options, !args.no_hooks)?;
 
     // `--sync` defaults to tarball; `sync_explicit` records whether the
@@ -306,6 +483,27 @@ pub(crate) async fn activate_session(
     // prompt tears it down instead of orphaning it in `Pending` — see
     // [`ActivationInterrupt`]. Disarmed once the session is `Active`.
     let interrupt_guard = arm_activation_interrupt(global, id);
+
+    // The box spec's grants, delivered now that the box has its final name:
+    // the sealed values in the grants' variables, the proxy environment and
+    // the proxy's root as a patch join the client contribution (BEP-007,
+    // BEP-011, BEP-012), so they ride the same `ConfigureLoadout` and patch
+    // upload the loadouts do and the daemon logs them with their provenance.
+    // A mint that fails leaves a draft session nothing can finish; abort it
+    // rather than orphan it.
+    if let Some(plan) = &grant_plan {
+        let box_name = config.name.as_deref().unwrap_or_default();
+        match deliver_box_grants(global, &abs_path, box_name, plan).await {
+            Ok(delivery) => {
+                contribution.vars.extend(delivery.vars);
+                contribution.patches.extend(delivery.patches);
+            }
+            Err(e) => {
+                send_abort(&mut client, id).await;
+                return Err(e);
+            }
+        }
+    }
 
     // Upload the project directory to the daemon so the session
     // workspace holds the user's files — `ConfigureLoadout`'s compose
@@ -1555,5 +1753,210 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
         minimald_rpc::Errorable::Err { error } => {
             bail!("RenameSession failed: {error}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bep::github::{MemorySignIns, Secret};
+    use bep::{Keys, Log, MemoryStore, SignIn, SignInStore as _, Submission};
+    use sessions::core::primitives::StrictVarName;
+    use sessions::wire::primitives::WireSource;
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+    use tokio::net::UnixListener;
+
+    use super::*;
+
+    const TOKEN: &str = "ghu_TESTTOKENfa2c1b0d8e7f6a5b4c3d2e1f0a9b8c7d";
+
+    /// A proxy's control socket that appends each submission to `log` and
+    /// answers with the record, the way the real one does.
+    async fn fake_proxy(socket: &std::path::Path, log: &std::path::Path) {
+        let listener = UnixListener::bind(socket).unwrap();
+        let mut log = Log::open(log).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let submission: Submission = serde_json_lenient::from_str(&line).unwrap();
+                let reply = match bep::submit(&mut log, &submission) {
+                    Ok(record) => serde_json_lenient::to_string(&record).unwrap(),
+                    Err(error) => format!(r#"{{"error":"{error}"}}"#),
+                };
+                writer
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+    }
+
+    fn github_grant() -> sessions::Grant {
+        sessions::Grant {
+            module: sessions::GrantModule::Github,
+            env: StrictVarName::try_new("GITHUB_TOKEN").unwrap(),
+            source: sessions::GrantSource::Broker,
+            mode: sessions::GrantMode::User,
+        }
+    }
+
+    /// A spec every check admits under `proxy_env` steering, with one
+    /// `no_proxy` entry of its own.
+    fn steered_network() -> sessions::BoxNetwork {
+        sessions::BoxNetwork {
+            mode: Some(sessions::NetworkMode::HostNet),
+            egress: Some(sessions::EgressPolicy {
+                allow_dns_hosts: Some(
+                    sessions::GITHUB_HOST_SET
+                        .iter()
+                        .map(|h| (*h).to_owned())
+                        .collect(),
+                ),
+                ..sessions::EgressPolicy::default()
+            }),
+            bep: sessions::BepPolicy {
+                steering: Some(sessions::Steering::ProxyEnv),
+                proxy_env: false,
+                no_proxy: vec!["release-assets.githubusercontent.com".to_owned()],
+            },
+        }
+    }
+
+    fn expand(network: &sessions::BoxNetwork) -> sessions::GrantExpansion {
+        let ctx = sessions::GrantContext {
+            box_name: "web",
+            host_set: &sessions::GITHUB_HOST_SET,
+            sign_in_held: true,
+            resolver_present: false,
+        };
+        sessions::validate_grants(network, &[github_grant()], &ctx).unwrap()
+    }
+
+    /// BEP-007, BEP-011, BEP-012: activation mints the grant's member from
+    /// the held sign-in and hands the composition the sealed value in the
+    /// grant's variable — never the token — beside the proxy environment
+    /// and the root patch, every item under the project's provenance.
+    #[tokio::test]
+    async fn activate_mints_and_hands_sealed_value_to_composition() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let audit = dir.path().join("audit.jsonl");
+        fake_proxy(&socket, &audit).await;
+        let root_pem = dir.path().join("root.pem");
+        std::fs::write(&root_pem, "-----BEGIN CERTIFICATE-----\n").unwrap();
+        let root_pem =
+            paths::HostAbsPath::try_new(camino::Utf8PathBuf::from_path_buf(root_pem).unwrap())
+                .unwrap();
+        let project = paths::HostAbsPath::try_new("/repo/web").unwrap();
+
+        let store = MemorySignIns::new();
+        let now = crate::auth::unix_now();
+        store
+            .store(&SignIn {
+                account: "octocat".into(),
+                token: Secret::new(TOKEN),
+                expires_at: Some(now + 28_800),
+                refresh_token: None,
+                refresh_expires_at: None,
+            })
+            .unwrap();
+        let keys = Keys::open(MemoryStore::new()).unwrap();
+
+        // The mint: one sealed member for the one grant, bound to the box.
+        let sealed = mint_grants(
+            &store,
+            &keys,
+            &socket,
+            "web",
+            "mac-1",
+            &[github_grant()],
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(sealed[0].0.to_string(), "GITHUB_TOKEN");
+        let unsealed = bep::unseal(&keys, sealed[0].1.as_str()).unwrap();
+        assert_eq!(unsealed.member.expose(), TOKEN);
+        assert_eq!(unsealed.context.box_id, "web");
+        assert_eq!(unsealed.context.host, "mac-1");
+        assert_eq!(
+            unsealed.context.host_set_version,
+            sessions::GITHUB_HOST_SET_VERSION
+        );
+
+        // The hand-off: the grant variable, the proxy environment, the root.
+        let network = steered_network();
+        let expansion = expand(&network);
+        let delivery = box_delivery(&project, &expansion, &sealed, Some(&root_pem));
+        let names: Vec<&str> = delivery.vars.iter().map(|v| v.var.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["GITHUB_TOKEN", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]
+        );
+        let grant_var = &delivery.vars[0].var;
+        assert_eq!(grant_var.value, sealed[0].1.as_str());
+        assert!(
+            grant_var.value.starts_with(bep::seal::PREFIX),
+            "{grant_var:?}"
+        );
+        assert!(!grant_var.value.contains(TOKEN));
+        assert!(!grant_var.carries_user_data);
+        assert_eq!(delivery.vars[1].var.value, sessions::BEP_PROXY_URL);
+        assert_eq!(delivery.vars[2].var.value, sessions::BEP_PROXY_URL);
+        assert_eq!(
+            delivery.vars[3].var.value,
+            ".min.internal,host.min.internal,localhost,127.0.0.1,release-assets.githubusercontent.com"
+        );
+        let project_source = WireSource::Project {
+            path: project.clone().into(),
+        };
+        for var in &delivery.vars {
+            assert_eq!(var.source, project_source, "{var:?}");
+        }
+        assert_eq!(delivery.patches.len(), 1);
+        assert_eq!(delivery.patches[0].patch.host_path, root_pem);
+        assert_eq!(
+            delivery.patches[0].patch.destination.as_str(),
+            sessions::BEP_ROOT_PATCH_DEST
+        );
+        assert_eq!(delivery.patches[0].source, project_source);
+        // Nothing that rides the wire carries the token.
+        let wire = serde_json_lenient::to_string(&delivery.vars).unwrap();
+        assert!(!wire.contains(TOKEN), "{wire}");
+
+        // The mint is on the proxy's record, naming the box and never the
+        // token.
+        let log = std::fs::read_to_string(&audit).unwrap();
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert!(log.contains(r#""kind":"mint""#), "{log}");
+        assert!(log.contains(r#""sub":"web""#), "{log}");
+        assert!(!log.contains(TOKEN), "{log}");
+
+        // `steering = "off"`: the value is delivered, no CA and no proxy
+        // environment (BEP-010).
+        let mut off = network.clone();
+        off.bep.steering = Some(sessions::Steering::Off);
+        let delivery = box_delivery(&project, &expand(&off), &sealed, Some(&root_pem));
+        let names: Vec<&str> = delivery.vars.iter().map(|v| v.var.name.as_str()).collect();
+        assert_eq!(names, ["GITHUB_TOKEN"]);
+        assert!(delivery.patches.is_empty());
+    }
+
+    /// The proxy publishes its root beside its control socket, under the
+    /// same `--minimal-dir`.
+    #[test]
+    fn proxy_root_is_published_beside_the_control_socket() {
+        let dir = std::path::Path::new("/state/minimal");
+        assert_eq!(
+            bep_root_pem_path(Some(dir)),
+            PathBuf::from("/state/minimal/bep/root.pem")
+        );
+        assert_eq!(
+            bep_root_pem_path(Some(dir)).parent(),
+            crate::auth::control_socket_path(Some(dir)).parent()
+        );
     }
 }

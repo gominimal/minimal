@@ -273,6 +273,27 @@ pub enum Steering {
     Off,
 }
 
+impl Steering {
+    /// The steering a box spec declaring a credentialed upstream and no
+    /// `steering` resolves to (BEP-016). `dns` is the architecture's
+    /// default, so a spec written today means the same thing once the
+    /// box-zone resolver exists; until then an unadorned grant is refused
+    /// naming the missing resolver (BEP-017).
+    pub const DEFAULT: Self = Self::Dns;
+
+    /// Whether this steering needs the host's box-zone resolver.
+    #[must_use]
+    pub fn steers_dns(self) -> bool {
+        matches!(self, Self::Dns | Self::Both)
+    }
+
+    /// Whether this steering points `HTTPS_PROXY`/`HTTP_PROXY` at the proxy.
+    #[must_use]
+    pub fn steers_proxy_env(self) -> bool {
+        matches!(self, Self::ProxyEnv | Self::Both)
+    }
+}
+
 impl fmt::Display for Steering {
     /// Renders the `snake_case` spelling a box spec uses, so a refusal or a
     /// warning names the value as the operator wrote it.
@@ -301,6 +322,48 @@ pub struct BepPolicy {
     #[serde(default)]
     pub no_proxy: Vec<String>,
 }
+
+impl BepPolicy {
+    /// The steering a box declaring a credentialed upstream is created
+    /// with: the declared value, else [`Steering::DEFAULT`] (BEP-016).
+    #[must_use]
+    pub fn resolved_steering(&self) -> Steering {
+        self.steering.unwrap_or(Steering::DEFAULT)
+    }
+}
+
+/// The proxy's address as a box under `proxy_env` steering reaches it: the
+/// redemption listener's default bind, on the loopback a host-network box
+/// shares with the host. An own-IP or VM-hosted box reaches the host at
+/// another address; that addressing arrives with the listener's own-IP
+/// attachment work and is not this constant's to guess.
+pub const BEP_PROXY_URL: &str = "http://127.0.0.1:7655";
+
+/// The local zone `NO_PROXY` always carries under `proxy_env` (BEP-012):
+/// peer boxes by name, the host, and loopback, so local traffic never
+/// detours through a credential proxy. The spec's `[network.bep] no_proxy`
+/// entries follow these.
+pub const BEP_NO_PROXY_LOCAL_ZONE: [&str; 4] = [
+    ".min.internal",
+    "host.min.internal",
+    "localhost",
+    "127.0.0.1",
+];
+
+/// Where the CLI delivers the host's interception root CA into the session
+/// home, as a composition patch (relative to the sandbox home like every
+/// patch destination), and where the daemon reads it back from at launch to
+/// install it into the box trust store (BEP-011). The daemon holds no host
+/// key material of its own — on macOS it runs inside a VM — so the root
+/// rides the same upload the loadouts' files do.
+pub const BEP_ROOT_PATCH_DEST: &str = ".local/share/minimal/bep/root.pem";
+
+/// The box trust store directory, relative to the rootfs, and the file the
+/// root lands in there. `/etc/ssl/certs` is where OpenSSL-linked tools
+/// (curl, git) look for anchors.
+pub const BEP_TRUST_STORE_DIR: &str = "etc/ssl/certs";
+/// See [`BEP_TRUST_STORE_DIR`].
+pub const BEP_TRUST_STORE_FILE: &str = "minimal-bep-root.pem";
 
 /// The `[session.network]` table of a box spec.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -400,6 +463,11 @@ pub const GITHUB_HOST_SET: [&str; 4] = [
     "codeload.github.com",
 ];
 
+/// The version of [`GITHUB_HOST_SET`] a member minted today binds to; the
+/// proxy's module carries the same number, and a member minted under
+/// another version is refused at redemption.
+pub const GITHUB_HOST_SET_VERSION: u32 = 1;
+
 /// What the grant validation runs against, beyond the spec itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GrantContext<'a> {
@@ -409,16 +477,63 @@ pub struct GrantContext<'a> {
     pub host_set: &'a [&'a str],
     /// Whether a GitHub sign-in is held on this host.
     pub sign_in_held: bool,
+    /// Whether this host runs the box-zone resolver that `dns` steering
+    /// needs to answer the credentialed hostnames with the proxy's address.
+    pub resolver_present: bool,
 }
 
 /// The outcome of an admitted expansion: what the box is created with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantExpansion {
+    /// The resolved steering: the spec's, else [`Steering::DEFAULT`] when a
+    /// grant is declared (BEP-016). With no grant there is nothing to
+    /// steer, and the spec's own value (or `off`) is reported as it stands.
+    pub steering: Steering,
     /// Whether the host's interception root CA is injected into the box's
     /// trust store; `false` under `steering = "off"`.
     pub inject_ca: bool,
+    /// Whether `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` are set in the box:
+    /// `proxy_env` or `both` steering, or `[network.bep] proxy_env = true`
+    /// (BEP-012).
+    pub proxy_env: bool,
+    /// What `NO_PROXY` carries when `proxy_env` is set: the local zone,
+    /// then the spec's `no_proxy` entries, deduplicated in that order.
+    pub no_proxy: Vec<String>,
     /// Validation warnings, one per grant declared under `steering = "off"`.
     pub warnings: Vec<GrantWarning>,
+}
+
+impl GrantExpansion {
+    /// The proxy environment the box is created with (BEP-012): both proxy
+    /// variables at [`BEP_PROXY_URL`] and `NO_PROXY` as a comma-joined
+    /// list, or nothing when `proxy_env` is not set.
+    #[must_use]
+    pub fn proxy_env_vars(&self) -> Vec<(String, String)> {
+        if !self.proxy_env {
+            return Vec::new();
+        }
+        vec![
+            ("HTTPS_PROXY".to_owned(), BEP_PROXY_URL.to_owned()),
+            ("HTTP_PROXY".to_owned(), BEP_PROXY_URL.to_owned()),
+            ("NO_PROXY".to_owned(), self.no_proxy.join(",")),
+        ]
+    }
+}
+
+/// The `NO_PROXY` list for a spec: [`BEP_NO_PROXY_LOCAL_ZONE`] followed by
+/// the spec's own entries, each host once, in first-seen order.
+fn no_proxy_list(bep: &BepPolicy) -> Vec<String> {
+    let mut list: Vec<String> = Vec::new();
+    for host in BEP_NO_PROXY_LOCAL_ZONE
+        .iter()
+        .copied()
+        .chain(bep.no_proxy.iter().map(String::as_str))
+    {
+        if !list.iter().any(|seen| seen.eq_ignore_ascii_case(host)) {
+            list.push(host.to_owned());
+        }
+    }
+    list
 }
 
 /// A validation warning: the spec is honoured, and the operator is told what
@@ -452,6 +567,15 @@ pub enum GrantRefusalCause {
          would fail every TLS handshake"
     )]
     SteeringOffWithProxyEnv,
+    /// `dns` or `both` steering on a host with no box-zone resolver: nothing
+    /// would answer the credentialed hostnames with the proxy's address, so
+    /// the box's requests would go direct with the sealed value in hand.
+    #[error(
+        "`[session.network.bep] steering = \"{steering}\"` needs the host's box-zone resolver \
+         to answer the credentialed hostnames with the proxy's address, and this host has no \
+         box-zone resolver; declare `steering = \"proxy_env\"` until it exists"
+    )]
+    NoBoxZoneResolver { steering: Steering },
     /// `mode = "installation"` on an un-enrolled host, which holds no App
     /// private key to mint one with.
     #[error(
@@ -519,7 +643,14 @@ impl std::error::Error for GrantRefusal {}
 /// (BEP-003). A grant under `steering = "off"` is admitted with a warning,
 /// and the expansion injects no CA (BEP-010).
 ///
-/// A spec with no grants is admitted as it stands, sign-in or not.
+/// A spec declaring a grant and no `steering` resolves to
+/// [`Steering::DEFAULT`] (BEP-016); a resolved `dns` or `both` on a host with
+/// no box-zone resolver is refused naming the resolver (BEP-017). The
+/// expansion says whether the proxy environment is set and what `NO_PROXY`
+/// carries (BEP-012).
+///
+/// A spec with no grants is admitted as it stands, sign-in or not, and
+/// delivers nothing: no CA, no proxy environment.
 ///
 /// # Errors
 ///
@@ -531,14 +662,26 @@ pub fn validate_grants(
 ) -> Result<GrantExpansion, GrantRefusal> {
     if grants.is_empty() {
         return Ok(GrantExpansion {
+            steering: network.bep.steering.unwrap_or(Steering::Off),
             inject_ca: false,
+            proxy_env: false,
+            no_proxy: Vec::new(),
             warnings: Vec::new(),
         });
     }
-    let steering_off = network.bep.steering == Some(Steering::Off);
+    let steering = network.bep.resolved_steering();
+    let steering_off = steering == Steering::Off;
     let mut causes = Vec::new();
     if steering_off && network.bep.proxy_env {
         causes.push(GrantRefusalCause::SteeringOffWithProxyEnv);
+    }
+    if steering.steers_dns() && !ctx.resolver_present {
+        tracing::warn!(
+            box_name = ctx.box_name,
+            %steering,
+            "steering needs the box-zone resolver, which this host does not run"
+        );
+        causes.push(GrantRefusalCause::NoBoxZoneResolver { steering });
     }
     let mut warnings = Vec::new();
     for grant in grants {
@@ -594,8 +737,16 @@ pub fn validate_grants(
     if !causes.is_empty() {
         return Err(GrantRefusal { causes });
     }
+    let proxy_env = steering.steers_proxy_env() || network.bep.proxy_env;
     Ok(GrantExpansion {
+        steering,
         inject_ca: !steering_off,
+        proxy_env,
+        no_proxy: if proxy_env {
+            no_proxy_list(&network.bep)
+        } else {
+            Vec::new()
+        },
         warnings,
     })
 }
@@ -1315,11 +1466,13 @@ mod tests {
             }
         }
 
+        /// The host as it is today: no box-zone resolver.
         fn ctx(sign_in_held: bool) -> GrantContext<'static> {
             GrantContext {
                 box_name: "web",
                 host_set: &GITHUB_HOST_SET,
                 sign_in_held,
+                resolver_present: false,
             }
         }
 
@@ -1430,6 +1583,135 @@ mod tests {
             assert!(text.contains("steering = \"off\""), "{text}");
             assert!(text.contains("proxy_env = true"), "{text}");
             assert!(text.contains("exit 3"), "{text}");
+        }
+
+        /// BEP-016: a spec declaring a grant and no `steering` resolves to
+        /// `dns`, and is created with the CA and no proxy environment once
+        /// the resolver exists. `[network.bep] proxy_env = true` adds the
+        /// proxy environment without changing the resolved steering; a
+        /// declared steering is kept as written; and a spec with no grant
+        /// has nothing to steer, so nothing is resolved for it.
+        #[test]
+        fn steering_defaults_to_dns() {
+            let with_resolver = GrantContext {
+                resolver_present: true,
+                ..ctx(true)
+            };
+            let mut network = admitted_network();
+            network.bep.steering = None;
+            assert_eq!(network.bep.resolved_steering(), Steering::Dns);
+
+            let expansion = validate_grants(&network, &[user_grant()], &with_resolver).unwrap();
+            assert_eq!(expansion.steering, Steering::Dns);
+            assert!(expansion.inject_ca);
+            assert!(!expansion.proxy_env);
+            assert!(expansion.no_proxy.is_empty());
+            assert!(expansion.proxy_env_vars().is_empty());
+
+            network.bep.proxy_env = true;
+            network.bep.no_proxy = vec![
+                "release-assets.githubusercontent.com".to_owned(),
+                "LOCALHOST".to_owned(),
+            ];
+            let expansion = validate_grants(&network, &[user_grant()], &with_resolver).unwrap();
+            assert_eq!(expansion.steering, Steering::Dns);
+            assert!(expansion.proxy_env);
+            // BEP-012: the local zone first, then the spec's entries, each
+            // host once.
+            assert_eq!(
+                expansion.no_proxy,
+                vec![
+                    ".min.internal",
+                    "host.min.internal",
+                    "localhost",
+                    "127.0.0.1",
+                    "release-assets.githubusercontent.com",
+                ]
+            );
+            assert_eq!(
+                expansion.proxy_env_vars(),
+                vec![
+                    ("HTTPS_PROXY".to_owned(), BEP_PROXY_URL.to_owned()),
+                    ("HTTP_PROXY".to_owned(), BEP_PROXY_URL.to_owned()),
+                    (
+                        "NO_PROXY".to_owned(),
+                        ".min.internal,host.min.internal,localhost,127.0.0.1,\
+                         release-assets.githubusercontent.com"
+                            .to_owned()
+                    ),
+                ]
+            );
+
+            for declared in [Steering::ProxyEnv, Steering::Both, Steering::Dns] {
+                network.bep.steering = Some(declared);
+                network.bep.proxy_env = false;
+                let expansion = validate_grants(&network, &[user_grant()], &with_resolver).unwrap();
+                assert_eq!(expansion.steering, declared);
+                assert_eq!(expansion.proxy_env, declared.steers_proxy_env());
+            }
+
+            // No grant: the spec's value is reported, none is resolved.
+            network.bep.steering = None;
+            let expansion = validate_grants(&network, &[], &ctx(false)).unwrap();
+            assert_eq!(expansion.steering, Steering::Off);
+            assert!(!expansion.inject_ca);
+            assert!(!expansion.proxy_env);
+        }
+
+        proptest! {
+            /// BEP-017: for every box spec declaring a credentialed upstream,
+            /// on a host with no box-zone resolver, expansion refuses iff the
+            /// resolved steering is `dns` or `both` — naming the resolver —
+            /// and the same spec is admitted once the resolver is present.
+            #[test]
+            fn prop_dns_steering_without_resolver_is_exit_3(
+                steering in prop_oneof![
+                    Just(None),
+                    Just(Some(Steering::Dns)),
+                    Just(Some(Steering::ProxyEnv)),
+                    Just(Some(Steering::Both)),
+                    Just(Some(Steering::Off)),
+                ],
+                proxy_env in any::<bool>(),
+                grant_count in 1usize..3,
+            ) {
+                let mut network = admitted_network();
+                network.bep.steering = steering;
+                // `off` with `proxy_env` is refused on its own (BEP-010) and
+                // would muddy the property, so it is kept out of the space.
+                network.bep.proxy_env = proxy_env && steering != Some(Steering::Off);
+                let grants: Vec<Grant> = (0..grant_count)
+                    .map(|i| grant(&format!("TOKEN_{i}"), GrantMode::User))
+                    .collect();
+                let resolved = steering.unwrap_or(Steering::Dns);
+
+                let result = validate_grants(&network, &grants, &ctx(true));
+                prop_assert_eq!(result.is_err(), resolved.steers_dns());
+                match result {
+                    Err(refusal) => {
+                        prop_assert_eq!(GrantRefusal::EXIT_CODE, 3);
+                        let text = refusal.to_string();
+                        prop_assert_eq!(
+                            refusal.causes,
+                            vec![GrantRefusalCause::NoBoxZoneResolver { steering: resolved }]
+                        );
+                        prop_assert!(text.contains("box-zone resolver"), "{}", text);
+                        prop_assert!(text.contains(&format!("steering = \"{resolved}\"")), "{}", text);
+                    }
+                    Ok(expansion) => {
+                        prop_assert_eq!(expansion.steering, resolved);
+                    }
+                }
+
+                let with_resolver = GrantContext { resolver_present: true, ..ctx(true) };
+                let expansion = validate_grants(&network, &grants, &with_resolver).unwrap();
+                prop_assert_eq!(expansion.steering, resolved);
+                prop_assert_eq!(expansion.inject_ca, resolved != Steering::Off);
+                prop_assert_eq!(
+                    expansion.proxy_env,
+                    resolved.steers_proxy_env() || network.bep.proxy_env
+                );
+            }
         }
 
         /// A pool of hostnames a host set and an allow list are drawn from.

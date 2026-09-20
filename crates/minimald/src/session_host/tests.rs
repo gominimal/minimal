@@ -1291,3 +1291,51 @@ async fn stale_binding_generation_input_is_discarded() {
         .expect("host task should not panic during teardown")
         .expect("mainloop should return the reaped exit status");
 }
+
+/// BEP-011: the root the box spec's grants delivered into the session home
+/// (the CLI's root patch at `BEP_ROOT_PATCH_DEST`) lands in the rootfs trust
+/// store directory, byte for byte and world-readable; a home carrying no root
+/// installs nothing and creates no trust store directory.
+#[test]
+fn root_patch_lands_in_trust_store_dir() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const PEM: &str =
+        "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END CERTIFICATE-----\n";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let rootfs = tmp.path().join("rootfs");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&rootfs).unwrap();
+
+    // No root delivered: nothing installed, and the trust store untouched.
+    assert_eq!(install_trust_root(&home, &rootfs).unwrap(), None);
+    assert!(!rootfs.join(sessions::BEP_TRUST_STORE_DIR).exists());
+
+    // The root, materialized into the home the way `FinalizeSession` does
+    // for every patch, with the tight bits an upload may carry.
+    let source = home.join(sessions::BEP_ROOT_PATCH_DEST);
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, PEM).unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let installed = install_trust_root(&home, &rootfs)
+        .unwrap()
+        .expect("a delivered root is installed");
+    let expected = rootfs
+        .join(sessions::BEP_TRUST_STORE_DIR)
+        .join(sessions::BEP_TRUST_STORE_FILE);
+    assert_eq!(installed, expected);
+    assert_eq!(expected, rootfs.join("etc/ssl/certs/minimal-bep-root.pem"));
+    assert_eq!(std::fs::read_to_string(&installed).unwrap(), PEM);
+    assert_eq!(
+        std::fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
+        0o644,
+        "the anchor must be readable by every process in the box"
+    );
+
+    // A second launch of the same session installs the same root again
+    // without complaint.
+    assert_eq!(install_trust_root(&home, &rootfs).unwrap(), Some(installed));
+}

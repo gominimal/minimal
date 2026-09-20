@@ -81,14 +81,31 @@ pub async fn cmd_auth(global: &GlobalArgs, command: AuthCommand) -> Result<(), a
 /// store that holds the material outside any file, per the spec's keychain
 /// rule.
 #[cfg(target_os = "macos")]
-fn host_store() -> Result<bep::github::KeychainSignIns, anyhow::Error> {
+pub(crate) fn host_store() -> Result<bep::github::KeychainSignIns, anyhow::Error> {
     Ok(bep::github::KeychainSignIns)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn host_store() -> Result<bep::MemorySignIns, anyhow::Error> {
+pub(crate) fn host_store() -> Result<bep::MemorySignIns, anyhow::Error> {
     bail!(
         "min auth holds the GitHub sign-in in the host keychain, and this host has no \
+         keychain backend yet (macOS only)"
+    )
+}
+
+/// The host's proxy keys — the sealing key a box's member is sealed to —
+/// held in the same store as the sign-in. Opening generates them on first
+/// use; a host with no keychain backend has none, as it holds no sign-in to
+/// mint from either.
+#[cfg(target_os = "macos")]
+pub(crate) fn host_keys() -> Result<Keys<bep::keychain::MacosKeychain>, anyhow::Error> {
+    Ok(Keys::open(bep::keychain::MacosKeychain)?)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn host_keys() -> Result<Keys<bep::MemoryStore>, anyhow::Error> {
+    bail!(
+        "the box egress proxy's keys live in the host keychain, and this host has no \
          keychain backend yet (macOS only)"
     )
 }
