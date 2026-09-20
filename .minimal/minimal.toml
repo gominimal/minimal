@@ -88,32 +88,9 @@ cargo fmt --all
 # runtime falls back to the plan survey's `just test-one`, which has no
 # filter to run.
 #
-# It was rustfmt only, because a COLD `cargo clippy --all-targets` on this
-# workspace does not fit that budget. The runtime stopped running this task
-# cold on 2026-09-20 (gominimal/agent-runtime#122): it is wrapped now, with
-# the job's shared `CARGO_TARGET_DIR` and sccache, so it starts from the
-# graph the task's own `test:` lines just built rather than from nothing.
-#
-# What that bought, and why the gate is wider now — canary 1569 on this
-# repository, 2026-09-20, needed two coder jobs after the first:
-#
-#   Round 1: `clippy` red. The fix was `fix: remove redundant .into() in
-#   policy test`. 29 minutes of a second job to delete two words, because
-#   `[tasks.clippy]` sat right here and the gate did not run it.
-#
-#   Round 2: `unit` red. A box spec accepted ingress on HostNet. The task's
-#   three `test:` lines in `-p sessions` all passed — they name single
-#   tests, which is what the plan format requires — and the crate's own
-#   suite is what caught it.
-#
-# So: clippy, then the suite of each crate the coder touched. Not the
-# workspace's suite; `MINIMAL_CHANGED_PATHS` is what the runtime hands this
-# task (one path per line) and the crates are read off it, so the gate is
-# the size of the work. Empty means the runtime told us nothing, which is
-# "no scope" — clippy still runs.
-#
-# Both mirror a CI job exactly, which is the point: CI is the gate that
-# decides, and a signal that disagrees with it costs a whole job.
+# rustfmt, clippy, and the test suite of each crate the coder touched, read
+# off `MINIMAL_CHANGED_PATHS` — the changed files the runtime puts in this
+# task's env, one per line. No paths means no suites; clippy still runs.
 [tasks.verify]
 description = "the cheap gate the agent runtime runs after a task's test lines"
 inherit_cwd = true
@@ -122,9 +99,7 @@ set -e
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 
-# The crates the coder touched, from the paths the runtime handed us:
-# `crates/<name>/...` is the only layout this workspace has. Sorted and
-# deduplicated, and a path outside `crates/` contributes nothing.
+# Crate names out of `crates/<name>/...`, deduplicated; other paths ignored.
 crates=$(printf '%s\\n' "${MINIMAL_CHANGED_PATHS:-}" \\
   | sed -n 's|^crates/\\([^/][^/]*\\)/.*|\\1|p' \\
   | sort -u)
