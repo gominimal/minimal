@@ -19,11 +19,13 @@
 //! - [`audit`] is the log: one hash-chained JSONL record per decision, append
 //!   only, carrying no credential and no body.
 //! - [`control`] is the control socket's audit submissions: how a client's
-//!   mints and revocations reach the log the proxy alone writes.
+//!   mints and revocations reach the log the proxy alone writes, and the
+//!   revocations they put in force.
 //! - [`github`] is the GitHub sign-in: the device and browser flows under
 //!   the Minimal-published App, and the host store the sign-in lives in.
 //! - [`mint`] mints a member from the held sign-in, sealed to this host,
-//!   and makes the identity events a mint and a logout record.
+//!   and makes the identity events a mint, a logout and a box's removal
+//!   record.
 //! - [`listener`] is the shell around the decision: it accepts a box's
 //!   connections, terminates TLS for the declared hosts, decides each request
 //!   and forwards it with the substitution the decision allows.
@@ -46,12 +48,12 @@ pub mod upstream;
 // refuse is not the redemption outcome.
 pub use audit::{AuditError, Event, Hash, Kind, Log, Mapping, Record};
 pub use ca::{Authority, CaError, DeclaredUnion, Leaf};
-pub use control::{ControlError, Submission, submit};
+pub use control::{ControlError, REVOCATION_DEADLINE_SECS, Revocations, Submission, submit};
 pub use github::{GitHub, GitHubError, MemorySignIns, SignIn, SignInStore};
 pub use keychain::{KeyStore, MemoryStore, PrivateKey, StoreError};
 pub use keys::{Fingerprint, KeyRole, KeyStatus, Keys, KeysError, inspect};
 pub use listener::{Addressing, Attachments, Config, ListenerError, Module, Proxy, Sender};
-pub use mint::{MintError, MintRequest, Minted, mint, revocation_event};
+pub use mint::{MintError, MintRequest, Minted, box_revocation_event, mint, revocation_event};
 pub use redeem::{Check, Decision, Redemption, decide};
 pub use seal::{Member, Refusal, SealError, SealedContext, SealedValue, Unsealed, seal, unseal};
 pub use upstream::{Resolver, Trust, TrustError, UpstreamError, Validated};

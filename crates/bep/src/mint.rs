@@ -9,9 +9,9 @@
 //! from the mint and the token's own expiry: the member is a creation-time
 //! snapshot, and a box that outlives it is re-created to re-mint.
 //!
-//! The mint and the logout each make one [`Event`] for the proxy's log; the
-//! client submits it over the control socket ([`crate::control`]) and never
-//! opens the log itself.
+//! The mint, the logout and a box's removal each make one [`Event`] for the
+//! proxy's log; the client submits it over the control socket
+//! ([`crate::control`]) and never opens the log itself.
 
 use crate::audit::{Decision, Event, Kind, Mapping};
 use crate::github::SignIn;
@@ -132,6 +132,13 @@ pub fn mint<S: KeyStore>(
 #[must_use]
 pub fn revocation_event() -> Event {
     identity_event(Kind::Revocation, EVERY_BOX)
+}
+
+/// The `revocation` event a box's removal records: every sealed value naming
+/// `box_id` is refused from now on, whatever its own expiry says (BEP-043).
+#[must_use]
+pub fn box_revocation_event(box_id: &str) -> Event {
+    identity_event(Kind::Revocation, box_id)
 }
 
 fn identity_event(kind: Kind, box_id: &str) -> Event {

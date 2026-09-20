@@ -459,7 +459,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use bep::github::{Endpoints, MemorySignIns, Secret};
-    use bep::{Kind, Log, MemoryStore};
+    use bep::{Kind, Log, MemoryStore, Revocations};
     use tokio::net::{TcpStream, UnixListener};
 
     use super::*;
@@ -839,10 +839,16 @@ mod tests {
     }
 
     /// A proxy's control socket on loopback: reads one submission per
-    /// connection and appends it to the log it alone writes.
-    async fn fake_proxy(socket: &Path, log: &Path) {
+    /// connection, appends it to the log it alone writes and puts a revocation
+    /// it carries in force, as the proxy's own intake does.
+    ///
+    /// The returned set is what a test reads to see what the proxy would
+    /// refuse from then on.
+    async fn fake_proxy(socket: &Path, log: &Path) -> Arc<Mutex<Revocations>> {
         let listener = UnixListener::bind(socket).unwrap();
         let mut log = Log::open(log).unwrap();
+        let revocations = Arc::new(Mutex::new(Revocations::default()));
+        let in_force = Arc::clone(&revocations);
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -850,9 +856,12 @@ mod tests {
                 let mut line = String::new();
                 BufReader::new(reader).read_line(&mut line).await.unwrap();
                 let submission: Submission = serde_json_lenient::from_str(&line).unwrap();
-                let reply = match bep::submit(&mut log, &submission) {
-                    Ok(record) => serde_json_lenient::to_string(&record).unwrap(),
-                    Err(error) => format!(r#"{{"error":"{error}"}}"#),
+                let reply = {
+                    let mut in_force = in_force.lock().unwrap();
+                    match bep::submit(&mut log, &mut in_force, &submission) {
+                        Ok(record) => serde_json_lenient::to_string(&record).unwrap(),
+                        Err(error) => format!(r#"{{"error":"{error}"}}"#),
+                    }
                 };
                 writer
                     .write_all(format!("{reply}\n").as_bytes())
@@ -860,6 +869,7 @@ mod tests {
                     .unwrap();
             }
         });
+        revocations
     }
 
     /// BEP-067: a mint and a logout each append their record to the proxy's
@@ -870,7 +880,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
         let audit = dir.path().join("audit.jsonl");
-        fake_proxy(&socket, &audit).await;
+        let _revocations = fake_proxy(&socket, &audit).await;
 
         let store = MemorySignIns::new();
         let now = unix_now();
@@ -949,5 +959,92 @@ mod tests {
             "{refused:#}"
         );
         assert_eq!(std::fs::read_to_string(&audit).unwrap().lines().count(), 2);
+    }
+
+    /// BEP-044: `min auth logout` sends the proxy the one revocation that puts
+    /// every GitHub member minted on this host beyond redemption, whichever box
+    /// it was minted for — and a proxy that is not there does not turn a logout
+    /// into a failure.
+    #[tokio::test]
+    async fn logout_sends_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let audit = dir.path().join("audit.jsonl");
+        let revocations = fake_proxy(&socket, &audit).await;
+
+        let store = MemorySignIns::new();
+        let now = unix_now();
+        let sign_in = SignIn {
+            account: "octocat".into(),
+            token: Secret::new(TOKEN),
+            expires_at: Some(now + 28_800),
+            refresh_token: Some(Secret::new(REFRESH)),
+            refresh_expires_at: Some(now + 15_811_200),
+        };
+        store.store(&sign_in).unwrap();
+        let keys = Keys::open(MemoryStore::new()).unwrap();
+
+        // A member minted for a box: what the logout has to cover. Minting
+        // revokes nothing of its own.
+        mint_member(
+            &store,
+            &keys,
+            &socket,
+            &MintRequest {
+                box_id: "box-a1",
+                host: "mac-1",
+                host_set_version: 1,
+                now,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(revocations.lock().unwrap().is_empty());
+
+        let mut out = Vec::new();
+        logout(&store, &socket, &mut out).await.unwrap();
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("Signed out of GitHub")
+        );
+        assert_eq!(store.load().unwrap(), None);
+
+        // What the proxy now refuses: every member of the module on this host,
+        // which is broader than any one box's values.
+        let (module, one_box) = {
+            let in_force = revocations.lock().unwrap();
+            (
+                in_force.covers_module("github"),
+                in_force.covers_box("box-a1"),
+            )
+        };
+        assert!(module);
+        assert!(!one_box, "a logout revokes the module, not one box");
+
+        // The submission's own record: a revocation naming every box, and no
+        // token anywhere in the log.
+        let log = std::fs::read_to_string(&audit).unwrap();
+        let last: Record = serde_json_lenient::from_str(log.lines().last().unwrap()).unwrap();
+        assert_eq!(last.kind, Kind::Revocation);
+        assert_eq!(last.sub, "*");
+        assert!(!log.contains(TOKEN), "{log}");
+
+        // A logout with no proxy listening still forgets the sign-in and
+        // succeeds: an absent proxy redeems nothing meanwhile.
+        store.store(&sign_in).unwrap();
+        let mut out = Vec::new();
+        logout(&store, &dir.path().join("absent.sock"), &mut out)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("Signed out of GitHub")
+        );
+        assert_eq!(store.load().unwrap(), None);
+        // Nothing was appended for the submission that went nowhere.
+        let after = std::fs::read_to_string(&audit).unwrap();
+        assert_eq!(after.lines().count(), 2, "{after}");
     }
 }
