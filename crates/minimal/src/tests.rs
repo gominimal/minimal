@@ -73,6 +73,11 @@ fn every_daemon_connection_is_classified() {
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
             "cmd/session.rs::cmd_session_setup_zed = gated",
+            "cmd/session.rs::connect_box_host = gated",
+            // Reading another VM's listing, not acting on a box through it: a
+            // VM on a different build must still be visible, and the command
+            // that goes on to act asserts the build on its own connection.
+            "cmd/session.rs::list_one_vm = ungated",
             "diag/net.rs::probe_socket = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
         ]
@@ -326,6 +331,7 @@ fn twin_entry(
         status,
         git: None,
         attrs: None,
+        vm: None,
     }
 }
 

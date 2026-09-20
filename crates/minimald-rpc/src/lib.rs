@@ -194,6 +194,18 @@ pub struct ListSessionsEntry {
     #[serde(default)]
     pub git: Option<Box<GitInfo>>,
     pub attrs: Option<RunningSessionAttrs>,
+    /// The VM whose box host holds this box (NET-057), so a listing that spans
+    /// the VMs on one machine says which one each box lives on.
+    ///
+    /// Filled by whoever knows the VM. A box host in a microVM does not: the
+    /// name is the `--vm-name` the VM host daemon was started with, a
+    /// host-side fact naming the socket the client dialled, and the guest sees
+    /// neither. So today the client that listed the boxes stamps it — leaving
+    /// the field for a box host that *does* know its own VM to fill instead.
+    /// `None` when the machine runs a single box host, in which case there is
+    /// no VM to tell apart, and from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm: Option<String>,
 }
 
 /// The git state of a session's project path, as of the last
@@ -2064,5 +2076,62 @@ mod tests {
             }))
         );
         assert_eq!(round_trip(&with), with);
+    }
+
+    /// NET-057: an entry says which VM's box host holds the box, so a listing
+    /// spanning two VMs can show it per box. A single box host has no VM to
+    /// tell apart, and a daemon that predates the field says nothing about
+    /// one: both are absence on the wire, never a guessed VM.
+    #[test]
+    fn list_sessions_entry_carries_vm() {
+        let entry = ListSessionsEntry {
+            id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            name: Some("api".to_string()),
+            project_path: None,
+            status: sessions::SessionStatus::Active,
+            git: None,
+            attrs: None,
+            vm: Some("beta".to_string()),
+        };
+        let json = serde_json_lenient::to_string(&entry).expect("serializes");
+        assert!(json.contains(r#""vm":"beta""#), "got: {json}");
+        assert_eq!(round_trip(&entry), entry);
+
+        // Two VMs, one listing: each entry keeps its own VM through the
+        // response it is carried in.
+        let resp = ListSessionsResponse {
+            resource_pool: None,
+            sessions: vec![
+                ListSessionsEntry {
+                    vm: Some("default".to_string()),
+                    ..entry.clone()
+                },
+                entry.clone(),
+            ],
+            daemon_version: None,
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            name_surface: None,
+        };
+        let json = serde_json_lenient::to_string(&resp).expect("serializes");
+        let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
+        assert_eq!(
+            back.sessions
+                .iter()
+                .map(|e| e.vm.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("default"), Some("beta")]
+        );
+
+        // No VM to name: omitted from the wire, and a pre-field payload
+        // decodes as "no VM named" rather than failing.
+        let unnamed = ListSessionsEntry { vm: None, ..entry };
+        let json = serde_json_lenient::to_string(&unnamed).expect("serializes");
+        assert!(!json.contains("vm"), "got: {json}");
+        let older: ListSessionsEntry = serde_json_lenient::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000001","name":"api","attrs":null}"#,
+        )
+        .expect("a pre-field entry must still decode");
+        assert!(older.vm.is_none());
     }
 }

@@ -162,6 +162,11 @@ async fn serve_list_sessions(
                                 last: t.into(),
                             }),
                         }),
+                        // The VM this box host serves is a host-side fact (the
+                        // `--vm-name` the VM host daemon was started with); a
+                        // daemon in the guest does not know it, so the client
+                        // that listed the boxes stamps it (NET-057).
+                        vm: None,
                     }
                 }))
                 .await,
@@ -2662,6 +2667,7 @@ mod tests {
                 // /uwu is not a git repository, so the probe yields nothing.
                 git: None,
                 attrs: None,
+                vm: None,
             }]
         );
     }

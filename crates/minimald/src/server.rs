@@ -858,6 +858,125 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
     }
 }
 
+/// The host-side publish of the hostname proxy's port, behind a trait so the
+/// two-VM port policy below can be exercised against a stand-in host.
+///
+/// Only a daemon in a microVM publishes: a native one binds the host loopback
+/// itself and has nothing to hand to a forwarder.
+#[cfg(target_os = "linux")]
+trait HostPublish {
+    /// Publishes `port` on the host loopback, returning why it did not happen.
+    fn publish(&self, port: u16) -> impl std::future::Future<Output = Option<String>> + Send;
+}
+
+/// The real publisher: the host gvproxy forwarder, over the vsock shuttle.
+#[cfg(target_os = "linux")]
+struct GvproxyForwarder;
+
+#[cfg(target_os = "linux")]
+impl HostPublish for GvproxyForwarder {
+    async fn publish(&self, port: u16) -> Option<String> {
+        expose_proxy_on_host(crate::net::DEFAULT_SUBNET.daemon_ip(), port).await
+    }
+}
+
+/// A bound — and, in a VM, published — hostname proxy: the listener to serve,
+/// and the fault to report when the host-side publish did not land.
+#[cfg(target_os = "linux")]
+struct ProxySurface {
+    bound: crate::net::proxy::ProxyListener,
+    unavailable: Option<String>,
+}
+
+/// How many host ports a VM's daemon tries before it reports the publish as
+/// failed. The first collision is the other VM's daemon holding the port and
+/// every retry asks the OS for a port it says is free, so a handful is already
+/// generous; the bound is what stops a host with no forwarder at all from being
+/// walked through ports.
+#[cfg(target_os = "linux")]
+const HOST_PUBLISH_PORT_TRIES: u32 = 4;
+
+/// Whether a refused publish says the host loopback port is already published —
+/// the two-VM case (NET-059), where another VM's daemon got there first — rather
+/// than a fault that retrying the same port will clear (no host forwarder, a
+/// control request that timed out).
+#[cfg(target_os = "linux")]
+fn host_port_already_published(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("already in use") || reason.contains("address in use")
+}
+
+/// Binds the hostname proxy's listener and, in a microVM, publishes its port on
+/// the host loopback — taking a different port when that host port is already
+/// published by another VM's daemon (NET-059).
+///
+/// A guest bind cannot collide with another VM's: each VM has a network of its
+/// own, so both reach for the standard port and both get it. The collision
+/// appears one step later, on the host loopback the port is published to, where
+/// the second VM's publish is refused. Retrying it would leave that VM's box
+/// names unreachable from the machine for as long as the first VM lives, so the
+/// port is re-picked on both sides instead: the guest listener is rebound to a
+/// free port and that port is published, keeping the port a client dials and the
+/// port the daemon reports (NET-026) one number.
+///
+/// A configured port is never moved (NET-024): the operator named it, so a
+/// refusal is reported and retried exactly as before.
+#[cfg(target_os = "linux")]
+async fn bind_and_publish_proxy<P: HostPublish>(
+    bind_base: std::net::IpAddr,
+    configured_port: Option<u16>,
+    default_port: u16,
+    in_microvm: bool,
+    publisher: &P,
+) -> Option<ProxySurface> {
+    use crate::net::proxy::{self, PortChoice, ProxyListener};
+
+    let mut bound =
+        proxy::bind_proxy_listener_with_default(bind_base, configured_port, default_port).await?;
+    if !in_microvm {
+        return Some(ProxySurface {
+            bound,
+            unavailable: None,
+        });
+    }
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let Some(reason) = publisher.publish(bound.port).await else {
+            return Some(ProxySurface {
+                bound,
+                unavailable: None,
+            });
+        };
+        if configured_port.is_some()
+            || !host_port_already_published(&reason)
+            || attempt >= HOST_PUBLISH_PORT_TRIES
+        {
+            return Some(ProxySurface {
+                bound,
+                unavailable: Some(reason),
+            });
+        }
+        tracing::warn!(
+            component = "dns-proxy",
+            port = bound.port,
+            attempt,
+            %reason,
+            "another VM's daemon already publishes this port on the host loopback; taking another"
+        );
+        // Port 0: the OS hands back a free one. Assigning drops the listener
+        // bound a moment ago, so nothing is left listening on a port no client
+        // can reach.
+        let listener = proxy::bind_listener(std::net::SocketAddr::new(bind_base, 0)).await?;
+        let port = listener.local_addr().ok()?.port();
+        bound = ProxyListener {
+            listener,
+            port,
+            choice: PortChoice::Selected,
+        };
+    }
+}
+
 /// Binds and serves minimald's host-side egress proxy for the daemon's lifetime
 /// and, in a microVM (DM1), publishes it on the macOS host loopback.
 ///
@@ -898,8 +1017,16 @@ async fn start_host_proxies(
     // `<name>.min.internal` not routing, so both are recorded on the
     // state where `ListSessions` can reach them — a daemon that keeps serving
     // without its proxy looks identical to a healthy one otherwise.
-    match proxy::bind_proxy_listener(bind_base, configured_port).await {
-        Some(bound) => {
+    match bind_and_publish_proxy(
+        bind_base,
+        configured_port,
+        proxy::EGRESS_PROXY_PORT,
+        in_microvm,
+        &GvproxyForwarder,
+    )
+    .await
+    {
+        Some(ProxySurface { bound, unavailable }) => {
             let port = bound.port;
             state
                 .set_hostname_proxy_port(HostnameProxyPort {
@@ -913,13 +1040,7 @@ async fn start_host_proxies(
                     tracing::error!(%error, "egress proxy accept loop exited");
                 }
             });
-            // DM1: the guest bind cannot collide with a host process, so the
-            // failure moves to the publish instead. Only publish a port whose
-            // listener actually bound.
-            if in_microvm
-                && let Some(reason) =
-                    expose_proxy_on_host(crate::net::DEFAULT_SUBNET.daemon_ip(), port).await
-            {
+            if let Some(reason) = unavailable {
                 state.set_proxy_unavailable(reason).await;
                 // The listener is serving; only its host-side publish is
                 // missing, so that alone is retried.
@@ -1402,5 +1523,252 @@ mod tests {
             .call::<Shutdown>(&ShutdownRequest { force: false })
             .await;
         let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+    }
+
+    /// This machine's loopback standing in for the host gvproxy's forwarder:
+    /// `port` is published on `127.0.0.1` and relayed to `target` inside the VM
+    /// that published it, or refused in the forwarder's own words when another
+    /// VM already holds it. The host is shared by the two VMs below, which is
+    /// what makes the second VM's publish fail the way it does on a real
+    /// machine.
+    #[cfg(target_os = "linux")]
+    async fn publish_on_host_loopback(port: u16, target: std::net::SocketAddr) -> Option<String> {
+        use std::net::Ipv4Addr;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+            Ok(listener) => listener,
+            Err(error) => return Some(format!("listen tcp 127.0.0.1:{port}: bind: {error}")),
+        };
+        tokio::spawn(async move {
+            while let Ok((mut down, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(mut up) = TcpStream::connect(target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
+                    }
+                });
+            }
+        });
+        None
+    }
+
+    /// One VM's publisher: the address inside that VM a published host port has
+    /// to be relayed back to.
+    #[cfg(target_os = "linux")]
+    struct VmPublisher {
+        guest: std::net::IpAddr,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl HostPublish for VmPublisher {
+        async fn publish(&self, port: u16) -> Option<String> {
+            publish_on_host_loopback(port, std::net::SocketAddr::new(self.guest, port)).await
+        }
+    }
+
+    /// A box-host registry holding one box that carries its node's address, and
+    /// the declarations a routed request is decided against. A host-address box
+    /// declares no ports of its own, so every port a direct connection reaches
+    /// routes — what a test about *names* wants.
+    #[cfg(target_os = "linux")]
+    fn box_named(
+        name: &str,
+    ) -> (
+        Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
+        Arc<std::sync::RwLock<crate::net::policy::BoxAdmissions>>,
+    ) {
+        use crate::net::dns::{DEFAULT_HOST_ID, HostnameRegistry};
+        use crate::net::policy::{BoxAdmissions, BoxDeclaration};
+
+        let registry = Arc::new(std::sync::RwLock::new(HostnameRegistry::new(
+            DEFAULT_HOST_ID,
+        )));
+        registry
+            .write()
+            .unwrap()
+            .register_host_net(::sessions::SessionId::nil(), name);
+        let admissions = Arc::new(std::sync::RwLock::new(BoxAdmissions::new()));
+        admissions.write().unwrap().declare(
+            name,
+            BoxDeclaration::for_host_address(crate::net::SwitchSubnet::default()),
+        );
+        (registry, admissions)
+    }
+
+    /// A loopback backend answering every connection with `200 OK`, standing in
+    /// for the server inside a box. Returns the port it listens on.
+    #[cfg(target_os = "linux")]
+    async fn box_backend() -> u16 {
+        use std::net::Ipv4Addr;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = backend.accept().await {
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 1024];
+                    let _ = sock.read(&mut scratch).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        port
+    }
+
+    /// One `GET` through the host's published port, carrying `authority` as its
+    /// `Host:` header, and the raw response that came back.
+    #[cfg(target_os = "linux")]
+    async fn get_through_host(port: u16, authority: &str) -> String {
+        use std::net::Ipv4Addr;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut client = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let request = format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// A free loopback port: bound only to learn a port the OS had free, then
+    /// dropped. What the default hostname-proxy port stands in as, so the test
+    /// never depends on whatever holds the standard one on this machine.
+    #[cfg(target_os = "linux")]
+    async fn free_port() -> u16 {
+        tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// NET-059: with two VMs running, both VMs' box hostnames route through the
+    /// host's hostname surface at the same time.
+    ///
+    /// Each VM's daemon binds its hostname proxy inside its own VM, where the
+    /// standard port is always free, so the only place two VMs can collide is
+    /// the host loopback they publish that port on. Both VMs are stood up here
+    /// as their own addresses on this machine's loopback net, preferring one
+    /// default port, against a shared host that holds each port once and relays
+    /// it into the VM that published it — the forwarder's behaviour. The second
+    /// VM's publish is refused, it takes another port, and a request to each
+    /// published port then reaches that VM's own box and no other's.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn two_vms_hostnames_route_concurrently() {
+        use crate::net::proxy::{self, Router};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let default_port = free_port().await;
+        // Two VMs, each with an address of its own: inside a VM the daemon's
+        // bind can never meet the other VM's.
+        let alpha_guest = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let beta_guest = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3));
+
+        let alpha = bind_and_publish_proxy(
+            alpha_guest,
+            None,
+            default_port,
+            true,
+            &VmPublisher { guest: alpha_guest },
+        )
+        .await
+        .expect("the first VM's daemon binds and publishes");
+        let beta = bind_and_publish_proxy(
+            beta_guest,
+            None,
+            default_port,
+            true,
+            &VmPublisher { guest: beta_guest },
+        )
+        .await
+        .expect("the second VM's daemon binds and publishes");
+
+        assert_eq!(
+            alpha.unavailable, None,
+            "the first VM's publish must land: {:?}",
+            alpha.unavailable
+        );
+        assert_eq!(
+            beta.unavailable, None,
+            "the second VM must end up published too, not left reporting a held port: {:?}",
+            beta.unavailable
+        );
+        assert_eq!(alpha.bound.port, default_port);
+        assert_ne!(
+            alpha.bound.port, beta.bound.port,
+            "two VMs cannot share one host loopback port"
+        );
+        assert_eq!(
+            beta.bound.choice,
+            proxy::PortChoice::Selected,
+            "the second VM's port was selected after the first one's was held"
+        );
+
+        // Each VM serves its own box's name, and only that one.
+        let (alpha_registry, alpha_admissions) = box_named("alpha-web");
+        let (beta_registry, beta_admissions) = box_named("beta-web");
+        let alpha_port = alpha.bound.port;
+        let beta_port = beta.bound.port;
+        tokio::spawn(proxy::serve(
+            alpha.bound.listener,
+            Router::new(alpha_registry, alpha_admissions),
+        ));
+        tokio::spawn(proxy::serve(
+            beta.bound.listener,
+            Router::new(beta_registry, beta_admissions),
+        ));
+
+        // Both surfaces at once: one request per VM, in flight together, each
+        // for its own box, both through the host's published ports.
+        let backend = box_backend().await;
+        let alpha_authority = format!("alpha-web.min.internal:{backend}");
+        let beta_authority = format!("beta-web.min.internal:{backend}");
+        let (alpha_answer, beta_answer) = tokio::join!(
+            get_through_host(alpha_port, &alpha_authority),
+            get_through_host(beta_port, &beta_authority),
+        );
+        assert!(
+            alpha_answer.contains("200 OK"),
+            "the first VM's box must route through the host: {alpha_answer}"
+        );
+        assert!(
+            beta_answer.contains("200 OK"),
+            "the second VM's box must route through the host at the same time: {beta_answer}"
+        );
+
+        // Two surfaces, not one: neither VM answers for the other's boxes.
+        let crossed = get_through_host(alpha_port, &beta_authority).await;
+        assert!(
+            crossed.contains("502 Bad Gateway"),
+            "a VM must not route another VM's box names: {crossed}"
+        );
+    }
+
+    /// A publish refused because the host port is held is the one refusal a
+    /// daemon answers by taking another port; every other refusal is retried on
+    /// the port it has, so a host with no forwarder is not walked through ports.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_held_host_port_moves_the_proxy() {
+        assert!(host_port_already_published(
+            "the daemon could not publish port 7654 on the host loopback via the gvproxy \
+             forwarder: listen tcp 127.0.0.1:7654: bind: Address already in use (os error 98)"
+        ));
+        assert!(host_port_already_published("expose failed: address in use"));
+        assert!(!host_port_already_published(
+            "publishing port 7654 on the host loopback did not complete within 1s"
+        ));
+        assert!(!host_port_already_published(
+            "the daemon could not publish port 7654 on the host loopback via the gvproxy \
+             forwarder: connection refused"
+        ));
     }
 }

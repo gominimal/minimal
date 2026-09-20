@@ -271,7 +271,7 @@ pub async fn bind_proxy_listener(
 /// test can drive both the "default is free" and "default is taken" paths
 /// against a port it controls rather than against whatever holds
 /// [`EGRESS_PROXY_PORT`] on the machine running the test.
-async fn bind_proxy_listener_with_default(
+pub(crate) async fn bind_proxy_listener_with_default(
     bind_base: IpAddr,
     configured: Option<u16>,
     default_port: u16,

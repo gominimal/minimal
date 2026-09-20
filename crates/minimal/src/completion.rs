@@ -217,6 +217,7 @@ mod tests {
             status: Default::default(),
             git: None,
             attrs: None,
+            vm: None,
         }
     }
 

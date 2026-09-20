@@ -701,8 +701,16 @@ pub(crate) async fn activate_session(
 pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
 
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
-        .context("Failed to resolve daemon socket path")?;
+    // A named box is addressed by its name alone: with more than one VM on the
+    // machine, the VM holding it is resolved from the name rather than from a
+    // flag (NET-058). With no box named, the resolution below is the current
+    // directory's, on this machine's default box host — where a bare `min`
+    // creates one when it finds nothing.
+    let sock = match args.session {
+        Some(ref session) => resolve_box_host(global, session).await?.sock,
+        None => client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+            .context("Failed to resolve daemon socket path")?,
+    };
 
     let mut client = client::Client::connect(&sock)
         .await
@@ -837,7 +845,7 @@ pub(crate) fn resolve_smart_attach(
                     attach::created_from_suffix(&entry, &cwd)
                 );
             }
-            Ok(SmartAttach::Attach(entry))
+            Ok(SmartAttach::Attach(Box::new(entry)))
         }
         attach::SmartResolve::Pick(cands) => {
             if global.no_input || !attach::can_pick_interactively() {
@@ -854,8 +862,9 @@ pub(crate) fn resolve_smart_attach(
 
 /// Outcome of smart attach resolution when the user gave no explicit session.
 pub(crate) enum SmartAttach {
-    /// Attach to this resolved or picked session.
-    Attach(minimald_rpc::ListSessionsEntry),
+    /// Attach to this resolved or picked session. Boxed so the outcome stays
+    /// the size of its other two answers, which carry nothing.
+    Attach(Box<minimald_rpc::ListSessionsEntry>),
     /// The picker's create row was chosen: activate a fresh session for the
     /// cwd and attach, exactly as `min session activate --attach .` would.
     CreateForCwd,
@@ -1745,5 +1754,406 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
         minimald_rpc::Errorable::Err { error } => {
             bail!("RenameSession failed: {error}")
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Box hosts across the machine's VMs (NET-057, NET-058)
+
+/// One box host on this machine: the VM it serves and the socket its daemon
+/// answers on.
+///
+/// A machine can run several. A VM started with `minvmd --vm-name <name>` has
+/// its own state directory, socket and box-host daemon under `vms/<name>/`,
+/// while the `default` VM's socket is the provider instance dir's own. The
+/// name is in the path, which is what lets the CLI find a box's VM from the
+/// box's name alone rather than from a flag naming the VM (NET-058).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoxHost {
+    /// The VM whose box host this is — `default` for the unnamed one.
+    pub(crate) vm: String,
+    /// The daemon socket that serves it.
+    pub(crate) sock: PathBuf,
+}
+
+/// Every box host on this machine: the `default` VM first, then each named VM
+/// in name order.
+///
+/// A VM is here when its socket is present — the CLI addresses box hosts over
+/// sockets, and a VM directory with none has no daemon to talk to. The
+/// `default` VM leads so that on a machine with one box host the answer is the
+/// socket the CLI always resolved, unchanged.
+pub(crate) fn box_hosts(global: &GlobalArgs) -> Result<Vec<BoxHost>, anyhow::Error> {
+    let provider_dir =
+        client::resolve_provider_dir(global.minimal_dir.as_deref(), global.use_minvmd())
+            .context("Failed to resolve the provider directory")?;
+    let mut hosts = vec![BoxHost {
+        vm: paths::DEFAULT_VM_NAME.to_string(),
+        sock: provider_dir.join(paths::SSH_SOCK_FILE),
+    }];
+    // A missing `vms/` dir is a machine that has only ever run the default VM,
+    // which is the ordinary case and not a fault.
+    let mut named: Vec<BoxHost> = std::fs::read_dir(provider_dir.join(paths::VMS_SUBDIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let vm = entry.file_name().into_string().ok()?;
+            // Only a directory `minvmd --vm-name` could have created: anything
+            // else under `vms/` names no VM this CLI can address.
+            paths::VmName::new(&vm).ok()?;
+            let sock = entry.path().join(paths::SSH_SOCK_FILE);
+            sock.exists().then_some(BoxHost { vm, sock })
+        })
+        .collect();
+    named.sort_by(|a, b| a.vm.cmp(&b.vm));
+    hosts.extend(named);
+    Ok(hosts)
+}
+
+/// `ListSessions` against one VM's box host, every entry stamped with that VM.
+///
+/// The connection is deliberately not version-gated: this reads another VM's
+/// listing rather than handing off into a session on it, and a VM running a
+/// different build must still be *visible* — its boxes are what a listing is
+/// for. The command that goes on to act on a box asserts the build on its own
+/// connection to that box's host.
+async fn list_one_vm(
+    host: &BoxHost,
+) -> Result<Vec<minimald_rpc::ListSessionsEntry>, anyhow::Error> {
+    let mut client = client::Client::connect(&host.sock)
+        .await
+        .with_context(|| format!("Failed to connect to the box host of VM '{}'", host.vm))?;
+    let resp = client
+        .oneshot_rpc::<minimald_rpc::ListSessions>(())
+        .await
+        .context("ListSessions RPC failed")?;
+    Ok(resp
+        .sessions
+        .into_iter()
+        .map(|mut entry| {
+            entry.vm = Some(host.vm.clone());
+            entry
+        })
+        .collect())
+}
+
+/// Adds the other VMs' boxes to `resp` and says which VM holds each box
+/// (NET-057).
+///
+/// A machine with one box host is left exactly as it was: there is no VM to
+/// tell apart, no entry is stamped, and the listing costs the one round trip it
+/// always did. A VM whose box host does not answer is reported on stderr and
+/// skipped — one VM being down must not take the whole listing with it. The
+/// rest of the response (the daemon's version, its proxy port, its
+/// hostname-routing fault) stays the primary box host's, which is the daemon
+/// the command connected to.
+pub(crate) async fn list_boxes_across_vms(
+    global: &GlobalArgs,
+    resp: &mut minimald_rpc::ListSessionsResponse,
+) {
+    let hosts = match box_hosts(global) {
+        Ok(hosts) => hosts,
+        Err(error) => {
+            eprintln!("warning: could not look for other VMs' boxes: {error:#}");
+            return;
+        }
+    };
+    let Some((primary, others)) = hosts.split_first() else {
+        return;
+    };
+    if others.is_empty() {
+        return;
+    }
+    for entry in &mut resp.sessions {
+        entry.vm = Some(primary.vm.clone());
+    }
+    for host in others {
+        match list_one_vm(host).await {
+            Ok(sessions) => resp.sessions.extend(sessions),
+            Err(error) => eprintln!(
+                "warning: could not list the boxes on VM '{}': {error:#}",
+                host.vm
+            ),
+        }
+    }
+}
+
+/// Whether `entry` is the box `lookup` names — by name, or by id.
+fn entry_is(entry: &minimald_rpc::ListSessionsEntry, lookup: &SessionLookup) -> bool {
+    match lookup {
+        SessionLookup::Id(id) => entry.id == *id,
+        SessionLookup::Name(name) => entry.name.as_deref() == Some(name.as_str()),
+    }
+}
+
+/// The box host holding the box `session` names, resolved from the name alone
+/// (NET-058).
+///
+/// With one box host on the machine nothing needs resolving: its socket is the
+/// answer and no listing is fetched, so the single-VM path is unchanged. With
+/// several, each VM's box host is asked whether it holds the name (or id) — the
+/// box's name is its address, and no global flag names the VM. A name two VMs
+/// both hold is reported as ambiguous, naming both, rather than resolved by an
+/// order nobody chose.
+pub(crate) async fn resolve_box_host(
+    global: &GlobalArgs,
+    session: &str,
+) -> Result<BoxHost, anyhow::Error> {
+    let hosts = box_hosts(global)?;
+    if let [single] = &hosts[..] {
+        return Ok(single.clone());
+    }
+    let lookup = SessionLookup::parse(session);
+    let mut holders = Vec::new();
+    for host in &hosts {
+        match list_one_vm(host).await {
+            Ok(sessions) => {
+                if sessions.iter().any(|entry| entry_is(entry, &lookup)) {
+                    holders.push(host.clone());
+                }
+            }
+            // A VM that cannot be listed cannot be shown to hold the box. Said
+            // at debug: the resolution below reports the outcome, and a VM that
+            // is down is not itself an error when another VM holds the box.
+            Err(error) => tracing::debug!(
+                vm = %host.vm,
+                error = %format!("{error:#}"),
+                "could not ask a VM's box host which boxes it holds"
+            ),
+        }
+    }
+    match holders.as_slice() {
+        [host] => {
+            tracing::debug!(box_name = session, vm = %host.vm, "resolved the box to a VM");
+            Ok(host.clone())
+        }
+        [] => bail!(
+            "No box named '{session}' on any VM of this machine ({}); `min ls` lists every box \
+             with the VM that holds it",
+            vm_names(&hosts)
+        ),
+        many => bail!(
+            "'{session}' names a box on more than one VM ({}); rename one so the name addresses \
+             a single box",
+            vm_names(many)
+        ),
+    }
+}
+
+/// The VMs' names, for a message that has to say which ones were looked at.
+fn vm_names(hosts: &[BoxHost]) -> String {
+    hosts
+        .iter()
+        .map(|host| host.vm.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// [`connect_daemon`] for a command that names a box: connects to the box host
+/// that holds it, on whichever VM that is (NET-058), with the same build
+/// assertion every acting command makes.
+pub(crate) async fn connect_box_host(
+    global: &GlobalArgs,
+    session: &str,
+) -> Result<client::Client, anyhow::Error> {
+    let host = resolve_box_host(global, session).await?;
+    let mut client = client::Client::connect(&host.sock)
+        .await
+        .with_context(|| format!("Failed to connect to the box host of VM '{}'", host.vm))?;
+    ensure_version_match(&mut client).await?;
+    Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minimald::test_harness::{TestClient, TestServer, create_configured_session};
+
+    /// Two VMs on one machine, each with its own box-host daemon: the `default`
+    /// VM's on the provider dir's own socket, and a VM named `beta`'s under
+    /// `vms/beta/` — the paths `minvmd --vm-name` lays down and the CLI looks
+    /// for. The servers and the tempdir are held so the sockets stay live.
+    struct TwoVms {
+        _default_server: TestServer,
+        _beta_server: TestServer,
+        _dir: tempfile::TempDir,
+        global: GlobalArgs,
+        /// A connection to each VM's daemon, for creating that VM's boxes.
+        on_default: TestClient,
+        on_beta: TestClient,
+    }
+
+    async fn two_vms() -> TwoVms {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider = dir.path().join("providers/local-minimald0");
+        std::fs::create_dir_all(&provider).unwrap();
+        let default_server = TestServer::new().await;
+        default_server
+            .listen_on_uds(&provider.join(paths::SSH_SOCK_FILE))
+            .await;
+        let beta_dir = provider.join(paths::VMS_SUBDIR).join("beta");
+        std::fs::create_dir_all(&beta_dir).unwrap();
+        let beta_server = TestServer::new().await;
+        beta_server
+            .listen_on_uds(&beta_dir.join(paths::SSH_SOCK_FILE))
+            .await;
+        let on_default = default_server.connect().await;
+        let on_beta = beta_server.connect().await;
+        TwoVms {
+            _default_server: default_server,
+            _beta_server: beta_server,
+            global: GlobalArgs {
+                minimal_dir: Some(dir.path().to_path_buf()),
+                ..GlobalArgs::default()
+            },
+            _dir: dir,
+            on_default,
+            on_beta,
+        }
+    }
+
+    /// The `ls` table as the operator reads it.
+    fn ls_table(resp: &minimald_rpc::ListSessionsResponse) -> String {
+        let mut out = Vec::new();
+        format_ls(
+            &mut out,
+            &LsArgs {
+                raw: false,
+                json: false,
+            },
+            resp,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// NET-057: with two VMs running, the listing spans both VMs' box hosts and
+    /// every box says which VM holds it — in the entries `--json` carries and
+    /// in the table's own column. A single box host's listing is unchanged:
+    /// there is no VM to tell apart, so no VM is claimed and no column appears.
+    #[tokio::test]
+    async fn ls_shows_vm_per_box() {
+        let mut vms = two_vms().await;
+        create_configured_session(&mut vms.on_default, "on-default", "/tmp").await;
+        create_configured_session(&mut vms.on_beta, "on-beta", "/tmp").await;
+
+        // What the command has in hand before it looks for other VMs: the boxes
+        // of the one box host it connected to, naming no VM.
+        let mut client = connect_daemon(&vms.global).await.unwrap();
+        let mut resp = client
+            .oneshot_rpc::<minimald_rpc::ListSessions>(())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.sessions.len(),
+            1,
+            "one box host lists only its own boxes"
+        );
+        assert!(resp.sessions[0].vm.is_none());
+        assert!(
+            !ls_table(&resp).contains("VM  "),
+            "a listing naming no VM must not grow a VM column"
+        );
+
+        list_boxes_across_vms(&vms.global, &mut resp).await;
+
+        let mut listed: Vec<(String, String)> = resp
+            .sessions
+            .iter()
+            .map(|entry| {
+                (
+                    entry.name.clone().unwrap(),
+                    entry.vm.clone().expect("every box names its VM"),
+                )
+            })
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed,
+            [
+                ("on-beta".to_string(), "beta".to_string()),
+                ("on-default".to_string(), "default".to_string()),
+            ]
+        );
+
+        let table = ls_table(&resp);
+        assert!(
+            table.contains("VM  "),
+            "no VM column in the table:\n{table}"
+        );
+        for (box_name, vm) in [("on-default", "default"), ("on-beta", "beta")] {
+            let row = table
+                .lines()
+                .find(|line| line.contains(box_name))
+                .unwrap_or_else(|| panic!("{box_name} is missing from the table:\n{table}"));
+            assert!(
+                row.starts_with(vm),
+                "the row for {box_name} must name VM {vm}: {row:?}"
+            );
+        }
+    }
+
+    /// NET-058: with two VMs running, naming a box is enough to reach it —
+    /// attach and `min net expose` resolve the VM from the box's name, with no
+    /// global flag naming a VM anywhere. A name two VMs both hold is reported
+    /// as the ambiguity it is rather than resolved by an order nobody chose.
+    #[tokio::test]
+    async fn box_name_resolves_vm_without_flag() {
+        let mut vms = two_vms().await;
+        create_configured_session(&mut vms.on_default, "web", "/tmp").await;
+        let api = create_configured_session(&mut vms.on_beta, "api", "/tmp").await;
+        create_configured_session(&mut vms.on_default, "twin", "/tmp").await;
+        create_configured_session(&mut vms.on_beta, "twin", "/tmp").await;
+
+        // Nothing selects a VM: the only thing named below is the box.
+        assert!(vms.global.provider.is_none());
+        let hosts = box_hosts(&vms.global).unwrap();
+        assert_eq!(
+            hosts
+                .iter()
+                .map(|host| host.vm.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "beta"],
+            "both VMs' box hosts are found from their sockets alone"
+        );
+
+        assert_eq!(
+            resolve_box_host(&vms.global, "web").await.unwrap().vm,
+            "default"
+        );
+        let resolved = resolve_box_host(&vms.global, "api").await.unwrap();
+        assert_eq!(resolved.vm, "beta");
+        assert_eq!(resolved.sock, hosts[1].sock);
+        // By id too: `min session attach` and `min net expose` take either.
+        assert_eq!(
+            resolve_box_host(&vms.global, &api.to_string())
+                .await
+                .unwrap()
+                .vm,
+            "beta"
+        );
+
+        // And the connection a command acts through lands on that VM: the box
+        // is there to be looked up, which it would not be on the other one.
+        let mut client = connect_box_host(&vms.global, "api").await.unwrap();
+        assert_eq!(resolve_session(&mut client, "api").await.unwrap().id, api);
+
+        let ambiguous = format!(
+            "{:#}",
+            resolve_box_host(&vms.global, "twin").await.unwrap_err()
+        );
+        assert!(
+            ambiguous.contains("default") && ambiguous.contains("beta"),
+            "an ambiguous name must name both VMs: {ambiguous}"
+        );
+        let missing = format!(
+            "{:#}",
+            resolve_box_host(&vms.global, "ghost").await.unwrap_err()
+        );
+        assert!(
+            missing.contains("ghost") && missing.contains("beta"),
+            "a name no VM holds must say what was asked: {missing}"
+        );
     }
 }

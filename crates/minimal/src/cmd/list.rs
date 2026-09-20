@@ -292,10 +292,14 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     let mut client = connect_daemon(global).await?;
 
     use minimald_rpc::ListSessions;
-    let resp = client
+    let mut resp = client
         .oneshot_rpc::<ListSessions>(())
         .await
         .context("ListSessions RPC failed")?;
+
+    // With a second VM on the machine, the listing spans every VM's box host
+    // and each box says which VM holds it (NET-057). With one it is untouched.
+    list_boxes_across_vms(global, &mut resp).await;
 
     // On stderr, and outside `format_ls`: every output mode should carry a
     // fault this severe — `--raw` most of all, since a script parsing bare ids
@@ -398,14 +402,29 @@ pub fn format_ls(
 
     // Format as a table. The columns mirror the fields `--json` exposes so
     // the two surfaces present the same session attributes.
+    //
+    // The VM column appears only when the boxes say which VM holds them — a
+    // machine running two VMs (NET-057). With one box host there is no VM to
+    // tell apart and the table is the one it always was.
+    let vms = resp.sessions.iter().any(|entry| entry.vm.is_some());
+    let vm_header = if vms {
+        format!("{:<12}  ", "VM")
+    } else {
+        String::new()
+    };
+    let vm_rule = if vms {
+        format!("{:-<12}  ", "")
+    } else {
+        String::new()
+    };
     writeln!(
         out,
-        "{:<36}  {:<20}  {:<13}  {:<20}  {:<19}  PROJECT PATH",
+        "{vm_header}{:<36}  {:<20}  {:<13}  {:<20}  {:<19}  PROJECT PATH",
         "SESSION ID", "NAME", "STATUS", "TITLE", "LAST ACTIVITY"
     )?;
     writeln!(
         out,
-        "{:-<36}  {:-<20}  {:-<13}  {:-<20}  {:-<19}  {:-<24}",
+        "{vm_rule}{:-<36}  {:-<20}  {:-<13}  {:-<20}  {:-<19}  {:-<24}",
         "", "", "", "", "", ""
     )?;
 
@@ -437,9 +456,15 @@ pub fn format_ls(
             }
             None => ("-", "-".to_string()),
         };
+        let vm = if vms {
+            format!("{:<12}  ", entry.vm.as_deref().unwrap_or("-"))
+        } else {
+            String::new()
+        };
         writeln!(
             out,
-            "{id:<36}  {name:<20}  {status:<13}  {title:<20}  {last_activity:<19}  {project_path}"
+            "{vm}{id:<36}  {name:<20}  {status:<13}  {title:<20}  {last_activity:<19}  \
+             {project_path}"
         )?;
     }
 

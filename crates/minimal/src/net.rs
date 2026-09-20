@@ -231,7 +231,9 @@ pub(crate) async fn cmd_net_expose(
         })?,
     };
     cmd::ensure_daemon(global)?;
-    let mut client = cmd::connect_daemon(global).await?;
+    // The box's name resolves the VM holding it, so nothing has to name the VM
+    // (NET-058); on a machine with one box host this is that box host.
+    let mut client = cmd::connect_box_host(global, &session).await?;
     let record = cmd::resolve_session(&mut client, &session).await?;
     match send_expose(&mut client, record.id, args.port).await? {
         minimald_rpc::ExposeResponse::Published {

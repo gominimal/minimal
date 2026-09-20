@@ -185,8 +185,28 @@ fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
                 // network/indicator block, so a long branch name truncates
                 // instead of pushing those cells off the right edge.
                 let right = format!("{net} {indicator:>2}");
-                let max_branch_width =
+                // VM segment (` ▣ beta` + a two-space gutter), only when the
+                // listing says which VM's box host holds this box — a machine
+                // running two VMs (NET-057). A single-VM listing names no VM,
+                // so those rows render exactly as they did. Budgeted like the
+                // branch below: it truncates rather than pushing the
+                // network/indicator cells off the right edge.
+                let max_vm_width =
                     inner_width.saturating_sub(UnicodeWidthStr::width(right.as_str()) + 2);
+                let vm = entry
+                    .vm
+                    .as_deref()
+                    .map(|vm| format!(" ▣ {vm}"))
+                    .filter(|_| max_vm_width > UnicodeWidthStr::width(" ▣ "))
+                    .map(|vm| truncate(&vm, max_vm_width))
+                    .unwrap_or_default();
+                let vm_w = if vm.is_empty() {
+                    0
+                } else {
+                    UnicodeWidthStr::width(vm.as_str()) + 2
+                };
+                let max_branch_width =
+                    inner_width.saturating_sub(UnicodeWidthStr::width(right.as_str()) + vm_w + 2);
                 let branch = entry
                     .git
                     .as_ref()
@@ -195,6 +215,7 @@ fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
                     .map(|b| truncate(&b, max_branch_width))
                     .unwrap_or_default();
                 let right_w = UnicodeWidthStr::width(right.as_str())
+                    + vm_w
                     + if branch.is_empty() {
                         0
                     } else {
@@ -216,6 +237,10 @@ fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
                     },
                 );
                 let mut spans = vec![name_span];
+                if !vm.is_empty() {
+                    spans.push(Span::styled(vm, Style::default().fg(Color::Gray)));
+                    spans.push(Span::raw("  "));
+                }
                 if !branch.is_empty() {
                     spans.push(Span::styled(branch, Style::default().fg(Color::Gray)));
                     spans.push(Span::raw("  "));
@@ -879,6 +904,7 @@ mod tests {
             status: sessions::SessionStatus::Active,
             git: None,
             attrs: None,
+            vm: None,
         }
     }
 
@@ -1002,6 +1028,61 @@ mod tests {
         assert!(
             !out.contains("native"),
             "an unreported surface must not claim native:\n{out}"
+        );
+    }
+
+    /// NET-057: with two VMs on the machine the dashboard says which VM holds
+    /// each box, so two boxes of the same name are told apart by the VM beside
+    /// them. A listing from a single box host names no VM, and those rows are
+    /// left exactly as they were.
+    #[test]
+    fn sidebar_shows_vm_per_box() {
+        let mut on_default = sess_entry(1, "web");
+        on_default.vm = Some("default".to_string());
+        let mut on_beta = sess_entry(2, "web");
+        on_beta.vm = Some("beta".to_string());
+        let mut model = sidebar_model(vec![provider_view(
+            "vm",
+            false,
+            vec![on_default, on_beta.clone()],
+        )]);
+        let out = draw_sidebar(&mut model, 44, 12);
+        assert!(
+            out.contains("▣ default"),
+            "the default VM's box must name its VM:\n{out}"
+        );
+        assert!(
+            out.contains("▣ beta"),
+            "the named VM's box must name its VM:\n{out}"
+        );
+
+        // A box whose listing named no VM keeps the row it always had.
+        let mut model = sidebar_model(vec![provider_view("vm", false, vec![sess_entry(1, "web")])]);
+        let out = draw_sidebar(&mut model, 44, 12);
+        assert!(
+            !out.contains('▣'),
+            "a listing naming no VM must claim none:\n{out}"
+        );
+
+        // The VM segment is budgeted, not bolted on: in a narrow sidebar the
+        // box's name and the network cell both survive beside it, rather than
+        // the row growing past the pane and losing its right-hand cells.
+        let mut model = sidebar_model(vec![provider_view("vm", false, vec![on_beta])]);
+        let out = draw_sidebar(&mut model, 26, 12);
+        let row = out
+            .lines()
+            .find(|line| line.contains("web"))
+            .unwrap_or_else(|| panic!("the box row must be drawn:\n{out}"));
+        let vm_at = row.find("▣ beta").unwrap_or_else(|| {
+            panic!("VM segment missing from a narrow sidebar's row: {row:?}");
+        });
+        let name_at = row.find("web").expect("the box's name is on its row");
+        let net_at = row
+            .rfind('-')
+            .unwrap_or_else(|| panic!("the network cell must still be on the row: {row:?}"));
+        assert!(
+            name_at < vm_at && vm_at < net_at,
+            "the VM belongs between the box's name and the network cell: {row:?}"
         );
     }
 }

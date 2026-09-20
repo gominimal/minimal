@@ -1199,6 +1199,7 @@ mod tests {
             status: sessions::SessionStatus::Active,
             git: None,
             attrs: None,
+            vm: None,
         }
     }
 

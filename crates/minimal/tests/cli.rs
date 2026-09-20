@@ -56,6 +56,7 @@ fn ls_shows_shared_resource_pool() {
             status: sessions::SessionStatus::Active,
             git: None,
             attrs: None,
+            vm: None,
         }],
         name_surface: None,
     };
@@ -91,6 +92,7 @@ fn ls_table_exposes_project_path_and_status() {
             status: sessions::SessionStatus::Active,
             git: None,
             attrs: None,
+            vm: None,
         }],
         name_surface: None,
     };

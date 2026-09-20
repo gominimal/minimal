@@ -21,6 +21,7 @@ fn entry(n: u128, name: Option<&str>, project: &str) -> minimald_rpc::ListSessio
         status: sessions::SessionStatus::Active,
         git: None,
         attrs: None,
+        vm: None,
     }
 }
 
