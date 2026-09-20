@@ -74,6 +74,7 @@
 #     fresh_arm64_kvm_activate_local_minvmd
 #     hostnames_recover_and_two_daemons_route
 #     proxy_refuses_like_direct
+#     port_publishes_on_listen_and_box_outlives_client
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -1884,6 +1885,105 @@ run_case_proxy_refuses_like_direct() {
   echo "::endgroup::"
 }
 
+# NET-014..017, tied together end to end: a port no --ingress names publishes
+# ITSELF the moment a process in the box starts listening on one its rules
+# permit (NET-016), answers by name at once, keeps answering once the client
+# that started it is gone (NET-015: a box outlives its client), and a port
+# nothing ever published refuses a direct connection instantly rather than
+# hanging (NET-014). HostNet (the default network mode; no --network or
+# --ingress flag) runs this on every lane, same reasoning as the HostNet half
+# of run_case_min_internal_names_through_proxy above: it permits every port
+# that carries one (its own listeners already answer them at the shared
+# address), and that address is reachable through the proxy wherever
+# minimald itself runs — this host natively, or the guest on a VM lane.
+run_case_port_publishes_on_listen_and_box_outlives_client() {
+  echo "::group::a listened-on port publishes itself, and the box outlives its client (NET-014..017)"
+
+  local pl_name=e2e-portlisten pl_port=18210 pl_unpub_port=18211
+  local pl_sid pl_status attach_out
+  local pl_unpub_start_ms pl_unpub_elapsed_ms pl_unpub_status
+
+  pl_sid="$(cd "$PROJECT_DIR" && mnl session activate . --name "$pl_name" 2>"$WORK/pl-activate.err")" || {
+    echo "::error::'min session activate --name $pl_name' failed"
+    cat "$WORK/pl-activate.err" 2>/dev/null || true
+    fail
+  }
+  pl_sid="$(printf '%s\n' "$pl_sid" | tail -n1 | tr -d '\r')"
+  echo "session: $pl_sid ($pl_name)"
+
+  # Attach over a REAL pty (a session is interactive by design), start a
+  # responder in the FOREGROUND on a port no --ingress names, then leave by
+  # the shipped detach chord (ctrl-] then d) once it goes quiet — never
+  # `exit`, which would end the shell (and the responder with it) rather than
+  # just the attach. `socat` is in the launcher baseline (base/coreutils/
+  # socat), needing no `min add`. -T300 is a safety net this case's own
+  # cleanup below is expected to beat, not a timeout this proof relies on.
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  attach_out="$(E2E_PTY_COMMANDS="printf 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' > /tmp/pl-resp.http
+socat -T300 TCP-LISTEN:$pl_port,reuseaddr,fork SYSTEM:'cat /tmp/pl-resp.http'" \
+    E2E_PTY_DETACH=1 python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+    min ${E2E_MINIMAL_ARGS:-} session attach "$pl_sid" \
+    2>"$WORK/pl-attach.err")" || {
+    echo "::error::the pty attach that starts the box's responder and detaches did not exit cleanly"
+    echo "--- transcript ---"; printf '%s\n' "$attach_out"
+    echo "--- stderr ---"; cat "$WORK/pl-attach.err" 2>/dev/null || true
+    mnl session destroy --force "$pl_sid" >/dev/null 2>&1 || true
+    fail
+  }
+
+  # The attach above returned by DETACHING, not by destroying — so a session
+  # still listed here is already the box outliving its client (NET-015),
+  # before we have even checked whether the port it started still answers.
+  if ! mnl ls --raw 2>/dev/null | grep -q -- "$pl_sid"; then
+    echo "::error::NET-015: the session is gone after its only attach detached rather than destroyed"
+    fail
+  fi
+
+  # NET-016: reach the listened-on port by name, through the proxy — with no
+  # --ingress typed for it, and the client that started it already gone, so
+  # this doubles as NET-015's reachability half: the box outlived it.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    pl_status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+      --proxy 127.0.0.1:7654 "http://$pl_name.min.internal:$pl_port/" 2>"$WORK/pl-curl.err")"
+    [ "$pl_status" = "200" ] && break
+    sleep 1
+  done
+  echo "GET http://$pl_name.min.internal:$pl_port/ via proxy -> ${pl_status:-<no response>}"
+  if [ "$pl_status" != "200" ]; then
+    echo "::error::NET-016: the listened-on port did not publish itself at $pl_name.min.internal:$pl_port"
+    cat "$WORK/pl-curl.err" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-016 OK: the port published itself on listen, with no --ingress typed for it"
+  echo "NET-015 OK: it still answered after the attach that started it detached — the box outlived its client"
+
+  # NET-014: a port nothing ever published refuses a direct connection
+  # instantly, rather than hanging to curl's own timeout — checked from
+  # inside the box's own netns (`min session exec`), which is where a
+  # HostNet box's published address actually lives (this host natively, or
+  # the guest on a VM lane).
+  pl_unpub_start_ms="$(now_ms)"
+  pl_unpub_status="$(mnl session exec "$pl_sid" curl -sS -o /dev/null -w '%{http_code}' \
+    --max-time 10 "http://127.0.0.1:$pl_unpub_port/" 2>"$WORK/pl-unpub-curl.err")"
+  pl_unpub_elapsed_ms=$(( $(now_ms) - pl_unpub_start_ms ))
+  echo "(inside $pl_sid) GET http://127.0.0.1:$pl_unpub_port/ -> status=${pl_unpub_status:-<none>} elapsed=${pl_unpub_elapsed_ms}ms"
+  if [ "$pl_unpub_status" = "200" ]; then
+    echo "::error::NET-014: an unpublished port answered a connection; nothing should be listening there"
+    fail
+  fi
+  if [ "$pl_unpub_elapsed_ms" -ge 5000 ]; then
+    echo "::error::NET-014: an unpublished port took ${pl_unpub_elapsed_ms}ms to refuse — that is a timeout, not connection-refused"
+    cat "$WORK/pl-unpub-curl.err" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-014 OK: the unpublished port refused instantly (${pl_unpub_elapsed_ms}ms), not a timeout"
+
+  mnl session exec "$pl_sid" 'pkill socat >/dev/null 2>&1 || true' >/dev/null 2>&1 || true
+  mnl session destroy --force "$pl_sid" >/dev/null 2>&1 || true
+  echo "port-on-listen proof OK: published itself by name at once, outlived its client after detach, and an unpublished port refused instantly"
+  echo "::endgroup::"
+}
+
 E2E_CASE="${E2E_CASE:-${1:-}}"
 if [ -n "$E2E_CASE" ]; then
   case "$E2E_CASE" in
@@ -1903,8 +2003,10 @@ if [ -n "$E2E_CASE" ]; then
       run_case_fresh_arm64_kvm_activate_local_minvmd; exit $? ;;
     hostnames_recover_and_two_daemons_route) run_case_hostnames_recover_and_two_daemons_route; exit $? ;;
     proxy_refuses_like_direct) run_case_proxy_refuses_like_direct; exit $? ;;
+    port_publishes_on_listen_and_box_outlives_client)
+      run_case_port_publishes_on_listen_and_box_outlives_client; exit $? ;;
     *)
-      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy, fresh_linux_kvm_activate_local_minvmd, fresh_arm64_kvm_activate_local_minvmd, hostnames_recover_and_two_daemons_route, proxy_refuses_like_direct)" >&2
+      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy, fresh_linux_kvm_activate_local_minvmd, fresh_arm64_kvm_activate_local_minvmd, hostnames_recover_and_two_daemons_route, proxy_refuses_like_direct, port_publishes_on_listen_and_box_outlives_client)" >&2
       exit 2
       ;;
   esac
