@@ -15,11 +15,15 @@
 //! request leaves no partial mapping — not in the zone, not on the switch,
 //! not in the policy.
 //!
-//! An `ask` is answered here as a refusal: nobody is prompted yet, so nobody
-//! is attached to answer (NET-045's failure case). Prompting the attached
-//! human and recording each decision in the audit log (NET-046) build on this
-//! module.
+//! An `ask` is put to the human attached to the box, over their own terminal,
+//! and their answer is the decision (NET-045): a yes publishes the port as an
+//! `allow` would, a no refuses it as itself. Nobody attached, and nobody
+//! answering, are refusals too — an `ask` the human never saw fails closed.
+//! Every decision this module takes, whoever took it, is written to the
+//! daemon's local audit log on the way out (NET-046, [`crate::audit`]), which
+//! is where an un-enrolled host's account of an opened port lives.
 
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use minimald_rpc::{ExposeRefusal, ExposeResponse};
@@ -29,6 +33,8 @@ use tokio::sync::Mutex;
 use super::SwitchClient;
 use super::dns::HOSTNAME_SUFFIX;
 use super::publish::{DeclaredPort, Forwarders, PublishTable, port_answer};
+use crate::audit::{DecidedBy, IngressDecision, Outcome};
+use crate::session_host::{Answer, HostHandle};
 use crate::store::SessionRecordHandle;
 
 /// What a request evaluated against the box's setting is decided, short of
@@ -91,11 +97,87 @@ pub fn evaluate(record: &Record, port: u16, proto: IpProto) -> Result<Decision, 
     }
 }
 
-/// Serves one expose request for the box `handle` holds the record of: the
-/// decision, and on an `allow` the publication (NET-044).
+/// Everything one expose request is decided against, beyond the request
+/// itself: the box's record and its publication, the switch that carries its
+/// live ingress, the human who can be asked, and where the decision is written
+/// down.
+///
+/// Travels as one bundle because the session actor assembles all five in one
+/// place and [`expose`] needs all five; naming them keeps the call readable.
+pub struct ExposeCtx<'a> {
+    /// The box's record: what the request is decided against, and where an
+    /// allowed mapping is written.
+    pub record: &'a SessionRecordHandle,
+    /// The host's published-port table: where the box's address comes from and
+    /// where the new forwarder is listed.
+    pub published: &'a RwLock<PublishTable>,
+    /// The host's switch, for a box that is running: its live ingress takes
+    /// the port without a relaunch.
+    pub switch: &'a Arc<Mutex<SwitchClient>>,
+    /// The host holding this box's terminal, when it has one: who an `ask` is
+    /// put to. `None` — a box that was never launched, or whose host is gone —
+    /// is nobody to ask (NET-045).
+    pub asker: Option<&'a HostHandle>,
+    /// The daemon's local audit log, where every decision below is recorded
+    /// (NET-046).
+    pub audit_log: &'a Path,
+}
+
+/// Serves one expose request for the box `ctx.record` holds the record of: the
+/// decision, the human's answer when the box's setting asks for one, and on an
+/// allow the publication (NET-044, NET-045).
+///
+/// Whatever the outcome, it is written to the local audit log before the answer
+/// goes back (NET-046): the box, the port, the setting it was decided against,
+/// what became of it, and who decided — the setting itself, the attached human,
+/// or nobody at all.
+///
+/// # Errors
+///
+/// The store's error when the record cannot be read, or cannot be written
+/// once the port is bound — the port is unbound again before it returns.
+pub async fn expose(
+    ctx: ExposeCtx<'_>,
+    port: u16,
+    proto: IpProto,
+) -> Result<ExposeResponse, std::io::Error> {
+    let record = ctx.record.record().await?;
+    let session_name = crate::session::registry_name(&record);
+    let setting = record
+        .policy
+        .dynamic_ingress
+        .map_or_else(|| "unset".to_string(), |d| d.to_string());
+    let mut decided_by = DecidedBy::Policy;
+    let result = decide(&ctx, &record, &session_name, port, proto, &mut decided_by).await;
+    let (outcome, reason) = match &result {
+        Ok(ExposeResponse::Published { .. }) => (Outcome::Published, None),
+        Ok(ExposeResponse::Refused { reason }) => (Outcome::Refused, Some(reason.to_string())),
+        // A permitted request the record would not take: nothing is published,
+        // and the decision that was taken is still worth recording.
+        Err(error) => (Outcome::Failed, Some(error.to_string())),
+    };
+    crate::audit::record(
+        ctx.audit_log,
+        &IngressDecision {
+            session_id: record.id,
+            box_name: session_name,
+            port,
+            proto,
+            setting,
+            outcome,
+            decided_by,
+            reason,
+        },
+    )
+    .await;
+    result
+}
+
+/// The decision and, on an allow, the publication — everything [`expose`]
+/// records the outcome of.
 ///
 /// The port is bound at the box's published address first; then, when the
-/// box is running on `switch`, it is admitted into the box's live ingress —
+/// box is running on the switch, it is admitted into the box's live ingress —
 /// the switch forward that carries the port to its lease and the relay gate
 /// that admits the connection, so the port answers without a relaunch; then
 /// it is added to the box's publication and written into its ingress
@@ -104,19 +186,21 @@ pub fn evaluate(record: &Record, port: u16, proto: IpProto) -> Result<Decision, 
 /// its policy either all carry the port or none does (NET-047). One info
 /// line per request names the box, the port, the decision and the outcome.
 ///
-/// # Errors
-///
-/// The store's error when the record cannot be read, or cannot be written
-/// once the port is bound — the port is unbound again before it returns.
-pub async fn expose(
-    handle: &SessionRecordHandle,
-    published: &RwLock<PublishTable>,
-    switch: &Arc<Mutex<SwitchClient>>,
+/// `decided_by` is set to whoever settled the request, for the audit record
+/// [`expose`] writes: an `ask` is the only case where that is not the box's own
+/// setting.
+async fn decide(
+    ctx: &ExposeCtx<'_>,
+    record: &Record,
+    session_name: &str,
     port: u16,
     proto: IpProto,
+    decided_by: &mut DecidedBy,
 ) -> Result<ExposeResponse, std::io::Error> {
-    let record = handle.record().await?;
-    let session_name = crate::session::registry_name(&record);
+    let published = ctx.published;
+    let switch = ctx.switch;
+    // The setting the request is decided against, for the log lines below; the
+    // audit record carries the same string, derived the same way.
     let setting = record
         .policy
         .dynamic_ingress
@@ -135,9 +219,43 @@ pub async fn expose(
         ExposeResponse::Refused { reason }
     };
 
-    match evaluate(&record, port, proto) {
+    match evaluate(record, port, proto) {
         Ok(Decision::Allow) => {}
-        Ok(Decision::Ask) => return Ok(refuse(ExposeRefusal::NobodyToAsk)),
+        // The box's setting hands the decision to whoever is attached, so the
+        // request waits on their keystroke. Nobody attached, and nobody
+        // answering, refuse it: an `ask` nobody saw is never an allow.
+        Ok(Decision::Ask) => {
+            let Some(asker) = ctx.asker else {
+                *decided_by = DecidedBy::NoOneAttached;
+                return Ok(refuse(ExposeRefusal::NobodyToAsk));
+            };
+            tracing::info!(
+                session_id = %record.id,
+                box_name = %session_name,
+                port,
+                %proto,
+                "asking the attached human to decide a dynamic ingress request"
+            );
+            let question = format!(
+                "min net expose asks to publish port {port}/{proto} of box \
+                 `{session_name}` — allow it?"
+            );
+            match asker.ask(question).await {
+                Answer::Answered(true) => *decided_by = DecidedBy::AttachedHuman,
+                Answer::Answered(false) => {
+                    *decided_by = DecidedBy::AttachedHuman;
+                    return Ok(refuse(ExposeRefusal::AskDeclined));
+                }
+                Answer::NobodyAttached => {
+                    *decided_by = DecidedBy::NoOneAttached;
+                    return Ok(refuse(ExposeRefusal::NobodyToAsk));
+                }
+                Answer::Unanswered => {
+                    *decided_by = DecidedBy::Unanswered;
+                    return Ok(refuse(ExposeRefusal::AskUnanswered));
+                }
+            }
+        }
         Err(reason) => return Ok(refuse(reason)),
     }
 
@@ -146,7 +264,7 @@ pub async fn expose(
     let Some((address, kind)) = published
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .published_at(&session_name)
+        .published_at(session_name)
     else {
         return Ok(refuse(ExposeRefusal::NotPublished));
     };
@@ -174,7 +292,7 @@ pub async fn expose(
     // gate at its tap are fixed at attach, so without this the port would
     // answer only after a relaunch. A box that is not running has nothing
     // to admit into; the recorded mapping applies at its next attach.
-    let live = switch.lock().await.live_boxes().get(&session_name);
+    let live = switch.lock().await.live_boxes().get(session_name);
     if let Some(live) = &live
         && let Err(error) = live.admit(&mapping).await
     {
@@ -188,7 +306,7 @@ pub async fn expose(
     if !published
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .add_ports(&session_name, forwarders)
+        .add_ports(session_name, forwarders)
     {
         // Withdrawn between the read and now; the forwarders dropped with
         // the refused add, so the port is unbound again.
@@ -205,14 +323,14 @@ pub async fn expose(
         .get_or_insert_with(Default::default)
         .port_mappings
         .push(mapping.clone());
-    if let Err(error) = handle.write(new_record).await {
+    if let Err(error) = ctx.record.write(new_record).await {
         // The policy did not take the mapping, so neither the zone nor the
         // running box may keep the port: unbound, delisted and retracted, as
         // if never requested.
         let unbinding = published
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove_port(&session_name, port);
+            .remove_port(session_name, port);
         if let Some(unbinding) = unbinding {
             unbinding.finished().await;
         }
@@ -323,6 +441,86 @@ mod tests {
         {
             Errorable::Ok(response) => response,
             Errorable::Err { error } => panic!("Expose RPC failed: {error}"),
+        }
+    }
+
+    /// Every decision the daemon has written to its local audit log, oldest
+    /// first, one JSON object per line as [`crate::audit`] appends them.
+    async fn audit_records(server: &TestServer) -> Vec<serde_json_lenient::Value> {
+        let state = server.state.minimal_state_dir().await;
+        let path = crate::audit::log_path(state.as_utf8_path().as_std_path());
+        let text = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        text.lines()
+            .map(|line| serde_json_lenient::from_str(line).expect("each line is one record"))
+            .collect()
+    }
+
+    /// Drives an interactive attach to `id` and returns the channel once the
+    /// binding is proven live — the mock shell has echoed a line back — so a
+    /// question put to the session afterwards has a terminal to reach.
+    async fn attached_shell(
+        client: &mut TestClient,
+        id: SessionId,
+    ) -> russh::Channel<russh::client::Msg> {
+        let mut shell = client.open_shell(id).await;
+        shell.data_bytes(b"hello\n".to_vec()).await.unwrap();
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), shell.wait()).await {
+                Ok(Some(russh::ChannelMsg::Data { data })) => {
+                    out.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&out).contains("got:hello") {
+                        return shell;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the shell channel closed before the echo arrived"),
+                Err(_) => panic!(
+                    "no echo from the attached shell: {}",
+                    String::from_utf8_lossy(&out)
+                ),
+            }
+        }
+    }
+
+    /// Waits for a prompt naming `port` to render on the attached terminal,
+    /// answers it with `key`, and returns everything the terminal was shown.
+    async fn answer_prompt(
+        shell: &mut russh::Channel<russh::client::Msg>,
+        port: u16,
+        key: u8,
+    ) -> String {
+        let needle = format!("publish port {port}");
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), shell.wait()).await {
+                Ok(Some(russh::ChannelMsg::Data { data })) => {
+                    out.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&out).contains(&needle) {
+                        shell.data_bytes(vec![key]).await.unwrap();
+                        // Keep reading briefly so the echoed answer is part of
+                        // what the terminal is shown to have said.
+                        while let Ok(Some(russh::ChannelMsg::Data { data })) = tokio::time::timeout(
+                            std::time::Duration::from_millis(200),
+                            shell.wait(),
+                        )
+                        .await
+                        {
+                            out.extend_from_slice(&data);
+                        }
+                        return String::from_utf8_lossy(&out).into_owned();
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!(
+                    "the shell channel closed before the prompt rendered: {}",
+                    String::from_utf8_lossy(&out)
+                ),
+                Err(_) => panic!(
+                    "no prompt for {port} within 10s; the terminal showed: {}",
+                    String::from_utf8_lossy(&out)
+                ),
+            }
         }
     }
 
@@ -563,6 +761,264 @@ mod tests {
         );
         assert_eq!(listed_mappings(&mut client, id).await.len(), 1);
         assert_eq!(entry(&server, "ranged").await.ports, vec![PORT]);
+    }
+
+    /// NET-045: a request decided `ask` is put to the human attached to the
+    /// box, on their own terminal, and their answer is what happens — a `y`
+    /// publishes the port exactly as an `allow` would, an `n` refuses it as
+    /// their refusal, and each answer is recorded as theirs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_ask_prompts_attached_human() {
+        const ALLOWED: u16 = 18_470;
+        const DECLINED: u16 = 18_471;
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = own_ip_box(&mut client, "asked", Some(DynamicIngress::Ask), Some(RANGE)).await;
+        let mut shell = attached_shell(&mut client, id).await;
+
+        // Answered `y`: the question names the box, the port and the transport,
+        // and the port is published.
+        let (shown, response) = tokio::join!(
+            answer_prompt(&mut shell, ALLOWED, b'y'),
+            expose_rpc(&mut client, id, ALLOWED),
+        );
+        assert!(
+            shown.contains("min net expose asks to publish port 18470/tcp of box `asked`"),
+            "the prompt names what is being asked: {shown:?}"
+        );
+        let ExposeResponse::Published { mapping, .. } = response else {
+            panic!("the human said yes, so the port is published: {response:?}");
+        };
+        assert_eq!(mapping.internal_port, ALLOWED);
+        assert_eq!(
+            listed_mappings(&mut client, id).await,
+            vec![mapping.clone()],
+            "the answer is applied: the mapping is in the box's policy"
+        );
+        let published = entry(&server, "asked").await;
+        assert_eq!(published.ports, vec![ALLOWED]);
+        TcpStream::connect((published.address, ALLOWED))
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{}:{ALLOWED} must answer once published: {e}",
+                    published.address
+                )
+            });
+
+        // Answered `n`: refused as the human's refusal, not as a policy
+        // decision, and nothing of the port is left on the box.
+        let (_, refused) = tokio::join!(
+            answer_prompt(&mut shell, DECLINED, b'n'),
+            expose_rpc(&mut client, id, DECLINED),
+        );
+        assert_eq!(
+            refused,
+            ExposeResponse::Refused {
+                reason: ExposeRefusal::AskDeclined
+            }
+        );
+        assert_eq!(
+            listed_mappings(&mut client, id).await,
+            vec![mapping],
+            "a declined request adds nothing to the policy"
+        );
+        let after = entry(&server, "asked").await;
+        assert!(
+            !after.ports.contains(&DECLINED),
+            "a declined port is not published: {:?}",
+            after.ports
+        );
+        drop(
+            TcpListener::bind((after.address, DECLINED)).unwrap_or_else(|e| {
+                panic!(
+                    "{}:{DECLINED} must be free after a decline: {e}",
+                    after.address
+                )
+            }),
+        );
+
+        // Both answers are recorded as the attached human's (NET-046).
+        let records = audit_records(&server).await;
+        assert_eq!(records.len(), 2, "one record per decision: {records:?}");
+        assert_eq!(records[0]["port"], ALLOWED);
+        assert_eq!(records[0]["setting"], "ask");
+        assert_eq!(records[0]["outcome"], "published");
+        assert_eq!(records[0]["decided_by"], "attached-human");
+        assert_eq!(records[0]["box_name"], "asked");
+        assert_eq!(records[1]["port"], DECLINED);
+        assert_eq!(records[1]["outcome"], "refused");
+        assert_eq!(records[1]["decided_by"], "attached-human");
+        assert!(
+            records[1]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("declined to publish"),
+            "the record says why it was refused: {:?}",
+            records[1]
+        );
+    }
+
+    /// NET-045: a request decided `ask` with nobody attached to answer is
+    /// refused with the typed error that says so — before any prompt exists
+    /// (a box that was never attached) and after the human has gone (a box
+    /// that outlived its client, NET-015) — and nothing of it is published.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_ask_without_client_refused() {
+        const PORT: u16 = 18_480;
+        const AFTER: u16 = 18_481;
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = own_ip_box(
+            &mut client,
+            "lonely",
+            Some(DynamicIngress::Ask),
+            Some(RANGE),
+        )
+        .await;
+
+        // Never attached: there is no terminal in the world to prompt.
+        let response = expose_rpc(&mut client, id, PORT).await;
+        assert_eq!(
+            response,
+            ExposeResponse::Refused {
+                reason: ExposeRefusal::NobodyToAsk
+            }
+        );
+        let ExposeResponse::Refused { reason } = response else {
+            unreachable!()
+        };
+        assert!(
+            reason.to_string().contains("nobody is attached to answer"),
+            "the refusal says nobody is attached: {reason}"
+        );
+        assert_no_mapping(&server, &mut client, id, "lonely", PORT).await;
+
+        // Attached, then detached: the session outlives the client, and the
+        // ask arrives with nothing on the other end of it.
+        let mut shell = attached_shell(&mut client, id).await;
+        shell.data_bytes(vec![0x1d]).await.unwrap();
+        shell.data_bytes(vec![b'd']).await.unwrap();
+        while let Ok(Some(_)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), shell.wait()).await
+        {}
+        assert_eq!(
+            expose_rpc(&mut client, id, AFTER).await,
+            ExposeResponse::Refused {
+                reason: ExposeRefusal::NobodyToAsk
+            },
+            "a box whose human has left has nobody to ask"
+        );
+        assert_no_mapping(&server, &mut client, id, "lonely", AFTER).await;
+
+        // Both refusals are recorded, each naming that nobody was there.
+        let records = audit_records(&server).await;
+        assert_eq!(records.len(), 2, "one record per decision: {records:?}");
+        for record in &records {
+            assert_eq!(record["setting"], "ask");
+            assert_eq!(record["outcome"], "refused");
+            assert_eq!(record["decided_by"], "no-one-attached");
+        }
+        assert_eq!(records[0]["port"], PORT);
+        assert_eq!(records[1]["port"], AFTER);
+    }
+
+    /// NET-046: on an un-enrolled host every dynamic ingress decision reaches
+    /// the local audit log — the published and the refused alike — each naming
+    /// the box, the port, the transport, the setting it was decided against,
+    /// what became of it and who decided. This is the host's only account of a
+    /// port it opened, so a decision missing from it is a decision nobody can
+    /// audit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_unenrolled_decision_audited() {
+        const PORT: u16 = 18_490;
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let allow = own_ip_box(&mut client, "yes", Some(DynamicIngress::Allow), Some(RANGE)).await;
+        let deny = own_ip_box(&mut client, "no", Some(DynamicIngress::Deny), Some(RANGE)).await;
+        let unset = own_ip_box(&mut client, "quiet", None, Some(RANGE)).await;
+
+        assert!(
+            audit_records(&server).await.is_empty(),
+            "nothing is recorded before anything is decided"
+        );
+
+        assert!(matches!(
+            expose_rpc(&mut client, allow, PORT).await,
+            ExposeResponse::Published { .. }
+        ));
+        assert_eq!(
+            expose_rpc(&mut client, deny, PORT).await,
+            ExposeResponse::Refused {
+                reason: ExposeRefusal::Denied
+            }
+        );
+        assert_eq!(
+            expose_rpc(&mut client, unset, PORT).await,
+            ExposeResponse::Refused {
+                reason: ExposeRefusal::Unset
+            }
+        );
+        // A refusal the setting never got to decide is still a decision.
+        assert_eq!(
+            expose_rpc(&mut client, allow, 9000).await,
+            ExposeResponse::Refused {
+                reason: ExposeRefusal::OutOfRange {
+                    port: 9000,
+                    lo: RANGE.0,
+                    hi: RANGE.1
+                }
+            }
+        );
+
+        let records = audit_records(&server).await;
+        assert_eq!(records.len(), 4, "one record per decision: {records:?}");
+        for record in &records {
+            assert_eq!(record["proto"], "tcp");
+            assert_eq!(record["decided_by"], "policy");
+            assert!(
+                chrono::DateTime::parse_from_rfc3339(record["at"].as_str().unwrap()).is_ok(),
+                "each record says when it was decided: {record:?}"
+            );
+            assert!(
+                !record["session_id"].as_str().unwrap().is_empty(),
+                "each record names the box it was about: {record:?}"
+            );
+        }
+
+        assert_eq!(records[0]["box_name"], "yes");
+        assert_eq!(records[0]["port"], PORT);
+        assert_eq!(records[0]["setting"], "allow");
+        assert_eq!(records[0]["outcome"], "published");
+        assert_eq!(records[0]["reason"], serde_json_lenient::Value::Null);
+
+        assert_eq!(records[1]["box_name"], "no");
+        assert_eq!(records[1]["setting"], "deny");
+        assert_eq!(records[1]["outcome"], "refused");
+        assert!(
+            records[1]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("dynamic_ingress"),
+            "the record carries the refusal the client was given: {:?}",
+            records[1]
+        );
+
+        assert_eq!(records[2]["box_name"], "quiet");
+        assert_eq!(records[2]["setting"], "unset");
+        assert_eq!(records[2]["outcome"], "refused");
+
+        assert_eq!(records[3]["box_name"], "yes");
+        assert_eq!(records[3]["port"], 9000);
+        assert_eq!(records[3]["outcome"], "refused");
+        assert!(
+            records[3]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("dynamic_allowed_range"),
+            "an out-of-range refusal is audited as itself: {:?}",
+            records[3]
+        );
     }
 
     /// A stand-in for gvproxy's control socket: answers every forwarder verb

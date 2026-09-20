@@ -934,6 +934,14 @@ pub enum ExposeRefusal {
     /// The box's `dynamic_ingress` is `ask` and nobody is attached to answer
     /// (NET-045).
     NobodyToAsk,
+    /// The box's `dynamic_ingress` is `ask` and the attached human said no
+    /// (NET-045). Their answer, not a policy decision.
+    AskDeclined,
+    /// The box's `dynamic_ingress` is `ask`, the prompt reached the attached
+    /// terminal, and no answer came back — nobody was watching, or the client
+    /// left with the prompt up. Refused like every other unanswered request
+    /// (NET-045).
+    AskUnanswered,
     /// The port is outside the box's `dynamic_allowed_range`.
     OutOfRange { port: u16, lo: u16, hi: u16 },
     /// The port is below 1024, which the daemon never publishes.
@@ -977,6 +985,14 @@ impl std::fmt::Display for ExposeRefusal {
             Self::NobodyToAsk => write!(
                 f,
                 "the box's dynamic_ingress setting is ask, and nobody is attached to answer"
+            ),
+            Self::AskDeclined => write!(
+                f,
+                "the human attached to the box was asked, and declined to publish the port"
+            ),
+            Self::AskUnanswered => write!(
+                f,
+                "the human attached to the box was asked, and the prompt went unanswered"
             ),
             Self::OutOfRange { port, lo, hi } => write!(
                 f,

@@ -774,16 +774,32 @@ impl Session {
     /// allow binds the port at the box's published address and records the
     /// mapping in its policy (NET-043, NET-044, NET-047). The actor serves
     /// it because the record write goes through its handle, like a rename.
+    ///
+    /// A box whose setting is `ask` is decided by the human attached to it
+    /// (NET-045), so the box's host rides along: it owns the terminal the
+    /// prompt renders on. A box with no live host is nobody to ask.
     #[cfg(target_os = "linux")]
     async fn expose(
         &self,
         port: u16,
         proto: sessions::IpProto,
     ) -> Result<minimald_rpc::ExposeResponse, std::io::Error> {
+        let asker = match &self.inner {
+            SessionInner::Active {
+                host: Some((host, _)),
+                ..
+            } if host.is_alive() => Some(host),
+            _ => None,
+        };
+        let audit_log = crate::audit::log_path(self.minimal_state_dir.as_utf8_path().as_std_path());
         crate::net::dynamic_ingress::expose(
-            &self.record,
-            &self.published,
-            &self.net_switch,
+            crate::net::dynamic_ingress::ExposeCtx {
+                record: &self.record,
+                published: &self.published,
+                switch: &self.net_switch,
+                asker,
+                audit_log: &audit_log,
+            },
             port,
             proto,
         )

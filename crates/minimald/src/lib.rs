@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+pub mod audit;
 pub mod channel_progress;
 pub mod connection;
 mod diag;

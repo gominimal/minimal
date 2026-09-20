@@ -163,8 +163,43 @@ fn log_session_contents(
     }
 }
 
+/// How long a question put to the attached human is held open before the
+/// asker gives up on it ([`HostHandle::ask`]).
+///
+/// It bounds the *asker*, not the human: the session actor serves one message
+/// at a time, so an `ask` nobody answers would hold everything else that
+/// session owes anyone — a detach, a stop — for as long as the terminal sits
+/// unwatched. Long enough to read a line and press a key, short enough that a
+/// walked-away terminal does not wedge the session.
+const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What became of a yes/no question put to the human attached to a session
+/// ([`HostHandle::ask`]).
+///
+/// Three outcomes, not two: an answer is one thing, and *nobody having
+/// answered* is another — which is what a caller that must fail closed needs
+/// to tell apart from a "no".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// Nobody is attached to the session, so nobody could be asked. Also the
+    /// answer from a host whose runtime loop is gone or wedged: it has no
+    /// terminal to reach either.
+    NobodyAttached,
+    /// The attached human answered: `true` for yes, `false` for no.
+    Answered(bool),
+    /// A prompt reached the attached terminal and no answer came back within
+    /// [`ASK_TIMEOUT`], or the client left with it still up.
+    Unanswered,
+}
+
 enum BindingMsg {
     Stdin(Vec<u8>),
+    /// Put a yes/no question to the human on the other end of this binding,
+    /// over their terminal, alongside whatever their shell is doing. The
+    /// binding answers the `oneshot` from their keystroke; dropping it — a
+    /// binding that leaves with the prompt up — is
+    /// [`Answer::Unanswered`](Answer::Unanswered).
+    Ask(String, oneshot::Sender<Answer>),
     /// The session process ended, so the binding should tear down and raise the
     /// shell-exit prompt. See [`TeardownCause`] for what the binding surfaces.
     ///
@@ -360,6 +395,23 @@ struct Binding {
     /// Daemon-side directory the save-then-delete lane archives into
     /// (`<minimal_state_dir>/archives`). Created on demand at save time.
     archives_dir: std::path::PathBuf,
+    /// The out-of-band question currently on this terminal, waiting for a
+    /// keystroke to answer it. While it is held, keystrokes answer the prompt
+    /// instead of reaching the shell; dropping it answers
+    /// [`Answer::Unanswered`].
+    ask: Option<oneshot::Sender<Answer>>,
+}
+
+/// Reads one keystroke of `data` as an answer to a yes/no prompt: `y` accepts,
+/// `n`, `Enter`, `Escape`, `Ctrl-C` and `Ctrl-D` refuse, and anything else is
+/// no answer at all — a stray key must not decide a question about opening a
+/// port.
+fn answer_key(data: &[u8]) -> Option<bool> {
+    data.iter().find_map(|b| match b {
+        b'y' | b'Y' => Some(true),
+        b'n' | b'N' | b'\r' | b'\n' | 0x1b | 0x03 | 0x04 => Some(false),
+        _ => None,
+    })
 }
 
 impl Binding {
@@ -385,6 +437,7 @@ impl Binding {
             delta,
             name,
             archives_dir,
+            ask: None,
         };
 
         // The channel id ties every line this binding logs back to the
@@ -442,6 +495,32 @@ impl Binding {
                     Some(msg) => {
                         match msg {
                             russh::ChannelMsg::Data{ data } => {
+                                // A prompt on this terminal takes the keystroke
+                                // that answers it: forwarding it to the shell
+                                // instead would both leave the question
+                                // unanswered and type a stray `y` at whatever is
+                                // running. A key that answers nothing leaves the
+                                // prompt up and is dropped — it is not the
+                                // shell's either, since the human is being asked.
+                                if let Some(reply) = self.ask.take() {
+                                    match answer_key(&data) {
+                                        Some(yes) => {
+                                            let _ = w
+                                                .write_all(
+                                                    if yes { b"y\r\n" } else { b"n\r\n" },
+                                                )
+                                                .await;
+                                            tracing::info!(
+                                                session = %self.name,
+                                                answer = yes,
+                                                "the attached human answered a prompt",
+                                            );
+                                            let _ = reply.send(Answer::Answered(yes));
+                                        }
+                                        None => self.ask = Some(reply),
+                                    }
+                                    continue;
+                                }
                                 let _ = self
                                     .stdin_tx
                                     .send(StdinMsg::new(self.generation, StdinMsgKind::Bytes(data)))
@@ -506,6 +585,26 @@ impl Binding {
                     match msg {
                         BindingMsg::Stdin(b) => {
                             let _ = w.write_all(&b).await;
+                        },
+                        BindingMsg::Ask(question, reply) => {
+                            // Written and left: the loop keeps pumping the
+                            // shell's output while the question stands, so a
+                            // prompt never stalls this binding's mailbox (a
+                            // binding that stops draining is shed) and never
+                            // holds the host's loop. The keystroke that answers
+                            // it arrives in the stdin arm above.
+                            tracing::info!(
+                                session = %self.name,
+                                "prompting the attached human",
+                            );
+                            let _ = w
+                                .write_all(format!("\r\n{question} [y/N] ").as_bytes())
+                                .await;
+                            // A second question while one stands cannot happen
+                            // from one session actor, which decides one request
+                            // at a time; if it ever did, the older one is
+                            // unanswered rather than silently replaced.
+                            self.ask = Some(reply);
                         },
                         BindingMsg::TeardownDueToProcessExit { cause, unwind_codes } => {
                             // Before the notices below and before the
@@ -999,6 +1098,12 @@ enum Message {
     /// Answered straight off the parser — no PTY resize, no I/O relay.
     GetScreen(oneshot::Sender<minimald_rpc::ScreenSnapshot>),
 
+    /// Put a yes/no question to the human attached to this session, and reply
+    /// with what became of it. Handed straight to the attached binding, never
+    /// awaited here: the human takes as long as they take, and this loop has a
+    /// pty to pump meanwhile.
+    Ask(String, oneshot::Sender<Answer>),
+
     SetTitleCallback(String),
     VisualBellCallback,
     AudibleBellCallback,
@@ -1217,6 +1322,38 @@ impl HostHandle {
             Err(SendTimeoutError::Timeout(Message::Attach(c, sz, _, _)))
             | Err(SendTimeoutError::Closed(Message::Attach(c, sz, _, _))) => Err((c, sz)),
             Err(e) => unreachable!("{:?}", e),
+        }
+    }
+
+    /// Puts `question` to the human attached to this session, and reports what
+    /// became of it (NET-045).
+    ///
+    /// The prompt is rendered on their terminal alongside whatever their shell
+    /// is doing, and answered by one keystroke. Nothing here answers for them:
+    /// a session nobody is attached to, a host that cannot be reached, and a
+    /// prompt left unanswered are each reported as themselves, so a caller that
+    /// must fail closed can say which happened — and say so to the human's
+    /// face, rather than recording a "no" they never gave.
+    pub async fn ask(&self, question: String) -> Answer {
+        let (send, recv) = oneshot::channel();
+        // A host whose loop is gone or wedged has no terminal to reach, which
+        // is indistinguishable — to the asker — from nobody being attached.
+        if self
+            .sender
+            .send_timeout(
+                Message::Ask(question, send),
+                crate::session::HOST_PROBE_TIMEOUT,
+            )
+            .await
+            .is_err()
+        {
+            return Answer::NobodyAttached;
+        }
+        match tokio::time::timeout(ASK_TIMEOUT, recv).await {
+            Ok(Ok(answer)) => answer,
+            // The binding left with the prompt up, taking the reply with it.
+            Ok(Err(_)) => Answer::Unanswered,
+            Err(_) => Answer::Unanswered,
         }
     }
 
@@ -3100,6 +3237,38 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         let (count, last) = &mut self.attrs.visual_bell;
                         *count += 1;
                         *last = Some(SystemTime::now());
+                    }
+                    Message::Ask(question, reply) => {
+                        match self.remote.as_mut() {
+                            // Bounded like every other send to a binding: a
+                            // binding that cannot take the question within the
+                            // probe deadline leaves it unasked, and dropping
+                            // `reply` with the message tells the asker so.
+                            Some((tx, _hnd)) => if let Err(e) = tx
+                                .send_timeout(
+                                    BindingMsg::Ask(question, reply),
+                                    crate::session::HOST_PROBE_TIMEOUT,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    session_id = %self.session_id,
+                                    error = %e,
+                                    "could not put a question to the attached binding",
+                                );
+                            },
+                            // Nothing attached: nobody to ask, and the asker
+                            // must hear that rather than a refusal it might
+                            // read as an answer.
+                            None => {
+                                tracing::info!(
+                                    session_id = %self.session_id,
+                                    session = %self.session_name,
+                                    "nothing attached to put a question to",
+                                );
+                                let _ = reply.send(Answer::NobodyAttached);
+                            }
+                        }
                     }
                     Message::GetAttrs(s) => {
                         let _ = s.send(self.attrs.clone());

@@ -288,6 +288,48 @@ pub async fn zone(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow:
     }
 }
 
+// ── audit/decisions.jsonl ────────────────────────────────────────────────────
+
+/// Where a native `minimald` appends one record per decision it took on its own
+/// authority — today every dynamic ingress decision: the box, the port, the
+/// setting it was decided against, what became of it, and who decided
+/// (NET-046). Relative to the state dir, and the same path the daemon writes.
+const AUDIT_LOG: &str = "audit/decisions.jsonl";
+
+/// The tail of the daemon's local audit log.
+///
+/// The tail, not the file: it only grows, and a bundle carries what a reader
+/// needs — the decisions around the incident. Capped like the log tails, and
+/// the cap is recorded as a redaction so nobody reads a truncated first line as
+/// the first decision ever taken.
+///
+/// Absent on a host with no native daemon (macOS, where the daemon runs in the
+/// microVM and writes its log to the guest volume), which is recorded as a skip
+/// rather than an error — the same fact, and the same phrasing, as the zone
+/// dump above.
+pub async fn audit(
+    w: &mut BundleWriter,
+    paths: &DiagPaths,
+    tail_bytes: u64,
+) -> Result<(), anyhow::Error> {
+    let src = paths.state.join(AUDIT_LOG);
+    match w.add_file_tail(AUDIT_LOG, &src, tail_bytes).await {
+        Ok(()) => Ok(()),
+        Err(e) if is_not_found(&e) => {
+            w.skip(
+                AUDIT_LOG,
+                format!(
+                    "no audit log at {}: no native minimald has decided anything on this \
+                     host",
+                    src.display()
+                ),
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 // ── logs/ ────────────────────────────────────────────────────────────────────
 
 /// How many rotated files per log prefix make it into the bundle.
@@ -1016,6 +1058,109 @@ mod tests {
         let reason = skipped[0]["reason"].as_str().unwrap();
         assert!(
             reason.contains(&bare.path().join("net/zone.json").display().to_string()),
+            "{reason}"
+        );
+    }
+
+    /// The bundle carries the tail of the daemon's local audit log, so every
+    /// dynamic ingress decision — its box, its port and who decided — can be
+    /// read back from a report; a tail longer than the cap is marked as
+    /// capped, and a host whose daemon has decided nothing records the absence
+    /// instead of guessing.
+    #[tokio::test]
+    async fn bug_bundle_carries_audit_tail() {
+        let state = tempfile::TempDir::new().unwrap();
+        let planted = concat!(
+            r#"{"at":"2026-09-20T10:00:00+00:00","session_id":"0000","box_name":"web","#,
+            r#""port":8080,"proto":"tcp","setting":"ask","outcome":"published","#,
+            r#""decided_by":"attached-human","reason":null}"#,
+            "\n",
+            r#"{"at":"2026-09-20T10:01:00+00:00","session_id":"0000","box_name":"api","#,
+            r#""port":9090,"proto":"tcp","setting":"ask","outcome":"refused","#,
+            r#""decided_by":"no-one-attached","reason":"nobody is attached to answer"}"#,
+            "\n",
+        );
+        std::fs::create_dir_all(state.path().join("audit")).unwrap();
+        std::fs::write(state.path().join(AUDIT_LOG), planted).unwrap();
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+        audit(&mut w, &paths(state.path()), 64 * 1024)
+            .await
+            .unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        let files = unpack(&out, "r").await;
+        assert_eq!(
+            files[AUDIT_LOG],
+            planted.as_bytes(),
+            "the tail is carried verbatim"
+        );
+        // Each line is one decision, and the fields a reader needs are in it.
+        let lines: Vec<serde_json_lenient::Value> = String::from_utf8(files[AUDIT_LOG].clone())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json_lenient::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["box_name"], "web");
+        assert_eq!(lines[0]["port"], 8080);
+        assert_eq!(lines[0]["decided_by"], "attached-human");
+        assert_eq!(lines[1]["outcome"], "refused");
+        assert_eq!(lines[1]["decided_by"], "no-one-attached");
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let entry = manifest["collected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["path"] == AUDIT_LOG)
+            .expect("the manifest lists the audit tail");
+        assert_eq!(entry["redaction"], "none");
+        assert!(manifest["skipped"].as_array().unwrap().is_empty());
+
+        // A log longer than the cap is carried as a tail, and the manifest
+        // says so rather than letting it pass for the whole log.
+        let out = out_dir.path().join("capped.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+        audit(&mut w, &paths(state.path()), 32).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "r").await;
+        assert_eq!(files[AUDIT_LOG].len(), 32, "capped at the tail size");
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let entry = manifest["collected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["path"] == AUDIT_LOG)
+            .expect("the manifest lists the capped tail");
+        assert_eq!(entry["redaction"], "tail-capped");
+
+        // Nothing decided here: the absence is a recorded skip naming the path
+        // looked at, not an error and not silence.
+        let bare = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("bare.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+        audit(&mut w, &paths(bare.path()), 64 * 1024).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "r").await;
+        assert!(!files.contains_key(AUDIT_LOG));
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let skipped = manifest["skipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0]["what"], AUDIT_LOG);
+        let reason = skipped[0]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains(&bare.path().join(AUDIT_LOG).display().to_string()),
             "{reason}"
         );
     }
