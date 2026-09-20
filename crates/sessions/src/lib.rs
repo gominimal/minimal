@@ -443,6 +443,26 @@ pub struct Grant {
     /// The kind of member; `user` unless declared.
     #[serde(default)]
     pub mode: GrantMode,
+    /// The scopes the grant asks for, as the box spec spells them
+    /// ([`GITHUB_SCOPE_FULL`] for the `full` member this host mints,
+    /// `github:repo:<owner>/<name>` for a narrower one). Declaring none
+    /// takes the member as minted.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+impl Grant {
+    /// The declared scopes narrower than `full`, in declared order: empty
+    /// when the grant declares nothing, or [`GITHUB_SCOPE_FULL`] alone
+    /// (BEP-057).
+    #[must_use]
+    pub fn narrower_than_full(&self) -> Vec<String> {
+        self.scopes
+            .iter()
+            .filter(|scope| scope.as_str() != GITHUB_SCOPE_FULL)
+            .cloned()
+            .collect()
+    }
 }
 
 impl fmt::Display for Grant {
@@ -451,6 +471,50 @@ impl fmt::Display for Grant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} grant `{}`", self.module, self.env)
     }
+}
+
+/// The scope a `full`-breadth GitHub member is declared as: the honest
+/// spelling of what an un-enrolled host mints (BEP-005). Every other
+/// spelling is narrower — `github:repo:<owner>/<name>` and any scope a later
+/// version adds — and is read fail-closed, so an unknown spelling is never
+/// taken for `full`.
+pub const GITHUB_SCOPE_FULL: &str = "github:user-token";
+
+/// The `[session.secrets]` table of a box spec.
+///
+/// The full-breadth acknowledgement is the operator's, held in the client
+/// configuration, so a project that sets it here is ignored with a warning
+/// (BEP-057): the scopes a project declares are honoured unchanged the moment
+/// the host enrolls.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BoxSecrets {
+    /// Set by a project asking for full-breadth minting. Ignored.
+    pub acknowledge_full_breadth_unenrolled: Option<bool>,
+}
+
+/// The full-breadth acknowledgement in force for a box spec: the client
+/// configuration's `[secrets] acknowledge_full_breadth_unenrolled`, and a
+/// warning when the project's `[session.secrets]` sets it too (BEP-057).
+///
+/// Widening a declared scope is the operator's to accept, never the
+/// project's to ask for, so the project's value is dropped rather than
+/// merged.
+#[must_use]
+pub fn acknowledgement_in_force(
+    client: bool,
+    project: &BoxSecrets,
+) -> (bool, Option<GrantWarning>) {
+    let warning = project.acknowledge_full_breadth_unenrolled.map(|declared| {
+        tracing::warn!(
+            declared,
+            in_force = client,
+            "the project set `[session.secrets] acknowledge_full_breadth_unenrolled`; it is \
+             ignored"
+        );
+        GrantWarning::ProjectAcknowledgement { declared }
+    });
+    (client, warning)
 }
 
 /// The GitHub module's v1 host set (Gatehouse §6.10, Module host sets): the
@@ -480,6 +544,10 @@ pub struct GrantContext<'a> {
     /// Whether this host runs the box-zone resolver that `dns` steering
     /// needs to answer the credentialed hostnames with the proxy's address.
     pub resolver_present: bool,
+    /// Whether the client configuration acknowledges full-breadth minting
+    /// while the host is not enrolled: `[secrets]
+    /// acknowledge_full_breadth_unenrolled` (BEP-057).
+    pub full_breadth_acknowledged: bool,
 }
 
 /// The outcome of an admitted expansion: what the box is created with.
@@ -549,6 +617,15 @@ pub enum GrantWarning {
          never redeemed"
     )]
     SteeringOff { grant: Grant },
+    /// The project set the full-breadth acknowledgement. It is the
+    /// operator's, held in the client configuration, so the project's value
+    /// is ignored (BEP-057).
+    #[error(
+        "the project sets `[session.secrets] acknowledge_full_breadth_unenrolled = {declared}`, \
+         which is ignored: the acknowledgement is the operator's, read from the user or \
+         organization client configuration alone"
+    )]
+    ProjectAcknowledgement { declared: bool },
 }
 
 /// One reason an expansion is refused.
@@ -583,6 +660,17 @@ pub enum GrantRefusalCause {
          enrolled and holds no App private key"
     )]
     InstallationModeUnenrolled { grant: Grant },
+    /// The grant declares scopes narrower than `full` and no acknowledgement
+    /// is in force: un-enrolled, the member minted from the sign-in is
+    /// `full` breadth, so honouring the declaration is impossible and
+    /// widening it silently is refused (BEP-057).
+    #[error(
+        "{grant} declares scopes narrower than `full` ({}), and this host mints `full` members \
+         only while it is not enrolled; set `[secrets] acknowledge_full_breadth_unenrolled = \
+         true` in the user or organization client configuration to accept the widening",
+        .narrower.join(", ")
+    )]
+    NarrowScopesUnacknowledged { grant: Grant, narrower: Vec<String> },
     /// The box's `egress.allow_dns_hosts` does not admit every host of the
     /// module's host set; `missing` names exactly the absent hosts.
     #[error(
@@ -636,12 +724,13 @@ impl std::error::Error for GrantRefusal {}
 ///
 /// Refused, with every cause named: a grant under `mode = "none"` (BEP-009),
 /// `steering = "off"` together with `proxy_env = true` (BEP-010), a grant
-/// asking for `mode = "installation"` (BEP-056), and a grant whose module
-/// host set `egress.allow_dns_hosts` does not admit in full — an absent
-/// `allow_dns_hosts` admits every host (BEP-008). A spec that passes those
-/// is then refused with `github_sign_in_required` when no sign-in is held
-/// (BEP-003). A grant under `steering = "off"` is admitted with a warning,
-/// and the expansion injects no CA (BEP-010).
+/// asking for `mode = "installation"` (BEP-056), a grant declaring scopes
+/// narrower than `full` with no acknowledgement in force (BEP-057), and a
+/// grant whose module host set `egress.allow_dns_hosts` does not admit in
+/// full — an absent `allow_dns_hosts` admits every host (BEP-008). A spec
+/// that passes those is then refused with `github_sign_in_required` when no
+/// sign-in is held (BEP-003). A grant under `steering = "off"` is admitted
+/// with a warning, and the expansion injects no CA (BEP-010).
 ///
 /// A spec declaring a grant and no `steering` resolves to
 /// [`Steering::DEFAULT`] (BEP-016); a resolved `dns` or `both` on a host with
@@ -694,6 +783,13 @@ pub fn validate_grants(
         if grant.mode == GrantMode::Installation {
             causes.push(GrantRefusalCause::InstallationModeUnenrolled {
                 grant: grant.clone(),
+            });
+        }
+        let narrower = grant.narrower_than_full();
+        if !narrower.is_empty() && !ctx.full_breadth_acknowledged {
+            causes.push(GrantRefusalCause::NarrowScopesUnacknowledged {
+                grant: grant.clone(),
+                narrower,
             });
         }
         let missing = hosts_outside_egress(network.egress.as_ref(), ctx.host_set);
@@ -1441,11 +1537,20 @@ mod tests {
                 env: StrictVarName::try_new(env).unwrap(),
                 source: GrantSource::Broker,
                 mode,
+                scopes: Vec::new(),
             }
         }
 
         fn user_grant() -> Grant {
             grant("GITHUB_TOKEN", GrantMode::User)
+        }
+
+        /// A user grant declaring `scopes`.
+        fn scoped_grant(env: &str, scopes: &[&str]) -> Grant {
+            Grant {
+                scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
+                ..grant(env, GrantMode::User)
+            }
         }
 
         /// A spec every check admits: own-IP, the whole GitHub host set
@@ -1473,6 +1578,7 @@ mod tests {
                 host_set: &GITHUB_HOST_SET,
                 sign_in_held,
                 resolver_present: false,
+                full_breadth_acknowledged: false,
             }
         }
 
@@ -1512,9 +1618,76 @@ mod tests {
             .unwrap();
             assert_eq!(parsed, user_grant());
             assert_eq!(parsed.to_string(), "github grant `GITHUB_TOKEN`");
+            assert!(parsed.narrower_than_full().is_empty());
+
+            // `scopes` is what the grant asks for; `github:user-token` is the
+            // spelling of the `full` member, so it is not narrower.
+            let scoped: Grant = toml::from_str(
+                r#"
+                module = "github"
+                env = "GITHUB_TOKEN"
+                source = "broker"
+                scopes = ["github:user-token", "github:repo:acme/web"]
+                "#,
+            )
+            .unwrap();
+            assert_eq!(
+                scoped.narrower_than_full(),
+                vec!["github:repo:acme/web".to_owned()]
+            );
+
+            let secrets: BoxSecrets =
+                toml::from_str("acknowledge_full_breadth_unenrolled = true").unwrap();
+            assert_eq!(secrets.acknowledge_full_breadth_unenrolled, Some(true));
+            assert_eq!(
+                BoxSecrets::default().acknowledge_full_breadth_unenrolled,
+                None
+            );
 
             // A typo in a security-relevant table is refused, not dropped.
             assert!(toml::from_str::<BepPolicy>("proxyenv = true").is_err());
+            assert!(toml::from_str::<BoxSecrets>("acknowledge = true").is_err());
+        }
+
+        /// BEP-057: the acknowledgement a project's `[session.secrets]` sets
+        /// is ignored — the client configuration's value is the one in force
+        /// — and the operator is warned that it was dropped.
+        #[test]
+        fn project_acknowledgement_is_ignored_with_warning() {
+            let asked = BoxSecrets {
+                acknowledge_full_breadth_unenrolled: Some(true),
+            };
+            let (in_force, warning) = acknowledgement_in_force(false, &asked);
+            assert!(!in_force, "a project cannot acknowledge the widening");
+            let text = warning
+                .expect("the dropped value is warned about")
+                .to_string();
+            assert!(
+                text.contains("acknowledge_full_breadth_unenrolled"),
+                "{text}"
+            );
+            assert!(text.contains("ignored"), "{text}");
+
+            // The client's value stands on its own, and a project that says
+            // nothing is not warned about.
+            assert_eq!(
+                acknowledgement_in_force(true, &BoxSecrets::default()),
+                (true, None)
+            );
+
+            // A narrow grant is refused with the client's `false` however
+            // loudly the project asks, and admitted once the client sets it.
+            let grants = [scoped_grant("GITHUB_TOKEN", &["github:repo:acme/web"])];
+            let context = GrantContext {
+                full_breadth_acknowledged: in_force,
+                ..ctx(true)
+            };
+            assert!(validate_grants(&admitted_network(), &grants, &context).is_err());
+            let acknowledged = GrantContext {
+                full_breadth_acknowledged: acknowledgement_in_force(true, &asked).0,
+                ..ctx(true)
+            };
+            assert!(validate_grants(&admitted_network(), &grants, &acknowledged).is_ok());
         }
 
         /// BEP-003: with no sign-in held, a box declaring a GitHub grant
@@ -1844,6 +2017,84 @@ mod tests {
                     prop_assert_eq!(refusal.causes, expected);
                 }
             }
+
+            /// BEP-057: on an un-enrolled host, expansion refuses iff some
+            /// grant declares scopes narrower than `full` and the
+            /// acknowledgement is unset — naming each such grant and the
+            /// acknowledgement as the remedy. With it set, the same spec is
+            /// admitted and the member minted is the `full` one.
+            #[test]
+            fn prop_narrow_scopes_unenrolled_need_acknowledgement(
+                scope_sets in prop::collection::vec(arb_scopes(), 1..4),
+                acknowledged in any::<bool>(),
+            ) {
+                let network = admitted_network();
+                let grants: Vec<Grant> = scope_sets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, scopes)| {
+                        let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
+                        scoped_grant(&format!("TOKEN_{i}"), &scopes)
+                    })
+                    .collect();
+                let context = GrantContext {
+                    full_breadth_acknowledged: acknowledged,
+                    ..ctx(true)
+                };
+
+                let narrow: Vec<&Grant> = grants
+                    .iter()
+                    .filter(|g| !g.narrower_than_full().is_empty())
+                    .collect();
+                let result = validate_grants(&network, &grants, &context);
+                prop_assert_eq!(result.is_err(), !narrow.is_empty() && !acknowledged);
+                match result {
+                    Err(refusal) => {
+                        prop_assert_eq!(GrantRefusal::EXIT_CODE, 3);
+                        let text = refusal.to_string();
+                        prop_assert_eq!(
+                            refusal.causes,
+                            narrow
+                                .iter()
+                                .map(|g| GrantRefusalCause::NarrowScopesUnacknowledged {
+                                    grant: (*g).clone(),
+                                    narrower: g.narrower_than_full(),
+                                })
+                                .collect::<Vec<_>>()
+                        );
+                        prop_assert!(
+                            text.contains("acknowledge_full_breadth_unenrolled"),
+                            "{}",
+                            text
+                        );
+                        for grant in &narrow {
+                            prop_assert!(text.contains(&grant.to_string()), "{}", text);
+                            for scope in grant.narrower_than_full() {
+                                prop_assert!(text.contains(&scope), "{}", text);
+                            }
+                        }
+                    }
+                    Ok(expansion) => {
+                        prop_assert!(expansion.inject_ca);
+                        prop_assert!(expansion.warnings.is_empty());
+                    }
+                }
+            }
+        }
+
+        /// The scopes a grant is written with: the `full` spelling, narrower
+        /// repository scopes, and a spelling this version does not know —
+        /// which is read as narrower, never as `full`.
+        const SCOPE_POOL: [&str; 4] = [
+            GITHUB_SCOPE_FULL,
+            "github:repo:acme/web",
+            "github:repo:acme/*",
+            "github:issues:read",
+        ];
+
+        fn arb_scopes() -> impl Strategy<Value = Vec<String>> {
+            prop::collection::vec(0..SCOPE_POOL.len(), 0..3)
+                .prop_map(|idx| idx.into_iter().map(|i| SCOPE_POOL[i].to_owned()).collect())
         }
     }
 }

@@ -71,6 +71,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Auth(AuthArgs { command })) => {
             auth::cmd_auth(&cli.global_args, command).await
         }
+        Some(Command::Box(BoxArgs { command })) => match command {
+            BoxCommand::Spec(args) => box_cmd::cmd_box_spec(&cli.global_args, args),
+        },
         Some(Command::Task(TaskArgs { command })) => match command {
             TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
         },

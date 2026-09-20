@@ -491,6 +491,11 @@ pub struct Session {
     /// Credentials the box receives as sealed values: `[[session.grants]]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub grants: Vec<sessions::Grant>,
+    /// The box's `[session.secrets]` table. Client-owned keys a project
+    /// cannot set land here so they are warned about rather than silently
+    /// swallowed by `extra`; see `sessions::acknowledgement_in_force`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<sessions::BoxSecrets>,
 
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
@@ -510,8 +515,8 @@ impl Session {
     /// [`Session`] has anything worth materializing.
     ///
     /// `extra` is ignored — unknown fields don't count as
-    /// contributions — and so are `network` and `grants`, which
-    /// describe the box rather than contribute to its composition.
+    /// contributions — and so are `network`, `grants` and `secrets`,
+    /// which describe the box rather than contribute to its composition.
     ///
     /// The exhaustive `let Self { ... } = self` destructure in the
     /// body is what makes this drift-proof: if a sixth primitive
@@ -529,6 +534,7 @@ impl Session {
             lifecycle_hooks,
             network: _,
             grants: _,
+            secrets: _,
             extra: _,
         } = self;
         packages.is_empty()

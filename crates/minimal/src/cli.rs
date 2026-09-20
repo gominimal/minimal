@@ -53,6 +53,8 @@ pub enum Command {
     Loadout(LoadoutArgs),
     /// GitHub sign-in: log in, log out, and report the held sign-in
     Auth(AuthArgs),
+    /// Box credential review: what a box's spec asks for and is given
+    Box(BoxArgs),
     /// Task subcommands: run declared project tasks in ephemeral sessions
     #[command(visible_alias = "tasks")]
     Task(TaskArgs),
@@ -309,6 +311,31 @@ pub enum AuthCommand {
     Logout,
     /// Report whether a GitHub sign-in is held, as whom, and until when
     Status,
+}
+
+#[derive(Debug, Args)]
+pub struct BoxArgs {
+    #[command(subcommand)]
+    pub command: BoxCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BoxCommand {
+    /// Show what the project's box spec asks for and what the box is given
+    ///
+    /// Renders the fingerprint of the host's interception root, each grant
+    /// with the upstream hosts its member is bound to and the breadth it is
+    /// minted at, the resolved steering mode, and each store reference with
+    /// the authorities registered for it. A spec this host cannot honour is
+    /// refused with exit 3 naming every cause, as activation would.
+    Spec(BoxSpecArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct BoxSpecArgs {
+    /// Project path. Defaults to the directory set by `-C`/`--repo-dir`,
+    /// or the current working directory when neither is given.
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Args)]

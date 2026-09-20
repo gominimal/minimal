@@ -418,6 +418,64 @@ the held sign-in at creation — `mode = "user"`, `full` breadth, expiring at
 most eight hours later or when the token itself does, whichever is sooner —
 and the mint is recorded in the proxy's audit log alongside its decisions.
 
+### `box spec`
+
+```
+min box spec [<PATH>]
+```
+
+Shows what the project's box spec asks for and what a box created from it is
+given: the fingerprint of this host's interception root, the resolved steering
+mode and whether the root is injected, the proxy environment the box receives,
+each grant with the upstream hosts its member is bound to, and each store
+reference with the authorities registered for it. Interception is declared
+here rather than discovered inside a box. `<PATH>` defaults to `-C`/`--repo-dir`
+or the working directory.
+
+```console
+$ min box spec
+box spec: /repo/web
+  interception root: sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0
+  steering: proxy_env (interception root in the box trust store)
+  proxy environment:
+    HTTPS_PROXY=http://127.0.0.1:7655
+    HTTP_PROXY=http://127.0.0.1:7655
+    NO_PROXY=.min.internal,host.min.internal,localhost,127.0.0.1
+  grants:
+    - github grant `GITHUB_TOKEN`: mode user, declared github:user-token, minted full
+      upstreams: github.com, api.github.com, uploads.github.com, codeload.github.com
+  references: none declared
+```
+
+The review runs the same validation `min session activate` runs, so a spec
+this host cannot honour is refused with **exit 3** naming every cause, before
+any box exists.
+
+A grant may declare what it asks for in `scopes`. `github:user-token` is the
+honest spelling of the `full`-breadth member an un-enrolled host mints, and
+`min box spec` marks every grant `full` beside what it declared. A grant
+declaring anything narrower — `github:repo:acme/web`, say — cannot be honoured
+un-enrolled: the member minted from your sign-in is `full` breadth, so the box
+is refused until you accept the widening in your own config
+(`<config>/minimal/config.toml`):
+
+```toml
+[secrets]
+acknowledge_full_breadth_unenrolled = true
+```
+
+With it set, the member is minted `full` and the spec renders the widening
+beside the marker:
+
+```console
+    - github grant `GITHUB_TOKEN`: mode user, declared github:repo:acme/web, minted full (wider than declared, acknowledged by `[secrets] acknowledge_full_breadth_unenrolled = true`)
+```
+
+The acknowledgement is yours, never a project's: a `minimal.toml` that sets
+`[session.secrets] acknowledge_full_breadth_unenrolled` is ignored with a
+warning, so the scopes it declares are honoured unchanged the moment the host
+enrolls.
+
 ### `completions` (alias: `completion`)
 
 ```

@@ -43,6 +43,7 @@ fn expand_project_grants(
     project_root: &paths::HostAbsPath,
     box_name: &str,
     cli_mode: sessions::NetworkMode,
+    acknowledge_full_breadth: bool,
 ) -> Result<(sessions::NetworkMode, Option<GrantPlan>), anyhow::Error> {
     let Ok(mfile) = mfile::File::from_dir(project_root.as_utf8_path().as_std_path()) else {
         return Ok((cli_mode, None));
@@ -56,6 +57,16 @@ fn expand_project_grants(
     if session.grants.is_empty() {
         return Ok((mode, None));
     }
+    // The full-breadth acknowledgement is the operator's, read from the
+    // client configuration; a project that sets it is warned about and
+    // ignored (BEP-057).
+    let (full_breadth_acknowledged, ignored) = sessions::acknowledgement_in_force(
+        acknowledge_full_breadth,
+        &session.secrets.clone().unwrap_or_default(),
+    );
+    if let Some(warning) = &ignored {
+        eprintln!("warning: {warning}");
+    }
     let ctx = sessions::GrantContext {
         box_name,
         host_set: &sessions::GITHUB_HOST_SET,
@@ -64,6 +75,7 @@ fn expand_project_grants(
         // steering is refused naming it (BEP-017) and every box today
         // declares `proxy_env`. The flag flips when the resolver lands.
         resolver_present: false,
+        full_breadth_acknowledged,
     };
     let expansion = sessions::validate_grants(&network, &session.grants, &ctx)?;
     for warning in &expansion.warnings {
@@ -297,9 +309,17 @@ pub(crate) async fn activate_session(
     // BEP-010, BEP-056). A spec-declared `network.mode` is the session's
     // mode; `--network` fills in when the spec is silent. An admitted spec
     // with grants comes back as a plan, minted into the composition once
-    // the session exists (see `deliver_box_grants`).
-    let (network, grant_plan) =
-        expand_project_grants(&abs_path, &session_name, args.network.into())?;
+    // the session exists (see `deliver_box_grants`). The client config is
+    // read here rather than with the loadouts below because the
+    // full-breadth acknowledgement the validation reads lives in it
+    // (BEP-057).
+    let cfg = config::read_client_config(global)?;
+    let (network, grant_plan) = expand_project_grants(
+        &abs_path,
+        &session_name,
+        args.network.into(),
+        cfg.secrets.acknowledge_full_breadth_unenrolled,
+    )?;
 
     // The daemon sources `username` from the authenticated SSH
     // connection context; the client doesn't send it.
@@ -316,7 +336,6 @@ pub(crate) async fn activate_session(
     // connection: a missing loadout file or a malformed one should
     // fail loudly on the client side without ever touching the
     // daemon.
-    let cfg = config::read_client_config(global)?;
     let policy_path = config::user_policy_path(global);
     let user_policy = config::read_user_policy(global)?;
     let initial_policy = user_policy.clone();
@@ -1799,6 +1818,7 @@ mod tests {
             env: StrictVarName::try_new("GITHUB_TOKEN").unwrap(),
             source: sessions::GrantSource::Broker,
             mode: sessions::GrantMode::User,
+            scopes: vec![sessions::GITHUB_SCOPE_FULL.to_owned()],
         }
     }
 
@@ -1830,6 +1850,7 @@ mod tests {
             host_set: &sessions::GITHUB_HOST_SET,
             sign_in_held: true,
             resolver_present: false,
+            full_breadth_acknowledged: false,
         };
         sessions::validate_grants(network, &[github_grant()], &ctx).unwrap()
     }

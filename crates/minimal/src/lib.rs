@@ -3,6 +3,8 @@
 mod attach;
 pub mod auth;
 pub mod autospawn;
+// `box` is a keyword, so the module carrying `min box` is `box_cmd`.
+pub mod box_cmd;
 // The SSH client transport lives in the shared `minimal-client` crate (used
 // by the TUI as well); re-exported here so internal `crate::client::...`
 // paths and downstream users of `minimal::client` keep working.

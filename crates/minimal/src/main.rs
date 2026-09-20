@@ -192,6 +192,7 @@ mod tests {
             env: sessions::core::primitives::StrictVarName::try_new("GITHUB_TOKEN").unwrap(),
             source: sessions::GrantSource::Broker,
             mode: sessions::GrantMode::User,
+            scopes: Vec::new(),
         };
         let network = sessions::BoxNetwork {
             mode: Some(sessions::NetworkMode::NoNet),
@@ -202,6 +203,7 @@ mod tests {
             host_set: &sessions::GITHUB_HOST_SET,
             sign_in_held: true,
             resolver_present: false,
+            full_breadth_acknowledged: false,
         };
         let refusal = sessions::validate_grants(&network, &[grant], &ctx).unwrap_err();
         assert_eq!(exit_code_for(&anyhow::Error::from(refusal)), 3);

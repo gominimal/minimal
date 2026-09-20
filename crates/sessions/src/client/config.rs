@@ -30,6 +30,25 @@ pub struct Config {
     /// within stay `snake_case` to match the rest of the config.
     #[serde(default, rename = "session-keys")]
     pub session_keys: SessionKeysConfig,
+    /// `[secrets]` section: what the operator accepts about the
+    /// credentials this host mints for a box.
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+}
+
+/// The `[secrets]` section: the operator's standing decisions about the
+/// credentials a box receives. Client-owned by design — a project never
+/// supplies these (BEP-057).
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct SecretsConfig {
+    /// Accept that a box declaring scopes narrower than `full` is minted a
+    /// `full`-breadth member while this host is not enrolled, because that
+    /// is the only member it can mint. Unset, such a box is refused with
+    /// exit 3 naming the grant and this field.
+    #[serde(default)]
+    pub acknowledge_full_breadth_unenrolled: bool,
 }
 
 /// The `[loadouts]` section.
@@ -258,6 +277,29 @@ mod tests {
         );
         let cfg = read_config_file(&path).unwrap();
         assert!(cfg.loadouts.follow_symlinks);
+    }
+
+    /// The `[secrets]` acknowledgement round-trips, and is off in a config
+    /// that does not carry the section — a box declaring narrower scopes is
+    /// refused until the operator writes it down (BEP-057).
+    #[test]
+    fn read_config_file_secrets_acknowledgement() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(
+            dir.path(),
+            "config.toml",
+            indoc::indoc! {r"
+                [secrets]
+                acknowledge_full_breadth_unenrolled = true
+            "},
+        );
+        let cfg = read_config_file(&path).unwrap();
+        assert!(cfg.secrets.acknowledge_full_breadth_unenrolled);
+        assert!(
+            !Config::default()
+                .secrets
+                .acknowledge_full_breadth_unenrolled
+        );
     }
 
     /// An empty config file parses to `Config::default()`.
