@@ -19,10 +19,16 @@
 //! value is forwarded as sent once the connection and request checks pass,
 //! marked `foreign_credential` when it carries a credential of its own
 //! (BEP-030). A request carrying a sealed value is forwarded with the member's
-//! credential in the value's place when every check passes (BEP-025). Either
-//! way the upstream leg is opened and validated against the host's trust
-//! store first, and nothing is forwarded, and no credential substituted,
-//! before it is (BEP-055). Every decision appends one audit record (BEP-039).
+//! credential in the value's place when every check passes (BEP-025). A
+//! member that is a store handle is verified under the client keys registered
+//! over the control socket and checked against the rule currently registered
+//! for its store and identifier (BEP-064); admitted, the referenced value is
+//! read from the store and put on the wire in the rule's registered form,
+//! exactly (BEP-032, BEP-065), or not at all when the value or the prefix
+//! would break the header line (BEP-066). Either way the upstream leg is
+//! opened and validated against the host's trust store first, and nothing is
+//! forwarded, and no credential substituted, before it is (BEP-055). Every
+//! decision appends one audit record (BEP-039).
 //!
 //! The listener also holds the revocations in force ([`Revocations`]) and
 //! reads them for every value it unseals, so a box's removal or a logout
@@ -42,7 +48,7 @@ use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{
-    AUTHORIZATION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue, PROXY_AUTHORIZATION,
+    AUTHORIZATION, CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue, PROXY_AUTHORIZATION,
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -58,14 +64,17 @@ use tracing::Instrument as _;
 
 use crate::audit::{self, AuditError, Event, Kind, Log, Mapping, Record};
 use crate::ca::{Authority, Leaf};
-use crate::control::{self, ControlError, Revocations, Submission};
-use crate::keychain::KeyStore;
-use crate::keys::Keys;
-use crate::redeem::{
-    self, Attribution, AuthorityId, BoxId, Breadth, Check, Egress, Endpoint, HostId, HostSet, Mode,
-    ModuleId, Redemption, SealedMember,
+use crate::control::{
+    self, ClientKey, ClientKeys, ControlError, Registered, Revocations, Submission,
 };
-use crate::seal::{self, Member, PREFIX};
+use crate::keychain::{self, KeyStore, SecretItems};
+use crate::keys::Keys;
+use crate::mint::{self, Inject, StoreClaims};
+use crate::redeem::{
+    self, Attribution, AuthorityId, BasicField, BoxId, Breadth, Check, Egress, Endpoint, HostId,
+    HostSet, InjectId, Mode, ModuleId, Redemption, SealedMember, StoreHandle, StoreRule,
+};
+use crate::seal::{self, Member, PREFIX, SealedContext};
 use crate::upstream::{self, Resolver, Trust, Validated};
 
 /// The audit marker for a request naming an authority outside the union of
@@ -76,8 +85,25 @@ pub const OFF_MODULE: &str = "off_module";
 /// box's own (BEP-030).
 pub const FOREIGN_CREDENTIAL: &str = "foreign_credential";
 
+/// The audit marker for a store value the registered form cannot carry: the
+/// value or the registered prefix breaks the header line (BEP-066), or the
+/// form names no header the value can be written to and no field it can
+/// fill.
+pub const INJECTION_INVALID: &str = "injection_invalid";
+
+/// The audit marker for an admitted store handle whose value the store no
+/// longer holds, or would not hand over.
+pub const STORE_VALUE_MISSING: &str = "store_value_missing";
+
 /// The most authorities the decision's interned ids can name.
 pub const MAX_AUTHORITIES: usize = 255;
+
+/// The id an authority this host does not know interns as in a store
+/// handle's or a rule's `upstream`: past every known authority, so in no
+/// known set. A handle naming one is within no rule that does not name it
+/// too (BEP-064); two such authorities are not told apart, and neither is
+/// reachable through this proxy.
+const UNKNOWN_AUTHORITY: AuthorityId = AuthorityId(u8::MAX);
 
 /// The sending box, as the decision sees it.
 const SENDER: BoxId = BoxId(0);
@@ -137,12 +163,42 @@ impl Sender {
 /// address: `None` for a source that is no box's (BEP-026).
 pub type Attachments = Arc<dyn Fn(SocketAddr) -> Option<Sender> + Send + Sync>;
 
+/// A `[secret-store-rules]` rule as the proxy holds it: the current form of
+/// what a store handle was minted from, which the handle is checked against
+/// on every request (BEP-032, BEP-064).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisteredRule {
+    /// The store holding the value (`keychain`).
+    pub store: String,
+    /// The identifier the rule registers.
+    pub id: String,
+    /// The authorities the value may be injected into, each `host` or
+    /// `host:port`, port 443 when none is written.
+    pub upstream: Vec<String>,
+    /// How the value is put on the wire.
+    pub inject: Inject,
+}
+
+/// The rules in force on this host, looked up by store and identifier:
+/// `None` for a reference no rule registers. Read per request, never cached,
+/// so a rule edited since a handle was minted bites the next request that
+/// carries the handle (BEP-064).
+pub type StoreRules = Arc<dyn Fn(&str, &str) -> Option<RegisteredRule> + Send + Sync>;
+
+/// The store the proxy reads a referenced value from, once per request it
+/// injects the value into (BEP-032).
+pub type Secrets = Arc<dyn SecretItems + Send + Sync>;
+
 /// How the listener is configured.
 pub struct Config {
     /// The configured modules and their host sets.
     pub modules: Vec<Module>,
     /// The registered store authorities, `host:port` (BEP-029).
     pub store_authorities: Vec<String>,
+    /// The `[secret-store-rules]` in force, by store and identifier.
+    pub store_rules: StoreRules,
+    /// The store referenced values are read from.
+    pub secrets: Secrets,
     /// The box attachments on this host.
     pub attachments: Attachments,
     /// The host's trust store, for the upstream leg.
@@ -187,44 +243,97 @@ struct Flow {
 }
 
 /// What a sealed value presented on a flow unseals to: the member as the
-/// decision sees it, the credential the substitution puts in the value's
-/// place, the identifier the audit record names it by, and the revocations in
-/// force that cover it.
+/// decision sees it, the store handle it is when it is one, what goes on
+/// the wire in the value's place, the identifier the audit record names it
+/// by, and the revocations in force that cover it.
 struct Redeemed {
     member: SealedMember,
-    credential: Member,
+    /// The handle's facts, when the member is a store handle (BEP-064).
+    store: Option<StoreHandle>,
+    credential: Credential,
     id: String,
     revocations: Vec<redeem::Revocation>,
 }
 
-/// What a request's `Authorization` header carries.
+/// What goes on the wire in a sealed value's place once the decision admits
+/// it.
+enum Credential {
+    /// A module member's credential, in the place the sealed value sat
+    /// (BEP-025).
+    Member(Member),
+    /// A store value, read from the store at injection and put on the wire in
+    /// the registered form (BEP-032, BEP-065).
+    Store { id: String, inject: Inject },
+}
+
+/// What a request's headers carry.
 enum Carried {
     /// No credential at all.
     Nothing,
-    /// A credential of the box's own (BEP-030).
+    /// A credential of the box's own in `Authorization` (BEP-030).
     Foreign,
     /// A sealed value, in the place it sits.
     Sealed { value: String, place: Place },
 }
 
-/// Where a sealed value sits in an `Authorization` header.
+/// Where a sealed value sits in a request's headers.
 enum Place {
-    /// `<scheme> <value>`: `Bearer` or `token`.
-    Scheme(String),
-    /// `Basic` with the value as the password.
-    Basic { user: String },
+    /// The whole value of `header`: how a store handle rides in the header
+    /// its rule names (BEP-032).
+    Whole(HeaderName),
+    /// `<scheme> <value>` in `header`: `Bearer` or `token`.
+    Scheme { header: HeaderName, scheme: String },
+    /// `Authorization: Basic` with the value as `field`, and the other field
+    /// as the box sent it.
+    Basic { field: BasicField, other: String },
+}
+
+/// One header put in a sealed value's place: `value` as the whole of
+/// `name`, with `carrying`, the header the sealed value sat in, removed
+/// first — the same header for a module member, and for a store handle
+/// whatever header the box sent it in.
+struct Substitution {
+    carrying: HeaderName,
+    name: HeaderName,
+    value: HeaderValue,
 }
 
 impl Carried {
-    /// What `headers` carry.
+    /// What `headers` carry: `Authorization` is read first, as a module
+    /// member's place and the box's own credential's; a sealed value in any
+    /// other header is a store handle in the header its rule names.
     fn in_headers(headers: &HeaderMap) -> Self {
-        let Some(value) = headers
+        let carried = headers
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-        else {
-            return Self::Nothing;
-        };
-        let Some((scheme, param)) = value.trim().split_once(' ') else {
+            .map_or(Self::Nothing, Self::in_authorization);
+        if carried.sealed().is_some() {
+            return carried;
+        }
+        headers
+            .iter()
+            .filter(|(name, _)| **name != AUTHORIZATION)
+            .find_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| Self::in_header(name, value))
+            })
+            .unwrap_or(carried)
+    }
+
+    /// What an `Authorization` value carries: a sealed value as its whole
+    /// value, under a scheme, or as one field of a `Basic` credential; else
+    /// a credential of the box's own.
+    fn in_authorization(value: &str) -> Self {
+        let value = value.trim();
+        if value.starts_with(PREFIX) {
+            return Self::Sealed {
+                value: value.to_owned(),
+                place: Place::Whole(AUTHORIZATION),
+            };
+        }
+        let Some((scheme, param)) = value.split_once(' ') else {
             return Self::Foreign;
         };
         let param = param.trim();
@@ -232,7 +341,17 @@ impl Carried {
             return match basic_credentials(param) {
                 Some((user, password)) if password.starts_with(PREFIX) => Self::Sealed {
                     value: password,
-                    place: Place::Basic { user },
+                    place: Place::Basic {
+                        field: BasicField::Password,
+                        other: user,
+                    },
+                },
+                Some((user, password)) if user.starts_with(PREFIX) => Self::Sealed {
+                    value: user,
+                    place: Place::Basic {
+                        field: BasicField::User,
+                        other: password,
+                    },
                 },
                 _ => Self::Foreign,
             };
@@ -240,10 +359,34 @@ impl Carried {
         if param.starts_with(PREFIX) {
             return Self::Sealed {
                 value: param.to_owned(),
-                place: Place::Scheme(scheme.to_owned()),
+                place: Place::Scheme {
+                    header: AUTHORIZATION,
+                    scheme: scheme.to_owned(),
+                },
             };
         }
         Self::Foreign
+    }
+
+    /// The sealed value `value` of the header `name` carries as its whole
+    /// value or under a scheme, or `None` when it carries none.
+    fn in_header(name: &HeaderName, value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.starts_with(PREFIX) {
+            return Some(Self::Sealed {
+                value: value.to_owned(),
+                place: Place::Whole(name.clone()),
+            });
+        }
+        let (scheme, param) = value.split_once(' ')?;
+        let param = param.trim();
+        param.starts_with(PREFIX).then(|| Self::Sealed {
+            value: param.to_owned(),
+            place: Place::Scheme {
+                header: name.clone(),
+                scheme: scheme.to_owned(),
+            },
+        })
     }
 
     /// The sealed value, when one is carried.
@@ -254,21 +397,60 @@ impl Carried {
         }
     }
 
-    /// The header value with the sealed value replaced by `credential`, in the
-    /// place the sealed value sat.
-    fn substitute(&self, credential: &str) -> Option<HeaderValue> {
-        let text = match self {
+    /// The header the sealed value sits in, when one is carried.
+    fn header(&self) -> Option<HeaderName> {
+        match self {
             Self::Sealed {
-                place: Place::Scheme(scheme),
+                place: Place::Whole(header) | Place::Scheme { header, .. },
                 ..
-            } => format!("{scheme} {credential}"),
+            } => Some(header.clone()),
             Self::Sealed {
-                place: Place::Basic { user },
+                place: Place::Basic { .. },
                 ..
-            } => format!("Basic {}", STANDARD.encode(format!("{user}:{credential}"))),
+            } => Some(AUTHORIZATION),
+            Self::Nothing | Self::Foreign => None,
+        }
+    }
+
+    /// The other field of a `Basic` credential the sealed value sits in, as
+    /// the box sent it; empty when the value sits anywhere else.
+    fn basic_other(&self) -> &str {
+        match self {
+            Self::Sealed {
+                place: Place::Basic { other, .. },
+                ..
+            } => other,
+            _ => "",
+        }
+    }
+
+    /// The header with the sealed value replaced by `credential`, in the
+    /// place the sealed value sat (BEP-025).
+    fn substitute(&self, credential: &str) -> Option<Substitution> {
+        let (name, text) = match self {
+            Self::Sealed {
+                place: Place::Whole(header),
+                ..
+            } => (header.clone(), credential.to_owned()),
+            Self::Sealed {
+                place: Place::Scheme { header, scheme },
+                ..
+            } => (header.clone(), format!("{scheme} {credential}")),
+            Self::Sealed {
+                place: Place::Basic { field, other },
+                ..
+            } => (
+                AUTHORIZATION,
+                redeem::store::basic_value(*field, credential, other)?,
+            ),
             Self::Nothing | Self::Foreign => return None,
         };
-        HeaderValue::from_str(&text).ok()
+        let value = HeaderValue::from_str(&text).ok()?;
+        Some(Substitution {
+            carrying: name.clone(),
+            name,
+            value,
+        })
     }
 }
 
@@ -306,6 +488,13 @@ where
     module_sets: Vec<(Vec<Endpoint>, HostSet)>,
     /// The store authorities as endpoints and as interned authorities.
     stores: (Vec<Endpoint>, HostSet),
+    /// The client keys registered over the control socket: what a store
+    /// handle's signature is verified under (BEP-063, BEP-064).
+    client_keys: Mutex<ClientKeys>,
+    /// The `[secret-store-rules]` in force, read per request (BEP-064).
+    store_rules: StoreRules,
+    /// The store referenced values are read from (BEP-032).
+    secrets: Secrets,
     attachments: Attachments,
     trust: Trust,
     resolver: Resolver,
@@ -374,6 +563,9 @@ where
             credentialed: Vec::new(),
             module_sets: Vec::new(),
             stores: (Vec::new(), HostSet::default()),
+            client_keys: Mutex::new(ClientKeys::new()),
+            store_rules: config.store_rules,
+            secrets: config.secrets,
             attachments: config.attachments,
             trust: config.trust,
             resolver: config.resolver,
@@ -419,6 +611,25 @@ where
             .filter_map(|known| self.authority_id(&known.authority))
             .collect();
         (endpoints, HostSet(ids))
+    }
+
+    /// The interned form of a store handle's or a rule's `upstream`, each
+    /// `host` or `host:port` with 443 when none is written, as a rule writes
+    /// them (BEP-064). An authority this host does not know interns as
+    /// [`UNKNOWN_AUTHORITY`] rather than dropping out, so a handle minted
+    /// under a rule that has since dropped an authority is not within the
+    /// rule now.
+    fn intern_authorities(&self, authorities: &[String]) -> HostSet {
+        HostSet(
+            authorities
+                .iter()
+                .map(|text| {
+                    let (host, port) = split_host(text, 443);
+                    self.authority_id(&format!("{host}:{port}"))
+                        .unwrap_or(UNKNOWN_AUTHORITY)
+                })
+                .collect(),
+        )
     }
 
     /// The known authority `authority` names, with its id's index.
@@ -635,6 +846,9 @@ where
         let redemption = Redemption {
             request: self.facts(flow, &request),
             member: redeemed.as_ref().map(|redeemed| redeemed.member.clone()),
+            store: redeemed
+                .as_ref()
+                .and_then(|redeemed| redeemed.store.clone()),
             attribution: match flow.sender.addressing {
                 Addressing::OwnIp => Attribution::OwnIp(SENDER),
                 Addressing::HostIp => Attribution::HostIp(SENDER),
@@ -658,9 +872,13 @@ where
             "decided a request"
         );
         let substitution = match decision {
-            redeem::Decision::Admit => redeemed
-                .as_ref()
-                .and_then(|redeemed| carried.substitute(redeemed.credential.expose())),
+            redeem::Decision::Admit => match redeemed.as_ref() {
+                Some(redeemed) => match self.substitution(&carried, redeemed) {
+                    Ok(substitution) => substitution,
+                    Err(marker) => return self.refuse(box_id, authority, credential, marker),
+                },
+                None => None,
+            },
             // No sealed value and every connection and request check passed:
             // the request rides through as sent (BEP-030).
             redeem::Decision::Refuse(Check::Decrypts) if carried.sealed().is_none() => None,
@@ -715,6 +933,9 @@ where
             })
             .ok()?;
         let context = unsealed.context;
+        if context.mode == mint::STORE_MODE {
+            return Some(self.unseal_store(flow, &context, &unsealed.member));
+        }
         let module = self
             .modules
             .iter()
@@ -740,10 +961,165 @@ where
         let revocations = self.revocations_in_force(&context, &member);
         Some(Redeemed {
             member,
-            credential: unsealed.member,
+            store: None,
+            credential: Credential::Member(unsealed.member),
             id,
             revocations,
         })
+    }
+
+    /// What a store handle carried as the member unseals to, interned for the
+    /// decision (BEP-064): the signature verified now under the client keys
+    /// the proxy holds, the rule currently registered for the handle's store
+    /// and identifier looked up now, the handle's `upstream` as the member's
+    /// bound set, and the handle's and the rule's injection forms interned as
+    /// one id exactly when they are the same form. An envelope in store mode
+    /// whose member is no handle verifies under nothing.
+    fn unseal_store(&self, flow: &Flow, context: &SealedContext, member: &Member) -> Redeemed {
+        let parsed = mint::parse_store_handle(member.expose())
+            .inspect_err(|error| {
+                tracing::warn!(%error, "a store-mode envelope carries no readable handle");
+            })
+            .ok();
+        let verified = parsed.as_ref().is_some_and(|parsed| {
+            self.client_keys
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .holding(&parsed.claims.key)
+                .is_some_and(|public| parsed.verifies_under(public))
+        });
+        let claims = parsed.map_or_else(
+            || StoreClaims {
+                store: context.module.clone(),
+                id: String::new(),
+                upstream: Vec::new(),
+                inject: Inject::default(),
+                exp: 0,
+                key: String::new(),
+            },
+            |parsed| parsed.claims,
+        );
+        let rule = (self.store_rules)(&claims.store, &claims.id);
+        let handle = StoreHandle {
+            verified,
+            expires_at: claims.exp,
+            inject: InjectId(0),
+            rule: rule.as_ref().map(|rule| StoreRule {
+                upstream: self.intern_authorities(&rule.upstream),
+                inject: InjectId(u8::from(rule.inject != claims.inject)),
+            }),
+        };
+        let member = SealedMember {
+            box_id: if context.box_id == flow.sender.box_id {
+                SENDER
+            } else {
+                OTHER_BOX
+            },
+            // A store is no module: the id past every configured one.
+            module: ModuleId(u8::try_from(self.modules.len()).unwrap_or(u8::MAX)),
+            bound_set: self.intern_authorities(&claims.upstream),
+            mode: Mode::recognise(&context.mode),
+            breadth: Breadth::recognise(&context.breadth),
+            expires_at: context.expires_at,
+        };
+        tracing::info!(
+            store = %claims.store,
+            id = %claims.id,
+            verified,
+            registered = rule.is_some(),
+            exp = claims.exp,
+            "read a store handle for the decision"
+        );
+        let revocations = self.revocations_in_force(context, &member);
+        Redeemed {
+            member,
+            store: Some(handle),
+            id: format!("{}:{}", claims.store, claims.id),
+            credential: Credential::Store {
+                id: claims.id,
+                inject: claims.inject,
+            },
+            revocations,
+        }
+    }
+
+    /// What goes on the wire in the sealed value's place for an admitted
+    /// `redeemed`, or the marker the refusal carries when nothing can.
+    fn substitution(
+        &self,
+        carried: &Carried,
+        redeemed: &Redeemed,
+    ) -> Result<Option<Substitution>, &'static str> {
+        match &redeemed.credential {
+            Credential::Member(member) => Ok(carried.substitute(member.expose())),
+            Credential::Store { id, inject } => self.inject(carried, id, inject).map(Some),
+        }
+    }
+
+    /// The registered form with the store value `id` in it (BEP-032,
+    /// BEP-065): the value is read from the store now, for this request and
+    /// only once the decision admitted it, and put on the wire as exactly the
+    /// registered prefix then the value in the named header, or as the one
+    /// basic-authentication field the rule names. A value or a prefix that
+    /// would break the header line is not injected at all (BEP-066).
+    fn inject(
+        &self,
+        carried: &Carried,
+        id: &str,
+        inject: &Inject,
+    ) -> Result<Substitution, &'static str> {
+        let Some(value) = keychain::value_for_request(&*self.secrets, id) else {
+            tracing::warn!(id, "no store value for an admitted handle");
+            return Err(STORE_VALUE_MISSING);
+        };
+        let carrying = carried.header().ok_or(INJECTION_INVALID)?;
+        let (name, text) = match inject {
+            Inject {
+                header: Some(name),
+                prefix,
+                basic_auth: None,
+            } => {
+                let name =
+                    HeaderName::from_bytes(name.as_bytes()).map_err(|_| INJECTION_INVALID)?;
+                let text =
+                    redeem::store::header_value(prefix.as_deref().unwrap_or(""), value.expose())
+                        .ok_or(INJECTION_INVALID)?;
+                (name, text)
+            }
+            Inject {
+                header: None,
+                prefix: None,
+                basic_auth: Some(field),
+            } => {
+                let field = BasicField::recognise(field).ok_or(INJECTION_INVALID)?;
+                let text = redeem::store::basic_value(field, value.expose(), carried.basic_other())
+                    .ok_or(INJECTION_INVALID)?;
+                (AUTHORIZATION, text)
+            }
+            Inject { .. } => return Err(INJECTION_INVALID),
+        };
+        let value = HeaderValue::from_str(&text).map_err(|_| INJECTION_INVALID)?;
+        tracing::info!(id, header = %name, "injecting a store value in its registered form");
+        Ok(Substitution {
+            carrying,
+            name,
+            value,
+        })
+    }
+
+    /// Registers a client's handle-signing key the control socket carried:
+    /// what a store handle's signature is verified under from here on
+    /// (BEP-063, BEP-064).
+    ///
+    /// # Errors
+    ///
+    /// [`ControlError::InvalidClientKey`] when the registration does not
+    /// carry a P-256 point.
+    pub fn register_key(&self, key: &ClientKey) -> Result<Registered, ControlError> {
+        self.client_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .register(key)
     }
 
     /// The revocations in force that cover `context`'s member, in the terms
@@ -884,7 +1260,7 @@ async fn send(
 /// `request` as it is forwarded: origin-form, without the proxy's own
 /// headers, with `substitution` in place of the sealed value when there is
 /// one and every header else as the box sent it.
-fn rewrite(request: Request<Incoming>, substitution: Option<HeaderValue>) -> Request<Incoming> {
+fn rewrite(request: Request<Incoming>, substitution: Option<Substitution>) -> Request<Incoming> {
     let (mut parts, body) = request.into_parts();
     let uri = parts
         .uri
@@ -894,8 +1270,14 @@ fn rewrite(request: Request<Incoming>, substitution: Option<HeaderValue>) -> Req
     parts.headers.remove(PROXY_AUTHORIZATION);
     parts.headers.remove("proxy-connection");
     parts.extensions.clear();
-    if let Some(value) = substitution {
-        parts.headers.insert(AUTHORIZATION, value);
+    if let Some(Substitution {
+        carrying,
+        name,
+        value,
+    }) = substitution
+    {
+        parts.headers.remove(&carrying);
+        parts.headers.insert(name, value);
     }
     Request::from_parts(parts, body)
 }
@@ -1011,7 +1393,9 @@ mod tests {
     use super::*;
     use crate::audit::Record;
     use crate::ca::DeclaredUnion;
-    use crate::keychain::MemoryStore;
+    use crate::github::Secret;
+    use crate::keychain::{ItemAcl, MemoryKey, MemorySecrets, MemoryStore, PrivateKey as _};
+    use crate::redeem::STORE_HANDLE_INVALID;
     use crate::seal::SealedContext;
 
     /// The v1 GitHub host set.
@@ -1024,6 +1408,25 @@ mod tests {
 
     /// The member a sealed value carries.
     const CREDENTIAL: &str = "gho_16C7e42F292c6912E7710c838347Ae178B4a";
+
+    /// The one store authority the harness registers.
+    const STORE_AUTHORITY: &str = "api.anthropic.com:443";
+
+    /// The identifier the harness stores a value under, and its rules name.
+    const SECRET_ID: &str = "anthropic-api-key";
+
+    /// The value the store holds under it.
+    const SECRET_VALUE: &str = "sk-ant-api03-notreal";
+
+    /// A `[secret-store-rules]` rule for the harness identifier.
+    fn rule(upstream: &[&str], inject: Inject) -> RegisteredRule {
+        RegisteredRule {
+            store: "keychain".to_owned(),
+            id: SECRET_ID.to_owned(),
+            upstream: upstream.iter().map(|text| (*text).to_owned()).collect(),
+            inject,
+        }
+    }
 
     /// The kind of chain a fake upstream presents (BEP-055).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1062,9 +1465,10 @@ mod tests {
     }
 
     /// A proxy over a fresh host: its keys, an interception authority over
-    /// the GitHub set, an empty audit log, a host trust store anchoring the
-    /// test's host CA, attribution by the test's own table and a route to
-    /// wherever the test stands its upstream up.
+    /// the GitHub set and the store authority, an empty audit log, a host
+    /// trust store anchoring the test's host CA, attribution by the test's
+    /// own table, one store rule the test puts in force, an in-memory secret
+    /// store and a route to wherever the test stands its upstream up.
     struct Harness {
         proxy: Arc<Proxy<MemoryStore>>,
         addr: SocketAddr,
@@ -1072,6 +1476,8 @@ mod tests {
         _dir: tempfile::TempDir,
         attachments: Arc<Mutex<HashMap<SocketAddr, Sender>>>,
         route: Arc<Mutex<Option<SocketAddr>>>,
+        rules: Arc<Mutex<Option<RegisteredRule>>>,
+        secrets: MemorySecrets,
         host_ca: HostCa,
     }
 
@@ -1079,8 +1485,12 @@ mod tests {
         async fn start() -> Self {
             let keys: &'static Keys<MemoryStore> =
                 Box::leak(Box::new(Keys::open(MemoryStore::new()).unwrap()));
-            let union =
-                DeclaredUnion::of([GITHUB.map(|authority| authority.split(':').next().unwrap())]);
+            let union = DeclaredUnion::of([
+                GITHUB
+                    .map(|authority| authority.split(':').next().unwrap())
+                    .to_vec(),
+                vec![STORE_AUTHORITY.split(':').next().unwrap()],
+            ]);
             let authority = Authority::open(keys, union).unwrap();
             let dir = tempfile::tempdir().unwrap();
             let log_path = dir.path().join("audit.jsonl");
@@ -1090,15 +1500,26 @@ mod tests {
             roots.add(host_ca.root.clone()).unwrap();
             let attachments = Arc::new(Mutex::new(HashMap::new()));
             let route = Arc::new(Mutex::new(None));
+            let rules = Arc::new(Mutex::new(None));
+            let secrets = MemorySecrets::new();
             let table = Arc::clone(&attachments);
             let routed = Arc::clone(&route);
+            let in_force = Arc::clone(&rules);
             let config = Config {
                 modules: vec![Module {
                     id: "github".to_owned(),
                     host_set: GITHUB.map(str::to_owned).to_vec(),
                     version: 1,
                 }],
-                store_authorities: Vec::new(),
+                store_authorities: vec![STORE_AUTHORITY.to_owned()],
+                store_rules: Arc::new(move |store: &str, id: &str| {
+                    in_force
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .filter(|rule: &RegisteredRule| rule.store == store && rule.id == id)
+                }),
+                secrets: Arc::new(secrets.clone()),
                 attachments: Arc::new(move |source: SocketAddr| {
                     table.lock().unwrap().get(&source).cloned()
                 }),
@@ -1116,8 +1537,60 @@ mod tests {
                 _dir: dir,
                 attachments,
                 route,
+                rules,
+                secrets,
                 host_ca,
             }
+        }
+
+        /// Puts `rule` in force for the harness identifier, or none.
+        fn set_rule(&self, rule: Option<RegisteredRule>) {
+            *self.rules.lock().unwrap() = rule;
+        }
+
+        /// Stores `value` under the harness identifier, with the entry for
+        /// the proxy's process identity, as `min secret set` does.
+        fn store(&self, value: &str) {
+            self.secrets
+                .set(
+                    SECRET_ID,
+                    &Secret::new(value),
+                    &ItemAcl::for_proxy(std::path::Path::new("/usr/local/bin/bep")),
+                )
+                .unwrap();
+        }
+
+        /// A client's handle-signing key, registered with the proxy as the
+        /// client does over the control socket.
+        fn client(&self) -> MemoryKey {
+            let key = mint::client_key(&MemoryStore::new()).unwrap();
+            self.proxy
+                .register_key(&ClientKey::of(&key.public_key().unwrap()))
+                .unwrap();
+            key
+        }
+
+        /// The envelope the client delivers into `box-a1` for the store
+        /// reference: a handle minted at `now` under `client`'s key from the
+        /// rule in force, sealed to this host for the box.
+        fn store_handle(&self, client: &MemoryKey, now: u64) -> String {
+            let rule = self.rules.lock().unwrap().clone().expect("a rule in force");
+            mint::mint_store_handle(
+                self.proxy.keys,
+                client,
+                &mint::StoreMintRequest {
+                    box_id: "box-a1",
+                    host: "mac-1",
+                    store: "keychain",
+                    id: SECRET_ID,
+                    upstream: &rule.upstream,
+                    inject: &rule.inject,
+                    now,
+                },
+            )
+            .unwrap()
+            .value
+            .to_string()
         }
 
         /// Routes every upstream authority to `addr`.
@@ -1529,6 +2002,222 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         assert_eq!(h.last().marker, Check::EgressAdmitted.name());
         assert_eq!(h.records().len(), 3);
+    }
+
+    /// One request from `box-a1` on a terminated flow to the store authority,
+    /// with `headers` in its head, answered with the proxy's whole response.
+    async fn store_request(h: &Harness, headers: &str) -> String {
+        let tcp = attach(h, Some(box_a())).await;
+        let mut tls = tunnel(h, tcp, STORE_AUTHORITY).await.unwrap();
+        let request = format!(
+            "GET /v1/models HTTP/1.1\r\nHost: api.anthropic.com\r\n{headers}Connection: close\r\n\r\n"
+        );
+        exchange(&mut tls, &request).await
+    }
+
+    /// Sends `headers` to the store authority, expects the proxy to admit the
+    /// request, and returns what the upstream received for it alone.
+    async fn admitted(h: &Harness, up: &Upstream, headers: &str) -> String {
+        let sent = up.received().len();
+        let response = store_request(h, headers).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let record = h.last();
+        assert_eq!(record.decision, audit::Decision::Admit);
+        assert_eq!(record.authority, STORE_AUTHORITY);
+        assert_eq!(record.credential, "keychain:anthropic-api-key");
+        assert_eq!(record.marker, "");
+        up.received()[sent..].to_owned()
+    }
+
+    /// Sends `headers` to the store authority and expects the proxy to refuse
+    /// the request, recorded `marker` against the reference, with nothing of
+    /// it reaching the upstream.
+    async fn refused(h: &Harness, up: &Upstream, headers: &str, marker: &str, case: &str) {
+        let sent = up.received().len();
+        let response = store_request(h, headers).await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{case}: {response}");
+        let record = h.last();
+        assert_eq!(record.decision, audit::Decision::Refuse, "{case}");
+        assert_eq!(record.marker, marker, "{case}");
+        assert_eq!(record.credential, "keychain:anthropic-api-key", "{case}");
+        assert_eq!(record.authority, STORE_AUTHORITY, "{case}");
+        assert_eq!(
+            up.received().len(),
+            sent,
+            "{case}: the refused request reached the upstream"
+        );
+    }
+
+    /// BEP-032, BEP-064 and BEP-065: a request carrying a valid store handle
+    /// reaches the rule's registered upstream with exactly the registered
+    /// prefix and the stored value as the named header's value — or the
+    /// value as the one basic-authentication field the rule names — and
+    /// neither the handle nor the envelope goes upstream, nor the value into
+    /// the audit log. A handle whose rule has since narrowed, changed its
+    /// injection form or gone, one signed under a key the proxy does not
+    /// hold, and one past its expiry are each refused `store_handle_invalid`
+    /// before anything reaches the upstream; the rule restored, the same
+    /// handle is admitted again, because it is the rule in force that
+    /// decides.
+    #[tokio::test]
+    async fn store_reference_injects_in_registered_form() {
+        let h = Harness::start().await;
+        let (chain, key) = h.chain("api.anthropic.com", Chain::Valid);
+        let up = Upstream::serve(chain, key, Respond::Whole("{\"data\":[]}")).await;
+        h.route(up.addr);
+        h.store(SECRET_VALUE);
+        let client = h.client();
+        let wide = ["api.anthropic.com:443", "api.openai.com:443"];
+        let wide_rule = rule(&wide, Inject::header("x-api-key", ""));
+
+        // The header form with no prefix: the value is the header's whole
+        // value, in the header the handle rode in.
+        h.set_rule(Some(wide_rule.clone()));
+        let handle = h.store_handle(&client, now());
+        let received = admitted(&h, &up, &format!("x-api-key: {handle}\r\n")).await;
+        assert!(
+            received.starts_with("GET /v1/models HTTP/1.1\r\n"),
+            "{received}"
+        );
+        assert!(
+            received.contains(&format!("x-api-key: {SECRET_VALUE}\r\n")),
+            "{received}"
+        );
+        assert!(
+            !received.contains(PREFIX) && !received.contains(mint::HANDLE_PREFIX),
+            "the handle reached the upstream: {received}"
+        );
+        assert!(
+            !std::fs::read_to_string(&h.log_path)
+                .unwrap()
+                .contains(SECRET_VALUE),
+            "the value reached the audit log"
+        );
+
+        // The header form with a prefix, in `Authorization`: exactly the
+        // prefix then the value, whether the box sent the envelope bare or
+        // under a scheme of its own.
+        h.set_rule(Some(rule(
+            &[STORE_AUTHORITY],
+            Inject::header("Authorization", "Bearer "),
+        )));
+        let sealed = h.store_handle(&client, now());
+        for carried in [
+            format!("Authorization: {sealed}\r\n"),
+            format!("Authorization: Bearer {sealed}\r\n"),
+        ] {
+            let received = admitted(&h, &up, &carried).await;
+            assert!(
+                received.contains(&format!("authorization: Bearer {SECRET_VALUE}\r\n")),
+                "{received}"
+            );
+            assert_eq!(received.matches("authorization:").count(), 1, "{received}");
+        }
+
+        // The basic form: the value fills the field the rule names, and the
+        // other field stays the box's own.
+        h.set_rule(Some(rule(
+            &[STORE_AUTHORITY],
+            Inject::basic_auth("password"),
+        )));
+        let sealed = h.store_handle(&client, now());
+        let basic = STANDARD.encode(format!("octocat:{sealed}"));
+        let received = admitted(&h, &up, &format!("Authorization: Basic {basic}\r\n")).await;
+        let expected = STANDARD.encode(format!("octocat:{SECRET_VALUE}"));
+        assert!(
+            received.contains(&format!("authorization: Basic {expected}\r\n")),
+            "{received}"
+        );
+
+        // BEP-064: the handle minted under the wide rule, against each rule
+        // that has since narrowed, changed its form or gone; one signed under
+        // a key the proxy never held; one minted past its own lifetime.
+        h.set_rule(Some(wide_rule.clone()));
+        let stranger = mint::client_key(&MemoryStore::new()).unwrap();
+        let unregistered = h.store_handle(&stranger, now());
+        let expired = h.store_handle(&client, now() - mint::HANDLE_LIFETIME_SECS - 1);
+        let refusals = [
+            (
+                "narrowed rule",
+                Some(rule(&[STORE_AUTHORITY], Inject::header("x-api-key", ""))),
+                &handle,
+            ),
+            (
+                "changed form",
+                Some(rule(&wide, Inject::header("x-api-key", "Key "))),
+                &handle,
+            ),
+            ("no rule", None, &handle),
+            ("unregistered key", Some(wide_rule.clone()), &unregistered),
+            ("expired", Some(wide_rule.clone()), &expired),
+        ];
+        for (case, rule, sealed) in refusals {
+            h.set_rule(rule);
+            let headers = format!("x-api-key: {sealed}\r\n");
+            refused(&h, &up, &headers, STORE_HANDLE_INVALID, case).await;
+        }
+
+        // The rule restored, the handle it was minted from is admitted again.
+        h.set_rule(Some(wide_rule));
+        admitted(&h, &up, &format!("x-api-key: {handle}\r\n")).await;
+    }
+
+    /// BEP-066: a store value, or a registered prefix, carrying a carriage
+    /// return or a line feed is not injected — in the header form, where it
+    /// would end the header and start another, and in the basic form, whose
+    /// encoding would hide it: the request is refused `injection_invalid`,
+    /// recorded against the reference, and nothing of it reaches the
+    /// upstream.
+    #[tokio::test]
+    async fn crlf_in_value_or_prefix_refuses_injection_and_is_audited() {
+        let h = Harness::start().await;
+        let (chain, key) = h.chain("api.anthropic.com", Chain::Valid);
+        let up = Upstream::serve(chain, key, Respond::Whole("{\"data\":[]}")).await;
+        h.route(up.addr);
+        let client = h.client();
+
+        let broken = [
+            (
+                "value",
+                "sk-ant\r\nX-Injected: yes",
+                Inject::header("x-api-key", ""),
+            ),
+            (
+                "prefix",
+                SECRET_VALUE,
+                Inject::header("x-api-key", "Key\r\n"),
+            ),
+            ("basic value", "sk\nant", Inject::basic_auth("password")),
+        ];
+        for (case, value, inject) in broken {
+            h.store(value);
+            h.set_rule(Some(rule(&[STORE_AUTHORITY], inject.clone())));
+            let sealed = h.store_handle(&client, now());
+            let headers = if inject.basic_auth.is_some() {
+                format!(
+                    "Authorization: Basic {}\r\n",
+                    STANDARD.encode(format!("octocat:{sealed}"))
+                )
+            } else {
+                format!("x-api-key: {sealed}\r\n")
+            };
+            refused(&h, &up, &headers, INJECTION_INVALID, case).await;
+        }
+        assert!(up.received().is_empty(), "{}", up.received());
+        assert_eq!(h.records().len(), 3);
+
+        // The same value and rule, once neither breaks the line, go through.
+        h.store(SECRET_VALUE);
+        h.set_rule(Some(rule(
+            &[STORE_AUTHORITY],
+            Inject::header("x-api-key", "Key "),
+        )));
+        let sealed = h.store_handle(&client, now());
+        let received = admitted(&h, &up, &format!("x-api-key: {sealed}\r\n")).await;
+        assert!(
+            received.contains(&format!("x-api-key: Key {SECRET_VALUE}\r\n")),
+            "{received}"
+        );
     }
 
     /// The runtime the property drives its proxies on.

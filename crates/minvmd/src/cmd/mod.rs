@@ -279,6 +279,18 @@ pub(crate) fn default_vm_known_hosts_path() -> std::path::PathBuf {
     crate::state::provider_dir().join(paths::KNOWN_HOSTS_FILE)
 }
 
+/// The host file the guest console (hvc0) is captured to: `MINVMD_BOOT_LOG`
+/// when set non-empty, else `<provider dir>/boot.log`. Resolved by the VMM
+/// child, which writes it, and by the supervisor, which hands it to the VM's
+/// user before the child starts.
+#[cfg(minvmd_libkrun)]
+pub(crate) fn resolve_boot_log_path() -> std::path::PathBuf {
+    std::env::var_os("MINVMD_BOOT_LOG")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| crate::state::provider_dir().join("boot.log"))
+}
+
 /// Outcome of the guest boot beacon (R2.4/R2.5): the guest either reached
 /// READY, or refused with `MOUNT_FAILED\n<reason>\n` because the data volume
 /// could not be mounted.

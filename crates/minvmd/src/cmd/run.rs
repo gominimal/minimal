@@ -194,6 +194,38 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     }
 }
 
+/// The files the VM (and the switch beside it) writes that exist before the
+/// VMM child starts, for [`crate::net::HostUsers::grant_vm_files`]: the
+/// provider dir, the data volume and boot log, the READY-marker socket, and
+/// the daemon log files (`<state>/logs/minvmd.log.<date>`, which the child's
+/// own tracing appends to when detached). Paths that do not exist yet are
+/// listed anyway; the grant skips them.
+#[cfg(minvmd_libkrun)]
+fn vm_files(marker_sock: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = vec![
+        crate::state::provider_dir(),
+        crate::volume::resolve_data_volume_path(),
+        crate::cmd::resolve_boot_log_path(),
+        marker_sock.to_path_buf(),
+    ];
+    let log_dir = crate::state::state_base_dir()
+        .as_utf8_path()
+        .as_std_path()
+        .join("logs");
+    if let Ok(entries) = std::fs::read_dir(log_dir) {
+        files.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n.as_encoded_bytes().starts_with(b"minvmd.log"))
+                }),
+        );
+    }
+    files
+}
+
 /// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
 /// the VMM child exits.
 #[cfg(minvmd_libkrun)]
@@ -314,6 +346,19 @@ fn run_foreground() -> Result<()> {
     // lanes that exercise only the vsock bridge) we warn and boot without
     // egress rather than failing the VM — the daemon then has no network, the
     // pre-existing behaviour.
+    //
+    // The users the host's three processes run as (BEP-047): the proxy as the
+    // operator, the switch and the VM as the dedicated unprivileged user when
+    // this host has one and the supervisor may switch. Decided and logged once,
+    // then applied at each spawn below. The files the switch and the VM write
+    // are the supervisor's until now — the provider dir the sockets are bound
+    // in, the data volume and boot log, the marker socket the VM dials, the
+    // daemon log the VM appends to — so a dedicated user is handed them first;
+    // a grant that fails would only fail the boot later and less clearly.
+    let users = crate::net::HostUsers::resolve();
+    users
+        .grant_vm_files(vm_files(&marker_sock_path).iter().map(PathBuf::as_path))
+        .context("handing the VM's files to its user")?;
     let _gvproxy = match crate::image::resolve_gvproxy_path() {
         binary if binary.exists() => {
             let switch_sock =
@@ -321,9 +366,13 @@ fn run_foreground() -> Result<()> {
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
-            match crate::net::HostGvproxy::spawn(binary, switch_sock) {
+            match crate::net::HostGvproxy::spawn_as(binary, switch_sock, users.switch.clone()) {
                 Ok(gvproxy) => {
-                    tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");
+                    tracing::info!(
+                        pid = gvproxy.pid(),
+                        user = %users.switch,
+                        "host gvproxy switch up"
+                    );
                     Some(gvproxy)
                 }
                 // An own-IP VM cannot work without the switch: fail loudly. A
@@ -387,13 +436,16 @@ fn run_foreground() -> Result<()> {
     cmd.arg("__krun-vmm");
     cmd.args(crate::state::reexec_args());
     alive_lock.inherit_into(&mut cmd);
+    // The VM runs as the same user as the switch (BEP-047): a uid/gid switch
+    // at exec, to the operator's own account when the plan fell back.
+    users.vm.apply_std(&mut cmd);
     let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
         .spawn()
         .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
 
     let child_pid = child.id();
-    tracing::info!(pid = child_pid, "VMM child spawned");
+    tracing::info!(pid = child_pid, user = %users.vm, "VMM child spawned");
 
     // Update state with the known pid so that concurrent `stop` invocations
     // during Starting can signal the correct process.
@@ -501,10 +553,14 @@ fn run_foreground() -> Result<()> {
     );
 
     // Tighten + verify the bridge socket permissions (R3.2): libkrun creates
-    // it with default perms, and the shared provider dir is not 0700.
+    // it with default perms, and the shared provider dir is not 0700. A VM
+    // running as the dedicated user bound it as that user, so it is handed
+    // to the operator first (BEP-047): 0600 must admit the `min` CLI.
     match crate::sock::resolve_uds_path() {
         Ok(uds_path) => {
-            if let Err(e) = crate::sock::enforce_socket_permissions(&uds_path)
+            if let Err(e) = users
+                .hand_bridge_socket_to_operator(&uds_path)
+                .and_then(|()| crate::sock::enforce_socket_permissions(&uds_path))
                 .and_then(|()| crate::sock::verify_socket_permissions(&uds_path))
             {
                 tracing::warn!(

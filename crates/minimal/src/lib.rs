@@ -20,6 +20,7 @@ pub mod loadouts;
 mod net;
 mod notice;
 pub mod prompt;
+pub mod secret;
 pub mod task;
 pub mod theme;
 pub mod zed;

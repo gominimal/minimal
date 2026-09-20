@@ -12,11 +12,30 @@
 //! The mint, the logout and a box's removal each make one [`Event`] for the
 //! proxy's log; the client submits it over the control socket
 //! ([`crate::control`]) and never opens the log itself.
+//!
+//! The store-reference mint is here too ([`mint_store_handle`]): a box that
+//! refers to a Keychain value by identifier receives no value and no member
+//! of a module, but a short-lived [`StoreHandle`] signed under the client's
+//! own key ([`client_key`]), carrying the store, the identifier, the
+//! registered upstream authorities, the injection form and the expiry
+//! (BEP-063). The handle is the member inside the same envelope as a module's
+//! member, so the box binding and the expiry of BEP-019 and BEP-020 hold for
+//! it unchanged; the proxy verifies the signature under the client key the
+//! client registers over the control socket at first use
+//! ([`crate::control::ClientKey`]).
+
+use std::fmt;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use p256::PublicKey;
+use p256::ecdsa::signature::Verifier as _;
+use serde::{Deserialize, Serialize};
 
 use crate::audit::{Decision, Event, Kind, Mapping};
 use crate::github::SignIn;
-use crate::keychain::KeyStore;
-use crate::keys::Keys;
+use crate::keychain::{KeyStore, PrivateKey, StoreError};
+use crate::keys::{Fingerprint, Keys};
 use crate::seal::{Member, SealError, SealedContext, SealedValue, seal};
 
 /// The longest a locally minted member lives: eight hours from its mint.
@@ -151,6 +170,327 @@ fn identity_event(kind: Kind, box_id: &str) -> Event {
         decision: Decision::Admit,
         marker: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Store references: the handle a box receives for a value it never holds
+// (BEP-063).
+// ---------------------------------------------------------------------------
+
+/// The prefix every store handle carries; the `1` is the handle version.
+pub const HANDLE_PREFIX: &str = "minstore1.";
+
+/// The longest a store handle lives: five minutes from its mint.
+///
+/// Short because it stands for a value the box never holds: a handle that
+/// leaves the box outlives its usefulness in minutes rather than for the life
+/// of the session.
+pub const HANDLE_LIFETIME_SECS: u64 = 5 * 60;
+
+/// The name the client's handle-signing key lives under in the host key
+/// store.
+///
+/// The client's own key, not one of the proxy's roles
+/// ([`crate::keys::KeyRole`]): the client signs handles with it, and the proxy
+/// only ever holds its public half, registered over the control socket.
+pub const CLIENT_KEY_NAME: &str = "dev.minimal.bep.client";
+
+/// The mode a store handle's envelope carries: minted from a store reference
+/// rather than from the held sign-in.
+pub const STORE_MODE: &str = "store";
+
+/// The breadth a store handle's envelope carries: one referenced identifier,
+/// and nothing else the store holds.
+pub const STORE_BREADTH: &str = "reference";
+
+/// The host-set version a store handle's envelope carries: none, because a
+/// store handle binds no module host set. Its bound set is the handle's own
+/// `upstream`, which the rule registers and BEP-064 checks.
+pub const STORE_HOST_SET_VERSION: u32 = 0;
+
+/// The domain separator the signature covers, so a signature over a handle is
+/// a signature over nothing else this key signs.
+const HANDLE_CONTEXT: &[u8] = b"minimal bep store handle v1";
+
+/// How a store value is put on the wire, as the handle carries the rule's
+/// registered form.
+///
+/// The field names are the `[secret-store-rules]` rule's own, so BEP-064's
+/// check that a handle's `inject` is still the rule's is an equality of the
+/// two forms. Which combinations are a form at all is the rule's grammar and
+/// the client's to check before it mints: a handle carrying a combination no
+/// rule can spell equals no rule, and is refused for that.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Inject {
+    /// The header the value is written to, for the header form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// What precedes the value in that header; absent when the rule declares
+    /// no prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// The basic-authentication field the value fills, for that form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basic_auth: Option<String>,
+}
+
+impl Inject {
+    /// The header form: `prefix` then the value, as the whole value of
+    /// `name`. An empty prefix is carried as none, as the rule writes it.
+    #[must_use]
+    pub fn header(name: impl Into<String>, prefix: &str) -> Self {
+        Self {
+            header: Some(name.into()),
+            prefix: (!prefix.is_empty()).then(|| prefix.to_owned()),
+            basic_auth: None,
+        }
+    }
+
+    /// The basic-authentication form: the value as the `field` field.
+    #[must_use]
+    pub fn basic_auth(field: impl Into<String>) -> Self {
+        Self {
+            header: None,
+            prefix: None,
+            basic_auth: Some(field.into()),
+        }
+    }
+}
+
+/// What a store handle claims: the reference it was minted for, what the
+/// value may reach, how it is injected, when the handle expires, and the
+/// client key it is signed under (BEP-063).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreClaims {
+    /// The store the value is read from (`keychain`).
+    pub store: String,
+    /// The identifier the value is stored under.
+    pub id: String,
+    /// The authorities the value may be injected into, each `host` or
+    /// `host:port`, as the rule registers them.
+    pub upstream: Vec<String>,
+    /// How the value is put on the wire, as the rule registers it.
+    pub inject: Inject,
+    /// The expiry, as seconds since the Unix epoch.
+    pub exp: u64,
+    /// The fingerprint of the client key the handle is signed under: which
+    /// registered key the proxy verifies it with.
+    pub key: String,
+}
+
+/// A store handle: [`HANDLE_PREFIX`], then the claims and the signature over
+/// them, each unpadded base64url, separated by a dot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreHandle(String);
+
+impl StoreHandle {
+    /// The handle's text: what the box carries and sends on.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for StoreHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A store handle as read back: its claims, the bytes they were signed as,
+/// and the signature over them.
+#[derive(Debug, Clone)]
+pub struct ParsedHandle {
+    /// What the handle claims.
+    pub claims: StoreClaims,
+    /// The exact bytes the signature covers.
+    signed: Vec<u8>,
+    /// The DER signature.
+    signature: Vec<u8>,
+}
+
+impl ParsedHandle {
+    /// Whether the signature verifies under `public`: the first of BEP-064's
+    /// checks, and what the client key registration is for.
+    #[must_use]
+    pub fn verifies_under(&self, public: &PublicKey) -> bool {
+        p256::ecdsa::Signature::from_der(&self.signature).is_ok_and(|signature| {
+            p256::ecdsa::VerifyingKey::from(public)
+                .verify(&self.signed, &signature)
+                .is_ok()
+        })
+    }
+}
+
+/// Why a store handle could not be minted or read.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum HandleError {
+    /// The claims did not encode, or did not decode as claims.
+    #[error("the store handle's claims: {0}")]
+    Claims(#[from] serde_json_lenient::Error),
+    /// The key store refused to sign the handle, or to describe the key.
+    #[error("the client's handle-signing key: {0}")]
+    Key(#[from] StoreError),
+    /// The text is no store handle.
+    #[error("not a store handle: {0}")]
+    Malformed(&'static str),
+    /// The envelope the handle is delivered in could not be sealed.
+    #[error(transparent)]
+    Seal(#[from] SealError),
+}
+
+/// What a store handle is minted for: the reference, the rule in force for
+/// it, and the box the envelope is bound to.
+#[derive(Debug, Clone, Copy)]
+pub struct StoreMintRequest<'a> {
+    /// The box the handle is minted for.
+    pub box_id: &'a str,
+    /// The host the envelope is sealed on.
+    pub host: &'a str,
+    /// The store the value is read from.
+    pub store: &'a str,
+    /// The identifier the value is stored under.
+    pub id: &'a str,
+    /// The upstream authorities the rule registers for it.
+    pub upstream: &'a [String],
+    /// The injection form the rule registers for it.
+    pub inject: &'a Inject,
+    /// The clock, as seconds since the Unix epoch.
+    pub now: u64,
+}
+
+/// A minted store handle: the handle, the envelope the box receives it in,
+/// and the claims it carries.
+#[derive(Debug)]
+pub struct MintedHandle {
+    /// The handle, signed under the client's key.
+    pub handle: StoreHandle,
+    /// The sealed value delivered into the box: the handle as the member,
+    /// bound to this host's keys and to the box.
+    pub value: SealedValue,
+    /// The claims the handle carries.
+    pub claims: StoreClaims,
+}
+
+/// The client's handle-signing key in `store`, generated there on first use.
+///
+/// One key per host store, found again on every run: the proxy holds its
+/// public half from the first registration on, so handles minted later verify
+/// without registering again.
+///
+/// # Errors
+///
+/// When the store cannot be searched, or cannot generate the key.
+pub fn client_key<S: KeyStore>(store: &S) -> Result<S::Key, StoreError> {
+    if let Some(key) = store.find(CLIENT_KEY_NAME)? {
+        return Ok(key);
+    }
+    let key = store.generate(CLIENT_KEY_NAME)?;
+    tracing::info!(
+        name = CLIENT_KEY_NAME,
+        store = S::NAME,
+        "generated the client's handle-signing key"
+    );
+    Ok(key)
+}
+
+/// Mints a handle for one store reference, signed under `client`, and seals
+/// it to `keys` for `request.box_id` (BEP-063).
+///
+/// The handle expires [`HANDLE_LIFETIME_SECS`] after `request.now`, and the
+/// envelope it is delivered in carries the same expiry, so BEP-020's check
+/// and BEP-064's agree about when it is spent.
+///
+/// # Errors
+///
+/// A [`HandleError`]: the claims do not encode, the key store refuses to sign
+/// or to describe the client key, or the envelope cannot be sealed.
+pub fn mint_store_handle<S: KeyStore, K: PrivateKey>(
+    keys: &Keys<S>,
+    client: &K,
+    request: &StoreMintRequest<'_>,
+) -> Result<MintedHandle, HandleError> {
+    let fingerprint = Fingerprint::of(&client.public_key()?);
+    let claims = StoreClaims {
+        store: request.store.to_owned(),
+        id: request.id.to_owned(),
+        upstream: request.upstream.to_vec(),
+        inject: request.inject.clone(),
+        exp: request.now.saturating_add(HANDLE_LIFETIME_SECS),
+        key: fingerprint.to_string(),
+    };
+    let encoded = URL_SAFE_NO_PAD.encode(serde_json_lenient::to_vec(&claims)?);
+    let signature = client.sign(&signed_bytes(&encoded))?;
+    let handle = StoreHandle(format!(
+        "{HANDLE_PREFIX}{encoded}.{}",
+        URL_SAFE_NO_PAD.encode(&signature)
+    ));
+    let context = SealedContext {
+        box_id: request.box_id.to_owned(),
+        host: request.host.to_owned(),
+        // The store is the module a handle belongs to, so a revocation
+        // covering it reads as one covering a module's members does.
+        module: request.store.to_owned(),
+        host_set_version: STORE_HOST_SET_VERSION,
+        mode: STORE_MODE.to_owned(),
+        breadth: STORE_BREADTH.to_owned(),
+        expires_at: claims.exp,
+    };
+    let value = seal(keys, &context, &Member::new(handle.as_str()))?;
+    tracing::info!(
+        store = request.store,
+        id = request.id,
+        box_id = request.box_id,
+        exp = claims.exp,
+        key = %fingerprint,
+        "minted a store handle for a store reference"
+    );
+    Ok(MintedHandle {
+        handle,
+        value,
+        claims,
+    })
+}
+
+/// Reads `handle`: its claims, and the signature to verify under the client
+/// key those claims name.
+///
+/// # Errors
+///
+/// A [`HandleError`]: the text is no store handle, or its claims do not
+/// decode.
+pub fn parse_store_handle(handle: &str) -> Result<ParsedHandle, HandleError> {
+    let body = handle
+        .strip_prefix(HANDLE_PREFIX)
+        .ok_or(HandleError::Malformed("it carries no store-handle prefix"))?;
+    let (encoded, signature) = body
+        .split_once('.')
+        .ok_or(HandleError::Malformed("it carries no signature"))?;
+    let claims = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| HandleError::Malformed("the claims are not base64url"))?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature)
+        .map_err(|_| HandleError::Malformed("the signature is not base64url"))?;
+    Ok(ParsedHandle {
+        claims: serde_json_lenient::from_slice(&claims)?,
+        signed: signed_bytes(encoded),
+        signature,
+    })
+}
+
+/// The bytes a handle's signature covers: the domain separator, the handle
+/// version and the encoded claims exactly as the handle carries them, so
+/// verification never depends on re-encoding what was signed.
+fn signed_bytes(encoded: &str) -> Vec<u8> {
+    let mut signed = Vec::with_capacity(HANDLE_CONTEXT.len() + HANDLE_PREFIX.len() + encoded.len());
+    signed.extend_from_slice(HANDLE_CONTEXT);
+    signed.extend_from_slice(HANDLE_PREFIX.as_bytes());
+    signed.extend_from_slice(encoded.as_bytes());
+    signed
 }
 
 #[cfg(test)]

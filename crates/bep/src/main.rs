@@ -10,6 +10,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use bep::keychain::MemorySecrets;
 use bep::listener::{Config, Module, Proxy, Sender};
 use bep::upstream::{self, Trust};
 use bep::{Authority, DeclaredUnion, Keys, Log, MemoryStore};
@@ -105,6 +106,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             version: cli.host_set_version,
         }],
         store_authorities: cli.store_authorities.clone(),
+        // No rule and no store yet: the operator's rules and the host store
+        // are wired in with the daemon's configuration, so until then a store
+        // handle is refused rather than injected.
+        store_rules: Arc::new(|_: &str, _: &str| None),
+        secrets: Arc::new(MemorySecrets::new()),
         attachments: Arc::new(move |source: SocketAddr| {
             attachments
                 .iter()

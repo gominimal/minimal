@@ -563,6 +563,81 @@ $ min box audit self
 Error: audit_self_unsupported_unenrolled: `self` needs the box's own identity surface, which this host does not have while it is not enrolled; run `min box audit web-4f21` on the host instead
 ```
 
+### `secret set`, `secret list`, `secret rm`
+
+```
+min secret set <ID> [--store <STORE>]
+min secret list [--store <STORE>]
+min secret rm <ID> [--store <STORE>]
+```
+
+The values this host holds for a box to refer to. A box never holds one: it
+receives a short-lived handle, and the Box Egress Proxy injects the value
+itself into the box's requests to the upstream your rule registers. `min
+secret` is how the value gets onto the host.
+
+`secret set` reads the value from the terminal — which does not echo it — or
+from standard input when you pipe it:
+
+```console
+$ min secret set anthropic-api-key
+? value: ›
+keychain `anthropic-api-key` stored
+
+$ pbpaste | min secret set anthropic-api-key
+keychain `anthropic-api-key` stored
+```
+
+The command prints the identifier and never the value. A value given as an
+argument (`min secret set anthropic-api-key sk-...`) or named in an
+environment-variable flag (`--from-env ANTHROPIC_API_KEY`) is refused: every
+process on the host can read either, and an argument lands in your shell
+history as well. With no terminal to ask at and nothing piped, the command
+fails immediately rather than waiting for a value.
+
+The item is stored in this host's keychain with an access entry created for
+the proxy's process identity — the `bep` binary's path — so the proxy reads
+the value for each request it injects it into without a prompt, and every
+other application prompts. `min` itself only writes, lists and removes; it
+never reads a stored value back.
+
+`secret list` shows, for each stored identifier, its store, the upstream
+authorities and the injection form your `[secret-store-rules]` rule registers
+for it, the consent rule, and whether the proxy's access entry is set on the
+item — and no value:
+
+```console
+$ min secret list
+keychain  anthropic-api-key  authorities api.anthropic.com:443  inject header `x-api-key`  consent allow  proxy access set
+keychain  registry-token  authorities none registered  inject none registered  consent none  proxy access set
+```
+
+An identifier no rule registers is listed all the same, with nothing
+registered for it: the value is held, and a box referring to it is refused
+until you register the rule. The rules are yours, in
+`<config>/minimal/config.toml`, never a project's:
+
+```toml
+[[secret-store-rules]]
+store = "keychain"
+id = "anthropic-api-key"
+upstream = ["api.anthropic.com:443"]
+inject = { header = "x-api-key", prefix = "" }
+action = "allow"
+```
+
+`secret rm` takes the item out of its store:
+
+```console
+$ min secret rm anthropic-api-key
+keychain `anthropic-api-key` removed
+```
+
+`--store` names the store; with none, the command uses this host's native
+store, which is the macOS Keychain. `--store gatehouse` is the tenant-store
+deposit a Gatehouse-configured host makes — the two share one grammar — and is
+refused here, naming the deposit as outside this host's scope.
+
 ### `completions` (alias: `completion`)
 
 ```

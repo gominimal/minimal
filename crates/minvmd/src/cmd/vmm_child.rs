@@ -92,10 +92,7 @@ fn run_vmm() -> Result<()> {
     // is exactly the evidence lost in wedged-boot/dead-transport incidents,
     // and `min bug` bundles this file (tail-capped) per provider. Truncated
     // each boot so it holds the current VM generation's console.
-    let boot_log = std::env::var_os("MINVMD_BOOT_LOG")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| crate::state::provider_dir().join("boot.log"));
+    let boot_log = crate::cmd::resolve_boot_log_path();
     // Capture is diagnostics, not a boot dependency: any failure — creating
     // the file or wiring the console — warns and boots on, never propagates.
     if let Err(e) = std::fs::File::create(&boot_log) {
