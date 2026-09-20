@@ -67,6 +67,7 @@
 #     session_outbound_request
 #     native_resolution_without_proxy_env
 #     own_ip_egress_declared_and_enforced
+#     network_posture_from_stock_install
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -960,6 +961,81 @@ run_case_own_ip_egress_declared_and_enforced() {
   echo "::endgroup::"
 }
 
+# Integration: the whole network-posture story in one lane, tying together
+# what NET-035/036 (help + reference), NET-038/039 (`none`), and NET-040/107
+# (`own_ip` ingress + outbound reach) each prove on their own — so a
+# regression in how the pieces COMPOSE (choosing a posture on a stock
+# install), not just in one piece alone, fails a single named case. The
+# own-IP and outbound-reach legs are the existing named cases above, called
+# directly rather than re-deriving their retry/response logic here.
+run_case_network_posture_from_stock_install() {
+  echo "::group::network posture: --network/--ingress shown in help and the reference"
+  local help_out
+  help_out="$(mnl session activate --help 2>&1)" || {
+    echo "::error::'min session activate --help' failed"
+    fail
+  }
+  for needle in --network --ingress none host_ip own_ip; do
+    if ! printf '%s' "$help_out" | grep -q -- "$needle"; then
+      echo "::error::'min session activate --help' does not show '$needle'"
+      printf '%s\n' "$help_out"
+      fail
+    fi
+  done
+  local ref_file="$ROOT/docs/reference/cli-min.md"
+  for needle in --network --ingress none host_ip own_ip; do
+    if ! grep -q -- "$needle" "$ref_file"; then
+      echo "::error::$ref_file does not document '$needle'"
+      fail
+    fi
+  done
+  echo "help + reference OK: --network and --ingress, with none/host_ip/own_ip, are both shown"
+  echo "::endgroup::"
+
+  echo "::group::network posture: a --network none box accepts attach and reaches nothing"
+  local none_out none_sid attach_out
+  none_out="$(cd "$PROJECT_DIR" && mnl session activate . --no-prompt --name e2e-posture-none \
+    --network none 2>"$WORK/posture-none-activate.err")" || {
+    echo "::error::'min session activate --network none' failed"
+    cat "$WORK/posture-none-activate.err" 2>/dev/null || true
+    fail
+  }
+  none_sid="$(printf '%s\n' "$none_out" | tail -n1 | tr -d '\r')"
+  echo "none-network session: $none_sid"
+
+  # The attach path, not the sandbox network layer: a trivial exec is the
+  # same non-interactive stand-in the session-exec proof above uses, and is
+  # what network_none_attach_works asserts at the unit level too.
+  attach_out="$(mnl session exec "$none_sid" echo mi-posture-none-attach-ok 2>"$WORK/posture-none-exec.err")"
+  if [ "$attach_out" != "mi-posture-none-attach-ok" ]; then
+    echo "::error::a --network none box refused a trivial exec (the attach path); got '${attach_out:-<none>}'"
+    cat "$WORK/posture-none-exec.err" 2>/dev/null || true
+    mnl session destroy --force "$none_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  echo "NET-039 OK: a --network none box accepts attach"
+
+  if mnl session exec "$none_sid" curl -sS -o /dev/null --max-time 5 http://example.com \
+      >/dev/null 2>"$WORK/posture-none-curl.err"; then
+    echo "::error::a --network none box reached http://example.com; it must reach nothing"
+    cat "$WORK/posture-none-curl.err" 2>/dev/null || true
+    mnl session destroy --force "$none_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  echo "NET-038 OK: a --network none box reaches nothing"
+
+  mnl session destroy --force "$none_sid" >/dev/null 2>&1 || true
+  echo "::endgroup::"
+
+  # NET-040: own-IP --ingress on loopback. Gated inside the case itself on
+  # MINVMD_GVPROXY_BIN — the one signal a switch exists — so a target with no
+  # switch SKIPs rather than fails, same as running it standalone.
+  run_case_fresh_install_own_ip_ingress_publishes_loopback
+  # NET-107: outbound reach from a session, on every lane (not gated on a
+  # switch — a native lane has no switch to lose and still needs the check).
+  run_case_session_outbound_request
+}
+
 E2E_CASE="${E2E_CASE:-${1:-}}"
 if [ -n "$E2E_CASE" ]; then
   case "$E2E_CASE" in
@@ -969,8 +1045,9 @@ if [ -n "$E2E_CASE" ]; then
     session_outbound_request) run_case_session_outbound_request; exit $? ;;
     native_resolution_without_proxy_env) run_case_native_resolution_without_proxy_env; exit $? ;;
     own_ip_egress_declared_and_enforced) run_case_own_ip_egress_declared_and_enforced; exit $? ;;
+    network_posture_from_stock_install) run_case_network_posture_from_stock_install; exit $? ;;
     *)
-      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced)" >&2
+      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install)" >&2
       exit 2
       ;;
   esac
