@@ -39,7 +39,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -220,6 +220,11 @@ pub struct SwitchClient {
     /// the zone is the switch's — it lives as long as the address book that
     /// leases the addresses in it.
     box_zone: Arc<policy::BoxZone>,
+    /// What each live box declared, for the daemon's hostname-routing surfaces
+    /// to decide requests against (NET-069 to NET-071). It rides here because
+    /// this is the one daemon-scoped object both sides already hold: a box's
+    /// network, which learns its address and its rules, and the proxy startup.
+    admissions: Arc<RwLock<policy::BoxAdmissions>>,
 }
 
 impl SwitchClient {
@@ -247,7 +252,16 @@ impl SwitchClient {
             exit_tx,
             transport: SwitchTransport::default(),
             box_zone: Arc::new(policy::BoxZone::default()),
+            admissions: Arc::new(RwLock::new(policy::BoxAdmissions::new())),
         }
+    }
+
+    /// The live box declarations this switch's boxes register into, shared with
+    /// the daemon's hostname proxy so a routed request is decided against what
+    /// the target box declared (NET-069 to NET-071).
+    #[must_use]
+    pub fn admissions(&self) -> Arc<RwLock<policy::BoxAdmissions>> {
+        Arc::clone(&self.admissions)
     }
 
     /// Sets how PTask taps reach the switch. The DM2 default is

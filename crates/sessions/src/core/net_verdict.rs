@@ -16,7 +16,7 @@
 use std::fmt;
 use std::net::Ipv4Addr;
 
-use crate::{EgressPolicy, IpProto};
+use crate::{EgressPolicy, IngressPolicy, IpProto};
 
 /// IPv4 protocol number for ICMP.
 pub const IPPROTO_ICMP: u8 = 1;
@@ -203,6 +203,8 @@ pub enum DropRule {
     /// The destination is in neither `allow_subnets` nor the carve-out
     /// (NET-062).
     Undeclared,
+    /// The target box did not declare the port asked for (NET-069).
+    UndeclaredPort,
 }
 
 impl DropRule {
@@ -214,6 +216,7 @@ impl DropRule {
             Self::Protocol => "allow_protocols",
             Self::DeniedSubnet => "deny_subnets",
             Self::Undeclared => "allow_subnets",
+            Self::UndeclaredPort => "ingress.port_mappings",
         }
     }
 }
@@ -261,6 +264,142 @@ pub fn frame_verdict(frame: &FrameSummary, rules: &EgressRules) -> Verdict {
         return Verdict::Drop(DropRule::Undeclared);
     }
     Verdict::Admit
+}
+
+/// The ports one box declared inbound, as the surface deciding a connection to
+/// it reads them.
+///
+/// A box with an address of its own declares them in `ingress.port_mappings`.
+/// Each pair carries a host-side port and a box-side port; a hostname-routing
+/// surface on the host dials the host-side one (it is the port gvproxy
+/// publishes, and so the port a direct connection from the host reaches), while
+/// the relay's switch-side gate sees the box-side twin of the same
+/// declaration. One declaration, read where each surface meets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressRules {
+    /// The declared `(transport, port)` pairs, host-side. `None` for a box that
+    /// carries the host's address: ingress declarations are own-address only
+    /// (launch validation refuses them elsewhere), so such a box declares
+    /// nothing of its own and a direct connection reaches its listeners like
+    /// any other process on the host.
+    declared: Option<Vec<(IpProto, u16)>>,
+}
+
+impl IngressRules {
+    /// The rules for a box with an address of its own, from its declared
+    /// `ingress`. An absent section declares no port at all, which is the
+    /// deny-all default: nothing inbound is admitted.
+    #[must_use]
+    pub fn for_own_address(ingress: Option<&IngressPolicy>) -> Self {
+        Self {
+            declared: Some(
+                ingress
+                    .map(|i| {
+                        i.port_mappings
+                            .iter()
+                            .map(|m| (m.proto, m.external_port))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// The rules for a box that carries the host's address: it declares no
+    /// ingress of its own, and every port a direct connection reaches is one a
+    /// hostname-routing surface may reach too (NET-071).
+    #[must_use]
+    pub fn for_host_address() -> Self {
+        Self { declared: None }
+    }
+
+    /// Whether the box declared `port` for the transport `proto` names (an IPv4
+    /// protocol number).
+    ///
+    /// Only TCP and UDP carry a port, and a declaration is about a port, so any
+    /// other transport is admitted for none — which is also what keeps the
+    /// decision the same whether it is taken on a frame (where a portless
+    /// transport carries no port to read) or on a request's stated facts.
+    #[must_use]
+    pub fn admits(&self, proto: u8, port: u16) -> bool {
+        let carries_a_port = proto == IPPROTO_TCP || proto == IPPROTO_UDP;
+        match &self.declared {
+            None => carries_a_port,
+            Some(declared) => {
+                carries_a_port && ip_proto(proto).is_some_and(|p| declared.contains(&(p, port)))
+            }
+        }
+    }
+}
+
+/// One request a hostname-routing surface is asked to carry: who asked, the box
+/// the name resolved to, and the port and transport asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxiedRequest {
+    /// The caller's own address — a box's switch lease, which is what
+    /// attributes the request to that box (NET-084).
+    pub caller: Ipv4Addr,
+    /// The target box's own address: what the direct connection would dial,
+    /// not the address the surface forwards to.
+    pub target: Ipv4Addr,
+    /// The port asked for.
+    pub port: u16,
+    /// IPv4 protocol number of the transport asked for.
+    pub proto: u8,
+}
+
+impl ProxiedRequest {
+    /// The frame the direct connection would open with: from the caller's own
+    /// address to the target box's, carrying the port asked for. Deciding on
+    /// this frame rather than on the one the surface itself would send is what
+    /// keeps the caller's rules the caller's, not the surface's.
+    #[must_use]
+    pub fn as_frame(&self) -> FrameSummary {
+        FrameSummary {
+            src: self.caller,
+            dst: self.target,
+            proto: self.proto,
+            dst_port: Some(self.port),
+        }
+    }
+}
+
+/// Decides the connection `frame` opens: the caller's egress rules, then the
+/// target's declared ports — the two legs the relay applies, in the order it
+/// applies them (NET-073). A frame with no port carries no declared port to
+/// match, so it is refused like one to a port nobody declared.
+///
+/// `caller` is `None` for a caller whose rules are not this decision's to
+/// apply: a process on the host, or a host-address cohort sharing the host's
+/// address (NET-078), whose declaration is enforced inside the box (NET-079).
+#[must_use]
+pub fn direct_verdict(
+    frame: &FrameSummary,
+    caller: Option<&EgressRules>,
+    target: &IngressRules,
+) -> Verdict {
+    if let Some(rules) = caller
+        && let Verdict::Drop(rule) = frame_verdict(frame, rules)
+    {
+        return Verdict::Drop(rule);
+    }
+    match frame.dst_port {
+        Some(port) if target.admits(frame.proto, port) => Verdict::Admit,
+        _ => Verdict::Drop(DropRule::UndeclaredPort),
+    }
+}
+
+/// Decides `request` as the direct connection it stands in for (NET-069 to
+/// NET-071): the same function, on the frame that connection would carry.
+/// Going through a hostname-routing surface changes the bytes' path, never the
+/// decision, so the surface has no reach a direct connection would not have.
+#[must_use]
+pub fn proxied_verdict(
+    request: &ProxiedRequest,
+    caller: Option<&EgressRules>,
+    target: &IngressRules,
+) -> Verdict {
+    direct_verdict(&request.as_frame(), caller, target)
 }
 
 /// Bounded verification of [`frame_verdict`] (NET-062, NET-064, NET-084):
@@ -362,6 +501,9 @@ mod kani_proofs {
             Verdict::Drop(DropRule::Protocol) => assert!(!protocol_allowed),
             Verdict::Drop(DropRule::DeniedSubnet) => assert!(denied),
             Verdict::Drop(DropRule::Undeclared) => assert!(!declared),
+            // The frame verdict names egress rules only; the port declaration
+            // is the ingress leg's, applied by `direct_verdict`.
+            Verdict::Drop(DropRule::UndeclaredPort) => panic!("not an egress rule"),
         }
     }
 }
@@ -369,6 +511,7 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PortMapping;
 
     const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
     const RESOLVER: Endpoint = Endpoint {
@@ -391,6 +534,22 @@ mod tests {
 
     fn summary(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, dst_port: u16) -> FrameSummary {
         summarize_ipv4(&packet(src, dst, proto, dst_port)).expect("a well-formed packet")
+    }
+
+    /// An ingress policy declaring each `(host-side port, transport)` pair,
+    /// forwarding to the same port inside the box.
+    fn ingress(mappings: &[(u16, IpProto)]) -> IngressPolicy {
+        IngressPolicy {
+            port_mappings: mappings
+                .iter()
+                .map(|&(port, proto)| PortMapping {
+                    external_port: port,
+                    internal_port: port,
+                    proto,
+                })
+                .collect(),
+            dynamic_allowed_range: None,
+        }
     }
 
     fn policy(allow: &[&str], deny: &[&str], protocols: Option<Vec<IpProto>>) -> EgressPolicy {
@@ -564,6 +723,71 @@ mod tests {
         assert!(rules.deny_subnets.is_empty());
     }
 
+    /// A box with an address of its own admits exactly the ports it declared;
+    /// one that carries the host's address declares none of its own and admits
+    /// every port a direct connection to it would reach (NET-069, NET-071).
+    #[test]
+    fn declared_ports_decide_an_own_address_box_but_not_a_host_address_one() {
+        let declared = ingress(&[(18080, IpProto::Tcp), (15353, IpProto::Udp)]);
+        let own = IngressRules::for_own_address(Some(&declared));
+        assert!(own.admits(IPPROTO_TCP, 18080));
+        assert!(own.admits(IPPROTO_UDP, 15353));
+        // The declared port on another transport is not declared.
+        assert!(!own.admits(IPPROTO_UDP, 18080));
+        assert!(!own.admits(IPPROTO_TCP, 9999));
+        // A transport with no port has no declared port to match.
+        assert!(!own.admits(IPPROTO_ICMP, 18080));
+        // No `ingress` section at all: the deny-all default.
+        assert!(!IngressRules::for_own_address(None).admits(IPPROTO_TCP, 18080));
+        // The host's address: any port, as a direct connection reaches it.
+        assert!(IngressRules::for_host_address().admits(IPPROTO_TCP, 9999));
+        assert!(!IngressRules::for_host_address().admits(IPPROTO_ICMP, 9999));
+    }
+
+    /// NET-069, NET-070: a request through a hostname-routing surface is
+    /// refused exactly as the direct connection it stands in for — for a port
+    /// the target did not declare, and for a caller whose own rules deny the
+    /// target — and each refusal names the rule it tripped.
+    #[test]
+    fn a_proxied_request_is_refused_like_the_direct_connection() {
+        const TARGET: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 12);
+        let target = IngressRules::for_own_address(Some(&ingress(&[(18080, IpProto::Tcp)])));
+        let reaches =
+            EgressRules::for_box(LEASE, Some(&policy(&["100.64.0.0/10"], &[], None)), None);
+        let denies = EgressRules::for_box(LEASE, Some(&policy(&["10.0.0.0/8"], &[], None)), None);
+        let asking = |port| ProxiedRequest {
+            caller: LEASE,
+            target: TARGET,
+            port,
+            proto: IPPROTO_TCP,
+        };
+
+        assert_eq!(
+            proxied_verdict(&asking(18080), Some(&reaches), &target),
+            Verdict::Admit
+        );
+        assert_eq!(
+            proxied_verdict(&asking(9999), Some(&reaches), &target),
+            Verdict::Drop(DropRule::UndeclaredPort)
+        );
+        // The caller's rules do not allow the target's address: refused with the
+        // egress rule a direct connection would have tripped.
+        assert_eq!(
+            proxied_verdict(&asking(18080), Some(&denies), &target),
+            Verdict::Drop(DropRule::Undeclared)
+        );
+        // A caller whose rules are not the surface's to apply: the target's
+        // declaration alone decides.
+        assert_eq!(
+            proxied_verdict(&asking(18080), None, &target),
+            Verdict::Admit
+        );
+        assert_eq!(
+            proxied_verdict(&asking(9999), None, &target),
+            Verdict::Drop(DropRule::UndeclaredPort)
+        );
+    }
+
     mod property {
         use super::*;
         use proptest::prelude::*;
@@ -587,6 +811,82 @@ mod tests {
                 .filter_map(|(on, p)| on.then_some(p))
                 .collect()
             })
+        }
+
+        fn arb_mappings() -> impl Strategy<Value = Vec<PortMapping>> {
+            proptest::collection::vec(
+                (
+                    any::<u16>(),
+                    prop_oneof![Just(IpProto::Tcp), Just(IpProto::Udp)],
+                ),
+                0..=4,
+            )
+            .prop_map(|raw| {
+                raw.into_iter()
+                    .map(|(port, proto)| PortMapping {
+                        external_port: port,
+                        internal_port: port,
+                        proto,
+                    })
+                    .collect()
+            })
+        }
+
+        proptest! {
+            /// NET-071: for every network mode, every rule set and every
+            /// request, the verdict a hostname-routing surface reaches is the
+            /// verdict the direct connection reaches. The surface decides on the
+            /// request's stated facts; the direct leg decides on the frame that
+            /// connection carries, read off the wire the way the relay reads it.
+            /// Ports are drawn from a small set so a declared one is asked for
+            /// often enough to exercise the admit arm.
+            #[test]
+            fn proxy_verdict_equals_direct_verdict_property(
+                caller in any::<u32>(),
+                target_address in any::<u32>(),
+                port in prop_oneof![Just(0u16), Just(80), Just(443), Just(18080), any::<u16>()],
+                proto in prop_oneof![
+                    Just(IPPROTO_TCP),
+                    Just(IPPROTO_UDP),
+                    Just(IPPROTO_ICMP),
+                    any::<u8>(),
+                ],
+                host_address in any::<bool>(),
+                mappings in arb_mappings(),
+                caller_is_a_box in proptest::bool::weighted(0.8),
+                other_lease in any::<u32>(),
+                from_lease in proptest::bool::weighted(0.7),
+                allow in proptest::option::of(arb_cidrs()),
+                deny in arb_cidrs(),
+                protocols in proptest::option::of(arb_protocols()),
+            ) {
+                let caller = Ipv4Addr::from(caller);
+                let target_address = Ipv4Addr::from(target_address);
+                let rules = EgressRules {
+                    lease: if from_lease { caller } else { Ipv4Addr::from(other_lease) },
+                    allow_subnets: allow,
+                    deny_subnets: deny,
+                    allow_protocols: protocols,
+                    resolver: None,
+                };
+                let caller_rules = caller_is_a_box.then_some(&rules);
+                let target = if host_address {
+                    IngressRules::for_host_address()
+                } else {
+                    IngressRules::for_own_address(Some(&IngressPolicy {
+                        port_mappings: mappings,
+                        dynamic_allowed_range: None,
+                    }))
+                };
+
+                let request = ProxiedRequest { caller, target: target_address, port, proto };
+                let direct = summarize_ipv4(&packet(caller, target_address, proto, port))
+                    .expect("a well-formed packet");
+                prop_assert_eq!(
+                    proxied_verdict(&request, caller_rules, &target),
+                    direct_verdict(&direct, caller_rules, &target)
+                );
+            }
         }
 
         proptest! {
@@ -649,6 +949,9 @@ mod tests {
                     Verdict::Drop(DropRule::Protocol) => prop_assert!(!protocol_allowed),
                     Verdict::Drop(DropRule::DeniedSubnet) => prop_assert!(denied),
                     Verdict::Drop(DropRule::Undeclared) => prop_assert!(!declared),
+                    Verdict::Drop(DropRule::UndeclaredPort) => {
+                        unreachable!("the frame verdict names egress rules only")
+                    }
                 }
             }
         }

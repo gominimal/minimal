@@ -217,6 +217,12 @@ pub struct ServerState {
     /// cache clean — can reach the cache without a project mfile.
     daemon_ctx: Arc<mctx::DaemonContext>,
 
+    /// The daemon-scoped gvproxy switch, whose `Arc` the sessions manager also
+    /// holds. Kept here for what belongs to no session either: the hostname
+    /// proxy reads the box declarations it carries, so a routed request is
+    /// decided against what the target box declared (NET-069 to NET-071).
+    net_switch: Arc<Mutex<crate::net::SwitchClient>>,
+
     /// The housekeeping actor, installed by [`Server::run`] once the state
     /// exists (the actor holds a handle to it, so it can't be built in
     /// [`ServerState::new`]). `None` before that, and for a state built
@@ -323,9 +329,10 @@ impl ServerState {
                 minimal_state_dir,
                 minimal_cache_dir,
                 Arc::clone(&daemon_ctx),
-                net_switch,
+                Arc::clone(&net_switch),
             )
             .await?,
+            net_switch,
             config,
             daemon_id,
             daemon_ctx,
@@ -391,6 +398,16 @@ impl ServerStateHandle {
     /// The in-guest box zone of the daemon's switch, for the zone dump.
     pub(crate) async fn box_zone(&self) -> Arc<crate::net::policy::BoxZone> {
         Arc::clone(&self.0.lock().await.box_zone)
+    }
+
+    /// The live box declarations, for the hostname proxy to decide requests
+    /// against (NET-069 to NET-071).
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn box_admissions(
+        &self,
+    ) -> Arc<std::sync::RwLock<crate::net::policy::BoxAdmissions>> {
+        let switch = Arc::clone(&self.0.lock().await.net_switch);
+        switch.lock().await.admissions()
     }
 
     /// Records why hostname routing is unavailable, so a client can be told.
@@ -861,6 +878,7 @@ async fn start_host_proxies(
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     let registry = state.sessions_manager().await.hostnames();
+    let admissions = state.box_admissions().await;
     // DM1 (in-VM): bind 0.0.0.0 so the listener comes up regardless of whether
     // eth0 has finished coming up, then publish the port on the host loopback via
     // the gvproxy forwarder. DM2: bind host loopback directly, no host-expose.
@@ -883,7 +901,7 @@ async fn start_host_proxies(
                     chosen: bound.choice.as_str(),
                 })
                 .await;
-            let router = Router::new(registry.clone());
+            let router = Router::new(registry.clone(), Arc::clone(&admissions));
             tokio::spawn(async move {
                 if let Err(error) = proxy::serve(bound.listener, router).await {
                     tracing::error!(%error, "egress proxy accept loop exited");
@@ -924,6 +942,7 @@ async fn start_host_proxies(
             recover_egress_listener(
                 state.clone(),
                 registry.clone(),
+                admissions,
                 egress_addr,
                 in_microvm,
                 if configured_port.is_some() {
@@ -948,6 +967,7 @@ async fn start_host_proxies(
 fn recover_egress_listener(
     state: ServerStateHandle,
     registry: Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
+    admissions: Arc<std::sync::RwLock<crate::net::policy::BoxAdmissions>>,
     addr: std::net::SocketAddr,
     in_microvm: bool,
     chosen: crate::net::proxy::PortChoice,
@@ -966,7 +986,7 @@ fn recover_egress_listener(
             })
             .await;
         state.clear_proxy_unavailable().await;
-        let router = Router::new(registry);
+        let router = Router::new(registry, admissions);
         if let Err(error) = proxy::serve(listener, router).await {
             tracing::error!(%error, "egress proxy accept loop exited");
         }

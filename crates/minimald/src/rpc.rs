@@ -2777,7 +2777,16 @@ mod tests {
             .await
             .unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve(proxy, Router::new(registry)));
+        // The box carries the host's address, so it declares no ingress of its
+        // own and every port a direct connection reaches routes (NET-071).
+        let admissions = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::net::policy::BoxAdmissions::new(),
+        ));
+        admissions.write().unwrap().declare(
+            "web",
+            crate::net::policy::BoxDeclaration::for_host_address(crate::net::DEFAULT_SUBNET),
+        );
+        tokio::spawn(serve(proxy, Router::new(registry, admissions)));
 
         let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
         let request = format!("GET / HTTP/1.1\r\nHost: {hostname}:{backend_port}\r\n\r\n");

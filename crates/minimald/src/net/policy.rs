@@ -22,7 +22,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::hash::Hash;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_vsock::{VsockAddr, VsockStream};
 
+use sessions::core::net_verdict::{
+    DropRule, EgressRules, IPPROTO_TCP, IngressRules, ProxiedRequest, Verdict, proxied_verdict,
+};
 use sessions::{IngressPolicy, IpProto, PortMapping};
 
 use super::SwitchSubnet;
@@ -888,9 +891,194 @@ impl PinTable {
     }
 }
 
+/// What one live box declared, as a surface routing by hostname needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxDeclaration {
+    /// The box's own address: its switch lease when it has an address of its
+    /// own, the switch's host alias when it carries the host's. What a direct
+    /// connection to the box would dial, which is what the caller's egress
+    /// rules are read against — not the address a routing surface forwards to.
+    pub address: Ipv4Addr,
+    /// The box's declared egress, where its address attributes traffic to this
+    /// box alone (NET-084). `None` for a box carrying the host's address: that
+    /// cohort shares one address (NET-078) and each box's own declaration is
+    /// enforced inside it (NET-079), so no rules here are attributable to it.
+    pub egress: Option<EgressRules>,
+    /// The ports the box declared inbound.
+    pub ingress: IngressRules,
+}
+
+impl BoxDeclaration {
+    /// The declaration of a box with an address of its own: its lease, the
+    /// rules its relay decides frames with, and its declared ports.
+    #[must_use]
+    pub fn for_own_address(
+        lease: Ipv4Addr,
+        egress: EgressRules,
+        ingress: Option<&IngressPolicy>,
+    ) -> Self {
+        Self {
+            address: lease,
+            egress: Some(egress),
+            ingress: IngressRules::for_own_address(ingress),
+        }
+    }
+
+    /// The declaration of a box that carries the host's address on `subnet`:
+    /// the address a box on the switch dials to reach the host it runs on
+    /// ([`host_reach_address`]), and no ingress declaration of its own.
+    #[must_use]
+    pub fn for_host_address(subnet: SwitchSubnet) -> Self {
+        Self {
+            address: subnet.host_alias(),
+            egress: None,
+            ingress: IngressRules::for_host_address(),
+        }
+    }
+}
+
+/// Every live box's declarations, keyed by the session name its hostname is
+/// minted from, so a surface that resolved a name to a box can decide the
+/// request against what that box declared (NET-069 to NET-071).
+///
+/// Held behind an `RwLock` on the daemon-scoped switch client: the box's
+/// network is where its address and its rules are both known, and the switch is
+/// the one object every box's network and the daemon's hostname proxy already
+/// share. Writers are the network providers (declare) and the session actor
+/// (withdraw with the hostname route); the proxy only reads.
+#[derive(Debug, Default)]
+pub struct BoxAdmissions {
+    boxes: HashMap<String, BoxDeclaration>,
+}
+
+impl BoxAdmissions {
+    /// An empty table: no box has declared anything, so nothing is admitted.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records what the box named `session` declared, replacing any earlier
+    /// declaration under that name (a relaunch leases a new address).
+    pub fn declare(&mut self, session: &str, declaration: BoxDeclaration) {
+        self.boxes.insert(session.to_string(), declaration);
+    }
+
+    /// Drops `session`'s declaration: the box is gone, and declares nothing.
+    pub fn withdraw(&mut self, session: &str) {
+        self.boxes.remove(session);
+    }
+
+    /// The verdict on one TCP request the hostname proxy is asked to carry from
+    /// `caller` to the box named `session` on `port`, decided as the direct
+    /// connection it stands in for (NET-069 to NET-071).
+    ///
+    /// A name with no declaration behind it — a box whose network never came
+    /// up, or one that has gone — declared no port, so the request is refused:
+    /// a routing surface admits only what a box declared.
+    #[must_use]
+    pub fn verdict(&self, caller: IpAddr, session: &str, port: u16) -> Verdict {
+        let Some(target) = self.boxes.get(session) else {
+            return Verdict::Drop(DropRule::UndeclaredPort);
+        };
+        let request = ProxiedRequest {
+            caller: match caller {
+                IpAddr::V4(v4) => v4,
+                // No box holds an IPv6 address on the IPv4-only switch, so such
+                // a caller is attributed to none and is decided by the target's
+                // declaration alone.
+                IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+            },
+            target: target.address,
+            port,
+            proto: IPPROTO_TCP,
+        };
+        proxied_verdict(&request, self.caller(caller), &target.ingress)
+    }
+
+    /// The declared egress of the box that holds `caller`, or `None` when the
+    /// address is not one box's: a process on the host, or the host-address
+    /// cohort. Leases are never reused for the daemon's lifetime, so an address
+    /// answers for at most one box.
+    fn caller(&self, caller: IpAddr) -> Option<&EgressRules> {
+        let IpAddr::V4(address) = caller else {
+            return None;
+        };
+        self.boxes
+            .values()
+            .find(|b| b.address == address)
+            .and_then(|b| b.egress.as_ref())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table attributes a caller by the lease it sends from, and a
+    /// withdrawn box declares nothing: neither as a target nor as a caller.
+    #[test]
+    fn admissions_attribute_a_caller_by_its_lease_until_it_is_withdrawn() {
+        const CALLER: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 5);
+        const TARGET: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 6);
+        let mut table = BoxAdmissions::new();
+        // A caller allowed nothing outside its own loopback.
+        table.declare(
+            "caller",
+            BoxDeclaration::for_own_address(
+                CALLER,
+                EgressRules::for_box(
+                    CALLER,
+                    Some(&sessions::EgressPolicy {
+                        allow_subnets: Some(vec!["127.0.0.0/8".to_string()]),
+                        ..sessions::EgressPolicy::default()
+                    }),
+                    None,
+                ),
+                None,
+            ),
+        );
+        table.declare(
+            "web",
+            BoxDeclaration::for_own_address(
+                TARGET,
+                EgressRules::for_box(TARGET, None, None),
+                Some(&IngressPolicy {
+                    port_mappings: vec![PortMapping {
+                        external_port: 18080,
+                        internal_port: 8080,
+                        proto: IpProto::Tcp,
+                    }],
+                    dynamic_allowed_range: None,
+                }),
+            ),
+        );
+
+        // The caller's own rules do not reach the target's address.
+        assert_eq!(
+            table.verdict(CALLER.into(), "web", 18080),
+            Verdict::Drop(DropRule::Undeclared)
+        );
+        // A caller the table holds no rules for reaches the declared port.
+        let host: IpAddr = Ipv4Addr::LOCALHOST.into();
+        assert_eq!(table.verdict(host, "web", 18080), Verdict::Admit);
+        assert_eq!(
+            table.verdict(host, "web", 9999),
+            Verdict::Drop(DropRule::UndeclaredPort)
+        );
+        // Withdrawn: the name declares no port, and the lease attributes nobody.
+        table.withdraw("web");
+        assert_eq!(
+            table.verdict(host, "web", 18080),
+            Verdict::Drop(DropRule::UndeclaredPort)
+        );
+        table.withdraw("caller");
+        table.declare(
+            "web",
+            BoxDeclaration::for_host_address(SwitchSubnet::default()),
+        );
+        assert_eq!(table.verdict(CALLER.into(), "web", 18080), Verdict::Admit);
+    }
 
     #[test]
     fn admission_window_is_the_ttl_held_between_the_bounds() {

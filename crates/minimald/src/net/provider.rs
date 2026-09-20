@@ -11,6 +11,7 @@ use sandbox2::{
     Spawned, TapSpec,
 };
 use sessions::NetworkMode;
+use sessions::core::net_verdict::{EgressRules, Endpoint};
 use tokio::sync::Mutex;
 
 use crate::net::policy::{ControlChannel, HostReach};
@@ -31,6 +32,7 @@ pub(crate) fn network_for(
     match mode {
         NetworkMode::HostNet => Arc::new(HostNetNetwork {
             switch: Arc::clone(switch),
+            identity: identity.to_string(),
             egress,
         }),
         NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
@@ -68,6 +70,10 @@ pub(crate) fn host_reach(mode: NetworkMode, transport: SwitchTransport) -> Optio
 /// and from the box's own declaration.
 struct HostNetNetwork {
     switch: Arc<Mutex<SwitchClient>>,
+    /// The box's name, under which it declares itself to the hostname surfaces
+    /// (NET-071): a host-address box declares no ingress of its own, and its
+    /// egress is not attributable to it from outside (NET-078).
+    identity: String,
     /// The box's declared egress rules. A deny-all declaration decides the
     /// resolver on a native host (NET-003); its enforcement is the box host's
     /// classifier, decided at session start (`crate::net::host_cohort`).
@@ -88,12 +94,24 @@ impl std::fmt::Debug for HostNetNetwork {
 impl Network for HostNetNetwork {
     /// Reads the switch to learn which host this is — nothing is reserved, and
     /// the default no-op `attach`/`abandon` stand.
+    ///
+    /// It is also where the box declares itself to the daemon's hostname
+    /// surfaces: a host-address box has no attach of its own to declare at, and
+    /// what it declares never changes — the host's address, no ingress of its
+    /// own, and no egress attributable to it from outside (NET-071, NET-078).
     fn plan(&self) -> PlanFuture<'_> {
         Box::pin(async move {
-            let (transport, subnet) = {
+            let (transport, subnet, admissions) = {
                 let switch = self.switch.lock().await;
-                (switch.transport(), switch.subnet())
+                (switch.transport(), switch.subnet(), switch.admissions())
             };
+            admissions
+                .write()
+                .expect("box declarations lock poisoned")
+                .declare(
+                    &self.identity,
+                    crate::net::policy::BoxDeclaration::for_host_address(subnet),
+                );
             Ok(host_net_plan(subnet, transport, self.egress.as_ref()))
         })
     }
@@ -327,17 +345,33 @@ impl Network for OwnIpNetwork {
             // The frame verdict's inputs, owned and parsed once here: the
             // lease it must send from, its declared rules, and the resolver
             // carve-out at the switch's DNS address (design §4.1).
-            let mut egress = crate::net::switch::EgressGate::for_box(
-                self.identity.clone(),
-                sessions::core::net_verdict::EgressRules::for_box(
-                    reserved.lease.ip,
-                    self.egress.as_ref(),
-                    Some(sessions::core::net_verdict::Endpoint {
-                        ip: reserved.subnet.dns_server(),
-                        port: 53,
-                    }),
-                ),
+            let rules = EgressRules::for_box(
+                reserved.lease.ip,
+                self.egress.as_ref(),
+                Some(Endpoint {
+                    ip: reserved.subnet.dns_server(),
+                    port: 53,
+                }),
             );
+            // The same rules, declared to the daemon's hostname surfaces with
+            // the lease that attributes them and the ports this box declared
+            // inbound: everything needed to refuse a routed request exactly as
+            // this box's relay refuses the frame (NET-069 to NET-071).
+            self.switch
+                .lock()
+                .await
+                .admissions()
+                .write()
+                .expect("box declarations lock poisoned")
+                .declare(
+                    &self.identity,
+                    crate::net::policy::BoxDeclaration::for_own_address(
+                        reserved.lease.ip,
+                        rules.clone(),
+                        self.ingress.as_ref(),
+                    ),
+                );
+            let mut egress = crate::net::switch::EgressGate::for_box(self.identity.clone(), rules);
             // A box allowing names reaches what they resolve to, less the
             // denied ranges, which hold the switch's own addresses (NET-066,
             // NET-067).

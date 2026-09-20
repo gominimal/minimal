@@ -827,10 +827,21 @@ impl Session {
         if !self.owns_hostname_route(&record) {
             return;
         }
+        let name = registry_name(&record);
         self.hostnames
             .write()
             .expect("hostname registry lock poisoned")
-            .deregister(&registry_name(&record));
+            .deregister(&name);
+        // The box is gone, so what it declared goes with its route: a name that
+        // no longer resolves declares no port and attributes no caller
+        // (NET-069, NET-070).
+        self.net_switch
+            .lock()
+            .await
+            .admissions()
+            .write()
+            .expect("box declarations lock poisoned")
+            .withdraw(&name);
     }
 
     /// The async task which handles interactions with the session.
