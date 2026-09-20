@@ -76,6 +76,7 @@
 #     proxy_refuses_like_direct
 #     port_publishes_on_listen_and_box_outlives_client
 #     github_only_allowlist
+#     expose_from_inside_box
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -116,6 +117,7 @@ HR_OCCUPIER_PID=""       # the two-daemons proof's port-occupier; killed on tear
 HR_NATIVE_SOCAT_PID=""   # the two-daemons proof's native responder; killed on teardown
 HR_VM_SOCAT_PID=""       # the two-daemons proof's VM responder; killed on teardown
 PRD_SEED_DIR=""    # seeded by the proxy-honours-the-same-rules proof below; removed on teardown
+EXPOSE_SEED_DIR=""  # seeded by the min-net-expose proof below; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -240,6 +242,7 @@ teardown() {
   [ -n "$BOXID_SEED_DIR2" ] && rm -rf "$BOXID_SEED_DIR2"
   [ -n "$HR_VM_SEED_DIR" ] && rm -rf "$HR_VM_SEED_DIR"
   [ -n "$PRD_SEED_DIR" ] && rm -rf "$PRD_SEED_DIR"
+  [ -n "$EXPOSE_SEED_DIR" ] && rm -rf "$EXPOSE_SEED_DIR"
   # shellcheck disable=SC2086 # a space-separated list of dirs on purpose.
   [ -n "$GHA_SEED_DIRS" ] && rm -rf $GHA_SEED_DIRS
   # The two-daemons proof's port-occupier and responders: backgrounded, and
@@ -2217,6 +2220,274 @@ run_case_github_only_allowlist() {
   echo "::endgroup::"
 }
 
+# NET-043..047, tied together end to end: `min net expose <port>` run INSIDE
+# the box (the in-sandbox `min` helper, over `/run/minenv_sock`) is decided
+# against its `dynamic_ingress` setting three ways in this one case — allow
+# publishes it at once (NET-043), deny refuses it with a typed reason
+# (NET-044), and ask puts the decision to the human attached to the SAME
+# box, over the SAME terminal `min net expose` itself is running on, answered
+# by one keystroke exactly as the daemon renders it (NET-045) — and every one
+# of those three decisions, whoever took it, lands in the daemon's local
+# audit log (NET-046). own-IP only: the address `min net expose` publishes
+# onto is the box's own, which needs a real switch, same gating as every
+# other own-IP case above.
+run_case_expose_from_inside_box() {
+  echo "::group::min net expose, decided against dynamic_ingress: allow/ask/deny, every decision audited (NET-043..047)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "min net expose proof SKIPPED (no MINVMD_GVPROXY_BIN: own-IP boxes need a real switch)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  local allow_port=19180 deny_port=19181 ask_port=19182
+  local allow_name=e2e-expose-allow deny_name=e2e-expose-deny ask_name=e2e-expose-ask
+  local sid out audit attach_out ask_status
+
+  EXPOSE_SEED_DIR="$(mktemp -d /tmp/mnlxp.XXXXXX)"
+  EXPOSE_SEED_DIR="$(cd "$EXPOSE_SEED_DIR" && pwd -P)"
+  {
+    awk '
+      /^\[upstream\]/            { grab = 1; print; next }
+      grab && (/^$/ || /^\[/)    { exit }
+      grab                       { print }
+    ' "$ROOT/.minimal/minimal.toml"
+    printf '\n[stack]\nuse = "shell"\n'
+  } > "$EXPOSE_SEED_DIR/minimal.toml"
+  mkdir "$EXPOSE_SEED_DIR/.git"
+
+  # The last decision the daemon's local audit log recorded for `box_name`
+  # (NET-046), read straight from its JSON Lines file rather than through
+  # `jq` — nothing shipped assumes that on the host. SKIPPED, not failed, on
+  # a VM lane: minimald runs in-guest there and the log is in guest tmpfs,
+  # unreachable from here (same rationale as assert_log_has elsewhere above).
+  audit_line_for() {
+    if [ -n "$E2E_VM" ]; then
+      return 0
+    fi
+    find "$XDG_STATE_HOME/minimal/audit" -name 'decisions.jsonl' -type f \
+      -exec grep -h -- "\"box_name\":\"$1\"" {} + 2>/dev/null | tail -n1
+  }
+
+  # -- allow: publishes at once, from inside the box, nobody asked -----------
+  out="$(cd "$EXPOSE_SEED_DIR" && mnl session activate . --no-prompt --name "$allow_name" \
+    --network own_ip --dynamic-ingress allow 2>"$WORK/expose-allow-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --dynamic-ingress allow' failed"
+    cat "$WORK/expose-allow-activate.err" 2>/dev/null || true
+    fail
+  }
+  sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+  echo "allow session: $sid ($allow_name)"
+
+  out="$(mnl session exec "$sid" min net expose "$allow_port" 2>"$WORK/expose-allow.err")" || {
+    echo "::error::NET-043: 'min net expose $allow_port' (dynamic_ingress allow) was refused inside an allowing box"
+    cat "$WORK/expose-allow.err" 2>/dev/null || true
+    mnl session destroy --force "$sid" >/dev/null 2>&1 || true
+    fail
+  }
+  case "$out" in
+    "published $allow_name.min.internal:$allow_port at "*) ;;
+    *)
+      echo "::error::NET-043: 'min net expose $allow_port' did not report a publication; got '$out'"
+      fail
+      ;;
+  esac
+  echo "NET-043 OK: allow published it from inside the box at once: $out"
+
+  audit="$(audit_line_for "$allow_name")"
+  if [ -z "$E2E_VM" ]; then
+    if [ -z "$audit" ] || [[ "$audit" != *'"outcome":"published"'* ]] \
+        || [[ "$audit" != *'"decided_by":"policy"'* ]] || [[ "$audit" != *'"setting":"allow"'* ]]; then
+      echo "::error::NET-046: the audit log has no allow/published/policy record for $allow_name; got '${audit:-<none>}'"
+      fail
+    fi
+    echo "NET-046 OK: the allow decision is in the audit log: $audit"
+  fi
+
+  mnl session destroy --force "$sid" >/dev/null 2>&1 || true
+
+  # -- deny: refused with a typed reason, nothing published ------------------
+  out="$(cd "$EXPOSE_SEED_DIR" && mnl session activate . --no-prompt --name "$deny_name" \
+    --network own_ip --dynamic-ingress deny 2>"$WORK/expose-deny-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --dynamic-ingress deny' failed"
+    cat "$WORK/expose-deny-activate.err" 2>/dev/null || true
+    fail
+  }
+  sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+  echo "deny session: $sid ($deny_name)"
+
+  if mnl session exec "$sid" min net expose "$deny_port" >"$WORK/expose-deny.out" 2>"$WORK/expose-deny.err"; then
+    echo "::error::NET-044: 'min net expose $deny_port' succeeded inside a denying box; it must refuse"
+    cat "$WORK/expose-deny.out" 2>/dev/null || true
+    mnl session destroy --force "$sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  if ! grep -q "denies it" "$WORK/expose-deny.err"; then
+    echo "::error::NET-044: the refusal did not name the dynamic_ingress setting; got:"
+    cat "$WORK/expose-deny.err"
+    fail
+  fi
+  echo "NET-044 OK: deny refused it with a typed reason: $(cat "$WORK/expose-deny.err")"
+
+  audit="$(audit_line_for "$deny_name")"
+  if [ -z "$E2E_VM" ]; then
+    if [ -z "$audit" ] || [[ "$audit" != *'"outcome":"refused"'* ]] \
+        || [[ "$audit" != *'"decided_by":"policy"'* ]] || [[ "$audit" != *'"setting":"deny"'* ]]; then
+      echo "::error::NET-046: the audit log has no deny/refused/policy record for $deny_name; got '${audit:-<none>}'"
+      fail
+    fi
+    echo "NET-046 OK: the deny decision is in the audit log: $audit"
+  fi
+
+  mnl session destroy --force "$sid" >/dev/null 2>&1 || true
+
+  # -- ask: the human attached to the SAME box decides, one keystroke --------
+  out="$(cd "$EXPOSE_SEED_DIR" && mnl session activate . --no-prompt --name "$ask_name" \
+    --network own_ip --dynamic-ingress ask 2>"$WORK/expose-ask-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --dynamic-ingress ask' failed"
+    cat "$WORK/expose-ask-activate.err" 2>/dev/null || true
+    fail
+  }
+  sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+  echo "ask session: $sid ($ask_name)"
+
+  # A one-shot pty driver, generated here rather than added to the shared
+  # scripts/e2e-attach-pty.py: that helper answers only the session-exit
+  # menu (a `Select`), a different prompt shape than the plain `[y/N]`
+  # keystroke `min net expose` raises (NET-045). Typed into the freshly
+  # attached shell, `min net expose <port>` reaches the daemon over the
+  # in-sandbox helper — which asks the human attached to THIS box, over this
+  # SAME channel, exactly the case this proof needs a real pty for (a pipe
+  # could not answer it). Detaching afterwards (not `exit`) leaves the shell
+  # alive, so the attach process ends cleanly with no exit-menu to answer.
+  cat > "$WORK/expose-ask-pty.py" <<'PY'
+"""One-shot pty driver for a single `[y/N]` ask prompt mid-attach (NET-045).
+
+Types <command> into the freshly-attached shell, waits for <marker> — the
+rendered question's leading text — to appear on the SAME raw channel the
+shell is on (the daemon prompts over the attach itself, not a separate one),
+sends one keystroke ('y') to answer it, waits for the reply to settle, then
+leaves by the shipped detach chord (ctrl-] then d) so the box's shell
+survives: a bare `exit` would end it and raise the session-exit menu
+instead, which this one-shot driver does not handle.
+
+Usage: expose-ask-pty.py <command> <marker> <attach-argv...>
+Prints the captured transcript on stdout. Exits 0 iff the marker was seen,
+answered, and the attach process exited 0.
+"""
+import os
+import pty
+import select
+import signal
+import sys
+import time
+
+command = sys.argv[1]
+marker = sys.argv[2].encode()
+attach_argv = sys.argv[3:]
+
+DEADLINE = time.monotonic() + 120
+
+pid, fd = pty.fork()
+if pid == 0:  # child
+    os.execvp(attach_argv[0], attach_argv)
+    os._exit(127)
+
+buf = bytearray()
+answered = False
+detached = False
+
+
+def drain_ready(timeout):
+    if select.select([fd], [], [], timeout)[0]:
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            return None
+        return chunk or None
+    return b""
+
+
+try:
+    # The shell only starts once the sandbox is minted; bytes written before
+    # then buffer in the pty (same reasoning as scripts/e2e-attach-pty.py).
+    time.sleep(1.5)
+    os.write(fd, (command + "\n").encode())
+
+    quiet = 0
+    while time.monotonic() < DEADLINE:
+        chunk = drain_ready(1.0)
+        if chunk is None:
+            break  # EOF / closed
+        buf.extend(chunk)
+        quiet = 0 if chunk else quiet + 1
+        if not answered and marker in bytes(buf):
+            # The daemon intercepts this keystroke before the shell ever
+            # sees it; the trailing '\n' is swallowed with it.
+            os.write(fd, b"y\n")
+            answered = True
+            quiet = 0
+        elif answered and not detached and quiet >= 2:
+            os.write(fd, b"\x1dd")
+            detached = True
+finally:
+    try:
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid == 0:
+            time.sleep(2)
+            wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid == 0:
+            os.kill(pid, signal.SIGKILL)
+            _, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        status = 0
+
+sys.stdout.buffer.write(bytes(buf))
+sys.stdout.flush()
+ok = answered and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+sys.exit(0 if ok else 1)
+PY
+
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  attach_out="$(python3 "$WORK/expose-ask-pty.py" \
+    "min net expose $ask_port" "asks to publish port $ask_port/tcp of box \`$ask_name\`" \
+    min ${E2E_MINIMAL_ARGS:-} session attach "$sid" \
+    2>"$WORK/expose-ask-attach.err")"
+  ask_status=$?
+  if [ "$ask_status" -ne 0 ]; then
+    echo "::error::NET-045: the ask prompt for 'min net expose $ask_port' was never seen or never answered"
+    echo "--- transcript ---"; printf '%s\n' "$attach_out"
+    echo "--- stderr ---"; cat "$WORK/expose-ask-attach.err" 2>/dev/null || true
+    mnl session destroy --force "$sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  if ! printf '%s' "$attach_out" | tr -d '\r' | grep -q "asks to publish port $ask_port/tcp of box \`$ask_name\`"; then
+    echo "::error::NET-045: the attached terminal never showed the ask question"
+    printf '%s\n' "$attach_out"
+    fail
+  fi
+  if ! printf '%s' "$attach_out" | tr -d '\r' | grep -q "published $ask_name.min.internal:$ask_port at "; then
+    echo "::error::NET-045: answering 'y' did not publish the port"
+    printf '%s\n' "$attach_out"
+    fail
+  fi
+  echo "NET-045 OK: the human attached to the box was asked, over its own terminal, and their 'y' published it"
+
+  audit="$(audit_line_for "$ask_name")"
+  if [ -z "$E2E_VM" ]; then
+    if [ -z "$audit" ] || [[ "$audit" != *'"outcome":"published"'* ]] \
+        || [[ "$audit" != *'"decided_by":"attached-human"'* ]] || [[ "$audit" != *'"setting":"ask"'* ]]; then
+      echo "::error::NET-046: the audit log has no ask/published/attached-human record for $ask_name; got '${audit:-<none>}'"
+      fail
+    fi
+    echo "NET-046 OK: the ask decision is in the audit log: $audit"
+  fi
+
+  mnl session destroy --force "$sid" >/dev/null 2>&1 || true
+  rm -rf "$EXPOSE_SEED_DIR"; EXPOSE_SEED_DIR=""
+  echo "min net expose proof OK: allow published at once, deny refused with a typed reason, ask put it to the attached human and their answer decided it — every decision landed in the audit log"
+  echo "::endgroup::"
+}
+
 E2E_CASE="${E2E_CASE:-${1:-}}"
 if [ -n "$E2E_CASE" ]; then
   case "$E2E_CASE" in
@@ -2239,8 +2510,9 @@ if [ -n "$E2E_CASE" ]; then
     port_publishes_on_listen_and_box_outlives_client)
       run_case_port_publishes_on_listen_and_box_outlives_client; exit $? ;;
     github_only_allowlist) run_case_github_only_allowlist; exit $? ;;
+    expose_from_inside_box) run_case_expose_from_inside_box; exit $? ;;
     *)
-      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy, fresh_linux_kvm_activate_local_minvmd, fresh_arm64_kvm_activate_local_minvmd, hostnames_recover_and_two_daemons_route, proxy_refuses_like_direct, port_publishes_on_listen_and_box_outlives_client, github_only_allowlist)" >&2
+      echo "::error::unknown e2e case '$E2E_CASE' (known: min_internal_names_through_proxy, fresh_install_own_ip_ingress_publishes_loopback, session_outbound_request, native_resolution_without_proxy_env, own_ip_egress_declared_and_enforced, network_posture_from_stock_install, escape_reaches_only_declared_union, box_name_resolves_natively_without_proxy, fresh_linux_kvm_activate_local_minvmd, fresh_arm64_kvm_activate_local_minvmd, hostnames_recover_and_two_daemons_route, proxy_refuses_like_direct, port_publishes_on_listen_and_box_outlives_client, github_only_allowlist, expose_from_inside_box)" >&2
       exit 2
       ;;
   esac
