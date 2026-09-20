@@ -904,7 +904,11 @@ async fn async_main() -> Result<(), MainError> {
         // attached to the host gvproxy over the vsock shuttle. Held for the
         // server's lifetime (dropping `_egress` tears the relay down). Best
         // effort — if the host gvproxy is absent the daemon serves without
-        // network, the prior behaviour.
+        // network, the prior behaviour. Invariant: nothing between the READY
+        // marker above and `Server::run` below may block on the host answering —
+        // the listener is bound but unserved until the accept loop starts, so any
+        // wait here is a window where the bridge takes a connection and no daemon
+        // replies.
         let _egress = match guest::bring_up_root_egress().await {
             Ok(relay) => Some(relay),
             Err(e) => {

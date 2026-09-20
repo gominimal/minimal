@@ -1053,17 +1053,33 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     // own-IP attach, so without this the name would answer only on a node that
     // happens to run an own-address box. Best-effort: the node's egress is up
     // either way.
+    //
+    // Spawned rather than awaited, because "best-effort" has to mean off the
+    // bring-up path too: the control request waits on the host answering over
+    // the shuttle and only gives up at its own timeout, and bring-up runs
+    // between the READY marker and the accept loop. Awaiting it on a node where
+    // nothing answers the control socket left the bridge bound but unserved for
+    // that whole timeout — long enough for a `stop` issued at Running to miss
+    // the guest Shutdown RPC and leave the data volume's journal open.
     let control = crate::net::policy::ControlChannel::Vsock {
         cid: VSOCK_HOST_CID,
         port: VSOCK_GVPROXY_SHUTTLE_PORT,
     };
-    if let Err(e) = crate::net::policy::register_host_name(&control, DEFAULT_SUBNET).await {
-        tracing::warn!(
-            error = %e,
-            name = crate::net::policy::HOST_HOSTNAME,
-            "registering the host's name on the node's DNS layer"
-        );
-    }
+    let posted_at = std::time::Instant::now();
+    tokio::spawn(async move {
+        match crate::net::policy::register_host_name(&control, DEFAULT_SUBNET).await {
+            Ok(()) => tracing::debug!(
+                name = crate::net::policy::HOST_HOSTNAME,
+                elapsed_ms = posted_at.elapsed().as_millis() as u64,
+                "registered the host's name on the node's DNS layer"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                name = crate::net::policy::HOST_HOSTNAME,
+                "registering the host's name on the node's DNS layer"
+            ),
+        }
+    });
 
     tracing::info!(%cidr, %gateway, "guest root egress up via host gvproxy shuttle");
     Ok(relay)
