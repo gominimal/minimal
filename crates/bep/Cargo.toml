@@ -13,6 +13,7 @@ hex.workspace = true
 hkdf.workspace = true
 p256.workspace = true
 rand.workspace = true
+rcgen.workspace = true
 serde.workspace = true
 serde_json_lenient.workspace = true
 sha2.workspace = true
@@ -28,6 +29,7 @@ security-framework-sys.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 reqwest = { workspace = true, features = ["rustls"] }
+rustls.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 

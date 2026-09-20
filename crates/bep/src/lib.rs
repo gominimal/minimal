@@ -13,12 +13,17 @@
 //! - [`redeem`] is the redemption decision: one pure function that admits a
 //!   request carrying a sealed value exactly when every check passes, and
 //!   names the first failing check otherwise.
+//! - [`ca`] is the interception certificates: the root a box trusts, the one
+//!   signing certificate constrained to the names the host's boxes declare,
+//!   and the leaves issued under it.
 
+pub mod ca;
 pub mod keychain;
 pub mod keys;
 pub mod redeem;
 pub mod seal;
 
+pub use ca::{Authority, CaError, DeclaredUnion, Leaf};
 pub use keychain::{KeyStore, MemoryStore, PrivateKey, StoreError};
 pub use keys::{Fingerprint, KeyRole, KeyStatus, Keys, KeysError, inspect};
 pub use redeem::{Check, Decision, Redemption, decide};
