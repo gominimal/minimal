@@ -781,6 +781,62 @@ async fn session_policy_succeeds() {
     .unwrap();
 }
 
+/// `min session policy` shows the box's effective egress rules: every field of
+/// the `egress` section the daemon parsed, the denied subnets among them. The
+/// session carries the host's address, which is also where the daemon used to
+/// refuse the declaration outright.
+#[tokio::test]
+async fn policy_shows_effective_egress() {
+    let (daemon, args) = setup().await;
+
+    let project_path =
+        camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
+    let egress = sessions::EgressPolicy {
+        allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+        allow_dns_hosts: Some(vec!["api.example.com".to_string()]),
+        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+        deny_subnets: Some(vec!["10.1.0.0/16".to_string()]),
+    };
+    let session_id = create_session_with(
+        &daemon,
+        minimald_rpc::SessionConfig {
+            name: Some("egress-policy".to_string()),
+            project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
+            network: sessions::NetworkMode::HostNet,
+            policy: sessions::SessionPolicy::new(Some(egress.clone()), None),
+            hooks_enabled: true,
+            attrs: Default::default(),
+        },
+    )
+    .await;
+
+    let shown = session_policy_json(
+        &args,
+        PolicyArgs {
+            session: session_id.to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // What the user reads is the policy the daemon holds, field for field.
+    let parsed: sessions::SessionPolicy = serde_json_lenient::from_str(&shown).unwrap();
+    assert_eq!(parsed.egress, Some(egress));
+    // Each rule is legible in the line itself, not only after a round trip.
+    for rule in [
+        "allow_subnets",
+        "10.0.0.0/8",
+        "allow_dns_hosts",
+        "api.example.com",
+        "allow_protocols",
+        "tcp",
+        "deny_subnets",
+        "10.1.0.0/16",
+    ] {
+        assert!(shown.contains(rule), "{rule} missing from: {shown}");
+    }
+}
+
 // --- helpers ---
 
 /// Creates a session whose workspace mfile declares a `[session.vars]`
@@ -843,8 +899,6 @@ async fn create_session_at(
     name: &str,
     project_path: paths::HostAbsPath,
 ) -> SessionId {
-    let mut client = daemon.server.connect().await;
-
     let config = minimald_rpc::SessionConfig {
         name: Some(name.to_string()),
         project_path,
@@ -853,6 +907,16 @@ async fn create_session_at(
         hooks_enabled: true,
         attrs: Default::default(),
     };
+    create_session_with(daemon, config).await
+}
+
+/// Like [`create_session_at`] but takes the whole [`minimald_rpc::SessionConfig`],
+/// so a test can give the session a network mode and a networking policy.
+async fn create_session_with(
+    daemon: &common::TestDaemon,
+    config: minimald_rpc::SessionConfig,
+) -> SessionId {
+    let mut client = daemon.server.connect().await;
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,

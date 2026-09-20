@@ -83,6 +83,21 @@ fn build_record(
     record
         .validate_policy()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // One line per session start saying what the daemon made of the box's
+    // egress declaration, beside the network mode that decides how it is
+    // enforced: a count per field, so a rule list that arrived short — or a
+    // section that never arrived at all — is visible in the log without the
+    // record in hand. Counts, not values: destinations are the operator's.
+    let egress = record.policy.egress.as_ref();
+    tracing::info!(
+        network = ?record.network,
+        egress_declared = egress.is_some(),
+        allow_subnets = ?egress.and_then(|e| e.allow_subnets.as_ref()).map(Vec::len),
+        allow_dns_hosts = ?egress.and_then(|e| e.allow_dns_hosts.as_ref()).map(Vec::len),
+        allow_protocols = ?egress.and_then(|e| e.allow_protocols.as_ref()).map(Vec::len),
+        deny_subnets = ?egress.and_then(|e| e.deny_subnets.as_ref()).map(Vec::len),
+        "session egress policy parsed (None = field not declared)"
+    );
     Ok(record)
 }
 

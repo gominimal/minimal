@@ -844,6 +844,21 @@ pub async fn cmd_session_policy(
     global: &GlobalArgs,
     args: PolicyArgs,
 ) -> Result<(), anyhow::Error> {
+    println!("{}", session_policy_json(global, args).await?);
+    Ok(())
+}
+
+/// Ask the daemon for a session's effective networking policy and render it as
+/// the JSON line [`cmd_session_policy`] prints: the egress rules the daemon
+/// parsed — every field of the box's `egress` section, including the subnets it
+/// denies — beside its ingress forwarding.
+///
+/// Split from the command so what the user reads is assertable without
+/// capturing stdout.
+pub async fn session_policy_json(
+    global: &GlobalArgs,
+    args: PolicyArgs,
+) -> Result<String, anyhow::Error> {
     ensure_daemon(global)?;
 
     let mut client = connect_daemon(global).await?;
@@ -858,10 +873,7 @@ pub async fn cmd_session_policy(
 
     match resp {
         minimald_rpc::Errorable::Ok(policy) => {
-            let json =
-                serde_json_lenient::to_string(&policy).context("Failed to serialize policy")?;
-            println!("{json}");
-            Ok(())
+            serde_json_lenient::to_string(&policy).context("Failed to serialize policy")
         }
         minimald_rpc::Errorable::Err { error } => {
             bail!("{error}")

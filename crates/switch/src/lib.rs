@@ -30,6 +30,12 @@ pub const VSOCK_GVPROXY_SHUTTLE_PORT: u32 = 1024;
 ///
 /// Chosen so PTask switch addresses never collide with the common RFC 1918
 /// ranges a host or its containers already use.
+///
+/// This is the default address plan, and an un-enrolled host — one with no
+/// gateway to assign it a plan — self-allocates box addresses out of it: the
+/// switch's [`Default`] is this block, and the allocator walks
+/// [`first_ptask`](SwitchSubnet::first_ptask)`..=`[`last_ptask`](SwitchSubnet::last_ptask)
+/// within it.
 pub const DEFAULT_SUBNET: SwitchSubnet = SwitchSubnet {
     base: Ipv4Addr::new(100, 64, 0, 0),
     prefix: 16,
@@ -326,6 +332,50 @@ mod tests {
         assert_eq!(net.gateway(), Ipv4Addr::new(100, 64, 0, 1));
         assert_eq!(net.host_alias(), Ipv4Addr::new(100, 64, 255, 254));
         assert_eq!(net.daemon_ip(), Ipv4Addr::new(100, 64, 255, 253));
+    }
+
+    /// An un-enrolled host has no gateway to hand it an address plan, so it
+    /// self-allocates box addresses from the default plan: the subnet a switch
+    /// takes when nobody supplies one is the CGNAT block, and the addresses it
+    /// hands boxes all fall inside that block, clear of the reserved gateway,
+    /// daemon, host-alias and broadcast addresses that would collide.
+    #[test]
+    fn unenrolled_self_allocates_default_plan() {
+        // No plan supplied is the un-enrolled case: `Default` is what the
+        // allocator and the switch supervisor construct from.
+        let plan = SwitchSubnet::default();
+        assert_eq!(plan, DEFAULT_SUBNET);
+        // RFC 6598 space, so a self-allocating host cannot collide with the
+        // RFC 1918 networks it or its containers already use.
+        assert_eq!(plan.network(), Ipv4Addr::new(100, 64, 0, 0));
+        assert_eq!(plan.prefix(), 16);
+
+        let (first, last) = (plan.first_ptask(), plan.last_ptask());
+        assert!(first <= last, "the default plan must have room for a box");
+        // Every self-allocated address lies inside the plan.
+        for addr in [first, last] {
+            assert_eq!(
+                u32::from(Ipv4Addr::from(addr)) & u32::from(plan.netmask()),
+                u32::from(plan.network()),
+                "{} is outside {plan}",
+                Ipv4Addr::from(addr)
+            );
+        }
+        // And none of the reserved addresses is inside the box range.
+        for reserved in [
+            plan.network(),
+            plan.gateway(),
+            plan.daemon_ip(),
+            plan.host_alias(),
+            plan.broadcast(),
+        ] {
+            let reserved = u32::from(reserved);
+            assert!(
+                reserved < first || reserved > last,
+                "{} is inside the box range",
+                Ipv4Addr::from(reserved)
+            );
+        }
     }
 
     #[test]
