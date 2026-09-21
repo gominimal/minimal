@@ -67,8 +67,8 @@ pub enum StoreError {
     /// (BEP-060).
     #[error(
         "the key store holds the key but will not let this program use it, which is what it \
-         does for a key another program generated; replacing the key is the way back, and \
-         every member sealed to the old one is refused from then on"
+         does for a key another program generated; `bep --replace-key <sealing|root|signing>` \
+         is the way back, and every member sealed to the old key is refused from then on"
     )]
     Unusable,
 }

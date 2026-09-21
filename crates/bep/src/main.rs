@@ -31,8 +31,8 @@ use bep::keychain::SecretItems;
 use bep::listener::{Config, Module, Proxy, RegisteredRule, Sender};
 use bep::mint::Inject;
 use bep::upstream::{self, Trust};
-use bep::{Authority, DeclaredUnion, KeyStore, Keys, Log};
-use clap::Parser;
+use bep::{Authority, DeclaredUnion, KeyRole, KeyStore, Keys, Log};
+use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, UnixListener};
@@ -58,15 +58,16 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:7656")]
     listen: SocketAddr,
 
-    /// The audit log, appended to and never rewritten.
-    #[arg(long)]
-    audit_log: PathBuf,
+    /// The audit log, appended to and never rewritten. Required to serve;
+    /// a `--replace-key` run writes no record, because it serves nothing.
+    #[arg(long, required_unless_present = "replace_keys")]
+    audit_log: Option<PathBuf>,
 
     /// The box attachments on this host: a JSON list of objects with
     /// `source` (the box's address), `box`, `addressing` (`own_ip` or
     /// `host_ip`) and an optional `egress` host allow-list.
-    #[arg(long)]
-    boxes: PathBuf,
+    #[arg(long, required_unless_present = "replace_keys")]
+    boxes: Option<PathBuf>,
 
     /// A `host:port` of the module's host set; repeatable. Defaults to the
     /// v1 GitHub set.
@@ -104,6 +105,34 @@ struct Cli {
     /// no rule and refuses every store handle.
     #[arg(long)]
     store_rules: Option<PathBuf>,
+
+    /// Replace these keys and exit, serving nothing: the explicit operator
+    /// command BEP-060 requires before a key changes, and the way back from a
+    /// store that no longer admits this program. Repeatable.
+    ///
+    /// Every member sealed to a replaced sealing key, and every leaf under a
+    /// replaced root, is refused from then on; a running box holding one is
+    /// re-created to re-mint (BEP-060).
+    #[arg(long = "replace-key", value_name = "ROLE")]
+    replace_keys: Vec<RoleArg>,
+}
+
+/// Which key `--replace-key` names, as the command line spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RoleArg {
+    Sealing,
+    Root,
+    Signing,
+}
+
+impl From<RoleArg> for KeyRole {
+    fn from(arg: RoleArg) -> Self {
+        match arg {
+            RoleArg::Sealing => Self::Sealing,
+            RoleArg::Root => Self::Root,
+            RoleArg::Signing => Self::Signing,
+        }
+    }
 }
 
 /// One box attachment: the address the box's connections arrive from, and
@@ -325,6 +354,58 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// Replaces the named keys and reports the set that results: `store` drops
+/// each one, and opening the set generates a new one in its place (BEP-060).
+///
+/// Dropping first, rather than replacing through an already-open set, is what
+/// makes this the way back from a key this program cannot use. Opening the set
+/// is precisely what fails then — deriving each key's public half is the first
+/// thing it does — so a remedy that needed an open set could never run when it
+/// is needed.
+///
+/// Every member sealed to a replaced sealing key, and every leaf under a
+/// replaced root, is refused from here on. Nothing warns twice: the caller
+/// asked for this by name.
+fn replace_keys<S>(store: S, roles: &[RoleArg]) -> Result<(), Box<dyn Error>>
+where
+    S: KeyStore,
+{
+    for role in roles.iter().copied().map(KeyRole::from) {
+        match store.delete(role.store_name()) {
+            Ok(()) => tracing::info!(role = %role, "dropped the key held for replacement"),
+            // A store holding no such key is where a replacement leaves it
+            // anyway, so this is the asked-for state, not a failure.
+            Err(bep::StoreError::Missing { .. }) => {
+                tracing::info!(role = %role, "the store held no key to replace");
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let keys = Keys::open(store).map_err(|error| -> Box<dyn Error> {
+        // Opening the set touches every key, not just the replaced ones. A
+        // program locked out of one of its keys is usually locked out of all
+        // of them, so say which one is left rather than report a role the
+        // operator did not name and leave them to guess why.
+        if let bep::KeysError::Store {
+            role,
+            source: bep::StoreError::Unusable,
+        } = &error
+            && !roles.iter().copied().map(KeyRole::from).any(|r| r == *role)
+        {
+            return format!(
+                "the {role} key is one this program cannot use either, and opening the set \
+                 touches every key: name it too, with --replace-key {role}"
+            )
+            .into();
+        }
+        error.into()
+    })?;
+    for role in KeyRole::ALL {
+        println!("{role} {}", keys.fingerprint(role));
+    }
+    Ok(())
+}
+
 /// The proxy over `store`'s keys, reading referenced values from `secrets`.
 async fn run<S>(
     store: S,
@@ -335,8 +416,17 @@ where
     S: KeyStore + Send + Sync + 'static,
     S::Key: Send + Sync + 'static,
 {
+    // Before anything the proxy needs to serve: a replacement is what an
+    // operator runs when the proxy cannot start, so it must not depend on the
+    // files, listeners or rules a running proxy does.
+    if !cli.replace_keys.is_empty() {
+        return replace_keys(store, &cli.replace_keys);
+    }
+
+    // Past the replacement branch above, clap has proved both are present.
+    let boxes = cli.boxes.as_ref().expect("--boxes is required to serve");
     let attachments: Vec<Attachment> =
-        serde_json_lenient::from_str(&std::fs::read_to_string(&cli.boxes)?)?;
+        serde_json_lenient::from_str(&std::fs::read_to_string(boxes)?)?;
     let hosts = if cli.hosts.is_empty() {
         GITHUB_HOST_SET.map(str::to_owned).to_vec()
     } else {
@@ -374,7 +464,11 @@ where
         tracing::warn!("the proxy holds no store rule; every store handle is refused");
     }
 
-    let log = Log::open(&cli.audit_log)?;
+    let log = Log::open(
+        cli.audit_log
+            .as_ref()
+            .expect("--audit-log is required to serve"),
+    )?;
     let config = Config {
         modules: vec![Module {
             id: "github".to_owned(),
@@ -420,4 +514,43 @@ where
     tracing::info!(listen = %cli.listen, "the box egress proxy is listening");
     proxy.serve(listener).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use bep::MemoryStore;
+
+    use super::*;
+
+    /// A replacement changes the keys it names and leaves the rest of the set
+    /// alone: an operator replacing a compromised sealing key does not also
+    /// invalidate every leaf the root has issued (BEP-060).
+    #[test]
+    fn replacing_one_key_leaves_the_others_where_they_were() {
+        let store = MemoryStore::new();
+        let before = Keys::open(store.clone()).unwrap();
+        let (sealing, root, signing) = (
+            before.fingerprint(KeyRole::Sealing),
+            before.fingerprint(KeyRole::Root),
+            before.fingerprint(KeyRole::Signing),
+        );
+        drop(before);
+
+        replace_keys(store.clone(), &[RoleArg::Sealing]).unwrap();
+
+        let after = Keys::open(store).unwrap();
+        assert_ne!(after.fingerprint(KeyRole::Sealing), sealing);
+        assert_eq!(after.fingerprint(KeyRole::Root), root);
+        assert_eq!(after.fingerprint(KeyRole::Signing), signing);
+    }
+
+    /// Replacing a key the store does not hold is the asked-for state, not a
+    /// failure: it is where a replacement leaves the store anyway, and a
+    /// store holding nothing is exactly what a first run finds.
+    #[test]
+    fn replacing_a_key_the_store_never_held_generates_it() {
+        let store = MemoryStore::new();
+        replace_keys(store.clone(), &[RoleArg::Root]).unwrap();
+        assert!(Keys::open(store).is_ok());
+    }
 }
