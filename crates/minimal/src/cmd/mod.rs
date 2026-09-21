@@ -742,8 +742,12 @@ fn handle_injection(injection: &sessions::Injection) -> Result<bep::mint::Inject
 }
 
 /// Mints one short-lived handle per admitted store reference, sealed to this
-/// host's keys and bound to `box_name`, and registers the client's own
+/// host's keys and bound to `box_id`, and registers the client's own
 /// handle-signing key with the proxy first (BEP-063).
+///
+/// Each handle's mint is recorded with the proxy before the handle is sealed,
+/// and the envelope carries the position the log gave the record: a
+/// revocation covers what was minted before it and nothing after (BEP-043).
 ///
 /// The registration goes over the proxy's control socket before any handle is
 /// minted: a handle the proxy cannot verify is no use to the box, so a proxy
@@ -758,13 +762,13 @@ fn handle_injection(injection: &sessions::Injection) -> Result<bep::mint::Inject
 /// # Errors
 ///
 /// When the client's handle-signing key cannot be opened or described, the
-/// proxy does not register it, a rule registers a form no handle can carry, or
-/// a handle cannot be minted or sealed.
+/// proxy does not register it or does not record a mint, a rule registers a
+/// form no handle can carry, or a handle cannot be minted or sealed.
 pub async fn mint_store_handles<S: bep::KeyStore>(
     key_store: &S,
     identity: &bep::PublicIdentity,
     control: &std::path::Path,
-    box_name: &str,
+    box_id: &str,
     host: &str,
     admitted: &[sessions::AdmittedReference<'_>],
     now: u64,
@@ -785,20 +789,23 @@ pub async fn mint_store_handles<S: bep::KeyStore>(
         let reference = &candidate.reference;
         let inject = handle_injection(&candidate.rule.inject)?;
         let store = reference.store.to_string();
-        let handle = bep::mint::mint_store_handle(
-            identity,
-            &client,
-            &bep::mint::StoreMintRequest {
-                box_id: box_name,
-                host,
-                store: &store,
-                id: &reference.id,
-                upstream: &candidate.rule.upstream,
-                inject: &inject,
-                now,
-            },
+        let request = bep::mint::StoreMintRequest {
+            box_id,
+            host,
+            store: &store,
+            id: &reference.id,
+            upstream: &candidate.rule.upstream,
+            inject: &inject,
+            now,
+        };
+        let recorded = crate::auth::submit_audit(
+            control,
+            &bep::Submission::Audit(bep::mint::store_mint_event(&request)),
         )
-        .with_context(|| format!("minting a handle for the {reference}"))?;
+        .await
+        .with_context(|| format!("recording the mint of a handle for the {reference}"))?;
+        let handle = bep::mint::mint_store_handle(identity, &client, &request, recorded.position)
+            .with_context(|| format!("minting a handle for the {reference}"))?;
         minted.push((reference.env.clone(), handle.value));
     }
     Ok(minted)
@@ -878,9 +885,10 @@ mod tests {
         }
     }
 
-    /// A proxy's control socket, for the client to register a key over: it
-    /// records every submission it is sent and answers a registration the way
-    /// the proxy does, refusing anything else.
+    /// A proxy's control socket, for the client to register a key and record
+    /// mints over: it records every submission it is sent, answers a
+    /// registration the way the proxy does, and answers an audit submission
+    /// with its record placed at the submission's index.
     fn control_socket(path: &std::path::Path) -> Arc<Mutex<Vec<bep::Submission>>> {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&seen);
@@ -898,8 +906,19 @@ mod tests {
                         .await
                         .unwrap();
                     let submission: bep::Submission = serde_json_lenient::from_str(&line).unwrap();
-                    recorded.lock().unwrap().push(submission.clone());
+                    let position = {
+                        let mut recorded = recorded.lock().unwrap();
+                        recorded.push(submission.clone());
+                        u64::try_from(recorded.len() - 1).unwrap()
+                    };
                     let reply = match &submission {
+                        bep::Submission::Audit(event) => {
+                            serde_json_lenient::to_string(&bep::Appended {
+                                record: bep::Record::new(event, bep::Hash::ZERO),
+                                position,
+                            })
+                            .unwrap()
+                        }
                         bep::Submission::RegisterKey(key) => keys
                             .lock()
                             .unwrap()
@@ -990,12 +1009,13 @@ mod tests {
         .unwrap();
 
         // The key the proxy verifies handles under reached it over the control
-        // socket, once, and it is the client's own key — nothing else was
-        // submitted, and no value of any kind was.
+        // socket, once and first, and it is the client's own key; then one
+        // mint record per handle, naming the box and the stored value's
+        // identifier — no value of any kind was submitted.
         let client = bep::mint::client_key(&store).unwrap();
         let public = client.public_key().unwrap();
         let submissions = seen.lock().unwrap().clone();
-        assert_eq!(submissions.len(), 1, "{submissions:?}");
+        assert_eq!(submissions.len(), 3, "{submissions:?}");
         match &submissions[0] {
             bep::Submission::RegisterKey(key) => {
                 assert_eq!(key, &bep::control::ClientKey::of(&public));
@@ -1006,6 +1026,19 @@ mod tests {
             }
             other => panic!("expected a key registration, got {other:?}"),
         }
+        for (submission, reference) in submissions[1..].iter().zip(&references) {
+            match submission {
+                bep::Submission::Audit(event) => {
+                    assert_eq!(event.kind, bep::Kind::Mint);
+                    assert_eq!(event.box_id, BOX);
+                    assert_eq!(
+                        event.credential.as_deref(),
+                        Some(format!("keychain:{}", reference.id).as_str())
+                    );
+                }
+                other => panic!("expected a mint record, got {other:?}"),
+            }
+        }
 
         // One handle per reference, in the variable the reference names.
         assert_eq!(minted.len(), 2);
@@ -1014,13 +1047,20 @@ mod tests {
             .public_key()
             .unwrap();
         let mut handles = Vec::new();
-        for ((env, value), (reference, rule)) in minted.iter().zip(references.iter().zip(&rules)) {
+        for (index, ((env, value), (reference, rule))) in
+            minted.iter().zip(references.iter().zip(&rules)).enumerate()
+        {
             assert_eq!(env, &reference.env);
             // What the box carries is the envelope, not the handle in the
             // clear: the handle is the member inside it, bound to this box.
             assert!(value.as_str().starts_with(bep::seal::PREFIX), "{value}");
             let unsealed = bep::unseal(&keys, value.as_str()).unwrap();
             assert_eq!(unsealed.context.box_id, BOX);
+            // Sealed after its mint was recorded, carrying where it was.
+            assert_eq!(
+                unsealed.context.mint_position,
+                u64::try_from(index + 1).unwrap()
+            );
             assert_eq!(unsealed.context.host, HOST);
             assert_eq!(unsealed.context.module, "keychain");
             assert_eq!(unsealed.context.mode, bep::mint::STORE_MODE);
@@ -1085,8 +1125,8 @@ mod tests {
         );
         assert!(handle.verifies_under(&public));
         let submissions = seen.lock().unwrap().clone();
-        assert_eq!(submissions.len(), 2, "{submissions:?}");
-        assert_eq!(submissions[0], submissions[1]);
+        assert_eq!(submissions.len(), 5, "{submissions:?}");
+        assert_eq!(submissions[0], submissions[3]);
 
         // A box that refers to nothing registers nothing and mints nothing.
         assert!(
@@ -1103,6 +1143,6 @@ mod tests {
             .unwrap()
             .is_empty()
         );
-        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_eq!(seen.lock().unwrap().len(), 5);
     }
 }

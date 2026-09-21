@@ -381,6 +381,59 @@ fn head_of_log(active: &Path) -> Result<Hash, AuditError> {
     Ok(Hash::ZERO)
 }
 
+/// The records every segment of the log at `active` holds, oldest first, each
+/// with its position: its index among all of them, counting from zero.
+///
+/// A record's position is how the log orders it against every other, across
+/// rotations: a revocation covers what was minted before it and nothing after
+/// ([`crate::control::Revocations`]). A segment that is not there holds none.
+///
+/// # Errors
+///
+/// [`AuditError::Read`] when a segment cannot be read, or
+/// [`AuditError::Malformed`] when one holds a line that is no record.
+pub fn positioned(active: &Path) -> Result<Vec<(u64, Record)>, AuditError> {
+    let mut records = Vec::new();
+    for segment in segments(active)? {
+        for line in record_lines(&segment)? {
+            let record: Record =
+                serde_json_lenient::from_str(&line).map_err(|source| AuditError::Malformed {
+                    path: segment.clone(),
+                    source,
+                })?;
+            records.push((u64::try_from(records.len()).unwrap_or(u64::MAX), record));
+        }
+    }
+    Ok(records)
+}
+
+/// How many records every segment of the log at `active` holds.
+fn records_in(active: &Path) -> Result<u64, AuditError> {
+    let mut records = 0u64;
+    for segment in segments(active)? {
+        records += u64::try_from(record_lines(&segment)?.len()).unwrap_or(u64::MAX);
+    }
+    Ok(records)
+}
+
+/// The lines of `segment` that hold a record: every line but a blank one, and
+/// none when the segment is not there.
+fn record_lines(segment: &Path) -> Result<Vec<String>, AuditError> {
+    match std::fs::read(segment) {
+        Ok(bytes) => Ok(bytes
+            .split(|byte| *byte == b'\n')
+            .map(String::from_utf8_lossy)
+            .filter(|line| !line.trim().is_empty())
+            .map(std::borrow::Cow::into_owned)
+            .collect()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(AuditError::Read {
+            path: segment.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// The index of a rotated segment of the log named `active`: `<active>.<n>`,
 /// with `n` a decimal index, or `None` for any other name.
 fn rotated_index(path: &Path, active: &str) -> Option<u32> {
@@ -448,6 +501,9 @@ pub struct Log {
     path: PathBuf,
     file: File,
     head: Hash,
+    /// How many records every segment holds: the position the next record
+    /// takes.
+    records: u64,
     /// The bytes the active segment holds.
     size: u64,
     /// The size the active segment rotates at (BEP-068).
@@ -478,10 +534,12 @@ impl Log {
             })?
             .len();
         let head = head_of_log(&path)?;
+        let records = records_in(&path)?;
         Ok(Self {
             path,
             file,
             head,
+            records,
             size,
             bound: SEGMENT_BYTES,
         })
@@ -508,6 +566,13 @@ impl Log {
         &self.path
     }
 
+    /// How many records the log holds across every segment: the position the
+    /// next record appended takes, counting from zero.
+    #[must_use]
+    pub fn records(&self) -> u64 {
+        self.records
+    }
+
     /// Appends the one record `event` makes and returns it, rotating the active
     /// segment first when it has reached its size bound (BEP-068).
     ///
@@ -529,6 +594,7 @@ impl Log {
                 source,
             })?;
         self.head = hash;
+        self.records += 1;
         self.size += u64::try_from(line.len()).unwrap_or(u64::MAX);
         tracing::info!(
             kind = %record.kind,
@@ -582,11 +648,36 @@ impl Log {
 /// so a subject holding one names a box under another.
 pub const CHILD_SEPARATOR: char = '/';
 
+/// What separates a box's name from the id of its creation in the subject a
+/// value is sealed for and a revocation names: `<name>@<id>`. No session name
+/// carries it either.
+pub const INSTANCE_SEPARATOR: char = '@';
+
+/// The subject a box named `name`, created as `instance`, is known by: unique
+/// per creation, so a box made again under a name that was used before is a
+/// different subject, and the revocation of the one before does not reach it
+/// (BEP-043). The name leads, so the trail still reads by name.
+#[must_use]
+pub fn box_subject(name: &str, instance: &str) -> String {
+    format!("{name}{INSTANCE_SEPARATOR}{instance}")
+}
+
+/// The name of the box `subject` names: what a person calls it, with the id
+/// of its creation left off.
+#[must_use]
+pub fn box_name(subject: &str) -> &str {
+    subject
+        .split_once(INSTANCE_SEPARATOR)
+        .map_or(subject, |(name, _)| name)
+}
+
 /// Which records a read of the log wants (BEP-042).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Subject {
     /// One box's records and no other's, whether or not the box still
     /// exists: the log is the proxy's, so a reaped box's trail stays in it.
+    /// A name reads every box ever created under it, each record naming its
+    /// own creation; a `<name>@<id>` subject reads that one creation.
     Box(String),
     /// The records of every box under one, merged onto the one stream each
     /// record names its own box on.
@@ -598,7 +689,15 @@ impl Subject {
     #[must_use]
     pub fn admits(&self, sub: &str) -> bool {
         match self {
-            Self::Box(box_id) => sub == box_id,
+            Self::Box(box_id) => {
+                sub == box_id
+                    || sub
+                        .strip_prefix(box_id.as_str())
+                        .and_then(|rest| rest.strip_prefix(INSTANCE_SEPARATOR))
+                        .is_some_and(|instance| {
+                            !instance.is_empty() && !instance.contains(CHILD_SEPARATOR)
+                        })
+            }
             Self::Children(parent) => sub
                 .strip_prefix(parent.as_str())
                 .and_then(|under| under.strip_prefix(CHILD_SEPARATOR))
@@ -1100,6 +1199,34 @@ mod tests {
             .read(&Subject::Box("web".to_owned()))
             .expect_err("a line that is no record is an error");
         assert!(matches!(error, AuditError::Malformed { .. }), "{error}");
+    }
+
+    /// A box's name reads every box created under it, each by its own
+    /// subject, and a subject with its creation's id reads that one: a box
+    /// made again under a used name is a different subject, and its trail is
+    /// still found by name.
+    #[test]
+    fn a_box_name_reads_every_creation_under_it() {
+        let first = box_subject("web", "0199a4c2");
+        let second = box_subject("web", "0199a4d7");
+        assert_eq!(first, "web@0199a4c2");
+        assert_eq!(box_name(&first), "web");
+        assert_eq!(box_name("web"), "web");
+
+        let by_name = Subject::Box("web".to_owned());
+        for sub in ["web", first.as_str(), second.as_str()] {
+            assert!(by_name.admits(sub), "{sub}");
+        }
+        // Not another box whose name it prefixes, not a creation with no id,
+        // and not a box under one of its creations.
+        for sub in ["webapp", "webapp@0199a4c2", "web@", "web@0199a4c2/agent-1"] {
+            assert!(!by_name.admits(sub), "{sub}");
+        }
+
+        let one = Subject::Box(first.clone());
+        assert!(one.admits(&first));
+        assert!(!one.admits(&second));
+        assert!(!one.admits("web"));
     }
 
     /// A request as the proxy handles it: the fields it may record, and the

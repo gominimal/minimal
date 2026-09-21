@@ -27,7 +27,7 @@
 //! the redemption listener, which stays closed to everything that is not a box
 //! attachment (BEP-026, BEP-063).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::Permissions;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
@@ -161,6 +161,18 @@ impl ClientKeys {
     }
 }
 
+/// What the proxy answers an audit submission with: the record it appended,
+/// and the record's position in the log — what a value minted under that
+/// record carries, so a revocation can tell whether it came before the mint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Appended {
+    /// The record appended.
+    #[serde(flatten)]
+    pub record: Record,
+    /// Its position in the log, counting every segment from zero.
+    pub position: u64,
+}
+
 /// The longest a revocation may take to reach the decision, in seconds
 /// (BEP-043, BEP-044).
 ///
@@ -175,51 +187,41 @@ pub const REVOCATION_DEADLINE_SECS: u64 = 60;
 /// The revocations in force on this host: what may no longer be redeemed,
 /// whatever a sealed value's own expiry says (BEP-024).
 ///
-/// A subject is a box name, from `min box stop` or `min box rm` of that box
+/// A subject is a box, from `min box stop` or `min box rm` of that box
 /// (BEP-043), or a module, from `min auth logout` on this host (BEP-044). Both
 /// are the names the sealed context carries, not the ids the decision interns:
 /// the set outlives any one request, while the ids are minted per request by
 /// the shell.
+///
+/// A revocation covers what was minted before it and nothing after: each
+/// subject is held with the log position of its latest revocation, and a
+/// sealed value carries the position of its own mint record, so a box made
+/// again under a removed box's name, or a sign-in made again after a logout,
+/// mints values the earlier revocation does not reach.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Revocations {
-    /// Box names every sealed value naming which is refused.
-    boxes: BTreeSet<String>,
-    /// Modules every member of which is refused on this host.
-    modules: BTreeSet<String>,
+    /// Each revoked box, with the position of its latest revocation.
+    boxes: BTreeMap<String, u64>,
+    /// Each revoked module, with the position of its latest revocation.
+    modules: BTreeMap<String, u64>,
 }
 
 impl Revocations {
-    /// The revocations the log at `path` records, oldest first: the set a
-    /// proxy starts from, so a restart refuses what was revoked before it.
+    /// The revocations the log at `path` records across every segment: the
+    /// set a proxy starts from, so a restart refuses what was revoked before
+    /// it, however long ago the log rotated past it.
     ///
     /// A log that is not there yet is no revocation at all — a host whose
     /// proxy has never run.
     ///
     /// # Errors
     ///
-    /// [`AuditError::Read`] when the log cannot be read, or
-    /// [`AuditError::Malformed`] when it holds a line that is no record.
+    /// [`AuditError::Read`] when a segment cannot be read, or
+    /// [`AuditError::Malformed`] when one holds a line that is no record.
     pub fn in_log(path: &Path) -> Result<Self, AuditError> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(source) => {
-                return Err(AuditError::Read {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-        };
         let mut revocations = Self::default();
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let record: Record =
-                serde_json_lenient::from_str(line).map_err(|source| AuditError::Malformed {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
-            revocations.record(&record);
+        for (position, record) in crate::audit::positioned(path)? {
+            revocations.record(&record, position);
         }
         Ok(revocations)
     }
@@ -230,33 +232,40 @@ impl Revocations {
         self.boxes.is_empty() && self.modules.is_empty()
     }
 
-    /// Puts what `record` revokes in force; a record of any other kind
-    /// changes nothing.
+    /// Puts what `record`, at `position` in the log, revokes in force; a
+    /// record of any other kind changes nothing.
     ///
     /// A revocation naming [`EVERY_BOX`] is the logout of a sign-in, so it
     /// covers the module its member identifier names rather than a box.
-    pub fn record(&mut self, record: &Record) {
+    pub fn record(&mut self, record: &Record, position: u64) {
         if record.kind != Kind::Revocation {
             return;
         }
-        if record.sub == EVERY_BOX {
-            self.modules
-                .insert(module_of(&record.credential).to_owned());
+        let (held, subject) = if record.sub == EVERY_BOX {
+            (&mut self.modules, module_of(&record.credential))
         } else {
-            self.boxes.insert(record.sub.clone());
-        }
+            (&mut self.boxes, record.sub.as_str())
+        };
+        let revoked = held.entry(subject.to_owned()).or_default();
+        *revoked = (*revoked).max(position);
     }
 
-    /// Whether every sealed value naming `box_id` is refused (BEP-043).
+    /// Whether a sealed value naming `box_id`, whose mint the log recorded at
+    /// `minted`, is refused (BEP-043).
     #[must_use]
-    pub fn covers_box(&self, box_id: &str) -> bool {
-        self.boxes.contains(box_id)
+    pub fn covers_box(&self, box_id: &str, minted: u64) -> bool {
+        self.boxes
+            .get(box_id)
+            .is_some_and(|&revoked| minted < revoked)
     }
 
-    /// Whether every member of `module` on this host is refused (BEP-044).
+    /// Whether a member of `module`, whose mint the log recorded at `minted`,
+    /// is refused on this host (BEP-044).
     #[must_use]
-    pub fn covers_module(&self, module: &str) -> bool {
-        self.modules.contains(module)
+    pub fn covers_module(&self, module: &str, minted: u64) -> bool {
+        self.modules
+            .get(module)
+            .is_some_and(|&revoked| minted < revoked)
     }
 }
 
@@ -307,7 +316,7 @@ pub fn submit(
     log: &mut Log,
     revocations: &mut Revocations,
     submission: &Submission,
-) -> Result<Record, ControlError> {
+) -> Result<Appended, ControlError> {
     let Submission::Audit(event) = submission else {
         return Err(ControlError::NotAudit);
     };
@@ -324,8 +333,9 @@ pub fn submit(
         box_id = %event.box_id,
         "appending a control-socket audit submission"
     );
+    let position = log.records();
     let record = log.append(event)?;
-    revocations.record(&record);
+    revocations.record(&record, position);
     if record.kind == Kind::Revocation {
         tracing::info!(
             subject = %record.sub,
@@ -334,7 +344,7 @@ pub fn submit(
             "a revocation is in force; every request from here on reads it"
         );
     }
-    Ok(record)
+    Ok(Appended { record, position })
 }
 
 // ---------------------------------------------------------------------------
@@ -473,8 +483,10 @@ mod tests {
             &Submission::Audit(event(Kind::Mint)),
         )
         .unwrap();
-        assert_eq!(minted.kind, Kind::Mint);
-        assert_eq!(minted.previous_hash, decided.line_hash());
+        assert_eq!(minted.record.kind, Kind::Mint);
+        assert_eq!(minted.record.previous_hash, decided.line_hash());
+        // The answer names where the record sits: after the decision.
+        assert_eq!(minted.position, 1);
         // A mint revokes nothing.
         assert!(revocations.is_empty());
         let revoked = submit(
@@ -482,11 +494,13 @@ mod tests {
             &mut revocations,
             &Submission::Audit(event(Kind::Revocation)),
         )
-        .unwrap();
-        assert_eq!(revoked.previous_hash, minted.line_hash());
+        .unwrap()
+        .record;
+        assert_eq!(revoked.previous_hash, minted.record.line_hash());
         assert_ne!(revoked.previous_hash, Hash::ZERO);
-        // The append and the set move together: the box is refused from here.
-        assert!(revocations.covers_box("box-a1"));
+        // The append and the set move together: the box's mint is refused
+        // from here.
+        assert!(revocations.covers_box("box-a1", minted.position));
 
         // A decision is the proxy's own: submitting one appends nothing.
         let refused = submit(
@@ -523,6 +537,14 @@ mod tests {
                 .is_empty()
         );
 
+        let minted = submit(
+            &mut log,
+            &mut revocations,
+            &Submission::Audit(event(Kind::Mint)),
+        )
+        .unwrap()
+        .position;
+
         // `min box rm box-a1`: that box, and nothing else.
         submit(
             &mut log,
@@ -530,21 +552,60 @@ mod tests {
             &Submission::Audit(event(Kind::Revocation)),
         )
         .unwrap();
-        assert!(revocations.covers_box("box-a1"));
-        assert!(!revocations.covers_box("box-b2"));
-        assert!(!revocations.covers_module("github"));
+        assert!(revocations.covers_box("box-a1", minted));
+        assert!(!revocations.covers_box("box-b2", minted));
+        assert!(!revocations.covers_module("github", minted));
 
         // `min auth logout`: every member of the module on this host.
         let mut logout = event(Kind::Revocation);
         logout.box_id = EVERY_BOX.to_owned();
         submit(&mut log, &mut revocations, &Submission::Audit(logout)).unwrap();
-        assert!(revocations.covers_module("github"));
-        assert!(!revocations.covers_module("store"));
+        assert!(revocations.covers_module("github", minted));
+        assert!(!revocations.covers_module("store", minted));
         // The wildcard subject is not a box name of its own.
-        assert!(!revocations.covers_box(EVERY_BOX));
+        assert!(!revocations.covers_box(EVERY_BOX, minted));
 
         // What a proxy that restarts reads back out of the log.
         assert_eq!(Revocations::in_log(&path).unwrap(), revocations);
+    }
+
+    /// A revocation covers what was minted before it and nothing after: a box
+    /// name used again, and a sign-in made again after a logout, mint values
+    /// the earlier revocation does not reach — across a rotation and a
+    /// restart as much as within one run.
+    #[test]
+    fn a_revocation_covers_only_what_was_minted_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        // Rotating after every record: each record its own segment.
+        let mut log = Log::open(&path).unwrap().with_segment_bytes(0);
+        let mut revocations = Revocations::default();
+        let appended = |log: &mut Log, revocations: &mut Revocations, event: Event| {
+            submit(log, revocations, &Submission::Audit(event))
+                .unwrap()
+                .position
+        };
+
+        let before = appended(&mut log, &mut revocations, event(Kind::Mint));
+        appended(&mut log, &mut revocations, event(Kind::Revocation));
+        let mut logout = event(Kind::Revocation);
+        logout.box_id = EVERY_BOX.to_owned();
+        appended(&mut log, &mut revocations, logout);
+        let after = appended(&mut log, &mut revocations, event(Kind::Mint));
+
+        assert!(revocations.covers_box("box-a1", before));
+        assert!(revocations.covers_module("github", before));
+        assert!(!revocations.covers_box("box-a1", after));
+        assert!(!revocations.covers_module("github", after));
+
+        // A restarted proxy reads every rotated segment, in order.
+        assert!(crate::audit::segments(&path).unwrap().len() > 2);
+        let replayed = Revocations::in_log(&path).unwrap();
+        assert_eq!(replayed, revocations);
+        assert!(replayed.covers_box("box-a1", before));
+        assert!(!replayed.covers_box("box-a1", after));
+        // And a log reopened there positions its next record past them all.
+        assert_eq!(Log::open(&path).unwrap().records(), after + 1);
     }
 
     /// The submission is one wire form, and it round-trips — both a client's

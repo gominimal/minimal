@@ -62,8 +62,9 @@ struct Cli {
     audit_log: Option<PathBuf>,
 
     /// The box attachments on this host: a JSON list of objects with
-    /// `source` (the box's address), `box`, `addressing` (`own_ip` or
-    /// `host_ip`) and an optional `egress` host allow-list.
+    /// `source` (the box's address), `box` (the subject its values are sealed
+    /// for, `<name>@<session-id>`, or a cohort's name), `addressing` (`own_ip`
+    /// or `host_ip`) and an optional `egress` host allow-list.
     #[arg(long, required_unless_present = "replace_keys")]
     boxes: Option<PathBuf>,
 

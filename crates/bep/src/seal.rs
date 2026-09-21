@@ -62,6 +62,10 @@ pub struct SealedContext {
     pub breadth: String,
     /// The expiry, as seconds since the Unix epoch.
     pub expires_at: u64,
+    /// The position of the member's mint record in the proxy's audit log: a
+    /// revocation covers the member only when the log recorded it after this
+    /// (BEP-043, BEP-044).
+    pub mint_position: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -352,6 +356,7 @@ mod tests {
             mode: "sealed".into(),
             breadth: "account".into(),
             expires_at: 4_102_444_800,
+            mint_position: 7,
         }
     }
 
@@ -381,7 +386,7 @@ mod tests {
 
         // Every context field is authenticated: editing any one of them in
         // the envelope fails the unseal, even though the ciphertext is intact.
-        let edits: [(&str, Edit); 7] = [
+        let edits: [(&str, Edit); 8] = [
             ("box", |c| c.box_id = "box-b2".into()),
             ("host", |c| c.host = "mac-2".into()),
             ("module", |c| c.module = "gitlab".into()),
@@ -389,6 +394,7 @@ mod tests {
             ("mode", |c| c.mode = "passthrough".into()),
             ("breadth", |c| c.breadth = "org".into()),
             ("expires_at", |c| c.expires_at += 3600),
+            ("mint_position", |c| c.mint_position += 1),
         ];
         for (field, edit) in edits {
             let mut header = header_of(&sealed);

@@ -884,6 +884,36 @@ mod tests {
         assert!(crate::Cli::try_parse_from(["min", "box", "audit"]).is_err());
     }
 
+    /// A box made again under a name used before is its own subject, so its
+    /// trail and the removed box's stay apart — and a read by name still
+    /// finds both, each line naming its own creation.
+    #[test]
+    fn box_audit_reads_every_box_made_under_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let first = bep::audit::box_subject("web", "0199a4c2-7d1e-7a3b-9f40-2c5e8b1d6a01");
+        let again = bep::audit::box_subject("web", "0199a4d7-1b2c-7e4f-8a90-3d6f9c2e7b02");
+        let other = bep::audit::box_subject("webapp", "0199a4e1-5c6d-7f80-9b1a-4e7fad3f8c03");
+        log_with(
+            &path,
+            &[
+                audit_event(&first, "api.github.com"),
+                audit_event(&other, "api.github.com"),
+                audit_event(&again, "codeload.github.com"),
+            ],
+        );
+
+        let (text, written) = read(&path, &audit_args(&["min", "box", "audit", "web"]));
+        assert_eq!(written, 2, "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with(&format!("{first}  ")), "{text}");
+        assert!(lines[1].starts_with(&format!("{again}  ")), "{text}");
+
+        let (text, written) = read(&path, &audit_args(&["min", "box", "audit", &again]));
+        assert_eq!(written, 1, "{text}");
+        assert!(text.starts_with(&format!("{again}  ")), "{text}");
+    }
+
     /// BEP-068: a read covers every retained segment, oldest first — a box's
     /// trail that crossed a rotation reads as one trail, with the same filter
     /// applied across the segments.

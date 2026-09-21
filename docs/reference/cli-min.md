@@ -449,10 +449,10 @@ GitHub: signed in as octocat; expires 2027-01-15T16:00:00Z (in 7h 59m)
 ```
 
 `auth logout` forgets the sign-in and records a revocation with the Box
-Egress Proxy, so every member minted from the sign-in is refused from then
-on; a box that outlives it is re-created to re-mint. When no proxy is running
-the revocation is reported as unrecorded on stderr and the sign-in is still
-forgotten.
+Egress Proxy, so every member minted before it is refused from then on; a box
+that outlives it is re-created to re-mint. Signing in again mints members the
+logout does not reach. When no proxy is running the revocation is reported as
+unrecorded on stderr and the sign-in is still forgotten.
 
 A box declaring a `source = "broker"` GitHub grant is minted a member from
 the held sign-in at creation — `mode = "user"`, `full` breadth, expiring at
@@ -532,10 +532,15 @@ them. One line per record, the box first:
 
 ```console
 $ min box audit web
-web  decision admit  api.github.com  github:user-token  repo:acme/web contents:write
-web  decision refuse  packages.example  none  module_unmapped module_unmapped (off_module)
-web  mint admit  api.github.com  github:user-token  module_unmapped module_unmapped
+web@0199a4c2-7d1e-7a3b-9f40-2c5e8b1d6a01  mint admit  api.github.com  github:user-token  module_unmapped module_unmapped
+web@0199a4c2-7d1e-7a3b-9f40-2c5e8b1d6a01  revocation admit  api.github.com  github:user-token  module_unmapped module_unmapped
+web@0199a4d7-1b2c-7e4f-8a90-3d6f9c2e7b02  mint admit  api.github.com  github:user-token  module_unmapped module_unmapped
 ```
+
+The proxy knows a box by its name and the session id of that creation,
+`<name>@<id>`, so a box made again under a name used before is a different
+box: removing one revokes nothing of the other's. A name reads every box made
+under it, as above; `<name>@<id>` reads one.
 
 `-o jsonl` prints the log's own JSON lines instead, for `jq` and for scripts;
 `-o text` is the default. `--follow` replays the box's records and then keeps

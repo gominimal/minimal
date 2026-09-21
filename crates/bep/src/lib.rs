@@ -56,14 +56,18 @@ pub mod upstream;
 // refuse is not the redemption outcome.
 pub use audit::{AuditError, Event, Hash, Kind, Log, Mapping, Record};
 pub use ca::{Authority, CaError, DeclaredUnion, Leaf};
-pub use control::{ControlError, REVOCATION_DEADLINE_SECS, Revocations, Submission, submit};
+pub use control::{
+    Appended, ControlError, REVOCATION_DEADLINE_SECS, Revocations, Submission, submit,
+};
 pub use github::{GitHub, GitHubError, MemorySignIns, SignIn, SignInStore};
 pub use keychain::{KeyStore, MemoryStore, PrivateKey, StoreError};
 pub use keys::{
     Fingerprint, IdentityError, KeyRole, KeyStatus, Keys, KeysError, PublicIdentity, inspect,
 };
 pub use listener::{Addressing, Attachments, Config, ListenerError, Module, Proxy, Sender};
-pub use mint::{MintError, MintRequest, Minted, box_revocation_event, mint, revocation_event};
+pub use mint::{
+    MintError, MintRequest, Minted, box_revocation_event, mint, mint_event, revocation_event,
+};
 pub use redeem::{Check, Decision, Redemption, decide};
 pub use seal::{
     Member, Refusal, SealError, SealedContext, SealedValue, Unsealed, seal, seal_to, unseal,

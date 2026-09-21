@@ -9,8 +9,9 @@
 //! with the proxy (BEP-044, BEP-067).
 //!
 //! The mint a box creation performs from the held sign-in lives here too
-//! ([`mint_member`]): it seals the member (BEP-005) and records the `mint`
-//! with the proxy. Both records go over the proxy's control socket
+//! ([`mint_member`]): it records the `mint` with the proxy and seals the
+//! member (BEP-005) with the position the proxy gave the record. Both records
+//! go over the proxy's control socket
 //! ([`submit_audit`]), one JSON line each way, because the proxy is the
 //! audit log's sole writer.
 
@@ -19,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 use bep::github::{AuthorizeRequest, Pkce, Secret, Url, random_token};
-use bep::{GitHub, MintRequest, Record, SealedValue, SignIn, SignInStore, Submission};
+use bep::{Appended, GitHub, MintRequest, SealedValue, SignIn, SignInStore, Submission};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, UnixStream};
@@ -371,8 +372,9 @@ pub async fn logout<S: SignInStore>(
     // refused (BEP-044); a proxy that is not running redeems nothing
     // meanwhile, so its absence is a warning, not a failed logout.
     match submit_audit(control, &Submission::Audit(bep::revocation_event())).await {
-        Ok(record) => tracing::info!(
-            previous_hash = %record.previous_hash,
+        Ok(appended) => tracing::info!(
+            previous_hash = %appended.record.previous_hash,
+            position = appended.position,
             "the proxy recorded the revocation"
         ),
         Err(error) => eprintln!("warning: the proxy did not record the revocation: {error:#}"),
@@ -454,13 +456,18 @@ pub async fn renew_if_expiring<S: SignInStore>(
     Ok(())
 }
 
-/// Mints a member for a box from the held sign-in, sealed to `keys`, and
-/// records the mint with the proxy; the value is what the box receives.
+/// Mints a member for a box from the held sign-in, sealed to `keys`, after
+/// recording the mint with the proxy; the value is what the box receives.
+///
+/// The record comes first because the value carries the position the log gave
+/// it: a revocation the proxy recorded before the mint, of a box of the same
+/// name or of an earlier sign-in, does not cover the member (BEP-043,
+/// BEP-044).
 ///
 /// # Errors
 ///
-/// When no sign-in is held or it has expired, the envelope cannot be sealed,
-/// or the proxy does not record the mint.
+/// When no sign-in is held or it has expired, the proxy does not record the
+/// mint, or the envelope cannot be sealed.
 pub async fn mint_member<S: SignInStore>(
     store: &S,
     identity: &bep::PublicIdentity,
@@ -471,19 +478,20 @@ pub async fn mint_member<S: SignInStore>(
         .load()
         .context("reading the held sign-in")?
         .ok_or_else(|| anyhow::anyhow!("no GitHub sign-in is held; run `min auth login`"))?;
-    let minted = bep::mint(identity, &sign_in, request)?;
-    submit_audit(control, &Submission::Audit(minted.event))
+    bep::mint::unexpired(&sign_in, request)?;
+    let recorded = submit_audit(control, &Submission::Audit(bep::mint_event(request.box_id)))
         .await
         .context("recording the mint with the proxy")?;
+    let minted = bep::mint(identity, &sign_in, request, recorded.position)?;
     Ok(minted.value)
 }
 
-/// The proxy's answer to a submission: the record it appended, or why it
-/// refused.
+/// The proxy's answer to a submission: the record it appended and where, or
+/// why it refused.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum Reply {
-    Record(Box<Record>),
+    Appended(Box<Appended>),
     Refused { error: String },
 }
 
@@ -494,7 +502,10 @@ enum Reply {
 ///
 /// When the socket cannot be reached, the exchange fails, or the proxy
 /// refuses the submission.
-pub async fn submit_audit(socket: &Path, submission: &Submission) -> Result<Record, anyhow::Error> {
+pub async fn submit_audit(
+    socket: &Path,
+    submission: &Submission,
+) -> Result<Appended, anyhow::Error> {
     let stream = UnixStream::connect(socket).await.with_context(|| {
         format!(
             "connecting to the proxy's control socket {}",
@@ -510,7 +521,7 @@ pub async fn submit_audit(socket: &Path, submission: &Submission) -> Result<Reco
     let reply: Reply =
         serde_json_lenient::from_str(reply.trim()).context("reading the proxy's reply")?;
     match reply {
-        Reply::Record(record) => Ok(*record),
+        Reply::Appended(appended) => Ok(*appended),
         Reply::Refused { error } => bail!("the proxy refused the submission: {error}"),
     }
 }
@@ -542,7 +553,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use bep::github::{Endpoints, MemorySignIns, Secret};
-    use bep::{Keys, Kind, Log, MemoryStore, Revocations};
+    use bep::{Keys, Kind, Log, MemoryStore, Record, Revocations};
     use tokio::net::{TcpStream, UnixListener};
 
     use super::*;
@@ -1077,6 +1088,8 @@ mod tests {
         assert_eq!(unsealed.context.mode, "user");
         assert_eq!(unsealed.context.breadth, "full");
         assert!(unsealed.context.expires_at <= now + 8 * 3600);
+        // The member carries where the log recorded its mint: the first line.
+        assert_eq!(unsealed.context.mint_position, 0);
 
         let mut out = Vec::new();
         logout(&store, &socket, &mut out).await.unwrap();
@@ -1127,8 +1140,8 @@ mod tests {
 
     /// BEP-044: `min auth logout` sends the proxy the one revocation that puts
     /// every GitHub member minted on this host beyond redemption, whichever box
-    /// it was minted for — and a proxy that is not there does not turn a logout
-    /// into a failure.
+    /// it was minted for, and none minted after a sign-in made again — and a
+    /// proxy that is not there does not turn a logout into a failure.
     #[tokio::test]
     async fn logout_sends_revocation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1148,21 +1161,26 @@ mod tests {
         store.store(&sign_in).unwrap();
         let keys = Keys::open(MemoryStore::new()).unwrap();
 
+        let request = MintRequest {
+            box_id: "box-a1",
+            host: "mac-1",
+            host_set_version: 1,
+            now,
+        };
+        let minted_at = |value: SealedValue| {
+            bep::unseal(&keys, value.as_str())
+                .unwrap()
+                .context
+                .mint_position
+        };
+
         // A member minted for a box: what the logout has to cover. Minting
         // revokes nothing of its own.
-        mint_member(
-            &store,
-            &keys.public_identity(),
-            &socket,
-            &MintRequest {
-                box_id: "box-a1",
-                host: "mac-1",
-                host_set_version: 1,
-                now,
-            },
-        )
-        .await
-        .unwrap();
+        let minted = minted_at(
+            mint_member(&store, &keys.public_identity(), &socket, &request)
+                .await
+                .unwrap(),
+        );
         assert!(revocations.lock().unwrap().is_empty());
 
         let mut out = Vec::new();
@@ -1179,8 +1197,8 @@ mod tests {
         let (module, one_box) = {
             let in_force = revocations.lock().unwrap();
             (
-                in_force.covers_module("github"),
-                in_force.covers_box("box-a1"),
+                in_force.covers_module("github", minted),
+                in_force.covers_box("box-a1", minted),
             )
         };
         assert!(module);
@@ -1193,6 +1211,18 @@ mod tests {
         assert_eq!(last.kind, Kind::Revocation);
         assert_eq!(last.sub, "*");
         assert!(!log.contains(TOKEN), "{log}");
+
+        // Signing in again mints members the logout does not reach: it covers
+        // what was minted before it and nothing after.
+        store.store(&sign_in).unwrap();
+        let again = minted_at(
+            mint_member(&store, &keys.public_identity(), &socket, &request)
+                .await
+                .unwrap(),
+        );
+        assert!(again > minted);
+        assert!(!revocations.lock().unwrap().covers_module("github", again));
+        store.clear().unwrap();
 
         // A logout with no proxy listening still forgets the sign-in and
         // succeeds: an absent proxy redeems nothing meanwhile.
@@ -1209,6 +1239,6 @@ mod tests {
         assert_eq!(store.load().unwrap(), None);
         // Nothing was appended for the submission that went nowhere.
         let after = std::fs::read_to_string(&audit).unwrap();
-        assert_eq!(after.lines().count(), 2, "{after}");
+        assert_eq!(after.lines().count(), 3, "{after}");
     }
 }

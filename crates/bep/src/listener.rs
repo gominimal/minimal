@@ -63,10 +63,10 @@ use tokio_rustls::TlsAcceptor;
 use tracing::Instrument as _;
 
 use crate::attribution;
-use crate::audit::{self, AuditError, Event, Kind, Log, Mapping, Record};
+use crate::audit::{self, AuditError, Event, Kind, Log, Mapping};
 use crate::ca::{Authority, Leaf};
 use crate::control::{
-    self, ClientKey, ClientKeys, ControlError, Registered, Revocations, Submission,
+    self, Appended, ClientKey, ClientKeys, ControlError, Registered, Revocations, Submission,
 };
 use crate::keychain::{self, KeyStore, SecretItems};
 use crate::keys::Keys;
@@ -1191,7 +1191,8 @@ where
     /// The revocations in force that cover `context`'s member, in the terms
     /// the decision reads: the set holds the box and module names a sealed
     /// context carries, the decision the ids the shell interned for this
-    /// request (BEP-043, BEP-044).
+    /// request (BEP-043, BEP-044). A revocation recorded after the member's
+    /// mint covers it; one recorded before does not.
     fn revocations_in_force(
         &self,
         context: &seal::SealedContext,
@@ -1202,10 +1203,10 @@ where
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut in_force = Vec::new();
-        if revoked.covers_box(&context.box_id) {
+        if revoked.covers_box(&context.box_id, context.mint_position) {
             in_force.push(redeem::Revocation::Box(member.box_id));
         }
-        if revoked.covers_module(&context.module) {
+        if revoked.covers_module(&context.module, context.mint_position) {
             in_force.push(redeem::Revocation::Module(member.module));
         }
         if !in_force.is_empty() {
@@ -1227,7 +1228,7 @@ where
     ///
     /// A [`ControlError`]: the submission claims a kind only the proxy
     /// records, or the log refuses the append.
-    pub fn submit(&self, submission: &Submission) -> Result<Record, ControlError> {
+    pub fn submit(&self, submission: &Submission) -> Result<Appended, ControlError> {
         let mut log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
         let mut revocations = self
             .revocations
@@ -1653,6 +1654,7 @@ mod tests {
                     inject: &rule.inject,
                     now,
                 },
+                0,
             )
             .unwrap()
             .value
@@ -1737,6 +1739,7 @@ mod tests {
             mode: "user".to_owned(),
             breadth: "full".to_owned(),
             expires_at: 4_102_444_800,
+            mint_position: 0,
         }
     }
 
@@ -2655,8 +2658,9 @@ mod tests {
     }
 
     /// Submits `event` over the control socket at `path` the way the client
-    /// does — one JSON line out, the record back — and returns the record.
-    async fn submit_over(path: &std::path::Path, event: Event) -> Record {
+    /// does — one JSON line out, the record and its position back — and
+    /// returns what came back.
+    async fn submit_over(path: &std::path::Path, event: Event) -> Appended {
         let stream = tokio::net::UnixStream::connect(path).await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut line = serde_json_lenient::to_string(&Submission::Audit(event)).unwrap();
@@ -2670,12 +2674,13 @@ mod tests {
         serde_json_lenient::from_str(reply.trim()).unwrap()
     }
 
-    /// Redeems a value minted for `box_id` from that box itself: one request
-    /// carrying it on a terminated flow to `api.github.com`, answered with the
-    /// whole response the proxy returned.
-    async fn redeem_from(h: &Harness, box_id: &str) -> String {
+    /// Redeems a value minted for `box_id` from that box itself, its mint
+    /// recorded at `minted`: one request carrying it on a terminated flow to
+    /// `api.github.com`, answered with the whole response the proxy returned.
+    async fn redeem_from(h: &Harness, box_id: &str, minted: u64) -> String {
         let mut context = context();
         context.box_id = box_id.to_owned();
+        context.mint_position = minted;
         let value = seal::seal(h.proxy.keys, &context, &Member::new(CREDENTIAL))
             .unwrap()
             .to_string();
@@ -2709,7 +2714,7 @@ mod tests {
         // Both boxes redeem what was minted for them before anything is
         // revoked, and the member itself is what goes upstream.
         for box_id in ["box-a1", "box-b2"] {
-            let response = redeem_from(&h, box_id).await;
+            let response = redeem_from(&h, box_id, 0).await;
             assert!(response.starts_with("HTTP/1.1 200"), "{box_id}: {response}");
             assert_eq!(h.last().decision, audit::Decision::Admit);
         }
@@ -2721,7 +2726,9 @@ mod tests {
         // `min box rm box-a1`: one revocation record, chained onto the proxy's
         // own decisions.
         let started = std::time::Instant::now();
-        let revoked = submit_over(&socket, crate::mint::box_revocation_event("box-a1")).await;
+        let revoked = submit_over(&socket, crate::mint::box_revocation_event("box-a1"))
+            .await
+            .record;
         assert_eq!(revoked.kind, Kind::Revocation);
         assert_eq!(revoked.sub, "box-a1");
         let records = h.records();
@@ -2734,7 +2741,7 @@ mod tests {
         // That box's values are refused from the next request on, and nothing
         // of the request reaches the upstream.
         let sent = up.received().len();
-        let response = redeem_from(&h, "box-a1").await;
+        let response = redeem_from(&h, "box-a1", 0).await;
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         let record = h.last();
         assert_eq!(record.decision, audit::Decision::Refuse);
@@ -2751,16 +2758,18 @@ mod tests {
         );
 
         // The other box is untouched by it: that revocation names one box.
-        let response = redeem_from(&h, "box-b2").await;
+        let response = redeem_from(&h, "box-b2", 0).await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
         // `min auth logout`: every GitHub member on this host, the other box's
         // included.
         let started = std::time::Instant::now();
-        let logout = submit_over(&socket, crate::mint::revocation_event()).await;
+        let logout = submit_over(&socket, crate::mint::revocation_event())
+            .await
+            .record;
         assert_eq!(logout.kind, Kind::Revocation);
         assert_eq!(logout.sub, crate::mint::EVERY_BOX);
-        let response = redeem_from(&h, "box-b2").await;
+        let response = redeem_from(&h, "box-b2", 0).await;
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         assert_eq!(h.last().marker, Check::Unrevoked.name());
         assert!(
@@ -2768,9 +2777,22 @@ mod tests {
             "the logout revocation took longer than the requirement allows"
         );
 
-        // What a proxy restarted on this log starts from: both revocations.
+        // A box made again under the removed box's name after a sign-in made
+        // again: its mint is recorded after both revocations, so neither
+        // covers what it carries.
+        let minted = submit_over(&socket, crate::mint::mint_event("box-a1"))
+            .await
+            .position;
+        let response = redeem_from(&h, "box-a1", minted).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(h.last().decision, audit::Decision::Admit);
+
+        // What a proxy restarted on this log starts from: both revocations,
+        // each covering what was minted before it and nothing after.
         let replayed = Revocations::in_log(&h.log_path).unwrap();
-        assert!(replayed.covers_box("box-a1"));
-        assert!(replayed.covers_module("github"));
+        assert!(replayed.covers_box("box-a1", 0));
+        assert!(replayed.covers_module("github", 0));
+        assert!(!replayed.covers_box("box-a1", minted));
+        assert!(!replayed.covers_module("github", minted));
     }
 }

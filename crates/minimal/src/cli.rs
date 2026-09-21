@@ -324,7 +324,8 @@ pub struct BoxSpecArgs {
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("audit-subject").args(["box_id", "parent"]).required(true).multiple(false)))]
 pub struct BoxAuditArgs {
-    /// The box whose records to print
+    /// The box whose records to print: a name reads every box made under it,
+    /// `<name>@<id>` the one made as that session
     #[arg(value_name = "BOX")]
     pub box_id: Option<String>,
     /// Merge the records of every box under this one onto one stream

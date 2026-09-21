@@ -423,6 +423,7 @@ mod tests {
             mode: "user".into(),
             breadth: "full".into(),
             expires_at: 4_102_444_800,
+            mint_position: 0,
         }
     }
 
@@ -509,6 +510,7 @@ mod tests {
                     inject: &mint::Inject::header("x-api-key", ""),
                     now: 0,
                 },
+                0,
             )
             .unwrap();
             let text = minted.handle.as_str();

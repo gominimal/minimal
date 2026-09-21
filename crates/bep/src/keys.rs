@@ -385,6 +385,7 @@ mod tests {
             mode: "sealed".into(),
             breadth: "account".into(),
             expires_at: 4_102_444_800,
+            mint_position: 0,
         }
     }
 

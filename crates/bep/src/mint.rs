@@ -11,7 +11,10 @@
 //!
 //! The mint, the logout and a box's removal each make one [`Event`] for the
 //! proxy's log; the client submits it over the control socket
-//! ([`crate::control`]) and never opens the log itself.
+//! ([`crate::control`]) and never opens the log itself. A mint is recorded
+//! before its value is sealed, because the value carries the position the log
+//! gave its record: a revocation covers what was minted before it and nothing
+//! after (BEP-043, BEP-044).
 //!
 //! The store-reference mint is here too ([`mint_store_handle`]): a box that
 //! refers to a Keychain value by identifier receives no value and no member
@@ -66,16 +69,14 @@ pub struct MintRequest<'a> {
     pub now: u64,
 }
 
-/// A minted member: the sealed value for the box, the context it was sealed
-/// with, and the record of the mint for the proxy's log.
+/// A minted member: the sealed value for the box, and the context it was
+/// sealed with.
 #[derive(Debug)]
 pub struct Minted {
     /// The sealed value, as delivered into the box.
     pub value: SealedValue,
     /// The authenticated context the value was sealed with.
     pub context: SealedContext,
-    /// The `mint` event for the audit log.
-    pub event: Event,
 }
 
 /// Why a member could not be minted.
@@ -99,18 +100,15 @@ pub fn member_expiry(now: u64, token_expires_at: Option<u64>) -> u64 {
     token_expires_at.map_or(ceiling, |expiry| expiry.min(ceiling))
 }
 
-/// Mints a `user`, `full` member for `request.box_id` from `sign_in`, sealed
-/// to `keys`.
+/// Whether `sign_in` may mint for `request`: refused once its token has
+/// expired. The client asks before it records a mint, so the log never holds
+/// the record of one that could not be made.
 ///
 /// # Errors
 ///
 /// [`MintError::Expired`] when the sign-in's token has expired at
-/// `request.now`; [`MintError::Seal`] when the envelope cannot be sealed.
-pub fn mint(
-    identity: &PublicIdentity,
-    sign_in: &SignIn,
-    request: &MintRequest<'_>,
-) -> Result<Minted, MintError> {
+/// `request.now`.
+pub fn unexpired(sign_in: &SignIn, request: &MintRequest<'_>) -> Result<(), MintError> {
     if let Some(expired_at) = sign_in.expires_at.filter(|expiry| *expiry <= request.now) {
         tracing::warn!(
             account = %sign_in.account,
@@ -123,6 +121,24 @@ pub fn mint(
             expired_at,
         });
     }
+    Ok(())
+}
+
+/// Mints a `user`, `full` member for `request.box_id` from `sign_in`, sealed
+/// to `keys`, carrying `mint_position`: where the log recorded the mint's
+/// [`mint_event`].
+///
+/// # Errors
+///
+/// [`MintError::Expired`] when the sign-in's token has expired at
+/// `request.now`; [`MintError::Seal`] when the envelope cannot be sealed.
+pub fn mint(
+    identity: &PublicIdentity,
+    sign_in: &SignIn,
+    request: &MintRequest<'_>,
+    mint_position: u64,
+) -> Result<Minted, MintError> {
+    unexpired(sign_in, request)?;
     let context = SealedContext {
         box_id: request.box_id.to_owned(),
         host: request.host.to_owned(),
@@ -131,6 +147,7 @@ pub fn mint(
         mode: MODE.to_owned(),
         breadth: BREADTH.to_owned(),
         expires_at: member_expiry(request.now, sign_in.expires_at),
+        mint_position,
     };
     let value = seal_to(identity, &context, &Member::new(sign_in.token.expose()))?;
     tracing::info!(
@@ -139,11 +156,13 @@ pub fn mint(
         expires_at = context.expires_at,
         "minted a GitHub member from the held sign-in"
     );
-    Ok(Minted {
-        value,
-        event: identity_event(Kind::Mint, request.box_id),
-        context,
-    })
+    Ok(Minted { value, context })
+}
+
+/// The `mint` event a member minted for `box_id` records.
+#[must_use]
+pub fn mint_event(box_id: &str) -> Event {
+    identity_event(Kind::Mint, box_id)
 }
 
 /// The `revocation` event `min auth logout` records: every GitHub member on
@@ -415,8 +434,28 @@ pub fn client_key<S: KeyStore>(store: &S) -> Result<S::Key, StoreError> {
     Ok(key)
 }
 
+/// The `mint` event a store handle minted for `request` records: the box, the
+/// first authority the rule registers, and the store and identifier as the
+/// proxy's own records name a handle.
+#[must_use]
+pub fn store_mint_event(request: &StoreMintRequest<'_>) -> Event {
+    Event {
+        kind: Kind::Mint,
+        box_id: request.box_id.to_owned(),
+        authority: request
+            .upstream
+            .first()
+            .map_or_else(|| crate::audit::NONE.to_owned(), Clone::clone),
+        credential: Some(format!("{}:{}", request.store, request.id)),
+        mapping: Mapping::Unmapped,
+        decision: Decision::Admit,
+        marker: None,
+    }
+}
+
 /// Mints a handle for one store reference, signed under `client`, and seals
-/// it to `keys` for `request.box_id` (BEP-063).
+/// it to `keys` for `request.box_id` (BEP-063), carrying `mint_position`:
+/// where the log recorded the handle's [`store_mint_event`].
 ///
 /// The handle expires [`HANDLE_LIFETIME_SECS`] after `request.now`, and the
 /// envelope it is delivered in carries the same expiry, so BEP-020's check
@@ -430,6 +469,7 @@ pub fn mint_store_handle<K: PrivateKey>(
     identity: &PublicIdentity,
     client: &K,
     request: &StoreMintRequest<'_>,
+    mint_position: u64,
 ) -> Result<MintedHandle, HandleError> {
     let fingerprint = Fingerprint::of(&client.public_key()?);
     let claims = StoreClaims {
@@ -456,6 +496,7 @@ pub fn mint_store_handle<K: PrivateKey>(
         mode: STORE_MODE.to_owned(),
         breadth: STORE_BREADTH.to_owned(),
         expires_at: claims.exp,
+        mint_position,
     };
     let value = seal_to(identity, &context, &Member::new(handle.as_str()))?;
     tracing::info!(
@@ -556,7 +597,13 @@ mod tests {
             (Some(NOW + 3_600), NOW + 3_600),
             (Some(NOW + 100_000), ceiling),
         ] {
-            let minted = mint(&keys.public_identity(), &sign_in(token_expiry), &request()).unwrap();
+            let minted = mint(
+                &keys.public_identity(),
+                &sign_in(token_expiry),
+                &request(),
+                5,
+            )
+            .unwrap();
             assert!(minted.context.expires_at <= ceiling, "{token_expiry:?}");
             assert_eq!(minted.context.expires_at, expected, "{token_expiry:?}");
 
@@ -568,19 +615,25 @@ mod tests {
             assert_eq!(unsealed.context.box_id, "box-a1");
             assert_eq!(unsealed.context.host, "mac-1");
             assert_eq!(unsealed.context.host_set_version, 3);
+            assert_eq!(unsealed.context.mint_position, 5);
             assert_eq!(unsealed.member.expose(), sign_in(None).token.expose());
-
-            // The mint's record names the box and the member, never the token.
-            assert_eq!(minted.event.kind, Kind::Mint);
-            assert_eq!(minted.event.box_id, "box-a1");
-            assert_eq!(minted.event.credential.as_deref(), Some(CREDENTIAL));
-            let line = serde_json_lenient::to_string(&minted.event).unwrap();
-            assert!(!line.contains("ghu_"), "{line}");
         }
 
-        // An expired sign-in mints nothing.
+        // The mint's record names the box and the member, never the token.
+        let event = mint_event("box-a1");
+        assert_eq!(event.kind, Kind::Mint);
+        assert_eq!(event.box_id, "box-a1");
+        assert_eq!(event.credential.as_deref(), Some(CREDENTIAL));
+        let line = serde_json_lenient::to_string(&event).unwrap();
+        assert!(!line.contains("ghu_"), "{line}");
+
+        // An expired sign-in mints nothing, and says so before any record.
         assert!(matches!(
-            mint(&keys.public_identity(), &sign_in(Some(NOW)), &request()),
+            unexpired(&sign_in(Some(NOW)), &request()),
+            Err(MintError::Expired { expired_at, .. }) if expired_at == NOW
+        ));
+        assert!(matches!(
+            mint(&keys.public_identity(), &sign_in(Some(NOW)), &request(), 5),
             Err(MintError::Expired { expired_at, .. }) if expired_at == NOW
         ));
 
