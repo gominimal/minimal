@@ -49,9 +49,43 @@ pub struct App {
 /// ceiling: a user token is the App's permissions intersected with the
 /// user's and with the installations the user holds.
 pub const MINIMAL_APP: App = App {
-    client_id: "Iv23liMinimalDevGitHubApp",
-    client_secret: "minimal-public-client-secret-see-gatehouse-6-10",
+    client_id: "Iv23liv6KetAFJp4Eb5K",
+    client_secret: "",
 };
+
+/// The environment variable naming a GitHub App to present instead of
+/// [`MINIMAL_APP`]: the App's client id.
+pub const APP_CLIENT_ID_VAR: &str = "MINIMAL_GITHUB_APP_CLIENT_ID";
+
+/// The environment variable holding that App's client secret. The device flow
+/// needs none; GitHub's web application flow requires one at the code
+/// exchange, so a host running the browser flow sets this.
+pub const APP_CLIENT_SECRET_VAR: &str = "MINIMAL_GITHUB_APP_CLIENT_SECRET";
+
+/// The App the client presents: [`MINIMAL_APP`], or the one the environment
+/// names.
+///
+/// The override exists so a host can sign in under its own App — a fork, a
+/// test registration — without a rebuild. A client id is public by
+/// construction: both flows put it on the wire, so it is not a secret and is
+/// spelled above rather than configured. The secret is not spelled above
+/// because the device flow needs none and this repository is public.
+///
+/// The returned `App` borrows for the process: an overridden value is leaked
+/// once, at the first sign-in, which is the lifetime the flows want anyway.
+#[must_use]
+pub fn published_app() -> App {
+    fn from_env(var: &str, fallback: &'static str) -> &'static str {
+        match std::env::var(var) {
+            Ok(value) if !value.is_empty() => Box::leak(value.into_boxed_str()),
+            _ => fallback,
+        }
+    }
+    App {
+        client_id: from_env(APP_CLIENT_ID_VAR, MINIMAL_APP.client_id),
+        client_secret: from_env(APP_CLIENT_SECRET_VAR, MINIMAL_APP.client_secret),
+    }
+}
 
 /// A token or other secret: zeroed on drop, redacted from `Debug`, and
 /// serialised as its bare text only into the store that holds it.

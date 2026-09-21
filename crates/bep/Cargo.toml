@@ -27,6 +27,8 @@ serde.workspace = true
 serde_json_lenient.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+# The operator's `[[secret-store-rules]]` file, read at startup (`main.rs`).
+toml.workspace = true
 # The device flow's polling interval (`github.rs`) and the listener's runtime.
 tokio.workspace = true
 tokio-rustls.workspace = true

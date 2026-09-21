@@ -27,6 +27,10 @@ pub(crate) fn session_announce_label(id: &sessions::SessionId, name: Option<&str
 struct GrantPlan {
     expansion: sessions::GrantExpansion,
     grants: Vec<sessions::Grant>,
+    /// The box's resolved network mode: what decides where it reaches the
+    /// proxy ([`sessions::bep_proxy_url`]). A box that stands on the switch
+    /// reaches this host at the switch's host alias, not at its own loopback.
+    mode: Option<sessions::NetworkMode>,
     /// The store references the operator's `[secret-store-rules]` admit: what
     /// the handles are minted for (BEP-063).
     references: Vec<PlannedReference>,
@@ -139,6 +143,7 @@ fn expand_project_grants(
         mode,
         Some(GrantPlan {
             expansion,
+            mode: Some(mode),
             grants: session.grants.clone(),
             references: admitted
                 .expect("a refusal was returned above")
@@ -219,6 +224,7 @@ fn box_delivery(
     expansion: &sessions::GrantExpansion,
     sealed: &[(sessions::core::primitives::StrictVarName, bep::SealedValue)],
     root_pem: Option<&paths::HostAbsPath>,
+    mode: Option<sessions::NetworkMode>,
 ) -> BoxDelivery {
     use sessions::wire::primitives::{
         WireResolvedPatch, WireResolvedVar, WireSessionPatch, WireSessionVar, WireSource,
@@ -240,7 +246,7 @@ fn box_delivery(
         .collect();
     vars.extend(
         expansion
-            .proxy_env_vars()
+            .proxy_env_vars_at(sessions::bep_proxy_url(mode))
             .into_iter()
             .map(|(name, value)| var(name, value)),
     );
@@ -366,6 +372,7 @@ async fn deliver_box_grants(
         &plan.expansion,
         &sealed,
         root_pem.as_ref(),
+        plan.mode,
     ))
 }
 

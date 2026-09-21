@@ -57,7 +57,10 @@ pub async fn cmd_auth(global: &GlobalArgs, command: AuthCommand) -> Result<(), a
     let mut out = std::io::stdout();
     match command {
         AuthCommand::Login(args) => {
-            let github = GitHub::new(bep::github::MINIMAL_APP, bep::github::Endpoints::github())?;
+            let github = GitHub::new(
+                bep::github::published_app(),
+                bep::github::Endpoints::github(),
+            )?;
             if args.device {
                 login_device(&github, &store, &mut out).await?;
             } else {

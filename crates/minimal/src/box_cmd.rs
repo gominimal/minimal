@@ -115,7 +115,7 @@ impl SpecView {
             steering: expansion.map_or_else(|| network.bep.resolved_steering(), |e| e.steering),
             inject_ca: expansion.is_some_and(|e| e.inject_ca),
             proxy_env: expansion
-                .map(sessions::GrantExpansion::proxy_env_vars)
+                .map(|e| e.proxy_env_vars_at(sessions::bep_proxy_url(network.mode)))
                 .unwrap_or_default(),
             acknowledged,
             grants: grants
@@ -650,7 +650,12 @@ mod tests {
             text.contains("interception root in the box trust store"),
             "{text}"
         );
-        assert!(text.contains("HTTPS_PROXY=http://127.0.0.1:7656"), "{text}");
+        // An own-address box stands on the switch, so it reaches the proxy at
+        // the switch's host alias, not at its own loopback.
+        assert!(
+            text.contains("HTTPS_PROXY=http://100.64.255.254:7656"),
+            "{text}"
+        );
         assert!(
             text.contains(
                 "keychain reference `anthropic-api-key`: authorities \

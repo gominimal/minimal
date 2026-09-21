@@ -1202,6 +1202,27 @@ pub const BEP_AUDIT_LOG_FILE: &str = "audit.log";
 /// not run without one.
 pub const BEP_BOXES_FILE: &str = "boxes.json";
 
+/// The control socket the `min` client submits mints, client-key registrations
+/// and revocations over, in the proxy's directory beside its audit log
+/// (BEP-063, BEP-067). The name is the client's own
+/// (`minimal::auth::CONTROL_SOCKET`), which this crate cannot import.
+pub const BEP_CONTROL_SOCKET_FILE: &str = "control.sock";
+
+/// Where the proxy publishes its interception root, PEM: what a box's trust
+/// store is seeded from at creation (BEP-011). The name is the client's own
+/// (`minimal::cmd::session`'s `BEP_ROOT_PEM`), which this crate cannot import.
+pub const BEP_ROOT_PEM_FILE: &str = "root.pem";
+
+/// The cohort a VM-hosted box's connection is attributed to.
+///
+/// A box inside the VM reaches the proxy through the switch's host-alias
+/// address, which gvproxy NATs to this host's loopback — so every box's
+/// connection arrives from one source and the source names a cohort, not a
+/// box, exactly as a `host_ip` box's does on a native host (BEP-028). The
+/// admit is marked `cohort_attributed`; per-box attribution behind the NAT
+/// waits on the listener's own-IP attachment work.
+pub const BEP_COHORT_BOX: &str = "local-minvmd";
+
 /// The proxy binary's file name, as an install places it.
 const BEP_FILE: &str = "bep";
 
@@ -1221,6 +1242,20 @@ pub fn resolve_bep_dir() -> PathBuf {
         .as_utf8_path()
         .as_std_path()
         .join(BEP_DIR)
+}
+
+/// The operator's `[[secret-store-rules]]` file — the client's own
+/// `config.toml` — or `None` where this host has none.
+///
+/// The rules are the operator's, never the project's, so the proxy reads the
+/// same file `min` validates them from rather than being handed a copy.
+#[must_use]
+pub fn client_store_rules() -> Option<PathBuf> {
+    let path = paths::minimal_config_dir()
+        .as_utf8_path()
+        .as_std_path()
+        .join("config.toml");
+    path.is_file().then_some(path)
 }
 
 /// Resolve the box egress proxy binary: the `MINVMD_BEP_BIN` override, then the
@@ -1283,6 +1318,15 @@ pub struct BepConfig {
     audit_log: PathBuf,
     /// The box attachments the proxy attributes connections with.
     boxes: PathBuf,
+    /// The control socket the `min` client submits mints, client-key
+    /// registrations and revocations over (BEP-063, BEP-067).
+    control_socket: PathBuf,
+    /// Where the proxy publishes its interception root, PEM: what a box's
+    /// trust store is seeded from at creation (BEP-011).
+    root_pem: PathBuf,
+    /// The operator's `[[secret-store-rules]]` file, or `None` where this host
+    /// has none — the proxy then holds no rule and refuses every store handle.
+    store_rules: Option<PathBuf>,
     /// Grace period before SIGTERM escalates to SIGKILL on teardown.
     term_timeout: Duration,
     /// The user the proxy runs as: always the operator (BEP-047). There is no
@@ -1301,6 +1345,9 @@ impl BepConfig {
             listen: SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_BEP_PORT)),
             audit_log: bep_dir.join(BEP_AUDIT_LOG_FILE),
             boxes: bep_dir.join(BEP_BOXES_FILE),
+            control_socket: bep_dir.join(BEP_CONTROL_SOCKET_FILE),
+            root_pem: bep_dir.join(BEP_ROOT_PEM_FILE),
+            store_rules: None,
             term_timeout: DEFAULT_TERM_TIMEOUT,
             user: ProcessUser::operator(),
         }
@@ -1317,6 +1364,16 @@ impl BepConfig {
     #[must_use]
     pub fn with_listen(mut self, listen: SocketAddr) -> Self {
         self.listen = listen;
+        self
+    }
+
+    /// The operator's `[[secret-store-rules]]` file, or `None` to hold none.
+    ///
+    /// Set by the caller rather than read here, so a config is a decision the
+    /// supervisor takes ([`client_store_rules`]) and this stays a constructor.
+    #[must_use]
+    pub fn with_store_rules(mut self, path: Option<PathBuf>) -> Self {
+        self.store_rules = path;
         self
     }
 
@@ -1342,22 +1399,45 @@ impl BepConfig {
     /// its version are the proxy's own defaults (the GitHub v1 set).
     #[must_use]
     pub fn argv(&self) -> Vec<String> {
-        vec![
+        let mut argv = vec![
             "--listen".to_string(),
             self.listen.to_string(),
             "--audit-log".to_string(),
             self.audit_log.display().to_string(),
             "--boxes".to_string(),
             self.boxes.display().to_string(),
-        ]
+            "--control-socket".to_string(),
+            self.control_socket.display().to_string(),
+            "--root-pem".to_string(),
+            self.root_pem.display().to_string(),
+        ];
+        if let Some(rules) = &self.store_rules {
+            argv.push("--store-rules".to_string());
+            argv.push(rules.display().to_string());
+        }
+        argv
+    }
+
+    /// The control socket the client submits over.
+    #[must_use]
+    pub fn control_socket(&self) -> &Path {
+        &self.control_socket
+    }
+
+    /// Where the proxy publishes its interception root.
+    #[must_use]
+    pub fn root_pem(&self) -> &Path {
+        &self.root_pem
     }
 
     /// Create the proxy's directory and, when it is not there yet, an empty
     /// attachments list — the proxy reads that file at startup and will not run
     /// without one.
     ///
-    /// An existing file is never rewritten: its contents are box creation's,
-    /// not the supervisor's.
+    /// The list holds one attachment: the cohort every VM-hosted box's
+    /// connection arrives as ([`BEP_COHORT_BOX`]). An existing file is never
+    /// rewritten, so an operator who has narrowed it by hand keeps their
+    /// narrowing.
     ///
     /// # Errors
     ///
@@ -1368,7 +1448,12 @@ impl BepConfig {
             std::fs::create_dir_all(dir)?;
         }
         if !self.boxes.exists() {
-            std::fs::write(&self.boxes, b"[]\n")?;
+            let cohort = format!(
+                "[{{\"source\":\"{}\",\"box\":\"{}\",\"addressing\":\"host_ip\"}}]\n",
+                Ipv4Addr::LOCALHOST,
+                BEP_COHORT_BOX,
+            );
+            std::fs::write(&self.boxes, cohort)?;
         }
         Ok(())
     }
@@ -1504,7 +1589,7 @@ pub fn spawn_host_bep(binary: PathBuf, bep_dir: &Path) -> Option<HostBep> {
         );
         return None;
     }
-    match HostBep::spawn(BepConfig::new(binary, bep_dir)) {
+    match HostBep::spawn(BepConfig::new(binary, bep_dir).with_store_rules(client_store_rules())) {
         Ok(bep) => {
             tracing::info!(
                 pid = bep.pid(),
@@ -2116,23 +2201,53 @@ mod tests {
                 "/s/bep/audit.log".to_string(),
                 "--boxes".to_string(),
                 "/s/bep/boxes.json".to_string(),
+                "--control-socket".to_string(),
+                "/s/bep/control.sock".to_string(),
+                "--root-pem".to_string(),
+                "/s/bep/root.pem".to_string(),
             ]
         );
         assert_eq!(cfg.audit_log(), Path::new("/s/bep/audit.log"));
         assert_eq!(cfg.boxes(), Path::new("/s/bep/boxes.json"));
+        assert_eq!(cfg.control_socket(), Path::new("/s/bep/control.sock"));
+        assert_eq!(cfg.root_pem(), Path::new("/s/bep/root.pem"));
+
+        // A rules file is the operator's, so it is passed only when there is
+        // one: a proxy handed `--store-rules` for a file that is not there
+        // would fail to start rather than hold no rule.
+        let with_rules = BepConfig::new(
+            PathBuf::from("/usr/lib/minimal/bin/bep"),
+            Path::new("/s/bep"),
+        )
+        .with_store_rules(Some(PathBuf::from("/c/minimal/config.toml")));
+        assert!(
+            with_rules
+                .argv()
+                .windows(2)
+                .any(|pair| pair == ["--store-rules", "/c/minimal/config.toml"]),
+            "{:?}",
+            with_rules.argv()
+        );
     }
 
-    /// The attachments file is created empty so the proxy can start, and an
-    /// existing one is left alone: its contents are box creation's.
+    /// The attachments file is created holding the cohort a VM-hosted box's
+    /// connection arrives as, and an existing one is left alone: an operator
+    /// who narrowed it by hand keeps their narrowing.
     #[test]
-    fn bep_attachments_file_is_created_empty_and_never_clobbered() {
+    fn bep_attachments_file_carries_the_cohort_and_is_never_clobbered() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let bep_dir = dir.path().join("nested").join(BEP_DIR);
         let cfg = BepConfig::new(PathBuf::from("/usr/lib/minimal/bin/bep"), &bep_dir);
         cfg.ensure_files().expect("lay down the proxy's files");
+        let written = std::fs::read_to_string(cfg.boxes()).expect("read attachments");
         assert_eq!(
-            std::fs::read_to_string(cfg.boxes()).expect("read attachments"),
-            "[]\n"
+            written,
+            format!(
+                "[{{\"source\":\"{}\",\"box\":\"{}\",\"addressing\":\"host_ip\"}}]\n",
+                Ipv4Addr::LOCALHOST,
+                BEP_COHORT_BOX,
+            ),
+            "the cohort attachment is what a VM-hosted box arrives as"
         );
 
         let declared = r#"[{"source":"100.64.0.2","box":"b","addressing":"own_ip"}]"#;

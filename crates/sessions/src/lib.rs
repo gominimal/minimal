@@ -582,6 +582,29 @@ impl BepPolicy {
 /// `bep_default_listener_is_the_box_proxy_url` asserts the two agree.
 pub const BEP_PROXY_URL: &str = "http://127.0.0.1:7656";
 
+/// Where a box that stands on the switch reaches the proxy: the switch's
+/// host-alias address, which gvproxy NATs to the loopback of the host it runs
+/// on — the host where the proxy listens (`switch`'s rendered `nat` map).
+///
+/// The address is the default subnet's alias (`100.64.0.0/16` -> `.255.254`),
+/// spelled here because this crate does not depend on `switch`. A host running
+/// a non-default subnet needs the alias computed rather than assumed; that
+/// arrives with the listener's own-IP attachment work, which is also what
+/// gives such a box an attribution of its own.
+pub const BEP_PROXY_URL_SWITCH: &str = "http://100.64.255.254:7656";
+
+/// Where a box of `mode` reaches the proxy: its own loopback where it shares
+/// the host's namespace, the switch's host alias where it does not.
+///
+/// `None` is the CLI's `--network` default, which is `host_net`.
+#[must_use]
+pub fn bep_proxy_url(mode: Option<NetworkMode>) -> &'static str {
+    match mode {
+        Some(NetworkMode::OwnIp) => BEP_PROXY_URL_SWITCH,
+        _ => BEP_PROXY_URL,
+    }
+}
+
 /// The local zone `NO_PROXY` always carries under `proxy_env` (BEP-012):
 /// peer boxes by name, the host, and loopback, so local traffic never
 /// detours through a credential proxy. The spec's `[network.bep] no_proxy`
@@ -820,12 +843,20 @@ impl GrantExpansion {
     /// list, or nothing when `proxy_env` is not set.
     #[must_use]
     pub fn proxy_env_vars(&self) -> Vec<(String, String)> {
+        self.proxy_env_vars_at(BEP_PROXY_URL)
+    }
+
+    /// The proxy environment for a box that reaches the proxy at `url`
+    /// ([`bep_proxy_url`]): both proxy variables at `url` and `NO_PROXY` as a
+    /// comma-joined list, or nothing when `proxy_env` is not set.
+    #[must_use]
+    pub fn proxy_env_vars_at(&self, url: &str) -> Vec<(String, String)> {
         if !self.proxy_env {
             return Vec::new();
         }
         vec![
-            ("HTTPS_PROXY".to_owned(), BEP_PROXY_URL.to_owned()),
-            ("HTTP_PROXY".to_owned(), BEP_PROXY_URL.to_owned()),
+            ("HTTPS_PROXY".to_owned(), url.to_owned()),
+            ("HTTP_PROXY".to_owned(), url.to_owned()),
             ("NO_PROXY".to_owned(), self.no_proxy.join(",")),
         ]
     }
