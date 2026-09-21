@@ -227,6 +227,29 @@ fn read_rules(path: &Path) -> Result<Vec<RegisteredRule>, Box<dyn Error>> {
     Ok(held)
 }
 
+/// The store authorities the proxy intercepts for: those named with
+/// `--store-authority` and every upstream an `allow` rule registers, each as
+/// `host:port`, port 443 when a rule writes none. The rules' upstreams belong
+/// here because the anchor's name constraints are drawn from this set, and a
+/// rule whose upstream fell outside them would have its leaf refused by every
+/// box.
+fn store_authorities(named: &[String], rules: &[RegisteredRule]) -> Vec<String> {
+    let mut authorities: Vec<String> = named
+        .iter()
+        .chain(rules.iter().flat_map(|rule| &rule.upstream))
+        .map(|authority| {
+            if authority.contains(':') {
+                authority.clone()
+            } else {
+                format!("{authority}:443")
+            }
+        })
+        .collect();
+    authorities.sort();
+    authorities.dedup();
+    authorities
+}
+
 /// Publishes `der` at `path` as PEM: what a box's trust store is seeded from
 /// (BEP-011). Written whole and renamed over, so a box never reads half a
 /// certificate.
@@ -433,16 +456,23 @@ where
         cli.hosts.clone()
     };
 
+    let rules = match &cli.store_rules {
+        Some(path) => read_rules(path)?,
+        None => Vec::new(),
+    };
+    if rules.is_empty() {
+        tracing::warn!("the proxy holds no store rule; every store handle is refused");
+    }
+    let store_authorities = store_authorities(&cli.store_authorities, &rules);
+
     // The keys live as long as the process: the interception authority
     // borrows them for as long as the listener runs.
     let keys: &'static Keys<S> = Box::leak(Box::new(Keys::open(store)?));
-    let union = DeclaredUnion::of(
-        [hosts.iter().chain(&cli.store_authorities).map(|authority| {
-            authority
-                .rsplit_once(':')
-                .map_or(authority.as_str(), |(host, _)| host)
-        })],
-    );
+    let union = DeclaredUnion::of([hosts.iter().chain(&store_authorities).map(|authority| {
+        authority
+            .rsplit_once(':')
+            .map_or(authority.as_str(), |(host, _)| host)
+    })]);
     let authority = Authority::open(keys, union)?;
 
     // Published before anything is served: a box created while the root is
@@ -456,14 +486,6 @@ where
         tracing::info!(path = %path.display(), "published this host's public identity");
     }
 
-    let rules = match &cli.store_rules {
-        Some(path) => read_rules(path)?,
-        None => Vec::new(),
-    };
-    if rules.is_empty() {
-        tracing::warn!("the proxy holds no store rule; every store handle is refused");
-    }
-
     let log = Log::open(
         cli.audit_log
             .as_ref()
@@ -475,7 +497,7 @@ where
             host_set: hosts,
             version: cli.host_set_version,
         }],
-        store_authorities: cli.store_authorities.clone(),
+        store_authorities,
         // Read per request rather than cached, so a rule edited since a handle
         // was minted bites the next request that carries it (BEP-064).
         store_rules: Arc::new(move |store: &str, id: &str| {
@@ -552,5 +574,36 @@ mod tests {
         let store = MemoryStore::new();
         replace_keys(store.clone(), &[RoleArg::Root]).unwrap();
         assert!(Keys::open(store).is_ok());
+    }
+
+    /// A rule's upstreams join the authorities the proxy intercepts for, so
+    /// the anchor it publishes admits the leaves it presents for them. A bare
+    /// host is port 443, and an authority both named and registered is held
+    /// once.
+    #[test]
+    fn a_rules_upstreams_are_store_authorities() {
+        let rule = |upstream: &[&str]| RegisteredRule {
+            store: "keychain".to_owned(),
+            id: "demo".to_owned(),
+            upstream: upstream
+                .iter()
+                .map(|&authority| authority.to_owned())
+                .collect(),
+            inject: Inject {
+                header: Some("x-api-key".to_owned()),
+                prefix: None,
+                basic_auth: None,
+            },
+        };
+        assert_eq!(
+            store_authorities(
+                &["api.anthropic.com:443".to_owned()],
+                &[
+                    rule(&["api.anthropic.com"]),
+                    rule(&["mcp.example.com:8443"])
+                ],
+            ),
+            ["api.anthropic.com:443", "mcp.example.com:8443"]
+        );
     }
 }
