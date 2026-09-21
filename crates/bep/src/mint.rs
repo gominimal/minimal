@@ -379,14 +379,28 @@ pub struct MintedHandle {
 ///
 /// One key per host store, found again on every run: the proxy holds its
 /// public half from the first registration on, so handles minted later verify
-/// without registering again.
+/// without registering again. A key the store refuses this program is
+/// replaced: macOS admits only the program that generated a key, so a rebuilt
+/// client is refused its predecessor's. Unlike the proxy's keys, which
+/// BEP-060 replaces only on the operator's word, this one signs nothing but
+/// handles, and every mint registers the key it signs under first.
 ///
 /// # Errors
 ///
-/// When the store cannot be searched, or cannot generate the key.
+/// When the store cannot be searched, or cannot replace or generate the key.
 pub fn client_key<S: KeyStore>(store: &S) -> Result<S::Key, StoreError> {
     if let Some(key) = store.find(CLIENT_KEY_NAME)? {
-        return Ok(key);
+        match key.public_key() {
+            Err(StoreError::Unusable) => {
+                tracing::warn!(
+                    name = CLIENT_KEY_NAME,
+                    store = S::NAME,
+                    "the store refuses this program the client's handle-signing key; replacing it"
+                );
+                store.delete(CLIENT_KEY_NAME)?;
+            }
+            _ => return Ok(key),
+        }
     }
     let key = store.generate(CLIENT_KEY_NAME)?;
     tracing::info!(
@@ -570,5 +584,80 @@ mod tests {
         let revocation = revocation_event();
         assert_eq!(revocation.kind, Kind::Revocation);
         assert_eq!(revocation.box_id, EVERY_BOX);
+    }
+
+    /// A key the store refuses this program, as macOS refuses a rebuilt
+    /// binary the key its predecessor generated.
+    #[derive(Clone)]
+    enum Held {
+        Refused,
+        Usable(crate::keychain::MemoryKey),
+    }
+
+    impl PrivateKey for Held {
+        fn public_key(&self) -> Result<PublicKey, StoreError> {
+            match self {
+                Self::Refused => Err(StoreError::Unusable),
+                Self::Usable(key) => key.public_key(),
+            }
+        }
+
+        fn agree(&self, peer: &PublicKey) -> Result<crate::keychain::SharedSecret, StoreError> {
+            match self {
+                Self::Refused => Err(StoreError::Unusable),
+                Self::Usable(key) => key.agree(peer),
+            }
+        }
+
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, StoreError> {
+            match self {
+                Self::Refused => Err(StoreError::Unusable),
+                Self::Usable(key) => key.sign(message),
+            }
+        }
+
+        fn created_at(&self) -> Option<std::time::SystemTime> {
+            None
+        }
+    }
+
+    /// A store holding a client key its previous program generated.
+    #[derive(Default)]
+    struct Rebuilt {
+        replaced: std::sync::Mutex<bool>,
+        keys: MemoryStore,
+    }
+
+    impl KeyStore for Rebuilt {
+        type Key = Held;
+
+        const NAME: &'static str = "rebuilt";
+
+        fn find(&self, name: &str) -> Result<Option<Held>, StoreError> {
+            if !*self.replaced.lock().unwrap() {
+                return Ok(Some(Held::Refused));
+            }
+            Ok(self.keys.find(name)?.map(Held::Usable))
+        }
+
+        fn generate(&self, name: &str) -> Result<Held, StoreError> {
+            self.keys.generate(name).map(Held::Usable)
+        }
+
+        fn delete(&self, _name: &str) -> Result<(), StoreError> {
+            *self.replaced.lock().unwrap() = true;
+            Ok(())
+        }
+    }
+
+    /// A rebuilt client is refused the key its predecessor generated. That
+    /// key signs nothing but handles, and every mint registers the key it
+    /// signs under first, so it is replaced with one this program can use,
+    /// found again from then on, rather than failing every mint.
+    #[test]
+    fn a_client_key_this_program_is_refused_is_replaced() {
+        let store = Rebuilt::default();
+        let replaced = client_key(&store).unwrap().public_key().unwrap();
+        assert_eq!(client_key(&store).unwrap().public_key().unwrap(), replaced);
     }
 }
