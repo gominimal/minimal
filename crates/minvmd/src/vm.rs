@@ -238,10 +238,8 @@ impl VmConfig {
         // the &str handed to `set_kernel` outlives the call.
         let rust_log = std::env::var(GUEST_LOG_ENV).ok();
         let cmdline = kernel_cmdline(rust_log.as_deref());
-        // The boot line on the VM's boot log (NET-082 observability): a guest
-        // route-table question is answerable from the host side — the line
-        // shows `ipv6.disable=1`, the reason no IPv6 route ever appears.
-        tracing::info!(cmdline = %cmdline, "guest boot line: console on hvc0, IPv6 disabled");
+        // On the VM's boot log, so the boot line is inspectable from the host.
+        tracing::info!(cmdline = %cmdline, "guest boot cmdline");
         ctx.set_kernel(
             &self.kernel_path,
             crate::image::kernel_format(),
