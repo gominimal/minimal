@@ -4,7 +4,7 @@ title: Local Box Egress Proxy — sealed GitHub credentials and host-store secre
 owner: norrietaylor
 epic: gominimal/inbox#625
 arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
-updated: 2026-09-18
+updated: 2026-09-21
 ---
 
 # BEP — Local Box Egress Proxy — sealed GitHub credentials and host-store secrets without Gatehouse
@@ -62,6 +62,7 @@ PAC recipe and `host_ip` cohort handling are later slices.
 **Roles:** developer on an un-enrolled laptop, developer working in a box, developer reviewing what a box may reach
 
 - AS A developer using Minimal on a laptop with no Gatehouse, I WANT to sign in to GitHub once with `min`, SO THAT every box I start afterwards can reach my repositories without me handling a token.
+- AS A developer who signed in yesterday, I WANT today's boxes to get working GitHub credentials without signing in again, SO THAT the 8-hour life of a GitHub token asks nothing of me.
 - AS A developer working in a box, I WANT `git clone`, `git push` and `gh` to work against my repositories, SO THAT I do real work without configuring any tool.
 - AS A developer with an API key in my macOS Keychain, I WANT to reference it by identifier in a box spec, SO THAT requests from the box to that key's upstream carry it without the key entering the box.
 - AS A developer with a third-party API key, such as a Claude OAuth token or an MCP server credential, I WANT to store it once with `min secret`, SO THAT box specs reference it by identifier and its value never appears in `min` output, a spec, or a box.
@@ -69,7 +70,8 @@ PAC recipe and `host_ip` cohort handling are later slices.
 - AS A developer, I WANT a sealed value copied out of a box to be worthless anywhere else, SO THAT exfiltration of the box environment yields nothing usable.
 - AS A developer reviewing what a box may reach, I WANT the expanded box spec to show the interception CA and the derived credentialed upstream set, SO THAT interception is declared, not discovered.
 - AS A developer, I WANT to read what the proxy admitted and refused, SO THAT I can see what my agents did with my credentials.
-- AS A developer, I WANT to revoke a session's credentials, SO THAT a value already delivered stops working.
+- AS A developer, I WANT to revoke a session's credentials, SO THAT a value already delivered stops working and nothing I create afterwards is affected.
+- AS A developer who removes a box and creates another under the same name, I WANT the new box's credentials to work, SO THAT a revocation stays with the box it was made for, not with its name.
 
 ## Requirements
 
@@ -99,17 +101,33 @@ Sign-in
 - **BEP-004** WHEN `min auth status` is run THE SYSTEM SHALL report whether a GitHub sign-in is held and its expiry, and output no token value.
   tier:     T0
   verify:   cargo nextest run -p minimal auth_status_reports_expiry_without_token
+  - WHERE the held token has expired and its refresh material has not, WHEN `min auth status` is run THE SYSTEM SHALL report that the sign-in renews when the next box declaring a GitHub grant is created.
+    tier:   T0
+    verify: cargo nextest run -p minimal auth_status_reports_renewal_of_expired_sign_in
+
+- **BEP-069** WHILE a GitHub sign-in is held, WHEN a box declaring a GitHub grant is created and the held token has expired or expires within 5 minutes THE SYSTEM SHALL renew the sign-in from its refresh material, hold the renewed token and refresh material in the host keychain in place of the old, and mint from the renewed token.
+  tier:     T0
+  verify:   cargo nextest run -p minimal an_expiring_sign_in_is_renewed_from_its_refresh_token
+  <!-- Gatehouse §6.10 un-enrolled bullet: the user token expires in 8 h and renews on GitHub's refresh token, which is what BEP-002 keeps the refresh material for; a device-flow sign-in renews with no client secret -->
+  - IF the held token expires more than 5 minutes after the box is created THEN THE SYSTEM SHALL mint from it without renewing.
+    tier:   T0
+    verify: cargo nextest run -p minimal a_sign_in_with_time_to_live_is_not_renewed
+    <!-- unwanted; GitHub invalidates the token and the refresh token it renews, so an early renewal would end every member already minted from the old token, in every running box -->
+  - IF the held token has expired and GitHub refuses the renewal, or the refresh material has expired too THEN THE SYSTEM SHALL fail the creation as BEP-003 fails it with no sign-in held.
+    tier:   T0
+    verify: cargo nextest run -p minimal unrenewable_sign_in_fails_creation_with_defined_error
 
 Minting and sealing
 
-- **BEP-005** WHERE the host is not enrolled, WHEN a box declaring a `source = "broker"` GitHub grant is created THE SYSTEM SHALL mint a `mode = "user"` member of `full` breadth from the held sign-in with an expiry no later than 8 hours after creation.
+- **BEP-005** WHERE the host is not enrolled, WHEN a box declaring a `source = "broker"` GitHub grant is created THE SYSTEM SHALL mint a `mode = "user"` member of `full` breadth from the held sign-in with an expiry no later than the held token's expiry and no later than 8 hours after creation.
   tier:     T0
   verify:   cargo nextest run -p bep local_mint_expiry_is_at_most_8h
+  <!-- a member lives no longer than the token it was minted from; BEP-069 renews only a token about to expire, so a box created late in a token's life holds a member shorter than 8 hours -->
 
-- **BEP-006** WHEN a GitHub member is minted THE SYSTEM SHALL seal it to this host's proxy key with the box, the host, the module identifier, the host-set version, the mode, the breadth and the expiry bound in the authenticated context.
+- **BEP-006** WHEN a GitHub member is minted THE SYSTEM SHALL seal it to this host's proxy key with the box, the host, the module identifier, the host-set version, the mode, the breadth, the expiry and the position of the member's mint record in the audit log bound in the authenticated context.
   tier:     T0
   verify:   cargo nextest run -p bep sealed_context_binds_box_host_module_version_expiry
-  <!-- the module's host set and its version are Gatehouse §6.10's (Module host sets): the v1 GitHub set is `github.com`, `api.github.com`, `uploads.github.com` and `codeload.github.com`, enumerated and versioned by the module definition; every "host set" in this document reads there -->
+  <!-- the module's host set and its version are Gatehouse §6.10's (Module host sets): the v1 GitHub set is `github.com`, `api.github.com`, `uploads.github.com` and `codeload.github.com`, enumerated and versioned by the module definition; every "host set" in this document reads there; the box is one creation of it (BEP-070), and the mint record's position is what scopes a revocation to what was minted before it (BEP-071) -->
 
 - **BEP-007** WHEN a sealed member is delivered THE SYSTEM SHALL place the sealed value, and no plaintext token, in the grant's environment variable in the box.
   tier:     T0
@@ -155,19 +173,35 @@ Minting and sealing
 
 Steering and the interception CA
 
-- **BEP-011** WHERE a box declares a credentialed upstream and its steering is not `off`, WHEN the box is created THE SYSTEM SHALL inject the host root CA certificate into the box trust store.
+- **BEP-011** WHERE a box declares a credentialed upstream and its steering is not `off`, WHEN the box is created THE SYSTEM SHALL add the host root CA certificate, the self-signed anchor that carries the name constraints, to the box's OS trust store in both standard forms, appended to the CA bundle and linked in the hashed certificate directory under its subject hash, beside the system roots.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_root_ca_present_in_box_trust_store
+  <!-- Gatehouse §6.10 trust-store injection: the bundle alone is invisible to OpenSSL built with a certificate directory and no bundle file, and the directory alone to bundle readers such as Go and GnuTLS; additive, because the proxy terminates only credentialed flows and every other flow validates against the system roots; the box host writes and the image reads; a box's trust store does not change after its creation -->
+  - WHERE a box declares no credentialed upstream, or its steering is `off`, THE SYSTEM SHALL keep the root out of the box's trust store, whichever other boxes on the host were created from the same packages.
+    tier:   T0
+    verify: ./scripts/session-e2e.sh bep_root_ca_absent_from_box_without_credentialed_upstream
+    <!-- trust injected only where declared (Gatehouse T27); the bundle a box reads can be the package store's own copy, and writing the root into that copy would put it in every box built from the package -->
+  - WHERE the root is injected, WHEN the box is created THE SYSTEM SHALL set `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` to the box's CA bundle and `NODE_EXTRA_CA_CERTS` to the root.
+    tier:   T0
+    verify: ./scripts/session-e2e.sh bep_trust_env_points_at_bundle_and_root
+    <!-- Gatehouse §6.10 trust-store injection's environment block, for stacks that keep a store of their own; Node reads no OS store, so a Node client such as Claude Code refuses every leaf without it; the list is maintained with the package set, and the JVM keystore is outside it -->
+  - IF a box spec's environment sets one of those variables THEN THE SYSTEM SHALL keep the spec's value and emit a validation warning naming the variable.
+    tier:   T0
+    verify: cargo nextest run -p sessions spec_trust_env_shadows_platform_with_warning
 
 - **BEP-012** WHERE a box's steering is `proxy_env` or `both`, or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `HTTPS_PROXY` and `HTTP_PROXY` in the box environment to the proxy's address and set `NO_PROXY` to `.min.internal`, `host.min.internal`, `localhost`, `127.0.0.1` and the box's `[network.bep] no_proxy` entries.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_proxy_env_and_no_proxy_are_set
 
-- **BEP-013** WHEN a box connects to an admitted credentialed hostname through the proxy THE SYSTEM SHALL present a leaf certificate for that hostname that chains to the host root CA through the host's one signing CA, whose name constraints equal the union of the credentialed upstream sets every box on the host declares.
+- **BEP-013** WHEN a box connects to an admitted credentialed hostname through the proxy THE SYSTEM SHALL present a leaf certificate for that hostname that chains through the host's one signing CA to the host root CA, whose name constraints equal the union of the configured modules' host sets and the authorities the operator's `[secret-store-rules]` register, less the fixed deny set.
   tier:     T1
-  verify:   cargo nextest run -p bep prop_signing_ca_constraints_equal_declared_union
-  property: for every family of declared credentialed upstream sets on a host, the signing CA's permitted-names constraint equals their union, a leaf for a name in the union validates against the root, a leaf for any name outside the subtrees the union permits fails validation, and the proxy issues leaves for names in the union alone
-  <!-- Gatehouse §6.10 un-enrolled bullet: the host-generated CA is name-constrained to the union of the host's declared credentialed upstream sets, exactly as the enrolled intermediate; one keychain-held signing CA per host (BEP-014, BEP-059 to BEP-061), not one per box; X.509 permitted subtrees admit a name's subdomains (RFC 5280 §4.2.1.10), so exact admission is by leaf issuance, never by the constraint alone; a box's own reach within the union is bounded by its egress declaration (BEP-022) and its sealed values' host sets (BEP-021) -->
+  verify:   cargo nextest run -p bep prop_root_constraints_equal_registered_union
+  property: for every family of module host sets and registered authorities on a host, the root's permitted-names constraint equals their union less the deny set, a leaf for a name in the union validates against the root alone, a leaf for any name outside the subtrees the union permits fails validation, and the proxy issues leaves for names in the union alone
+  <!-- Gatehouse §6.10 per-node interception CA and trust-store injection: the constraints come from the host's registrations, never a spec-chosen name, and sit on the self-signed anchor itself; one keychain-held signing CA per host (BEP-014, BEP-059 to BEP-061), not one per box; X.509 permitted subtrees admit a name's subdomains (RFC 5280 §4.2.1.10), so exact admission is by leaf issuance, never by the constraint alone; a box's own reach within the union is bounded by its egress declaration (BEP-022) and its sealed values' host sets (BEP-021); a rule's authority written with no port is port 443 -->
+  - WHEN the registered authorities change THE SYSTEM SHALL re-issue the root under the same key and subject with the changed constraints, and leave every running box's trust store as it was.
+    tier:   T0
+    verify: cargo nextest run -p bep root_recertified_under_same_key_and_subject
+    <!-- Gatehouse §6.10: re-certification is not rotation; a running box keeps validating the names its root already permitted and reaches an added authority once re-created; the certificates below the root carry a key-identifier-only authority key identifier, so they chain to either issue of it -->
 
 - **BEP-014** THE SYSTEM SHALL hold the signing CA private key in the host keychain as a non-exportable key and write it to no file.
   tier:     T0
@@ -178,6 +212,14 @@ Steering and the interception CA
   verify:   cargo nextest run -p bep sealing_and_root_keys_persist_non_exportable
   <!-- Gatehouse §6.10 un-enrolled lifecycle and the hardware-backed custody bullet -->
 
+- **BEP-072** THE SYSTEM SHALL publish the sealing key's public half, the key fingerprints a sealed context binds and the root certificate where the operator's processes read them, and seal every value from that published material without opening the proxy's key store.
+  tier:     T0
+  verify:   cargo nextest run -p bep a_value_sealed_to_the_published_identity_unseals_under_the_keys
+  <!-- ubiquitous; sealing is public-key work; a client that opened the store would be refused keys the keychain admits to the proxy alone, or would generate keys the proxy cannot use; this is how the custody invariant holds on the client's side -->
+  - IF the published material does not parse as a key of the role it is published under THEN THE SYSTEM SHALL refuse to seal and name the role.
+    tier:   T0
+    verify: cargo nextest run -p bep a_published_identity_carrying_no_key_is_refused_by_role
+
 - **BEP-060** THE SYSTEM SHALL replace the sealing key or the root CA only on an explicit operator command, and never on restart.
   tier:     T0
   verify:   cargo nextest run -p bep keys_never_regenerated_on_restart
@@ -186,6 +228,10 @@ Steering and the interception CA
     tier:   T0
     verify: cargo nextest run -p bep key_replacement_kills_outstanding_members
     <!-- the recreate-to-re-mint rule of Gatehouse §8.3 -->
+  - IF the host keychain refuses the proxy a key it holds for the proxy THEN THE SYSTEM SHALL refuse to start and name `bep --replace-key` with the role of each refused key.
+    tier:   T0
+    verify: cargo nextest run -p bep refused_key_names_the_replacement_command
+    <!-- unwanted; the keychain admits a key to the program that generated it, so a rebuilt proxy is a different program and is refused its predecessor's keys; the replacement is this requirement's operator command, and it runs without the files a serving proxy reads, since the case it exists for is a proxy that will not start -->
 
 - **BEP-061** WHEN the signing CA rotates under an unchanged root THE SYSTEM SHALL keep every running box's trust anchor valid with no change inside the box.
   tier:     T0
@@ -246,10 +292,10 @@ Redemption
   property: for every connection authority, every `Host` value and every request-target authority (the connection authority itself for an origin-form request), substitution happens only when all three are equal
   harness:  kani_redeem_pins_request_authority, same bound and purity constraint as BEP-019
 
-- **BEP-024** IF a sealed value's expiry has passed, or the value has been revoked THEN THE SYSTEM SHALL refuse the request.
+- **BEP-024** IF a sealed value's expiry has passed, or a revocation in force covers it (BEP-071) THEN THE SYSTEM SHALL refuse the request.
   tier:     T2
   verify:   cargo nextest run -p bep prop_expired_or_revoked_value_is_refused
-  property: for every sealed value, every clock reading and every revocation set, redemption admits only when the clock is before the value's expiry and the value is not in the set
+  property: for every sealed value, every clock reading and every revocation set, redemption admits only when the clock is before the value's expiry and no revocation in the set covers the value
   harness:  kani_redeem_refuses_expired_or_revoked, same bound and purity constraint as BEP-019
 
 - **BEP-058** IF a sealed member carries no `mode` or no `breadth`, or a `breadth` the proxy does not recognise THEN THE SYSTEM SHALL refuse the request.
@@ -317,10 +363,18 @@ Store references
   tier:     T0
   verify:   cargo nextest run -p bep store_value_read_per_request_never_written
 
-- **BEP-063** WHEN a store reference is minted for a box THE SYSTEM SHALL issue a handle signed under the client's local key carrying the store, the identifier, the registered upstream authorities, the injection form and a short expiry, and register that key with the proxy over the proxy's control socket at first use.
+- **BEP-063** WHEN a store reference is minted for a box THE SYSTEM SHALL issue a handle signed under the client's local key carrying the store, the identifier, the registered upstream authorities, the injection form and an expiry no later than 8 hours after the mint, and register that key with the proxy over the proxy's control socket before the handle is delivered.
   tier:     T0
   verify:   cargo nextest run -p minimal store_handle_signed_and_key_registered
-  <!-- Gatehouse §6.10 store members, un-enrolled: the client signs handles in the store-handle wire format under its local key; the control socket is the local UDS of §6.2's same-machine trust, distinct from the redemption listener BEP-026 closes to non-box connections -->
+  <!-- Gatehouse §6.10 store members, un-enrolled: the client signs handles in the store-handle wire format under its local key; the control socket is the local UDS of §6.2's same-machine trust, distinct from the redemption listener BEP-026 closes to non-box connections; the 8-hour bound is the member's (BEP-005): with no in-box re-mint path (Non-goals), a shorter handle ends a box's store references hours before its member, and the sealed context already binds the handle to its box and host -->
+  - WHEN the proxy restarts THE SYSTEM SHALL verify store handles under every client key registered before the restart.
+    tier:   T0
+    verify: cargo nextest run -p bep client_key_registrations_survive_restart
+    <!-- event-driven; a registration held only by the running process would refuse every running box's store references after a restart, until the next mint registered the key again -->
+  - IF the host keychain refuses the running client its handle-signing key THEN THE SYSTEM SHALL replace the key and register the replacement before minting.
+    tier:   T0
+    verify: cargo nextest run -p bep a_client_key_this_program_is_refused_is_replaced
+    <!-- unwanted; unlike the proxy's keys (BEP-060), this key signs handles only and every mint registers the key it signs under, so its replacement needs no operator step -->
   - THE SYSTEM SHALL accept key registration and audit submissions only over a control socket owned by the operator's user with mode `0600`, separate from the redemption listener.
     tier:   T0
     verify: cargo nextest run -p bep control_socket_is_owner_only_and_separate_from_listener
@@ -332,6 +386,10 @@ Store references
   property: for every handle, every registered key set, every clock reading and every current rule, redemption admits only when the signature verifies, the clock is before `exp`, `upstream` is a subset of the rule's authorities and `inject` equals the rule's form
   harness:  kani_redeem_refuses_invalid_store_handle, same bound and purity constraint as BEP-019
   <!-- a rule that has since narrowed, or changed its injection form, refuses: editing a rule bites a running box -->
+  - WHEN the operator's `[secret-store-rules]` change THE SYSTEM SHALL judge the next request against the changed rules, with no restart of the proxy or the box.
+    tier:   T0
+    verify: cargo nextest run -p bep edited_store_rule_applies_to_next_request
+    <!-- event-driven; the rule is read as current at each request, as BEP-054 reads the stored value; a rule registering a new authority also changes the root's constraints (BEP-013), which reach boxes created afterwards -->
 
 - **BEP-034** IF a `[secret-store-rules]` rule names a deep module's host, Minimal's own infrastructure, or an injection header among `Host`, `:authority`, `Cookie`, `Proxy-*`, `Transfer-Encoding`, `Connection` and `Upgrade` THEN THE SYSTEM SHALL refuse the rule when reading configuration and name it.
   tier:     T0
@@ -374,10 +432,14 @@ Review, audit and revocation
   verify:   cargo nextest run -p bep every_decision_appends_one_audit_record
   <!-- the F12 shape by ruling (Gatehouse §6.10 Audit bullet, v1.20.1); `kind` tells a proxy decision from an identity event once the host enrolls; off-module and unsealed records carry `none` -->
 
-- **BEP-067** WHEN the client mints a member or `min auth logout` completes THE SYSTEM SHALL append a record of kind `mint` or `revocation` to the same log through the proxy, the log's sole writer, over the control socket.
+- **BEP-067** WHEN the client mints a member or a store handle, or `min auth logout` completes THE SYSTEM SHALL append a record of kind `mint` or `revocation` to the same log through the proxy, the log's sole writer, over the control socket, a mint's record before the value is sealed.
   tier:     T0
   verify:   cargo nextest run -p minimal mint_and_logout_append_audit_records
   <!-- so a box's trail reads the same un-enrolled and enrolled, where the STS pipeline carries the box's identity events; one writer means the head read, the append and the chain advance are one operation in one process, so concurrent client and proxy records cannot share a predecessor -->
+  - IF the proxy does not append a mint's record THEN THE SYSTEM SHALL seal nothing and fail the box's creation with the defined error `egress_proxy_unavailable`.
+    tier:   T0
+    verify: cargo nextest run -p minimal unrecorded_mint_fails_with_defined_error
+    <!-- unwanted; no value exists whose mint the log does not hold, the local form of Gatehouse's INV-4 (nothing signed without a durably recorded event); the value carries the record's position (BEP-006) -->
 
 - **BEP-040** THE SYSTEM SHALL write no credential, injected header value, or request body to the audit log.
   tier:     T1
@@ -395,11 +457,21 @@ Review, audit and revocation
   - WHEN `min box audit` is run THE SYSTEM SHALL read across every retained segment.
     tier:   T0
     verify: cargo nextest run -p minimal box_audit_reads_across_segments
+  - WHEN the proxy starts THE SYSTEM SHALL restore every revocation recorded in every retained segment.
+    tier:   T0
+    verify: cargo nextest run -p bep revocations_restored_from_every_segment_on_start
+  - THE SYSTEM SHALL give each record a position in the log that no other record, retained or removed, has held.
+    tier:   T0
+    verify: cargo nextest run -p bep record_positions_never_repeat
+    <!-- ubiquitous; a retention bound that renumbered what it kept would move a revocation behind values it covers (BEP-071) -->
 
-- **BEP-042** WHEN `min box audit <box> [-o jsonl]` is run THE SYSTEM SHALL output the audit records whose subject is that box and no other, a reaped box included.
+- **BEP-042** WHEN `min box audit <name>@<id> [-o jsonl]` is run THE SYSTEM SHALL output the audit records whose subject is that creation of the box and no other, a reaped box included.
   tier:     T0
   verify:   cargo nextest run -p minimal box_audit_filters_to_one_box
   <!-- the ruled grammar: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`; the log is the proxy's, not part of the box record, so `rm` and `prune` never touch it -->
+  - WHEN `min box audit <name>` is run THE SYSTEM SHALL output the records of every box created under that name, reaped boxes included, each naming its creation, and no other.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_audit_reads_every_box_made_under_a_name
   - WHEN `--follow` is given THE SYSTEM SHALL replay the box's records and then tail new ones.
     tier:   T0
     verify: cargo nextest run -p minimal box_audit_follow_replays_then_tails
@@ -413,13 +485,27 @@ Review, audit and revocation
     verify: cargo nextest run -p minimal box_audit_self_unenrolled_refused_with_error
     <!-- no `identity.sock` un-enrolled; the in-box read path is Gatehouse §14.4 item 7's local surface -->
 
-- **BEP-043** WHEN `min box stop` or `min box rm` of a box, or a type-noun alias of either, completes THE SYSTEM SHALL refuse redemption of every sealed value naming that box within 60 seconds.
+- **BEP-043** WHEN `min session destroy`, `min box stop` or `min box rm` of a box, or a type-noun alias of any of them, completes THE SYSTEM SHALL refuse redemption of every sealed value naming that box within 60 seconds.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_stopped_box_values_refused_within_60s
 
-- **BEP-044** WHEN `min auth logout` completes THE SYSTEM SHALL refuse redemption of every sealed GitHub member on this host within 60 seconds.
+- **BEP-044** WHEN `min auth logout` completes THE SYSTEM SHALL refuse redemption of every sealed GitHub member minted on this host before it within 60 seconds.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_logout_refuses_all_members_within_60s
+  - WHEN a GitHub sign-in completes after `min auth logout` THE SYSTEM SHALL redeem the members minted from it.
+    tier:   T0
+    verify: cargo nextest run -p minimal sign_in_after_logout_mints_redeemable_members
+
+- **BEP-070** WHEN a box is created under the name a destroyed box held THE SYSTEM SHALL redeem the new box's sealed values and keep refusing the destroyed box's.
+  tier:     T0
+  verify:   ./scripts/session-e2e.sh bep_box_recreated_under_its_name_redeems
+  <!-- Gatehouse §5.2: a box id is unique per creation and the friendly name is an alias; un-enrolled, the session id of the creation stands in for the ULID, and the sealed context, the revocation and the audit subject name the box as `<name>@<session id>` -->
+
+- **BEP-071** THE SYSTEM SHALL treat a revocation as covering a sealed value exactly when it names the value's box or module and was recorded in the audit log after the value's mint record.
+  tier:     T1
+  verify:   cargo nextest run -p bep prop_revocation_covers_only_earlier_mints
+  property: for every sequence of mint and revocation records and every sealed value, the value is covered iff some revocation naming its box or its module holds a later position in the log than the value's mint record
+  <!-- the filter selects the revocations in force for a value before the pure decision reads them, so BEP-024's harness is unchanged -->
 
 - **BEP-045** IF a referenced Keychain item has been deleted or disabled THEN THE SYSTEM SHALL refuse the next request that would inject it.
   tier:     T0
@@ -460,6 +546,10 @@ Setting secrets
 - **BEP-051** WHEN `min secret set` stores an item THE SYSTEM SHALL set the item's access control so that the proxy process reads it without a prompt and any other application prompts.
   tier:     T0
   verify:   cargo nextest run -p minimal secret_item_acl_admits_proxy_only
+  - IF the proxy binary is not at the path the item's access control would name THEN THE SYSTEM SHALL refuse the command, naming that path, before reading the value.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_refuses_when_proxy_binary_absent
+    <!-- unwanted; the keychain resolves a trusted application from a path that has to exist -->
 
 - **BEP-052** WHEN `min secret list [--store <s>]` is run THE SYSTEM SHALL output, for each stored identifier: its store; the authorities and the injection form the matching `[secret-store-rules]` rule registers for it; the consent rule or `none`; and whether the item's access control carries the entry `set` created for the proxy's process identity; and output no value.
   tier:     T0
@@ -479,7 +569,7 @@ Setting secrets
 - Anthropic and MCP upstream modules; 1Password, LastPass, Linux Secret Service, `pass` and Bitwarden store backends: follow-on epics reusing this document's module and resolver seams (Gatehouse §6.10 store members lists the roster).
 - The Gatehouse-hosted proxy, the enrolled `gateway` helper, the tenant secret store and the revocation feed: [GHI](https://github.com/gominimal/gatehouse/pull/1), Gatehouse §6.10, §6.11, §8.6. With a Gatehouse configured, `min` delegates sign-in, minting and sealing to it; nothing here forecloses that and the envelope is the same.
 - Repository narrowing of a locally minted GitHub member: later work, the §6.4 scoped-token endpoint against the local App under the embedded client secret (Gatehouse §14.4 item 7); an open question below records the residual meanwhile.
-- An in-box re-mint path for a locally minted member: none exists un-enrolled, since there is no `identity.sock`; members are creation-time snapshots and a box that outlives its member's expiry is re-created to re-mint (Gatehouse §8.3). BEP-024 refuses the expired value; the local re-mint surface is Gatehouse §14.4 item 7.
+- An in-box re-mint path for a locally minted member or store handle: none exists un-enrolled, since there is no `identity.sock`; members and handles are creation-time snapshots and a box that outlives their expiry is re-created to re-mint (Gatehouse §8.3). BEP-024 refuses the expired value; the local re-mint surface is Gatehouse §14.4 item 7.
 - The box-zone resolver, DNS-pinned admission, `network.mode` and the `[network]` table's egress fields: [NET](https://github.com/gominimal/minimal/pull/1380) (NET-060, NET-066, NET-072, NET-122). This document owns `[network.bep]` (`steering`, `proxy_env`, `no_proxy`) and `quic443`; the rest of the `[network]` schema is [gominimal/inbox#570](https://github.com/gominimal/inbox/issues/570).
 - `min secret` against the Gatehouse tenant store (deposits): Gatehouse §8.6 and the architecture's `min secret` reference; here the noun binds host stores only and refuses `--store gatehouse` (BEP-050), and the two forms share one grammar.
 - `min login` as the alias for `min auth login`: the command tree; the daemon-mTLS meaning the verb carries today is retired by NET (NET-109).
@@ -548,6 +638,28 @@ of existing specs at the flip; requiring an explicit mode was rejected because
 it privileges neither mode and adds a validation error the architecture does
 not have.
 
+**Renewal waits for the token to expire.** GitHub invalidates the token and the
+refresh token it renews, so renewing a token with time left would end every
+member already minted from it. The client renews only a token that has expired
+or is within five minutes of it (BEP-069), and a box created late in a token's
+life holds a member shorter than 8 hours (BEP-005). Renewing on a schedule was
+set aside for the same reason; a re-mint surface for running boxes is the
+architecture's open item (Non-goals).
+
+**A revocation is scoped by position, a box by creation.** A revocation names a
+box or the GitHub module and holds from where it sits in the audit log: it
+covers a value whose mint record comes before it and nothing minted after
+(BEP-071), and the value binds its mint record's position so the proxy can
+tell (BEP-006). Two narrower rules were weighed. Scoping by box alone clears a
+re-used name but leaves `min auth logout` refusing every later sign-in's
+members; scoping by time needs a timestamp the audit record's fixed field set
+does not carry, and a clock the client and the proxy agree on. A box is named
+per creation, `<name>@<session id>`, the session id standing in for Gatehouse
+§5.2's per-creation ULID, so a name used again after a removal is a different
+box (BEP-070); `min box audit <name>` still reads every creation under the
+name. Recording the mint before sealing is what yields the position, and it
+makes an unrecorded mint a failed creation rather than a warning (BEP-067).
+
 **Sign-in and audit verbs.** `min auth login | logout | status` and the `min box
 audit` grammar follow the command tree; `login` is the tree's alias for `min
 auth login`, and NET retires the daemon-mTLS meaning the verb carries today.
@@ -571,10 +683,13 @@ set` writes to the operator's keychain, so the proxy reads as the operator's
 login user; gvproxy and the VM run as a dedicated unprivileged user (BEP-047).
 A proxy user with a keychain of its own was rejected for v1 because the write
 path would need a helper channel and the items would fall outside the
-operator's Keychain Access view. On macOS the item's access control keys on
-code signature, so a development build must be signed with a stable identity or
-every redemption prompts; that is a build-time constraint for the plan, not a
-requirement.
+operator's Keychain Access view. On macOS the keychain keys on code signature: a
+stored item's access control prompts for any binary it does not name, and a
+non-exportable key admits only the program that generated it, so a rebuilt
+proxy is refused its own keys outright. A release signed with a stable identity
+stays the same program across upgrades; a development build does not, and
+recovers through the replacement command after each rebuild (BEP-060). That is
+a build-time constraint for the plan, not a requirement.
 **`[network.bep]` is bound here.** This document owns `steering`, `proxy_env`
 and `no_proxy`, and `quic443`, because it introduces them and three
 requirements cannot be implemented without them; `network.mode` stays NET's and
@@ -631,11 +746,19 @@ enforced by keychain access control rather than by a decision function this code
 owns (BEP-014, BEP-051, BEP-059), so a property test would restate the
 keychain's contract.
 
-**Three-layer CA, keys in the keychain.** A root as the injected anchor, a
-keychain-held signing CA that rotates freely, and per-hostname leaves is the
-reading of the per-host intermediate Gatehouse §6.10 records; the un-enrolled
-key lifecycle it states is bound as BEP-059 to BEP-061. Requirements state only
-the observables.
+**Three-layer CA, keys in the keychain.** A self-signed root as the injected
+anchor, a keychain-held signing CA that rotates freely, and per-hostname leaves
+is the reading of the per-host intermediate Gatehouse §6.10 records; the
+un-enrolled key lifecycle it states is bound as BEP-059 to BEP-061. The name
+constraints sit on the root itself (BEP-013). Two alternatives were set aside.
+Constraints on the signing CA alone bind only while the proxy presents that
+certificate, so a certificate the root signed directly would validate
+unconstrained. Anchoring boxes on the constrained signing CA instead needs
+partial-chain validation, which OpenSSL's own `verify` and stock Node lack;
+constraints on a self-signed anchor are enforced by OpenSSL, Go and rustls, and
+signing-CA rotation stays invisible to boxes. Injection writes the bundle and
+the hashed directory both (BEP-011), because each form is read by stacks the
+other misses. Requirements state only the observables.
 
 **`min secret` is the store's front door.** The grammar and the `list` row are
 the architecture's `min secret` reference; this document binds the host-store
@@ -671,7 +794,12 @@ compromised box, the irreducible floor, now scoped, audited and revocable. The
 baseline this replaces, a raw token in the box environment usable from anywhere
 for its full TTL, is retired in every mode.
 
-Residuals recorded: T28 for `host_ip` cohort attribution; T31 for host-OS
+Residuals recorded: T28 for `host_ip` cohort attribution, which covers every
+box and any host process that reaches the listener on a VM-backed host whose
+box host does not deliver each box's switch address to the proxy (NET-132,
+NET-133): on such a host a copied value is redeemable from any box or the host
+shell within its own bound, audited `cohort_attributed`, and BEP-020's
+cross-box and BEP-026's host-shell refusals do not hold; T31 for host-OS
 compromise, which on a single-operator laptop is compromise of the operator's
 own machine, reaching the signing key by use but not export, and the audit log,
 whose chain detects an edit that is not followed by recomputation and nothing
@@ -684,7 +812,7 @@ deny set and per-request Keychain access control.
 
 - **Invariant:** THE SYSTEM SHALL redeem a sealed value only on this host and only from the box it names.
   enforced by: host key binding; box attribution from the switch's source address
-  covered by: BEP-019, BEP-020, BEP-026, BEP-028, BEP-058
+  covered by: BEP-019, BEP-020, BEP-026, BEP-028, BEP-058, BEP-070
 
 - **Invariant:** THE SYSTEM SHALL substitute a credential only into a request whose connection authority and `Host` are one declared authority of its module or registration, on an upstream connection that authenticated as that authority.
   enforced by: host-set membership, request-authority pinning, port discipline, name-constrained CA, upstream validation against the host trust store, TLS-only upstream legs for credentialed hosts
@@ -700,11 +828,11 @@ deny set and per-request Keychain access control.
 
 - **Invariant:** THE SYSTEM SHALL grant unattended access to the signing key, the sealing key and store items to the proxy's process identity alone.
   enforced by: process separation; keychain access control bound to the proxy's identity
-  covered by: BEP-014, BEP-047, BEP-051, BEP-059, BEP-060
+  covered by: BEP-014, BEP-047, BEP-051, BEP-059, BEP-060, BEP-072
 
 - **Invariant:** THE SYSTEM SHALL stop redeeming a revoked or expired value within 60 seconds.
   enforced by: expiry in the sealed context; revocation set consulted per request
-  covered by: BEP-024, BEP-043, BEP-044, BEP-045, BEP-060
+  covered by: BEP-024, BEP-043, BEP-044, BEP-045, BEP-060, BEP-068, BEP-071
 
 Architecture threats this document must hold: T28, T31, T32 (Gatehouse §11);
 AT7 and AT25 (architecture threat model).
@@ -713,4 +841,7 @@ AT7 and AT25 (architecture threat model).
 
 - [NEEDS CLARIFICATION (MEDIUM): When does local repository narrowing land? The path is recorded, the §6.4 scoped-token endpoint against the local App under the embedded client secret (Gatehouse §14.4 item 7), and until it does the member is `full` breadth and the T28 residual is the signed-in account's manifest-capped reach for at most 8 hours.]
 - [NEEDS CLARIFICATION (MEDIUM): Does every intended client accept the sealed handle as its bearer unmodified? Claude Code with an OAuth token and MCP clients send `Authorization: Bearer <value>`, which BEP-032 substitutes, but a client that validates token shape before sending, or sends the credential in a header the rule does not name, needs the harness adapter ([gominimal/inbox#345](https://github.com/gominimal/inbox/issues/345)); unmeasured, a plan spike.]
+- [NEEDS CLARIFICATION (HIGH): What happens when the proxy cannot record a revocation? A command that removes a box or the sign-in completes while the proxy is down, and the values it should revoke stay redeemable until they expire, which misses BEP-043 and BEP-044's 60 seconds. The options: fail the command, leaving a box the operator asked to remove; hold the revocation in the client until the proxy answers; or let the box host's withdrawal of a removed box's attachment (NET-133) refuse its values, which covers removal but not logout.]
+- [NEEDS CLARIFICATION (MEDIUM): Gatehouse §6.10 gives store handles a short expiry, and BEP-063 gives them the member's 8 hours because an un-enrolled box has no re-mint path. Does the architecture accept the longer bound un-enrolled, or does the local re-mint surface of Gatehouse §14.4 item 7 come first? Either answer also settles how a box running past 8 hours is told, before its credentials lapse, that it has to be re-created.]
+- [NEEDS CLARIFICATION (MEDIUM): How long is the root valid? Gatehouse §6.10 leaves the injected anchor's validity open, and because a box's trust store never changes after creation, the root's expiry is one more bound on how long a box can reach its credentialed upstreams.]
 - [NEEDS CLARIFICATION (MEDIUM): On a Linux LocalVM host, which key store holds the signing CA key as non-exportable (TPM 2.0 via a PKCS#11 provider, or Secret Service without hardware backing)? BEP-014 is written over "the host keychain"; the plan carries a spike, and until it lands the Linux host is unverified for BEP-014.]

@@ -4,7 +4,7 @@ title: Box networking on the local host: preview by name and bounded egress
 owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md
-updated: 2026-09-18
+updated: 2026-09-21
 ---
 
 # NET — Box networking on the local host: preview by name and bounded egress
@@ -53,13 +53,16 @@ secret stores and GitHub grants the `min` client minted from its own GitHub
 sign-in (no Gatehouse-brokered grants; Gatehouse §6.10's un-enrolled bullet,
 ruled 2026-09-17), is the next thing built and is a separate document,
 [BEP](https://github.com/gominimal/minimal/pull/1426), that cites this one. It
-depends on five behaviours bound here: box-zone resolution (NET-072, NET-073)
+depends on these behaviours bound here: box-zone resolution (NET-072, NET-073)
 and the resolver advisory that makes its default `dns` steering buildable
 (NET-122), `egress.allow_dns_hosts` with DNS-pinned admission (NET-066,
-NET-067), the hostname-proxy parity rule (NET-069 to NET-071), and the relay's
-source-address check (NET-084), which on a VM-backed host is what lets the
-proxy attribute a box by its switch source address: each own-address box holds
-one lease there. On a co-resident host the host-address boxes share the host's
+NET-067), the hostname-proxy parity rule (NET-069 to NET-071), the relay's
+source-address check (NET-084), which on a VM-backed host makes a box's switch
+address its identity, each own-address box holding one lease there; the leg
+that delivers a box's connection to the proxy from that address and nothing
+else from it (NET-132); the attachments that tell the proxy which live box
+holds which address (NET-133); and the proxy's reach from a box whose other
+egress is denied (NET-134). On a co-resident host the host-address boxes share the host's
 address and are attributed as one cohort outside the box host (NET-078), while
 each box's own declaration is enforced inside it (NET-079) on the box's own
 cgroup ([design §4.1][design]). HTTP/3 to a steered host is governed by the
@@ -571,6 +574,29 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minvmd vm_escape_bounded_to_resident_union
   <!-- S10a/AC4; prose 54; feature+unwanted; the union bound is design §4.3 rule 0 and §8; un-enrolled, the baseline set is NET-130's -->
 
+- **NET-132** WHERE the host is VM-backed and runs a node-local Box Egress Proxy THE SYSTEM SHALL deliver a box's connection to the proxy at the switch's host-gateway address with the box's own switch address as its source.
+  tier:     T0
+  verify:   ./scripts/session-e2e.sh proxy_sees_each_vm_box_by_its_switch_address
+  <!-- design §7.1 and Gatehouse §6.10: a node-local BEP's steered destination is its address on the switch's host-gateway, with box source addresses preserved; a leg that translated every box to the host's loopback would give the proxy one source for every box and every host process, and the Box Egress Proxy document's cross-box and host-shell refusals rest on the source; the host-gateway address follows the switch's subnet -->
+  - IF a process outside every box connects to the proxy's listener THEN THE SYSTEM SHALL present it from no box's address.
+    tier:   T0
+    verify: cargo nextest run -p minvmd host_process_never_arrives_from_a_box_address
+    <!-- unwanted; what lets the proxy refuse a connection from the host shell -->
+
+- **NET-133** WHEN a box is created on a host running a node-local Box Egress Proxy THE SYSTEM SHALL give the proxy, before the box's first connection, an attachment naming the box as its sealed values name it, with its addressing and the source address it arrives from.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd proxy_attachment_given_before_first_connection
+  <!-- event-driven; the proxy attributes a connection only to a live box it holds an attachment for; host-address boxes share one attachment as their cohort (NET-078) -->
+  - WHEN the box ends THE SYSTEM SHALL withdraw its attachment within 60 seconds.
+    tier:   T0
+    verify: cargo nextest run -p minvmd proxy_attachment_withdrawn_within_60s_of_box_end
+    <!-- event-driven; a withdrawn attachment refuses an ended box's values even when its revocation was not recorded -->
+
+- **NET-134** WHILE a box declares a credentialed upstream THE SYSTEM SHALL admit its connections to the node-local Box Egress Proxy's listener whatever its egress rules, and its connections to any other host destination only as those rules admit them.
+  tier:     T0
+  verify:   ./scripts/session-e2e.sh deny_all_box_reaches_proxy_and_no_other_host_port
+  <!-- state-driven; the one carve-out beside the resolver's (NET-074, NET-079), bounded to the proxy's listener; a box that declares no credentialed upstream reaches the listener only as its egress rules admit, and `host.min.internal` stays local reach under the box's rules (NET-003) -->
+
 - **NET-102** WHERE the host is un-enrolled THE SYSTEM SHALL self-allocate box addresses from the default plan.
   tier:     T0
   verify:   cargo nextest run -p switch unenrolled_self_allocates_default_plan
@@ -710,7 +736,10 @@ included, with every refusal logged (NET-001 to NET-004).
   mode and HTTP/3 posture), store references, and the client's
   `[secret-store-rules]` consent: the node-local Box Egress Proxy document; the
   fields live in the box spec's `[network]` and `[secrets]` sections but the
-  behaviour is the proxy's ([Gatehouse §6.10][gatehouse]).
+  behaviour is the proxy's ([Gatehouse §6.10][gatehouse]). The leg that carries
+  that traffic to the proxy, the attachments the proxy attributes it by, and its
+  reach under a deny-all verdict are the box host's, bound here (NET-132 to
+  NET-134).
 - Host enrolment, the node record's creation, host listing, and revocation: the
   host-enrolment work
   ([gominimal/inbox#648](https://github.com/gominimal/inbox/issues/648)). No
@@ -992,7 +1021,7 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   enforced by: the frame-level admit-or-drop decision applied at the switch,
   the relay, and every hostname-routing surface
   covered by: NET-016, NET-038, NET-062, NET-064, NET-069, NET-070, NET-074,
-  NET-079, NET-121
+  NET-079, NET-121, NET-134
 - **Invariant:** THE SYSTEM SHALL give a hostname-routing surface no reach that
   a direct connection would not have.
   enforced by: one decision function shared by the proxy and the relay
@@ -1005,6 +1034,11 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   disabled
   ([design §4.3 rule 0 and §8][design])
   covered by: NET-081, NET-082, NET-083, NET-084, NET-085, NET-130
+- **Invariant:** THE SYSTEM SHALL present each box to the node-local Box Egress
+  Proxy from its own source address, and no other process from a box's.
+  enforced by: the relay's source-address check, a proxy leg that keeps the
+  switch source, and attachments that follow each box's lifecycle
+  covered by: NET-084, NET-132, NET-133
 - **Invariant:** THE SYSTEM SHALL admit for a name only addresses that name
   resolved to, intersected with the box's denies and the infrastructure deny
   set.
