@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
-use bep::github::{AuthorizeRequest, Pkce, Url, random_token};
+use bep::github::{AuthorizeRequest, Pkce, Secret, Url, random_token};
 use bep::{GitHub, MintRequest, Record, SealedValue, SignIn, SignInStore, Submission};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
@@ -343,6 +343,13 @@ pub fn status<S: SignInStore>(
                     expiry_text(Some(refresh_expires_at), now)
                 )?;
             }
+            if sign_in.expires_at.is_some_and(|at| at <= now) && renewable(&sign_in, now).is_some()
+            {
+                writeln!(
+                    out,
+                    "  renews when the next box with a GitHub grant is created"
+                )?;
+            }
         }
     }
     Ok(())
@@ -375,6 +382,75 @@ pub async fn logout<S: SignInStore>(
     } else {
         writeln!(out, "GitHub: no sign-in was held")?;
     }
+    Ok(())
+}
+
+/// How close to its expiry a held token is renewed rather than used. GitHub
+/// revokes a token the moment it renews it, which cuts off every member
+/// already minted from it; renewing this early costs those members at most
+/// these last minutes, and spares a box created in them a member that dies
+/// almost at once.
+const RENEW_WITHIN_SECS: u64 = 5 * 60;
+
+/// The refresh token `sign_in` can still be renewed with at `now`, if any.
+fn renewable(sign_in: &SignIn, now: u64) -> Option<&Secret> {
+    sign_in
+        .refresh_token
+        .as_ref()
+        .filter(|_| sign_in.refresh_expires_at.is_none_or(|at| at > now))
+}
+
+/// Renews the held sign-in from GitHub's refresh token when its token has
+/// expired or is about to, and holds the renewed one in its place (BEP-002).
+/// A sign-in with longer to live, or one whose token never expires, is left
+/// as it is, and so is a store holding none.
+///
+/// # Errors
+///
+/// When the store cannot be read or written, when the token has expired and
+/// the refresh material has too, or when GitHub refuses the renewal; each
+/// means signing in again.
+pub async fn renew_if_expiring<S: SignInStore>(
+    store: &S,
+    github: &GitHub,
+    now: u64,
+) -> Result<(), anyhow::Error> {
+    let Some(sign_in) = store.load().context("reading the held sign-in")? else {
+        return Ok(());
+    };
+    let Some(expires_at) = sign_in.expires_at else {
+        return Ok(());
+    };
+    if expires_at > now + RENEW_WITHIN_SECS {
+        return Ok(());
+    }
+    let Some(refresh_token) = renewable(&sign_in, now) else {
+        if expires_at <= now {
+            bail!(
+                "the GitHub sign-in as {} {}, and its refresh material has expired too; run \
+                 `min auth login`",
+                sign_in.account,
+                expiry_text(Some(expires_at), now)
+            );
+        }
+        return Ok(());
+    };
+    let grant = github.refresh(refresh_token).await.with_context(|| {
+        format!(
+            "renewing the GitHub sign-in as {}; run `min auth login` if GitHub keeps refusing",
+            sign_in.account
+        )
+    })?;
+    let renewed = grant.into_sign_in(sign_in.account, now);
+    store
+        .store(&renewed)
+        .with_context(|| format!("storing the renewed sign-in in the {} store", S::NAME))?;
+    tracing::info!(
+        account = %renewed.account,
+        expires_at = renewed.expires_at,
+        store = S::NAME,
+        "renewed the GitHub sign-in"
+    );
     Ok(())
 }
 
@@ -473,6 +549,8 @@ mod tests {
 
     const TOKEN: &str = "ghu_TESTTOKENfa2c1b0d8e7f6a5b4c3d2e1f0a9b8c7d";
     const REFRESH: &str = "ghr_TESTREFRESH0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d";
+    const RENEWED: &str = "ghu_TESTRENEWED9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c";
+    const RENEWED_REFRESH: &str = "ghr_TESTRENEWED0f1e2d3c4b5a6f7e8d9c0b1a2f3e4d5c";
     const DEVICE_CODE: &str = "device-code-3f2a";
     const AUTH_CODE: &str = "auth-code-9b1c";
     const APP: bep::github::App = bep::github::App {
@@ -485,6 +563,7 @@ mod tests {
     struct Seen {
         device_polls: u32,
         challenge: Option<String>,
+        refreshes: u32,
     }
 
     /// A GitHub on loopback: the device-code, token and user endpoints, as
@@ -610,6 +689,14 @@ mod tests {
                     } else {
                         reply(&mut stream, "200 OK", &grant()).await;
                     }
+                } else if request["grant_type"] == "refresh_token" {
+                    assert_eq!(request["refresh_token"], REFRESH);
+                    assert_eq!(request["client_secret"], APP.client_secret);
+                    seen.lock().unwrap().refreshes += 1;
+                    let body = format!(
+                        r#"{{"access_token":"{RENEWED}","token_type":"bearer","scope":"","expires_in":28800,"refresh_token":"{RENEWED_REFRESH}","refresh_token_expires_in":15897600}}"#
+                    );
+                    reply(&mut stream, "200 OK", &body).await;
                 } else {
                     // The browser flow's exchange: the code, the embedded
                     // secret, the redirect it was issued for, and a verifier
@@ -659,6 +746,76 @@ mod tests {
 
     fn held(store: &MemorySignIns) -> SignIn {
         store.load().unwrap().expect("a sign-in is held")
+    }
+
+    /// A sign-in as `octocat` whose token expires at `expires_at` and whose
+    /// refresh material expires at `refresh_expires_at`.
+    fn signed_in(expires_at: u64, refresh_expires_at: u64) -> MemorySignIns {
+        let store = MemorySignIns::new();
+        store
+            .store(&SignIn {
+                account: "octocat".into(),
+                token: Secret::new(TOKEN),
+                expires_at: Some(expires_at),
+                refresh_token: Some(Secret::new(REFRESH)),
+                refresh_expires_at: Some(refresh_expires_at),
+            })
+            .unwrap();
+        store
+    }
+
+    /// BEP-002: a token that has expired, or is about to, renews from the
+    /// refresh material. The renewed token and refresh token replace the old
+    /// ones in the store, and the account stays the one that signed in.
+    #[tokio::test]
+    async fn an_expiring_sign_in_is_renewed_from_its_refresh_token() {
+        let github = FakeGitHub::start().await;
+        let now = unix_now();
+        for expires_at in [now - 60, now + 60] {
+            let store = signed_in(expires_at, now + 86_400);
+            renew_if_expiring(&store, &github.client(), now)
+                .await
+                .unwrap();
+
+            let renewed = held(&store);
+            assert_eq!(renewed.account, "octocat");
+            assert_eq!(renewed.token.expose(), RENEWED);
+            assert_eq!(renewed.expires_at, Some(now + 28_800));
+            assert_eq!(renewed.refresh_token.unwrap().expose(), RENEWED_REFRESH);
+        }
+        assert_eq!(github.seen.lock().unwrap().refreshes, 2);
+    }
+
+    /// GitHub revokes the token it renews, and every member minted from a
+    /// token dies with it, so a token with longer to live is never renewed:
+    /// the store is untouched and GitHub is not asked.
+    #[tokio::test]
+    async fn a_sign_in_with_time_to_live_is_not_renewed() {
+        let github = FakeGitHub::start().await;
+        let now = unix_now();
+        let store = signed_in(now + 3_600, now + 86_400);
+        renew_if_expiring(&store, &github.client(), now)
+            .await
+            .unwrap();
+
+        assert_eq!(held(&store).token.expose(), TOKEN);
+        assert_eq!(github.seen.lock().unwrap().refreshes, 0);
+    }
+
+    /// A token and refresh material that have both expired cannot be renewed:
+    /// the error says to sign in again, and GitHub is not asked.
+    #[tokio::test]
+    async fn an_expired_sign_in_past_its_refresh_material_asks_for_login() {
+        let github = FakeGitHub::start().await;
+        let now = unix_now();
+        let store = signed_in(now - 60, now - 1);
+        let error = renew_if_expiring(&store, &github.client(), now)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("min auth login"), "{error}");
+        assert_eq!(github.seen.lock().unwrap().refreshes, 0);
     }
 
     /// BEP-001: `min auth login --device` completes the device flow under

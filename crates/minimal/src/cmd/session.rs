@@ -225,6 +225,13 @@ async fn mint_grants<S: bep::SignInStore>(
     grants: &[sessions::Grant],
     now: u64,
 ) -> Result<Vec<(sessions::core::primitives::StrictVarName, bep::SealedValue)>, anyhow::Error> {
+    if !grants.is_empty() {
+        let github = bep::github::GitHub::new(
+            bep::github::published_app(),
+            bep::github::Endpoints::github(),
+        )?;
+        crate::auth::renew_if_expiring(store, &github, now).await?;
+    }
     let mut sealed = Vec::with_capacity(grants.len());
     for grant in grants {
         let request = bep::MintRequest {

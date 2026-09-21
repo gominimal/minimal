@@ -420,6 +420,18 @@ struct User {
     login: String,
 }
 
+/// The refresh exchange's body. The secret is left out when the App has
+/// none: GitHub renews a token the device flow granted without one, and an
+/// empty secret is a wrong one.
+#[derive(Serialize)]
+struct RefreshExchange<'a> {
+    client_id: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    client_secret: &'a str,
+    grant_type: &'a str,
+    refresh_token: &'a str,
+}
+
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const SLOW_DOWN: Duration = Duration::from_secs(5);
 
@@ -574,6 +586,48 @@ impl GitHub {
         }
     }
 
+    /// Exchanges `refresh_token` for a new token and refresh token.
+    ///
+    /// GitHub revokes the refresh token used and the token it renews the
+    /// moment it answers, so this is for a token that has expired or is about
+    /// to: renewing a live one would cut off every member already minted from
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// [`GitHubError::Refused`] when GitHub rejects the refresh token;
+    /// another [`GitHubError`] when the exchange fails.
+    pub async fn refresh(&self, refresh_token: &Secret) -> Result<Grant, GitHubError> {
+        let reply: TokenReply = self
+            .post_json(
+                "renewing the sign-in",
+                self.endpoints.oauth("login/oauth/access_token"),
+                &RefreshExchange {
+                    client_id: self.app.client_id,
+                    client_secret: self.app.client_secret,
+                    grant_type: "refresh_token",
+                    refresh_token: refresh_token.expose(),
+                },
+            )
+            .await?;
+        match reply {
+            TokenReply::Grant(grant) => {
+                tracing::info!("GitHub renewed the sign-in");
+                Ok(grant)
+            }
+            TokenReply::Error {
+                error,
+                error_description,
+            } => {
+                tracing::warn!(error = %error, "GitHub refused to renew the sign-in");
+                Err(GitHubError::Refused {
+                    error,
+                    description: error_description,
+                })
+            }
+        }
+    }
+
     /// The login of the account `token` belongs to.
     ///
     /// # Errors
@@ -702,6 +756,23 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refresh under an App with no secret sends none: GitHub renews a
+    /// device-flow token without one, and an empty secret is a wrong one.
+    #[test]
+    fn a_refresh_sends_the_secret_only_when_the_app_has_one() {
+        let body = |client_secret| {
+            serde_json_lenient::to_value(RefreshExchange {
+                client_id: "Iv23liTestApp",
+                client_secret,
+                grant_type: "refresh_token",
+                refresh_token: "ghr_refresh",
+            })
+            .unwrap()
+        };
+        assert!(body("").get("client_secret").is_none(), "{}", body(""));
+        assert_eq!(body("shh")["client_secret"], "shh");
+    }
 
     /// The PKCE challenge is the S256 of the verifier, and every pair is
     /// fresh.
