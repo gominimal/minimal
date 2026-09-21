@@ -616,20 +616,31 @@ pub const BEP_NO_PROXY_LOCAL_ZONE: [&str; 4] = [
     "127.0.0.1",
 ];
 
-/// Where the CLI delivers the host's interception root CA into the session
+/// Where the CLI delivers the host's interception anchor into the session
 /// home, as a composition patch (relative to the sandbox home like every
 /// patch destination), and where the daemon reads it back from at launch to
 /// install it into the box trust store (BEP-011). The daemon holds no host
-/// key material of its own — on macOS it runs inside a VM — so the root
+/// key material of its own — on macOS it runs inside a VM — so the anchor
 /// rides the same upload the loadouts' files do.
-pub const BEP_ROOT_PATCH_DEST: &str = ".local/share/minimal/bep/root.pem";
+pub const BEP_ANCHOR_PATCH_DEST: &str = ".local/share/minimal/bep/anchor.pem";
 
-/// The box trust store directory, relative to the rootfs, and the file the
-/// root lands in there. `/etc/ssl/certs` is where OpenSSL-linked tools
-/// (curl, git) look for anchors.
+/// The box trust store directory, relative to the rootfs.
 pub const BEP_TRUST_STORE_DIR: &str = "etc/ssl/certs";
-/// See [`BEP_TRUST_STORE_DIR`].
-pub const BEP_TRUST_STORE_FILE: &str = "minimal-bep-root.pem";
+
+/// Where the anchor is kept under [`BEP_TRUST_STORE_DIR`] in its own right:
+/// what a tool pointed at one certificate is pointed at, and what a reader
+/// checking whether a box was given an anchor looks for.
+///
+/// A file here under its own name is not itself trusted by anything. OpenSSL
+/// finds an anchor in this directory only by its subject hash, and the tools
+/// that matter — curl, git — read [`BEP_TRUST_BUNDLE_FILE`] instead. Trust
+/// comes from being in that bundle.
+pub const BEP_TRUST_STORE_FILE: &str = "minimal-bep-anchor.pem";
+
+/// The certificate bundle under [`BEP_TRUST_STORE_DIR`] that OpenSSL-linked
+/// tools actually read: the box's trust store as `curl`, `git` and every
+/// OpenSSL default resolve it. An anchor is trusted by being appended to it.
+pub const BEP_TRUST_BUNDLE_FILE: &str = "ca-certificates.crt";
 
 /// The `[session.network]` table of a box spec.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

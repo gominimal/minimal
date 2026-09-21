@@ -158,14 +158,15 @@ fn expand_project_grants(
     ))
 }
 
-/// The file the proxy publishes its root certificate in, PEM, beside its
-/// control socket: what the box's trust store is seeded from (BEP-011).
-const BEP_ROOT_PEM: &str = "root.pem";
+/// The file the proxy publishes its interception anchor in, PEM, beside its
+/// control socket: what the box's trust store is seeded from (BEP-011). The
+/// name-constrained signing certificate, not the root above it.
+const BEP_ANCHOR_PEM: &str = "anchor.pem";
 
-/// `<minimal_dir>/bep/root.pem`, with `--minimal-dir` honoured: the control
+/// `<minimal_dir>/bep/anchor.pem`, with `--minimal-dir` honoured: the control
 /// socket's directory ([`crate::auth::control_socket_path`]).
-fn bep_root_pem_path(minimal_dir: Option<&std::path::Path>) -> PathBuf {
-    crate::auth::control_socket_path(minimal_dir).with_file_name(BEP_ROOT_PEM)
+fn bep_anchor_pem_path(minimal_dir: Option<&std::path::Path>) -> PathBuf {
+    crate::auth::control_socket_path(minimal_dir).with_file_name(BEP_ANCHOR_PEM)
 }
 
 /// The file the proxy publishes its public identity in, beside its control
@@ -174,7 +175,7 @@ fn bep_root_pem_path(minimal_dir: Option<&std::path::Path>) -> PathBuf {
 /// this host can seal one.
 const BEP_PUBLIC_KEYS: &str = "keys.json";
 
-/// `<minimal_dir>/bep/keys.json`, resolved as [`bep_root_pem_path`] is.
+/// `<minimal_dir>/bep/keys.json`, resolved as [`bep_anchor_pem_path`] is.
 fn bep_public_keys_path(minimal_dir: Option<&std::path::Path>) -> PathBuf {
     crate::auth::control_socket_path(minimal_dir).with_file_name(BEP_PUBLIC_KEYS)
 }
@@ -253,14 +254,14 @@ struct BoxDelivery {
 
 /// Lays out the delivery for an admitted expansion: `sealed` in the grants'
 /// variables — the sealed value and nothing else (BEP-007) — the proxy
-/// environment when the expansion sets it (BEP-012), and `root_pem` as a
-/// patch at [`sessions::BEP_ROOT_PATCH_DEST`] when the expansion injects the
+/// environment when the expansion sets it (BEP-012), and `anchor_pem` as a
+/// patch at [`sessions::BEP_ANCHOR_PATCH_DEST`] when the expansion injects the
 /// CA (BEP-011).
 fn box_delivery(
     project_root: &paths::HostAbsPath,
     expansion: &sessions::GrantExpansion,
     sealed: &[(sessions::core::primitives::StrictVarName, bep::SealedValue)],
-    root_pem: Option<&paths::HostAbsPath>,
+    anchor_pem: Option<&paths::HostAbsPath>,
     mode: Option<sessions::NetworkMode>,
 ) -> BoxDelivery {
     use sessions::wire::primitives::{
@@ -287,13 +288,13 @@ fn box_delivery(
             .into_iter()
             .map(|(name, value)| var(name, value)),
     );
-    let patches = root_pem
+    let patches = anchor_pem
         .filter(|_| expansion.inject_ca)
         .map(|pem| WireSessionPatch {
             patch: WireResolvedPatch {
                 host_path: pem.clone(),
-                destination: paths::SandboxRelPath::try_new(sessions::BEP_ROOT_PATCH_DEST)
-                    .expect("BEP_ROOT_PATCH_DEST is a relative sandbox path"),
+                destination: paths::SandboxRelPath::try_new(sessions::BEP_ANCHOR_PATCH_DEST)
+                    .expect("BEP_ANCHOR_PATCH_DEST is a relative sandbox path"),
             },
             source: source.clone(),
         })
@@ -405,18 +406,18 @@ async fn deliver_box_grants(
             .await?,
         );
     }
-    let root_pem = if plan.expansion.inject_ca {
-        let path = bep_root_pem_path(minimal_dir);
+    let anchor_pem = if plan.expansion.inject_ca {
+        let path = bep_anchor_pem_path(minimal_dir);
         if !path.is_file() {
             bail!(
-                "the box egress proxy has not published its root certificate at {}, so the \
-                 box's trust store cannot be seeded; start the proxy and re-create the box",
+                "the box egress proxy has not published its interception anchor at {}, so \
+                 the box's trust store cannot be seeded; start the proxy and re-create the box",
                 path.display()
             );
         }
         let utf8 = camino::Utf8PathBuf::from_path_buf(path)
             .map_err(|p| anyhow::anyhow!("{} is not valid UTF-8", p.display()))?;
-        Some(paths::HostAbsPath::try_new(utf8).context("the proxy root's path")?)
+        Some(paths::HostAbsPath::try_new(utf8).context("the proxy anchor's path")?)
     } else {
         None
     };
@@ -424,7 +425,7 @@ async fn deliver_box_grants(
         project_root,
         &plan.expansion,
         &sealed,
-        root_pem.as_ref(),
+        anchor_pem.as_ref(),
         plan.mode,
     ))
 }
@@ -2558,10 +2559,10 @@ mod tests {
         let socket = dir.path().join("control.sock");
         let audit = dir.path().join("audit.jsonl");
         let _revocations = fake_proxy(&socket, &audit).await;
-        let root_pem = dir.path().join("root.pem");
-        std::fs::write(&root_pem, "-----BEGIN CERTIFICATE-----\n").unwrap();
-        let root_pem =
-            paths::HostAbsPath::try_new(camino::Utf8PathBuf::from_path_buf(root_pem).unwrap())
+        let anchor_pem = dir.path().join("anchor.pem");
+        std::fs::write(&anchor_pem, "-----BEGIN CERTIFICATE-----\n").unwrap();
+        let anchor_pem =
+            paths::HostAbsPath::try_new(camino::Utf8PathBuf::from_path_buf(anchor_pem).unwrap())
                 .unwrap();
         let project = paths::HostAbsPath::try_new("/repo/web").unwrap();
 
@@ -2604,7 +2605,13 @@ mod tests {
         // The hand-off: the grant variable, the proxy environment, the root.
         let network = steered_network();
         let expansion = expand(&network);
-        let delivery = box_delivery(&project, &expansion, &sealed, Some(&root_pem), network.mode);
+        let delivery = box_delivery(
+            &project,
+            &expansion,
+            &sealed,
+            Some(&anchor_pem),
+            network.mode,
+        );
         let names: Vec<&str> = delivery.vars.iter().map(|v| v.var.name.as_str()).collect();
         assert_eq!(
             names,
@@ -2631,10 +2638,10 @@ mod tests {
             assert_eq!(var.source, project_source, "{var:?}");
         }
         assert_eq!(delivery.patches.len(), 1);
-        assert_eq!(delivery.patches[0].patch.host_path, root_pem);
+        assert_eq!(delivery.patches[0].patch.host_path, anchor_pem);
         assert_eq!(
             delivery.patches[0].patch.destination.as_str(),
-            sessions::BEP_ROOT_PATCH_DEST
+            sessions::BEP_ANCHOR_PATCH_DEST
         );
         assert_eq!(delivery.patches[0].source, project_source);
         // Nothing that rides the wire carries the token.
@@ -2653,7 +2660,13 @@ mod tests {
         // environment (BEP-010).
         let mut off = network.clone();
         off.bep.steering = Some(sessions::Steering::Off);
-        let delivery = box_delivery(&project, &expand(&off), &sealed, Some(&root_pem), off.mode);
+        let delivery = box_delivery(
+            &project,
+            &expand(&off),
+            &sealed,
+            Some(&anchor_pem),
+            off.mode,
+        );
         let names: Vec<&str> = delivery.vars.iter().map(|v| v.var.name.as_str()).collect();
         assert_eq!(names, ["GITHUB_TOKEN"]);
         assert!(delivery.patches.is_empty());
@@ -2744,17 +2757,17 @@ mod tests {
         assert!(log.is_empty(), "{log}");
     }
 
-    /// The proxy publishes its root beside its control socket, under the
+    /// The proxy publishes its anchor beside its control socket, under the
     /// same `--minimal-dir`.
     #[test]
-    fn proxy_root_is_published_beside_the_control_socket() {
+    fn proxy_anchor_is_published_beside_the_control_socket() {
         let dir = std::path::Path::new("/state/minimal");
         assert_eq!(
-            bep_root_pem_path(Some(dir)),
-            PathBuf::from("/state/minimal/bep/root.pem")
+            bep_anchor_pem_path(Some(dir)),
+            PathBuf::from("/state/minimal/bep/anchor.pem")
         );
         assert_eq!(
-            bep_root_pem_path(Some(dir)).parent(),
+            bep_anchor_pem_path(Some(dir)).parent(),
             crate::auth::control_socket_path(Some(dir)).parent()
         );
     }

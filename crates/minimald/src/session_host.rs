@@ -2089,28 +2089,40 @@ fn layer_session_env(
     env
 }
 
-/// Installs the host's interception root CA into the box trust store
-/// (BEP-011): the root the CLI delivered into the session home at
-/// [`sessions::BEP_ROOT_PATCH_DEST`] — a composition patch, materialized at
-/// `FinalizeSession` like every other — is copied to
-/// `<rootfs>/{BEP_TRUST_STORE_DIR}/{BEP_TRUST_STORE_FILE}`, world-readable,
-/// where OpenSSL-linked tools look for anchors. Returns the installed path,
-/// or `None` when the home carries no root: a box with no grant, or one under
-/// `steering = "off"`, whose CLI delivered none.
+/// Installs the host's interception anchor into the box trust store
+/// (BEP-011): the anchor the CLI delivered into the session home at
+/// [`sessions::BEP_ANCHOR_PATCH_DEST`] — a composition patch, materialized at
+/// `FinalizeSession` like every other — is put under
+/// `<rootfs>/{BEP_TRUST_STORE_DIR}` and appended to the certificate bundle
+/// there. Returns the installed path, or `None` when the home carries no
+/// anchor: a box with no grant, or one under `steering = "off"`, whose CLI
+/// delivered none.
+///
+/// The append is what makes the box trust it. A certificate sitting in that
+/// directory under a name of its own is trusted by nothing: OpenSSL finds an
+/// anchor there only by its subject hash, and `curl` and `git` read the
+/// bundle. The architecture's bar is that `git`, `gh`, SDKs and MCP clients
+/// need no configuration, which only the bundle meets — an `SSL_CERT_FILE`
+/// pointing at a lone file is per-tool configuration by another name, and
+/// silently misses everything that reads the store directly.
+///
+/// The bundle is rewritten rather than appended to. It arrives hardlinked out
+/// of the content-addressed package store, so an append would edit the
+/// store's own copy — every box built from that package, and every later
+/// build reading it, would see this host's anchor.
 ///
 /// Runs at launch rather than at finalize because the rootfs does not exist
-/// before the launcher builds it; the home does, so the root is read back
+/// before the launcher builds it; the home does, so the anchor is read back
 /// from there.
 ///
 /// [`BEP_TRUST_STORE_DIR`]: sessions::BEP_TRUST_STORE_DIR
-/// [`BEP_TRUST_STORE_FILE`]: sessions::BEP_TRUST_STORE_FILE
-fn install_trust_root(
+fn install_trust_anchor(
     home: &std::path::Path,
     rootfs: &std::path::Path,
 ) -> io::Result<Option<std::path::PathBuf>> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let source = home.join(sessions::BEP_ROOT_PATCH_DEST);
+    let source = home.join(sessions::BEP_ANCHOR_PATCH_DEST);
     if !source.is_file() {
         return Ok(None);
     }
@@ -2121,13 +2133,47 @@ fn install_trust_root(
     // A trust anchor is public by nature and every process in the box reads
     // it; the delivered patch's own bits are whatever the upload carried.
     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644))?;
+    trust_bundle(&dir, &dest)?;
     Ok(Some(dest))
 }
 
+/// Appends `anchor` to the certificate bundle in `dir`, by writing a whole
+/// new bundle and renaming it over the old one — the old one is a hardlink
+/// into the package store, and only a replacement leaves the store's copy
+/// alone. A box whose packages carry no bundle gets one holding the anchor.
+fn trust_bundle(dir: &std::path::Path, anchor: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let bundle = dir.join(sessions::BEP_TRUST_BUNDLE_FILE);
+    let mut combined = match std::fs::read(&bundle) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let pem = std::fs::read(anchor)?;
+    // A launcher builds the rootfs fresh, so the bundle is normally the
+    // package's. Not assumed: a bundle already carrying this anchor is left
+    // as it is, rather than growing a copy of it per launch.
+    if combined
+        .windows(pem.len())
+        .any(|window| window == pem.as_slice())
+    {
+        return Ok(());
+    }
+    if !combined.is_empty() && !combined.ends_with(b"\n") {
+        combined.push(b'\n');
+    }
+    combined.extend_from_slice(&pem);
+    let staged = dir.join(format!("{}.new", sessions::BEP_TRUST_BUNDLE_FILE));
+    std::fs::write(&staged, &combined)?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o644))?;
+    std::fs::rename(&staged, &bundle)
+}
+
 /// Whether the box holds a credentialed upstream, as the daemon sees it: the
-/// CLI delivered the host's interception root into the session home, which it
+/// CLI delivered the host's interception anchor into the session home, which it
 /// does for a box declaring one under any steering but `off` (BEP-011). The
-/// same file [`install_trust_root`] installs, read before the launch rather
+/// same file [`install_trust_anchor`] installs, read before the launch rather
 /// than after, because the box's network is planned first.
 ///
 /// This is the whole of what the daemon is told about `[network.bep]` today:
@@ -2135,7 +2181,7 @@ fn install_trust_root(
 /// its default here, which is the `auto` BEP-018 names.
 #[cfg(not(test))]
 fn holds_credentialed_upstream(home: &std::path::Path) -> bool {
-    home.join(sessions::BEP_ROOT_PATCH_DEST).is_file()
+    home.join(sessions::BEP_ANCHOR_PATCH_DEST).is_file()
 }
 
 /// The real [`SessionLauncher`]: evaluates a minimal context into a graph,
@@ -2329,7 +2375,7 @@ impl SessionLauncher for SandboxLauncher {
         // says what it is. `PlannedLaunch` owns the release from here: an early
         // `Err` return or a cancelled launch gives the lease back.
         // What the box's credentials mean for its relay (BEP-018): a box the
-        // CLI delivered the interception root to holds a credentialed upstream,
+        // CLI delivered the interception anchor to holds a credentialed upstream,
         // and its QUIC to :443 is dropped so the upstream is reached through
         // the proxy.
         let credentials = crate::net::provider::BoxCredentials {
@@ -2475,22 +2521,22 @@ impl SessionLauncher for SandboxLauncher {
             ))
             .await?;
 
-            // The box trust store (BEP-011): the root the box spec's grants
+            // The box trust store (BEP-011): the anchor the box spec's grants
             // delivered into the home goes into the rootfs before anything
             // runs in it. Logged with its provenance like the other session
-            // contents; a box with no root installs nothing.
-            match install_trust_root(session_home.as_utf8_path().as_std_path(), &env.rootfs()) {
+            // contents; a box with no anchor installs nothing.
+            match install_trust_anchor(session_home.as_utf8_path().as_std_path(), &env.rootfs()) {
                 Ok(Some(dest)) => tracing::info!(
                     session = %session_label,
                     domain = "trust_store",
                     sandbox_dest = %dest.display(),
-                    source = sessions::BEP_ROOT_PATCH_DEST,
-                    "session content (trust store: host root CA installed from the box spec's root patch)",
+                    source = sessions::BEP_ANCHOR_PATCH_DEST,
+                    "session content (trust store: interception anchor trusted from the box spec's patch)",
                 ),
                 Ok(None) => {}
                 Err(e) => {
                     return Err(io::Error::other(format!(
-                        "installing the host root CA into the box trust store: {e}"
+                        "installing the interception anchor into the box trust store: {e}"
                     )));
                 }
             }

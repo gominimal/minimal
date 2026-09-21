@@ -1208,10 +1208,11 @@ pub const BEP_BOXES_FILE: &str = "boxes.json";
 /// (`minimal::auth::CONTROL_SOCKET`), which this crate cannot import.
 pub const BEP_CONTROL_SOCKET_FILE: &str = "control.sock";
 
-/// Where the proxy publishes its interception root, PEM: what a box's trust
-/// store is seeded from at creation (BEP-011). The name is the client's own
-/// (`minimal::cmd::session`'s `BEP_ROOT_PEM`), which this crate cannot import.
-pub const BEP_ROOT_PEM_FILE: &str = "root.pem";
+/// Where the proxy publishes its interception anchor, PEM: what a box's
+/// trust store is seeded from at creation (BEP-011). The name is the client's
+/// own (`minimal::cmd::session`'s `BEP_ANCHOR_PEM`), which this crate cannot
+/// import.
+pub const BEP_ANCHOR_PEM_FILE: &str = "anchor.pem";
 
 /// Where the proxy publishes its public identity: what a client on this host
 /// seals a member to, which it cannot read from the store the private halves
@@ -1328,9 +1329,9 @@ pub struct BepConfig {
     /// The control socket the `min` client submits mints, client-key
     /// registrations and revocations over (BEP-063, BEP-067).
     control_socket: PathBuf,
-    /// Where the proxy publishes its interception root, PEM: what a box's
+    /// Where the proxy publishes its interception anchor, PEM: what a box's
     /// trust store is seeded from at creation (BEP-011).
-    root_pem: PathBuf,
+    anchor_pem: PathBuf,
     /// Where the proxy publishes its public identity: what a client seals a
     /// member to (BEP-059).
     public_keys: PathBuf,
@@ -1356,7 +1357,7 @@ impl BepConfig {
             audit_log: bep_dir.join(BEP_AUDIT_LOG_FILE),
             boxes: bep_dir.join(BEP_BOXES_FILE),
             control_socket: bep_dir.join(BEP_CONTROL_SOCKET_FILE),
-            root_pem: bep_dir.join(BEP_ROOT_PEM_FILE),
+            anchor_pem: bep_dir.join(BEP_ANCHOR_PEM_FILE),
             public_keys: bep_dir.join(BEP_PUBLIC_KEYS_FILE),
             store_rules: None,
             term_timeout: DEFAULT_TERM_TIMEOUT,
@@ -1419,8 +1420,8 @@ impl BepConfig {
             self.boxes.display().to_string(),
             "--control-socket".to_string(),
             self.control_socket.display().to_string(),
-            "--root-pem".to_string(),
-            self.root_pem.display().to_string(),
+            "--anchor-pem".to_string(),
+            self.anchor_pem.display().to_string(),
             "--public-keys".to_string(),
             self.public_keys.display().to_string(),
         ];
@@ -1437,10 +1438,10 @@ impl BepConfig {
         &self.control_socket
     }
 
-    /// Where the proxy publishes its interception root.
+    /// Where the proxy publishes its interception anchor.
     #[must_use]
-    pub fn root_pem(&self) -> &Path {
-        &self.root_pem
+    pub fn anchor_pem(&self) -> &Path {
+        &self.anchor_pem
     }
 
     /// Where the proxy publishes its public identity.
@@ -2222,8 +2223,8 @@ mod tests {
                 "/s/bep/boxes.json".to_string(),
                 "--control-socket".to_string(),
                 "/s/bep/control.sock".to_string(),
-                "--root-pem".to_string(),
-                "/s/bep/root.pem".to_string(),
+                "--anchor-pem".to_string(),
+                "/s/bep/anchor.pem".to_string(),
                 "--public-keys".to_string(),
                 "/s/bep/keys.json".to_string(),
             ]
@@ -2231,7 +2232,7 @@ mod tests {
         assert_eq!(cfg.audit_log(), Path::new("/s/bep/audit.log"));
         assert_eq!(cfg.boxes(), Path::new("/s/bep/boxes.json"));
         assert_eq!(cfg.control_socket(), Path::new("/s/bep/control.sock"));
-        assert_eq!(cfg.root_pem(), Path::new("/s/bep/root.pem"));
+        assert_eq!(cfg.anchor_pem(), Path::new("/s/bep/anchor.pem"));
         assert_eq!(cfg.public_keys(), Path::new("/s/bep/keys.json"));
 
         // A rules file is the operator's, so it is passed only when there is

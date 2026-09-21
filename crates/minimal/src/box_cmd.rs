@@ -162,9 +162,9 @@ fn render(view: &SpecView, out: &mut impl Write) -> Result<(), anyhow::Error> {
         "  steering: {} ({})",
         view.steering,
         if view.inject_ca {
-            "interception root in the box trust store"
+            "interception anchor in the box trust store"
         } else {
-            "no interception root injected"
+            "no interception anchor injected"
         }
     )?;
     if view.proxy_env.is_empty() {
@@ -641,7 +641,7 @@ mod tests {
         }
         assert!(text.contains("steering: proxy_env"), "{text}");
         assert!(
-            text.contains("interception root in the box trust store"),
+            text.contains("interception anchor in the box trust store"),
             "{text}"
         );
         // An own-address box stands on the switch, so it reaches the proxy at

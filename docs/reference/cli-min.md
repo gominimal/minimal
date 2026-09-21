@@ -477,7 +477,7 @@ or the working directory.
 $ min box spec
 box spec: /repo/web
   interception root: sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0
-  steering: proxy_env (interception root in the box trust store)
+  steering: proxy_env (interception anchor in the box trust store)
   proxy environment:
     HTTPS_PROXY=http://127.0.0.1:7656
     HTTP_PROXY=http://127.0.0.1:7656

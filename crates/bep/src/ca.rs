@@ -334,11 +334,11 @@ impl<'k, K: PrivateKey> Authority<'k, K> {
     /// serial, under the unchanged root, over the same store-held signing key
     /// and the same permitted names.
     ///
-    /// Flows terminated from now on present the new certificate. The root the
-    /// box was given at creation is still its anchor, and a leaf already
-    /// presented under the previous signing certificate still chains to that
-    /// root, so a running box keeps working and nothing inside it changes
-    /// (BEP-061).
+    /// Flows terminated from now on present the new certificate. The anchor a
+    /// running box was given at creation is the certificate this replaces, but
+    /// the key under it is unchanged, so a leaf signed now still verifies
+    /// against the anchor that box holds and nothing inside it changes
+    /// (BEP-061). The constraints that box enforces stay the ones it was given.
     ///
     /// # Errors
     ///
@@ -355,14 +355,16 @@ impl<'k, K: PrivateKey> Authority<'k, K> {
         Ok(())
     }
 
-    /// The root certificate, DER: the trust anchor injected into a box.
+    /// The root certificate, DER: this host's CA identity, above the anchor a
+    /// box is given. Reported and fingerprinted; not itself injected.
     #[must_use]
     pub fn root_der(&self) -> &[u8] {
         &self.root_der
     }
 
     /// The signing certificate, DER: the host's one name-constrained issuer of
-    /// leaves.
+    /// leaves, and the trust anchor a box is given — the constraints ride the
+    /// anchor itself rather than a certificate below it.
     #[must_use]
     pub fn signing_der(&self) -> &[u8] {
         &self.signing.der

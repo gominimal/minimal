@@ -10,7 +10,7 @@
 //!
 //! - the **control socket** (`--control-socket`), which the client submits
 //!   mints, client-key registrations and revocations over (BEP-063, BEP-067);
-//! - the **published root** (`--root-pem`), which a box's trust store is
+//! - the **published anchor** (`--anchor-pem`), which a box's trust store is
 //!   seeded from at creation (BEP-011);
 //! - the operator's **store rules** (`--store-rules`), which a store handle is
 //!   checked against on every request (BEP-032, BEP-064).
@@ -86,10 +86,13 @@ struct Cli {
     #[arg(long)]
     control_socket: Option<PathBuf>,
 
-    /// Where to publish the interception root, PEM: what a box's trust store
-    /// is seeded from at creation. Omitted, none is published.
+    /// Where to publish the interception anchor, PEM: what a box's trust
+    /// store is seeded from at creation. The name-constrained signing
+    /// certificate, not the root above it, so the anchor a box holds is
+    /// bounded by the same names the proxy may issue for. Omitted, none is
+    /// published.
     #[arg(long)]
-    root_pem: Option<PathBuf>,
+    anchor_pem: Option<PathBuf>,
 
     /// Where to publish this host's public identity: what a client seals a
     /// member to, since the private halves are the proxy's alone (BEP-059).
@@ -198,7 +201,13 @@ fn read_rules(path: &Path) -> Result<Vec<RegisteredRule>, Box<dyn Error>> {
 /// Publishes `der` at `path` as PEM: what a box's trust store is seeded from
 /// (BEP-011). Written whole and renamed over, so a box never reads half a
 /// certificate.
-fn publish_root(path: &Path, der: &[u8]) -> std::io::Result<()> {
+///
+/// `der` is the signing certificate, which carries the permitted-name
+/// constraints; the root above it carries none. Anchoring a box on the root
+/// would leave those constraints binding only because the proxy happens to
+/// present the intermediate in every chain — a certificate the root signed
+/// directly would validate in that box unconstrained.
+fn publish_anchor(path: &Path, der: &[u8]) -> std::io::Result<()> {
     use base64::Engine as _;
     let body = base64::engine::general_purpose::STANDARD.encode(der);
     let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
@@ -348,9 +357,9 @@ where
 
     // Published before anything is served: a box created while the root is
     // absent has no anchor for the leaves this proxy will present it.
-    if let Some(path) = &cli.root_pem {
-        publish_root(path, authority.root_der())?;
-        tracing::info!(path = %path.display(), "published the interception root");
+    if let Some(path) = &cli.anchor_pem {
+        publish_anchor(path, authority.signing_der())?;
+        tracing::info!(path = %path.display(), "published the interception anchor");
     }
     if let Some(path) = &cli.public_keys {
         publish_identity(path, &keys.public_identity())?;

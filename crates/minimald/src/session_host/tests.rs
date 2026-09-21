@@ -1392,12 +1392,12 @@ async fn stale_binding_generation_input_is_discarded() {
         .expect("mainloop should return the reaped exit status");
 }
 
-/// BEP-011: the root the box spec's grants delivered into the session home
-/// (the CLI's root patch at `BEP_ROOT_PATCH_DEST`) lands in the rootfs trust
-/// store directory, byte for byte and world-readable; a home carrying no root
-/// installs nothing and creates no trust store directory.
+/// BEP-011: the anchor the box spec's grants delivered into the session home
+/// (the CLI's patch at `BEP_ANCHOR_PATCH_DEST`) lands in the rootfs trust
+/// store directory, byte for byte and world-readable; a home carrying no
+/// anchor installs nothing and creates no trust store directory.
 #[test]
-fn root_patch_lands_in_trust_store_dir() {
+fn anchor_patch_lands_in_trust_store_dir() {
     use std::os::unix::fs::PermissionsExt as _;
 
     const PEM: &str =
@@ -1409,25 +1409,28 @@ fn root_patch_lands_in_trust_store_dir() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&rootfs).unwrap();
 
-    // No root delivered: nothing installed, and the trust store untouched.
-    assert_eq!(install_trust_root(&home, &rootfs).unwrap(), None);
+    // No anchor delivered: nothing installed, and the trust store untouched.
+    assert_eq!(install_trust_anchor(&home, &rootfs).unwrap(), None);
     assert!(!rootfs.join(sessions::BEP_TRUST_STORE_DIR).exists());
 
-    // The root, materialized into the home the way `FinalizeSession` does
+    // The anchor, materialized into the home the way `FinalizeSession` does
     // for every patch, with the tight bits an upload may carry.
-    let source = home.join(sessions::BEP_ROOT_PATCH_DEST);
+    let source = home.join(sessions::BEP_ANCHOR_PATCH_DEST);
     std::fs::create_dir_all(source.parent().unwrap()).unwrap();
     std::fs::write(&source, PEM).unwrap();
     std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-    let installed = install_trust_root(&home, &rootfs)
+    let installed = install_trust_anchor(&home, &rootfs)
         .unwrap()
-        .expect("a delivered root is installed");
+        .expect("a delivered anchor is installed");
     let expected = rootfs
         .join(sessions::BEP_TRUST_STORE_DIR)
         .join(sessions::BEP_TRUST_STORE_FILE);
     assert_eq!(installed, expected);
-    assert_eq!(expected, rootfs.join("etc/ssl/certs/minimal-bep-root.pem"));
+    assert_eq!(
+        expected,
+        rootfs.join("etc/ssl/certs/minimal-bep-anchor.pem")
+    );
     assert_eq!(std::fs::read_to_string(&installed).unwrap(), PEM);
     assert_eq!(
         std::fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
@@ -1435,7 +1438,65 @@ fn root_patch_lands_in_trust_store_dir() {
         "the anchor must be readable by every process in the box"
     );
 
-    // A second launch of the same session installs the same root again
+    // A second launch of the same session installs the same anchor again
     // without complaint.
-    assert_eq!(install_trust_root(&home, &rootfs).unwrap(), Some(installed));
+    assert_eq!(
+        install_trust_anchor(&home, &rootfs).unwrap(),
+        Some(installed.clone())
+    );
+
+    // And the bundle carries it exactly once: the second launch rewrote the
+    // bundle this launch wrote, rather than appending to it again.
+    let bundle = rootfs
+        .join(sessions::BEP_TRUST_STORE_DIR)
+        .join(sessions::BEP_TRUST_BUNDLE_FILE);
+    assert_eq!(
+        std::fs::read_to_string(&bundle)
+            .unwrap()
+            .matches(PEM)
+            .count(),
+        1,
+        "the anchor is in the bundle once, however often the session launches"
+    );
+}
+
+/// BEP-011, the half that makes the anchor count: a certificate in the trust
+/// store directory is trusted by nothing until it is in the bundle the tools
+/// read, and the bundle arrives hardlinked out of the package store, so it is
+/// replaced rather than appended to.
+#[test]
+fn the_anchor_joins_the_bundle_without_editing_the_package_store() {
+    const PEM: &str =
+        "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END CERTIFICATE-----\n";
+    const SHIPPED: &str = "-----BEGIN CERTIFICATE-----\nc2hpcHBlZA==\n-----END CERTIFICATE-----\n";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let rootfs = tmp.path().join("rootfs");
+    let store = tmp.path().join("store");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(rootfs.join(sessions::BEP_TRUST_STORE_DIR)).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+
+    // The bundle as a package delivers it: one file, two names.
+    let shipped = store.join("ca-certificates.crt");
+    std::fs::write(&shipped, SHIPPED).unwrap();
+    let bundle = rootfs
+        .join(sessions::BEP_TRUST_STORE_DIR)
+        .join(sessions::BEP_TRUST_BUNDLE_FILE);
+    std::fs::hard_link(&shipped, &bundle).unwrap();
+
+    let source = home.join(sessions::BEP_ANCHOR_PATCH_DEST);
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, PEM).unwrap();
+    install_trust_anchor(&home, &rootfs).unwrap().unwrap();
+
+    // The box now trusts the anchor, and still trusts what it shipped with.
+    let trusted = std::fs::read_to_string(&bundle).unwrap();
+    assert!(trusted.contains(PEM), "{trusted}");
+    assert!(trusted.starts_with(SHIPPED), "{trusted}");
+
+    // The package store's own copy is untouched: an append would have
+    // written this host's anchor into every box built from that package.
+    assert_eq!(std::fs::read_to_string(&shipped).unwrap(), SHIPPED);
 }
