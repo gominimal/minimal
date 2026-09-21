@@ -180,12 +180,16 @@ fn identity_event(kind: Kind, box_id: &str) -> Event {
 /// The prefix every store handle carries; the `1` is the handle version.
 pub const HANDLE_PREFIX: &str = "minstore1.";
 
-/// The longest a store handle lives: five minutes from its mint.
+/// The longest a store handle lives: eight hours from its mint, the same
+/// ceiling as a GitHub member ([`MAX_LIFETIME_SECS`]).
 ///
-/// Short because it stands for a value the box never holds: a handle that
-/// leaves the box outlives its usefulness in minutes rather than for the life
-/// of the session.
-pub const HANDLE_LIFETIME_SECS: u64 = 5 * 60;
+/// A host that is not enrolled has no in-box re-mint path (Gatehouse §8.3), so
+/// a handle is a creation-time snapshot like the member beside it, and a box
+/// that outlives it is recreated. A handle shorter than that ended the box's
+/// use of the value minutes into its life. A handle copied out of its box
+/// buys nothing a shorter lifetime would take away: the sealed context binds
+/// it to this box and this host, and the proxy refuses it anywhere else.
+pub const HANDLE_LIFETIME_SECS: u64 = MAX_LIFETIME_SECS;
 
 /// The name the client's handle-signing key lives under in the host key
 /// store.

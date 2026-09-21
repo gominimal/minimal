@@ -138,8 +138,10 @@ minsealed1.eyJ2IjoxLCJib3hfaWQiOiJ3ZWItNGYyMSIsImhvc3QiOiJtYWMtMSIsIm1vZHVsZSI6�
 ```
 
 A sealed envelope carrying a handle that names the store, the identifier, the
-authorities and the injection form — and expires minutes later. It is bound to
-this box and this host, so it is no use anywhere else, and it is not the key.
+authorities and the injection form — and expires at most eight hours later, the
+same ceiling as a GitHub grant's value. Nothing renews it inside the box, so a
+box that outlives it is recreated. It is bound to this box and this host, so it
+is no use anywhere else, and it is not the key.
 This much is what a box gets today.
 
 What the proxy then does with the handle is decided per request: it reads your
