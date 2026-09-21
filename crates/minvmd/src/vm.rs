@@ -27,9 +27,13 @@ pub const DISK_SYNC_ENV: &str = "MINVMD_DISK_SYNC";
 pub const GUEST_LOG_ENV: &str = "RUST_LOG";
 
 /// Kernel command line every microVM boots with: the console the guest's
-/// stdout/stderr reaches the host boot log through. `kernel_cmdline` extends it;
+/// stdout/stderr reaches the host boot log through, and `ipv6.disable=1`, which
+/// keeps the IPv6 stack from ever registering in the guest (NET-082) — no IPv6
+/// route ever appears and no interface carries an IPv6 address, not even `::1`
+/// on `lo`. The switch is IPv4-only for v1 (design §12 item 5); the dual-stack
+/// additive that lands later retires this setting. `kernel_cmdline` extends it;
 /// nothing else in the boot line is optional.
-const BASE_KERNEL_CMDLINE: &str = "console=hvc0";
+const BASE_KERNEL_CMDLINE: &str = "console=hvc0 ipv6.disable=1";
 
 /// The kernel's `COMMAND_LINE_SIZE` — the buffer the boot line (including its
 /// NUL terminator) must fit in. 2048 on both arm64 and x86_64, the two
@@ -234,6 +238,10 @@ impl VmConfig {
         // the &str handed to `set_kernel` outlives the call.
         let rust_log = std::env::var(GUEST_LOG_ENV).ok();
         let cmdline = kernel_cmdline(rust_log.as_deref());
+        // The boot line on the VM's boot log (NET-082 observability): a guest
+        // route-table question is answerable from the host side — the line
+        // shows `ipv6.disable=1`, the reason no IPv6 route ever appears.
+        tracing::info!(cmdline = %cmdline, "guest boot line: console on hvc0, IPv6 disabled");
         ctx.set_kernel(
             &self.kernel_path,
             crate::image::kernel_format(),
@@ -432,15 +440,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kernel_cmdline_without_a_host_filter_is_the_bare_console_line() {
+    fn guest_ipv6_disabled_no_v6_route() {
+        // NET-082: the guest boots with IPv6 disabled so that no IPv6 route
+        // ever appears. `ipv6.disable=1` is the strongest form of the setting —
+        // the stack never registers, so no route and no address (not even
+        // `::1` on `lo`) exist for the guest to report. It must ride the boot
+        // line in both forms the line takes: bare, and with a forwarded
+        // RUST_LOG filter.
+        for line in [kernel_cmdline(None), kernel_cmdline(Some("debug"))] {
+            // Whole-token match, not a substring: it pins the parameter name
+            // and value together and cannot admit a lookalike fragment.
+            let tokens: Vec<&str> = line.split_ascii_whitespace().collect();
+            assert!(
+                tokens.contains(&"ipv6.disable=1"),
+                "boot line must disable IPv6 as its own token, got: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_cmdline_without_a_host_filter_is_the_bare_boot_line() {
         // Byte-identical to the pre-forwarding boot line: no empty token, no
         // trailing space.
-        assert_eq!(kernel_cmdline(None), "console=hvc0");
+        assert_eq!(kernel_cmdline(None), "console=hvc0 ipv6.disable=1");
     }
 
     #[test]
     fn kernel_cmdline_forwards_a_simple_filter() {
-        assert_eq!(kernel_cmdline(Some("debug")), "console=hvc0 RUST_LOG=debug");
+        assert_eq!(
+            kernel_cmdline(Some("debug")),
+            "console=hvc0 ipv6.disable=1 RUST_LOG=debug"
+        );
     }
 
     #[test]
@@ -448,7 +478,7 @@ mod tests {
         // The normal form of a real filter; commas are legal in a boot token.
         assert_eq!(
             kernel_cmdline(Some("info,russh=debug,minimald=debug")),
-            "console=hvc0 RUST_LOG=info,russh=debug,minimald=debug"
+            "console=hvc0 ipv6.disable=1 RUST_LOG=info,russh=debug,minimald=debug"
         );
     }
 
@@ -456,33 +486,43 @@ mod tests {
     fn kernel_cmdline_skips_a_filter_containing_whitespace() {
         // The kernel would split these into separate boot tokens, silently
         // corrupting the line, so the whole value is dropped.
-        assert_eq!(kernel_cmdline(Some("info, russh=debug")), "console=hvc0");
-        assert_eq!(kernel_cmdline(Some("info\trussh=debug")), "console=hvc0");
+        assert_eq!(
+            kernel_cmdline(Some("info, russh=debug")),
+            "console=hvc0 ipv6.disable=1"
+        );
+        assert_eq!(
+            kernel_cmdline(Some("info\trussh=debug")),
+            "console=hvc0 ipv6.disable=1"
+        );
     }
 
     #[test]
     fn kernel_cmdline_skips_an_empty_filter() {
-        assert_eq!(kernel_cmdline(Some("")), "console=hvc0");
+        assert_eq!(kernel_cmdline(Some("")), "console=hvc0 ipv6.disable=1");
     }
 
     #[test]
     fn kernel_cmdline_skips_an_oversized_filter() {
         let huge = "minimald=trace,".repeat(500);
         assert!(huge.len() > COMMAND_LINE_SIZE);
-        assert_eq!(kernel_cmdline(Some(&huge)), "console=hvc0");
+        assert_eq!(kernel_cmdline(Some(&huge)), "console=hvc0 ipv6.disable=1");
     }
 
     #[test]
     fn kernel_cmdline_forwards_the_longest_filter_that_fits_the_kernel_buffer() {
-        // `console=hvc0 RUST_LOG=` is 22 bytes, so a 2025-byte value yields a
-        // 2047-byte line that fills COMMAND_LINE_SIZE exactly once NUL-terminated.
-        let longest = "d".repeat(2025);
+        // `console=hvc0 ipv6.disable=1 RUST_LOG=` is 37 bytes, so a 2010-byte
+        // value yields a 2047-byte line that fills COMMAND_LINE_SIZE exactly
+        // once NUL-terminated.
+        let longest = "d".repeat(2010);
         let line = kernel_cmdline(Some(&longest));
         assert_eq!(line.len(), COMMAND_LINE_SIZE - 1);
         assert!(line.ends_with(&longest));
 
         // One byte more must be skipped, not truncated.
-        assert_eq!(kernel_cmdline(Some(&"d".repeat(2026))), "console=hvc0");
+        assert_eq!(
+            kernel_cmdline(Some(&"d".repeat(2011))),
+            "console=hvc0 ipv6.disable=1"
+        );
     }
 
     #[test]
