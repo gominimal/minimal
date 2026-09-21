@@ -59,9 +59,13 @@ pub use ca::{Authority, CaError, DeclaredUnion, Leaf};
 pub use control::{ControlError, REVOCATION_DEADLINE_SECS, Revocations, Submission, submit};
 pub use github::{GitHub, GitHubError, MemorySignIns, SignIn, SignInStore};
 pub use keychain::{KeyStore, MemoryStore, PrivateKey, StoreError};
-pub use keys::{Fingerprint, KeyRole, KeyStatus, Keys, KeysError, inspect};
+pub use keys::{
+    Fingerprint, IdentityError, KeyRole, KeyStatus, Keys, KeysError, PublicIdentity, inspect,
+};
 pub use listener::{Addressing, Attachments, Config, ListenerError, Module, Proxy, Sender};
 pub use mint::{MintError, MintRequest, Minted, box_revocation_event, mint, revocation_event};
 pub use redeem::{Check, Decision, Redemption, decide};
-pub use seal::{Member, Refusal, SealError, SealedContext, SealedValue, Unsealed, seal, unseal};
+pub use seal::{
+    Member, Refusal, SealError, SealedContext, SealedValue, Unsealed, seal, seal_to, unseal,
+};
 pub use upstream::{Resolver, Trust, TrustError, UpstreamError, Validated};

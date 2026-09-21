@@ -57,6 +57,20 @@ pub enum StoreError {
     /// The key's public half did not decode as a P-256 point.
     #[error("the key's public half is not a valid P-256 point")]
     InvalidPublicKey,
+    /// The store holds the key but will not hand it to this process.
+    ///
+    /// macOS admits the program that generated a key and no other, and it
+    /// recognises a program by its signature, so a rebuilt or replaced binary
+    /// is a different program and is locked out of what the previous one
+    /// made. The keys are the proxy's alone by design (BEP-059); the way back
+    /// is to replace them, which refuses every member sealed to the old ones
+    /// (BEP-060).
+    #[error(
+        "the key store holds the key but will not let this program use it, which is what it \
+         does for a key another program generated; replacing the key is the way back, and \
+         every member sealed to the old one is refused from then on"
+    )]
+    Unusable,
 }
 
 /// A private key held by a store. Every operation runs inside the store; the
@@ -695,10 +709,13 @@ mod macos {
 
     impl PrivateKey for KeychainKey {
         fn public_key(&self) -> Result<PublicKey, StoreError> {
-            let public = self.key.public_key().ok_or(StoreError::InvalidPublicKey)?;
+            // The keychain refusing to copy the public half is not a claim
+            // about the key: it is what it does for a key this program is not
+            // the one admitted to. Only the decode below judges the key.
+            let public = self.key.public_key().ok_or(StoreError::Unusable)?;
             let point = public
                 .external_representation()
-                .ok_or(StoreError::InvalidPublicKey)?;
+                .ok_or(StoreError::Unusable)?;
             PublicKey::from_sec1_bytes(point.bytes()).map_err(|_| StoreError::InvalidPublicKey)
         }
 

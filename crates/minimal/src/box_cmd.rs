@@ -223,22 +223,16 @@ fn acknowledgement_note(grant: &sessions::Grant, acknowledged: bool) -> String {
 }
 
 /// This host's interception root as the spec reports it: the fingerprint of
-/// the root CA key the proxy holds, read without generating one, or `None`
-/// when the host holds no root yet.
-#[cfg(target_os = "macos")]
-fn root_fingerprint() -> Option<String> {
-    let held = bep::keys::inspect(&bep::keychain::MacosKeychain).ok()?;
-    held.into_iter()
-        .find(|status| status.role == bep::KeyRole::Root)?
-        .fingerprint
-        .map(|fingerprint| fingerprint.to_string())
-}
-
-/// A host with no keychain backend holds no root CA key — as `min auth` says
-/// of the sign-in — so there is no fingerprint to report.
-#[cfg(not(target_os = "macos"))]
-fn root_fingerprint() -> Option<String> {
-    None
+/// the root CA key, or `None` when the proxy has published none because it
+/// has not run on this host yet.
+///
+/// Read from what the proxy published rather than from the key store. The
+/// store admits the proxy's process identity alone (BEP-059), so a client
+/// asking it directly reports no root on a host that holds one.
+fn root_fingerprint(minimal_dir: Option<&std::path::Path>) -> Option<String> {
+    crate::cmd::published_identity(minimal_dir)
+        .ok()
+        .map(|identity| identity.root_fingerprint().to_string())
 }
 
 /// The project directory the spec is read from: the argument, else
@@ -356,7 +350,7 @@ pub fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> Result<(), anyhow
     );
     let view = SpecView::of(
         &project,
-        root_fingerprint(),
+        root_fingerprint(global.minimal_dir.as_deref()),
         &network,
         &grants,
         expansion.as_ref().ok(),

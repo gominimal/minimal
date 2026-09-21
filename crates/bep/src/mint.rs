@@ -35,8 +35,8 @@ use serde::{Deserialize, Serialize};
 use crate::audit::{Decision, Event, Kind, Mapping};
 use crate::github::SignIn;
 use crate::keychain::{KeyStore, PrivateKey, StoreError};
-use crate::keys::{Fingerprint, Keys};
-use crate::seal::{Member, SealError, SealedContext, SealedValue, seal};
+use crate::keys::{Fingerprint, PublicIdentity};
+use crate::seal::{Member, SealError, SealedContext, SealedValue, seal_to};
 
 /// The longest a locally minted member lives: eight hours from its mint.
 pub const MAX_LIFETIME_SECS: u64 = 8 * 60 * 60;
@@ -106,8 +106,8 @@ pub fn member_expiry(now: u64, token_expires_at: Option<u64>) -> u64 {
 ///
 /// [`MintError::Expired`] when the sign-in's token has expired at
 /// `request.now`; [`MintError::Seal`] when the envelope cannot be sealed.
-pub fn mint<S: KeyStore>(
-    keys: &Keys<S>,
+pub fn mint(
+    identity: &PublicIdentity,
     sign_in: &SignIn,
     request: &MintRequest<'_>,
 ) -> Result<Minted, MintError> {
@@ -132,7 +132,7 @@ pub fn mint<S: KeyStore>(
         breadth: BREADTH.to_owned(),
         expires_at: member_expiry(request.now, sign_in.expires_at),
     };
-    let value = seal(keys, &context, &Member::new(sign_in.token.expose()))?;
+    let value = seal_to(identity, &context, &Member::new(sign_in.token.expose()))?;
     tracing::info!(
         account = %sign_in.account,
         box_id = request.box_id,
@@ -408,8 +408,8 @@ pub fn client_key<S: KeyStore>(store: &S) -> Result<S::Key, StoreError> {
 ///
 /// A [`HandleError`]: the claims do not encode, the key store refuses to sign
 /// or to describe the client key, or the envelope cannot be sealed.
-pub fn mint_store_handle<S: KeyStore, K: PrivateKey>(
-    keys: &Keys<S>,
+pub fn mint_store_handle<K: PrivateKey>(
+    identity: &PublicIdentity,
     client: &K,
     request: &StoreMintRequest<'_>,
 ) -> Result<MintedHandle, HandleError> {
@@ -439,7 +439,7 @@ pub fn mint_store_handle<S: KeyStore, K: PrivateKey>(
         breadth: STORE_BREADTH.to_owned(),
         expires_at: claims.exp,
     };
-    let value = seal(keys, &context, &Member::new(handle.as_str()))?;
+    let value = seal_to(identity, &context, &Member::new(handle.as_str()))?;
     tracing::info!(
         store = request.store,
         id = request.id,
@@ -498,6 +498,7 @@ mod tests {
     use super::*;
     use crate::github::Secret;
     use crate::keychain::MemoryStore;
+    use crate::keys::Keys;
     use crate::seal::unseal;
 
     const NOW: u64 = 1_800_000_000;
@@ -537,7 +538,7 @@ mod tests {
             (Some(NOW + 3_600), NOW + 3_600),
             (Some(NOW + 100_000), ceiling),
         ] {
-            let minted = mint(&keys, &sign_in(token_expiry), &request()).unwrap();
+            let minted = mint(&keys.public_identity(), &sign_in(token_expiry), &request()).unwrap();
             assert!(minted.context.expires_at <= ceiling, "{token_expiry:?}");
             assert_eq!(minted.context.expires_at, expected, "{token_expiry:?}");
 
@@ -561,7 +562,7 @@ mod tests {
 
         // An expired sign-in mints nothing.
         assert!(matches!(
-            mint(&keys, &sign_in(Some(NOW)), &request()),
+            mint(&keys.public_identity(), &sign_in(Some(NOW)), &request()),
             Err(MintError::Expired { expired_at, .. }) if expired_at == NOW
         ));
 

@@ -91,6 +91,12 @@ struct Cli {
     #[arg(long)]
     root_pem: Option<PathBuf>,
 
+    /// Where to publish this host's public identity: what a client seals a
+    /// member to, since the private halves are the proxy's alone (BEP-059).
+    /// Omitted, none is published and no client on this host can seal.
+    #[arg(long)]
+    public_keys: Option<PathBuf>,
+
     /// The operator's `[[secret-store-rules]]` file. Omitted, the proxy holds
     /// no rule and refuses every store handle.
     #[arg(long)]
@@ -206,6 +212,19 @@ fn publish_root(path: &Path, der: &[u8]) -> std::io::Result<()> {
     }
     let staged = path.with_extension("pem.new");
     std::fs::write(&staged, pem)?;
+    std::fs::rename(&staged, path)
+}
+
+/// Publishes `identity` at `path`: the public halves a client on this host
+/// seals with, which it cannot read from the store the private halves live in
+/// (BEP-059). Staged and renamed over, as the root is, so a client never reads
+/// half an identity.
+fn publish_identity(path: &Path, identity: &bep::PublicIdentity) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let staged = path.with_extension("json.new");
+    std::fs::write(&staged, identity.encode())?;
     std::fs::rename(&staged, path)
 }
 
@@ -332,6 +351,10 @@ where
     if let Some(path) = &cli.root_pem {
         publish_root(path, authority.root_der())?;
         tracing::info!(path = %path.display(), "published the interception root");
+    }
+    if let Some(path) = &cli.public_keys {
+        publish_identity(path, &keys.public_identity())?;
+        tracing::info!(path = %path.display(), "published this host's public identity");
     }
 
     let rules = match &cli.store_rules {

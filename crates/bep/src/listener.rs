@@ -1589,7 +1589,7 @@ mod tests {
         fn store_handle(&self, client: &MemoryKey, now: u64) -> String {
             let rule = self.rules.lock().unwrap().clone().expect("a rule in force");
             mint::mint_store_handle(
-                self.proxy.keys,
+                &self.proxy.keys.public_identity(),
                 client,
                 &mint::StoreMintRequest {
                     box_id: "box-a1",

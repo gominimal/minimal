@@ -34,7 +34,7 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::keychain::{KeyStore, PrivateKey, StoreError};
-use crate::keys::{Fingerprint, KeyRole, Keys};
+use crate::keys::{Fingerprint, KeyRole, Keys, PublicIdentity};
 
 /// The prefix every sealed value carries; the `1` is the envelope version.
 pub const PREFIX: &str = "minsealed1.";
@@ -171,16 +171,32 @@ pub fn seal<S: KeyStore>(
     context: &SealedContext,
     member: &Member,
 ) -> Result<SealedValue, SealError> {
-    let sealing = keys.fingerprint(KeyRole::Sealing);
+    seal_to(&keys.public_identity(), context, member)
+}
+
+/// Seals `member` under `context` to the host `identity` names.
+///
+/// Sealing is public-key work throughout: this is the whole of it, and it is
+/// what a client away from the proxy's key store calls.
+///
+/// # Errors
+///
+/// When the context does not encode or the cipher refuses the message.
+pub fn seal_to(
+    identity: &PublicIdentity,
+    context: &SealedContext,
+    member: &Member,
+) -> Result<SealedValue, SealError> {
+    let sealing = identity.sealing_fingerprint();
     let header = serde_json_lenient::to_vec(&Header {
         sealing_key: sealing.to_string(),
-        root_key: keys.fingerprint(KeyRole::Root).to_string(),
+        root_key: identity.root_fingerprint().to_string(),
         context: context.clone(),
     })?;
 
     let ephemeral = EphemeralSecret::generate_from_rng(&mut rand::rng());
     let point = ephemeral.public_key().to_sec1_point(false);
-    let shared = ephemeral.diffie_hellman(keys.public_key(KeyRole::Sealing));
+    let shared = ephemeral.diffie_hellman(identity.sealing());
     let content_key = derive_content_key(&sealing, shared.raw_secret_bytes(), point.as_bytes());
 
     let mut nonce = [0u8; NONCE_LEN];

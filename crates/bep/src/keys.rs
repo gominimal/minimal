@@ -12,6 +12,7 @@ use std::time::SystemTime;
 
 use p256::PublicKey;
 use p256::elliptic_curve::sec1::ToSec1Point;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::keychain::{KeyStore, PrivateKey, StoreError};
@@ -81,6 +82,93 @@ impl fmt::Debug for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
     }
+}
+
+/// The proxy's public identity: everything a client needs to seal a value to
+/// this host, and nothing else.
+///
+/// The private halves stay in the proxy's store, which the host grants to the
+/// proxy's process identity alone (BEP-059). A client that opened that store
+/// would find keys it cannot use — and on a host where it ran before the proxy
+/// it would generate keys the *proxy* then could not use — so the proxy
+/// publishes this beside its root certificate and the client reads it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicIdentity {
+    sealing: PublicKey,
+    root: PublicKey,
+}
+
+/// The published form: the two uncompressed SEC1 points, hex encoded, under
+/// the role names the rest of this module uses.
+#[derive(Serialize, Deserialize)]
+struct Published {
+    sealing: String,
+    root: String,
+}
+
+/// Why a published identity could not be read.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum IdentityError {
+    /// The text is not the published form.
+    #[error("the published identity is not readable: {0}")]
+    Malformed(String),
+    /// A point is there but is not a P-256 public key.
+    #[error("the published {role} key is not a valid P-256 point")]
+    Point { role: KeyRole },
+}
+
+impl PublicIdentity {
+    /// The key a value is sealed to.
+    #[must_use]
+    pub fn sealing(&self) -> &PublicKey {
+        &self.sealing
+    }
+
+    /// The fingerprint of the sealing key.
+    #[must_use]
+    pub fn sealing_fingerprint(&self) -> Fingerprint {
+        Fingerprint::of(&self.sealing)
+    }
+
+    /// The fingerprint of the root CA key.
+    #[must_use]
+    pub fn root_fingerprint(&self) -> Fingerprint {
+        Fingerprint::of(&self.root)
+    }
+
+    /// The published form of this identity.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let published = Published {
+            sealing: hex::encode(self.sealing.to_sec1_point(false).as_bytes()),
+            root: hex::encode(self.root.to_sec1_point(false).as_bytes()),
+        };
+        // The shape is this module's own and holds two hex strings, so it
+        // always encodes.
+        serde_json_lenient::to_string(&published).unwrap_or_default()
+    }
+
+    /// Reads a published identity.
+    ///
+    /// # Errors
+    ///
+    /// When the text is not the published form, or a point in it is not a
+    /// P-256 public key.
+    pub fn parse(text: &str) -> Result<Self, IdentityError> {
+        let published: Published = serde_json_lenient::from_str(text)
+            .map_err(|error| IdentityError::Malformed(error.to_string()))?;
+        Ok(Self {
+            sealing: point(KeyRole::Sealing, &published.sealing)?,
+            root: point(KeyRole::Root, &published.root)?,
+        })
+    }
+}
+
+/// One hex-encoded SEC1 point of the published form.
+fn point(role: KeyRole, hex_point: &str) -> Result<PublicKey, IdentityError> {
+    let bytes = hex::decode(hex_point).map_err(|_| IdentityError::Point { role })?;
+    PublicKey::from_sec1_bytes(&bytes).map_err(|_| IdentityError::Point { role })
 }
 
 /// Why the key set could not be opened or changed.
@@ -209,6 +297,16 @@ impl<S: KeyStore> Keys<S> {
         self.held(role).fingerprint
     }
 
+    /// This host's public identity: what a client seals with, published for
+    /// it because the private halves are the proxy's alone.
+    #[must_use]
+    pub fn public_identity(&self) -> PublicIdentity {
+        PublicIdentity {
+            sealing: self.sealing.public,
+            root: self.root.public,
+        }
+    }
+
     /// Replaces `role`'s key with a newly generated one, on an explicit
     /// operator command. Every member sealed to the previous sealing key or
     /// under the previous root is refused from now on; a running box holding
@@ -276,7 +374,7 @@ mod tests {
 
     use super::*;
     use crate::keychain::MemoryStore;
-    use crate::seal::{Member, Refusal, SealedContext, seal, unseal};
+    use crate::seal::{Member, Refusal, SealedContext, seal, seal_to, unseal};
 
     fn context() -> SealedContext {
         SealedContext {
@@ -288,6 +386,49 @@ mod tests {
             breadth: "account".into(),
             expires_at: 4_102_444_800,
         }
+    }
+
+    /// The published identity is the whole of what sealing needs: a client
+    /// that never opens the proxy's store seals with it, and the proxy
+    /// unseals what it sealed. This is the seam the store itself cannot
+    /// serve, since the private halves are the proxy's process identity's
+    /// alone (BEP-059).
+    #[test]
+    fn a_value_sealed_to_the_published_identity_unseals_under_the_keys() {
+        let keys = Keys::open(MemoryStore::new()).unwrap();
+        let published = PublicIdentity::parse(&keys.public_identity().encode()).unwrap();
+
+        assert_eq!(published, keys.public_identity());
+        assert_eq!(
+            published.sealing_fingerprint(),
+            keys.fingerprint(KeyRole::Sealing)
+        );
+        assert_eq!(
+            published.root_fingerprint(),
+            keys.fingerprint(KeyRole::Root)
+        );
+
+        let sealed = seal_to(&published, &context(), &Member::new("ghp_from_a_client")).unwrap();
+        assert_eq!(
+            unseal(&keys, sealed.as_str()).unwrap().member.expose(),
+            "ghp_from_a_client",
+        );
+    }
+
+    /// The published form is a file a client reads: a point in it that is no
+    /// key is refused by role, never taken for one.
+    #[test]
+    fn a_published_identity_carrying_no_key_is_refused_by_role() {
+        assert!(matches!(
+            PublicIdentity::parse(r#"{"sealing":"00","root":"00"}"#),
+            Err(IdentityError::Point {
+                role: KeyRole::Sealing
+            })
+        ));
+        assert!(matches!(
+            PublicIdentity::parse("not an identity"),
+            Err(IdentityError::Malformed(_))
+        ));
     }
 
     fn fingerprints<S: KeyStore>(keys: &Keys<S>) -> [Fingerprint; 3] {

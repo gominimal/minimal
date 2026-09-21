@@ -498,7 +498,7 @@ mod tests {
         std::array::from_fn(|_| {
             let key = mint::client_key(&MemoryStore::new()).unwrap();
             let minted = mint::mint_store_handle(
-                &HOSTS[0],
+                &HOSTS[0].public_identity(),
                 &key,
                 &mint::StoreMintRequest {
                     box_id: "box-a1",

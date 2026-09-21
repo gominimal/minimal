@@ -26,7 +26,7 @@
 use std::io::{BufRead, IsTerminal as _, Write};
 use std::path::Path;
 
-use anyhow::bail;
+use anyhow::{bail, ensure};
 use bep::github::Secret;
 use bep::keychain::{ItemAcl, SecretItem, SecretItems};
 use sessions::{Injection, SecretStore, StoreRule};
@@ -80,10 +80,22 @@ fn host_secrets() -> Result<bep::keychain::MemorySecrets, anyhow::Error> {
 }
 
 /// The proxy binary this host would run: its path is the process identity the
-/// item's access control names (BEP-051). Resolved rather than required to
-/// exist, because the item is set before the proxy has ever run.
+/// item's access control names (BEP-051). The binary has to be there, since
+/// the keychain resolves a trusted application from the path, but it need
+/// never have run: an item is set long before the first box wants it.
 fn proxy_identity() -> std::path::PathBuf {
     minvmd::net::resolve_bep_path()
+}
+
+/// Why a host with no proxy binary cannot store a value, and the two ways to
+/// give it one.
+fn missing_proxy(proxy: &Path) -> String {
+    format!(
+        "the box egress proxy is not installed at {path}, and the access control on a stored \
+         item names the proxy by path: install it there, or set MINVMD_BEP_BIN to the proxy \
+         binary this host runs",
+        path = proxy.display(),
+    )
 }
 
 /// The store a command names: this host's native store with no `--store`, and
@@ -222,6 +234,11 @@ pub fn cmd_secret(global: &GlobalArgs, command: SecretCommand) -> Result<(), any
     match command {
         SecretCommand::Set(args) => {
             let proxy = proxy_identity();
+            // The keychain resolves a trusted application from a path that has
+            // to exist: naming one that does not fails the write with a bare
+            // ENOENT from the Security framework, which names neither the path
+            // nor the reason.
+            ensure!(proxy.is_file(), "{}", missing_proxy(&proxy));
             if std::io::stdin().is_terminal() {
                 set(&store, &proxy, &args, Source::Terminal, &mut out)
             } else {

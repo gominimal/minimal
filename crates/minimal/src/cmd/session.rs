@@ -168,6 +168,43 @@ fn bep_root_pem_path(minimal_dir: Option<&std::path::Path>) -> PathBuf {
     crate::auth::control_socket_path(minimal_dir).with_file_name(BEP_ROOT_PEM)
 }
 
+/// The file the proxy publishes its public identity in, beside its control
+/// socket: what a member is sealed to. The private halves are the proxy's
+/// process identity's alone (BEP-059), so this is the only way a client on
+/// this host can seal one.
+const BEP_PUBLIC_KEYS: &str = "keys.json";
+
+/// `<minimal_dir>/bep/keys.json`, resolved as [`bep_root_pem_path`] is.
+fn bep_public_keys_path(minimal_dir: Option<&std::path::Path>) -> PathBuf {
+    crate::auth::control_socket_path(minimal_dir).with_file_name(BEP_PUBLIC_KEYS)
+}
+
+/// This host's public identity, as the proxy published it.
+///
+/// # Errors
+///
+/// When the proxy has published none — it has not run on this host — or what
+/// it published does not read as an identity.
+pub(crate) fn published_identity(
+    minimal_dir: Option<&std::path::Path>,
+) -> Result<bep::PublicIdentity, anyhow::Error> {
+    let path = bep_public_keys_path(minimal_dir);
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        anyhow::anyhow!(
+            "the box egress proxy has not published its public identity at {}, so nothing on \
+             this host can seal a credential to it ({error}); start the proxy and re-create the \
+             box",
+            path.display()
+        )
+    })?;
+    bep::PublicIdentity::parse(&text).with_context(|| {
+        format!(
+            "reading the proxy's published identity at {}",
+            path.display()
+        )
+    })
+}
+
 /// This host's name, as the sealed context records it.
 fn host_name() -> Result<String, anyhow::Error> {
     let name = nix::unistd::gethostname().context("reading this host's name")?;
@@ -178,9 +215,9 @@ fn host_name() -> Result<String, anyhow::Error> {
 /// keys and bound to `box_name`, recording each mint with the proxy
 /// (BEP-005, BEP-006). Every grant of the v1 module is a GitHub user token,
 /// so each gets its own mint and its own audit record.
-async fn mint_grants<S: bep::SignInStore, K: bep::KeyStore>(
+async fn mint_grants<S: bep::SignInStore>(
     store: &S,
-    keys: &bep::Keys<K>,
+    identity: &bep::PublicIdentity,
     control: &std::path::Path,
     box_name: &str,
     host: &str,
@@ -195,7 +232,7 @@ async fn mint_grants<S: bep::SignInStore, K: bep::KeyStore>(
             host_set_version: sessions::GITHUB_HOST_SET_VERSION,
             now,
         };
-        let value = crate::auth::mint_member(store, keys, control, &request)
+        let value = crate::auth::mint_member(store, identity, control, &request)
             .await
             .with_context(|| format!("minting the {grant}"))?;
         sealed.push((grant.env.clone(), value));
@@ -278,9 +315,9 @@ fn box_delivery(
 ///
 /// A declined reference, a host holding no store to sign the handle in, or a
 /// mint or registration [`mint_store_handles`] refuses.
-async fn mint_store_references<S: bep::KeyStore, K: bep::KeyStore>(
+async fn mint_store_references<S: bep::KeyStore>(
     key_store: &S,
-    keys: &bep::Keys<K>,
+    identity: &bep::PublicIdentity,
     control: &std::path::Path,
     box_name: &str,
     host: &str,
@@ -305,7 +342,7 @@ async fn mint_store_references<S: bep::KeyStore, K: bep::KeyStore>(
             prompt: planned.prompt,
         })
         .collect();
-    mint_store_handles(key_store, keys, control, box_name, host, &admitted, now).await
+    mint_store_handles(key_store, identity, control, box_name, host, &admitted, now).await
 }
 
 /// Delivers the box spec's credentials into the composition of the session
@@ -329,20 +366,36 @@ async fn deliver_box_grants(
     // it: a box referring to a stored secret and declaring no grant needs no
     // sign-in, and one declaring a grant and no reference mints no handle.
     let mut sealed = Vec::new();
+    // One read for both halves: the identity is the proxy's, not the grant's
+    // or the reference's, and a box declaring neither needs none.
+    let identity = if plan.grants.is_empty() && plan.references.is_empty() {
+        None
+    } else {
+        Some(published_identity(minimal_dir)?)
+    };
     if !plan.grants.is_empty() {
         let store = crate::auth::host_store()?;
-        let keys = crate::auth::host_keys()?;
+        let identity = identity.as_ref().expect("the identity was read above");
         sealed.extend(
-            mint_grants(&store, &keys, &control, box_name, &host, &plan.grants, now).await?,
+            mint_grants(
+                &store,
+                identity,
+                &control,
+                box_name,
+                &host,
+                &plan.grants,
+                now,
+            )
+            .await?,
         );
     }
     if !plan.references.is_empty() {
         let key_store = crate::auth::host_key_store()?;
-        let keys = crate::auth::host_keys()?;
+        let identity = identity.as_ref().expect("the identity was read above");
         sealed.extend(
             mint_store_references(
                 &key_store,
-                &keys,
+                identity,
                 &control,
                 box_name,
                 &host,
@@ -2528,7 +2581,7 @@ mod tests {
         // The mint: one sealed member for the one grant, bound to the box.
         let sealed = mint_grants(
             &store,
-            &keys,
+            &keys.public_identity(),
             &socket,
             "web",
             "mac-1",
@@ -2551,7 +2604,7 @@ mod tests {
         // The hand-off: the grant variable, the proxy environment, the root.
         let network = steered_network();
         let expansion = expand(&network);
-        let delivery = box_delivery(&project, &expansion, &sealed, Some(&root_pem));
+        let delivery = box_delivery(&project, &expansion, &sealed, Some(&root_pem), network.mode);
         let names: Vec<&str> = delivery.vars.iter().map(|v| v.var.name.as_str()).collect();
         assert_eq!(
             names,
@@ -2600,7 +2653,7 @@ mod tests {
         // environment (BEP-010).
         let mut off = network.clone();
         off.bep.steering = Some(sessions::Steering::Off);
-        let delivery = box_delivery(&project, &expand(&off), &sealed, Some(&root_pem));
+        let delivery = box_delivery(&project, &expand(&off), &sealed, Some(&root_pem), off.mode);
         let names: Vec<&str> = delivery.vars.iter().map(|v| v.var.name.as_str()).collect();
         assert_eq!(names, ["GITHUB_TOKEN"]);
         assert!(delivery.patches.is_empty());
@@ -2644,9 +2697,17 @@ mod tests {
             prompt: false,
         }];
 
-        let minted = mint_store_references(&store, &keys, &socket, "web", "mac-1", &planned, now)
-            .await
-            .unwrap();
+        let minted = mint_store_references(
+            &store,
+            &keys.public_identity(),
+            &socket,
+            "web",
+            "mac-1",
+            &planned,
+            now,
+        )
+        .await
+        .unwrap();
         assert_eq!(minted.len(), 1);
         assert_eq!(minted[0].0.to_string(), "ANTHROPIC_API_KEY");
         let unsealed = bep::unseal(&keys, minted[0].1.as_str()).unwrap();
@@ -2665,7 +2726,7 @@ mod tests {
         // box has to reach it.
         let network = steered_network();
         let expansion = sessions::expand_for_references(&network, "web", false).unwrap();
-        let delivery = box_delivery(&project, &expansion, &minted, None);
+        let delivery = box_delivery(&project, &expansion, &minted, None, network.mode);
         let names: Vec<&str> = delivery.vars.iter().map(|v| v.var.name.as_str()).collect();
         assert_eq!(
             names,
@@ -2723,7 +2784,7 @@ mod tests {
         let keys = Keys::open(MemoryStore::new()).unwrap();
         mint_grants(
             &store,
-            &keys,
+            &keys.public_identity(),
             &socket,
             "web",
             "mac-1",

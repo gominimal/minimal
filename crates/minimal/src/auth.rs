@@ -19,9 +19,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 use bep::github::{AuthorizeRequest, Pkce, Url, random_token};
-use bep::{
-    GitHub, KeyStore, Keys, MintRequest, Record, SealedValue, SignIn, SignInStore, Submission,
-};
+use bep::{GitHub, MintRequest, Record, SealedValue, SignIn, SignInStore, Submission};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, UnixStream};
@@ -96,26 +94,16 @@ pub(crate) fn host_store() -> Result<bep::MemorySignIns, anyhow::Error> {
     )
 }
 
-/// The host's proxy keys — the sealing key a box's member is sealed to —
-/// held in the same store as the sign-in. Opening generates them on first
-/// use; a host with no keychain backend has none, as it holds no sign-in to
-/// mint from either.
-#[cfg(target_os = "macos")]
-pub(crate) fn host_keys() -> Result<Keys<bep::keychain::MacosKeychain>, anyhow::Error> {
-    Ok(Keys::open(bep::keychain::MacosKeychain)?)
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn host_keys() -> Result<Keys<bep::MemoryStore>, anyhow::Error> {
-    bail!(
-        "the box egress proxy's keys live in the host keychain, and this host has no \
-         keychain backend yet (macOS only)"
-    )
-}
-
-/// The store [`host_keys`] holds them in, for the one key that is the
-/// client's rather than the proxy's: the handle-signing key a store reference
-/// is minted under (BEP-063), found or generated beside them.
+/// The host store the one key that is the client's rather than the proxy's
+/// lives in: the handle-signing key a store reference is minted under
+/// (BEP-063).
+///
+/// The proxy's own keys are deliberately not opened here. The host grants
+/// them to the proxy's process identity alone (BEP-059), so a client that
+/// opened that store would find keys it cannot use — and on a host where it
+/// ran first would generate keys the proxy then could not use. What a client
+/// needs to seal is public, and it reads it from where the proxy published
+/// it.
 #[cfg(target_os = "macos")]
 pub(crate) fn host_key_store() -> Result<bep::keychain::MacosKeychain, anyhow::Error> {
     Ok(bep::keychain::MacosKeychain)
@@ -397,9 +385,9 @@ pub async fn logout<S: SignInStore>(
 ///
 /// When no sign-in is held or it has expired, the envelope cannot be sealed,
 /// or the proxy does not record the mint.
-pub async fn mint_member<S: SignInStore, K: KeyStore>(
+pub async fn mint_member<S: SignInStore>(
     store: &S,
-    keys: &Keys<K>,
+    identity: &bep::PublicIdentity,
     control: &Path,
     request: &MintRequest<'_>,
 ) -> Result<SealedValue, anyhow::Error> {
@@ -407,7 +395,7 @@ pub async fn mint_member<S: SignInStore, K: KeyStore>(
         .load()
         .context("reading the held sign-in")?
         .ok_or_else(|| anyhow::anyhow!("no GitHub sign-in is held; run `min auth login`"))?;
-    let minted = bep::mint(keys, &sign_in, request)?;
+    let minted = bep::mint(identity, &sign_in, request)?;
     submit_audit(control, &Submission::Audit(minted.event))
         .await
         .context("recording the mint with the proxy")?;
@@ -478,7 +466,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use bep::github::{Endpoints, MemorySignIns, Secret};
-    use bep::{Kind, Log, MemoryStore, Revocations};
+    use bep::{Keys, Kind, Log, MemoryStore, Revocations};
     use tokio::net::{TcpStream, UnixListener};
 
     use super::*;
@@ -916,7 +904,7 @@ mod tests {
 
         let value = mint_member(
             &store,
-            &keys,
+            &keys.public_identity(),
             &socket,
             &MintRequest {
                 box_id: "box-a1",
@@ -962,7 +950,7 @@ mod tests {
         // Without a sign-in there is nothing to mint, and the log is untouched.
         let refused = mint_member(
             &store,
-            &keys,
+            &keys.public_identity(),
             &socket,
             &MintRequest {
                 box_id: "box-b2",
@@ -1007,7 +995,7 @@ mod tests {
         // revokes nothing of its own.
         mint_member(
             &store,
-            &keys,
+            &keys.public_identity(),
             &socket,
             &MintRequest {
                 box_id: "box-a1",

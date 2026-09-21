@@ -1213,6 +1213,13 @@ pub const BEP_CONTROL_SOCKET_FILE: &str = "control.sock";
 /// (`minimal::cmd::session`'s `BEP_ROOT_PEM`), which this crate cannot import.
 pub const BEP_ROOT_PEM_FILE: &str = "root.pem";
 
+/// Where the proxy publishes its public identity: what a client on this host
+/// seals a member to, which it cannot read from the store the private halves
+/// live in (BEP-059). The name is the client's own
+/// (`minimal::cmd::session`'s `BEP_PUBLIC_KEYS`), which this crate cannot
+/// import.
+pub const BEP_PUBLIC_KEYS_FILE: &str = "keys.json";
+
 /// The cohort a VM-hosted box's connection is attributed to.
 ///
 /// A box inside the VM reaches the proxy through the switch's host-alias
@@ -1324,6 +1331,9 @@ pub struct BepConfig {
     /// Where the proxy publishes its interception root, PEM: what a box's
     /// trust store is seeded from at creation (BEP-011).
     root_pem: PathBuf,
+    /// Where the proxy publishes its public identity: what a client seals a
+    /// member to (BEP-059).
+    public_keys: PathBuf,
     /// The operator's `[[secret-store-rules]]` file, or `None` where this host
     /// has none — the proxy then holds no rule and refuses every store handle.
     store_rules: Option<PathBuf>,
@@ -1347,6 +1357,7 @@ impl BepConfig {
             boxes: bep_dir.join(BEP_BOXES_FILE),
             control_socket: bep_dir.join(BEP_CONTROL_SOCKET_FILE),
             root_pem: bep_dir.join(BEP_ROOT_PEM_FILE),
+            public_keys: bep_dir.join(BEP_PUBLIC_KEYS_FILE),
             store_rules: None,
             term_timeout: DEFAULT_TERM_TIMEOUT,
             user: ProcessUser::operator(),
@@ -1410,6 +1421,8 @@ impl BepConfig {
             self.control_socket.display().to_string(),
             "--root-pem".to_string(),
             self.root_pem.display().to_string(),
+            "--public-keys".to_string(),
+            self.public_keys.display().to_string(),
         ];
         if let Some(rules) = &self.store_rules {
             argv.push("--store-rules".to_string());
@@ -1428,6 +1441,12 @@ impl BepConfig {
     #[must_use]
     pub fn root_pem(&self) -> &Path {
         &self.root_pem
+    }
+
+    /// Where the proxy publishes its public identity.
+    #[must_use]
+    pub fn public_keys(&self) -> &Path {
+        &self.public_keys
     }
 
     /// Create the proxy's directory and, when it is not there yet, an empty
@@ -2205,12 +2224,15 @@ mod tests {
                 "/s/bep/control.sock".to_string(),
                 "--root-pem".to_string(),
                 "/s/bep/root.pem".to_string(),
+                "--public-keys".to_string(),
+                "/s/bep/keys.json".to_string(),
             ]
         );
         assert_eq!(cfg.audit_log(), Path::new("/s/bep/audit.log"));
         assert_eq!(cfg.boxes(), Path::new("/s/bep/boxes.json"));
         assert_eq!(cfg.control_socket(), Path::new("/s/bep/control.sock"));
         assert_eq!(cfg.root_pem(), Path::new("/s/bep/root.pem"));
+        assert_eq!(cfg.public_keys(), Path::new("/s/bep/keys.json"));
 
         // A rules file is the operator's, so it is passed only when there is
         // one: a proxy handed `--store-rules` for a file that is not there

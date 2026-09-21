@@ -760,9 +760,9 @@ fn handle_injection(injection: &sessions::Injection) -> Result<bep::mint::Inject
 /// When the client's handle-signing key cannot be opened or described, the
 /// proxy does not register it, a rule registers a form no handle can carry, or
 /// a handle cannot be minted or sealed.
-pub async fn mint_store_handles<S: bep::KeyStore, K: bep::KeyStore>(
+pub async fn mint_store_handles<S: bep::KeyStore>(
     key_store: &S,
-    keys: &bep::Keys<K>,
+    identity: &bep::PublicIdentity,
     control: &std::path::Path,
     box_name: &str,
     host: &str,
@@ -786,7 +786,7 @@ pub async fn mint_store_handles<S: bep::KeyStore, K: bep::KeyStore>(
         let inject = handle_injection(&candidate.rule.inject)?;
         let store = reference.store.to_string();
         let handle = bep::mint::mint_store_handle(
-            keys,
+            identity,
             &client,
             &bep::mint::StoreMintRequest {
                 box_id: box_name,
@@ -977,9 +977,17 @@ mod tests {
             })
             .collect();
 
-        let minted = mint_store_handles(&store, &keys, &socket, BOX, HOST, &admitted, NOW)
-            .await
-            .unwrap();
+        let minted = mint_store_handles(
+            &store,
+            &keys.public_identity(),
+            &socket,
+            BOX,
+            HOST,
+            &admitted,
+            NOW,
+        )
+        .await
+        .unwrap();
 
         // The key the proxy verifies handles under reached it over the control
         // socket, once, and it is the client's own key — nothing else was
@@ -1057,9 +1065,17 @@ mod tests {
         // The next run signs under the same key the proxy already holds: the
         // key is found in the store, not generated again, and the proxy still
         // holds one.
-        let again = mint_store_handles(&store, &keys, &socket, BOX, HOST, &admitted[..1], NOW + 60)
-            .await
-            .unwrap();
+        let again = mint_store_handles(
+            &store,
+            &keys.public_identity(),
+            &socket,
+            BOX,
+            HOST,
+            &admitted[..1],
+            NOW + 60,
+        )
+        .await
+        .unwrap();
         let unsealed = bep::unseal(&keys, again[0].1.as_str()).unwrap();
         let handle = bep::mint::parse_store_handle(unsealed.member.expose()).unwrap();
         assert_eq!(handle.claims.key, bep::Fingerprint::of(&public).to_string());
@@ -1074,10 +1090,18 @@ mod tests {
 
         // A box that refers to nothing registers nothing and mints nothing.
         assert!(
-            mint_store_handles(&store, &keys, &socket, BOX, HOST, &[], NOW)
-                .await
-                .unwrap()
-                .is_empty()
+            mint_store_handles(
+                &store,
+                &keys.public_identity(),
+                &socket,
+                BOX,
+                HOST,
+                &[],
+                NOW
+            )
+            .await
+            .unwrap()
+            .is_empty()
         );
         assert_eq!(seen.lock().unwrap().len(), 2);
     }
