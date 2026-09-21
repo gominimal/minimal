@@ -31,6 +31,7 @@ use sessions::keys::{ChordMatcher, FeedOutcome, KeyAction, SessionKeys};
 use std::sync::Arc;
 
 mod pty;
+mod subject_hash;
 
 pub use pty::*;
 
@@ -2093,18 +2094,21 @@ fn layer_session_env(
 /// (BEP-011): the anchor the CLI delivered into the session home at
 /// [`sessions::BEP_ANCHOR_PATCH_DEST`] — a composition patch, materialized at
 /// `FinalizeSession` like every other — is put under
-/// `<rootfs>/{BEP_TRUST_STORE_DIR}` and appended to the certificate bundle
-/// there. Returns the installed path, or `None` when the home carries no
-/// anchor: a box with no grant, or one under `steering = "off"`, whose CLI
-/// delivered none.
+/// `<rootfs>/{BEP_TRUST_STORE_DIR}`, linked there under its subject hash, and
+/// appended to the certificate bundle there. Returns the installed path, or
+/// `None` when the home carries no anchor: a box with no grant, or one under
+/// `steering = "off"`, whose CLI delivered none.
 ///
-/// The append is what makes the box trust it. A certificate sitting in that
-/// directory under a name of its own is trusted by nothing: OpenSSL finds an
-/// anchor there only by its subject hash, and `curl` and `git` read the
-/// bundle. The architecture's bar is that `git`, `gh`, SDKs and MCP clients
-/// need no configuration, which only the bundle meets — an `SSL_CERT_FILE`
-/// pointing at a lone file is per-tool configuration by another name, and
-/// silently misses everything that reads the store directly.
+/// The link and the append are what make the box trust it. A certificate
+/// sitting in that directory under a name of its own is trusted by nothing.
+/// OpenSSL's directory lookup opens only `<subject hash>.<n>`, and that is
+/// how the image's `curl` and `git` find their roots: they are built with
+/// this directory as their CA path and no CA file. A tool given a CA file
+/// reads the bundle instead. The architecture's bar is that `git`, `gh`, SDKs
+/// and MCP clients need no configuration, which only the store itself meets —
+/// an `SSL_CERT_FILE` pointing at a lone file is per-tool configuration by
+/// another name, and silently misses everything that reads the store
+/// directly.
 ///
 /// The bundle is rewritten rather than appended to. It arrives hardlinked out
 /// of the content-addressed package store, so an append would edit the
@@ -2133,8 +2137,33 @@ fn install_trust_anchor(
     // A trust anchor is public by nature and every process in the box reads
     // it; the delivered patch's own bits are whatever the upload carried.
     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644))?;
+    hash_link(&dir)?;
     trust_bundle(&dir, &dest)?;
     Ok(Some(dest))
+}
+
+/// Links the anchor installed in `dir` under its OpenSSL subject hash, as
+/// `<hash>.<n>` for the first `n` no other certificate holds. OpenSSL's
+/// directory lookup tries `.0`, `.1`, … until one is missing, and takes the
+/// first whose certificate carries the subject it wants.
+fn hash_link(dir: &std::path::Path) -> io::Result<()> {
+    let target = std::path::Path::new(sessions::BEP_TRUST_STORE_FILE);
+    let hash = subject_hash::subject_hash(&std::fs::read(dir.join(target))?)?;
+    let mut n = 0u32;
+    loop {
+        let link = dir.join(format!("{hash:08x}.{n}"));
+        match std::fs::read_link(&link) {
+            // Already this anchor's: a second launch into the same rootfs.
+            Ok(existing) if existing == target => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return std::os::unix::fs::symlink(target, &link);
+            }
+            // Another certificate's, as a link or as a file.
+            Ok(_) => n += 1,
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => n += 1,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Appends `anchor` to the certificate bundle in `dir`, by writing a whole

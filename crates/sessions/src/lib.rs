@@ -628,18 +628,20 @@ pub const BEP_ANCHOR_PATCH_DEST: &str = ".local/share/minimal/bep/anchor.pem";
 pub const BEP_TRUST_STORE_DIR: &str = "etc/ssl/certs";
 
 /// Where the anchor is kept under [`BEP_TRUST_STORE_DIR`] in its own right:
-/// what a tool pointed at one certificate is pointed at, and what a reader
-/// checking whether a box was given an anchor looks for.
+/// what its subject-hash link points at, what a tool pointed at one
+/// certificate is pointed at, and what a reader checking whether a box was
+/// given an anchor looks for.
 ///
-/// A file here under its own name is not itself trusted by anything. OpenSSL
-/// finds an anchor in this directory only by its subject hash, and the tools
-/// that matter — curl, git — read [`BEP_TRUST_BUNDLE_FILE`] instead. Trust
-/// comes from being in that bundle.
+/// A file here under its own name is not itself trusted by anything.
+/// OpenSSL's directory lookup opens only `<subject hash>.<n>`, and a tool
+/// given a CA file reads [`BEP_TRUST_BUNDLE_FILE`]. Trust comes from the link
+/// and the bundle.
 pub const BEP_TRUST_STORE_FILE: &str = "minimal-bep-anchor.pem";
 
-/// The certificate bundle under [`BEP_TRUST_STORE_DIR`] that OpenSSL-linked
-/// tools actually read: the box's trust store as `curl`, `git` and every
-/// OpenSSL default resolve it. An anchor is trusted by being appended to it.
+/// The certificate bundle under [`BEP_TRUST_STORE_DIR`]: the box's trust store
+/// as a tool given a CA file reads it. An anchor is in it by being appended.
+/// A tool that looks the directory up instead — the image's `curl` and `git`
+/// — never opens the bundle, and finds the anchor by its subject-hash link.
 pub const BEP_TRUST_BUNDLE_FILE: &str = "ca-certificates.crt";
 
 /// The `[session.network]` table of a box spec.

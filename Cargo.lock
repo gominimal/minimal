@@ -4170,6 +4170,7 @@ dependencies = [
  "serde",
  "serde_json_lenient",
  "sessions",
+ "sha1",
  "size",
  "stdlib",
  "switch",

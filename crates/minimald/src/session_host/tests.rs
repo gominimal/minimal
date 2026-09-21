@@ -1394,14 +1394,14 @@ async fn stale_binding_generation_input_is_discarded() {
 
 /// BEP-011: the anchor the box spec's grants delivered into the session home
 /// (the CLI's patch at `BEP_ANCHOR_PATCH_DEST`) lands in the rootfs trust
-/// store directory, byte for byte and world-readable; a home carrying no
-/// anchor installs nothing and creates no trust store directory.
+/// store directory, byte for byte and world-readable, linked under the
+/// subject hash OpenSSL looks it up by; a home carrying no anchor installs
+/// nothing and creates no trust store directory.
 #[test]
 fn anchor_patch_lands_in_trust_store_dir() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    const PEM: &str =
-        "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END CERTIFICATE-----\n";
+    const PEM: &str = include_str!("test_anchor.pem");
 
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
@@ -1437,6 +1437,13 @@ fn anchor_patch_lands_in_trust_store_dir() {
         0o644,
         "the anchor must be readable by every process in the box"
     );
+    // `openssl x509 -subject_hash` of the test anchor is 42d333ec.
+    let link = expected.with_file_name("42d333ec.0");
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        std::path::Path::new(sessions::BEP_TRUST_STORE_FILE),
+        "OpenSSL's directory lookup opens only the subject-hash name"
+    );
 
     // A second launch of the same session installs the same anchor again
     // without complaint.
@@ -1458,6 +1465,39 @@ fn anchor_patch_lands_in_trust_store_dir() {
         1,
         "the anchor is in the bundle once, however often the session launches"
     );
+    // And it is linked once: the second launch found its own link.
+    assert!(!link.with_file_name("42d333ec.1").exists());
+}
+
+/// BEP-011: OpenSSL files certificates sharing a subject hash as `.0`, `.1`,
+/// …, so an anchor whose hash another certificate already holds is linked
+/// under the next free suffix, and that certificate keeps its own.
+#[test]
+fn the_anchor_is_linked_past_a_certificate_already_holding_its_hash() {
+    const PEM: &str = include_str!("test_anchor.pem");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let rootfs = tmp.path().join("rootfs");
+    let dir = rootfs.join(sessions::BEP_TRUST_STORE_DIR);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("shipped-root.pem"), "shipped").unwrap();
+    std::os::unix::fs::symlink("shipped-root.pem", dir.join("42d333ec.0")).unwrap();
+
+    let source = home.join(sessions::BEP_ANCHOR_PATCH_DEST);
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, PEM).unwrap();
+    install_trust_anchor(&home, &rootfs).unwrap().unwrap();
+
+    assert_eq!(
+        std::fs::read_link(dir.join("42d333ec.0")).unwrap(),
+        std::path::Path::new("shipped-root.pem")
+    );
+    assert_eq!(
+        std::fs::read_link(dir.join("42d333ec.1")).unwrap(),
+        std::path::Path::new(sessions::BEP_TRUST_STORE_FILE)
+    );
 }
 
 /// BEP-011, the half that makes the anchor count: a certificate in the trust
@@ -1466,8 +1506,7 @@ fn anchor_patch_lands_in_trust_store_dir() {
 /// replaced rather than appended to.
 #[test]
 fn the_anchor_joins_the_bundle_without_editing_the_package_store() {
-    const PEM: &str =
-        "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END CERTIFICATE-----\n";
+    const PEM: &str = include_str!("test_anchor.pem");
     const SHIPPED: &str = "-----BEGIN CERTIFICATE-----\nc2hpcHBlZA==\n-----END CERTIFICATE-----\n";
 
     let tmp = tempfile::tempdir().unwrap();
