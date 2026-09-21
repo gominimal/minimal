@@ -342,8 +342,21 @@ where
     });
 }
 
+/// Runs the proxy, and on failure prints the error as its message rather than
+/// the `Debug` form a `main` returning `Result` would: the message is what
+/// names the way back, and the supervisor's log is where an operator reads it.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> std::process::ExitCode {
+    match start().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("bep: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn start() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
