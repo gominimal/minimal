@@ -848,6 +848,143 @@ mod tests {
         assert_eq!(SessionStatus::default(), SessionStatus::Active);
     }
 
+    // ========================================================================
+    // Property tests
+    // ========================================================================
+
+    /// Property: for an `OwnIp` `PTask`, `first_invalid_subnet` reports the
+    /// first invalid CIDR in `allow_subnets`, and every syntactically valid IPv4
+    /// or IPv6 CIDR is accepted.
+    #[test]
+    fn egress_policy_property_check_runs() {
+        use std::fmt::Write as _;
+
+        use proptest::prelude::*;
+
+        fn arbitrary_cidr() -> impl Strategy<Value = String> {
+            prop_oneof![
+                // IPv4 CIDR
+                (0u8..=255, 0u8..=255, 0u8..=255, 0u8..=255, 0u8..=32)
+                    .prop_map(|(a, b, c, d, p)| format!("{a}.{b}.{c}.{d}/{p}")),
+                // IPv6 CIDR (collapse the longest run of zero words to `::`).
+                (prop::collection::vec(0u16..=0xffff, 8..=8), 0u8..=128)
+                    .prop_filter("IPv6 CIDR prefix in range", |(_, p)| *p <= 128)
+                    .prop_map(|(words, p)| {
+                        let mut best_start = None;
+                        let mut best_len = 0usize;
+                        let mut cur_start = None;
+                        let mut cur_len = 0usize;
+                        for (i, &w) in words.iter().enumerate() {
+                            if w == 0 {
+                                if cur_start.is_none() {
+                                    cur_start = Some(i);
+                                    cur_len = 1;
+                                } else {
+                                    cur_len += 1;
+                                }
+                            } else if let Some(start) = cur_start
+                                && cur_len > best_len
+                            {
+                                best_len = cur_len;
+                                best_start = Some(start);
+                                cur_start = None;
+                                cur_len = 0;
+                            }
+                        }
+                        if let Some(start) = cur_start
+                            && cur_len > best_len
+                        {
+                            best_start = Some(start);
+                            best_len = cur_len;
+                        }
+                        let mut s = String::new();
+                        let mut i = 0usize;
+                        while i < words.len() {
+                            if Some(i) == best_start {
+                                s.push(':');
+                                i += best_len;
+                                if i == words.len() {
+                                    s.push(':');
+                                }
+                            } else {
+                                if !s.is_empty() && !s.ends_with(':') {
+                                    s.push(':');
+                                }
+                                let _ = write!(s, "{:x}", words[i]);
+                                i += 1;
+                            }
+                        }
+                        if s.is_empty() {
+                            s.push_str("::");
+                        }
+                        format!("{s}/{p}")
+                    }),
+            ]
+        }
+
+        proptest!(|(mut cidrs in prop::collection::vec(arbitrary_cidr(), 0..=16),
+                     invalid_idx in 0_usize..=16)| {
+            // Insert a deliberately invalid entry at `invalid_idx` unless the
+            // index equals the vector length, which models "all valid".
+            let expect_invalid = if invalid_idx < cidrs.len() {
+                cidrs.insert(invalid_idx, "not-a-cidr".to_owned());
+                true
+            } else {
+                false
+            };
+
+            let egress = EgressPolicy {
+                allow_subnets: Some(cidrs),
+                ..EgressPolicy::default()
+            };
+
+            if expect_invalid {
+                prop_assert_eq!(
+                    egress.first_invalid_subnet(),
+                    Some("not-a-cidr"),
+                    "first_invalid_subnet must surface the invalid CIDR"
+                );
+            } else {
+                prop_assert_eq!(
+                    egress.first_invalid_subnet(),
+                    None,
+                    "all generated CIDRs must be accepted"
+                );
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------------
+    // Property placeholders for BEP requirements
+    // ------------------------------------------------------------------------
+
+    /// Property: a record with `NetworkMode::NoNet` and any egress config is
+    /// rejected by `validate_policy`, since egress policy is only valid for
+    /// `OwnIp` `PTasks`.
+    #[test]
+    fn prop_none_mode_with_grant_is_exit_3() {
+        use proptest::prelude::*;
+
+        proptest!(|(has_egress: bool, has_ingress: bool)| {
+            let mut record = record_with(NetworkMode::NoNet, SessionPolicy::default());
+            if has_egress {
+                record.policy.egress = Some(EgressPolicy::default());
+            }
+            if has_ingress {
+                record.policy.ingress = Some(IngressPolicy::default());
+            }
+
+            if has_egress {
+                prop_assert!(
+                    record.validate_policy().is_err(),
+                    "NoNet PTask with egress must be rejected"
+                );
+            } else {
+                prop_assert!(record.validate_policy().is_ok(), "NoNet without egress must pass");
+            }
+        });
+    }
+
     /// Records persisted before the `Draft` → `Pending` rename used
     /// the string `"draft"`. The serde alias keeps those records
     /// readable; regression guard for accidentally dropping the

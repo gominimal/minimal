@@ -190,6 +190,7 @@ globset = "0.4"
 walkdir = "2.5"
 
 petgraph = "0.8"
+proptest = "1"
 
 # Our crates. These are path deps in a `publish = false` workspace, so no
 # `version` requirement is needed (or used) — cargo resolves them by path. Adding
