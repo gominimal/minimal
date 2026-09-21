@@ -641,9 +641,21 @@ _smoke *args:
     done
     echo "min ls failed after retries" >&2; exit 1
 
+# minvmd boots without the box egress proxy when the proxy fails to start, so
+# `min ls` succeeding says nothing about it. Its own last word is in the
+# provider's run.log; a warning, not a failure, because a box with no
+# credentials still runs.
+[private]
+_bep-check:
+    #!/usr/bin/env sh
+    pgrep -f "^{{bep-bin}} " >/dev/null && exit 0
+    echo "warning: the box egress proxy is not running, so no box gets a credential:" >&2
+    grep '^bep: ' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/run.log" 2>/dev/null | tail -1 >&2
+    echo "after a rebuild of bep, 'just bep-rekey' replaces its keys; then 'min ls'" >&2
+
 # Bring the stack up: Linux VM over Hypervisor.framework (`min ls` autospawns minvmd).
 [macos]
-up: artifacts gvproxy initramfs bep minvmd-build minimal-cli && (_smoke)
+up: artifacts gvproxy initramfs bep minvmd-build minimal-cli && (_smoke) _bep-check
 
 # `just up` with the initramfs built from the cross toolchain on PATH rather than
 # through `cross` — see `initramfs-nodocker` for what that requires. The iteration
@@ -652,7 +664,7 @@ up: artifacts gvproxy initramfs bep minvmd-build minimal-cli && (_smoke)
 #
 # Bring the stack up, building the initramfs without a container.
 [macos]
-up-nodocker: artifacts gvproxy initramfs-nodocker bep minvmd-build minimal-cli && (_smoke)
+up-nodocker: artifacts gvproxy initramfs-nodocker bep minvmd-build minimal-cli && (_smoke) _bep-check
 
 # Bring the stack up: host-native minimald, no VM (`just up-kvm` for the VM stack).
 [linux]
