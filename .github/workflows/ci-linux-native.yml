@@ -196,7 +196,7 @@ jobs:
       - name: Install nextest
         # Convention selection is a nextest filterset (binary(/_root_integration$/));
         # cargo test cannot select test targets by pattern.
-        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2
         with:
           tool: nextest
       - name: Enable unprivileged user namespaces
