@@ -1,0 +1,48 @@
+# The Box Egress Proxy demo: one box, two credentials, neither of which it
+# ever holds. `GITHUB_TOKEN` is a member minted from your `min auth login`;
+# `DEMO_TOKEN` refers to a value you stored with `min secret set`. The box gets
+# a sealed handle for each, and the proxy puts the real value on the wire.
+
+[upstream] # Source of software & tooling; materialized by git clone
+repo = "https://github.com/gominimal/pkgs"
+branch = "main"
+locked_commit = "f4de33d06dada4edcf5076dded10e9c303cf597e"
+
+[session]
+packages = ["git", "curl"]
+
+[session.network]
+mode = "own_ip"
+
+[session.network.egress]
+# Every host a grant or reference reaches has to be listed, or expansion
+# refuses naming the missing ones. The layer comes from github.com and its
+# prebuilt artifacts from the cache; a box that cannot reach them builds every
+# package from source.
+allow_dns_hosts = [
+  "github.com",
+  "api.github.com",
+  "uploads.github.com",
+  "codeload.github.com",
+  "cache.minimal.dev",
+  "postman-echo.com",
+]
+
+[session.network.bep]
+steering = "proxy_env"
+
+# The GitHub lane: minted from the sign-in `min auth login` holds.
+[[session.grants]]
+module = "github"
+env    = "GITHUB_TOKEN"
+source = "broker"
+mode   = "user"
+
+# The stored-secret lane: the value `min secret set demo-echo-token` stored.
+# What it may be sent to is the operator rule in operator-rule.toml, not this
+# file.
+[[session.references]]
+store  = "keychain"
+id     = "demo-echo-token"
+env    = "DEMO_TOKEN"
+source = "store"

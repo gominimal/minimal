@@ -27,6 +27,7 @@ minvmd-bin   := minvmd-dir / "minvmd"
 minimald-bin := justfile_directory() / "target/debug/minimald"
 # The CLI crate is `minimal`; its [[bin]] target is `min`.
 min-bin      := justfile_directory() / "target/debug/min"
+bep-bin      := justfile_directory() / "target/debug/bep"
 # State dir for the host-native minimald that `just up` runs on Linux.
 native-dir   := scratch / "native-state"
 
@@ -55,6 +56,15 @@ export MINVMD_INITRAMFS := initramfs
 export MINVMD_READY_TIMEOUT_SECS := env('MINVMD_READY_TIMEOUT_SECS', '150')
 export MINIMAL_SPAWN_TIMEOUT_SECS := env('MINIMAL_SPAWN_TIMEOUT_SECS', '150')
 export MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS := env('MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS', '150')
+# The box egress proxy minvmd starts beside a VM: this checkout's build, not an
+# installed one (minvmd otherwise looks in ~/.local/bin and /usr/lib/minimal).
+export MINVMD_BEP_BIN := bep-bin
+# The dev stack's state (sessions, provider sockets, the proxy's published
+# files), apart from an installed minimal's ~/.local/state/minimal: sharing it,
+# `min` would reach whichever daemon was already running there instead of this
+# checkout's. Short and under /tmp so unix socket paths stay inside macOS's
+# 104-byte limit however deep the checkout sits.
+export XDG_STATE_HOME := "/tmp/minimal-dev-" + env('USER', 'dev')
 
 [private]
 default:
@@ -145,6 +155,39 @@ minvmd-build: libkrun-static
 minimal-cli:
     cargo build -p minimal --locked
 
+# Build bep, the box egress proxy minvmd starts beside each VM.
+bep:
+    cargo build -p bep --locked
+
+# macOS lets only the program that generated a key use it, and a rebuilt bep is
+# a different program, so a rebuild that changed bep locks it out of its keys.
+# This replaces all three (sealing, root, signing) after stopping the stack, so
+# the next `min` starts a proxy on the new ones. Boxes created before hold the
+# old anchor and sealed values: recreate them.
+#
+# Replace bep's keys after a rebuild locked it out of them (stops the stack).
+[macos]
+bep-rekey: bep stop
+    "{{bep-bin}}" --replace-key sealing --replace-key root --replace-key signing
+
+# The operator rule the demo's stored-secret lane needs (examples/bep-demo):
+# `demo-echo-token` may be injected into postman-echo.com. It is appended to
+# your own config, once, because a project cannot say what a value may be sent
+# to. The proxy reads the rules when it starts, so a running stack needs a
+# `just stop` before the rule bites.
+#
+# Register the bep demo's stored-secret rule in your minimal config.
+bep-demo-rule:
+    #!/usr/bin/env sh
+    set -eu
+    config="${XDG_CONFIG_HOME:-$HOME/.config}/minimal/config.toml"
+    if grep -qs '^id *= *"demo-echo-token"' "$config"; then
+      echo "demo-echo-token is already registered in $config"; exit 0
+    fi
+    mkdir -p "$(dirname "$config")"
+    cat "{{justfile_directory()}}/examples/bep-demo/operator-rule.toml" >> "$config"
+    echo "registered demo-echo-token in $config"
+
 # Build a host-native (glibc) minimald (for `just up`).
 [linux]
 minimald-build:
@@ -214,13 +257,14 @@ env:
       PATH "$PATH" \
       MINVMD_KERNEL_PATH "$MINVMD_KERNEL_PATH" MINVMD_ROOTFS_PATH "$MINVMD_ROOTFS_PATH" \
       MINVMD_INITRAMFS "$MINVMD_INITRAMFS" \
-      MINVMD_GVPROXY_BIN "{{gvproxy}}" \
+      MINVMD_GVPROXY_BIN "{{gvproxy}}" MINVMD_BEP_BIN "$MINVMD_BEP_BIN" \
+      XDG_STATE_HOME "$XDG_STATE_HOME" \
       MINVMD_READY_TIMEOUT_SECS "$MINVMD_READY_TIMEOUT_SECS" \
       MINIMAL_SPAWN_TIMEOUT_SECS "$MINIMAL_SPAWN_TIMEOUT_SECS"
 
 # Subshell with the dev env loaded (exit to leave).
 shell:
-    @echo "minimal dev shell: target/debug on PATH, MINVMD_* set (exit to leave)"
+    @echo "minimal dev shell: target/debug on PATH, MINVMD_* and XDG_STATE_HOME ($XDG_STATE_HOME) set (exit to leave)"
     @MINVMD_GVPROXY_BIN="{{gvproxy}}" "${SHELL:-sh}"
 
 # Report the supervised minvmd lifecycle state.
@@ -599,7 +643,7 @@ _smoke *args:
 
 # Bring the stack up: Linux VM over Hypervisor.framework (`min ls` autospawns minvmd).
 [macos]
-up: artifacts gvproxy initramfs minvmd-build minimal-cli && (_smoke)
+up: artifacts gvproxy initramfs bep minvmd-build minimal-cli && (_smoke)
 
 # `just up` with the initramfs built from the cross toolchain on PATH rather than
 # through `cross` — see `initramfs-nodocker` for what that requires. The iteration
@@ -608,7 +652,7 @@ up: artifacts gvproxy initramfs minvmd-build minimal-cli && (_smoke)
 #
 # Bring the stack up, building the initramfs without a container.
 [macos]
-up-nodocker: artifacts gvproxy initramfs-nodocker minvmd-build minimal-cli && (_smoke)
+up-nodocker: artifacts gvproxy initramfs-nodocker bep minvmd-build minimal-cli && (_smoke)
 
 # Bring the stack up: host-native minimald, no VM (`just up-kvm` for the VM stack).
 [linux]

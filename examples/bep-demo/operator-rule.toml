@@ -1,0 +1,10 @@
+
+# The bep demo's stored-secret rule (examples/bep-demo), added by
+# `just bep-demo-rule`. postman-echo.com answers with the headers it received,
+# so the box can see the proxy put the stored value in place of its handle.
+[[secret-store-rules]]
+store    = "keychain"
+id       = "demo-echo-token"
+upstream = ["postman-echo.com:443"]
+inject   = { header = "authorization", prefix = "Bearer " }
+action   = "allow"
