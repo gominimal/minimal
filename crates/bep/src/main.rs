@@ -24,9 +24,8 @@
 use std::error::Error;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use bep::control::{ClientKeys, Submission};
 use bep::keychain::SecretItems;
 use bep::listener::{Config, Module, Proxy, RegisteredRule, Sender};
 use bep::mint::Inject;
@@ -34,8 +33,7 @@ use bep::upstream::{self, Trust};
 use bep::{Authority, DeclaredUnion, KeyRole, KeyStore, Keys, Log};
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 /// The v1 GitHub module's host set.
@@ -289,59 +287,6 @@ fn publish_identity(path: &Path, identity: &bep::PublicIdentity) -> std::io::Res
     std::fs::rename(&staged, path)
 }
 
-/// The accept loop behind the control socket: one JSON-line submission per
-/// connection, the proxy's answer back on the same line. A registration goes
-/// to the keys the proxy verifies handles under; every other submission goes
-/// to the proxy's own intake, which appends it to the log it alone writes and
-/// puts a revocation it carries in force.
-fn serve_control<S>(proxy: Arc<Proxy<S>>, listener: UnixListener)
-where
-    S: KeyStore + Send + Sync + 'static,
-    S::Key: Send + Sync + 'static,
-{
-    let keys = Arc::new(Mutex::new(ClientKeys::new()));
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                tracing::warn!("the control socket stopped accepting");
-                return;
-            };
-            let proxy = Arc::clone(&proxy);
-            let keys = Arc::clone(&keys);
-            tokio::spawn(async move {
-                let (reader, mut writer) = stream.into_split();
-                let mut line = String::new();
-                if BufReader::new(reader).read_line(&mut line).await.is_err() {
-                    return;
-                }
-                let reply = match serde_json_lenient::from_str::<Submission>(&line) {
-                    Ok(Submission::RegisterKey(key)) => keys
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .register(&key)
-                        .map_err(|e| e.to_string())
-                        .and_then(|registered| {
-                            serde_json_lenient::to_string(&registered).map_err(|e| e.to_string())
-                        }),
-                    Ok(submission) => proxy
-                        .submit(&submission)
-                        .map_err(|e| e.to_string())
-                        .and_then(|record| {
-                            serde_json_lenient::to_string(&record).map_err(|e| e.to_string())
-                        }),
-                    Err(error) => Err(error.to_string()),
-                };
-                let reply = reply.unwrap_or_else(|error| {
-                    tracing::warn!(%error, "refused a control submission");
-                    serde_json_lenient::to_string(&serde_json_lenient::json!({"error": error}))
-                        .unwrap_or_else(|_| r#"{"error":"refused"}"#.to_owned())
-                });
-                let _ = writer.write_all(format!("{reply}\n").as_bytes()).await;
-            });
-        }
-    });
-}
-
 /// Runs the proxy, and on failure prints the error as its message rather than
 /// the `Debug` form a `main` returning `Result` would: the message is what
 /// names the way back, and the supervisor's log is where an operator reads it.
@@ -540,7 +485,7 @@ where
         }
         let listener = bep::control::bind(path)?;
         tracing::info!(path = %path.display(), "the control socket is listening");
-        serve_control(Arc::clone(&proxy), listener);
+        Arc::clone(&proxy).serve_control(listener);
     } else {
         tracing::warn!("no control socket: the client's mints and revocations are not recorded");
     }

@@ -702,6 +702,59 @@ where
         }
     }
 
+    /// Serves the control socket the `min` client submits over, one JSON line
+    /// in and one back per connection, until accepting fails. A key
+    /// registration goes to the keys this proxy verifies store handles under
+    /// (BEP-063), and every other submission to [`Proxy::submit`].
+    pub fn serve_control(self: Arc<Self>, listener: tokio::net::UnixListener) {
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    tracing::warn!("the control socket stopped accepting");
+                    return;
+                };
+                tokio::spawn(Arc::clone(&self).control_connection(stream));
+            }
+        });
+    }
+
+    /// Answers one control connection with the acknowledgement its line
+    /// earns, or `{"error": …}` naming why it earned none.
+    async fn control_connection(self: Arc<Self>, stream: tokio::net::UnixStream) {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let (reader, mut writer) = stream.into_split();
+        let mut line = String::new();
+        if tokio::io::BufReader::new(reader)
+            .read_line(&mut line)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let reply = match serde_json_lenient::from_str::<Submission>(&line) {
+            Ok(Submission::RegisterKey(key)) => self
+                .register_key(&key)
+                .map_err(|e| e.to_string())
+                .and_then(|registered| {
+                    serde_json_lenient::to_string(&registered).map_err(|e| e.to_string())
+                }),
+            Ok(submission) => self
+                .submit(&submission)
+                .map_err(|e| e.to_string())
+                .and_then(|record| {
+                    serde_json_lenient::to_string(&record).map_err(|e| e.to_string())
+                }),
+            Err(error) => Err(error.to_string()),
+        };
+        let reply = reply.unwrap_or_else(|error| {
+            tracing::warn!(%error, "refused a control submission");
+            serde_json_lenient::to_string(&serde_json_lenient::json!({"error": error}))
+                .unwrap_or_else(|_| r#"{"error":"refused"}"#.to_owned())
+        });
+        let _ = writer.write_all(format!("{reply}\n").as_bytes()).await;
+    }
+
     /// Serves one connection: refused at the listener unless `source` is a
     /// box attachment on this host (BEP-026).
     pub async fn connection(self: Arc<Self>, stream: TcpStream, source: SocketAddr) {
@@ -2236,6 +2289,53 @@ mod tests {
         let received = admitted(&h, &up, &format!("x-api-key: {sealed}\r\n")).await;
         assert!(
             received.contains(&format!("x-api-key: Key {SECRET_VALUE}\r\n")),
+            "{received}"
+        );
+    }
+
+    /// BEP-063: a key registered over the control socket is the key the
+    /// listener verifies a store handle under. The client registers over the
+    /// socket and nowhere else, so a registration held by anything but the
+    /// proxy that decides would leave every handle refused.
+    #[tokio::test]
+    async fn a_key_registered_over_the_control_socket_verifies_handles() {
+        let h = Harness::start().await;
+        let (chain, key) = h.chain("api.anthropic.com", Chain::Valid);
+        let up = Upstream::serve(chain, key, Respond::Whole("{\"data\":[]}")).await;
+        h.route(up.addr);
+        h.store(SECRET_VALUE);
+        h.set_rule(Some(rule(
+            &[STORE_AUTHORITY],
+            Inject::header("x-api-key", ""),
+        )));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        Arc::clone(&h.proxy).serve_control(control::bind(&path).unwrap());
+        let client = mint::client_key(&MemoryStore::new()).unwrap();
+        let registration = Submission::RegisterKey(ClientKey::of(&client.public_key().unwrap()));
+        let mut socket = tokio::net::UnixStream::connect(&path).await.unwrap();
+        socket
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json_lenient::to_string(&registration).unwrap()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        tokio::io::BufReader::new(socket)
+            .read_line(&mut reply)
+            .await
+            .unwrap();
+        assert!(!reply.contains("error"), "{reply}");
+
+        let handle = h.store_handle(&client, now());
+        let received = admitted(&h, &up, &format!("x-api-key: {handle}\r\n")).await;
+        assert!(
+            received.contains(&format!("x-api-key: {SECRET_VALUE}\r\n")),
             "{received}"
         );
     }
