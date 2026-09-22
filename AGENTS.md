@@ -149,7 +149,7 @@ Verified against the current tree; sources in parentheses.
   artifact fetching (`scripts/fetch-libkrun.sh`).
 - **Initramfs features come from the `FEATURES` env.**
   `scripts/build-initramfs.sh` compiles the guest `minimald` with
-  `FEATURES` (empty by default; the justfile passes `networking-proxy`).
+  `FEATURES` (empty by default).
   Calling the script directly yields a guest daemon without networking
   features; with a prebuilt `MINIMALD_BIN`, `TARGET`/`FEATURES` are ignored.
 - **macOS `--output` must stay under the repo.** On macOS the `minimal` shim

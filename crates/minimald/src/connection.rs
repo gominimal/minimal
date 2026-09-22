@@ -6,17 +6,13 @@ use sessions::SessionId;
 use std::{
     collections::BTreeMap,
     sync::{Arc, LazyLock},
+    time::Duration,
 };
-// Used only by the `ssh-forward` direct-tcpip handler.
-#[cfg(feature = "ssh-forward")]
-use std::time::Duration;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
     sync::{Mutex, MutexGuard},
 };
-// Used only by the `ssh-forward` direct-tcpip handler.
-#[cfg(feature = "ssh-forward")]
-use tokio::net::TcpStream;
 
 use crate::{
     ChannelConfig, RequestedPty, exec,
@@ -452,12 +448,13 @@ impl russh::server::Handler for ConnectionHandler {
     /// accepts the request, connects to the target, and relays bytes
     /// bidirectionally between the SSH channel and the upstream TCP connection.
     ///
-    /// Only authenticated (local) connections may forward ports; unauthenticated
-    /// connections are rejected by returning `false`.
+    /// Only authenticated (local) connections may forward ports; every open —
+    /// accepted or refused — emits exactly one outcome record carrying the
+    /// session, the target host:port and the result, so diagnostics can see
+    /// what was asked for and what happened.
     ///
     /// The connection attempt times out after 10 seconds; a failure rejects the
     /// channel so the SSH client receives a clean error rather than hanging.
-    #[cfg(feature = "ssh-forward")]
     async fn channel_open_direct_tcpip(
         &mut self,
         channel: RuChannel<Msg>,
@@ -482,54 +479,73 @@ impl russh::server::Handler for ConnectionHandler {
             )
         };
 
-        if !is_local {
-            reply
-                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
-                .await;
-            return Ok(());
-        }
-
         // Validate the session identified by the SSH username (R4.9). The client
         // passes the session UUID as `-l <uuid>` so the server can confirm the
-        // session exists before accepting the forward. Fail closed: a missing
-        // or non-UUID username is rejected so direct-tcpip cannot be used
-        // without a valid session context.
+        // session exists before accepting the forward. Fail closed: an
+        // unauthenticated connection, a missing or non-UUID username, or an
+        // unknown session is rejected so direct-tcpip cannot be used without a
+        // valid session context.
+        if !is_local {
+            reject_open(
+                reply,
+                username.as_deref().unwrap_or("<none>"),
+                host_to_connect,
+                port_to_connect,
+                "connection is not authenticated",
+                russh::ChannelOpenFailure::AdministrativelyProhibited,
+            )
+            .await;
+            return Ok(());
+        }
         let Some(uname) = username.as_deref() else {
-            tracing::warn!("direct-tcpip rejected: no SSH username");
-            reply
-                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
-                .await;
+            reject_open(
+                reply,
+                "<none>",
+                host_to_connect,
+                port_to_connect,
+                "no SSH username",
+                russh::ChannelOpenFailure::AdministrativelyProhibited,
+            )
+            .await;
             return Ok(());
         };
         let Ok(session_id) = SessionId::parse_str(uname) else {
-            tracing::warn!(value = %uname, "direct-tcpip rejected: username not a session UUID");
-            reply
-                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
-                .await;
+            reject_open(
+                reply,
+                uname,
+                host_to_connect,
+                port_to_connect,
+                "SSH username is not a session UUID",
+                russh::ChannelOpenFailure::AdministrativelyProhibited,
+            )
+            .await;
             return Ok(());
         };
         let mngr = serv.sessions_manager().await;
         match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
             Ok(Some(_)) => {}
             Ok(None) => {
-                tracing::warn!(
-                    %session_id,
-                    "direct-tcpip rejected: session not found"
-                );
-                reply
-                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
-                    .await;
+                reject_open(
+                    reply,
+                    uname,
+                    host_to_connect,
+                    port_to_connect,
+                    "session not found",
+                    russh::ChannelOpenFailure::AdministrativelyProhibited,
+                )
+                .await;
                 return Ok(());
             }
             Err(e) => {
-                tracing::warn!(
-                    %session_id,
-                    error = %e,
-                    "direct-tcpip rejected: session lookup failed"
-                );
-                reply
-                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
-                    .await;
+                reject_open(
+                    reply,
+                    uname,
+                    host_to_connect,
+                    port_to_connect,
+                    &format!("session lookup failed: {e}"),
+                    russh::ChannelOpenFailure::AdministrativelyProhibited,
+                )
+                .await;
                 return Ok(());
             }
         }
@@ -538,8 +554,15 @@ impl russh::server::Handler for ConnectionHandler {
         let port = match u16::try_from(port_to_connect) {
             Ok(p) => p,
             Err(_) => {
-                tracing::warn!(port = port_to_connect, "direct-tcpip: port out of range");
-                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                reject_open(
+                    reply,
+                    uname,
+                    &host,
+                    port_to_connect,
+                    "target port out of range",
+                    russh::ChannelOpenFailure::ConnectFailed,
+                )
+                .await;
                 return Ok(());
             }
         };
@@ -555,26 +578,38 @@ impl russh::server::Handler for ConnectionHandler {
         {
             Ok(Ok(s)) => s,
             Ok(Err(error)) => {
-                tracing::warn!(
-                    %host,
-                    port,
-                    %error,
-                    "direct-tcpip: could not connect to target"
-                );
-                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                reject_open(
+                    reply,
+                    uname,
+                    &host,
+                    u32::from(port),
+                    &format!("could not connect to target: {error}"),
+                    russh::ChannelOpenFailure::ConnectFailed,
+                )
+                .await;
                 return Ok(());
             }
             Err(_) => {
-                tracing::warn!(
-                    %host,
-                    port,
-                    "direct-tcpip: connection to target timed out"
-                );
-                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                reject_open(
+                    reply,
+                    uname,
+                    &host,
+                    u32::from(port),
+                    "connection to target timed out",
+                    russh::ChannelOpenFailure::ConnectFailed,
+                )
+                .await;
                 return Ok(());
             }
         };
 
+        tracing::info!(
+            session = uname,
+            host = %host,
+            port,
+            status = "accepted",
+            "direct-tcpip channel open"
+        );
         reply.accept().await;
 
         // Relay bytes bidirectionally: SSH channel ↔ upstream TCP.
@@ -582,31 +617,31 @@ impl russh::server::Handler for ConnectionHandler {
 
         Ok(())
     }
+}
 
-    /// With the `ssh-forward` feature disabled, port-forwarding is compiled out.
-    /// Reject every `direct-tcpip` channel so forwarding fails **closed**, rather
-    /// than relying on whatever russh's default handler does (finding #4 / the
-    /// user decision to disable ssh-forward for now).
-    #[cfg(not(feature = "ssh-forward"))]
-    async fn channel_open_direct_tcpip(
-        &mut self,
-        _channel: RuChannel<Msg>,
-        _host_to_connect: &str,
-        _port_to_connect: u32,
-        _originator_address: &str,
-        _originator_port: u32,
-        reply: ChannelOpenHandle,
-        _session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        reply
-            .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
-            .await;
-        Ok(())
-    }
+/// Emits the one outcome record for a refused `direct-tcpip` open — session,
+/// target host:port, the reason — and rejects the channel. A refused forward is
+/// an expected outcome rather than a fault, so this is info-level.
+async fn reject_open(
+    reply: ChannelOpenHandle,
+    session: &str,
+    host: &str,
+    port: u32,
+    reason: &str,
+    failure: russh::ChannelOpenFailure,
+) {
+    tracing::info!(
+        session = session,
+        host = host,
+        port,
+        status = "rejected",
+        reason,
+        "direct-tcpip channel open"
+    );
+    reply.reject(failure).await;
 }
 
 /// Relay bytes bidirectionally between two async streams, logging any relay error.
-#[cfg(feature = "ssh-forward")]
 async fn relay_streams<A, B>(mut a: A, mut b: B)
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -617,12 +652,11 @@ where
     }
 }
 
-// The only test here exercises `relay_streams`, which is itself behind
-// `ssh-forward`; gate the whole module so it (and its imports) compile out with
-// the feature.
-#[cfg(all(test, feature = "ssh-forward"))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_harness::{TestServer, create_configured_session};
+    use std::net::Ipv4Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
@@ -641,5 +675,48 @@ mod tests {
         let mut buf2 = [0u8; 5];
         client.read_exact(&mut buf2).await.unwrap();
         assert_eq!(&buf2, b"world");
+    }
+
+    /// An SSH `direct-tcpip` open on an authenticated connection relays to the
+    /// target, in every build. The handler used to live behind the `ssh-forward`
+    /// cargo feature, whose absence compiled in a reject-everything stub —
+    /// release builds shipped with port-forwarding dead. The feature is gone,
+    /// so this test asserts serving, and that is a statement about release
+    /// builds as much as about debug ones.
+    #[tokio::test]
+    async fn direct_tcpip_served_in_release() {
+        let server = TestServer::new().await;
+        let mut admin = server.connect().await;
+        let session_id = create_configured_session(&mut admin, "forwarding", "/tmp/proj").await;
+
+        // A loopback echo target for the forward to relay to.
+        let target = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = target.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = target.accept().await {
+                let (mut r, mut w) = sock.into_split();
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        // The client authenticates with the session UUID as its SSH username —
+        // the same contract `ssh -L … -l <session-uuid>` drove.
+        let mut client = server.connect_as(session_id.to_string().as_str()).await;
+        let mut channel = client.open_direct_tcpip("127.0.0.1", port).await;
+
+        channel.data_bytes(b"ping".to_vec()).await.unwrap();
+        let mut echoed = Vec::new();
+        while echoed.len() < 4
+            && let Some(msg) = channel.wait().await
+        {
+            if let russh::ChannelMsg::Data { data } = msg {
+                echoed.extend_from_slice(&data);
+            }
+        }
+        assert_eq!(&echoed, b"ping", "echo target must see the forwarded bytes");
     }
 }

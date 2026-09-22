@@ -101,6 +101,14 @@ impl TestServer {
     /// The server-side task is detached; it stays alive as long as the
     /// returned [`TestClient`] keeps its half of the pair open.
     pub async fn connect(&self) -> TestClient {
+        self.connect_as("test").await
+    }
+
+    /// [`Self::connect`] authenticating as `username` instead of the default
+    /// `"test"` — for a test that has to satisfy the daemon's per-channel
+    /// expectations about the SSH username (e.g. direct-tcpip, which names a
+    /// session by UUID).
+    pub async fn connect_as(&self, username: &str) -> TestClient {
         let (server_side, client_side) = UnixStream::pair().unwrap();
 
         // `russh::server::run_stream` (called inside `Connection::from_socket`)
@@ -127,7 +135,7 @@ impl TestServer {
 
         let (_, handle) = tokio::join!(server_setup, client_setup);
         let mut handle = handle.unwrap();
-        let auth = handle.authenticate_none("test").await.unwrap();
+        let auth = handle.authenticate_none(username).await.unwrap();
         assert!(auth.success(), "auth_none should succeed on local UDS");
 
         TestClient { handle }
@@ -353,6 +361,21 @@ impl TestClient {
             .unwrap();
         channel.request_shell(true).await.unwrap();
         channel
+    }
+
+    /// Opens a `direct-tcpip` channel to `host:port` — the channel OpenSSH
+    /// opens for `ssh -L local:host:port` — so a test can exercise the
+    /// daemon's port-forwarding path end to end. The originator address is
+    /// arbitrary (the daemon only logs it).
+    pub async fn open_direct_tcpip(
+        &mut self,
+        host: &str,
+        port: u16,
+    ) -> russh::Channel<russh::client::Msg> {
+        self.handle
+            .channel_open_direct_tcpip(host, u32::from(port), "127.0.0.1", 65535)
+            .await
+            .unwrap()
     }
 
     /// Opens a fresh session channel, applies `env` and optionally a PTY,
