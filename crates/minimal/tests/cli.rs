@@ -7,6 +7,7 @@
 
 mod common;
 
+use clap::Parser as _;
 use common::setup;
 use minimal::*;
 use minimald_rpc::{ListSessionsResponse, ResourcePool};
@@ -44,7 +45,6 @@ fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
-        mtls_proxy_unavailable: None,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -81,7 +81,6 @@ fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
-        mtls_proxy_unavailable: None,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -895,4 +894,46 @@ async fn create_session_at(
         }
     }
     id
+}
+
+// --- retired surfaces (NET-109 / NET-111) ---
+
+/// The mTLS-era commands must not parse. `min ssh-forward` (with its
+/// `forward` alias) was the client face of SSH port-forwarding and `min login`
+/// the issuer of the HTTPS reverse proxy's client certificates; the reverse
+/// proxy is gone, and direct-tcpip serves without a dedicated command.
+#[test]
+fn retired_surfaces_absent() {
+    for argv in [
+        vec!["min", "ssh-forward", "dev", "18080:127.0.0.1:80"],
+        vec!["min", "forward", "dev", "18080:127.0.0.1:80"],
+        vec!["min", "login"],
+    ] {
+        let message = match Cli::try_parse_from(&argv) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("retired command {argv:?} must not parse"),
+        };
+        assert!(
+            message.contains("unrecognized subcommand"),
+            "expected clap to refuse {argv:?}, got: {message}"
+        );
+    }
+}
+
+/// The CLI reference must not document a retired command (NET-111): scanning
+/// it for the mTLS-era command names keeps a doc drift — or a resurrected
+/// command documented before its code returns — from passing review.
+#[test]
+fn cli_reference_has_no_retired_commands() {
+    let doc = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/reference/cli-min.md"
+    ))
+    .expect("the CLI reference must exist");
+    for needle in ["ssh-forward", "min login"] {
+        assert!(
+            !doc.contains(needle),
+            "the CLI reference must not mention the retired command {needle:?}"
+        );
+    }
 }

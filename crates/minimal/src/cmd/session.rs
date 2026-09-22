@@ -252,7 +252,6 @@ pub(crate) async fn activate_session(
     // unfinalized for the daemon to reap when this connection drops.
     ensure_version_reported(created.daemon_version.as_deref())?;
     warn_if_hostname_routing_down(created.hostname_routing_unavailable.as_deref());
-    warn_if_mtls_proxy_down(created.mtls_proxy_unavailable.as_deref());
     let id = created.id;
 
     // From here the session exists on the daemon in an unfinalized state.
