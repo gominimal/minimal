@@ -130,10 +130,6 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimald host_ip_box_resolves_through_node_dns_layer
     <!-- design §5.3; state-driven; the node's DNS layer forwards the box's allowed names under its rules (NET-066), so the resolver Minimal owns is also the one that enforces names -->
-  - WHERE the host is not VM-backed, WHILE a host-address box is declared deny-all THE SYSTEM SHALL resolve its lookups through the box zone's answerer and never through the host's own resolver.
-    tier:   T0
-    verify: cargo nextest run -p minimald host_ip_box_resolves_through_answerer
-    <!-- design §4.1 (the deny-all carve-out) and §7.1; state-driven; on a native host the stub a host-address box would otherwise reach is the host's resolver, which forwards any name upstream, so a deny-all box would resolve arbitrary names through the carve-out; the answerer forwards nothing and holds only the zone, which is the whole answer for a deny-all box; a native host-address box that is not deny-all (NET-074 scopes the deny-all default to own-address boxes) is bound by nothing here and belongs to the open question on native forwarding, whose interim is the host's resolver -->
 
 - **NET-004** WHEN a box connects to the literal `100.64.255.254` THE SYSTEM SHALL route the connection as `host.min.internal` and emit a deprecation notice.
   tier:     T0
@@ -519,7 +515,11 @@ included, with every refusal logged (NET-001 to NET-004).
   - WHILE a host-address box is declared deny-all THE SYSTEM SHALL admit the box's connections to the resolver Minimal owns for it, at that resolver's address and port, and to no other loopback destination.
     tier:   T0
     verify: cargo nextest run -p minimald host_ip_deny_all_reaches_only_the_answerer
-    <!-- design §4.1; state-driven; the one carve-out from a deny-all verdict, by address and port, never loopback-wide: a loopback baseline exception for every box is rejected in the design reasoning; with NET-003's resolver rule a deny-all box resolves exactly the names that resolver holds and reaches nothing else -->
+    <!-- design §4.1; state-driven; the one carve-out from a deny-all verdict, by address and port, never loopback-wide: a loopback baseline exception for every box is rejected in the design reasoning; with the resolver rule below (and NET-003's inside a VM-backed host) a deny-all box resolves exactly the names that resolver holds and reaches nothing else -->
+  - WHERE the host is not VM-backed, WHILE a host-address box is declared deny-all THE SYSTEM SHALL resolve its lookups through the box zone's answerer and never through the host's own resolver.
+    tier:   T0
+    verify: cargo nextest run -p minimald host_ip_box_resolves_through_answerer
+    <!-- design §4.1 (the deny-all carve-out) and §7.1; state-driven; sits here rather than under NET-003 because it is the deny-all carve-out's other half and lands with the classifier, not with host name resolution; on a native host the stub a host-address box would otherwise reach is the host's resolver, which forwards any name upstream, so a deny-all box would resolve arbitrary names through the carve-out; the answerer forwards nothing and holds only the zone, which is the whole answer for a deny-all box; a native host-address box that is not deny-all (NET-074 scopes the deny-all default to own-address boxes) is bound by nothing here and belongs to the open question on native forwarding, whose interim is the host's resolver -->
   - WHILE a box is a host-address box, whatever its declaration, THE SYSTEM SHALL keep every process of that box inside the cgroup its verdict is decided on, so that no process in the box can move itself or a child out of it.
     tier:   T0
     verify: cargo nextest run -p minimald host_ip_box_cannot_leave_its_cgroup
@@ -877,7 +877,7 @@ namespaces as delegation boundaries, which is the box host's obligation
 (NET-079), not the kernel's default. The one carve-out from a deny-all verdict
 is the address and port of the resolver Minimal owns for the box, and a
 host-address box resolves through that resolver rather than the host's
-(NET-003), so a deny-all box resolves exactly the names it holds and reaches
+(NET-003 inside a VM-backed host, NET-079 natively), so a deny-all box resolves exactly the names it holds and reaches
 none of them. Inside a VM-backed host that resolver is the node's DNS layer,
 which forwards a box's allowed names under its rules (NET-066), for every
 host-address box. On a native host the resolver Minimal owns is the box zone's
