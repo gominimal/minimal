@@ -61,8 +61,8 @@ source-address check (NET-084), which on a VM-backed host is what lets the
 proxy attribute a box by its switch source address: each own-address box holds
 one lease there. On a co-resident host the host-address boxes share the host's
 address and are attributed as one cohort outside the box host (NET-078), while
-each box's own declaration is enforced inside it (NET-079); the classifier
-layout is the question below. HTTP/3 to a steered host is governed by the
+each box's own declaration is enforced inside it (NET-079) on the box's own
+cgroup ([design §4.1][design]). HTTP/3 to a steered host is governed by the
 `quic443` field ([design §5.3][design]), bound in that document; NET-064 covers
 the box that declared TCP only.
 
@@ -126,6 +126,14 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimald host_min_internal_resolves_to_host_reach_address_per_mode
   <!-- S1a/AC2; prose 3; ubiquitous; "inside boxes" per design §7.1 without qualification: an own-address box on a native host sits on the switch too; a host-address box on a native host shares the host's namespace and its answer; resolution only: reach over the name is local reach under the box's egress rules (NET-079; design §7.1 local names), so a deny-all box resolves it and reaches nothing -->
+  - WHERE the host is VM-backed, WHILE a box is a host-address box THE SYSTEM SHALL resolve its lookups through the node's DNS layer and never through the host's own resolver.
+    tier:   T0
+    verify: cargo nextest run -p minimald host_ip_box_resolves_through_node_dns_layer
+    <!-- design §5.3; state-driven; the node's DNS layer forwards the box's allowed names under its rules (NET-066), so the resolver Minimal owns is also the one that enforces names -->
+  - WHERE the host is not VM-backed, WHILE a host-address box is declared deny-all THE SYSTEM SHALL resolve its lookups through the box zone's answerer and never through the host's own resolver.
+    tier:   T0
+    verify: cargo nextest run -p minimald host_ip_box_resolves_through_answerer
+    <!-- design §4.1 (the deny-all carve-out) and §7.1; state-driven; on a native host the stub a host-address box would otherwise reach is the host's resolver, which forwards any name upstream, so a deny-all box would resolve arbitrary names through the carve-out; the answerer forwards nothing and holds only the zone, which is the whole answer for a deny-all box; a native host-address box that is not deny-all (NET-074 scopes the deny-all default to own-address boxes) is bound by nothing here and belongs to the open question on native forwarding, whose interim is the host's resolver -->
 
 - **NET-004** WHEN a box connects to the literal `100.64.255.254` THE SYSTEM SHALL route the connection as `host.min.internal` and emit a deprecation notice.
   tier:     T0
@@ -178,10 +186,23 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimald box_survives_without_client
   <!-- S1b-2c; prose 10; state-driven; interview decision -->
-  - IF an attached client is lost abruptly THEN THE SYSTEM SHALL keep the box's task running.
+  - IF the attached client of a PTY box is lost abruptly THEN THE SYSTEM SHALL keep the box's entrypoint running and accept a later attach.
     tier:   T0
     verify: cargo nextest run -p minimald abrupt_client_loss_keeps_task
-    <!-- S1b-2c; prose 10; unwanted -->
+    <!-- S1b-2c; prose 10; unwanted; client loss splits on the PTY, not on the verb: a lost PTY attach is a detach; in this tree the entrypoint is the session's shell -->
+  - IF the client of a non-PTY exec (`min session exec`, and the `min task run` or `min session run` command it carries) is lost abruptly THEN THE SYSTEM SHALL end the command that exec spawned and keep the box running; a box created for that run then ends under NET-131.
+    tier:   T0
+    verify: cargo nextest run -p minimald lost_exec_client_kills_only_its_own_process
+    <!-- S1b-2c; unwanted; a pty-req on the exec channel is refused at the channel, so no exec in this tree runs with a PTY and the rule as scoped is the shipped behaviour; the PTY exec the architecture defines is a re-attachable attach and falls under the sub-requirement above -->
+  - THE SYSTEM SHALL stop a box only when its client issues stop, destroy, or delete, when its entrypoint exits (subject to the exit prompt), or, for a box created for a run, when the run's command exits (NET-131), or when the box host tears it down by force: daemon shutdown, an abandoned launch, or the host reclaiming the VM.
+    tier:   T0
+    verify: cargo nextest run -p minimald box_has_no_idle_stop
+    <!-- S1b-2c; ubiquitous within the WHILE; the idle and stop policy is the client's (Design reasoning); a declared execution timeout is the client's policy, set at creation, and is not built here; "end" is this tree's destroy, and the architecture retains a completed box's record until reaped so a wait can read the exit code after the client is gone -->
+
+- **NET-131** WHILE a box was created for a non-detached run, WHEN the run's command exits THE SYSTEM SHALL end the box, whether or not the client that started the run is still present.
+  tier:     T0
+  verify:   cargo nextest run -p minimald run_box_ends_when_its_run_ends
+  <!-- S1b-2c; event-driven within the WHILE; `min task run` creates a session for the run, execs the task into it, and today destroys it from the client; the destroy moves to the daemon side of the exec's exit so a lost client strands no session; the abandoned-launch reap covers only un-finalized sessions and does not reach this case -->
 
 - **NET-016** WHILE a box is running, WHEN a process in it starts listening on a port its ingress rules permit and no declaration names THE SYSTEM SHALL publish that port on the box's address.
   tier:     T0
@@ -494,7 +515,23 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-079** WHILE a host-address box is declared deny-all THE SYSTEM SHALL refuse every outbound connection it opens, deciding inside the box host on the box's own declaration.
   tier:     T0
   verify:   cargo nextest run -p minimald host_ip_deny_all_no_outbound
-  <!-- S9b/AC2; prose 50; state-driven; the per-box decision for host-address boxes is the box host's classifier (design §4.1, UC3); outside the box host the cohort is one identity (NET-078) and the resident union is the floor -->
+  <!-- S9b/AC2; prose 50; state-driven; the per-box decision for host-address boxes is the box host's classifier (design §4.1, UC3), matching the box's own cgroup before any source translation; outside the box host the cohort is one identity (NET-078) and the resident union is the floor; the last sub-requirement below states the one host where no per-box decision exists and what the box does there -->
+  - WHILE a host-address box is declared deny-all THE SYSTEM SHALL admit the box's connections to the resolver Minimal owns for it, at that resolver's address and port, and to no other loopback destination.
+    tier:   T0
+    verify: cargo nextest run -p minimald host_ip_deny_all_reaches_only_the_answerer
+    <!-- design §4.1; state-driven; the one carve-out from a deny-all verdict, by address and port, never loopback-wide: a loopback baseline exception for every box is rejected in the design reasoning; with NET-003's resolver rule a deny-all box resolves exactly the names that resolver holds and reaches nothing else -->
+  - WHILE a box is a host-address box, whatever its declaration, THE SYSTEM SHALL keep every process of that box inside the cgroup its verdict is decided on, so that no process in the box can move itself or a child out of it.
+    tier:   T0
+    verify: cargo nextest run -p minimald host_ip_box_cannot_leave_its_cgroup
+    <!-- design §4.1; state-driven, and not inherited from the deny-all WHILE above: the classifier decides every host-address box's verdict on its cgroup, so an allow-list box that could leave its leaf would take a sibling's verdict; the box host's obligation, not a property of the kernel: the box is confined by a cgroup namespace rooted at its own placement on a mount that treats namespaces as delegation boundaries, with the host's cgroup mount kept out of the box's mount namespace; a box as the daemon's user with write access to a common ancestor can otherwise migrate itself -->
+  - WHERE the host is not VM-backed, WHILE the box host cannot decide per box, WHEN a session starts THE SYSTEM SHALL print an advisory naming the cause, with the exact command that installs the classifier's privileged step when that step is what is missing, with no privilege prompt, and record that host-address boxes have no per-box enforcement on that host.
+    tier:   T0
+    verify: cargo nextest run -p minimald native_host_advises_classifier_install_without_prompt
+    <!-- design §7.4; state+event; the causes are the privileged step not installed, or the host unable to confine a box as above (cgroup2 mounted without delegation-boundary namespaces, or the host's cgroup mount not keepable out of the box's mount namespace); installing the step clears only the first, so the command is named only for it; the ruleset needs a capability the native daemon lacks, so a native host takes one privileged install step in NET-122's advisory pattern; until then the host has no per-box host-address enforcement and says so at session start, visible to policy; refusing host-address egress declarations until then, and scoping the classifier to VM-backed hosts, are the shapes the architecture's ruling on the native install step rejected (design §7.4 and its v0.8 change history); the enforcement the host records covers addresses, never names, while the open question on native forwarding is open -->
+  - WHERE the host is not VM-backed, WHILE the box host cannot decide per box, WHILE a host-address box is declared deny-all or carries an `egress` section, THE SYSTEM SHALL run the box with no per-box verdict and its declaration unenforced, recorded as such, and never refuse the box or its connections on that ground.
+    tier:   T0
+    verify: cargo nextest run -p minimald unenforcing_native_host_runs_host_ip_box_unenforced
+    <!-- design §7.4; state-driven; the explicit exception to this requirement's deny and to NET-080's node-plane record: on that host there is no classifier, so there is no verdict to fail closed on, and the architecture's ruling on the native install step rejected turning the missing step into a hard failure for a mode whose chooser accepted the reduced tier; whether such a box may run there is policy's call on the recorded attribute, not the box host's; the box's declaration is enforced the moment the host can decide per box -->
 
 - **NET-080** WHILE a host-address box is declared deny-all THE SYSTEM SHALL complete the daemon's own package fetch on the same host and record it as node-plane traffic.
   tier:     T0
@@ -605,6 +642,10 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimald non_a_in_zone_query_is_nodata
   <!-- S1b-2b; design §7.1 (answer semantics); event-driven; never NXDOMAIN, since negative caching is name-wide and browsers pair A with HTTPS-type queries -->
+  - WHEN the answerer returns NODATA or NXDOMAIN THE SYSTEM SHALL carry the zone's SOA record in the authority section of the response so that the host resolver can cache the negative.
+    tier:   T0
+    verify: cargo nextest run -p minimald negative_answers_carry_zone_authority
+    <!-- design §7.1; event-driven; a scoped answerer whose negatives the host resolver cannot cache stalls every lookup on a macOS host, scoped or not, for the resolver's timeout per query, and reloading the resolver does not clear it; the host resolver also asks for AAAA, HTTPS and its discovery names, so every such negative needs the record -->
 
 - **NET-125** WHEN a lookup asks for a name in the box zone that no box or node holds THE SYSTEM SHALL answer NXDOMAIN.
   tier:     T0
@@ -733,9 +774,14 @@ from a reserved local range (`127.0.64.0/24`), Linux uses a systemd-resolved
 routing domain on a dedicated link of routable scope, and macOS uses
 `/etc/resolver/min.internal` with a `port` directive, written once by the
 advisory command NET-122 names at session start. On macOS the same command
-reserves the local range, and NET-123's bind probe with its `127.0.0.1` interim
-is what holds until that step is installed on a host, so session start never
-prompts. NET-018 and NET-019 take their WHERE from the same ruling: the proxy
+reserves the local range: it installs a root-held boot step that re-applies
+exactly the reserved range at each start, at root-owned paths no user can
+write, so the range is present before any session starts and no daemon
+re-applies it. NET-123's bind probe with its `127.0.0.1` interim is what holds
+on a host until that step is installed, so session start never prompts. The
+answerer's negatives are cacheable by the host resolver (NET-124): an
+uncacheable negative stalls every lookup on a macOS host, not only the zone's.
+NET-018 and NET-019 take their WHERE from the same ruling: the proxy
 is superseded only when host-OS resolution and published addresses are both
 deployed on that host, and identity plays no part in the condition. Allocation
 from the reserved range is host-global, arbitrated through the answerer's
@@ -764,8 +810,29 @@ a running box, or tying box lifetime to the attached client as today. The first
 would have left the unattended-box story unsized; the second makes "the name
 works whether or not a client is attached" narrower than the epic wrote it. The
 chosen shape makes port publication unconditional and coheres with the
-closed-laptop story elsewhere; the idle and stop policy that follows from it is
-an open question below.
+closed-laptop story elsewhere. **Idle and stop are the client's.** A box ends
+only when its client issues stop, destroy, or delete, when its entrypoint exits
+subject to the exit prompt, when the run it was created for ends (NET-131), or
+when the box host tears it down by force: daemon shutdown, an abandoned launch,
+or the host reclaiming the VM. A declared
+execution ceiling is the client's policy, set at creation. There is no
+daemon-side idle timeout. A daemon idle timeout was
+considered and rejected: it stops a box nobody asked to stop, and it breaks the
+closed-laptop story, which composes with the chosen shape with no extra rule
+because a closed laptop issues no stop. Client loss splits on the terminal,
+not on the verb: a lost PTY attach is a detach and the entrypoint keeps
+running; a lost non-PTY exec ends the command it spawned, which would otherwise
+block on a pipe nobody reads, and leaves the box untouched. In this tree each
+exec is its own sandboxed process with its own lease, and a single argument is
+reshelled; the architecture places an exec inside the box under the box's
+identity, ceilings, and network posture, argv only, with a re-attachable PTY
+form. Nothing bound here depends on the sibling-sandbox shape, and the exec
+requirement is worded for the non-PTY exec so the PTY exec does not contradict
+it when it lands. A box created for a run ends when the run ends, from the
+daemon's side of the exec's exit (NET-131). Leaving the destroy to the client,
+as the tree does today, was considered and rejected: a `min task run` client
+lost mid-run would strand its session, since the abandoned-launch reap covers
+only un-finalized sessions and there is no idle stop to catch it.
 
 **The proxy keeps running after native resolution supersedes it.** NET-018 and
 NET-019 make tooling report native DNS as the live surface while the hostname
@@ -802,8 +869,33 @@ answers the address that reaches the host's loopback from where the box stands
 (NET-003): `127.0.0.1` on the host, the switch's host-gateway address inside a
 VM-backed box, where `127.0.0.1` is the box's own loopback. A host-address
 box's own declaration is enforced inside the box host by its classifier
-([design §4.1][design], UC3); outside the box host the cohort is one identity
-(NET-078) and the escape floor is the resident union. That is the split between
+([design §4.1][design], UC3): the box host places each host-address box in a
+cgroup leaf of its own, beside the daemon's own leaf, and the packet filter
+matches the box's cgroup before any source translation; the placement holds
+because the box is confined by a cgroup namespace on a mount that treats
+namespaces as delegation boundaries, which is the box host's obligation
+(NET-079), not the kernel's default. The one carve-out from a deny-all verdict
+is the address and port of the resolver Minimal owns for the box, and a
+host-address box resolves through that resolver rather than the host's
+(NET-003), so a deny-all box resolves exactly the names it holds and reaches
+none of them. Inside a VM-backed host that resolver is the node's DNS layer,
+which forwards a box's allowed names under its rules (NET-066), for every
+host-address box. On a native host the resolver Minimal owns is the box zone's
+answerer, which forwards nothing, so the rule binds only the deny-all box
+there: a native host-address box that is not deny-all, which is any without an
+`egress` section (NET-074) as much as one with a name allow list, has no
+Minimal component that resolves its upstream names today. The open question
+below names that gap and its interim: such a box resolves through the host's
+resolver, the classifier decides its address rules, a name rule admits nothing
+on that host, since admission comes only from resolution through the resolver
+Minimal owns and a direct-to-address flow is admitted by address rules alone
+([design §5.3][design]), and the per-box enforcement the host records covers
+addresses, never names.
+Host-address boxes on a co-resident Linux host are in scope: the ruleset needs
+a capability the native daemon lacks, so a native host takes one privileged
+install step in the resolver advisory's pattern and has no per-box enforcement
+until then ([design §7.4][design]). Outside the box host the cohort is one
+identity (NET-078) and the escape floor is the resident union. That is the split between
 the first security invariant, per-box precision for traffic that leaves a box,
 and the third, the floor for anything inside the escape boundary; the
 invariants are not qualified by each other because the design splits them the
@@ -932,23 +1024,20 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   covered by: NET-006, NET-007, NET-127
 
 ## Open questions
-- [NEEDS CLARIFICATION (HIGH): the macOS mechanism for per-box loopback
-  addresses, a root-installed boot re-apply of the reserved range installed by
-  the same advisory command that writes the resolver file (NET-122), is proposed
-  in [design §7.1][design] pending the loopback-alias measurement (design §12
-  item 13). NET-123 binds the interim: until the step is installed on a host,
-  macOS publishes every box at `127.0.0.1`, and NET-010 binds distinct addresses
-  once it is; the interim is a per-host state, not a platform exception.]
-- [NEEDS CLARIFICATION (MEDIUM): what is the cgroup layout for the two-address
-  classifier that gives each host-address box its own identity inside the box
-  host (NET-079), and are host-address boxes on a co-resident Linux host in
-  scope of NET-078 to NET-080? [Design §7.4][design] applies the profile's
-  naming and addressing to that host and now permits a node-local Box Egress
-  Proxy inside its boundary at the advisory tier; it says nothing about the
-  classifier.]
-- [NEEDS CLARIFICATION (MEDIUM): with a box outliving its client (NET-015), who
-  owns the idle and stop policy, and how does it compose with the closed-laptop
-  story in the remote-sessions work?]
+- [NEEDS CLARIFICATION (MEDIUM): on a native host, which component forwards a
+  non-deny-all host-address box's upstream name queries under the box's rules
+  (NET-066, NET-079), or are native host-address allow lists CIDR-only until one
+  exists? [Design §5.3][design] models a Minimal resolver that forwards a
+  host-address box's queries and evaluates them against the cohort rules; the
+  native answerer of [design §7.1][design] forwards nothing by design, and no
+  native-host component forwards under cohort rules today. The deny-all case is
+  settled: in-zone names resolve and nothing else does. The interim while this
+  is open: a native host-address box that is not deny-all resolves through the
+  host's resolver; the classifier decides its address rules; a name rule
+  (NET-066) admits nothing on that host, since admission comes only from
+  resolution through the resolver Minimal owns and a direct-to-address flow is
+  admitted by address rules alone ([design §5.3][design]); and the per-box
+  enforcement the host records under NET-079 covers addresses, never names.]
 - [NEEDS CLARIFICATION (LOW): are HTTP/2 and HTTP/3 through any proxy surface in
   scope? [Design §5.3][design] governs QUIC for egress and leaves the proxy
   surfaces unaddressed; the local Box Egress Proxy document needs the answer for

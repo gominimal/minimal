@@ -388,6 +388,8 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
 
 impl<SF: SourceFetcher> LocalBackend<SF> {
     /// Creates a new orchestrator for local builds.
+    // Left positional: one call site (mctx), so a params struct would be
+    // single-use ceremony.
     #[allow(clippy::too_many_arguments)]
     pub fn new_orchestrator(
         output_base: PathBuf,

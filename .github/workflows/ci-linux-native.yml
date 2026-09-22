@@ -82,6 +82,11 @@ jobs:
               # Nextest profiles change how this lane's tests run.
               - ".config/nextest.toml"
               - "scripts/**"
+              # A workflow-only change to the Kani lane's path filter decides
+              # which pull requests run the proofs, and no other lane's filter
+              # names that file. Run the workspace suite on it, so a guard test
+              # over that filter has a lane that executes it.
+              - ".github/workflows/ci-kani.yml"
               - ".minimal/**"
               # The gvproxy pin: the netns job fetches + SHA-checks it, so a pin
               # bump must re-run this lane.
@@ -191,7 +196,7 @@ jobs:
       - name: Install nextest
         # Convention selection is a nextest filterset (binary(/_root_integration$/));
         # cargo test cannot select test targets by pattern.
-        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2
         with:
           tool: nextest
       - name: Enable unprivileged user namespaces
