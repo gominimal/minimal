@@ -17,17 +17,23 @@ pub(crate) fn project_has_mfile(project_path: &camino::Utf8Path) -> bool {
 }
 
 /// Offer to initialize a `minimal.toml` at the project path when it has
-/// none, on the way into an activation.
+/// none, on the way into an activation or a `min add`.
 ///
-/// Purely an offer: a project without one still activates. The daemon never
-/// reads this path — it is a path on the *client's* machine — and fabricates
-/// a default shell-stack `minimal.toml` inside the session's own workspace
-/// instead, so the session comes up either way. Scaffolding here is a
-/// convenience for the interactive case (the project gets a real config it
-/// can grow), not a precondition.
+/// Purely an offer: declining or skipping returns `Ok` and leaves the
+/// project untouched. `decline_notice`, when `Some`, is printed in that
+/// case. `min session activate` passes the session-specific wording; `min
+/// add` passes `None` and reports its own `min init` hint if the project
+/// still has no config afterwards.
+///
+/// The daemon never reads this path — it is a path on the *client's*
+/// machine — and fabricates a default shell-stack `minimal.toml` inside the
+/// session's own workspace instead, so a session comes up either way.
+/// Scaffolding here is a convenience for the interactive case (the project
+/// gets a real config it can grow), not a precondition.
 pub(crate) fn offer_mfile_scaffold(
     project_path: &camino::Utf8Path,
     global: &GlobalArgs,
+    decline_notice: Option<&str>,
 ) -> Result<(), anyhow::Error> {
     if project_has_mfile(project_path) {
         return Ok(());
@@ -45,10 +51,9 @@ pub(crate) fn offer_mfile_scaffold(
         || !std::io::stdin().is_terminal()
         || !confirm("Would you like to create one?", true)?
     {
-        eprintln!(
-            "Continuing without one; the session gets a default environment. \
-             Run 'min init' to give the project its own config."
-        );
+        if let Some(notice) = decline_notice {
+            eprintln!("{notice}");
+        }
         return Ok(());
     }
 
@@ -229,7 +234,38 @@ pub(crate) fn should_warm_host_cache(use_minvmd: bool) -> bool {
 /// Add packages as dependencies to the project's `minimal.toml`.
 pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Error> {
     let config = build_config(global)?;
-    let mut ctx = mctx::Context::new(config)?;
+    let mut ctx = match mctx::Context::new(config) {
+        Ok(ctx) => ctx,
+        // A project with no `minimal.toml` cannot take a dependency, so offer
+        // the same scaffold `min session activate` does before failing with
+        // the `min init` hint `min update` already gives.
+        Err(mctx::Error::MFile(mfile::Error::NotFound)) => {
+            let project_path = match &global.repo_dir {
+                Some(dir) => camino::Utf8PathBuf::from_path_buf(dir.clone()).map_err(|_| {
+                    mctx::Error::Other(anyhow::anyhow!("Project path is not valid UTF-8"))
+                })?,
+                None => {
+                    let cwd = std::env::current_dir().map_err(|e| {
+                        mctx::Error::IO("Getting current directory", std::path::PathBuf::new(), e)
+                    })?;
+                    camino::Utf8PathBuf::from_path_buf(cwd).map_err(|_| {
+                        mctx::Error::Other(anyhow::anyhow!("Project path is not valid UTF-8"))
+                    })?
+                }
+            };
+            offer_mfile_scaffold(&project_path, global, None).map_err(mctx::Error::Other)?;
+            match mctx::Context::new(build_config(global)?) {
+                Ok(ctx) => ctx,
+                Err(e @ mctx::Error::MFile(mfile::Error::NotFound)) => {
+                    return Err(mctx::Error::Other(anyhow::anyhow!(
+                        "{e}\nRun 'min init' to give the project its own config."
+                    )));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(e) => return Err(e),
+    };
 
     let graph = ctx.graph_from_package_names(args.packages.clone())?;
 
