@@ -24,7 +24,8 @@ its own GitHub sign-in under a Minimal-published GitHub App (Gatehouse F19,
 §6.10 un-enrolled bullet; [networking design
 §7.1](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)).
 Gatehouse v1.23 made that member a reference to the sign-in, resolved and
-renewed at the proxy on each request, so a box's credentials last its life; v1.24
+renewed at the proxy on each request, so a box's credentials work for its life
+within the credentialed lane's ceiling; v1.24
 gave an un-enrolled box a per-creation id, scoped revocation to that id, and
 made the proxy's address infrastructure for a box with a credentialed lane
 (networking design v0.8.3). The Gatehouse-hosted path lands with the identity plane's fifth phase
@@ -526,6 +527,10 @@ Review, audit and revocation
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_destroyed_box_values_refused_within_60s
   <!-- Gatehouse §6.10 v1.24: destroying a live box is the mode's one revocation event; reaping a stopped box's retained record later is not one, and a stopped box's values are refused by attribution once its attachment is withdrawn (BEP-020, NET-133) -->
+  - IF the proxy does not record a destroyed box's revocation THEN THE SYSTEM SHALL complete the destroy and refuse the box's values through the withdrawal of its attachment.
+    tier:   T0
+    verify: ./scripts/session-e2e.sh bep_destroy_with_proxy_down_refuses_by_attachment
+    <!-- unwanted; Gatehouse §6.10 v1.24 makes the host-side creator's attachment facts (NET-133) a v1 conformance requirement, so a destroyed box's values arrive from no live box and BEP-020 refuses them whether or not the record was written; a proxy that is down redeems nothing meanwhile; the record adds nothing the withdrawal lacks for a box id that never returns, and a revocation is never a reason to leave a box the operator asked to remove -->
 
 - **BEP-044** WHEN `min auth logout` is run THE SYSTEM SHALL delete the sign-in item from the host keychain and refuse every sign-in reference to it at its next request.
   tier:     T0
@@ -725,7 +730,11 @@ each weighed and dropped (Gatehouse §14.5, v1.24): with ids that never return
 they scope nothing a plain match does not, and they add envelope fields and a
 recording order. Logout revokes by deleting the sign-in item (BEP-044) and
 needs no record; destroying a live box writes the one record this mode has
-(BEP-043), kept until no value naming the box can be unexpired (BEP-068). An id
+(BEP-043), kept until no value naming the box can be unexpired (BEP-068). A
+destroy the proxy cannot record still completes: the withdrawn attachment
+(NET-133) already refuses the box's values, so failing the destroy would keep a
+box alive the operator asked to remove, and holding the record in the client
+would add a queue that protects nothing the withdrawal does not. An id
 embedding the name, such as `<name>@<session id>`, was rejected because renaming
 a box would change its identity. The two levers are blunt: destroy stops one box
 and its workload, and logout stops every reference on the host while the
@@ -922,6 +931,5 @@ AT7 and AT25 (architecture threat model).
 
 - [NEEDS CLARIFICATION (MEDIUM): When does local repository narrowing land? The path is recorded, the §6.4 scoped-token endpoint against the local App under the embedded client secret (Gatehouse §14.4 item 7), and until it does the member is `full` breadth and the T28 residual is the signed-in account's manifest-capped reach for the reference's life.]
 - [NEEDS CLARIFICATION (MEDIUM): Does every intended client accept the sealed handle as its bearer unmodified? Claude Code with an OAuth token and MCP clients send `Authorization: Bearer <value>`, which BEP-032 substitutes, but a client that validates token shape before sending, or sends the credential in a header the rule does not name, needs the harness adapter ([gominimal/inbox#345](https://github.com/gominimal/inbox/issues/345)); unmeasured, a plan spike.]
-- [NEEDS CLARIFICATION (HIGH): What happens when the proxy cannot record a destroyed box's revocation? Logout no longer depends on the proxy, since it deletes the sign-in item (BEP-044), and once NET-133 is built the withdrawn attachment refuses a destroyed box's values by attribution. Until then the record is the only lever, and a destroy that completes while the proxy is down leaves the box's values redeemable across the cohort, missing BEP-043's 60 seconds. Gatehouse §6.10 makes destroy the revocation event without ruling on this case. The options: fail the destroy, leaving a box the operator asked to remove; or hold the revocation in the client until the proxy answers.]
 - [NEEDS CLARIFICATION (MEDIUM): How long is the root valid ([gominimal/arch#85](https://github.com/gominimal/arch/issues/85))? Its remaining validity at mint is the expiry of every sign-in reference and store handle (BEP-005, BEP-063), so it is the ceiling on a box's credentialed life and on the T28 window of a stolen reference, and the point at which a running box has to be re-created.]
 - [NEEDS CLARIFICATION (MEDIUM): On a Linux LocalVM host, which key store holds the signing CA key as non-exportable (TPM 2.0 via a PKCS#11 provider, or Secret Service without hardware backing)? BEP-014 is written over "the host keychain"; the plan carries a spike, and until it lands the Linux host is unverified for BEP-014.]
