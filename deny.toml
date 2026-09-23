@@ -15,6 +15,17 @@ ignore = [
     # in 0.2.0, but nickel master still pins "0.1"; drop this ignore once a
     # nickel rev carrying the 0.2 bump is pinned in Cargo.toml.
     "RUSTSEC-2026-0292",
+    # bitmaps 3.2.x: `Bitmap`'s `TryFrom<&[u8]>` / `AsMut<[u8]>` impls can
+    # create invalid values (unsound). No patched release; upstream archived.
+    # Reached only via nickel-lang-core -> nickel-lang-vector ->
+    # imbl-sized-chunks 0.1, which uses `Bitmap` solely as `SparseChunk`'s
+    # private index map and never calls either API; nickel-lang-vector only
+    # uses `Chunk`, not `SparseChunk`. Not reachable from minimal. Fixed by
+    # imbl-sized-chunks 0.2.0 dropping bitmaps; remove with RUSTSEC-2026-0292.
+    # cargo-deny's default `unsound = "workspace"` scope doesn't flag this
+    # transitive advisory (so it reports "advisory-not-detected"); the entry
+    # records the accepted risk for other scanners and a future `unsound = "all"`.
+    "RUSTSEC-2025-0167",
 ]
 
 [licenses]
