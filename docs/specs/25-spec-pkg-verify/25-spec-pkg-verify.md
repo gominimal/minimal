@@ -123,12 +123,12 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
     tier:   none
     verify: none, the SBOM document and its publication are gominimal/inbox#582's (spec SBOM); this line binds once that spec names the object
 
-- **PKV-012** THE SYSTEM SHALL exit 0 only when every required check passed and 6 on any signature, hash or attestation failure, and with `--json` SHALL emit one object per check with `name`, `status` in `{pass, fail, absent}` and `detail`; text output SHALL carry the same lines.
+- **PKV-012** THE SYSTEM SHALL exit 0 only when every required check passed, 4 when the verified index has no entry for the package (the `artifact` check reports `not_found` and no later check runs), and 6 on any signature, hash or attestation failure; with `--json` THE SYSTEM SHALL emit one object per check with `name`, `status` in `{pass, fail, absent, not_found}` and `detail`, and text output SHALL carry the same lines.
   tier:     T1
   verify:   cargo nextest run -p minimal pkg_verify_exit_code_and_json_shape
-  property: exit = 0 ⇔ ∀c ∈ checks. status(c) ∈ {pass, absent} ∧ absent(c) ⇒ optional(c, root); exit = 6 ⇔ ∃c. status(c) = fail
+  property: exit = 0 ⇔ ∀c ∈ checks. status(c) ∈ {pass, absent} ∧ absent(c) ⇒ optional(c, root); exit = 4 ⇔ status(artifact) = not_found; exit = 6 ⇔ ∃c. status(c) = fail
 
-- **PKV-013** THE SYSTEM SHALL read the trust root as one versioned, append-only document carrying the builder identity, Sigstore identities (SAN, OIDC issuer, Fulcio, Rekor origin and log key, TSA) and KMS keys (algorithm, key id, raw public-key bytes), each signer with `valid_from` and `valid_to`, vendored into the `min` release and overridable with `--trusted-root <path>`.
+- **PKV-013** THE SYSTEM SHALL read the trust root as one versioned, append-only document carrying the builder identity, Sigstore identities (SAN, OIDC issuer, Fulcio, Rekor origin and log key, TSA), KMS keys (algorithm, key id, raw public-key bytes), each signer with `valid_from` and `valid_to`, and a `planes` policy naming each of `index_bundle`, `provenance_envelope`, `artifact_bundle` as `required` or `optional` (defaults when absent: the first two required, the third optional; a later root version may only move a plane from optional to required), vendored into the `min` release and overridable with `--trusted-root <path>`.
   tier:     T0
   verify:   cargo nextest run -p verify trust_root_parses_vendored_and_override
   - IF a key's window does not cover the signing time (bundles) or the build time (envelopes, self-asserted until gominimal/build-servers#95) THEN THE SYSTEM SHALL not use that key for the check.
@@ -157,10 +157,10 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   verify:   cargo nextest run -p buildbot per_artifact_bundle_statement_bytes_identical
   property: ∀a. statement_bytes(kms_envelope(a)) == statement_bytes(sigstore_dsse(a))
 
-- **PKV-018** WHERE verification is enabled in the client configuration THE SYSTEM SHALL verify, before a remote artifact is accepted at materialization, the index bundle once per registry pin and that artifact's hash and provenance envelope, and SHALL refuse the artifact with the verify error class on any failure.
+- **PKV-018** WHERE verification is enabled in the client configuration THE SYSTEM SHALL verify, before a remote artifact is accepted at materialization, the index bundle once per registry pin and that artifact's hash, provenance envelope and, under PKV-016's policy, its artifact bundle, and SHALL refuse the artifact with the verify error class on any failure.
   tier:     T1
   verify:   cargo nextest run -p rcache materialize_verifies_before_accept
-  property: accepted(a) ⇒ index_verified(pin(a)) ∧ hash_ok(a) ∧ provenance_ok(a)
+  property: accepted(a) ⇒ index_verified(pin(a)) ∧ hash_ok(a) ∧ provenance_ok(a) ∧ (bundle_ok(a) ∨ (absent(bundle(a)) ∧ optional(artifact_bundle, root)))
   - IF the artifact's Build Spec Hash is not in the verified index THEN THE SYSTEM SHALL treat it as a cache miss and build locally, as today, raising no verify error.
     tier:   T0
     verify: cargo nextest run -p rcache materialize_miss_builds_locally_under_verification
