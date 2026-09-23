@@ -10,6 +10,12 @@ name: publish-packages
 #   2. publish-aur — the PKGBUILD keys on the staged versions/<semver>/ row.
 #   3. publish-brew — the formula keys on the GitHub Release published in 1.
 #
+# Nightly and unstable package publishes live elsewhere: nightly.yml pushes
+# to minimal-bin-nightly / homebrew-minimal-nightly; a versioned release.yml
+# run pushes to minimal-bin-unstable / homebrew-minimal-unstable. This
+# workflow stays the stable-only path (semver, GitHub Release URLs for brew,
+# minimal-bin + gominimal/homebrew-minimal).
+#
 # The apt/dnf/apk repo trees are built by the infra repo from the staged
 # versions/<semver>/pkg/ row and are not this workflow's concern.
 #

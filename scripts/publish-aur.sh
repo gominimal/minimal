@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# publish-aur.sh — clone the minimal-bin AUR repo, stamp the PKGBUILD, push.
+# publish-aur.sh — clone an AUR package repo, stamp the PKGBUILD, push.
 #
 # The monorepo is the source of truth for the AUR package; the AUR repo is
 # generated output. Each run shallow-clones a fresh copy, downloads the 13
@@ -8,21 +8,36 @@
 # renders packaging/arch/PKGBUILD-bin.tmpl into PKGBUILD, copies the pacman
 # install hook, regenerates .SRCINFO, and commits + pushes.
 #
-# Usage: scripts/publish-aur.sh [--dry-run]
+# Usage: scripts/publish-aur.sh [--dry-run] [--channel stable|unstable|nightly]
+#
+# Channel (prefer one mechanism; CLI wins over env):
+#   --channel CHANNEL   or PUBLISH_CHANNEL (default: stable)
+#     stable   — released semver PKGVER; artifacts at versions/$PKGVER/;
+#                AUR repo minimal-bin (default). PKGBUILD source URLs keep
+#                ${pkgver} so a stable render is byte-identical to prior runs.
+#     unstable — released semver PKGVER; STAGE_VERSION defaults to PKGVER
+#                (GCS versions/<semver>/); AUR repo minimal-bin-unstable.
+#     nightly  — PKGVER must match ^0\.[0-9]{8}\.[0-9]+$; STAGE_VERSION is
+#                required and must be an 8-char hex short sha; artifacts at
+#                versions/$STAGE_VERSION/; AUR repo minimal-bin-nightly.
 #
 # Env:
-#   PKGVER              Required. A RELEASED semver WITHOUT the v prefix
-#                       (X.Y.Z, optional +build tail). Artifacts are fetched
-#                       from <bucket>/versions/$PKGVER/ — the same names the
-#                       PKGBUILD's source arrays use. A bare short SHA is
-#                       rejected, and so is a prerelease (-rc.1 tail): pacman
-#                       forbids hyphens in pkgver, so an RC could never be
-#                       published here anyway. The AUR package tracks
-#                       promoted semver releases, not nightly builds.
-#   AUR_REPO_URL        git URL to clone/push
-#                       (default: ssh://aur@aur.archlinux.org/minimal-bin.git).
+#   PKGVER              Required. Package version (released semver without the
+#                       v prefix for stable/unstable; synthetic 0.YYYYMMDD.run
+#                       for nightly). A bare short SHA is always rejected as
+#                       PKGVER — use STAGE_VERSION for the staged row key.
+#   STAGE_VERSION       Staged GCS row under versions/. Required for nightly
+#                       (8-char sha). Defaults to PKGVER for unstable; for
+#                       stable, downloads use PKGVER and the template keeps
+#                       ${pkgver} in source URLs.
+#   PUBLISH_CHANNEL     Default channel when --channel is omitted (stable).
+#   AUR_REPO_URL        git URL to clone/push. Defaults per channel:
+#                       stable   → ssh://aur@aur.archlinux.org/minimal-bin.git
+#                       unstable → .../minimal-bin-unstable.git
+#                       nightly  → .../minimal-bin-nightly.git
 #                       --dry-run without credentials falls back to the public
-#                       read-only https mirror so a rehearsal needs no key.
+#                       https mirror of the same package so a rehearsal needs
+#                       no key.
 #   MINIMAL_BUCKET_URL  Public base URL of the installer bucket
 #                       (default: https://storage.googleapis.com/minimal-one)
 #   MAINTAINER          PKGBUILD maintainer line. Defaults below to the
@@ -33,8 +48,8 @@
 #   - an ssh-agent holding the bot's AUR key (SSH_AUTH_SOCK set), or
 #   - AUR_SSH_PRIVATE_KEY in the environment (PEM text); it is written to a
 #     0600 file in the temp workdir for the run and removed with it.
-#   The bot AUR account must be a co-maintainer of minimal-bin. AUR has no
-#   key-management API: generate a dedicated keypair, put the public key on
+#   The bot AUR account must be a co-maintainer of the target package. AUR has
+#   no key-management API: generate a dedicated keypair, put the public key on
 #   the account, store the private key in the CI secret AUR_SSH_PRIVATE_KEY,
 #   and keep the account password/recovery email in a shared vault.
 #   --dry-run does not push, so it does not need a key: without one it reads
@@ -59,15 +74,31 @@ usage() {
 }
 
 DRY_RUN=0
-for arg in "$@"; do
-    case "$arg" in
-        --dry-run) DRY_RUN=1 ;;
+CHANNEL=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1; shift ;;
+        --channel)
+            [ "$#" -ge 2 ] || die "--channel requires an argument (stable|unstable|nightly)"
+            CHANNEL="$2"
+            shift 2
+            ;;
+        --channel=*)
+            CHANNEL="${1#--channel=}"
+            shift
+            ;;
         -h|--help) usage 0 ;;
-        *)         die "unknown argument: $arg (try --help)" ;;
+        *)         die "unknown argument: $1 (try --help)" ;;
     esac
 done
 
-[ -n "${PKGVER:-}" ] || die "PKGVER is required (the promoted semver, without the v prefix)"
+CHANNEL="${CHANNEL:-${PUBLISH_CHANNEL:-stable}}"
+case "$CHANNEL" in
+    stable|unstable|nightly) ;;
+    *) die "unknown channel '$CHANNEL' (want stable|unstable|nightly)" ;;
+esac
+
+[ -n "${PKGVER:-}" ] || die "PKGVER is required (see --help for the per-channel form)"
 
 # The PKGBUILD maintainer line.
 MAINTAINER="${MAINTAINER:-minimal <security@minimal.dev>}"
@@ -75,18 +106,47 @@ export MAINTAINER
 case "$PKGVER" in
     v*) die "PKGVER must not carry the v prefix: '$PKGVER' (use ${PKGVER#v})" ;;
 esac
-# A release only: pacman's pkgver forbids hyphens, so a prerelease tail
-# (-rc.1) could never publish — reject it here with that named, instead of
-# letting makepkg's lint blame the template. A +build tail is a valid release
-# version and passes.
-printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$' \
-    || die "PKGVER '$PKGVER' is not a RELEASED semver X.Y.Z (optional +build; prereleases and shas are rejected: pacman's pkgver forbids hyphens)"
 
-AUR_REPO_URL="${AUR_REPO_URL:-ssh://aur@aur.archlinux.org/minimal-bin.git}"
-# The public read-only mirror. Same repo, no credentials — a --dry-run needs
-# to clone to produce its diff, and demanding the bot key for a rehearsal made
-# dry-runs unreachable outside CI.
-AUR_PUBLIC_URL="https://aur.archlinux.org/minimal-bin.git"
+SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$'
+NIGHTLY_PKGVER_RE='^0\.[0-9]{8}\.[0-9]+$'
+STAGE_SHA_RE='^[0-9a-f]{8}$'
+
+# STAGE_REF is stamped into PKGBUILD source URLs. Stable keeps the literal
+# ${pkgver} so the rendered PKGBUILD bytes match the pre-channel template.
+# Nightly/unstable stamp the concrete staged row key.
+case "$CHANNEL" in
+    stable)
+        printf '%s\n' "$PKGVER" | grep -qE "$SEMVER_RE" \
+            || die "PKGVER '$PKGVER' is not a RELEASED semver X.Y.Z (optional +build; prereleases and shas are rejected: pacman's pkgver forbids hyphens)"
+        STAGE_VERSION="${STAGE_VERSION:-$PKGVER}"
+        STAGE_REF='${pkgver}'
+        PKGNAME="minimal-bin"
+        AUR_REPO_URL="${AUR_REPO_URL:-ssh://aur@aur.archlinux.org/minimal-bin.git}"
+        AUR_PUBLIC_URL="https://aur.archlinux.org/minimal-bin.git"
+        ;;
+    unstable)
+        printf '%s\n' "$PKGVER" | grep -qE "$SEMVER_RE" \
+            || die "PKGVER '$PKGVER' is not a RELEASED semver X.Y.Z (optional +build; prereleases and shas are rejected: pacman's pkgver forbids hyphens)"
+        STAGE_VERSION="${STAGE_VERSION:-$PKGVER}"
+        STAGE_REF="$STAGE_VERSION"
+        PKGNAME="minimal-bin-unstable"
+        AUR_REPO_URL="${AUR_REPO_URL:-ssh://aur@aur.archlinux.org/minimal-bin-unstable.git}"
+        AUR_PUBLIC_URL="https://aur.archlinux.org/minimal-bin-unstable.git"
+        ;;
+    nightly)
+        printf '%s\n' "$PKGVER" | grep -qE "$NIGHTLY_PKGVER_RE" \
+            || die "PKGVER '$PKGVER' is not a nightly package version 0.YYYYMMDD.run (raw shas and released semvers are rejected on --channel nightly)"
+        [ -n "${STAGE_VERSION:-}" ] \
+            || die "STAGE_VERSION is required for --channel nightly (8-char hex short sha of the staged GCS row)"
+        printf '%s\n' "$STAGE_VERSION" | grep -qE "$STAGE_SHA_RE" \
+            || die "STAGE_VERSION '$STAGE_VERSION' is not an 8-char hex short sha (nightly staged row key)"
+        STAGE_REF="$STAGE_VERSION"
+        PKGNAME="minimal-bin-nightly"
+        AUR_REPO_URL="${AUR_REPO_URL:-ssh://aur@aur.archlinux.org/minimal-bin-nightly.git}"
+        AUR_PUBLIC_URL="https://aur.archlinux.org/minimal-bin-nightly.git"
+        ;;
+esac
+
 BUCKET_URL="${MINIMAL_BUCKET_URL:-https://storage.googleapis.com/minimal-one}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -100,7 +160,7 @@ RENDER="$ROOT/scripts/render-packaging.sh"
 workdir="$(mktemp -d 2>/dev/null || mktemp -d -t publish-aur)"
 trap 'rm -rf "$workdir"' EXIT
 
-# artifact basename under versions/$PKGVER/ | env var holding its sha256.
+# artifact basename under versions/$STAGE_VERSION/ | env var holding its sha256.
 # The variable names must match the @@SHA_*@@ tokens the template stamps; the
 # list order is irrelevant (each sha lands in its named variable, and the
 # PKGBUILD keeps its own source/checksum arrays aligned).
@@ -124,16 +184,18 @@ dist="$workdir/dist"
 mkdir -p "$dist"
 for entry in "${ARTIFACTS[@]}"; do
     IFS='|' read -r name var <<<"$entry"
-    url="$BUCKET_URL/versions/$PKGVER/$name"
+    url="$BUCKET_URL/versions/$STAGE_VERSION/$name"
     curl -fsSL --retry 3 -o "$dist/$name" "$url" \
-        || die "cannot download $url — is $PKGVER staged in the bucket? (see stage-release.sh)"
+        || die "cannot download $url — is $STAGE_VERSION staged in the bucket? (see stage-release.sh)"
     printf -v "$var" '%s' "$(sha256sum "$dist/$name" | cut -d' ' -f1)"
 done
 
 # The renderer stamps from the environment. BUCKET_URL is the token behind
 # the PKGBUILD's _bucket: a MINIMAL_BUCKET_URL override must change the source
 # URLs along with the checksums fetched from them, or the two diverge silently.
-export PKGVER BUCKET_URL
+# STAGE_REF is the URL path segment (see channel setup above); PKGNAME is the
+# AUR package identity for this channel.
+export PKGVER PKGNAME BUCKET_URL STAGE_REF
 export SHA_APPARMOR SHA_APPARMOR_TUNABLE SHA_APPARMOR_LOADER \
        SHA_MIN_X86_64 SHA_MINIMALD_X86_64 SHA_MIP_X86_64 SHA_GVPROXY_X86_64 \
        SHA_MINVMD_X86_64 \
@@ -263,4 +325,4 @@ case "$remote_url" in
 esac
 git push origin HEAD:master
 
-echo "publish-aur: pushed minimal-bin $PKGVER to $remote_url"
+echo "publish-aur: pushed $PKGNAME $PKGVER to $remote_url"

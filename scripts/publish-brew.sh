@@ -1,32 +1,53 @@
 #!/usr/bin/env bash
 #
-# publish-brew.sh — clone the gominimal/homebrew-minimal tap, stamp the
-# Formula, push.
+# publish-brew.sh — clone a Homebrew tap, stamp the Formula, push.
 #
 # The monorepo is the source of truth for the Homebrew formula; the tap repo
 # is generated output. Each run shallow-clones a fresh copy, downloads the
-# four macOS arm64 assets (min, minvmd, gvproxy, and the libkrun dylib) from
-# the GitHub Release v$PKGVER to compute their sha256s, renders
-# packaging/homebrew/minimal.rb.tmpl into Formula/minimal.rb, and commits +
-# pushes.
+# four macOS arm64 assets (min, minvmd, gvproxy, and the libkrun dylib),
+# renders the channel's formula template into Formula/<name>.rb, and commits
+# + pushes.
 #
-# Usage: scripts/publish-brew.sh [--dry-run]
+# Usage: scripts/publish-brew.sh [--dry-run] [--channel stable|unstable|nightly]
+#
+# Channel (prefer one mechanism; CLI wins over env):
+#   --channel CHANNEL   or PUBLISH_CHANNEL (default: stable)
+#     stable   — released semver PKGVER; assets from the GitHub Release
+#                v$PKGVER (override with MINIMAL_RELEASE_URL); tap
+#                gominimal/homebrew-minimal; Formula/minimal.rb.
+#     unstable — released semver PKGVER; STAGE_VERSION defaults to PKGVER;
+#                assets from the GCS row versions/$STAGE_VERSION/ (the draft
+#                Release is not public yet); tap homebrew-minimal-unstable;
+#                Formula/minimal-unstable.rb.
+#     nightly  — PKGVER must match ^0\.[0-9]{8}\.[0-9]+$; STAGE_VERSION is
+#                required (8-char hex sha); assets from GCS
+#                versions/$STAGE_VERSION/; tap homebrew-minimal-nightly;
+#                Formula/minimal-nightly.rb. Formula test uses --help (nightly
+#                binaries report git-describe, not the synthetic pkgver).
 #
 # Env:
-#   PKGVER              Required. A RELEASED semver WITHOUT the v prefix
-#                       (X.Y.Z, optional +build tail). Assets are fetched from
-#                       the GitHub Release v$PKGVER of gominimal/minimal. A
-#                       bare short SHA is rejected: the tap tracks promoted
-#                       semver releases, not nightly builds. A prerelease
-#                       (-rc.1 tail) is rejected too: Homebrew has no
-#                       channels, so an RC would overwrite the only formula
-#                       for every user with no way to opt out.
-#   BREW_TAP_REPO       git URL to clone/push
-#                       (default: git@github.com:gominimal/homebrew-minimal.git)
-#   MINIMAL_RELEASE_URL Base URL the release assets are fetched from
-#                       (default: the GitHub Release download URL for
-#                       gominimal/minimal v$PKGVER). Overridable so a local
-#                       fixture can drive --dry-run without network access.
+#   PKGVER              Required. Package version (released semver without the
+#                       v prefix for stable/unstable; synthetic 0.YYYYMMDD.run
+#                       for nightly). A bare short SHA is always rejected as
+#                       PKGVER — use STAGE_VERSION for the staged row key.
+#   STAGE_VERSION       Staged GCS row under versions/. Required for nightly
+#                       (8-char sha). Defaults to PKGVER for unstable. Unused
+#                       for stable fetch (GitHub Release) unless
+#                       MINIMAL_RELEASE_URL is overridden to a GCS path.
+#   PUBLISH_CHANNEL     Default channel when --channel is omitted (stable).
+#   BREW_TAP_REPO       git URL to clone/push. Defaults per channel:
+#                       stable   → git@github.com:gominimal/homebrew-minimal.git
+#                       unstable → .../homebrew-minimal-unstable.git
+#                       nightly  → .../homebrew-minimal-nightly.git
+#   MINIMAL_RELEASE_URL Base URL the release assets are fetched from.
+#                       Stable default: GitHub Release download URL for
+#                       gominimal/minimal v$PKGVER. Nightly/unstable default:
+#                       $MINIMAL_BUCKET_URL/versions/$STAGE_VERSION. Overridable
+#                       so a local fixture can drive --dry-run without network.
+#   MINIMAL_BUCKET_URL  Public installer-bucket base (default:
+#                       https://storage.googleapis.com/minimal-one). Used for
+#                       nightly/unstable formula URL stamping and as the
+#                       default fetch base when MINIMAL_RELEASE_URL is unset.
 #
 # Credentials (env/ssh-agent only — never hardcoded or echoed here):
 #   - an ssh-agent holding a key with push access to the tap (for the SSH
@@ -41,7 +62,7 @@
 #   reported with the likely causes.
 #
 # First run: the tap repo must exist (user action) — create a new empty
-# repository at https://github.com/gominimal/homebrew-minimal, then run this.
+# repository at the channel's default GitHub path, then run this.
 #
 # --dry-run does everything up to the commit and prints the would-be diff.
 #
@@ -61,36 +82,85 @@ usage() {
 }
 
 DRY_RUN=0
-for arg in "$@"; do
-    case "$arg" in
-        --dry-run) DRY_RUN=1 ;;
+CHANNEL=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1; shift ;;
+        --channel)
+            [ "$#" -ge 2 ] || die "--channel requires an argument (stable|unstable|nightly)"
+            CHANNEL="$2"
+            shift 2
+            ;;
+        --channel=*)
+            CHANNEL="${1#--channel=}"
+            shift
+            ;;
         -h|--help) usage 0 ;;
-        *)         die "unknown argument: $arg (try --help)" ;;
+        *)         die "unknown argument: $1 (try --help)" ;;
     esac
 done
 
-[ -n "${PKGVER:-}" ] || die "PKGVER is required (the promoted semver, without the v prefix)"
+CHANNEL="${CHANNEL:-${PUBLISH_CHANNEL:-stable}}"
+case "$CHANNEL" in
+    stable|unstable|nightly) ;;
+    *) die "unknown channel '$CHANNEL' (want stable|unstable|nightly)" ;;
+esac
+
+[ -n "${PKGVER:-}" ] || die "PKGVER is required (see --help for the per-channel form)"
 case "$PKGVER" in
     v*) die "PKGVER must not carry the v prefix: '$PKGVER' (use ${PKGVER#v})" ;;
 esac
-# A release only: no prerelease tail (Homebrew has no channels — an RC would
-# overwrite the one formula for every user), no bare sha. A +build tail is a
-# valid release version and passes.
-printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$' \
-    || die "PKGVER '$PKGVER' is not a RELEASED semver X.Y.Z (optional +build; prereleases and shas are rejected: Homebrew has no channels)"
 
-BREW_TAP_REPO="${BREW_TAP_REPO:-git@github.com:gominimal/homebrew-minimal.git}"
-RELEASE_URL_BASE="${MINIMAL_RELEASE_URL:-https://github.com/gominimal/minimal/releases/download/v$PKGVER}"
+SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$'
+NIGHTLY_PKGVER_RE='^0\.[0-9]{8}\.[0-9]+$'
+STAGE_SHA_RE='^[0-9a-f]{8}$'
+
+BUCKET_URL="${MINIMAL_BUCKET_URL:-https://storage.googleapis.com/minimal-one}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TEMPLATE="$ROOT/packaging/homebrew/minimal.rb.tmpl"
 RENDER="$ROOT/scripts/render-packaging.sh"
-[ -f "$TEMPLATE" ] || die "no such template: $TEMPLATE"
 [ -x "$RENDER" ] || die "renderer missing or not executable: $RENDER"
 
+case "$CHANNEL" in
+    stable)
+        printf '%s\n' "$PKGVER" | grep -qE "$SEMVER_RE" \
+            || die "PKGVER '$PKGVER' is not a RELEASED semver X.Y.Z (optional +build; prereleases and shas are rejected: Homebrew has no channels)"
+        STAGE_VERSION="${STAGE_VERSION:-$PKGVER}"
+        BREW_TAP_REPO="${BREW_TAP_REPO:-git@github.com:gominimal/homebrew-minimal.git}"
+        RELEASE_URL_BASE="${MINIMAL_RELEASE_URL:-https://github.com/gominimal/minimal/releases/download/v$PKGVER}"
+        TEMPLATE="$ROOT/packaging/homebrew/minimal.rb.tmpl"
+        FORMULA_PATH="Formula/minimal.rb"
+        COMMIT_SUBJECT="minimal $PKGVER"
+        ;;
+    unstable)
+        printf '%s\n' "$PKGVER" | grep -qE "$SEMVER_RE" \
+            || die "PKGVER '$PKGVER' is not a RELEASED semver X.Y.Z (optional +build; prereleases and shas are rejected: Homebrew has no channels)"
+        STAGE_VERSION="${STAGE_VERSION:-$PKGVER}"
+        BREW_TAP_REPO="${BREW_TAP_REPO:-git@github.com:gominimal/homebrew-minimal-unstable.git}"
+        RELEASE_URL_BASE="${MINIMAL_RELEASE_URL:-$BUCKET_URL/versions/$STAGE_VERSION}"
+        TEMPLATE="$ROOT/packaging/homebrew/minimal-unstable.rb.tmpl"
+        FORMULA_PATH="Formula/minimal-unstable.rb"
+        COMMIT_SUBJECT="minimal-unstable $PKGVER"
+        ;;
+    nightly)
+        printf '%s\n' "$PKGVER" | grep -qE "$NIGHTLY_PKGVER_RE" \
+            || die "PKGVER '$PKGVER' is not a nightly package version 0.YYYYMMDD.run (raw shas and released semvers are rejected on --channel nightly)"
+        [ -n "${STAGE_VERSION:-}" ] \
+            || die "STAGE_VERSION is required for --channel nightly (8-char hex short sha of the staged GCS row)"
+        printf '%s\n' "$STAGE_VERSION" | grep -qE "$STAGE_SHA_RE" \
+            || die "STAGE_VERSION '$STAGE_VERSION' is not an 8-char hex short sha (nightly staged row key)"
+        BREW_TAP_REPO="${BREW_TAP_REPO:-git@github.com:gominimal/homebrew-minimal-nightly.git}"
+        RELEASE_URL_BASE="${MINIMAL_RELEASE_URL:-$BUCKET_URL/versions/$STAGE_VERSION}"
+        TEMPLATE="$ROOT/packaging/homebrew/minimal-nightly.rb.tmpl"
+        FORMULA_PATH="Formula/minimal-nightly.rb"
+        COMMIT_SUBJECT="minimal-nightly $PKGVER"
+        ;;
+esac
+
+[ -f "$TEMPLATE" ] || die "no such template: $TEMPLATE"
+
 # One release asset per sha256 the Formula declares: the url asset plus each
-# resource. Same names as the GitHub Release (release.yml's release job
-# uploads the release artifacts flat, basenames unchanged).
+# resource. Same basenames as stage-release.sh / the GitHub Release.
 # asset basename | env var holding its sha256 (the template's @@TOKEN@@)
 ASSETS=(
     "minimal-macos-arm64|SHA256"
@@ -120,15 +190,19 @@ for entry in "${ASSETS[@]}"; do
     IFS='|' read -r name var <<<"$entry"
     url="$RELEASE_URL_BASE/$name"
     curl -fsSL --retry 3 -o "$dist/$name" "$url" \
-        || die "cannot download $url — is v$PKGVER a GitHub Release of gominimal/minimal carrying the macOS arm64 assets?"
+        || die "cannot download $url — is the $CHANNEL channel's asset base reachable for $PKGVER (stage $STAGE_VERSION)?"
     printf -v "$var" '%s' "$(sha256_file "$dist/$name")"
 done
 
 # The renderer stamps from the environment (VERSION for the @@VERSION@@
-# token; PKGVER stays for error messages).
+# token; PKGVER stays for error messages). Nightly/unstable templates also
+# need BUCKET_URL and STAGE_VERSION for GCS asset URLs.
 export PKGVER
 export VERSION="$PKGVER"
 export SHA256 SHA_MINVMD SHA_GVPROXY SHA_LIBKRUN
+if [ "$CHANNEL" != "stable" ]; then
+    export BUCKET_URL STAGE_VERSION
+fi
 
 # Never let git hang on an interactive https credential prompt.
 export GIT_TERMINAL_PROMPT=0
@@ -188,7 +262,7 @@ if ! git clone --depth 1 "$BREW_TAP_REPO" "$workdir/tap" 2>"$clone_err"; then
 fi
 
 mkdir -p "$workdir/tap/Formula"
-"$RENDER" "$TEMPLATE" "$workdir/tap/Formula/minimal.rb"
+"$RENDER" "$TEMPLATE" "$workdir/tap/$FORMULA_PATH"
 
 cd "$workdir/tap"
 
@@ -200,7 +274,7 @@ git config user.email >/dev/null || git config user.email "minimal-ci@users.nore
 git add -A
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    echo "publish-brew: [dry-run] diff that would be committed as 'minimal $PKGVER':"
+    echo "publish-brew: [dry-run] diff that would be committed as '$COMMIT_SUBJECT':"
     # --no-ext-diff: machine-checked output, shape must not depend on the
     # runner's git config (see publish-aur.sh).
     git --no-pager diff --cached --no-ext-diff
@@ -213,7 +287,7 @@ if git diff --cached --quiet; then
     exit 0
 fi
 
-git commit -m "minimal $PKGVER"
+git commit -m "$COMMIT_SUBJECT"
 
 # Sanity guard: only ever push to the tap repo we cloned.
 remote_url="$(git remote get-url origin)"
@@ -223,4 +297,4 @@ remote_url="$(git remote get-url origin)"
 # the name of the first push).
 git push origin HEAD:refs/heads/main
 
-echo "publish-brew: pushed minimal $PKGVER to $remote_url"
+echo "publish-brew: pushed $COMMIT_SUBJECT to $remote_url"

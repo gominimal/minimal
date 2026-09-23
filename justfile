@@ -196,6 +196,31 @@ pkg-nfpm pkgver:
 pkg-smoke pkgdir="dist" *args:
     scripts/pkg-smoke.sh --pkg-dir {{quote(pkgdir)}} {{args}}
 
+# Dry-run both package publishers (AUR + Homebrew) for a channel against a
+# staged installer-bucket row. Downloads, checksums, and renders; never pushes.
+# channel: stable|unstable|nightly. For nightly, stage is the required 8-char
+# short sha and pkgver is 0.YYYYMMDD.run. For unstable, stage defaults to
+# pkgver (the semver GCS row). For stable, brew still fetches the GitHub
+# Release unless MINIMAL_RELEASE_URL is overridden. Needs network (or a
+# MINIMAL_BUCKET_URL / MINIMAL_RELEASE_URL fixture); not part of `just test`.
+#
+# Dry-run AUR + Homebrew publishers for channel (stable|unstable|nightly).
+pkg-publish-dry channel pkgver stage="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PUBLISH_CHANNEL={{quote(channel)}} PKGVER={{quote(pkgver)}}
+    stage={{quote(stage)}}
+    if [ -n "$stage" ]; then
+        export STAGE_VERSION="$stage"
+    elif [ "{{channel}}" = "nightly" ]; then
+        echo "pkg-publish-dry: STAGE_VERSION (8-char short sha) is required for nightly" >&2
+        exit 1
+    fi
+    echo "== publish-aur.sh --dry-run --channel {{channel}} =="
+    scripts/publish-aur.sh --dry-run --channel {{quote(channel)}}
+    echo "== publish-brew.sh --dry-run --channel {{channel}} =="
+    scripts/publish-brew.sh --dry-run --channel {{quote(channel)}}
+
 # Restage an already-shipped release under its semver so the command above can
 # see it (the one-time fix for releases staged before the semver-row
 # convention, e.g. `just backfill-version-row abc12345 0.5.3`).

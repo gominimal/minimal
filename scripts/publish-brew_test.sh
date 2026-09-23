@@ -7,7 +7,8 @@
 # GITHUB_TOKEN and no ssh-agent. Asserts that a dry run downloads the four
 # macOS assets, checksums them, renders the formula fully stamped — including
 # the libkrun dylib installed into the prefix's lib/, which @loader_path/../lib
-# resolves — and pushes nothing. Run directly or via `just test-shell`.
+# resolves — and pushes nothing. Also covers --channel nightly/unstable.
+# Run directly or via `just test-shell`.
 
 set -euo pipefail
 
@@ -40,7 +41,8 @@ eval "$(sed -n '/^sha256_file()/,/^}/p' "$script")"
 # --- fixtures -----------------------------------------------------------------
 
 # The versioned release assets, each with distinct content so the sha256s
-# differ. Keyed under releases/v<pkgver>/ the way MINIMAL_RELEASE_URL resolves.
+# differ. Stable keys under releases/v<pkgver>/ the way MINIMAL_RELEASE_URL
+# resolves; nightly/unstable key under versions/<stage>/.
 releases="$root/releases"
 mkdir -p "$releases/v0.5.4"
 release="$releases/v0.5.4"
@@ -48,6 +50,17 @@ assets=(minimal-macos-arm64 minvmd-macos-arm64 gvproxy-darwin-arm64 libkrun-maco
 for a in "${assets[@]}"; do
     printf 'mach-o payload of %s\n' "$a" >"$release/$a"
 done
+
+bucket_root="$root/bucket/versions"
+seed_bucket_row() {
+    local row="$1" a
+    mkdir -p "$bucket_root/$row"
+    for a in "${assets[@]}"; do
+        printf 'mach-o payload of %s in %s\n' "$a" "$row" >"$bucket_root/$row/$a"
+    done
+}
+seed_bucket_row 0.5.4
+seed_bucket_row abc12def
 
 # A bare "tap" repo with a committed formula to diff against.
 tap="$root/tap.git"
@@ -92,6 +105,16 @@ run_dry() {
         "$script" --dry-run
 }
 
+run_dry_channel() {
+    local channel="$1" pkgver="$2" stage="${3:-}"
+    env -u SSH_AUTH_SOCK -u GITHUB_TOKEN \
+        PKGVER="$pkgver" \
+        STAGE_VERSION="$stage" \
+        BREW_TAP_REPO="file://$tap" \
+        MINIMAL_BUCKET_URL="file://$root/bucket" \
+        "$script" --dry-run --channel "$channel"
+}
+
 # --- the dry run --------------------------------------------------------------
 
 out="$(run_dry 0.5.4 2>&1)"
@@ -123,6 +146,11 @@ if [[ "$out" == *'bin.install "minimal-macos-arm64" => "min"'* ]]; then
 else
     bad "the CLI installs as bin/min (not a bin/min directory)"
 fi
+if [[ "$out" == *'assert_match version.to_s'* ]]; then
+    ok "stable formula keeps the min --version assertion"
+else
+    bad "stable formula keeps the min --version assertion (out: $out)"
+fi
 
 # Every 64-hex digest in the diff must be one of the fixture assets'.
 digests="$(for a in "${assets[@]}"; do sha256_file "$release/$a"; done)"
@@ -153,6 +181,120 @@ expect 1 "not a RELEASED semver" "prerelease PKGVER is refused (Homebrew has no 
         MINIMAL_RELEASE_URL="file://$root/releases/v0.6.0-rc.1" "$script" --dry-run
 
 expect 1 "cannot download" "a missing release asset fails the run" -- run_dry 9.9.9
+
+# --- nightly channel ----------------------------------------------------------
+
+expect 1 "not a nightly package version" "nightly rejects a raw sha as PKGVER" -- \
+    env -u SSH_AUTH_SOCK -u GITHUB_TOKEN PKGVER=abc12def STAGE_VERSION=abc12def \
+        BREW_TAP_REPO="file://$tap" MINIMAL_BUCKET_URL="file://$root/bucket" \
+        "$script" --dry-run --channel nightly
+
+expect 1 "STAGE_VERSION is required" "nightly rejects a missing STAGE_VERSION" -- \
+    env -u SSH_AUTH_SOCK -u GITHUB_TOKEN -u STAGE_VERSION PKGVER=0.20260922.1847 \
+        BREW_TAP_REPO="file://$tap" MINIMAL_BUCKET_URL="file://$root/bucket" \
+        "$script" --dry-run --channel nightly
+
+expect 1 "not an 8-char hex short sha" "nightly rejects a malformed STAGE_VERSION" -- \
+    env -u SSH_AUTH_SOCK -u GITHUB_TOKEN PKGVER=0.20260922.1847 STAGE_VERSION=DEADBEEF \
+        BREW_TAP_REPO="file://$tap" MINIMAL_BUCKET_URL="file://$root/bucket" \
+        "$script" --dry-run --channel nightly
+
+out="$(run_dry_channel nightly 0.20260922.1847 abc12def 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ]; then ok "nightly dry run succeeds with pkgver + stage sha"; else bad "nightly dry run succeeds with pkgver + stage sha (rc=$rc; out: $out)"; fi
+if [[ "$out" == *"nothing committed, nothing pushed"* ]]; then
+    ok "nightly dry run pushes nothing"
+else
+    bad "nightly dry run pushes nothing (out: $out)"
+fi
+if [[ "$out" == *'+class MinimalNightly < Formula'* ]]; then
+    ok "nightly formula class is MinimalNightly"
+else
+    bad "nightly formula class is MinimalNightly (out: $out)"
+fi
+if [[ "$out" == *'Formula/minimal-nightly.rb'* ]] || [[ "$out" == *'minimal-nightly.rb'* ]]; then
+    ok "nightly writes Formula/minimal-nightly.rb"
+else
+    # Diff path may show as formula file content only; accept class + version.
+    if [[ "$out" == *'version "0.20260922.1847"'* ]]; then
+        ok "nightly writes Formula/minimal-nightly.rb (version stamped)"
+    else
+        bad "nightly writes Formula/minimal-nightly.rb (out: $out)"
+    fi
+fi
+if [[ "$out" == *'version "0.20260922.1847"'* ]]; then
+    ok "nightly stamps the synthetic pkgver as formula version"
+else
+    bad "nightly stamps the synthetic pkgver as formula version (out: $out)"
+fi
+if grep -qE 'versions/abc12def/minimal-macos-arm64' <<<"$out"; then
+    ok "nightly formula URLs use the stage sha GCS row"
+else
+    bad "nightly formula URLs use the stage sha GCS row (out: $out)"
+fi
+if grep -qE 'releases/download/' <<<"$out"; then
+    bad "nightly must not use GitHub Release URLs"
+else
+    ok "nightly does not use GitHub Release URLs"
+fi
+if grep -qE 'versions/0\.20260922\.1847/' <<<"$out"; then
+    bad "nightly must not fetch from versions/<pkgver>/"
+else
+    ok "nightly does not fetch from versions/<pkgver>/"
+fi
+if [[ "$out" == *'min --help'* ]]; then
+    ok "nightly formula test uses min --help"
+else
+    bad "nightly formula test uses min --help (out: $out)"
+fi
+if [[ "$out" == *'assert_match version.to_s'* ]]; then
+    bad "nightly must not assert min --version equals pkgver"
+else
+    ok "nightly does not assert min --version equals pkgver"
+fi
+nightly_digests="$(for a in "${assets[@]}"; do sha256_file "$bucket_root/abc12def/$a"; done)"
+stamped_ok=1
+count=0
+while IFS= read -r sha; do
+    count=$((count + 1))
+    grep -qx "$sha" <<<"$nightly_digests" || stamped_ok=0
+done < <(grep -oE '[0-9a-f]{64}' <<<"$out" | sort -u)
+if [ "$count" -eq "${#assets[@]}" ] && [ "$stamped_ok" -eq 1 ]; then
+    ok "nightly checksums match the stage-row assets"
+else
+    bad "nightly checksums match the stage-row assets (found $count distinct)"
+fi
+
+# --- unstable channel ---------------------------------------------------------
+
+out="$(run_dry_channel unstable 0.5.4 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ]; then ok "unstable dry run succeeds with semver"; else bad "unstable dry run succeeds with semver (rc=$rc; out: $out)"; fi
+if [[ "$out" == *'+class MinimalUnstable < Formula'* ]]; then
+    ok "unstable formula class is MinimalUnstable"
+else
+    bad "unstable formula class is MinimalUnstable (out: $out)"
+fi
+if [[ "$out" == *'version "0.5.4"'* ]]; then
+    ok "unstable stamps the semver as formula version"
+else
+    bad "unstable stamps the semver as formula version (out: $out)"
+fi
+if grep -qE 'versions/0\.5\.4/minimal-macos-arm64' <<<"$out"; then
+    ok "unstable formula URLs use the semver GCS row"
+else
+    bad "unstable formula URLs use the semver GCS row (out: $out)"
+fi
+if grep -qE 'releases/download/' <<<"$out"; then
+    bad "unstable must not use GitHub Release URLs"
+else
+    ok "unstable does not use GitHub Release URLs"
+fi
+if [[ "$out" == *'assert_match version.to_s'* ]]; then
+    ok "unstable keeps the min --version assertion"
+else
+    bad "unstable keeps the min --version assertion (out: $out)"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

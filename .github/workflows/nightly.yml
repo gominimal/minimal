@@ -5,6 +5,9 @@ name: nightly
 # stage, smoke the shipped artifacts, and record the smoke against the staged
 # row, then flips the `nightly` pointer inline — so promote.yml stays the
 # gated, manual stable/unstable path and needs no nightly-specific carve-outs.
+# After the channel flip it also publishes the nightly AUR package and
+# Homebrew tap (synthetic PKGVER 0.YYYYMMDD.<run_number>, STAGE_VERSION =
+# short sha) — not via publish-packages.yml, which stays stable-only.
 #
 # `nightly` is bleeding-edge like `unstable` (it's a once-a-day snapshot of
 # HEAD's build), so it is intentionally ungated — no approval issue.
@@ -134,3 +137,105 @@ jobs:
                     --channel nightly \
                     --version "$SHA" \
                     --bucket gs://minimal-one
+
+    # Package publishers for the nightly channel. PKGVER is the synthetic
+    # 0.YYYYMMDD.<run_number>; STAGE_VERSION is the smoked short-sha row the
+    # channel just pointed at. Does NOT call publish-packages.yml (no draft
+    # GitHub Release, no v-tag). Secrets: AUR_SSH_PRIVATE_KEY and
+    # BREW_TAP_TOKEN — the same names as publish-packages.yml; the AUR bot
+    # key must co-maintain minimal-bin-nightly and the PAT must write
+    # gominimal/homebrew-minimal-nightly (create those remotes first).
+    publish-nightly-dry:
+        needs: [check, promote-nightly]
+        if: ${{ needs.promote-nightly.result == 'success' }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Dry-run AUR + Homebrew against the staged nightly row
+              env:
+                  SHA: ${{ needs.check.outputs.sha }}
+                  RUN_NUMBER: ${{ github.run_number }}
+              run: |
+                  set -euo pipefail
+                  PKGVER="0.$(date -u +%Y%m%d).${RUN_NUMBER}"
+                  # Local fixture remotes: dry-run only needs to clone something;
+                  # the real destinations are exercised by the publish jobs.
+                  aur="$(mktemp -d)/aur.git"
+                  tap="$(mktemp -d)/tap.git"
+                  git init -q --bare -b master "$aur"
+                  git init -q --bare -b main "$tap"
+                  seed="$(mktemp -d)/seed"
+                  git clone -q "file://$aur" "$seed"
+                  git -C "$seed" config user.email ci@example.com
+                  git -C "$seed" config user.name ci
+                  printf 'pkgname=minimal-bin-nightly\npkgver=0.0.0\n' >"$seed/PKGBUILD"
+                  git -C "$seed" add -A && git -C "$seed" commit -q -m seed
+                  git -C "$seed" push -q origin master
+                  rm -rf "$seed"
+                  seed="$(mktemp -d)/seed"
+                  git clone -q "file://$tap" "$seed"
+                  git -C "$seed" config user.email ci@example.com
+                  git -C "$seed" config user.name ci
+                  mkdir -p "$seed/Formula"
+                  printf 'class MinimalNightly < Formula\n  version "0.0.0"\nend\n' >"$seed/Formula/minimal-nightly.rb"
+                  git -C "$seed" add -A && git -C "$seed" commit -q -m seed
+                  git -C "$seed" push -q origin main
+                  env PKGVER="$PKGVER" STAGE_VERSION="$SHA" \
+                      AUR_REPO_URL="file://$aur" \
+                      scripts/publish-aur.sh --dry-run --channel nightly
+                  env PKGVER="$PKGVER" STAGE_VERSION="$SHA" \
+                      BREW_TAP_REPO="file://$tap" \
+                      scripts/publish-brew.sh --dry-run --channel nightly
+
+    publish-nightly-aur:
+        needs: [check, publish-nightly-dry]
+        if: ${{ needs.publish-nightly-dry.result == 'success' }}
+        runs-on: ubuntu-latest
+        container: archlinux:base-devel
+        timeout-minutes: 30
+        permissions:
+            contents: read
+        steps:
+            - name: Install git and openssh
+              run: pacman -Syu --noconfirm --needed git openssh
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Publish minimal-bin-nightly to the AUR
+              env:
+                  SHA: ${{ needs.check.outputs.sha }}
+                  RUN_NUMBER: ${{ github.run_number }}
+                  AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+              run: |
+                  set -euo pipefail
+                  export PKGVER="0.$(date -u +%Y%m%d).${RUN_NUMBER}"
+                  export STAGE_VERSION="$SHA"
+                  scripts/publish-aur.sh --channel nightly
+
+    publish-nightly-brew:
+        needs: [check, publish-nightly-dry]
+        if: ${{ needs.publish-nightly-dry.result == 'success' }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Publish minimal-nightly to gominimal/homebrew-minimal-nightly
+              env:
+                  SHA: ${{ needs.check.outputs.sha }}
+                  RUN_NUMBER: ${{ github.run_number }}
+                  BREW_TAP_REPO: https://github.com/gominimal/homebrew-minimal-nightly.git
+                  GITHUB_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  export PKGVER="0.$(date -u +%Y%m%d).${RUN_NUMBER}"
+                  export STAGE_VERSION="$SHA"
+                  scripts/publish-brew.sh --channel nightly

@@ -1467,3 +1467,94 @@ jobs:
                     --channel unstable \
                     --version "$VERSION" \
                     --bucket gs://minimal-one
+
+    # Unstable package publishers — VERSIONED releases only. Sha-keyed builds
+    # also point `unstable` at the short-sha row above but must NOT publish
+    # semver packages (nightly.yml owns the short-sha tap/AUR). Does not call
+    # publish-packages.yml (no draft publish, no v-tag, no stable tap/AUR).
+    # Secrets mirror publish-packages.yml: AUR_SSH_PRIVATE_KEY must
+    # co-maintain minimal-bin-unstable; BREW_TAP_TOKEN must write
+    # gominimal/homebrew-minimal-unstable.
+    publish-unstable-dry:
+        needs: [assert-version, stage-installer]
+        if: ${{ !inputs.dry_run && needs.assert-version.outputs.release_version != '' }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Dry-run AUR + Homebrew against the staged semver row
+              env:
+                  PKGVER: ${{ needs.assert-version.outputs.release_version }}
+              run: |
+                  set -euo pipefail
+                  # Local fixture remotes so dry-run does not require the
+                  # unstable destinations to exist yet; real publish jobs
+                  # push to the live remotes.
+                  aur="$(mktemp -d)/aur.git"
+                  tap="$(mktemp -d)/tap.git"
+                  git init -q --bare -b master "$aur"
+                  git init -q --bare -b main "$tap"
+                  seed="$(mktemp -d)/seed"
+                  git clone -q "file://$aur" "$seed"
+                  git -C "$seed" config user.email ci@example.com
+                  git -C "$seed" config user.name ci
+                  printf 'pkgname=minimal-bin-unstable\npkgver=0.0.0\n' >"$seed/PKGBUILD"
+                  git -C "$seed" add -A && git -C "$seed" commit -q -m seed
+                  git -C "$seed" push -q origin master
+                  rm -rf "$seed"
+                  seed="$(mktemp -d)/seed"
+                  git clone -q "file://$tap" "$seed"
+                  git -C "$seed" config user.email ci@example.com
+                  git -C "$seed" config user.name ci
+                  mkdir -p "$seed/Formula"
+                  printf 'class MinimalUnstable < Formula\n  version "0.0.0"\nend\n' >"$seed/Formula/minimal-unstable.rb"
+                  git -C "$seed" add -A && git -C "$seed" commit -q -m seed
+                  git -C "$seed" push -q origin main
+                  env STAGE_VERSION="$PKGVER" AUR_REPO_URL="file://$aur" \
+                      scripts/publish-aur.sh --dry-run --channel unstable
+                  env STAGE_VERSION="$PKGVER" BREW_TAP_REPO="file://$tap" \
+                      scripts/publish-brew.sh --dry-run --channel unstable
+
+    publish-unstable-aur:
+        needs: [assert-version, record-smoked, publish-unstable-dry]
+        if: ${{ !inputs.dry_run && needs.assert-version.outputs.release_version != '' && needs.publish-unstable-dry.result == 'success' && needs.record-smoked.result == 'success' }}
+        runs-on: ubuntu-latest
+        container: archlinux:base-devel
+        timeout-minutes: 30
+        permissions:
+            contents: read
+        steps:
+            - name: Install git and openssh
+              run: pacman -Syu --noconfirm --needed git openssh
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Publish minimal-bin-unstable to the AUR
+              env:
+                  PKGVER: ${{ needs.assert-version.outputs.release_version }}
+                  STAGE_VERSION: ${{ needs.assert-version.outputs.release_version }}
+                  AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+              run: scripts/publish-aur.sh --channel unstable
+
+    publish-unstable-brew:
+        needs: [assert-version, record-smoked, publish-unstable-dry]
+        if: ${{ !inputs.dry_run && needs.assert-version.outputs.release_version != '' && needs.publish-unstable-dry.result == 'success' && needs.record-smoked.result == 'success' }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Publish minimal-unstable to gominimal/homebrew-minimal-unstable
+              env:
+                  PKGVER: ${{ needs.assert-version.outputs.release_version }}
+                  STAGE_VERSION: ${{ needs.assert-version.outputs.release_version }}
+                  BREW_TAP_REPO: https://github.com/gominimal/homebrew-minimal-unstable.git
+                  GITHUB_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}
+              run: scripts/publish-brew.sh --channel unstable
