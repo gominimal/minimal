@@ -1,5 +1,19 @@
 #!/usr/bin/bash
 
+# Columns of the controlling terminal, for clipping a progress line so it
+# does not wrap. A wrapped line breaks the in-place redraw. 80 when the
+# size cannot be read.
+__min_term_cols() {
+    local size cols
+    size=$(stty size </dev/tty 2>/dev/null) || size=""
+    cols=${size##* }
+    if [[ "$cols" =~ ^[0-9]+$ ]] && [[ "$cols" -ge 20 ]]; then
+        printf '%s' "$cols"
+    else
+        printf '80'
+    fi
+}
+
 __min_rpc() {
     local method="$1"
     shift
@@ -7,12 +21,30 @@ __min_rpc() {
 
     local error="false"
     local env_pairs=()
+    local bar_open=0
+    local cols=80
+    if [[ -t 1 ]]; then
+        cols=$(__min_term_cols)
+    fi
 
     while IFS= read -r line; do
         local tag="${line%%:*}"
         local rest="${line#*:}"
         case "$tag" in
+            bar)
+                # One live meter. The daemon sends a fresh line per paint;
+                # reprint it on the same row. A pipe or a log keeps the
+                # one-shot `msg:` lines and drops the redraws.
+                if [[ -t 1 && -n "$rest" ]]; then
+                    printf '\r\033[K%.*s' "$((cols - 1))" "$rest"
+                    bar_open=1
+                fi
+                ;;
             msg)
+                if [[ "$bar_open" -eq 1 ]]; then
+                    printf '\n'
+                    bar_open=0
+                fi
                 echo "$rest"
                 ;;
             set_env)
@@ -25,12 +57,20 @@ __min_rpc() {
                 break
                 ;;
             error)
+                if [[ "$bar_open" -eq 1 ]]; then
+                    printf '\n'
+                    bar_open=0
+                fi
                 echo "error:$rest" >&2
                 error="true"
                 break
                 ;;
         esac
     done < <(echo "${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
+
+    if [[ "$bar_open" -eq 1 ]]; then
+        printf '\n'
+    fi
 
     if [[ ${#env_pairs[@]} -gt 0 ]]; then
         echo ""
