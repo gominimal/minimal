@@ -32,6 +32,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
+use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
@@ -884,10 +885,15 @@ impl SessionChannel {
             }
         }
         // Stream build progress back to the client while the graph builds: a
-        // first-time `min add` fetches and extracts its packages right here,
-        // and previously drew nothing while the bytes downloaded. Rendered
-        // through the same `BuildRenderer` as `min build`, so both read
-        // identically; a fully-cached add emits no events and stays quiet.
+        // first-time `min add` fetches and extracts its packages right here.
+        // `msg:` lines (`fetching go`, `building go`) name what started. The
+        // byte meter those fetches already track is painted as `bar:` lines
+        // on the next row; the in-sandbox helper redraws each one in place. A
+        // fully-cached add emits neither and stays quiet.
+        //
+        // Cloned before the two futures: `build` needs `&mut self.ctx` and
+        // `render` must not borrow it as well.
+        let progress_tracker = self.ctx.op_tracker();
         let (log_tx, mut log_rx) = futures::channel::mpsc::unbounded();
         let build = async {
             // Reduce the `!Send` error (`mctx::Error` holds nickel `Rc`s) to a
@@ -901,11 +907,28 @@ impl SessionChannel {
         };
         let render = async {
             let mut renderer = orchestrator::BuildRenderer::new(false);
-            while let Some(event) = log_rx.next().await {
-                if let Some(line) = renderer.render(event) {
-                    let _ = writeln!(stream, "msg:{}", line.text);
+            let mut progress = crate::sandbox_progress::SandboxProgress::new(progress_tracker);
+            // ~12 Hz, the same cap the SSH progress renderer uses. A fetch
+            // reports every chunk; painting each one would flood the socket.
+            let mut tick = tokio::time::interval(Duration::from_millis(80));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // `interval` is ready immediately. Consume that tick so the first
+            // paint waits until a fetch has had a chance to report progress.
+            tick.tick().await;
+
+            loop {
+                tokio::select! {
+                    biased;
+                    event = log_rx.next() => {
+                        let Some(event) = event else { break };
+                        if let Some(line) = renderer.render(event) {
+                            let _ = writeln!(stream, "msg:{}", line.text);
+                        }
+                    }
+                    _ = tick.tick() => progress.refresh(stream),
                 }
             }
+            progress.refresh(stream);
         };
         let (build_err, ()) = tokio::join!(build, render);
         if let Some(e) = build_err {
