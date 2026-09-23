@@ -1,5 +1,6 @@
-# actionlint configuration for the nightly `hygiene` job (actionlint over
-# .github/workflows/). Declares hosted runner labels that are newer than the
+# actionlint configuration for the PR gate (`workflow-lint` in ci.yml) and
+# the nightly `hygiene` job (nightly-tests.yml), both of which run actionlint
+# over .github/workflows/. Declares hosted runner labels that are newer than the
 # actionlint release's built-in label list so they are not flagged as unknown.
 self-hosted-runner:
   labels:

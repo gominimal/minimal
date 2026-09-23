@@ -34,6 +34,7 @@ jobs:
         timeout-minutes: 5
         outputs:
             code: ${{ steps.filter.outputs.code }}
+            workflows: ${{ steps.filter.outputs.workflows }}
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
@@ -45,7 +46,9 @@ jobs:
               # diff our shallow, credential-free checkout cannot provide) —
               # and pushes to main / dispatches run everything regardless.
               # `code` = anything that is not documentation; the negations
-              # mirror the old paths-ignore list.
+              # mirror the old paths-ignore list. `workflows` = anything under
+              # .github/ (workflows, composite actions, and the actionlint /
+              # zizmor configs, listed explicitly), which gates `workflow-lint`.
               if: github.event_name == 'pull_request'
               uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d
               with:
@@ -57,6 +60,10 @@ jobs:
                         - "!**/*.md"
                         - "!docs/**"
                         - "!LICENSE"
+                      workflows:
+                        - ".github/**"
+                        - ".github/actionlint.yaml"
+                        - ".github/zizmor.yml"
 
     fmt:
         needs: [changes]
@@ -196,12 +203,42 @@ jobs:
               with:
                   channel: unstable
 
+    workflow-lint:
+        # PR-side gate for workflow changes. Mirrors the actionlint + zizmor
+        # steps of the nightly `hygiene` job in nightly-tests.yml (same image,
+        # same install-action SHA, same zizmor pin): keep the two in sync.
+        # Hygiene stays as the nightly backstop for rule drift and also runs
+        # cargo-machete, which this job does not.
+        needs: [changes]
+        if: github.event_name != 'pull_request' || needs.changes.outputs.workflows == 'true'
+        permissions:
+            contents: read
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Install zizmor
+              uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2
+              with:
+                  tool: zizmor@1.30.1
+            - name: actionlint (workflow lint)
+              # `if: always()` so a failed zizmor install doesn't skip
+              # actionlint; each check reports on its own. Pinned official
+              # image, auto-discovers .github/workflows and actionlint.yaml.
+              if: always()
+              run: docker run --rm -v "$PWD":/repo -w /repo rhysd/actionlint:1.7.12 -color
+            - name: zizmor (workflow security)
+              if: always()
+              run: zizmor .github/workflows/
+
     # Single required status check for branch protection. Green when every
     # gating job succeeded OR was path-skipped (docs-only changes); red only
     # on failure/cancellation.
     ci-success:
         if: always()
-        needs: [changes, fmt, clippy, dogfood, cargo-deny, minimal-check]
+        needs: [changes, fmt, clippy, dogfood, cargo-deny, minimal-check, workflow-lint]
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
