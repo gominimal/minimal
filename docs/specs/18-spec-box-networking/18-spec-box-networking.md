@@ -4,7 +4,7 @@ title: Box networking on the local host: preview by name and bounded egress
 owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md
-updated: 2026-09-21
+updated: 2026-09-23
 ---
 
 # NET — Box networking on the local host: preview by name and bounded egress
@@ -61,8 +61,8 @@ source-address check (NET-084), which on a VM-backed host makes a box's switch
 address its identity, each own-address box holding one lease there; the leg
 that delivers a box's connection to the proxy from that address and nothing
 else from it (NET-132); the attachments that tell the proxy which live box
-holds which address (NET-133); and the proxy's reach from a box whose other
-egress is denied (NET-134). On a co-resident host the host-address boxes share the host's
+holds which address (NET-133); and the proxy's address as infrastructure for a
+box with a credentialed lane, reachable whatever its other egress (NET-134). On a co-resident host the host-address boxes share the host's
 address and are attributed as one cohort outside the box host (NET-078), while
 each box's own declaration is enforced inside it (NET-079) on the box's own
 cgroup ([design §4.1][design]). HTTP/3 to a steered host is governed by the
@@ -577,25 +577,33 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-132** WHERE the host is VM-backed and runs a node-local Box Egress Proxy THE SYSTEM SHALL deliver a box's connection to the proxy at the switch's host-gateway address with the box's own switch address as its source.
   tier:     T0
   verify:   ./scripts/session-e2e.sh proxy_sees_each_vm_box_by_its_switch_address
-  <!-- design §7.1 and Gatehouse §6.10: a node-local BEP's steered destination is its address on the switch's host-gateway, with box source addresses preserved; a leg that translated every box to the host's loopback would give the proxy one source for every box and every host process, and the Box Egress Proxy document's cross-box and host-shell refusals rest on the source; the host-gateway address follows the switch's subnet -->
+  <!-- design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the machine-internal path MUST preserve each box's own source address, a v1 conformance requirement of the un-enrolled profile; a node-local BEP's steered destination is its address on the switch's host-gateway; a leg that translated every box to the host's loopback would give the proxy one source for every box and every host process, and the Box Egress Proxy document's cross-box and host-shell refusals rest on the source; the host-gateway address follows the switch's subnet -->
   - IF a process outside every box connects to the proxy's listener THEN THE SYSTEM SHALL present it from no box's address.
     tier:   T0
     verify: cargo nextest run -p minvmd host_process_never_arrives_from_a_box_address
     <!-- unwanted; what lets the proxy refuse a connection from the host shell -->
 
-- **NET-133** WHEN a box is created on a host running a node-local Box Egress Proxy THE SYSTEM SHALL give the proxy, before the box's first connection, an attachment naming the box as its sealed values name it, with its addressing and the source address it arrives from.
+- **NET-133** WHEN a box is created on a host running a node-local Box Egress Proxy THE SYSTEM SHALL give the proxy, from the host-side creator outside the VM and before the box's first connection, an attachment naming the box by its box id, with its addressing and the source address it arrives from.
   tier:     T0
   verify:   cargo nextest run -p minvmd proxy_attachment_given_before_first_connection
-  <!-- event-driven; the proxy attributes a connection only to a live box it holds an attachment for; host-address boxes share one attachment as their cohort (NET-078) -->
+  <!-- event-driven; design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the local analogue of the feed's `bep` audience, a v1 conformance requirement; the facts come from outside the VM escape boundary and never from the in-VM daemon, which an escapee controls; the proxy attributes a connection only to a live box it holds an attachment for; host-address boxes share one attachment as their cohort (NET-078) -->
+  - IF the in-VM daemon reports an address-to-box fact THEN THE SYSTEM SHALL keep it out of the proxy's attachments.
+    tier:   T0
+    verify: cargo nextest run -p minvmd proxy_attachment_never_sourced_from_guest
+    <!-- unwanted -->
   - WHEN the box ends THE SYSTEM SHALL withdraw its attachment within 60 seconds.
     tier:   T0
     verify: cargo nextest run -p minvmd proxy_attachment_withdrawn_within_60s_of_box_end
     <!-- event-driven; a withdrawn attachment refuses an ended box's values even when its revocation was not recorded -->
 
-- **NET-134** WHILE a box declares a credentialed upstream THE SYSTEM SHALL admit its connections to the node-local Box Egress Proxy's listener whatever its egress rules, and its connections to any other host destination only as those rules admit them.
+- **NET-134** WHILE a box declares a credentialed upstream THE SYSTEM SHALL admit its connections to the node-local Box Egress Proxy's listener as part of its infrastructure set, whatever its egress rules, and its connections to any other host destination only as those rules admit them.
   tier:     T0
   verify:   ./scripts/session-e2e.sh deny_all_box_reaches_proxy_and_no_other_host_port
-  <!-- state-driven; the one carve-out beside the resolver's (NET-074, NET-079), bounded to the proxy's listener; a box that declares no credentialed upstream reaches the listener only as its egress rules admit, and `host.min.internal` stays local reach under the box's rules (NET-003) -->
+  <!-- state-driven; design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the steered proxy address is infrastructure, the machine-internal analogue of the fabric pin's infrastructure set (design §4.4), never an egress carve-out, never spec-declared, and it grants nothing: the proxy's own checks and the box's egress still govern every upstream; the resolver stays the one carve-out from a deny-all verdict (NET-074, NET-079); `host.min.internal` stays local reach under the box's rules (NET-003) -->
+  - WHILE a box declares no credentialed upstream THE SYSTEM SHALL steer none of its flows to the proxy's listener and refuse its direct connections to it under the box-to-host default-deny.
+    tier:   T0
+    verify: ./scripts/session-e2e.sh box_without_credentialed_lane_cannot_reach_proxy
+    <!-- state-driven; the listener's parser surface is exposed to credentialed-lane boxes alone (Gatehouse T31) -->
 
 - **NET-102** WHERE the host is un-enrolled THE SYSTEM SHALL self-allocate box addresses from the default plan.
   tier:     T0
@@ -737,9 +745,9 @@ included, with every refusal logged (NET-001 to NET-004).
   `[secret-store-rules]` consent: the node-local Box Egress Proxy document; the
   fields live in the box spec's `[network]` and `[secrets]` sections but the
   behaviour is the proxy's ([Gatehouse §6.10][gatehouse]). The leg that carries
-  that traffic to the proxy, the attachments the proxy attributes it by, and its
-  reach under a deny-all verdict are the box host's, bound here (NET-132 to
-  NET-134).
+  that traffic to the proxy, the attachments the proxy attributes it by, and the
+  proxy's address as a credentialed-lane box's infrastructure are bound here
+  (NET-132 to NET-134).
 - Host enrolment, the node record's creation, host listing, and revocation: the
   host-enrolment work
   ([gominimal/inbox#648](https://github.com/gominimal/inbox/issues/648)). No
@@ -1021,7 +1029,7 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   enforced by: the frame-level admit-or-drop decision applied at the switch,
   the relay, and every hostname-routing surface
   covered by: NET-016, NET-038, NET-062, NET-064, NET-069, NET-070, NET-074,
-  NET-079, NET-121, NET-134
+  NET-079, NET-121
 - **Invariant:** THE SYSTEM SHALL give a hostname-routing surface no reach that
   a direct connection would not have.
   enforced by: one decision function shared by the proxy and the relay
@@ -1037,8 +1045,14 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
 - **Invariant:** THE SYSTEM SHALL present each box to the node-local Box Egress
   Proxy from its own source address, and no other process from a box's.
   enforced by: the relay's source-address check, a proxy leg that keeps the
-  switch source, and attachments that follow each box's lifecycle
+  switch source, and attachments from the host-side creator that follow each
+  box's lifecycle
   covered by: NET-084, NET-132, NET-133
+- **Invariant:** THE SYSTEM SHALL give a box reach to the node-local Box Egress
+  Proxy's listener only as infrastructure of a box with a credentialed lane.
+  enforced by: steering and routing to the listener only for credentialed-lane
+  boxes; the box-to-host default-deny for every other box
+  covered by: NET-134
 - **Invariant:** THE SYSTEM SHALL admit for a name only addresses that name
   resolved to, intersected with the box's denies and the infrastructure deny
   set.
