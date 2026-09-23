@@ -1,13 +1,14 @@
 #!/usr/bin/bash
 
-# Columns of the controlling terminal, for clipping a progress line so it
-# does not wrap. A wrapped line breaks the in-place redraw. 80 when the
-# size cannot be read.
+# Columns of the terminal stdout writes to, for clipping a progress line so
+# it does not wrap. A wrapped line breaks the in-place redraw. Measured
+# through fd 3, which the caller points at stdout: inside `$(...)` stdout is
+# the capture pipe. 80 when the size cannot be read.
 __min_term_cols() {
     local size cols
-    size=$(stty size </dev/tty 2>/dev/null) || size=""
+    size=$(stty size <&3 2>/dev/null) || size=""
     cols=${size##* }
-    if [[ "$cols" =~ ^[0-9]+$ ]] && [[ "$cols" -ge 20 ]]; then
+    if [[ "$cols" =~ ^[1-9][0-9]*$ ]]; then
         printf '%s' "$cols"
     else
         printf '80'
@@ -35,7 +36,9 @@ __min_rpc() {
                 # resize mid-download does not wrap the row.
                 if [[ -t 1 ]]; then
                     if [[ -n "$rest" ]]; then
-                        printf '\r\033[K%.*s' "$(($(__min_term_cols) - 1))" "$rest"
+                        local cols
+                        { cols=$(__min_term_cols); } 3>&1
+                        printf '\r\033[K%.*s' "$((cols - 1))" "$rest"
                         bar_open=1
                     elif [[ "$bar_open" -eq 1 ]]; then
                         printf '\r\033[K'

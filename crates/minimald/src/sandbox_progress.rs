@@ -35,8 +35,8 @@ pub(crate) struct SandboxProgress {
     /// task building in another shell reports into it too; `None` shows every
     /// package row.
     scope: Option<HashSet<String>>,
-    /// Every fetch seen during this run, finished ones included, so the meter
-    /// totals never shrink when one download of several completes.
+    /// Every fetch seen since downloads last went idle, finished ones included,
+    /// so the meter totals never shrink when one download of several completes.
     fetches: BTreeMap<OpId, Fetch>,
     /// Last line written, so an unchanged tree does not repaint.
     last: Option<String>,
@@ -87,6 +87,9 @@ impl SandboxProgress {
         for row in snapshot {
             let Some(op) = &row.op else { continue };
             let Progress { pos, len } = row.progress.unwrap_or(Progress { pos: 0, len: None });
+            // A zero length (chunked transfer, no Content-Length) is an
+            // unknown one: a meter drawn against it would read full at once.
+            let len = len.filter(|n| *n > 0);
             match self.activity(op) {
                 Some(Activity::Fetch(name)) => {
                     live.insert(row.id);
@@ -105,12 +108,15 @@ impl SandboxProgress {
             }
         }
         // A fetch no longer reporting (its row dropped, or moved on to
-        // extracting) is finished: count it as complete.
+        // extracting) is finished: count it as complete. One whose length was
+        // never known is as long as what it received, so it cannot hide the
+        // meter of the fetches still running beside it.
         for (id, fetch) in &mut self.fetches {
             if fetch.live && !live.contains(id) {
                 fetch.live = false;
-                if let Some(len) = fetch.len {
-                    fetch.pos = len;
+                match fetch.len {
+                    Some(len) => fetch.pos = len,
+                    None => fetch.len = Some(fetch.pos),
                 }
             }
         }
@@ -118,6 +124,9 @@ impl SandboxProgress {
         if !live.is_empty() {
             return Some(format_fetches(self.fetches.values()));
         }
+        // No download in flight: a later fetch (after an extract or a build)
+        // starts a fresh meter instead of inheriting these totals.
+        self.fetches.clear();
         if statuses.is_empty() {
             return None;
         }
@@ -199,9 +208,9 @@ fn format_fetches<'a>(fetches: impl Iterator<Item = &'a Fetch> + Clone) -> Strin
     let pos = fetches
         .clone()
         .fold(0u64, |acc, fetch| acc.saturating_add(fetch.pos));
-    // A missing length on any fetch means the total is unknown. A reported
-    // length of zero (chunked transfer, no Content-Length) is the same: a
-    // meter drawn against it would sit empty while bytes still arrive.
+    // A missing length on a live fetch means the total is unknown (zero
+    // lengths are already `None`). A total of zero is only possible for
+    // finished fetches that received nothing; there is no meter to draw.
     let len = fetches
         .clone()
         .try_fold(0u64, |acc, fetch| fetch.len.map(|n| acc.saturating_add(n)))
@@ -360,6 +369,71 @@ mod tests {
         let line = progress.line(&root.snapshot()).expect("gcc is live");
         assert!(line.contains("1.00 KiB"), "{line}");
         assert!(line.contains("2.00 KiB"), "{line}");
+    }
+
+    #[test]
+    fn a_finished_unknown_length_fetch_does_not_hide_the_meter() {
+        let root = OpTracker::new_root();
+        let mut progress = SandboxProgress::new(None, None);
+        let chunked = root.new_child().with_op(Operation::FetchPkg {
+            name: "index-ish".to_string(),
+        });
+        chunked.increment(1024);
+        let _go = fetch(&root, "go", 1024, 0);
+        let before = progress
+            .line(&root.snapshot())
+            .expect("fetches are visible");
+        assert!(!before.contains('['), "{before}");
+
+        // Finished, it counts as the 1 KiB it received: go's meter returns.
+        drop(chunked);
+        let after = progress.line(&root.snapshot()).expect("go is live");
+        assert!(after.contains("[=======>        ]"), "{after}");
+        assert!(after.contains("2.00 KiB"), "{after}");
+    }
+
+    #[test]
+    fn a_zero_length_is_unknown_and_never_counts_backwards() {
+        let root = OpTracker::new_root();
+        let mut progress = SandboxProgress::new(None, None);
+        let chunked = fetch(&root, "sqlite", 0, 5120);
+        let _go = fetch(&root, "go", 1024, 0);
+
+        // A zero length is not a total: no meter, just the bytes so far.
+        let before = progress
+            .line(&root.snapshot())
+            .expect("fetches are visible");
+        assert!(!before.contains('['), "{before}");
+        assert!(before.contains("5.00 KiB"), "{before}");
+
+        // Finished, its bytes stay counted rather than dropping to zero.
+        drop(chunked);
+        let after = progress.line(&root.snapshot()).expect("go is live");
+        assert!(after.contains("5.00 KiB / "), "{after}");
+        assert!(after.contains("6.00 KiB"), "{after}");
+    }
+
+    #[test]
+    fn a_fetch_after_an_idle_gap_starts_a_fresh_meter() {
+        let root = OpTracker::new_root();
+        let mut progress = SandboxProgress::new(None, None);
+        let go = fetch(&root, "go", 4096, 4096);
+        progress.line(&root.snapshot());
+        drop(go);
+        let build = root.new_child().with_op(Operation::PackageBuild {
+            name: "gcc".to_string(),
+        });
+        assert_eq!(
+            progress.line(&root.snapshot()).as_deref(),
+            Some("Building gcc")
+        );
+        drop(build);
+
+        let _gcc = fetch(&root, "gcc", 1024, 0);
+        let line = progress.line(&root.snapshot()).expect("gcc is live");
+        assert!(line.contains("[>               ]"), "{line}");
+        assert!(line.contains("1.00 KiB"), "{line}");
+        assert!(!line.contains("5.00 KiB"), "{line}");
     }
 
     #[test]
