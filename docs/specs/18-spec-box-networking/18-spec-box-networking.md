@@ -67,7 +67,10 @@ address and are attributed as one cohort outside the box host (NET-078), while
 each box's own declaration is enforced inside it (NET-079) on the box's own
 cgroup ([design §4.1][design]). HTTP/3 to a steered host is governed by the
 `quic443` field ([design §5.3][design]), bound in that document; NET-064 covers
-the box that declared TCP only.
+the box that declared TCP only. Which HTTP versions each proxy surface carries
+is [design §5.7][design]'s matrix: the `:7654` proxy is HTTP/1.1 (NET-135),
+published-address forwarders are TCP pass-through, and the Box Egress Proxy's
+row is bound in its document.
 
 **Success:** on a stock install, a browser opens
 `http://<name>.min.internal:<port>` with no proxy configuration; an own-address
@@ -455,6 +458,11 @@ included, with every refusal logged (NET-001 to NET-004).
     verify: cargo nextest run -p minimald denied_range_resolution_logged
     <!-- S8b/AC2; prose 43; unwanted -->
 
+- **NET-136** WHEN a box asks the node's DNS layer for an HTTPS (type 65) or SVCB (type 64) record THE SYSTEM SHALL answer NODATA.
+  tier:     T0
+  verify:   cargo nextest run -p minimald https_and_svcb_queries_are_nodata
+  <!-- design §5.3 (v0.9); event-driven; the gateway resolver's rule for every name in v1: an address hint would be either unadmitted, a silent stall for a client racing it, or a new admission path outside NET-067's intersection; `alpn="h3"` would invite the QUIC probes design §5.7 suppresses; and an ECH configuration would hide the SNI the gateway's monitoring reads -->
+
 - **NET-068** WHILE a box's egress is a hostname-only allowlist naming every host that `apt`, `git clone`, `npm install`, `pip`, and a container pull contact THE SYSTEM SHALL complete those operations.
   tier:     T0
   verify:   cargo nextest run -p minvmd hostname_allowlist_toolchain_completes
@@ -479,6 +487,15 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald proxy_parity_across_network_modes
   property: for every network mode, every rule set, and every request, the hostname proxy's verdict equals the direct connection's verdict
   <!-- S8c/AC2; prose 45; ubiquitous -->
+
+- **NET-135** THE SYSTEM SHALL route through the hostname proxy only HTTP/1.1 requests and CONNECT tunnels, and close a connection that opens with the HTTP/2 prior-knowledge preface.
+  tier:     T0
+  verify:   cargo nextest run -p minimald hostname_proxy_closes_h2_preface
+  <!-- design §5.7 (v0.9); ubiquitous; the preface is designed to read as an invalid HTTP/1.1 head, so it fails fast rather than stalling; the proxy has no TLS socket of its own, and h2 inside an accepted CONNECT tunnel is pass-through, parity-checked at connect -->
+  - IF a request through the hostname proxy carries `Upgrade: h2c` THEN THE SYSTEM SHALL remove it, its `Connection` token and `HTTP2-Settings`, and route the request as HTTP/1.1.
+    tier:   T0
+    verify: cargo nextest run -p minimald hostname_proxy_strips_h2c_upgrade
+    <!-- design §5.7; unwanted -->
 
 - **NET-072** THE SYSTEM SHALL resolve box-zone names with no `egress.allow_dns_hosts` entry.
   tier:     T0
@@ -1086,10 +1103,6 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   resolution through the resolver Minimal owns and a direct-to-address flow is
   admitted by address rules alone ([design §5.3][design]); and the per-box
   enforcement the host records under NET-079 covers addresses, never names.]
-- [NEEDS CLARIFICATION (LOW): are HTTP/2 and HTTP/3 through any proxy surface in
-  scope? [Design §5.3][design] governs QUIC for egress and leaves the proxy
-  surfaces unaddressed; the local Box Egress Proxy document needs the answer for
-  its steered hosts.]
 
 [design]: https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md
 [arch]: https://github.com/gominimal/arch/blob/main/architecture.md

@@ -28,7 +28,9 @@ renewed at the proxy on each request, so a box's credentials work for its life
 within the credentialed lane's ceiling; v1.24
 gave an un-enrolled box a per-creation id, scoped revocation to that id, and
 made the proxy's address infrastructure for a box with a credentialed lane
-(networking design v0.8.3). The Gatehouse-hosted path lands with the identity plane's fifth phase
+(networking design v0.8.3); v1.25 ruled which HTTP versions the proxy carries
+and conditioned `quic443`'s `auto` on the steering mode (networking design v0.9
+§5.3, §5.7). The Gatehouse-hosted path lands with the identity plane's fifth phase
 ([GHI](https://github.com/gominimal/gatehouse/pull/1)); until then an
 un-enrolled laptop has no credential path. The local-first ordering decided on
 2026-09-15 puts that laptop first.
@@ -284,14 +286,72 @@ Steering and the interception CA
   verify:   cargo nextest run -p sessions prop_dns_steering_without_resolver_is_exit_3
   property: for every box spec declaring a credentialed upstream, on a host with no box-zone resolver, expansion refuses iff the resolved steering is `dns` or `both`
 
-- **BEP-018** WHILE a box holds a credentialed upstream and its `quic443` resolves to `auto` or `block`, IF the box sends UDP to port 443 THEN THE SYSTEM SHALL drop the datagram.
+- **BEP-018** WHILE a box's resolved `quic443` stance is blocked, IF the box sends UDP to port 443 THEN THE SYSTEM SHALL reject the datagram with ICMP port unreachable.
   tier:     T0
-  verify:   cargo nextest run -p minimald quic443_auto_drops_udp_443_for_credentialed_box
+  verify:   cargo nextest run -p minimald quic443_blocked_rejects_udp_443
+  <!-- networking design §5.3 (v0.9): an active reject, never a silent drop, so a client falls back to TCP at once (§5.7's determinism rule); the stance governs the resolver-bypass path -->
+  - THE SYSTEM SHALL resolve `quic443 = "auto"` to blocked exactly when the box declares a credentialed upstream and its resolved steering is `dns` or `both`, and to allowed otherwise.
+    tier:   T1
+    verify: cargo nextest run -p sessions prop_quic443_auto_resolves_on_grants_and_steering
+    property: for every `quic443` value, credentialed-upstream set and steering mode, the resolved stance is blocked iff the value is `block`, or the value is `auto`, the set is non-empty and the steering is `dns` or `both`
+    <!-- ubiquitous; Gatehouse §6.3.2/§6.11 (v1.25): under `proxy_env` or `off` nothing is steered at a TCP-only listener, so the block bought neither interception coverage nor fallback determinism -->
+  - IF a box sends UDP to port 443 toward the steered proxy address THEN THE SYSTEM SHALL reject it with ICMP port unreachable, whatever the box's stance.
+    tier:   T0
+    verify: cargo nextest run -p minimald udp_443_to_steered_proxy_rejected_in_every_stance
+    <!-- unwanted; networking §5.3 (v0.9): the proxy has no QUIC listener, and `allow` re-opens resolver-bypass QUIC only -->
+  - WHERE boxes share the `host_ip` cohort address THE SYSTEM SHALL block UDP to port 443 for the cohort when any resident member's resolved stance is blocked.
+    tier:   T0
+    verify: cargo nextest run -p minimald host_ip_cohort_quic_stance_most_restrictive_wins
+    <!-- networking §5.3 (v0.9): most-restrictive-wins on the shared address, a grant-holding member costing its cohort HTTP/3; `own_ip` stances hold per box -->
+
+- **BEP-078** WHERE a box's steering is `dns` or `both`, WHEN the box asks for an AAAA, HTTPS (type 65) or SVCB (type 64) record of a steered name THE SYSTEM SHALL answer NODATA.
+  tier:     T0
+  verify:   cargo nextest run -p minimald steered_name_aaaa_https_svcb_are_nodata
+  <!-- networking §5.3 and §5.7 (v0.9): an HTTPS record would advertise `alpn="h3"` and endpoint hints for a name whose only reachable endpoint is the TCP-only proxy; with BEP-076's `Alt-Svc` strip it keeps clients from caching "this name speaks h3" -->
 
 - **BEP-062** WHILE the proxy's listener is not live, WHEN a box with `dns` or `both` steering resolves a credentialed hostname THE SYSTEM SHALL answer SERVFAIL.
   tier:     T0
   verify:   cargo nextest run -p minimald steered_name_servfail_while_proxy_down
   <!-- fail closed: a steered name never falls back to real DNS, so the egress re-check and the audit record are never skipped; under `proxy_env` a dead listener reaches nothing already -->
+
+HTTP versions and framing
+
+- **BEP-073** WHEN the proxy terminates a box's TLS THE SYSTEM SHALL offer `http/1.1` alone in ALPN and carry the request to the upstream over HTTP/1.1.
+  tier:     T0
+  verify:   cargo nextest run -p bep proxy_offers_http11_only_on_both_legs
+  <!-- networking §5.7 (v0.9): h2 header insertion is full termination, since HPACK's dynamic table is connection-scoped; clients offering `h2, http/1.1` downgrade silently; a client requiring h2 in ALPN, gRPC libraries among them, gets a handshake refusal, the recorded v1 limit (Non-goals) -->
+
+- **BEP-074** IF a request on a terminated flow opens with the HTTP/2 prior-knowledge preface THEN THE SYSTEM SHALL close the connection.
+  tier:     T0
+  verify:   cargo nextest run -p bep h2_prior_knowledge_preface_is_closed
+  - IF a request carries `Upgrade: h2c` THEN THE SYSTEM SHALL remove it, its `Connection` token and `HTTP2-Settings`, and handle the request as HTTP/1.1.
+    tier:   T0
+    verify: cargo nextest run -p bep h2c_upgrade_is_stripped
+    <!-- networking §5.7: the same rule as the `:7654` proxy's (NET-135) -->
+
+- **BEP-075** WHERE a box's steering is `proxy_env` or its `[network.bep] proxy_env` is true, THE SYSTEM SHALL accept CONNECT over HTTP/1.1 only, and refuse Extended CONNECT and `connect-udp` in either form.
+  tier:     T0
+  verify:   cargo nextest run -p bep connect_accepted_over_http11_only
+  <!-- networking §5.7: h3 through an HTTP proxy exists only as MASQUE, absent in v1; an accepted tunnel's inner TLS is terminated under BEP-073 -->
+
+- **BEP-076** WHEN the proxy relays an upstream response THE SYSTEM SHALL remove every `Alt-Svc` header from it.
+  tier:     T0
+  verify:   cargo nextest run -p bep alt_svc_is_stripped_from_responses
+  <!-- networking §5.7 h3 discovery suppression, the response-side half of BEP-078 -->
+
+- **BEP-077** WHEN the proxy forwards a request THE SYSTEM SHALL forward a canonical re-serialization of the parsed request and never the box's head bytes.
+  tier:     T1
+  verify:   cargo nextest run -p bep prop_forwarded_head_is_canonical
+  property: for every request head the parser accepts, the forwarded head is the canonical serialization of the parsed request, and parsing it again yields the same request
+  <!-- networking §5.7 framing discipline (normative): without it a box authoring ambiguous framing desyncs the proxy's parser from the upstream's, and bytes audited as body arrive upstream as a request the audit never saw and the authority pinning never checked -->
+  - IF a request carries `Content-Length` together with `Transfer-Encoding`, duplicate or conflicting `Content-Length` values, an obsolete line fold, or a transfer coding other than a final `chunked` THEN THE SYSTEM SHALL close the connection and record an audit event marked `framing_ambiguous`.
+    tier:   T1
+    verify: cargo nextest run -p bep prop_ambiguous_framing_is_refused
+    property: for every request head, the proxy forwards it only when its framing is unambiguous under the rules listed, and refuses and audits it otherwise
+  - THE SYSTEM SHALL carry each box's requests on upstream connections no other box's requests use.
+    tier:   T0
+    verify: cargo nextest run -p bep upstream_connections_never_shared_across_boxes
+    <!-- ubiquitous; networking §5.7 -->
 
 Redemption
 
@@ -467,6 +527,10 @@ Review, audit and revocation
     tier:   T0
     verify: cargo nextest run -p minimal box_spec_marks_full_breadth_member
     <!-- event-driven; the marker the first slice exercises with `github:user-token`; BEP-057's acknowledged case renders the acknowledgement beside the same marker -->
+  - WHEN `min box spec` renders a box that declares a credentialed upstream and whose resolved `quic443` stance is allowed THE SYSTEM SHALL flag the stance, whether `allow` was declared or `auto` resolved to it.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_spec_flags_allowed_quic_stance_on_grant_box
+    <!-- networking §5.3 (v0.9): the flag keys to the resolved stance, never the input; at v1.25 rollout a running grant-holding `auto` box under `proxy_env` or `off` flips from blocked to allowed with no event of its own -->
 
 - **BEP-039** WHEN the proxy admits or refuses a request THE SYSTEM SHALL append one JSONL record under the `min/v1` audit schema carrying its `kind`, the subject box, `act` and `txn` left empty, the upstream authority, the member or store identifier or `none`, the mapped resource and permission or `module_unmapped`, the decision and any marker.
   tier:     T0
@@ -635,6 +699,7 @@ Setting secrets
 - Repository narrowing of a locally minted GitHub member: later work, the §6.4 scoped-token endpoint against the local App under the embedded client secret (Gatehouse §14.4 item 7); an open question below records the residual meanwhile.
 - An in-box re-mint path for a locally minted member or store handle: none is needed un-enrolled, because both are references resolved at the proxy on each request (BEP-005, BEP-063), and Gatehouse v1.23 closed §14.4 item 7's re-mint surface by construction. A box is re-created only for what a reference cannot cross: the root's expiry and a sealing-key or root replacement (BEP-060).
 - Reading every creation under a friendly name: the architecture names it an explicit listing convenience, never what the name means, and gives it no grammar yet; `min box audit <name>` reads one creation (BEP-042).
+- HTTP/2 and HTTP/3 through the proxy, and MASQUE: networking design §12 item 10, whose first increment is h2 termination. Until then a client that requires h2 in ALPN, such as a gRPC library, is refused at the handshake (BEP-073), the recorded v1 limit.
 - The JVM keystore: out of v1 scope by Gatehouse §6.10's trust-store injection, a recorded limit; a JVM client in a credentialed box needs its own trust configuration.
 - The box-zone resolver, DNS-pinned admission, `network.mode` and the `[network]` table's egress fields: [NET](https://github.com/gominimal/minimal/pull/1380) (NET-060, NET-066, NET-072, NET-122). This document owns `[network.bep]` (`steering`, `proxy_env`, `no_proxy`) and `quic443`; the rest of the `[network]` schema is [gominimal/inbox#570](https://github.com/gominimal/inbox/issues/570).
 - `min secret` against the Gatehouse tenant store (deposits): Gatehouse §8.6 and the architecture's `min secret` reference; here the noun binds host stores only and refuses `--store gatehouse` (BEP-050), and the two forms share one grammar.
@@ -781,6 +846,18 @@ SERVFAIL rather than falling back to real DNS, because a fallback sends the box
 direct with no egress re-check and no audit record; `proxy_env` fails closed
 for free and `dns` steering is made to match.
 
+**HTTP/1.1 on both legs, with a strict parser.** Substituting a credential
+means inserting a header after TLS termination. On HTTP/1.1 that is a parse,
+an append and a stream over a self-delimiting head, the parser the audit needs
+anyway. On h2 it is full termination: HPACK's dynamic table is shared by every
+stream on a connection, so one inserted header means decoding and re-encoding
+every header block, and gRPC pins the upstream leg to h2 as well. Networking
+design §5.7 therefore rules HTTP/1.1 on both legs in v1 (BEP-073 to BEP-076)
+and defers h2 to §12 item 10. The cost it records is h2's immunity to request
+smuggling, which is why BEP-077 re-serializes every request and refuses
+ambiguous framing: a desync between the proxy's parser and the upstream's
+would carry a request past the audit and the authority pinning.
+
 **Direct presentation to GitHub is a requirement, verified against GitHub.**
 The sealed value is not a GitHub token, so GitHub refuses it. Keeping that as
 BEP-027 costs a network test run under `--run-ignored`; dropping it to a
@@ -909,8 +986,8 @@ per-request Keychain access control.
   covered by: BEP-019, BEP-020, BEP-026, BEP-028, BEP-058, BEP-070
 
 - **Invariant:** THE SYSTEM SHALL substitute a credential only into a request whose connection authority and `Host` are one declared authority of its module or registration, on an upstream connection that authenticated as that authority.
-  enforced by: host-set membership, request-authority pinning, port discipline, name-constrained CA, upstream validation against the host trust store, TLS-only upstream legs for credentialed hosts
-  covered by: BEP-013, BEP-021, BEP-023, BEP-031, BEP-032, BEP-055, BEP-064, BEP-065
+  enforced by: host-set membership, request-authority pinning, port discipline, name-constrained CA, upstream validation against the host trust store, TLS-only upstream legs for credentialed hosts, canonical re-serialization with ambiguous framing refused, no upstream connection shared across boxes
+  covered by: BEP-013, BEP-021, BEP-023, BEP-031, BEP-032, BEP-055, BEP-064, BEP-065, BEP-077
 
 - **Invariant:** THE SYSTEM SHALL admit no credentialed reach that the box's declared egress denies.
   enforced by: full-set validation at expansion; egress re-check at redemption
