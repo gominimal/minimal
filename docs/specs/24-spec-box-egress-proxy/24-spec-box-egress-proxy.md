@@ -157,10 +157,10 @@ Minting and sealing
   verify:   cargo nextest run -p minimal local_member_is_a_sign_in_reference_expiring_with_the_root
   <!-- Gatehouse §6.10 un-enrolled bullet (v1.23): the member is `{kind: "signin", breadth: "full", jws}` in the store-handle wire format (BEP-063); its expiry is the box's credentialed-lane ceiling, the injected anchor's remaining validity (the durations are an open question below), so the member works for the life of the box within it; the GitHub module stands as its registration (BEP-064) -->
 
-- **BEP-006** WHEN a GitHub member is minted THE SYSTEM SHALL seal it to this host's proxy key with the box's id, the host, the module identifier, the host-set version, the mode, the breadth and the expiry bound in the authenticated context.
+- **BEP-006** WHEN a GitHub member is minted THE SYSTEM SHALL seal it to this host's proxy key with the box's id, the host, the module identifier, the host-set version, the mode and the expiry bound in the authenticated context, and the member's breadth in the authenticated plaintext.
   tier:     T0
   verify:   cargo nextest run -p bep sealed_context_binds_box_host_module_version_expiry
-  <!-- the module's host set and its version are Gatehouse §6.10's (Module host sets): the v1 GitHub set is `github.com`, `api.github.com`, `uploads.github.com` and `codeload.github.com`, enumerated and versioned by the module definition; every "host set" in this document reads there; the box id names one creation (BEP-070), which is all a revocation needs to name (BEP-071), so the context stays member-invariant -->
+  <!-- the module's host set and its version are Gatehouse §6.10's (Module host sets): the v1 GitHub set is `github.com`, `api.github.com`, `uploads.github.com` and `codeload.github.com`, enumerated and versioned by the module definition; every "host set" in this document reads there; the box id names one creation (BEP-070), which is all a revocation needs to name (BEP-071), so the context stays member-invariant; per-member bounds, `breadth` included, ride the plaintext so a change of member cardinality touches the plaintext alone (Gatehouse §6.10 Sealed secret) -->
 
 - **BEP-007** WHEN a sealed member is delivered THE SYSTEM SHALL place the sealed value, and no plaintext token, in the grant's environment variable in the box.
   tier:     T0
@@ -195,10 +195,10 @@ Minting and sealing
   verify:   cargo nextest run -p sessions prop_narrow_scopes_unenrolled_need_acknowledgement
   property: for every box spec on an un-enrolled host and every client configuration, expansion refuses with exit 3 iff some GitHub grant declares scopes narrower than `full` and the acknowledgement is unset
   <!-- Gatehouse §6.10 Validation, un-enrolled: the declared bound cannot be honored locally until local narrowing lands, and a warning would be the silent widening §6.4 forbids -->
-  - WHERE the user-level or organization-level client configuration sets `[secrets] acknowledge_full_breadth_unenrolled = true` THE SYSTEM SHALL mint the member `full` and render it as `full` in `min box spec` with the acknowledgement visible.
+  - WHERE the user-level or organization-level client configuration sets `[secrets] acknowledge_full_breadth_unenrolled = true` THE SYSTEM SHALL mint the member `full` and render it as `full` in `min box spec` with the acknowledgement visible and stating that it covers the member's reach for the box's life, within the credentialed lane's ceiling.
     tier:   T0
     verify: cargo nextest run -p minimal acknowledged_narrow_grant_renders_full
-    <!-- the field name is this document's; the architecture carries it as a placeholder -->
+    <!-- the field name is this document's; the architecture carries it as a placeholder; Gatehouse v1.23 extends the acknowledgement to the reference's box-lifetime reach, so the rendering names that window, not the 8-hour token it replaced -->
   - IF a project `minimal.toml` sets the acknowledgement THEN THE SYSTEM SHALL ignore it and emit a warning.
     tier:   T0
     verify: cargo nextest run -p sessions project_acknowledgement_is_ignored_with_warning
@@ -885,7 +885,11 @@ the sender's, so a stolen sibling value also reaches upstreams the thief's box
 was denied. Gatehouse accepts that interim only under the single-operator
 premise, and states its cost: malware running as the operator redeems through
 the proxy past every prompt and consent surface, for as long as the reference
-lives. T31 for host-OS compromise, which on a single-operator laptop is
+lives. The interim has a destroy-time facet too: with one shared attachment
+there is no per-box withdrawal, so a destroy while the proxy is down leaves the
+destroyed box's values redeemable from the cohort until the root expires, with
+no revocation record ever written (BEP-043's sub-requirement holds only once
+NET-133 is built). T31 for host-OS compromise, which on a single-operator laptop is
 compromise of the operator's own machine, reaching the signing key by use but
 not export; the proxy's keychain holds the sign-in's 6-month refresh material,
 usable off the host until GitHub revokes it (BEP-044 asks it to); the listener
