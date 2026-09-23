@@ -22,10 +22,6 @@ __min_rpc() {
     local error="false"
     local env_pairs=()
     local bar_open=0
-    local cols=80
-    if [[ -t 1 ]]; then
-        cols=$(__min_term_cols)
-    fi
 
     while IFS= read -r line; do
         local tag="${line%%:*}"
@@ -33,16 +29,25 @@ __min_rpc() {
         case "$tag" in
             bar)
                 # One live meter. The daemon sends a fresh line per paint;
-                # reprint it on the same row. A pipe or a log keeps the
-                # one-shot `msg:` lines and drops the redraws.
-                if [[ -t 1 && -n "$rest" ]]; then
-                    printf '\r\033[K%.*s' "$((cols - 1))" "$rest"
-                    bar_open=1
+                # reprint it on the same row, and clear the row on an empty
+                # one. A pipe or a log keeps the one-shot `msg:` lines and
+                # drops the redraws. The width is re-read per paint so a
+                # resize mid-download does not wrap the row.
+                if [[ -t 1 ]]; then
+                    if [[ -n "$rest" ]]; then
+                        printf '\r\033[K%.*s' "$(($(__min_term_cols) - 1))" "$rest"
+                        bar_open=1
+                    elif [[ "$bar_open" -eq 1 ]]; then
+                        printf '\r\033[K'
+                        bar_open=0
+                    fi
                 fi
                 ;;
             msg)
+                # Clear the meter rather than leave its last frame behind;
+                # the daemon repaints it below this line.
                 if [[ "$bar_open" -eq 1 ]]; then
-                    printf '\n'
+                    printf '\r\033[K'
                     bar_open=0
                 fi
                 echo "$rest"
@@ -58,7 +63,7 @@ __min_rpc() {
                 ;;
             error)
                 if [[ "$bar_open" -eq 1 ]]; then
-                    printf '\n'
+                    printf '\r\033[K'
                     bar_open=0
                 fi
                 echo "error:$rest" >&2
@@ -69,7 +74,7 @@ __min_rpc() {
     done < <(echo "${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
 
     if [[ "$bar_open" -eq 1 ]]; then
-        printf '\n'
+        printf '\r\033[K'
     fi
 
     if [[ ${#env_pairs[@]} -gt 0 ]]; then
