@@ -32,10 +32,8 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
-use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use futures::StreamExt as _;
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives};
 use mctx::{AddDepMode, Context, Error};
 use mfile::{EnvPatches, EnvVarValue};
@@ -891,10 +889,13 @@ impl SessionChannel {
         // on the next row; the in-sandbox helper redraws each one in place. A
         // fully-cached add emits neither and stays quiet.
         //
-        // Cloned before the two futures: `build` needs `&mut self.ctx` and
+        // Built before the two futures: `build` needs `&mut self.ctx` and
         // `render` must not borrow it as well.
-        let progress_tracker = self.ctx.op_tracker();
-        let (log_tx, mut log_rx) = futures::channel::mpsc::unbounded();
+        let progress = crate::sandbox_progress::SandboxProgress::new(
+            self.ctx.op_tracker(),
+            Some(install_scope(&new_graph, pkgs)),
+        );
+        let (log_tx, log_rx) = futures::channel::mpsc::unbounded();
         let build = async {
             // Reduce the `!Send` error (`mctx::Error` holds nickel `Rc`s) to a
             // string in the same poll it appears, so `join!` never buffers it
@@ -905,31 +906,13 @@ impl SessionChannel {
                 Err(e) => Some(e.to_string()),
             }
         };
-        let render = async {
-            let mut renderer = orchestrator::BuildRenderer::new(false);
-            let mut progress = crate::sandbox_progress::SandboxProgress::new(progress_tracker);
-            // ~12 Hz, the same cap the SSH progress renderer uses. A fetch
-            // reports every chunk; painting each one would flood the socket.
-            let mut tick = tokio::time::interval(Duration::from_millis(80));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // `interval` is ready immediately. Consume that tick so the first
-            // paint waits until a fetch has had a chance to report progress.
-            tick.tick().await;
-
-            loop {
-                tokio::select! {
-                    biased;
-                    event = log_rx.next() => {
-                        let Some(event) = event else { break };
-                        if let Some(line) = renderer.render(event) {
-                            let _ = writeln!(stream, "msg:{}", line.text);
-                        }
-                    }
-                    _ = tick.tick() => progress.refresh(stream),
+        let mut renderer = orchestrator::BuildRenderer::new(false);
+        let render =
+            crate::sandbox_progress::relay(stream, progress, log_rx, |event, progress, stream| {
+                if let Some(line) = renderer.render(event) {
+                    progress.message(stream, &line.text);
                 }
-            }
-            progress.refresh(stream);
-        };
+            });
         let (build_err, ()) = tokio::join!(build, render);
         if let Some(e) = build_err {
             let _ = writeln!(stream, "error: {e}");
@@ -1272,16 +1255,21 @@ impl SessionChannel {
         use crate::session_sop::{BuildOutcome, BuildUpdate};
         let mut renderer = orchestrator::BuildRenderer::new(flag_verbose);
         let mut outcome = None;
-        while let Some(update) = events.recv().await {
+        // The same meter as `min add`. Unscoped: this build runs on the
+        // session's own side-op, so every package row on the tree is its.
+        let progress = crate::sandbox_progress::SandboxProgress::new(self.ctx.op_tracker(), None);
+        let updates = futures::stream::poll_fn(|cx| events.poll_recv(cx));
+        crate::sandbox_progress::relay(stream, progress, updates, |update, progress, stream| {
             match update {
                 BuildUpdate::Event(event) => {
                     if let Some(line) = renderer.render(event) {
-                        let _ = writeln!(stream, "msg:{}", line.text);
+                        progress.message(stream, &line.text);
                     }
                 }
                 BuildUpdate::Finished(o) => outcome = Some(o),
             }
-        }
+        })
+        .await;
 
         // Report the propagated outcome; only success claims completion.
         match outcome {
@@ -1454,6 +1442,18 @@ impl SessionChannel {
             })
             .collect()
     }
+}
+
+/// Names of `pkgs` and of everything building or running them needs: the
+/// packages an install's progress meter reports on.
+fn install_scope(graph: &Graph, pkgs: &[(&str, BuildSpecRef)]) -> HashSet<String> {
+    let top_levels: Vec<BuildSpecRef> = pkgs.iter().map(|(_n, bsr)| *bsr).collect();
+    let deps = Transitives::for_toplevels(graph, top_levels.clone(), true);
+    top_levels
+        .iter()
+        .chain(deps.keys())
+        .filter_map(|bsr| graph.get(bsr).map(|b| b.name.clone()))
+        .collect()
 }
 
 /// A parsed `min materialize` invocation: what to materialize, plus where in
