@@ -365,6 +365,9 @@ async fn dirs_report(w: &mut BundleWriter, global: &GlobalArgs) -> Result<(), an
 mod tests {
     use super::*;
     use clap::Parser as _;
+    use std::collections::BTreeMap;
+    use tokio::io::AsyncReadExt as _;
+    use tokio_stream::StreamExt as _;
 
     /// Parses `min bug`'s arguments the way the real CLI does, so these
     /// assertions cover the `value_parser` wiring and not just the function.
@@ -416,5 +419,565 @@ mod tests {
         assert!(parse(&["--log-tail-bytes", "0"]).is_err());
         assert!(parse(&["--log-tail-bytes", "5MiB"]).is_err());
         assert!(parse(&["--log-tail-bytes", "-1"]).is_err());
+    }
+
+    // ── cmd_bug integration tests ─────────────────────────────────────────
+
+    /// Unpacks a written bundle to `bundle-relative path -> contents`.
+    ///
+    /// `cmd_bug` writes entries under a single top-level directory (the
+    /// timestamped bundle name), so the first path component is stripped to
+    /// yield the collector-relative keys the assertions use. The `root`
+    /// parameter is accepted for symmetry with the `collect.rs` helper but is
+    /// not used: the bundle name is timestamped and unknown to the caller.
+    async fn unpack(out: &std::path::Path, _root: &str) -> BTreeMap<String, Vec<u8>> {
+        let bytes = tokio::fs::read(out).await.unwrap();
+        let decoder = async_compression::tokio::bufread::ZstdDecoder::new(&bytes[..]);
+        let mut entries = async_tar::Archive::new(decoder).entries().unwrap();
+        let mut files = BTreeMap::new();
+        while let Some(entry) = entries.next().await {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut contents = Vec::new();
+            entry.read_to_end(&mut contents).await.unwrap();
+            // Drop the leading `<bundle-name>/` component.
+            let key = path
+                .split_once('/')
+                .map(|(_, rest)| rest.to_string())
+                .unwrap_or(path);
+            files.insert(key, contents);
+        }
+        files
+    }
+
+    /// `cmd_bug` with `--no-guest` produces a valid bundle with a manifest
+    /// and the expected host-side collectors.
+    #[tokio::test]
+    async fn cmd_bug_no_guest_produces_valid_bundle() {
+        let state = tempfile::TempDir::new().unwrap();
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = BugArgs {
+            output: Some(out.clone()),
+            no_guest: true,
+            guest_timeout_secs: 60,
+            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+        };
+
+        cmd_bug(&global, args).await.unwrap();
+
+        let files = unpack(&out, "r").await;
+        assert!(
+            files.contains_key("manifest.json"),
+            "bundle must contain manifest.json"
+        );
+        assert!(
+            files.contains_key("host/system.json"),
+            "bundle must contain host/system.json"
+        );
+        assert!(
+            files.contains_key("host/terminal.json"),
+            "bundle must contain host/terminal.json"
+        );
+        assert!(
+            files.contains_key("host/env.json"),
+            "bundle must contain host/env.json"
+        );
+        assert!(
+            files.contains_key("host/dirs.txt"),
+            "bundle must contain host/dirs.txt"
+        );
+        assert!(
+            files.contains_key("project/project.json"),
+            "bundle must contain project/project.json"
+        );
+
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        assert_eq!(manifest["schema_version"], 1);
+        assert!(manifest["duration_ms"].as_u64().unwrap() > 0);
+        assert!(manifest["collected"].as_array().unwrap().len() > 0);
+    }
+
+    /// `cmd_bug` with `--no-guest` records the skip reason in the manifest.
+    #[tokio::test]
+    async fn cmd_bug_no_guest_records_skip() {
+        let state = tempfile::TempDir::new().unwrap();
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = BugArgs {
+            output: Some(out.clone()),
+            no_guest: true,
+            guest_timeout_secs: 60,
+            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+        };
+
+        cmd_bug(&global, args).await.unwrap();
+
+        let files = unpack(&out, "r").await;
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let skipped = manifest["skipped"].as_array().unwrap();
+        let guest_skip = skipped
+            .iter()
+            .find(|s| s["what"].as_str().unwrap().starts_with("providers/"))
+            .or_else(|| {
+                skipped
+                    .iter()
+                    .find(|s| s["reason"].as_str().unwrap().contains("no-guest"))
+            });
+        assert!(
+            guest_skip.is_some(),
+            "manifest must record that guest collection was skipped: {skipped:?}"
+        );
+    }
+
+    /// `cmd_bug` with a state dir that has a `logs/` directory collects log
+    /// tails.
+    #[tokio::test]
+    async fn cmd_bug_collects_log_tails_when_log_dir_exists() {
+        let state = tempfile::TempDir::new().unwrap();
+        let log_dir = state.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("minimald.log"), b"daemon log content\n").unwrap();
+        std::fs::write(log_dir.join("minvmd.log"), b"vmm log content\n").unwrap();
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = BugArgs {
+            output: Some(out.clone()),
+            no_guest: true,
+            guest_timeout_secs: 60,
+            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+        };
+
+        cmd_bug(&global, args).await.unwrap();
+
+        let files = unpack(&out, "r").await;
+        assert!(
+            files.contains_key("logs/minimald.log"),
+            "bundle must contain minimald.log"
+        );
+        assert!(
+            files.contains_key("logs/minvmd.log"),
+            "bundle must contain minvmd.log"
+        );
+        assert_eq!(
+            &files["logs/minimald.log"][..],
+            b"daemon log content\n",
+            "log content must be captured verbatim"
+        );
+    }
+
+    /// `cmd_bug` with a missing log directory records the absence as a skip,
+    /// not an error.
+    #[tokio::test]
+    async fn cmd_bug_missing_log_dir_is_skip_not_error() {
+        let state = tempfile::TempDir::new().unwrap();
+        // No logs/ directory at all.
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = BugArgs {
+            output: Some(out.clone()),
+            no_guest: true,
+            guest_timeout_secs: 60,
+            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+        };
+
+        cmd_bug(&global, args).await.unwrap();
+
+        let files = unpack(&out, "r").await;
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let skipped = manifest["skipped"].as_array().unwrap();
+        let log_skip = skipped
+            .iter()
+            .find(|s| s["what"].as_str().unwrap() == "logs/");
+        assert!(
+            log_skip.is_some(),
+            "missing log dir must be recorded as a skip: {skipped:?}"
+        );
+        assert!(
+            log_skip.unwrap()["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no log directory"),
+            "skip reason must explain absence"
+        );
+    }
+
+    /// `cmd_bug` with a state dir that has provider directories records
+    /// provider files.
+    #[tokio::test]
+    async fn cmd_bug_collects_provider_files() {
+        let state = tempfile::TempDir::new().unwrap();
+        let providers_dir = state.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&providers_dir).unwrap();
+        // A minvmd.toml so the provider-files collector has something to
+        // read.
+        std::fs::write(
+            providers_dir.join("minvmd.toml"),
+            b"state = \"running\"\npid = 42\n",
+        )
+        .unwrap();
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = BugArgs {
+            output: Some(out.clone()),
+            no_guest: true,
+            guest_timeout_secs: 60,
+            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+        };
+
+        cmd_bug(&global, args).await.unwrap();
+
+        let files = unpack(&out, "r").await;
+        assert!(
+            files.contains_key("providers/local-minvmd0/dir-listing.txt"),
+            "bundle must contain provider dir listing"
+        );
+        assert!(
+            files.contains_key("providers/local-minvmd0/minvmd.toml"),
+            "bundle must contain minvmd.toml"
+        );
+    }
+
+    /// `cmd_bug` with a state dir that has no providers records the absence
+    /// as a skip.
+    #[tokio::test]
+    async fn cmd_bug_no_providers_is_skip() {
+        let state = tempfile::TempDir::new().unwrap();
+        // No providers/ directory.
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = BugArgs {
+            output: Some(out.clone()),
+            no_guest: true,
+            guest_timeout_secs: 60,
+            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+        };
+
+        cmd_bug(&global, args).await.unwrap();
+
+        let files = unpack(&out, "r").await;
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let skipped = manifest["skipped"].as_array().unwrap();
+        let providers_skip = skipped
+            .iter()
+            .find(|s| s["what"].as_str().unwrap() == "providers/");
+        assert!(
+            providers_skip.is_some(),
+            "no providers must be recorded as a skip: {skipped:?}"
+        );
+    }
+
+    /// `cmd_bug` with `--no-guest` records the skip for each provider.
+    #[tokio::test]
+    async fn cmd_bug_no_guest_records_per_provider_skip() {
+        let state = tempfile::TempDir::new().unwrap();
+        let providers_dir = state.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&providers_dir).unwrap();
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = BugArgs {
+            output: Some(out.clone()),
+            no_guest: true,
+            guest_timeout_secs: 60,
+            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+        };
+
+        cmd_bug(&global, args).await.unwrap();
+
+        let files = unpack(&out, "r").await;
+        assert!(
+            files.contains_key("providers/local-minvmd0/guest/error.txt"),
+            "bundle must contain guest skip record"
+        );
+        let error_txt =
+            String::from_utf8(files["providers/local-minvmd0/guest/error.txt"].clone()).unwrap();
+        assert!(
+            error_txt.contains("no-guest"),
+            "guest skip must mention --no-guest: {error_txt}"
+        );
+    }
+
+    /// `cmd_bug` with `--log-tail-bytes` set to a small value tail-caps
+    /// large log files.
+    #[tokio::test]
+    async fn cmd_bug_tail_caps_large_logs() {
+        let state = tempfile::TempDir::new().unwrap();
+        let log_dir = state.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        // Write a log file larger than the cap.
+        let content = vec![b'A'; 2048];
+        std::fs::write(log_dir.join("minimald.log"), &content).unwrap();
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = BugArgs {
+            output: Some(out.clone()),
+            no_guest: true,
+            guest_timeout_secs: 60,
+            log_tail_bytes: 1024,
+        };
+
+        cmd_bug(&global, args).await.unwrap();
+
+        let files = unpack(&out, "r").await;
+        let log_contents = &files["logs/minimald.log"];
+        assert_eq!(
+            log_contents.len(),
+            1024,
+            "log must be tail-capped to 1024 bytes"
+        );
+        // The tail of the file (last 1024 bytes of all 'A's).
+        assert!(
+            log_contents.iter().all(|&b| b == b'A'),
+            "tail-capped content must be the last bytes of the file"
+        );
+
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let collected = manifest["collected"].as_array().unwrap();
+        let log_entry = collected
+            .iter()
+            .find(|e| e["path"].as_str().unwrap() == "logs/minimald.log")
+            .unwrap();
+        assert_eq!(
+            log_entry["redaction"].as_str().unwrap(),
+            "tail-capped",
+            "large log must be marked tail-capped"
+        );
+    }
+
+    /// `cmd_bug` with a config dir that has a `config.toml` collects it
+    /// redacted. `--config-dir` names the *parent* of the `minimal/`
+    /// subdirectory, so the file lives at `<config-dir>/minimal/config.toml`.
+    #[tokio::test]
+    async fn cmd_bug_collects_config_redacted() {
+        let state = tempfile::TempDir::new().unwrap();
+        let config_parent = state.path().join("config");
+        let config_dir = config_parent.join("minimal");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            b"token = \"secret-value\"\n",
+        )
+        .unwrap();
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            config_dir: Some(config_parent),
+            ..Default::default()
+        };
+        let args = BugArgs {
+            output: Some(out.clone()),
+            no_guest: true,
+            guest_timeout_secs: 60,
+            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+        };
+
+        cmd_bug(&global, args).await.unwrap();
+
+        let files = unpack(&out, "r").await;
+        assert!(
+            files.contains_key("config/config.toml.redacted"),
+            "bundle must contain redacted config"
+        );
+        let redacted = String::from_utf8(files["config/config.toml.redacted"].clone()).unwrap();
+        assert!(
+            !redacted.contains("secret-value"),
+            "redacted config must not contain the secret: {redacted}"
+        );
+    }
+
+    /// `cmd_bug` with a state dir that has a `state/` subdirectory collects
+    /// a state listing.
+    #[tokio::test]
+    async fn cmd_bug_collects_state_listing() {
+        let state = tempfile::TempDir::new().unwrap();
+        // Create a minimal state structure.
+        std::fs::create_dir_all(state.path().join("sessions")).unwrap();
+        std::fs::write(state.path().join("sessions").join("active"), b"session-1\n").unwrap();
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = BugArgs {
+            output: Some(out.clone()),
+            no_guest: true,
+            guest_timeout_secs: 60,
+            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+        };
+
+        cmd_bug(&global, args).await.unwrap();
+
+        let files = unpack(&out, "r").await;
+        assert!(
+            files.contains_key("state/listing.txt"),
+            "bundle must contain state listing"
+        );
+    }
+
+    /// `cmd_bug` with a state dir that has a `mesh-enrolment` file collects
+    /// it under `config/mesh-enrolment`.
+    #[tokio::test]
+    async fn cmd_bug_collects_mesh_enrolment() {
+        let state = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            state.path().join("mesh-enrolment"),
+            b"mesh enrolment data\n",
+        )
+        .unwrap();
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = BugArgs {
+            output: Some(out.clone()),
+            no_guest: true,
+            guest_timeout_secs: 60,
+            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+        };
+
+        cmd_bug(&global, args).await.unwrap();
+
+        let files = unpack(&out, "r").await;
+        assert!(
+            files.contains_key("config/mesh-enrolment"),
+            "bundle must contain mesh-enrolment under config/"
+        );
+        assert_eq!(
+            &files["config/mesh-enrolment"][..],
+            b"mesh enrolment data\n",
+            "mesh-enrolment must be captured verbatim"
+        );
+    }
+
+    /// `cmd_bug` with no `mesh-enrolment` file omits it without error: an
+    /// un-enrolled install is a normal state, not a finding.
+    #[tokio::test]
+    async fn cmd_bug_missing_mesh_enrolment_is_absent_not_error() {
+        let state = tempfile::TempDir::new().unwrap();
+        // No mesh-enrolment file.
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = BugArgs {
+            output: Some(out.clone()),
+            no_guest: true,
+            guest_timeout_secs: 60,
+            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+        };
+
+        cmd_bug(&global, args).await.unwrap();
+
+        let files = unpack(&out, "r").await;
+        assert!(
+            !files.contains_key("config/mesh-enrolment"),
+            "an un-enrolled install must not produce a mesh-enrolment entry"
+        );
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let errors = manifest["errors"].as_array().unwrap();
+        assert!(
+            errors.is_empty(),
+            "missing mesh-enrolment must not be recorded as an error: {errors:?}"
+        );
+    }
+
+    /// `cmd_bug` with a `config/loadouts/` directory under the resolved
+    /// config dir collects loadout definitions.
+    #[tokio::test]
+    async fn cmd_bug_collects_loadout_definitions() {
+        let state = tempfile::TempDir::new().unwrap();
+        // `--config-dir` names the *parent* of the `minimal/` subdirectory.
+        let loadouts_dir = state.path().join("minimal").join("loadouts");
+        std::fs::create_dir_all(&loadouts_dir).unwrap();
+        std::fs::write(loadouts_dir.join("default.toml"), b"name = \"default\"\n").unwrap();
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            config_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        };
+        let args = BugArgs {
+            output: Some(out.clone()),
+            no_guest: true,
+            guest_timeout_secs: 60,
+            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+        };
+
+        cmd_bug(&global, args).await.unwrap();
+
+        let files = unpack(&out, "r").await;
+        assert!(
+            files.contains_key("config/loadouts/default.toml.redacted"),
+            "bundle must contain redacted loadout definition"
+        );
     }
 }
