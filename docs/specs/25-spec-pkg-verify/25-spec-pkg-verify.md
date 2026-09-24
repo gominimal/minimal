@@ -153,7 +153,7 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   verify:   cargo nextest run -p verify vendored_root_append_only_and_version_monotonic
 
 - **PKV-015** WHERE a well-known trust-root URL and a pinned meta-key are configured THE SYSTEM SHALL fetch the published root, verify its meta-key signature, refuse a root whose version is lower than the vendored one or than the highest version it has previously accepted (a persistent high-water mark, advanced only after a fetched root verified), and cache it; the vendored root SHALL remain the floor, so a replayed older root can neither reopen a closed signer nor undo a tightened plane. The production URL and the meta-key's custody wait on gominimal/arch#91 (Open questions); the behaviour is tested against a fixture URL and a test meta-key.
-  tier:     T0
+  tier:     T1
   verify:   cargo nextest run -p verify wellknown_root_fetch_verify_version_floor
   property: accept(root_fetched) ⇒ version(root_fetched) ≥ max(version(root_vendored), high_water) ∧ high_water' = version(root_fetched)
 
