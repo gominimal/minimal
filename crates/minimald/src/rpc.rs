@@ -2860,6 +2860,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_session_to_its_current_name_is_an_error() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        // `fresh_session` names the session "stream-test"; renaming it to that
+        // same name must fail rather than silently no-op.
+        let resp = client
+            .call::<RenameSession>(&RenameSessionRequest {
+                id: session_id,
+                new_name: "stream-test".to_string(),
+            })
+            .await;
+
+        assert!(
+            matches!(&resp, Errorable::Err { error } if error.contains("session is already named")),
+            "expected a rename-to-self error, got {resp:?}",
+        );
+
+        // The failed rename left the name intact.
+        let mngr = server.state.sessions_manager().await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("freshly-created session should be retrievable");
+        let record = handle.record().await.unwrap();
+        assert_eq!(record.name.as_deref(), Some("stream-test"));
+    }
+
+    #[tokio::test]
     async fn rename_session_errors_for_unknown_id() {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
