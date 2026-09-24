@@ -22,12 +22,21 @@
 #
 # Usage:
 #   scripts/pkg-smoke.sh [--pkg-dir DIR] [--formats deb,rpm,apk]
-#                        [--apparmor] [--keep-boxes]
+#                        [--built-version VER] [--apparmor] [--keep-boxes]
 #
 #   --pkg-dir DIR   Where the packages are (default: dist/, package-nfpm.sh's
 #                   OUT_DIR default). Passed through as an absolute path, so
 #                   keep it under $HOME for the box to see it.
 #   --formats LIST  Comma-separated subset of deb,rpm,apk (default: all three).
+#   --built-version VER
+#                   The canonical version the packaged binaries REPORT (e.g.
+#                   0.6.0 or 0.6.0-dev.10.g8e7e72c2). Needed on a channel
+#                   package: the manager records the normalized version
+#                   (0.6.0~dev.10.g8e7e72c2 on deb/rpm) while `min --version`
+#                   prints the canonical one, so the package filename can no
+#                   longer stand in for it. Defaults to the version derived
+#                   from the package filename, which is exact for a released
+#                   semver.
 #   --apparmor      Also run the deb box with apparmor installed (see above).
 #   --keep-boxes    Leave the boxes behind for manual poking (default: removed
 #                   even on failure, so reruns start clean).
@@ -44,6 +53,7 @@ usage() { sed -n '2,/^set -euo/{/^set -euo/!p;}' "$0" | sed 's/^# \{0,1\}//'; }
 
 pkg_dir="dist"
 formats="deb,rpm,apk"
+built_version=""
 apparmor=0
 keep_boxes=0
 while [ $# -gt 0 ]; do
@@ -52,6 +62,8 @@ while [ $# -gt 0 ]; do
                      pkg_dir="$2"; shift 2 ;;
         --formats)   [ $# -ge 2 ] || die "--formats needs a value (e.g. deb,rpm)"
                      formats="$2"; shift 2 ;;
+        --built-version) [ $# -ge 2 ] || die "--built-version needs a value"
+                     built_version="$2"; shift 2 ;;
         --apparmor)  apparmor=1; shift ;;
         --keep-boxes) keep_boxes=1; shift ;;
         -h|--help)   usage; exit 0 ;;
@@ -256,7 +268,13 @@ for i in "${!boxes[@]}"; do
     fi
 
     note "== $name: verifying binaries run =="
-    if ! box "$i" sh -c "$(check_binaries | sed "s/PROBE_VERSION/${want%%-*}/")"; then
+    # The binary reports the CANONICAL built version; the manager records the
+    # NORMALIZED one the filename carries. They differ on a channel package
+    # (0.6.0-dev.x vs 0.6.0~dev.x), so the expected value is either the one the
+    # caller passed or, for a released semver, the filename's version.
+    want_bin="$built_version"
+    [ -n "$want_bin" ] || want_bin="${want%%-*}"
+    if ! box "$i" sh -c "$(check_binaries | sed "s/PROBE_VERSION/${want_bin}/")"; then
         note "$name: binary check failed"
         failed=1
         continue

@@ -9,9 +9,19 @@
 #     platform-suffixed files stage-release.sh is about to hash and upload).
 #     Packages are built in the same run as the binaries, before anything is
 #     staged, so the .deb/.rpm/.apk ship the exact bytes the run smokes.
-#   * otherwise — the staged versions/<PKGVER>/ row in the installer bucket
+#   * otherwise — the staged versions/<ROW>/ row in the installer bucket
 #     (scripts/stage-release.sh), each download verified against the row's
 #     `components` manifest before use.
+#
+# One package NAME (`minimal`) serves every channel: on the consuming side a
+# channel is a repo/suite (`deb http://… <suite> main`), so a user installs one
+# version at a time and there is no file-conflict problem. What the channel
+# changes here is only the VERSION STRING, via scripts/package-version.sh: a
+# stable semver stays byte-identical, while a dev build's `-dev.<N>.g<sha>`
+# tail becomes deb/rpm `~` (sorts below the release, so enabling a channel
+# suite never silently upgrades a stable user) and apk `_`. The built version
+# is read from the row's staged `version` file rather than re-derived from the
+# row name, which for a nightly is a bare sha.
 #
 # Either way it generates shell completions from the built `min` (the
 # scripts/dist-build.sh technique) and runs the pinned nfpm — fetched and
@@ -19,19 +29,27 @@
 # scripts/fetch-gvproxy.sh — once per format x arch against
 # packaging/nfpm.yaml.
 #
-# This script only produces packages. Repo-tree hosting — reprepro/aptly for
-# apt, createrepo_c for dnf/yum, apk index for apk, and serving from the
-# /repo/{apt,dnf,apk}/ bucket prefixes — lives in the infra/ repo, not here.
-# CI uploads $OUT_DIR as the staged row versions/<version>/pkg/.
+# This script only produces packages and their per-row layout; it hosts no
+# repo trees. CI uploads $OUT_DIR as the staged row versions/<version>/pkg/,
+# and the channel a row belongs to is recorded by the channel pointer files
+# (scripts/set-channel.sh), not by the package.
 #
-# Usage: scripts/package-nfpm.sh [--formats deb,rpm,apk]
+# Usage:
+#   scripts/package-nfpm.sh [--channel stable|unstable|nightly] [--formats deb,rpm,apk]
 #
 # Env:
-#   PKGVER              Required. The semver WITHOUT the v prefix (X.Y.Z,
-#                       optional -prerelease/+build tail). Without
+#   PKGVER              Required. The ROW the artifacts come from: the semver
+#                       WITHOUT the v prefix (X.Y.Z, optional -prerelease/+build
+#                       tail) on the stable channel, or the short sha of a
+#                       staged nightly/unstable row on a channel. Without
 #                       ARTIFACTS_DIR, artifacts are fetched from
 #                       <bucket>/versions/$PKGVER/ — the same names the AUR
 #                       PKGBUILD's source arrays use.
+#   BUILT_VERSION       Optional. The canonical built version string (what the
+#                       binaries report, e.g. 0.6.0-dev.10.g8e7e72c2). Set this
+#                       in ARTIFACTS_DIR mode on a channel; without it (and
+#                       without ARTIFACTS_DIR) the version is read from
+#                       <bucket>/versions/$PKGVER/version.
 #   ARTIFACTS_DIR       Optional. Directory of local build output holding
 #                       <name>-linux-{amd64,arm64} for minimal, minimald,
 #                       mip, minvmd, and gvproxy; nothing is downloaded.
@@ -66,15 +84,24 @@ usage() {
 }
 
 FORMATS_INPUT="deb,rpm,apk"
+CHANNEL="stable"
 while [ $# -gt 0 ]; do
     case "$1" in
         --formats)
             [ $# -ge 2 ] || die "--formats needs a value (e.g. deb,rpm,apk)"
             FORMATS_INPUT="$2"; shift 2 ;;
+        --channel)
+            [ $# -ge 2 ] || die "--channel needs a value (stable, unstable, nightly)"
+            CHANNEL="$2"; shift 2 ;;
         -h|--help) usage 0 ;;
         *)        die "unknown argument: $1 (try --help)" ;;
     esac
 done
+
+case "$CHANNEL" in
+    stable|unstable|nightly) ;;
+    *) die "unknown --channel '$CHANNEL' (want stable, unstable, or nightly)" ;;
+esac
 
 # Normalize the format list: canonical order, no duplicates, unknown names
 # rejected.
@@ -98,14 +125,49 @@ for f in deb rpm apk; do
 done
 [ "${#FORMATS_OUT[@]}" -gt 0 ] || die "--formats selected nothing (want a subset of deb,rpm,apk)"
 
-[ -n "${PKGVER:-}" ] || die "PKGVER is required (the promoted semver, without the v prefix)"
+[ -n "${PKGVER:-}" ] || die "PKGVER is required (the row: a semver without the v prefix, or a staged sha)"
 case "$PKGVER" in
     v*) die "PKGVER must not carry the v prefix: '$PKGVER' (use ${PKGVER#v})" ;;
 esac
-printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' \
-    || die "PKGVER '$PKGVER' is not a semver X.Y.Z (optional -prerelease/+build)"
+# stable is a versioned release: the row IS a released semver. A channel row is
+# a commit sha (nightly/unstable are sha-row-only — the stable package already
+# represents a versioned row's bytes), so the row name alone cannot be the
+# version and the built version comes from the row's `version` file below.
+if [ "$CHANNEL" = stable ]; then
+    printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' \
+        || die "PKGVER '$PKGVER' is not a semver X.Y.Z (optional -prerelease/+build) on the stable channel"
+else
+    case "$PKGVER" in
+        *[!0-9a-f]*) die "PKGVER '$PKGVER' is not a commit sha — the $CHANNEL channel ships sha rows only (a versioned row's bytes are represented by the stable package)" ;;
+    esac
+    len="${#PKGVER}"
+    [ "$len" -ge 7 ] && [ "$len" -le 40 ] \
+        || die "PKGVER '$PKGVER' is not a 7-40 character commit sha on the $CHANNEL channel"
+fi
 
 BUCKET_URL="${MINIMAL_BUCKET_URL:-https://storage.googleapis.com/minimal-one}"
+
+# ROW is the staged bucket row the artifacts come from; PKGVER (the row) is
+# replaced by the per-format package version only at the nfpm invocation below.
+ROW="$PKGVER"
+
+# Resolve the canonical built version (what the binaries report) — the source
+# of every package version string. It is NEVER re-derived from the row name:
+# a dev version is 0.6.0-dev.10.g<sha>, which no row name encodes.
+if [ -n "${BUILT_VERSION:-}" ]; then
+    VERSION="$BUILT_VERSION"
+elif [ -n "${ARTIFACTS_DIR:-}" ]; then
+    # Local build output, no staged row to read: stable's version is its row
+    # name; a channel must be told the built version (release.yml has it).
+    [ "$CHANNEL" = stable ] \
+        || die "BUILT_VERSION is required on the $CHANNEL channel in ARTIFACTS_DIR mode (the built version string, e.g. 0.6.0-dev.10.g8e7e72c2)"
+    VERSION="$PKGVER"
+else
+    VERSION="$(curl -fsSL --retry 3 "$BUCKET_URL/versions/$ROW/version")" \
+        || die "cannot download $BUCKET_URL/versions/$ROW/version — a row staged before the version file existed cannot be packaged from the bucket (backfill it with --extra, see scripts/backfill-version-row.sh)"
+fi
+printf '%s\n' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+_-]+)?$' \
+    || die "resolved version '$VERSION' is not a canonical X.Y.Z (optional -prerelease/+build) version"
 
 # nfpm.yaml's maintainer field env-expands this.
 MAINTAINER="${MAINTAINER:-minimal <security@minimal.dev>}"
@@ -222,9 +284,9 @@ else
     # is checked against it BEFORE anything chmods, executes, or packages it:
     # a corrupted, truncated, or wrongly-staged object must fail this job, not
     # enter the .deb/.rpm/.apk that users install.
-    manifest_url="$BUCKET_URL/versions/$PKGVER/components"
+    manifest_url="$BUCKET_URL/versions/$ROW/components"
     curl -fsSL --retry 3 -o "$workdir/components" "$manifest_url" \
-        || die "cannot download $manifest_url — is $PKGVER staged in the bucket? (see stage-release.sh)"
+        || die "cannot download $manifest_url — is $ROW staged in the bucket? (see stage-release.sh)"
 
     declare -A manifest_sha=()
     while IFS= read -r row; do
@@ -234,21 +296,21 @@ else
         [ "${#cols[@]}" -eq 8 ] || die "unexpected components row in $manifest_url: $row"
         src="${cols[7]}"
         case "$src" in
-            "versions/$PKGVER/"*) manifest_sha["${src##*/}"]="${cols[4]}" ;;
+            "versions/$ROW/"*) manifest_sha["${src##*/}"]="${cols[4]}" ;;
             *) ;; # symlink rows and other versions' rows carry no artifact here
         esac
     done <"$workdir/components"
 
-    [ "${#manifest_sha[@]}" -gt 0 ] || die "no artifact rows for $PKGVER in the staged components manifest"
+    [ "${#manifest_sha[@]}" -gt 0 ] || die "no artifact rows for $ROW in the staged components manifest"
 
     for arch in amd64 arm64; do
         art_dir="$artifacts_root/$arch"
         mkdir -p "$art_dir"
         for entry in "${ARTIFACTS[@]}"; do
             IFS='|' read -r staged installed <<<"$entry"
-            url="$BUCKET_URL/versions/$PKGVER/${staged}-linux-${arch}"
+            url="$BUCKET_URL/versions/$ROW/${staged}-linux-${arch}"
             curl -fsSL --retry 3 -o "$art_dir/$installed" "$url" \
-                || die "cannot download $url — is $PKGVER staged in the bucket? (see stage-release.sh)"
+                || die "cannot download $url — is $ROW staged in the bucket? (see stage-release.sh)"
             want="${manifest_sha[${staged}-linux-${arch}]:-}"
             [ -n "$want" ] \
                 || die "no digest for ${staged}-linux-${arch} in the staged components manifest — refusing to package an unverified artifact"
@@ -317,11 +379,16 @@ EOF
 # --- Package ------------------------------------------------------------------
 # One nfpm run per (format, arch): the config's ${NFPM_ARCH} and the
 # per-arch ${ARTIFACT_DIR} come from the environment, as do the other
-# expanded fields (see packaging/nfpm.yaml's header).
+# expanded fields (see packaging/nfpm.yaml's header). ${PKGVER} is the
+# PACKAGE version, not the row: it is the canonical built version normalized
+# into this format's charset by scripts/package-version.sh (`~` for deb/rpm,
+# `_` for apk). For a released semver that normalization is the identity.
 for format in "${FORMATS_OUT[@]}"; do
+    pkg_version="$("$ROOT/scripts/package-version.sh" --format "$format" "$VERSION")" \
+        || die "cannot normalize version '$VERSION' for $format"
     for arch in amd64 arm64; do
-        echo "package-nfpm: $format/$arch -> $OUT_DIR"
-        PKGVER="$PKGVER" \
+        echo "package-nfpm: $format/$arch version $pkg_version (row $ROW) -> $OUT_DIR"
+        PKGVER="$pkg_version" \
         NFPM_ARCH="$arch" \
         ARTIFACT_DIR="$artifacts_root/$arch" \
         COMPLETIONS_DIR="$completions_dir" \

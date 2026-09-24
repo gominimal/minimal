@@ -8,7 +8,10 @@
 # that a dry run downloads, checksums, renders the PKGBUILD fully stamped (the
 # reviewer-visible failure mode was five template defects reaching review
 # unexercised), regenerates .SRCINFO, and pushes nothing — plus that a
-# prerelease PKGVER is refused. Run directly or via `just test-shell`.
+# prerelease PKGVER is refused. A second block drives the channel path
+# (--channel nightly, sha row, version file): the channel package name, _row,
+# normalized pkgver, the conflicts list, the renamed install hook, and the
+# LICENSE copy, plus the channel refusals. Run directly or via `just test-shell`.
 
 set -euo pipefail
 
@@ -47,6 +50,17 @@ artifacts=(
 for a in "${artifacts[@]}"; do
     printf 'payload of %s\n' "$a" >"$bucket/$a"
 done
+
+# A channel row: the same 13 artifacts (distinct content, so distinct digests)
+# plus the canonical-version file the publisher reads to derive pkgver. The sha
+# is the one in the plan's example version string.
+chrow="8e7e72c2"
+cbucket="$root/bucket/versions/$chrow"
+mkdir -p "$cbucket"
+for a in "${artifacts[@]}"; do
+    printf 'channel payload of %s\n' "$a" >"$cbucket/$a"
+done
+printf '0.6.0-dev.10.g8e7e72c2\n' >"$cbucket/version"
 
 # A bare "AUR" repo with a committed PKGBUILD + .SRCINFO to diff against.
 aur="$root/aur.git"
@@ -105,6 +119,17 @@ run_dry() {
         "$script" --dry-run
 }
 
+run_channel_dry() {
+    # Same shape, but a channel: PKGVER is the sha row, and pkgver comes from
+    # the row's version file rather than from PKGVER itself.
+    env -u SSH_AUTH_SOCK \
+        PKGVER="$chrow" \
+        AUR_REPO_URL="file://$aur" \
+        MINIMAL_BUCKET_URL="file://$root/bucket" \
+        AUR_SSH_PRIVATE_KEY="not-a-real-key" \
+        "$script" --channel nightly --dry-run
+}
+
 # --- the dry run --------------------------------------------------------------
 
 out="$(run_dry 2>&1)"
@@ -161,6 +186,62 @@ else
     bad "the fixture remote is untouched (advanced to $pushed)"
 fi
 
+# --- the channel dry run ------------------------------------------------------
+
+out="$(run_channel_dry 2>&1)"
+rc=$?
+
+if [ "$rc" -eq 0 ]; then ok "channel dry run succeeds against fixtures"; else bad "channel dry run succeeds against fixtures (rc=$rc; out: $out)"; fi
+if [[ "$out" == *"nothing committed, nothing pushed"* ]]; then
+    ok "channel dry run commits and pushes nothing"
+else
+    bad "channel dry run commits and pushes nothing (out: $out)"
+fi
+if grep -qE '^\+.*@@' <<<"$out"; then
+    bad "channel PKGBUILD carries unrendered @@tokens@@"
+else
+    ok "channel PKGBUILD carries no @@tokens@@"
+fi
+if [[ "$out" == *'+pkgname=minimal-nightly-bin'* ]]; then
+    ok "channel renders the nightly pkgname"
+else
+    bad "channel renders the nightly pkgname (out: $out)"
+fi
+if [[ "$out" == *"+_row=$chrow"* ]]; then
+    ok "channel points _row at the sha row"
+else
+    bad "channel points _row at the sha row (out: $out)"
+fi
+if [[ "$out" == *'+pkgver=0.6.0.dev.10.g8e7e72c2'* ]]; then
+    ok "channel derives the normalized pkgver from the version file"
+else
+    bad "channel derives the normalized pkgver from the version file (out: $out)"
+fi
+if [[ "$out" == *"+conflicts=('minimal-bin' 'minimal-unstable-bin')"* ]]; then
+    ok "channel conflicts with the other two channel packages"
+else
+    bad "channel conflicts with the other two channel packages (out: $out)"
+fi
+if [[ "$out" == *'+install=minimal-nightly-bin.install'* ]]; then
+    ok "channel install hook is named for the package"
+else
+    bad "channel install hook is named for the package (out: $out)"
+fi
+if [[ "$out" == *'a/LICENSE b/LICENSE'* ]]; then
+    ok "channel copies LICENSE into the AUR clone"
+else
+    bad "channel copies LICENSE into the AUR clone (out: $out)"
+fi
+
+# The channel dry run pushed nothing either.
+pushed="$(git -C "$seed" fetch -q origin && git -C "$seed" rev-parse origin/master)"
+seeded="$(git -C "$seed" rev-parse master)"
+if [ "$pushed" = "$seeded" ]; then
+    ok "the fixture remote is untouched after the channel run"
+else
+    bad "the fixture remote is untouched after the channel run (advanced to $pushed)"
+fi
+
 # --- refusals -----------------------------------------------------------------
 
 expect 1 "not a RELEASED semver" "prerelease PKGVER is refused" -- \
@@ -170,6 +251,18 @@ expect 1 "not a RELEASED semver" "prerelease PKGVER is refused" -- \
 expect 1 "cannot download" "a missing bucket artifact fails the run" -- \
     env PKGVER=9.9.9 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
         AUR_SSH_PRIVATE_KEY=k "$script" --dry-run
+
+expect 1 "versioned row" "a semver row on a channel is refused" -- \
+    env PKGVER=0.6.0 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
+        AUR_SSH_PRIVATE_KEY=k "$script" --channel nightly --dry-run
+
+expect 1 "must be staged by a build that writes the version file" "a channel row with no version file is refused" -- \
+    env PKGVER=deadbeef AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
+        AUR_SSH_PRIVATE_KEY=k "$script" --channel nightly --dry-run
+
+expect 1 "unknown --channel" "an unknown channel is refused" -- \
+    env PKGVER=0.5.4 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
+        AUR_SSH_PRIVATE_KEY=k "$script" --channel beta --dry-run
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -3,11 +3,14 @@
 # publish-brew_test.sh — test harness for scripts/publish-brew.sh.
 #
 # Drives the publisher end to end against fixtures: a local bare "tap" repo to
-# clone and a local file:// release-asset base (MINIMAL_RELEASE_URL), with no
-# GITHUB_TOKEN and no ssh-agent. Asserts that a dry run downloads the four
-# macOS assets, checksums them, renders the formula fully stamped — including
-# the libkrun dylib installed into the prefix's lib/, which @loader_path/../lib
-# resolves — and pushes nothing. Run directly or via `just test-shell`.
+# clone and a local file:// asset base (MINIMAL_RELEASE_URL for stable,
+# MINIMAL_BUCKET_URL for channels), with no GITHUB_TOKEN and no ssh-agent.
+# Asserts that a dry run downloads the four macOS assets, checksums them,
+# renders the formula fully stamped — including the libkrun dylib installed
+# into the prefix's lib/, which @loader_path/../lib resolves — and pushes
+# nothing. Covers the stable formula (GitHub Release url) and a channel formula
+# (bucket row url, explicit version, `livecheck { skip }`), plus the refusals.
+# Run directly or via `just test-shell`.
 
 set -euo pipefail
 
@@ -47,6 +50,19 @@ release="$releases/v0.5.4"
 assets=(minimal-macos-arm64 minvmd-macos-arm64 gvproxy-darwin-arm64 libkrun-macos-arm64.dylib)
 for a in "${assets[@]}"; do
     printf 'mach-o payload of %s\n' "$a" >"$release/$a"
+done
+
+# The channel fixture: an immutable staged row versions/<short-sha>/ holding a
+# `version` file (the canonical built version) and the same four asset
+# basenames. Content differs from the release assets so the digests do, too.
+bucket="$root/bucket"
+row="8e7e72c2"                       # 8-char lowercase-hex short sha row
+canonical="0.6.0-dev.10.g8e7e72c2"   # what the row's version file holds
+rowdir="$bucket/versions/$row"
+mkdir -p "$rowdir"
+printf '%s\n' "$canonical" >"$rowdir/version"
+for a in "${assets[@]}"; do
+    printf 'mach-o payload of %s at %s\n' "$a" "$row" >"$rowdir/$a"
 done
 
 # A bare "tap" repo with a committed formula to diff against.
@@ -90,6 +106,16 @@ run_dry() {
         BREW_TAP_REPO="file://$tap" \
         MINIMAL_RELEASE_URL="file://$root/releases/v$ver" \
         "$script" --dry-run
+}
+
+run_dry_channel() {
+    local channel="${1:?usage: run_dry_channel <channel> <row>}" row="${2:?}"
+    # Same no-credential shape, but the asset base is the bucket's versions/<row>.
+    env -u SSH_AUTH_SOCK -u GITHUB_TOKEN \
+        PKGVER="$row" \
+        BREW_TAP_REPO="file://$tap" \
+        MINIMAL_BUCKET_URL="file://$root/bucket" \
+        "$script" --channel "$channel" --dry-run
 }
 
 # --- the dry run --------------------------------------------------------------
@@ -146,13 +172,87 @@ else
     bad "the fixture remote is untouched (advanced to $pushed)"
 fi
 
+# --- the channel dry run ------------------------------------------------------
+
+out="$(run_dry_channel nightly "$row" 2>&1)"
+rc=$?
+
+if [ "$rc" -eq 0 ]; then ok "nightly dry run succeeds without credentials"; else bad "nightly dry run succeeds without credentials (rc=$rc; out: $out)"; fi
+if [[ "$out" == *"nothing committed, nothing pushed"* ]]; then
+    ok "nightly dry run commits and pushes nothing"
+else
+    bad "nightly dry run commits and pushes nothing (out: $out)"
+fi
+if grep -qE '^\+.*@@' <<<"$out"; then
+    bad "nightly formula carries unrendered @@tokens@@"
+else
+    ok "nightly formula carries no @@tokens@@"
+fi
+if [[ "$out" == *'class MinimalNightly < Formula'* ]]; then
+    ok "nightly formula declares class MinimalNightly"
+else
+    bad "nightly formula declares class MinimalNightly (out: $out)"
+fi
+if [[ "$out" == *"version \"$canonical\""* ]]; then
+    ok "nightly formula pins the canonical built version"
+else
+    bad "nightly formula pins the canonical built version (out: $out)"
+fi
+if [[ "$out" == *'livecheck do'* && "$out" == *'skip'* ]]; then
+    ok "nightly formula skips livecheck (pinned to one staged row)"
+else
+    bad "nightly formula skips livecheck (out: $out)"
+fi
+if [[ "$out" == *"file://$root/bucket/versions/$row/minimal-macos-arm64"* ]]; then
+    ok "nightly formula urls point at the bucket row"
+else
+    bad "nightly formula urls point at the bucket row (out: $out)"
+fi
+if [[ "$out" == *'b/Formula/minimal-nightly.rb'* ]]; then
+    ok "the nightly formula renders to Formula/minimal-nightly.rb"
+else
+    bad "the nightly formula renders to Formula/minimal-nightly.rb (out: $out)"
+fi
+
+# Every 64-hex digest in the diff must be one of the channel row's assets'.
+digests="$(for a in "${assets[@]}"; do sha256_file "$rowdir/$a"; done)"
+stamped_ok=1
+count=0
+while IFS= read -r sha; do
+    count=$((count + 1))
+    grep -qx "$sha" <<<"$digests" || stamped_ok=0
+done < <(grep -oE '[0-9a-f]{64}' <<<"$out" | sort -u)
+if [ "$count" -eq "${#assets[@]}" ] && [ "$stamped_ok" -eq 1 ]; then
+    ok "nightly checksums in the diff are the row assets' real digests"
+else
+    bad "nightly checksums in the diff are the row assets' real digests (found $count distinct, want ${#assets[@]})"
+fi
+
+pushed="$(git -C "$seed" fetch -q origin && git -C "$seed" rev-parse origin/main)"
+if [ "$pushed" = "$seeded" ]; then
+    ok "the nightly dry run left the fixture remote untouched"
+else
+    bad "the nightly dry run left the fixture remote untouched (advanced to $pushed)"
+fi
+
 # --- refusals -----------------------------------------------------------------
 
-expect 1 "not a RELEASED semver" "prerelease PKGVER is refused (Homebrew has no channels)" -- \
+expect 1 "not a RELEASED semver" "prerelease PKGVER is refused by --channel stable" -- \
     env -u SSH_AUTH_SOCK -u GITHUB_TOKEN PKGVER=0.6.0-rc.1 BREW_TAP_REPO="file://$tap" \
         MINIMAL_RELEASE_URL="file://$root/releases/v0.6.0-rc.1" "$script" --dry-run
 
 expect 1 "cannot download" "a missing release asset fails the run" -- run_dry 9.9.9
+
+expect 1 "sha row, not the semver" "a semver row with --channel nightly is refused" -- \
+    env -u SSH_AUTH_SOCK -u GITHUB_TOKEN PKGVER=0.6.0 BREW_TAP_REPO="file://$tap" \
+        MINIMAL_BUCKET_URL="file://$root/bucket" "$script" --channel nightly --dry-run
+
+expect 1 "version file" "a channel row missing its version file is refused" -- \
+    run_dry_channel nightly deadbeef
+
+expect 1 "unknown --channel" "an unknown channel is refused" -- \
+    env -u SSH_AUTH_SOCK -u GITHUB_TOKEN PKGVER="$row" BREW_TAP_REPO="file://$tap" \
+        MINIMAL_BUCKET_URL="file://$root/bucket" "$script" --channel beta --dry-run
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

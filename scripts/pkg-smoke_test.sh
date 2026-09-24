@@ -51,6 +51,14 @@ case "$1" in
                 exit 0 ;;
             *does\ not\ run*)
                 [ "${FAIL_AT:-}" = binary ] && exit 1
+                # The probe script carries the version it expects as the quoted
+                # argument of its `grep -q "..."`; honor it, so a smoke that
+                # compares against the wrong version is really caught.
+                want="$(printf '%s' "$payload" | sed -n 's/.*grep -q "\([^"]*\)".*/\1/p')"
+                if [ -n "$want" ] && [ "$want" != "${STUB_BASE_VERSION:?}" ]; then
+                    echo "min ${STUB_BASE_VERSION} (wanted $want)" >&2
+                    exit 1
+                fi
                 echo "min ${STUB_BASE_VERSION:?}"
                 exit 0 ;;
             *dpkg\ -r*|*dnf\ remove*|*apk\ del*)
@@ -152,5 +160,37 @@ log_has "install-apparmor-profile" || fail "apparmor check never ran"
 run_smoke --pkg-dir "$dist" --formats rpm --apparmor &&
     fail "--apparmor without deb exited zero"
 grep -q "needs the deb box" "$root/out.log" || fail "apparmor/deb interaction message absent"
+
+# --- 9. channel packages: normalized manager version, canonical binary version --
+# nfpm names a dev-build channel package after the NORMALIZED version (deb
+# 0.6.0~dev.10.g8e7e72c2-1, apk 0.6.0_dev…-r1), while the packaged `min` still
+# reports the CANONICAL 0.6.0-dev.10.g8e7e72c2. --built-version is what bridges
+# the two; without it the filename-derived value would be compared against the
+# binary's output and every channel smoke would fail.
+channel_dist="$root/channel-dist"
+mkdir -p "$channel_dist"
+: >"$channel_dist/minimal_0.6.0~dev.10.g8e7e72c2-1_amd64.deb"
+: >"$channel_dist/minimal-0.6.0~dev.10.g8e7e72c2-1.x86_64.rpm"
+: >"$channel_dist/minimal_0.6.0_dev.10.g8e7e72c2-r1_x86_64.apk"
+
+: >"$STUB_LOG"
+STUB_DEB_VERSION='0.6.0~dev.10.g8e7e72c2-1' \
+STUB_RPM_VERSION='0.6.0~dev.10.g8e7e72c2-1' \
+STUB_APK_VERSION='0.6.0_dev.10.g8e7e72c2-r1' \
+STUB_BASE_VERSION='0.6.0-dev.10.g8e7e72c2' \
+    run_smoke --pkg-dir "$channel_dist" --built-version 0.6.0-dev.10.g8e7e72c2 ||
+    fail "channel smoke exited non-zero: $(cat "$root/out.log")"
+log_has "create --name min-test-deb" || fail "channel deb box not created"
+
+# The flag must actually gate the comparison: the canonical version does not
+# contain the filename's normalized form, so a wrong --built-version is caught.
+: >"$STUB_LOG"
+STUB_DEB_VERSION='0.6.0~dev.10.g8e7e72c2-1' \
+STUB_RPM_VERSION='0.6.0~dev.10.g8e7e72c2-1' \
+STUB_APK_VERSION='0.6.0_dev.10.g8e7e72c2-r1' \
+STUB_BASE_VERSION='0.6.0-dev.10.g8e7e72c2' \
+    run_smoke --pkg-dir "$channel_dist" --formats deb --built-version 0.0.0-wrong &&
+    fail "a wrong --built-version exited zero"
+grep -q "binary check failed" "$root/out.log" || fail "wrong --built-version was not caught"
 
 echo "pkg-smoke_test: all assertions passed"

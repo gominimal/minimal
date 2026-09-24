@@ -87,11 +87,18 @@ echo "backfill-version-row: fetched $n artifact(s) from $SHA"
 # stage-release.sh owns the row layout, the manifest, and the cache headers;
 # --allow-missing because an old release may lack artifacts the current table
 # lists. Fails loudly if a REQUIRED artifact is absent.
+#
+# The row's `version` file is the restaged semver: downstream packagers read it
+# rather than assuming the row name is the version, and this row IS a versioned
+# release, so the semver is exactly what its binaries report (the sha row's own
+# version file says 0.6.0-dev.N.g<sha>, which is not this row's version).
+printf '%s\n' "$SEMVER" >"$workdir/version"
 stage_args=(
     --artifacts-dir "$artifacts"
     --version "$SEMVER"
     --bucket "$BUCKET"
     --allow-missing
+    --extra "$workdir/version"
 )
 [ "$DRY_RUN" -eq 1 ] && stage_args+=(--dry-run)
 script_dir="$(cd "$(dirname "$0")" && pwd)"

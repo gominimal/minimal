@@ -62,6 +62,8 @@ curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/stable' | sh
 
 This installs the stable channel of Minimal, adds `min` to your PATH, and sets up shell completions for bash, fish, and zsh.
 
+Minimal also ships native packages. On Linux the `.deb`, `.rpm`, and `.apk` packages keep the name `minimal`, and the channel is the repository or suite you enable. The AUR and Homebrew packages carry the channel in their names: `minimal-bin`, `minimal-unstable-bin`, and `minimal-nightly-bin` on the AUR, and `minimal`, `minimal-unstable`, and `minimal-nightly` in the `gominimal/minimal` tap. Install one channel at a time, because every package provides the same `min` command.
+
 Minimal can be uninstalled with:
 
 ```shell

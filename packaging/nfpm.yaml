@@ -5,7 +5,12 @@
 #
 # Environment: nfpm expands ${VAR} in the metadata fields below and in every
 # content entry marked `expand: true`. scripts/package-nfpm.sh exports:
-#   PKGVER           the promoted semver, without the v prefix
+#   PKGVER           the package version, already normalized into this
+#                    format's charset by scripts/package-version.sh (a stable
+#                    semver is unchanged; a dev build gets `~` on deb/rpm and
+#                    `_` on apk). The package NAME is always `minimal` — a
+#                    channel is a repo/suite on the consuming side, not a
+#                    different package.
 #   NFPM_ARCH        amd64 or arm64 (one nfpm run per arch)
 #   ARTIFACT_DIR     per-arch dir of the staged static binaries, already
 #                    renamed to their installed names (min, minimald, mip,

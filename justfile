@@ -165,29 +165,35 @@ minimald-build:
 dist-build target:
     scripts/dist-build.sh {{quote(target)}}
 
-# Build the .deb/.rpm/.apk packages for a staged semver release from the
+# Build the .deb/.rpm/.apk packages for a staged release row from the
 # installer bucket via the pinned nfpm (fetched + sha256-verified by the
-# script). Packages land in dist/. Apt/dnf/apk repo-tree hosting lives in the
-# infra repo, not here. (The release workflow builds them from its own
-# artifacts instead — ARTIFACTS_DIR mode — before the row is staged.)
+# script). Packages land in dist/. The package NAME is always `minimal`; the
+# channel argument picks the row semantics and the version normalization:
+# `stable` takes a promoted semver, `unstable`/`nightly` take a staged sha row
+# and read the row's version file (scripts/package-version.sh turns a dev
+# version into the manager's charset — `~` on deb/rpm, `_` on apk). (The
+# release workflow builds them from its own artifacts instead — ARTIFACTS_DIR
+# mode — before the row is staged.)
 #
-# The semver row must exist: every versioned release build stages one;
-# releases up to and including 0.5.3 need scripts/backfill-version-row.sh
-# first. Linux-only for the same host-check reason as dist-build: the script
-# downloads static musl ELFs and runs the downloaded `min` to generate
-# completions.
+# The row must exist and carry a `version` file: every release build stages
+# both now; older rows need scripts/backfill-version-row.sh first. Linux-only
+# for the same host-check reason as dist-build: the script downloads static
+# musl ELFs and runs the downloaded `min` to generate completions.
 [linux]
-pkg-nfpm pkgver:
-    PKGVER={{quote(pkgver)}} scripts/package-nfpm.sh
+pkg-nfpm pkgver channel="stable":
+    PKGVER={{quote(pkgver)}} scripts/package-nfpm.sh --channel {{quote(channel)}}
 
 # Install-smoke packages built by pkg-nfpm (default OUT_DIR: dist/) in
 # throwaway distrobox boxes named min-test-{deb,rpm,apk}: the package manager
 # accepts and records the exact version, every shipped path exists, the
 # binaries run on the box's libc, and an uninstall round-trip cleans up. This
 # is the pre-publish ritual from the review feedback — run it before staging a
-# tag; the CI-native container smoke is a separate, follow-up lane. Distrobox
-# drives everything (no apx, no raw podman — see the script header); boxes are
-# removed even on failure unless --keep-boxes is passed through.
+# tag. release.yml runs the same script in CI (the `smoke-packages` job), so
+# the container smoke is no longer a follow-up lane. Distrobox drives
+# everything (no apx, no raw podman — see the script header); boxes are
+# removed even on failure unless --keep-boxes is passed through. A channel
+# package's manager version differs from the version the binary reports, so
+# pass --built-version <canonical> to check both (see the script's --help).
 # Linux-only: needs distrobox and a container engine on the host.
 [linux]
 pkg-smoke pkgdir="dist" *args:

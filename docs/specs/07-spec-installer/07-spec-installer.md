@@ -711,6 +711,26 @@ the rename so executability appears atomically.
 field loses information. `src` is bucket-root-relative to keep versioned
 artifacts addressable independent of the `stable`/`unstable` pointer.
 
+**Native packages track the same channels.** The channel pointers this spec
+resolves are also what the native package-manager channels key on. The Linux
+packages keep one name (`minimal`) with the channel distinguishing the
+repo/suite, so a user installs one version at a time; the AUR and Homebrew
+formulae carry the channel in the package name:
+
+| Target   | nfpm (`deb`/`rpm`/`apk`) | AUR | Homebrew |
+|---|---|---|---|
+| `stable` | `minimal` | `minimal-bin` | `minimal` |
+| `unstable` | `minimal` | `minimal-unstable-bin` | `minimal-unstable` |
+| `nightly` | `minimal` | `minimal-nightly-bin` | `minimal-nightly` |
+
+A channel package's version is the built version string normalized into that
+manager's charset (see
+[docs/internal/release-pipeline.md](../../internal/release-pipeline.md#channel-packages)),
+so a stable semver stays byte-identical while a dev build sorts below it —
+enabling a channel never silently upgrades a user who is on stable. The AUR
+and Homebrew formulae are generated from this repo's templates and pin one
+immutable staged row each, so they are "prebuilt" packages, not VCS packages.
+
 ## Repository Standards
 
 The installer is a standalone shell script (not a Rust crate) plus a small

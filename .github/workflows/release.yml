@@ -887,20 +887,31 @@ jobs:
               run: rm -f artifacts/temp-*
             - name: Make binaries executable
               run: chmod +x artifacts/*-*-*
-            - name: Build the distro packages (versioned release only)
+            - name: Build the distro packages
               # .deb/.rpm/.apk for both Linux arches from THIS run's binaries
               # (ARTIFACTS_DIR mode, no bucket round-trip), via the pinned
-              # nfpm. They are attached to the draft release below, staged as
-              # versions/<semver>/pkg/ by stage-installer, and the .deb is
-              # install-smoked by smoke-linux-amd64 — all the same bytes.
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
+              # nfpm. Built for EVERY row: a channel package's deb/rpm/apk
+              # differs from stable's only in the version string, which
+              # scripts/package-version.sh derives from the version this run
+              # reports (BUILT_VERSION), so a nightly row gets `~`/`_` and
+              # sorts below the stable release. Stable's semver normalizes to
+              # itself, keeping those bytes identical. They are attached to
+              # the draft release below, staged as versions/<row>/pkg/ by
+              # stage-installer, and install-smoked by smoke-linux-amd64 — all
+              # the same bytes.
               env:
-                  PKGVER: ${{ needs.assert-version.outputs.release_version }}
+                  PKGVER: ${{ needs.assert-version.outputs.version }}
+                  BUILT_VERSION: ${{ needs.compute-version-string.outputs.version }}
                   ARTIFACTS_DIR: artifacts
                   OUT_DIR: ${{ runner.temp }}/dist
-              run: scripts/package-nfpm.sh
+              run: |
+                  # The channel only picks the row semantics here (stable =
+                  # versioned row, a channel = sha row); the package version is
+                  # the same whichever sha-row channel consumes it.
+                  channel=stable
+                  [ -n "${{ needs.assert-version.outputs.release_version }}" ] || channel=unstable
+                  scripts/package-nfpm.sh --channel "$channel"
             - name: Upload distro packages
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: packages
@@ -1002,7 +1013,7 @@ jobs:
         # step, so it is skipped entirely on a dry run.
         runs-on: ubuntu-latest
         timeout-minutes: 20
-        needs: [assert-version, release]
+        needs: [assert-version, compute-version-string, release]
         if: ${{ !inputs.dry_run }}
         permissions:
             contents: read
@@ -1022,12 +1033,24 @@ jobs:
               with:
                   name: release-notes
                   path: ${{ runner.temp }}/notes
-            - name: Download distro packages (versioned release only)
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
+            - name: Download distro packages
               uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: packages
                   path: ${{ runner.temp }}/dist
+            - name: Write the row's version file
+              # The row must describe the version it BUILT, so that downstream
+              # packagers (publish-aur.sh, publish-brew.sh, package-nfpm.sh in
+              # bucket mode) normalize a dev version like
+              # 0.6.0-dev.10.g8e7e72c2 without re-deriving it from the row name
+              # — a nightly row is a bare sha. Uploaded as versions/<row>/version
+              # by stage-release.sh's --extra (basename = `version`).
+              env:
+                  VERSION: ${{ needs.assert-version.outputs.version }}
+                  VERSION_STRING: ${{ needs.compute-version-string.outputs.version }}
+              run: |
+                  printf '%s\n' "$VERSION_STRING" > "$RUNNER_TEMP/version"
+                  echo "staging versions/$VERSION/version = $VERSION_STRING"
             - name: Authenticate to Google Cloud (installer bucket)
               # Distinct project + workload-identity pool from the release job's
               # minimal-shim auth; this one grants write to gs://minimal-one.
@@ -1037,22 +1060,21 @@ jobs:
                   workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
             - name: Stage release into installer bucket
               # Upload versions/<version>/{components,<artifacts>,install.sh,
-              # notes.md[,pkg/]}. Inert on its own: changes nothing users
-              # receive until a channel points at it. Staged rows are
+              # notes.md,version[,pkg/]}. Inert on its own: changes nothing
+              # users receive until a channel points at it. Staged rows are
               # write-once — a row that already exists fails here before any
               # object is touched — unless `restage` was set to re-run a
               # versioned build that failed after staging.
               env:
                   VERSION: ${{ needs.assert-version.outputs.version }}
-                  RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
                   RESTAGE: ${{ inputs.restage }}
                   NOTES: ${{ runner.temp }}/notes/notes.md
                   DIST: ${{ runner.temp }}/dist
               run: |
                   set -euo pipefail
                   args=(--artifacts-dir artifacts --version "$VERSION" --bucket gs://minimal-one)
-                  args+=(--extra scripts/install.sh --extra "$NOTES")
-                  [ -z "$RELEASE_VERSION" ] || args+=(--pkg-dir "$DIST")
+                  args+=(--extra scripts/install.sh --extra "$NOTES" --extra "$RUNNER_TEMP/version")
+                  args+=(--pkg-dir "$DIST")
                   [ "$RESTAGE" != "true" ] || args+=(--restage)
                   scripts/stage-release.sh "${args[@]}"
 
@@ -1072,8 +1094,10 @@ jobs:
         # and pass the session e2e. Mirrors ci-linux-native's `native-daemon-e2e`
         # job, but against the release artifacts instead of a target/debug build.
         # A versioned build additionally installs the .deb it packaged and
-        # checks the installed `min` reports the release version.
-        needs: [assert-version, release]
+        # checks the installed `min` reports the release version; a channel row
+        # checks the normalized version the manager records and the canonical
+        # version the binary reports.
+        needs: [assert-version, compute-version-string, release]
         runs-on: ubuntu-latest
         timeout-minutes: 30
         permissions:
@@ -1121,8 +1145,7 @@ jobs:
               # No E2E_* knobs: native target, host daemon, and the e2e seeds its
               # own project workspace (E2E_PROJECT_DIR defaults to the checkout).
               run: ./scripts/session-e2e.sh
-            - name: Download the distro packages (versioned release only)
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
+            - name: Download the distro packages
               uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: packages
@@ -1130,22 +1153,27 @@ jobs:
             - name: Install the .deb and check the version it reports
               # The package is installed from the file (no repo), so this
               # proves the .deb built from this run's bytes installs on a
-              # stock Ubuntu and its `min` reports the release version. Runs
-              # AFTER the e2e so the PATH-first shipped binaries above are what
-              # the e2e exercised; /usr/bin/min is addressed explicitly.
-              if: ${{ needs.assert-version.outputs.release_version != '' }}
+              # stock Ubuntu, that the package manager records the NORMALIZED
+              # version (the dev-build `~` form on a channel row), and that the
+              # installed `min` still reports the canonical built version.
+              # Runs AFTER the e2e so the PATH-first shipped binaries above are
+              # what the e2e exercised; /usr/bin/min is addressed explicitly.
               env:
-                  RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
+                  BUILT_VERSION: ${{ needs.compute-version-string.outputs.version }}
                   PKG: ${{ runner.temp }}/pkg
               run: |
                   set -euo pipefail
                   deb="$(find "$PKG" -maxdepth 1 -name '*amd64*.deb' | head -n 1)"
                   [ -n "$deb" ] || { echo "::error::no amd64 .deb among the packages"; ls -l "$PKG"; exit 1; }
+                  pkg_version="$(scripts/package-version.sh --format deb "$BUILT_VERSION")"
                   sudo apt-get install -y "$deb"
+                  recorded="$(dpkg-query -W -f='${Version}' minimal)"
+                  [ "$recorded" = "${pkg_version}-1" ] \
+                    || { echo "::error::dpkg records 'minimal' at '$recorded', expected '${pkg_version}-1'"; exit 1; }
                   got="$(/usr/bin/min -V | awk '{print $2}')"
-                  [ "$got" = "$RELEASE_VERSION" ] \
-                    || { echo "::error::installed min reports '$got', expected '$RELEASE_VERSION'"; exit 1; }
-                  echo "installed $(basename "$deb"): min -V reports $got"
+                  [ "$got" = "$BUILT_VERSION" ] \
+                    || { echo "::error::installed min reports '$got', expected '$BUILT_VERSION'"; exit 1; }
+                  echo "installed $(basename "$deb"): minimal $recorded, min -V reports $got"
 
     smoke-linux-kvm:
         # DM3 (native Linux + a minvmd/libkrun microVM): boot a REAL microVM from
@@ -1395,6 +1423,51 @@ jobs:
                   path: ${{ runner.temp }}/cli-e2e-boot.log
                   if-no-files-found: ignore
 
+    smoke-packages:
+        # The INSTALL smoke for the .deb/.rpm/.apk this run packaged: a real
+        # package-manager install in throwaway distrobox boxes (Debian, Fedora,
+        # Alpine), asserting the manager records the NORMALIZED version
+        # (scripts/package-version.sh — `~` on deb/rpm, `_` on apk for a dev
+        # build), the shipped paths land, the binaries run on the box's libc
+        # (static musl), and an uninstall round-trip cleans up. This is the
+        # same scripts/pkg-smoke.sh the justfile's `just pkg-smoke` runs — the
+        # "CI-native container smoke" that used to be a follow-up. It runs on
+        # the channel packages too, so a stable cut is no longer where the
+        # packaging path is first exercised.
+        needs: [assert-version, compute-version-string, release]
+        runs-on: ubuntu-latest
+        timeout-minutes: 40
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Download the distro packages
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: packages
+                  path: ${{ runner.temp }}/pkg
+            - name: Install distrobox and podman
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y distrobox podman
+            - name: Allow unqualified image names
+              # Rootless podman refuses `debian:latest` unless docker.io is a
+              # configured unqualified-search-registry, and the distrobox box
+              # images are named exactly that way. A fresh apt install does not
+              # guarantee the entry, so write it.
+              run: |
+                  sudo mkdir -p /etc/containers/registries.conf.d
+                  printf 'unqualified-search-registries = ["docker.io"]\n' \
+                    | sudo tee /etc/containers/registries.conf.d/000-unqualified.conf
+            - name: Install-smoke every package in its distrobox
+              env:
+                  BUILT_VERSION: ${{ needs.compute-version-string.outputs.version }}
+                  PKG: ${{ runner.temp }}/pkg
+              run: |
+                  scripts/pkg-smoke.sh --pkg-dir "$PKG" --built-version "$BUILT_VERSION" --apparmor
+
     smoke-success:
         # Skip-tolerant gate that `record-smoked` needs: the shipped-artifact
         # smokes must pass BEFORE the row is marked smoked. `if: always()` so a
@@ -1404,7 +1477,7 @@ jobs:
         # two Linux smokes are never skipped when `release` ran, so a green
         # here always means they passed.
         if: always()
-        needs: [smoke-linux-amd64, smoke-linux-kvm, smoke-macos]
+        needs: [smoke-linux-amd64, smoke-linux-kvm, smoke-macos, smoke-packages]
         runs-on: ubuntu-latest
         timeout-minutes: 5
         permissions:
@@ -1467,3 +1540,53 @@ jobs:
                     --channel unstable \
                     --version "$VERSION" \
                     --bucket gs://minimal-one
+
+    # --- Channel packages: publish the unstable channel's AUR and Homebrew
+    # packages, AFTER the smoke and the pointer advance above. The invariant is
+    # build -> smoke -> publish: a package may never be published for bytes
+    # that have not passed their smoke. Both jobs are idempotent (the AUR
+    # publisher no-ops when the PKGBUILD is unchanged, the tap publisher when
+    # the formula is), so a re-run or a skipped night is safe.
+    #
+    # SHA-ROW ONLY: a versioned row's bytes are what the stable package
+    # represents, so the channel packages are built and published for sha rows
+    # alone (the nfpm packages for a versioned row already exist in its pkg/,
+    # and set-channel has pointed unstable at that same row).
+    publish-aur-unstable:
+        needs: [assert-version, record-smoked]
+        if: ${{ !inputs.dry_run && needs.assert-version.outputs.release_version == '' }}
+        runs-on: ubuntu-latest
+        container: archlinux:base-devel
+        timeout-minutes: 30
+        permissions:
+            contents: read
+        steps:
+            - name: Install git and openssh
+              # base-devel carries neither; curl is already in the image.
+              run: pacman -Syu --noconfirm --needed git openssh
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Publish minimal-unstable-bin to the AUR
+              env:
+                  PKGVER: ${{ needs.assert-version.outputs.version }}
+                  AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+              run: scripts/publish-aur.sh --channel unstable --verify-build
+
+    publish-brew-unstable:
+        needs: [assert-version, record-smoked]
+        if: ${{ !inputs.dry_run && needs.assert-version.outputs.release_version == '' }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Publish minimal-unstable to gominimal/homebrew-minimal
+              env:
+                  PKGVER: ${{ needs.assert-version.outputs.version }}
+                  BREW_TAP_REPO: https://github.com/gominimal/homebrew-minimal.git
+                  GITHUB_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}
+              run: scripts/publish-brew.sh --channel unstable

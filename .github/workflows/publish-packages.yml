@@ -106,7 +106,7 @@ jobs:
               env:
                   PKGVER: ${{ needs.publish-release.outputs.semver }}
                   AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-              run: scripts/publish-aur.sh
+              run: scripts/publish-aur.sh --verify-build
 
     publish-brew:
         # Homebrew has no channels, so the tap is stable-only and publishes on
