@@ -1018,8 +1018,83 @@ fn is_microvm_init(pid: u32, argv0: Option<&std::ffi::OsStr>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_microvm_init;
+    use super::*;
     use std::ffi::OsStr;
+
+    /// Builds a `Cli` for a native (UDS) daemon with deterministic state and
+    /// cache overrides, so path-derived assertions do not depend on the
+    /// ambient `$XDG_*`/home environment.
+    fn test_cli(instance_num: u32) -> Cli {
+        Cli {
+            command: Command::Run(ListenArgs {
+                instance_num,
+                vsock: false,
+                mount_dev: false,
+                mount_rootfs: None,
+                mk_mount_state_volume: None,
+                rlimit_nofile: None,
+                timekeep_listener_port: None,
+                detach: false,
+                gvproxy_bin: None,
+            }),
+            global_args: GlobalArgs {
+                minimal_state_dir: Some(CwdRelative::from(
+                    DaemonAbsPath::try_new("/tmp/minimald-test-state").unwrap(),
+                )),
+                minimal_cache_dir: Some(CwdRelative::from(
+                    DaemonAbsPath::try_new("/tmp/minimald-test-cache").unwrap(),
+                )),
+                stdlib_dir: None,
+                num_parallel_builds: None,
+            },
+        }
+    }
+
+    #[test]
+    fn cli_resolves_state_and_cache_overrides() {
+        let cli = test_cli(0);
+        assert_eq!(cli.minimal_state_dir().as_str(), "/tmp/minimald-test-state");
+        assert_eq!(cli.minimal_cache_dir().as_str(), "/tmp/minimald-test-cache");
+    }
+
+    #[test]
+    fn cli_instance_num_defaults_to_zero_without_run() {
+        let cli = Cli {
+            command: Command::Completions(CompletionsArgs { shell: Shell::Bash }),
+            global_args: GlobalArgs {
+                minimal_state_dir: None,
+                minimal_cache_dir: None,
+                stdlib_dir: None,
+                num_parallel_builds: None,
+            },
+        };
+        assert_eq!(cli.instance_num(), 0);
+    }
+
+    #[test]
+    fn cli_instance_num_reads_run_args() {
+        assert_eq!(test_cli(7).instance_num(), 7);
+    }
+
+    #[test]
+    fn cli_ssh_args_proxy_targets_the_listen_socket() {
+        let cli = test_cli(0);
+        let (opts, name) = cli.ssh_args();
+        let proxy = opts
+            .iter()
+            .find(|(k, _)| *k == "ProxyCommand")
+            .expect("ssh_args must include a ProxyCommand");
+        assert!(proxy.1.contains(cli.listen_on().as_str()));
+        assert_eq!(name, "local-minimald0");
+    }
+
+    #[test]
+    fn cli_listen_on_points_at_instance_ssh_sock() {
+        let cli = test_cli(3);
+        let sock = cli.listen_on();
+        assert!(sock.as_str().ends_with("/ssh.sock"));
+        assert!(sock.as_str().contains("local-minimald3"));
+    }
 
     #[test]
     fn the_microvm_init_is_pid_1_named_init() {
