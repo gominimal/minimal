@@ -831,8 +831,10 @@ async fn session_policy_prints_valid_json() {
     let policy: Value = serde_json_lenient::from_str(stdout.trim())
         .expect("session policy output must be valid JSON");
     // A NoNet session has no egress/ingress config: both fields are null.
-    assert_eq!(policy["egress"], Value::Null);
-    assert_eq!(policy["ingress"], Value::Null);
+    // `get` (not `["k"]`): indexing a missing key also yields `Null`, so the
+    // lookup must assert the field is present as well as null.
+    assert_eq!(policy.get("egress"), Some(&Value::Null));
+    assert_eq!(policy.get("ingress"), Some(&Value::Null));
 }
 
 // --- helpers ---
