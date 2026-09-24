@@ -1511,8 +1511,18 @@ mod tests {
         )
         .unwrap();
 
+        // An empty `[vars]` policy, isolated from the developer's real
+        // config, so the variable is always unapproved and the run always
+        // reaches the refusal asserted below rather than the inherited
+        // lookup a permissive developer policy would allow.
+        let config = tempfile::tempdir().unwrap();
+        let minimal_dir = config.path().join("minimal");
+        std::fs::create_dir_all(&minimal_dir).unwrap();
+        std::fs::write(minimal_dir.join("user_policy.toml"), "[vars]\n").unwrap();
+
         let global = GlobalArgs {
             repo_dir: Some(project.path().to_path_buf()),
+            config_dir: Some(config.path().to_path_buf()),
             no_input: true,
             ..Default::default()
         };
