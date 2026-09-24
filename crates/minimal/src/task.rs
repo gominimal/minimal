@@ -1493,4 +1493,98 @@ mod tests {
         assert!(msg.contains("unknown task 'deploy'"), "got: {msg}");
         assert!(msg.contains("declared tasks: build"), "got: {msg}");
     }
+
+    /// `cmd_task_run` resolves a task's `env_vars` against the invoking
+    /// shell *before* it ever touches the daemon. With an empty policy and
+    /// no terminal, a declared `{ inherit = true }` variable is refused by
+    /// the non-interactive hook, so the run fails client-side — naming the
+    /// task, the count, and the policy file to edit — with no session
+    /// created and no daemon required. This pins the policy-rejection leg
+    /// of the entry path; the daemon-backed run/finalize legs need a live
+    /// daemon and are covered by the session e2e, not a unit test.
+    #[tokio::test]
+    async fn cmd_task_run_refuses_an_unapproved_inherited_var_client_side() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            b"[tasks.build]\nexec = 'true'\nenv_vars.ZZ_TASK_TOKEN = { inherit = true }\n",
+        )
+        .unwrap();
+
+        let global = GlobalArgs {
+            repo_dir: Some(project.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        let args = TaskRunArgs {
+            task: "build".into(),
+            path: None,
+            keep: false,
+        };
+
+        let err = cmd_task_run(&global, args)
+            .await
+            .expect_err("an unapproved inherited variable must be refused before the daemon");
+        let msg = err.to_string();
+        assert!(msg.contains("task 'build'"), "names the task: {msg}");
+        assert!(
+            msg.contains("1 environment variable"),
+            "names the count: {msg}"
+        );
+        assert!(
+            msg.contains("policy does not allow"),
+            "names the gate: {msg}"
+        );
+    }
+
+    /// `cmd_task_run` resolves a task's `env_vars` against the invoking
+    /// shell *before* it ever touches the daemon: an `{ inherit = true }`
+    /// variable the policy allows but that is not set in this shell fails
+    /// client-side — naming the task, the variable, and the fix — with no
+    /// session created and no daemon required. This pins the unset-inherited
+    /// leg of the entry path; the daemon-backed run/finalize legs need a
+    /// live daemon and are covered by the session e2e, not a unit test.
+    #[tokio::test]
+    async fn cmd_task_run_rejects_an_unset_inherited_var_client_side() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            b"[tasks.build]\nexec = 'true'\nenv_vars.ZZ_MINIMAL_TASK_RUN_UNSET_INHERITED = { inherit = true }\n",
+        )
+        .unwrap();
+
+        // A policy that allows the variable, so the gate does not refuse it
+        // and the unset-inherited lookup is what fails.
+        let config = tempfile::tempdir().unwrap();
+        let minimal_dir = config.path().join("minimal");
+        std::fs::create_dir_all(&minimal_dir).unwrap();
+        std::fs::write(
+            minimal_dir.join("user_policy.toml"),
+            "[vars]\nallow = [\"ZZ_MINIMAL_TASK_RUN_UNSET_INHERITED\"]\n",
+        )
+        .unwrap();
+
+        let global = GlobalArgs {
+            repo_dir: Some(project.path().to_path_buf()),
+            config_dir: Some(config.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        let args = TaskRunArgs {
+            task: "build".into(),
+            path: None,
+            keep: false,
+        };
+
+        let err = cmd_task_run(&global, args)
+            .await
+            .expect_err("an unset inherited variable must be rejected before the daemon");
+        let msg = err.to_string();
+        assert!(msg.contains("task 'build'"), "names the task: {msg}");
+        assert!(
+            msg.contains("ZZ_MINIMAL_TASK_RUN_UNSET_INHERITED"),
+            "names the variable: {msg}"
+        );
+        assert!(msg.contains("export it"), "names the fix: {msg}");
+    }
 }
