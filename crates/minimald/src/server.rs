@@ -911,9 +911,9 @@ impl HostProxyStartup {
     /// Spawns the serve loop for a bound listener. Runs for the daemon's
     /// lifetime; the startup retry never rebinds a bound-and-served listener.
     async fn spawn_serve(&self, state: &ServerStateHandle, listener: TcpListener) {
-        use crate::net::proxy::{Router, serve};
         #[cfg(feature = "networking-proxy")]
         use crate::net::proxy::serve_https;
+        use crate::net::proxy::{Router, serve};
 
         let router = Router::new(state.sessions_manager().await.hostnames());
         match self {
@@ -1359,7 +1359,9 @@ mod tests {
     #[tokio::test]
     async fn listener_retries_with_backoff() {
         // Hold an address so the startup retry's binds fail deterministically.
-        let held = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let held = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let addr = held.local_addr().unwrap();
 
         let buf = CaptureWriter::default();
@@ -1370,7 +1372,9 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None).await.unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
         // A compressed schedule: first retry 5 ms after the failure, doubling
         // to a 20 ms cap, so a loop's worth of failures costs milliseconds.
         let retrier = tokio::spawn(drive_proxy_until_serving(
@@ -1382,7 +1386,12 @@ mod tests {
         // Three failures are enough to see the doubling and the cap.
         let mut saw_three_warnings = false;
         for _ in 0..200 {
-            if buf.contents().matches("could not bind its listener").count() >= 3 {
+            if buf
+                .contents()
+                .matches("could not bind its listener")
+                .count()
+                >= 3
+            {
                 saw_three_warnings = true;
                 break;
             }
