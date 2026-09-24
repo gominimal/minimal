@@ -71,6 +71,18 @@ pub struct NetPlan {
     isolate_netns: bool,
     tap: Option<TapSpec>,
     resolver: Resolver,
+    hosts: Vec<HostEntry>,
+}
+
+/// A static `name → address` line the container build writes into the
+/// sandbox's `/etc/hosts`, so a name the box's resolver does not know still
+/// answers (NSS consults `/etc/hosts` before DNS).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEntry {
+    /// The name to answer, as written — `/etc/hosts` needs no zone suffix.
+    pub name: String,
+    /// The address the name answers with.
+    pub address: Ipv4Addr,
 }
 
 impl NetPlan {
@@ -81,6 +93,7 @@ impl NetPlan {
             isolate_netns: false,
             tap: None,
             resolver: Resolver::None,
+            hosts: Vec::new(),
         }
     }
 
@@ -92,6 +105,7 @@ impl NetPlan {
             isolate_netns: true,
             tap: None,
             resolver: Resolver::None,
+            hosts: Vec::new(),
         }
     }
 
@@ -102,6 +116,7 @@ impl NetPlan {
             isolate_netns: true,
             tap: Some(tap),
             resolver: Resolver::None,
+            hosts: Vec::new(),
         }
     }
 
@@ -109,6 +124,16 @@ impl NetPlan {
     #[must_use]
     pub fn with_resolver(mut self, resolver: Resolver) -> Self {
         self.resolver = resolver;
+        self
+    }
+
+    /// Adds a static `/etc/hosts` entry for the sandbox.
+    #[must_use]
+    pub fn with_hosts_entry(mut self, name: impl Into<String>, address: Ipv4Addr) -> Self {
+        self.hosts.push(HostEntry {
+            name: name.into(),
+            address,
+        });
         self
     }
 
@@ -128,6 +153,12 @@ impl NetPlan {
     #[must_use]
     pub fn resolver(&self) -> &Resolver {
         &self.resolver
+    }
+
+    /// The static `/etc/hosts` entries to write.
+    #[must_use]
+    pub fn hosts(&self) -> &[HostEntry] {
+        &self.hosts
     }
 }
 
@@ -260,6 +291,12 @@ pub trait NetGuard: Send {
     fn teardown(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
+/// The static name the host answers by, for boxes that share its network
+/// namespace (NET-003). The host's own resolver has no `min.internal.` zone, so
+/// a native host-address box resolves the host by name through this
+/// `/etc/hosts` entry at the host's loopback.
+pub const HOST_MIN_INTERNAL: &str = "host.min.internal";
+
 /// Shares the host/VM network namespace (the default), and the host's
 /// resolver with it. No isolation, no wiring.
 #[derive(Debug, Default, Clone, Copy)]
@@ -268,7 +305,9 @@ pub struct HostNet;
 impl Network for HostNet {
     fn plan(&self) -> PlanFuture<'_> {
         Box::pin(std::future::ready(Ok(
-            NetPlan::host().with_resolver(Resolver::Host)
+            NetPlan::host()
+                .with_resolver(Resolver::Host)
+                .with_hosts_entry(HOST_MIN_INTERNAL, Ipv4Addr::LOCALHOST)
         )))
     }
 }
