@@ -4,7 +4,7 @@ title: Package verification — `min pkg verify`, fail-closed pulls, and a Sigst
 owner: bryan-minimal
 epic: gominimal/inbox#721
 arch: https://github.com/gominimal/arch/blob/faccc370fdc8568c085ca481b497e43475fdd98a/architecture.md
-updated: 2026-09-23
+updated: 2026-09-24
 ---
 
 # PKV — Package verification — `min pkg verify`, fail-closed pulls, and a Sigstore bundle on every artifact
@@ -53,11 +53,19 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   - IF the bundle is absent THEN THE SYSTEM SHALL exit 6 with `index: no bundle`.
     tier:   T0
     verify: cargo nextest run -p verify index_bundle_absent_exits_6
+  - THE SYSTEM SHALL verify the bundle over the sealed per-commit closure, `<commit>.closure.shisha`, and WHILE verification is enabled SHALL neither fall back to the byte-copy `<commit>.shisha` nor to the mutable root `index.shisha` (neither is sealed or bundled), reporting `index: no bundle` instead of reading either.
+    tier:   T1
+    verify: cargo nextest run -p rcache verified_index_reads_closure_never_fallback
+    property: verification_on ∧ read(index) ⇒ source(index) = closure(commit) ∧ verified(bundle(closure(commit)))
+  - WHEN the resolved index is a union of the upstream closure and sideload closures THE SYSTEM SHALL verify each link's bundle against that link's trust root (`--trusted-root` per source, the vendored root for the upstream) before its entries are read, and SHALL mark every entry from a link without a verified bundle `unverified`; `min pkg verify` reports an `unverified` entry as `index: source not verified` and PKV-018 refuses artifacts resolved from it.
+    tier:   T1
+    verify: cargo nextest run -p rcache sideload_entries_verified_per_source_or_marked
+    property: index_verified(pin(a)) ⇔ verified(bundle(source(entry(a))), root(source(entry(a))))
 
-- **PKV-002** THE SYSTEM SHALL accept a Cache Index bundle if and only if stock `cosign verify-blob --bundle` (v3 or later, which reads Rekor v2 bundles) with the trust root's identity and issuer accepts it.
+- **PKV-002** THE SYSTEM SHALL accept a Cache Index bundle only if stock `cosign verify-blob --bundle` (v3 or later, which reads Rekor v2 bundles), given the identity and issuer of the trust-root entry that `min` matched, accepts it; and WHEN that entry's window covers the bundle's signing time THE SYSTEM SHALL accept every bundle `cosign` accepts under that identity (the window is `min`'s check alone; `cosign` has none).
   tier:     T1
   verify:   cargo nextest run -p verify index_bundle_agrees_with_cosign_corpus
-  property: for every bundle b in the live corpus, accept_min(b) == accept_cosign(b)
+  property: for every bundle b in the live corpus, accept_min(b) ⇒ accept_cosign(b, identity(b)); and in_window(identity(b), t(b)) ⇒ (accept_min(b) ⇔ accept_cosign(b, identity(b)))
 
 - **PKV-003** WHEN an index has been verified THE SYSTEM SHALL compute the package's Build Spec Hash under the epoch that index declares (today's encoding until the index carries an epoch field, spec EPOCH, gominimal/minimal#1305) and compare the tarball's locally recomputed sha256 to the index entry for that hash, consulting neither the object name nor any bucket metadata.
   tier:     T1
@@ -74,8 +82,12 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   tier:     T1
   verify:   cargo nextest run -p verify envelope_parse_rejects_unknown_fields_and_oversize
   property: parse(e) = Ok ⇒ fields(e) ⊆ {payload, payloadType, signatures} ∧ 1 ≤ |signatures| ≤ 8 ∧ ∀s ∈ signatures. fields(s) = {keyid, sig}
+  - WHEN the file holds more than one envelope THE SYSTEM SHALL verify every envelope's signatures (PKV-005, PKV-006), select the envelopes whose statement decodes with `predicateType` SLSA Provenance v1, and accept exactly one such envelope; IF none or more than one such envelope verifies THEN THE SYSTEM SHALL exit 6 with `provenance: none` or `provenance: ambiguous`; an envelope with another `predicateType` is reported in `detail` and never used by the `provenance` check.
+    tier:   T1
+    verify: cargo nextest run -p verify multi_envelope_exactly_one_provenance
+    property: accept(file) ⇒ |{e ∈ file : verifies(e) ∧ predicate(e) = slsa_v1}| = 1, and an appended envelope that does not verify changes nothing
 
-- **PKV-005** THE SYSTEM SHALL verify each signature over the DSSE pre-authentication encoding of the base64-decoded payload, `"DSSEv1" SP len(type) SP type SP len(body) SP body`, with the trust-root key chosen by algorithm and validity and never by the envelope's `keyid` alone.
+- **PKV-005** THE SYSTEM SHALL verify each signature over the DSSE pre-authentication encoding of the base64-decoded payload, `"DSSEv1" SP len(type) SP type SP len(body) SP body`, trying every trust-root key of the signature's algorithm and never trusting the envelope's `keyid` alone; a key's validity window is checked only after that key verified (PKV-013), so no field of the payload is read before a signature over it has verified.
   tier:     T1
   verify:   cargo nextest run -p verify pae_is_byte_exact
   property: pae(t, b) == b"DSSEv1 " ++ dec(len(t)) ++ b" " ++ t ++ b" " ++ dec(len(b)) ++ b" " ++ b, with b the decoded bytes and never a re-serialised JSON
@@ -104,13 +116,13 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
 - **PKV-009** IF `<spec_hash>.intoto.jsonl` is absent THEN THE SYSTEM SHALL exit 6 with `provenance: none`, and THE SYSTEM SHALL never accept the legacy unsigned `<spec_hash>.intoto.json` as provenance.
   tier:     T1
   verify:   cargo nextest run -p verify absent_envelope_fails_closed_legacy_json_ignored
-  property: ∀ artifact a. required(provenance) ∧ envelope(a) = ∅ ⇒ exit = 6, whatever other objects exist under a's name
+  property: ∀ artifact a. envelope(a) = ∅ ⇒ exit = 6, whatever other objects exist under a's name
 
 - **PKV-010** THE SYSTEM SHALL verify every envelope in the live corpus of production `.intoto.jsonl` objects with both signatures and the `{repo, commit, package, arch}` round trip.
   tier:     T0
   verify:   cargo nextest run -p verify live_corpus_round_trip
 
-- **PKV-011** WHEN `--verify` is given to `min pkg provenance <pkg>` THE SYSTEM SHALL run the index, artifact and provenance checks and print the decoded statement only after every required check passes; without `--verify` THE SYSTEM SHALL print the payload preceded by one line stating it is unverified.
+- **PKV-011** WHEN `--verify` is given to `min pkg provenance <pkg>` THE SYSTEM SHALL run every check PKV-012 requires, the artifact bundle under PKV-016's policy included, and print the decoded statement to stdout only after every required check passes; without `--verify` THE SYSTEM SHALL print the payload to stdout and one line to stderr stating it is unverified, so that stdout is the payload alone in both modes and with `--json` the notice is not part of the document.
   tier:     T0
   verify:   cargo nextest run -p minimal pkg_payload_commands_verify_before_print
   - IF a required check fails THEN THE SYSTEM SHALL print nothing of the payload and exit 6.
@@ -119,30 +131,30 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   - WHILE no SBOM or build-log document is published for the package THE SYSTEM SHALL, for `sbom --verify` and `build-log --verify`, exit 6 with `sbom: not published` or `build-log: not published` rather than print unverified bytes.
     tier:   T0
     verify: cargo nextest run -p minimal pkg_sbom_verify_unpublished_exits_6
-  - WHERE an SBOM document and its bundle are published THE SYSTEM SHALL verify the bundle with the index-bundle checks before printing the SBOM.
-    tier:   none
-    verify: none, the SBOM document and its publication are gominimal/inbox#582's (spec SBOM); this line binds once that spec names the object
+  - WHERE an SBOM document and its bundle are published under the names spec SBOM (gominimal/inbox#582) assigns THE SYSTEM SHALL verify the bundle with the index-bundle checks before printing the SBOM.
+    tier:   T0
+    verify: cargo nextest run -p minimal pkg_sbom_verify_bundle_before_print
 
 - **PKV-012** THE SYSTEM SHALL exit 0 only when every required check passed, 4 when the verified index has no entry for the package (the `artifact` check reports `not_found` and no later check runs), and 6 on any signature, hash or attestation failure; with `--json` THE SYSTEM SHALL emit one object per check with `name`, `status` in `{pass, fail, absent, not_found}` and `detail`, and text output SHALL carry the same lines.
   tier:     T1
   verify:   cargo nextest run -p minimal pkg_verify_exit_code_and_json_shape
-  property: exit = 0 ⇔ ∀c ∈ checks. status(c) ∈ {pass, absent} ∧ absent(c) ⇒ optional(c, root); exit = 4 ⇔ status(artifact) = not_found; exit = 6 ⇔ ∃c. status(c) = fail
+  property: exit = 0 ⇔ ∀c ∈ checks. status(c) ∈ {pass, absent} ∧ absent(c) ⇒ optional(c, root) ∧ c ∉ {index, artifact, provenance}; exit = 4 ⇔ status(artifact) = not_found; exit = 6 ⇔ ∃c. status(c) = fail
 
-- **PKV-013** THE SYSTEM SHALL read the trust root as one versioned, append-only document carrying the builder identity, Sigstore identities (SAN, OIDC issuer, Fulcio, Rekor origin and log key, TSA), KMS keys (algorithm, key id, raw public-key bytes), each signer with `valid_from` and `valid_to`, and a `planes` policy naming each of `index_bundle`, `provenance_envelope`, `artifact_bundle` as `required` or `optional` (defaults when absent: the first two required, the third optional; a later root version may only move a plane from optional to required), vendored into the `min` release and overridable with `--trusted-root <path>`.
+- **PKV-013** THE SYSTEM SHALL read the trust root as one versioned, append-only document carrying the builder identity, Sigstore identities (SAN, OIDC issuer, Fulcio, Rekor origin and log key, TSA), KMS keys (algorithm, key id, raw public-key bytes), each signer with `valid_from` and `valid_to`, and a `planes` policy that names `artifact_bundle`, and any plane a later format adds, as `required` or `optional` (default when absent: optional; a later root version may only move a plane from optional to required); the index bundle and the provenance envelope are always required and no root, vendored or `--trusted-root`, can mark them optional; vendored into the `min` release and overridable with `--trusted-root <path>`.
   tier:     T0
   verify:   cargo nextest run -p verify trust_root_parses_vendored_and_override
-  - IF a key's window does not cover the signing time (bundles) or the build time (envelopes, self-asserted until gominimal/build-servers#95) THEN THE SYSTEM SHALL not use that key for the check.
+  - WHEN a key has verified a signature THE SYSTEM SHALL then read the time that signature covers, the bundle's signing time or the envelope's build time (self-asserted until gominimal/build-servers#95), and IF the key's window does not cover it THEN THE SYSTEM SHALL count that signature as not verified, reporting `provenance: key window` or `index: key window` when no other key satisfies the role.
     tier:   T1
     verify: cargo nextest run -p verify key_outside_validity_window_is_not_used
-    property: uses(k, t) ⇒ valid_from(k) ≤ t ∧ (valid_to(k) = ∅ ∨ t < valid_to(k))
+    property: counts(k, sig) ⇒ verifies(k, sig) ∧ valid_from(k) ≤ t(sig) ∧ (valid_to(k) = ∅ ∨ t(sig) < valid_to(k)), with t(sig) read only after verifies(k, sig)
 
-- **PKV-014** THE SYSTEM SHALL ship vendored production entries whose builder identity, Sigstore identities and KMS key ids equal the producer's trust policy at the time of vendoring; the producer's repository, which holds that policy and depends on the public verifier, carries the test.
+- **PKV-014** THE SYSTEM SHALL ship a vendored trust root that parses under PKV-013, whose entries are append-only across releases (an entry, once shipped, is never removed or altered, only closed with `valid_to`), and whose version never decreases; that its production entries equal the producer's trust policy at the time of vendoring is the producer's test (Non-goals).
   tier:     T0
-  verify:   cargo nextest run -p buildbot trust_policy_matches_vendored_root
+  verify:   cargo nextest run -p verify vendored_root_append_only_and_version_monotonic
 
-- **PKV-015** WHERE a well-known trust-root URL and a pinned meta-key are configured THE SYSTEM SHALL fetch the published root, verify its meta-key signature, refuse a root whose version is lower than the vendored one, and cache it; the vendored root SHALL remain the floor.
-  tier:     none
-  verify:   none, the URL and meta-key custody are not yet named by the architecture ("What verified means" names the list and the pinning only); gominimal/arch#91 asks for the ruling and the epic's S7 carries the story
+- **PKV-015** WHERE a well-known trust-root URL and a pinned meta-key are configured THE SYSTEM SHALL fetch the published root, verify its meta-key signature, refuse a root whose version is lower than the vendored one, and cache it; the vendored root SHALL remain the floor. The production URL and the meta-key's custody wait on gominimal/arch#91 (Open questions); the behaviour is tested against a fixture URL and a test meta-key.
+  tier:     T0
+  verify:   cargo nextest run -p verify wellknown_root_fetch_verify_version_floor
 
 - **PKV-016** WHEN the producer publishes a Sigstore bundle for the artifact's provenance statement THE SYSTEM SHALL verify it with the same four checks as the index bundle, bind its subject digest to the locally recomputed tarball hash, and report it as `artifact bundle`; WHILE the trust root marks that plane optional THE SYSTEM SHALL report an absent bundle as `absent`, and WHERE `--require-bundle` is given or the plane is marked required THE SYSTEM SHALL treat absence as `fail`.
   tier:     T1
@@ -152,10 +164,10 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
     tier:   T0
     verify: cargo nextest run -p verify artifact_bundle_invalid_exits_6
 
-- **PKV-017** THE SYSTEM SHALL publish, for every artifact a run builds, a Sigstore bundle over a classical DSSE of statement bytes identical to the KMS envelope's, at `<spec_hash>.provenance.sigstore.json` beside the envelope, signed under the same pinned identity as the index, and the sealed map SHALL record the state `bundled` for an entry with both the envelope and the bundle, leaving `signed` meaning envelope-present as before.
+- **PKV-017** WHEN the artifact bundle at `<spec_hash>.provenance.sigstore.json` is present THE SYSTEM SHALL accept it only if the statement bytes its DSSE carries are identical to the KMS envelope's statement bytes, reporting `artifact bundle: statement differs` otherwise; producing that bundle, under the same pinned identity as the index, and recording the sealed-map state `bundled`, is the producer's (Non-goals).
   tier:     T1
-  verify:   cargo nextest run -p buildbot per_artifact_bundle_statement_bytes_identical
-  property: ∀a. statement_bytes(kms_envelope(a)) == statement_bytes(sigstore_dsse(a))
+  verify:   cargo nextest run -p verify artifact_bundle_statement_bytes_identical
+  property: accept(bundle(a)) ⇒ statement_bytes(kms_envelope(a)) == statement_bytes(sigstore_dsse(a))
 
 - **PKV-018** WHERE verification is enabled in the client configuration THE SYSTEM SHALL verify, before a remote artifact is accepted at materialization, the index bundle once per registry pin and that artifact's hash, provenance envelope and, under PKV-016's policy, its artifact bundle, and SHALL refuse the artifact with the verify error class on any failure.
   tier:     T1
@@ -171,13 +183,13 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
     tier:   T0
     verify: cargo nextest run -p rcache materialize_disabled_checks_hash_only
 
-- **PKV-019** WHERE the release ships with verification on by default THE SYSTEM SHALL verify every pull from the public registry as PKV-018 describes unless an explicit configuration line turns it off, and `min doctor` SHALL report when it is off.
-  tier:     none
-  verify:   none, the default flips only once the vendored root ships in a release and the producer's attestation census reads zero on main (gominimal/build-servers#322), an operator readiness gate the verifier never consults; the epic's S12 tracks the flip
-
-- **PKV-020** THE SYSTEM SHALL document, per artifact type, the object names, the trust-root entries and the exact `cosign` or verifier command that reproduces each check, with a worked example on a live commit, and a daily CI job SHALL run those commands against the current registry head.
+- **PKV-019** WHERE the release ships with verification on by default THE SYSTEM SHALL verify every pull from the public registry as PKV-018 describes unless an explicit configuration line turns it off, and `min doctor` SHALL report when it is off. The default flips only once the vendored root ships in a release and the producer's attestation census reads zero on main (gominimal/build-servers#322), an operator gate the verifier never consults; the epic's S12 tracks the flip.
   tier:     T0
-  verify:   cargo nextest run -p verify docs_commands_match_ci_workflow
+  verify:   cargo nextest run -p minimal verify_default_on_config_off_doctor_reports
+
+- **PKV-020** THE SYSTEM SHALL document, per artifact type, the object names, the trust-root entries and the exact `cosign` or verifier command that reproduces each check, with a worked example on a live commit, and SHALL ship those commands as a `scripts/` entry with a `justfile` recipe that the nightly lane discovers by convention (`.github/workflows/` is frozen here); the daily run against the registry head lives beside the producer's `verify-signing` job in gominimal/build-servers.
+  tier:     T0
+  verify:   cargo nextest run -p verify docs_commands_match_scripts
 
 ## Non-goals
 
@@ -187,6 +199,8 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
 - A third, attested-cosigner signature on the envelope: gominimal/build-servers#338; PKV-006's threshold model accepts it without change.
 - Computing the Build Spec Hash: gominimal/inbox#583 (spec EPOCH); PKV-003 calls it under the index's declared epoch.
 - The SBOM document's content: gominimal/inbox#582 (spec SBOM); PKV-011 only prints it after verification.
+- Producing the per-artifact Sigstore bundle (`<spec_hash>.provenance.sigstore.json`, same identity as the index, sealed-map state `bundled`) and testing that the vendored root's production entries equal the producer's trust policy: gominimal/build-servers, the epic's S8 and S6; this spec verifies what is published (PKV-016, PKV-017).
+- The daily cross-check of the documented commands against the registry head: gominimal/build-servers, beside `verify-signing` (PKV-020 ships the commands).
 
 ## Design reasoning
 
@@ -228,4 +242,4 @@ Where the verifier lives. The architecture says `min` performs the checks; `min`
 
 - [NEEDS CLARIFICATION (HIGH): the well-known trust-root URL and the custody of the meta-key that signs it. architecture.md "What verified means" names the published list and the pinning in `min`; it does not name the URL, the key, or who rotates it. PKV-015 waits on gominimal/arch#91.]
 - [NEEDS CLARIFICATION (MEDIUM): whether the architecture's "What verified means" should state the post-quantum plane explicitly. This spec treats the KMS ML-DSA-65 signature as a permanent second plane; the architecture text describes Sigstore only. Asked in gominimal/arch#91.]
-- [NEEDS CLARIFICATION (LOW): the crate name in the public repository for the verifier the producer will depend on. `verify` is assumed in the `verify:` lines and changes nothing else.]
+- [NEEDS CLARIFICATION (LOW): the crate name in the public repository for the verifier the producer will depend on. `verify` is assumed in the `verify:` lines and changes nothing else; every `verify:` line now names a crate of this workspace.]
