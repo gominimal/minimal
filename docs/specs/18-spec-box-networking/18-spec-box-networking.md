@@ -65,9 +65,10 @@ holds which address (NET-133); and the proxy's address as infrastructure for a
 box with a credentialed lane, reachable whatever its other egress (NET-134). On a co-resident host the host-address boxes share the host's
 address and are attributed as one cohort outside the box host (NET-078), while
 each box's own declaration is enforced inside it (NET-079) on the box's own
-cgroup ([design §4.1][design]). HTTP/3 to a steered host is governed by the
-`quic443` field ([design §5.3][design]), bound in that document; NET-064 covers
-the box that declared TCP only. Which HTTP versions each proxy surface carries
+cgroup ([design §4.1][design]). HTTP/3 to a steered host is rejected in every
+stance, and the resolver-bypass stance is `quic443`'s ([design §5.3][design],
+v0.9), bound in the proxy document; NET-064 covers the box that declared TCP
+only. Which HTTP versions each proxy surface carries
 is [design §5.7][design]'s matrix: the `:7654` proxy is HTTP/1.1 (NET-135),
 published-address forwarders are TCP pass-through, and the Box Egress Proxy's
 row is bound in its document.
@@ -458,10 +459,10 @@ included, with every refusal logged (NET-001 to NET-004).
     verify: cargo nextest run -p minimald denied_range_resolution_logged
     <!-- S8b/AC2; prose 43; unwanted -->
 
-- **NET-136** WHEN a box asks the node's DNS layer for an HTTPS (type 65) or SVCB (type 64) record THE SYSTEM SHALL answer NODATA.
+- **NET-136** WHEN a box asks the node's DNS layer for an AAAA, HTTPS (type 65) or SVCB (type 64) record THE SYSTEM SHALL answer NODATA.
   tier:     T0
-  verify:   cargo nextest run -p minimald https_and_svcb_queries_are_nodata
-  <!-- design §5.3 (v0.9); event-driven; the gateway resolver's rule for every name in v1: an address hint would be either unadmitted, a silent stall for a client racing it, or a new admission path outside NET-067's intersection; `alpn="h3"` would invite the QUIC probes design §5.7 suppresses; and an ECH configuration would hide the SNI the gateway's monitoring reads -->
+  verify:   cargo nextest run -p minimald aaaa_https_and_svcb_queries_are_nodata
+  <!-- design §5.3 (v0.9); event-driven; the gateway resolver's rule for every name in v1: AAAA because no IPv6 admission path exists yet, so happy-eyeballs degrades cleanly to IPv4 instead of timing out (an interim the IPv6 dual-stack epoch replaces, design §12 item 5); HTTPS and SVCB because an address hint would be either unadmitted, a silent stall for a client racing it, or a new admission path outside NET-067's intersection; `alpn="h3"` would invite the QUIC probes design §5.7 suppresses; and an ECH configuration would hide the SNI the gateway's monitoring reads -->
 
 - **NET-068** WHILE a box's egress is a hostname-only allowlist naming every host that `apt`, `git clone`, `npm install`, `pip`, and a container pull contact THE SYSTEM SHALL complete those operations.
   tier:     T0

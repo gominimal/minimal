@@ -219,7 +219,7 @@ Steering and the interception CA
   - WHERE the root is injected, WHEN the box is created THE SYSTEM SHALL set `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` to the box's CA bundle and `NODE_EXTRA_CA_CERTS` to the root.
     tier:   T0
     verify: ./scripts/session-e2e.sh bep_trust_env_points_at_bundle_and_root
-    <!-- Gatehouse §6.10 trust-store injection's environment block, for stacks that keep a store of their own; Node reads no OS store, so a Node client such as Claude Code refuses every leaf without it; the list is maintained with the package set, and the JVM keystore is outside it -->
+    <!-- Gatehouse §6.10 trust-store injection's environment block, carried there as [proposed]: making it normative was considered and declined (Gatehouse v1.22), so the architecture's guarantee covers OS-trust-store readers alone and this document builds the proposed block; if the architecture ratifies a different variable list, this requirement follows it; the block serves stacks that keep a store of their own; Node reads no OS store, so a Node client such as Claude Code refuses every leaf without it; the list is maintained with the package set, and the JVM keystore is outside it -->
   - IF a box spec's environment sets one of those variables THEN THE SYSTEM SHALL keep the spec's value and emit a validation warning naming the variable.
     tier:   T0
     verify: cargo nextest run -p sessions spec_trust_env_shadows_platform_with_warning
@@ -329,10 +329,10 @@ HTTP versions and framing
     verify: cargo nextest run -p bep h2c_upgrade_is_stripped
     <!-- networking §5.7: the same rule as the `:7654` proxy's (NET-135) -->
 
-- **BEP-075** WHERE a box's steering is `proxy_env` or its `[network.bep] proxy_env` is true, THE SYSTEM SHALL accept CONNECT over HTTP/1.1 only, and refuse Extended CONNECT and `connect-udp` in either form.
+- **BEP-075** WHERE a box's steering is `proxy_env` or its `[network.bep] proxy_env` is true, THE SYSTEM SHALL accept CONNECT and absolute-form plain HTTP requests over HTTP/1.1 only, and refuse Extended CONNECT and `connect-udp` in either form.
   tier:     T0
-  verify:   cargo nextest run -p bep connect_accepted_over_http11_only
-  <!-- networking §5.7: h3 through an HTTP proxy exists only as MASQUE, absent in v1; an accepted tunnel's inner TLS is terminated under BEP-073 -->
+  verify:   cargo nextest run -p bep connect_and_absolute_form_accepted_over_http11_only
+  <!-- networking §5.7's `proxy_env` row: h3 through an HTTP proxy exists only as MASQUE, absent in v1; an accepted tunnel's inner TLS is terminated under BEP-073; either form naming a target outside the module host sets is refused `off_module` (BEP-029), and an absolute-form request to a credentialed host is refused `upstream_not_tls` (BEP-055) -->
 
 - **BEP-076** WHEN the proxy relays an upstream response THE SYSTEM SHALL remove every `Alt-Svc` header from it.
   tier:     T0
