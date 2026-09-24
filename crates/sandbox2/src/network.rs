@@ -304,11 +304,9 @@ pub struct HostNet;
 
 impl Network for HostNet {
     fn plan(&self) -> PlanFuture<'_> {
-        Box::pin(std::future::ready(Ok(
-            NetPlan::host()
-                .with_resolver(Resolver::Host)
-                .with_hosts_entry(HOST_MIN_INTERNAL, Ipv4Addr::LOCALHOST)
-        )))
+        Box::pin(std::future::ready(Ok(NetPlan::host()
+            .with_resolver(Resolver::Host)
+            .with_hosts_entry(HOST_MIN_INTERNAL, Ipv4Addr::LOCALHOST))))
     }
 }
 

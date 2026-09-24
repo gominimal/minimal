@@ -14,7 +14,7 @@ pub mod config;
 use config::Config;
 pub mod network;
 pub use network::{
-    AbandonFuture, AttachFuture, HostEntry, HostNet, HOST_MIN_INTERNAL, NetGuard, NetPlan, Network,
+    AbandonFuture, AttachFuture, HOST_MIN_INTERNAL, HostEntry, HostNet, NetGuard, NetPlan, Network,
     NetworkError, NoNet, PlanFuture, Resolver, Spawned, TapSpec,
 };
 use std::fs::{self, Permissions};

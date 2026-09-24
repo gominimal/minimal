@@ -53,7 +53,8 @@ struct HostIpAddressNetwork {
 
 impl std::fmt::Debug for HostIpAddressNetwork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostIpAddressNetwork").finish_non_exhaustive()
+        f.debug_struct("HostIpAddressNetwork")
+            .finish_non_exhaustive()
     }
 }
 
@@ -64,7 +65,10 @@ impl Network for HostIpAddressNetwork {
         Box::pin(async move {
             let vm_host = {
                 let s = self.switch.lock().await;
-                matches!(s.transport(), crate::net::SwitchTransport::HostShuttle { .. })
+                matches!(
+                    s.transport(),
+                    crate::net::SwitchTransport::HostShuttle { .. }
+                )
             };
             if !vm_host {
                 // Native host: the namespace the box shares is the host's own,

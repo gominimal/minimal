@@ -1133,12 +1133,18 @@ mod tests {
 
         // A frame to the literal is noticed; one to the gateway is not; a
         // truncated frame and a non-IPv4 ethertype are not.
-        assert!(is_legacy_host_literal(&udp_frame(SRC, 40000, alias, 53), alias));
+        assert!(is_legacy_host_literal(
+            &udp_frame(SRC, 40000, alias, 53),
+            alias
+        ));
         assert!(!is_legacy_host_literal(
             &udp_frame(SRC, 40000, Ipv4Addr::new(100, 64, 0, 1), 53),
             alias
         ));
-        assert!(!is_legacy_host_literal(&udp_frame(SRC, 40000, alias, 53)[..14], alias));
+        assert!(!is_legacy_host_literal(
+            &udp_frame(SRC, 40000, alias, 53)[..14],
+            alias
+        ));
         assert!(!is_legacy_host_literal(
             &tcp_frame(0x0806, IPPROTO_TCP, SYN, SRC, 53),
             alias
@@ -1146,8 +1152,14 @@ mod tests {
 
         // Rate-limited through the limiter: the first connection to the literal
         // notices, a second one inside the interval does not.
-        assert!(notice.emit(), "the first frames to the literal emit a notice");
-        assert!(!notice.emit(), "the notice is rate-limited within the interval");
+        assert!(
+            notice.emit(),
+            "the first frames to the literal emit a notice"
+        );
+        assert!(
+            !notice.emit(),
+            "the notice is rate-limited within the interval"
+        );
 
         // The notice's limiter is its own: a policy warning on the same relay
         // does not consume the deprecation notice's interval.

@@ -787,6 +787,10 @@ mod tests {
         assert!(yaml.contains(&format!("\"{ip}\": \"{mac}\"")));
         // Host alias is NAT'd to loopback and never allocated.
         assert!(yaml.contains("\"100.64.255.254\": \"127.0.0.1\""));
+        // NET-003: the host switch answers `host.min.internal` in its static
+        // zone at the NAT'd alias, so guest boxes resolve the host by name.
+        assert!(yaml.contains("    - name: \"min.internal.\"\n"));
+        assert!(yaml.contains("        - name: \"host\"\n          ip: \"100.64.255.254\"\n"));
     }
 
     #[test]
