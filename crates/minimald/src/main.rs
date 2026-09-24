@@ -1092,8 +1092,10 @@ mod tests {
     fn cli_listen_on_points_at_instance_ssh_sock() {
         let cli = test_cli(3);
         let sock = cli.listen_on();
-        assert!(sock.as_str().ends_with("/ssh.sock"));
-        assert!(sock.as_str().contains("local-minimald3"));
+        assert_eq!(
+            sock.as_str(),
+            "/tmp/minimald-test-state/providers/local-minimald3/ssh.sock"
+        );
     }
 
     #[test]
