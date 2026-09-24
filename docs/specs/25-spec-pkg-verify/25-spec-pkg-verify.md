@@ -85,7 +85,7 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   - WHEN the file holds more than one envelope THE SYSTEM SHALL verify every envelope's signatures (PKV-005, PKV-006), select the envelopes whose statement decodes with `predicateType` SLSA Provenance v1, and accept exactly one such envelope; IF none or more than one such envelope verifies THEN THE SYSTEM SHALL exit 6 with `provenance: none` or `provenance: ambiguous`; an envelope with another `predicateType` is reported in `detail` and never used by the `provenance` check.
     tier:   T1
     verify: cargo nextest run -p verify multi_envelope_exactly_one_provenance
-    property: accept(file) ⇒ |{e ∈ file : verifies(e) ∧ predicate(e) = slsa_v1}| = 1, and an appended envelope that does not verify changes nothing
+    property: accept(file) ⇒ |{e ∈ file : verifies(e) ∧ predicate(e) = slsa_v1}| = 1, and appending a structurally valid envelope (PKV-004) whose signatures do not verify changes nothing; a malformed appended envelope fails parsing and so invalidates the file, by PKV-004's rule
 
 - **PKV-005** THE SYSTEM SHALL verify each signature over the DSSE pre-authentication encoding of the base64-decoded payload, `"DSSEv1" SP len(type) SP type SP len(body) SP body`, trying every trust-root key of the signature's algorithm and never trusting the envelope's `keyid` alone; a key's validity window is checked only after that key verified (PKV-013), so no field of the payload is read before a signature over it has verified.
   tier:     T1
@@ -152,9 +152,10 @@ Checks are named `index`, `artifact`, `provenance`, `artifact bundle`; a failure
   tier:     T0
   verify:   cargo nextest run -p verify vendored_root_append_only_and_version_monotonic
 
-- **PKV-015** WHERE a well-known trust-root URL and a pinned meta-key are configured THE SYSTEM SHALL fetch the published root, verify its meta-key signature, refuse a root whose version is lower than the vendored one, and cache it; the vendored root SHALL remain the floor. The production URL and the meta-key's custody wait on gominimal/arch#91 (Open questions); the behaviour is tested against a fixture URL and a test meta-key.
+- **PKV-015** WHERE a well-known trust-root URL and a pinned meta-key are configured THE SYSTEM SHALL fetch the published root, verify its meta-key signature, refuse a root whose version is lower than the vendored one or than the highest version it has previously accepted (a persistent high-water mark, advanced only after a fetched root verified), and cache it; the vendored root SHALL remain the floor, so a replayed older root can neither reopen a closed signer nor undo a tightened plane. The production URL and the meta-key's custody wait on gominimal/arch#91 (Open questions); the behaviour is tested against a fixture URL and a test meta-key.
   tier:     T0
   verify:   cargo nextest run -p verify wellknown_root_fetch_verify_version_floor
+  property: accept(root_fetched) ⇒ version(root_fetched) ≥ max(version(root_vendored), high_water) ∧ high_water' = version(root_fetched)
 
 - **PKV-016** WHEN the producer publishes a Sigstore bundle for the artifact's provenance statement THE SYSTEM SHALL verify it with the same four checks as the index bundle, bind its subject digest to the locally recomputed tarball hash, and report it as `artifact bundle`; WHILE the trust root marks that plane optional THE SYSTEM SHALL report an absent bundle as `absent`, and WHERE `--require-bundle` is given or the plane is marked required THE SYSTEM SHALL treat absence as `fail`.
   tier:     T1
