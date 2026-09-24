@@ -501,7 +501,7 @@ mod tests {
             serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
         assert_eq!(manifest["schema_version"], 1);
         assert!(manifest["duration_ms"].as_u64().unwrap() > 0);
-        assert!(manifest["collected"].as_array().unwrap().len() > 0);
+        assert!(!manifest["collected"].as_array().unwrap().is_empty());
     }
 
     /// `cmd_bug` with `--no-guest` records the skip reason in the manifest.
@@ -748,8 +748,11 @@ mod tests {
         let state = tempfile::TempDir::new().unwrap();
         let log_dir = state.path().join("logs");
         std::fs::create_dir_all(&log_dir).unwrap();
-        // Write a log file larger than the cap.
-        let content = vec![b'A'; 2048];
+        // A log file larger than the cap, with the first and last 1024 bytes
+        // made of different characters: a read from the head would fail the
+        // tail assertion below, so this test can tell the two apart.
+        let mut content = vec![b'H'; 1024];
+        content.extend(std::iter::repeat_n(b'T', 1024));
         std::fs::write(log_dir.join("minimald.log"), &content).unwrap();
 
         let out_dir = tempfile::TempDir::new().unwrap();
@@ -775,10 +778,11 @@ mod tests {
             1024,
             "log must be tail-capped to 1024 bytes"
         );
-        // The tail of the file (last 1024 bytes of all 'A's).
+        // The tail of the file (its last 1024 bytes, all 'T's — the 'H' head
+        // must not have been captured).
         assert!(
-            log_contents.iter().all(|&b| b == b'A'),
-            "tail-capped content must be the last bytes of the file"
+            log_contents.iter().all(|&b| b == b'T'),
+            "tail-capped content must be the last bytes of the file: {log_contents:?}"
         );
 
         let manifest: serde_json_lenient::Value =
@@ -940,9 +944,15 @@ mod tests {
         );
         let manifest: serde_json_lenient::Value =
             serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        // Scoped to mesh-enrolment on purpose: the manifest's error list is
+        // fed by every host collector (net, procs, power read the live
+        // system), and this test's subject is only the missing-enrolment
+        // handling. An error from an unrelated collector must not fail it.
         let errors = manifest["errors"].as_array().unwrap();
         assert!(
-            errors.is_empty(),
+            !errors
+                .iter()
+                .any(|e| e.to_string().contains("mesh-enrolment")),
             "missing mesh-enrolment must not be recorded as an error: {errors:?}"
         );
     }
