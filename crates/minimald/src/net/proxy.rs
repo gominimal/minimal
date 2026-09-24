@@ -141,11 +141,38 @@ fn split_authority(authority: &str) -> (&str, Option<u16>) {
     (host, port)
 }
 
-/// Binds the egress-proxy listener at `addr`, returning it on success. On a bind
-/// failure it emits the `component = "dns-proxy"` reachability warning and
-/// returns `None`: the proxy is unavailable and PTask hostnames will not route
-/// until the address is free. This is the daemon-startup reachability check that
-/// supersedes the former systemd-resolved probe (R3.4).
+/// Why a host-side proxy listener could not bind its address, carrying the
+/// reason and the one remedy that clears it.
+///
+/// The pair is authored once here so every surface reads the same text: the
+/// startup retry's warning, the daemon's `proxy_unavailable` note the
+/// `ListSessions` RPC serves, and the warning `min ls` and
+/// `min session activate` print (NET-020).
+#[derive(Debug, Clone)]
+pub struct BindFailure {
+    /// What failed, named for a human: the address and the OS error.
+    pub reason: String,
+    /// The remedy: free the listen address so the daemon's retry can bind it.
+    pub remedy: String,
+}
+
+impl BindFailure {
+    /// The reason and remedy as the one report the daemon's unavailable note
+    /// and the CLI warning carry.
+    #[must_use]
+    pub fn reported(&self) -> String {
+        format!("{}. Remedy: {}", self.reason, self.remedy)
+    }
+}
+
+/// Binds the egress-proxy listener at `addr`, returning it on success. On a
+/// bind failure it returns a [`BindFailure`] carrying the reason (the address
+/// and the OS error) and the remedy that clears it, and logs nothing: the
+/// caller owns the failure's log line, because only it knows the retry
+/// schedule that line reports — `server::start_host_proxies` retries with
+/// backoff until the bind succeeds (NET-021), so one failed bind is one
+/// warning, not a silent fallback. This is the daemon-startup reachability
+/// check that supersedes the former systemd-resolved probe (R3.4).
 ///
 /// The returned listener is the caller's to either serve (via [`serve`]) or
 /// drop. The success event reports the address as `reachable` rather than
@@ -154,7 +181,12 @@ fn split_authority(authority: &str) -> (&str, Option<u16>) {
 /// serve it (see `server::start_host_proxies`); this said otherwise, and reading
 /// it as a bind-and-drop probe is what made gominimal/inbox#560 look like a
 /// false alarm on macOS.
-pub async fn bind_listener(addr: SocketAddr) -> Option<TcpListener> {
+///
+/// # Errors
+///
+/// Returns a [`BindFailure`] when the address cannot be bound; the OS error is
+/// carried inside the failure's reason.
+pub async fn bind_listener(addr: SocketAddr) -> Result<TcpListener, BindFailure> {
     match TcpListener::bind(addr).await {
         Ok(listener) => {
             tracing::info!(
@@ -163,19 +195,15 @@ pub async fn bind_listener(addr: SocketAddr) -> Option<TcpListener> {
                 status = "reachable",
                 "host-side egress proxy listen address is bindable"
             );
-            Some(listener)
+            Ok(listener)
         }
-        Err(error) => {
-            tracing::warn!(
-                component = "dns-proxy",
-                %addr,
-                status = "unavailable",
-                error = %error,
-                remedy = "free the listen address; PTask *.min.internal hostnames will not route until the egress proxy can bind",
-                "host-side egress proxy could not bind its listener"
-            );
-            None
-        }
+        Err(error) => Err(BindFailure {
+            reason: format!("the daemon could not bind {addr}: {error}"),
+            remedy: format!(
+                "free the listen address; `lsof -nP -iTCP:{} -sTCP:LISTEN` names the holder",
+                addr.port()
+            ),
+        }),
     }
 }
 
@@ -595,35 +623,6 @@ mod tests {
     use std::sync::{Mutex, RwLock};
 
     use sessions::SessionId;
-    use tracing_subscriber::fmt::MakeWriter;
-
-    /// A `MakeWriter` accumulating everything written into a shared buffer, so a
-    /// test can assert on the structured fields a `tracing` event emitted.
-    #[derive(Clone, Default)]
-    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl CaptureWriter {
-        fn contents(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
-
-    impl io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for CaptureWriter {
-        type Writer = CaptureWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
 
     /// Spawns a one-shot loopback backend that answers every connection with a
     /// fixed `200 OK` and closes, returning the port it listens on.
@@ -723,32 +722,36 @@ mod tests {
     }
 
     /// Proof artifact 3 (R3.4 supersession): when the listen address cannot be
-    /// bound, the reachability check emits the `component = "dns-proxy"`
-    /// `status = "unavailable"` warning and yields no listener.
+    /// bound, the reachability check yields no listener and a failure carrying
+    /// the reason (address and OS error) and the remedy that clears it — the
+    /// text the startup retry warns with, the daemon records on its
+    /// unavailable note, and `min ls` / `min session activate` print. The
+    /// failure is logged by the caller (the startup retry in
+    /// `server::start_host_proxies`), not here, so nothing is asserted about
+    /// `tracing` output.
     #[tokio::test]
-    async fn bind_failure_warns_dns_proxy_unavailable() {
+    async fn bind_failure_carries_reason_and_remedy() {
         // Hold the address so the reachability bind fails deterministically.
         let held = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = held.local_addr().unwrap();
 
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        let listener = bind_listener(addr).await;
-        drop(guard);
-
-        assert!(listener.is_none(), "a bind to a held address must fail");
-        let logged = buf.contents();
+        let failure = bind_listener(addr)
+            .await
+            .expect_err("a bind to a held address must fail");
         assert!(
-            logged.contains(r#"component="dns-proxy""#),
-            "expected the dns-proxy component field, got: {logged}"
+            failure.reason.contains("could not bind") && failure.reason.contains(&addr.to_string()),
+            "the reason must name the address, got: {}",
+            failure.reason
         );
         assert!(
-            logged.contains(r#"status="unavailable""#),
-            "expected the unavailable status field, got: {logged}"
+            failure.remedy.contains("free") && failure.remedy.contains(&addr.port().to_string()),
+            "the remedy must point at freeing the held port, got: {}",
+            failure.remedy
+        );
+        assert!(
+            failure.reported().contains("Remedy"),
+            "the report must carry both parts, got: {}",
+            failure.reported()
         );
     }
 
