@@ -75,41 +75,11 @@ pub enum Command {
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
     #[command(hide = true)]
     Proxy(ProxyArgs),
-    /// Forward a local TCP port to a remote address inside a PTask via SSH
-    /// (R4.8, R4.9).
+    /// Print that there is nothing to mint
     ///
-    /// Sets up an SSH `LocalForward` (`-L`) tunnel through the minimald SSH
-    /// server so traffic sent to `<local-port>` on the host is relayed to
-    /// `<remote-host>:<remote-port>` from inside the named PTask's network
-    /// namespace. Useful when WireGuard (`networking-wg` feature) is
-    /// unavailable (e.g., on corporate networks that block UDP).
-    ///
-    /// Examples:
-    ///
-    ///   # Forward host port 18080 to the webserver inside the "dev" session:
-    ///   min ssh-forward dev 18080:127.0.0.1:80
-    ///
-    ///   # Then access it from the host:
-    ///   curl http://localhost:18080/
-    #[cfg(feature = "remote-access")]
-    #[command(name = "ssh-forward", visible_alias = "forward")]
-    SshForward(SshForwardArgs),
-    /// Obtain an mTLS client certificate for the HTTPS reverse proxy
-    ///
-    /// Connects to minimald, generates a fresh client certificate signed by
-    /// the daemon's internal CA, and saves the certificate and
-    /// private key to `~/.config/minimal/client.pem` /
-    /// `~/.config/minimal/client.key`. Also saves the CA certificate to
-    /// `~/.config/minimal/ca.pem` so tools like `curl` can trust the HTTPS
-    /// proxy.
-    ///
-    /// Example:
-    ///
-    ///   min login
-    ///   curl --cacert ~/.config/minimal/ca.pem \
-    ///        --cert ~/.config/minimal/client.pem \
-    ///        --key  ~/.config/minimal/client.key \
-    ///        https://localhost:7655/
+    /// The HTTPS reverse proxy this verb once served is retired, so it
+    /// issues nothing and writes nothing to disk. The verb stays as the
+    /// future home of the sign-in that replaces it.
     #[command(verbatim_doc_comment)]
     #[command(hide = true)]
     Login(LoginArgs),
@@ -706,29 +676,9 @@ pub struct ProxyArgs {
     pub socket: Option<String>,
 }
 
-/// Arguments for `min ssh-forward`.
-#[cfg(feature = "remote-access")]
-#[derive(Debug, Args)]
-pub struct SshForwardArgs {
-    /// Session identifier (UUID or session name)
-    #[arg(add = completion::session_completer())]
-    pub session: String,
-    /// Port-forward specification: `<local-port>:<remote-host>:<remote-port>`
-    ///
-    /// Example: `18080:127.0.0.1:80` to forward local port 18080 to port 80
-    /// on the loopback address as seen from inside the session.
-    #[arg(value_name = "LOCAL:REMOTE_HOST:REMOTE_PORT")]
-    pub forward: String,
-}
-
 /// Arguments for `min login`.
 #[derive(Debug, Args)]
-pub struct LoginArgs {
-    /// Override the directory where client cert files are written
-    /// (default: `~/.config/minimal/`).
-    #[arg(long)]
-    pub cert_dir: Option<PathBuf>,
-}
+pub struct LoginArgs {}
 
 /// Arguments for the hidden `min complete-session-str`.
 #[derive(Debug, Args)]
