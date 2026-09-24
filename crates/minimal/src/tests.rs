@@ -1393,3 +1393,119 @@ async fn proxy_exits_when_the_daemon_closes_the_socket() {
     .expect("proxy must exit once the socket closes, not hang on open stdin")
     .expect("a bridge that ends on a closed socket is not an error");
 }
+
+/// `--network` and `--ingress` are visible in `min session activate --help`
+/// (NET-035), with the `--network` value advertising the current
+/// `none|host_ip|own_ip` spellings.
+#[test]
+fn activate_help_shows_network_flags() {
+    use clap::CommandFactory as _;
+
+    let mut cmd = Cli::command();
+    let activate = cmd
+        .find_subcommand_mut("session")
+        .expect("`session` stays a subcommand")
+        .find_subcommand_mut("activate")
+        .expect("`session activate` stays a subcommand");
+    let help = activate.render_help().to_string();
+    assert!(
+        help.contains("--network <none|host_ip|own_ip>"),
+        "--help must advertise the network modes and their spellings: {help}"
+    );
+    assert!(
+        help.contains("--ingress <EXT:INT[/PROTO]>"),
+        "--help must show the ingress flag: {help}"
+    );
+}
+
+/// Every legacy `--network` spelling still parses to the mode its current
+/// spelling names (NET-037), and carries a hint naming both the spelling
+/// typed and the one to use; the current spellings carry no hint, the
+/// default stays the shared-host network, and anything else is refused.
+#[test]
+fn legacy_network_spellings_parse_with_hint() {
+    use clap::Parser as _;
+
+    let activate_args = |args: &[&str]| -> ActivateArgs {
+        match Cli::try_parse_from(args).unwrap().command {
+            Some(Command::Session(SessionArgs {
+                command: SessionCommand::Activate(a),
+            })) => a,
+            _ => panic!("expected an activate command for {args:?}"),
+        }
+    };
+
+    for (legacy, current, mode) in [
+        ("no-net", "none", CliNetworkMode::NoNet),
+        ("host-net", "host_ip", CliNetworkMode::HostNet),
+        ("own-ip", "own_ip", CliNetworkMode::OwnIp),
+    ] {
+        let args = activate_args(&["min", "session", "activate", "--network", legacy]);
+        assert_eq!(
+            args.network, mode,
+            "--network {legacy} must parse to {current}'s mode"
+        );
+        let hint = legacy_network_hint(legacy).expect("a legacy spelling carries a hint");
+        assert!(
+            hint.contains(legacy),
+            "the hint must name the spelling typed: {hint}"
+        );
+        assert!(
+            hint.contains(current),
+            "the hint must name the current spelling: {hint}"
+        );
+    }
+
+    for (current, mode) in [
+        ("none", CliNetworkMode::NoNet),
+        ("host_ip", CliNetworkMode::HostNet),
+        ("own_ip", CliNetworkMode::OwnIp),
+    ] {
+        let args = activate_args(&["min", "session", "activate", "--network", current]);
+        assert_eq!(args.network, mode);
+        assert!(
+            legacy_network_hint(current).is_none(),
+            "a current spelling must not carry a hint"
+        );
+    }
+
+    let args = activate_args(&["min", "session", "activate"]);
+    assert_eq!(args.network, CliNetworkMode::HostNet);
+
+    let err = Cli::try_parse_from(["min", "session", "activate", "--network", "bogus"])
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("none, host_ip, own_ip"),
+        "the error must name the accepted spellings: {err}"
+    );
+}
+
+/// The CLI reference documents the network flags on `session activate`
+/// (NET-036), read from the real file so a docs edit cannot silently drop
+/// either row.
+#[test]
+fn cli_reference_documents_network_flags() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/cli-min.md");
+    let doc = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let section = doc
+        .split_once("### `session activate`")
+        .expect("a `session activate` section in the CLI reference")
+        .1;
+    let section = section.split("### ").next().unwrap();
+    // Table cells escape their pipes as `\|`; compare against the rendered
+    // form.
+    let section = section.replace("\\|", "|");
+    for row in [
+        "--network <none|host_ip|own_ip>",
+        "--ingress <EXT:INT[/PROTO]>",
+    ] {
+        assert!(
+            section.contains(row),
+            "the CLI reference's `session activate` rows must document `{row}`"
+        );
+    }
+}

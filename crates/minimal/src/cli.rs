@@ -473,25 +473,24 @@ pub struct ActivateArgs {
     /// are otherwise skipped without a prompt.
     #[arg(long, value_enum)]
     pub sync: Option<SyncMode>,
-    /// Network mode: no-net, host-net (default), or own-ip.
+    /// Network mode for the session: `none` gives the session no network
+    /// (every socket it opens to a destination outside itself fails),
+    /// `host_ip` shares the host's network namespace (the default), and
+    /// `own_ip` gives the session an IP of its own on the host's switch, so
+    /// `--ingress` can publish ports.
     ///
-    /// Hidden from `--help` while `own-ip` is not usable on an installed host:
-    /// the daemon resolves a switch binary that no install ships yet
-    /// (gominimal/minimal#980), so advertising the flag offers a mode that
-    /// cannot work outside a dev checkout. Still accepted, and `host-net`
-    /// remains the default, so nothing that passes it today breaks. Unhide,
-    /// and restore the row in docs/reference/cli-min.md, once own-ip works
-    /// from an install.
-    #[arg(long, value_enum, default_value_t = CliNetworkMode::HostNet)]
-    #[clap(hide = true)]
+    /// The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still
+    /// accepted, but each prints a one-line hint naming the current spelling.
+    #[arg(
+        long,
+        value_name = "none|host_ip|own_ip",
+        value_parser = parse_network_mode,
+        default_value = "host_ip"
+    )]
     pub network: CliNetworkMode,
     /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
-    /// tcp). Repeatable. Requires `--network own-ip`.
-    ///
-    /// Hidden for the same reason as `--network`: it is only meaningful with
-    /// `--network own-ip`.
+    /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
-    #[clap(hide = true)]
     pub ingress: Vec<String>,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
     /// Repeatable. If any `--loadout` is specified, defaults from
@@ -546,13 +545,55 @@ pub enum SyncMode {
     None,
 }
 
-/// CLI surface for [`sessions::NetworkMode`]. A local `ValueEnum` keeps the
-/// `sessions` crate free of a clap dependency.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+/// CLI surface for [`sessions::NetworkMode`]. Parsed by hand in
+/// [`parse_network_mode`] rather than derived from a `ValueEnum`: the hand
+/// parser is what accepts the legacy hyphenated spellings with a rename hint,
+/// which a derived enum cannot, and it keeps the `sessions` crate free of a
+/// clap dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliNetworkMode {
     NoNet,
     HostNet,
     OwnIp,
+}
+
+/// Parses the `--network <none|host_ip|own_ip>` value (NET-037). The
+/// hyphenated spellings `no-net`, `host-net`, and `own-ip` predate the
+/// rename to the underscore forms and still parse to the same modes, each
+/// printing a one-line hint naming the current spelling, so scripts and
+/// muscle memory keep working through the rename window. Anything else is
+/// a clap error.
+pub(crate) fn parse_network_mode(raw: &str) -> Result<CliNetworkMode, String> {
+    let mode = match raw {
+        "none" | "no-net" => CliNetworkMode::NoNet,
+        "host_ip" | "host-net" => CliNetworkMode::HostNet,
+        "own_ip" | "own-ip" => CliNetworkMode::OwnIp,
+        _ => {
+            return Err("expected one of none, host_ip, own_ip (the hyphenated \
+                 no-net, host-net, own-ip are accepted as legacy spellings)"
+                .to_owned());
+        }
+    };
+    if let Some(hint) = legacy_network_hint(raw) {
+        eprintln!("{hint}");
+    }
+    Ok(mode)
+}
+
+/// The rename hint for a legacy `--network` spelling: one line naming the
+/// spelling typed and the current one. `None` for a current spelling, so
+/// only the old forms are announced.
+pub(crate) fn legacy_network_hint(raw: &str) -> Option<String> {
+    let current = match raw {
+        "no-net" => "none",
+        "host-net" => "host_ip",
+        "own-ip" => "own_ip",
+        _ => return None,
+    };
+    Some(format!(
+        "note: --network {raw} still works for one release; \
+         the current spelling is --network {current}"
+    ))
 }
 
 impl From<CliNetworkMode> for sessions::NetworkMode {
