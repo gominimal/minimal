@@ -422,7 +422,8 @@ mod tests {
         // — with or without the `:port` a real header carries.
         let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         assert_eq!(
-            reg.resolve("myservice.min.internal").map(|r| r.target(8080)),
+            reg.resolve("myservice.min.internal")
+                .map(|r| r.target(8080)),
             Some(loopback)
         );
         assert_eq!(
@@ -431,7 +432,8 @@ mod tests {
             Some(loopback)
         );
         assert_eq!(
-            reg.resolve("myservice.min.internal").map(|r| r.session().to_string()),
+            reg.resolve("myservice.min.internal")
+                .map(|r| r.session().to_string()),
             Some("myservice".to_string())
         );
 
@@ -469,10 +471,7 @@ mod tests {
         let route = reg
             .resolve("web.min.internal")
             .expect("routes after the report");
-        assert_eq!(
-            route.target(18080),
-            SocketAddr::new(loopback_addr(), 18080)
-        );
+        assert_eq!(route.target(18080), SocketAddr::new(loopback_addr(), 18080));
         assert_eq!(route.session(), "web");
 
         // A rename withdraws and re-registers against the same lease.
@@ -507,7 +506,10 @@ mod tests {
         reg.report_own_address(SessionId::nil(), "web", lease, leased_ports());
 
         let route = reg.resolve("web.min.internal:18080").expect("routes");
-        assert_eq!(route.target(18080), SocketAddr::new(IpAddr::V4(lease), 8080));
+        assert_eq!(
+            route.target(18080),
+            SocketAddr::new(IpAddr::V4(lease), 8080)
+        );
         // A port the ingress declaration does not publish passes through.
         assert_eq!(route.target(9000), SocketAddr::new(IpAddr::V4(lease), 9000));
         assert_eq!(route.session(), "web");
@@ -521,7 +523,9 @@ mod tests {
         let mut reg = HostnameRegistry::new("local", false);
         reg.register_host_net(SessionId::nil(), "web");
 
-        let legacy = reg.resolve("web.local.min.internal").expect("legacy form routes");
+        let legacy = reg
+            .resolve("web.local.min.internal")
+            .expect("legacy form routes");
         assert_eq!(legacy.session(), "web");
         assert_eq!(
             reg.resolve("web.min.internal"),

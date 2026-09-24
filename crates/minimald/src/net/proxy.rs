@@ -280,20 +280,20 @@ where
 
     let mut upstream =
         match TcpStream::connect(route.target(port.unwrap_or(DEFAULT_UPSTREAM_PORT))).await {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            tracing::warn!(
-                component = "dns-proxy",
-                host = %host,
-                session = route.session(),
-                %error,
-                reason = "the upstream box refused the connection",
-                status = "502 Bad Gateway",
-                "refused a proxied request"
-            );
-            return write_status(&mut client, "502 Bad Gateway").await;
-        }
-    };
+            Ok(upstream) => upstream,
+            Err(error) => {
+                tracing::warn!(
+                    component = "dns-proxy",
+                    host = %host,
+                    session = route.session(),
+                    %error,
+                    reason = "the upstream box refused the connection",
+                    status = "502 Bad Gateway",
+                    "refused a proxied request"
+                );
+                return write_status(&mut client, "502 Bad Gateway").await;
+            }
+        };
 
     match kind {
         // Tunnel: acknowledge the CONNECT, then splice raw bytes both ways.
@@ -835,10 +835,7 @@ mod tests {
 
         // The legacy form routes exactly as the two-label form does.
         let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-        assert_eq!(
-            router.route("web.local.min.internal:8080"),
-            Some(loopback)
-        );
+        assert_eq!(router.route("web.local.min.internal:8080"), Some(loopback));
         assert_eq!(router.route("web.min.internal:8080"), Some(loopback));
 
         drop(_guard);
@@ -905,10 +902,7 @@ mod tests {
 
         // A head no request can be parsed from: a bad-request refusal.
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-        client
-            .write_all(b"this is not http\r\n\r\n")
-            .await
-            .unwrap();
+        client.write_all(b"this is not http\r\n\r\n").await.unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         let bad = String::from_utf8_lossy(&response).into_owned();

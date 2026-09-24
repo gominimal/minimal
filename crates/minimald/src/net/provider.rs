@@ -39,7 +39,10 @@ impl OwnAddressReporter {
         registry: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
         session_id: SessionId,
     ) -> Self {
-        Self { registry, session_id }
+        Self {
+            registry,
+            session_id,
+        }
     }
 
     /// Reports `lease` — with the box's ingress declaration as an
