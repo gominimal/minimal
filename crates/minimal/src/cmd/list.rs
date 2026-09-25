@@ -304,21 +304,46 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // fault this severe — `--raw` most of all, since a script parsing bare ids
     // is exactly what will go on using hostnames that no longer resolve — and
     // stdout stays clean for the parser either way.
-    warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref());
+    warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref(), "min ls");
     warn_if_mtls_proxy_down(resp.mtls_proxy_unavailable.as_deref());
     format_ls(&mut std::io::stdout(), &args, &resp)?;
     Ok(())
 }
 
-/// Tells the user that `<name>.local.min.internal` will not resolve, and why.
+/// The warning `min ls` and `min session activate` print when the daemon
+/// reports hostname routing down: the daemon's reason and remedy for the
+/// failed bind or publish, plus what recovery looks like from here — the
+/// daemon retries with backoff and clears the warning on its own once the
+/// listener recovers (NET-020, NET-022). `command` names the command the
+/// warning rides on: re-running it shows the warning while the listener is
+/// still down and nothing once it has recovered, so the recovery sentence
+/// tells the user to re-run the command they are already in, not some other
+/// one. Pure, so tests can assert the wording without capturing stderr.
+#[must_use]
+pub fn hostname_routing_warning(reason: &str, command: &str) -> String {
+    format!(
+        "warning: session hostnames will not route: {reason}. The daemon retries \
+         with backoff and clears this warning on its own once the listener \
+         recovers; run `{command}` again to check."
+    )
+}
+
+/// Tells the user that `<name>.local.min.internal` will not resolve, and why,
+/// and what clears it.
 ///
 /// The daemon keeps serving without its host-side proxy, so nothing else the
 /// user sees is different: sessions activate, exec works, the list prints. The
 /// only other trace is a `warn!` in the daemon log, which is not where someone
-/// watching curl fail is looking (gominimal/inbox#560).
-pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>) {
+/// watching curl fail is looking (gominimal/inbox#560). The daemon's report
+/// carries the reason and the remedy for the cause (a held port, a failed
+/// publish); the recovery is the daemon's job now — it retries with backoff
+/// and the warning goes away by itself, so the remedy says to check again
+/// rather than to restart anything. `command` names the command this runs
+/// from, so the recovery sentence fits it — `min ls` on the list, `min
+/// session activate` at activation.
+pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>, command: &str) {
     if let Some(reason) = reason {
-        eprintln!("warning: session hostnames will not route: {reason}");
+        eprintln!("{}", hostname_routing_warning(reason, command));
     }
 }
 
