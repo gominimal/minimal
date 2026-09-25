@@ -187,7 +187,6 @@ fn sudo_ok(label: &str, args: &[&str]) {
 /// a static probe inside that asserts `AF_INET`, `AF_INET6`, and `AF_VSOCK`
 /// all fail with `EAFNOSUPPORT` while `AF_UNIX` still works.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs a network namespace; gated on MINIMALD_NETNS_TEST; runs in the ci-linux-native netns job"]
 async fn network_none_blocks_all_outside_sockets() {
     if !gated() {
         return;
@@ -247,7 +246,6 @@ async fn network_none_blocks_all_outside_sockets() {
 /// `AF_UNIX` socket — the local family the minenv socket and `min` helper rely
 /// on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs a network namespace; gated on MINIMALD_NETNS_TEST; runs in the ci-linux-native netns job"]
 async fn network_none_attach_works() {
     if !gated() {
         return;
