@@ -1302,8 +1302,14 @@ mod kani_proofs {
     ///   clean) and no loss can hide.
     ///
     /// Every CIDR set rides [`two_cidrs`]: `None`, empty, or two symbolic
-    /// rules — at most 4 per set, per the harness's tier text — including
-    /// both halves of the infrastructure set.
+    /// rules — **two** per set, one tighter than the tier text's "at most
+    /// 4", for the same reason [`two_protocols`] pins two: two rules is
+    /// what catches a scan that reads only one element or stops one short
+    /// of the end, and a third adds no failure shape while it multiplies
+    /// CBMC's search. Both halves of the infrastructure set ride it too,
+    /// so a set-shaped hole that only opens at three or more rules is
+    /// outside this proof's bound — stated here rather than left to be
+    /// read off the tier text.
     ///
     /// The unwind bound is 4. No loop this proof unwinds runs past its third
     /// check: the set scans walk lists of at most two CIDRs, the answer-set
