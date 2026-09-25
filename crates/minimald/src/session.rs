@@ -2151,15 +2151,18 @@ impl Session {
         phase: LaunchPhase,
     ) -> Result<session_host::SandboxLauncher, AttachError> {
         // R2.1: reject a policy that is incompatible with the network mode
-        // (e.g. egress on a non-`OwnIp` PTask) before launching the host.
+        // (e.g. ingress forwards on a non-`OwnIp` PTask) before launching the
+        // host.
         record
             .validate_policy()
             .map_err(AttachError::InvalidPolicy)?;
         let network_mode = record.network;
         // Only an `OwnIp` PTask attaches to the switch, so the policy's relay
         // halves — egress verdict and ingress forwards — are only consumed in
-        // that mode; `validate_policy` has already rejected either half
-        // configured on any other mode.
+        // that mode. `validate_policy` rejects egress rules only on `NoNet`: a
+        // host-address box may carry them (NET-120), and such a box never
+        // reaches the relay. Only the ingress half is own-address-only, and
+        // `validate_policy` has already rejected it on any other mode.
         let policy = record.policy.clone();
         Ok(session_host::SandboxLauncher {
             ctx: match phase {
