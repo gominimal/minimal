@@ -34,6 +34,26 @@ pub(crate) const ZONE: &str = "min.internal";
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const ZONE_LINK: &str = "minzone0";
 
+/// The address [`ZONE_LINK`] carries, as a `/32` of global scope: the
+/// machine-internal plane's reserved-from-the-top address — the RFC 6598
+/// `100.64.0.0/10` block the switch's default `100.64.0.0/16` subnet also
+/// lives in, mirroring the switch's `host_alias` convention of reserving an
+/// infrastructure address at `broadcast - 1` of its block, outside that
+/// subnet's leases, and never one of [`RESERVED_LOCAL_RANGE`], whose aliases
+/// belong to `lo` and the boxes publishing from it.
+///
+/// The address is what makes the link "of routable scope" at all:
+/// systemd-resolved consults a link's DNS servers and routing domains only
+/// while the link is *relevant* to it — up, with carrier, and carrying at
+/// least one address whose scope is below `RT_SCOPE_LINK` (v255's
+/// `link_relevant`/`link_address_relevant`) — and a link with no address
+/// never has its DNS scope allocated, so the routing domain the command
+/// sets is configuration nothing consults: the state the native lane's
+/// `getent` failed on before this address existed. A `/32` routes nowhere
+/// beyond the address itself.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const ZONE_LINK_ADDR: Ipv4Addr = Ipv4Addr::new(100, 127, 255, 254);
+
 /// The reserved local range the daemon publishes per-box addresses from and
 /// whose presence at session start NET-123's bind probe verifies. Mirrors
 /// `minimald::net::dns::RESERVED_LOCAL_RANGE` — the probe here and the
@@ -45,6 +65,17 @@ pub(crate) const RESERVED_LOCAL_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 64, 
 /// mDNSResponder (docs/spikes/2026-09-22-macos-loopback-alias.md).
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) const RESOLVER_FILE: &str = "/etc/resolver/min.internal";
+
+/// `/etc/resolv.conf`: the file every host process's lookup reads (through
+/// the `dns` NSS module), and so the one that must name resolved's stub for
+/// the routing-domain link to matter to host processes at all.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const RESOLV_CONF: &str = "/etc/resolv.conf";
+
+/// systemd-resolved's stub address, as `/etc/resolv.conf` names it on every
+/// host resolved serves.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const RESOLVED_STUB: &str = "127.0.0.53";
 
 /// The state of the host resolver's hook for [`ZONE`]: what was read, and
 /// the port it points the zone's lookups at, if any.
@@ -222,6 +253,52 @@ pub(crate) fn routing_domain_hook(domain_output: Option<&str>, dns_output: Optio
     }
 }
 
+/// Why no routing-domain command would reach this host's lookups, when none
+/// would: `/etc/resolv.conf` names a resolver other than systemd-resolved's
+/// stub, so a host process's lookup never travels through resolved and a
+/// link's routing domain — however exactly it is configured — never applies
+/// to it. The command NET-122's advisory names configures resolved; on this
+/// host that is configuration nothing consults, so the advisory says this
+/// instead of naming it.
+///
+/// `domain_read` is whether `resolvectl domain` answered: a host with no
+/// resolved at all has no routing-domain command to withhold, so the blocker
+/// is absent there. `None` also when the stub is named (the command works,
+/// alone or beside foreign servers — glibc asks every listed resolver), or
+/// when the file could not be read or names nothing. Pure over the reads, so
+/// it is unit-tested on every platform the suite runs on.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) fn stub_bypass_blocker(
+    domain_read: Option<&str>,
+    resolv_conf: Option<&str>,
+) -> Option<String> {
+    let text = resolv_conf?;
+    let mut servers = Vec::new();
+    for line in text.lines() {
+        let mut tokens = line.split_whitespace();
+        if tokens.next() != Some("nameserver") {
+            continue;
+        }
+        let Some(server) = tokens.next() else {
+            continue;
+        };
+        if server == RESOLVED_STUB {
+            return None;
+        }
+        servers.push(server.to_string());
+    }
+    if servers.is_empty() || domain_read.is_none() {
+        return None;
+    }
+    Some(format!(
+        "this host's lookups bypass systemd-resolved: {RESOLV_CONF} names {} \
+         and not its {RESOLVED_STUB} stub, so the routing-domain command \
+         cannot reach them; the zone resolves in host processes only once \
+         their lookups reach that stub",
+        servers.join(" ")
+    ))
+}
+
 /// One read-only `resolvectl` query, or `None` when the binary is missing,
 /// the call failed, or its output is not UTF-8. Reading through
 /// systemd-resolved's read API writes nothing, so it cannot prompt.
@@ -241,10 +318,30 @@ async fn resolvectl(args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
-/// Reads the host's current hook state (NET-122). Detection is read-only and
-/// never prompts: one file read on macOS, two `resolvectl` queries on Linux.
-pub(crate) async fn detect() -> Hook {
-    host_hook().await
+/// Reads the host's current hook state (NET-122's detection proper) and the
+/// reason no zone command would reach this host's lookups, when there is one.
+/// Detection is read-only and never prompts: two `resolvectl` queries and one
+/// file read on Linux, one file read on macOS.
+pub(crate) async fn session_detection() -> (Hook, Option<String>) {
+    host_detection().await
+}
+
+#[cfg(target_os = "macos")]
+async fn host_detection() -> (Hook, Option<String>) {
+    // macOS's resolver consults the resolver file directly — there is no
+    // stub for host lookups to bypass, so nothing can block the command.
+    (host_hook().await, None)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn host_detection() -> (Hook, Option<String>) {
+    let domain = resolvectl(&["domain"]).await;
+    let dns = resolvectl(&["dns"]).await;
+    let resolv_conf = tokio::fs::read_to_string(RESOLV_CONF).await.ok();
+    (
+        routing_domain_hook(domain.as_deref(), dns.as_deref()),
+        stub_bypass_blocker(domain.as_deref(), resolv_conf.as_deref()),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -254,13 +351,6 @@ async fn host_hook() -> Hook {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => resolver_file_hook(None),
         Err(e) => Hook::absent(RESOLVER_FILE, format!("resolver file unreadable: {e}")),
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-async fn host_hook() -> Hook {
-    let domain = resolvectl(&["domain"]).await;
-    let dns = resolvectl(&["dns"]).await;
-    routing_domain_hook(domain.as_deref(), dns.as_deref())
 }
 
 /// The exact command that points macOS's resolver at the answerer: one
@@ -284,19 +374,23 @@ pub(crate) fn macos_command(port: u16) -> String {
 ///
 /// The steps, in the order they run: create the dedicated link if this host
 /// does not have it yet (a re-run after `resolvectl revert`, which undoes
-/// the DNS configuration but not the link, must not die on `File exists`),
-/// bring it up, take it off the default route, then give it the answerer as
-/// its server and the zone as its routing domain. `default-route false`
-/// comes *before* the server because a link with servers and no routing
-/// domain is a default-route link implicitly — the flag first means no
-/// partially-run command ever routes non-zone queries here. `~{ZONE}` is
-/// single-quoted so the inner shell does not expand the tilde.
+/// the DNS configuration but not the link, must not die on `File exists` —
+/// the guard covers the link, and `ip addr replace` covers its address),
+/// bring it up, give it [`ZONE_LINK_ADDR`] — the fact that makes resolved
+/// treat the link as routable and ever consult its routing domain — take it
+/// off the default route, then give it the answerer as its server and the
+/// zone as its routing domain. `default-route false` comes *before* the
+/// server because a link with servers and no routing domain is a
+/// default-route link implicitly — the flag first means no partially-run
+/// command ever routes non-zone queries here. `~{ZONE}` is single-quoted so
+/// the inner shell does not expand the tilde.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn linux_command(port: u16) -> String {
     format!(
         "sudo sh -c \"[ -e /sys/class/net/{ZONE_LINK} ] \
          || ip link add {ZONE_LINK} type dummy \
          && ip link set {ZONE_LINK} up \
+         && ip addr replace {ZONE_LINK_ADDR}/32 dev {ZONE_LINK} \
          && resolvectl default-route {ZONE_LINK} false \
          && resolvectl dns {ZONE_LINK} 127.0.0.1:{port} \
          && resolvectl domain {ZONE_LINK} '~{ZONE}'\""
@@ -315,8 +409,9 @@ pub(crate) fn command(port: u16) -> String {
     linux_command(port)
 }
 
-/// The advisory for one session start, as a function of the hook state and
-/// the daemon's interim verdict (NET-122, NET-123's interim arm). Pure.
+/// The advisory for one session start, as a function of the hook state, the
+/// daemon's interim verdict, and whether anything blocks the command
+/// (NET-122, NET-123's interim arm). Pure.
 ///
 /// `None` — nothing to say — when the hook already routes the zone to this
 /// answerer *and* the daemon did not publish at the interim. Otherwise the
@@ -325,7 +420,19 @@ pub(crate) fn command(port: u16) -> String {
 /// the advisory of NET-122"): a session on the interim is a fact the user
 /// has no other way to see, and the advisory command is the same privileged
 /// step that ends it. String assembly only.
-pub(crate) fn advisory_at(hook: &Hook, port: u16, interim: bool) -> Option<String> {
+///
+/// `blocker` names why the command would do nothing on this host — a host
+/// whose lookups never reach the resolver the command configures — in which
+/// case the advisory says that instead of naming a command: NET-122's
+/// "exact command" is only ever one that works, and printing a dead one
+/// would take a privilege prompt in exchange for configuration no host
+/// process would ever consult.
+pub(crate) fn advisory_at(
+    hook: &Hook,
+    port: u16,
+    interim: bool,
+    blocker: Option<&str>,
+) -> Option<String> {
     if hook.routes(port) && !interim {
         return None;
     }
@@ -345,6 +452,9 @@ pub(crate) fn advisory_at(hook: &Hook, port: u16, interim: bool) -> Option<Strin
         ));
     }
     let facts = facts.join("; ");
+    if let Some(blocker) = blocker {
+        return Some(format!("note: {facts}; {blocker}."));
+    }
     let command = command(port);
     Some(format!(
         "note: {facts}. Configure the host's resolver for the zone with:\n  {command}"
@@ -360,7 +470,10 @@ pub(crate) fn advisory_at(hook: &Hook, port: u16, interim: bool) -> Option<Strin
 /// at, so the advisory stays quiet rather than naming a command that
 /// cannot work. `interim_loopback` is the daemon's NET-123 verdict: its
 /// session-start bind probe found the reserved range absent and it
-/// published this session at the 127.0.0.1 interim.
+/// published this session at the 127.0.0.1 interim. On a host whose
+/// `/etc/resolv.conf` bypasses systemd-resolved's stub, the advisory says
+/// so and names no command (see [`session_detection`]): none would reach
+/// host lookups there.
 ///
 /// Printed once per session start, to stderr; never prompts.
 pub(crate) async fn session_advisory(
@@ -368,8 +481,8 @@ pub(crate) async fn session_advisory(
     interim_loopback: bool,
 ) -> Option<String> {
     let port = zone_answerer_port?;
-    let hook = detect().await;
-    advisory_at(&hook, port, interim_loopback)
+    let (hook, blocker) = session_detection().await;
+    advisory_at(&hook, port, interim_loopback, blocker.as_deref())
 }
 
 /// The reserved range as `network/prefix`, the form the advisory and the
@@ -468,7 +581,7 @@ pub(crate) struct NamingSurface {
 
 /// Reads everything [`NamingSurface`] holds, for `min bug` to record.
 pub(crate) async fn naming_surface() -> NamingSurface {
-    let hook = detect().await;
+    let (hook, _) = session_detection().await;
     let probe = tokio::task::spawn_blocking(probe_range)
         .await
         .unwrap_or_else(|join| {
@@ -509,6 +622,7 @@ mod tests {
     fn command_markers(port: u16) -> Vec<String> {
         vec![
             "sudo".into(),
+            format!("ip addr replace {ZONE_LINK_ADDR}/32 dev {ZONE_LINK}"),
             format!("resolvectl dns {ZONE_LINK} 127.0.0.1:{port}"),
             format!("resolvectl domain {ZONE_LINK} '~{ZONE}'"),
             format!("resolvectl default-route {ZONE_LINK} false"),
@@ -525,8 +639,8 @@ mod tests {
         let port = 15353;
         // An unconfigured host is advised, with the exact command to run.
         let unconfigured = Hook::absent("test", "no hook for the zone");
-        let advisory =
-            advisory_at(&unconfigured, port, false).expect("an unconfigured host must be advised");
+        let advisory = advisory_at(&unconfigured, port, false, None)
+            .expect("an unconfigured host must be advised");
         for marker in command_markers(port) {
             assert!(
                 advisory.contains(&marker),
@@ -541,14 +655,14 @@ mod tests {
         // A hook already routing this answerer is not advised again.
         let configured = Hook::configured("test", Some(port), "routes the zone");
         assert!(
-            advisory_at(&configured, port, false).is_none(),
+            advisory_at(&configured, port, false, None).is_none(),
             "a configured host must not be re-advised"
         );
 
         // A hook routing a *stale* port is advised: the command points the
         // resolver at this daemon's answerer, not the old one's.
         let stale = Hook::configured("test", Some(port - 1), "routes the zone elsewhere");
-        let advisory = advisory_at(&stale, port, false)
+        let advisory = advisory_at(&stale, port, false, None)
             .expect("a stale hook must be re-advised for this answerer's port");
         for marker in command_markers(port) {
             assert!(
@@ -559,8 +673,8 @@ mod tests {
 
         // NET-123's interim arm: a session published at the 127.0.0.1
         // interim re-surfaces the advisory even when the hook routes.
-        let interim =
-            advisory_at(&configured, port, true).expect("the interim must re-surface the advisory");
+        let interim = advisory_at(&configured, port, true, None)
+            .expect("the interim must re-surface the advisory");
         assert!(
             interim.contains("127.0.0.1 interim"),
             "the interim advisory must name the interim: {interim}"
@@ -582,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn session_advisory_agrees_with_the_hook_it_detected() {
         let port = 15353;
-        let hook = detect().await;
+        let (hook, _) = session_detection().await;
         let advisory = session_advisory(Some(port), false).await;
         if hook.routes(port) {
             assert!(advisory.is_none(), "configured host must not be advised");
@@ -711,6 +825,27 @@ mod tests {
             command.contains(&format!("resolvectl domain {ZONE_LINK} '~{ZONE}'")),
             "{command}"
         );
+        // The link carries an address of global scope — the fact that makes
+        // systemd-resolved treat it as relevant and ever consult its routing
+        // domain. A bare dummy link has no address, is not relevant to
+        // resolved, and its routing domain is configuration nothing consults:
+        // the state the native lane's resolution check failed on. `replace`,
+        // not `add`: a re-run on a host that still has the link must re-apply
+        // the servers, not die on `File exists` before it reaches them.
+        let address = format!("ip addr replace {ZONE_LINK_ADDR}/32 dev {ZONE_LINK}");
+        assert!(command.contains(&address), "{command}");
+        assert!(
+            !command.contains("ip addr add "),
+            "the address step must re-apply, not fail a re-run: {command}"
+        );
+        let up_at = command
+            .find(&format!("ip link set {ZONE_LINK} up"))
+            .expect("the link-up step is named");
+        let address_at = command.find(&address).expect("the address step is named");
+        assert!(
+            up_at < address_at,
+            "the link must be up before it carries the address: {command}"
+        );
         // The dedicated link never carries non-zone queries: it is
         // explicitly off the default route, and that flag is set before
         // its server, so not even a partially-run command leaves it a
@@ -727,6 +862,10 @@ mod tests {
             isolate_at < serve_at,
             "default-route false must precede the server: {command}"
         );
+        assert!(
+            address_at < serve_at,
+            "the routable address must precede the server it routes: {command}"
+        );
         // A host that already has the link — a re-run after
         // `resolvectl revert`, which undoes the DNS configuration but not
         // the link — can run the command again: creation is guarded, the
@@ -739,6 +878,62 @@ mod tests {
         // start (NET-122: no privilege prompt — the prompt, if any, is the
         // paste's).
         assert!(command.starts_with("sudo "), "{command}");
+    }
+
+    #[cfg(any(test, not(target_os = "macos")))]
+    #[test]
+    fn a_stub_bypassing_host_is_advised_without_a_dead_command() {
+        let domain = "Global Domains: ~.\nLink 2 (enp3s0): lab.example.com\n";
+        // A resolv.conf naming anything but resolved's stub, on a host whose
+        // resolved answered: host lookups bypass it, and the routing-domain
+        // command would configure nothing they consult.
+        let resolv_conf = "search example.com\nnameserver 192.168.1.1\nnameserver 1.1.1.1\n";
+        let blocker = stub_bypass_blocker(Some(domain), Some(resolv_conf))
+            .expect("a stub-bypassing host must block the command");
+        assert!(blocker.contains("bypass systemd-resolved"), "{blocker}");
+        assert!(blocker.contains("192.168.1.1 1.1.1.1"), "{blocker}");
+        assert!(blocker.contains(RESOLVED_STUB), "{blocker}");
+
+        let hook = Hook::absent("test", "no link carries a routing domain for the zone");
+        let advisory = advisory_at(&hook, 15353, false, Some(&blocker))
+            .expect("a stub-bypassing host is still advised");
+        assert!(
+            advisory.contains(&blocker),
+            "the advisory says why no command is named: {advisory}"
+        );
+        assert!(
+            !advisory.contains("sudo"),
+            "a command that does nothing is not named, and no prompt is asked \
+             for it: {advisory}"
+        );
+        assert!(
+            !advisory.contains('?'),
+            "an advisory never asks a question — it says what is wrong: {advisory}"
+        );
+
+        // The stub named — alone or beside foreign servers — is a host the
+        // command works on: no blocker, the command is named.
+        assert!(
+            stub_bypass_blocker(Some(domain), Some("nameserver 127.0.0.53\n")).is_none()
+        );
+        assert!(stub_bypass_blocker(
+            Some(domain),
+            Some("nameserver 192.168.1.1\nnameserver 127.0.0.53\n")
+        )
+        .is_none());
+
+        // No resolved to configure — `resolvectl domain` did not run — no
+        // routing-domain command to withhold, however foreign the file: the
+        // advisory's mechanism question does not arise on that host.
+        assert!(stub_bypass_blocker(None, Some(resolv_conf)).is_none());
+
+        // An unreadable or empty resolv.conf is no evidence against the stub:
+        // the command is named rather than withheld for no reason.
+        assert!(stub_bypass_blocker(Some(domain), None).is_none());
+        assert!(
+            stub_bypass_blocker(Some(domain), Some("search example.com\n")).is_none(),
+            "a file naming no resolver blocks nothing"
+        );
     }
 
     #[test]
