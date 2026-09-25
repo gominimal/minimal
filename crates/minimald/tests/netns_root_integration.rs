@@ -9,6 +9,12 @@
 //! * `netns_ingress_static_port_mapping_exposes_then_unexposes` — a static
 //!   ingress mapping makes a listener inside an own-IP task reachable from the
 //!   host, then removes it on exit.
+//! * `network_none_blocks_all_outside_sockets` — a none box, launched through
+//!   the production sandbox and its socket-family filter, cannot create any
+//!   socket that reaches outside it, `AF_VSOCK` included.
+//! * `network_none_attach_works` — a none box launched the way the session
+//!   host launches it, session leader and pty included, keeps its terminal
+//!   and still accepts an injected process.
 //!
 //! The own-IP proofs drive the **production** switch-attach wiring rather than a
 //! hand-rolled `ip netns` sequence: each task's namespace is created by the same
@@ -20,14 +26,21 @@
 //! which needs `CAP_NET_ADMIN`; the daemon holds it in production, so the proof
 //! wraps each command in `sudo` on the unprivileged CI runner.
 //!
-//! Both tests are `#[ignore]` and additionally early-return unless
-//! `MINIMALD_NETNS_TEST` is set, and read the gvproxy binary from `GVPROXY_BIN`.
-//! Auto-discovered by the native lane's `minimald-root-integration` job via its
-//! `_root_integration` binary-name suffix (`-E 'binary(/_root_integration$/)'`) — ubuntu-latest
+//! Every proof here early-returns unless `MINIMALD_NETNS_TEST` is set, so the
+//! default `cargo test` run (and this sandbox) never attempts privileged netns
+//! operations; the three netns/gvproxy tests are additionally `#[ignore]`,
+//! while the two none-box proofs are not, so the surveyed nextest lines can
+//! name them. The own-IP proofs read the gvproxy binary from `GVPROXY_BIN`,
+//! and the none-box proofs compile their socket probe with `gcc` — a gated
+//! host that lacks either fails the proof rather than skipping it into a
+//! false green. Auto-discovered by the native lane's `minimald-root-integration`
+//! job via its `_root_integration` binary-name suffix
+//! (`-E 'binary(/_root_integration$/)'`) — ubuntu-latest
 //! with unprivileged userns + sudo for netns/tap and a userspace gvproxy switch,
 //! no KVM; a new `crates/minimald/tests/*_root_integration.rs` joins that job with no
 //! workflow edit. To run locally you need a netns-capable host (unprivileged
-//! userns + sudo) and a pinned gvproxy (scripts/fetch-gvproxy.sh):
+//! userns + sudo), gcc to build the socket probes, and a pinned gvproxy
+//! (scripts/fetch-gvproxy.sh):
 //! `MINIMALD_NETNS_TEST=1 GVPROXY_BIN=... cargo test -p minimald --test netns_root_integration -- --include-ignored`
 #![cfg(target_os = "linux")]
 
@@ -136,9 +149,14 @@ int main(int argc, char **argv) {
 }
 "#;
 
-/// Compile the socket-family probe statically and return its path, or `None`
-/// if no C compiler is available on this host.
-fn compile_socket_probe(base: &Path) -> Option<PathBuf> {
+/// Compile the socket-family probe statically and return its path.
+///
+/// Panics when no C compiler is on `PATH` instead of skipping: this proof is
+/// only reached behind `MINIMALD_NETNS_TEST`, so a host that sets the gate is
+/// a host that promised to run it, and a skip here would be a vacuous green on
+/// a security proof — the same shape the CI job's own fail-fast netns check
+/// exists to prevent.
+fn compile_socket_probe(base: &Path) -> PathBuf {
     let src = base.join("socket_probe.c");
     let bin = base.join("socket_probe");
     std::fs::write(&src, SOCKET_PROBE_C).expect("writing socket probe source");
@@ -150,8 +168,13 @@ fn compile_socket_probe(base: &Path) -> Option<PathBuf> {
     let status = match status {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("skipping netns proof: gcc not found");
-            return None;
+            panic!(
+                "gcc not found: the netns proofs are gated on \
+                 MINIMALD_NETNS_TEST, so this host promised to run them; \
+                 install a C compiler (build-essential on Ubuntu) rather \
+                 than letting a security proof pass without asserting \
+                 anything (spawn error: {e})"
+            );
         }
         Err(e) => panic!("spawning gcc to compile socket probe: {e}"),
     };
@@ -159,7 +182,7 @@ fn compile_socket_probe(base: &Path) -> Option<PathBuf> {
         status.success(),
         "gcc failed to compile socket probe: {status:?}"
     );
-    Some(bin)
+    bin
 }
 
 /// Create a minimal rootfs directory containing the static probe at
@@ -194,6 +217,25 @@ fn sudo_ok(label: &str, args: &[&str]) {
     );
 }
 
+/// The session id and controlling-terminal number of `pid`, from
+/// `/proc/<pid>/stat` (fields 6 and 7).  Read from outside the sandbox as the
+/// process's owner, so no privilege is needed.
+fn proc_session_and_tty(pid: u32) -> (u32, i32) {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .unwrap_or_else(|e| panic!("reading /proc/{pid}/stat for the launch-path check: {e}"));
+    // The comm field (2) is parenthesised and may itself contain a ')', so the
+    // parse starts after the last one.  What follows it is:
+    // state(0) ppid(1) pgrp(2) session(3) tty_nr(4).
+    let after_comm = stat
+        .rsplit_once(')')
+        .expect("/proc/<pid>/stat always carries a parenthesised comm field")
+        .1;
+    let fields: Vec<&str> = after_comm.split_ascii_whitespace().collect();
+    let session: u32 = fields[3].parse().expect("the session field is a number");
+    let tty_nr: i32 = fields[4].parse().expect("the tty_nr field is a number");
+    (session, tty_nr)
+}
+
 /// NET-038. A none box refuses every socket family that reaches outside the
 /// sandbox, `AF_VSOCK` included.  The test builds a real sandbox with an
 /// isolated `NetPlan`, installs the production socket-family filter, and runs
@@ -213,9 +255,7 @@ async fn network_none_blocks_all_outside_sockets() {
     }
 
     let rootfs_tmp = tempfile::tempdir_in("/tmp").expect("rootfs temp dir under /tmp");
-    let Some(probe) = compile_socket_probe(rootfs_tmp.path()) else {
-        return;
-    };
+    let probe = compile_socket_probe(rootfs_tmp.path());
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
 
@@ -270,10 +310,18 @@ async fn network_none_blocks_all_outside_sockets() {
 }
 
 /// NET-039. A none box stays attachable.  The test launches a long-lived none
-/// box, injects a second process into its namespaces with the production
-/// nsenter shim, and verifies that the injected process can still create an
-/// `AF_UNIX` socket — the local family the minenv socket and `min` helper rely
-/// on.
+/// box the way the session host launches a real one — `set_session_leader()`
+/// before the command is built, a pty slave on the box's stdin — injects a
+/// second process into its namespaces with the production nsenter shim, and
+/// verifies that the injected process can still create an `AF_UNIX` socket —
+/// the local family the minenv socket and `min` helper rely on.
+///
+/// Driving the session-leader runctl is what makes this a launch-path proof:
+/// the none-box launch swaps the built command for a seccomp closure, and if
+/// that swap ever dropped `Runctl::NewSession`, every none box would start
+/// without a controlling terminal and attach would break — so the box's
+/// process is asserted to come out of the swap as its own session leader
+/// holding the pty as its controlling terminal.
 ///
 /// Both processes also report their working directory and `SHELL`: the
 /// none-box launch swaps the built command for a seccomp closure, and the
@@ -286,15 +334,14 @@ async fn network_none_attach_works() {
         return;
     }
     use minimald::nsenter::{Injection, session_leader_pid};
+    use minimald::session_host::{Pty, WinSize};
     use std::io::BufRead as _;
 
     /// What the session host would set: the shell that is actually running.
     const PROBE_SHELL: &str = "/usr/bin/probe";
 
     let rootfs_tmp = tempfile::tempdir_in("/tmp").expect("rootfs temp dir under /tmp");
-    let Some(probe) = compile_socket_probe(rootfs_tmp.path()) else {
-        return;
-    };
+    let probe = compile_socket_probe(rootfs_tmp.path());
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
 
@@ -308,9 +355,14 @@ async fn network_none_attach_works() {
         .await
         .expect("building none-box sandbox");
     let plan = sandbox.built_in_plan();
-    let container = sandbox
+    let mut container = sandbox
         .new_container(&plan)
         .expect("building none-box container");
+    // The session host's own sequence (session_host.rs:2207): the box becomes
+    // its own session leader *before* `Sandbox::command` builds the command
+    // whose program the seccomp closure swap replaces, so the swap is what has
+    // to carry the runctl to the child hakoniwa forks.
+    container.set_session_leader();
 
     let expected_cwd = sandbox.command_cwd();
     let expected_report = vec![
@@ -328,6 +380,24 @@ async fn network_none_attach_works() {
         .expect("building hold command");
     // Set after `command()` returns, exactly as the session host sets `SHELL`.
     hold.env("SHELL", PROBE_SHELL);
+    // The terminal the launch hands the box, on stdin — the fd hakoniwa's
+    // `TIOCSCTTY` acts on, so `Runctl::NewSession` can make it the box's
+    // controlling terminal.  A real session wires stdout and stderr to the
+    // same slave (session_host.rs:2256-2260); stdout stays a pipe here so the
+    // report below arrives byte-exact, and the box's stdin — the one the
+    // terminal dance needs — is the part this proof exercises.  The pair
+    // outlives the box: closing the master while the box runs would SIGHUP it.
+    let pty = Pty::open(WinSize {
+        rows: 24,
+        cols: 80,
+        xpixel: 0,
+        ypixel: 0,
+    })
+    .expect("opening the launch-path pty");
+    hold.stdin(hakoniwa::Stdio::from(
+        pty.dup_slave_fd()
+            .expect("duplicating the launch-path pty slave"),
+    ));
     hold.stdout(hakoniwa::Stdio::MakePipe);
     let mut child = hold.spawn().expect("spawning hold process in none box");
 
@@ -369,6 +439,28 @@ async fn network_none_attach_works() {
 
     let leader =
         session_leader_pid(child.id()).expect("resolving the none box's session leader pid");
+
+    // The launch-path half of NET-039: hakoniwa runs `setsid()` and
+    // `TIOCSCTTY` in the box's own process, driven by the container's runctl
+    // set before the command was built — so the process the injection targets
+    // must be its own session leader holding the pty as its controlling
+    // terminal, exactly the state an attach hands a client.  A closure swap
+    // that dropped the runctl, or the stdio the terminal dance acts on, fails
+    // here instead of leaving every none box terminal-less.
+    let (session, tty_nr) = proc_session_and_tty(leader);
+    assert_eq!(
+        session, leader,
+        "the none-box launch lost Runctl::NewSession across the seccomp \
+         closure swap: the box's process is not its own session leader, so \
+         an attach would find no session to hand a terminal to"
+    );
+    assert_ne!(
+        tty_nr, 0,
+        "the none-box launch acquired no controlling terminal: hakoniwa's \
+         TIOCSCTTY needs the pty slave on the box's stdin, so a swap that \
+         dropped the stdio or the session-leader runctl would start the box \
+         without a terminal"
+    );
 
     let mut env = sandbox.command_env();
     env.insert("SHELL".to_string(), PROBE_SHELL.to_string());
