@@ -272,8 +272,9 @@ impl ServerState {
         // — whose switch it does not own stays on the default /16 — still draw
         // from a slice of its own: two VM daemons on one host take two
         // distinct octets and never meet on one slice (NET-027).
-        let slice_octet =
-            config.switch_subnet_octet.unwrap_or_else(|| octet_for_daemon_id(&daemon_id));
+        let slice_octet = config
+            .switch_subnet_octet
+            .unwrap_or_else(|| octet_for_daemon_id(&daemon_id));
         // The subnet this daemon's switch carries — decided by who owns the
         // gvproxy it attaches to; see [`switch_subnet_for`].
         let switch_subnet = switch_subnet_for(config.in_microvm, slice_octet);
@@ -2900,12 +2901,8 @@ mod tests {
     async fn a_forwarder_refusal_classifies_the_host_port_as_taken() {
         let dir = TempDir::new().unwrap();
         let control = dir.path().join("gvproxy.sock");
-        spawn_control_channel_answering(
-            control.clone(),
-            "409 Conflict",
-            "port already in use",
-        )
-        .await;
+        spawn_control_channel_answering(control.clone(), "409 Conflict", "port already in use")
+            .await;
 
         let failure = publish_listener_on_control(
             &crate::net::policy::ControlChannel::Unix(control),
@@ -3346,19 +3343,16 @@ mod tests {
             );
         }
         assert_eq!(
-            slice_d,
-            slice_a,
+            slice_d, slice_a,
             "a VM daemon pinned to octet 37 draws from that octet's slice, \
              not its switch's"
         );
         assert_eq!(
-            slice_e,
-            slice_b,
+            slice_e, slice_b,
             "a VM daemon pinned to octet 52 draws from that octet's slice, \
              not its switch's"
         );
-        let switch_shared_slice =
-            sessions::LoopbackAllocator::for_slice_octet(0).range();
+        let switch_shared_slice = sessions::LoopbackAllocator::for_slice_octet(0).range();
         assert_ne!(
             slice_d, switch_shared_slice,
             "two VM daemons must not share one slice of the reserved local range"

@@ -876,10 +876,9 @@ mod tests {
         // another daemon holding the port — moving the listener would hide it
         // (NET-021), so the failure must not read as busy.
         let not_busy = BindFailure {
-            reason:
-                "the daemon could not bind 192.0.2.1:7654: Cannot assign requested \
+            reason: "the daemon could not bind 192.0.2.1:7654: Cannot assign requested \
                  address — not Address already in use"
-                    .to_owned(),
+                .to_owned(),
             remedy: "free the listen address".to_owned(),
             kind: io::ErrorKind::AddrNotAvailable,
         };
