@@ -516,27 +516,31 @@ where
                 }
             }
         }
-        // Track outbound UDP so the inbound gate recognizes its reply as
-        // solicited. Only a frame the verdict admitted gets a window: an
-        // undeclared datagram must not punch a hole in the inbound gate.
-        if let Some(gate) = &gate
-            && let Some(pkt) = parse_ipv4_l4(&buf[..n])
-            && pkt.proto == IPPROTO_UDP
-        {
-            gate.conntrack.record_egress(&pkt);
-        }
-        // NET-136: the box's AAAA, HTTPS and SVCB lookups toward this
-        // switch's resolver are answered NODATA by the relay itself and
-        // never reach the switch. The box gets its empty answer — its own
-        // query id, so its resolver stack matches the reply — and nothing
-        // upstream can answer an empty-records lookup differently.
-        if let Some(gate) = &gate
-            && let Some((pkt, payload)) = udp_datagram(&buf[..n])
-            && let Some(reply) = gate.dns.intercept_query(&pkt.dst, payload)
-        {
-            let frame = udp_reply_frame(&buf[..n], &pkt, &reply);
-            write_tap_frame(&tap, &frame).await?;
-            continue;
+        // The frame's UDP addressing, parsed once for both of this leg's UDP
+        // consumers below: the conntrack window and the DNS gate's NODATA
+        // interception. A frame that is not IPv4+UDP — most of a box's
+        // traffic — reaches neither, and costs no second parse here.
+        if let Some(gate) = &gate {
+            let udp = parse_ipv4_l4(&buf[..n]).filter(|pkt| pkt.proto == IPPROTO_UDP);
+            // Track outbound UDP so the inbound gate recognizes its reply as
+            // solicited. Only a frame the verdict admitted gets a window: an
+            // undeclared datagram must not punch a hole in the inbound gate.
+            if let Some(pkt) = &udp {
+                gate.conntrack.record_egress(pkt);
+            }
+            // NET-136: the box's AAAA, HTTPS and SVCB lookups toward this
+            // switch's resolver are answered NODATA by the relay itself and
+            // never reach the switch. The box gets its empty answer — its own
+            // query id, so its resolver stack matches the reply — and nothing
+            // upstream can answer an empty-records lookup differently.
+            if let Some(pkt) = &udp
+                && let Some(payload) = udp_payload(&buf[..n], pkt)
+                && let Some(reply) = gate.dns.intercept_query(&pkt.dst, payload)
+            {
+                let frame = udp_reply_frame(&buf[..n], pkt, &reply);
+                write_tap_frame(&tap, &frame).await?;
+                continue;
+            }
         }
         // NET-004: the literal host address still routes — the switch's `nat`
         // table maps it to the host's loopback — but the relay says, once per
@@ -941,35 +945,58 @@ fn blocked_udp(
 /// datagram's payload — or `None` for anything that is not an
 /// IPv4+UDP frame, or whose claimed lengths do not bound its own payload.
 ///
-/// [`parse_ipv4_l4`] decides the addressing; here the IPv4 total length and
-/// the UDP length do the rest, because the DNS gate reads the datagram's
-/// payload and a hostile frame yields `None` — never an out-of-bounds slice,
-/// and never a slice padded out to the Ethernet frame's end: the datagram is
-/// `total` bytes, whatever the frame around it claims to be.
+/// [`parse_ipv4_l4`] decides the addressing and [`udp_payload`] the length
+/// arithmetic, because the DNS gate reads the datagram's payload and a
+/// hostile frame yields `None` — never an out-of-bounds slice, and never a
+/// slice padded out to the Ethernet frame's end: the datagram is `total`
+/// bytes, whatever the frame around it claims to be.
 pub(crate) fn udp_datagram(frame: &[u8]) -> Option<(L4Packet, &[u8])> {
-    let pkt = parse_ipv4_l4(frame)?;
+    let pkt = parse_ipv4_l4(frame).filter(|pkt| pkt.proto == IPPROTO_UDP)?;
+    let payload = udp_payload(frame, &pkt)?;
+    Some((pkt, payload))
+}
+
+/// The payload of the UDP datagram one frame carries, for a caller already
+/// holding that frame's own [`parse_ipv4_l4`] result — the egress leg, whose
+/// conntrack window and DNS-gate interception share one parse instead of a
+/// parse each. The length contract is [`udp_datagram`]'s: a claimed length
+/// that does not bound a payload yields `None`, so a mismatched `pkt` can
+/// only cost a parse, never panic.
+fn udp_payload<'a>(frame: &'a [u8], pkt: &L4Packet) -> Option<&'a [u8]> {
     if pkt.proto != IPPROTO_UDP {
         return None;
     }
-    let ip = &frame[ETH_HDR..];
-    let ihl = ((ip[0] & 0x0f) as usize) * 4;
+    let ip = frame.get(ETH_HDR..)?;
+    let ihl = ((ip.first()? & 0x0f) as usize) * 4;
     // The IPv4 total length bounds the datagram; a total shorter than its
     // own headers (including the `0` an offload'd frame carries) is not a
     // datagram this relay reads.
-    let total = u16::from_be_bytes([ip[2], ip[3]]) as usize;
+    let total = u16::from_be_bytes([*ip.get(2)?, *ip.get(3)?]) as usize;
     if total < ihl + 8 {
         return None;
     }
-    let udp = &ip[ihl..];
+    let udp = ip.get(ihl..)?;
     // A UDP length shorter than its own header is malformed; a longer one is
     // trimmed to the IP total, which is the datagram's real bound.
-    let udp_len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+    let udp_len = u16::from_be_bytes([*udp.get(4)?, *udp.get(5)?]) as usize;
     if udp_len < 8 {
         return None;
     }
     let end = total.min(ip.len());
     let payload_end = (ihl + udp_len).min(end);
-    Some((pkt, udp.get(8..payload_end - ihl)?))
+    udp.get(8..payload_end - ihl)
+}
+
+/// Whether an Ethernet frame's IPv4 protocol byte says UDP — a pre-check, not
+/// a parse: the EtherType and the one protocol byte, nothing else, so the
+/// relay's inbound hot path — mostly a peer's TCP frames, which the DNS gate
+/// can never observe — spends three comparisons per frame instead of the full
+/// [`udp_datagram`] parse. A frame that says UDP here is still parsed and
+/// length-checked before the gate reads a word of it.
+fn is_ipv4_udp(frame: &[u8]) -> bool {
+    frame.len() > ETH_HDR + 9
+        && frame[12..14] == ETHERTYPE_IPV4.to_be_bytes()
+        && frame[ETH_HDR + 9] == IPPROTO_UDP
 }
 
 /// The IPv4 header checksum of `header` (a whole header, the checksum field
@@ -1093,7 +1120,14 @@ where
         // is never admitted at all. The reply itself always passes on to
         // the box below: resolution is honest, only the connection to a
         // refused address is not admitted.
+        //
+        // Before it parses anything, the gate reads the two header bytes
+        // that decide whether the frame can be one of its own at all: only
+        // an IPv4+UDP frame can carry a resolver reply, and most inbound
+        // traffic — a peer's TCP — is not one, so the full [`udp_datagram`]
+        // parse is spent on UDP frames alone.
         if let Some(gate) = &gate
+            && is_ipv4_udp(&frame[..n])
             && let Some((pkt, payload)) = udp_datagram(&frame[..n])
         {
             gate.dns.observe_response(&pkt.src, payload, Instant::now());
@@ -1331,6 +1365,38 @@ pub(crate) mod tests {
         // As is one from a different source to the tracked local port.
         let spoof = udp_frame(PEER, 53, LEASE, 40000);
         assert!(blocked_udp(&spoof, &HashSet::new(), &ct).is_some());
+    }
+
+    /// The DNS gate's inbound pre-check reads the EtherType and the IPv4
+    /// protocol byte and nothing else, so the relay's hot path spends three
+    /// comparisons on a peer's TCP frames rather than a full parse — and it
+    /// only ever *narrows*: every frame it rejects is one `udp_datagram` could
+    /// not have read anyway, and every frame it admits is still parsed and
+    /// length-checked before the gate reads a word of it.
+    #[test]
+    fn udp_precheck_narrows_without_losing_datagrams() {
+        // A UDP frame passes the pre-check and parses as a datagram.
+        let udp = udp_frame(PEER, 33333, LEASE, 53);
+        assert!(is_ipv4_udp(&udp));
+        assert!(udp_datagram(&udp).is_some());
+
+        // A peer's TCP, ARP, and IPv6: the traffic that dominates the
+        // inbound leg, none of it a datagram the gate could observe.
+        for frame in [
+            &tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, SRC, 9999)[..],
+            &arp_frame()[..],
+            &ipv6_frame()[..],
+        ] {
+            assert!(!is_ipv4_udp(frame), "rejected: {frame:02x?}");
+            assert!(udp_datagram(frame).is_none());
+        }
+
+        // A frame too short to carry the bytes the pre-check reads: the same
+        // `None` the parse would give, never a misclassification.
+        for cut in [0, 14, 20, 23] {
+            assert!(!is_ipv4_udp(&udp[..cut]), "len {cut}");
+            assert!(udp_datagram(&udp[..cut]).is_none(), "len {cut}");
+        }
     }
 
     #[test]
