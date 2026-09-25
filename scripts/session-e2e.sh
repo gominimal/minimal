@@ -1852,15 +1852,22 @@ proof_native_resolution_without_proxy_env() {
   # What this run actually asserted, for the closing line — a degraded run
   # must not claim the halves it skipped.
   native_proved=""
+  # Set when the advisory named no command because this host's lookups
+  # bypass systemd-resolved's stub (NET-122's detection): the resolution
+  # check cannot pass on a host no command can configure.
+  native_bypassed=""
   NATIVE_SEED_DIR="$(hook_mktemp /tmp/mnlnr.XXXXXX)"
   hook_seed_preamble > "$NATIVE_SEED_DIR/minimal.toml"
   mkdir "$NATIVE_SEED_DIR/.git"
 
   # Restart with the daemon's rpc module at INFO, so this create's probe
-  # record is written; the poll below re-spawns the daemon under it.
+  # record is written, and the zone answerer at DEBUG, so its per-lookup
+  # lines are too — a resolution failure below can then say whether the
+  # query ever reached the answerer. The poll below re-spawns the daemon
+  # under it.
   if hook_log_readable; then
     mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
-    export RUST_LOG="warn,minimald::rpc=info"
+    export RUST_LOG="warn,minimald::rpc=info,minimald::net::answerer=debug"
   fi
 
   # Warm the daemon and wait until its answerer is on record, so the
@@ -1956,6 +1963,23 @@ proof_native_resolution_without_proxy_env() {
       echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
       fail
     fi
+  elif grep -q -- 'bypass systemd-resolved' "$native_err" 2>/dev/null; then
+    # An advisory that names no command: this host's lookups never reach
+    # systemd-resolved's stub, so the routing-domain command would
+    # configure nothing a host process consults — NET-122's detection says
+    # so instead of printing a dead command. Only a dev host can see this;
+    # a lane's lookups go through the stub, so CI must always get the
+    # command above.
+    native_bypassed=yes
+    echo "advisory said this host's lookups bypass systemd-resolved's stub (NET-122 detection):"
+    echo "  $(grep -F -- 'bypass systemd-resolved' "$native_err" 2>/dev/null | head -n1)"
+    if [ -n "${CI:-}" ] || [ -n "$E2E_VM" ]; then
+      echo "::error::this lane's host bypasses systemd-resolved's stub, so NET-009 cannot be proved on it"
+      echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
+      echo "--- /etc/resolv.conf ---"; cat /etc/resolv.conf 2>&1 || true
+      fail
+    fi
+    native_proved="advised-bypass"
   else
     # No advisory. NET-122's only quiet state is a hook that already routes
     # this answerer's port (the create carried the port — warmed above — and
@@ -2033,36 +2057,82 @@ proof_native_resolution_without_proxy_env() {
       # the command created.
       NATIVE_REVERT_LINK="$(printf '%s\n' "$native_cmd" \
         | sed -n 's/.*resolvectl dns \([^ ][^ ]*\) .*/\1/p')"
+    elif [ -n "$native_bypassed" ]; then
+      echo "no command to run: this host's lookups bypass systemd-resolved's stub, so no routing-domain command could reach them"
     else
       echo "no command to run (the advisory was quiet); the resolution check below is the assertion"
     fi
 
-    # NET-009: any process on the host, through the host's NATIVE resolver,
-    # with every proxy variable stripped from its environment.
-    native_resolved="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
-      -u ALL_PROXY -u all_proxy getent hosts "$NATIVE_NAME.min.internal" 2>/dev/null || true)"
-    if [ -z "$native_resolved" ]; then
-      echo "::error::$NATIVE_NAME.min.internal did not resolve on the host with no proxy settings"
-      echo "--- resolvectl domain ---"; resolvectl domain 2>&1 || true
-      echo "--- resolvectl dns ---"; resolvectl dns 2>&1 || true
-      fail
-    fi
-    echo "resolved $NATIVE_NAME.min.internal with no proxy settings: $native_resolved"
-    case "$native_resolved" in
-      *127.0.0.1*|*127.64.0.*) ;;
-      *)
-        echo "::error::the name resolved outside the box zone's loopback (got: '$native_resolved')"
+    if [ -n "$native_bypassed" ]; then
+      # NET-009's WHERE names a host whose native resolver is configured for
+      # the zone; a host whose lookups never reach resolved's stub cannot be
+      # one, and the advisory already said so — the check would fail for a
+      # fact the detection explained, not for a defect.
+      echo "resolution check SKIPPED — this host's lookups never reach systemd-resolved, so they cannot carry the zone"
+    else
+      # NET-009: any process on the host, through the host's NATIVE resolver,
+      # with every proxy variable stripped from its environment.
+      native_resolved="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+        -u ALL_PROXY -u all_proxy getent hosts "$NATIVE_NAME.min.internal" 2>/dev/null || true)"
+      if [ -z "$native_resolved" ]; then
+        echo "::error::$NATIVE_NAME.min.internal did not resolve on the host with no proxy settings"
+        # The two causes this could be, each answered by its own read below —
+        # all read-only, so nothing here can prompt:
+        #   1. whether host lookups reach resolved's stub at all — `getent`
+        #      uses the `dns` NSS module against /etc/resolv.conf, and a file
+        #      naming the upstream directly never travels through resolved,
+        #      so a per-link routing domain cannot apply to it;
+        #   2. whether the query reached the answerer and what it answered —
+        #      resolved's own verdict, and the answerer's log lines for this
+        #      very name (the case runs the daemon with the answerer at
+        #      DEBUG for exactly this).
+        # `resolvectl dns`'s Global line is printed in full too: nothing
+        # this script or the advisory's command runs can set a global server
+        # (every resolvectl verb is per-link, and a foreign resolv.conf loads
+        # with no port), so resolved.conf and its dropins — the only inputs
+        # that can — are dumped to name the source when one appears.
+        echo "--- /etc/resolv.conf ---"; cat /etc/resolv.conf 2>&1 || true
+        echo "--- nsswitch hosts ---"
+        grep -E '^[[:space:]]*hosts:' /etc/nsswitch.conf 2>&1 || true
+        echo "--- resolvectl domain ---"; resolvectl domain 2>&1 || true
+        echo "--- resolvectl dns ---"; resolvectl dns 2>&1 || true
+        echo "--- resolvectl query ---"
+        resolvectl query "$NATIVE_NAME.min.internal" 2>&1 || true
+        echo "--- resolved.conf and dropins ---"
+        cat /etc/systemd/resolved.conf /etc/systemd/resolved.conf.d/*.conf 2>&1 || true
+        if hook_log_readable; then
+          native_answers="$(grep -h -- 'zone-answerer' "$(native_log)" 2>/dev/null \
+            | grep -F -- "$NATIVE_NAME.min.internal" | tail -n20 || true)"
+          if [ -n "$native_answers" ]; then
+            echo "--- zone answerer: this query ---"
+            printf '%s\n' "$native_answers"
+          else
+            echo "--- zone answerer: no log line for this query — it never reached the answerer ---"
+            echo "  (the daemon log's last zone-answerer lines, for contrast:)"
+            grep -h -- 'zone-answerer' "$(native_log)" 2>/dev/null | tail -n5 || true
+          fi
+        fi
         fail
-        ;;
-    esac
+      fi
+      echo "resolved $NATIVE_NAME.min.internal with no proxy settings: $native_resolved"
+      case "$native_resolved" in
+        *127.0.0.1*|*127.64.0.*) ;;
+        *)
+          echo "::error::the name resolved outside the box zone's loopback (got: '$native_resolved')"
+          fail
+          ;;
+      esac
 
-    native_proved="${native_proved:+$native_proved, }resolved"
+      native_proved="${native_proved:+$native_proved, }resolved"
+    fi
 
     if [ -n "$NATIVE_REVERT_LINK" ]; then
       # Undo the whole command: `resolvectl revert` restores the link's
       # DNS state, `ip link del` removes the dedicated link itself — the
       # next iteration (the soak runs this script ten times) must find the
-      # host as this run did.
+      # host as this run did. The record is kept when a deletion fails, so
+      # the teardown retries it: this block must not clear the variable on
+      # a link it could not remove.
       if sudo resolvectl revert "$NATIVE_REVERT_LINK" >/dev/null 2>&1; then
         echo "reverted the routing domain on $NATIVE_REVERT_LINK"
       else
@@ -2070,10 +2140,10 @@ proof_native_resolution_without_proxy_env() {
       fi
       if sudo ip link del "$NATIVE_REVERT_LINK" >/dev/null 2>&1; then
         echo "removed the dedicated link $NATIVE_REVERT_LINK"
+        NATIVE_REVERT_LINK=""
       else
         echo "::warning::could not remove the dedicated link $NATIVE_REVERT_LINK (this host still carries it)"
       fi
-      NATIVE_REVERT_LINK=""
     fi
   fi
 
