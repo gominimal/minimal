@@ -453,24 +453,22 @@ fn install_filter_in_command(
     let envs = command.get_envs();
     // SAFETY: `command_from_closure` is unsafe because the closure runs in a
     // forked child.  `filter` is `&'static`; it is leaked by the Container and
-    // outlives every command spawned from it.  `execv_in_child` is
-    // async-signal-safe and only uses libc.
+    // outlives every command spawned from it.  The closure is not
+    // async-signal-safe: it allocates after the fork (the argv `CString`s, a
+    // failure message), in kind with hakoniwa's own closure path, which
+    // `format!`s its panic report at the same point.  The child is
+    // single-threaded, so no allocator lock can be held across the fork.  The
+    // closure never returns: it execs, or `_exit`s.
     let mut closure = unsafe {
-        container.command_from_closure({
-            move || {
-                if let Err(e) = install_socket_family_filter(filter) {
-                    // Fail the child so the spawn errors; stderr may not be
-                    // attached, so a numeric code is all we can return.
-                    return -(e.raw_os_error().unwrap_or(libc::EIO));
-                }
-                // `command_from_closure` replaces the program with this closure;
-                // exec into the real program so the spawn runs what the caller
-                // asked for, now with the seccomp filter installed.
-                if let Err(code) = execv_in_child(&program, &args) {
-                    return -code;
-                }
-                0
+        container.command_from_closure(move || {
+            if let Err(e) = install_socket_family_filter(filter) {
+                exit_child("installing the socket-family filter", &e);
             }
+            // `command_from_closure` replaces the program with this closure;
+            // exec into the real program so the spawn runs what the caller
+            // asked for, now with the seccomp filter installed.
+            let e = execv_in_child(&program, &args);
+            exit_child(&format!("exec {program}"), &e)
         })
     };
     if let Some(dir) = current_dir {
@@ -481,38 +479,45 @@ fn install_filter_in_command(
     Ok(())
 }
 
-/// Exec into `program` with `args` using only libc, suitable for the forked
-/// child of a hakoniwa `command_from_closure` closure.  The environment is
-/// not passed explicitly: `execv` hands the program the `environ` hakoniwa
-/// rebuilt from the command's final `envs` just before running the closure.
+/// Exec into `program` with `args` from the forked child of a hakoniwa
+/// `command_from_closure` closure; returns only when the exec failed.  The
+/// environment is not passed explicitly: `execv` hands the program the
+/// `environ` hakoniwa rebuilt from the command's final `envs` just before
+/// running the closure.
 #[cfg(target_os = "linux")]
-fn execv_in_child(program: &str, args: &[String]) -> Result<(), i32> {
-    #[cfg_attr(target_os = "linux", allow(clippy::unnecessary_cast))]
-    fn to_cstring(s: &str) -> std::result::Result<std::ffi::CString, i32> {
-        std::ffi::CString::new(s).map_err(|_| libc::EINVAL)
-    }
-
-    let program_c = to_cstring(program)?;
-
-    // It is safe to keep pointers into these `CString`s because this process is
-    // about to be replaced by execv; no allocation is freed before the syscall.
-    let mut argv_c: Vec<std::ffi::CString> = Vec::with_capacity(args.len() + 1);
-    argv_c.push(program_c.clone());
-    for arg in args {
-        argv_c.push(to_cstring(arg)?);
-    }
+fn execv_in_child(program: &str, args: &[String]) -> std::io::Error {
+    let argv_c: Result<Vec<std::ffi::CString>, _> = std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(std::ffi::CString::new)
+        .collect();
+    let argv_c = match argv_c {
+        Ok(argv) => argv,
+        Err(_) => return std::io::Error::from_raw_os_error(libc::EINVAL),
+    };
     let mut argv_ptrs: Vec<*const libc::c_char> = argv_c.iter().map(|s| s.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
 
-    // SAFETY: execv only touches the C strings we just built; the vectors are
-    // still alive for the call.
-    let rc = unsafe { libc::execv(program_c.as_ptr(), argv_ptrs.as_ptr()) };
-    if rc == -1 {
-        return Err(std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO));
+    // SAFETY: execv only touches the C strings we just built, which `argv_c`
+    // keeps alive for the call.
+    unsafe { libc::execv(argv_c[0].as_ptr(), argv_ptrs.as_ptr()) };
+    // execv returns only on failure.
+    std::io::Error::last_os_error()
+}
+
+/// Reports a failure of the forked child on its stderr and exits it with 127,
+/// the shell's "cannot run" status, so a spawn that never reached the program
+/// is distinguishable from the program's own exit codes.  Called after the
+/// fork, so it uses `write(2)` and `_exit(2)` rather than the Rust stdio and
+/// exit machinery.
+#[cfg(target_os = "linux")]
+fn exit_child(what: &str, err: &std::io::Error) -> ! {
+    let msg = format!("minimal: none box: {what} failed: {err}\n");
+    // SAFETY: `write` and `_exit` are async-signal-safe; `msg` outlives the
+    // write, and `_exit` does not return.
+    unsafe {
+        libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+        libc::_exit(127)
     }
-    Ok(())
 }
 
 /// Options for [`Sandbox::bind_mount`].

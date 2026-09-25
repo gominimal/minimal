@@ -588,9 +588,17 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
         cmd.current_dir(dir);
     }
 
+    // Resolved here, before the fork: building the filter allocates, and the
+    // first `OnceLock` access is what builds it. Only the `&'static` result
+    // crosses into the child.
+    let none_box_filter = args
+        .seal_none_box
+        .then(sandbox2::socket_family_filter_for_none_box);
+
     // SAFETY: the closures run in the forked child between `fork` and `exec`,
-    // where only async-signal-safe calls are legal. `prctl` is on that list,
-    // and the closures allocate nothing and capture only a static reference.
+    // where only async-signal-safe calls are legal. `prctl` and the raw
+    // `seccomp` syscall are on that list, and the closures allocate nothing
+    // and capture only a static reference.
     unsafe {
         cmd.pre_exec(|| {
             // Tie the injected process's lifetime to this shim's. Nothing else
@@ -612,17 +620,15 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
             Ok(())
         });
 
-        if args.seal_none_box {
+        if let Some(filter) = none_box_filter {
             cmd.pre_exec(move || {
                 // Re-install the none-box socket-family filter.  The filter
                 // installed at sandbox launch is inherited by children of the
                 // filtered process, but this injected process joins the
                 // namespaces later and must load it itself.
-                // SAFETY: the filter is a `&'static` value owned by the
-                // process-wide OnceLock; it is valid for the program's lifetime.
-                sandbox2::install_socket_family_filter(
-                    sandbox2::socket_family_filter_for_none_box(),
-                )?;
+                // SAFETY: `filter` is a `&'static` owned by the process-wide
+                // OnceLock, valid and immutable for the program's lifetime.
+                sandbox2::install_socket_family_filter(filter)?;
                 Ok(())
             });
         }
