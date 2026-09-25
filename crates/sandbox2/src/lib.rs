@@ -1536,12 +1536,20 @@ const ALLOWED_NONE_FAMILIES: &[u32] = &[libc::AF_UNIX as u32];
 #[cfg(target_os = "linux")]
 const ALLOWED_NONE_FAMILIES_LABEL: &str = "unix";
 
-/// Audit-architecture identifiers used by seccomp filters.  These are kernel
-/// ABI constants; they are not exposed by the `libc` crate.
-#[cfg(target_os = "linux")]
-const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
-#[cfg(target_os = "linux")]
-const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
+/// The audit-architecture identifier of the ABI this binary is built for.  A
+/// kernel ABI constant (`AUDIT_ARCH_*` in `linux/audit.h`) that the `libc`
+/// crate does not expose; chosen at compile time so an unsupported target
+/// fails to build rather than panicking at launch.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const AUDIT_ARCH: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const AUDIT_ARCH: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
+
+/// The x32 ABI shares `AUDIT_ARCH_X86_64` and marks its syscalls by setting
+/// this bit in `nr`, so a plain compare against `SYS_socket` would let an x32
+/// caller through.  The filter kills any such call instead.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 /// The socket-family seccomp filter as a classic BPF program.  It is installed
 /// via `prctl(PR_SET_NO_NEW_PRIVS, 1)` and `seccomp(SECCOMP_SET_MODE_FILTER, 0,
@@ -1569,18 +1577,16 @@ const SYS_SOCKETPAIR: i64 = libc::SYS_socketpair;
 /// in-sandbox `min` helper and the minenv socket keep functioning.
 #[cfg(target_os = "linux")]
 fn build_socket_family_filter(_plan: &network::NetPlan) -> SocketFamilyFilter {
-    let audit_arch = match std::env::consts::ARCH {
-        "x86_64" => AUDIT_ARCH_X86_64,
-        "aarch64" => AUDIT_ARCH_AARCH64,
-        other => panic!("unsupported architecture for seccomp filter: {other}"),
-    };
-
     // Return the selected action for a socket() or socketpair() whose arg0 (the
     // address family) is not in ALLOWED_NONE_FAMILIES.
     let refuse_action = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
     // Return the default allow action when the syscall is not one we restrict
     // or when the address family is allowed.
     let allow_action = libc::SECCOMP_RET_ALLOW;
+    // A caller on a foreign ABI (another audit arch, or x32 on x86_64) is not
+    // something a none box ever runs legitimately, and the syscall numbers
+    // below would not mean the same thing there: kill it rather than guess.
+    let kill_action = libc::SECCOMP_RET_KILL_PROCESS;
 
     // Offsets into struct seccomp_data in bytes:
     //   int nr;                  // 0
@@ -1591,76 +1597,65 @@ fn build_socket_family_filter(_plan: &network::NetPlan) -> SocketFamilyFilter {
     const OFFSET_ARCH: u32 = 4;
     const OFFSET_ARG0: u32 = 16;
 
+    let load = |offset: u32| libc::sock_filter {
+        code: (libc::BPF_LD | libc::BPF_ABS | libc::BPF_W) as u16,
+        jt: 0,
+        jf: 0,
+        k: offset,
+    };
+    let jeq = |k: u32, jt: u8, jf: u8| libc::sock_filter {
+        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        jt,
+        jf,
+        k,
+    };
+    let ret = |action: u32| libc::sock_filter {
+        code: (libc::BPF_RET | libc::BPF_K) as u16,
+        jt: 0,
+        jf: 0,
+        k: action,
+    };
+
     // Classic BPF seccomp program.  `jt` and `jf` are the number of
-    // instructions to skip after the current one (a jump target of 0 means
-    // "fall through to the next instruction").
-    let filter: Vec<libc::sock_filter> = vec![
-        // 0: load arch; if it does not match, skip to allow_all.
-        libc::sock_filter {
-            code: (libc::BPF_LD | libc::BPF_ABS | libc::BPF_W) as u16,
-            jt: 0,
-            jf: 0,
-            k: OFFSET_ARCH,
-        },
-        libc::sock_filter {
-            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
-            jt: 0,
-            jf: 7,
-            k: audit_arch,
-        },
-        // 2: load syscall number; if this is socket(), jump to arg0 check.
-        libc::sock_filter {
-            code: (libc::BPF_LD | libc::BPF_ABS | libc::BPF_W) as u16,
-            jt: 0,
-            jf: 0,
-            k: OFFSET_NR,
-        },
-        libc::sock_filter {
-            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
-            jt: 1,
-            jf: 0,
-            k: SYS_SOCKET as u32,
-        },
-        // 4: if not socketpair() either, skip to allow_all.
-        libc::sock_filter {
-            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
-            jt: 0,
-            jf: 4,
-            k: SYS_SOCKETPAIR as u32,
-        },
-        // 5: load arg0 (domain); if AF_UNIX allow, else refuse.
-        libc::sock_filter {
-            code: (libc::BPF_LD | libc::BPF_ABS | libc::BPF_W) as u16,
-            jt: 0,
-            jf: 0,
-            k: OFFSET_ARG0,
-        },
-        libc::sock_filter {
-            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+    // instructions to skip after the current one (0 means "fall through to the
+    // next instruction").  Indices below are for x86_64; aarch64 has no x32
+    // guard, so everything from the `SYS_socket` compare on sits two lower
+    // (relative jumps in that tail are unchanged).
+    let mut filter: Vec<libc::sock_filter> = Vec::new();
+    // 0: load arch.
+    filter.push(load(OFFSET_ARCH));
+    // 1: native ABI -> 3; anything else -> 2.
+    filter.push(jeq(AUDIT_ARCH, 1, 0));
+    // 2: kill: foreign ABI.
+    filter.push(ret(kill_action));
+    // 3: load syscall number.
+    filter.push(load(OFFSET_NR));
+    #[cfg(target_arch = "x86_64")]
+    {
+        // 4: nr >= X32_SYSCALL_BIT -> 5; else -> 6.
+        filter.push(libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K) as u16,
             jt: 0,
             jf: 1,
-            k: libc::AF_UNIX as u32,
-        },
-        libc::sock_filter {
-            code: (libc::BPF_RET | libc::BPF_K) as u16,
-            jt: 0,
-            jf: 0,
-            k: allow_action,
-        },
-        libc::sock_filter {
-            code: (libc::BPF_RET | libc::BPF_K) as u16,
-            jt: 0,
-            jf: 0,
-            k: refuse_action,
-        },
-        // 9: default allow.
-        libc::sock_filter {
-            code: (libc::BPF_RET | libc::BPF_K) as u16,
-            jt: 0,
-            jf: 0,
-            k: allow_action,
-        },
-    ];
+            k: X32_SYSCALL_BIT,
+        });
+        // 5: kill: x32 ABI.
+        filter.push(ret(kill_action));
+    }
+    // 6: socket() -> 8; else -> 7.
+    filter.push(jeq(SYS_SOCKET as u32, 1, 0));
+    // 7: socketpair() -> 8; anything else -> 12 (default allow).
+    filter.push(jeq(SYS_SOCKETPAIR as u32, 0, 4));
+    // 8: load arg0 (the address family).
+    filter.push(load(OFFSET_ARG0));
+    // 9: AF_UNIX -> 10; else -> 11.
+    filter.push(jeq(libc::AF_UNIX as u32, 0, 1));
+    // 10: allow: local socket family.
+    filter.push(ret(allow_action));
+    // 11: refuse: any other family, EAFNOSUPPORT.
+    filter.push(ret(refuse_action));
+    // 12: allow: not a socket-creating syscall.
+    filter.push(ret(allow_action));
 
     let label = if ALLOWED_NONE_FAMILIES.len() == 1 {
         ALLOWED_NONE_FAMILIES_LABEL.to_string()
