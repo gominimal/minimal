@@ -139,8 +139,7 @@ jobs:
     # packages, AFTER promote-nightly verified the smoke and moved the pointer.
     # build -> smoke -> publish, never the reverse. Both are idempotent, and a
     # no-op night (release skipped, pointer unmoved) re-publishes the same row to
-    # a no-op. A nightly always targets a sha row, so the sha-row-only rule the
-    # publishers enforce is satisfied by construction. tolerate: true keeps a
+    # a no-op. A nightly always targets a sha row. tolerate: true keeps a
     # failed push from failing this run (a stale mirror is not a failed release);
     # brew_published still reports the real outcome for the install proof below.
     publish-channel-nightly:
@@ -183,6 +182,7 @@ jobs:
               env:
                   HOMEBREW_NO_AUTO_UPDATE: "1"
                   HOMEBREW_NO_INSTALL_CLEANUP: "1"
+                  SHA: ${{ needs.check.outputs.sha }}
               run: |
                   set -euo pipefail
                   brew uninstall --force minimal minimal-unstable minimal-nightly 2>/dev/null || true
@@ -199,7 +199,21 @@ jobs:
                   prefix="$(brew --prefix minimal-nightly)"
                   installed="$prefix/bin/min"
                   [ -x "$installed" ] || { echo "::error::$installed not installed by the formula"; exit 1; }
-                  "$installed" --version
+                  # Bind the proof to THIS run's formula. There is no
+                  # workflow-level concurrency, so a later nightly could have
+                  # re-pushed the tap between our publish and this install, and
+                  # the tap is refreshed to whatever is current above. The row's
+                  # version file is what the formula we published declares, and
+                  # the built version carries the commit count and sha, so only
+                  # this run's row can match.
+                  expected="$(curl -fsSL --retry 3 "https://storage.googleapis.com/minimal-one/versions/$SHA/version")"
+                  [ -n "$expected" ] || { echo "::error::empty version file for row $SHA"; exit 1; }
+                  version_out="$("$installed" --version)"
+                  echo "$version_out"
+                  case "$version_out" in
+                    *"$expected"*) ;;
+                    *) echo "::error::installed $installed reports '$version_out', not row $SHA's version '$expected' — the tap served a different night's formula"; exit 1 ;;
+                  esac
                   echo "brew-installed $installed"
             - name: Uninstall the channel formula
               if: always()
