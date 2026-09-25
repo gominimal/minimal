@@ -128,6 +128,11 @@ async fn finish_own_ip_attach(
             match crate::net::policy::apply_ingress(&control, lease_ip, ingress).await {
                 Ok(exposed) => exposed,
                 Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        session = session_name,
+                        "exposing ingress port mappings on the host loopback"
+                    );
                     drop(relay);
                     return Err(e);
                 }
@@ -135,6 +140,23 @@ async fn finish_own_ip_attach(
         }
         _ => Vec::new(),
     };
+
+    // One info line per exposed mapping (NET-040): the host address it is
+    // reachable at, the port, and the session it belongs to — so the daemon
+    // log tail (and the `min bug` bundle carrying it) shows each forwarder
+    // expose call and its result when a publish goes wrong. A successful
+    // apply is 1:1 with the requested mappings, so log from those; the host
+    // address is the loopback `expose_request` publishes at.
+    if let Some(ingress) = ingress {
+        for mapping in &ingress.port_mappings {
+            tracing::info!(
+                host = "127.0.0.1",
+                port = mapping.external_port,
+                session = session_name,
+                "exposed ingress port on the host loopback"
+            );
+        }
+    }
 
     // Register this PTask's two-label name — with the deprecated three-label
     // forms beside it (NET-002) — pointing at its current lease, so peer
