@@ -503,6 +503,36 @@ check 1 "$rc" "unsupported manifest format exits non-zero (R2.4)"
 want_ok "format error names supported version (R2.4)" grep -q "supports 1" "$OUT"
 write_manifest 1
 
+# --version names the version directly: no pointer is fetched, so it installs
+# with the pointer file gone (R2.5).
+mv "$mock/stable" "$root/stable.saved"
+HV="$root/hv"; mkdir -p "$HV"
+run version "$HV" --version v1
+check 0 "$rc" "--version installs without a pointer (R2.5)"
+check "$h_minimald" "$(hash_file "$HV/bin/minimald")" "--version installs that version's bytes (R2.5)"
+want_ok "--version names the version, not a target (R2.5)" grep -q "version.*v1" "$OUT"
+HV2="$root/hv2"; mkdir -p "$HV2"
+run versioneq "$HV2" --force-stop --version=v1
+check 0 "$rc" "--version=VER with another flag installs (R2.5)"
+mv "$root/stable.saved" "$mock/stable"
+
+reset_dl
+run versiondot "$HV" --version ..
+check 1 "$rc" "dot-segment --version exits non-zero (R2.5)"
+check 0 "$(downloads)" "dot-segment --version fetches nothing (R2.5)"
+run versionbad "$HV" --version 'a/b'
+check 1 "$rc" "--version outside the charset exits non-zero (R2.5)"
+run versionnone "$HV" --version
+check 1 "$rc" "--version without a value exits non-zero (R2.5)"
+run versionflag "$HV" --version --force-stop
+check 1 "$rc" "--version followed by a flag exits non-zero (R2.5)"
+want_ok "a flag is not taken as the version (R2.5)" grep -q "needs a value" "$OUT"
+run versionboth "$HV" unstable --version v1
+check 1 "$rc" "a target plus --version exits non-zero (R2.5)"
+want_ok "the conflict is named (R2.5)" grep -q "not both" "$OUT"
+run versionmissing "$HV" --version v9
+check 1 "$rc" "--version with no staged manifest exits non-zero (R2.5)"
+
 # --- Unit 4: prefix resolution + traversal rejection (R4.1/R4.2) -----------
 # A dest with a `..` component must be rejected, writing nothing.
 awk '$1=="minimal" && $2=="linux" {$7="bin/../../etc/x"} {print}' "$root/good-components" \

@@ -117,7 +117,8 @@ defaulting to `stable`. The target is validated against `^[A-Za-z0-9._-]+$`
 before use; a value containing any other character exits with an error. Install
 mode's one option, `--force-stop` (R5.5), is recognized wherever it appears in
 the arguments and removed from them before the target is read, so the target
-stays the sole positional on either side of the flag.
+stays the sole positional on either side of the flag. `--version` (R2.5) is
+removed the same way, together with its value.
 
 **R2.2**, The script fetches `<BUCKET>/<target>` to get a version string.
 The result is validated against `^[A-Za-z0-9._-]+$` (command substitution having
@@ -132,12 +133,22 @@ components manifest, into a temp file. A fetch failure exits with an error.
 version the installer does not support, it exits with an actionable error rather
 than misparsing.
 
+**R2.5**, `--version VER` (or `--version=VER`) names the version directly and
+replaces R2.1 and R2.2: the script fetches no pointer and goes straight to the
+manifest (R2.3). The value is validated like a target, `^[A-Za-z0-9._-]+$`
+with `.` and `..` rejected, before any fetch. A missing value, or a target
+passed alongside it (positional or `MINIMAL_INSTALL_TARGET_OVERRIDE`), exits
+with an error. This installs a staged version that no channel points at.
+
 **Proof artifacts**:
 
 - **Test**: Passing `../evil` (or an empty string) as the target argument exits
   non-zero without performing any fetch.
 - **Test**: A manifest whose `# format:` line names an unsupported version exits
   non-zero with a message naming the supported version.
+- **Test**: `--version v1` installs `v1` with the pointer file absent;
+  `--version ..`, `--version` with no value, and a target plus `--version`
+  exit non-zero.
 
 ### Unit 3 - Manifest format and field extraction
 
