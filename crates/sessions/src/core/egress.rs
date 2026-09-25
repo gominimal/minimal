@@ -825,7 +825,13 @@ mod kani_proofs {
     /// rules — the resolver carve-out first (NET-079), then the three
     /// declared dimensions conjunctively — so a verdict that checks in a
     /// different order, or that reads `None` as deny-all, fails here.
+    // The rule lists are at most 4 long (`bounded_*` assume `n <= 4`), so
+    // every loop over them — the harness's own pushes, the compile in
+    // `EgressRules::new`, the `any` scans in the verdict and in the
+    // restatement below — exits by its fifth check. Without this bound
+    // CBMC keeps unwinding a symbolic-length scan and never returns.
     #[kani::proof]
+    #[kani::unwind(5)]
     fn kani_frame_verdict_admits_nothing_undeclared() {
         // The 40-byte IPv4+L4 region of an Ethernet frame — a 20-byte IPv4
         // header plus 20 bytes of L4 — fully symbolic, under a fixed IPv4
