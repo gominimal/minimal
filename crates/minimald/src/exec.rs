@@ -2279,6 +2279,71 @@ mod tests {
         assert!(ctrl.was_killed());
     }
 
+    /// NET-015: a lost client on a non-PTY exec ends the command that exec
+    /// spawned — and only it. The lost client is the SSH write side failing
+    /// (the channel's peer is gone): the bridge kills the child it was
+    /// driving, reports the kill as exit 1, and stops the sequence without
+    /// ever pulling the next process, so nothing beyond the exec's own
+    /// command was touched. The box the exec ran against is the session
+    /// plane's concern (`session::tests` proves it survives the same loss).
+    #[tokio::test]
+    async fn lost_exec_client_kills_only_its_own_process() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (iter, mut endpoints) = build_mock_seq(2);
+        let second = endpoints.pop().unwrap();
+        let MockEndpoints {
+            stdin_reader: _stdin_reader,
+            stdout_writer: mut first_stdout,
+            stderr_writer: first_stderr,
+            ctrl: first_ctrl,
+        } = endpoints.pop().unwrap();
+        // Nothing on stderr; its EOF is the ordinary case.
+        drop(first_stderr);
+
+        // The client hung up: writes to its stdout side fail at once.
+        let (lost_client, mut bridge_stdout) = duplex(64);
+        drop(lost_client);
+        // bridge_stderr exists only because the signature requires it; the
+        // bridge never touches it in this test.
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64);
+        // The client's stdin went with it: EOF.
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                iter,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+            )
+            .await
+        });
+
+        // The child prints; forwarding it to the dead channel is the write
+        // that models the lost client.
+        first_stdout.write_all(b"output").await.unwrap();
+        drop(first_stdout);
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must end the exec promptly, not hang the bridge")
+            .unwrap();
+        // A killed mock waits back Ok(None), which the bridge maps to 1.
+        assert_eq!(exit, 1);
+        assert!(
+            first_ctrl.was_killed(),
+            "the exec's own command must be killed when its client is lost"
+        );
+        assert!(
+            !second.ctrl.was_killed(),
+            "nothing beyond the exec's own command was spawned, let alone killed"
+        );
+    }
+
     /// A grandchild that inherited the child's stdout keeps the pipe
     /// open past the child's own exit — `sh -c 'sleep 20 & echo
     /// STARTED'`. The bridge must return on the *child's* exit, relay
@@ -2635,36 +2700,6 @@ mod tests {
             session_id
         }
 
-        /// A `MakeWriter` accumulating everything written into a shared
-        /// buffer, so a test can assert on the structured fields a
-        /// `tracing` event emitted (the same capture `net::proxy`'s tests
-        /// use).
-        #[derive(Clone, Default)]
-        struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-        impl CaptureWriter {
-            fn contents(&self) -> String {
-                String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-            }
-        }
-
-        impl std::io::Write for CaptureWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-            type Writer = CaptureWriter;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
         /// End-to-end happy path for `min run <task>`: an `echo` task is
         /// serviced straight from the workspace `minimal.toml` — no
         /// package graph, upstream, or sandbox — and its text (plus a
@@ -2723,20 +2758,7 @@ mod tests {
             let server = TestServer::new().await;
             let mut client = server.connect().await;
 
-            let capture = CaptureWriter::default();
-            // Global, not thread-local: the box's end runs on whatever
-            // worker the daemon spawned the exec task on, which a
-            // thread-local default would not cover. Safe under nextest's
-            // one-process-per-test isolation; under a shared-process runner
-            // the assertions below are `contains`, so a neighbour's records
-            // reaching the same buffer cost nothing.
-            tracing::subscriber::set_global_default(
-                tracing_subscriber::fmt()
-                    .with_writer(capture.clone())
-                    .with_ansi(false)
-                    .finish(),
-            )
-            .unwrap();
+            let capture = crate::test_harness::captured_log();
 
             let session_id =
                 active_session_with_echo_task(&server, &mut client, "run-box-ends").await;
