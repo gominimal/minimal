@@ -139,7 +139,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   - IF a resuming box's stored spec can no longer be satisfied THEN THE SYSTEM SHALL refuse with the exit code creation would give and leave the box's state unchanged.
     tier:   T0
     verify: cargo nextest run -p minimald resume_refuses_unsatisfiable_spec_keeps_state
-  - IF a stopped or exited box is resumed while a running box on the same host holds its name THEN THE SYSTEM SHALL refuse the resume, naming the running box, and leave the state unchanged.
+  - IF a stopped or exited box is resumed while a running box on the same host holds its name THEN THE SYSTEM SHALL refuse the resume, naming the running box, and leave the state unchanged, evaluating this name check before BVOL-013's volume-hold check.
     tier:   T0
     verify: cargo nextest run -p minimald resume_refuses_when_name_held_by_running_box
 
@@ -251,7 +251,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-065** THE SYSTEM SHALL produce an expanded spec whose serialization is byte-identical across two runs over one file and one set of command-line overrides.
   tier:     T1
   verify:   cargo nextest run -p mfile expansion_is_byte_identical_across_runs
-  property: For every minimal.toml, expanding twice yields identical bytes.
+  property: For every minimal.toml and every set of command-line overrides, expanding twice yields identical bytes.
 
 - **BOX-066** IF an expanded spec carries an invalid key or value THEN THE SYSTEM SHALL fail with exit 3 naming the key and the layer it came from.
   tier:     T0
@@ -365,7 +365,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-142** THE SYSTEM SHALL produce identical spec bytes and projection digest for one `minimal.toml` and one set of command-line overrides whether the host facts are un-enrolled or enrolled.
   tier:     T1
   verify:   cargo nextest run -p mfile enrolled_and_unenrolled_expansion_identical
-  property: For every minimal.toml, expansion under un-enrolled and enrolled host facts yields identical spec bytes and projection digest.
+  property: For every minimal.toml and every set of command-line overrides, expansion under un-enrolled and enrolled host facts yields identical spec bytes and projection digest.
 
 - **BOX-143** THE SYSTEM SHALL key every record, event and audit entry on `box_id`, resolve a CLI name lookup to the current alias's `box_id`, and keep every id-addressed reference resolving across a rename.
   tier:     T1

@@ -31,13 +31,13 @@ This spec is the first backing: a volume lives on the host that runs the box, in
   tier:     T0
   verify:   cargo nextest run -p minimald declared_volume_is_mounted
 
-- **BVOL-002** WHEN a box is created with a volume name its project does not yet hold on the host THE SYSTEM SHALL create that volume for the project on the host.
+- **BVOL-002** WHEN a box is created or resumed with a volume name its project does not yet hold on the host, including a volume removed while the resumed box was `exited`, THE SYSTEM SHALL create that volume for the project on the host and mount it.
   tier:     T0
-  verify:   cargo nextest run -p minimald first_use_creates_project_volume
+  verify:   cargo nextest run -p minimald create_or_resume_creates_missing_project_volume
 
-- **BVOL-003** WHEN a box is created with a volume name its project already holds on the host THE SYSTEM SHALL mount that project's existing volume with its contents.
+- **BVOL-003** WHEN a box is created or resumed with a volume name its project already holds on the host THE SYSTEM SHALL mount that project's existing volume with its contents.
   tier:     T0
-  verify:   cargo nextest run -p minimald volume_reattached_by_project_and_name_keeps_contents
+  verify:   cargo nextest run -p minimald create_or_resume_reattaches_volume_by_project_and_name_keeps_contents
 
 - **BVOL-004** IF a box declares `rw` access to a volume that another box holds for writing THEN THE SYSTEM SHALL refuse the box with exit 5, naming the holding box.
   tier:     T0
@@ -90,7 +90,7 @@ This spec is the first backing: a volume lives on the host that runs the box, in
 
 **Volumes are keyed by project and name.** The architecture scopes volume names to the project (AT21), so two projects on one host that both declare `cache` get two volumes (BVOL-009). A host-wide name would have let one project's compromised run poison another's cache.
 
-**A write hold ends when the box exits, not when it stops.** The owner decided on 2026-09-25 that a box keeps its write hold while `stopped` and releases it on reaching `exited` (BVOL-010), so a task re-run at once takes the volume its previous run just wrote, and a stopped session still resumes with its volume. The exited record and the volume's files stay readable; only the hold drops. `min volume prune` skips only a volume that is still held, so a volume whose writers have all exited can be pruned (BVOL-012). Two alternatives were rejected by the owner. Keeping the hold until the box is reaped, for every box, made each repeat run of a task fail with exit 5 until the previous run was pruned. Releasing on exit only for `until_complete` boxes had the same effect keyed on the lifetime, since a session is `until_complete` too. The accepted consequence is that a session whose shell exited, which is `exited` and still resumable as a PTY box (BOX-030), may find its volume held by another box on resume, and is then refused by the single-writer rule with exit 5 (BVOL-013).
+**A write hold ends when the box exits, not when it stops.** The owner decided on 2026-09-25 that a box keeps its write hold while `stopped` and releases it on reaching `exited` (BVOL-010), so a task re-run at once takes the volume its previous run just wrote, and a stopped session still resumes with its volume. The exited record and the volume's files stay readable; only the hold drops. `min volume prune` skips only a volume that is still held, so a volume whose writers have all exited can be pruned (BVOL-012). Two alternatives were rejected by the owner. Keeping the hold until the box is reaped, for every box, made each repeat run of a task fail with exit 5 until the previous run was pruned. Releasing on exit only for `until_complete` boxes had the same effect keyed on the lifetime, since a session is `until_complete` too. The accepted consequence is that a session whose shell exited, which is `exited` and still resumable as a PTY box (BOX-030), may find its volume held by another box on resume, and is then refused by the single-writer rule with exit 5 (BVOL-013). Because an exited box holds nothing, `min volume prune` may also remove an exited resumable box's volume; the resume then starts with a fresh, empty volume, created and reattached by project and name (BVOL-002, BVOL-003).
 
 **A bare volume name means read-write.** The owner decided on 2026-09-25 that `volumes = ["cache"]` holds the volume for writing, matching the architecture's `volumes = ["dev"]` example, which implies a writer; `{ name, mode = "ro" }` is the reader form (BVOL-011). The alternative, a bare name meaning read-only, was rejected by the owner because it diverges from that example.
 
