@@ -684,7 +684,10 @@ mod tests {
         let package = tmp.path().join("package-gvproxy-min");
         let system = tmp.path().join("gvproxy-min");
         let legacy = tmp.path().join("gvproxy");
-        assert_eq!(resolve_installed(Some(bin), &package, &system, &legacy), system);
+        assert_eq!(
+            resolve_installed(Some(bin), &package, &system, &legacy),
+            system
+        );
     }
 
     // The system-path branches go through `resolve_installed` with temp paths.
@@ -750,7 +753,10 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         let want = bin.join(GVPROXY_FILE);
         std::fs::write(&want, b"user-local").unwrap();
-        assert_eq!(resolve_installed(Some(bin), &package, &system, &legacy), want);
+        assert_eq!(
+            resolve_installed(Some(bin), &package, &system, &legacy),
+            want
+        );
     }
 
     #[cfg_attr(miri, ignore)]

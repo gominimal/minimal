@@ -249,11 +249,7 @@ impl SwitchClient {
     /// host self-allocates from.
     #[must_use]
     pub fn new(binary: impl Into<PathBuf>, state_dir: impl Into<PathBuf>) -> Self {
-        Self::with_subnet(
-            binary,
-            state_dir,
-            AddressPlan::default().switch_subnet(),
-        )
+        Self::with_subnet(binary, state_dir, AddressPlan::default().switch_subnet())
     }
 
     /// Builds a switch supervisor over a non-default subnet.
