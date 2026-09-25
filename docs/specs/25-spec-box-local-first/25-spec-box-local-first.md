@@ -1,28 +1,28 @@
 ---
 id: BOX
-title: Box — one record, one spec, one grammar for every session and task
+title: Box — one record and one spec for every session and task on a stock install
 owner: mitodrummer
 epic: gominimal/inbox#731
 arch: https://github.com/gominimal/arch/blob/main/architecture.md
 updated: 2026-09-25
 ---
 
-# BOX — Box — one record, one spec, one grammar for every session and task
+# BOX — Box — one record and one spec for every session and task on a stock install
 
 ## Context
 
-A session and a task are the same kind of thing in the architecture of record: a box, described by one expanded spec, named by one grammar, retained after it ends. The daemon today holds a session model with three live states and no exit, a task that is an ephemeral session the client destroys, a `minimal.toml` with a single `[session]` table, and a CLI with no `box` noun. The networking and egress-proxy specs (NET, BEP) bind their configuration "in the box spec" and have no schema to bind to; the remote-host specs were parked until the local story is settled; the Box Provider API draft requires the built-in local providers to serve the same surface as a remote one.
+A session and a task are the same kind of thing in the architecture of record: a box, described by one expanded spec, named by one grammar, retained after it ends. The daemon today holds a session model with three live states and no exit, a task that is an ephemeral session the client destroys, and a `minimal.toml` with a single `[session]` table. The networking and egress-proxy specs (NET, BEP) bind their configuration "in the box spec" and have no schema to bind to; the remote-host specs were parked until the local story is settled; the Box Provider API draft requires the built-in local providers to serve the same surface as a remote one.
 
-After this ships, a developer on a stock install with no identity plane runs sessions and tasks as boxes: each has a stable id, a type, a spec they can read before it runs, and a record that survives its exit and can be resumed, inspected, or reaped. The record, spec, projection and provider surface are the ones a remote host reads later, so nothing here is redone when boxes leave the laptop. Surfaces: the CLI, the daemon, the config expander, and the local provider's host commands.
+After this ships, a developer on a stock install with no identity plane runs sessions and tasks as boxes: each has a stable id, a type, a spec they can read before it runs, and a record that survives its exit and can be resumed, inspected, or reaped. The record, spec, projection and provider surface are the ones a remote host reads later, so nothing here is redone when boxes leave the laptop. Surfaces: the daemon and the config expander. The `min` grammar that drives them is the sibling spec `docs/specs/28-spec-box-cli` (BCLI), which lands after this one.
 
-**Success:** on one machine with no identity plane, `min shell`, `min run`, and `min box list|show|spec|stop|rm|prune|resume` all operate on the same box records; a stopped session resumes with its files; a task leaves an exited box whose exit code and files are readable; and the same `minimal.toml` expands to identical bytes whether the host is enrolled or not.
+**Success:** on one machine with no identity plane, every session and task is a box record with an id, a type and a parent; a stopped session resumes with its files under the same id and name; a task leaves an exited box whose exit code, events and files are readable until it is reaped; and the same `minimal.toml` expands to identical bytes whether the host is enrolled or not.
 
-**First slice:** every existing session becomes a box with a stable id, type, parent and the `stopped`/`exited` states, listed by `min ls` and `min box list` with provider and host, and stoppable, on today's create path and before any schema change (BOX-001, BOX-003, BOX-006, BOX-011, BOX-013, BOX-112 and BOX-117). Resume follows the stored spec (BOX-068).
+**First slice:** every existing session becomes a box record with a stable id, type, parent and the `stopped`/`exited` states, and a stop retains it, on today's create path and before any schema change (BOX-001, BOX-003, BOX-011 and BOX-013). Resume follows the stored spec (BOX-068).
 
 ## Users and stories
 
 
-**Roles:** developer who scripts against Minimal, developer, developer or a script, developer or an orchestrating script, developer editing `minimal.toml`, developer or platform engineer, developer or a reviewer, developer declaring a box, and as the networking and egress-proxy epics, developer or an agent, developer debugging any box, developer with scripts and muscle memory, developer on a stock install
+**Roles:** developer who scripts against Minimal, developer, developer or a script, developer or an orchestrating script, developer editing `minimal.toml`, developer or platform engineer, developer or a reviewer, developer declaring a box, and as the networking and egress-proxy epics, developer on a stock install
 
 - AS A developer who scripts against Minimal, I WANT every box to carry a UUIDv7 `box_id`, a type, and a parent from creation, with its name as an alias, SO THAT a rename, a re-creation under the same name, or a second host never changes what my script refers to.
 - AS A developer, I WANT `stop` to end a box's processes and keep its record and files, and `rm` and `prune` to be the only things that delete them, SO THAT I can read an exit code, pull results, and decide when disk is reclaimed.
@@ -33,10 +33,6 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - AS A developer or platform engineer, I WANT the six shipped Box Types to exist as data, and to define my own with `[box_types.<name>] extends = …`, with defaults I can override and constraints that only narrow, SO THAT what a session or task is lives in one reviewable table, and a project can say what a box means without editing `min`.
 - AS A developer or a reviewer, I WANT `min box spec <entry>` to render the fully expanded Box Spec, byte for byte what minimald receives and stores, with the same digest on both sides, SO THAT the review artifact is the runtime artifact, locally today and under an identity plane later.
 - AS A developer declaring a box, and as the networking and egress-proxy epics, I WANT `[machine]`, `[io]`, `[execution]`, `[network]`, `[network.bep]`, `[secrets]`, `[params]`, and `[nesting]` accepted, validated, and rendered in the spec, whether or not this host enforces every key yet, SO THAT a key is declared once, in one file, and the epic that enforces it reads it from the spec instead of adding a flag.
-- AS A developer or an agent, I WANT `min box start|run|list|show|spec|stop|rm|prune|resume|logs|wait|events|cp|exec` for any box and `min session list|start|attach|stop|rm`, `min task run|list|logs|stop|rm` as aliases, with `min shell`, `min run`, `min attach`, and `min ls` as the daily shortcuts, SO THAT one verb means one thing under every noun, and a script written for a session works for a task.
-- AS A developer debugging any box, I WANT `min box exec <box> [-t] [--detach] -- <cmd>` to run a command inside a running box under its own namespaces, limits, and posture, with a re-attachable PTY when I ask for one, SO THAT I can get a shell into a task or check a session without another mechanism.
-- AS A developer with scripts and muscle memory, I WANT `min session activate`, `min session destroy`, `min session exec`, and bare `min stop` to keep working for one release with a hint naming the new verb, SO THAT the rename is a migration I can schedule, not a break I discover.
-- AS A developer, I WANT `min provider list --all` to show `local0` and `local-minvmd0`, and `min host list|show|stop` to work on them, SO THAT the daemon I stop, the VM I look at, and the provider a remote box will come from are one vocabulary.
 - AS A developer on a stock install, I WANT everything above to work with no Gatehouse and no per-box identity, and the same `minimal.toml` to work unchanged when my host is later enrolled, SO THAT local-first costs nothing now and remote costs no rewrite later.
 
 
@@ -71,26 +67,16 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p sessions unqualified_name_resolves_running_else_latest
   property: For every store state and name, resolution returns the unique running box of that name if one exists, else the most recently created box of that name, else none.
 
-- **BOX-006** WHEN `min box list` or `min ls` runs THE SYSTEM SHALL print id, name, type, state, provider and host per box, scoped to the current project unless `--all` is given, and carry `"schema": "min/v1/box"` under `-o json`.
+- **BOX-007** IF an entry or box is named `self` THEN THE SYSTEM SHALL refuse creation with exit 3.
   tier:     T0
-  verify:   cargo nextest run -p minimal box_list_prints_columns_and_schema
+  verify:   cargo nextest run -p mfile self_as_name_is_exit3
 
-- **BOX-007** THE SYSTEM SHALL accept a box address as an id, a name, or `provider/host/name`.
-  tier:     T0
-  verify:   cargo nextest run -p minimal box_address_accepts_id_name_and_qualified
-  - IF an unqualified name matches more than one running box across hosts THEN THE SYSTEM SHALL fail with exit 2 listing the candidates.
-    tier:   T0
-    verify: cargo nextest run -p minimal ambiguous_name_across_hosts_exit2_lists_candidates
-  - IF an entry or box is named `self` THEN THE SYSTEM SHALL refuse creation with exit 3.
-    tier:   T0
-    verify: cargo nextest run -p mfile self_as_name_is_exit3
-
-- **BOX-010** WHEN `min box rename <box> <name>` runs THE SYSTEM SHALL change only the alias, leave `box_id`, spec, events and filesystem unchanged, and record a `renamed` event carrying the old and new names.
+- **BOX-010** WHEN a box is renamed THE SYSTEM SHALL change only the alias, leave `box_id`, spec, events and filesystem unchanged, and record a `renamed` event carrying the old and new names.
   tier:     T1
   verify:   cargo nextest run -p sessions rename_changes_only_alias_and_records_event
   property: For every box and every new name, rename leaves id, spec and filesystem path equal before and after, preserves every prior event, and appends exactly one `renamed` event.
 
-- **BOX-011** THE SYSTEM SHALL hold every box record in exactly one of the states `pending`, `materializing`, `running`, `stopped`, or `exited`, with `stopped` and `exited` records carrying `exit_code` and a `reason` (`stopped` for a `stopped` record; `exit`, `timeout` or `oom` for an `exited` one), and render the state in `min box show`.
+- **BOX-011** THE SYSTEM SHALL hold every box record in exactly one of the states `pending`, `materializing`, `running`, `stopped`, or `exited`, with `stopped` and `exited` records carrying `exit_code` and a `reason` (`stopped` for a `stopped` record; `exit`, `timeout` or `oom` for an `exited` one).
   tier:     T2
   verify:   cargo nextest run -p sessions record_state_is_one_of_five_with_exit_reason
   property: For every reachable store state, each record is in exactly one state, `stopped` records carry an exit code and reason `stopped`, and `exited` records carry an exit code and one of `exit`, `timeout` or `oom`.
@@ -102,10 +88,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
   property: For every store state, restart reaping removes exactly the records in `pending` or `materializing` and no others.
   harness:  sessions/src/core/record.rs `restart_reaps_only_pending_or_materializing` over a bounded store of at most 4 records, unwind 4
 
-- **BOX-013** WHEN `min box stop <box>` runs THE SYSTEM SHALL send SIGTERM to the box's process tree, wait, then send SIGKILL, set the state to `stopped`, and record an `exited` event with `reason = "stopped"`.
+- **BOX-013** WHEN a box is stopped THE SYSTEM SHALL send SIGTERM to the box's process tree, wait, then send SIGKILL, set the state to `stopped`, and record an `exited` event with `reason = "stopped"`.
   tier:     T0
   verify:   cargo nextest run -p minimald stop_sends_term_then_kill_and_records_exited_stopped
-  - WHERE `--force` is given to `min box stop` THE SYSTEM SHALL kill the process tree at once.
+  - WHERE a forced stop is requested THE SYSTEM SHALL kill the process tree at once.
     tier:   T0
     verify: cargo nextest run -p minimald stop_force_kills_at_once
 
@@ -125,38 +111,24 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimald stopped_box_record_readable_until_reaped
 
-- **BOX-019** WHEN `min box rm <box>` runs on a stopped or exited box THE SYSTEM SHALL delete the record and its filesystem.
+- **BOX-019** WHEN a stopped or exited box is reaped THE SYSTEM SHALL delete the record and its filesystem.
   tier:     T0
   verify:   cargo nextest run -p minimald rm_deletes_record_and_filesystem
-  - IF `min box rm` targets a running box without `--force` THEN THE SYSTEM SHALL refuse and name `--force`.
-    tier:   T0
-    verify: cargo nextest run -p minimal rm_running_box_refuses_naming_force
 
-- **BOX-021** WHEN `min box prune` runs with `--stopped`, `--older-than <d>`, or `--parent <box>` THE SYSTEM SHALL reap every box the selectors match, treating `--stopped` as matching both `stopped` and `exited`, and print what it reaped.
+- **BOX-021** WHEN boxes are pruned by the `stopped`, `older-than <d>` or `parent <box>` selector THE SYSTEM SHALL reap every box the selectors match, treating the `stopped` selector as matching both `stopped` and `exited`, and print what it reaped.
   tier:     T0
   verify:   cargo nextest run -p minimald prune_selectors_reap_and_print
-  - IF `min box prune` runs off a TTY without `--yes` THEN THE SYSTEM SHALL fail with exit 2 naming `--yes`.
-    tier:   T0
-    verify: cargo nextest run -p minimal prune_off_tty_needs_yes
-
-- **BOX-023** THE SYSTEM SHALL report the disk held by each stopped or exited box in `min box show` and the sum in `min box prune --dry-run`.
-  tier:     T0
-  verify:   cargo nextest run -p minimal show_and_prune_dry_run_report_disk
 
 - **BOX-024** THE SYSTEM SHALL run no automatic reaper of stopped or exited boxes.
   tier:     T0
   verify:   cargo nextest run -p minimald no_automatic_reaper_runs
 
-- **BOX-025** WHEN `min shell`, `min attach`, or `min box resume` targets a stopped or exited session THE SYSTEM SHALL start its processes again from the stored spec and retained filesystem under the same `box_id` and name, and record a `resumed` event.
+- **BOX-025** WHEN a stopped or exited session is resumed THE SYSTEM SHALL start its processes again from the stored spec and retained filesystem under the same `box_id` and name, and record a `resumed` event.
   tier:     T0
   verify:   cargo nextest run -p minimald resume_restarts_from_stored_spec_same_id_and_name
   - IF a resuming box's stored spec can no longer be satisfied THEN THE SYSTEM SHALL refuse with the exit code creation would give and leave the box's state unchanged.
     tier:   T0
     verify: cargo nextest run -p minimald resume_refuses_unsatisfiable_spec_keeps_state
-
-- **BOX-026** WHEN `min shell` resumes a session THE SYSTEM SHALL attach to it.
-  tier:     T0
-  verify:   cargo nextest run -p minimal shell_resume_attaches
 
 - **BOX-027** WHEN a box resumes THE SYSTEM SHALL run no lifecycle hook other than `on_attach` on attach, unless BOX-028 applies.
   tier:     T0
@@ -169,40 +141,14 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-030** THE SYSTEM SHALL allow resume of any box whose spec sets `pty_enabled`, from `stopped` or `exited`.
   tier:     T0
   verify:   cargo nextest run -p minimald pty_box_resumes_from_stopped_and_exited
-  - IF resume targets a box whose spec does not set `pty_enabled` THEN THE SYSTEM SHALL fail with exit 2 naming `min run`.
-    tier:   T0
-    verify: cargo nextest run -p minimal resume_non_pty_box_exit2_names_run
 
-- **BOX-032** WHEN `min run <task> [-- <args>…]` runs without `--detach` THE SYSTEM SHALL create a box of type `task` from the entry, connect the box's stdin, stdout and stderr to the command's, write nothing else to stdout, and exit with the entrypoint's code.
+- **BOX-037** IF a task runs past its declared `timeout` THEN THE SYSTEM SHALL end the box with `exited.reason = "timeout"`.
   tier:     T0
-  verify:   cargo nextest run -p minimal run_wires_stdio_and_propagates_exit
-  - WHERE `--detach` is given to `min run` THE SYSTEM SHALL print only the `box_id` to stdout, close the task's stdin at creation, capture the task's output for `min task logs`, and return.
-    tier:   T0
-    verify: cargo nextest run -p minimal run_detach_prints_id_closes_stdin
-
-- **BOX-033** THE SYSTEM SHALL provide `min task run` as the noun form of `min run` and remove the previous hidden `min run` that only errored.
-  tier:     T0
-  verify:   cargo nextest run -p minimal task_run_is_noun_form_of_run
-
-- **BOX-035** WHEN `min task logs <box> -f` runs THE SYSTEM SHALL follow the task's captured output.
-  tier:     T0
-  verify:   cargo nextest run -p minimal task_logs_follow
-
-- **BOX-036** WHEN `min box wait <box>` runs THE SYSTEM SHALL return the box's retained exit code, reading the stored `exited` event when the box has already ended.
-  tier:     T0
-  verify:   cargo nextest run -p minimal box_wait_returns_retained_exit_code
-
-- **BOX-037** IF a task runs past its declared `timeout` THEN THE SYSTEM SHALL end the box with `exited.reason = "timeout"`, emit a machine-mode error with `code = "timeout"`, and return 124 from `min run`.
-  tier:     T0
-  verify:   cargo nextest run -p minimald task_timeout_exits_124_with_reason_timeout
+  verify:   cargo nextest run -p minimald task_timeout_ends_box_with_reason_timeout
 
 - **BOX-038** WHEN a task's entrypoint returns THE SYSTEM SHALL end the box from the daemon whether or not a client is connected, and retain the record.
   tier:     T0
   verify:   cargo nextest run -p minimald task_ends_on_entrypoint_return_without_client
-
-- **BOX-039** THE SYSTEM SHALL list exited tasks in `min task list` until they are pruned.
-  tier:     T0
-  verify:   cargo nextest run -p minimal task_list_shows_exited_until_pruned
 
 - **BOX-040** THE SYSTEM SHALL write `created`, `started`, `exec_started`, `exec_exited`, `oom_killed`, `exited`, `renamed`, `resumed` and `detached` events into the box record outside the box filesystem.
   tier:     T0
@@ -211,16 +157,6 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-041** THE SYSTEM SHALL reject any append to a box's events stream that originates from a process inside the box's namespaces, including one running as root inside the box.
   tier:     T0
   verify:   cargo nextest run -p minimald in_box_root_cannot_append_events
-
-- **BOX-042** WHEN `min box events <box> -o jsonl` runs THE SYSTEM SHALL replay the full retained stream, with each line carrying `"schema": "min/v1/event"`, `ts`, `box`, `parent`, `type` and `data`.
-  tier:     T0
-  verify:   cargo nextest run -p minimal events_jsonl_replay_schema_fields
-  - WHERE `--follow` is given to `min box events` THE SYSTEM SHALL replay the stream then tail it.
-    tier:   T0
-    verify: cargo nextest run -p minimal events_follow_replays_then_tails
-  - WHERE `--parent <box>` is given to `min box events` THE SYSTEM SHALL merge the children's streams.
-    tier:   T0
-    verify: cargo nextest run -p minimal events_parent_merges_children
 
 - **BOX-045** THE SYSTEM SHALL retain a box's events stream across stop and exit and delete it only on `rm` or `prune`.
   tier:     T0
@@ -264,22 +200,6 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p mfile interactive_task_exit3_names_session
 
-- **BOX-055** WHEN `min init` runs with no entry THE SYSTEM SHALL scaffold a `minimal.toml` in the entry-based shape.
-  tier:     T0
-  verify:   cargo nextest run -p minimal init_scaffolds_entry_shape
-
-- **BOX-056** WHEN `min init <entry> --type <type>` or its `--session`/`--task` alias runs THE SYSTEM SHALL append that one entry.
-  tier:     T0
-  verify:   cargo nextest run -p minimal init_entry_type_appends_one
-
-- **BOX-057** WHEN `min type list` runs THE SYSTEM SHALL show the six built-in types with source `builtin`.
-  tier:     T0
-  verify:   cargo nextest run -p minimal type_list_shows_six_builtins
-
-- **BOX-058** WHEN `min type show <name>` runs THE SYSTEM SHALL render the type's defaults and constraints exactly as the architecture's shipped-types table states, naming the source of every value.
-  tier:     T0
-  verify:   cargo nextest run -p minimal type_show_matches_shipped_table_with_sources
-
 - **BOX-059** THE SYSTEM SHALL resolve a `[box_types.<name>]` with `extends`, `defaults` and `constraints` transitively to a built-in root.
   tier:     T1
   verify:   cargo nextest run -p mfile box_type_resolves_to_builtin_root
@@ -313,20 +233,13 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p mfile expansion_is_byte_identical_across_runs
   property: For every minimal.toml, expanding twice yields identical bytes.
 
-- **BOX-066** WHEN `min box spec <entry>` runs THE SYSTEM SHALL render the expanded spec in the format `-o toml|json|yaml` names, with secrets as references only.
+- **BOX-066** IF an expanded spec carries an invalid key or value THEN THE SYSTEM SHALL fail with exit 3 naming the key and the layer it came from.
   tier:     T0
-  verify:   cargo nextest run -p minimal box_spec_renders_formats_secrets_as_refs
-  - IF an expanded spec carries an invalid key or value THEN THE SYSTEM SHALL fail with exit 3 naming the key and the layer it came from.
-    tier:   T0
-    verify: cargo nextest run -p mfile invalid_key_exit3_names_key_and_layer
+  verify:   cargo nextest run -p mfile invalid_key_exit3_names_key_and_layer
 
 - **BOX-068** WHEN a box is created THE SYSTEM SHALL send the daemon the expanded spec rather than the entry and store it in the record.
   tier:     T0
   verify:   cargo nextest run -p minimald-rpc create_sends_expanded_spec_and_stores_it
-
-- **BOX-069** WHEN `min box spec <box>` runs THE SYSTEM SHALL render the spec stored in that box's record.
-  tier:     T0
-  verify:   cargo nextest run -p minimal box_spec_box_renders_stored_copy
 
 - **BOX-071** WHEN a box is created THE SYSTEM SHALL compute, in both the client and the daemon, the Gatehouse §6.3.2 Box Spec projection of the expanded spec, exactly the §6.3.2 field set (`v`; `type.name`, `type.source`, `type.root`, and `type.registry` when the source is `org`; `network.mode`, `egress_dns`, `egress_subnets`, `ingress_ports` and `quic443`; `bep.steering`; `registry_pinned`; `registry_commit`; `loadout_mode`; `pty_enabled`; `lifetime`; the `[nesting]` bounds; `secret_grants`), and digest it as SHA-256 over its RFC 8785 JCS bytes.
   tier:     T1
@@ -362,10 +275,6 @@ After this ships, a developer on a stock install with no identity plane runs ses
     tier:   T0
     verify: cargo nextest run -p mfile unknown_key_or_shape_exit3
 
-- **BOX-078** THE SYSTEM SHALL render every section of a spec in `min box spec` whether or not the current host enforces it.
-  tier:     T0
-  verify:   cargo nextest run -p minimal box_spec_renders_unenforced_sections
-
 - **BOX-079** THE SYSTEM SHALL accept `[network] mode` values `none`, `host_ip` and `own_ip`, and accept the legacy spellings with a hint.
   tier:     T0
   verify:   cargo nextest run -p mfile network_mode_values_and_legacy_hint
@@ -381,150 +290,44 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimald broker_secret_unenrolled_exit5
 
-- **BOX-082** THE SYSTEM SHALL document `--network` and `--ingress` as overrides of the entry's `[network]` keys.
-  tier:     T0
-  verify:   cargo nextest run -p minimal network_flags_documented_as_overrides
-
-- **BOX-083** WHEN `min box show <box> --network` runs THE SYSTEM SHALL render the effective `[network]` section from the stored spec.
-  tier:     T0
-  verify:   cargo nextest run -p minimal box_show_network_renders_effective
-
 - **BOX-085** THE SYSTEM SHALL accept `[params]` on an entry and render it in `min box spec`.
   tier:     T0
   verify:   cargo nextest run -p mfile params_accepted_and_rendered
 
 
-### O3 One grammar
+### O4 Exec
 
-- **BOX-086** THE SYSTEM SHALL provide `min box start`, `run`, `list`, `show`, `spec`, `stop`, `rm`, `prune`, `resume`, `logs`, `wait`, `events`, `cp` and `exec` with the flags the architecture's command reference lists.
-  tier:     T0
-  verify:   cargo nextest run -p minimal box_verbs_exist_with_arch_flags
-
-- **BOX-087** THE SYSTEM SHALL accept the plural of every countable noun.
-  tier:     T0
-  verify:   cargo nextest run -p minimal plural_nouns_accepted
-
-- **BOX-088** THE SYSTEM SHALL generate `--help` at every level and shell completions from one command model.
-  tier:     T0
-  verify:   cargo nextest run -p minimal help_and_completions_from_one_model
-
-- **BOX-089** WHEN `min session start <entry>` runs THE SYSTEM SHALL create the box and attach, or print the id and return under `--detach`.
-  tier:     T0
-  verify:   cargo nextest run -p minimal session_start_attaches_or_detaches
-  - IF `min shell` or `min session start` without `--detach` runs off a TTY THEN THE SYSTEM SHALL fail with exit 2 naming `session start --detach`.
-    tier:   T0
-    verify: cargo nextest run -p minimal shell_off_tty_exit2_names_detach
-
-- **BOX-148** THE SYSTEM SHALL provide `min session list|start|attach|stop|rm` and `min task run|list|logs|stop|rm` as aliases of the `min box` forms, filtered to boxes of that type.
-  tier:     T0
-  verify:   cargo nextest run -p minimal type_noun_verbs_alias_box_forms
-
-- **BOX-090** WHEN `min shell [<session>]` runs THE SYSTEM SHALL resolve the named entry, else the sole session entry, else the entry named `default`, and start, re-attach, or resume it; and WHERE `--new` is given THE SYSTEM SHALL start a parallel instance.
-  tier:     T0
-  verify:   cargo nextest run -p minimal shell_resolves_named_sole_or_default_and_new
-  - IF `min shell` runs with no argument and the file has several session entries and none named `default` THEN THE SYSTEM SHALL fail with exit 2 listing the entries.
-    tier:   T0
-    verify: cargo nextest run -p minimal shell_ambiguous_entries_exit2_lists
-
-- **BOX-093** WHEN `min attach <box>` targets a box whose spec sets `pty_enabled` THE SYSTEM SHALL re-attach its PTY.
-  tier:     T0
-  verify:   cargo nextest run -p minimal attach_reattaches_pty_box
-  - IF `min attach` targets a box without `pty_enabled` and no `--exec <id>` naming a PTY exec THEN THE SYSTEM SHALL fail with exit 2.
-    tier:   T0
-    verify: cargo nextest run -p minimal attach_non_pty_without_exec_exit2
-
-- **BOX-095** THE SYSTEM SHALL emit `-o json` and `-o jsonl` output under the versioned schemas `min/v1/box`, `min/v1/event` and `min/v1/error`.
-  tier:     T0
-  verify:   cargo nextest run -p minimal json_output_carries_versioned_schemas
-  - IF a command fails in a machine output mode THEN THE SYSTEM SHALL write one JSON object to stderr carrying `code`, `message` and `hint`.
-    tier:   T0
-    verify: cargo nextest run -p minimal machine_mode_error_object_on_stderr
-
-- **BOX-097** THE SYSTEM SHALL use exit code 2 for usage errors, 3 for invalid configuration, 4 for not found, 5 for policy refusals, 7 for an unreachable host, 8 for insufficient resources, and 125 to 127 for runtime failures.
-  tier:     T0
-  verify:   cargo nextest run -p minimal exit_code_table
-
-- **BOX-098** WHEN a run-style command's entrypoint exits THE SYSTEM SHALL propagate the entrypoint's exit code.
-  tier:     T0
-  verify:   cargo nextest run -p minimal run_style_propagates_entrypoint_exit
-
-- **BOX-099** WHEN `min box exec <box> -- <cmd>` runs THE SYSTEM SHALL run the command inside the box's cgroup, namespaces and network posture, connect its stdio to the client's pipes, and propagate its exit code.
+- **BOX-149** WHEN a command is executed in a box THE SYSTEM SHALL run the command inside the box's cgroup, namespaces and network posture, connect its stdio to the client's pipes, and propagate its exit code.
+  <!-- was BOX-099 -->
   tier:     T0
   verify:   cargo nextest run -p minimald exec_runs_in_box_namespaces_and_cgroup
-  - WHERE `-t` is given to `min box exec` THE SYSTEM SHALL allocate a PTY inside the box and return an exec id that `min attach <box> --exec <id>` resumes.
+  - WHERE an exec requests a PTY THE SYSTEM SHALL allocate a PTY inside the box and return an exec id that a later attach to that exec resumes.
     tier:   T0
     verify: cargo nextest run -p minimald exec_tty_returns_reattachable_id
-  - WHERE `--detach` is given to `min box exec` THE SYSTEM SHALL print the exec id, capture its output to `logs --exec`, and return its exit code from `min box wait <box> --exec <id>`.
+  - WHERE an exec is detached THE SYSTEM SHALL return its exec id, capture its output for reading by that id, and retain its exit code for a wait on that id.
     tier:   T0
     verify: cargo nextest run -p minimald exec_detach_captures_logs_and_wait_returns_code
 
-- **BOX-100** WHEN an exec's client disconnects THE SYSTEM SHALL end the exec and leave the box running.
+- **BOX-150** WHEN an exec's client disconnects THE SYSTEM SHALL end the exec and leave the box running.
+  <!-- was BOX-100 -->
   tier:     T0
   verify:   cargo nextest run -p minimald exec_client_loss_ends_exec_keeps_box
 
-- **BOX-103** WHEN `min box stop <box> --exec <id>` runs THE SYSTEM SHALL end that exec's process group with SIGTERM, a wait, then SIGKILL.
+- **BOX-151** WHEN an exec is stopped THE SYSTEM SHALL end that exec's process group with SIGTERM, a wait, then SIGKILL.
+  <!-- was BOX-103 -->
   tier:     T0
   verify:   cargo nextest run -p minimald stop_exec_ends_process_group
 
-- **BOX-104** WHEN an exec starts or exits THE SYSTEM SHALL record `exec_started` and `exec_exited` events carrying principal, argv, PTY flag and exit code.
+- **BOX-152** WHEN an exec starts or exits THE SYSTEM SHALL record `exec_started` and `exec_exited` events carrying principal, argv, PTY flag and exit code.
+  <!-- was BOX-104 -->
   tier:     T0
   verify:   cargo nextest run -p minimald exec_events_carry_principal_argv_pty_code
 
-- **BOX-105** IF the stored spec sets `[io] exec_enabled = false` THEN THE SYSTEM SHALL refuse `min box exec` with exit 5 naming the key.
+- **BOX-153** IF the stored spec sets `[io] exec_enabled = false` THEN THE SYSTEM SHALL refuse to execute a command in the box with exit 5 naming the key.
+  <!-- was BOX-105 -->
   tier:     T0
   verify:   cargo nextest run -p minimald exec_disabled_refuses_exit5
 
-- **BOX-106** THE SYSTEM SHALL accept `min session exec` as a hidden alias of `min box exec` for one release.
-  tier:     T0
-  verify:   cargo nextest run -p minimal session_exec_alias_hidden_one_release
-
-- **BOX-107** THE SYSTEM SHALL accept `session activate` (mapping a path to the entry and `--name` to the box name, `--network` and `--ingress` to the overrides), `session destroy`, `session exec`, `session rename`, `session policy`, `session hooks`, `session run`, `task run --keep`, and bare `stop` as hidden aliases of their new forms for one release, printing one stderr hint naming the replacement and leaving `-o json` output unchanged.
-  tier:     T0
-  verify:   cargo nextest run -p minimal legacy_session_verbs_alias_with_hint
-  - IF an alias from BOX-106 or BOX-107 is invoked after the release that accepted it THEN THE SYSTEM SHALL fail with exit 2 carrying the same hint.
-    tier:   T0
-    verify: cargo nextest run -p minimal aliases_exit2_after_grace_release
-
-- **BOX-108** THE SYSTEM SHALL keep `session setup-zed` hidden and unchanged.
-  tier:     T0
-  verify:   cargo nextest run -p minimal setup_zed_unchanged
-
-- **BOX-110** THE SYSTEM SHALL describe only the new grammar in the synced reference and concept docs, with one migration note listing the aliases and their removal release.
-  tier:     T0
-  verify:   cargo nextest run -p minimal docs_describe_new_grammar_with_migration_note
-
-- **BOX-111** THE SYSTEM SHALL keep `min ls` as the alias of `min box list`.
-  tier:     T0
-  verify:   cargo nextest run -p minimal ls_aliases_box_list
-
-- **BOX-112** THE SYSTEM SHALL name the well-known local providers `local0..N` (native daemon) and `local-minvmd0..N` (one per VM), each with exactly one host of the same name, and accept `local-minimald` and `local-minvmd` as aliases for one release with a hint.
-  tier:     T0
-  verify:   cargo nextest run -p minimal local_provider_names_and_aliases
-
-- **BOX-113** WHEN `min host list` runs THE SYSTEM SHALL render each local host with its name and state, beside the resource figures BRES-014 adds.
-  tier:     T0
-  verify:   cargo nextest run -p minimal host_list_name_and_state
-
-- **BOX-114** WHEN `min host show <host>` runs THE SYSTEM SHALL add the host-side socket path and the daemon version.
-  tier:     T0
-  verify:   cargo nextest run -p minimal host_show_socket_and_version
-
-- **BOX-115** WHEN `min host stop <host>` runs THE SYSTEM SHALL stop that daemon, and its VM where one exists, once its boxes are stopped, or at once under `--force`.
-  tier:     T0
-  verify:   cargo nextest run -p minimal host_stop_stops_daemon_and_vm
-  <!-- runs on the VM lane (NET-107): the behaviour exists only with the VM host daemon in the loop -->
-
-- **BOX-116** THE SYSTEM SHALL map bare `min stop`, a BOX-107 alias, to `min host stop` on the local host for one release, after which BOX-107 applies.
-  tier:     T0
-  verify:   cargo nextest run -p minimal bare_stop_aliases_host_stop
-
-- **BOX-117** THE SYSTEM SHALL show the host of every box in `min ls` and `min box list`.
-  tier:     T0
-  verify:   cargo nextest run -p minimal list_shows_host_per_box
-
-- **BOX-147** WHEN `min provider list --all` runs THE SYSTEM SHALL list every well-known local provider present on the machine.
-  tier:     T0
-  verify:   cargo nextest run -p minimal provider_list_all_shows_local_providers
 
 ### O5 Un-enrolled
 
@@ -548,7 +351,8 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 ## Non-goals
 
-- Network enforcement, box names in DNS, port publication, forwarding, ingress, and the VM egress filter: the networking spec, `docs/specs/18-spec-box-networking` (NET), and its epic gominimal/minimal#1437. This spec accepts and passes the `[network]` section (BOX-076 to BOX-083); NET enforces it.
+- The `min` grammar: the `min box` verbs and the type nouns, `min shell`, `min run`, `min attach` and `min ls`, `min type`, `min init`, `min host` and `min provider`, the `min box exec` verb and its flags, the legacy aliases, help, completions, output schemas and exit codes: `docs/specs/28-spec-box-cli` (BCLI), which lands after this spec and drives the operations defined here.
+- Network enforcement, box names in DNS, port publication, forwarding, ingress, and the VM egress filter: the networking spec, `docs/specs/18-spec-box-networking` (NET), and its epic gominimal/minimal#1437. This spec accepts and passes the `[network]` section (BOX-076 to BOX-081); NET enforces it.
 - Credentialed egress, the node-local egress proxy, `[network.bep]`, `[secrets]` resolution, `min auth`, `min secret`, and `min box audit`: the egress-proxy spec, `docs/specs/24-spec-box-egress-proxy` (BEP), and gominimal/minimal#1501.
 - Behaviour specific to the `agent`, `service`, `build`, and `container-build` types beyond expansion and validation (`service restart`, the agent harness, hermetic builds): the Agent Box epic gominimal/inbox#678 and successors.
 - Nesting, the `local-box` provider, and running `min` inside a box, including `min box spec self`: gominimal/inbox#568.
@@ -564,19 +368,19 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 ## Design reasoning
 
-**One spec, one codebase.** The epic's surfaces (CLI, daemon, expander, TUI, local provider) live in one codebase, and its four amendments to the architecture of record are one-line changes with no spec process of their own. The alternatives were a sibling spec in the architecture repository, rejected because it would carry four lines under a second prefix, and a sibling in the identity plane, rejected because the un-enrolled path changes nothing there. The amendments are Open questions here and issues on the architecture repository.
+**One spec, one codebase.** The epic's surfaces (CLI, daemon, expander, TUI, local provider) live in one codebase, and its four amendments to the architecture of record are one-line changes with no spec process of their own. The alternatives were a sibling spec in the architecture repository, rejected because it would carry four lines under a second prefix, and a sibling in the identity plane, rejected because the un-enrolled path changes nothing there. The amendments are Open questions here and issues on the architecture repository. The grammar was later split into a sibling in the same codebase; see the next paragraph.
 
-**Host-agnostic requirements, exercised on the two local providers.** Every requirement is written for any host a daemon runs on and verified on `local0` and `local-minvmd0`; a remote host inherits them unchanged, which is what makes the local box the remote box. The alternative, naming the local providers in the requirements, was rejected because the remote work would then re-specify the same behaviours. Three exceptions are deliberate: BOX-112 and BOX-147 name the well-known local providers because those names are the behaviour, BOX-002 applies only where the host is a VM, and BOX-140 names `identity.sock` because its absence is what un-enrolled means inside a box.
+**The grammar is a sibling spec.** The owner split the `min` grammar into `docs/specs/28-spec-box-cli` (BCLI) on 2026-09-25. The model lands first because it unblocks the networking and egress-proxy specs, which bind to the box spec and record rather than to verbs; the grammar is scheduled and reviewed separately; and a client other than the CLI binds to the model. So the requirements here name operations (a box is stopped, reaped, resumed, renamed) rather than commands, and BCLI maps each verb onto them.
+
+**Host-agnostic requirements, exercised on the two local providers.** Every requirement is written for any host a daemon runs on and verified on `local0` and `local-minvmd0`; a remote host inherits them unchanged, which is what makes the local box the remote box. The alternative, naming the local providers in the requirements, was rejected because the remote work would then re-specify the same behaviours. Two exceptions are deliberate: BOX-002 applies only where the host is a VM, and BOX-140 names `identity.sock` because its absence is what un-enrolled means inside a box. The well-known local provider names are BCLI's.
 
 **The local Box Provider API, resources and the dash moved out on the author's review.** The epic committed all three. The local providers' obligations under the Box Provider API wait on gominimal/arch#45's transport and authentication decision; memory and resource declaration, admission, limits and OOM handling are the sibling spec `docs/specs/26-spec-box-resources`; and the dash is an amendment to `docs/specs/07-spec-min-dash-tui`. Each non-goal names its destination.
 
-**VM-host behaviours run on the VM lane.** Minting the id outside the VM and stopping a VM host exist only with the VM host daemon in the loop, so their tests name the VM lane (NET-107) rather than `tier: none`. The alternative left the VM path unverified.
+**VM-host behaviours run on the VM lane.** Minting the id outside the VM exists only with the VM host daemon in the loop, so its test names the VM lane (NET-107) rather than `tier: none`. The alternative left the VM path unverified.
 
-**Stop states the order, not the duration.** `min box stop` is SIGTERM, a wait, SIGKILL; the length of the wait is the daemon's and is an open question. Fixing ten seconds would have made a test own a number the architecture does not state; a per-entry `stop_grace` key would add schema the architecture lacks.
+**Stop states the order, not the duration.** A stop is SIGTERM, a wait, SIGKILL; the length of the wait is the daemon's and is an open question. Fixing ten seconds would have made a test own a number the architecture does not state; a per-entry `stop_grace` key would add schema the architecture lacks.
 
 **Legacy tables map to their real meaning.** Today's single `[session]` table is a project-wide contribution to every session, so it reads as `[defaults.session]`, not as one named entry, which would have silently dropped the project's packages from any second session. The top-level `[params]` schema is renamed `[args]` and the per-task `args` key is left alone, the smallest change that lets a per-entry `[params]` take the architecture's meaning. A task with `interactive = true` is refused with a hint rather than mapped, because the `task` type constrains `pty_enabled` false.
-
-**`min shell` with several entries and no `default` is a usage error.** Starting the first entry in file order would depend on layout; prompting was rejected as more code for the daily loop. Listing the candidates matches the ambiguous-name rule.
 
 **A name is unique per host; a task ending is not a stop.** Per-host uniqueness follows the architecture's addressing (`provider/host/name`) and lets a laptop and a remote host both run `dev`. The daemon's never-stop rule covers idleness and client loss (gominimal/arch#74); a task reaching the end of its entrypoint is completion, recorded as `exited` with reason `exit`.
 
@@ -586,7 +390,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 **Tiers.** Expansion and merge (BOX-048, 064, 065, 142) and type constraints (BOX-059 to 062) are T1 property tests, which constrains the expander and the type resolver to pure functions over in-memory inputs; names and ids (BOX-004, 005, 010, 143) are T1 over operation sequences, which forbids any name-keyed index; the record state machine (BOX-011, 012) is a T2 Kani harness, which constrains transitions to a pure function separate from disk writes, the shape the daemon's policy harnesses already use. T3 is refused throughout: there is no Lean project, and the surrounding behaviour is not safe sequential Rust.
 
-**Generality:** a second implementation of the daemon, on a second provider or platform, fits: every requirement names the surface (record, spec, projection, grammar), and none names a provider or a file path apart from the exceptions under host-agnostic requirements above; the identity-plane requirements are written for the un-enrolled case and the enrolled case is the same spec bytes (BOX-142). What breaks if not: a host that cannot mint the id outside a VM cannot be a VM host (BOX-002), and a host whose expander disagrees with the client's refuses creation (BOX-072).
+**Generality:** a second implementation of the daemon, on a second provider or platform, fits: every requirement names the surface (record, spec, projection) and states an operation rather than a command, so a client other than the CLI drives the same behaviour, and none names a provider or a file path apart from the exceptions under host-agnostic requirements above; the identity-plane requirements are written for the un-enrolled case and the enrolled case is the same spec bytes (BOX-142). What breaks if not: a host that cannot mint the id outside a VM cannot be a VM host (BOX-002), and a host whose expander disagrees with the client's refuses creation (BOX-072).
 
 ## Security considerations
 
@@ -611,9 +415,8 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 ## Open questions
 
-- [NEEDS CLARIFICATION (MEDIUM): the stop grace duration between SIGTERM and SIGKILL (BOX-013, BOX-103) is unstated in the architecture; the daemon owns it until an architecture line fixes it (gominimal/arch#98).]
-- [NEEDS CLARIFICATION (MEDIUM): the architecture's exit-code table has no row for a task timeout; BOX-037 uses 124 by convention beside 137 for OOM and needs the row added (gominimal/arch#97).]
-- [NEEDS CLARIFICATION (MEDIUM): the architecture's command tree lacks `min box rename` and `min host stop`, its event list lacks `renamed` and `resumed` (both named in gominimal/arch#98) and `detached` (to be added to arch#98), `box.toml` lacks `hooks_on_resume`, and it names no box states; BOX-010, BOX-011, BOX-016, BOX-028, BOX-040 and BOX-115 are written to this spec's additions pending one architecture line each (gominimal/arch#98).]
+- [NEEDS CLARIFICATION (MEDIUM): the stop grace duration between SIGTERM and SIGKILL (BOX-013, and BOX-151 for an exec) is unstated in the architecture; the daemon owns it until an architecture line fixes it (gominimal/arch#98).]
+- [NEEDS CLARIFICATION (MEDIUM): the architecture's event list lacks `renamed` and `resumed` (both named in gominimal/arch#98) and `detached` (to be added to arch#98), `box.toml` lacks `hooks_on_resume`, and it names no box states; BOX-010, BOX-011, BOX-016, BOX-028 and BOX-040 are written to this spec's additions pending one architecture line each (gominimal/arch#98). The command-tree items in arch#98, `min box rename` and `min host stop`, are BCLI's.]
 - [NEEDS CLARIFICATION (MEDIUM): `box.toml` writes flat `egress_allow_*` keys while NET-060 and BEP-008 bind nested `egress.*`; BOX-076 follows the two merged specs and `box.toml` needs aligning (gominimal/arch#99).]
 - [NEEDS CLARIFICATION (LOW): how the host surfaces `[params]` values to the entrypoint (file, path, format key); BOX-085 accepts and renders only, and `box.toml` says only JSON/YAML/TOML (gominimal/arch#100).]
-- [NEEDS CLARIFICATION (LOW): `[io] exec_enabled` is still marked proposed in the architecture; BOX-105 honours it from the stored spec and follows whatever the architecture rules.]
+- [NEEDS CLARIFICATION (LOW): `[io] exec_enabled` is still marked proposed in the architecture; BOX-153 honours it from the stored spec and follows whatever the architecture rules.]
