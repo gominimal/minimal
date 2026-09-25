@@ -136,10 +136,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-025** WHEN a stopped or exited box whose spec sets `pty_enabled` is resumed THE SYSTEM SHALL start its processes again from the stored spec and retained filesystem under the same `box_id` and name, and record a `resumed` event.
   tier:     T0
   verify:   cargo nextest run -p minimald resume_restarts_from_stored_spec_same_id_and_name
-  - IF a resuming box's stored spec can no longer be satisfied THEN THE SYSTEM SHALL refuse with the exit code creation would give and leave the box's state unchanged.
+  - IF a resuming box's stored spec can no longer be satisfied THEN THE SYSTEM SHALL refuse with the exit code creation would give and leave the box's state unchanged, evaluating this check after the name check and before BVOL-013's volume-hold check in the order the next sub-bullet states.
     tier:   T0
     verify: cargo nextest run -p minimald resume_refuses_unsatisfiable_spec_keeps_state
-  - IF a stopped or exited box is resumed while a running box on the same host holds its name THEN THE SYSTEM SHALL refuse the resume, naming the running box, and leave the state unchanged, evaluating a resume's refusals in the order BOX-030's PTY check, then this name check, then BVOL-013's volume-hold check, so the first that applies decides the refusal.
+  - IF a stopped or exited box is resumed while a running box on the same host holds its name THEN THE SYSTEM SHALL refuse the resume, naming the running box, and leave the state unchanged, evaluating a resume's refusals in the order BOX-030's PTY check, then this name check, then the unsatisfiable-spec refusal above, then BVOL-013's volume-hold check, so the first that applies decides the refusal.
     tier:   T0
     verify: cargo nextest run -p minimald resume_refuses_when_name_held_by_running_box
 

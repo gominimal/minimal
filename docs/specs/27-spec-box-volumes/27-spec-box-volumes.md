@@ -67,7 +67,7 @@ This spec is the first backing: a volume lives on the host that runs the box, in
   tier:     T0
   verify:   cargo nextest run -p minimald write_hold_kept_while_stopped_released_on_exit
 
-- **BVOL-013** IF an `exited` box whose spec sets `pty_enabled` is resumed while another box holds for writing a volume the resumed box declares `rw` THEN THE SYSTEM SHALL refuse the resume with exit 5, naming the holding box, and leave the record `exited`, evaluating this check after BOX-030's PTY check and BOX-025's name check.
+- **BVOL-013** IF an `exited` box whose spec sets `pty_enabled` is resumed while another box holds for writing a volume the resumed box declares `rw` THEN THE SYSTEM SHALL refuse the resume with exit 5, naming the holding box, and leave the record `exited`, evaluated last in the resume refusal order BOX-025 states.
   tier:     T0
   verify:   cargo nextest run -p minimald resume_from_exited_refused_exit5_when_volume_held
 
