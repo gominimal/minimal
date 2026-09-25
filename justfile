@@ -432,46 +432,57 @@ lint-shell:
 # against main, staged, unstaged, and untracked) so the common loop stays
 # short; pass files for specific ones, or --all for the whole tree. The
 # existing tree carries thousands of alerts: drive files you touch to zero,
-# leave untouched files' alerts alone. Packages fetch on first use (styles/
-# is gitignored; later runs never touch the network); --no-global keeps a
-# personal ~/.vale.ini from leaking its styles into the repo's run. Paths
-# with spaces are not supported.
+# leave untouched files' alerts alone. `vale sync` fetches the pinned packages
+# into styles/ (gitignored) and runs again whenever `.vale.ini` changes, so a
+# bumped pin moves the lint; --no-global keeps a personal ~/.vale.ini from
+# leaking its styles into the repo's run.
 #
 # Vale prose-lint this branch's markdown (`just lint-prose [files|--all]`).
 lint-prose *args: (_need "vale" "brew install vale (or a release binary: github.com/errata-ai/vale/releases)")
     #!/usr/bin/env sh
     set -eu
     args={{quote(args)}}
-    [ -d styles/ai-tells ] && [ -d styles/ste ] || vale sync
-    if [ "$args" = "--all" ]; then
-        exec vale --no-global -- $(git ls-files '*.md')
+    # Re-sync when a package directory is missing, or when `.vale.ini` changed
+    # since the last sync. Vale keeps no version stamp of its own next to the
+    # synced styles, so an existence check alone would freeze a warm checkout
+    # at its first sync and ignore a later pin bump.
+    stamp="$(cksum .vale.ini)"
+    if [ ! -d styles/ai-tells ] || [ ! -d styles/ste ] \
+        || [ "$(cat styles/.sync-stamp 2>/dev/null || true)" != "$stamp" ]; then
+        vale sync
+        printf '%s\n' "$stamp" > styles/.sync-stamp
     fi
-    if [ -n "$args" ]; then
-        exec vale --no-global -- $args
-    fi
-    base=main
-    git rev-parse -q --verify "$base" >/dev/null || base=origin/main
-    git rev-parse -q --verify "$base" >/dev/null || {
-        echo "lint-prose: no 'main' or 'origin/main' ref to diff against" >&2
-        exit 1
-    }
-    changed="$(
-        { git diff --name-only "$base...HEAD" -- '*.md'
-          git diff --name-only --cached -- '*.md'
-          git diff --name-only -- '*.md'
-          git ls-files --others --exclude-standard -- '*.md'
-        } | sort -u
-    )"
-    # Unquoted expansions below word-split on purpose: repo paths have no
-    # spaces. {{quote(args)}} keeps shell metacharacters in arguments inert;
-    # `--` stops vale from parsing leading-dash paths as options.
+    # `quote()` joins the arguments into a single shell word, so the splits
+    # below are what separate them again; `set -f` keeps a path's glob
+    # characters literal. Repo paths carry no whitespace, so an argument
+    # holding a space is not supported.
     set -f
-    files=""
-    for f in $changed; do
-        if [ -f "$f" ]; then files="$files $f"; fi
+    if [ "$args" = "--all" ]; then
+        files="$(git ls-files '*.md')"
+    elif [ -n "$args" ]; then
+        files="$args"
+    else
+        base=main
+        git rev-parse -q --verify "$base" >/dev/null || base=origin/main
+        git rev-parse -q --verify "$base" >/dev/null || {
+            echo "lint-prose: no 'main' or 'origin/main' ref to diff against" >&2
+            exit 1
+        }
+        files="$(
+            { git diff --name-only "$base...HEAD" -- '*.md'
+              git diff --name-only --cached -- '*.md'
+              git diff --name-only -- '*.md'
+              git ls-files --others --exclude-standard -- '*.md'
+            } | sort -u
+        )"
+    fi
+    keep=""
+    for f in $files; do
+        if [ -f "$f" ]; then keep="$keep $f"; fi
     done
-    [ -n "$files" ] || { echo "lint-prose: no changed markdown on this branch" >&2; exit 0; }
-    exec vale --no-global -- $files
+    [ -n "$keep" ] || { echo "lint-prose: no markdown to lint" >&2; exit 0; }
+    # `--` stops vale from parsing a leading-dash path as an option.
+    exec vale --no-global -- $keep
 
 # scripts/record-smoked.sh writes the smoke-provenance marker and
 # scripts/verify-smoked.sh reads it back, over a stubbed `gcloud` backed by a
