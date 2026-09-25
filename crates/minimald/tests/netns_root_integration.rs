@@ -229,6 +229,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
             proto: IpProto::Tcp,
         }],
         dynamic_allowed_range: None,
+        dynamic_ingress: None,
     };
     let control = ControlChannel::Unix(sock.clone());
     let exposed = apply_ingress(&control, lease.ip, &ingress)
