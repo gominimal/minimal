@@ -163,7 +163,7 @@ grep -q "needs the deb box" "$root/out.log" || fail "apparmor/deb interaction me
 
 # --- 9. channel packages: normalized manager version, canonical binary version --
 # nfpm names a dev-build channel package after the NORMALIZED version (deb
-# 0.6.0~dev.10.g8e7e72c2-1, apk 0.6.0_dev…-r1), while the packaged `min` still
+# 0.6.0~dev.10.g8e7e72c2-1, apk 0.6.0_pre10-r1), while the packaged `min` still
 # reports the CANONICAL 0.6.0-dev.10.g8e7e72c2. --built-version is what bridges
 # the two; without it the filename-derived value would be compared against the
 # binary's output and every channel smoke would fail.
@@ -171,12 +171,12 @@ channel_dist="$root/channel-dist"
 mkdir -p "$channel_dist"
 : >"$channel_dist/minimal_0.6.0~dev.10.g8e7e72c2-1_amd64.deb"
 : >"$channel_dist/minimal-0.6.0~dev.10.g8e7e72c2-1.x86_64.rpm"
-: >"$channel_dist/minimal_0.6.0_dev.10.g8e7e72c2-r1_x86_64.apk"
+: >"$channel_dist/minimal_0.6.0_pre10-r1_x86_64.apk"
 
 : >"$STUB_LOG"
 STUB_DEB_VERSION='0.6.0~dev.10.g8e7e72c2-1' \
 STUB_RPM_VERSION='0.6.0~dev.10.g8e7e72c2-1' \
-STUB_APK_VERSION='0.6.0_dev.10.g8e7e72c2-r1' \
+STUB_APK_VERSION='0.6.0_pre10-r1' \
 STUB_BASE_VERSION='0.6.0-dev.10.g8e7e72c2' \
     run_smoke --pkg-dir "$channel_dist" --built-version 0.6.0-dev.10.g8e7e72c2 ||
     fail "channel smoke exited non-zero: $(cat "$root/out.log")"
@@ -187,7 +187,7 @@ log_has "create --name min-test-deb" || fail "channel deb box not created"
 : >"$STUB_LOG"
 STUB_DEB_VERSION='0.6.0~dev.10.g8e7e72c2-1' \
 STUB_RPM_VERSION='0.6.0~dev.10.g8e7e72c2-1' \
-STUB_APK_VERSION='0.6.0_dev.10.g8e7e72c2-r1' \
+STUB_APK_VERSION='0.6.0_pre10-r1' \
 STUB_BASE_VERSION='0.6.0-dev.10.g8e7e72c2' \
     run_smoke --pkg-dir "$channel_dist" --formats deb --built-version 0.0.0-wrong &&
     fail "a wrong --built-version exited zero"

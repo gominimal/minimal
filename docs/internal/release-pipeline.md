@@ -252,7 +252,7 @@ string the binaries report, normalized per manager by
 | Manager | `0.6.0-dev.10.g8e7e72c2` becomes | Why |
 |---|---|---|
 | deb / rpm | `0.6.0~dev.10.g8e7e72c2` | rpm forbids `-` in `Version:`; `~` sorts below the release, so enabling a channel suite never silently upgrades a stable user |
-| apk | `0.6.0_dev.10.g8e7e72c2` | apk uses `-r<N>` as its own revision separator |
+| apk | `0.6.0_pre10` | apk allows only the suffixes alpha/beta/pre/rc/cvs/svn/git/hg/p, so neither the `dev` word nor the git hash is expressible; `pre` sorts below the release and `<N>` keeps the series ordered (the hash is dropped — a trailing hash must be lowercase hex and would read onto `<N>` ambiguously). A plain `0.6.0-rc1` keeps its word as `0.6.0_rc1`. |
 | aur | `0.6.0.dev.10.g8e7e72c2` | pacman's `pkgver` forbids `-` |
 | brew | `0.6.0-dev.10.g8e7e72c2` | Homebrew versions may carry `-` |
 

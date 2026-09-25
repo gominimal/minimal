@@ -177,7 +177,7 @@ else
     bad "deb/rpm normalize the dev version with ~ (log:
 $(cat "$cl"))"
 fi
-if grep -q 'PKGVER=0.6.0_dev.10.g8e7e72c2' "$cl"; then
+if grep -q 'PKGVER=0.6.0_pre10' "$cl"; then
     ok "apk normalizes the dev version with _"
 else
     bad "apk normalizes the dev version with _ (log:

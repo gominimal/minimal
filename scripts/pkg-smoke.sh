@@ -272,7 +272,7 @@ for i in "${!boxes[@]}"; do
     # NORMALIZED one the filename carries. They are identical only for a
     # released semver (0.6.0-1 -> 0.6.0), which is why --built-version exists
     # for channel packages: a dev build's normalized form (0.6.0~dev.…,
-    # 0.6.0_dev.…) can never match what the binary prints, so refuse the run
+    # 0.6.0_pre10) can never match what the binary prints, so refuse the run
     # rather than report a "binary check failed" that names the wrong cause.
     want_bin="$built_version"
     if [ -z "$want_bin" ]; then
