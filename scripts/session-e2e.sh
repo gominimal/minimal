@@ -349,10 +349,13 @@ teardown() {
   [ -n "$NATIVE_SEED_DIR" ] && rm -rf "$NATIVE_SEED_DIR"
   # The native-resolution proof points the HOST resolver at the daemon's
   # answerer; a run that died between that and its own revert must not leave
-  # the change behind. `resolvectl revert` restores the link's configured
-  # state, whatever this host had before.
+  # the change behind. `resolvectl revert` restores the link's DNS state and
+  # `ip link del` removes the dedicated link the command created — the soak
+  # runs this script ten times on one runner, so the next iteration must
+  # find the host as this one did.
   if [ -n "$NATIVE_REVERT_LINK" ]; then
     sudo -n resolvectl revert "$NATIVE_REVERT_LINK" >/dev/null 2>&1 || true
+    sudo -n ip link del "$NATIVE_REVERT_LINK" >/dev/null 2>&1 || true
   fi
   [ -n "$PROXY_SEED_DIR" ] && rm -rf "$PROXY_SEED_DIR"
   [ -n "$PROXY_OWN_SEED_DIR" ] && rm -rf "$PROXY_OWN_SEED_DIR"
@@ -2002,14 +2005,15 @@ proof_native_resolution_without_proxy_env() {
   if [ -n "$E2E_VM" ]; then
     echo "host half SKIPPED (VM-backed target: the answerer is guest-side; the native lane proves it)"
   elif ! command -v resolvectl >/dev/null 2>&1 \
+       || ! command -v ip >/dev/null 2>&1 \
        || ! command -v getent >/dev/null 2>&1 \
        || ! sudo -n true >/dev/null 2>&1; then
     if [ -z "${CI:-}" ]; then
       echo "::warning::native-resolution host half SKIPPED — this host cannot run the advisory's command"
-      echo "  (needs resolvectl, getent and passwordless sudo; CI's native lane has all three)"
+      echo "  (needs resolvectl, ip, getent and passwordless sudo; CI's native lane has all four)"
       echo "  asserted here: the advisory's exact command and the daemon's probe record above"
     else
-      echo "::error::a CI native lane must be able to run the advisory's command (resolvectl, getent, passwordless sudo)"
+      echo "::error::a CI native lane must be able to run the advisory's command (resolvectl, ip, getent, passwordless sudo)"
       fail
     fi
   else
@@ -2017,14 +2021,16 @@ proof_native_resolution_without_proxy_env() {
       # Run the exact command the advisory printed — verbatim, as the user
       # would have. Passwordless sudo is the gate above, so it cannot prompt.
       if ! sh -c "$native_cmd" >"$WORK/native-cmd.out" 2>"$WORK/native-cmd.err"; then
-        echo "::error::the advisory's command did not run (does it name this host's link?)"
+        echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
         echo "--- command ---"; echo "$native_cmd"
         echo "--- output ---"; cat "$WORK/native-cmd.out" "$WORK/native-cmd.err" 2>/dev/null || true
         fail
       fi
       echo "ran the advisory's command"
-      # Undo it afterwards: `resolvectl revert` restores the link's
-      # configured state, whatever this host had before the proof touched it.
+      # Undo it afterwards: the teardown runs `resolvectl revert` on this
+      # link — restoring its DNS state, whatever this host had before the
+      # proof touched it — and `ip link del`, removing the dedicated link
+      # the command created.
       NATIVE_REVERT_LINK="$(printf '%s\n' "$native_cmd" \
         | sed -n 's/.*resolvectl dns \([^ ][^ ]*\) .*/\1/p')"
     else
@@ -2053,10 +2059,19 @@ proof_native_resolution_without_proxy_env() {
     native_proved="${native_proved:+$native_proved, }resolved"
 
     if [ -n "$NATIVE_REVERT_LINK" ]; then
+      # Undo the whole command: `resolvectl revert` restores the link's
+      # DNS state, `ip link del` removes the dedicated link itself — the
+      # next iteration (the soak runs this script ten times) must find the
+      # host as this run did.
       if sudo resolvectl revert "$NATIVE_REVERT_LINK" >/dev/null 2>&1; then
         echo "reverted the routing domain on $NATIVE_REVERT_LINK"
       else
         echo "::warning::could not revert the routing domain on $NATIVE_REVERT_LINK (this host's resolver still carries it)"
+      fi
+      if sudo ip link del "$NATIVE_REVERT_LINK" >/dev/null 2>&1; then
+        echo "removed the dedicated link $NATIVE_REVERT_LINK"
+      else
+        echo "::warning::could not remove the dedicated link $NATIVE_REVERT_LINK (this host still carries it)"
       fi
       NATIVE_REVERT_LINK=""
     fi
