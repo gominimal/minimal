@@ -297,12 +297,14 @@ impl Manager {
 /// a microVM does **not** own its switch (its boxes tap the gvproxy
 /// `minvmd` runs, on the default /16 every VM on the host shares), so its
 /// slice is keyed by the octet alone and two VM daemons on one host still
-/// draw from two disjoint slices — the primary NET-027 case. Keying the
+/// draw from two different slices — the primary NET-027 case. Keying the
 /// slice on the switch *subnet* instead would collapse every microVM
 /// daemon onto the default subnet's octet, and with it onto one shared
 /// slice. The daemon's start line reads exactly this function to name the
 /// slice in its log (see `crate::server`), so a reader of two daemons'
-/// logs can see the two hold disjoint halves.
+/// logs can compare the two slices — and see the wrap-around
+/// [`LoopbackAllocator::for_slice_octet`] names where it lands the pair
+/// on one.
 ///
 /// The full arbitration is NET-010's host-global allocation; this is the
 /// per-daemon half of it. The publish path that **spends** these addresses
@@ -324,17 +326,19 @@ pub struct LoopbackAllocator {
 
 /// How many addresses one daemon's slice of the reserved local range holds:
 /// a /27 gives each daemon 32 published boxes' worth of room, and the octet
-/// index below eight daemons' worth of distinct slices before the
-/// wrap-around the doc on [`LoopbackAllocator::for_slice_octet`] names.
+/// indexes eight daemons' worth of distinct slices before the wrap-around the
+/// doc on [`LoopbackAllocator::for_slice_octet`] names.
 #[cfg(target_os = "linux")]
 const LOOPBACK_SLICE_PREFIX: u8 = 27;
 
 /// How many slices the reserved local range holds: it is one /24 (256
 /// addresses, see [`crate::net::dns::RESERVED_LOCAL_RANGE`]) carved into
 /// /27s — eight slices — so a slice octet mod this many indexes every
-/// slice there is.
+/// slice there is. `pub(crate)` for the daemon-start tests, which assert
+/// two daemons' slices against exactly this wrap-around.
 #[cfg(target_os = "linux")]
-const LOOPBACK_SLICES: u32 = 1 << (LOOPBACK_SLICE_PREFIX - crate::net::dns::RESERVED_LOCAL_RANGE.1);
+pub(crate) const LOOPBACK_SLICES: u32 =
+    1 << (LOOPBACK_SLICE_PREFIX - crate::net::dns::RESERVED_LOCAL_RANGE.1);
 
 #[cfg(target_os = "linux")]
 impl LoopbackAllocator {
@@ -344,10 +348,14 @@ impl LoopbackAllocator {
     /// the one a microVM daemon's instance id derives, since its switch
     /// (the host's default /16, which `minvmd` renders) is the same for
     /// every VM on the host and cannot differ. Two daemons whose octets
-    /// differ therefore hand out disjoint addresses; octets that differ by
-    /// a multiple of [`LOOPBACK_SLICES`] share a slice (two daemons that
-    /// far apart collide only in the last eighth of the address space, and
-    /// NET-010's host-global allocation is what arbitrates when it binds).
+    /// differ therefore hand out disjoint addresses, except across the
+    /// wrap-around this doc exists to name: octets that differ by a
+    /// multiple of [`LOOPBACK_SLICES`] index one shared slice, so those
+    /// two daemons hand out the same addresses — a pair of derived octets
+    /// lands there about one time in eight. The daemon's start line
+    /// prints the slice's range, so the wrap is visible rather than
+    /// hidden (two daemons' logs carry the same `loopback_slice`), and
+    /// NET-010's host-global allocation is what arbitrates when it binds.
     #[must_use]
     pub fn for_slice_octet(octet: u8) -> Self {
         let (range_base, _) = crate::net::dns::RESERVED_LOCAL_RANGE;
@@ -2350,8 +2358,10 @@ pub(crate) mod tests {
     /// for a native daemon the third octet of its own gvproxy's /24, for a
     /// microVM daemon the octet its instance id derives, since its switch is
     /// the host's default /16 and is the same for every VM on the host. Two
-    /// daemons whose octets differ draw from disjoint ranges, and every
-    /// address one hands out stays inside its own.
+    /// daemons whose octets differ draw from disjoint ranges — save octets
+    /// that differ by a multiple of the slice count, which index one
+    /// shared slice (the wrap the last assertion pins) — and every address
+    /// one hands out stays inside its own.
     #[cfg(target_os = "linux")]
     #[test]
     fn loopback_allocators_follow_the_daemon_s_slice_octet() {

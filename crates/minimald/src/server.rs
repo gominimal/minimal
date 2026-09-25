@@ -84,8 +84,14 @@ pub struct Config {
     /// draws its `OwnIp` PTask leases — and, keyed on the same octet, this
     /// daemon's slice of the reserved local range — from. `None` (the
     /// default) derives the octet from the daemon instance id, so two
-    /// daemons on one machine take two different octets and never hand out
-    /// colliding lease addresses or overlapping publish slices (NET-027).
+    /// daemons on one machine take two different octets and with them two
+    /// different switch /24s: their PTask leases can never collide. Their
+    /// publish slices are disjoint only while the two octets stay
+    /// incongruent modulo the reserved range's slice count — the
+    /// wrap-around [`crate::sessions::LoopbackAllocator::for_slice_octet`]
+    /// names, which a pair of derived octets falls into about one time in
+    /// eight; two daemons that fall in share one slice until NET-010's
+    /// host-global allocation arbitrates (NET-027's address half).
     /// A deployment — or a test that needs a deterministic pair — pins the
     /// octet instead; pinning it does not check what other daemons on the
     /// host hold, which is the host-global arbitration NET-010's allocation
@@ -97,7 +103,8 @@ pub struct Config {
     /// carries that switch's default /16 whatever this field says (see
     /// [`switch_subnet_for`]). Its *slice* still follows the octet, derived
     /// when unpinned: the slice is the daemon's own state, not the switch's,
-    /// and two VM daemons on one host must not meet on one slice.
+    /// so two VM daemons on one host draw from their own octets' slices —
+    /// disjoint, save for the same wrap-around the paragraph above names.
     #[serde(default)]
     pub switch_subnet_octet: Option<u8>,
 }
@@ -271,7 +278,11 @@ impl ServerState {
         // third octet of the switch's own /24, while letting a microVM daemon
         // — whose switch it does not own stays on the default /16 — still draw
         // from a slice of its own: two VM daemons on one host take two
-        // distinct octets and never meet on one slice (NET-027).
+        // distinct octets, and with them two different slices except where
+        // the octets land congruent modulo the reserved range's slice count —
+        // the wrap-around `LoopbackAllocator::for_slice_octet` names and the
+        // start line below makes visible, which NET-010's host-global
+        // allocation arbitrates (NET-027).
         let slice_octet = config
             .switch_subnet_octet
             .unwrap_or_else(|| octet_for_daemon_id(&daemon_id));
@@ -295,7 +306,12 @@ impl ServerState {
         // boxes lease on, the octet its published boxes' slice is keyed to,
         // and that slice of the reserved local range — the facts a reader of
         // two daemons' logs (a diagnostics bundle tails exactly this log)
-        // checks to see the two hold disjoint halves of the machine.
+        // compares: two lines with different `loopback_slice` ranges hold
+        // disjoint halves of the machine, and two lines carrying the *same*
+        // range are the wrap-around — octets congruent modulo the reserved
+        // range's slice count index one slice — visible in the logs rather
+        // than hidden, and arbitrated host-globally by NET-010's allocation
+        // when it binds.
         let (slice_first, slice_last) =
             sessions::LoopbackAllocator::for_slice_octet(slice_octet).range();
         tracing::info!(
@@ -356,9 +372,12 @@ impl ServerState {
 /// from a config it renders itself) runs it on the /24 inside the default
 /// switch /16 whose third octet is `octet` — the octet a deployment pins,
 /// else the one its instance id derives — so two daemons on one machine take
-/// two different /24s and with them two disjoint `OwnIp` PTask-lease ranges
-/// and, keyed on the same octet, two disjoint slices of the reserved local
-/// range (NET-027).
+/// two different /24s and with them two disjoint `OwnIp` PTask-lease ranges,
+/// and keyed on the same octet two slices of the reserved local range that
+/// are disjoint except across the wrap-around
+/// [`crate::sessions::LoopbackAllocator::for_slice_octet`] names: octets
+/// congruent modulo the range's slice count index one shared slice
+/// (NET-027).
 ///
 /// A daemon in a microVM (DM1/3/4) does **not** own its switch: it attaches
 /// its boxes' taps to the host gvproxy `minvmd` owns, whose config the
@@ -3161,22 +3180,31 @@ mod tests {
         );
     }
 
-    /// NET-027: two daemons on one machine must not draw published boxes
-    /// from one slice of the reserved local range — a shared slice is a
+    /// NET-027: two daemons on one machine draw their published boxes from
+    /// their own slices of the reserved local range — a shared slice is a
     /// shared address space, the collision that has one daemon's published
     /// box answer a name the other daemon routed. Each daemon's slice is
     /// keyed to its own octet — configured onto two daemons here, derived
     /// from the instance id on a third — which on a native host is also the
-    /// /24 its own gvproxy runs on, and each names the slice it draws from on
-    /// its own start line, where a reader of two daemons' logs can see the
-    /// two hold disjoint halves.
+    /// /24 its own gvproxy runs on, and each names the slice it draws from
+    /// on its own start line, where a reader of two daemons' logs can
+    /// compare the two.
+    ///
+    /// The comparison is honest about the wrap-around
+    /// `LoopbackAllocator::for_slice_octet` names: octets congruent
+    /// modulo the reserved range's slice count index one shared slice, so
+    /// disjointness holds only between incongruent octets. The
+    /// pinned pair (37/52) sits incongruent on purpose; the wrap's both arms
+    /// are pinned below with ids chosen for their derived octets, and the
+    /// deriving daemon's relation to the pinned pair follows the same
+    /// predicate, not a promise of disjointness its random id cannot keep.
     ///
     /// The `in_microvm: true` pair is the primary case for exactly this
     /// keying: a VM daemon does not own its switch — its boxes tap the host
     /// gvproxy, on the default /16 every VM on the host shares — so a slice
     /// keyed on the switch *subnet* would put every VM on the machine on one
     /// slice. Keyed on the octet, the two VM daemons here hold the same two
-    /// disjoint slices as their native twins on the same octets.
+    /// slices as their native twins on the same octets.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn two_daemons_draw_disjoint_loopback_slices() {
@@ -3330,6 +3358,34 @@ mod tests {
             "an unpinned daemon's slice must follow its derived octet"
         );
 
+        // ...and its relation to the pinned pair is the wrap predicate, not a
+        // promise of disjointness a random id cannot keep: disjoint from
+        // every pinned octet its derived octet is incongruent to modulo the
+        // reserved range's slice count, and equal to the one (if any) it is
+        // congruent to — the wrap `LoopbackAllocator::for_slice_octet`
+        // documents, walked here against a live daemon's own start line.
+        for (pinned_name, pinned_octet, pinned_slice) in
+            [("A", 37u8, slice_a), ("B", 52u8, slice_b)]
+        {
+            if u32::from(octet_c) % sessions::LOOPBACK_SLICES
+                == u32::from(pinned_octet) % sessions::LOOPBACK_SLICES
+            {
+                assert_eq!(
+                    slice_c, pinned_slice,
+                    "the deriving daemon's octet {octet_c} is congruent to \
+                     pinned daemon {pinned_name}'s {pinned_octet} modulo the \
+                     slice count: the two share one slice — the wrap the docs \
+                     name, which NET-010's allocation arbitrates"
+                );
+            } else {
+                assert!(
+                    slice_c.1 < pinned_slice.0 || pinned_slice.1 < slice_c.0,
+                    "the deriving daemon's slice must be disjoint from pinned \
+                     daemon {pinned_name}'s, got {slice_c:?} and {pinned_slice:?}"
+                );
+            }
+        }
+
         // The VM pair keeps the host's switch — both start lines carry the
         // default /16, which no native daemon's does — and still draws from
         // the octet each was pinned to: the same slices as their native
@@ -3360,6 +3416,59 @@ mod tests {
         assert!(
             slice_d.1 < slice_e.0 || slice_e.1 < slice_d.0,
             "the two VM daemons' slices must be disjoint, got {slice_d:?} and {slice_e:?}"
+        );
+
+        // The wrap-around's both arms, pinned with ids chosen for their
+        // derived octets rather than a live daemon's random one — the wrap is
+        // a property of the octet arithmetic, so any id space reaches it;
+        // here a fixed one, so the two pairs are stable whichever ids the
+        // search finds. Searched, not hardcoded, so a re-keyed derivation
+        // still yields a pair for each arm.
+        let mut congruent = None;
+        let mut incongruent = None;
+        'ids: for i in 0..64u32 {
+            for j in (i + 1)..64u32 {
+                let (octet_i, octet_j) = (
+                    octet_for_daemon_id(&i.to_string()),
+                    octet_for_daemon_id(&j.to_string()),
+                );
+                if octet_i == octet_j {
+                    // Two ids hashing to one octet is the id-collision case
+                    // `octet_for_daemon_id`'s doc names — not the wrap.
+                    continue;
+                }
+                if u32::from(octet_i) % sessions::LOOPBACK_SLICES
+                    == u32::from(octet_j) % sessions::LOOPBACK_SLICES
+                {
+                    congruent.get_or_insert((i, octet_i, j, octet_j));
+                } else {
+                    incongruent.get_or_insert((i, octet_i, j, octet_j));
+                }
+                if congruent.is_some() && incongruent.is_some() {
+                    break 'ids;
+                }
+            }
+        }
+        let (id_wa, octet_wa, id_wb, octet_wb) =
+            congruent.expect("64 ids must derive one octet pair congruent mod 8");
+        assert_eq!(
+            sessions::LoopbackAllocator::for_slice_octet(octet_wa).range(),
+            sessions::LoopbackAllocator::for_slice_octet(octet_wb).range(),
+            "ids {id_wa} and {id_wb} derive octets {octet_wa} and {octet_wb}, \
+             congruent modulo the slice count: two daemons that derived them \
+             share one slice — the wrap the docs and the start line name, \
+             which NET-010's allocation arbitrates"
+        );
+        let (id_ia, octet_ia, id_ib, octet_ib) =
+            incongruent.expect("64 ids must derive one incongruent octet pair");
+        let (first_ia, last_ia) = sessions::LoopbackAllocator::for_slice_octet(octet_ia).range();
+        let (first_ib, last_ib) = sessions::LoopbackAllocator::for_slice_octet(octet_ib).range();
+        assert!(
+            last_ia < first_ib || last_ib < first_ia,
+            "ids {id_ia} and {id_ib} derive octets {octet_ia} and {octet_ib}, \
+             incongruent modulo the slice count: two daemons that derived \
+             them must draw from disjoint slices, got {first_ia}..={last_ia} \
+             and {first_ib}..={last_ib}"
         );
 
         run_a.abort();
