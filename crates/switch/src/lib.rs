@@ -1,5 +1,6 @@
 //! gvproxy-switch primitives: subnet arithmetic, MAC derivation, the vsock wire
-//! constants, and gvproxy `-config` rendering.
+//! constants, gvproxy `-config` rendering, and the default address plan an
+//! un-enrolled host self-allocates from.
 //!
 //! Shared by `minimald` (the in-guest / native switch client + IP allocator) and
 //! `minvmd` (the host switch supervisor). A standalone crate — these are network
@@ -35,8 +36,24 @@ pub const DEFAULT_SUBNET: SwitchSubnet = SwitchSubnet {
     prefix: 16,
 };
 
-/// Filename the switch binary is installed under, in both the user-local `bin/`
-/// prefix and the system-wide path below.
+/// The reserved local range published box addresses come from on the host's
+/// loopback: `127.64.0.0/24` (design §7.1) — a loopback block no stock host
+/// service claims, so a box published on the host answers there without
+/// colliding with the host's own `127.0.0.1` services.
+///
+/// The same block the daemon's DNS zone answers published names from
+/// (`minimald::net::dns::RESERVED_LOCAL_RANGE`); defined here so the plan
+/// below and the answerer cannot drift on where published addresses live.
+pub const RESERVED_LOCAL_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 64, 0, 0), 24);
+
+/// Prefix of the reserved local range slice each switch (one gvproxy) publishes
+/// its boxes at. A /27 is 32 addresses — 32 published boxes per switch — and a
+/// /24 range holds exactly eight of them, which is also how many switches the
+/// default plan serves on one host (see [`AddressPlan`]).
+pub const SWITCH_SLICE_PREFIX: u8 = 27;
+
+/// Filename the switch binary is installed under, in the user-local `bin/`
+/// prefix and the system paths below.
 ///
 /// Deliberately **not** plain `gvproxy`: the installer's `bin` prefix is
 /// `~/.local/bin`, which is on `PATH`, and podman/crc/Docker Desktop all ship
@@ -46,8 +63,16 @@ pub const DEFAULT_SUBNET: SwitchSubnet = SwitchSubnet {
 /// gvproxy (`scripts/fetch-gvproxy.sh` pins and SHA-256-verifies them).
 pub const GVPROXY_FILE: &str = "gvproxy-min";
 
-/// System-wide install path for the switch binary: the final fallback when no
-/// user-local install exists.
+/// System package install path for the switch binary: where the distro
+/// packages place it (`packaging/nfpm.yaml` for deb/rpm/apk,
+/// `packaging/arch/PKGBUILD-bin.tmpl` for the AUR), so a host that installed
+/// minimal through its package manager finds the binary without a user-local
+/// install.
+pub const PACKAGE_GVPROXY_BIN: &str = "/usr/bin/gvproxy-min";
+
+/// Operator-provisioned system-wide install path for the switch binary: the
+/// final fallback when neither a user-local nor a system package install
+/// exists.
 pub const DEFAULT_GVPROXY_BIN: &str = "/usr/lib/minimal/bin/gvproxy-min";
 
 /// The pre-rename system-wide path, still honoured when it exists and the
@@ -75,19 +100,21 @@ fn installer_bin_dir() -> Option<PathBuf> {
 
 /// Resolve the switch binary an install placed on this host: an existing
 /// user-local install (`<bin-dir>/gvproxy-min`, where the curl|sh installer
-/// stamps it), else the system-wide [`DEFAULT_GVPROXY_BIN`].
+/// stamps it), else the system package install ([`PACKAGE_GVPROXY_BIN`]), else
+/// the operator-provisioned [`DEFAULT_GVPROXY_BIN`].
 ///
 /// One definition shared by `minimald` (which spawns the switch for native
 /// own-IP sessions) and `minvmd` (the host switch supervisor), so the two
 /// daemons and the installer cannot drift on where the binary lives;
 /// daemon-specific overrides (config field, env var) layer on top in the
-/// callers. Never errors: the system path is returned as a last resort even if
-/// nothing exists there, so the caller surfaces a spawn failure naming a
-/// concrete path.
+/// callers. Never errors: the operator system path is returned as a last
+/// resort even if nothing exists there, so the caller surfaces a spawn failure
+/// naming a concrete path.
 #[must_use]
 pub fn installed_gvproxy_bin() -> PathBuf {
     resolve_installed(
         installer_bin_dir(),
+        Path::new(PACKAGE_GVPROXY_BIN),
         Path::new(DEFAULT_GVPROXY_BIN),
         Path::new(LEGACY_SYSTEM_GVPROXY_BIN),
     )
@@ -95,17 +122,28 @@ pub fn installed_gvproxy_bin() -> PathBuf {
 
 /// The resolution itself, with every probed location passed in.
 ///
-/// Split out so the tests can drive both system-path branches against temp
-/// dirs. Probing the real `/usr/lib/minimal/bin` instead would make them depend
-/// on host install state — and fail on exactly the pre-rename hosts the legacy
-/// branch exists to serve.
-fn resolve_installed(bin_dir: Option<PathBuf>, system: &Path, legacy: &Path) -> PathBuf {
+/// Split out so the tests can drive the system-path branches against temp
+/// dirs. Probing the real `/usr/bin` and `/usr/lib/minimal/bin` instead would
+/// make them depend on host install state — and fail on exactly the
+/// pre-rename hosts the legacy branch exists to serve.
+fn resolve_installed(
+    bin_dir: Option<PathBuf>,
+    package: &Path,
+    system: &Path,
+    legacy: &Path,
+) -> PathBuf {
     if let Some(local) = bin_dir.map(|dir| dir.join(GVPROXY_FILE))
         && local.exists()
     {
         return local;
     }
-    if !system.exists() && legacy.exists() {
+    if package.exists() {
+        return package.to_path_buf();
+    }
+    if system.exists() {
+        return system.to_path_buf();
+    }
+    if legacy.exists() {
         return legacy.to_path_buf();
     }
     system.to_path_buf()
@@ -255,6 +293,209 @@ impl SwitchSubnet {
     #[must_use]
     pub fn last_ptask(self) -> u32 {
         u32::from(self.broadcast()) - 3
+    }
+}
+
+/// An inclusive run of the reserved local range: [`first`](Self::first) through
+/// [`last`](Self::last).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopbackSlice {
+    first: Ipv4Addr,
+    last: Ipv4Addr,
+}
+
+impl LoopbackSlice {
+    /// The first address of the slice.
+    #[must_use]
+    pub fn first(self) -> Ipv4Addr {
+        self.first
+    }
+
+    /// The last address of the slice (inclusive).
+    #[must_use]
+    pub fn last(self) -> Ipv4Addr {
+        self.last
+    }
+
+    /// Whether `addr` falls inside the slice.
+    #[must_use]
+    pub fn contains(self, addr: Ipv4Addr) -> bool {
+        self.first <= addr && addr <= self.last
+    }
+
+    /// Whether the two slices share at least one address. Slices the same
+    /// [`AddressPlan`] minted never do — the property that keeps two gvproxies
+    /// on one host from publishing boxes at the same loopback address.
+    #[must_use]
+    pub fn overlaps(self, other: Self) -> bool {
+        self.first <= other.last && other.first <= self.last
+    }
+}
+
+impl fmt::Display for LoopbackSlice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}", self.first, self.last)
+    }
+}
+
+/// One switch the plan serves: the subnet its boxes lease addresses on, and
+/// the slice of the reserved local range its published boxes come from.
+///
+/// The pairing is the point (NET-102): a switch's loopback slice is a function
+/// of the switch itself, so two switches one host holds never publish from
+/// the same addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwitchSlice {
+    subnet: SwitchSubnet,
+    loopback: LoopbackSlice,
+}
+
+impl SwitchSlice {
+    /// The subnet this switch serves box addresses on.
+    #[must_use]
+    pub fn subnet(self) -> SwitchSubnet {
+        self.subnet
+    }
+
+    /// The disjoint slice of the reserved local range this switch publishes at.
+    #[must_use]
+    pub fn loopback(self) -> LoopbackSlice {
+        self.loopback
+    }
+}
+
+/// The default address plan an **un-enrolled host self-allocates from**
+/// (NET-102): the built-in block every box host draws on when no control plane
+/// has handed it one.
+///
+/// Two paired halves:
+///
+/// * the [`switch subnet`](Self::switch_subnet) boxes lease addresses on —
+///   the CGNAT [`DEFAULT_SUBNET`], which the host's switches carve `/24`s out
+///   of;
+/// * the [`RESERVED_LOCAL_RANGE`] those boxes' published addresses come from
+///   on the host's loopback, carved one [`SWITCH_SLICE_PREFIX`] slice per
+///   switch.
+///
+/// The pairing between the two is what makes published addresses safe to hand
+/// out per switch: switch *i* holds slice *i*, so two gvproxies on one host
+/// never hold the same loopback slice — whatever they are (the host switch a
+/// `minvmd` owns beside a native daemon's own, two native daemons, ...). The
+/// plan serves exactly [`switch_capacity`](Self::switch_capacity) switches —
+/// eight on the default plan; a host needing more switches needs the
+/// host-global arbitration NET-010 is the layer for, not a ninth slice of the
+/// same block.
+///
+/// The plan pairs switches with loopback slices; it does **not** arbitrate the
+/// box leases two switches' subnets could contend for — the `/24` a second
+/// daemon carves sits inside the host switch's default subnet, and keeping
+/// those leases distinct is exactly the host-global layer NET-010's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressPlan {
+    switch_subnet: SwitchSubnet,
+    reserved_local_range: (Ipv4Addr, u8),
+    slice_prefix: u8,
+}
+
+/// The plan an un-enrolled host takes: the one built into the binaries.
+pub const DEFAULT_ADDRESS_PLAN: AddressPlan = AddressPlan {
+    switch_subnet: DEFAULT_SUBNET,
+    reserved_local_range: RESERVED_LOCAL_RANGE,
+    slice_prefix: SWITCH_SLICE_PREFIX,
+};
+
+impl Default for AddressPlan {
+    fn default() -> Self {
+        DEFAULT_ADDRESS_PLAN
+    }
+}
+
+impl AddressPlan {
+    /// The subnet a host's switches serve box addresses on: the CGNAT /16 the
+    /// default switch runs on and later switches carve `/24`s out of.
+    #[must_use]
+    pub fn switch_subnet(self) -> SwitchSubnet {
+        self.switch_subnet
+    }
+
+    /// The reserved local range published box addresses come from, as
+    /// `(network, prefix)`.
+    #[must_use]
+    pub fn reserved_local_range(self) -> (Ipv4Addr, u8) {
+        self.reserved_local_range
+    }
+
+    /// How many switches this plan serves on one host: the reserved local range
+    /// holds exactly one slice per switch, so the capacity *is* the slice
+    /// count — eight on the default plan.
+    #[must_use]
+    pub fn switch_capacity(self) -> usize {
+        1usize << (self.slice_prefix - self.reserved_local_range.1)
+    }
+
+    /// The switch a host self-allocates at `index`: the subnet it serves and
+    /// the loopback slice it publishes at.
+    ///
+    /// Index `0` is the host's own switch — the plan's default subnet itself,
+    /// the one a `minvmd`-owned gvproxy serves every VM's boxes on — and each
+    /// later index is the next `/24` carved out of the plan's subnet, paired
+    /// with the next slice of the reserved local range. `None` once the plan's
+    /// switches are used up: a host that needs more switches is the
+    /// host-global arbitration NET-010 is the layer for, and inventing a ninth
+    /// slice of the same /24 would hand two gvproxies the same addresses.
+    #[must_use]
+    pub fn switch_slice(self, index: usize) -> Option<SwitchSlice> {
+        let loopback = self.slice_at(index)?;
+        let subnet = if index == 0 {
+            self.switch_subnet
+        } else {
+            let [a, b, _, _] = self.switch_subnet.network().octets();
+            SwitchSubnet::new(Ipv4Addr::new(a, b, index as u8, 0), 24).ok()?
+        };
+        Some(SwitchSlice { subnet, loopback })
+    }
+
+    /// The slice a switch already running on `subnet` publishes its boxes at —
+    /// the same pairing [`switch_slice`](Self::switch_slice) mints, derived
+    /// back from the switch's own subnet: the plan's default subnet is slice
+    /// `0`, and the `/24` it carved at octet *o* is slice *o*.
+    ///
+    /// `None` for a switch this plan does not serve — a subnet outside its
+    /// own, or a `/24` past its capacity: no slice exists to publish from, and
+    /// a `None` the caller can log beats the wrap-around collision a
+    /// `mod`-count slice derivation would silently hand two gvproxies.
+    #[must_use]
+    pub fn loopback_slice_for_switch(self, subnet: SwitchSubnet) -> Option<LoopbackSlice> {
+        if subnet == self.switch_subnet {
+            return self.slice_at(0);
+        }
+        if subnet.prefix() != 24 {
+            return None;
+        }
+        if u32::from(subnet.network()) & u32::from(self.switch_subnet.netmask())
+            != u32::from(self.switch_subnet.network())
+        {
+            return None;
+        }
+        let [_, _, octet, _] = subnet.network().octets();
+        if octet == 0 || usize::from(octet) >= self.switch_capacity() {
+            return None;
+        }
+        self.slice_at(usize::from(octet))
+    }
+
+    /// The `index`-th slice of the reserved local range: a run of
+    /// `2^(32 - slice_prefix)` addresses starting at the range's network.
+    fn slice_at(self, index: usize) -> Option<LoopbackSlice> {
+        if index >= self.switch_capacity() {
+            return None;
+        }
+        let step = 1u32 << (32 - self.slice_prefix);
+        let first = u32::from(self.reserved_local_range.0) + (index as u32) * step;
+        Some(LoopbackSlice {
+            first: Ipv4Addr::from(first),
+            last: Ipv4Addr::from(first + step - 1),
+        })
     }
 }
 
@@ -435,53 +676,81 @@ mod tests {
         // A foreign `gvproxy` (podman's, crc's) sitting in the bin dir must not
         // be picked up — only our own filename counts. Driven through
         // `resolve_installed` so the assertion does not depend on what the host
-        // has under /usr/lib/minimal/bin.
+        // has under /usr/bin or /usr/lib/minimal/bin.
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         std::fs::write(bin.join("gvproxy"), b"podman's").unwrap();
+        let package = tmp.path().join("package-gvproxy-min");
         let system = tmp.path().join("gvproxy-min");
         let legacy = tmp.path().join("gvproxy");
-        assert_eq!(resolve_installed(Some(bin), &system, &legacy), system);
+        assert_eq!(resolve_installed(Some(bin), &package, &system, &legacy), system);
     }
 
     // The system-path branches go through `resolve_installed` with temp paths.
-    // Calling the public resolver would probe the real /usr/lib/minimal/bin and
-    // flip on a host that has either binary installed — failing on precisely
-    // the pre-rename hosts the legacy branch exists to serve.
+    // Calling the public resolver would probe the real /usr/bin and
+    // /usr/lib/minimal/bin and flip on a host that has any of the binaries
+    // installed — failing on precisely the pre-rename hosts the legacy branch
+    // exists to serve.
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn falls_back_to_the_current_system_path() {
         let tmp = tempfile::tempdir().unwrap();
+        let package = tmp.path().join("package-gvproxy-min");
         let system = tmp.path().join("gvproxy-min");
         let legacy = tmp.path().join("gvproxy");
         std::fs::write(&system, b"current").unwrap();
         std::fs::write(&legacy, b"legacy").unwrap();
-        // Both present: the current name wins.
-        assert_eq!(resolve_installed(None, &system, &legacy), system);
+        // Both operator paths present: the current name wins.
+        assert_eq!(resolve_installed(None, &package, &system, &legacy), system);
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn falls_back_to_the_legacy_system_path_when_only_it_exists() {
         let tmp = tempfile::tempdir().unwrap();
+        let package = tmp.path().join("package-gvproxy-min");
         let system = tmp.path().join("gvproxy-min");
         let legacy = tmp.path().join("gvproxy");
         std::fs::write(&legacy, b"legacy").unwrap();
         // An operator who provisioned the pre-rename path keeps working.
-        assert_eq!(resolve_installed(None, &system, &legacy), legacy);
+        assert_eq!(resolve_installed(None, &package, &system, &legacy), legacy);
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn reports_the_current_system_path_when_neither_exists() {
         let tmp = tempfile::tempdir().unwrap();
+        let package = tmp.path().join("package-gvproxy-min");
         let system = tmp.path().join("gvproxy-min");
         let legacy = tmp.path().join("gvproxy");
         // Nothing installed anywhere: name the current path, so the caller's
         // spawn failure cites the location an install should have used.
-        assert_eq!(resolve_installed(None, &system, &legacy), system);
+        assert_eq!(resolve_installed(None, &package, &system, &legacy), system);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn package_install_wins_over_the_operator_paths() {
+        // /usr/bin/gvproxy-min is where the system packages put the binary
+        // (packaging/nfpm.yaml, packaging/arch/PKGBUILD-bin.tmpl): a managed
+        // package install outranks an operator-provisioned /usr/lib path, and
+        // is itself outranked by a user-local install.
+        let tmp = tempfile::tempdir().unwrap();
+        let package = tmp.path().join("package-gvproxy-min");
+        std::fs::write(&package, b"from the package").unwrap();
+        let system = tmp.path().join("gvproxy-min");
+        let legacy = tmp.path().join("gvproxy");
+        std::fs::write(&system, b"operator").unwrap();
+        std::fs::write(&legacy, b"operator-legacy").unwrap();
+        assert_eq!(resolve_installed(None, &package, &system, &legacy), package);
+
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let want = bin.join(GVPROXY_FILE);
+        std::fs::write(&want, b"user-local").unwrap();
+        assert_eq!(resolve_installed(Some(bin), &package, &system, &legacy), want);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -492,10 +761,102 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         let want = bin.join(GVPROXY_FILE);
         std::fs::write(&want, b"user-local").unwrap();
+        let package = tmp.path().join("package-gvproxy-min");
         let system = tmp.path().join("gvproxy-min");
         let legacy = tmp.path().join("gvproxy");
+        std::fs::write(&package, b"from the package").unwrap();
         std::fs::write(&system, b"current").unwrap();
         std::fs::write(&legacy, b"legacy").unwrap();
-        assert_eq!(resolve_installed(Some(bin), &system, &legacy), want);
+        assert_eq!(
+            resolve_installed(Some(bin), &package, &system, &legacy),
+            want
+        );
+    }
+
+    #[test]
+    fn unenrolled_self_allocates_default_plan() {
+        // NET-102: no control plane hands this host a plan, so it
+        // self-allocates the default one — the CGNAT /16 for box leases, the
+        // reserved local /24 for published addresses.
+        let plan = AddressPlan::default();
+        assert_eq!(plan, DEFAULT_ADDRESS_PLAN);
+        assert_eq!(plan.switch_subnet(), SwitchSubnet::default());
+        assert_eq!(
+            plan.reserved_local_range(),
+            (Ipv4Addr::new(127, 64, 0, 0), 24)
+        );
+        // Box addresses self-allocated from the plan come from its switch
+        // subnet, starting at the first allocatable host address — the same
+        // address minimald's IpAllocator hands out.
+        assert_eq!(
+            Ipv4Addr::from(plan.switch_subnet().first_ptask()),
+            Ipv4Addr::new(100, 64, 0, 2)
+        );
+        // The first switch an un-enrolled host takes is the plan's default
+        // subnet — the host switch every VM's boxes ride on.
+        let host = plan.switch_slice(0).unwrap();
+        assert_eq!(host.subnet(), SwitchSubnet::default());
+        assert_eq!(host.loopback().first(), Ipv4Addr::new(127, 64, 0, 0));
+        assert_eq!(host.loopback().last(), Ipv4Addr::new(127, 64, 0, 31));
+        assert!(host.loopback().contains(Ipv4Addr::new(127, 64, 0, 16)));
+        assert_eq!(host.loopback().to_string(), "127.64.0.0-127.64.0.31");
+        // A second daemon on the same host self-allocates the next switch: a
+        // /24 carved from the plan's subnet, with its own slice to publish at.
+        let second = plan.switch_slice(1).unwrap();
+        assert_eq!(second.subnet().to_string(), "100.64.1.0/24");
+        assert_eq!(second.loopback().first(), Ipv4Addr::new(127, 64, 0, 32));
+        // The plan runs out of switches exactly when it runs out of slices.
+        assert!(plan.switch_slice(plan.switch_capacity()).is_none());
+    }
+
+    #[test]
+    fn loopback_slices_disjoint_per_switch() {
+        let plan = AddressPlan::default();
+        let n = plan.switch_capacity();
+        assert_eq!(n, 8, "a /24 carved at /27 holds eight slices");
+        // Every pair of switches the plan serves publishes from disjoint
+        // slices: two gvproxies on one host never hold the same loopback
+        // addresses, whatever they are.
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let a = plan.switch_slice(i).unwrap().loopback();
+                let b = plan.switch_slice(j).unwrap().loopback();
+                assert!(
+                    !a.overlaps(b),
+                    "slices {a} and {b} overlap: switches {i} and {j}"
+                );
+            }
+        }
+        // The slices tile the whole reserved range: no address is double-held
+        // and none is unassigned.
+        let (net, prefix) = plan.reserved_local_range();
+        let expected: Vec<u32> =
+            (u32::from(net)..u32::from(net) + (1u32 << (32 - prefix))).collect();
+        let mut held: Vec<u32> = Vec::with_capacity(expected.len());
+        for i in 0..n {
+            let slice = plan.switch_slice(i).unwrap().loopback();
+            held.extend(u32::from(slice.first())..=u32::from(slice.last()));
+        }
+        assert_eq!(held, expected);
+        // A switch derives its own slice back from its subnet — including the
+        // host switch, whose subnet (the plan's default) is slice 0.
+        for i in 0..n {
+            let switch = plan.switch_slice(i).unwrap();
+            assert_eq!(
+                plan.loopback_slice_for_switch(switch.subnet()),
+                Some(switch.loopback())
+            );
+        }
+        // A /24 past the plan's capacity has no slice: refusing beats the
+        // wrap-around collision a `mod`-count derivation would hand out.
+        let beyond = SwitchSubnet::new(Ipv4Addr::new(100, 64, n as u8, 0), 24).unwrap();
+        assert_eq!(plan.loopback_slice_for_switch(beyond), None);
+        // A /24 at octet 0 would share box addresses with the host switch's
+        // own subnet, so the plan serves it no slice either.
+        let inside_host = SwitchSubnet::new(Ipv4Addr::new(100, 64, 0, 0), 24).unwrap();
+        assert_eq!(plan.loopback_slice_for_switch(inside_host), None);
+        // Neither does a switch outside the plan's subnet.
+        let foreign = SwitchSubnet::new(Ipv4Addr::new(10, 0, 1, 0), 24).unwrap();
+        assert_eq!(plan.loopback_slice_for_switch(foreign), None);
     }
 }
