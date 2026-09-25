@@ -676,7 +676,15 @@ pub async fn cmd_session_run(
     session_via_ssh(
         &sock,
         r.id,
-        Some(minimald_rpc::exec::ExecRequest::TaskRun(args.task).encode()),
+        // No owns-box flag (NET-131): the task runs in a session someone
+        // else keeps, so its end stays with whoever holds it.
+        Some(
+            minimald_rpc::exec::ExecRequest::TaskRun {
+                task: args.task,
+                owns_box: false,
+            }
+            .encode(),
+        ),
         None,
     )
     .await

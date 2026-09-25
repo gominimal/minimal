@@ -192,14 +192,16 @@ struct DnsRecord {
     ip: String,
 }
 
-/// Registers `<session_name>.<host_id>` in gvproxy's `min.internal.` DNS zone,
-/// pointing at the PTask's current switch lease (finding #3 / UC6).
+/// Registers the PTask's box name `<session_name>` — with the deprecated
+/// three-label form `<session_name>.<host_id>` beside it (NET-002) — in
+/// gvproxy's `min.internal.` DNS zone, pointing at its current switch lease
+/// (finding #3 / UC6).
 ///
 /// gvproxy's resolver is the switch gateway (`100.64.0.1`) that every own-IP
 /// sandbox's `resolv.conf` already targets, so this makes a PTask's
 /// `*.min.internal` hostname resolvable *from a peer session* — with no new
 /// resolver process and no `resolv.conf` change. The zone `Name` carries the
-/// trailing dot gvproxy matches DNS queries against; the record label is
+/// trailing dot gvproxy matches DNS queries against; the record labels are
 /// lowercased (gvproxy matches labels case-sensitively).
 ///
 /// # Errors
@@ -221,14 +223,23 @@ pub async fn register_dns_name(
 
 /// Builds the `/services/dns/add` zone body for a PTask. Split out so the exact
 /// wire shape (trailing-dot zone, lowercased label, dotted-quad IP) is unit-testable
-/// without a live gvproxy.
+/// without a live gvproxy. It carries both names the zone answers for: the
+/// two-label box name `<session>` (NET-001), and the deprecated three-label
+/// form `<session>.<host-id>` beside it (NET-002, answered for one release) —
+/// both pointing at the same lease.
 fn dns_add_body(host_id: &str, session_name: &str, lease_ip: Ipv4Addr) -> DnsZone {
     DnsZone {
         name: format!("{}.", crate::net::dns::HOSTNAME_SUFFIX),
-        records: vec![DnsRecord {
-            name: format!("{session_name}.{host_id}").to_ascii_lowercase(),
-            ip: lease_ip.to_string(),
-        }],
+        records: vec![
+            DnsRecord {
+                name: session_name.to_ascii_lowercase(),
+                ip: lease_ip.to_string(),
+            },
+            DnsRecord {
+                name: format!("{session_name}.{host_id}").to_ascii_lowercase(),
+                ip: lease_ip.to_string(),
+            },
+        ],
     }
 }
 
@@ -510,13 +521,15 @@ mod tests {
     #[test]
     fn dns_add_body_matches_gvproxy_zone_shape() {
         // The zone Name carries a trailing dot (gvproxy matches DNS queries, which
-        // are trailing-dotted, against it); the record label is lowercased
-        // (gvproxy matches labels case-sensitively); the IP is dotted-quad.
+        // are trailing-dotted, against it); the record labels are lowercased
+        // (gvproxy matches labels case-sensitively); the IP is dotted-quad. Both
+        // the two-label box name and the deprecated three-label form are
+        // registered, pointing at the same lease.
         let body = dns_add_body("Local", "Web", Ipv4Addr::new(100, 64, 0, 5));
         let json = serde_json_lenient::to_string(&body).unwrap();
         assert_eq!(
             json,
-            r#"{"name":"min.internal.","records":[{"name":"web.local","ip":"100.64.0.5"}]}"#
+            r#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.5"},{"name":"web.local","ip":"100.64.0.5"}]}"#
         );
     }
 

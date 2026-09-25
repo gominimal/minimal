@@ -75,41 +75,11 @@ pub enum Command {
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
     #[command(hide = true)]
     Proxy(ProxyArgs),
-    /// Forward a local TCP port to a remote address inside a PTask via SSH
-    /// (R4.8, R4.9).
+    /// Print that there is nothing to mint
     ///
-    /// Sets up an SSH `LocalForward` (`-L`) tunnel through the minimald SSH
-    /// server so traffic sent to `<local-port>` on the host is relayed to
-    /// `<remote-host>:<remote-port>` from inside the named PTask's network
-    /// namespace. Useful when WireGuard (`networking-wg` feature) is
-    /// unavailable (e.g., on corporate networks that block UDP).
-    ///
-    /// Examples:
-    ///
-    ///   # Forward host port 18080 to the webserver inside the "dev" session:
-    ///   min ssh-forward dev 18080:127.0.0.1:80
-    ///
-    ///   # Then access it from the host:
-    ///   curl http://localhost:18080/
-    #[cfg(feature = "remote-access")]
-    #[command(name = "ssh-forward", visible_alias = "forward")]
-    SshForward(SshForwardArgs),
-    /// Obtain an mTLS client certificate for the HTTPS reverse proxy
-    ///
-    /// Connects to minimald, generates a fresh client certificate signed by
-    /// the daemon's internal CA, and saves the certificate and
-    /// private key to `~/.config/minimal/client.pem` /
-    /// `~/.config/minimal/client.key`. Also saves the CA certificate to
-    /// `~/.config/minimal/ca.pem` so tools like `curl` can trust the HTTPS
-    /// proxy.
-    ///
-    /// Example:
-    ///
-    ///   min login
-    ///   curl --cacert ~/.config/minimal/ca.pem \
-    ///        --cert ~/.config/minimal/client.pem \
-    ///        --key  ~/.config/minimal/client.key \
-    ///        https://localhost:7655/
+    /// The HTTPS reverse proxy this verb once served is retired, so it
+    /// issues nothing and writes nothing to disk. The verb stays as the
+    /// future home of the sign-in that replaces it.
     #[command(verbatim_doc_comment)]
     #[command(hide = true)]
     Login(LoginArgs),
@@ -473,25 +443,24 @@ pub struct ActivateArgs {
     /// are otherwise skipped without a prompt.
     #[arg(long, value_enum)]
     pub sync: Option<SyncMode>,
-    /// Network mode: no-net, host-net (default), or own-ip.
+    /// Network mode for the session: `none` gives the session no network
+    /// (every socket it opens to a destination outside itself fails),
+    /// `host_ip` shares the host's network namespace (the default), and
+    /// `own_ip` gives the session an IP of its own on the host's switch, so
+    /// `--ingress` can publish ports.
     ///
-    /// Hidden from `--help` while `own-ip` is not usable on an installed host:
-    /// the daemon resolves a switch binary that no install ships yet
-    /// (gominimal/minimal#980), so advertising the flag offers a mode that
-    /// cannot work outside a dev checkout. Still accepted, and `host-net`
-    /// remains the default, so nothing that passes it today breaks. Unhide,
-    /// and restore the row in docs/reference/cli-min.md, once own-ip works
-    /// from an install.
-    #[arg(long, value_enum, default_value_t = CliNetworkMode::HostNet)]
-    #[clap(hide = true)]
+    /// The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still
+    /// accepted, but each prints a one-line hint naming the current spelling.
+    #[arg(
+        long,
+        value_name = "none|host_ip|own_ip",
+        value_parser = parse_network_mode,
+        default_value = "host_ip"
+    )]
     pub network: CliNetworkMode,
     /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
-    /// tcp). Repeatable. Requires `--network own-ip`.
-    ///
-    /// Hidden for the same reason as `--network`: it is only meaningful with
-    /// `--network own-ip`.
+    /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
-    #[clap(hide = true)]
     pub ingress: Vec<String>,
     /// Allowed destination subnets in CIDR form (`egress.allow_subnets`),
     /// e.g. `10.0.0.0/8`. Repeatable; unset means allow-all subnets. Valid on
@@ -566,13 +535,55 @@ pub enum SyncMode {
     None,
 }
 
-/// CLI surface for [`sessions::NetworkMode`]. A local `ValueEnum` keeps the
-/// `sessions` crate free of a clap dependency.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+/// CLI surface for [`sessions::NetworkMode`]. Parsed by hand in
+/// [`parse_network_mode`] rather than derived from a `ValueEnum`: the hand
+/// parser is what accepts the legacy hyphenated spellings with a rename hint,
+/// which a derived enum cannot, and it keeps the `sessions` crate free of a
+/// clap dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliNetworkMode {
     NoNet,
     HostNet,
     OwnIp,
+}
+
+/// Parses the `--network <none|host_ip|own_ip>` value (NET-037). The
+/// hyphenated spellings `no-net`, `host-net`, and `own-ip` predate the
+/// rename to the underscore forms and still parse to the same modes, each
+/// printing a one-line hint naming the current spelling, so scripts and
+/// muscle memory keep working through the rename window. Anything else is
+/// a clap error.
+pub(crate) fn parse_network_mode(raw: &str) -> Result<CliNetworkMode, String> {
+    let mode = match raw {
+        "none" | "no-net" => CliNetworkMode::NoNet,
+        "host_ip" | "host-net" => CliNetworkMode::HostNet,
+        "own_ip" | "own-ip" => CliNetworkMode::OwnIp,
+        _ => {
+            return Err("expected one of none, host_ip, own_ip (the hyphenated \
+                 no-net, host-net, own-ip are accepted as legacy spellings)"
+                .to_owned());
+        }
+    };
+    if let Some(hint) = legacy_network_hint(raw) {
+        eprintln!("{hint}");
+    }
+    Ok(mode)
+}
+
+/// The rename hint for a legacy `--network` spelling: one line naming the
+/// spelling typed and the current one. `None` for a current spelling, so
+/// only the old forms are announced.
+pub(crate) fn legacy_network_hint(raw: &str) -> Option<String> {
+    let current = match raw {
+        "no-net" => "none",
+        "host-net" => "host_ip",
+        "own-ip" => "own_ip",
+        _ => return None,
+    };
+    Some(format!(
+        "note: --network {raw} still works for one release; \
+         the current spelling is --network {current}"
+    ))
 }
 
 impl From<CliNetworkMode> for sessions::NetworkMode {
@@ -741,29 +752,9 @@ pub struct ProxyArgs {
     pub socket: Option<String>,
 }
 
-/// Arguments for `min ssh-forward`.
-#[cfg(feature = "remote-access")]
-#[derive(Debug, Args)]
-pub struct SshForwardArgs {
-    /// Session identifier (UUID or session name)
-    #[arg(add = completion::session_completer())]
-    pub session: String,
-    /// Port-forward specification: `<local-port>:<remote-host>:<remote-port>`
-    ///
-    /// Example: `18080:127.0.0.1:80` to forward local port 18080 to port 80
-    /// on the loopback address as seen from inside the session.
-    #[arg(value_name = "LOCAL:REMOTE_HOST:REMOTE_PORT")]
-    pub forward: String,
-}
-
 /// Arguments for `min login`.
 #[derive(Debug, Args)]
-pub struct LoginArgs {
-    /// Override the directory where client cert files are written
-    /// (default: `~/.config/minimal/`).
-    #[arg(long)]
-    pub cert_dir: Option<PathBuf>,
-}
+pub struct LoginArgs {}
 
 /// Arguments for the hidden `min complete-session-str`.
 #[derive(Debug, Args)]

@@ -146,14 +146,22 @@ impl Exec for TaskExec {
 /// The mode, not the identity: an own-IP task is a second PTask beside the
 /// session's, on the same switch at the same time, so it registers under its
 /// own name and carries none of the session's ingress — forwards a task
-/// applied would come down again at its teardown.
+/// applied would come down again at its teardown. It carries no registry
+/// handle either: a task owns no proxy route of its own, so no lease is ever
+/// reported for it.
 pub(crate) fn task_network(
     record: &sessions::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
 ) -> std::sync::Arc<dyn sandbox2::Network> {
     let id = record.id.to_string();
     let session = record.name.as_deref().unwrap_or(&id);
-    crate::net::provider::network_for(record.network, switch, &format!("{session}-task"), None)
+    crate::net::provider::network_for(
+        record.network,
+        switch,
+        &format!("{session}-task"),
+        None,
+        None,
+    )
 }
 
 /// The slice of `hakoniwa::Child` the attach-failure arm needs, so the arm can
@@ -747,7 +755,11 @@ struct ExecTask<S: Exec> {
 }
 
 impl<S: Exec> ExecTask<S> {
-    pub async fn run(self, channel: Channel<Msg>) {
+    /// Drives the exec to completion over the channel and reports the
+    /// SSH-encoded exit code it ended with. The status is on the wire and
+    /// the channel is closed once this returns — the point at which a box
+    /// created for the run can end (NET-131).
+    pub async fn run(self, channel: Channel<Msg>) -> u32 {
         let (mut rs, ws) = channel.split();
         // SSH_EXTENDED_DATA_STDERR (RFC 4254 §5.2) — selects the stderr
         // stream on the same channel as a separate extended-data type.
@@ -765,6 +777,7 @@ impl<S: Exec> ExecTask<S> {
         let _ = ws.eof().await;
         let _ = ws.exit_status(exit_status).await; // otherwise considered -1
         let _ = ws.close().await; // needed to release the remote
+        exit_status
     }
 }
 
@@ -1317,7 +1330,7 @@ pub(crate) async fn handle_exec(
                 .instrument(span),
             );
         }
-        ExecRequest::TaskRun(task) => {
+        ExecRequest::TaskRun { task, owns_box } => {
             let task = task.trim().to_string();
             if task.is_empty() {
                 tracing::warn!(%session_id, "execution request rejected: task/run names no task");
@@ -1332,6 +1345,9 @@ pub(crate) async fn handle_exec(
             let drop_env = minimald_rpc::taskenv::drops_from_channel_env(&config.env_vars);
             session.channel_success(id)?;
             spawn(async move {
+                // `ExecTask::run` consumes the server handle; the box's end
+                // needs one after the bridge returns.
+                let end_serv = serv.clone();
                 let exec_task = ExecTask {
                     conn,
                     serv,
@@ -1339,12 +1355,19 @@ pub(crate) async fn handle_exec(
                     channel_id: id,
                     exec: TaskExec {
                         args: None,
-                        task,
+                        // The name stays behind for the run-box-end log line.
+                        task: task.clone(),
                         env: task_env,
                         drop_env,
                     },
                 };
-                exec_task.run(channel).await;
+                let exit_status = exec_task.run(channel).await;
+                // The exit status is on the wire and the channel closed: the
+                // run is over whether or not its client is still here, so a
+                // box created for it ends now (NET-131).
+                if owns_box {
+                    end_run_box(&end_serv, session_id, &task, exit_status).await;
+                }
             });
         }
         ExecRequest::PackageBuild(args) => {
@@ -1455,6 +1478,52 @@ async fn run_in_session(
         },
     };
     exec_task.run(channel).await;
+}
+
+/// Ends the box a task run owns, from the daemon's side of the exec's exit
+/// (NET-131). The destroy used to be the client's, issued after a normal
+/// run; left there, a client killed mid-run would strand its session — the
+/// abandoned-launch reap covers only un-finalized sessions and there is no
+/// idle stop to catch one. The teardown is the `DestroySession` RPC's own
+/// path, so the box ends exactly as a client-issued destroy ends it.
+///
+/// The one info line this emits on success is what a diagnostic bundle's
+/// daemon-log tail reads the end of a run box from: it names the session,
+/// the run and the exit code.
+async fn end_run_box(
+    serv: &ServerStateHandle,
+    session_id: SessionId,
+    task: &str,
+    exit_status: u32,
+) {
+    let mngr = serv.sessions_manager().await;
+    // The name for the log line, resolved before the delete for the same
+    // reason `serve_destroy_session` resolves it there: once the record is
+    // gone there is nothing left to resolve it against.
+    let session_name = mngr
+        .get_record(SessionKeyPredicate::Id(session_id))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|record| record.name);
+    match mngr.delete_session(session_id).await {
+        Ok(()) => tracing::info!(
+            session_id = %session_id,
+            session_name = session_name.as_deref().unwrap_or("<anonymous>"),
+            task = %task,
+            exit = exit_status,
+            "run box ended",
+        ),
+        // Most plausibly the interrupt path's own destroy won the race; the
+        // error names what actually blocked the teardown.
+        Err(e) => tracing::warn!(
+            session_id = %session_id,
+            task = %task,
+            exit = exit_status,
+            error = %e,
+            "ending the run's box failed",
+        ),
+    }
 }
 
 /// Streams a `min package build [--verbose] [--rebuild] [pkgs...]` exec over the SSH
@@ -2505,6 +2574,97 @@ mod tests {
             );
         }
 
+        /// Brings a session to `Active` with a task-only `minimal.toml` in
+        /// its workspace: the create → populate → configure → finalize
+        /// sequence a task run's client drives, shared by every test here
+        /// that execs a task.
+        ///
+        /// The mfile holds only `tasks.echo_ok`, whose entire output lives
+        /// in its declaration — no `[upstream]`, package graph, or sandbox:
+        /// the echo short-circuit never builds a graph, so nothing here
+        /// reaches the (network-bound) package machinery. A task-only mfile
+        /// gates nothing, so the loadout composes in one shot, and this
+        /// composition has no patches, so `FinalizeSession` takes the
+        /// empty-composition shortcut past the marker check and promotes
+        /// the record to `Active` in one call.
+        async fn active_session_with_echo_task(
+            server: &TestServer,
+            client: &mut TestClient,
+            name: &str,
+        ) -> SessionId {
+            use minimald_rpc::{
+                ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
+                FinalizeSessionRequest,
+            };
+
+            let session_id = client
+                .call::<CreateSession>(&create_session_req(name, "/tmp"))
+                .await
+                .unwrap()
+                .id;
+
+            // Drop a task-only `minimal.toml` into the session workspace,
+            // standing in for the e2e test's SFTP upload.
+            server
+                .seed_workspace_mfile(
+                    session_id,
+                    "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n",
+                )
+                .await;
+
+            crate::test_harness::unwrap_ready(
+                client
+                    .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                        session_id,
+                        contribution: Default::default(),
+                    })
+                    .await
+                    .unwrap(),
+            );
+
+            match client
+                .call::<FinalizeSession>(&FinalizeSessionRequest { session_id })
+                .await
+            {
+                minimald_rpc::Errorable::Ok(_) => {}
+                minimald_rpc::Errorable::Err { error } => {
+                    panic!("FinalizeSession failed: {error}");
+                }
+            }
+
+            session_id
+        }
+
+        /// A `MakeWriter` accumulating everything written into a shared
+        /// buffer, so a test can assert on the structured fields a
+        /// `tracing` event emitted (the same capture `net::proxy`'s tests
+        /// use).
+        #[derive(Clone, Default)]
+        struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl CaptureWriter {
+            fn contents(&self) -> String {
+                String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+            }
+        }
+
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
         /// End-to-end happy path for `min run <task>`: an `echo` task is
         /// serviced straight from the workspace `minimal.toml` — no
         /// package graph, upstream, or sandbox — and its text (plus a
@@ -2518,63 +2678,20 @@ mod tests {
         /// to resolve a task against) surfaces without needing a VM.
         #[tokio::test]
         async fn exec_runs_echo_task() {
-            use minimald_rpc::{
-                ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
-                FinalizeSessionRequest,
-            };
-
             let server = TestServer::new().await;
             let mut client = server.connect().await;
-            let session_id = client
-                .call::<CreateSession>(&create_session_req("exec-test", "/tmp"))
-                .await
-                .unwrap()
-                .id;
+            let session_id = active_session_with_echo_task(&server, &mut client, "exec-test").await;
             let session_str = session_id.to_string();
-
-            // Drop a task-only `minimal.toml` into the session workspace,
-            // standing in for the e2e test's SFTP upload. No `[upstream]`:
-            // the echo short-circuit never builds a graph, so nothing here
-            // reaches the (network-bound) package machinery.
-            server
-                .seed_workspace_mfile(
-                    session_id,
-                    "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n",
-                )
-                .await;
-
-            // A task-only mfile gates nothing, so the loadout composes in
-            // one shot rather than erroring or pending.
-            crate::test_harness::unwrap_ready(
-                client
-                    .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
-                        session_id,
-                        contribution: Default::default(),
-                    })
-                    .await
-                    .unwrap(),
-            );
-
-            // ConfigureLoadout leaves the record `Materializing`; exec
-            // (and its `context()` gate) requires `Active`. This
-            // composition has no patches, so FinalizeSession takes the
-            // empty-composition shortcut past the marker check and
-            // promotes the record to `Active` in one call.
-            match client
-                .call::<FinalizeSession>(&FinalizeSessionRequest { session_id })
-                .await
-            {
-                minimald_rpc::Errorable::Ok(_) => {}
-                minimald_rpc::Errorable::Err { error } => {
-                    panic!("FinalizeSession failed: {error}");
-                }
-            }
 
             let out = client
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    &ExecRequest::TaskRun("echo_ok".to_string()).encode(),
+                    &ExecRequest::TaskRun {
+                        task: "echo_ok".to_string(),
+                        owns_box: false,
+                    }
+                    .encode(),
                     &[],
                 )
                 .await
@@ -2586,6 +2703,130 @@ mod tests {
                 out.stderr.is_empty(),
                 "echo task should produce no stderr: {:?}",
                 out.stderr,
+            );
+        }
+
+        /// NET-131: a box created for a run ends when the run's command
+        /// exits, whether or not the client that started it is still here.
+        /// The request carries the owns-box flag; the daemon destroys the
+        /// session after the exit status is on the wire — the destroy the
+        /// client used to issue after a normal run, moved here so a client
+        /// killed mid-run strands nothing.
+        ///
+        /// The destroy runs after the channel closes, so this client's exec
+        /// can return before the box is gone: the end is polled for, not
+        /// raced on. The info line the run's end emits is asserted too — it
+        /// is what a diagnostic bundle's daemon-log tail reads the end of a
+        /// run box from.
+        #[tokio::test]
+        async fn run_box_ends_when_its_run_ends() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+
+            let capture = CaptureWriter::default();
+            // Global, not thread-local: the box's end runs on whatever
+            // worker the daemon spawned the exec task on, which a
+            // thread-local default would not cover. Safe under nextest's
+            // one-process-per-test isolation; under a shared-process runner
+            // the assertions below are `contains`, so a neighbour's records
+            // reaching the same buffer cost nothing.
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(capture.clone())
+                    .with_ansi(false)
+                    .finish(),
+            )
+            .unwrap();
+
+            let session_id =
+                active_session_with_echo_task(&server, &mut client, "run-box-ends").await;
+            let session_str = session_id.to_string();
+
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &ExecRequest::TaskRun {
+                        task: "echo_ok".to_string(),
+                        owns_box: true,
+                    }
+                    .encode(),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert_eq!(out.exit_status, Some(0));
+            assert_eq!(out.stdout, b"MINIMALD_SESSION_OK\n");
+
+            // The box ends after the channel closes; poll until the listing
+            // is empty rather than racing the destroy.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let listed = client.call::<minimald_rpc::ListSessions>(&()).await;
+                if listed.sessions.is_empty() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the run's box must end once its task exits, but {} session(s) are still \
+                     listed: {:?}",
+                    listed.sessions.len(),
+                    listed.sessions,
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
+            // The one info line the run's end emits, naming the session, the
+            // exec and the exit code.
+            let logged = capture.contents();
+            assert!(
+                logged.contains("run box ended"),
+                "expected the run-box-end info line, got: {logged}"
+            );
+            assert!(logged.contains(&session_str), "names the session: {logged}");
+            assert!(logged.contains("echo_ok"), "names the exec: {logged}");
+            assert!(logged.contains("exit=0"), "names the exit code: {logged}");
+        }
+
+        /// A task run that does not own its box leaves the session standing:
+        /// the daemon ends only what the run owns, and the unflagged
+        /// spelling — what `min session run` sends, and what every client
+        /// from before the flag sent — keeps the box for whoever holds it.
+        /// After the exec has returned, and the moment a stray destroy would
+        /// have needed, the session is still listed.
+        #[tokio::test]
+        async fn run_box_survives_when_run_keeps_it() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id =
+                active_session_with_echo_task(&server, &mut client, "run-box-kept").await;
+            let session_str = session_id.to_string();
+
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &ExecRequest::TaskRun {
+                        task: "echo_ok".to_string(),
+                        owns_box: false,
+                    }
+                    .encode(),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert_eq!(out.exit_status, Some(0));
+            assert_eq!(out.stdout, b"MINIMALD_SESSION_OK\n");
+
+            // The exec is over; the box is not. Give the moment a stray
+            // destroy would have needed before asserting.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let listed = client.call::<minimald_rpc::ListSessions>(&()).await;
+            assert_eq!(
+                listed.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+                vec![session_id],
+                "a run that keeps its box must not end it; got {:?}",
+                listed.sessions,
             );
         }
 
@@ -2606,7 +2847,11 @@ mod tests {
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    &ExecRequest::TaskRun("some_task".to_string()).encode(),
+                    &ExecRequest::TaskRun {
+                        task: "some_task".to_string(),
+                        owns_box: false,
+                    }
+                    .encode(),
                     &[],
                 )
                 .await;
@@ -2621,7 +2866,11 @@ mod tests {
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    &ExecRequest::TaskRun(String::new()).encode(),
+                    &ExecRequest::TaskRun {
+                        task: String::new(),
+                        owns_box: false,
+                    }
+                    .encode(),
                     &[],
                 )
                 .await;
