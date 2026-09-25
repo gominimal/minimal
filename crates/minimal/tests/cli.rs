@@ -271,6 +271,10 @@ async fn activate_creates_session() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        allow_subnets: vec![],
+        allow_dns_hosts: vec![],
+        allow_protocols: vec![],
+        deny_subnets: vec![],
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -314,6 +318,10 @@ async fn activate_uploads_project_files() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        allow_subnets: vec![],
+        allow_dns_hosts: vec![],
+        allow_protocols: vec![],
+        deny_subnets: vec![],
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -396,6 +404,10 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        allow_subnets: vec![],
+        allow_dns_hosts: vec![],
+        allow_protocols: vec![],
+        deny_subnets: vec![],
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -781,6 +793,65 @@ async fn session_policy_succeeds() {
     .unwrap();
 }
 
+/// `min session policy` shows the effective egress rules (NET-061): the four
+/// egress fields the session was activated with, each unset dimension
+/// resolved to its default instead of a bare `null`. The policy is stored
+/// through the daemon and fetched the way the command fetches it;
+/// `format_policy` is the rendering the command prints.
+#[tokio::test]
+async fn policy_shows_effective_egress() {
+    let (daemon, args) = setup().await;
+    let egress = sessions::EgressPolicy {
+        allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+        allow_dns_hosts: Some(vec!["github.com".to_string()]),
+        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+        deny_subnets: Some(vec!["169.254.169.254/32".to_string()]),
+    };
+    let session_id = create_session_with_policy(
+        &daemon,
+        "egress-policy",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::new(Some(egress.clone()), None),
+    )
+    .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
+    let resp = client
+        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(session_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+    };
+    assert_eq!(
+        policy.egress,
+        Some(egress),
+        "the stored egress must survive the record round trip"
+    );
+
+    let mut out = Vec::new();
+    format_policy(&mut out, &policy).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("subnets  10.0.0.0/8"),
+        "allowed subnets missing:\n{text}"
+    );
+    assert!(
+        text.contains("dns hosts  github.com"),
+        "allowed hosts missing:\n{text}"
+    );
+    assert!(
+        text.contains("protocols  tcp"),
+        "allowed protocols missing:\n{text}"
+    );
+    assert!(
+        text.contains("deny subnets  169.254.169.254/32"),
+        "denied subnets missing:\n{text}"
+    );
+}
+
 // --- helpers ---
 
 /// Creates a session whose workspace mfile declares a `[session.vars]`
@@ -843,13 +914,32 @@ async fn create_session_at(
     name: &str,
     project_path: paths::HostAbsPath,
 ) -> SessionId {
+    create_session_with(
+        daemon,
+        name,
+        project_path,
+        sessions::NetworkMode::NoNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await
+}
+
+/// Like [`create_session`] but with the network mode and policy the caller
+/// chooses, so a test can store a policy the CLI surfaces must render.
+async fn create_session_with(
+    daemon: &common::TestDaemon,
+    name: &str,
+    project_path: paths::HostAbsPath,
+    network: sessions::NetworkMode,
+    policy: sessions::SessionPolicy,
+) -> SessionId {
     let mut client = daemon.server.connect().await;
 
     let config = minimald_rpc::SessionConfig {
         name: Some(name.to_string()),
         project_path,
-        network: sessions::NetworkMode::NoNet,
-        policy: Default::default(),
+        network,
+        policy,
         hooks_enabled: true,
         attrs: Default::default(),
     };
@@ -895,4 +985,18 @@ async fn create_session_at(
         }
     }
     id
+}
+
+/// Like [`create_session`] but with the network mode and policy the caller
+/// chooses.
+async fn create_session_with_policy(
+    daemon: &common::TestDaemon,
+    name: &str,
+    network: sessions::NetworkMode,
+    policy: sessions::SessionPolicy,
+) -> SessionId {
+    let project_path =
+        camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
+    let abs_path = paths::HostAbsPath::try_new(project_path).unwrap();
+    create_session_with(daemon, name, abs_path, network, policy).await
 }

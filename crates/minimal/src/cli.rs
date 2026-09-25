@@ -493,6 +493,26 @@ pub struct ActivateArgs {
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
     #[clap(hide = true)]
     pub ingress: Vec<String>,
+    /// Allowed destination subnets in CIDR form (`egress.allow_subnets`),
+    /// e.g. `10.0.0.0/8`. Repeatable; unset means allow-all subnets. Valid on
+    /// an own-address (`--network own-ip`) or host-address
+    /// (`--network host-net`) box; a none box rejects the whole egress
+    /// declaration.
+    #[arg(long = "allow-subnets", value_name = "CIDR")]
+    pub allow_subnets: Vec<String>,
+    /// Allowed destination DNS hostnames (`egress.allow_dns_hosts`), e.g.
+    /// `github.com`. Repeatable; unset means allow-all hosts.
+    #[arg(long = "allow-dns-hosts", value_name = "HOST")]
+    pub allow_dns_hosts: Vec<String>,
+    /// Allowed outbound transport protocols (`egress.allow_protocols`):
+    /// tcp, udp, or icmp. Repeatable; unset means allow all protocols.
+    #[arg(long = "allow-protocols", value_name = "PROTO")]
+    pub allow_protocols: Vec<String>,
+    /// Denied destination subnets in CIDR form (`egress.deny_subnets`),
+    /// subtracted from the allowed set. Repeatable; unset means nothing is
+    /// denied.
+    #[arg(long = "deny-subnets", value_name = "CIDR")]
+    pub deny_subnets: Vec<String>,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
     /// Repeatable. If any `--loadout` is specified, defaults from
     /// `[loadouts].default_loadouts` in the client config are ignored.
@@ -595,6 +615,21 @@ pub(crate) fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyh
         "udp" => Ok(sessions::IpProto::Udp),
         other => Err(anyhow::anyhow!(
             "ingress: unsupported protocol '{other}' (use tcp or udp)"
+        )),
+    }
+}
+
+/// Parse an `--allow-protocols <PROTO>` spec into an [`sessions::IpProto`].
+/// Egress rules name any transport the policy type carries, so unlike the
+/// ingress parser (whose vocabulary is gvproxy's static forwarder's), icmp is
+/// accepted here.
+pub(crate) fn parse_egress_proto(proto: &str) -> Result<sessions::IpProto, anyhow::Error> {
+    match proto.to_ascii_lowercase().as_str() {
+        "tcp" => Ok(sessions::IpProto::Tcp),
+        "udp" => Ok(sessions::IpProto::Udp),
+        "icmp" => Ok(sessions::IpProto::Icmp),
+        other => Err(anyhow::anyhow!(
+            "egress: unsupported protocol '{other}' (use tcp, udp, or icmp)"
         )),
     }
 }
