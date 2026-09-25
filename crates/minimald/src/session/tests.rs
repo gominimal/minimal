@@ -2415,7 +2415,7 @@ async fn box_has_no_idle_stop() {
     let capture = crate::test_harness::captured_log();
 
     let mut client = server.connect().await;
-    let session_id = create_session(&mut client).await;
+    let session_id = create_configured_session(&mut client, "idle-stop-test", "/uwu").await;
 
     // Attach, drive, then detach by the client's own chord.
     let mut shell = client.open_shell(session_id).await;
@@ -2435,7 +2435,9 @@ async fn box_has_no_idle_stop() {
         let logged = capture.contents();
         let detach_line = logged
             .lines()
-            .find(|line| line.contains("binding leaving mainloop") && line.contains("shell-test"))
+            .find(|line| {
+                line.contains("binding leaving mainloop") && line.contains("idle-stop-test")
+            })
             .map(str::to_string);
         if let Some(line) = detach_line {
             assert!(
