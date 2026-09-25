@@ -902,14 +902,16 @@ jobs:
               env:
                   PKGVER: ${{ needs.assert-version.outputs.version }}
                   BUILT_VERSION: ${{ needs.compute-version-string.outputs.version }}
+                  RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
                   ARTIFACTS_DIR: artifacts
                   OUT_DIR: ${{ runner.temp }}/dist
               run: |
                   # The channel only picks the row semantics here (stable =
                   # versioned row, a channel = sha row); the package version is
-                  # the same whichever sha-row channel consumes it.
+                  # the same whichever sha-row channel consumes it. A versioned
+                  # row is a stable release; a sha row is a channel build.
                   channel=stable
-                  [ -n "${{ needs.assert-version.outputs.release_version }}" ] || channel=unstable
+                  [ -n "$RELEASE_VERSION" ] || channel=unstable
                   scripts/package-nfpm.sh --channel "$channel"
             - name: Upload distro packages
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
