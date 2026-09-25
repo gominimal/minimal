@@ -15,10 +15,8 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/package-version.sh"
 [ -f "$script" ] || { echo "cannot find package-version.sh next to test" >&2; exit 1; }
-
-pass=0 fail=0
-ok()  { pass=$((pass + 1)); printf 'ok   - %s\n' "$*"; }
-bad() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$*"; }
+# shellcheck disable=SC1091  # dynamic path: testlib.sh sits beside this harness
+. "$here/testlib.sh"
 
 # normalize <format> <version> — the script's stdout, or empty on failure.
 normalize() { "$script" --format "$1" "$2" 2>/dev/null; }
@@ -85,19 +83,6 @@ fi
 
 # --- refusals -----------------------------------------------------------------
 
-expect() {
-    local want_rc="$1" want_msg="$2" desc="$3"; shift 3
-    [ "${1:-}" = "--" ] || { bad "$desc (test bug: missing -- separator)"; return; }
-    shift
-    local out rc=0
-    out="$("$@" 2>&1)" || rc=$?
-    if [ "$rc" -eq "$want_rc" ] && [[ "$out" == *"$want_msg"* ]]; then
-        ok "$desc"
-    else
-        bad "$desc (want rc=$want_rc and '$want_msg'; got rc=$rc, out: $out)"
-    fi
-}
-
 expect 1 "unknown --format" "an unknown format is refused" -- "$script" --format msi 0.6.0
 expect 1 "--format is required" "a missing format is refused" -- "$script" 0.6.0
 expect 1 "VERSION is required" "a missing version is refused" -- "$script" --format deb
@@ -105,5 +90,4 @@ expect 1 "must not carry the v prefix" "a v-prefixed version is refused" -- "$sc
 expect 1 "not a canonical" "a bare sha is refused" -- "$script" --format deb 8e7e72c2
 expect 1 "not a canonical" "a two-part version is refused" -- "$script" --format deb 0.6
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
-[ "$fail" -eq 0 ]
+finish

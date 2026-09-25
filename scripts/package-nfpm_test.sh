@@ -16,29 +16,21 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/package-nfpm.sh"
 [ -f "$script" ] || { echo "cannot find package-nfpm.sh next to test" >&2; exit 1; }
+# shellcheck disable=SC1091  # dynamic path: testlib.sh sits beside this harness
+. "$here/testlib.sh"
 
-missing=""
-command -v curl >/dev/null 2>&1 || missing="$missing curl"
-# sha256_of (extracted below) needs sha256sum or shasum; the harness computes
+require_tools curl
+# sha256_of (sourced below) needs sha256sum or shasum; the harness computes
 # fixture digests with it, so skip where neither exists.
 command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 \
-    || missing="$missing sha256sum/shasum"
-if [ -n "$missing" ]; then
-    echo "package-nfpm_test: skipping, no$missing on PATH"
-    exit 0
-fi
+    || { echo "${0##*/}: skipping, no sha256sum/shasum on PATH"; exit 0; }
 
 root="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-nfpmtest)"
 trap 'rm -rf "$root"' EXIT
 
 # The digest routine must match the script's, so it is extracted rather than
 # copied: one definition.
-# shellcheck source=scripts/package-nfpm.sh
-eval "$(sed -n '/^sha256_of()/,/^}/p' "$script")"
-[ "$(type -t sha256_of)" = "function" ] || {
-    echo "package-nfpm_test: cannot extract sha256_of from package-nfpm.sh" >&2
-    exit 1
-}
+source_function "$script" sha256_of
 
 # --- fixtures -----------------------------------------------------------------
 
@@ -129,10 +121,6 @@ chmod +x "$stub_nfpm"
 out_dir="$root/out"
 mkdir -p "$out_dir"
 
-pass=0 fail=0
-ok()  { pass=$((pass + 1)); printf 'ok   - %s\n' "$*"; }
-bad() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$*"; }
-
 # run <log> <pkgver> [extra args] — drive the script with a stub nfpm, from the
 # local build output (run_artifacts) or the staged bucket row (run_bucket).
 run_artifacts() {
@@ -147,20 +135,6 @@ run_bucket() {
     NFPM_BIN="$stub_nfpm" NFPM_STUB_LOG="$log" PKGVER="$pkgver" \
         MINIMAL_BUCKET_URL="file://$bucket" OUT_DIR="$out_dir" \
         "$script" "$@"
-}
-
-# expect <want_rc> <want_substring> <description> -- <command...>
-expect() {
-    local want_rc="$1" want_msg="$2" desc="$3"; shift 3
-    [ "${1:-}" = "--" ] || { bad "$desc (test bug: missing -- separator)"; return; }
-    shift
-    local out rc=0
-    out="$("$@" 2>&1)" || rc=$?
-    if [ "$rc" -eq "$want_rc" ] && [[ "$out" == *"$want_msg"* ]]; then
-        ok "$desc"
-    else
-        bad "$desc (want rc=$want_rc and '$want_msg'; got rc=$rc, out: $out)"
-    fi
 }
 
 # --- the anti-drift contract: both branches agree on a released semver --------
@@ -244,5 +218,4 @@ expect 1 "unknown format" "an unknown format is refused" -- \
 expect 1 "selected nothing" "--formats selecting nothing is refused" -- \
     run_artifacts "$root/r.log" "$stable_row" --formats ""
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
-[ "$fail" -eq 0 ]
+finish

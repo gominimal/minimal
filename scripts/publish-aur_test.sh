@@ -19,16 +19,11 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/publish-aur.sh"
 [ -f "$script" ] || { echo "cannot find publish-aur.sh next to test" >&2; exit 1; }
+# shellcheck disable=SC1091  # dynamic path: testlib.sh sits beside this harness
+. "$here/testlib.sh"
 
 # The harness needs git (fixture remotes) and curl (file:// fetches).
-missing=""
-for tool in git curl; do
-    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
-done
-if [ -n "$missing" ]; then
-    echo "publish-aur_test: skipping, no$missing on PATH"
-    exit 0
-fi
+require_tools git curl
 
 root="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-aurtest)"
 trap 'rm -rf "$root"' EXIT
@@ -40,12 +35,7 @@ chmod a+rx "$root"
 # The digest routine must match the publisher's (portable across
 # sha256sum/shasum/openssl — this harness also runs on hosts without
 # sha256sum), so it is extracted rather than copied: one definition.
-# shellcheck source=scripts/publish-aur.sh
-eval "$(sed -n '/^sha256_file()/,/^}/p' "$script")"
-[ "$(type -t sha256_file)" = "function" ] || {
-    echo "publish-aur_test: cannot extract sha256_file from publish-aur.sh" >&2
-    exit 1
-}
+source_function "$script" sha256_file
 
 # --- fixtures -----------------------------------------------------------------
 
@@ -105,24 +95,6 @@ echo "pkgver = $(sed -n 's/^pkgver=//p' PKGBUILD)"
 EOF
 chmod +x "$root/bin/makepkg"
 export PATH="$root/bin:$PATH"
-
-pass=0 fail=0
-ok()  { pass=$((pass + 1)); printf 'ok   - %s\n' "$*"; }
-bad() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$*"; }
-
-# expect <want_rc> <want_substring> <description> -- <command...>
-expect() {
-    local want_rc="$1" want_msg="$2" desc="$3"; shift 3
-    [ "${1:-}" = "--" ] || { bad "$desc (test bug: missing -- separator)"; return; }
-    shift
-    local out rc=0
-    out="$("$@" 2>&1)" || rc=$?
-    if [ "$rc" -eq "$want_rc" ] && [[ "$out" == *"$want_msg"* ]]; then
-        ok "$desc"
-    else
-        bad "$desc (want rc=$want_rc and '$want_msg'; got rc=$rc, out: $out)"
-    fi
-}
 
 run_dry() {
     # SSH_AUTH_SOCK is dropped so the harness never depends on (or uses) an
@@ -295,5 +267,4 @@ expect 1 "unknown --channel" "an unknown channel is refused" -- \
     env PKGVER=0.5.4 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
         AUR_SSH_PRIVATE_KEY=k "$script" --channel beta --dry-run
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
-[ "$fail" -eq 0 ]
+finish

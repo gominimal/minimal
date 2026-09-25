@@ -12,6 +12,8 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/assert-release-version.sh"
 [ -f "$script" ] || { echo "cannot find assert-release-version.sh next to test" >&2; exit 1; }
+# shellcheck disable=SC1091  # dynamic path: testlib.sh sits beside this harness
+. "$here/testlib.sh"
 
 root="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-verassert)"
 trap 'rm -rf "$root"' EXIT
@@ -19,25 +21,6 @@ trap 'rm -rf "$root"' EXIT
 # cargo_toml <version-line> — write a fixture Cargo.toml carrying the given package.version.
 cargo_toml() {
     printf '[package]\nname = "minimal"\nversion = "0.0.0"\n%s\n' "$1" >"$root/Cargo.toml"
-}
-
-pass=0 fail=0
-# ok / bad <description> — count and print one passing / failing case.
-ok()  { pass=$((pass + 1)); printf 'ok   - %s\n' "$*"; }
-bad() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$*"; }
-
-# expect <want_rc> <want_substring> <description> -- <command...>
-expect() {
-    local want_rc="$1" want_msg="$2" desc="$3"; shift 3
-    [ "${1:-}" = "--" ] || { bad "$desc (test bug: missing -- separator)"; return; }
-    shift
-    local out rc=0
-    out="$("$@" 2>&1)" || rc=$?
-    if [ "$rc" -eq "$want_rc" ] && [[ "$out" == *"$want_msg"* ]]; then
-        ok "$desc"
-    else
-        bad "$desc (want rc=$want_rc and '$want_msg'; got rc=$rc, out: $out)"
-    fi
 }
 
 # run <tag> — the script under test against the fixture Cargo.toml.
@@ -89,5 +72,4 @@ expect 1 "could not extract package.version" "unreadable Cargo.toml fails loudly
 expect 1 "no such Cargo.toml" "missing Cargo.toml fails loudly" -- \
     "$script" --tag v0.5.4 --cargo-toml "$root/absent.toml"
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
-[ "$fail" -eq 0 ]
+finish

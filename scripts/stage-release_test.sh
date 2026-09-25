@@ -15,6 +15,8 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/stage-release.sh"
 [ -f "$script" ] || { echo "cannot find stage-release.sh next to test" >&2; exit 1; }
+# shellcheck disable=SC1091  # dynamic path: testlib.sh sits beside this harness
+. "$here/testlib.sh"
 
 root="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-stagetest)"
 trap 'rm -rf "$root"' EXIT
@@ -50,25 +52,6 @@ mkdir -p "$root/artifacts" "$root/pkg"
 printf 'fake min\n' >"$root/artifacts/minimal-linux-amd64"
 printf 'fake mip\n' >"$root/artifacts/mip-linux-amd64"
 printf 'fake deb\n' >"$root/pkg/minimal_0.6.0_amd64.deb"
-
-pass=0 fail=0
-# ok / bad <description> — count and print one passing / failing case.
-ok()  { pass=$((pass + 1)); printf 'ok   - %s\n' "$*"; }
-bad() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$*"; }
-
-# expect <want_rc> <want_substring> <description> -- <command...>
-expect() {
-    local want_rc="$1" want_msg="$2" desc="$3"; shift 3
-    [ "${1:-}" = "--" ] || { bad "$desc (test bug: missing -- separator)"; return; }
-    shift
-    local out rc=0
-    out="$("$@" 2>&1)" || rc=$?
-    if [ "$rc" -eq "$want_rc" ] && [[ "$out" == *"$want_msg"* ]]; then
-        ok "$desc"
-    else
-        bad "$desc (want rc=$want_rc and '$want_msg'; got rc=$rc, out: $out)"
-    fi
-}
 
 # calls <grep pattern> — how many recorded gcloud invocations match.
 calls() {
@@ -247,5 +230,4 @@ expect 0 "dry run, nothing uploaded" "--dry-run over an existing version still p
     with GCLOUD_STUB_EXISTS=1 -- stage --version 0.6.0 --dry-run
 expect_calls 0 "" "--dry-run makes no gcloud call at all"
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
-[ "$fail" -eq 0 ]
+finish
