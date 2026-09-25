@@ -911,7 +911,12 @@ pub fn format_policy(
         None => writeln!(out, "  allow all")?,
         Some(egress) => {
             write_rules(out, "subnets", egress.allow_subnets.as_ref(), "allow all")?;
-            write_rules(out, "dns hosts", egress.allow_dns_hosts.as_ref(), "allow all")?;
+            write_rules(
+                out,
+                "dns hosts",
+                egress.allow_dns_hosts.as_ref(),
+                "allow all",
+            )?;
             match &egress.allow_protocols {
                 None => writeln!(out, "  protocols  allow all")?,
                 Some(protos) => writeln!(

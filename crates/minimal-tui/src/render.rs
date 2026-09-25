@@ -526,10 +526,8 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                         // "allow all".
                         match &egress.deny_subnets {
                             None => lines.push(Line::raw("  deny subnets  (none)")),
-                            Some(subnets) => lines.push(Line::raw(format!(
-                                "  deny subnets  {}",
-                                subnets.join(", ")
-                            ))),
+                            Some(subnets) => lines
+                                .push(Line::raw(format!("  deny subnets  {}", subnets.join(", ")))),
                         }
                     }
                 }
