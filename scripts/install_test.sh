@@ -13,8 +13,9 @@
 # run against the real bucket, not here.
 #
 # Usage:
-#   scripts/install_test.sh            # runs under `sh`
-#   sh scripts/install_test.sh         # ditto
+#   scripts/install_test.sh             # runs every case, under `sh`
+#   scripts/install_test.sh <case>      # runs the one named case
+#   sh scripts/install_test.sh          # ditto
 # CI additionally runs it under dash (and macOS /bin/sh where available).
 
 set -eu
@@ -144,6 +145,9 @@ printf 'linux-amd64-minimald-body\n'  >"$mock/versions/v1/minimald-linux-amd64"
 write_min_stub "$mock/versions/v1/minimal-linux-amd64"  linux-amd64
 write_min_stub "$mock/versions/v1/minimal-darwin-arm64" darwin-arm64
 printf 'darwin-arm64-rootfs-body\n'   >"$mock/versions/v1/rootfs-arm64.img"
+# The switch binary the daemon spawns for own-IP sessions (NET-041); shipped
+printf 'mock-gvproxy-switch-body\n'  >"$mock/versions/v1/gvproxy-min-linux-amd64"
+# as bin/gvproxy-min so the installer has a row to verify.
 
 # AppArmor components: noarch text (the loader is a runnable stub here), shipped
 # to Linux hosts under the data prefix (see stage-release.sh).
@@ -158,6 +162,7 @@ h_rootfs="$(hash_file "$mock/versions/v1/rootfs-arm64.img")"
 h_aaprof="$(hash_file "$mock/versions/v1/minimald.apparmor")"
 h_aatun="$(hash_file "$mock/versions/v1/minimald.apparmor-tunable")"
 h_aaload="$(hash_file "$mock/versions/v1/install-apparmor-profile.sh")"
+h_gvmin="$(hash_file "$mock/versions/v1/gvproxy-min-linux-amd64")"
 
 printf 'v1\n' >"$mock/stable"
 
@@ -171,6 +176,8 @@ write_manifest() {
             minimald linux amd64 v1 "$h_minimald" file bin/minimald versions/v1/minimald-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimal linux amd64 v1 "$h_minimal" file bin/min versions/v1/minimal-linux-amd64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            gvproxy-min linux amd64 v1 "$h_gvmin" file bin/gvproxy-min versions/v1/gvproxy-min-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimal darwin arm64 v1 "$h_dmin" file bin/min versions/v1/minimal-darwin-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
@@ -190,6 +197,11 @@ write_manifest() {
     } >"$mock/versions/v1/components"
 }
 write_manifest 1
+
+# The pristine manifest every scenario that rewrites it restores from. Saved
+# once, up front, so each case below is self-contained whether it runs alone
+# or in the full sweep.
+cp "$mock/versions/v1/components" "$root/good-components"
 
 # --- Stubbed downloader (fake curl on PATH) --------------------------------
 
@@ -318,474 +330,506 @@ run() {
 # ===========================================================================
 echo "# install.sh tests (SH=$SH)"
 
-# --- Unit 5: install, skip-on-rerun (R5.1), atomic + exec (R5.4) -----------
-H1="$root/h1"; mkdir -p "$H1"
-reset_dl
-run first "$H1"
-check 0 "$rc" "fresh install exits 0"
-want_ok "minimald installed to bin" test -f "$H1/bin/minimald"
-want_ok "bin component is executable (R5.4)" test -x "$H1/bin/minimald"
-check "$h_minimald" "$(hash_file "$H1/bin/minimald")" "installed content matches manifest hash"
-# Only linux/amd64 rows apply on this host: darwin row must not be installed.
-want_err "darwin-only component skipped on linux host" test -e "$H1/data/rootfs.img"
-n1="$(downloads)"; want_ok "first run downloaded ($n1)" test "$n1" -gt 0
-want_ok "symlink component placed as a symlink (R5.6)" test -L "$H1/bin/git-remote-min"
-check "min" "$(readlink "$H1/bin/git-remote-min")" "symlink points at its manifest target (R5.6)"
-
-# A successful run closes on the card, after every bookkeeping note (here the
-# PATH advisory fires), so the parting block is what the user is left looking
-# at (R10.4).
-want_ok "fresh install emits the closing card (R10.4)" \
-    grep -qE "Minimal .+ is ready" "$OUT"
-want_ok "the card names the first command (R10.4)" \
-    grep -qE "min +build the sandbox and step inside" "$OUT"
-want_card_last "the card closes a fresh install (R10.4)"
-# Nothing on a redirected stream may carry terminal escapes (R10.1): this
-# output is a file, so a stray SGR here would land in every CI log. `run` sets a
-# terminal-like TERM, so what this pins is the `[ -t 2 ]` half of the guard:
-# with TERM unset the assertion would still pass if that check were dropped.
-want_err "no terminal escapes when stderr is not a terminal (R10.1)" \
-    grep -q "$esc" "$OUT"
-
-reset_dl
-run second "$H1"
-check 0 "$rc" "rerun exits 0"
-check 0 "$(downloads)" "rerun performs zero downloads (R5.1/R2 reruns cheap)"
-want_card_last "the card closes an up-to-date rerun (R10.4)"
-
-# --- AppArmor components + Ubuntu 24.04+ advisory --------------------------
-# The three noarch apparmor components install under the data prefix on Linux.
-aa_root="$H1/xdg-data/minimal/apparmor"
-want_ok "apparmor profile installed under data prefix"  test -f "$aa_root/minimald"
-want_ok "apparmor tunable installed under data prefix"  test -f "$aa_root/tunables/minimald"
-want_ok "apparmor loader installed under data prefix"   test -f "$aa_root/install-apparmor-profile.sh"
-
-# The advisory fires only when the userns restriction is active (sysctl reads 1),
-# points at the shipped loader, and never elevates — install still exits 0.
-printf '1\n' >"$root/sysctl-on"
-printf '0\n' >"$root/sysctl-off"
-
-USERNS_SYSCTL="$root/sysctl-on"
-run aa_restricted "$H1"
-USERNS_SYSCTL=
-check 0 "$rc" "install on a restricted host still exits 0 (advice only)"
-want_ok "advisory names the userns restriction" \
-    grep -q "restricts unprivileged user namespaces" "$OUT"
-want_ok "advisory points at the shipped loader with sudo bash" \
-    grep -q "sudo bash .*apparmor/install-apparmor-profile.sh" "$OUT"
-# The harness bindir is a custom MINIMAL_BIN, outside the tunable's stock
-# attachment set, so the advised command must attach it explicitly.
-want_ok "advisory carries --path for a custom MINIMAL_BIN" \
-    grep -q -- "--path \"$H1/bin/minimald\"" "$OUT"
-# The card is the parting block even when the AppArmor advisory is the last note.
-want_card_last "the card follows the AppArmor advisory (R10.4)"
-
-USERNS_SYSCTL="$root/sysctl-off"
-run aa_unrestricted "$H1"
-USERNS_SYSCTL=
-want_err "no advisory when the restriction is off (sysctl 0)" \
-    grep -q "restricts unprivileged user namespaces" "$OUT"
-
-# A loaded system profile alone is NOT remediation for a custom MINIMAL_BIN:
-# the stock tunable does not attach it, so sessions still die and the advisory
-# must keep firing (with --path) until the tunables name this binary.
-mkdir -p "$root/aa-present"; printf 'profile\n' >"$root/aa-present/minimald"
-USERNS_SYSCTL="$root/sysctl-on"; APPARMOR_DIR="$root/aa-present"
-run aa_present_unattached "$H1"
-want_ok "advisory still fires when the profile is loaded but MINIMAL_BIN unattached" \
-    grep -q -- "--path \"$H1/bin/minimald\"" "$OUT"
-
-# ...and is suppressed once the tunables do name it (what the loader's --path
-# records under tunables/minimald.d).
-mkdir -p "$root/aa-present/tunables/minimald.d"
-printf '@{minimald_bin} += %s/bin/minimald\n' "$H1" \
-    >"$root/aa-present/tunables/minimald.d/paths"
-run aa_attached "$H1"
-want_err "no advisory when the tunables attach this MINIMAL_BIN" \
-    grep -q "restricts unprivileged user namespaces" "$OUT"
-
-# For the stock prefix (~/.local/bin) the profile's own tunable already
-# attaches the binary, so the profile file existing IS remediation.
-BIN_OVERRIDE="$H1/.local/bin"
-run aa_already_default_bin "$H1"
-BIN_OVERRIDE=
-want_err "no advisory for the default prefix when the system profile is installed" \
-    grep -q "restricts unprivileged user namespaces" "$OUT"
-USERNS_SYSCTL=; APPARMOR_DIR=
-
-# Darwin hosts never receive the apparmor components (linux-only manifest rows).
-HAA_D="$root/haa_d"; mkdir -p "$HAA_D"
-PLAT_S=Darwin; PLAT_M=arm64
-run aa_darwin "$HAA_D"
-PLAT_S=Linux; PLAT_M=x86_64
-check 0 "$rc" "darwin install exits 0"
-want_err "apparmor components skipped on darwin" \
-    test -e "$HAA_D/xdg-data/minimal/apparmor/minimald"
-
-# --- Uninstall: offer to remove the system AppArmor profile ----------------
-# A non-interactive uninstall (stdin is /dev/null, not a tty) advises the root
-# removal command and never elevates: the seeded system profile survives, while
-# the shipped loader is removed by the record walk like any other component.
-HAA_U="$root/haa_u"; mkdir -p "$HAA_U"
-run aa_u_seed "$HAA_U"
-check 0 "$rc" "uninstall-apparmor seed install exits 0"
-fake_aa="$root/fake-apparmor.d"; mkdir -p "$fake_aa/tunables"
-printf 'profile\n' >"$fake_aa/minimald"
-printf 'tunable\n' >"$fake_aa/tunables/minimald"
-APPARMOR_DIR="$fake_aa"
-run aa_u_run "$HAA_U" --uninstall
-APPARMOR_DIR=
-check 0 "$rc" "uninstall with a loaded system profile exits 0"
-want_ok "uninstall advises the system profile is still loaded" \
-    grep -q "system AppArmor profile is still loaded" "$OUT"
-want_ok "advisory gives the root removal command" grep -q "apparmor_parser -R" "$OUT"
-want_ok "non-interactive uninstall never elevates (profile survives)" \
-    test -f "$fake_aa/minimald"
-want_err "uninstall removed the shipped apparmor loader" \
-    test -e "$HAA_U/xdg-data/minimal/apparmor/install-apparmor-profile.sh"
-
-# Corrupt one on-disk binary and retarget the symlink -> only the binary
-# re-fetches (a symlink repair needs no download), and both are restored.
-printf 'tampered\n' >"$H1/bin/minimald"
-rm -f "$H1/bin/git-remote-min"; ln -s minimald "$H1/bin/git-remote-min"
-reset_dl
-run third "$H1"
-check 0 "$rc" "rerun after tamper exits 0"
-check 1 "$(downloads)" "only the changed component re-downloads"
-check "$h_minimald" "$(hash_file "$H1/bin/minimald")" "tampered binary restored"
-check "min" "$(readlink "$H1/bin/git-remote-min")" "retargeted symlink repaired without a download (R5.6)"
-
-# --- Unit 5: checksum mismatch (R5.3) --------------------------------------
-# Point the manifest's minimal hash at a wrong value; artifact stays as-is.
-cp "$mock/versions/v1/components" "$root/good-components"
-awk '$1=="minimal" && $2=="linux" {$5="deadbeef"} {print}' "$root/good-components" \
-    >"$mock/versions/v1/components"
-H2="$root/h2"; mkdir -p "$H2"
-reset_dl
-run mismatch "$H2"
-check 1 "$rc" "checksum mismatch exits non-zero (R5.3)"
-want_ok "mismatch names the failure" grep -q "checksum mismatch" "$OUT"
-want_err "no closing card on a failed install (R10.4)" \
-    grep -qE "Minimal .+ is ready" "$OUT"
-want_err "no file installed on mismatch" test -e "$H2/bin/min"
-if ls "$H2/bin/"min.tmp.* >/dev/null 2>&1
-then bad "temp file left behind"; else ok "no .tmp file left (R5.3)"; fi
-cp "$root/good-components" "$mock/versions/v1/components"   # restore
-
-# --- Unit 2: target / version / format validation --------------------------
-H3="$root/h3"; mkdir -p "$H3"
-reset_dl
-run traversal "$H3" "../evil"
-check 1 "$rc" "path-like target exits non-zero (R2.1)"
-check 0 "$(downloads)" "invalid target fetches nothing (R2.1)"
-
-run emptytarget "$H3" ""
-check 1 "$rc" "empty target exits non-zero (R2.1)"
-
-# Dot-segment targets pass the charset but would let curl normalize the URL past
-# the bucket prefix; reject them outright, before any fetch.
-for dot in . ..; do
+case_install() {
+    # --- Unit 5: install, skip-on-rerun (R5.1), atomic + exec (R5.4) -----------
+    H1="$root/h1"; mkdir -p "$H1"
     reset_dl
-    run "dottarget" "$H3" "$dot"
-    check 1 "$rc" "dot-segment target '$dot' exits non-zero (R2.1)"
-    check 0 "$(downloads)" "dot-segment target '$dot' fetches nothing"
-done
+    run first "$H1"
+    check 0 "$rc" "fresh install exits 0"
+    want_ok "minimald installed to bin" test -f "$H1/bin/minimald"
+    want_ok "bin component is executable (R5.4)" test -x "$H1/bin/minimald"
+    check "$h_minimald" "$(hash_file "$H1/bin/minimald")" "installed content matches manifest hash"
+    # Only linux/amd64 rows apply on this host: darwin row must not be installed.
+    want_err "darwin-only component skipped on linux host" test -e "$H1/data/rootfs.img"
+    n1="$(downloads)"; want_ok "first run downloaded ($n1)" test "$n1" -gt 0
+    want_ok "symlink component placed as a symlink (R5.6)" test -L "$H1/bin/git-remote-min"
+    check "min" "$(readlink "$H1/bin/git-remote-min")" "symlink points at its manifest target (R5.6)"
 
-# A compromised pointer resolving to a dot-segment version must also be rejected
-# (before the manifest fetch), not just the char whitelist.
-printf '..\n' >"$mock/dotversion"
-run dotversion "$H3" dotversion
-check 1 "$rc" "dot-segment version from pointer exits non-zero (R2.2)"
+    # A successful run closes on the card, after every bookkeeping note (here the
+    # PATH advisory fires), so the parting block is what the user is left looking
+    # at (R10.4).
+    want_ok "fresh install emits the closing card (R10.4)" \
+        grep -qE "Minimal .+ is ready" "$OUT"
+    want_ok "the card names the first command (R10.4)" \
+        grep -qE "min +build the sandbox and step inside" "$OUT"
+    want_card_last "the card closes a fresh install (R10.4)"
+    # Nothing on a redirected stream may carry terminal escapes (R10.1): this
+    # output is a file, so a stray SGR here would land in every CI log. `run` sets a
+    # terminal-like TERM, so what this pins is the `[ -t 2 ]` half of the guard:
+    # with TERM unset the assertion would still pass if that check were dropped.
+    want_err "no terminal escapes when stderr is not a terminal (R10.1)" \
+        grep -q "$esc" "$OUT"
 
-write_manifest 999
-run badformat "$H3"
-check 1 "$rc" "unsupported manifest format exits non-zero (R2.4)"
-want_ok "format error names supported version (R2.4)" grep -q "supports 1" "$OUT"
-write_manifest 1
+    reset_dl
+    run second "$H1"
+    check 0 "$rc" "rerun exits 0"
+    check 0 "$(downloads)" "rerun performs zero downloads (R5.1/R2 reruns cheap)"
+    want_card_last "the card closes an up-to-date rerun (R10.4)"
 
-# --- Unit 4: prefix resolution + traversal rejection (R4.1/R4.2) -----------
-# A dest with a `..` component must be rejected, writing nothing.
-awk '$1=="minimal" && $2=="linux" {$7="bin/../../etc/x"} {print}' "$root/good-components" \
-    >"$mock/versions/v1/components"
-H4="$root/h4"; mkdir -p "$H4"
-run unsafedest "$H4"
-check 1 "$rc" "unsafe .. dest exits non-zero (R4.2)"
-want_err "traversal wrote nothing (R4.2)" test -e "$H4/etc/x"
-# Absolute subpath likewise.
-awk '$1=="minimal" && $2=="linux" {$7="bin//etc/x"} {print}' "$root/good-components" \
-    >"$mock/versions/v1/components"
-run absdest "$H4"
-check 1 "$rc" "absolute dest subpath exits non-zero (R4.2)"
-cp "$root/good-components" "$mock/versions/v1/components"
 
-# XDG_DATA_HOME steers the `data` prefix (R4.1): a one-off manifest with a
-# single data-prefixed row that applies to this host, asserting where it lands.
-{
-    printf '# format: 1\n'
-    printf '# c o a v s k d s\n'
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-        rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
-} >"$mock/versions/v1/components"
-H5="$root/h5"; mkdir -p "$H5"
-run datadest "$H5"
-check 0 "$rc" "data-prefixed component installs (R4.1)"
-want_ok "data resolves under XDG_DATA_HOME/minimal (R4.1)" \
-    test -f "$H5/xdg-data/minimal/rootfs.img"
-cp "$root/good-components" "$mock/versions/v1/components"
-
-# The `lib` prefix (R4.1) is a bin SIBLING: it resolves to ~/.local/lib with NO
-# `/minimal` suffix (unlike data/state/cache), so a bin/<x> binary reaches a
-# shipped lib/<y> via a `@loader_path/../lib` rpath. XDG_LIB_HOME is unset in the
-# run env, so it must fall back to $HOME/.local/lib. A lib file is also not `bin`,
-# so it must NOT be marked executable.
-{
-    printf '# format: 1\n'
-    printf '# c o a v s k d s\n'
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-        libkrun linux amd64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-arm64.img
-} >"$mock/versions/v1/components"
-H6="$root/h6"; mkdir -p "$H6"
-run libdest "$H6"
-check 0 "$rc" "lib-prefixed component installs (R4.1)"
-want_ok "lib falls back to HOME/.local/lib, no /minimal suffix (R4.1)" \
-    test -f "$H6/.local/lib/libkrun.1.dylib"
-want_err "lib component is not marked executable (only bin gets +x)" \
-    test -x "$H6/.local/lib/libkrun.1.dylib"
-cp "$root/good-components" "$mock/versions/v1/components"
-
-# --- Unit 6: install record (R6.1) + PATH advisory (R6.2) ------------------
-record="$H1/xdg-state/minimal/installed"
-want_ok "install record lists components (R6.1)" grep -q "minimald" "$record"
-want_ok "install record lists resolved dest (R6.1)" grep -q "$H1/bin/minimald" "$record"
-want_ok "install record lists hash (R6.1)" grep -q "$h_minimald" "$record"
-want_ok "symlink row records link:<target> in the hash columns (R6.1)" \
-    grep -q "link:min" "$record"
-
-# bin not on PATH -> advisory printed.
-run advise_off "$H1"
-want_ok "PATH advisory printed when bin absent (R6.2)" grep -q "is not on your PATH" "$OUT"
-# bin on PATH -> advisory suppressed. Re-run with bin on PATH via a wrapper env.
-OUT="$root/out.advise_on"
-set +e
-env -i PATH="$stubbin:$H1/bin:/usr/bin:/bin" HOME="$H1" MINIMAL_BIN="$H1/bin" \
-    XDG_STATE_HOME="$H1/xdg-state" XDG_DATA_HOME="$H1/xdg-data" XDG_CACHE_HOME="$H1/xdg-cache" \
-    MINIMAL_OVERRIDE_INSTALLER_BUCKET="$BUCKET_HOST" \
-    STUB_UNAME_S="$PLAT_S" STUB_UNAME_M="$PLAT_M" \
-    "$SH" "$installer" >"$OUT" 2>&1
-set -e
-want_err "PATH advisory suppressed when bin present (R6.2)" grep -q "is not on your PATH" "$OUT"
-
-# --- Unit 5: pre-upgrade daemon stop (R5.5) --------------------------------
-# The installed `min` (the mock records its `stop` calls to $HOME/stop.calls) is
-# run once, only on a run that actually replaces a file, and only when it was
-# already on disk beforehand.
-
-# Seed <home> with a completed install, then stage the next run as an upgrade
-# (one stale component) whose on-disk `min` reports live sessions.
-stage_live_upgrade() {
-    run "$2_seed" "$1"
-    check 0 "$rc" "$2: seed install exits 0"
-    printf 'stale\n' >"$1/bin/minimald"
-    write_min_stub "$1/bin/min"
-    : >"$1/sessions.live"
-    rm -f "$1/stop.calls"
+    # Corrupt one on-disk binary and retarget the symlink -> only the binary
+    # re-fetches (a symlink repair needs no download), and both are restored.
+    printf 'tampered\n' >"$H1/bin/minimald"
+    rm -f "$H1/bin/git-remote-min"; ln -s minimald "$H1/bin/git-remote-min"
+    reset_dl
+    run third "$H1"
+    check 0 "$rc" "rerun after tamper exits 0"
+    check 1 "$(downloads)" "only the changed component re-downloads"
+    check "$h_minimald" "$(hash_file "$H1/bin/minimald")" "tampered binary restored"
+    check "min" "$(readlink "$H1/bin/git-remote-min")" "retargeted symlink repaired without a download (R5.6)"
 }
 
-H8="$root/h8"; mkdir -p "$H8"
-run daemonfresh "$H8"
-check 0 "$rc" "fresh install exits 0"
-want_err "fresh install stops no daemon: none installed yet (R5.5)" test -e "$H8/stop.calls"
+case_apparmor() {
+    # --- AppArmor components + Ubuntu 24.04+ advisory --------------------------
+    # The components and the advisory both assert over a home holding a completed
+    # install, so this case seeds its own instead of inheriting another case's.
+    H_A="$root/ha"; mkdir -p "$H_A"
+    run aa_seed "$H_A"
+    check 0 "$rc" "apparmor seed install exits 0"
+    # The three noarch apparmor components install under the data prefix on Linux.
+    aa_root="$H_A/xdg-data/minimal/apparmor"
+    want_ok "apparmor profile installed under data prefix"  test -f "$aa_root/minimald"
+    want_ok "apparmor tunable installed under data prefix"  test -f "$aa_root/tunables/minimald"
+    want_ok "apparmor loader installed under data prefix"   test -f "$aa_root/install-apparmor-profile.sh"
 
-# Everything up to date -> nothing replaced -> a healthy daemon is left alone.
-run daemonnoop "$H8"
-check 0 "$rc" "up-to-date rerun exits 0"
-want_err "up-to-date rerun stops no daemon (R5.5)" test -e "$H8/stop.calls"
+    # The advisory fires only when the userns restriction is active (sysctl reads 1),
+    # points at the shipped loader, and never elevates — install still exits 0.
+    printf '1\n' >"$root/sysctl-on"
+    printf '0\n' >"$root/sysctl-off"
 
-# An upgrade (two components stale) stops the daemon exactly once, before the
-# swap, via the min that is on disk now — an older build than the manifest's,
-# still runnable, still able to reach the daemon it started. With no sessions
-# running the graceful stop succeeds, so nothing is forced and nothing is asked.
-printf 'stale\n' >"$H8/bin/minimald"
-write_min_stub "$H8/bin/min" "previous release"
-run daemonupgrade "$H8"
-check 0 "$rc" "upgrade exits 0"
-want_ok "upgrade runs min stop (R5.5)" test -f "$H8/stop.calls"
-check "stop" "$(cat "$H8/stop.calls")" "stop is called once, gracefully (R5.5)"
-want_err "a graceful stop is never escalated to --force (R5.5)" \
-    grep -qx "stop --force" "$H8/stop.calls"
-want_err "no sessions means no question (R5.5)" grep -q "Continue?" "$OUT"
+    USERNS_SYSCTL="$root/sysctl-on"
+    run aa_restricted "$H_A"
+    USERNS_SYSCTL=
+    check 0 "$rc" "install on a restricted host still exits 0 (advice only)"
+    want_ok "advisory names the userns restriction" \
+        grep -q "restricts unprivileged user namespaces" "$OUT"
+    want_ok "advisory points at the shipped loader with sudo bash" \
+        grep -q "sudo bash .*apparmor/install-apparmor-profile.sh" "$OUT"
+    # The harness bindir is a custom MINIMAL_BIN, outside the tunable's stock
+    # attachment set, so the advised command must attach it explicitly.
+    want_ok "advisory carries --path for a custom MINIMAL_BIN" \
+        grep -q -- "--path \"$H_A/bin/minimald\"" "$OUT"
+    # The card is the parting block even when the AppArmor advisory is the last note.
+    want_card_last "the card follows the AppArmor advisory (R10.4)"
 
-# Replacing only a data component must NOT stop the daemon: data files (the
-# apparmor profile/tunable/loader) are not executable images, and the running
-# daemon does not serve from them — only bin/lib swaps wedge it (R5.5).
-rm -f "$H8/stop.calls"
-printf 'tampered\n' >"$H8/xdg-data/minimal/apparmor/minimald"
-run daemondataonly "$H8"
-check 0 "$rc" "data-only rerun exits 0"
-want_err "data-only replacement leaves the daemon alone (R5.5)" test -e "$H8/stop.calls"
-check "$h_aaprof" "$(hash_file "$H8/xdg-data/minimal/apparmor/minimald")" \
-    "tampered data component was re-placed"
+    USERNS_SYSCTL="$root/sysctl-off"
+    run aa_unrestricted "$H_A"
+    USERNS_SYSCTL=
+    want_err "no advisory when the restriction is off (sysctl 0)" \
+        grep -q "restricts unprivileged user namespaces" "$OUT"
 
-# A `min` that fails and shouts is non-fatal and silent: an old binary may not
-# know `stop --force`, and no daemon running is itself a non-zero `min stop`.
-H9="$root/h9"; mkdir -p "$H9"
-run daemonprep "$H9"
-check 0 "$rc" "prep install exits 0"
-cat >"$H9/bin/min" <<'EOF'
+    # A loaded system profile alone is NOT remediation for a custom MINIMAL_BIN:
+    # the stock tunable does not attach it, so sessions still die and the advisory
+    # must keep firing (with --path) until the tunables name this binary.
+    mkdir -p "$root/aa-present"; printf 'profile\n' >"$root/aa-present/minimald"
+    USERNS_SYSCTL="$root/sysctl-on"; APPARMOR_DIR="$root/aa-present"
+    run aa_present_unattached "$H_A"
+    want_ok "advisory still fires when the profile is loaded but MINIMAL_BIN unattached" \
+        grep -q -- "--path \"$H_A/bin/minimald\"" "$OUT"
+
+    # ...and is suppressed once the tunables do name it (what the loader's --path
+    # records under tunables/minimald.d).
+    mkdir -p "$root/aa-present/tunables/minimald.d"
+    printf '@{minimald_bin} += %s/bin/minimald\n' "$H_A" \
+        >"$root/aa-present/tunables/minimald.d/paths"
+    run aa_attached "$H_A"
+    want_err "no advisory when the tunables attach this MINIMAL_BIN" \
+        grep -q "restricts unprivileged user namespaces" "$OUT"
+
+    # For the stock prefix (~/.local/bin) the profile's own tunable already
+    # attaches the binary, so the profile file existing IS remediation.
+    BIN_OVERRIDE="$H_A/.local/bin"
+    run aa_already_default_bin "$H_A"
+    BIN_OVERRIDE=
+    want_err "no advisory for the default prefix when the system profile is installed" \
+        grep -q "restricts unprivileged user namespaces" "$OUT"
+    USERNS_SYSCTL=; APPARMOR_DIR=
+
+    # Darwin hosts never receive the apparmor components (linux-only manifest rows).
+    HAA_D="$root/haa_d"; mkdir -p "$HAA_D"
+    PLAT_S=Darwin; PLAT_M=arm64
+    run aa_darwin "$HAA_D"
+    PLAT_S=Linux; PLAT_M=x86_64
+    check 0 "$rc" "darwin install exits 0"
+    want_err "apparmor components skipped on darwin" \
+        test -e "$HAA_D/xdg-data/minimal/apparmor/minimald"
+
+}
+
+case_apparmor_uninstall() {
+    # --- Uninstall: offer to remove the system AppArmor profile ----------------
+    # A non-interactive uninstall (stdin is /dev/null, not a tty) advises the root
+    # removal command and never elevates: the seeded system profile survives, while
+    # the shipped loader is removed by the record walk like any other component.
+    HAA_U="$root/haa_u"; mkdir -p "$HAA_U"
+    run aa_u_seed "$HAA_U"
+    check 0 "$rc" "uninstall-apparmor seed install exits 0"
+    fake_aa="$root/fake-apparmor.d"; mkdir -p "$fake_aa/tunables"
+    printf 'profile\n' >"$fake_aa/minimald"
+    printf 'tunable\n' >"$fake_aa/tunables/minimald"
+    APPARMOR_DIR="$fake_aa"
+    run aa_u_run "$HAA_U" --uninstall
+    APPARMOR_DIR=
+    check 0 "$rc" "uninstall with a loaded system profile exits 0"
+    want_ok "uninstall advises the system profile is still loaded" \
+        grep -q "system AppArmor profile is still loaded" "$OUT"
+    want_ok "advisory gives the root removal command" grep -q "apparmor_parser -R" "$OUT"
+    want_ok "non-interactive uninstall never elevates (profile survives)" \
+        test -f "$fake_aa/minimald"
+    want_err "uninstall removed the shipped apparmor loader" \
+        test -e "$HAA_U/xdg-data/minimal/apparmor/install-apparmor-profile.sh"
+}
+
+case_checksum_mismatch() {
+    # --- Unit 5: checksum mismatch (R5.3) --------------------------------------
+    # Point the manifest's minimal hash at a wrong value; artifact stays as-is.
+    awk '$1=="minimal" && $2=="linux" {$5="deadbeef"} {print}' "$root/good-components" \
+        >"$mock/versions/v1/components"
+    H2="$root/h2"; mkdir -p "$H2"
+    reset_dl
+    run mismatch "$H2"
+    check 1 "$rc" "checksum mismatch exits non-zero (R5.3)"
+    want_ok "mismatch names the failure" grep -q "checksum mismatch" "$OUT"
+    want_err "no closing card on a failed install (R10.4)" \
+        grep -qE "Minimal .+ is ready" "$OUT"
+    want_err "no file installed on mismatch" test -e "$H2/bin/min"
+    if ls "$H2/bin/"min.tmp.* >/dev/null 2>&1
+    then bad "temp file left behind"; else ok "no .tmp file left (R5.3)"; fi
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+}
+
+case_target_validation() {
+    # --- Unit 2: target / version / format validation --------------------------
+    H3="$root/h3"; mkdir -p "$H3"
+    reset_dl
+    run traversal "$H3" "../evil"
+    check 1 "$rc" "path-like target exits non-zero (R2.1)"
+    check 0 "$(downloads)" "invalid target fetches nothing (R2.1)"
+
+    run emptytarget "$H3" ""
+    check 1 "$rc" "empty target exits non-zero (R2.1)"
+
+    # Dot-segment targets pass the charset but would let curl normalize the URL past
+    # the bucket prefix; reject them outright, before any fetch.
+    for dot in . ..; do
+        reset_dl
+        run "dottarget" "$H3" "$dot"
+        check 1 "$rc" "dot-segment target '$dot' exits non-zero (R2.1)"
+        check 0 "$(downloads)" "dot-segment target '$dot' fetches nothing"
+    done
+
+    # A compromised pointer resolving to a dot-segment version must also be rejected
+    # (before the manifest fetch), not just the char whitelist.
+    printf '..\n' >"$mock/dotversion"
+    run dotversion "$H3" dotversion
+    check 1 "$rc" "dot-segment version from pointer exits non-zero (R2.2)"
+
+    write_manifest 999
+    run badformat "$H3"
+    check 1 "$rc" "unsupported manifest format exits non-zero (R2.4)"
+    want_ok "format error names supported version (R2.4)" grep -q "supports 1" "$OUT"
+    write_manifest 1
+}
+
+case_prefix_resolution() {
+    # --- Unit 4: prefix resolution + traversal rejection (R4.1/R4.2) -----------
+    # A dest with a `..` component must be rejected, writing nothing.
+    awk '$1=="minimal" && $2=="linux" {$7="bin/../../etc/x"} {print}' "$root/good-components" \
+        >"$mock/versions/v1/components"
+    H4="$root/h4"; mkdir -p "$H4"
+    run unsafedest "$H4"
+    check 1 "$rc" "unsafe .. dest exits non-zero (R4.2)"
+    want_err "traversal wrote nothing (R4.2)" test -e "$H4/etc/x"
+    # Absolute subpath likewise.
+    awk '$1=="minimal" && $2=="linux" {$7="bin//etc/x"} {print}' "$root/good-components" \
+        >"$mock/versions/v1/components"
+    run absdest "$H4"
+    check 1 "$rc" "absolute dest subpath exits non-zero (R4.2)"
+    cp "$root/good-components" "$mock/versions/v1/components"
+
+    # XDG_DATA_HOME steers the `data` prefix (R4.1): a one-off manifest with a
+    # single data-prefixed row that applies to this host, asserting where it lands.
+    {
+        printf '# format: 1\n'
+        printf '# c o a v s k d s\n'
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
+    } >"$mock/versions/v1/components"
+    H5="$root/h5"; mkdir -p "$H5"
+    run datadest "$H5"
+    check 0 "$rc" "data-prefixed component installs (R4.1)"
+    want_ok "data resolves under XDG_DATA_HOME/minimal (R4.1)" \
+        test -f "$H5/xdg-data/minimal/rootfs.img"
+    cp "$root/good-components" "$mock/versions/v1/components"
+
+    # The `lib` prefix (R4.1) is a bin SIBLING: it resolves to ~/.local/lib with NO
+    # `/minimal` suffix (unlike data/state/cache), so a bin/<x> binary reaches a
+    # shipped lib/<y> via a `@loader_path/../lib` rpath. XDG_LIB_HOME is unset in the
+    # run env, so it must fall back to $HOME/.local/lib. A lib file is also not `bin`,
+    # so it must NOT be marked executable.
+    {
+        printf '# format: 1\n'
+        printf '# c o a v s k d s\n'
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            libkrun linux amd64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-arm64.img
+    } >"$mock/versions/v1/components"
+    H6="$root/h6"; mkdir -p "$H6"
+    run libdest "$H6"
+    check 0 "$rc" "lib-prefixed component installs (R4.1)"
+    want_ok "lib falls back to HOME/.local/lib, no /minimal suffix (R4.1)" \
+        test -f "$H6/.local/lib/libkrun.1.dylib"
+    want_err "lib component is not marked executable (only bin gets +x)" \
+        test -x "$H6/.local/lib/libkrun.1.dylib"
+    cp "$root/good-components" "$mock/versions/v1/components"
+
+    # A manifest without the min CLI (data-only) skips completions, non-fatally.
+    want_ok "completions skipped when min absent (R9.3)" \
+        grep -qE "completions +skipped" "$root/out.datadest"
+}
+
+case_install_record() {
+    # --- Unit 6: install record (R6.1) + PATH advisory (R6.2) ------------------
+    # Reads the record a completed install wrote, so this case seeds its own home
+    # rather than inheriting another case's.
+    H_IR="$root/hir"; mkdir -p "$H_IR"
+    run record_seed "$H_IR"
+    check 0 "$rc" "record seed install exits 0"
+    record="$H_IR/xdg-state/minimal/installed"
+    want_ok "install record lists components (R6.1)" grep -q "minimald" "$record"
+    want_ok "install record lists resolved dest (R6.1)" grep -q "$H_IR/bin/minimald" "$record"
+    want_ok "install record lists hash (R6.1)" grep -q "$h_minimald" "$record"
+    want_ok "symlink row records link:<target> in the hash columns (R6.1)" \
+        grep -q "link:min" "$record"
+
+    # bin not on PATH -> advisory printed.
+    run advise_off "$H_IR"
+    want_ok "PATH advisory printed when bin absent (R6.2)" grep -q "is not on your PATH" "$OUT"
+    # bin on PATH -> advisory suppressed. Re-run with bin on PATH via a wrapper env.
+    OUT="$root/out.advise_on"
+    set +e
+    env -i PATH="$stubbin:$H_IR/bin:/usr/bin:/bin" HOME="$H_IR" MINIMAL_BIN="$H_IR/bin" \
+        XDG_STATE_HOME="$H_IR/xdg-state" XDG_DATA_HOME="$H_IR/xdg-data" XDG_CACHE_HOME="$H_IR/xdg-cache" \
+        MINIMAL_OVERRIDE_INSTALLER_BUCKET="$BUCKET_HOST" \
+        STUB_UNAME_S="$PLAT_S" STUB_UNAME_M="$PLAT_M" \
+        "$SH" "$installer" >"$OUT" 2>&1
+    set -e
+    want_err "PATH advisory suppressed when bin present (R6.2)" grep -q "is not on your PATH" "$OUT"
+}
+
+case_daemon_stop() {
+    # --- Unit 5: pre-upgrade daemon stop (R5.5) --------------------------------
+    # The installed `min` (the mock records its `stop` calls to $HOME/stop.calls) is
+    # run once, only on a run that actually replaces a file, and only when it was
+    # already on disk beforehand.
+
+    # Seed <home> with a completed install, then stage the next run as an upgrade
+    # (one stale component) whose on-disk `min` reports live sessions.
+    stage_live_upgrade() {
+        run "$2_seed" "$1"
+        check 0 "$rc" "$2: seed install exits 0"
+        printf 'stale\n' >"$1/bin/minimald"
+        write_min_stub "$1/bin/min"
+        : >"$1/sessions.live"
+        rm -f "$1/stop.calls"
+    }
+
+    H8="$root/h8"; mkdir -p "$H8"
+    run daemonfresh "$H8"
+    check 0 "$rc" "fresh install exits 0"
+    want_err "fresh install stops no daemon: none installed yet (R5.5)" test -e "$H8/stop.calls"
+
+    # Everything up to date -> nothing replaced -> a healthy daemon is left alone.
+    run daemonnoop "$H8"
+    check 0 "$rc" "up-to-date rerun exits 0"
+    want_err "up-to-date rerun stops no daemon (R5.5)" test -e "$H8/stop.calls"
+
+    # An upgrade (two components stale) stops the daemon exactly once, before the
+    # swap, via the min that is on disk now — an older build than the manifest's,
+    # still runnable, still able to reach the daemon it started. With no sessions
+    # running the graceful stop succeeds, so nothing is forced and nothing is asked.
+    printf 'stale\n' >"$H8/bin/minimald"
+    write_min_stub "$H8/bin/min" "previous release"
+    run daemonupgrade "$H8"
+    check 0 "$rc" "upgrade exits 0"
+    want_ok "upgrade runs min stop (R5.5)" test -f "$H8/stop.calls"
+    check "stop" "$(cat "$H8/stop.calls")" "stop is called once, gracefully (R5.5)"
+    want_err "a graceful stop is never escalated to --force (R5.5)" \
+        grep -qx "stop --force" "$H8/stop.calls"
+    want_err "no sessions means no question (R5.5)" grep -q "Continue?" "$OUT"
+
+    # Replacing only a data component must NOT stop the daemon: data files (the
+    # apparmor profile/tunable/loader) are not executable images, and the running
+    # daemon does not serve from them — only bin/lib swaps wedge it (R5.5).
+    rm -f "$H8/stop.calls"
+    printf 'tampered\n' >"$H8/xdg-data/minimal/apparmor/minimald"
+    run daemondataonly "$H8"
+    check 0 "$rc" "data-only rerun exits 0"
+    want_err "data-only replacement leaves the daemon alone (R5.5)" test -e "$H8/stop.calls"
+    check "$h_aaprof" "$(hash_file "$H8/xdg-data/minimal/apparmor/minimald")" \
+        "tampered data component was re-placed"
+
+    # A `min` that fails and shouts is non-fatal and silent: an old binary may not
+    # know `stop --force`, and no daemon running is itself a non-zero `min stop`.
+    H9="$root/h9"; mkdir -p "$H9"
+    run daemonprep "$H9"
+    check 0 "$rc" "prep install exits 0"
+    cat >"$H9/bin/min" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"$HOME/stop.calls"
 echo "old min: unrecognized subcommand 'stop'" >&2
 echo "noise on stdout" >&1
 exit 2
 EOF
-chmod +x "$H9/bin/min"
-printf 'stale\n' >"$H9/bin/minimald"
-run daemonfails "$H9"
-check 0 "$rc" "a failing min stop does not fail the install (R5.5)"
-want_err "min stop stderr is hidden (R5.5)" grep -q "unrecognized subcommand" "$OUT"
-want_err "min stop stdout is hidden (R5.5)" grep -q "noise on stdout" "$OUT"
-check "$h_minimald" "$(hash_file "$H9/bin/minimald")" "the upgrade still completed (R5.5)"
-# Only the active-sessions refusal may prompt: every other non-zero stop (no
-# daemon, a failed connect, a min too old) stays silent and best-effort, and
-# still falls through to the force stop — the arm that covers a wedged daemon.
-want_err "a non-sessions stop failure asks nothing (R5.5)" grep -q "Continue?" "$OUT"
-want_err "a non-sessions stop failure lists nothing (R5.5)" grep -q "active sessions" "$OUT"
-want_ok "a non-sessions stop failure still force-stops (R5.5)" \
-    grep -qx "stop --force" "$H9/stop.calls"
+    chmod +x "$H9/bin/min"
+    printf 'stale\n' >"$H9/bin/minimald"
+    run daemonfails "$H9"
+    check 0 "$rc" "a failing min stop does not fail the install (R5.5)"
+    want_err "min stop stderr is hidden (R5.5)" grep -q "unrecognized subcommand" "$OUT"
+    want_err "min stop stdout is hidden (R5.5)" grep -q "noise on stdout" "$OUT"
+    check "$h_minimald" "$(hash_file "$H9/bin/minimald")" "the upgrade still completed (R5.5)"
+    # Only the active-sessions refusal may prompt: every other non-zero stop (no
+    # daemon, a failed connect, a min too old) stays silent and best-effort, and
+    # still falls through to the force stop — the arm that covers a wedged daemon.
+    want_err "a non-sessions stop failure asks nothing (R5.5)" grep -q "Continue?" "$OUT"
+    want_err "a non-sessions stop failure lists nothing (R5.5)" grep -q "active sessions" "$OUT"
+    want_ok "a non-sessions stop failure still force-stops (R5.5)" \
+        grep -qx "stop --force" "$H9/stop.calls"
 
-# Live sessions turn the stop into a decision: the installer lists what is
-# running and asks. The answer is read from the controlling terminal, never
-# from stdin — under `curl … | sh` stdin is the script itself — so the harness
-# points MINIMAL_OVERRIDE_TTY at a file standing in for /dev/tty.
-#
-# These homes carry their own HL prefix rather than extending the plain H<n>
-# run, following the HAA_/HD/HU families above. Every scenario here deliberately
-# leaves a home a later run must not inherit — a `sessions.live` marker and a
-# `min` that refuses to stop while it exists — so a home reused by number
-# further down would not be the fresh install it reads as, and would abort on
-# the prompt instead.
-HL1="$root/hl1"; mkdir -p "$HL1"
-stage_live_upgrade "$HL1" liveyes
-printf 'y\n' >"$root/tty-yes"
-TTY_FILE="$root/tty-yes"
-run liveyes "$HL1"
-TTY_FILE=
-check 0 "$rc" "confirmed upgrade exits 0 (R5.5)"
-want_ok "the running sessions are listed (R5.5)" grep -q "session-alpha" "$OUT"
-want_ok "the user is asked before sessions die (R5.5)" grep -q "Continue?" "$OUT"
-want_ok "the graceful stop is tried first (R5.5)" grep -qx "stop" "$HL1/stop.calls"
-want_ok "confirmation escalates to --force (R5.5)" grep -qx "stop --force" "$HL1/stop.calls"
-check "$h_minimald" "$(hash_file "$HL1/bin/minimald")" "a confirmed upgrade completes (R5.5)"
+    # Live sessions turn the stop into a decision: the installer lists what is
+    # running and asks. The answer is read from the controlling terminal, never
+    # from stdin — under `curl … | sh` stdin is the script itself — so the harness
+    # points MINIMAL_OVERRIDE_TTY at a file standing in for /dev/tty.
+    #
+    # These homes carry their own HL prefix rather than extending the plain H<n>
+    # run, following the HAA_/HD/HU families above. Every scenario here deliberately
+    # leaves a home a later run must not inherit — a `sessions.live` marker and a
+    # `min` that refuses to stop while it exists — so a home reused by number
+    # further down would not be the fresh install it reads as, and would abort on
+    # the prompt instead.
+    HL1="$root/hl1"; mkdir -p "$HL1"
+    stage_live_upgrade "$HL1" liveyes
+    printf 'y\n' >"$root/tty-yes"
+    TTY_FILE="$root/tty-yes"
+    run liveyes "$HL1"
+    TTY_FILE=
+    check 0 "$rc" "confirmed upgrade exits 0 (R5.5)"
+    want_ok "the running sessions are listed (R5.5)" grep -q "session-alpha" "$OUT"
+    want_ok "the user is asked before sessions die (R5.5)" grep -q "Continue?" "$OUT"
+    want_ok "the graceful stop is tried first (R5.5)" grep -qx "stop" "$HL1/stop.calls"
+    want_ok "confirmation escalates to --force (R5.5)" grep -qx "stop --force" "$HL1/stop.calls"
+    check "$h_minimald" "$(hash_file "$HL1/bin/minimald")" "a confirmed upgrade completes (R5.5)"
 
-# Declining aborts before the first swap: non-zero, nothing installed, no
-# temp file left behind, and the daemon never force-stopped.
-HL2="$root/hl2"; mkdir -p "$HL2"
-stage_live_upgrade "$HL2" liveno
-printf 'n\n' >"$root/tty-no"
-TTY_FILE="$root/tty-no"
-run liveno "$HL2"
-TTY_FILE=
-check 1 "$rc" "declining aborts the install (R5.5)"
-want_ok "the abort reports no executable was replaced (R5.5)" \
-    grep -q "no executables were replaced" "$OUT"
-want_err "declining never force-stops (R5.5)" grep -qx "stop --force" "$HL2/stop.calls"
-check "stale" "$(cat "$HL2/bin/minimald")" "the stale component is left in place (R5.5)"
-want_err "no temp file survives the abort (R5.5)" ls "$HL2/bin/"*.tmp.* 2>/dev/null
+    # Declining aborts before the first swap: non-zero, nothing installed, no
+    # temp file left behind, and the daemon never force-stopped.
+    HL2="$root/hl2"; mkdir -p "$HL2"
+    stage_live_upgrade "$HL2" liveno
+    printf 'n\n' >"$root/tty-no"
+    TTY_FILE="$root/tty-no"
+    run liveno "$HL2"
+    TTY_FILE=
+    check 1 "$rc" "declining aborts the install (R5.5)"
+    want_ok "the abort reports no executable was replaced (R5.5)" \
+        grep -q "no executables were replaced" "$OUT"
+    want_err "declining never force-stops (R5.5)" grep -qx "stop --force" "$HL2/stop.calls"
+    check "stale" "$(cat "$HL2/bin/minimald")" "the stale component is left in place (R5.5)"
+    want_err "no temp file survives the abort (R5.5)" ls "$HL2/bin/"*.tmp.* 2>/dev/null
 
-# No terminal to ask on (CI, a non-interactive shell): abort promptly naming the
-# escape hatch rather than hang on a read or destroy sessions unasked.
-HL3="$root/hl3"; mkdir -p "$HL3"
-stage_live_upgrade "$HL3" livenotty
-run livenotty "$HL3"
-check 1 "$rc" "an unconfirmable upgrade aborts (R5.5)"
-want_ok "the abort names the escape hatch (R5.5)" grep -q -- "--force-stop" "$OUT"
-want_err "nothing is asked without a terminal (R5.5)" grep -q "Continue?" "$OUT"
-want_err "an unconfirmable upgrade never force-stops (R5.5)" \
-    grep -qx "stop --force" "$HL3/stop.calls"
-check "stale" "$(cat "$HL3/bin/minimald")" "nothing is installed without confirmation (R5.5)"
+    # No terminal to ask on (CI, a non-interactive shell): abort promptly naming the
+    # escape hatch rather than hang on a read or destroy sessions unasked.
+    HL3="$root/hl3"; mkdir -p "$HL3"
+    stage_live_upgrade "$HL3" livenotty
+    run livenotty "$HL3"
+    check 1 "$rc" "an unconfirmable upgrade aborts (R5.5)"
+    want_ok "the abort names the escape hatch (R5.5)" grep -q -- "--force-stop" "$OUT"
+    want_err "nothing is asked without a terminal (R5.5)" grep -q "Continue?" "$OUT"
+    want_err "an unconfirmable upgrade never force-stops (R5.5)" \
+        grep -qx "stop --force" "$HL3/stop.calls"
+    check "stale" "$(cat "$HL3/bin/minimald")" "nothing is installed without confirmation (R5.5)"
 
-# The escape hatch as a flag: force-stop straight away, no question, no hang.
-HL4="$root/hl4"; mkdir -p "$HL4"
-stage_live_upgrade "$HL4" liveforce
-run liveforce "$HL4" --force-stop
-check 0 "$rc" "--force-stop upgrade exits 0 (R5.5)"
-want_err "--force-stop asks nothing (R5.5)" grep -q "Continue?" "$OUT"
-want_err "--force-stop skips the graceful stop (R5.5)" grep -qx "stop" "$HL4/stop.calls"
-want_ok "--force-stop force-stops (R5.5)" grep -qx "stop --force" "$HL4/stop.calls"
-check "$h_minimald" "$(hash_file "$HL4/bin/minimald")" "a forced upgrade completes (R5.5)"
+    # The escape hatch as a flag: force-stop straight away, no question, no hang.
+    HL4="$root/hl4"; mkdir -p "$HL4"
+    stage_live_upgrade "$HL4" liveforce
+    run liveforce "$HL4" --force-stop
+    check 0 "$rc" "--force-stop upgrade exits 0 (R5.5)"
+    want_err "--force-stop asks nothing (R5.5)" grep -q "Continue?" "$OUT"
+    want_err "--force-stop skips the graceful stop (R5.5)" grep -qx "stop" "$HL4/stop.calls"
+    want_ok "--force-stop force-stops (R5.5)" grep -qx "stop --force" "$HL4/stop.calls"
+    check "$h_minimald" "$(hash_file "$HL4/bin/minimald")" "a forced upgrade completes (R5.5)"
 
-# The same hatch through the environment, for a pipeline with no argv at all.
-HL5="$root/hl5"; mkdir -p "$HL5"
-stage_live_upgrade "$HL5" liveforceenv
-FORCE_STOP=1
-run liveforceenv "$HL5"
-FORCE_STOP=
-check 0 "$rc" "MINIMAL_INSTALL_FORCE_STOP upgrade exits 0 (R5.5)"
-want_err "the env hatch asks nothing (R5.5)" grep -q "Continue?" "$OUT"
-want_ok "the env hatch force-stops (R5.5)" grep -qx "stop --force" "$HL5/stop.calls"
+    # The same hatch through the environment, for a pipeline with no argv at all.
+    HL5="$root/hl5"; mkdir -p "$HL5"
+    stage_live_upgrade "$HL5" liveforceenv
+    FORCE_STOP=1
+    run liveforceenv "$HL5"
+    FORCE_STOP=
+    check 0 "$rc" "MINIMAL_INSTALL_FORCE_STOP upgrade exits 0 (R5.5)"
+    want_err "the env hatch asks nothing (R5.5)" grep -q "Continue?" "$OUT"
+    want_ok "the env hatch force-stops (R5.5)" grep -qx "stop --force" "$HL5/stop.calls"
 
-# The flag is filtered out of the arguments wherever it sits, so the target
-# positional still resolves (R2.1). Deliberately a NON-default target: with
-# `stable` a filter that dropped every positional would land on the default and
-# still look right.
-printf 'v1\n' >"$mock/unstable"
-HL6="$root/hl6"; mkdir -p "$HL6"
-stage_live_upgrade "$HL6" liveforcepos
-run liveforcepos "$HL6" unstable --force-stop
-check 0 "$rc" "target plus --force-stop exits 0 (R5.5/R2.1)"
-want_ok "the target survives the option filter (R2.1)" grep -q "target 'unstable'" "$OUT"
-want_ok "the trailing flag still force-stops (R5.5)" grep -qx "stop --force" "$HL6/stop.calls"
+    # The flag is filtered out of the arguments wherever it sits, so the target
+    # positional still resolves (R2.1). Deliberately a NON-default target: with
+    # `stable` a filter that dropped every positional would land on the default and
+    # still look right.
+    printf 'v1\n' >"$mock/unstable"
+    HL6="$root/hl6"; mkdir -p "$HL6"
+    stage_live_upgrade "$HL6" liveforcepos
+    run liveforcepos "$HL6" unstable --force-stop
+    check 0 "$rc" "target plus --force-stop exits 0 (R5.5/R2.1)"
+    want_ok "the target survives the option filter (R2.1)" grep -q "target 'unstable'" "$OUT"
+    want_ok "the trailing flag still force-stops (R5.5)" grep -qx "stop --force" "$HL6/stop.calls"
+}
 
-# --- Unit 9: shell-init files, rc hook, completions (R9.1-R9.3) -------------
-# A bash-login-shell install generates the three init files, hooks .bashrc
-# (creating it, since none exists in the fresh home), and produces completions
-# by running the installed bin/min itself.
-H7="$root/h7"; mkdir -p "$H7"
-TEST_SHELL=/bin/bash
-run shellinit "$H7"
-check 0 "$rc" "shell-init install exits 0"
-init7="$H7/xdg-data/minimal/shell-init"
-for f in bash.sh zsh.sh fish.fish; do
-    want_ok "init file $f generated (R9.1)" test -f "$init7/$f"
-done
-want_ok "init embeds the resolved bin dir (R9.1)" grep -q "$H7/bin" "$init7/bash.sh"
-want_ok "record lists the generated init files (R9.1/R6.1)" \
-    grep -q "shell-init-bash" "$H7/xdg-state/minimal/installed"
+case_shell_integration() {
+    # --- Unit 9: shell-init files, rc hook, completions (R9.1-R9.3) -------------
+    # A bash-login-shell install generates the three init files, hooks .bashrc
+    # (creating it, since none exists in the fresh home), and produces completions
+    # by running the installed bin/min itself.
+    H7="$root/h7"; mkdir -p "$H7"
+    TEST_SHELL=/bin/bash
+    run shellinit "$H7"
+    check 0 "$rc" "shell-init install exits 0"
+    init7="$H7/xdg-data/minimal/shell-init"
+    for f in bash.sh zsh.sh fish.fish; do
+        want_ok "init file $f generated (R9.1)" test -f "$init7/$f"
+    done
+    want_ok "init embeds the resolved bin dir (R9.1)" grep -q "$H7/bin" "$init7/bash.sh"
+    want_ok "record lists the generated init files (R9.1/R6.1)" \
+        grep -q "shell-init-bash" "$H7/xdg-state/minimal/installed"
 
-# Sourcing the init under plain sh prepends bin to PATH exactly once.
-p1="$(env -i PATH=/usr/bin:/bin HOME="$H7" sh -c ". '$init7/bash.sh'; printf %s \"\$PATH\"")"
-check "$H7/bin:/usr/bin:/bin" "$p1" "sourcing the init prepends bin to PATH (R9.1)"
-p2="$(env -i PATH="$H7/bin:/usr/bin:/bin" HOME="$H7" sh -c ". '$init7/bash.sh'; printf %s \"\$PATH\"")"
-check "$H7/bin:/usr/bin:/bin" "$p2" "init never duplicates an existing PATH entry (R9.1)"
+    # Sourcing the init under plain sh prepends bin to PATH exactly once.
+    p1="$(env -i PATH=/usr/bin:/bin HOME="$H7" sh -c ". '$init7/bash.sh'; printf %s \"\$PATH\"")"
+    check "$H7/bin:/usr/bin:/bin" "$p1" "sourcing the init prepends bin to PATH (R9.1)"
+    p2="$(env -i PATH="$H7/bin:/usr/bin:/bin" HOME="$H7" sh -c ". '$init7/bash.sh'; printf %s \"\$PATH\"")"
+    check "$H7/bin:/usr/bin:/bin" "$p2" "init never duplicates an existing PATH entry (R9.1)"
 
-# rc hook: created .bashrc carries exactly one marker-fenced block sourcing the
-# bash init; a rerun adds nothing (R9.2 idempotence).
-want_ok ".bashrc created with the marker block (R9.2)" grep -q '>>> minimal >>>' "$H7/.bashrc"
-want_ok "rc block sources the bash init (R9.2)" grep -q "shell-init/bash.sh" "$H7/.bashrc"
-run shellinit2 "$H7"
-check 0 "$rc" "shell-init rerun exits 0"
-check 1 "$(grep -c '>>> minimal >>>' "$H7/.bashrc")" "rerun adds no second rc block (R9.2)"
+    # rc hook: created .bashrc carries exactly one marker-fenced block sourcing the
+    # bash init; a rerun adds nothing (R9.2 idempotence).
+    want_ok ".bashrc created with the marker block (R9.2)" grep -q '>>> minimal >>>' "$H7/.bashrc"
+    want_ok "rc block sources the bash init (R9.2)" grep -q "shell-init/bash.sh" "$H7/.bashrc"
+    run shellinit2 "$H7"
+    check 0 "$rc" "shell-init rerun exits 0"
+    check 1 "$(grep -c '>>> minimal >>>' "$H7/.bashrc")" "rerun adds no second rc block (R9.2)"
 
-# Completions, installed by executing the installed mock min (R9.3).
-want_ok "bash completions written for min (R9.3)" \
-    grep -q "mock min completions for bash" "$H7/xdg-data/bash-completion/completions/min"
-want_ok "zsh completions written as _min (R9.3)" \
-    grep -q "mock min completions for zsh" "$H7/xdg-data/zsh/completions/_min"
-want_ok "fish completions written (R9.3)" \
-    grep -q "mock min completions for fish" "$H7/xdg-config/fish/completions/min.fish"
-want_ok "record lists the generated completions (R9.3/R6.1)" \
-    grep -q "completions-zsh" "$H7/xdg-state/minimal/installed"
-# The record's path column is the path the binary printed, per shell — the
-# whole contract of the delegation (R9.3).
-want_ok "record row carries the installed zsh path (R9.3)" \
-    record_has completions-zsh "$H7/xdg-data/zsh/completions/_min" \
-        "$H7/xdg-state/minimal/installed"
+    # Completions, installed by executing the installed mock min (R9.3).
+    want_ok "bash completions written for min (R9.3)" \
+        grep -q "mock min completions for bash" "$H7/xdg-data/bash-completion/completions/min"
+    want_ok "zsh completions written as _min (R9.3)" \
+        grep -q "mock min completions for zsh" "$H7/xdg-data/zsh/completions/_min"
+    want_ok "fish completions written (R9.3)" \
+        grep -q "mock min completions for fish" "$H7/xdg-config/fish/completions/min.fish"
+    want_ok "record lists the generated completions (R9.3/R6.1)" \
+        grep -q "completions-zsh" "$H7/xdg-state/minimal/installed"
+    # The record's path column is the path the binary printed, per shell — the
+    # whole contract of the delegation (R9.3).
+    want_ok "record row carries the installed zsh path (R9.3)" \
+        record_has completions-zsh "$H7/xdg-data/zsh/completions/_min" \
+            "$H7/xdg-state/minimal/installed"
 
-# The record is fed by what the binary PRINTS on stdout, not by a path table
-# the installer keeps: a min that installs somewhere the installer never
-# derives is still recorded (and so still uninstallable). That is the contract
-# between the two halves of R9.3.
-cat >"$mock/versions/v1/minimal-odd" <<'EOF'
+    # The record is fed by what the binary PRINTS on stdout, not by a path table
+    # the installer keeps: a min that installs somewhere the installer never
+    # derives is still recorded (and so still uninstallable). That is the contract
+    # between the two halves of R9.3.
+    cat >"$mock/versions/v1/minimal-odd" <<'EOF'
 #!/bin/sh
 # mock min that installs completions where it likes, and says so on stdout
 [ "${1:-}" = completions ] || exit 0
@@ -793,471 +837,587 @@ mkdir -p "$HOME/odd"
 printf '# odd completions for %s\n' "$3" >"$HOME/odd/$3-odd"
 printf '%s\n' "$HOME/odd/$3-odd"
 EOF
-chmod +x "$mock/versions/v1/minimal-odd"
-h_odd="$(hash_file "$mock/versions/v1/minimal-odd")"
-awk -v h="$h_odd" \
-    '$1=="minimal" && $2=="linux" {$5=h; $8="versions/v1/minimal-odd"} {print}' \
-    "$root/good-components" >"$mock/versions/v1/components"
-H16="$root/h16"; mkdir -p "$H16"
-run oddpaths "$H16"
-check 0 "$rc" "install exits 0 when min installs completions elsewhere (R9.3)"
-want_ok "the path the binary printed is what gets recorded (R9.3)" \
-    record_has completions-zsh "$H16/odd/zsh-odd" "$H16/xdg-state/minimal/installed"
-want_err "the installer records no path of its own devising (R9.3)" \
-    grep -q "bash-completion/completions/min" "$H16/xdg-state/minimal/installed"
-cp "$root/good-components" "$mock/versions/v1/components"   # restore
+    chmod +x "$mock/versions/v1/minimal-odd"
+    h_odd="$(hash_file "$mock/versions/v1/minimal-odd")"
+    awk -v h="$h_odd" \
+        '$1=="minimal" && $2=="linux" {$5=h; $8="versions/v1/minimal-odd"} {print}' \
+        "$root/good-components" >"$mock/versions/v1/components"
+    H16="$root/h16"; mkdir -p "$H16"
+    run oddpaths "$H16"
+    check 0 "$rc" "install exits 0 when min installs completions elsewhere (R9.3)"
+    want_ok "the path the binary printed is what gets recorded (R9.3)" \
+        record_has completions-zsh "$H16/odd/zsh-odd" "$H16/xdg-state/minimal/installed"
+    want_err "the installer records no path of its own devising (R9.3)" \
+        grep -q "bash-completion/completions/min" "$H16/xdg-state/minimal/installed"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
 
-# Both existing bash rc files are hooked, and user content is preserved.
-H8="$root/h8"; mkdir -p "$H8"
-printf '# my bashrc\n' >"$H8/.bashrc"
-printf '# my bash_profile\n' >"$H8/.bash_profile"
-run bashboth "$H8"
-want_ok "existing .bashrc hooked (R9.2)" grep -q '>>> minimal >>>' "$H8/.bashrc"
-want_ok "existing .bash_profile hooked too (R9.2)" grep -q '>>> minimal >>>' "$H8/.bash_profile"
-want_ok "user rc content preserved (R9.2)" grep -q '# my bashrc' "$H8/.bashrc"
+    # Both existing bash rc files are hooked, and user content is preserved.
+    HS_B="$root/hs_b"; mkdir -p "$HS_B"
+    printf '# my bashrc\n' >"$HS_B/.bashrc"
+    printf '# my bash_profile\n' >"$HS_B/.bash_profile"
+    run bashboth "$HS_B"
+    want_ok "existing .bashrc hooked (R9.2)" grep -q '>>> minimal >>>' "$HS_B/.bashrc"
+    want_ok "existing .bash_profile hooked too (R9.2)" grep -q '>>> minimal >>>' "$HS_B/.bash_profile"
+    want_ok "user rc content preserved (R9.2)" grep -q '# my bashrc' "$HS_B/.bashrc"
 
-# zsh and fish get their own rc files (created when missing); an unknown shell
-# falls back to .profile with the POSIX init.
-H9="$root/h9"; mkdir -p "$H9"
-TEST_SHELL=/usr/bin/zsh
-run zshinit "$H9"
-want_ok ".zshrc created and hooked (R9.2)" grep -q "shell-init/zsh.sh" "$H9/.zshrc"
-want_ok "zsh init wires fpath completions (R9.1)" \
-    grep -q "fpath=" "$H9/xdg-data/minimal/shell-init/zsh.sh"
-want_ok "zsh init self-heals a stale compinit dump (R9.1)" \
-    grep -q '_comps\[min\]' "$H9/xdg-data/minimal/shell-init/zsh.sh"
-H10="$root/h10"; mkdir -p "$H10"
-TEST_SHELL=/usr/bin/fish
-run fishinit "$H10"
-want_ok "config.fish created and hooked (R9.2)" \
-    grep -q "shell-init/fish.fish" "$H10/xdg-config/fish/config.fish"
-H11="$root/h11"; mkdir -p "$H11"
-TEST_SHELL=/bin/ksh
-run kshinit "$H11"
-want_ok "unknown shell falls back to .profile (R9.2)" grep -q "shell-init/bash.sh" "$H11/.profile"
-TEST_SHELL=
-
-# Upgrade from the pre-rewrite installer: its rc block used the same markers
-# but sources ~/.minimal/shim/shell-init, so an unreplaced block leaves PATH
-# and completions silently dead. The markers are ours to own (R9.2): a stale
-# block is swapped for the current one, exactly once, preserving the user's
-# own rc content on both sides of it.
-H14="$root/h14"; mkdir -p "$H14"
-{
-    printf '# my zshrc\n'
-    printf '\n# >>> minimal >>>\n'
-    # The old installer wrote a literal $HOME, hence the single quotes.
-    # shellcheck disable=SC2016
-    printf '[ -f "$HOME/.minimal/shim/shell-init/zsh.sh" ] && . "$HOME/.minimal/shim/shell-init/zsh.sh"\n'
-    printf '# <<< minimal <<<\n'
-    printf '\n# added after the old install\n'
-} >"$H14/.zshrc"
-# A compinit dump from the old install: its (version, file count) header can
-# keep matching after the completions-dir swap, so compinit would trust it and
-# never see the new _min. The install must drop it when it (re)writes the zsh
-# completions.
-printf '#files: 1 version: 5.9\n' >"$H14/.zcompdump"
-TEST_SHELL=/usr/bin/zsh
-run oldblock "$H14"
-check 0 "$rc" "upgrade over old rc block exits 0"
-want_err "stale compinit dump dropped on upgrade (R9.3)" test -e "$H14/.zcompdump"
-want_ok "dump drop announced (R9.3)" grep -q "cleared compinit dump cache" "$OUT"
-want_ok "stale block replacement announced (R9.2)" grep -qE "shell-init +replaced" "$OUT"
-check 1 "$(grep -c '>>> minimal >>>' "$H14/.zshrc")" "exactly one marker block after upgrade (R9.2)"
-want_ok "block now sources the current zsh init (R9.2)" grep -q "shell-init/zsh.sh" "$H14/.zshrc"
-want_err "no reference to the old shim path remains (R9.2)" grep -q '\.minimal/shim' "$H14/.zshrc"
-want_ok "user content before the old block preserved (R9.2)" grep -q '# my zshrc' "$H14/.zshrc"
-want_ok "user content after the old block preserved (R9.2)" \
-    grep -q '# added after the old install' "$H14/.zshrc"
-run oldblock2 "$H14"
-check 0 "$rc" "rerun after replacement exits 0"
-want_err "rerun rewrites nothing (R9.2)" grep -qE "shell-init +(added|replaced)" "$OUT"
-check 1 "$(grep -c '>>> minimal >>>' "$H14/.zshrc")" "rerun keeps a single marker block (R9.2)"
-want_err "no dump means no drop announcement on rerun (R9.3)" \
-    grep -q "cleared compinit dump cache" "$OUT"
-TEST_SHELL=
-
-# A start marker whose end marker was lost to a hand edit must never cost the
-# user the tail of their rc file: the strip refuses (the naive filter would
-# drop everything from the marker to EOF), the install warns with the manual
-# line, appends nothing, and still exits 0. Uninstall likewise keeps the file.
-H15="$root/h15"; mkdir -p "$H15"
-{
-    printf '# my zshrc\n'
-    printf '# >>> minimal >>>\n'
-    printf '# end marker lost in a hand edit\n'
-    printf 'alias important=stuff\n'
-} >"$H15/.zshrc"
-TEST_SHELL=/usr/bin/zsh
-run unterminated "$H15"
-check 0 "$rc" "unterminated marker block is non-fatal on install (R9.2)"
-want_ok "warning names the broken block (R9.2)" \
-    grep -q "unterminated minimal block" "$OUT"
-want_ok "manual line still offered (R9.2)" grep -q "shell-init/zsh.sh" "$OUT"
-want_err "nothing appended after the stray marker (R9.2)" \
-    grep -q "shell-init/zsh.sh" "$H15/.zshrc"
-want_ok "rc tail survives (R9.2)" grep -q "alias important=stuff" "$H15/.zshrc"
-want_ok "binaries still installed (R9.2)" test -x "$H15/bin/min"
-run untermuninst "$H15" --uninstall
-check 0 "$rc" "uninstall over unterminated block exits 0 (R9.4)"
-want_ok "uninstall warns about the broken block (R9.4)" \
-    grep -q "unterminated minimal block" "$OUT"
-want_ok "uninstall keeps the rc tail (R9.4)" grep -q "alias important=stuff" "$H15/.zshrc"
-# The block survived, so the record must survive with it. The record is the only
-# inventory a later run has and `--uninstall` reads a missing one as "nothing to
-# undo", so dropping it here would strand the stray block permanently.
-want_ok "record retained while a shell block remains (R9.4)" \
-    test -f "$H15/xdg-state/minimal/installed"
-want_ok "record retention is announced (R9.4)" grep -q "kept install record" "$OUT"
-# ...and the retention is worth something: repair the marker by hand and a second
-# uninstall finishes the job, block and record both.
-{
-    printf '# my zshrc\n'
-    printf '# >>> minimal >>>\n'
-    printf '# end marker restored by hand\n'
-    printf '# <<< minimal <<<\n'
-    printf 'alias important=stuff\n'
-} >"$H15/.zshrc"
-TEST_SHELL=/usr/bin/zsh
-run untermretry "$H15" --uninstall
-check 0 "$rc" "uninstall retry over a repaired block exits 0 (R9.4)"
-want_err "repaired block is stripped on the retry (R9.4)" \
-    grep -q '>>> minimal >>>' "$H15/.zshrc"
-want_ok "retry keeps the rc tail (R9.4)" grep -q "alias important=stuff" "$H15/.zshrc"
-want_err "record removed once the footprint is fully gone (R9.4)" \
-    test -f "$H15/xdg-state/minimal/installed"
-TEST_SHELL=
-
-# A manifest without the min CLI (data-only) skips completions, non-fatally.
-want_ok "completions skipped when min absent (R9.3)" \
-    grep -qE "completions +skipped" "$root/out.datadest"
-
-# A read-only rc file degrades to a warning: the install itself already
-# succeeded and must still exit 0, with the PATH advisory still printed.
-# (Root ignores file modes, so the scenario can't be staged there.)
-if [ "$(id -u)" -ne 0 ]; then
-    H12="$root/h12"; mkdir -p "$H12"
-    printf '# locked down\n' >"$H12/.bashrc"
-    chmod 444 "$H12/.bashrc"
-    TEST_SHELL=/bin/bash
-    run rcreadonly "$H12"
-    check 0 "$rc" "unwritable rc is non-fatal (R9.2)"
-    want_ok "warning names the unwritable rc (R9.2)" \
-        grep -q "failed to hook minimal shell support" "$OUT"
-    want_ok "warning shows the line to add by hand (R9.2)" \
-        grep -q "shell-init/bash.sh" "$OUT"
-    want_err "read-only rc left untouched (R9.2)" grep -q '>>> minimal >>>' "$H12/.bashrc"
-    want_ok "binaries still installed despite rc failure (R9.2)" test -x "$H12/bin/min"
-    want_ok "PATH advisory still printed after rc failure (R6.2)" \
-        grep -q "is not on your PATH" "$OUT"
-    want_err "no raw shell error leaks on rc failure (R9.2)" \
-        grep -qi "permission denied" "$OUT"
+    # zsh and fish get their own rc files (created when missing); an unknown shell
+    # falls back to .profile with the POSIX init.
+    HS_Z="$root/hs_z"; mkdir -p "$HS_Z"
+    TEST_SHELL=/usr/bin/zsh
+    run zshinit "$HS_Z"
+    want_ok ".zshrc created and hooked (R9.2)" grep -q "shell-init/zsh.sh" "$HS_Z/.zshrc"
+    want_ok "zsh init wires fpath completions (R9.1)" \
+        grep -q "fpath=" "$HS_Z/xdg-data/minimal/shell-init/zsh.sh"
+    want_ok "zsh init self-heals a stale compinit dump (R9.1)" \
+        grep -q '_comps\[min\]' "$HS_Z/xdg-data/minimal/shell-init/zsh.sh"
+    H10="$root/h10"; mkdir -p "$H10"
+    TEST_SHELL=/usr/bin/fish
+    run fishinit "$H10"
+    want_ok "config.fish created and hooked (R9.2)" \
+        grep -q "shell-init/fish.fish" "$H10/xdg-config/fish/config.fish"
+    H11="$root/h11"; mkdir -p "$H11"
+    TEST_SHELL=/bin/ksh
+    run kshinit "$H11"
+    want_ok "unknown shell falls back to .profile (R9.2)" grep -q "shell-init/bash.sh" "$H11/.profile"
     TEST_SHELL=
 
-    # An unwritable completion dir (e.g. a root-owned ~/.config/fish/completions
-    # left by another tool) degrades to a warning naming the dir: the install
-    # still exits 0, the other shells' completions still land, and the shell's
-    # own redirection error is not leaked to the user.
-    H13="$root/h13"; mkdir -p "$H13/xdg-config/fish/completions"
-    chmod 555 "$H13/xdg-config/fish/completions"
-    run compreadonly "$H13"
-    chmod 755 "$H13/xdg-config/fish/completions"   # restore for later cleanup
-    check 0 "$rc" "unwritable completion dir is non-fatal (R9.3)"
-    # The binary warns on stderr; the installer relays it in its own voice.
-    want_ok "warning names the unwritable completion dir (R9.3)" \
-        grep -q "completions: warning: failed to install fish completions" "$OUT"
-    want_err "no raw shell error leaks on completion failure (R9.3)" \
-        grep -qi "permission denied" "$OUT"
-    want_ok "other shells' completions still installed (R9.3)" \
-        test -f "$H13/xdg-data/bash-completion/completions/min"
-    want_err "nothing written into the unwritable dir (R9.3)" \
-        ls "$H13/xdg-config/fish/completions/"* 2>/dev/null
-fi
+    # Upgrade from the pre-rewrite installer: its rc block used the same markers
+    # but sources ~/.minimal/shim/shell-init, so an unreplaced block leaves PATH
+    # and completions silently dead. The markers are ours to own (R9.2): a stale
+    # block is swapped for the current one, exactly once, preserving the user's
+    # own rc content on both sides of it.
+    H14="$root/h14"; mkdir -p "$H14"
+    {
+        printf '# my zshrc\n'
+        printf '\n# >>> minimal >>>\n'
+        # The old installer wrote a literal $HOME, hence the single quotes.
+        # shellcheck disable=SC2016
+        printf '[ -f "$HOME/.minimal/shim/shell-init/zsh.sh" ] && . "$HOME/.minimal/shim/shell-init/zsh.sh"\n'
+        printf '# <<< minimal <<<\n'
+        printf '\n# added after the old install\n'
+    } >"$H14/.zshrc"
+    # A compinit dump from the old install: its (version, file count) header can
+    # keep matching after the completions-dir swap, so compinit would trust it and
+    # never see the new _min. The install must drop it when it (re)writes the zsh
+    # completions.
+    printf '#files: 1 version: 5.9\n' >"$H14/.zcompdump"
+    TEST_SHELL=/usr/bin/zsh
+    run oldblock "$H14"
+    check 0 "$rc" "upgrade over old rc block exits 0"
+    want_err "stale compinit dump dropped on upgrade (R9.3)" test -e "$H14/.zcompdump"
+    want_ok "dump drop announced (R9.3)" grep -q "cleared compinit dump cache" "$OUT"
+    want_ok "stale block replacement announced (R9.2)" grep -qE "shell-init +replaced" "$OUT"
+    check 1 "$(grep -c '>>> minimal >>>' "$H14/.zshrc")" "exactly one marker block after upgrade (R9.2)"
+    want_ok "block now sources the current zsh init (R9.2)" grep -q "shell-init/zsh.sh" "$H14/.zshrc"
+    want_err "no reference to the old shim path remains (R9.2)" grep -q '\.minimal/shim' "$H14/.zshrc"
+    want_ok "user content before the old block preserved (R9.2)" grep -q '# my zshrc' "$H14/.zshrc"
+    want_ok "user content after the old block preserved (R9.2)" \
+        grep -q '# added after the old install' "$H14/.zshrc"
+    run oldblock2 "$H14"
+    check 0 "$rc" "rerun after replacement exits 0"
+    want_err "rerun rewrites nothing (R9.2)" grep -qE "shell-init +(added|replaced)" "$OUT"
+    check 1 "$(grep -c '>>> minimal >>>' "$H14/.zshrc")" "rerun keeps a single marker block (R9.2)"
+    want_err "no dump means no drop announcement on rerun (R9.3)" \
+        grep -q "cleared compinit dump cache" "$OUT"
+    TEST_SHELL=
 
-# --- Unit 5 (darwin): dequarantine Mach-O bin/lib components ---------------
-# Force a darwin/arm64 platform (via the uname stub) so this runs on every lane.
-# The applicable rows are then `minimal` (bin) and `rootfs` (data). A bin file
-# must be quarantine-stripped; a data file must not be. Release artifacts are
-# Developer ID signed at build time, so the installer does NO local signing —
-# it places the downloaded bytes verbatim.
-PLAT_S=Darwin
-PLAT_M=arm64
-: >"$root/xattr.calls"
-HD="$root/hd"; mkdir -p "$HD"
-reset_dl
-run darwin1 "$HD"
-check 0 "$rc" "darwin install exits 0"
-want_ok "darwin bin component installed" test -f "$HD/bin/min"
-want_ok "quarantine stripped from bin (xattr)" grep -q "/bin/min\.tmp" "$root/xattr.calls"
-want_err "data component not dequarantined" grep -q "rootfs" "$root/xattr.calls"
+    # A start marker whose end marker was lost to a hand edit must never cost the
+    # user the tail of their rc file: the strip refuses (the naive filter would
+    # drop everything from the marker to EOF), the install warns with the manual
+    # line, appends nothing, and still exits 0. Uninstall likewise keeps the file.
+    H15="$root/h15"; mkdir -p "$H15"
+    {
+        printf '# my zshrc\n'
+        printf '# >>> minimal >>>\n'
+        printf '# end marker lost in a hand edit\n'
+        printf 'alias important=stuff\n'
+    } >"$H15/.zshrc"
+    TEST_SHELL=/usr/bin/zsh
+    run unterminated "$H15"
+    check 0 "$rc" "unterminated marker block is non-fatal on install (R9.2)"
+    want_ok "warning names the broken block (R9.2)" \
+        grep -q "unterminated minimal block" "$OUT"
+    want_ok "manual line still offered (R9.2)" grep -q "shell-init/zsh.sh" "$OUT"
+    want_err "nothing appended after the stray marker (R9.2)" \
+        grep -q "shell-init/zsh.sh" "$H15/.zshrc"
+    want_ok "rc tail survives (R9.2)" grep -q "alias important=stuff" "$H15/.zshrc"
+    want_ok "binaries still installed (R9.2)" test -x "$H15/bin/min"
+    run untermuninst "$H15" --uninstall
+    check 0 "$rc" "uninstall over unterminated block exits 0 (R9.4)"
+    want_ok "uninstall warns about the broken block (R9.4)" \
+        grep -q "unterminated minimal block" "$OUT"
+    want_ok "uninstall keeps the rc tail (R9.4)" grep -q "alias important=stuff" "$H15/.zshrc"
+    # The block survived, so the record must survive with it. The record is the only
+    # inventory a later run has and `--uninstall` reads a missing one as "nothing to
+    # undo", so dropping it here would strand the stray block permanently.
+    want_ok "record retained while a shell block remains (R9.4)" \
+        test -f "$H15/xdg-state/minimal/installed"
+    want_ok "record retention is announced (R9.4)" grep -q "kept install record" "$OUT"
+    # ...and the retention is worth something: repair the marker by hand and a second
+    # uninstall finishes the job, block and record both.
+    {
+        printf '# my zshrc\n'
+        printf '# >>> minimal >>>\n'
+        printf '# end marker restored by hand\n'
+        printf '# <<< minimal <<<\n'
+        printf 'alias important=stuff\n'
+    } >"$H15/.zshrc"
+    TEST_SHELL=/usr/bin/zsh
+    run untermretry "$H15" --uninstall
+    check 0 "$rc" "uninstall retry over a repaired block exits 0 (R9.4)"
+    want_err "repaired block is stripped on the retry (R9.4)" \
+        grep -q '>>> minimal >>>' "$H15/.zshrc"
+    want_ok "retry keeps the rc tail (R9.4)" grep -q "alias important=stuff" "$H15/.zshrc"
+    want_err "record removed once the footprint is fully gone (R9.4)" \
+        test -f "$H15/xdg-state/minimal/installed"
+    TEST_SHELL=
 
-# A darwin `lib` dylib gets the SAME dequarantine treatment as a bin file so the
-# shipped libkrun.1.dylib runs without a Gatekeeper prompt. Isolated home +
-# one-off manifest with a single darwin lib row, so it doesn't perturb the rerun
-# counts below.
-{
-    printf '# format: 1\n'
-    printf '# c o a v s k d s\n'
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-        libkrun darwin arm64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-arm64.img
-} >"$mock/versions/v1/components"
-: >"$root/xattr.calls"
-HDL="$root/hdl"; mkdir -p "$HDL"
-reset_dl
-run darwinlib "$HDL"
-check 0 "$rc" "darwin lib install exits 0"
-want_ok "darwin lib dylib installed" test -f "$HDL/.local/lib/libkrun.1.dylib"
-want_ok "quarantine stripped from lib dylib (xattr)" \
-    grep -q "/lib/libkrun.1.dylib" "$root/xattr.calls"
-cp "$root/good-components" "$mock/versions/v1/components"   # restore
-: >"$root/xattr.calls"
 
-# The installer places the artifact bytes verbatim, so the on-disk hash equals
-# the manifest hash. A rerun recognizes the component as already installed and
-# downloads nothing (Goal 2 — cheap reruns).
-reset_dl
-run darwin2 "$HD"
-check 0 "$rc" "darwin rerun exits 0"
-check 0 "$(downloads)" "darwin bin: rerun downloads nothing"
+    # A read-only rc file degrades to a warning: the install itself already
+    # succeeded and must still exit 0, with the PATH advisory still printed.
+    # (Root ignores file modes, so the scenario can't be staged there.)
+    if [ "$(id -u)" -ne 0 ]; then
+        H12="$root/h12"; mkdir -p "$H12"
+        printf '# locked down\n' >"$H12/.bashrc"
+        chmod 444 "$H12/.bashrc"
+        TEST_SHELL=/bin/bash
+        run rcreadonly "$H12"
+        check 0 "$rc" "unwritable rc is non-fatal (R9.2)"
+        want_ok "warning names the unwritable rc (R9.2)" \
+            grep -q "failed to hook minimal shell support" "$OUT"
+        want_ok "warning shows the line to add by hand (R9.2)" \
+            grep -q "shell-init/bash.sh" "$OUT"
+        want_err "read-only rc left untouched (R9.2)" grep -q '>>> minimal >>>' "$H12/.bashrc"
+        want_ok "binaries still installed despite rc failure (R9.2)" test -x "$H12/bin/min"
+        want_ok "PATH advisory still printed after rc failure (R6.2)" \
+            grep -q "is not on your PATH" "$OUT"
+        want_err "no raw shell error leaks on rc failure (R9.2)" \
+            grep -qi "permission denied" "$OUT"
+        TEST_SHELL=
 
-# A NEW release (its manifest sha256 changes) is re-downloaded rather than judged
-# up to date, since the on-disk bytes no longer match the new manifest hash.
-printf 'darwin-arm64-minimal-body-v2\n' >"$mock/versions/v1/minimal-darwin-arm64-v2"
-h_dmin2="$(hash_file "$mock/versions/v1/minimal-darwin-arm64-v2")"
-awk -v h="$h_dmin2" \
-    '$1=="minimal" && $2=="darwin" {$5=h; $8="versions/v1/minimal-darwin-arm64-v2"} {print}' \
-    "$root/good-components" >"$mock/versions/v1/components"
-reset_dl
-run darwin3 "$HD"
-check 0 "$rc" "darwin new-version rerun exits 0"
-check 1 "$(downloads)" "new manifest hash re-downloads the darwin bin"
-# The v2 artifact is an opaque body, not a runnable script: completion
-# generation must degrade to a warning, not fail the install (R9.3).
-want_ok "unrunnable min degrades to a completions warning (R9.3)" \
-    grep -q "could not generate" "$OUT"
-cp "$root/good-components" "$mock/versions/v1/components"   # restore
-PLAT_S=Linux
-PLAT_M=x86_64
+        # An unwritable completion dir (e.g. a root-owned ~/.config/fish/completions
+        # left by another tool) degrades to a warning naming the dir: the install
+        # still exits 0, the other shells' completions still land, and the shell's
+        # own redirection error is not leaked to the user.
+        H13="$root/h13"; mkdir -p "$H13/xdg-config/fish/completions"
+        chmod 555 "$H13/xdg-config/fish/completions"
+        run compreadonly "$H13"
+        chmod 755 "$H13/xdg-config/fish/completions"   # restore for later cleanup
+        check 0 "$rc" "unwritable completion dir is non-fatal (R9.3)"
+        # The binary warns on stderr; the installer relays it in its own voice.
+        want_ok "warning names the unwritable completion dir (R9.3)" \
+            grep -q "completions: warning: failed to install fish completions" "$OUT"
+        want_err "no raw shell error leaks on completion failure (R9.3)" \
+            grep -qi "permission denied" "$OUT"
+        want_ok "other shells' completions still installed (R9.3)" \
+            test -f "$H13/xdg-data/bash-completion/completions/min"
+        want_err "nothing written into the unwritable dir (R9.3)" \
+            ls "$H13/xdg-config/fish/completions/"* 2>/dev/null
+    fi
+}
 
-# --- Units 7-8: uninstall (walk the install record and undo it) ------------
-# Uninstall is offline and driven solely by the record the install wrote (R6.1).
-# Each scenario seeds a fresh home with a normal linux/amd64 install (placing
-# bin/minimald + bin/minimal and the record), then exercises one uninstall path.
+case_darwin_dequarantine() {
+    # --- Unit 5 (darwin): dequarantine Mach-O bin/lib components ---------------
+    # Force a darwin/arm64 platform (via the uname stub) so this runs on every lane.
+    # The applicable rows are then `minimal` (bin) and `rootfs` (data). A bin file
+    # must be quarantine-stripped; a data file must not be. Release artifacts are
+    # Developer ID signed at build time, so the installer does NO local signing —
+    # it places the downloaded bytes verbatim.
+    PLAT_S=Darwin
+    PLAT_M=arm64
+    : >"$root/xattr.calls"
+    HD="$root/hd"; mkdir -p "$HD"
+    reset_dl
+    run darwin1 "$HD"
+    check 0 "$rc" "darwin install exits 0"
+    want_ok "darwin bin component installed" test -f "$HD/bin/min"
+    want_ok "quarantine stripped from bin (xattr)" grep -q "/bin/min\.tmp" "$root/xattr.calls"
+    want_err "data component not dequarantined" grep -q "rootfs" "$root/xattr.calls"
 
-# R7.3/R8.1 — basic uninstall removes every recorded file, the record, and prunes
-# the now-empty owned dirs.
-HU="$root/hu"; mkdir -p "$HU"
-run u_install "$HU"
-check 0 "$rc" "uninstall: seed install exits 0"
-urec="$HU/xdg-state/minimal/installed"
-want_ok "uninstall: seed wrote the record" test -f "$urec"
-run u_basic "$HU" --uninstall
-check 0 "$rc" "uninstall exits 0 (R8.4)"
-want_err "uninstall removed minimald (R7.3)" test -e "$HU/bin/minimald"
-want_err "uninstall removed min (R7.3)" test -e "$HU/bin/min"
-want_err "uninstall removed the git-remote-min symlink (R7.3)" test -L "$HU/bin/git-remote-min"
-want_err "uninstall removed the record (R8.1)" test -e "$urec"
-want_ok "uninstall prints a summary" grep -q "uninstall:" "$OUT"
-want_err "empty bin dir pruned (R8.1)" test -d "$HU/bin"
-want_err "empty state dir pruned (R8.1)" test -d "$HU/xdg-state/minimal"
-# R7.2 — a second uninstall (record now gone) is a clean no-op.
-run u_again "$HU" --uninstall
-check 0 "$rc" "second uninstall is a clean no-op (R7.2)"
-want_ok "no-op names the missing record (R7.2)" grep -q "nothing to uninstall" "$OUT"
+    # A darwin `lib` dylib gets the SAME dequarantine treatment as a bin file so the
+    # shipped libkrun.1.dylib runs without a Gatekeeper prompt. Isolated home +
+    # one-off manifest with a single darwin lib row, so it doesn't perturb the rerun
+    # counts below.
+    {
+        printf '# format: 1\n'
+        printf '# c o a v s k d s\n'
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            libkrun darwin arm64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-arm64.img
+    } >"$mock/versions/v1/components"
+    : >"$root/xattr.calls"
+    HDL="$root/hdl"; mkdir -p "$HDL"
+    reset_dl
+    run darwinlib "$HDL"
+    check 0 "$rc" "darwin lib install exits 0"
+    want_ok "darwin lib dylib installed" test -f "$HDL/.local/lib/libkrun.1.dylib"
+    want_ok "quarantine stripped from lib dylib (xattr)" \
+        grep -q "/lib/libkrun.1.dylib" "$root/xattr.calls"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+    : >"$root/xattr.calls"
 
-# R7.3/R7.4 — a file modified since install is KEPT (its bytes no longer match the
-# recorded hash), and the record is retained so --force can still reach it.
-HU2="$root/hu2"; mkdir -p "$HU2"
-run u2_install "$HU2"
-urec2="$HU2/xdg-state/minimal/installed"
-printf 'my own build\n' >"$HU2/bin/minimald"      # user replaced a binary
-run u2_keep "$HU2" --uninstall
-check 0 "$rc" "uninstall with a modified file exits 0 (R8.4)"
-want_ok "modified file kept (R7.3)" test -f "$HU2/bin/minimald"
-want_ok "keep is reported (R7.3)" grep -qE "kept +modified since install" "$OUT"
-want_err "unmodified sibling still removed (R7.3)" test -e "$HU2/bin/min"
-want_ok "record retained while entries remain (R8.1)" test -f "$urec2"
-# --force then removes the modified file and, footprint clear, drops the record.
-run u2_force "$HU2" --uninstall --force
-check 0 "$rc" "uninstall --force exits 0"
-want_err "modified file removed under --force (R7.3)" test -e "$HU2/bin/minimald"
-want_err "record removed once footprint is gone (R8.1)" test -e "$urec2"
+    # The installer places the artifact bytes verbatim, so the on-disk hash equals
+    # the manifest hash. A rerun recognizes the component as already installed and
+    # downloads nothing (Goal 2 — cheap reruns).
+    reset_dl
+    run darwin2 "$HD"
+    check 0 "$rc" "darwin rerun exits 0"
+    check 0 "$(downloads)" "darwin bin: rerun downloads nothing"
 
-# R7.2 — uninstall on a home that never installed anything exits 0, does nothing.
-HU3="$root/hu3"; mkdir -p "$HU3"
-run u3_noop "$HU3" --uninstall
-check 0 "$rc" "uninstall with no record exits 0 (R7.2)"
-want_ok "no-op names the missing record" grep -q "nothing to uninstall" "$OUT"
+    # A NEW release (its manifest sha256 changes) is re-downloaded rather than judged
+    # up to date, since the on-disk bytes no longer match the new manifest hash.
+    printf 'darwin-arm64-minimal-body-v2\n' >"$mock/versions/v1/minimal-darwin-arm64-v2"
+    h_dmin2="$(hash_file "$mock/versions/v1/minimal-darwin-arm64-v2")"
+    awk -v h="$h_dmin2" \
+        '$1=="minimal" && $2=="darwin" {$5=h; $8="versions/v1/minimal-darwin-arm64-v2"} {print}' \
+        "$root/good-components" >"$mock/versions/v1/components"
+    reset_dl
+    run darwin3 "$HD"
+    check 0 "$rc" "darwin new-version rerun exits 0"
+    check 1 "$(downloads)" "new manifest hash re-downloads the darwin bin"
+    # The v2 artifact is an opaque body, not a runnable script: completion
+    # generation must degrade to a warning, not fail the install (R9.3).
+    want_ok "unrunnable min degrades to a completions warning (R9.3)" \
+        grep -q "could not generate" "$OUT"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+    PLAT_S=Linux
+    PLAT_M=x86_64
+}
 
-# R8.3 — --dry-run removes nothing and leaves the record; a real run still cleans.
-HU4="$root/hu4"; mkdir -p "$HU4"
-run u4_install "$HU4"
-urec4="$HU4/xdg-state/minimal/installed"
-run u4_dry "$HU4" --uninstall --dry-run
-check 0 "$rc" "uninstall --dry-run exits 0 (R8.3)"
-want_ok "dry-run keeps minimald (R8.3)" test -f "$HU4/bin/minimald"
-want_ok "dry-run keeps the record (R8.3)" test -f "$urec4"
-want_ok "dry-run announces itself (R8.3)" grep -q "dry run" "$OUT"
-run u4_real "$HU4" --uninstall
-want_err "real uninstall after dry-run removes minimald" test -e "$HU4/bin/minimald"
+case_uninstall() {
+    # --- Units 7-8: uninstall (walk the install record and undo it) ------------
+    # Uninstall is offline and driven solely by the record the install wrote (R6.1).
+    # Each scenario seeds a fresh home with a normal linux/amd64 install (placing
+    # bin/minimald + bin/minimal and the record), then exercises one uninstall path.
 
-# R8.2 — plain uninstall leaves an unrelated build artifact in the cache tree;
-# --purge removes the whole minimal-owned cache tree.
-HU5="$root/hu5"; mkdir -p "$HU5"
-run u5_install "$HU5"
-stray="$HU5/xdg-cache/minimal/built/deadbeef"
-mkdir -p "$HU5/xdg-cache/minimal/built"; printf 'artifact\n' >"$stray"
-run u5_plain "$HU5" --uninstall
-want_ok "plain uninstall leaves the build cache (R8.2)" test -f "$stray"
-run u5_reinstall "$HU5"
-run u5_purge "$HU5" --uninstall --purge
-check 0 "$rc" "uninstall --purge exits 0"
-want_err "purge removes the cache tree (R8.2)" test -e "$HU5/xdg-cache/minimal"
+    # R7.3/R8.1 — basic uninstall removes every recorded file, the record, and prunes
+    # the now-empty owned dirs.
+    HU="$root/hu"; mkdir -p "$HU"
+    run u_install "$HU"
+    check 0 "$rc" "uninstall: seed install exits 0"
+    urec="$HU/xdg-state/minimal/installed"
+    want_ok "uninstall: seed wrote the record" test -f "$urec"
+    run u_basic "$HU" --uninstall
+    check 0 "$rc" "uninstall exits 0 (R8.4)"
+    want_err "uninstall removed minimald (R7.3)" test -e "$HU/bin/minimald"
+    want_err "uninstall removed min (R7.3)" test -e "$HU/bin/min"
+    want_err "uninstall removed the git-remote-min symlink (R7.3)" test -L "$HU/bin/git-remote-min"
+    want_err "uninstall removed the record (R8.1)" test -e "$urec"
+    want_ok "uninstall prints a summary" grep -q "uninstall:" "$OUT"
+    want_err "empty bin dir pruned (R8.1)" test -d "$HU/bin"
+    want_err "empty state dir pruned (R8.1)" test -d "$HU/xdg-state/minimal"
+    # R7.2 — a second uninstall (record now gone) is a clean no-op.
+    run u_again "$HU" --uninstall
+    check 0 "$rc" "second uninstall is a clean no-op (R7.2)"
+    want_ok "no-op names the missing record (R7.2)" grep -q "nothing to uninstall" "$OUT"
 
-# R7.3 — a non-regular file now occupying a recorded path is never removed, even
-# with --force (the installer only ever wrote regular files there).
-HU6="$root/hu6"; mkdir -p "$HU6"
-run u6_install "$HU6"
-urec6="$HU6/xdg-state/minimal/installed"
-rm -f "$HU6/bin/minimald"; mkdir -p "$HU6/bin/minimald"   # a dir now sits there
-run u6_foreign "$HU6" --uninstall --force
-check 0 "$rc" "uninstall over a non-regular path exits 0 (R7.3)"
-want_ok "directory at a recorded path is left alone (R7.3)" test -d "$HU6/bin/minimald"
-want_ok "foreign entry is reported (R7.3)" grep -q "not a regular file" "$OUT"
-want_ok "record retained due to the foreign entry (R8.1)" test -f "$urec6"
+    # R7.3/R7.4 — a file modified since install is KEPT (its bytes no longer match the
+    # recorded hash), and the record is retained so --force can still reach it.
+    HU2="$root/hu2"; mkdir -p "$HU2"
+    run u2_install "$HU2"
+    urec2="$HU2/xdg-state/minimal/installed"
+    printf 'my own build\n' >"$HU2/bin/minimald"      # user replaced a binary
+    run u2_keep "$HU2" --uninstall
+    check 0 "$rc" "uninstall with a modified file exits 0 (R8.4)"
+    want_ok "modified file kept (R7.3)" test -f "$HU2/bin/minimald"
+    want_ok "keep is reported (R7.3)" grep -qE "kept +modified since install" "$OUT"
+    want_err "unmodified sibling still removed (R7.3)" test -e "$HU2/bin/min"
+    want_ok "record retained while entries remain (R8.1)" test -f "$urec2"
+    # --force then removes the modified file and, footprint clear, drops the record.
+    run u2_force "$HU2" --uninstall --force
+    check 0 "$rc" "uninstall --force exits 0"
+    want_err "modified file removed under --force (R7.3)" test -e "$HU2/bin/minimald"
+    want_err "record removed once footprint is gone (R8.1)" test -e "$urec2"
 
-# R7.3 — a symlink retargeted since install is the user's edit: kept by default,
-# removed under --force. A regular file now at the recorded symlink path is
-# foreign — kept even with --force.
-HU8="$root/hu8"; mkdir -p "$HU8"
-run u8_install "$HU8"
-urec8="$HU8/xdg-state/minimal/installed"
-rm -f "$HU8/bin/git-remote-min"; ln -s minimald "$HU8/bin/git-remote-min"
-run u8_keep "$HU8" --uninstall
-check 0 "$rc" "uninstall with a retargeted symlink exits 0 (R8.4)"
-want_ok "retargeted symlink kept (R7.3)" test -L "$HU8/bin/git-remote-min"
-want_ok "retarget keep is reported (R7.3)" grep -q "retargeted" "$OUT"
-want_ok "record retained while the link remains (R8.1)" test -f "$urec8"
-run u8_force "$HU8" --uninstall --force
-check 0 "$rc" "uninstall --force over a retargeted symlink exits 0"
-want_err "retargeted symlink removed under --force (R7.3)" test -L "$HU8/bin/git-remote-min"
-want_err "record removed once footprint is gone (R8.1)" test -e "$urec8"
+    # R7.2 — uninstall on a home that never installed anything exits 0, does nothing.
+    HU3="$root/hu3"; mkdir -p "$HU3"
+    run u3_noop "$HU3" --uninstall
+    check 0 "$rc" "uninstall with no record exits 0 (R7.2)"
+    want_ok "no-op names the missing record" grep -q "nothing to uninstall" "$OUT"
 
-HU9="$root/hu9"; mkdir -p "$HU9"
-run u9_install "$HU9"
-rm -f "$HU9/bin/git-remote-min"; printf 'a real file now\n' >"$HU9/bin/git-remote-min"
-run u9_foreign "$HU9" --uninstall --force
-check 0 "$rc" "uninstall over a file at a symlink row exits 0 (R7.3)"
-want_ok "regular file at a symlink row kept even with --force (R7.3)" \
-    test -f "$HU9/bin/git-remote-min"
-want_ok "foreign symlink row is reported (R7.3)" grep -q "not a symlink" "$OUT"
+    # R8.3 — --dry-run removes nothing and leaves the record; a real run still cleans.
+    HU4="$root/hu4"; mkdir -p "$HU4"
+    run u4_install "$HU4"
+    urec4="$HU4/xdg-state/minimal/installed"
+    run u4_dry "$HU4" --uninstall --dry-run
+    check 0 "$rc" "uninstall --dry-run exits 0 (R8.3)"
+    want_ok "dry-run keeps minimald (R8.3)" test -f "$HU4/bin/minimald"
+    want_ok "dry-run keeps the record (R8.3)" test -f "$urec4"
+    want_ok "dry-run announces itself (R8.3)" grep -q "dry run" "$OUT"
+    run u4_real "$HU4" --uninstall
+    want_err "real uninstall after dry-run removes minimald" test -e "$HU4/bin/minimald"
 
-# R9.4 — uninstall removes the generated init/completion files (they are plain
-# record rows), strips the marker block from the rc file, prunes the emptied
-# completion dirs, and leaves the user's own rc content untouched.
-HU7="$root/hu7"; mkdir -p "$HU7"
-printf '# keep me\n' >"$HU7/.bashrc"
-TEST_SHELL=/bin/bash
-run u7_install "$HU7"
-check 0 "$rc" "shell-integration seed install exits 0"
-# A dump written after the install (by the user's shells) still holds the min
-# registration; uninstall must drop it or the next `min <tab>` autoload fails.
-printf '#files: 1 version: 5.9\n' >"$HU7/.zcompdump"
-run u7_dry "$HU7" --uninstall --dry-run
-want_ok "dry-run announces the rc strip without editing (R9.4/R8.3)" \
-    grep -q "would remove shell-init block" "$OUT"
-want_ok "dry-run leaves the rc block (R8.3)" grep -q '>>> minimal >>>' "$HU7/.bashrc"
-want_ok "dry-run announces the compinit dump drop (R9.4/R8.3)" \
-    grep -q "would remove compinit dump cache" "$OUT"
-want_ok "dry-run leaves the compinit dump (R8.3)" test -f "$HU7/.zcompdump"
-run u7_un "$HU7" --uninstall
-check 0 "$rc" "uninstall with shell integration exits 0"
-want_err "compinit dump dropped (R9.4)" test -e "$HU7/.zcompdump"
-want_err "completions removed (R9.4)" test -e "$HU7/xdg-data/bash-completion/completions/min"
-want_err "init files removed (R9.4)" test -e "$HU7/xdg-data/minimal/shell-init"
-want_err "emptied completion dirs pruned (R9.4)" test -d "$HU7/xdg-data/bash-completion"
-want_err "emptied data dir pruned (R9.4)" test -d "$HU7/xdg-data/minimal"
-want_err "rc block stripped (R9.4)" grep -q '>>> minimal >>>' "$HU7/.bashrc"
-want_ok "user rc content survives the strip (R9.4)" grep -q '# keep me' "$HU7/.bashrc"
-TEST_SHELL=
+    # R8.2 — plain uninstall leaves an unrelated build artifact in the cache tree;
+    # --purge removes the whole minimal-owned cache tree.
+    HU5="$root/hu5"; mkdir -p "$HU5"
+    run u5_install "$HU5"
+    stray="$HU5/xdg-cache/minimal/built/deadbeef"
+    mkdir -p "$HU5/xdg-cache/minimal/built"; printf 'artifact\n' >"$stray"
+    run u5_plain "$HU5" --uninstall
+    want_ok "plain uninstall leaves the build cache (R8.2)" test -f "$stray"
+    run u5_reinstall "$HU5"
+    run u5_purge "$HU5" --uninstall --purge
+    check 0 "$rc" "uninstall --purge exits 0"
+    want_err "purge removes the cache tree (R8.2)" test -e "$HU5/xdg-cache/minimal"
 
-# R9.4 — a record without a completions-zsh row (the data-only install above)
-# must NOT cost the user their compinit dump: the cache is only cleared when
-# the installer actually put min into it.
-printf '# untouched user cache\n' >"$H5/.zcompdump"
-run u_datadump "$H5" --uninstall
-check 0 "$rc" "data-only uninstall exits 0"
-want_ok "dump kept when no zsh completions were installed (R9.4)" \
-    grep -q '# untouched user cache' "$H5/.zcompdump"
+    # R7.3 — a non-regular file now occupying a recorded path is never removed, even
+    # with --force (the installer only ever wrote regular files there).
+    HU6="$root/hu6"; mkdir -p "$HU6"
+    run u6_install "$HU6"
+    urec6="$HU6/xdg-state/minimal/installed"
+    rm -f "$HU6/bin/minimald"; mkdir -p "$HU6/bin/minimald"   # a dir now sits there
+    run u6_foreign "$HU6" --uninstall --force
+    check 0 "$rc" "uninstall over a non-regular path exits 0 (R7.3)"
+    want_ok "directory at a recorded path is left alone (R7.3)" test -d "$HU6/bin/minimald"
+    want_ok "foreign entry is reported (R7.3)" grep -q "not a regular file" "$OUT"
+    want_ok "record retained due to the foreign entry (R8.1)" test -f "$urec6"
 
-# --- gvproxy -> gvproxy-min rename migration --------------------------------
+    # R7.3 — a symlink retargeted since install is the user's edit: kept by default,
+    # removed under --force. A regular file now at the recorded symlink path is
+    # foreign — kept even with --force.
+    HU8="$root/hu8"; mkdir -p "$HU8"
+    run u8_install "$HU8"
+    urec8="$HU8/xdg-state/minimal/installed"
+    rm -f "$HU8/bin/git-remote-min"; ln -s minimald "$HU8/bin/git-remote-min"
+    run u8_keep "$HU8" --uninstall
+    check 0 "$rc" "uninstall with a retargeted symlink exits 0 (R8.4)"
+    want_ok "retargeted symlink kept (R7.3)" test -L "$HU8/bin/git-remote-min"
+    want_ok "retarget keep is reported (R7.3)" grep -q "retargeted" "$OUT"
+    want_ok "record retained while the link remains (R8.1)" test -f "$urec8"
+    run u8_force "$HU8" --uninstall --force
+    check 0 "$rc" "uninstall --force over a retargeted symlink exits 0"
+    want_err "retargeted symlink removed under --force (R7.3)" test -L "$HU8/bin/git-remote-min"
+    want_err "record removed once footprint is gone (R8.1)" test -e "$urec8"
 
-# The switch binary moved from bin/gvproxy to bin/gvproxy-min (the bin prefix is
-# on PATH and podman/crc ship their own gvproxy). The old dest is in no
-# manifest any more, so nothing would ever revisit it — the install has to undo
-# it explicitly, on the same bytes-still-ours terms as uninstall.
-H15="$root/h15"; mkdir -p "$H15"
-run gvren_seed "$H15"
-check 0 "$rc" "rename-migration seed install exits 0"
+    HU9="$root/hu9"; mkdir -p "$HU9"
+    run u9_install "$HU9"
+    rm -f "$HU9/bin/git-remote-min"; printf 'a real file now\n' >"$HU9/bin/git-remote-min"
+    run u9_foreign "$HU9" --uninstall --force
+    check 0 "$rc" "uninstall over a file at a symlink row exits 0 (R7.3)"
+    want_ok "regular file at a symlink row kept even with --force (R7.3)" \
+        test -f "$HU9/bin/git-remote-min"
+    want_ok "foreign symlink row is reported (R7.3)" grep -q "not a symlink" "$OUT"
 
-# Seed what a pre-rename install left behind: the binary plus its record row.
-gvren_rec="$H15/xdg-state/minimal/installed"
-printf 'old-gvproxy-body\n' >"$H15/bin/gvproxy"
-gvren_h="$(hash_file "$H15/bin/gvproxy")"
-printf 'gvproxy\t%s\t%s\t%s\n' "$H15/bin/gvproxy" "$gvren_h" "$gvren_h" >>"$gvren_rec"
+    # R9.4 — uninstall removes the generated init/completion files (they are plain
+    # record rows), strips the marker block from the rc file, prunes the emptied
+    # completion dirs, and leaves the user's own rc content untouched.
+    HU7="$root/hu7"; mkdir -p "$HU7"
+    printf '# keep me\n' >"$HU7/.bashrc"
+    TEST_SHELL=/bin/bash
+    run u7_install "$HU7"
+    check 0 "$rc" "shell-integration seed install exits 0"
+    # A dump written after the install (by the user's shells) still holds the min
+    # registration; uninstall must drop it or the next `min <tab>` autoload fails.
+    printf '#files: 1 version: 5.9\n' >"$HU7/.zcompdump"
+    run u7_dry "$HU7" --uninstall --dry-run
+    want_ok "dry-run announces the rc strip without editing (R9.4/R8.3)" \
+        grep -q "would remove shell-init block" "$OUT"
+    want_ok "dry-run leaves the rc block (R8.3)" grep -q '>>> minimal >>>' "$HU7/.bashrc"
+    want_ok "dry-run announces the compinit dump drop (R9.4/R8.3)" \
+        grep -q "would remove compinit dump cache" "$OUT"
+    want_ok "dry-run leaves the compinit dump (R8.3)" test -f "$HU7/.zcompdump"
+    run u7_un "$HU7" --uninstall
+    check 0 "$rc" "uninstall with shell integration exits 0"
+    want_err "compinit dump dropped (R9.4)" test -e "$HU7/.zcompdump"
+    want_err "completions removed (R9.4)" test -e "$HU7/xdg-data/bash-completion/completions/min"
+    want_err "init files removed (R9.4)" test -e "$HU7/xdg-data/minimal/shell-init"
+    want_err "emptied completion dirs pruned (R9.4)" test -d "$HU7/xdg-data/bash-completion"
+    want_err "emptied data dir pruned (R9.4)" test -d "$HU7/xdg-data/minimal"
+    want_err "rc block stripped (R9.4)" grep -q '>>> minimal >>>' "$HU7/.bashrc"
+    want_ok "user rc content survives the strip (R9.4)" grep -q '# keep me' "$HU7/.bashrc"
+    TEST_SHELL=
 
-run gvren "$H15"
-check 0 "$rc" "rename-migration install exits 0"
-want_err "stale bin/gvproxy removed on upgrade" test -e "$H15/bin/gvproxy"
-want_ok "removal announced" grep -q "renamed to gvproxy-min" "$OUT"
+    # R9.4 — a record without a completions-zsh row must NOT cost the user their
+    # compinit dump: the cache is only cleared when the installer actually put min
+    # into it. Seeds its own data-only install (as the prefix case does), so the
+    # case stands alone.
+    {
+        printf '# format: 1\n'
+        printf '# c o a v s k d s\n'
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
+    } >"$mock/versions/v1/components"
+    HUD="$root/hud"; mkdir -p "$HUD"
+    run u_datadump_install "$HUD"
+    check 0 "$rc" "data-only seed install exits 0"
+    printf '# untouched user cache\n' >"$HUD/.zcompdump"
+    run u_datadump "$HUD" --uninstall
+    check 0 "$rc" "data-only uninstall exits 0"
+    want_ok "dump kept when no zsh completions were installed (R9.4)" \
+        grep -q '# untouched user cache' "$HUD/.zcompdump"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+}
 
-run gvren_rerun "$H15"
-check 0 "$rc" "rerun after migration exits 0"
-want_err "rerun says nothing about gvproxy" grep -q "renamed to gvproxy-min" "$OUT"
+case_gvproxy_rename_migration() {
+    # --- gvproxy -> gvproxy-min rename migration --------------------------------
 
-# A manifest that STILL ships a `gvproxy` component is not a rename: the file
-# on disk is the one this very run installed, so the migration must not touch
-# it. Channels advance independently, so a post-rename installer WILL be
-# pointed at a pre-rename manifest — deleting there would leave the host with
-# no switch binary at all, on every single run.
-H17="$root/h17"; mkdir -p "$H17"
-run gvship_seed "$H17"
-check 0 "$rc" "still-ships-gvproxy seed install exits 0"
-gvship_rec="$H17/xdg-state/minimal/installed"
-printf 'shipped-gvproxy-body\n' >"$H17/bin/gvproxy"
-gvship_h="$(hash_file "$H17/bin/gvproxy")"
-printf 'gvproxy\t%s\t%s\t%s\n' "$H17/bin/gvproxy" "$gvship_h" "$gvship_h" >>"$gvship_rec"
-# Make THIS run install a gvproxy component too, as a pre-rename manifest does.
-printf 'shipped-gvproxy-body\n' >"$mock/versions/v1/gvproxy-linux-amd64"
-h_gv="$(hash_file "$mock/versions/v1/gvproxy-linux-amd64")"
-{
-    cat "$mock/versions/v1/components"
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-        gvproxy linux amd64 v1 "$h_gv" file bin/gvproxy versions/v1/gvproxy-linux-amd64
-} >"$mock/versions/v1/components.new"
-mv "$mock/versions/v1/components.new" "$mock/versions/v1/components"
-run gvship "$H17"
-check 0 "$rc" "install against a manifest that still ships gvproxy exits 0"
-want_ok "the just-installed bin/gvproxy survives" test -f "$H17/bin/gvproxy"
-want_err "no removal is announced" grep -q "renamed to gvproxy-min" "$OUT"
-write_manifest 1
+    # The switch binary moved from bin/gvproxy to bin/gvproxy-min (the bin prefix is
+    # on PATH and podman/crc ship their own gvproxy). The old dest is in no
+    # manifest any more, so nothing would ever revisit it — the install has to undo
+    # it explicitly, on the same bytes-still-ours terms as uninstall.
+    HG_R="$root/hg_r"; mkdir -p "$HG_R"
+    run gvren_seed "$HG_R"
+    check 0 "$rc" "rename-migration seed install exits 0"
 
-# A gvproxy the user replaced (podman's, say) is NOT ours to delete: the hash
-# no longer matches what we recorded writing, so it is kept and reported.
-H16="$root/h16"; mkdir -p "$H16"
-run gvkeep_seed "$H16"
-check 0 "$rc" "rename-keep seed install exits 0"
-gvkeep_rec="$H16/xdg-state/minimal/installed"
-printf 'ours-when-installed\n' >"$H16/bin/gvproxy"
-gvkeep_h="$(hash_file "$H16/bin/gvproxy")"
-printf 'gvproxy\t%s\t%s\t%s\n' "$H16/bin/gvproxy" "$gvkeep_h" "$gvkeep_h" >>"$gvkeep_rec"
-printf 'the-users-own-gvproxy\n' >"$H16/bin/gvproxy"
+    # Seed what a pre-rename install left behind: the binary plus its record row.
+    gvren_rec="$HG_R/xdg-state/minimal/installed"
+    printf 'old-gvproxy-body\n' >"$HG_R/bin/gvproxy"
+    gvren_h="$(hash_file "$HG_R/bin/gvproxy")"
+    printf 'gvproxy\t%s\t%s\t%s\n' "$HG_R/bin/gvproxy" "$gvren_h" "$gvren_h" >>"$gvren_rec"
 
-run gvkeep "$H16"
-check 0 "$rc" "rename-keep install exits 0"
-want_ok "a user-replaced gvproxy is kept" test -f "$H16/bin/gvproxy"
-want_ok "kept content is untouched" grep -q 'the-users-own-gvproxy' "$H16/bin/gvproxy"
-want_ok "keeping it is announced" grep -q "modified since install" "$OUT"
+    run gvren "$HG_R"
+    check 0 "$rc" "rename-migration install exits 0"
+    want_err "stale bin/gvproxy removed on upgrade" test -e "$HG_R/bin/gvproxy"
+    want_ok "removal announced" grep -q "renamed to gvproxy-min" "$OUT"
+
+    run gvren_rerun "$HG_R"
+    check 0 "$rc" "rerun after migration exits 0"
+    want_err "rerun says nothing about gvproxy" grep -q "renamed to gvproxy-min" "$OUT"
+
+    # A manifest that STILL ships a `gvproxy` component is not a rename: the file
+    # on disk is the one this very run installed, so the migration must not touch
+    # it. Channels advance independently, so a post-rename installer WILL be
+    # pointed at a pre-rename manifest — deleting there would leave the host with
+    # no switch binary at all, on every single run.
+    HG_S="$root/hg_s"; mkdir -p "$HG_S"
+    run gvship_seed "$HG_S"
+    check 0 "$rc" "still-ships-gvproxy seed install exits 0"
+    gvship_rec="$HG_S/xdg-state/minimal/installed"
+    printf 'shipped-gvproxy-body\n' >"$HG_S/bin/gvproxy"
+    gvship_h="$(hash_file "$HG_S/bin/gvproxy")"
+    printf 'gvproxy\t%s\t%s\t%s\n' "$HG_S/bin/gvproxy" "$gvship_h" "$gvship_h" >>"$gvship_rec"
+    # Make THIS run install a gvproxy component too, as a pre-rename manifest does.
+    printf 'shipped-gvproxy-body\n' >"$mock/versions/v1/gvproxy-linux-amd64"
+    h_gv="$(hash_file "$mock/versions/v1/gvproxy-linux-amd64")"
+    {
+        cat "$mock/versions/v1/components"
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            gvproxy linux amd64 v1 "$h_gv" file bin/gvproxy versions/v1/gvproxy-linux-amd64
+    } >"$mock/versions/v1/components.new"
+    mv "$mock/versions/v1/components.new" "$mock/versions/v1/components"
+    run gvship "$HG_S"
+    check 0 "$rc" "install against a manifest that still ships gvproxy exits 0"
+    want_ok "the just-installed bin/gvproxy survives" test -f "$HG_S/bin/gvproxy"
+    want_err "no removal is announced" grep -q "renamed to gvproxy-min" "$OUT"
+    write_manifest 1
+
+    # A gvproxy the user replaced (podman's, say) is NOT ours to delete: the hash
+    # no longer matches what we recorded writing, so it is kept and reported.
+    HG_K="$root/hg_k"; mkdir -p "$HG_K"
+    run gvkeep_seed "$HG_K"
+    check 0 "$rc" "rename-keep seed install exits 0"
+    gvkeep_rec="$HG_K/xdg-state/minimal/installed"
+    printf 'ours-when-installed\n' >"$HG_K/bin/gvproxy"
+    gvkeep_h="$(hash_file "$HG_K/bin/gvproxy")"
+    printf 'gvproxy\t%s\t%s\t%s\n' "$HG_K/bin/gvproxy" "$gvkeep_h" "$gvkeep_h" >>"$gvkeep_rec"
+    printf 'the-users-own-gvproxy\n' >"$HG_K/bin/gvproxy"
+
+    run gvkeep "$HG_K"
+    check 0 "$rc" "rename-keep install exits 0"
+    want_ok "a user-replaced gvproxy is kept" test -f "$HG_K/bin/gvproxy"
+    want_ok "kept content is untouched" grep -q 'the-users-own-gvproxy' "$HG_K/bin/gvproxy"
+    want_ok "keeping it is announced" grep -q "modified since install" "$OUT"
+}
+
+# --- NET-041: the installer verifies the switch binary -----------------------
+# An own-IP session is served by a switch binary (gvproxy-min) the daemon
+# spawns from exactly the paths this installer writes to, so the install
+# confirms the binary is present and executable — and names the path it
+# checked — before the gvproxy rename cleanup can delete anything.
+case_installer_switch_binary_executable() {
+    # A fresh install of the default manifest ships bin/gvproxy-min and must
+    # verify it, by path, on stdout.
+    HX="$root/hx"; mkdir -p "$HX"
+    run sw_fresh "$HX"
+    check 0 "$rc" "fresh install exits 0 with the switch binary shipped"
+    want_ok "install names the switch binary it verified" \
+        grep -qE "switch-binary +verified +[^ ]*bin/gvproxy-min$" "$OUT"
+    want_ok "the verified switch binary is executable" test -x "$HX/bin/gvproxy-min"
+
+    # The bytes still match the manifest, so no download repairs the bit: only
+    # the executable check catches a file that lost its +x.
+    chmod -x "$HX/bin/gvproxy-min"
+    run sw_noexec "$HX"
+    check 1 "$rc" "install dies when the shipped switch binary is not executable"
+    want_ok "the failure names the switch binary path" \
+        grep -qE "switch binary .*bin/gvproxy-min .*not.*executable" "$OUT"
+    want_err "no closing card on the failed install (R10.4)" \
+        grep -qE "Minimal .+ is ready" "$OUT"
+    chmod +x "$HX/bin/gvproxy-min"
+
+    # A channel with no switch binary at all says so and still succeeds.
+    {
+        printf '# format: 1\n'
+        printf '# c o a v s k d s\n'
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
+    } >"$mock/versions/v1/components"
+    HY="$root/hy"; mkdir -p "$HY"
+    run sw_noship "$HY"
+    check 0 "$rc" "a channel that ships no switch binary still exits 0"
+    want_ok "the absent switch binary is reported, not fatal" \
+        grep -qE "switch-binary +skipped" "$OUT"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+
+    # A pre-rename channel still ships `bin/gvproxy` under the old name: the
+    # check falls back to that row, the only switch binary such a host has
+    # (and the rename cleanup below it must not leave the host without one).
+    printf 'pre-rename-gvproxy-body\n' >"$mock/versions/v1/gvproxy-linux-amd64"
+    h_gv_old="$(hash_file "$mock/versions/v1/gvproxy-linux-amd64")"
+    {
+        printf '# format: 1\n'
+        printf '# c o a v s k d s\n'
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            minimald linux amd64 v1 "$h_minimald" file bin/minimald versions/v1/minimald-linux-amd64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            gvproxy linux amd64 v1 "$h_gv_old" file bin/gvproxy versions/v1/gvproxy-linux-amd64
+    } >"$mock/versions/v1/components"
+    HZ="$root/hz"; mkdir -p "$HZ"
+    run sw_prerename "$HZ"
+    check 0 "$rc" "pre-rename channel install exits 0"
+    want_ok "the check verifies the old gvproxy row the channel still ships" \
+        grep -qE "switch-binary +verified +[^ ]*bin/gvproxy$" "$OUT"
+    want_ok "the pre-rename switch binary is executable" test -x "$HZ/bin/gvproxy"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+}
+
+# --- Case dispatch -----------------------------------------------------------
+# Every scenario group above is one named case. No argument runs them all, in
+# the order the linear script used to have; one argument runs exactly that
+# case (`just test-installer <case>`) for a tight loop on the case being
+# edited. Each case seeds its own homes and restores whatever manifest state
+# it mutates, so any one of them is runnable alone.
+case_for() {
+    case "$1" in
+        install)                            case_install ;;
+        apparmor)                           case_apparmor ;;
+        apparmor_uninstall)                 case_apparmor_uninstall ;;
+        checksum_mismatch)                  case_checksum_mismatch ;;
+        target_validation)                  case_target_validation ;;
+        prefix_resolution)                  case_prefix_resolution ;;
+        install_record)                     case_install_record ;;
+        daemon_stop)                        case_daemon_stop ;;
+        shell_integration)                  case_shell_integration ;;
+        darwin_dequarantine)                case_darwin_dequarantine ;;
+        uninstall)                          case_uninstall ;;
+        gvproxy_rename_migration)           case_gvproxy_rename_migration ;;
+        installer_switch_binary_executable) case_installer_switch_binary_executable ;;
+        *)
+            echo "install_test: unknown case '$1' (known cases listed in the dispatch)" >&2
+            exit 2
+            ;;
+    esac
+}
+case "${1:-}" in
+    "")
+        for _c in install apparmor apparmor_uninstall checksum_mismatch \
+            target_validation prefix_resolution install_record daemon_stop \
+            shell_integration darwin_dequarantine uninstall \
+            gvproxy_rename_migration installer_switch_binary_executable; do
+            case_for "$_c"
+        done
+        ;;
+    *)  case_for "$1" ;;
+esac
 
 # ===========================================================================
 echo "# ---"
