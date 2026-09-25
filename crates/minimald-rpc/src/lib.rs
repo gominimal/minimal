@@ -18,7 +18,8 @@ pub mod taskenv;
 pub mod trace;
 
 pub use sessions::{
-    DynamicIngress, EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
+    DynamicIngress, EffectiveEgress, EffectiveSessionPolicy, EgressPolicy, IngressPolicy, IpProto,
+    NetworkMode, PortMapping, SessionPolicy,
 };
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
@@ -774,10 +775,11 @@ impl OneshotSshRpc for AbortSession {
 // ---------------------------------------------------------------------------
 // Networking policy types (Unit 2: egress, ingress, dynamic port mapping).
 //
-// `PortMapping`, `EgressPolicy`, `IngressPolicy`, and `SessionPolicy` are
-// defined in `sessions` and re-exported above, so the only live per-session
-// store (`sessions::Record`) can carry the policy configured at launch without
-// a `sessions` → `minimald-rpc` dependency cycle. The RPC method types below
+// `PortMapping`, `EgressPolicy`, `IngressPolicy`, `SessionPolicy`, and the
+// effective halves (`EffectiveEgress`, `EffectiveSessionPolicy`) are defined
+// in `sessions` and re-exported above, so the only live per-session store
+// (`sessions::Record`) can carry the policy configured at launch without a
+// `sessions` → `minimald-rpc` dependency cycle. The RPC method types below
 // stay here, where the wire contract lives.
 // ---------------------------------------------------------------------------
 
@@ -796,6 +798,34 @@ impl OneshotSshRpc for GetSessionPolicy {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionPolicy");
     type Request<'a> = GetSessionPolicyRequest;
     type Response = Errorable<SessionPolicy>;
+}
+
+/// An RPC to read the *effective* networking policy for a session: the same
+/// record [`GetSessionPolicy`] serves, with its egress half resolved to what
+/// the gate enforces (NET-075) — the answer `min session policy` renders.
+///
+/// A separate response rather than a field on [`SessionPolicy`], so the
+/// strict declaration a client reads back stays exactly what the box was
+/// launched with: the deny-all default (NET-074) reaches the client as
+/// `deny_all` in this response without rewriting the record. The daemon
+/// answers it, not the client, because the inputs are the daemon's own
+/// facts — the rollout phase its build ships and its opt-out flag
+/// (NET-077) — which no client can know.
+pub struct GetEffectiveSessionPolicy;
+
+/// Request for the [`GetEffectiveSessionPolicy`] RPC: the same lookup as
+/// [`GetSessionPolicyRequest`], over the same record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GetEffectiveSessionPolicyRequest {
+    Name(String),
+    Id(SessionId),
+}
+
+impl OneshotSshRpc for GetEffectiveSessionPolicy {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetEffectiveSessionPolicy");
+    type Request<'a> = GetEffectiveSessionPolicyRequest;
+    type Response = Errorable<EffectiveSessionPolicy>;
 }
 
 /// An RPC to list the lifecycle hooks composed into a session, and where
