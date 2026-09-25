@@ -2578,6 +2578,11 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 leader_pid,
                 cwd: environment.cwd,
                 vars: environment.vars,
+                // A hook joins the namespaces rather than being forked from the
+                // filtered shell, so a none box's seal has to be handed to it
+                // the same way the interactive attach path hands it to an
+                // injected command.
+                seal_none_box: self.seal_injection,
             },
             composition,
             session_id: self.session_id,
