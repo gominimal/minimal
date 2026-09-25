@@ -2156,10 +2156,11 @@ impl Session {
             .validate_policy()
             .map_err(AttachError::InvalidPolicy)?;
         let network_mode = record.network;
-        // Only an `OwnIp` PTask attaches to the switch, so ingress forwards are
-        // only carried for that mode; `validate_policy` has already rejected
-        // ingress configured on any other mode.
-        let ingress = record.policy.ingress.clone();
+        // Only an `OwnIp` PTask attaches to the switch, so the policy's relay
+        // halves — egress verdict and ingress forwards — are only consumed in
+        // that mode; `validate_policy` has already rejected either half
+        // configured on any other mode.
+        let policy = record.policy.clone();
         Ok(session_host::SandboxLauncher {
             ctx: match phase {
                 LaunchPhase::Attached => self.context(true).await,
@@ -2176,7 +2177,7 @@ impl Session {
             attach_env,
             network_mode,
             net_switch: Arc::clone(&self.net_switch),
-            ingress,
+            policy,
             // The attach reports the lease through this, so the box's
             // `<name>.min.internal` proxy route exists exactly while the box
             // does (NET-001).
