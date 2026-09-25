@@ -84,12 +84,17 @@ pub(crate) async fn complete_own_ip_attach(
     own_address: Option<&crate::net::provider::OwnAddressReporter>,
 ) -> io::Result<OwnIpGuard> {
     let gate = crate::net::switch::IngressGate::for_session(lease_ip.to_string(), ingress);
+    // The relay's deprecation notice (NET-004) derives the old literal from
+    // the subnet of the switch it attaches to, so a custom-subnet switch is
+    // watched at its own host alias.
+    let subnet = switch.lock().await.subnet();
     let relay = match &control {
         ControlChannel::Unix(sock) => {
-            crate::net::switch::attach_to_switch(tap_fd, sock, Some(gate)).await?
+            crate::net::switch::attach_to_switch(tap_fd, sock, Some(gate), subnet).await?
         }
         ControlChannel::Vsock { cid, port } => {
-            crate::net::switch::attach_to_switch_vsock(tap_fd, *cid, *port, Some(gate)).await?
+            crate::net::switch::attach_to_switch_vsock(tap_fd, *cid, *port, Some(gate), subnet)
+                .await?
         }
     };
     finish_own_ip_attach(

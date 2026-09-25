@@ -14,8 +14,8 @@ pub mod config;
 use config::Config;
 pub mod network;
 pub use network::{
-    AbandonFuture, AttachFuture, HostNet, NetGuard, NetPlan, Network, NetworkError, NoNet,
-    PlanFuture, Resolver, Spawned, TapSpec,
+    AbandonFuture, AttachFuture, HOST_MIN_INTERNAL, HostEntry, HostNet, NetGuard, NetPlan, Network,
+    NetworkError, NoNet, PlanFuture, Resolver, Spawned, TapSpec,
 };
 use std::fs::{self, Permissions};
 #[cfg(target_os = "linux")]
@@ -697,6 +697,9 @@ impl<C: Channel> Sandbox<C> {
         // `/etc/hostname` above: hakoniwa binds `/etc` read-only from
         // `<rootfs>/etc`, so an in-sandbox write would hit a read-only fs.
         write_resolv_conf(&self.rootfs(), plan.resolver())?;
+        // The plan's static hosts entries, written the same way — a name the
+        // box's resolver does not know still answers from `/etc/hosts`.
+        write_hosts(&self.rootfs(), plan.hosts())?;
 
         if let Some(s) = &self.config.cpu_weight
             && booted_with_systemd()
@@ -1430,6 +1433,56 @@ fn write_resolv_conf(rootfs: &Path, resolver: &network::Resolver) -> Result<(), 
     }
 }
 
+/// Appends the plan's static entries to `<rootfs>/etc/hosts`, preserving
+/// whatever the rootfs ships. The file is replaced rather than appended in
+/// place, unlinking first for the same reason [`write_resolv_conf`] does: the
+/// rootfs is a hardlink farm over the package cache, and an in-place append
+/// would write through the link into the cached package.
+///
+/// Idempotent: `new_container` runs once per task invocation over the same
+/// rootfs, so an entry a previous invocation already wrote is skipped instead
+/// of growing the file a line per exec.
+fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry]) -> Result<(), Error> {
+    if hosts.is_empty() {
+        return Ok(());
+    }
+    let etc_hosts = rootfs.join("etc").join("hosts");
+    fs::create_dir_all(rootfs.join("etc"))
+        .map_err(|e| Error::IO("creating /etc", rootfs.join("etc"), e))?;
+    let shipped = match fs::read(&etc_hosts) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(Error::IO("reading /etc/hosts", etc_hosts.clone(), e)),
+    };
+    let mut body = String::from_utf8_lossy(&shipped).into_owned();
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    for entry in hosts {
+        if hosts_entry_present(&body, entry) {
+            continue;
+        }
+        body.push_str(&format!("{}\t{}\n", entry.address, entry.name));
+    }
+    match fs::remove_file(&etc_hosts) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::IO("replacing /etc/hosts", etc_hosts.clone(), e)),
+    }
+    fs::write(&etc_hosts, body).map_err(|e| Error::IO("writing /etc/hosts", etc_hosts, e))
+}
+
+/// Whether `body` already answers `entry` — a line whose whitespace-separated
+/// fields carry both the address and the name, in tab- or space-separated
+/// form, and whether it was written by this function or shipped by the rootfs.
+fn hosts_entry_present(body: &str, entry: &network::HostEntry) -> bool {
+    let address = entry.address.to_string();
+    body.lines().any(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        fields.contains(&address.as_str()) && fields.contains(&entry.name.as_str())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1697,6 +1750,56 @@ mod tests {
             fs::read_to_string(&resolv).unwrap(),
             "nameserver 100.64.0.1\n",
             "named servers must replace what is there"
+        );
+    }
+
+    /// NET-003: a host-address box resolves `host.min.internal` through a
+    /// static `/etc/hosts` entry — the plan carries it and the container build
+    /// writes it, keeping whatever the rootfs ships and leaving the hardlinked
+    /// package cache untouched.
+    #[test]
+    fn hosts_entry_names_host_min_internal() {
+        let plan = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(network::HostNet.plan())
+            .expect("HostNet plans do not fail");
+        let hosts = plan.hosts();
+        assert_eq!(
+            hosts.len(),
+            1,
+            "the native host-address plan carries one entry"
+        );
+        assert_eq!(hosts[0].name, network::HOST_MIN_INTERNAL);
+        assert_eq!(hosts[0].address, std::net::Ipv4Addr::LOCALHOST);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path();
+        let etc_hosts = rootfs.join("etc").join("hosts");
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+        // The rootfs's hosts file is hardlinked from the package cache.
+        let cache = tmp.path().join("package-etc-hosts");
+        fs::write(&cache, "127.0.0.1\tlocalhost\n").unwrap();
+        fs::hard_link(&cache, &etc_hosts).unwrap();
+
+        write_hosts(rootfs, hosts).unwrap();
+        assert_eq!(
+            fs::read_to_string(&etc_hosts).unwrap(),
+            "127.0.0.1\tlocalhost\n127.0.0.1\thost.min.internal\n",
+            "shipped content kept, entry appended"
+        );
+        // `new_container` runs once per task invocation on the same rootfs, so
+        // a second write over an already-present entry must not duplicate it.
+        write_hosts(rootfs, hosts).unwrap();
+        assert_eq!(
+            fs::read_to_string(&etc_hosts).unwrap(),
+            "127.0.0.1\tlocalhost\n127.0.0.1\thost.min.internal\n",
+            "a repeat write does not grow the file a line per invocation"
+        );
+        assert_eq!(
+            fs::read_to_string(&cache).unwrap(),
+            "127.0.0.1\tlocalhost\n",
+            "the package cache file must be untouched"
         );
     }
 
