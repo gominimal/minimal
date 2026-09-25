@@ -1507,19 +1507,23 @@ async fn net_forward_survives_a_refused_box_port() {
         .await
     });
 
-    // The refused connection is accepted — the forward's listener is up —
-    // and then closed by the refusal, not hung.
+    // The refused connection is accepted — the forward's listener is up — and
+    // then closed by the refusal, not hung. It ends with a reset or with a
+    // clean EOF, whichever side of the race the bytes the client sent land
+    // on: a socket dropped with unread data in its receive queue resets,
+    // one dropped after the bytes arrived and were read ends cleanly. Either
+    // way the connection is over, which is the point.
     let mut refused = connect_with_retry(local_port).await;
     refused.write_all(b"ping").await.unwrap();
     let mut seen = Vec::new();
-    let n = refused
-        .read_to_end(&mut seen)
-        .await
-        .expect("read the refused connection to its end");
-    assert_eq!(
-        n, 0,
-        "a refused dial must close the connection, got: {seen:?}"
-    );
+    match refused.read_to_end(&mut seen).await {
+        Ok(n) => assert_eq!(
+            n, 0,
+            "a refused dial must close the connection, got: {seen:?}"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("a refused dial must close the connection, got: {e}"),
+    }
     drop(refused);
 
     // The service comes up on the box port, and the forward that survived
