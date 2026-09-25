@@ -69,6 +69,7 @@ fn every_daemon_connection_is_classified() {
             "cmd/list.rs::cmd_bare = gated",
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
+            "cmd/net.rs::cmd_net_forward = gated",
             "cmd/session.rs::cmd_attach = gated",
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
