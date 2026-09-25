@@ -7,17 +7,10 @@ publish.workspace = true
 license.workspace = true
 
 [features]
-# Enables the B8 HTTPS reverse proxy with mTLS termination (R4.4–R4.7) in front
-# of the shared B5 routing core. Requires the rustls/rcgen/tokio-rustls deps.
-networking-proxy = ["dep:rcgen", "dep:rustls", "dep:tokio-rustls"]
 # WireGuard mesh peer and its CLI/RPC plumbing (Unit 4). Off by default so the
 # default `minimald` build pulls in no WireGuard code and pays no binary-size or
 # startup cost (R4.7); enable with `--features networking-wg`.
 networking-wg = ["dep:boringtun", "dep:base64", "dep:rand_core"]
-# Enables the SSH `direct-tcpip` (LocalForward) handler for `minimal ssh-forward`
-# (R4.8/R4.9). Off by default so port-forwarding is compiled out and every
-# `direct-tcpip` channel is rejected fail-closed; deferred for now (finding #4).
-ssh-forward = []
 # Exposes the in-process test harness (TestServer/TestClient) so external
 # crates — notably `minimal`'s integration tests — can spin up a real
 # minimald server over an in-memory or UDS transport without a separate
@@ -36,6 +29,9 @@ clap.workspace = true
 clap_complete.workspace = true
 constcat.workspace = true
 fd-lock.workspace = true
+# DNS message parsing/encoding for the box-zone answerer (`net::answerer`).
+# Message types only: no resolver, no server, no runtime features.
+hickory-proto.workspace = true
 futures.workspace = true
 size.workspace = true
 hakoniwa.workspace = true
@@ -85,10 +81,6 @@ switch.workspace = true
 stdlib.workspace = true
 version.workspace = true
 
-rcgen = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true }
-tokio-rustls = { workspace = true, optional = true }
-
 [dev-dependencies]
 # The two-namespace UC7 mesh integration test (`tests/mesh_uc7.rs`) drives a
 # tokio runtime and `setns(2)` directly.
@@ -102,6 +94,9 @@ decode.workspace = true
 indoc.workspace = true
 # `maintenance.rs`'s tests seed the local cache the clean reclaims.
 lcache.workspace = true
+# Property tests over the request parsers (NET spec, tiers: the T1 lane adds
+# this dev-dependency; see `net/proxy.rs` for the first property test).
+proptest.workspace = true
 
 # The guest (initramfs pid-1) boot path is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]

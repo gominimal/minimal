@@ -93,11 +93,21 @@ the current directory).
 |------|-------|-------------|
 | `--name <NAME>` | `-n` | Optional session name |
 | `--sync <MODE>` | | How to load project files into the session: `tarball` (default: stream a tarball of your project and unpack it) or `none` (do not populate the worktree) |
+| `--network <none\|host_ip\|own_ip>` | | Network mode for the session: `none` gives it no network (every socket it opens to a destination outside itself fails), `host_ip` shares the host's network namespace (the default), and `own_ip` gives it an IP of its own on the host's switch so `--ingress` can publish ports. The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling |
+| `--ingress <EXT:INT[/PROTO]>` | | Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Repeatable. Requires `--network own_ip` |
 | `--loadout <NAME>` | | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml` or `<config>/minimal/loadouts/<NAME>/loadout.toml`. Repeatable; if given, config-file `default_loadouts` are ignored |
 | `--no-loadouts` | | Apply no loadouts at all (also skips the config's `default_loadouts`). Conflicts with `--loadout` |
 | `--no-hooks` | | Run none of the session's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from either the loadouts or the project's `minimal.toml`. Recorded on the session, so it applies to the later attach, detach, and destroy transitions too |
 | `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy can't auto-decide; implied when stdin/stderr isn't a TTY |
 | `--attach` | | Automatically attach after creation |
+| `--allow-subnets <CIDR>` | | Destination subnet the box may reach, in CIDR form (e.g. `10.0.0.0/8`). Repeatable; unset means allow all. Valid on an own-address (`--network own_ip`) or host-address (`--network host_ip`) box; a `--network none` box rejects the whole egress declaration |
+| `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable; unset means allow all |
+| `--allow-protocols <PROTO>` | | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable; unset means allow all |
+| `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied |
+
+Together the four `--allow-*`/`--deny-*` flags form the box's `egress`
+declaration; naming any one of them stores it on the session, and `min
+session policy` shows what the session ended up with.
 
 Activating a path that already has a session is allowed, but warns: `min` names
 the existing session and creates a second one anyway. With two sessions on one
@@ -228,9 +238,36 @@ Renames an existing session.
 min session policy <SESSION>
 ```
 
-Prints the effective networking policy for `SESSION` (a UUID or session
-name) as JSON — an object with `egress` and `ingress` fields, each null
-when unset. Resolved from the daemon.
+Prints the effective networking rules for `SESSION` (a UUID or session
+name). Resolved from the daemon, which answers from the policy stored at
+activation; each rule line shows what the session ended up with, not just
+what was typed.
+
+The egress block resolves every dimension of the box's `egress` declaration
+to its rule or its default:
+
+```
+egress
+  subnets  10.0.0.0/8
+  dns hosts  allow all
+  protocols  tcp, udp
+  deny subnets  169.254.169.254/32
+```
+
+`subnets`, `dns hosts`, and `protocols` each read `allow all` when the
+matching flag was not given; `deny subnets` reads `(none)` when nothing is
+denied. The ingress block lists the published port mappings the session's
+`--ingress` flags declared (or `deny all` when none were), plus the dynamic
+port range when one is configured:
+
+```
+ingress
+  tcp  :8080 → :80
+```
+
+A host-address (`--network host_ip`) session prints no ingress block at all:
+it shares its host's network namespace, so minimald applies no per-session
+ingress to it and there is no rule to state.
 
 ### `session hooks`
 

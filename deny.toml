@@ -9,6 +9,12 @@ ignore = [
     "RUSTSEC-2024-0436",
     # Bitmaps unmaintained
     "RUSTSEC-2026-0247",
+    # imbl-sized-chunks < 0.2.0 double-frees when an element's Drop panics
+    # mid-removal. Reached via nickel-lang-core -> nickel-lang-vector, which
+    # stores nickel values whose Drop impls only decrement a refcount. Fixed
+    # in 0.2.0, but nickel master still pins "0.1"; drop this ignore once a
+    # nickel rev carrying the 0.2 bump is pinned in Cargo.toml.
+    "RUSTSEC-2026-0292",
 ]
 
 [licenses]
@@ -71,4 +77,11 @@ skip = [
     # nickel-lang-core -> malachite -> malachite-base
     # https://github.com/tweag/nickel/pull/2367
     { name = "itertools", version = "0.11.0" },
+]
+deny = [
+    # bitmaps is pinned below 3.2.0 in Cargo.lock because 3.2.x is affected by
+    # RUSTSEC-2025-0167 (unsound, no patched release). Remove together with
+    # the RUSTSEC-2026-0292 ignore once nickel moves to imbl-sized-chunks 0.2,
+    # which drops bitmaps.
+    { crate = "bitmaps:>=3.2.0", reason = "RUSTSEC-2025-0167: keep bitmaps pinned below 3.2.0" },
 ]

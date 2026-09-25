@@ -296,6 +296,7 @@ impl CheckCache {
                     name.ends_with(b"__libpthread_version_placeholder")
                         || name.ends_with(b"__libdl_version_placeholder")
                         || name.ends_with(b"__librt_version_placeholder")
+                        || name.ends_with(b"__libresolv_version_placeholder")
                 });
 
                 let mut symbols: HashSet<String> = HashSet::new();

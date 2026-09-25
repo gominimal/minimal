@@ -805,4 +805,212 @@ mod tests {
 
         std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
     }
+
+    /// A binary output that is a shebang script but declares
+    /// `allow_missing_interpreter = true` must not fail even when no runtime
+    /// dependency provides its interpreter. This exercises the
+    /// `allow_missing_interpreter: false` guard: the interpreter collection is
+    /// skipped entirely, so the checker reports `Pass`.
+    #[tokio::test]
+    async fn missing_runtime_deps_pass_when_interpreter_allowed_missing() {
+        let tmpdir = make_tmp_dir("interp_allowed_missing");
+        let ctx = make_ctx(&tmpdir, vec![]);
+
+        let graph = graph_with_pkg(
+            r#"
+            let {BuildSpec, OutputBin, ..} = import "minimal.ncl" in
+            {
+                name = "scriptpkg",
+                build_deps = [],
+                cmd = "",
+                outputs = {
+                    bin = {glob = "run.sh", allow_missing_interpreter = true} | OutputBin,
+                },
+            } | BuildSpec
+            "#,
+        );
+
+        // Fake a completed build whose only output is a shebang script whose
+        // interpreter (/bin/sh) is provided by no runtime dependency. Because
+        // the output opts out of the interpreter check, this must still pass.
+        let spec_hash = {
+            let g = graph.read().await;
+            g.spec_hash(g.by_name("scriptpkg").expect("pkg in graph"))
+        };
+        let pending = ctx.cache.write_dir(&spec_hash).expect("write cache dir");
+        std::fs::write(pending.path().join("run.sh"), b"#!/bin/sh\necho hi\n")
+            .expect("write output file");
+        pending
+            .finalize(EntryMeta {
+                inner: MetaInner::Spec("scriptpkg".to_string()),
+                ..Default::default()
+            })
+            .expect("finalize cache entry");
+
+        let guard = graph.read().await;
+        let result = MissingRuntimeDeps
+            .check(&ctx, "scriptpkg".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error");
+
+        assert!(
+            matches!(result.verdict, CheckVerdict::Pass),
+            "expected Pass when the interpreter check is opted out, got {:?} (errors: {:?})",
+            result.verdict,
+            result.err
+        );
+        assert!(
+            result.err.is_empty(),
+            "expected no errors when allow_missing_interpreter is set, got {:?}",
+            result.err
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
+    /// When the package's own build is cached but a declared runtime dependency's
+    /// build is not, the checker cannot resolve the transitive runtime-dep set
+    /// and must return `Skip` rather than erroring or failing.
+    #[tokio::test]
+    async fn missing_runtime_deps_skip_when_runtime_dep_not_cached() {
+        let tmpdir = make_tmp_dir("dep_not_cached");
+        let ctx = make_ctx(&tmpdir, vec![]);
+
+        let graph = graph_with_pkg(
+            r#"
+            let {BuildSpec, OutputData, ..} = import "minimal.ncl" in
+            let shprovider = {
+                name = "shprovider",
+                build_deps = [],
+                cmd = "",
+                outputs = { interp = {glob = "bin/sh"} | OutputData },
+            } | BuildSpec
+            in
+            {
+                name = "app",
+                build_deps = [],
+                runtime_deps = [shprovider],
+                cmd = "",
+                outputs = { doc = {glob = "readme.txt"} | OutputData },
+            } | BuildSpec
+            "#,
+        );
+
+        // Cache only `app`'s build; leave `shprovider`'s build uncached so the
+        // transitive runtime-dep collection fails and the checker skips.
+        let app_hash = {
+            let g = graph.read().await;
+            g.spec_hash(g.by_name("app").expect("app in graph"))
+        };
+        let pending = ctx.cache.write_dir(&app_hash).expect("write app cache dir");
+        std::fs::write(pending.path().join("readme.txt"), b"not an ELF binary")
+            .expect("write output file");
+        pending
+            .finalize(EntryMeta {
+                inner: MetaInner::Spec("app".to_string()),
+                ..Default::default()
+            })
+            .expect("finalize app cache entry");
+
+        let guard = graph.read().await;
+        let result = MissingRuntimeDeps
+            .check(&ctx, "app".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error when a runtime dep is uncached");
+
+        assert!(
+            matches!(result.verdict, CheckVerdict::Skip),
+            "expected Skip when a runtime dep's build is absent from the cache, got {:?}",
+            result.verdict
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
+    /// When a shebang script's interpreter is provided by a runtime dependency
+    /// under `usr/bin` (rather than the top-level `bin`), the checker must
+    /// resolve it through the `usr/bin` fallback and report `Pass`. This
+    /// exercises the second branch of the interpreter-satisfaction check.
+    #[tokio::test]
+    async fn missing_runtime_deps_pass_when_interpreter_in_usr_bin() {
+        let tmpdir = make_tmp_dir("interp_usr_bin");
+        let ctx = make_ctx(&tmpdir, vec![]);
+
+        let graph = graph_with_pkg(
+            r#"
+            let {BuildSpec, OutputBin, OutputData, ..} = import "minimal.ncl" in
+            let shprovider = {
+                name = "shprovider",
+                build_deps = [],
+                cmd = "",
+                outputs = { interp = {glob = "usr/bin/sh"} | OutputData },
+            } | BuildSpec
+            in
+            {
+                name = "app",
+                build_deps = [],
+                runtime_deps = [shprovider],
+                cmd = "",
+                outputs = {
+                    bin = {glob = "run.sh", allow_missing_interpreter = false} | OutputBin,
+                },
+            } | BuildSpec
+            "#,
+        );
+
+        let (app_hash, dep_hash) = {
+            let g = graph.read().await;
+            (
+                g.spec_hash(g.by_name("app").expect("app in graph")),
+                g.spec_hash(g.by_name("shprovider").expect("shprovider in graph")),
+            )
+        };
+
+        // Fake the runtime dependency's completed build: it ships the
+        // interpreter at `usr/bin/sh`, which the `bin/` → `usr/bin/` fallback
+        // in the checker resolves for the `#!/bin/sh` shebang.
+        let dep_pending = ctx.cache.write_dir(&dep_hash).expect("write dep cache dir");
+        std::fs::create_dir_all(dep_pending.path().join("usr/bin"))
+            .expect("create dep usr/bin dir");
+        std::fs::write(dep_pending.path().join("usr/bin/sh"), b"#!/bin/sh\n")
+            .expect("write interpreter file");
+        dep_pending
+            .finalize(EntryMeta {
+                inner: MetaInner::Spec("shprovider".to_string()),
+                ..Default::default()
+            })
+            .expect("finalize dep cache entry");
+
+        // Fake `app`'s completed build: a single shebang script whose
+        // interpreter (/bin/sh) is satisfied only via the `usr/bin` fallback.
+        let app_pending = ctx.cache.write_dir(&app_hash).expect("write app cache dir");
+        std::fs::write(app_pending.path().join("run.sh"), b"#!/bin/sh\necho hi\n")
+            .expect("write output file");
+        app_pending
+            .finalize(EntryMeta {
+                inner: MetaInner::Spec("app".to_string()),
+                ..Default::default()
+            })
+            .expect("finalize app cache entry");
+
+        let guard = graph.read().await;
+        let result = MissingRuntimeDeps
+            .check(&ctx, "app".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error");
+
+        assert!(
+            matches!(result.verdict, CheckVerdict::Pass),
+            "expected Pass when the interpreter is provided under usr/bin, got {:?} (errors: {:?})",
+            result.verdict,
+            result.err
+        );
+        assert!(
+            result.err.is_empty(),
+            "expected no errors when the interpreter is satisfied via usr/bin, got {:?}",
+            result.err
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
 }

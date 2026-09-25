@@ -10,6 +10,7 @@
 //! or the `minvmd` host supervisor (DM1/3/4); this only wires an
 //! already-running switch into a sandbox's namespace (spec R1.4/R1.5).
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::net::Ipv4Addr;
@@ -80,17 +81,32 @@ pub(crate) async fn complete_own_ip_attach(
     lease_ip: Ipv4Addr,
     session_name: &str,
     ingress: Option<&sessions::IngressPolicy>,
+    own_address: Option<&crate::net::provider::OwnAddressReporter>,
 ) -> io::Result<OwnIpGuard> {
     let gate = crate::net::switch::IngressGate::for_session(lease_ip.to_string(), ingress);
+    // The relay's deprecation notice (NET-004) derives the old literal from
+    // the subnet of the switch it attaches to, so a custom-subnet switch is
+    // watched at its own host alias.
+    let subnet = switch.lock().await.subnet();
     let relay = match &control {
         ControlChannel::Unix(sock) => {
-            crate::net::switch::attach_to_switch(tap_fd, sock, Some(gate)).await?
+            crate::net::switch::attach_to_switch(tap_fd, sock, Some(gate), subnet).await?
         }
         ControlChannel::Vsock { cid, port } => {
-            crate::net::switch::attach_to_switch_vsock(tap_fd, *cid, *port, Some(gate)).await?
+            crate::net::switch::attach_to_switch_vsock(tap_fd, *cid, *port, Some(gate), subnet)
+                .await?
         }
     };
-    finish_own_ip_attach(switch, relay, control, lease_ip, session_name, ingress).await
+    finish_own_ip_attach(
+        switch,
+        relay,
+        control,
+        lease_ip,
+        session_name,
+        ingress,
+        own_address,
+    )
+    .await
 }
 
 /// Tail of the own-IP attach: apply static ingress forwards (R2.3) over
@@ -104,6 +120,7 @@ async fn finish_own_ip_attach(
     lease_ip: Ipv4Addr,
     session_name: &str,
     ingress: Option<&sessions::IngressPolicy>,
+    own_address: Option<&crate::net::provider::OwnAddressReporter>,
 ) -> io::Result<OwnIpGuard> {
     let exposed = match ingress {
         Some(ingress) if !ingress.port_mappings.is_empty() => {
@@ -118,8 +135,9 @@ async fn finish_own_ip_attach(
         _ => Vec::new(),
     };
 
-    // Register this PTask's `<name>.<host-id>.min.internal` → its current lease so
-    // peer sessions can resolve it (finding #3 / UC6). Done for *every* own-IP
+    // Register this PTask's two-label name — with the deprecated three-label
+    // form beside it (NET-002) — pointing at its current lease, so peer
+    // sessions can resolve it (finding #3 / UC6). Done for *every* own-IP
     // PTask, even with no ingress: resolvable names are how peers find each other,
     // and the ingress gate independently governs reachability. Best-effort — a DNS
     // hiccup must not fail an otherwise-working attach.
@@ -132,6 +150,22 @@ async fn finish_own_ip_attach(
     .await
     {
         tracing::warn!(error = %e, session = session_name, "registering *.min.internal name on gvproxy");
+    }
+
+    // Report the lease to the proxy's routing table, so the box's
+    // `<name>.min.internal` routes from here on (NET-001). Done after the
+    // forwards: the route must not lead to a box the switch cannot yet reach.
+    // A launch without a reporter — a task, which owns no proxy route of its
+    // own — skips this.
+    if let Some(own_address) = own_address {
+        let ports = ingress.map_or_else(BTreeMap::new, |ingress| {
+            ingress
+                .port_mappings
+                .iter()
+                .map(|mapping| (mapping.external_port, mapping.internal_port))
+                .collect()
+        });
+        own_address.report(session_name, lease_ip, ports);
     }
 
     Ok(OwnIpGuard {

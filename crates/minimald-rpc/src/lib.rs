@@ -17,7 +17,9 @@ pub mod exec;
 pub mod taskenv;
 pub mod trace;
 
-pub use sessions::{EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy};
+pub use sessions::{
+    DynamicIngress, EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
+};
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
 
@@ -186,18 +188,20 @@ pub struct ListSessionsEntry {
     /// field so an older server still deserializes cleanly.
     #[serde(default)]
     pub status: sessions::SessionStatus,
-    /// Git context for the project path, probed at list time. `None` on
-    /// responses from daemons that predate this field, and whenever the
-    /// probe fails: not a repo, no git binary, or a timeout (a VM guest
-    /// without git lands here too). Boxed so the (usually `None`) field
-    /// stays small in the enums that wrap [`ListSessionsEntry`].
+    /// Git context for the project path, probed by the client at list time
+    /// (the daemon cannot probe it: on macOS it runs in the minvmd guest,
+    /// where the host's project paths do not exist and git is not on PATH).
+    /// `None` on responses from daemons that predate this field, and
+    /// whenever the client-side probe fails: not a repo, no git binary, or
+    /// a timeout. Boxed so the (usually `None`) field stays small in the
+    /// enums that wrap [`ListSessionsEntry`].
     #[serde(default)]
     pub git: Option<Box<GitInfo>>,
     pub attrs: Option<RunningSessionAttrs>,
 }
 
-/// The git state of a session's project path, as of the last
-/// [`ListSessions`] response.
+/// The git state of a session's project path, probed by the client on the
+/// host filesystem as of the last [`ListSessions`] response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitInfo {
     /// `git rev-parse --abbrev-ref HEAD` — the branch name, or `HEAD` when
@@ -205,8 +209,7 @@ pub struct GitInfo {
     pub branch: String,
     /// `git rev-parse --show-toplevel` — the working-tree root. For a
     /// linked worktree this is the worktree's root, not the main repo's.
-    /// On the listing daemon's own filesystem (the guest's for a VM
-    /// daemon).
+    /// On the host's own filesystem.
     pub repo_root: String,
     /// The checkout is a linked worktree (or submodule): its git directory
     /// lives outside `<toplevel>/.git`.
@@ -244,18 +247,6 @@ pub struct ListSessionsResponse {
     /// daemon log, and the user is at a terminal watching curl fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_routing_unavailable: Option<String>,
-    /// Why the mTLS reverse proxy (`:7655`) is not serving, when it is not.
-    ///
-    /// Separate from [`Self::hostname_routing_unavailable`] because they are
-    /// different services with different consumers: losing `:7654` costs every
-    /// session its hostname, losing `:7655` costs whatever terminates TLS
-    /// against it. Reporting them through one field would tell a user their
-    /// hostnames are broken when they are not.
-    ///
-    /// Always `None` from a daemon built without the `networking-proxy`
-    /// feature, which is the default — there is no proxy to be unavailable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mtls_proxy_unavailable: Option<String>,
 }
 
 impl OneshotSshRpc for ListSessions {
@@ -445,15 +436,6 @@ pub struct CreateSessionResponse {
     /// looking healthy either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_routing_unavailable: Option<String>,
-    /// Why the mTLS reverse proxy is not serving, when it is not — see
-    /// [`ListSessionsResponse::mtls_proxy_unavailable`].
-    ///
-    /// Here for the same reason as the field above it: both proxies are
-    /// daemon-wide rather than session-scoped, so the thing that decides
-    /// whether activation should mention them is whether the person
-    /// activating is about to depend on one, and that is not ours to know.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mtls_proxy_unavailable: Option<String>,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -846,43 +828,6 @@ impl OneshotSshRpc for DynamicPortMap {
 }
 
 // ---------------------------------------------------------------------------
-// mTLS client certificate issuance (R4.4 / `minimal login`).
-// ---------------------------------------------------------------------------
-
-/// An RPC that signs and returns a fresh client certificate for use with the
-/// HTTPS reverse proxy's mTLS authentication (R4.4). The caller supplies a
-/// subject common name; the daemon generates a key pair, signs the certificate
-/// with its internal CA, and returns PEM-encoded certificate and private key.
-/// The CA certificate PEM is also returned so the client can add it to
-/// its trust store.
-pub struct IssueClientCert;
-
-/// Request for the [`IssueClientCert`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IssueClientCertRequest {
-    /// Subject common name for the client certificate (e.g. the OS username).
-    pub subject_cn: String,
-}
-
-/// Response for the [`IssueClientCert`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct IssueClientCertResponse {
-    /// PEM-encoded client certificate signed by the daemon's CA.
-    pub cert_pem: String,
-    /// PEM-encoded PKCS#8 private key matching the certificate.
-    pub key_pem: String,
-    /// PEM-encoded CA certificate, so the client can trust the HTTPS proxy's
-    /// server certificate.
-    pub ca_cert_pem: String,
-}
-
-impl OneshotSshRpc for IssueClientCert {
-    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "IssueClientCert");
-    type Request<'a> = IssueClientCertRequest;
-    type Response = Errorable<IssueClientCertResponse>;
-}
-
-// ---------------------------------------------------------------------------
 // WireGuard mesh status (Unit 4: R4.6).
 //
 // These types are the wire contract for `minimal mesh status` and carry no
@@ -1265,6 +1210,7 @@ mod tests {
         let ingress = IngressPolicy {
             port_mappings: vec![mapping],
             dynamic_allowed_range: Some((10000, 20000)),
+            dynamic_ingress: Some(sessions::DynamicIngress::Ask),
         };
         let json = serde_json_lenient::to_string(&ingress).unwrap();
         let rt: IngressPolicy = serde_json_lenient::from_str(&json).unwrap();
@@ -1287,6 +1233,7 @@ mod tests {
             json.contains("\"dynamic_allowed_range\":null"),
             "got: {json}"
         );
+        assert!(json.contains("\"dynamic_ingress\":null"), "got: {json}");
     }
 
     fn round_trip<T>(value: &T) -> T
@@ -1447,7 +1394,6 @@ mod tests {
             id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: None,
-            mtls_proxy_unavailable: None,
         };
         assert_eq!(round_trip(&resp), resp);
     }
@@ -1462,7 +1408,6 @@ mod tests {
             serde_json_lenient::from_str(r#"{"sessions":[],"daemon_version":"0.5.0"}"#)
                 .expect("a pre-field ListSessions reply must still decode");
         assert!(list.hostname_routing_unavailable.is_none());
-        assert!(list.mtls_proxy_unavailable.is_none());
 
         let create: Errorable<CreateSessionResponse> = serde_json_lenient::from_str(
             r#"{"id":"00000000-0000-0000-0000-000000000001","daemon_version":"0.5.0"}"#,
@@ -1471,7 +1416,6 @@ mod tests {
         match create {
             Errorable::Ok(c) => {
                 assert!(c.hostname_routing_unavailable.is_none());
-                assert!(c.mtls_proxy_unavailable.is_none());
             }
             Errorable::Err { error } => panic!("expected Ok, got {error}"),
         }
@@ -1485,7 +1429,6 @@ mod tests {
         let resp = ListSessionsResponse {
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: None,
-            mtls_proxy_unavailable: None,
             resource_pool: None,
             sessions: vec![],
         };
@@ -1493,10 +1436,6 @@ mod tests {
         assert!(
             !json.contains("hostname_routing_unavailable"),
             "healthy reply should omit the field, got {json}"
-        );
-        assert!(
-            !json.contains("mtls_proxy_unavailable"),
-            "healthy reply should omit the mTLS field too, got {json}"
         );
 
         let down = ListSessionsResponse {

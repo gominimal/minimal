@@ -946,6 +946,11 @@ pub(crate) struct Launched<P, G> {
     /// Path of the session PTY's slave side, so hooks can open the
     /// terminal briefly rather than the host retaining a descriptor.
     tty_path: std::path::PathBuf,
+    /// Whether processes injected into this session should reinstall the
+    /// none-box socket-family filter; `true` when the session was launched
+    /// with [`NetworkMode::NoNet`], since the filter is inherited only by
+    /// children of the filtered process.
+    seal_injection: bool,
 }
 
 /// Actor messages to a [`Host`].
@@ -1420,6 +1425,13 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // (`Message::GetAtRisk`): the VCS mode needs the tree path even when
     // the baseline snapshot could not be armed.
     workspace_root: std::path::PathBuf,
+
+    // Whether to reinstall the none-box socket-family filter on every process
+    // injected into this session. Set at launch from the network mode, since the
+    // original seccomp filter is inherited by children of the first process, not by
+    // later processes that join its namespaces via `nsenter`.
+    #[cfg_attr(test, allow(dead_code))]
+    seal_injection: bool,
 
     // The session's display name, handed to each binding so the shell-exit
     // prompt's save-then-delete lane can name its archive.
@@ -1937,6 +1949,10 @@ pub(crate) struct SandboxLauncher {
     /// `OwnIp` PTask attaches, removed on exit. `None` for other
     /// network modes.
     pub(crate) ingress: Option<sessions::IngressPolicy>,
+    /// The proxy-routing-table handle the `OwnIp` lease is reported through
+    /// on attach, so the box's `<name>.min.internal` route exists exactly
+    /// while the box does (NET-001). Ignored by every other network mode.
+    pub(crate) own_address: Option<crate::net::provider::OwnAddressReporter>,
     /// Composition to merge into the launcher's baseline packages and
     /// vars. Patches and lifecycle hooks are ignored today.
     pub(crate) composition: Option<std::sync::Arc<sessions::core::compose::Composition>>,
@@ -2031,6 +2047,7 @@ impl SessionLauncher for SandboxLauncher {
         let ingress = self.ingress;
         let network_mode = self.network_mode;
         let net_switch = self.net_switch;
+        let own_address = self.own_address;
         // The session name, registered as this PTask's `*.min.internal` hostname on
         // an own-IP attach (finding #3 / UC6); cloned because `name` is consumed by
         // the sandbox env below.
@@ -2059,6 +2076,7 @@ impl SessionLauncher for SandboxLauncher {
             &net_switch,
             &session_name,
             ingress.clone(),
+            own_address,
         ))
         .await
         .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;
@@ -2288,6 +2306,7 @@ impl SessionLauncher for SandboxLauncher {
             guard: env,
             net_guard,
             tty_path,
+            seal_injection: network_mode == NetworkMode::NoNet,
         })
     }
 }
@@ -2410,6 +2429,7 @@ impl SessionLauncher for MockLauncher {
             guard: (),
             net_guard: None,
             tty_path,
+            seal_injection: false,
         })
     }
 }
@@ -2485,10 +2505,15 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         let mut vars = environment.vars;
         vars.extend(self.connection_env.clone());
         vars.extend(extra_env);
-        crate::nsenter::Injection::new(self.session_leader_pid()?, program, args)
+        let injection = crate::nsenter::Injection::new(self.session_leader_pid()?, program, args)
             .with_cwd(environment.cwd)
-            .with_env(vars)
-            .command()
+            .with_env(vars);
+        let injection = if self.seal_injection {
+            injection.seal_none_box()
+        } else {
+            injection
+        };
+        injection.command()
     }
 
     /// Under test, build a plain host-side command instead of injecting into
@@ -2553,6 +2578,11 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 leader_pid,
                 cwd: environment.cwd,
                 vars: environment.vars,
+                // A hook joins the namespaces rather than being forked from the
+                // filtered shell, so a none box's seal has to be handed to it
+                // the same way the interactive attach path hands it to an
+                // injected command.
+                seal_none_box: self.seal_injection,
             },
             composition,
             session_id: self.session_id,
@@ -2630,6 +2660,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             guard,
             net_guard,
             tty_path,
+            seal_injection,
         } = launcher.launch(name, username, paths, sz).await?;
 
         let (sender, receiver) = mpsc::channel(HOST_MAILBOX_CAPACITY);
@@ -2677,6 +2708,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             archives_dir,
             connection_env,
             home_dir,
+            seal_injection,
             chord_matcher: ChordMatcher::new(SessionKeys::default()),
             chord_flush_deadline: None,
             guard,

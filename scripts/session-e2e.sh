@@ -1287,6 +1287,65 @@ exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   rm -f "$XDG_CONFIG_HOME/minimal/loadouts/shellmissing.toml"
   echo "shell fallback proof OK (bash started, notice names the package)"
   echo "::endgroup::"
+
+  # -- A patched-in .bashrc --------------------------------------------------
+  # The session bash is started `--noprofile --rcfile <daemon rc>`, so it finds
+  # no startup file by itself: the daemon's rc is what sources the user's.
+  # Only an interactive attach can show that — `min session exec` runs
+  # `bash -c` through nsenter and reads no rc at all — and only a real session
+  # proves the whole hop, since the unit tests run that rc against a temp dir
+  # rather than against a patched session home.
+  #
+  # The second half of the marker is the ORDER: `__minimal_attach_env` is the
+  # daemon's `TERM`-refresh hook, defined earlier in the same rc, so a
+  # `.bashrc` that can see it is one that ran after the hook went in.
+  echo "::group::session bash sources a patched .bashrc"
+  PATCH_SRC_DIR="$(hook_mktemp /tmp/mnlrc.XXXXXX)"
+  cat > "$PATCH_SRC_DIR/bashrc" <<'BASHRC'
+__e2e_hook_seen=no
+declare -F __minimal_attach_env >/dev/null && __e2e_hook_seen=yes
+export E2E_BASHRC_RAN=yes
+BASHRC
+  mkdir -p "$XDG_CONFIG_HOME/minimal/loadouts"
+  {
+    printf 'description = "e2e patched bashrc"\n\n'
+    printf 'patches = [\n'
+    printf '  { dest = ".bashrc", source = "%s/bashrc" },\n' "$PATCH_SRC_DIR"
+    printf ']\n'
+  } > "$XDG_CONFIG_HOME/minimal/loadouts/bashrcdev.toml"
+  HOOK_SEED_DIR="$(hook_mktemp /tmp/mnlrr.XXXXXX)"
+  hook_seed_preamble > "$HOOK_SEED_DIR/minimal.toml"
+  mkdir "$HOOK_SEED_DIR/.git"
+
+  rc_sid="$(cd "$HOOK_SEED_DIR" && mnl session activate . --no-prompt --loadout bashrcdev 2>"$WORK/bashrc.err")" || {
+    echo "::error::activation with a .bashrc-patching loadout failed"
+    echo "--- stderr ---"; cat "$WORK/bashrc.err" 2>/dev/null || true
+    fail
+  }
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  # shellcheck disable=SC2016 # both vars must reach the SESSION's shell unexpanded.
+  rc_out="$(E2E_PTY_COMMANDS='printf "BASHRC_MARK[%s/%s]\n" "$E2E_BASHRC_RAN" "$__e2e_hook_seen"
+exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+    min ${E2E_MINIMAL_ARGS:-} session attach "$rc_sid" \
+    2>"$WORK/bashrc-attach.err")" || {
+    echo "::error::pty attach for the patched-.bashrc proof failed"
+    echo "--- transcript ---"; printf '%s\n' "$rc_out"
+    echo "--- stderr ---"; cat "$WORK/bashrc-attach.err" 2>/dev/null || true
+    fail
+  }
+  if [[ "$rc_out" != *"BASHRC_MARK[yes/yes]"* ]]; then
+    echo "::error::the patched ~/.bashrc did not run after the attach-env hook"
+    echo "--- transcript ---"; printf '%s\n' "$rc_out"
+    fail
+  fi
+  # Same best-effort exit prompt as the shell proofs above; same explicit
+  # teardown.
+  mnl session destroy --force "$rc_sid" >/dev/null 2>&1 || true
+  rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
+  rm -rf "$PATCH_SRC_DIR"; PATCH_SRC_DIR=""
+  rm -f "$XDG_CONFIG_HOME/minimal/loadouts/bashrcdev.toml"
+  echo "patched .bashrc proof OK (sourced, and after the daemon's hook)"
+  echo "::endgroup::"
 fi
 # ---------------------------------------------------------------------------
 # Skip-lane scaffold proof (every lane). Every other seed here deliberately

@@ -1,15 +1,13 @@
 use futures::StreamExt as _;
-#[cfg(feature = "networking-proxy")]
-use minimald_rpc::IssueClientCertResponse;
 use minimald_rpc::{
     AbortSession, AbortSessionResponse, CleanCacheRequest, CleanCacheUpdate, CreateSession,
     DestroySession, DestroySessionResponse, Errorable, FinalizeSession, FinalizeSessionResponse,
     GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
     GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen, GetVersion,
-    GetVersionResponse, IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry,
-    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
-    RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
-    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
+    GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
+    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool, SessionDelta,
+    SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest, ShutdownResponse,
+    SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -128,21 +126,19 @@ async fn serve_list_sessions(
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
-                mtls_proxy_unavailable: s.mtls_unavailable().await,
                 resource_pool,
-                // The git probes run in parallel across sessions: each is
-                // one small process under a deadline, and serializing them
-                // would multiply the latency of every list call.
-                sessions: futures::future::join_all(infos.into_iter().map(|i| async move {
-                    let git = probe_git_info(i.project_path.as_utf8_path().as_std_path())
-                        .await
-                        .map(Box::new);
-                    ListSessionsEntry {
+                // `git` is left `None`: the daemon cannot probe it — on
+                // macOS it runs in the minvmd guest, where the host's
+                // project paths do not exist and git is not on PATH. The
+                // client fills it host-side after the reply.
+                sessions: infos
+                    .into_iter()
+                    .map(|i| ListSessionsEntry {
                         id: i.id,
                         name: i.name,
                         project_path: Some(i.project_path),
                         status: i.status,
-                        git,
+                        git: None,
                         attrs: i.attrs.map(|a| minimald_rpc::RunningSessionAttrs {
                             last_stdout: a.stdout_last.map(|i| i.into()),
                             last_stdin: a.stdin_last.map(|i| i.into()),
@@ -159,61 +155,11 @@ async fn serve_list_sessions(
                                 last: t.into(),
                             }),
                         }),
-                    }
-                }))
-                .await,
+                    })
+                    .collect(),
             })
         })
         .await
-}
-
-/// Per-probe deadline for the `git rev-parse` calls
-/// [`serve_list_sessions`] runs: a list response must stay fast even when
-/// a session's project sits on a wedged filesystem.
-const GIT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Probes the git context of `path` for [`minimald_rpc::GitInfo`]: one
-/// `rev-parse` invocation answers the branch, the toplevel, and the git
-/// directory. `--absolute-git-dir` (not `--git-dir`) keeps the worktree
-/// comparison exact — the relative form prints `.git` when `path` is the
-/// toplevel. Anything but a clean success — not a repo, no git binary, a
-/// timeout — yields `None`.
-async fn probe_git_info(path: &std::path::Path) -> Option<minimald_rpc::GitInfo> {
-    let out = tokio::time::timeout(
-        GIT_PROBE_TIMEOUT,
-        tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args([
-                "rev-parse",
-                "--abbrev-ref",
-                "HEAD",
-                "--show-toplevel",
-                "--absolute-git-dir",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?;
-    let mut lines = text.lines();
-    let (branch, toplevel, git_dir) = match (lines.next(), lines.next(), lines.next(), lines.next())
-    {
-        (Some(branch), Some(toplevel), Some(git_dir), None) => (branch, toplevel, git_dir),
-        _ => return None,
-    };
-    Some(minimald_rpc::GitInfo {
-        branch: branch.to_string(),
-        repo_root: toplevel.to_string(),
-        is_worktree: git_dir != format!("{toplevel}/.git"),
-    })
 }
 
 fn detect_resource_pool() -> Option<ResourcePool> {
@@ -259,6 +205,38 @@ async fn serve_get_session_record(
 /// anonymous session, and an absent field reads like a logging bug.
 const ANONYMOUS_SESSION: &str = "<anonymous>";
 
+/// The egress rule counts a session config parses to, one per egress field.
+/// Logged beside the record the daemon stores at session start, they are the
+/// diagnostic for what a session actually activated with: a count of `0`
+/// means the field — or the whole `egress` section — carries no rules.
+#[derive(Debug, Clone, Copy)]
+struct EgressRuleCounts {
+    allow_subnets: usize,
+    allow_protocols: usize,
+    allow_dns_hosts: usize,
+    deny_subnets: usize,
+}
+
+impl EgressRuleCounts {
+    fn of(policy: &minimald_rpc::SessionPolicy) -> Self {
+        let egress = policy.egress.as_ref();
+        Self {
+            allow_subnets: egress
+                .and_then(|e| e.allow_subnets.as_ref())
+                .map_or(0, Vec::len),
+            allow_protocols: egress
+                .and_then(|e| e.allow_protocols.as_ref())
+                .map_or(0, Vec::len),
+            allow_dns_hosts: egress
+                .and_then(|e| e.allow_dns_hosts.as_ref())
+                .map_or(0, Vec::len),
+            deny_subnets: egress
+                .and_then(|e| e.deny_subnets.as_ref())
+                .map_or(0, Vec::len),
+        }
+    }
+}
+
 /// `CreateSession`: allocates the session's record and brings its actor
 /// up, replying with the assigned id. The loadout is composed separately,
 /// by the `ConfigureLoadout` that follows.
@@ -287,6 +265,10 @@ async fn serve_create_session(
             // manager: the success record below needs it, and the reply
             // carries only the assigned id.
             let session_name = req.config.name.clone();
+            // Read the egress rule counts off the config for the same reason:
+            // the manager consumes it, and the stored record's egress is what
+            // the counts below report beside the "session created" line.
+            let egress_counts = EgressRuleCounts::of(&req.config.policy);
 
             Ok(match mngr.create_session(req.config, ssh_username).await {
                 Ok(id) => {
@@ -298,13 +280,16 @@ async fn serve_create_session(
                     tracing::info!(
                         session_id = %id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
+                        egress_allow_subnets = egress_counts.allow_subnets,
+                        egress_allow_protocols = egress_counts.allow_protocols,
+                        egress_allow_dns_hosts = egress_counts.allow_dns_hosts,
+                        egress_deny_subnets = egress_counts.deny_subnets,
                         "session created"
                     );
                     Errorable::Ok(minimald_rpc::CreateSessionResponse {
                         id,
                         daemon_version: Some(OWN_VERSION.to_string()),
                         hostname_routing_unavailable: s.proxy_unavailable().await,
-                        mtls_proxy_unavailable: s.mtls_unavailable().await,
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
@@ -733,48 +718,6 @@ async fn serve_get_session_screen(
                 None => Errorable::Err {
                     error: "session is not active".to_string(),
                 },
-            })
-        })
-        .await
-}
-
-/// Signs a fresh client certificate for the `minimal login` flow and returns
-/// the cert PEM, key PEM, and CA cert PEM so the client can authenticate to
-/// the HTTPS reverse proxy. Only compiled when the `networking-proxy` feature
-/// is enabled.
-#[cfg(feature = "networking-proxy")]
-async fn serve_issue_client_cert(
-    s: ServerStateHandle,
-    c: RuChannel<Msg>,
-) -> Result<(), ConnectionError> {
-    IssueClientCert
-        .handle_channel(c, async |req: IssueClientCertRequest| {
-            let ca = s.cert_authority().await;
-            match ca.sign_client_cert(&req.subject_cn) {
-                Ok((cert_pem, key_pem)) => Ok(Errorable::Ok(IssueClientCertResponse {
-                    cert_pem,
-                    key_pem,
-                    ca_cert_pem: ca.ca_cert_pem.clone(),
-                })),
-                Err(e) => Ok(Errorable::Err {
-                    error: e.to_string(),
-                }),
-            }
-        })
-        .await
-}
-
-/// Replies to an `IssueClientCert` request with a readable error when the
-/// `networking-proxy` feature is compiled out, so the client sees "feature not
-/// enabled" instead of an opaque EOF/channel-close on the response stream.
-#[cfg(not(feature = "networking-proxy"))]
-async fn serve_issue_client_cert_unavailable(c: RuChannel<Msg>) -> Result<(), ConnectionError> {
-    IssueClientCert
-        .handle_channel(c, async |_req: IssueClientCertRequest| {
-            Ok(Errorable::Err {
-                error: "minimald was built without the networking-proxy feature; \
-                        client certificate issuance is unavailable"
-                    .to_string(),
             })
         })
         .await
@@ -1638,8 +1581,7 @@ pub async fn handle_ssh_rpc(
         | STREAM_WORKSPACE_PATCHES
         | STREAM_WORKSPACE_HOOK_SCRIPTS
         | minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
-        | minimald_rpc::CLEAN_CACHE_SUBSYSTEM
-        | IssueClientCert::NAME => {
+        | minimald_rpc::CLEAN_CACHE_SUBSYSTEM => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
                 None => {
@@ -1727,19 +1669,6 @@ pub async fn handle_ssh_rpc(
             serve!(crate::diag::serve_stream_diag_bundle(s, config, channel))
         }
         minimald_rpc::CLEAN_CACHE_SUBSYSTEM => serve!(serve_clean_cache(s, channel)),
-        IssueClientCert::NAME => {
-            #[cfg(feature = "networking-proxy")]
-            serve!(serve_issue_client_cert(s, channel));
-            #[cfg(not(feature = "networking-proxy"))]
-            {
-                tracing::warn!(
-                    "IssueClientCert RPC called but the networking-proxy \
-                     feature is not enabled; replying with an error"
-                );
-                drop(s);
-                serve!(serve_issue_client_cert_unavailable(channel));
-            }
-        }
         _ => unreachable!(),
     };
 
@@ -2694,9 +2623,9 @@ mod tests {
         assert_eq!(created.daemon_version.as_deref(), Some(OWN_VERSION));
     }
 
-    /// The two read RPCs the attach / exec / setup-zed / ssh-forward paths
-    /// gate on must report the daemon's build, or those paths have nothing to
-    /// assert against and would have to spend a `GetVersion` to find out.
+    /// The two read RPCs the attach / exec / setup-zed paths gate on must
+    /// report the daemon's build, or those paths have nothing to assert
+    /// against and would have to spend a `GetVersion` to find out.
     #[tokio::test]
     async fn the_read_rpcs_report_the_daemon_build() {
         let server = TestServer::new().await;
@@ -2738,6 +2667,7 @@ mod tests {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             allow_dns_hosts: None,
             allow_protocols: None,
+            deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
         };
         let created_id = client
             .call::<CreateSession>(&CreateSessionRequest {
@@ -2763,100 +2693,6 @@ mod tests {
         // The configured ingress was `None`, and the read reflects that rather
         // than the old hardcoded `Some(IngressPolicy::default())`.
         assert_eq!(policy.ingress, None);
-    }
-
-    /// `ListSessions` answers each session's git context: branch and
-    /// toplevel for a plain repo, the worktree flag for a linked
-    /// worktree, and `None` for a non-repo project. Follows
-    /// `session_delta`'s fixture; skipped where no git binary exists.
-    #[tokio::test]
-    async fn list_sessions_reports_git_info_per_session() {
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("skipping: no git binary in this environment");
-            return;
-        }
-
-        let repo = tempfile::tempdir().unwrap();
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo.path())
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@example.invalid",
-                    "-c",
-                    "commit.gpgsign=false",
-                ])
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        git(&["init", "-b", "main"]);
-        git(&["commit", "--allow-empty", "-m", "initial"]);
-        let wt_parent = tempfile::tempdir().unwrap();
-        let wt_path = wt_parent.path().join("wt");
-        git(&[
-            "worktree",
-            "add",
-            "-b",
-            "feature",
-            wt_path.to_str().unwrap(),
-        ]);
-        let plain = tempfile::tempdir().unwrap();
-
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        for (name, path) in [
-            ("repo-s", repo.path()),
-            ("wt-s", wt_path.as_path()),
-            ("plain-s", plain.path()),
-        ] {
-            crate::test_harness::create_configured_session(
-                &mut client,
-                name,
-                path.to_str().unwrap(),
-            )
-            .await;
-        }
-
-        let list = client.call::<ListSessions>(&()).await;
-        let by_name = |n: &str| {
-            list.sessions
-                .iter()
-                .find(|s| s.name.as_deref() == Some(n))
-                .unwrap_or_else(|| panic!("session {n} missing from list"))
-        };
-
-        // `--show-toplevel` canonicalizes; tempdir paths may pass through
-        // symlinks (/var → /private/var on macOS).
-        let repo_root = std::fs::canonicalize(repo.path()).unwrap();
-        let repo_s = by_name("repo-s")
-            .git
-            .clone()
-            .expect("repo-s must have git info");
-        assert_eq!(repo_s.branch, "main");
-        assert_eq!(std::fs::canonicalize(&repo_s.repo_root).unwrap(), repo_root,);
-        assert!(!repo_s.is_worktree);
-
-        let wt_s = by_name("wt-s")
-            .git
-            .clone()
-            .expect("wt-s must have git info");
-        assert_eq!(wt_s.branch, "feature");
-        assert!(wt_s.is_worktree, "linked worktree must be flagged");
-
-        assert_eq!(by_name("plain-s").git, None, "non-repo must probe to None");
     }
 
     #[tokio::test]
@@ -2933,19 +2769,22 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        // R2.1: an egress policy on a non-`OwnIp` PTask is rejected at
-        // declaration time, so the invalid session is never stored.
+        // NET-065: an egress policy on a none (`NoNet`) box is rejected at
+        // declaration time, so the invalid session is never stored. Egress on
+        // a host-address box is accepted (NET-120), so `NoNet` is the only
+        // mode that still refuses it.
         let egress = EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             allow_dns_hosts: None,
             allow_protocols: None,
+            deny_subnets: None,
         };
         let resp = client
             .call::<CreateSession>(&CreateSessionRequest {
                 config: minimald_rpc::SessionConfig {
                     name: Some("bad-policy".to_string()),
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: NetworkMode::HostNet,
+                    network: NetworkMode::NoNet,
                     policy: SessionPolicy::new(Some(egress), None),
                     hooks_enabled: true,
                     attrs: Default::default(),
@@ -2956,7 +2795,8 @@ mod tests {
         assert_eq!(
             resp,
             Errorable::Err {
-                error: "egress policy is only valid for an own-IP PTask, not HostNet".to_string()
+                error: "egress policy is only valid for an own-IP or host-address PTask, not NoNet"
+                    .to_string()
             }
         );
 

@@ -44,7 +44,6 @@ fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
-        mtls_proxy_unavailable: None,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -81,7 +80,6 @@ fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
-        mtls_proxy_unavailable: None,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -271,6 +269,10 @@ async fn activate_creates_session() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        allow_subnets: vec![],
+        allow_dns_hosts: vec![],
+        allow_protocols: vec![],
+        deny_subnets: vec![],
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -314,6 +316,10 @@ async fn activate_uploads_project_files() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        allow_subnets: vec![],
+        allow_dns_hosts: vec![],
+        allow_protocols: vec![],
+        deny_subnets: vec![],
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -396,6 +402,10 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        allow_subnets: vec![],
+        allow_dns_hosts: vec![],
+        allow_protocols: vec![],
+        deny_subnets: vec![],
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -781,6 +791,433 @@ async fn session_policy_succeeds() {
     .unwrap();
 }
 
+/// `min session policy` shows the effective egress rules (NET-061): the four
+/// egress fields the session was activated with, each unset dimension
+/// resolved to its default instead of a bare `null`. The policy is stored
+/// through the daemon and fetched the way the command fetches it;
+/// `format_policy` is the rendering the command prints. The same egress on a
+/// host-address box is still shown, but with no ingress block, and a none
+/// box shows no blocks at all — just the note the TUI shows in their place.
+#[tokio::test]
+async fn policy_shows_effective_egress() {
+    let (daemon, args) = setup().await;
+    let egress = sessions::EgressPolicy {
+        allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+        allow_dns_hosts: Some(vec!["github.com".to_string()]),
+        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+        deny_subnets: Some(vec!["169.254.169.254/32".to_string()]),
+    };
+    let session_id = create_session_with_policy(
+        &daemon,
+        "egress-policy",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::new(Some(egress.clone()), None),
+    )
+    .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
+    let resp = client
+        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(session_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+    };
+    assert_eq!(
+        policy.egress,
+        Some(egress.clone()),
+        "the stored egress must survive the record round trip"
+    );
+
+    let mut out = Vec::new();
+    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("subnets  10.0.0.0/8"),
+        "allowed subnets missing:\n{text}"
+    );
+    assert!(
+        text.contains("dns hosts  github.com"),
+        "allowed hosts missing:\n{text}"
+    );
+    assert!(
+        text.contains("protocols  tcp"),
+        "allowed protocols missing:\n{text}"
+    );
+    assert!(
+        text.contains("deny subnets  169.254.169.254/32"),
+        "denied subnets missing:\n{text}"
+    );
+
+    // The same egress is accepted on a host-address box (NET-120), but the
+    // ingress block is suppressed there: a host-address session shares its
+    // host's namespace, so minimald applies no per-session ingress to it and
+    // a `deny all` row would claim a deny-rule that does not exist. The TUI's
+    // detail pane suppresses the block for the same reason.
+    let host_id = create_session_with_policy(
+        &daemon,
+        "egress-policy-host",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::new(Some(egress.clone()), None),
+    )
+    .await;
+    let resp = client
+        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(host_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+    };
+    let mut out = Vec::new();
+    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("subnets  10.0.0.0/8"),
+        "the host-address egress rules are still shown:\n{text}"
+    );
+    assert!(
+        !text.contains("ingress"),
+        "a host-address session has no per-session ingress policy to show:\n{text}"
+    );
+
+    // A none box has no network, so it can carry no egress or ingress
+    // declaration at all — the whole policy is replaced by the one-line
+    // note the TUI's detail pane shows, since `egress / allow all` there
+    // would claim a reach a box with no network does not have.
+    let none_id = create_session_with_policy(
+        &daemon,
+        "egress-policy-none",
+        sessions::NetworkMode::NoNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+    let resp = client
+        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(none_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+    };
+    let mut out = Vec::new();
+    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(
+        text, "No network policy (NoNet)\n",
+        "a none session prints the note in place of both blocks:\n{text}"
+    );
+}
+
+// --- hostname routing warning (NET-020/NET-021/NET-022) ---
+//
+// The startup retry lives in `minimald::server` behind the Linux gate with the
+// `net` module it drives, so this section is Linux-only too: it holds a port,
+// runs the real retry loop against it, and reads what `min ls` and
+// `min session activate` print while the proxy is down and after it recovers.
+
+/// Runs the compiled `min` with the harness daemon's `--minimal-dir`, an empty
+/// `--config-dir` (the developer's own loadouts and policy stay out of the
+/// run), and `--no-input`, plus `extra` as the command, and returns stderr.
+#[cfg(target_os = "linux")]
+async fn run_min_stderr(args: &GlobalArgs, extra: &[&str]) -> String {
+    let minimal_dir = args
+        .minimal_dir
+        .as_ref()
+        .expect("setup points at a tempdir");
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(extra)
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Polls `ListSessions` until the daemon reports hostname routing down — the
+/// startup retry's first failed bind has landed on its note — and returns the
+/// reason.
+#[cfg(target_os = "linux")]
+async fn wait_for_routing_failure(args: &GlobalArgs) -> String {
+    use minimald_rpc::ListSessions;
+
+    let mut client = connect_daemon(args).await.unwrap();
+    for _ in 0..200 {
+        let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+        if let Some(reason) = resp.hostname_routing_unavailable {
+            return reason;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the daemon never reported hostname routing down");
+}
+
+/// Holds a fresh port and starts the daemon's hostname-proxy startup retry
+/// against it — the real loop `start_host_proxies` spawns, with a compressed
+/// backoff — so the note `min ls` warns from is set exactly the way an
+/// occupied proxy port sets it, without holding the production `:7654`.
+/// Dropping the held listener frees the port; the returned task resolves once
+/// the proxy is serving again and the note is cleared.
+#[cfg(target_os = "linux")]
+async fn hold_proxy_port_and_start_retry(
+    state: &minimald::server::ServerStateHandle,
+) -> (tokio::net::TcpListener, tokio::task::JoinHandle<()>) {
+    use minimald::server::{RetryBackoff, retry_hostname_proxy_until_serving};
+
+    let held = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = held.local_addr().unwrap();
+    let retry = tokio::spawn(retry_hostname_proxy_until_serving(
+        state.clone(),
+        addr,
+        RetryBackoff::new(
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(40),
+        ),
+    ));
+    (held, retry)
+}
+
+/// NET-020: with the proxy port occupied, both `min ls` and `min session
+/// activate` print the failure's reason and the remedy for it, and say the
+/// daemon recovers on its own. Driven through the compiled binary so the
+/// assertion is on what the user actually sees.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn listener_failure_reported_with_remedy() {
+    let (daemon, args) = setup().await;
+    let (held, retry) = hold_proxy_port_and_start_retry(&daemon.server.state).await;
+    let reason = wait_for_routing_failure(&args).await;
+
+    let ls_stderr = run_min_stderr(&args, &["ls"]).await;
+    assert!(
+        ls_stderr.contains("warning: session hostnames will not route"),
+        "ls must warn about hostname routing, got: {ls_stderr}"
+    );
+    assert!(
+        ls_stderr.contains(&reason),
+        "ls must print the daemon's reason, got: {ls_stderr}"
+    );
+    assert!(
+        ls_stderr.contains("Remedy"),
+        "ls must print the remedy, got: {ls_stderr}"
+    );
+    assert!(
+        ls_stderr.contains("retries"),
+        "ls must say the daemon recovers on its own, got: {ls_stderr}"
+    );
+    assert!(
+        ls_stderr.contains("run `min ls` again to check"),
+        "ls must name the command its warning rides on, got: {ls_stderr}"
+    );
+
+    // `min session activate` prints the same report on its path.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+    let activate_stderr = run_min_stderr(
+        &args,
+        &[
+            "session",
+            "activate",
+            project.path().to_str().unwrap(),
+            "--name",
+            "remedy-report",
+            "--sync",
+            "tarball",
+            "--no-prompt",
+        ],
+    )
+    .await;
+    assert!(
+        activate_stderr.contains("warning: session hostnames will not route"),
+        "activate must warn about hostname routing, got: {activate_stderr}"
+    );
+    assert!(
+        activate_stderr.contains(&reason),
+        "activate must print the daemon's reason, got: {activate_stderr}"
+    );
+    assert!(
+        activate_stderr.contains("Remedy"),
+        "activate must print the remedy, got: {activate_stderr}"
+    );
+    assert!(
+        activate_stderr.contains("run `min session activate` again to check"),
+        "activate must name the command its warning rides on, got: {activate_stderr}"
+    );
+
+    drop(held);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), retry).await;
+}
+
+/// NET-022: once the port frees and the listener recovers, `min ls` stops
+/// carrying the warning — against the same daemon process, with no restart.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ls_warning_clears_on_recovery() {
+    let (daemon, args) = setup().await;
+    let (held, retry) = hold_proxy_port_and_start_retry(&daemon.server.state).await;
+    let _reason = wait_for_routing_failure(&args).await;
+
+    let before = run_min_stderr(&args, &["ls"]).await;
+    assert!(
+        before.contains("warning: session hostnames will not route"),
+        "ls must warn while the port is held, got: {before}"
+    );
+
+    // Free the port: the startup retry binds (a native daemon has no
+    // host-loopback publish gate) and clears the note.
+    drop(held);
+    tokio::time::timeout(std::time::Duration::from_secs(5), retry)
+        .await
+        .expect("the startup retry must finish once the port frees")
+        .expect("the startup retry must not panic");
+
+    let after = run_min_stderr(&args, &["ls"]).await;
+    assert!(
+        !after.contains("warning: session hostnames will not route"),
+        "the warning must clear without a daemon restart, got: {after}"
+    );
+}
+
+// --- retired surfaces (NET-109 / NET-110) ---
+
+/// No build of the daemon carries the retired mTLS reverse proxy, its
+/// client-certificate RPC, or the `ssh-forward` feature that compiled
+/// `direct-tcpip` out (NET-109, NET-110). A client crate cannot reach the
+/// daemon's build flags from here, so assert on its sources and manifests —
+/// the same source-scan approach `minimal`'s own `login_mints_no_certificate`
+/// uses to prove a verb dropped a surface.
+#[test]
+fn retired_surfaces_absent() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crates/minimal sits two levels below the workspace root");
+
+    let source = |rel: &str| {
+        std::fs::read_to_string(root.join(rel))
+            .unwrap_or_else(|e| panic!("readable source {rel}: {e}"))
+    };
+
+    let retired_surfaces: &[(&str, &[&str])] = &[
+        // The proxy serves plain HTTP only: no TLS port, no certificate
+        // authority, no TLS-terminating serve loop, no TLS deps.
+        (
+            "crates/minimald/src/net/proxy.rs",
+            &[
+                "HTTPS_PROXY_PORT",
+                "CertAuthority",
+                "serve_https",
+                "tokio_rustls",
+                "networking-proxy",
+            ],
+        ),
+        // The daemon opens one routing listener and keeps no proxy state.
+        (
+            "crates/minimald/src/server.rs",
+            &["mtls", "7655", "cert_authority", "networking-proxy"],
+        ),
+        // No client-certificate RPC handler or dispatch arm, and no
+        // mTLS field on the replies.
+        (
+            "crates/minimald/src/rpc.rs",
+            &[
+                "IssueClientCert",
+                "mtls_proxy_unavailable",
+                "networking-proxy",
+            ],
+        ),
+        // No crypto-provider install for the removed feature, and no
+        // second-proxy comment in the startup path.
+        ("crates/minimald/src/main.rs", &["networking-proxy", "7655"]),
+        // direct-tcpip is served in every build: neither the handler nor
+        // the relay is behind a feature gate anymore.
+        (
+            "crates/minimald/src/connection.rs",
+            &[
+                "feature = \"ssh-forward\"",
+                "feature = \"networking-proxy\"",
+            ],
+        ),
+        // Both features and their optional TLS deps are gone from the
+        // manifest, so no build can turn them back on.
+        (
+            "crates/minimald/Cargo.toml",
+            &[
+                "networking-proxy",
+                "ssh-forward",
+                "rcgen",
+                "rustls",
+                "tokio-rustls",
+            ],
+        ),
+        // The wire contract carries no client-certificate types and no
+        // mTLS-unavailable fields.
+        (
+            "crates/minimald-rpc/src/lib.rs",
+            &["IssueClientCert", "mtls_proxy_unavailable"],
+        ),
+        // The workspace drops the certificate generator only minimald used.
+        ("Cargo.toml", &["rcgen"]),
+        // Nothing passes a removed feature to the daemon builds.
+        ("justfile", &["networking-proxy", "{{features}}"]),
+    ];
+    for (rel, retired) in retired_surfaces.iter().copied() {
+        let text = source(rel);
+        for &token in retired {
+            assert!(
+                !text.contains(token),
+                "{rel} still names the retired surface `{token}` (NET-109)"
+            );
+        }
+    }
+}
+
+/// The daemon's `ListSessions` reply no longer carries the mTLS field, and a
+/// reply without it decodes: `min ls` keeps reading the list, and never
+/// prints an mTLS warning again (NET-109). A reply from an older daemon that
+/// still sends the field decodes too — an unknown field is skipped, so the
+/// version skew never breaks the list.
+#[test]
+fn session_list_decodes_without_mtls_field() {
+    let resp = ListSessionsResponse {
+        daemon_version: Some("test".to_string()),
+        hostname_routing_unavailable: None,
+        resource_pool: None,
+        sessions: vec![],
+    };
+
+    // The reply this build's daemon sends carries no mtls field.
+    let json = serde_json_lenient::to_string(&resp).unwrap();
+    assert!(
+        !json.contains("mtls_proxy_unavailable"),
+        "the serialized reply must not carry the retired field: {json}"
+    );
+
+    // And it decodes back through the client's own type.
+    let decoded: ListSessionsResponse = serde_json_lenient::from_str(&json).unwrap();
+    assert_eq!(decoded.daemon_version.as_deref(), Some("test"));
+    assert!(decoded.sessions.is_empty());
+
+    // An older daemon's reply, still carrying the field, decodes as well:
+    // the extra field is ignored rather than fatal.
+    let older = r#"{"daemon_version":"old","mtls_proxy_unavailable":"still here","sessions":[]}"#;
+    let from_older: ListSessionsResponse = serde_json_lenient::from_str(older).unwrap();
+    assert_eq!(from_older.daemon_version.as_deref(), Some("old"));
+    assert!(from_older.sessions.is_empty());
+}
+
 // --- helpers ---
 
 /// Creates a session whose workspace mfile declares a `[session.vars]`
@@ -843,13 +1280,32 @@ async fn create_session_at(
     name: &str,
     project_path: paths::HostAbsPath,
 ) -> SessionId {
+    create_session_with(
+        daemon,
+        name,
+        project_path,
+        sessions::NetworkMode::NoNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await
+}
+
+/// Like [`create_session`] but with the network mode and policy the caller
+/// chooses, so a test can store a policy the CLI surfaces must render.
+async fn create_session_with(
+    daemon: &common::TestDaemon,
+    name: &str,
+    project_path: paths::HostAbsPath,
+    network: sessions::NetworkMode,
+    policy: sessions::SessionPolicy,
+) -> SessionId {
     let mut client = daemon.server.connect().await;
 
     let config = minimald_rpc::SessionConfig {
         name: Some(name.to_string()),
         project_path,
-        network: sessions::NetworkMode::NoNet,
-        policy: Default::default(),
+        network,
+        policy,
         hooks_enabled: true,
         attrs: Default::default(),
     };
@@ -895,4 +1351,18 @@ async fn create_session_at(
         }
     }
     id
+}
+
+/// Like [`create_session`] but with the network mode and policy the caller
+/// chooses.
+async fn create_session_with_policy(
+    daemon: &common::TestDaemon,
+    name: &str,
+    network: sessions::NetworkMode,
+    policy: sessions::SessionPolicy,
+) -> SessionId {
+    let project_path =
+        camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
+    let abs_path = paths::HostAbsPath::try_new(project_path).unwrap();
+    create_session_with(daemon, name, abs_path, network, policy).await
 }

@@ -4,37 +4,134 @@
 //! daemon-scoped [`SwitchClient`] (DM2) or to `minvmd` (DM1/3/4); this only
 //! leases from it and wires a running switch into a sandbox's namespace.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
+use std::sync::{Arc, RwLock};
 
 use sandbox2::{
     AbandonFuture, AttachFuture, NetGuard, NetPlan, Network, NetworkError, PlanFuture, Resolver,
     Spawned, TapSpec,
 };
-use sessions::NetworkMode;
+use sessions::{NetworkMode, SessionId};
 use tokio::sync::Mutex;
 
 use crate::net::SwitchClient;
 use crate::net::policy::ControlChannel;
 
-/// The network provider for `mode`. `HostNet` and `NoNet` are the sandbox
-/// layer's own; `OwnIp` needs a lease, a tap and a switch attach. An
-/// unrecognised mode (`NetworkMode` is `#[non_exhaustive]`) gets the empty
-/// namespace, the safe direction.
+/// Reports an own-address box's lease to the proxy's routing table (NET-001).
+/// The session launcher mints one per launch carrying the stable `SessionId`,
+/// so the lease the attach path reports stays with the session across a
+/// rename — the registry keys the fact by the id, not the mutable name.
+///
+/// A task launch carries none: a task is a second PTask beside its session's
+/// and owns no proxy route of its own.
+#[derive(Debug, Clone)]
+pub(crate) struct OwnAddressReporter {
+    registry: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    session_id: SessionId,
+}
+
+impl OwnAddressReporter {
+    /// Builds the reporter for one session's launches.
+    #[must_use]
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn new(
+        registry: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+        session_id: SessionId,
+    ) -> Self {
+        Self {
+            registry,
+            session_id,
+        }
+    }
+
+    /// Reports `lease` — with the box's ingress declaration as an
+    /// external→internal port map — and registers `session_name`'s box name
+    /// against it, so the name routes exactly when the box is reachable.
+    /// Best-effort by construction: the registry is always held, and a
+    /// registration cannot fail.
+    pub(crate) fn report(&self, session_name: &str, lease: Ipv4Addr, ports: BTreeMap<u16, u16>) {
+        let mut registry = self
+            .registry
+            .write()
+            .expect("hostname registry lock poisoned");
+        registry.report_own_address(self.session_id, session_name, lease, ports);
+    }
+}
+
+/// The network provider for `mode`. `NoNet` is the sandbox layer's own; `HostNet`
+/// is the sandbox layer's plan, decided here against the switch (on a VM host
+/// the resolver must be the node's DNS layer, not the host's); `OwnIp` needs a
+/// lease, a tap and a switch attach. An unrecognised mode (`NetworkMode` is
+/// `#[non_exhaustive]`) gets the empty namespace, the safe direction.
+///
+/// `own_address` carries the registry handle an own-address launch reports its
+/// lease through once the box attaches (NET-001); a task launch passes `None`.
 pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
     ingress: Option<sessions::IngressPolicy>,
+    own_address: Option<OwnAddressReporter>,
 ) -> Arc<dyn Network> {
     match mode {
-        NetworkMode::HostNet => Arc::new(sandbox2::HostNet),
+        NetworkMode::HostNet => Arc::new(HostIpAddressNetwork {
+            switch: Arc::clone(switch),
+        }),
         NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
             switch: Arc::clone(switch),
             identity: identity.to_string(),
             ingress,
+            own_address,
             reserved: std::sync::Mutex::new(None),
         }),
         _ => Arc::new(sandbox2::NoNet),
+    }
+}
+
+/// A host-address box: it shares the daemon host's network namespace, so its
+/// plan is the sandbox layer's [`sandbox2::HostNet`] — except on a VM host,
+/// where the namespace it shares is the *guest's* and the host's own resolver
+/// is unreachable from it. There the plan points the resolver at the node's
+/// DNS layer — the switch gateway, whose static `min.internal.` zone carries
+/// the `host` record (NET-003) — whatever the rootfs ships.
+struct HostIpAddressNetwork {
+    switch: Arc<Mutex<SwitchClient>>,
+}
+
+impl std::fmt::Debug for HostIpAddressNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostIpAddressNetwork")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Network for HostIpAddressNetwork {
+    /// Reads the switch's transport once, before the process starts. Nothing is
+    /// attached, so this never starts or stops a gvproxy process.
+    fn plan(&self) -> PlanFuture<'_> {
+        Box::pin(async move {
+            let vm_host = {
+                let s = self.switch.lock().await;
+                matches!(
+                    s.transport(),
+                    crate::net::SwitchTransport::HostShuttle { .. }
+                )
+            };
+            if !vm_host {
+                // Native host: the namespace the box shares is the host's own,
+                // so the sandbox layer's plan answers `host.min.internal` from
+                // `/etc/hosts` at the host's loopback.
+                return sandbox2::HostNet.plan().await;
+            }
+            // NET-003: on a VM host, 127.0.0.1 in the namespace a host-address
+            // box shares is the guest's loopback, not the host's, and the host
+            // resolver `/etc/hosts` would complement is unreachable. The node's
+            // DNS layer answers the name at the gateway, and
+            // `Resolver::Nameservers` replaces whatever the rootfs ships.
+            let ns = { self.switch.lock().await.subnet().dns_server() };
+            Ok(NetPlan::host().with_resolver(Resolver::Nameservers(vec![ns])))
+        })
     }
 }
 
@@ -140,6 +237,10 @@ struct OwnIpNetwork {
     identity: String,
     /// Static ingress port mappings to apply once attached.
     ingress: Option<sessions::IngressPolicy>,
+    /// The registry handle the lease is reported through on attach, so the
+    /// box's proxy route exists exactly while the lease does (NET-001). `None`
+    /// for a task launch, which owns no proxy route.
+    own_address: Option<OwnAddressReporter>,
     /// Taken by `plan`, taken back out by `attach` or `abandon`. A `std` mutex,
     /// never held across an await, so a cancelled launch cannot leak it.
     reserved: std::sync::Mutex<Option<Reserved>>,
@@ -228,6 +329,7 @@ impl Network for OwnIpNetwork {
                 reserved.lease.ip,
                 &self.identity,
                 self.ingress.as_ref(),
+                self.own_address.as_ref(),
             )
             .await
             .map_err(NetworkError::new)?;
@@ -277,21 +379,28 @@ mod tests {
     async fn every_mode_gets_its_provider() {
         let switch = counting_switch();
 
-        let host = network_for(NetworkMode::HostNet, &switch, "s", None)
+        let host = network_for(NetworkMode::HostNet, &switch, "s", None, None)
             .plan()
             .await
             .unwrap();
         assert!(!host.isolates_netns());
-        assert_eq!(host.resolver(), &Resolver::Host);
+        // The fixture's switch is a `HostShuttle` — a VM host — so the
+        // host-address box resolves through the node's DNS layer, not the
+        // host's own resolver (NET-003; the native case is
+        // `host_min_internal_resolves_to_host_reach_address_per_mode`).
+        assert_eq!(
+            host.resolver(),
+            &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()])
+        );
 
-        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None)
+        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None, None)
             .plan()
             .await
             .unwrap();
         assert!(no_net.isolates_netns() && no_net.tap().is_none());
         assert_eq!(no_net.resolver(), &Resolver::None);
 
-        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None);
+        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None, None);
         assert!(own_ip.plan().await.unwrap().isolates_netns());
         assert_eq!(switch.lock().await.attached(), 1, "own-IP takes a lease");
         own_ip.abandon().await;
@@ -362,7 +471,7 @@ mod tests {
         let switch = counting_switch();
         let before = switch.lock().await.attached();
 
-        let net = network_for(NetworkMode::OwnIp, &switch, "s", None);
+        let net = network_for(NetworkMode::OwnIp, &switch, "s", None, None);
         net.plan().await.expect("planning leases an address");
         assert_eq!(switch.lock().await.attached(), before + 1);
 
@@ -393,7 +502,7 @@ mod tests {
     async fn concurrent_own_ip_launches_do_not_serialize() {
         let switch = counting_switch();
         let launches: Vec<_> = (0..4)
-            .map(|i| network_for(NetworkMode::OwnIp, &switch, &format!("p{i}"), None))
+            .map(|i| network_for(NetworkMode::OwnIp, &switch, &format!("p{i}"), None, None))
             .collect();
         for net in &launches {
             net.plan().await.expect("planning leases an address");
@@ -407,5 +516,94 @@ mod tests {
             net.abandon().await;
         }
         assert_eq!(switch.lock().await.attached(), 0);
+    }
+
+    /// NET-003: on a VM host the namespace a host-address box shares is the
+    /// guest's, so it resolves `host.min.internal` through the node's DNS layer
+    /// — the switch gateway — never through the host's own resolver and never
+    /// from an `/etc/hosts` entry that would shadow the node's answer.
+    #[tokio::test]
+    async fn host_ip_box_resolves_through_node_dns_layer() {
+        let subnet = crate::net::SwitchSubnet::default();
+        let switch = counting_switch();
+        let plan = network_for(NetworkMode::HostNet, &switch, "s", None, None)
+            .plan()
+            .await
+            .expect("host-address plans do not fail");
+
+        assert_eq!(
+            plan.resolver(),
+            &Resolver::Nameservers(vec![subnet.dns_server()]),
+            "the resolver is the node's DNS layer, the switch gateway"
+        );
+        assert!(
+            plan.hosts().is_empty(),
+            "no /etc/hosts entry may shadow the node's answer"
+        );
+
+        // The same DNS layer an own-address box on the same host resolves
+        // through: one switch, one zone, one answer for the host.
+        let own = own_ip_plan(
+            subnet,
+            std::net::Ipv4Addr::new(100, 64, 0, 9),
+            TapMechanism::InNamespace,
+        );
+        assert_eq!(plan.resolver(), own.resolver());
+    }
+
+    /// NET-003 for every box kind: `host.min.internal` answers with the address
+    /// that reaches the host's loopback — `127.0.0.1` from `/etc/hosts` for a
+    /// box sharing the native host's namespace, the switch gateway's DNS zone
+    /// for own-address boxes and for host-address boxes on a VM host.
+    #[tokio::test]
+    async fn host_min_internal_resolves_to_host_reach_address_per_mode() {
+        let subnet = crate::net::SwitchSubnet::default();
+
+        // Native host-address: `/etc/hosts` at the host's loopback, because the
+        // host's own resolver has no `min.internal.` zone to answer from.
+        let native = Arc::new(Mutex::new(SwitchClient::new(
+            "/usr/bin/gvproxy",
+            "/run/minimal/gvproxy",
+        )));
+        let plan = network_for(NetworkMode::HostNet, &native, "s", None, None)
+            .plan()
+            .await
+            .unwrap();
+        assert_eq!(plan.resolver(), &Resolver::Host);
+        assert_eq!(plan.hosts().len(), 1, "one static entry for the host");
+        let entry = &plan.hosts()[0];
+        assert_eq!(entry.name, sandbox2::HOST_MIN_INTERNAL);
+        assert_eq!(
+            entry.address,
+            std::net::Ipv4Addr::LOCALHOST,
+            "the name answers at the host's loopback"
+        );
+
+        // VM-host host-address: the node's DNS layer answers the same name.
+        let vm = counting_switch();
+        let plan = network_for(NetworkMode::HostNet, &vm, "s", None, None)
+            .plan()
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.resolver(),
+            &Resolver::Nameservers(vec![subnet.gateway()])
+        );
+
+        // Own-address (the plan is transport-independent): the same gateway,
+        // whose static zone answers the name with the NAT'd host-alias address.
+        let own = own_ip_plan(
+            subnet,
+            std::net::Ipv4Addr::new(100, 64, 0, 9),
+            TapMechanism::InNamespace,
+        );
+        assert_eq!(
+            own.resolver(),
+            &Resolver::Nameservers(vec![subnet.gateway()])
+        );
+        assert!(
+            own.hosts().is_empty(),
+            "own-address boxes resolve the host through the zone, not /etc/hosts"
+        );
     }
 }

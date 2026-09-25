@@ -158,10 +158,13 @@ pub async fn refresh(provider: &mut Provider) -> Result<ProviderData, anyhow::Er
     let version = timed::<GetVersion>(&mut provider.client, ())
         .await
         .context("GetVersion RPC failed")?;
-    let sessions = timed::<ListSessions>(&mut provider.client, ())
+    let mut sessions = timed::<ListSessions>(&mut provider.client, ())
         .await
         .context("ListSessions RPC failed")?
         .sessions;
+    // The daemon cannot probe git (on macOS it runs in the minvmd guest),
+    // so fill each session's git context host-side before rendering.
+    minimal_client::fill_git_info(&mut sessions).await;
     Ok(ProviderData {
         label: provider.label.to_string(),
         version: version.version,
