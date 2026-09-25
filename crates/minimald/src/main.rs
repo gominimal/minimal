@@ -864,9 +864,10 @@ async fn async_main() -> Result<(), MainError> {
     if !cli.listen_args().unwrap().vsock {
         // standard path, listening on UDS socket.
         //
-        // The B5 host-side egress proxy (:7654) and B8 mTLS reverse proxy
-        // (:7655) are bound and served by `Server::run` for both DM2 (here) and
-        // DM1 (the vsock path below), so no separate startup bind happens here.
+        // The B5 host-side egress proxy (on its configured port, or one the
+        // OS selected) and the B8 mTLS reverse proxy (:7655) are bound and
+        // served by `Server::run` for both DM2 (here) and DM1 (the vsock
+        // path below), so no separate startup bind happens here.
 
         if let Err(e) = std::fs::remove_file(cli.listen_on())
             && e.kind() != std::io::ErrorKind::NotFound
