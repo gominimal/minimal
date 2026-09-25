@@ -1933,6 +1933,25 @@ s.close()' "$1"
   # a tripped gate there is a lane-level fault, not a degraded proof.
   recover_gate_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
 
+  # The pids whose cmdline carries $1, straight off /proc — pgrep -f's
+  # answer without the procps dependency (musl guest images and slim CI
+  # images both lack it). Beat B reads the pinned daemon's pid from here
+  # twice, to prove the recovery happened without a restart.
+  recover_pids_for() {
+    local proc entry pat="$1"
+    for proc in /proc/[0-9]*; do
+      [ -r "$proc/cmdline" ] || continue
+      # 2>/dev/null BEFORE the file redirect: a pid can vanish between the
+      # glob and the open, and the shell reports the failed redirect to the
+      # stderr in effect at that point — discard it first, or every scan
+      # prints noise for pids that died mid-scan.
+      entry="$(tr '\0' ' ' 2>/dev/null <"$proc/cmdline" || true)"
+      case "$entry" in
+        *"$pat"*) printf '%s\n' "${proc#/proc/}" ;;
+      esac
+    done
+  }
+
   # ---- the VM branch: only beat C exists there ----------------------------
   if [ "$min_daemon" = minvmd ]; then
     mnl ls >/dev/null 2>&1 || true # a standalone run: make sure the VM is up
@@ -2123,10 +2142,22 @@ while True:
     echo "--- daemon log (tail) ---"; tail -20 "$(recover_daemon_log)" 2>/dev/null || true
     fail
   fi
+  # Two separate substring checks, never one ordered glob: the file log is
+  # JSON with its fields rendered alphabetically, so "next_retry" sorts
+  # BEFORE "status" and a single `*status*next_retry*` pattern could never
+  # match a real record.
   case "$recover_bind_record" in
-    *'"status":"unavailable"'*'next_retry'*) ;;
+    *'"status":"unavailable"'*) ;;
     *)
-      echo "::error::the bind-failure record does not carry its unavailable status and next-retry schedule"
+      echo "::error::the bind-failure record does not carry its unavailable status"
+      echo "--- record ---"; printf '%s\n' "$recover_bind_record"
+      fail
+      ;;
+  esac
+  case "$recover_bind_record" in
+    *'"next_retry"'*) ;;
+    *)
+      echo "::error::the bind-failure record does not carry its next-retry schedule"
       echo "--- record ---"; printf '%s\n' "$recover_bind_record"
       fail
       ;;
@@ -2134,7 +2165,7 @@ while True:
   echo "daemon log: $recover_bind_record"
 
   # ---- beat B: free the port; recovery, no restart ------------------------
-  recover_pid_before="$(pgrep -f "hostname-proxy-port $RECOVER_PIN" 2>/dev/null | head -n1 || true)"
+  recover_pid_before="$(recover_pids_for "hostname-proxy-port $RECOVER_PIN" | head -n1)"
   if [ -z "$recover_pid_before" ]; then
     echo "::error::cannot find the daemon pinned to --hostname-proxy-port $RECOVER_PIN — the no-restart proof has no pid to compare"
     fail
@@ -2167,7 +2198,7 @@ while True:
   echo "min ls cleared the warning after ${recover_try} one-second poll(s); it now reads:"
   printf '%s\n' "$recover_ls_after" | grep -E -- 'HOSTNAME PROXY|ZONE ANSWERER' | sed 's/^/  /'
 
-  recover_pid_after="$(pgrep -f "hostname-proxy-port $RECOVER_PIN" 2>/dev/null | head -n1 || true)"
+  recover_pid_after="$(recover_pids_for "hostname-proxy-port $RECOVER_PIN" | head -n1)"
   if [ "$recover_pid_after" != "$recover_pid_before" ]; then
     echo "::error::the daemon's pid changed across the recovery ($recover_pid_before -> ${recover_pid_after:-<none>}) — a restart clears the warning too, so this proves nothing (NET-022 is about the daemon recovering on its own)"
     fail
@@ -2187,9 +2218,17 @@ while True:
     fail
   fi
   case "$recover_recover_record" in
-    *'"status":"recovered"'*"\"addr\":\"127.0.0.1:$RECOVER_PIN\""*) ;;
+    *'"status":"recovered"'*) ;;
     *)
-      echo "::error::the recovered record does not name the recovered address and status"
+      echo "::error::the recovered record does not carry its recovered status"
+      echo "--- record ---"; printf '%s\n' "$recover_recover_record"
+      fail
+      ;;
+  esac
+  case "$recover_recover_record" in
+    *"\"addr\":\"127.0.0.1:$RECOVER_PIN\""*) ;;
+    *)
+      echo "::error::the recovered record does not name the recovered address"
       echo "--- record ---"; printf '%s\n' "$recover_recover_record"
       fail
       ;;
