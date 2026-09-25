@@ -2301,6 +2301,115 @@ mod tests {
         }
     }
 
+    /// The socket families the filter's live-kernel behaviour is probed for,
+    /// in the order the probe child reports them.
+    #[cfg(target_os = "linux")]
+    const PROBED_FAMILIES: [(&str, i32); 4] = [
+        ("AF_UNIX", libc::AF_UNIX),
+        ("AF_INET", libc::AF_INET),
+        ("AF_INET6", libc::AF_INET6),
+        ("AF_VSOCK", libc::AF_VSOCK),
+    ];
+
+    /// Probes [`PROBED_FAMILIES`] in a forked child, installing the production
+    /// none-box filter first when `filtered`, and returns one errno byte per
+    /// family: `0` when the child created a socket of that family, the raw
+    /// errno otherwise.
+    ///
+    /// The child runs only async-signal-safe calls between the fork and its
+    /// `_exit` (`prctl`, the raw `seccomp` syscall, `socket`, `close`, `write`,
+    /// `_exit`), matching the pre-exec environment the production filter is
+    /// installed in; the parent owns every assertion, so a failure is reported
+    /// with the test's own messages rather than a bare child exit code.
+    #[cfg(target_os = "linux")]
+    fn probe_socket_families_in_child(filtered: bool) -> std::io::Result<[u8; 4]> {
+        let mut report = [0u8; 4];
+        let mut fds = [0; 2];
+        // SAFETY: `pipe(2)` writes two descriptors into `fds` and reads no
+        // memory of ours beyond it; the result is checked.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the fork runs in the test's process, and the child only
+        // touches async-signal-safe calls before its `_exit`, so no allocator
+        // or lock can be held across the fork by the child itself.
+        let pid = unsafe { libc::fork() };
+        if pid == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if pid == 0 {
+            // Child: the production filter, then one errno byte per family.
+            // SAFETY: the descriptors are the pipe's own ends.
+            unsafe { libc::close(fds[0]) };
+            if filtered {
+                // SAFETY: the filter is the `&'static` the process-wide
+                // OnceLock owns, valid and immutable for the child's lifetime.
+                if unsafe { install_socket_family_filter(socket_family_filter_for_none_box()) }
+                    .is_err()
+                {
+                    // Distinguishable in the parent's failure message: no
+                    // install, no probe. This host cannot launch none boxes.
+                    unsafe { libc::_exit(127) };
+                }
+            }
+            for (i, &(_, family)) in PROBED_FAMILIES.iter().enumerate() {
+                // SAFETY: `socket(2)` reads only its arguments.
+                let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
+                report[i] = if fd >= 0 {
+                    // SAFETY: `close(2)` consumes the descriptor just created.
+                    unsafe { libc::close(fd) };
+                    0
+                } else {
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(1) as u8
+                };
+            }
+            // SAFETY: `write(2)` reads `report`, which outlives the call, and
+            // `_exit(2)` never returns, so the child ends here.
+            unsafe {
+                libc::write(fds[1], report.as_ptr().cast(), report.len());
+                libc::_exit(0);
+            }
+        }
+        // Parent: drain the report, then reap the child.
+        // SAFETY: the write end is the parent's to close.
+        unsafe { libc::close(fds[1]) };
+        let mut filled = 0;
+        while filled < report.len() {
+            // SAFETY: `read(2)` writes only into the unfilled tail of
+            // `report`, and the length is bounded by the same slice.
+            let n = unsafe {
+                libc::read(
+                    fds[0],
+                    report[filled..].as_mut_ptr().cast(),
+                    report.len() - filled,
+                )
+            };
+            if n <= 0 {
+                break; // The child is gone; its exit status below names it.
+            }
+            filled += n as usize;
+        }
+        let mut status = 0;
+        // SAFETY: `waitpid(2)` waits on the child this function forked.
+        if unsafe { libc::waitpid(pid, &mut status, 0) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+            return Err(std::io::Error::other(format!(
+                "the socket-family probe child exited with status {status} \
+                 (127 means installing the filter failed, so this host cannot \
+                 launch none boxes at all)"
+            )));
+        }
+        if filled != report.len() {
+            return Err(std::io::Error::other(format!(
+                "the socket-family probe child reported {filled} of {} bytes",
+                report.len()
+            )));
+        }
+        Ok(report)
+    }
+
     /// NET-038. The none-box filter refuses `AF_VSOCK` sockets (which bypass the
     /// network namespace) while still allowing the local `AF_UNIX` sockets the
     /// sandbox's own minenv socket depends on, leaves every other syscall alone,
@@ -2308,7 +2417,10 @@ mod tests {
     /// production runtime effect is proved by
     /// `network_none_blocks_all_outside_sockets` in the minimald root integration
     /// harness; this unit test evaluates the program
-    /// [`build_socket_family_filter`] produces.
+    /// [`build_socket_family_filter`] produces and installs the production
+    /// filter against the live kernel this test runs on, so the shipped BPF is
+    /// exercised by real `socket(2)` calls on every host that runs the suite,
+    /// not only where the root harness can.
     /// Only a none plan seals sockets. An isolated plan without a tap is
     /// also what an own-address box starts from inside a microVM, where the
     /// daemon moves the tap in after spawn; sealing it would refuse the
@@ -2339,6 +2451,21 @@ mod tests {
         assert!(
             plan.blocks_outside_sockets(),
             "a none plan must block outside sockets"
+        );
+
+        // The provider is the consumer-facing surface: `network_for` maps every
+        // no-net consumer — a `--network none` session's interactive box and a
+        // no-net task's sandbox alike (`task_network` goes through the same
+        // mapping) — to `NoNet`, so pinning that its plan seals is pinning the
+        // task path, not just the session path.
+        let no_net = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("building a current-thread runtime for the provider pin")
+            .block_on(network::NoNet.plan())
+            .expect("NoNet plans do not fail");
+        assert!(
+            no_net.blocks_outside_sockets(),
+            "the NoNet provider must yield the sealing plan for every consumer it plans"
         );
 
         let filter = build_socket_family_filter();
@@ -2389,6 +2516,51 @@ mod tests {
             libc::SECCOMP_RET_KILL_PROCESS,
             "an x32 caller must be killed, not allowed"
         );
+
+        // The program above is what ships; these probes run the shipped
+        // filter against the kernel this test executes on, exactly the way a
+        // none-box child experiences it: install via `prctl` + `seccomp`,
+        // then call `socket(2)` for real.  A control child runs unfiltered,
+        // so a family the kernel itself cannot create (no AF_VSOCK driver,
+        // say) is told apart from one the filter refused.
+        let unfiltered = probe_socket_families_in_child(false)
+            .expect("running the unfiltered socket-family probe");
+        let filtered =
+            probe_socket_families_in_child(true).expect("running the filtered socket-family probe");
+        let [unix, inet, inet6, vsock] = filtered;
+        assert_eq!(
+            unix, 0,
+            "the filter must keep AF_UNIX sockets working (errno {unix})"
+        );
+        assert_eq!(
+            inet,
+            libc::EAFNOSUPPORT as u8,
+            "the filter must refuse AF_INET with EAFNOSUPPORT"
+        );
+        assert_eq!(
+            inet6,
+            libc::EAFNOSUPPORT as u8,
+            "the filter must refuse AF_INET6 with EAFNOSUPPORT"
+        );
+        assert_eq!(
+            vsock,
+            libc::EAFNOSUPPORT as u8,
+            "the filter must refuse AF_VSOCK with EAFNOSUPPORT — the family \
+             that bypasses the network namespace is the point of the seal"
+        );
+        // Where the control child could create the family at all, the filter
+        // is what refused it; where the kernel never could, the refusal above
+        // matches what the kernel already answers and says so, so a missing
+        // driver on the host is never mistaken for the seal working.
+        for (i, (name, _)) in PROBED_FAMILIES.iter().enumerate().skip(1) {
+            if unfiltered[i] != 0 {
+                eprintln!(
+                    "note: this kernel creates no {name} sockets (errno {}), \
+                     so the filtered refusal matches what it already answers",
+                    unfiltered[i]
+                );
+            }
+        }
     }
 
     /// After a successful `Sandbox::new`, the minenv Unix socket must be connectable.
