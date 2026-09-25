@@ -265,6 +265,17 @@ pub struct ListenArgs {
     /// install.
     #[arg(long)]
     gvproxy_bin: Option<std::path::PathBuf>,
+
+    /// Keep the shipped allow-all egress default for a box that declares no
+    /// `egress` section (NET-077). While the deny-all default is in force,
+    /// an own-address box created with no egress declaration reaches
+    /// nothing outside itself (NET-074) and shows `deny all` in
+    /// `min session policy` (NET-075). Opt out to keep the prior default —
+    /// a deployment that cannot carry the change in this release — and
+    /// retire the flag once yours declares its boxes' egress. A box that
+    /// declares its own egress section is unaffected either way.
+    #[arg(long, default_value_t = false)]
+    egress_deny_all_opt_out: bool,
 }
 
 /// An error at the top level of minimald.
@@ -477,6 +488,10 @@ async fn async_main() -> Result<(), MainError> {
                 // something else on the machine holds it.
                 hostname_proxy_port: None,
                 zone_answerer_port: None,
+                // The microVM's pid-1 has no flags to read: the guest runs
+                // the default its host's build ships — the deny-all default,
+                // not opted out.
+                egress_deny_all_opt_out: false,
             }),
             global_args: GlobalArgs {
                 minimal_state_dir: Some(DaemonAbsPath::try_new("/run/minimal").unwrap().into()),
@@ -785,6 +800,9 @@ async fn async_main() -> Result<(), MainError> {
         // The daemon derives its switch /24 from its instance id (NET-027);
         // no CLI flag pins one yet.
         switch_subnet_octet: None,
+        // NET-077: the deployment's opt-out of the deny-all egress default —
+        // the one daemon-side knob the default has.
+        deny_all_opt_out: cli.listen_args().unwrap().egress_deny_all_opt_out,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.

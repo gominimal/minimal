@@ -68,10 +68,12 @@ impl OwnAddressReporter {
 /// `policy` is the launch's whole session policy — the own-IP relay gate carries
 /// it in both directions (egress verdict per NET-062/063/064, inbound
 /// default-block per finding #2), while other modes have no relay to gate;
-/// `None` attaches ungated, which is what a task launch passes (a task is not a
-/// declared box). `own_address` carries the registry handle an own-address
-/// launch reports its lease through once the box attaches (NET-001); a task
-/// launch passes `None` for that too.
+/// `None` attaches ungated. The session launcher passes the box's *effective*
+/// policy (NET-074), and a task launch passes its session's effective egress
+/// alone — a task carries none of its session's ingress, because the session's
+/// own PTask is attached at the same time. `own_address` carries the registry
+/// handle an own-address launch reports its lease through once the box
+/// attaches (NET-001); a task launch passes `None` for that too.
 pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,

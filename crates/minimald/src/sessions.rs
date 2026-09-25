@@ -197,6 +197,12 @@ pub struct Manager {
     /// `HostNet` PTasks register on launch and withdraw on teardown.
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+
+    /// Whether this daemon opted out of the deny-all egress default
+    /// (NET-077), threaded from the server config into every session actor
+    /// so each one resolves its own effective egress (NET-074) the same way
+    /// the RPC path does.
+    deny_all_opt_out: bool,
 }
 
 impl Manager {
@@ -207,6 +213,7 @@ impl Manager {
         minimal_cache_dir: DaemonAbsPath,
         daemon_ctx: Arc<mctx::DaemonContext>,
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
+        deny_all_opt_out: bool,
     ) -> Result<ManagerHandle, std::io::Error> {
         let store = Store::init(minimal_state_dir.clone()).await?;
 
@@ -274,6 +281,7 @@ impl Manager {
             net_switch,
             #[cfg(target_os = "linux")]
             hostnames,
+            deny_all_opt_out,
         };
 
         tokio::spawn(mngr.mainloop());
@@ -512,6 +520,7 @@ impl Manager {
             record,
             net_switch: Arc::clone(&self.net_switch),
             manager: self.weak_self.clone(),
+            deny_all_opt_out: self.deny_all_opt_out,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
         }
@@ -1309,9 +1318,17 @@ pub(crate) mod tests {
             .build()
             .unwrap();
         let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
-        Manager::init(daemon_abs(&state), daemon_abs(&cache), daemon_ctx, switch)
-            .await
-            .unwrap()
+        // `false`: these tests run the default the build ships, not the
+        // opt-out.
+        Manager::init(
+            daemon_abs(&state),
+            daemon_abs(&cache),
+            daemon_ctx,
+            switch,
+            false,
+        )
+        .await
+        .unwrap()
     }
 
     /// A [`DaemonAbsPath`] for a test directory.

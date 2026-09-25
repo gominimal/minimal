@@ -139,27 +139,35 @@ impl Exec for TaskExec {
     }
 }
 
-/// The network a task gets: the provider for its session's mode (017-005).
-/// Shared by the two ways a task starts — over an exec channel here, and from
-/// inside the session (`env::SessionChannel::run_task`).
+/// The network a task gets: the provider for its session's mode (017-005),
+/// carrying the session's *effective* egress (NET-074) — a task in an
+/// own-address session that declared nothing runs under the deny-all default
+/// like the session itself does — and none of its ingress. Shared by the two
+/// ways a task starts — over an exec channel here, and from inside the
+/// session (`env::SessionChannel::run_task`).
 ///
 /// The mode, not the identity: an own-IP task is a second PTask beside the
 /// session's, on the same switch at the same time, so it registers under its
 /// own name and carries none of the session's ingress — forwards a task
 /// applied would come down again at its teardown. It carries no registry
 /// handle either: a task owns no proxy route of its own, so no lease is ever
-/// reported for it.
+/// reported for it. `deny_all_opt_out` is the daemon's opt-out (NET-077),
+/// read through the session handle so a task resolves its egress exactly as
+/// the launcher did.
 pub(crate) fn task_network(
     record: &sessions::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
+    deny_all_opt_out: bool,
 ) -> std::sync::Arc<dyn sandbox2::Network> {
     let id = record.id.to_string();
     let session = record.name.as_deref().unwrap_or(&id);
+    let egress =
+        crate::session::effective_egress_section(&record.policy, record.network, deny_all_opt_out);
     crate::net::provider::network_for(
         record.network,
         switch,
         &format!("{session}-task"),
-        None,
+        Some(sessions::SessionPolicy::new(egress, None)),
         None,
     )
 }
@@ -266,7 +274,11 @@ async fn task_producer(
             task.vars
                 .insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
         }
-        let network = task_network(&session.record().await?, &session.net_switch().await?);
+        let network = task_network(
+            &session.record().await?,
+            &session.net_switch().await?,
+            session.deny_all_opt_out().await?,
+        );
         // A task's `~/` resolves against the session's home, the same
         // directory the interactive session sees at `/home`. The daemon's own
         // ambient home is `/` inside the guest, and expanding against that
@@ -2030,17 +2042,19 @@ mod tests {
                 }),
         ));
 
-        let host = super::task_network(&record_with(sessions::NetworkMode::HostNet), &switch);
+        let host =
+            super::task_network(&record_with(sessions::NetworkMode::HostNet), &switch, false);
         assert!(!host.plan().await.unwrap().isolates_netns());
 
-        let no_net = super::task_network(&record_with(sessions::NetworkMode::NoNet), &switch);
+        let no_net =
+            super::task_network(&record_with(sessions::NetworkMode::NoNet), &switch, false);
         let plan = no_net.plan().await.unwrap();
         assert!(plan.isolates_netns() && plan.tap().is_none());
 
         let mut record = record_with(sessions::NetworkMode::OwnIp);
         record.name = Some("web".to_string());
         record.policy.ingress = Some(sessions::IngressPolicy::default());
-        let own_ip = super::task_network(&record, &switch);
+        let own_ip = super::task_network(&record, &switch, false);
         let plan = own_ip.plan().await.unwrap();
         assert!(
             plan.isolates_netns(),
@@ -2050,17 +2064,20 @@ mod tests {
             plan.resolver(),
             sandbox2::Resolver::Nameservers(_)
         ));
-        // Its own identity on the switch, and none of the session's policy:
-        // the session's PTask is attached at the same time.
+        // Its own identity on the switch, and the session's *effective*
+        // egress — deny-all here: no declaration, the default in force
+        // (NET-074) — but none of its ingress, because the session's PTask
+        // is attached at the same time.
         let described = format!("{own_ip:?}");
         assert!(
-            described.contains("\"web-task\"") && described.contains("has_policy: false"),
+            described.contains("\"web-task\"") && described.contains("has_policy: true"),
             "got {described}"
         );
         own_ip.abandon().await;
 
         // No name: the session id, rather than an empty hostname.
-        let unnamed = super::task_network(&record_with(sessions::NetworkMode::OwnIp), &switch);
+        let unnamed =
+            super::task_network(&record_with(sessions::NetworkMode::OwnIp), &switch, false);
         assert!(format!("{unnamed:?}").contains(&sessions::SessionId::nil().to_string()));
     }
 

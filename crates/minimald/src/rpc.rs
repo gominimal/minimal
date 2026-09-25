@@ -2,12 +2,12 @@ use futures::StreamExt as _;
 use minimald_rpc::{
     AbortSession, AbortSessionResponse, CleanCacheRequest, CleanCacheUpdate, CreateSession,
     DestroySession, DestroySessionResponse, Errorable, FinalizeSession, FinalizeSessionResponse,
-    GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
-    GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen, GetVersion,
-    GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
-    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool, SessionDelta,
-    SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest, ShutdownResponse,
-    SubmitVerdict,
+    GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetMeshStatus, GetSessionPolicy,
+    GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse,
+    GetSessionScreen, GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry,
+    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
+    RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
+    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -621,6 +621,51 @@ async fn serve_get_session_policy(
                 // R2.6: return the policy configured at launch from the live
                 // session record, not a hardcoded default.
                 Some(record) => Ok(Errorable::Ok(record.policy)),
+            }
+        })
+        .await
+}
+
+/// `GetEffectiveSessionPolicy`: the same record
+/// [`serve_get_session_policy`] serves, with the egress half resolved to what
+/// the gate enforces — the answer `min session policy` renders (NET-075).
+///
+/// Resolved here rather than in the client because the inputs are this
+/// daemon's own facts: the rollout phase its build ships
+/// ([`sessions::EGRESS_DEFAULT_PHASE`]) and its opt-out flag (NET-077). An
+/// own-address box with no `egress` section answers `deny_all` once the
+/// default is in force (NET-074) and `allow_all` behind the opt-out; a
+/// declared section answers verbatim; the strict declaration the record
+/// holds is never rewritten to say any of this.
+async fn serve_get_effective_session_policy(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    GetEffectiveSessionPolicy
+        .handle_channel(c, async |req| {
+            let opt_out = s.deny_all_opt_out().await;
+            let mngr = s.sessions_manager().await;
+            let predicate = match req {
+                GetEffectiveSessionPolicyRequest::Id(id) => SessionKeyPredicate::Id(id),
+                GetEffectiveSessionPolicyRequest::Name(name) => SessionKeyPredicate::Name(name),
+            };
+            let record = mngr
+                .get_record(predicate)
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            match record {
+                None => Ok(Errorable::Err {
+                    error: "no session found".to_string(),
+                }),
+                Some(record) => Ok(Errorable::Ok(minimald_rpc::EffectiveSessionPolicy {
+                    egress: sessions::effective_egress(
+                        record.policy.egress.as_ref(),
+                        record.network,
+                        sessions::EGRESS_DEFAULT_PHASE,
+                        opt_out,
+                    ),
+                    ingress: record.policy.ingress,
+                })),
             }
         })
         .await
@@ -1577,6 +1622,7 @@ pub async fn handle_ssh_rpc(
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
+        | GetEffectiveSessionPolicy::NAME
         | minimald_rpc::GetSessionHooks::NAME
         | SessionDelta::NAME
         | GetSessionScreen::NAME
@@ -1660,6 +1706,9 @@ pub async fn handle_ssh_rpc(
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
+        GetEffectiveSessionPolicy::NAME => {
+            serve!(serve_get_effective_session_policy(s, channel))
+        }
         minimald_rpc::GetSessionHooks::NAME => serve!(serve_get_session_hooks(s, channel)),
         SessionDelta::NAME => serve!(serve_session_delta(s, channel)),
         GetSessionScreen::NAME => serve!(serve_get_session_screen(s, channel)),
@@ -1682,9 +1731,10 @@ pub async fn handle_ssh_rpc(
 #[cfg(test)]
 mod tests {
     use minimald_rpc::{
-        CreateSession, CreateSessionRequest, DestroySessionRequest, EgressPolicy, GetSessionPolicy,
-        GetSessionPolicyRequest, RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest,
-        ShutdownResponse,
+        CreateSession, CreateSessionRequest, DestroySessionRequest, EffectiveEgress,
+        EffectiveSessionPolicy, EgressPolicy, GetEffectiveSessionPolicy,
+        GetEffectiveSessionPolicyRequest, GetSessionPolicy, GetSessionPolicyRequest,
+        RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest, ShutdownResponse,
     };
     use paths::HostAbsPath;
     use sessions::{NetworkMode, SessionId};
@@ -2697,6 +2747,151 @@ mod tests {
         // The configured ingress was `None`, and the read reflects that rather
         // than the old hardcoded `Some(IngressPolicy::default())`.
         assert_eq!(policy.ingress, None);
+    }
+
+    /// Creates an own-address session carrying `policy` and returns its id —
+    /// the box shape the deny-all default is about (NET-074): an
+    /// own-address box, whatever its egress declaration.
+    async fn own_ip_session(
+        client: &mut TestClient,
+        name: &str,
+        policy: SessionPolicy,
+    ) -> SessionId {
+        client
+            .call::<CreateSession>(&CreateSessionRequest {
+                config: minimald_rpc::SessionConfig {
+                    name: Some(name.to_string()),
+                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                    network: NetworkMode::OwnIp,
+                    policy,
+                    hooks_enabled: true,
+                    attrs: Default::default(),
+                },
+                must_match_version: None,
+            })
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// NET-074/NET-075: `GetEffectiveSessionPolicy` answers, over the real
+    /// SSH wire, what the gate enforces. An own-address box with no `egress`
+    /// section answers `deny_all` — the default this build ships is in
+    /// force, and this daemon has not opted out — while the strict
+    /// `GetSessionPolicy` reply still carries the absent section as `None`:
+    /// the default reaches the client without rewriting the record. A box
+    /// that declared its own egress answers it verbatim, survived the JSON
+    /// round trip, with its ingress beside it.
+    #[tokio::test]
+    async fn effective_policy_response_round_trips() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let egress = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            allow_dns_hosts: None,
+            allow_protocols: None,
+            deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
+        };
+        let declared_id = own_ip_session(
+            &mut client,
+            "declared-egress",
+            SessionPolicy::new(Some(egress.clone()), None),
+        )
+        .await;
+        let bare_id = own_ip_session(&mut client, "bare-egress", SessionPolicy::default()).await;
+
+        // The default's own case: an own-address box that declared nothing
+        // is deny-all (NET-074), reported as the posture, not as a
+        // materialized section.
+        let bare = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(bare_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            bare,
+            EffectiveSessionPolicy {
+                egress: EffectiveEgress::DenyAll,
+                ingress: None,
+            },
+            "an own-address box with no egress section must answer deny-all",
+        );
+
+        // The strict reply is unchanged: the declaration the box was
+        // launched with, absent section still absent.
+        let strict = client
+            .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(bare_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            strict,
+            SessionPolicy::default(),
+            "the strict policy reply must keep the declaration as launched",
+        );
+
+        // A declared section round-trips verbatim, ingress beside it.
+        let declared = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(declared_id))
+            .await
+            .unwrap();
+        assert_eq!(declared.egress, EffectiveEgress::Declared(egress));
+        assert_eq!(declared.ingress, None);
+    }
+
+    /// NET-077: a daemon started with the deny-all opt-out keeps the shipped
+    /// allow-all default — an own-address box with no `egress` section
+    /// answers `allow_all` where the same box on an opted-in daemon answers
+    /// `deny_all` — and its gate resolves no section, so nothing is
+    /// enforced. A box that declared its own egress keeps it either way.
+    #[tokio::test]
+    async fn deny_all_opt_out_keeps_prior_default() {
+        let server = TestServer::new_opted_out_in(tempfile::tempdir().unwrap()).await;
+        let mut client = server.connect().await;
+
+        let egress = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..EgressPolicy::default()
+        };
+        let declared_id = own_ip_session(
+            &mut client,
+            "opt-out-declared",
+            SessionPolicy::new(Some(egress.clone()), None),
+        )
+        .await;
+        let bare_id = own_ip_session(&mut client, "opt-out-bare", SessionPolicy::default()).await;
+
+        let bare = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(bare_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            bare,
+            EffectiveSessionPolicy {
+                egress: EffectiveEgress::AllowAll,
+                ingress: None,
+            },
+            "behind the opt-out, an absent egress section keeps the shipped allow-all",
+        );
+
+        // The report and the gate agree: the same resolution the launcher
+        // applies materializes no section to enforce.
+        assert_eq!(
+            crate::session::effective_egress_section(
+                &sessions::SessionPolicy::default(),
+                NetworkMode::OwnIp,
+                true,
+            ),
+            None,
+            "behind the opt-out, the gate compiles no egress section at all",
+        );
+
+        // The opt-out never rewrites a declaration: what the box said is
+        // what it gets, whichever daemon it runs on.
+        let declared = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(declared_id))
+            .await
+            .unwrap();
+        assert_eq!(declared.egress, EffectiveEgress::Declared(egress));
     }
 
     #[tokio::test]
