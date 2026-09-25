@@ -50,7 +50,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 ### O1 One box record
 
-- **BOX-001** WHEN a box is created THE SYSTEM SHALL assign it a UUIDv7 `box_id`, a `box_type`, and a `parent`, minted by the host-side creator outside any VM and never supplied by the client.
+- **BOX-001** WHEN a box is created THE SYSTEM SHALL assign it a UUIDv7 `box_id` whose random fields come from the OS CSPRNG, a `box_type`, and a `parent`, minted by the host-side creator outside any VM and never supplied by the client (BEP-070).
+  - IF a minted `box_id` is named by any retained record THEN THE SYSTEM SHALL refuse the creation (BEP-070).
+    tier:   T0
+    verify: cargo nextest run -p minimald colliding_box_id_refuses_creation
   tier:     T0
   verify:   cargo nextest run -p minimald create_assigns_uuidv7_id_type_and_parent
 
@@ -91,7 +94,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-010** WHEN `min box rename <box> <name>` runs THE SYSTEM SHALL change only the alias, leave `box_id`, spec, events and filesystem unchanged, and record a `renamed` event carrying the old and new names.
   tier:     T1
   verify:   cargo nextest run -p sessions rename_changes_only_alias_and_records_event
-  property: For every box and every new name, rename changes only the name field: id, spec, events and filesystem path are equal before and after.
+  property: For every box and every new name, rename leaves id, spec and filesystem path equal before and after, preserves every prior event, and appends exactly one `renamed` event.
 
 - **BOX-011** THE SYSTEM SHALL hold every box record in exactly one of the states `pending`, `materializing`, `running`, `stopped`, or `exited`, with `exited` carrying `exit_code` and a `reason` of `exit`, `timeout`, `oom`, or `stopped`, and render the state in `min box show`.
   tier:     T2
@@ -181,7 +184,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal resume_non_pty_box_exit2_names_run
 
-- **BOX-032** WHEN `min run <task> [-- <args>…]` runs THE SYSTEM SHALL create a box of type `task` from the entry, connect the box's stdin, stdout and stderr to the command's, write nothing else to stdout, and exit with the entrypoint's code.
+- **BOX-032** WHEN `min run <task> [-- <args>…]` runs without `--detach` THE SYSTEM SHALL create a box of type `task` from the entry, connect the box's stdin, stdout and stderr to the command's, write nothing else to stdout, and exit with the entrypoint's code.
   tier:     T0
   verify:   cargo nextest run -p minimal run_wires_stdio_and_propagates_exit
 
@@ -189,7 +192,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal task_run_is_noun_form_of_run
 
-- **BOX-034** WHERE `--detach` is given to `min run` THE SYSTEM SHALL print the `box_id`, close the task's stdin at creation, and return.
+- **BOX-034** WHERE `--detach` is given to `min run` THE SYSTEM SHALL print only the `box_id` to stdout, close the task's stdin at creation, capture the task's output for `min task logs`, and return.
   tier:     T0
   verify:   cargo nextest run -p minimal run_detach_prints_id_closes_stdin
 
@@ -596,11 +599,11 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimald ram_auto_resolves_to_host_default
 
-- **BOX-130** THE SYSTEM SHALL place every box's memory cgroup in one boxes subtree capped at allocatable, with the daemon outside it, setting `memory.max` to the box's `ram` and, on an `enforced` host, `memory.min` to its reservation.
+- **BOX-130** WHERE the host's memory enforcement is `enforced` THE SYSTEM SHALL place every box's memory cgroup in one boxes subtree capped at allocatable, with the daemon outside it, setting `memory.max` to the box's `ram` and `memory.min` to its reservation.
   tier:     T0
   verify:   cargo nextest run -p minimald boxes_subtree_memory_max_and_min   # VM lane (NET-107)
 
-- **BOX-131** THE SYSTEM SHALL reject any write to a box's memory limit that originates from a process inside the box's namespaces, including one running as root inside the box.
+- **BOX-131** WHERE the host's memory enforcement is `enforced` THE SYSTEM SHALL reject any write to a box's memory limit that originates from a process inside the box's namespaces, including one running as root inside the box.
   tier:     T0
   verify:   cargo nextest run -p minimald in_box_root_cannot_raise_memory_limit
 
@@ -620,12 +623,12 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimald memory_policy_from_capabilities_not_config
 
-- **BOX-136** WHILE a native host has no delegated memory controller THE SYSTEM SHALL report `advisory` and still perform admission accounting.
+- **BOX-136** WHILE a native host has no delegated memory controller THE SYSTEM SHALL report `advisory`, perform admission accounting, and apply no memory cgroup limit.
   tier:     T0
   verify:   cargo nextest run -p minimald native_without_controller_is_advisory
 
 
-### O5 The local provider, un-enrolled (BOX-137 to BOX-145 wait on arch PR #45)
+### O5 The local provider, un-enrolled (BOX-137 to BOX-139 wait on arch PR #45)
 
 - **BOX-137** THE SYSTEM SHALL serve, from the client, `ProviderService.GetProviderInfo`, `GetQuotas`, `GetUsage`, `HostService.ListHosts` and `GetHost` for each local provider in the `minimal.provider.v1` shape with `profile = "static"` and no `CreateHost`.
   tier:     none
@@ -652,10 +655,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p mfile enrolled_and_unenrolled_expansion_identical
   property: For every minimal.toml, expansion under un-enrolled and enrolled host facts yields identical spec bytes and projection digest.
 
-- **BOX-143** THE SYSTEM SHALL key no record, event, audit entry, or CLI lookup on the box name, so that renaming a box leaves every reference resolving.
+- **BOX-143** THE SYSTEM SHALL key every record, event and audit entry on `box_id`, resolve a CLI name lookup to the current alias's `box_id`, and keep every id-addressed reference resolving across a rename.
   tier:     T1
   verify:   cargo nextest run -p sessions nothing_keys_on_box_name
-  property: For every operation in the record, event, audit and lookup APIs, the operation's result is invariant under renaming any box.
+  property: For every id-addressed operation in the record, event and audit APIs, the result is invariant under renaming any box; a name lookup resolves the current alias and only the current alias.
 
 
 ### O6 Prove it
@@ -713,7 +716,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 ## Security considerations
 
 - **Invariant:** THE SYSTEM SHALL identify a box by its `box_id` and never by its name.
-  enforced by: the record store keys every lookup, event, and audit entry on the id; rename changes one field (Gatehouse §5.2)
+  enforced by: the record store keys every record, event, and audit entry on the id and resolves a name to the current alias's id; rename changes one field (Gatehouse §5.2; BEP-070 for entropy and collision refusal)
   covered by: BOX-001, BOX-010, BOX-143
 - **Invariant:** THE SYSTEM SHALL mint every `box_id` outside the VM escape boundary.
   enforced by: the native daemon on `local0`, the VM host daemon on `local-minvmd` (BEP-070; Gatehouse §6.10)
@@ -724,7 +727,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **Invariant:** THE SYSTEM SHALL let a Box Type constraint only narrow a spec, never widen it.
   enforced by: constraint intersection at expansion (architecture design principle 9; Policy layers and precedence)
   covered by: BOX-061, BOX-062
-- **Invariant:** THE SYSTEM SHALL keep a box's events stream and memory limit unwritable from any process in the box's namespaces.
+- **Invariant:** THE SYSTEM SHALL keep a box's events stream, and on an `enforced` host its memory limit, unwritable from any process in the box's namespaces.
   enforced by: the record and the cgroup files live outside the box's mount and cgroup namespaces
   covered by: BOX-041, BOX-131
 - **Invariant:** THE SYSTEM SHALL fail a brokered secret reference on an un-enrolled host with no node-local proxy rather than resolve it by other means.
