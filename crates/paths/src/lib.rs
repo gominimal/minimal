@@ -202,6 +202,53 @@ pub fn provider_instance_dir(
     sub_path!(state_dir, "providers").sub_path_unchecked(&provider_instance_name(kind, instance))
 }
 
+/// The VM name that means "the default VM": the single unnamed instance whose
+/// on-disk layout predates named VMs. Every path of that VM must stay
+/// unchanged (NET-053), so it resolves to the provider-instance dir itself
+/// rather than a per-name subdirectory.
+pub const DEFAULT_VM_NAME: &str = "default";
+
+/// Validate a VM name (`--vm <NAME>`): it names a directory, so it must be a
+/// single path component — non-empty, no `/`, not `.` or `..`. That is the
+/// whole guarantee a name needs: it can only select a subdirectory *under*
+/// the provider dir, never escape it.
+///
+/// # Errors
+///
+/// [`Error::InvalidVmName`] when `vm` is not a single path component.
+pub fn validate_vm_name(vm: &str) -> Result<(), Error> {
+    if vm.is_empty() || vm == "." || vm == ".." || vm.contains('/') {
+        return Err(Error::InvalidVmName(vm.to_owned()));
+    }
+    Ok(())
+}
+
+/// The per-name provider-instance dir (NET-052, NET-054): the directory
+/// holding one named VM's own state files, socket, and locks.
+///
+/// A named VM — any `vm` other than [`DEFAULT_VM_NAME`] — nests under a
+/// per-name subdirectory:
+/// `<state_dir>/providers/local-<kind><instance>/<vm>/`. The default VM
+/// resolves to the provider-instance dir itself, exactly as
+/// [`provider_instance_dir`] does, so its paths are unchanged (NET-053).
+///
+/// # Errors
+///
+/// [`Error::InvalidVmName`] when `vm` is not a single path component.
+pub fn provider_instance_dir_named(
+    state_dir: &DaemonAbsPath,
+    kind: ProviderKind,
+    instance: u32,
+    vm: &str,
+) -> Result<DaemonAbsPath, Error> {
+    let base = provider_instance_dir(state_dir, kind, instance);
+    if vm == DEFAULT_VM_NAME {
+        return Ok(base);
+    }
+    validate_vm_name(vm)?;
+    Ok(base.sub_path_unchecked(vm))
+}
+
 /// Migrate legacy `providers/local-<N>` instance dirs — the pre-split naming,
 /// from before the native minimald and minvmd backends had distinct identities
 /// — to the kind-tagged scheme (`local-minimald<N>` / `local-minvmd<N>`), so
@@ -458,6 +505,12 @@ pub enum Error {
     /// re-validate.
     #[error("path contains a `..` traversal component: {0}")]
     ContainsParentDir(Utf8PathBuf),
+    /// A VM name was not a single path component (empty, contained `/`, or
+    /// was `.`/`..`), so it cannot name a per-VM subdirectory.
+    #[error(
+        "invalid VM name `{0}`: must be a single non-empty path component without `/` (`..` and `.` are not names)"
+    )]
+    InvalidVmName(String),
 }
 
 #[doc(hidden)]
@@ -1872,6 +1925,44 @@ mod tests {
             provider_instance_dir(&state, ProviderKind::Minvmd, 0).as_str(),
             "/state/minimal/providers/local-minvmd0",
         );
+    }
+
+    /// A named VM's provider dir nests under a per-name subdirectory
+    /// (NET-054); the default VM's is the provider dir itself, unchanged
+    /// (NET-053); and a name that is not a single path component is rejected
+    /// rather than resolved somewhere outside the provider dir.
+    #[test]
+    fn provider_instance_dir_accepts_a_name() {
+        let state = DaemonAbsPath::try_new("/state/minimal").unwrap();
+
+        // A named VM: its own directory under the provider dir.
+        assert_eq!(
+            provider_instance_dir_named(&state, ProviderKind::Minvmd, 0, "alpha")
+                .unwrap()
+                .as_str(),
+            "/state/minimal/providers/local-minvmd0/alpha",
+        );
+        // The default VM: byte-for-byte the pre-named-VMs layout.
+        assert_eq!(
+            provider_instance_dir_named(&state, ProviderKind::Minvmd, 0, DEFAULT_VM_NAME)
+                .unwrap()
+                .as_str(),
+            provider_instance_dir(&state, ProviderKind::Minvmd, 0).as_str(),
+        );
+        assert_eq!(
+            provider_instance_dir_named(&state, ProviderKind::Minimald, 2, DEFAULT_VM_NAME)
+                .unwrap()
+                .as_str(),
+            provider_instance_dir(&state, ProviderKind::Minimald, 2).as_str(),
+        );
+
+        // A name that is not a single path component must not resolve at all:
+        // each of these would otherwise escape the provider dir.
+        for bad in ["", ".", "..", "a/b", "../sibling"] {
+            let err = provider_instance_dir_named(&state, ProviderKind::Minvmd, 0, bad)
+                .expect_err("a non-component name must be rejected");
+            assert_eq!(err, Error::InvalidVmName(bad.to_owned()));
+        }
     }
 
     /// A tempdir turned into a `DaemonAbsPath` state root.
