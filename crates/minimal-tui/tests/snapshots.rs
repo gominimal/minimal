@@ -194,7 +194,7 @@ fn preview_section_with_screen_snapshot() {
 }
 
 #[test]
-fn detail_pane_with_policy() {
+fn detail_pane_shows_dynamic_ingress() {
     let mut model = fixed_model(vec![provider(
         "host",
         vec![entry(1, Some("api-staging"), "/src/api")],
