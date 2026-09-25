@@ -199,6 +199,13 @@ fn sudo_ok(label: &str, args: &[&str]) {
 /// isolated `NetPlan`, installs the production socket-family filter, and runs
 /// a static probe inside that asserts `AF_INET`, `AF_INET6`, and `AF_VSOCK`
 /// all fail with `EAFNOSUPPORT` while `AF_UNIX` still works.
+///
+/// The plan comes from the production provider, not the `NetPlan::none()`
+/// constructor: `network_for(NetworkMode::NoNet)` maps every no-net consumer
+/// to `sandbox2::NoNet` — a `--network none` session's box and a no-net
+/// task's sandbox alike, since `task_network` goes through the same mapping —
+/// so this proof runs the exact plan a no-net task's sandbox is built with
+/// and pins that the task path is sealed like the session path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn network_none_blocks_all_outside_sockets() {
     if !gated() {
@@ -212,10 +219,19 @@ async fn network_none_blocks_all_outside_sockets() {
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
 
+    let no_net = sandbox2::NoNet
+        .plan()
+        .await
+        .expect("the production NoNet provider plans do not fail");
+    assert!(
+        no_net.blocks_outside_sockets(),
+        "the NoNet provider must seal every consumer it plans, tasks included"
+    );
+
     let config = Config::new("none-sockets")
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
-        .with_plan(NetPlan::none());
+        .with_plan(no_net);
     // Build the sandbox in /tmp rather than the default (/home is a read-only
     // ext4 bind with locked nosuid, which breaks the unprivileged remounts
     // hakoniwa does inside the user namespace).
@@ -329,10 +345,27 @@ async fn network_none_attach_works() {
     .await
     .expect("hold process report timed out")
     .expect("spawn_blocking join");
-    assert_eq!(
-        hold_report, expected_report,
-        "the none-box launch lost the command's cwd or SHELL across the seccomp closure swap"
-    );
+    if hold_report != expected_report {
+        // The hold process is gone — its stdout reached EOF — so say how it
+        // died, not just what failed to arrive.  A launch that never reached
+        // the program (a host that cannot build the sandbox exits 125 in
+        // hakoniwa's mount setup, before any seccomp or exec) reads
+        // differently here from a launch that started the program without
+        // its cwd or `SHELL`, and the difference is the first thing to check.
+        let status = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || child.wait()),
+        )
+        .await
+        .expect("waiting for the silent hold process timed out")
+        .expect("spawn_blocking join")
+        .expect("waiting for the silent hold process");
+        panic!(
+            "the none-box launch lost the command's cwd or SHELL across the \
+             seccomp closure swap: expected {expected_report:?}, got \
+             {hold_report:?}; the hold process exited with {status:?}"
+        );
+    }
 
     let leader =
         session_leader_pid(child.id()).expect("resolving the none box's session leader pid");
