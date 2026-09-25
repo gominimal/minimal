@@ -173,8 +173,10 @@ cp "$INSTALL_HOOK" "$workdir/aur/minimal-bin.install"
 # makepkg --printsrcinfo refuses to run as root outright (its EUID == 0 guard
 # fires before the printsrcinfo early-return; FS#67158, Arch declined to
 # exempt it) — which is every container job. When root, run it as an
-# unprivileged user over a world-readable copy of the package files (the
-# workdir itself is 0700, so the copy must live outside it to be traversable).
+# unprivileged user over a copy of the package files that user owns (the
+# workdir itself is 0700, so the copy must live outside it to be traversable,
+# and makepkg >= 7 aborts unless $BUILDDIR and $PKGDEST, the copy's own
+# directory, are writable by the user it runs as, even for --printsrcinfo).
 # Prints the .SRCINFO on stdout.
 generate_srcinfo() {
     local dir="$1" rundir rc
@@ -196,6 +198,7 @@ generate_srcinfo() {
     # so the payload re-exports the caller's PATH — where makepkg, and any
     # harness stub shadowing it, live — and the scratch HOME explicitly.
     if id nobody >/dev/null 2>&1; then
+        chown -R nobody "$rundir" || { rm -rf "$rundir"; return 1; }
         if command -v runuser >/dev/null 2>&1; then
             runuser -u nobody -- bash -c "export PATH=\"$PATH\" HOME='$rundir'; cd '$rundir' && makepkg --printsrcinfo" </dev/null
             rc=$?
@@ -237,6 +240,10 @@ git config user.name  >/dev/null || git config user.name "minimal-ci"
 git config user.email >/dev/null || git config user.email "minimal-ci@users.noreply.archlinux.com"
 
 git add -A
+# The minimal-bin repo's .gitignore is an allowlist (`/*` then `!PKGBUILD`,
+# ...) that does not name the install hook, so -A skips it. The PKGBUILD's
+# install= line requires the file; force it in.
+git add -f minimal-bin.install
 
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "publish-aur: [dry-run] diff that would be committed as 'Update to $PKGVER':"

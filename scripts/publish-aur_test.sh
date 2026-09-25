@@ -48,7 +48,9 @@ for a in "${artifacts[@]}"; do
     printf 'payload of %s\n' "$a" >"$bucket/$a"
 done
 
-# A bare "AUR" repo with a committed PKGBUILD + .SRCINFO to diff against.
+# A bare "AUR" repo with a committed PKGBUILD + .SRCINFO to diff against, and
+# the live minimal-bin repo's allowlist .gitignore, which ignores every file it
+# does not name (the install hook included).
 aur="$root/aur.git"
 git init -q --bare -b master "$aur"
 seed="$root/seed"
@@ -57,6 +59,7 @@ git -C "$seed" config user.email test@example.com
 git -C "$seed" config user.name test
 printf 'pkgname=minimal-bin\npkgver=0.0.0\n' >"$seed/PKGBUILD"
 printf 'pkgname = minimal-bin\n' >"$seed/.SRCINFO"
+printf '/*\n!.gitignore\n!PKGBUILD\n!.SRCINFO\n!LICENSE\n!REUSE.toml\n' >"$seed/.gitignore"
 git -C "$seed" add -A
 git -C "$seed" commit -q -m seed
 git -C "$seed" push -q origin master
@@ -127,6 +130,13 @@ if [[ "$out" == *'+pkgver=0.5.4'* ]]; then
     ok "diff shows the stamped semver pkgver"
 else
     bad "diff shows the stamped semver pkgver (out: $out)"
+fi
+# The PKGBUILD names install=minimal-bin.install; a diff without the hook
+# publishes a package makepkg refuses ("install file ... does not exist").
+if [[ "$out" == *'+++ b/minimal-bin.install'* ]]; then
+    ok "the diff adds the install hook despite the allowlist .gitignore"
+else
+    bad "the diff adds the install hook despite the allowlist .gitignore (out: $out)"
 fi
 if [[ "$out" == *'minvmd'* ]]; then
     ok "the package ships minvmd (source entries and checksums rendered)"
