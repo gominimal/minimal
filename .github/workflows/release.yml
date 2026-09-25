@@ -971,7 +971,7 @@ jobs:
                     # GitHub prerelease so it never shows as "Latest". A
                     # leftover draft from an earlier attempt at the same version
                     # is replaced (it was never published).
-                    extra+=(--draft --target "$REL_SHA")
+                    extra+=(--draft)
                     case "$RELEASE_VERSION" in
                       *-*) extra+=(--prerelease) ;;
                     esac
@@ -981,6 +981,9 @@ jobs:
                     fi
                   fi
                   cd artifacts/
+                  # --target pins the tag to the commit that was built. Without
+                  # it GitHub tags the default branch's tip at create time, which
+                  # is a later commit if main moved during the build.
                   # find output is intentionally word-split so each artifact becomes
                   # its own positional arg to `gh release create`; quoting would break it.
                   # shellcheck disable=SC2046
@@ -989,6 +992,7 @@ jobs:
                     --repo="${GITHUB_REPOSITORY}" \
                     --title="$REL_TITLE" \
                     --notes-file "$NOTES" \
+                    --target "$REL_SHA" \
                     "${extra[@]}"
 
     stage-installer:
