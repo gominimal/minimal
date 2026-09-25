@@ -30,6 +30,7 @@ use sha2::{Digest as _, Sha256};
 pub const DEFAULT_ENDPOINT: &str = "https://agents.minimal.farm";
 
 /// A bundle the portal took.
+#[derive(Debug)]
 pub struct Uploaded {
     /// The page a person opens to read the report once it is written.
     pub report_url: String,
