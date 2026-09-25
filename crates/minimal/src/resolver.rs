@@ -5,9 +5,9 @@
 //! answerer before any process on the host can resolve a box name with no
 //! proxy settings (NET-009). The hook that points it is per-OS: a resolver
 //! file under `/etc/resolver/` on macOS, a systemd-resolved routing domain
-//! on a routable link on Linux. This module detects the hook, renders the
-//! exact command that installs it, and reads the reserved range's loopback
-//! state for the diagnostic bundle.
+//! on a link dedicated to the zone on Linux. This module detects the hook,
+//! renders the exact command that installs it, and reads the reserved
+//! range's loopback state for the diagnostic bundle.
 //!
 //! Nothing here prompts. Detecting reads files and runs `resolvectl`
 //! read-only; the advisory is pure string assembly over what those reads
@@ -23,6 +23,16 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 /// `minimald::net::dns::HOSTNAME_SUFFIX`; the CLI does not depend on the
 /// daemon crate, so the two constants move together.
 pub(crate) const ZONE: &str = "min.internal";
+
+/// The link dedicated to [`ZONE`]'s DNS hook on Linux: a dummy interface
+/// the advisory's command creates, whose only job is to carry the routing
+/// domain that scopes the zone to the answerer (NET-122: the design's
+/// "dedicated link of routable scope"). The host's general-purpose DNS
+/// link keeps its servers, domains and default-route flag untouched — a
+/// link that exists for the zone alone is what keeps `resolvectl dns`'s
+/// replace-semantics from ever reaching the host's upstream resolution.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const ZONE_LINK: &str = "minzone0";
 
 /// The reserved local range the daemon publishes per-box addresses from and
 /// whose presence at session start NET-123's bind probe verifies. Mirrors
@@ -253,40 +263,6 @@ async fn host_hook() -> Hook {
     routing_domain_hook(domain.as_deref(), dns.as_deref())
 }
 
-/// The routable link named by a `/proc/net/route` table: the one carrying
-/// the default route, else the first non-`lo` link with any route — the
-/// routing domain has to live on a link of routable scope. Pure over the
-/// table's text, so it is unit-tested on every platform the suite runs on.
-#[cfg(any(test, not(target_os = "macos")))]
-pub(crate) fn link_from_route_table(route_table: &str) -> Option<String> {
-    let mut routed = None;
-    for line in route_table.lines().skip(1) {
-        let mut fields = line.split_whitespace();
-        let (Some(iface), Some(destination)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        if iface == "lo" {
-            continue; // a loopback link is not of routable scope
-        }
-        if destination == "00000000" {
-            return Some(iface.to_string()); // the default route's link
-        }
-        if routed.is_none() {
-            routed = Some(iface.to_string());
-        }
-    }
-    routed
-}
-
-/// The host's routable link, read from `/proc/net/route` — a read of a few
-/// hundred bytes of procfs, paid once per advisory.
-#[cfg(not(target_os = "macos"))]
-fn routable_link() -> Option<String> {
-    std::fs::read_to_string("/proc/net/route")
-        .ok()
-        .and_then(|table| link_from_route_table(&table))
-}
-
 /// The exact command that points macOS's resolver at the answerer: one
 /// `sudo` writing the resolver file the zone's hook reads. `mkdir -p`
 /// because `/etc/resolver` does not exist until the first hook does.
@@ -298,15 +274,32 @@ pub(crate) fn macos_command(port: u16) -> String {
     )
 }
 
-/// The exact command that points systemd-resolved at the answerer: set the
-/// link's DNS server, then the routing domain that scopes it to the zone.
-/// `~{ZONE}` is single-quoted so the shell does not expand the tilde.
+/// The exact command that points systemd-resolved at the answerer: one
+/// `sudo` configuring [`ZONE_LINK`] and nothing else. The dedicated link
+/// exists because `resolvectl dns` and `resolvectl domain` *replace* a
+/// link's server and domain lists: on the host's general-purpose link they
+/// would wipe its upstream resolvers and search domains, and a link whose
+/// only server is the answerer — which holds just the zone and forwards
+/// nothing — must not carry the host's other queries either.
+///
+/// The steps, in the order they run: create the dedicated link if this host
+/// does not have it yet (a re-run after `resolvectl revert`, which undoes
+/// the DNS configuration but not the link, must not die on `File exists`),
+/// bring it up, take it off the default route, then give it the answerer as
+/// its server and the zone as its routing domain. `default-route false`
+/// comes *before* the server because a link with servers and no routing
+/// domain is a default-route link implicitly — the flag first means no
+/// partially-run command ever routes non-zone queries here. `~{ZONE}` is
+/// single-quoted so the inner shell does not expand the tilde.
 #[cfg(any(test, not(target_os = "macos")))]
-pub(crate) fn linux_command(port: u16, link: Option<&str>) -> String {
-    let link = link.unwrap_or("<link>");
+pub(crate) fn linux_command(port: u16) -> String {
     format!(
-        "sudo resolvectl dns {link} 127.0.0.1:{port} && \
-         sudo resolvectl domain {link} '~{ZONE}'"
+        "sudo sh -c \"[ -e /sys/class/net/{ZONE_LINK} ] \
+         || ip link add {ZONE_LINK} type dummy \
+         && ip link set {ZONE_LINK} up \
+         && resolvectl default-route {ZONE_LINK} false \
+         && resolvectl dns {ZONE_LINK} 127.0.0.1:{port} \
+         && resolvectl domain {ZONE_LINK} '~{ZONE}'\""
     )
 }
 
@@ -319,7 +312,7 @@ pub(crate) fn command(port: u16) -> String {
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn command(port: u16) -> String {
-    linux_command(port, routable_link().as_deref())
+    linux_command(port)
 }
 
 /// The advisory for one session start, as a function of the hook state and
@@ -331,8 +324,7 @@ pub(crate) fn command(port: u16) -> String {
 /// re-surfaces the advisory even when the hook routes (NET-123: "re-surface
 /// the advisory of NET-122"): a session on the interim is a fact the user
 /// has no other way to see, and the advisory command is the same privileged
-/// step that ends it. String assembly only, bar the one procfs read
-/// [`command`] makes on Linux to name the routable link.
+/// step that ends it. String assembly only.
 pub(crate) fn advisory_at(hook: &Hook, port: u16, interim: bool) -> Option<String> {
     if hook.routes(port) && !interim {
         return None;
@@ -516,9 +508,10 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     fn command_markers(port: u16) -> Vec<String> {
         vec![
-            "sudo resolvectl".into(),
-            format!("127.0.0.1:{port}"),
-            format!("'~{ZONE}'"),
+            "sudo".into(),
+            format!("resolvectl dns {ZONE_LINK} 127.0.0.1:{port}"),
+            format!("resolvectl domain {ZONE_LINK} '~{ZONE}'"),
+            format!("resolvectl default-route {ZONE_LINK} false"),
         ]
     }
 
@@ -699,50 +692,53 @@ mod tests {
 
     #[cfg(any(test, not(target_os = "macos")))]
     #[test]
-    fn linux_command_scopes_the_routing_domain_to_the_zone() {
-        let command = linux_command(15353, Some("enp3s0"));
+    fn linux_command_targets_a_dedicated_link_off_the_default_route() {
+        let command = linux_command(15353);
+        // The hook rides a link dedicated to the zone, never the host's
+        // general-purpose DNS link: `resolvectl dns` and `resolvectl
+        // domain` replace a link's lists, so on the general-purpose link
+        // this command would wipe the host's upstream resolvers and search
+        // domains.
         assert!(
-            command.contains("resolvectl dns enp3s0 127.0.0.1:15353"),
+            command.contains(&format!("ip link add {ZONE_LINK} type dummy")),
             "{command}"
         );
         assert!(
-            command.contains("resolvectl domain enp3s0 '~min.internal'"),
+            command.contains(&format!("resolvectl dns {ZONE_LINK} 127.0.0.1:15353")),
             "{command}"
         );
-        // A host with no routable link still gets the command shape, with
-        // the link left to fill in.
-        let bare = linux_command(15353, None);
         assert!(
-            bare.contains("resolvectl dns <link> 127.0.0.1:15353"),
-            "{bare}"
+            command.contains(&format!("resolvectl domain {ZONE_LINK} '~{ZONE}'")),
+            "{command}"
         );
-    }
-
-    #[cfg(any(test, not(target_os = "macos")))]
-    #[test]
-    fn link_from_route_table_prefers_the_default_route() {
-        let table = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
-                     lo\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0\n\
-                     cfeth0\t00000000\t0180A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
-                     docker0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
-        assert_eq!(
-            link_from_route_table(table).as_deref(),
-            Some("cfeth0"),
-            "the default route's link wins over lo's and any other route's"
+        // The dedicated link never carries non-zone queries: it is
+        // explicitly off the default route, and that flag is set before
+        // its server, so not even a partially-run command leaves it a
+        // default-route link (a link with servers and no routing domain is
+        // one implicitly).
+        let isolate = format!("resolvectl default-route {ZONE_LINK} false");
+        let isolate_at = command
+            .find(&isolate)
+            .expect("the default-route step is named");
+        let serve_at = command
+            .find(&format!("resolvectl dns {ZONE_LINK}"))
+            .expect("the dns step is named");
+        assert!(
+            isolate_at < serve_at,
+            "default-route false must precede the server: {command}"
         );
-        let no_default = "Iface\tDestination\tGateway\n\
-                         lo\t00000000\t00000000\n\
-                         docker0\t0001A8C0\t00000000\n";
-        assert_eq!(
-            link_from_route_table(no_default).as_deref(),
-            Some("docker0"),
-            "without a default route, the first routed link carries it"
+        // A host that already has the link — a re-run after
+        // `resolvectl revert`, which undoes the DNS configuration but not
+        // the link — can run the command again: creation is guarded, the
+        // rest re-applies.
+        assert!(
+            command.contains(&format!("[ -e /sys/class/net/{ZONE_LINK} ] || ")),
+            "{command}"
         );
-        assert_eq!(
-            link_from_route_table("Iface\tDestination\tGateway\nlo\t00000000\t00000000\n"),
-            None,
-            "a loopback-only table has no routable link"
-        );
+        // And it is one privileged step the user runs, not the session
+        // start (NET-122: no privilege prompt — the prompt, if any, is the
+        // paste's).
+        assert!(command.starts_with("sudo "), "{command}");
     }
 
     #[test]
