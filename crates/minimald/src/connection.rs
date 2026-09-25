@@ -662,6 +662,18 @@ fn dial_site(network: sessions::NetworkMode) -> DialSite {
     }
 }
 
+/// socat's half-close linger (`-t`), in seconds, for the in-box dial.
+///
+/// socat's own default is half a second: the moment one side reaches EOF —
+/// a laptop client that half-closes its write half and waits for the reply is
+/// the common case — socat shuts the other side's write half down and gives
+/// the reply that long to arrive before exiting. A box slower than that
+/// loses its answer. Five is generous without holding a dead relay open:
+/// every other end of the dial is bounded by something else (the box's own
+/// refusal, the channel closing, the child's `kill_on_drop`), so the linger
+/// only widens the window a half-closing client has to hear the box.
+const IN_BOX_DIAL_LINGER_SECS: u32 = 5;
+
 /// Dials `host:port` from inside the box's namespaces, returning the relay's
 /// box-side half on success and the SSH open failure to reject the channel
 /// with otherwise.
@@ -697,6 +709,7 @@ async fn dial_in_box(
         .command_in_session_env(
             "socat",
             [
+                format!("-t{IN_BOX_DIAL_LINGER_SECS}"),
                 "-".to_string(),
                 format!("TCP:{host}:{port},connect-timeout=10"),
             ],
@@ -986,10 +999,13 @@ mod tests {
     /// Production runs the real `socat` in-session — a baseline package,
     /// so every box has it — but the harness's "in-session" command runs
     /// host-side, and the host is not a box: a bare CI runner ships no
-    /// socat. The stand-in implements exactly the one argv the dial passes
-    /// (`-`, relaying stdio, and `TCP:host:port[,options]`), so what
+    /// socat. The stand-in implements the one contract the dial relies on —
+    /// relay stdio onto a `TCP:host:port[,options]` address — so what
     /// reaches it is the production argv, resolved as `socat` through the
-    /// [`PATH`](super::TEST_RELAY_PATH_VAR) the test supplies.
+    /// [`PATH`](super::TEST_RELAY_PATH_VAR) the test supplies. The address
+    /// is picked out by its prefix rather than its position: the dial's
+    /// options precede it, and what the test pins is the argv itself, so
+    /// the stand-in records that argv where the test can read it.
     ///
     /// bash is the one interpreter every Linux test host can count on
     /// (`/dev/tcp` is a bash feature, on in the default build). One
@@ -998,21 +1014,34 @@ mod tests {
     /// socket — bash cannot `shutdown(2)` a write half a child still holds
     /// — and this test never asks for that shape: teardown kills the relay
     /// child, and the channel's EOF comes from that.
-    fn write_socat_standin(dir: &std::path::Path) {
-        const STANDIN: &str = r#"#!/bin/bash
-target=${2#TCP:}
-target=${target%%,*}
-exec 3<>"/dev/tcp/${target%:*}/${target##*:}" || exit 1
+    fn write_socat_standin(dir: &std::path::Path) -> std::path::PathBuf {
+        let argv_path = dir.join("argv");
+        assert!(
+            !argv_path.to_string_lossy().contains('\''),
+            "the stand-in dir must be shell-quoting-safe: {}",
+            argv_path.display()
+        );
+        let standin_script = format!(
+            r#"#!/bin/bash
+printf '%s\n' "$@" >'{argv}'
+for arg in "$@"; do
+  case "$arg" in TCP:*) target=${{arg#TCP:}};; esac
+done
+target=${{target%%,*}}
+exec 3<>"/dev/tcp/${{target%:*}}/${{target##*:}}" || exit 1
 cat <&3 &
 peer=$!
 cat >&3
 kill "$peer" 2>/dev/null
-"#;
+"#,
+            argv = argv_path.to_string_lossy(),
+        );
         let standin = dir.join("socat");
-        std::fs::write(&standin, STANDIN).expect("write the socat stand-in");
+        std::fs::write(&standin, standin_script).expect("write the socat stand-in");
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&standin, std::fs::Permissions::from_mode(0o755))
             .expect("make the socat stand-in executable");
+        argv_path
     }
 
     /// Points the in-box dial's `socat` at the test's stand-in until the
@@ -1082,7 +1111,7 @@ kill "$peer" 2>/dev/null
         // the in-box dial is exercised on every host — those that ship
         // socat and those (the CI runner) that do not — identically.
         let standin_dir = tempfile::tempdir().expect("tempdir for the socat stand-in");
-        write_socat_standin(standin_dir.path());
+        let argv_path = write_socat_standin(standin_dir.path());
         let _relay_path = RelayPathGuard::set_to(standin_dir.path());
 
         // The box port: a loopback listener echoing whatever it receives.
@@ -1191,6 +1220,27 @@ kill "$peer" 2>/dev/null
         assert_eq!(
             &echoed, b"ping",
             "the box port must echo the relayed bytes through the in-box dial"
+        );
+
+        // The dial's argv, as the stand-in received it: the linger is
+        // explicit — socat's own 0.5 s default would cut a slow box reply
+        // short once the laptop side half-closes — and the relay really is
+        // stdio onto the box port, not some other shape the test happens
+        // to satisfy.
+        let argv = std::fs::read_to_string(&argv_path).expect("the stand-in records its argv");
+        assert!(
+            argv.lines()
+                .any(|a| a == format!("-t{IN_BOX_DIAL_LINGER_SECS}")),
+            "the in-box dial must pass socat an explicit linger, got: {argv}"
+        );
+        assert!(
+            argv.lines().any(|a| a == "-"),
+            "the in-box dial must relay stdio, got: {argv}"
+        );
+        assert!(
+            argv.lines()
+                .any(|a| a.starts_with("TCP:") && a.contains(&port.to_string())),
+            "the in-box dial must name the box port in a TCP: address, got: {argv}"
         );
 
         // Observability: the open's info line names the session, the box
