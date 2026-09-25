@@ -20,9 +20,9 @@ name: CI (Linux KVM)
 # Until the ruleset flip the lane remains advisory, as before.
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "release/**"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "release/**"]
   workflow_dispatch:
 
 env:
@@ -37,7 +37,7 @@ env:
 # Cancel superseded runs so the e2e job isn't queued on stale commits.
 concurrency:
   group: ci-linux-kvm-${{ github.ref }}-${{ github.workflow }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
 
 permissions:
   contents: read
