@@ -162,7 +162,7 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T2
   verify:   cargo nextest run -p minimald each_box_gets_own_loopback_address
   property: for every host with the reserved local range present and every sequence of publish and withdraw operations from every allocator on it, up to 8 live boxes, no two live own-address or `none` boxes hold the same loopback address
-  harness:  kani_loopback_alloc_injective, exhaustive to 8 live boxes across daemons; requires the allocator to be a pure function over one host-wide owned set of leased addresses, separate from the publish call and from any daemon's own state
+  harness:  kani_loopback_alloc_injective, exhaustive to 8 live boxes across allocators; requires the allocator to be a pure function over one host-wide owned set of leased addresses, separate from the publish call and from any allocator's own state
   <!-- S1b-2a; prose 6; event-driven; the no-collision clause is the universal for spec-tiers; "host-global" per design §7.1: allocation is host-global through the answerer's authenticated channel for every allocator, the helper for each VM (NET-138) and each native daemon, and no in-VM daemon self-assigns; host-address boxes mirror their node's address (NET-129); a host without the range publishes at `127.0.0.1` under NET-123's interim, outside this requirement -->
 
 - **NET-011** WHEN a session is finalised THE SYSTEM SHALL register `<name>.min.internal` for the box's loopback address.
