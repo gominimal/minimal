@@ -65,7 +65,6 @@ fn every_daemon_connection_is_classified() {
     assert_eq!(
         connect_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
-            "cmd/admin.rs::cmd_ssh_forward = gated",
             "cmd/admin.rs::cmd_version = ungated",
             "cmd/list.rs::cmd_bare = gated",
             "cmd/mod.rs::arm_activation_interrupt = ungated",
@@ -311,6 +310,127 @@ fn host_cache_warmup_skips_vm_backed_providers() {
 fn cli_command_tree_stays_renderable() {
     use clap::CommandFactory as _;
     Cli::command().debug_assert();
+}
+
+/// `min login` mints nothing (NET-109): the verb runs without a daemon and
+/// writes no key or certificate to the config directory, where the reverse
+/// proxy's files used to land, and it prints the one line saying there is
+/// nothing to mint. The `--cert-dir` flag that steered the old writes is
+/// refused by the parser.
+#[tokio::test]
+async fn login_mints_no_certificate() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config");
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(dir.path().join("state")),
+        config_dir: Some(config.clone()),
+        provider: None,
+        no_input: true,
+    };
+
+    // No daemon is running and none may be spawned: with the certificate
+    // RPC gone the verb has nothing to ask one for. The notice is captured
+    // from the verb itself, so the assertions below hold what it emits.
+    let mut out = Vec::new();
+    cmd_login(&global, LoginArgs {}, &mut out)
+        .await
+        .expect("a verb with nothing to mint succeeds without a daemon");
+
+    // The config directory is where the key and CA used to be written.
+    for file in ["client.pem", "client.key", "ca.pem"] {
+        assert!(
+            !config.join("minimal").join(file).exists(),
+            "login wrote {file}; it must write no key or certificate"
+        );
+    }
+
+    // The one line it prints, read back out of what the verb wrote: a
+    // handler that stopped emitting it, printed something else, or printed
+    // it twice fails here rather than passing on the helper's own text.
+    let printed = String::from_utf8(out).expect("stdout is UTF-8");
+    assert!(
+        printed.contains("Nothing to mint"),
+        "the line must say there is nothing to mint, got: {printed}"
+    );
+    assert_eq!(
+        printed,
+        format!("{}\n", login_nothing_to_mint_line()),
+        "the verb prints exactly the one required line"
+    );
+
+    // And the minting is gone from the verb's body, asserted on the source
+    // the way `the_activation_path_makes_no_version_round_trip` is: the
+    // certificate RPC, the write sites, the cert paths, and the daemon
+    // spawn must all be absent.
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/admin.rs"),
+    )
+    .expect("readable source");
+    let body = function_body(&text, "cmd_login").expect("admin.rs no longer defines cmd_login");
+    for minted_again in [
+        "IssueClientCert",
+        "client.pem",
+        "client.key",
+        "ca.pem",
+        "fs::write",
+        "ensure_daemon",
+    ] {
+        assert!(
+            !body.contains(minted_again),
+            "cmd_login mints again ({minted_again})"
+        );
+    }
+
+    // The flag that directed the writes is retired with them.
+    use clap::Parser as _;
+    let Err(err) = Cli::try_parse_from(["min", "login", "--cert-dir", "/tmp/certs"]) else {
+        panic!("--cert-dir is retired and must not parse");
+    };
+    assert!(
+        err.to_string().contains("--cert-dir"),
+        "the refusal must name the retired flag, got: {err}"
+    );
+}
+
+/// The CLI reference documents no retired command (NET-111): the reference
+/// is the page a person reads to learn what the CLI offers, so a command
+/// the tree no longer parses must not survive there. `min login` survives
+/// as a verb, so the guard is on what it must never document again — the
+/// minted key and CA — not on the verb's name. And the tree agrees with
+/// the page: the retired verb is refused by the argument parser, with its
+/// usage, rather than parsing into nothing.
+#[test]
+fn cli_reference_has_no_retired_commands() {
+    let reference = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/cli-min.md"),
+    )
+    .expect("the min CLI reference must be readable at docs/reference/cli-min.md");
+    for (retired, why) in [
+        ("ssh-forward", "the SSH LocalForward verb is retired"),
+        ("client.pem", "the retired client certificate"),
+        ("client.key", "the retired client key"),
+        ("ca.pem", "the retired CA certificate"),
+        ("cert-dir", "login's retired --cert-dir flag"),
+    ] {
+        assert!(
+            !reference.contains(retired),
+            "the CLI reference documents a retired surface ({retired}): {why}"
+        );
+    }
+
+    let Err(err) = Cli::try_parse_from(["min", "ssh-forward", "dev", "18080:127.0.0.1:80"]) else {
+        panic!("ssh-forward is retired and must not parse");
+    };
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("unrecognized subcommand 'ssh-forward'"),
+        "the refusal must name the verb, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("Usage:"),
+        "the refusal must carry the usage, got: {rendered}"
+    );
 }
 
 /// Entry constructor for the bare-`min` state-report tests.
