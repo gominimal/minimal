@@ -1961,7 +1961,9 @@ proof_min_internal_names_through_proxy() {
   # NET-003 from one box: host.min.internal must land on the host's
   # loopback, straight from the box (no proxy in the picture — this is the
   # one name requirement a host that cannot serve :7654 can still prove).
-  # $1 = the box's session id, $2 = the label the prints carry.
+  # $1 = the box's session id, $2 = the label the prints carry, $3 = the
+  # box's address mode: `host` (shares its host's network) or `own` (a
+  # lease of its own on the switch).
   proxy_assert_host_by_name() {
     proxy_request "$1" "$2: host.min.internal reaches the host's loopback" \
       "http://host.min.internal:$PROXY_HOST_PORT/marker" direct ""
@@ -1972,16 +1974,26 @@ proof_min_internal_names_through_proxy() {
     # the proof's first CI run grepped its `Connected to host (ip) port N`
     # line, which the curl every box ships (upstream pins 8.22) stopped
     # printing — it says `Established connection to host (ip port N) from local
-    # port M` — so the grep came back empty and the whole lane failed. Native:
-    # 127.0.0.1, written into the box's /etc/hosts by the HostNet plan —
-    # asserted, it is pinned. VM: the switch zone's host alias, which gvproxy
-    # NATs to the host's loopback — printed, not asserted, so a lane on a
-    # custom subnet does not fail here.
+    # port M` — so the grep came back empty and the whole lane failed. What
+    # the answer is depends on where the box stands, not on the lane: a
+    # host-address box on a native host shares the host's namespace, so the
+    # HostNet plan pins 127.0.0.1 in its /etc/hosts — asserted there, it is
+    # pinned. Every other box resolves the switch zone's host alias, which
+    # gvproxy NATs to the host's loopback — a host-address box on a VM host,
+    # and an own-address box on ANY host, native included: its lease is a
+    # switch address, so the switch zone answers, never /etc/hosts (the
+    # own-ip plan carries no hosts entry). Printed, not asserted, so a lane
+    # on a custom subnet does not fail here.
     proxy_resolved="$(mnl session exec "$1" \
       "curl -sS --max-time 10 -o /dev/null -w '%{remote_ip}' http://host.min.internal:$PROXY_HOST_PORT/marker" \
       2>"$WORK/proxy-hostresolve.err" | tail -n1 | tr -d '\r\n')" || true
     echo "$2: host.min.internal resolved in the box: ${proxy_resolved:-<curl never connected>}"
-    if hook_log_readable && [ "${proxy_resolved:-}" != "127.0.0.1" ]; then
+    # The 127.0.0.1 pin belongs to the host-address box on a native host —
+    # gated on the box's mode, never on the lane: a native host driving a
+    # switch (a developer run) puts the own-address half through this same
+    # function with hook_log_readable true, and its answer is the switch
+    # alias, so a lane gate here would fail that run spuriously.
+    if [ "${3:-}" = host ] && hook_log_readable && [ "${proxy_resolved:-}" != "127.0.0.1" ]; then
       echo "::error::host.min.internal did not resolve to the host's loopback in the box (expected 127.0.0.1, got '${proxy_resolved:-<none>}')"
       echo "--- curl stderr ---"; cat "$WORK/proxy-hostresolve.err" 2>/dev/null || true
       fail
@@ -2093,7 +2105,7 @@ proof_min_internal_names_through_proxy() {
   if [ "$proxy_bind_taken" -eq 1 ]; then
     if proxy_gate_can_skip; then
       proxy_start_host_listener
-      proxy_assert_host_by_name "$proxy_sid" "NET-003 (degraded)"
+      proxy_assert_host_by_name "$proxy_sid" "NET-003 (degraded)" host
       echo "::warning::min.internal proxy routing SKIPPED — another daemon owns 127.0.0.1:7654 on this host"
       echo "  asserted here: host.min.internal, straight from the box"
       hook_log_readable && echo "  and the registration record above, the daemon half of NET-001"
@@ -2222,7 +2234,7 @@ proof_min_internal_names_through_proxy() {
   fi
 
   # ---- NET-003: host.min.internal from a host-address box -------------------
-  proxy_assert_host_by_name "$proxy_sid" "NET-003"
+  proxy_assert_host_by_name "$proxy_sid" "NET-003" host
 
   # ---- NET-001's own-address half: a VM host's lease route -----------------
   # Gated like the own-IP proof: MINVMD_GVPROXY_BIN is the one signal that a
@@ -2285,7 +2297,7 @@ proof_min_internal_names_through_proxy() {
 
     # NET-003's own-address half: the box resolves host.min.internal through
     # the switch zone, to the alias gvproxy NATs to the host's loopback.
-    proxy_assert_host_by_name "$PROXY_OWN_SID" "NET-003 (own-address box)"
+    proxy_assert_host_by_name "$PROXY_OWN_SID" "NET-003 (own-address box)" own
 
     # NET-004: the deprecated literal itself. It must still reach the host's
     # loopback, and the box's egress relay must notice the connection — the
