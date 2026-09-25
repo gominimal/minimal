@@ -13,15 +13,25 @@
 //!   for a name the box's `egress.allow_dns_hosts` declared is split by the
 //!   pure rebinding intersection ([`sessions::core::egress`]): the answers
 //!   that survive the box's denies and the infrastructure deny set are
-//!   admitted into a per-box table for [`ADMISSION_WINDOW`], and the relay's
-//!   egress leg accepts a frame to an admitted address it would otherwise
-//!   drop as an undeclared destination. A pin lifts only that one drop: the
-//!   protocol rules keep governing pinned addresses, and a denied range
-//!   stays refused whatever resolved into it.
+//!   admitted into a per-box table for [`ADMISSION_WINDOW`], capped at
+//!   [`MAX_ADDRESSES_PER_NAME`] addresses per name per family (design
+//!   §5.3), and the relay's egress leg accepts a frame to an admitted
+//!   address it would otherwise drop as an undeclared destination. A pin
+//!   lifts only that one drop: the protocol rules keep governing pinned
+//!   addresses, and a denied range stays refused whatever resolved into it.
+//!
+//!   A pin the box *used* outlives its window. The first frame a pin
+//!   admits establishes its flow, and an established flow keeps its
+//!   admitted destination past window expiry until the flow ends (design
+//!   §5.3's conntrack-aware retention): a `git clone` or a long keep-alive
+//!   to an allowed name is not severed at the window's edge, while a *new*
+//!   connection to the same address after the window is refused until the
+//!   box re-resolves ([`admits_flow`]).
 //! * **Refusing denied ranges** (NET-067) — an answer the intersection
 //!   refuses never enters the table, and each refusal says so through the
-//!   session's rate limiter with the name and the answer, once per rule per
-//!   minute — the same budget and the same log the frame drops share.
+//!   session's rate limiter with the name and the answer, once per name per
+//!   rule per minute — the same budget and the same log the frame drops
+//!   share.
 //! * **NODATA for the record types v1 does not carry** (NET-136) — AAAA,
 //!   HTTPS (65) and SVCB (64) queries toward this box's resolver are
 //!   answered empty by the relay itself and never written on to the switch,
@@ -35,22 +45,67 @@
 //! refused — passes through to the box: resolution is honest; it is the
 //! *connection* to a refused address that is not admitted.
 //!
-//! Two boundaries worth naming:
+//! An undeclared `allow_dns_hosts` (`None`) pins nothing. The field's
+//! schema doc calls `None` "allow-all hosts", and for the *address*
+//! dimensions that is exactly right — but a name grant is the one thing in
+//! the egress policy that can lift another dimension's declared deny (an
+//! empty `allow_subnets`), so it is earned only by an entry. Reading it the
+//! other way would turn every deny-all box into a resolve-anything box,
+//! which is the opposite of what NET-063 established.
 //!
-//! * An undeclared `allow_dns_hosts` (`None`) pins nothing. The field's
-//!   schema doc calls `None` "allow-all hosts", and for the *address*
-//!   dimensions that is exactly right — but a name grant is the one thing in
-//!   the egress policy that can lift another dimension's declared deny (an
-//!   empty `allow_subnets`), so it is earned only by an entry. Reading it
-//!   the other way would turn every deny-all box into a resolve-anything
-//!   box, which is the opposite of what NET-063 established.
-//! * A forged reply from the resolver's address — hairpinned through the
-//!   switch by a peer — could pin an attacker-chosen address. The defense is
-//!   the relay's own source-address check (NET-084), which is what stops
-//!   any non-lease source from imitating the resolver; until it is in
-//!   force, this gate inherits that hole rather than widening it, since it
-//!   admits nothing the box could not already have reached by resolving
-//!   through the real resolver.
+//! ## The window, and the one place this gate departs from design §5.3
+//!
+//! §5.3 defines the admission window as TTL-bounded — an answer holds for
+//! its own TTL, floored at 600 s and capped at 24 h — where that cap is a
+//! proposal in the design text. This gate ships a fixed
+//! [`ADMISSION_WINDOW`] instead, as a deliberate deviation toward the tight
+//! side, and names its reason:
+//!
+//! * A TTL-bounded window hands the *duration* of the box's grant to the
+//!   upstream zone's TTL — a value the box's policy does not control and a
+//!   rebinding-controlled zone can set to the cap. The fixed window keeps
+//!   the duration in the box host, whatever the answer says about itself.
+//! * §5.3's floor alone would double the reach every answer holds here.
+//! * What the floor buys — covering the gap between resolution and use,
+//!   and an application-level resolver cache outliving the box's own — is
+//!   covered for established flows by the retention above, and for new
+//!   connections by re-resolution: the box's libc holds no DNS cache, so
+//!   every new `getaddrinfo` rides the relay again and re-admits. The one
+//!   case the floor covers that this gate does not is an application that
+//!   caches an answer for longer than five minutes and then opens a new
+//!   connection to it; that connection is refused the way every undeclared
+//!   destination is, and the application's retry re-resolves.
+//!
+//! ## Known loose ends, named so nobody has to re-derive them
+//!
+//! * The forward NODATA of NET-136 carries no SOA in its authority section,
+//!   deliberately. An SOA is a statement by the zone's authority, and this
+//!   gate is authoritative for no forward zone — there is no record it
+//!   could honestly carry. The same crate's box-zone answerer does add one
+//!   to every negative ([`super::answerer`], NET-124), because *it* owns
+//!   its zone and because the host resolver it serves must cache the
+//!   negative; the gate's empty answer serves the box's own resolver
+//!   stack, which holds no cache to warm (the same fact the window's
+//!   rationale rests on), so the omission costs one more relay ride per
+//!   lookup and asserts no authority the gate lacks.
+//! * Reply matching is loose, and the source check is the whole defence:
+//!   the gate reads a reply's first question for the name and nothing
+//!   else — not the query id, not the qtype, and not whether the box ever
+//!   asked the question. A forged reply from the resolver's address —
+//!   hairpinned through the switch by a peer — could pin an
+//!   attacker-chosen address, and that defence is the relay's own
+//!   source-address check (NET-084), which is what stops any non-lease
+//!   source from imitating the resolver; until it is in force, this gate
+//!   inherits that hole rather than widening it, since it admits nothing
+//!   the box could not already have reached by resolving through the real
+//!   resolver. Matching the id would need per-query state on the egress leg
+//!   for a check that does not change what the box can reach.
+//! * DNS over TCP is not carried. A deny-all box's TCP to the resolver is
+//!   dropped by the frame verdict, so a `TC=1` answer cannot be retried
+//!   over TCP and that resolution fails. Not a rebinding vector — the gate
+//!   admits nothing on the TCP path — but a resolution failure this module
+//!   records rather than fixes: the UDP datagram is the only DNS path v1
+//!   carries, and the one the gate knows how to read.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -61,6 +116,7 @@ use hickory_proto::op::{Message, MessageType, Metadata, ResponseCode};
 use hickory_proto::rr::{RData, RecordType};
 
 use super::policy::PolicyWarnLimiter;
+use super::switch::L4Packet;
 use sessions::core::egress::{self, EgressRules, InfrastructureDenySet};
 
 /// The port DNS is served on: the resolver's destination port on the query
@@ -84,17 +140,74 @@ const COMPONENT: &str = "dns-gate";
 /// comfortably inside five minutes, the system's other short-expiry window
 /// (BEP-007's renewal boundary), without keeping a box's long-dead
 /// resolutions reachable for the rest of its uptime.
+///
+/// It is a *fixed* window where design §5.3's is TTL-bounded (floored at
+/// 600 s, capped at 24 h); the module doc states that departure and its
+/// reason. An established flow does not depend on it at all — see
+/// [`admits_flow`].
 pub(crate) const ADMISSION_WINDOW: Duration = Duration::from_secs(5 * 60);
 
-/// Sweep expired admissions once the table crosses this many entries,
-/// bounding memory under a burst of distinct answers without a background
-/// timer (the conntrack's pattern).
+/// Design §5.3's cap on a name's admitted addresses: at most this many per
+/// name per family, fail closed. A reply whose A records run past the cap
+/// has its tail refused, so a hostile or pathological answer cannot grow
+/// the box's grant one address at a time; the cap is what keeps the table
+/// proportionate to the box's declared names rather than to what its
+/// resolver chose to say. Only IPv4 addresses are ever admitted here (AAAA
+/// is answered NODATA, NET-136), so the family half of the cap is the IPv4
+/// half alone.
+const MAX_ADDRESSES_PER_NAME: usize = 32;
+
+/// Sweep expired admissions once the table crosses this many entries — the
+/// per-box backstop behind the per-name cap, bounding memory without a
+/// background timer (the conntrack's pattern).
 const ADMISSION_SWEEP_AT: usize = 4096;
+
+/// TCP FIN: the box's half-close, the end of its outbound use of a flow.
+const TCP_FIN: u8 = 0x01;
+/// TCP RST: an abortive end of a flow.
+const TCP_RST: u8 = 0x04;
+
+/// How long an established flow keeps its pinned destination with no frame
+/// riding it (design §5.3): the retention's one memory bound. A day is
+/// past any live transport's keep-alive interval and past every
+/// retransmission schedule, so an idle day is a flow that ended without a
+/// FIN — the bound exists so a flow the box leaked cannot hold its pin for
+/// the rest of the box's uptime, which ends the whole table anyway.
+const FLOW_IDLE_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Sweep idle flows once the table crosses this many entries, bounding
+/// memory under a box that opens more flows than it closes (the conntrack's
+/// pattern again).
+const FLOW_SWEEP_AT: usize = 4096;
 
 /// Largest DNS datagram the gate reads — the answerer's bound: a DNS message
 /// fits far below it, and a larger datagram is ignored rather than buffered
 /// unbounded.
 const MAX_DATAGRAM: usize = 4096;
+
+/// One admitted address: the name whose resolution admitted it — §5.3's
+/// cap is per name, so the owner is what the cap counts — and the instant
+/// its window ends.
+struct Admission {
+    name: Arc<str>,
+    expires: Instant,
+}
+
+/// The identity of one flow the box opened through a pin: the transport,
+/// the destination, and the two ports. The source address is the box's own
+/// lease — the one address the relay moves for it — so the ports are what
+/// tells two flows to the same destination apart.
+#[derive(Hash, PartialEq, Eq)]
+struct FlowKey {
+    /// The flow's IPv4 protocol number.
+    proto: u8,
+    /// The flow's source port, `0` when the transport has none.
+    src_port: u16,
+    /// The destination the pin admitted.
+    dst: [u8; 4],
+    /// The flow's destination port, `0` when the transport has none.
+    dst_port: u16,
+}
 
 /// One box's DNS-pinned admission state, built at attach and shared between
 /// the relay's two legs through the [`super::switch::SessionGate`]: the
@@ -112,14 +225,23 @@ pub(crate) struct DnsGate {
     /// The infrastructure deny set the intersection subtracts from every
     /// answer (design §5.3, NET-067).
     infrastructure: InfrastructureDenySet,
-    /// The addresses admitted by resolution, each with the instant its
-    /// window ends.
-    admitted: Mutex<HashMap<[u8; 4], Instant>>,
+    /// The addresses admitted by resolution, each with the name that
+    /// admitted it — §5.3's cap is per name, so the owner is what the cap
+    /// counts — and the instant its window ends.
+    admitted: Mutex<HashMap<[u8; 4], Admission>>,
+    /// The flows the box opened through a pin — established while the
+    /// window held, retained past it until the flow ends — each with the
+    /// instant its last frame rode it (the idle bound's clock).
+    flows: Mutex<HashMap<FlowKey, Instant>>,
+    /// The admission window, [`ADMISSION_WINDOW`] in production. A field so
+    /// the relay-level proof of the retention can shrink it: expiry cannot
+    /// be observed in a test that would have to wait five minutes.
+    window: Duration,
     /// The box's switch IP, the `session_id` of every log line and the
     /// limiter's key.
     label: String,
     /// The session's rate limiter, shared with the frame-drop warnings so
-    /// every refusal line costs from the same per-box-per-rule budget.
+    /// every refusal line costs from the same per-box budget.
     limiter: Arc<PolicyWarnLimiter>,
 }
 
@@ -148,9 +270,19 @@ impl DnsGate {
             rules,
             infrastructure,
             admitted: Mutex::new(HashMap::new()),
+            flows: Mutex::new(HashMap::new()),
+            window: ADMISSION_WINDOW,
             label: label.to_string(),
             limiter,
         }
+    }
+
+    /// Shrinks the admission window. A test hook for the one proof that
+    /// needs it: the relay-level proof that an established flow outlives
+    /// the window cannot be written against a five-minute window.
+    #[cfg(test)]
+    pub(crate) fn shrink_window(&mut self, window: Duration) {
+        self.window = window;
     }
 
     /// Whether `name` is one the box's policy allowed — the trigger for
@@ -305,44 +437,149 @@ impl DnsGate {
     }
 
     /// Admits `addresses` — one name's surviving answers — until
-    /// `now` + [`ADMISSION_WINDOW`], with the window's one debug line: the
+    /// `now` + the admission window, with the window's one debug line: the
     /// name, the addresses, and how long they hold (the bundle's daemon log
     /// tail carries every admission this way).
+    ///
+    /// §5.3's cap is enforced here: a name holds at most
+    /// [`MAX_ADDRESSES_PER_NAME`] addresses at once, counted over the whole
+    /// table, so answers past the cap are refused (fail closed) and the
+    /// table stays proportionate to the box's declared names rather than to
+    /// what its resolver chose to say. An address a *different* allowed name
+    /// already admitted keeps its first owner: it is one address either way,
+    /// and re-owning it would let a second name's burst evict the first's.
     fn admit(&self, name: &str, addresses: &[[u8; 4]], now: Instant) {
         if addresses.is_empty() {
             return;
         }
-        let expires = now + ADMISSION_WINDOW;
+        let expires = now + self.window;
         let mut admitted = self
             .admitted
             .lock()
             .expect("DNS admission table mutex poisoned");
+        // How many addresses this name already holds — §5.3's per-name cap,
+        // counted where it is spent. One scan per observed reply, on a table
+        // the cap itself keeps small.
+        let mut held = admitted
+            .values()
+            .filter(|admission| &*admission.name == name)
+            .count();
+        let mut admitted_now = Vec::new();
+        let mut over_cap = Vec::new();
         for address in addresses {
-            admitted.insert(*address, expires);
+            if let Some(existing) = admitted.get_mut(address) {
+                // The name answered again: refresh the window it holds for,
+                // under whichever owner first admitted the address.
+                existing.expires = expires;
+                admitted_now.push(*address);
+                continue;
+            }
+            if held >= MAX_ADDRESSES_PER_NAME {
+                over_cap.push(Ipv4Addr::from(*address));
+                continue;
+            }
+            held += 1;
+            admitted.insert(
+                *address,
+                Admission {
+                    name: Arc::from(name),
+                    expires,
+                },
+            );
+            admitted_now.push(*address);
         }
         if admitted.len() > ADMISSION_SWEEP_AT {
-            admitted.retain(|_, expiry| now < *expiry);
+            admitted.retain(|_, admission| now < admission.expires);
         }
-        let addresses: Vec<Ipv4Addr> = addresses.iter().copied().map(Ipv4Addr::from).collect();
+        if !over_cap.is_empty() {
+            tracing::debug!(
+                component = COMPONENT,
+                session_id = %self.label,
+                name,
+                ?over_cap,
+                cap = MAX_ADDRESSES_PER_NAME,
+                "refused a resolved name's answers past the per-name cap"
+            );
+        }
+        let addresses: Vec<Ipv4Addr> = admitted_now.iter().copied().map(Ipv4Addr::from).collect();
         tracing::debug!(
             component = COMPONENT,
             session_id = %self.label,
             name,
             ?addresses,
-            window_secs = ADMISSION_WINDOW.as_secs(),
+            window_secs = self.window.as_secs(),
             "admitted a resolved name's addresses for the window"
         );
     }
 
     /// Whether `dst` is an address this box resolved from an allowed name
     /// and whose window still holds at `now` — the relay's one reason to
-    /// lift an undeclared-destination drop (NET-066).
+    /// lift an undeclared-destination drop for a *new* flow (NET-066).
     pub(crate) fn admits_destination(&self, dst: [u8; 4], now: Instant) -> bool {
         let admitted = self
             .admitted
             .lock()
             .expect("DNS admission table mutex poisoned");
-        admitted.get(&dst).is_some_and(|expires| now < *expires)
+        admitted
+            .get(&dst)
+            .is_some_and(|admission| now < admission.expires)
+    }
+
+    /// Whether the egress leg may lift an undeclared-destination drop for
+    /// the frame whose L4 addressing was `pkt` and whose destination is
+    /// `dst` (NET-066): the destination is inside its admission window, or
+    /// the frame belongs to a flow a pin already established — design §5.3's
+    /// conntrack-aware retention, which is what keeps an established flow's
+    /// admitted destination past window expiry until the flow ends, so a
+    /// `git clone` or a long keep-alive to an allowed name is not severed at
+    /// the window's edge while a *new* connection to the same address is.
+    ///
+    /// The first frame a pin admits establishes its flow — the window's work
+    /// is done at the first segment and the flow carries itself from there —
+    /// and every later frame refreshes it. The flow ends when the box sends
+    /// a FIN or RST on it, whose own segment is admitted as the flow's last
+    /// frame, or when [`FLOW_IDLE_CAP`] reclaims a flow nothing has ridden
+    /// for a day. `pkt` is `None` for a frame with no L4 header to read: no
+    /// ports, no flow identity, so only the window can admit it.
+    pub(crate) fn admits_flow(&self, dst: [u8; 4], pkt: Option<&L4Packet>, now: Instant) -> bool {
+        let Some(pkt) = pkt else {
+            return self.admits_destination(dst, now);
+        };
+        let key = FlowKey {
+            proto: pkt.proto,
+            src_port: pkt.src.port(),
+            dst,
+            dst_port: pkt.dst.port(),
+        };
+        // The flags byte is TCP's only (`parse_ipv4_l4` zeroes it for every
+        // other transport), so a FIN or RST is a close exactly where one can
+        // be signalled.
+        let ends = pkt.tcp_flags & (TCP_FIN | TCP_RST) != 0;
+        {
+            let mut flows = self.flows.lock().expect("DNS flow table mutex poisoned");
+            if flows.get(&key).is_some() {
+                if ends {
+                    flows.remove(&key);
+                } else {
+                    flows.insert(key, now);
+                }
+                return true;
+            }
+        }
+        if !self.admits_destination(dst, now) {
+            return false;
+        }
+        if ends {
+            // A closing segment with no flow to end: nothing to retain, and
+            // the window admits the frame itself.
+            return true;
+        }
+        let mut flows = self.flows.lock().expect("DNS flow table mutex poisoned");
+        flows.insert(key, now);
+        if flows.len() > FLOW_SWEEP_AT {
+            flows.retain(|_, seen| now.duration_since(*seen) < FLOW_IDLE_CAP);
+        }
+        true
     }
 }
 
@@ -350,7 +587,8 @@ impl DnsGate {
 mod tests {
     use super::*;
     use crate::net::switch::tests::{
-        LEASE, RelayHarness, arp_frame, egress_tcp_frame, read_framed, spawn_test_relay,
+        ACK, LEASE, RelayHarness, SYN, arp_frame, egress_tcp_frame, egress_tcp_segment,
+        read_framed, spawn_test_relay, spawn_test_relay_with,
     };
     use crate::net::switch::udp_datagram;
     use crate::test_harness::captured_log;
@@ -382,14 +620,16 @@ mod tests {
         }
     }
 
-    /// The box that allows `example.com` and denies `10.9.9.0/24`: the
-    /// denied-range refusal's box (NET-067).
+    /// The box that allows two names and denies `10.9.9.0/24`: the
+    /// denied-range refusal's box (NET-067). Two names, because the refusal
+    /// log's requirement is the *name* and the answer — the log proof
+    /// refuses each of them inside the limiter's interval and must hear both.
     fn denied_range_egress() -> sessions::SessionPolicy {
         sessions::SessionPolicy {
             egress: Some(sessions::EgressPolicy {
                 allow_protocols: Some(vec![sessions::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
-                allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                allow_dns_hosts: Some(vec!["example.com".to_string(), "other.example".to_string()]),
                 deny_subnets: Some(vec!["10.9.9.0/24".to_string()]),
             }),
             ingress: None,
@@ -486,10 +726,9 @@ mod tests {
         ))
     }
 
-    /// A fresh gate over the `github_only_egress` policy, for the unit tests
-    /// that drive the gate directly.
-    fn test_gate() -> DnsGate {
-        let policy = github_only_egress();
+    /// A fresh gate over `policy`, on the default switch's resolver and
+    /// infrastructure set, for the unit tests that drive the gate directly.
+    fn gate_for(policy: &sessions::SessionPolicy) -> DnsGate {
         let label = LEASE.to_string();
         DnsGate::new(
             &label,
@@ -501,6 +740,71 @@ mod tests {
             InfrastructureDenySet::new(RESOLVER.octets(), [100, 64, 0, 254]),
             Arc::new(PolicyWarnLimiter::new()),
         )
+    }
+
+    /// A fresh gate over the `github_only_egress` policy, for the unit tests
+    /// that drive the gate directly.
+    fn test_gate() -> DnsGate {
+        gate_for(&github_only_egress())
+    }
+
+    /// Design §5.3's per-name cap: a name holds at most
+    /// [`MAX_ADDRESSES_PER_NAME`] admitted addresses at once, so the tail of
+    /// a reply past the cap is refused, fail closed — and a second name's
+    /// addresses are admitted beside the first's, because the cap is per
+    /// name, not per box. An address the table already holds is refreshed
+    /// rather than counted again, so an ordinary re-resolution never pays
+    /// the cap.
+    #[test]
+    fn admitted_addresses_are_capped_per_name() {
+        let two_names = sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy {
+                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: Some(vec!["github.com".to_string(), "second.example".to_string()]),
+                deny_subnets: None,
+            }),
+            ingress: None,
+        };
+        let gate = gate_for(&two_names);
+        let now = Instant::now();
+
+        // One reply carrying more answers than the cap.
+        let burst: Vec<[u8; 4]> = (0..MAX_ADDRESSES_PER_NAME + 4)
+            .map(|host| [198, 51, 100, host as u8])
+            .collect();
+        gate.admit("github.com", &burst, now);
+        for (index, address) in burst.iter().enumerate() {
+            assert_eq!(
+                gate.admits_destination(*address, now),
+                index < MAX_ADDRESSES_PER_NAME,
+                "the cap decides answer {index}, not the window"
+            );
+        }
+
+        // Re-resolving the same name refreshes what it holds — nothing is
+        // counted twice — and its over-cap tail stays refused.
+        let later = now + Duration::from_secs(1);
+        gate.admit("github.com", &burst, later);
+        assert!(
+            gate.admits_destination(burst[0], later),
+            "an address the table already holds is refreshed, not re-counted"
+        );
+        assert!(
+            !gate.admits_destination(burst[MAX_ADDRESSES_PER_NAME], later),
+            "the over-cap tail stays refused"
+        );
+
+        // The cap is per name: a second name's addresses are admitted
+        // beside the first name's full set.
+        let second: Vec<[u8; 4]> = (0..4).map(|host| [203, 0, 113, host as u8]).collect();
+        gate.admit("second.example", &second, later);
+        for address in &second {
+            assert!(
+                gate.admits_destination(*address, later),
+                "the cap bounds each name, not the box"
+            );
+        }
     }
 
     /// The resolver's reply to a resolved name pins its addresses, so the
@@ -603,11 +907,162 @@ mod tests {
         );
     }
 
+    /// Design §5.3's conntrack-aware retention, with NET-066's window as its
+    /// bound: a flow the box opened through a pin while the window held
+    /// keeps passing frames after the window has passed, until the box ends
+    /// it — a `git clone` or a long keep-alive to an allowed name is not
+    /// severed at the window's edge — while a *new* flow to the same
+    /// destination after the window is refused until the box re-resolves,
+    /// and the retained flow's end releases the destination.
+    ///
+    /// The window is the gate's own production constant, so the relay is
+    /// spawned with a window short enough for its expiry to happen inside
+    /// the test; the retention being proved is the part that does not
+    /// depend on the window's length.
+    #[tokio::test]
+    async fn established_flow_keeps_its_pin_past_the_window() {
+        const PINNED: Ipv4Addr = Ipv4Addr::new(140, 82, 121, 3);
+        let mut harness = spawn_test_relay_with(&github_only_egress(), |gate| {
+            gate.shrink_admission_window(Duration::from_secs(1));
+        });
+
+        // The box resolves github.com and the reply admits its address.
+        let query = udp_payload_frame(
+            LEASE,
+            40000,
+            RESOLVER,
+            53,
+            &dns_query("github.com.", RecordType::A),
+        );
+        harness.box_end.write_all(&query).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the query is forwarded");
+        let response = dns_response("github.com.", &[PINNED]);
+        let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, 40000, &response);
+        harness
+            .switch
+            .write_all(&wire_frame(&response_frame))
+            .await
+            .unwrap();
+        let _ = read_box_frame(&harness)
+            .await
+            .expect("the reply itself passes through");
+
+        // The connection opens inside the window: the SYN is admitted by
+        // the pin, and the flow it opens is established.
+        let syn = egress_tcp_segment(LEASE, 40000, PINNED, 443, SYN);
+        harness.box_end.write_all(&syn).unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the pinned connection opens")
+            .expect("the switch side stays open");
+        assert_eq!(out, syn, "the SYN is admitted inside the window");
+
+        // The window passes, and with it the address it admitted.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // The established flow still passes its frames: the retention
+        // belongs to the flow, and the flow has not ended.
+        let data = egress_tcp_segment(LEASE, 40000, PINNED, 443, ACK);
+        harness.box_end.write_all(&data).unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("an established flow keeps its destination")
+            .expect("the switch side stays open");
+        assert_eq!(
+            out, data,
+            "an established flow passes frames past the window"
+        );
+
+        // A new flow to the same destination is not retained: only the flow
+        // the pin established holds, so a fresh connection — from another
+        // source port — is refused until the box re-resolves the name.
+        let fresh = egress_tcp_segment(LEASE, 40001, PINNED, 443, SYN);
+        let sentinel = arp_frame();
+        harness.box_end.write_all(&fresh).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay keeps deciding")
+            .expect("the switch side stays open");
+        assert_eq!(next, sentinel, "a new flow after the window is refused");
+
+        // The box ends the retained flow: the RST is the flow's own last
+        // frame, so it is admitted with it.
+        let rst = egress_tcp_segment(LEASE, 40000, PINNED, 443, TCP_RST);
+        harness.box_end.write_all(&rst).unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the flow's closing segment is admitted")
+            .expect("the switch side stays open");
+        assert_eq!(out, rst, "the RST that ends the flow rides it out");
+
+        // And with the flow ended, the destination is not retained any
+        // further: the same flow's next frame is refused as any other
+        // undeclared destination.
+        let after = egress_tcp_segment(LEASE, 40000, PINNED, 443, ACK);
+        harness.box_end.write_all(&after).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let last = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay keeps deciding")
+            .expect("the switch side stays open");
+        assert_eq!(last, sentinel, "an ended flow releases its destination");
+
+        // The window's expiry did not end the *pin's* honesty: re-resolving
+        // the name admits the address again, and a new flow opens.
+        let requery = udp_payload_frame(
+            LEASE,
+            40002,
+            RESOLVER,
+            53,
+            &dns_query("github.com.", RecordType::A),
+        );
+        harness.box_end.write_all(&requery).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the re-query is forwarded");
+        harness
+            .switch
+            .write_all(&wire_frame(&udp_payload_frame(
+                RESOLVER,
+                53,
+                LEASE,
+                40002,
+                &dns_response("github.com.", &[PINNED]),
+            )))
+            .await
+            .unwrap();
+        let _ = read_box_frame(&harness)
+            .await
+            .expect("the re-resolution reaches the box");
+        let reopen = egress_tcp_segment(LEASE, 40003, PINNED, 443, SYN);
+        harness.box_end.write_all(&reopen).unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("a re-resolved name opens a new flow")
+            .expect("the switch side stays open");
+        assert_eq!(out, reopen, "re-resolution admits the address again");
+    }
+
     /// An allowed name that resolves into a denied range is refused: the
     /// answer is never pinned, so the connection to it is never admitted —
     /// whether the range is the box's own `deny_subnets` or the
     /// infrastructure deny set — while the clean answers of the same reply
     /// are pinned and reachable (NET-067).
+    ///
+    /// Of the two denied halves, only the infrastructure one is proved by
+    /// the frame drops here, and that is inherent rather than an accident of
+    /// the fixtures: the box's own `deny_subnets` is compiled into the frame
+    /// verdict as well, so a frame to `10.9.9.9` would be dropped as a
+    /// `DeniedSubnet` even had the intersection admitted it, while
+    /// `169.254.169.254` is decided by no rule the verdict reads and is
+    /// refused *only* because the pin was never granted. The intersection's
+    /// refusal of the box's own deny range is proved where its effect lives,
+    /// by the log line `denied_range_resolution_logged` asserts carries
+    /// `dns-rebinding-denied-subnet`, and by the pure intersection's own
+    /// proofs in `sessions::core::egress`.
     #[tokio::test]
     async fn denied_range_resolution_refused() {
         let mut harness = spawn_test_relay(&denied_range_egress());
@@ -684,9 +1139,11 @@ mod tests {
     }
 
     /// NET-067's log: each refused answer says the name and the address, in
-    /// one rate-limited warn line per rule per minute through the same
-    /// limiter the frame drops use — a burst of the same refusals is one
-    /// line per rule, not one per answer.
+    /// one rate-limited warn line per name per rule per minute through the
+    /// same limiter the frame drops use — a burst of the same name's
+    /// refusals is one line per rule, not one per answer, while a *second*
+    /// refused name inside the interval is heard on its own line, because
+    /// the requirement is the name and the answer per refusal.
     #[tokio::test]
     async fn denied_range_resolution_logged() {
         let capture = captured_log();
@@ -753,8 +1210,40 @@ mod tests {
                 .matches("an allowed name resolved into a refused range")
                 .count(),
             2,
-            "one rate-limited line per rule, not one per answer: {}",
+            "one rate-limited line per name and rule, not one per answer: {}",
             capture.contents()
+        );
+
+        // A second refused *name*, inside the same interval and under the
+        // same rule, is its own line: the rate limit keys on the name, so
+        // the first name's burst cannot silence it (the requirement is the
+        // name and the answer per refusal).
+        let second = udp_payload_frame(
+            RESOLVER,
+            53,
+            LEASE,
+            40000,
+            &dns_response("other.example.", &[Ipv4Addr::new(10, 9, 9, 10)]),
+        );
+        harness
+            .switch
+            .write_all(&wire_frame(&second))
+            .await
+            .unwrap();
+        let _ = read_box_frame(&harness)
+            .await
+            .expect("the second name's reply passes through too");
+        let logged = capture.contents();
+        assert_eq!(
+            logged
+                .matches("an allowed name resolved into a refused range")
+                .count(),
+            3,
+            "a second refused name is heard inside the interval: {logged}"
+        );
+        assert!(
+            logged.contains("name=\"other.example\"") && logged.contains("answer=10.9.9.10"),
+            "the second name's line carries its own name and answer: {logged}"
         );
     }
 

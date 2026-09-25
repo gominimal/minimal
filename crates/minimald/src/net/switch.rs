@@ -491,18 +491,26 @@ where
         if let Some(gate) = &gate {
             let summary = egress::summarize(&buf[..n]);
             if let FrameVerdict::Drop(reason) = egress::verdict(&summary, &gate.egress) {
-                // NET-066: an address the box resolved from a name its policy
-                // allowed is admitted for the DNS gate's window, and that is
-                // the one drop a pin lifts — the resolution-time intersection
-                // (NET-067, on the ingress leg) already subtracted the box's
-                // denies and the infrastructure deny set from those
-                // addresses, so a pin cannot smuggle a refused range past
-                // this drop. Denied ranges and the protocol rules keep
-                // governing pinned addresses too.
+                // NET-066, with design §5.3's conntrack-aware retention: an
+                // address the box resolved from a name its policy allowed is
+                // admitted for the DNS gate's window, and a flow that pin
+                // established keeps its destination past the window until the
+                // flow ends — together those are the one drop a pin lifts.
+                // The resolution-time intersection (NET-067, on the ingress
+                // leg) already subtracted the box's denies and the
+                // infrastructure deny set from those addresses, so a pin
+                // cannot smuggle a refused range past this drop. Denied
+                // ranges and the protocol rules keep governing pinned
+                // addresses too.
                 let pinned = matches!(reason, DropReason::UndeclaredSubnet { .. })
-                    && reason
-                        .destination()
-                        .is_some_and(|dst| gate.dns.admits_destination(dst, Instant::now()));
+                    && reason.destination().is_some_and(|dst| {
+                        // The flow's identity is the frame's own ports, so
+                        // this parse is spent on the pin's path alone: a
+                        // frame with no L4 header to read has no flow to
+                        // retain and only the window can admit it.
+                        let pkt = parse_ipv4_l4(&buf[..n]);
+                        gate.dns.admits_flow(dst, pkt.as_ref(), Instant::now())
+                    });
                 if !pinned {
                     gate.limiter.warn(
                         &gate.label,
@@ -781,6 +789,14 @@ impl SessionGate {
             egress: rules,
             dns,
         }
+    }
+
+    /// Shrinks the DNS gate's admission window — a test hook for the
+    /// relay-level proof that an established flow outlives the window,
+    /// which cannot be written against a five-minute one.
+    #[cfg(test)]
+    pub(crate) fn shrink_admission_window(&mut self, window: Duration) {
+        self.dns.shrink_window(window);
     }
 
     /// The inbound-gate decision for one Ethernet frame: `Some((proto, dst_port,
@@ -1203,8 +1219,11 @@ pub(crate) mod tests {
         f
     }
 
-    const SYN: u8 = 0x02;
-    const ACK: u8 = 0x10;
+    /// TCP SYN. `pub(crate)`: the DNS gate's retention proof builds segments
+    /// that open, ride and close a flow.
+    pub(crate) const SYN: u8 = 0x02;
+    /// TCP ACK, likewise shared with the DNS gate's proofs.
+    pub(crate) const ACK: u8 = 0x10;
     const SRC: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 5);
 
     #[test]
@@ -1452,6 +1471,17 @@ pub(crate) mod tests {
     /// subnet (whose gateway is the resolver the carve-out is keyed to),
     /// under `policy`.
     pub(crate) fn spawn_test_relay(policy: &sessions::SessionPolicy) -> RelayHarness {
+        spawn_test_relay_with(policy, |_| {})
+    }
+
+    /// [`spawn_test_relay`] with the session gate handed to `configure`
+    /// before the relay takes it: the DNS-gate proofs are the callers, for
+    /// the one thing a policy cannot say — a window short enough that its
+    /// expiry is observable inside a test.
+    pub(crate) fn spawn_test_relay_with(
+        policy: &sessions::SessionPolicy,
+        configure: impl FnOnce(&mut SessionGate),
+    ) -> RelayHarness {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `socketpair` with a valid domain/type either returns -1
         // (checked) or fills `fds` with two fresh descriptors.
@@ -1464,7 +1494,8 @@ pub(crate) mod tests {
 
         let (switch, relay_side) = tokio::io::duplex(64 * 1024);
         let (sock_rx, sock_tx) = tokio::io::split(relay_side);
-        let gate = SessionGate::for_session(LEASE.to_string(), policy, SwitchSubnet::default());
+        let mut gate = SessionGate::for_session(LEASE.to_string(), policy, SwitchSubnet::default());
+        configure(&mut gate);
         let relay = spawn_relay(
             tap_fd,
             sock_rx,
@@ -1511,10 +1542,25 @@ pub(crate) mod tests {
         f
     }
 
-    /// An Ethernet II + IPv4 + TCP frame the box sends to `dst`:`dst_port` —
-    /// the egress direction of [`tcp_frame`], whose destination is the box
-    /// itself. The segment is a new connection (SYN).
+    /// An Ethernet II + IPv4 + TCP frame the box sends to `dst`:`dst_port`
+    /// from a fixed ephemeral source port — a new connection (SYN).
     pub(crate) fn egress_tcp_frame(src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16) -> Vec<u8> {
+        egress_tcp_segment(src, 40000, dst, dst_port, SYN)
+    }
+
+    /// An Ethernet II + IPv4 + TCP segment the box sends to
+    /// `dst`:`dst_port` from `src_port` with `flags` — [`egress_tcp_frame`]
+    /// with the source port and the flags the DNS gate's retention proof
+    /// varies: a flow opens on a SYN, rides on an ACK and ends on a FIN or
+    /// RST, and the flow a second SYN belongs to is told apart by its source
+    /// port.
+    pub(crate) fn egress_tcp_segment(
+        src: Ipv4Addr,
+        src_port: u16,
+        dst: Ipv4Addr,
+        dst_port: u16,
+        flags: u8,
+    ) -> Vec<u8> {
         let mut f = Vec::new();
         f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x01]); // dst MAC
         f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // src MAC
@@ -1529,12 +1575,12 @@ pub(crate) mod tests {
         f.extend_from_slice(&0u16.to_be_bytes()); // header checksum (unread)
         f.extend_from_slice(&src.octets());
         f.extend_from_slice(&dst.octets());
-        f.extend_from_slice(&40000u16.to_be_bytes()); // src port
+        f.extend_from_slice(&src_port.to_be_bytes());
         f.extend_from_slice(&dst_port.to_be_bytes());
         f.extend_from_slice(&0u32.to_be_bytes()); // seq
         f.extend_from_slice(&0u32.to_be_bytes()); // ack
         f.push(0x50); // data offset 5, reserved
-        f.push(SYN);
+        f.push(flags);
         f.extend_from_slice(&0u16.to_be_bytes()); // window
         f.extend_from_slice(&0u16.to_be_bytes()); // checksum
         f.extend_from_slice(&0u16.to_be_bytes()); // urgent pointer
