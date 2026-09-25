@@ -251,9 +251,16 @@ pub fn wait_for_minvmd_stopped(minimal_dir: Option<&Path>) -> io::Result<()> {
             return Ok(());
         }
         if Instant::now() >= deadline {
+            // The hint must name the VM this command was driving: a bare
+            // `minvmd stop` forces the *default* VM down and leaves a named
+            // one wedged (NET-052).
+            let stop_hint = match crate::client::vm_name() {
+                paths::DEFAULT_VM_NAME => "minvmd stop".to_owned(),
+                vm => format!("minvmd --vm {vm} stop"),
+            };
             return Err(io::Error::other(format!(
                 "the VM is still shutting down after {STOPPED_WAIT_SECS}s; \
-                 run `minvmd stop` to force it down"
+                 run `{stop_hint}` to force it down"
             )));
         }
         thread::sleep(Duration::from_millis(STOPPING_POLL_MS));

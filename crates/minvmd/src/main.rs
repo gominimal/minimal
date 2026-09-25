@@ -23,7 +23,8 @@ struct Cli {
     ///
     /// A named VM keeps its own state directory, socket, and daemon under
     /// `<dir>/providers/local-minvmd0/<NAME>/`; the default VM's paths are
-    /// unchanged. Must be a single path component.
+    /// unchanged. Names are at most 24 bytes of ASCII lowercase letters,
+    /// digits and `-`, starting with a letter or digit; `guest` is reserved.
     #[arg(long = "vm", global = true, value_name = "NAME")]
     vm: Option<String>,
 }
@@ -135,11 +136,7 @@ fn main() -> Result<()> {
             // One line per VM stop, naming the VM and its state directory:
             // `stop` acts on exactly one VM, and which one is the whole
             // question a person reading the log is asking (NET-055).
-            tracing::info!(
-                vm = %minvmd::state::vm_name(),
-                state_dir = %minvmd::state::provider_dir().display(),
-                "stopping VM"
-            );
+            minvmd::cmd::log_stopping_vm(&minvmd::state::provider_dir());
             minvmd::cmd::stop::run()
         }
         Command::KrunVmm => minvmd::cmd::vmm_child::run(),

@@ -43,6 +43,23 @@ pub fn own_ip_requested() -> bool {
     })
 }
 
+/// The one-per-stop info line (NET-055): it names the VM being stopped and
+/// its state directory, so a stop in the log answers "which VM?" at a glance.
+///
+/// Every stop funnels here: the `minvmd stop` CLI logs it before it signals,
+/// and the `run` supervisor and a foreground `boot` log it when they observe
+/// the VMM child exit — which is where a `min stop` (a Shutdown RPC the
+/// guest answers by powering off) surfaces, since only the supervisor sees
+/// that stop happen. One definition of the line, so the fields cannot drift
+/// between the paths that log it.
+pub fn log_stopping_vm(state_dir: &std::path::Path) {
+    tracing::info!(
+        vm = %crate::state::vm_name(),
+        state_dir = %state_dir.display(),
+        "stopping VM"
+    );
+}
+
 /// Environment variable overriding the [`DEFAULT_READY_TIMEOUT_SECS`] wait for
 /// the guest `READY` marker.
 pub const READY_TIMEOUT_ENV: &str = "MINVMD_READY_TIMEOUT_SECS";

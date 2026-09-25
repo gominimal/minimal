@@ -223,6 +223,13 @@ fn run_foreground() -> Result<()> {
     use crate::lifecycle::{Action, Lifecycle, next_state};
     use crate::state::{StartingGuard, State, StateDir};
 
+    // One span per supervised VM, like minimald's per-connection `conn` span:
+    // every record the supervisor emits carries `vm`, so a detached
+    // supervisor's lines in the shared log (`<state>/logs/minvmd.log`, common
+    // to every VM on the host) stay attributable once a second VM runs —
+    // grep instead of manual fields on each line.
+    let _vm_scope = tracing::info_span!("supervisor", vm = %crate::state::vm_name()).entered();
+
     // Fail-fast: resolve paths before touching lifecycle state.
     // (UDS path lengths were already checked in `run_supervisor`.)
     let _kernel = resolve_kernel_path().context("resolving kernel path")?;
@@ -524,7 +531,12 @@ fn run_foreground() -> Result<()> {
 
     // ── Phase 3: Supervise until VMM child exits ─────────────────────────────
     let status = child.wait().context("waiting for VMM child")?;
-    tracing::info!(success = status.success(), "VMM child exited");
+    // The one-per-stop line (NET-055): the supervisor observes every stop of
+    // its VM — `min stop`, `minvmd stop`, a guest poweroff, a crash — as the
+    // VMM child exiting, so this is where a `min stop` gets its stop line
+    // (the `minvmd stop` CLI logs its own before it signals). A crash still
+    // says so, as the error below.
+    crate::cmd::log_stopping_vm(state_dir.dir());
 
     // ── Phase 4: Running → Stopped (under lock) ─────────────────────────────
     {

@@ -219,6 +219,10 @@ fn run_boot(foreground: bool) -> Result<()> {
 
     if foreground {
         let status = child.wait().context("waiting for VMM child")?;
+        // The one-per-stop line (NET-055): a foreground `boot` supervises the
+        // VM like `run` does, so a stop of it — `min stop` included — is
+        // observed here, as the VMM child exiting.
+        crate::cmd::log_stopping_vm(state_dir.dir());
         if !status.success() {
             let code = status.code().unwrap_or(-1);
             bail!("VMM child exited with code {code}");
