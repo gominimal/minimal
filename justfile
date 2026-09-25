@@ -285,6 +285,18 @@ fmt-check:
 clippy:
     cargo clippy {{scope}} --all-targets --locked -- -D warnings
 
+# CI: none — this is a local gate (scripts/clippy-strict.sh).
+#
+# The lints below are the ones the tree is not yet clean for: CI's clippy job
+# runs `-D warnings`, so they live here rather than in Cargo.toml and only the
+# lines you changed are reported. Run it after every change, fix what it reports
+# in the files you touched, and promote each lint into [workspace.lints.clippy]
+# as its count reaches zero.
+#
+# Strict Clippy on the lines this branch changed (BASE defaults to merge-base with main).
+clippy-strict BASE="":
+    scripts/clippy-strict.sh "{{BASE}}" {{scope}}
+
 # A local advisories failure may just mean newer RUSTSEC data than CI's last run.
 # CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).
 #
