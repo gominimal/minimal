@@ -205,7 +205,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
     tier:   T0
     verify: cargo nextest run -p minimal shell_off_tty_exit2_names_detach
 
-- **BCLI-030** THE SYSTEM SHALL provide `min session list|start|attach|stop|rm` and `min task run|list|logs|stop|rm` as aliases of the `min box` forms, filtered to boxes of that type.
+- **BCLI-030** THE SYSTEM SHALL provide `min session list|start|attach|stop|rm` and `min task run|list|logs|stop|rm` as aliases of the `min box` forms, filtered to boxes of that type, except `min session attach`, which aliases the top-level `min attach` shortcut (BCLI-032), the one session-specific verb the architecture's Type nouns name.
   <!-- was BOX-148 -->
   tier:     T0
   verify:   cargo nextest run -p minimal type_noun_verbs_alias_box_forms
