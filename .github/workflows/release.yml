@@ -1555,6 +1555,19 @@ jobs:
     publish-aur-unstable:
         needs: [assert-version, record-smoked]
         if: ${{ !inputs.dry_run && needs.assert-version.outputs.release_version == '' }}
+        # NON-GATING on purpose (as is publish-brew-unstable below): these run
+        # AFTER record-smoked advanced the `unstable` pointer, so a publish
+        # failure means a stale mirror, not a failed release. Without this the
+        # failure would make the CALLED workflow's conclusion `failure`, and
+        # nightly.yml's promote-nightly (which skips on needs.release.result ==
+        # 'failure') would freeze the nightly channel for a transient push error
+        # long after staging, smoke, provenance and the pointer all succeeded.
+        # continue-on-error keeps needs.<job>.result == 'success' (the run stays
+        # green) while the failing step is still annotated in the run.
+        # RESIDUAL TRADE: a --verify-build failure is tolerated too. Fix a
+        # tolerated failure with "Re-run failed jobs" (idempotent), or locally
+        # with `just publish-aur unstable <row> --verify-build`.
+        continue-on-error: true
         runs-on: ubuntu-latest
         container: archlinux:base-devel
         timeout-minutes: 30
@@ -1576,6 +1589,7 @@ jobs:
     publish-brew-unstable:
         needs: [assert-version, record-smoked]
         if: ${{ !inputs.dry_run && needs.assert-version.outputs.release_version == '' }}
+        continue-on-error: true # non-gating, as explained on publish-aur-unstable above
         runs-on: ubuntu-latest
         timeout-minutes: 20
         permissions:

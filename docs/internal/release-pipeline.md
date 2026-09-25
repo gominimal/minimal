@@ -279,6 +279,36 @@ a skipped night is safe. Channel publishers are **sha-row only**: a versioned
 row's bytes are what the stable package represents, so its `pkg/` row is
 already in place and the channel packages are built and published for sha rows.
 
+**A publish failure never gates a release.** The pointer has already advanced
+by the time either publisher runs, so a failed push is a stale mirror, not a
+failed release — and it must not stop the channel from moving. For `unstable`
+that is load-bearing: `release.yml`'s `publish-{aur,brew}-unstable` jobs carry
+`continue-on-error: true`, because they are terminal jobs inside a workflow
+`nightly.yml` calls. Untolerated, their failure would make the *called*
+workflow's conclusion `failure`, and nightly.yml's `promote-nightly` (which
+skips on `needs.release.result == 'failure'`) would freeze the `nightly`
+channel over a transient push error — long after staging, smoke, provenance and
+the pointer had all succeeded. `continue-on-error` keeps the run green while
+the failing step stays annotated; the residual trade is that a `--verify-build`
+failure is tolerated too. The `nightly` publishers (`nightly.yml`) and the
+stable ones (`publish-packages.yml`) are terminal with nothing gating on them,
+so a red run there is a red run, not a blocked release.
+
+Retrying a publish, per channel:
+
+- `unstable` / `nightly` — "Re-run failed jobs" on the run: both publishers are
+  idempotent and no-op when nothing changed. Locally the same scripts CI runs
+  are one recipe away: `just publish-brew <channel> <row>` (and `just
+  publish-aur <channel> <row> --verify-build`) forward their args verbatim, so
+  `--dry-run` is the credential-free rehearsal and a real push needs
+  credentials.
+- `stable` — dispatch `publish-packages.yml` by hand: `gh workflow run
+  publish-packages.yml -f version=X.Y.Z -f release_already_published=true`.
+  That skips re-publishing the already-published GitHub Release. A plain re-run
+  cannot: a failed-jobs re-run does not reliably retain the earlier job's
+  outputs, and a full re-run re-opens the promotion approval gate and then
+  fails at `publish-release`, which refuses an already-published release.
+
 ## prune-releases.yml: GitHub Release housekeeping
 
 [`.github/workflows/prune-releases.yml`](../../.github/workflows/prune-releases.yml)

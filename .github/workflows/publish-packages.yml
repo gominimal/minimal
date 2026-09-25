@@ -1,7 +1,8 @@
 name: publish-packages
 
 # Publish an already-promoted versioned release. Called by promote.yml after a
-# `stable` promotion; never runs on its own. Three steps, in order:
+# `stable` promotion; also dispatchable by hand to retry a failed AUR/Homebrew
+# push (with release_already_published=true). Three steps, in order:
 #
 #   1. publish-release — publish the DRAFT GitHub Release `v<semver>` the
 #      versioned release build parked (release.yml). Publishing a draft is
@@ -22,6 +23,25 @@ on:
                 description: "The promoted version: a semver (X.Y.Z[-pre]) publishes; anything else skips with a notice."
                 required: true
                 type: string
+    # A manual dispatch is the clean retry for a FAILED package publish. The
+    # normal path (promote.yml -> workflow_call) is unaffected: pass
+    # release_already_published=true to skip re-publishing the (already
+    # published) GitHub Release and go straight to the AUR/Homebrew publishers,
+    # which are idempotent. A failed-jobs re-run of a workflow_call cannot do
+    # this: the earlier job's outputs are not reliably retained, and a full
+    # re-run re-opens the promotion approval gate and then fails at
+    # publish-release, which refuses an already-published release.
+    workflow_dispatch:
+        inputs:
+            version:
+                description: "The released semver to (re)publish, without the v prefix."
+                required: true
+                type: string
+            release_already_published:
+                description: "Set true to retry only the AUR/Homebrew publishes; the GitHub Release is already published."
+                required: false
+                default: false
+                type: boolean
 
 permissions:
     contents: read
@@ -42,6 +62,8 @@ jobs:
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                   VERSION: ${{ inputs.version }}
+                  # Set only by a manual workflow_dispatch retry (see `on:`).
+                  RELEASE_ALREADY_PUBLISHED: ${{ github.event_name == 'workflow_dispatch' && inputs.release_already_published || 'false' }}
               run: |
                   set -euo pipefail
                   semver=""
@@ -53,6 +75,28 @@ jobs:
                       exit 0 ;;
                   esac
                   tag="v$semver"
+                  # A prerelease (a `-` tail, judged before any `+build`
+                  # metadata) never becomes "Latest" and never reaches the AUR
+                  # or the tap: pacman forbids a hyphen in pkgver, Homebrew has
+                  # no channel to keep an rc off, and both publish scripts
+                  # reject the tail. Its GitHub Release is still published.
+                  publish_semver="$semver"
+                  case "${semver%%+*}" in
+                    *-*) publish_semver=""
+                         echo "::notice::$tag is a prerelease — AUR and Homebrew skipped" ;;
+                  esac
+                  if [ "$RELEASE_ALREADY_PUBLISHED" = "true" ]; then
+                    # Manual retry of a failed AUR/Homebrew push: the GitHub
+                    # Release was published by an earlier run, so there is
+                    # nothing to publish here — confirm the tag resolves (a typo
+                    # must fail here, not inside a publisher) and hand the
+                    # version to the idempotent publishers below.
+                    tagged="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2>/dev/null)" \
+                      || { echo "::error::no GitHub Release tag $tag — check the version input"; exit 1; }
+                    echo "release $tag already published at $tagged; retrying the package publishers"
+                    echo "semver=$publish_semver" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
                   # The draft must exist: the versioned release build parks it
                   # with the notes and every artifact attached. A missing or
                   # already-published release is a pipeline invariant broken
@@ -61,19 +105,12 @@ jobs:
                     || { echo "::error::no GitHub Release $tag — was $semver cut by a versioned release build (release.yml versioned: true)?"; exit 1; }
                   read -r is_draft target <<<"$state"
                   if [ "$is_draft" != "true" ]; then
-                    echo "::error::GitHub Release $tag is already published (target $target); refusing to re-publish"
+                    echo "::error::GitHub Release $tag is already published (target $target); refusing to re-publish — to retry only the package publishers, dispatch this workflow with release_already_published=true"
                     exit 1
                   fi
-                  # A prerelease (a `-` tail, judged before any `+build`
-                  # metadata) never becomes "Latest" and never reaches the AUR
-                  # or the tap: pacman forbids a hyphen in pkgver, Homebrew has
-                  # no channel to keep an rc off, and both publish scripts
-                  # reject the tail. Its GitHub Release is still published.
                   extra=()
-                  publish_semver="$semver"
                   case "${semver%%+*}" in
-                    *-*) publish_semver=""
-                         echo "::notice::$tag is a prerelease — GitHub Release published; AUR and Homebrew skipped" ;;
+                    *-*) ;;
                     *)   extra+=(--latest) ;;
                   esac
                   gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false "${extra[@]}"
