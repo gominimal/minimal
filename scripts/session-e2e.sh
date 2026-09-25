@@ -2605,7 +2605,10 @@ echo "::group::retired surfaces gone (ssh-forward, login, :7655, direct-tcpip)"
   # every accepted connection gets its own direct-tcpip channel — the thing
   # the retired ssh-forward verb used to be the CLI for.
   echo "opening the forward: min net forward $RETIRED_NAME $RETIRED_LOCAL_PORT:$RETIRED_BOX_PORT"
-  mnl net forward "$retired_sid" "$RETIRED_LOCAL_PORT:$RETIRED_BOX_PORT" \
+  # Not `mnl ... &`: mnl is a function, so `$!` would be a subshell that ignores
+  # SIGINT; exec the binary so the pid is `min`'s and Ctrl-C reaches it.
+  # shellcheck disable=SC2086
+  ( exec min ${E2E_MINIMAL_ARGS:-} net forward "$retired_sid" "$RETIRED_LOCAL_PORT:$RETIRED_BOX_PORT" ) \
     >"$WORK/retired-forward.out" 2>"$WORK/retired-forward.err" &
   RETIRED_FWD_PID=$!
   retired_fwd_ready=""
