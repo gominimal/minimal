@@ -22,6 +22,7 @@ use sandbox2::NetGuard;
 use tokio::sync::Mutex;
 
 use crate::net::SwitchClient;
+use crate::net::dns;
 use crate::net::policy::{ControlChannel, ExposedMapping};
 use crate::net::switch::SwitchRelay;
 
@@ -136,19 +137,25 @@ async fn finish_own_ip_attach(
     };
 
     // Register this PTask's two-label name — with the deprecated three-label
-    // form beside it (NET-002) — pointing at its current lease, so peer
+    // forms beside it (NET-002) — pointing at its current lease, so peer
     // sessions can resolve it (finding #3 / UC6). Done for *every* own-IP
     // PTask, even with no ingress: resolvable names are how peers find each other,
     // and the ingress gate independently governs reachability. The host label
     // is this daemon instance's own id — carried by the switch, same as the
     // proxy's registry — so a second daemon on the host registers beside the
-    // first's names instead of over them (NET-027). Best-effort — a DNS
+    // first's names instead of over them (NET-027). `local` — the label the
+    // pre-instance world promised — is published too, so a
+    // `<name>.local.min.internal` that resolved before the ids existed keeps
+    // resolving while it lives (NET-002); the routing side answers the same
+    // pair (`HostnameRegistry`'s `host_ids`). Best-effort — a DNS
     // hiccup must not fail an otherwise-working attach.
-    let host_id = switch.lock().await.host_id().to_owned();
-    if let Err(e) =
-        crate::net::policy::register_dns_name(&control, &host_id, session_name, lease_ip).await
-    {
-        tracing::warn!(error = %e, session = session_name, "registering *.min.internal name on gvproxy");
+    let host_ids = dns::host_ids_for(switch.lock().await.host_id());
+    for host_id in host_ids {
+        if let Err(e) =
+            crate::net::policy::register_dns_name(&control, &host_id, session_name, lease_ip).await
+        {
+            tracing::warn!(error = %e, session = session_name, "registering *.min.internal name on gvproxy");
+        }
     }
 
     // Report the lease to the proxy's routing table, so the box's

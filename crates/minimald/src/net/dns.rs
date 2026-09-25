@@ -308,9 +308,14 @@ pub struct ZoneRow {
 /// box name) so a name is withdrawn when its session exits.
 #[derive(Debug)]
 pub struct HostnameRegistry {
-    /// The `<host-id>` of the deprecated three-label zone this registry still
-    /// answers for (NET-002).
-    host_id: String,
+    /// The `<host-id>` labels of the deprecated three-label zones this
+    /// registry still answers for (NET-002): the daemon's own id first — so
+    /// a second daemon beside the first can hold a zone of its own
+    /// (NET-027) — and `local` after it, because the pre-instance world
+    /// promised every daemon's boxes that label and a name like
+    /// `web.local.min.internal` keeps routing while it lives (see
+    /// [`host_ids_for`]).
+    host_ids: Vec<String>,
     /// Whether the daemon sits on the gvproxy switch (a VM host): an `OwnIp`
     /// box's route then targets its lease; on a native host it keeps the
     /// published-loopback model.
@@ -323,14 +328,31 @@ pub struct HostnameRegistry {
     own: HashMap<SessionId, OwnAddress>,
 }
 
+/// The `<host-id>` labels one daemon answers for: its own instance id, and
+/// `local` — the label of the pre-instance zone, which every daemon keeps
+/// answering so a `<name>.local.min.internal` that routed before the ids
+/// existed still routes (NET-002, NET-027). The same pair is what
+/// [`register_dns_name`](crate::net::policy::register_dns_name) publishes
+/// into the gvproxy zone, so the DNS side and the routing side answer for
+/// the same names.
+#[must_use]
+pub fn host_ids_for(host_id: &str) -> Vec<String> {
+    let mut ids = vec![host_id.to_string()];
+    if host_id != DEFAULT_HOST_ID {
+        ids.push(DEFAULT_HOST_ID.to_string());
+    }
+    ids
+}
+
 impl HostnameRegistry {
-    /// Creates an empty registry whose deprecated three-label zone uses the
-    /// given `<host-id>`, and which routes `OwnIp` boxes by whether the daemon
-    /// sits on the gvproxy switch (`on_switch` — a VM host).
+    /// Creates an empty registry whose deprecated three-label zones use the
+    /// given `<host-id>` (plus `local` — see [`host_ids_for`]), and which
+    /// routes `OwnIp` boxes by whether the daemon sits on the gvproxy switch
+    /// (`on_switch` — a VM host).
     #[must_use]
     pub fn new(host_id: impl Into<String>, on_switch: bool) -> Self {
         Self {
-            host_id: host_id.into(),
+            host_ids: host_ids_for(&host_id.into()),
             on_switch,
             by_host: HashMap::new(),
             by_session: HashMap::new(),
@@ -481,17 +503,21 @@ impl HostnameRegistry {
 
     /// The two-label name a deprecated three-label one maps to, when `host` is
     /// of the `<name>.<host-id>.min.internal` form (NET-002). The `<host-id>`
-    /// label must equal this registry's own: a dotted session name (e.g.
-    /// `my.app`) renders the two-label name `my.app.<host-id>.min.internal`,
-    /// and a suffix match alone would strip the wrong label. A name that is
-    /// both a live session's two-label name and a legacy form is unambiguous
-    /// only while that session is live — exact lookups win, so a live dotted
-    /// name routes to itself and only falls back to the legacy reading once it
-    /// is withdrawn.
+    /// label must be one of this registry's own — the daemon's instance id or
+    /// `local`: a dotted session name (e.g. `my.app`) renders the two-label
+    /// name `my.app.<host-id>.min.internal`, and a suffix match alone would
+    /// strip the wrong label. A name that is both a live session's two-label
+    /// name and a legacy form is unambiguous only while that session is live —
+    /// exact lookups win, so a live dotted name routes to itself and only
+    /// falls back to the legacy reading once it is withdrawn.
     fn legacy_two_label(&self, host: &str) -> Option<String> {
-        let legacy_suffix = format!(".{}.{}", self.host_id, HOSTNAME_SUFFIX);
-        host.strip_suffix(&legacy_suffix)
-            .filter(|name| !name.is_empty())
+        self.host_ids
+            .iter()
+            .find_map(|id| {
+                let legacy_suffix = format!(".{id}.{HOSTNAME_SUFFIX}");
+                host.strip_suffix(&legacy_suffix)
+                    .filter(|name| !name.is_empty())
+            })
             .map(|name| format!("{name}.{HOSTNAME_SUFFIX}"))
     }
 
