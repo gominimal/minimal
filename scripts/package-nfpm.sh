@@ -57,6 +57,14 @@
 #                       vendor/nfpm/nfpm.lock; it exists to catch a stale
 #                       environment, not to override the pin (bump the lock
 #                       instead).
+#   NFPM_BIN            Optional. Path to an already-present nfpm binary; set it
+#                       to SKIP the pinned download + SHA-256 verification and
+#                       use this binary instead. A testability seam for the
+#                       harness (scripts/package-nfpm_test.sh), the same shape
+#                       as the prebuilt-binary overrides elsewhere in scripts/
+#                       (MINIMALD_BIN, MINVMD_GVPROXY_BIN). NFPM_VERSION is
+#                       still checked against the lock, so this cannot smuggle
+#                       an unpinned nfpm past the pin.
 #   MINIMAL_BUCKET_URL  Public base URL of the installer bucket
 #                       (default: https://storage.googleapis.com/minimal-one)
 #   MAINTAINER          Package maintainer identity. Defaults below to the
@@ -186,11 +194,14 @@ sha256_of() {
     else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
 
-# --- Fetch the pinned nfpm -------------------------------------------------
-# vendor/nfpm/nfpm.lock pins the version and per-asset SHA-256, read exactly
-# like vendor/gvproxy/gvproxy.lock in scripts/fetch-gvproxy.sh. The tarball
-# caches under .scratch/ and is re-verified on every run, so a stale or
-# tampered cache entry cannot pass.
+# --- Resolve nfpm -----------------------------------------------------------
+# The shipped path is a pinned download + SHA-256 verification:
+# vendor/nfpm/nfpm.lock pins the version and per-asset digest, read exactly like
+# vendor/gvproxy/gvproxy.lock in scripts/fetch-gvproxy.sh, and the tarball
+# caches under .scratch/ re-verified on every run, so a stale or tampered cache
+# entry cannot pass. NFPM_BIN short-circuits the download with a prebuilt binary
+# — the harness seam (see the header) — while the NFPM_VERSION pin check above
+# stays in force.
 lock="$ROOT/vendor/nfpm/nfpm.lock"
 [ -f "$lock" ] || die "no nfpm pin: $lock"
 locked_version="$(sed -n 's/^version=//p' "$lock")"
@@ -199,48 +210,53 @@ NFPM_VERSION="${NFPM_VERSION:-$locked_version}"
 [ "$NFPM_VERSION" = "$locked_version" ] \
     || die "NFPM_VERSION=$NFPM_VERSION does not match the pin in $lock ($locked_version); bump the lock, not the environment"
 
-case "$(uname -m)" in
-    x86_64)        nfpm_host_arch=x86_64 ;;
-    aarch64|arm64) nfpm_host_arch=arm64 ;;
-    *)             die "unsupported host arch for the nfpm fetch: $(uname -m)" ;;
-esac
-nfpm_asset="nfpm_${NFPM_VERSION#v}_Linux_${nfpm_host_arch}.tar.gz"
-nfpm_want="$(sed -n "s/^${nfpm_asset}=//p" "$lock")"
-[ -n "$nfpm_want" ] || die "no pinned digest for ${nfpm_asset} in $lock"
+if [ -n "${NFPM_BIN:-}" ]; then
+    nfpm_bin="$NFPM_BIN"
+    [ -x "$nfpm_bin" ] || die "NFPM_BIN is not an executable file: $nfpm_bin"
+else
+    case "$(uname -m)" in
+        x86_64)        nfpm_host_arch=x86_64 ;;
+        aarch64|arm64) nfpm_host_arch=arm64 ;;
+        *)             die "unsupported host arch for the nfpm fetch: $(uname -m)" ;;
+    esac
+    nfpm_asset="nfpm_${NFPM_VERSION#v}_Linux_${nfpm_host_arch}.tar.gz"
+    nfpm_want="$(sed -n "s/^${nfpm_asset}=//p" "$lock")"
+    [ -n "$nfpm_want" ] || die "no pinned digest for ${nfpm_asset} in $lock"
 
-nfpm_cache="$ROOT/.scratch/nfpm"
-mkdir -p "$nfpm_cache"
-nfpm_tarball="$nfpm_cache/$nfpm_asset"
-if [ ! -f "$nfpm_tarball" ]; then
-    nfpm_url="https://github.com/goreleaser/nfpm/releases/download/${NFPM_VERSION}/${nfpm_asset}"
-    echo "package-nfpm: downloading ${nfpm_url}"
-    curl -fsSL --retry 3 -o "$nfpm_tarball.partial" "$nfpm_url" \
-        || die "nfpm download failed: $nfpm_url"
-    nfpm_got="$(sha256_of "$nfpm_tarball.partial")"
+    nfpm_cache="$ROOT/.scratch/nfpm"
+    mkdir -p "$nfpm_cache"
+    nfpm_tarball="$nfpm_cache/$nfpm_asset"
+    if [ ! -f "$nfpm_tarball" ]; then
+        nfpm_url="https://github.com/goreleaser/nfpm/releases/download/${NFPM_VERSION}/${nfpm_asset}"
+        echo "package-nfpm: downloading ${nfpm_url}"
+        curl -fsSL --retry 3 -o "$nfpm_tarball.partial" "$nfpm_url" \
+            || die "nfpm download failed: $nfpm_url"
+        nfpm_got="$(sha256_of "$nfpm_tarball.partial")"
+        [ "$nfpm_got" = "$nfpm_want" ] || {
+            rm -f "$nfpm_tarball.partial"
+            die "SHA-256 mismatch for ${nfpm_asset}: got ${nfpm_got}, want ${nfpm_want}"
+        }
+        mv -f "$nfpm_tarball.partial" "$nfpm_tarball"
+    fi
+    nfpm_got="$(sha256_of "$nfpm_tarball")"
     [ "$nfpm_got" = "$nfpm_want" ] || {
-        rm -f "$nfpm_tarball.partial"
-        die "SHA-256 mismatch for ${nfpm_asset}: got ${nfpm_got}, want ${nfpm_want}"
+        rm -f "$nfpm_tarball"
+        die "cached $nfpm_tarball fails verification (got ${nfpm_got}, want ${nfpm_want}); delete $nfpm_cache and re-fetch"
     }
-    mv -f "$nfpm_tarball.partial" "$nfpm_tarball"
-fi
-nfpm_got="$(sha256_of "$nfpm_tarball")"
-[ "$nfpm_got" = "$nfpm_want" ] || {
-    rm -f "$nfpm_tarball"
-    die "cached $nfpm_tarball fails verification (got ${nfpm_got}, want ${nfpm_want}); delete $nfpm_cache and re-fetch"
-}
 
-nfpm_bin="$nfpm_cache/nfpm-${NFPM_VERSION#v}-${nfpm_host_arch}"
-if [ ! -x "$nfpm_bin" ]; then
-    # The release tarball also carries LICENSE/README/completions/manpages;
-    # extract the binary only.
-    nfpm_extract="$nfpm_cache/extract"
-    rm -rf "$nfpm_extract"
-    mkdir -p "$nfpm_extract"
-    tar -xzf "$nfpm_tarball" -C "$nfpm_extract" nfpm
-    mv -f "$nfpm_extract/nfpm" "$nfpm_bin"
-    rm -rf "$nfpm_extract"
+    nfpm_bin="$nfpm_cache/nfpm-${NFPM_VERSION#v}-${nfpm_host_arch}"
+    if [ ! -x "$nfpm_bin" ]; then
+        # The release tarball also carries LICENSE/README/completions/manpages;
+        # extract the binary only.
+        nfpm_extract="$nfpm_cache/extract"
+        rm -rf "$nfpm_extract"
+        mkdir -p "$nfpm_extract"
+        tar -xzf "$nfpm_tarball" -C "$nfpm_extract" nfpm
+        mv -f "$nfpm_extract/nfpm" "$nfpm_bin"
+        rm -rf "$nfpm_extract"
+    fi
 fi
-"$nfpm_bin" --version >/dev/null || die "fetched nfpm does not run: $nfpm_bin"
+"$nfpm_bin" --version >/dev/null || die "nfpm does not run: $nfpm_bin"
 echo "package-nfpm: using ${nfpm_bin}"
 
 workdir="$(mktemp -d 2>/dev/null || mktemp -d -t package-nfpm)"
