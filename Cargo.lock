@@ -2618,6 +2618,7 @@ dependencies = [
  "close_fds",
  "libc",
  "libcgroups",
+ "libseccomp",
  "log",
  "nix 0.29.0",
  "oci-spec",
@@ -3663,6 +3664,24 @@ checksum = "2026a5056764a10b2bf5d56488cba40da507f5493a6a429340e2004d9ed085fa"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "libseccomp"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e5310a2c5b6ffbc094b5f70a2ca7b79ed36ad90e6f90994b166489a1bce3fcc"
+dependencies = [
+ "bitflags 2.13.1",
+ "libc",
+ "libseccomp-sys",
+ "pkg-config",
+]
+
+[[package]]
+name = "libseccomp-sys"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60276e2d41bbb68b323e566047a1bfbf952050b157d8b5cdc74c07c1bf4ca3b6"
 
 [[package]]
 name = "line-clipping"
@@ -6443,6 +6462,7 @@ dependencies = [
  "common",
  "globset",
  "hakoniwa",
+ "libc",
  "nix 0.31.3",
  "tempfile",
  "thiserror 2.0.20",

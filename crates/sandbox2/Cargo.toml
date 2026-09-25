@@ -18,5 +18,7 @@ common.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-hakoniwa.workspace = true
+hakoniwa = { workspace = true, features = ["seccomp"] }
+libc.workspace = true
 nix.workspace = true
+

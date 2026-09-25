@@ -73,6 +73,20 @@ pub struct NetPlan {
     resolver: Resolver,
 }
 
+impl std::fmt::Display for NetPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.isolate_netns {
+            if self.tap.is_some() {
+                write!(f, "own_ip")
+            } else {
+                write!(f, "none")
+            }
+        } else {
+            write!(f, "host_ip")
+        }
+    }
+}
+
 impl NetPlan {
     /// Share the host's (or VM's) network namespace: no isolation, no tap.
     #[must_use]
@@ -116,6 +130,16 @@ impl NetPlan {
     #[must_use]
     pub fn isolates_netns(&self) -> bool {
         self.isolate_netns
+    }
+
+    /// Whether this plan promises no network reach outside the sandbox and
+    /// therefore should refuse socket families that bypass the network namespace.
+    #[must_use]
+    pub fn blocks_outside_sockets(&self) -> bool {
+        // Only an isolated namespace with no tap can promise no outside reach.
+        // A host-namespace plan shares the host stack; an own-IP plan is wired
+        // to the switch and intentionally reaches the outside under policy.
+        self.isolate_netns && self.tap.is_none()
     }
 
     /// The tap to build inside that namespace, if any.

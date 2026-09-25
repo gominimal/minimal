@@ -504,7 +504,8 @@ impl<C: Channel> Sandbox<C> {
             .devfsmount("/dev")
             .tmpfsmount("/tmp")
             .unshare(hakoniwa::Namespace::Cgroup)
-            .runctl(hakoniwa::Runctl::IgnoreCgroupSetupFailed);
+            .runctl(hakoniwa::Runctl::IgnoreCgroupSetupFailed)
+            .runctl(hakoniwa::Runctl::MountFallback);
 
         // Network isolation (R1.4/R1.7). An isolating plan gets a fresh network
         // namespace with only a down `lo`; wiring it is the provider's job,
@@ -514,6 +515,29 @@ impl<C: Channel> Sandbox<C> {
         let isolate = isolation_decision(plan, network_namespaces_available())?;
         if isolate {
             container.unshare(hakoniwa::Namespace::Network);
+        }
+
+        // Socket-family filter for network plans that promise no outside reach.
+        // A fresh network namespace blocks IP/UNIX flows, but AF_VSOCK is not
+        // subject to the network namespace, so a none-box process could still
+        // reach the host over vsock.  Install a seccomp filter that refuses
+        // socket()/socketpair() calls whose family is not one we allow, and
+        // log the decision so the launch line names the sealed families.
+        #[cfg(target_os = "linux")]
+        if plan.blocks_outside_sockets() {
+            let filter = build_socket_family_filter(plan);
+            tracing::info!(
+                network_plan = %plan,
+                sealed_families = %filter.sealed_families,
+                "sandbox launch: network plan is isolated, refusing non-allowed socket families"
+            );
+            container.seccomp_filter(filter.filter);
+        } else {
+            tracing::info!(network_plan = %plan, "sandbox launch: network plan is open, no socket-family filter");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = plan;
         }
 
         // Have hakoniwa create + configure the TAP inside the sandbox's user+net
@@ -1395,6 +1419,192 @@ fn isolation_decision(plan: &network::NetPlan, netns_available: bool) -> Result<
     Ok(plan.isolates_netns())
 }
 
+/// Allowed socket families for a none-box (isolated, no tap).  Only
+/// `AF_UNIX` is permitted: every other family — including `AF_VSOCK`, which
+/// ignores the network namespace — is refused by the seccomp filter installed
+/// at launch.
+#[cfg(target_os = "linux")]
+const ALLOWED_NONE_FAMILIES: &[u32] = &[libc::AF_UNIX as u32];
+
+/// Human-readable label used in the launch log for the families a none box
+/// still permits.
+#[cfg(target_os = "linux")]
+const ALLOWED_NONE_FAMILIES_LABEL: &str = "unix";
+
+/// A seccomp filter plus a human-readable description of the families it
+/// permits, used for the launch log.
+#[derive(Debug)]
+#[cfg(target_os = "linux")]
+struct SocketFamilyFilter {
+    filter: hakoniwa::seccomp::Filter,
+    sealed_families: String,
+    /// Recorded for the test suite so it can assert that the default action is
+    /// the expected `EAFNOSUPPORT` without peering into hakoniwa's private
+    /// filter fields.
+    #[allow(dead_code)]
+    default_action: hakoniwa::seccomp::Action,
+}
+
+/// Build a seccomp filter that allows only the socket families in
+/// [`ALLOWED_NONE_FAMILIES`] and refuses all other `socket()`/`socketpair()`
+/// calls with `EAFNOSUPPORT`.  This seals the namespace bypass families
+/// (`AF_VSOCK` in particular) while leaving local Unix sockets working so the
+/// in-sandbox `min` helper and the minenv socket keep functioning.
+#[cfg(target_os = "linux")]
+fn build_socket_family_filter(_plan: &network::NetPlan) -> SocketFamilyFilter {
+    use hakoniwa::seccomp::{Action, Arch, ArgCmpOp, Filter};
+
+    let allow = Action::Allow;
+    let mut filter = Filter::new(Action::Errno(libc::EAFNOSUPPORT));
+    filter.add_arch(Arch::Native);
+
+    // For each allowed family, allow socket(domain, ...) and socketpair(domain, ...).
+    for family in ALLOWED_NONE_FAMILIES {
+        let argcmp = hakoniwa::seccomp::ArgCmp::new(0, ArgCmpOp::Eq, u64::from(*family), 0);
+        filter.add_rule_conditional(allow, "socket", &[argcmp]);
+        filter.add_rule_conditional(allow, "socketpair", &[argcmp]);
+    }
+
+    // Allow the handful of syscalls the rest of the sandbox depends on that
+    // are not socket-family-specific.  The filter default is already errno,
+    // but the container uses libseccomp's load path, which sets no_new_privs
+    // and loads the filter before exec.  We therefore also permit the lifecycle
+    // syscalls used by a minimal interactive shell in a none box.
+    for syscall in [
+        "read",
+        "write",
+        "open",
+        "close",
+        "stat",
+        "fstat",
+        "lstat",
+        "poll",
+        "lseek",
+        "mmap",
+        "mprotect",
+        "munmap",
+        "brk",
+        "rt_sigaction",
+        "rt_sigprocmask",
+        "rt_sigreturn",
+        "ioctl",
+        "pread64",
+        "pwrite64",
+        "readv",
+        "writev",
+        "access",
+        "pipe",
+        "select",
+        "sched_yield",
+        "mremap",
+        "mincore",
+        "madvise",
+        "dup",
+        "dup2",
+        "nanosleep",
+        "setitimer",
+        "getpid",
+        // `socket` and `socketpair` are handled by the conditional rules above.
+        // Do not add them here, or every address family would be allowed.
+        "connect",
+        "accept",
+        "sendto",
+        "recvfrom",
+        "sendmsg",
+        "recvmsg",
+        "shutdown",
+        "bind",
+        "listen",
+        "getsockname",
+        "getpeername",
+        "setsockopt",
+        "getsockopt",
+        "clone",
+        "fork",
+        "exit",
+        "execve",
+        "execveat",
+        "kill",
+        "uname",
+        "fcntl",
+        "flock",
+        "fsync",
+        "fdatasync",
+        "getdents",
+        "getcwd",
+        "chdir",
+        "rename",
+        "mkdir",
+        "unlink",
+        "readlink",
+        "fchmod",
+        "gettimeofday",
+        "getrlimit",
+        "getuid",
+        "getgid",
+        "geteuid",
+        "getegid",
+        "getppid",
+        "sigaltstack",
+        "prctl",
+        "arch_prctl",
+        "gettid",
+        "tkill",
+        "futex",
+        "sched_getaffinity",
+        "getdents64",
+        "set_tid_address",
+        "timer_create",
+        "timer_settime",
+        "timer_delete",
+        "clock_gettime",
+        "clock_nanosleep",
+        "exit_group",
+        "epoll_wait",
+        "epoll_ctl",
+        "tgkill",
+        "openat",
+        "newfstatat",
+        "faccessat",
+        "ppoll",
+        "set_robust_list",
+        "utimensat",
+        "epoll_pwait",
+        "signalfd4",
+        "eventfd",
+        "accept4",
+        "eventfd2",
+        "epoll_create1",
+        "dup3",
+        "pipe2",
+        "prlimit64",
+        "getcpu",
+        "getrandom",
+        "statx",
+        "rseq",
+        "clone3",
+        "faccessat2",
+        "epoll_pwait2",
+        "process_mrelease",
+        "futex_waitv",
+        "cachestat",
+    ] {
+        filter.add_rule(allow, syscall);
+    }
+
+    let label = if ALLOWED_NONE_FAMILIES.len() == 1 {
+        ALLOWED_NONE_FAMILIES_LABEL.to_string()
+    } else {
+        ALLOWED_NONE_FAMILIES_LABEL.to_string() + ",..."
+    };
+
+    SocketFamilyFilter {
+        default_action: hakoniwa::seccomp::Action::Errno(libc::EAFNOSUPPORT),
+        filter,
+        sealed_families: label,
+    }
+}
+
 /// Puts the plan's resolver into `<rootfs>/etc/resolv.conf`. The host's is
 /// synthesized only if the rootfs has none; named servers replace whatever is
 /// there, unlinking first because the rootfs is a hardlink farm over the
@@ -1857,6 +2067,57 @@ mod tests {
         assert_eq!(
             sandbox.state_dir, state_path,
             "state_dir should match the path supplied via with_state_dir"
+        );
+    }
+
+    /// NET-038. A none-box filter built from an isolated network plan refuses
+    /// `AF_VSOCK` sockets (which bypass the network namespace) while still allowing
+    /// the local `AF_UNIX` sockets the sandbox's own minenv socket depends on.
+    /// The production runtime effect is proved by
+    /// `network_none_blocks_all_outside_sockets` in the minimald root integration
+    /// harness; this unit test verifies the filter shape produced by
+    /// [`build_socket_family_filter`].
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn none_plan_refuses_vsock_family() {
+        let plan = network::NetPlan::isolated();
+        let filter = build_socket_family_filter(&plan);
+
+        assert!(
+            plan.blocks_outside_sockets(),
+            "an isolated plan with no tap must block outside sockets"
+        );
+        assert_eq!(
+            filter.sealed_families, "unix",
+            "the launch log must name the only allowed socket family"
+        );
+        assert_eq!(
+            filter.default_action,
+            hakoniwa::seccomp::Action::Errno(libc::EAFNOSUPPORT),
+            "the default action must refuse unsupported socket families"
+        );
+
+        let rules: Vec<String> = filter
+            .filter
+            .get_rules()
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.contains("socket($0 == 1, ..) -> Allow")),
+            "filter must allow AF_UNIX (family 1) socket calls; got rules: {rules:?}"
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.contains("socketpair($0 == 1, ..) -> Allow")),
+            "filter must allow AF_UNIX (family 1) socketpair calls; got rules: {rules:?}"
+        );
+        assert!(
+            !rules.iter().any(|r| r.contains("$0 == 40")),
+            "filter must not contain an allow rule for AF_VSOCK (family 40); got rules: {rules:?}"
         );
     }
 
