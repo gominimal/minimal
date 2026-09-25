@@ -53,18 +53,18 @@ After this ships, every box declares its size or takes the host's default, the h
   property: For every rejected admission, the error carries the first failing dimension, the requested size, and the host's allocatable and allocated figures.
   harness:  minimald/src/admission.rs `rejection_names_first_failing_dimension`, same bounds
 
-- **BRES-006** WHEN `ram` is `"auto"` THE SYSTEM SHALL resolve it to the host's default box size and report in `min box show` the resolved limit and whether it came from the spec or the host.
+- **BRES-006** WHEN `ram` is omitted or `"auto"` THE SYSTEM SHALL resolve it to the host's default box size and report in `min box show` the resolved limit and whether it came from the spec or the host.
   tier:     T0
   verify:   cargo nextest run -p minimald ram_auto_resolves_to_host_default
 
 - **BRES-007** WHERE the host's memory enforcement is `enforced` THE SYSTEM SHALL place every box's memory cgroup in one boxes subtree capped at allocatable, with the daemon outside it, setting `memory.max` to the box's `ram` and `memory.min` to its reservation.
+  tier:     T0
+  verify:   cargo nextest run -p minimald boxes_subtree_memory_max_and_min
+  <!-- a root integration test on a native `local0` with a delegated memory controller -->
   - WHERE the enforced host is a VM THE SYSTEM SHALL apply the same subtree and limits inside the guest.
     tier:   T0
     verify: cargo nextest run -p minimald vm_boxes_subtree_memory_max_and_min
     <!-- runs on the VM lane (NET-107): the behaviour exists only with the VM host daemon in the loop -->
-  tier:     T0
-  verify:   cargo nextest run -p minimald boxes_subtree_memory_max_and_min
-  <!-- a root integration test on a native `local0` with a delegated memory controller -->
 
 - **BRES-008** WHERE the host's memory enforcement is `enforced` THE SYSTEM SHALL reject any write to a box's memory limit that originates from a process inside the box's namespaces, including one running as root inside the box.
   tier:     T0
@@ -90,11 +90,15 @@ After this ships, every box declares its size or takes the host's default, the h
   tier:     T0
   verify:   cargo nextest run -p minimald native_without_controller_is_advisory
 
+- **BRES-016** WHERE the host's memory enforcement is `advisory`, WHEN a box that fits is admitted THE SYSTEM SHALL warn at creation that the box's memory is not protected, and mark the box's limit and reservation advisory in `min box show`.
+  tier:     T0
+  verify:   cargo nextest run -p minimald advisory_host_warns_memory_unprotected_at_creation
+
 - **BRES-014** THE SYSTEM SHALL render, in `min host list` and `min host show`, each host's capacity, allocatable, allocated, default box size and whether its memory enforcement is `enforced` or `advisory`.
   tier:     T0
   verify:   cargo nextest run -p minimal host_list_and_show_render_resource_figures
 
-- **BRES-015** IF a written `ram_reserved` exceeds the `ram` that `"auto"` resolved to THEN THE SYSTEM SHALL fail admission with exit 8 and `code = "insufficient_resources"`, naming `ram` as the remedy.
+- **BRES-015** IF a written `ram_reserved` exceeds the `ram` that an omitted or `"auto"` `ram` resolved to THEN THE SYSTEM SHALL fail admission with exit 8 and `code = "insufficient_resources"`, naming `ram` as the remedy.
   tier:     T0
   verify:   cargo nextest run -p minimald reserved_over_resolved_auto_ram_exit8
 

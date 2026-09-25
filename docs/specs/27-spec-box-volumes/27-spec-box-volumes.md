@@ -27,7 +27,7 @@ This spec is the first backing: a volume lives on the host that runs the box, in
 
 ## Requirements
 
-- **BVOL-001** WHERE an entry declares `volumes = ["<name>", …]` THE SYSTEM SHALL mount each named volume into every box created from that entry.
+- **BVOL-001** WHERE an entry declares `volumes = ["<name>", …]` THE SYSTEM SHALL mount each named volume at `/volumes/<name>` in every box created from that entry.
   tier:     T0
   verify:   cargo nextest run -p minimald declared_volume_is_mounted
 
@@ -67,6 +67,10 @@ This spec is the first backing: a volume lives on the host that runs the box, in
   tier:     T0
   verify:   cargo nextest run -p minimald write_hold_persists_until_box_reaped
 
+- **BVOL-012** WHEN `min volume prune` runs THE SYSTEM SHALL skip every volume that a box holds for writing, whatever its last use.
+  tier:     T0
+  verify:   cargo nextest run -p minimald volume_prune_skips_held_volumes
+
 - **BVOL-011** THE SYSTEM SHALL accept each `volumes` item as a bare name, meaning `mode = "rw"`, or as `{ name = "<name>", mode = "rw" | "ro" }`, holding an `rw` volume for writing and mounting an `ro` volume read-only.
   tier:     T0
   verify:   cargo nextest run -p minimald volume_mode_bare_is_rw_and_ro_mounts_read_only
@@ -78,11 +82,11 @@ This spec is the first backing: a volume lives on the host that runs the box, in
 
 ## Design reasoning
 
-**A local directory first, the interface fixed.** The epic and the author's promotion of the story name the host's state directory as the first backing and require that the interface not change when object storage arrives. The requirements therefore speak of volumes the host holds, mounts and refuses, never of a directory or a path, so the second backing is a change beneath them rather than a rewrite of them.
+**A local directory first, the interface fixed.** The epic and the author's promotion of the story name the host's state directory as the first backing and require that the interface not change when object storage arrives. The requirements therefore speak of volumes the host holds, mounts and refuses, never of a host directory or host path, so the second backing is a change beneath them rather than a rewrite of them.
 
 **Volumes are keyed by project and name.** The architecture scopes volume names to the project (AT21), so two projects on one host that both declare `cache` get two volumes (BVOL-009). A host-wide name would have let one project's compromised run poison another's cache.
 
-**A write hold lasts as long as the box record.** The hold persists across stop, exit and resume and is released when the box is reaped (BVOL-010), so a stopped session always resumes with its volume and resume needs no second check. The alternative, releasing the hold on stop and re-checking it on resume, was rejected because a stopped box could then fail to resume after another box took its volume. The cost is that a second writer waits for the first box's `rm`, not its stop.
+**A write hold lasts as long as the box record.** The hold persists across stop, exit and resume and is released when the box is reaped (BVOL-010), so a stopped session always resumes with its volume and resume needs no second check. `min volume prune` skips a held volume for the same reason (BVOL-012). The alternative, releasing the hold on stop and re-checking it on resume, was rejected because a stopped box could then fail to resume after another box took its volume. The cost is that a second writer waits for the first box's `rm`, not its stop.
 
 **A bare volume name means read-write.** `volumes = ["cache"]` stays the common case and holds the volume for writing; `{ name, mode = "ro" }` is the reader form (BVOL-011). Defaulting to read-only was rejected because a cache nobody can write never fills.
 
@@ -101,6 +105,7 @@ This spec is the first backing: a volume lives on the host that runs the box, in
 ## Open questions
 
 - [NEEDS CLARIFICATION (HIGH): the state directory path on each host kind and who owns the volume directories (the daemon's user, the box's user, or root); the epic's own note on S19 asks for this before sizing.]
+- [NEEDS CLARIFICATION (MEDIUM): neither the architecture's `box.toml` nor its Glossary gives the path at which a volume is mounted inside a box; BVOL-001 fixes `/volumes/<name>` as this spec's decision pending an architecture line.]
 - [NEEDS CLARIFICATION (MEDIUM): the architecture's `box.toml` writes `volumes` with no access mode; BVOL-011 adds one pending an architecture line.]
 - [NEEDS CLARIFICATION (MEDIUM): what identifies a project for BVOL-009, its root directory's path or a stable id; a path changes when the project directory moves, which would orphan its volumes.]
 - [NEEDS CLARIFICATION (LOW): whether `min box rm` of the last box that wrote a volume should warn that the volume remains (BVOL-008).]

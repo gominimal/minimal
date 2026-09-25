@@ -46,11 +46,11 @@ After this ships, a developer on a stock install with no identity plane runs ses
 ### O1 One box record
 
 - **BOX-001** WHEN a box is created THE SYSTEM SHALL assign it a UUIDv7 `box_id` whose random fields come from the OS CSPRNG, a `box_type`, and a `parent`, minted by the host-side creator outside any VM and never supplied by the client (BEP-070).
+  tier:     T0
+  verify:   cargo nextest run -p minimald create_assigns_uuidv7_id_type_and_parent
   - IF a minted `box_id` is named by any retained record THEN THE SYSTEM SHALL refuse the creation (BEP-070).
     tier:   T0
     verify: cargo nextest run -p minimald colliding_box_id_refuses_creation
-  tier:     T0
-  verify:   cargo nextest run -p minimald create_assigns_uuidv7_id_type_and_parent
 
 - **BOX-002** WHERE the box host is a VM THE SYSTEM SHALL mint the `box_id` in the VM host daemon and pass it to the in-VM daemon at creation.
   tier:     T0
@@ -329,12 +329,12 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p minimal box_spec_box_renders_stored_copy
 
 - **BOX-071** WHEN a box is created THE SYSTEM SHALL compute, in both the client and the daemon, the Gatehouse §6.3.2 Box Spec projection of the expanded spec, exactly the §6.3.2 field set (`v`; `type.name`, `type.source`, `type.root`, and `type.registry` when the source is `org`; `network.mode`, `egress_dns`, `egress_subnets`, `ingress_ports` and `quic443`; `bep.steering`; `registry_pinned`; `registry_commit`; `loadout_mode`; `pty_enabled`; `lifetime`; the `[nesting]` bounds; `secret_grants`), and digest it as SHA-256 over its RFC 8785 JCS bytes.
-  - WHEN a box is created THE SYSTEM SHALL store the daemon's recomputed digest beside the client's in the record.
-    tier:   T0
-    verify: cargo nextest run -p minimald projection_digests_stored_side_by_side
   tier:     T1
   verify:   cargo nextest run -p mfile projection_is_the_6_3_2_field_set
   property: For every expanded spec, the digest equals SHA-256 over the RFC 8785 JCS bytes of the §6.3.2 record built from that spec: changing a field outside the §6.3.2 set leaves the digest unchanged, and changing one inside it changes the digest.
+  - WHEN a box is created THE SYSTEM SHALL store the daemon's recomputed digest beside the client's in the record.
+    tier:   T0
+    verify: cargo nextest run -p minimald projection_digests_stored_side_by_side
 
 - **BOX-072** IF the client's and the daemon's projection digests differ THEN THE SYSTEM SHALL refuse creation.
   tier:     T0
@@ -355,7 +355,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p mfile golden_vectors_pinned
 
-- **BOX-076** THE SYSTEM SHALL accept every Box Spec section with the keys and value types of the architecture's `box.toml`, except that the `[machine]` keys and `[execution] on_oom` are as BRES-001 defines them and `[network]` egress keys take the nested `egress.*` shape the networking and egress-proxy specs bind.
+- **BOX-076** THE SYSTEM SHALL accept every Box Spec section with the keys and value types of the architecture's `box.toml`, except that the `[machine]` keys and `[execution] on_oom` are as BRES-001 defines them, `volumes` items are as BVOL-011 defines them, and `[network]` egress keys take the nested `egress.*` shape the networking and egress-proxy specs bind.
   tier:     T0
   verify:   cargo nextest run -p mfile sections_follow_box_toml_with_nested_egress
   - IF a spec carries an unknown key or a value of the wrong shape THEN THE SYSTEM SHALL fail with exit 3 naming the key.
@@ -411,9 +411,6 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-089** WHEN `min session start <entry>` runs THE SYSTEM SHALL create the box and attach, or print the id and return under `--detach`.
   tier:     T0
   verify:   cargo nextest run -p minimal session_start_attaches_or_detaches
-  - IF `min shell` runs with no argument and the file has several session entries and none named `default` THEN THE SYSTEM SHALL fail with exit 2 listing the entries.
-    tier:   T0
-    verify: cargo nextest run -p minimal shell_ambiguous_entries_exit2_lists
   - IF `min shell` or `min session start` without `--detach` runs off a TTY THEN THE SYSTEM SHALL fail with exit 2 naming `session start --detach`.
     tier:   T0
     verify: cargo nextest run -p minimal shell_off_tty_exit2_names_detach
@@ -425,6 +422,9 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-090** WHEN `min shell [<session>]` runs THE SYSTEM SHALL resolve the named entry, else the sole session entry, else the entry named `default`, and start, re-attach, or resume it; and WHERE `--new` is given THE SYSTEM SHALL start a parallel instance.
   tier:     T0
   verify:   cargo nextest run -p minimal shell_resolves_named_sole_or_default_and_new
+  - IF `min shell` runs with no argument and the file has several session entries and none named `default` THEN THE SYSTEM SHALL fail with exit 2 listing the entries.
+    tier:   T0
+    verify: cargo nextest run -p minimal shell_ambiguous_entries_exit2_lists
 
 - **BOX-093** WHEN `min attach <box>` targets a box whose spec sets `pty_enabled` THE SYSTEM SHALL re-attach its PTY.
   tier:     T0
@@ -548,7 +548,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 ## Non-goals
 
-- Network enforcement, box names in DNS, port publication, forwarding, ingress, and the VM egress filter: the networking spec, `docs/specs/18-spec-box-networking` (NET), and its epic gominimal/minimal#1437. This spec accepts and passes the `[network]` section (BOX-076 to BOX-080); NET enforces it.
+- Network enforcement, box names in DNS, port publication, forwarding, ingress, and the VM egress filter: the networking spec, `docs/specs/18-spec-box-networking` (NET), and its epic gominimal/minimal#1437. This spec accepts and passes the `[network]` section (BOX-076 to BOX-083); NET enforces it.
 - Credentialed egress, the node-local egress proxy, `[network.bep]`, `[secrets]` resolution, `min auth`, `min secret`, and `min box audit`: the egress-proxy spec, `docs/specs/24-spec-box-egress-proxy` (BEP), and gominimal/minimal#1501.
 - Behaviour specific to the `agent`, `service`, `build`, and `container-build` types beyond expansion and validation (`service restart`, the agent harness, hermetic builds): the Agent Box epic gominimal/inbox#678 and successors.
 - Nesting, the `local-box` provider, and running `min` inside a box, including `min box spec self`: gominimal/inbox#568.
