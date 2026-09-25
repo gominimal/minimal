@@ -2266,6 +2266,16 @@ proof_min_internal_names_through_proxy() {
   # Gated like the own-IP proof: MINVMD_GVPROXY_BIN is the one signal that a
   # switch exists. On every lane that sets it the daemon is in a VM, so its
   # records are guest-side and the statuses carry the assertion.
+  #
+  # The box declares the one address the NET-003/NET-004 steps below are about
+  # reaching — the switch's host alias — because the deny-all egress default
+  # (NET-074, in force) means a bare own-address box reaches nothing, the host
+  # included: it still resolves host.min.internal (the resolver carve-out,
+  # NET-079) and reaches none of it. Those two steps are about NAME routing, so
+  # the box asks for the host the way a box that wants it would. Its published
+  # port needs no egress declaration — a declared exposure is answered even
+  # under deny-all (the daemon's reply window) — so NET-001 below stays the
+  # bare-egress assertion it always was.
   PROXY_OWN_SID=""
   if [ -n "${MINVMD_GVPROXY_BIN:-}" ]; then
     PROXY_OWN_SEED_DIR="$(hook_mktemp /tmp/mnlpo.XXXXXX)"
@@ -2273,6 +2283,7 @@ proof_min_internal_names_through_proxy() {
     mkdir "$PROXY_OWN_SEED_DIR/.git"
     PROXY_OWN_SID="$(cd "$PROXY_OWN_SEED_DIR" && mnl session activate . --no-prompt \
       --name "$PROXY_OWN_NAME" --network own_ip \
+      --allow-subnets "$PROXY_HOST_ALIAS/32" \
       --ingress "$PROXY_OWN_EXTERNAL_PORT:$PROXY_BOX_PORT" 2>"$WORK/proxy-own.err")" || {
       echo "::error::'min session activate --network own_ip --ingress ...' failed"
       echo "--- stderr ---"; cat "$WORK/proxy-own.err" 2>/dev/null || true
