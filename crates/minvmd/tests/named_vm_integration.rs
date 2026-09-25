@@ -40,9 +40,9 @@ fn minvmd_bin() -> std::ffi::OsString {
 /// exercises.
 const REAP_SCRIPT: &str = include_str!("../../../scripts/reap-vms.sh");
 
-/// The `minvmd` binary this package builds, run against a `--minimal-state-dir`
-/// base. `RUST_LOG` is dropped so the default `info` filter applies and these
-/// tests observe the info lines every install gets.
+/// Run the `minvmd` binary under test ([`minvmd_bin`]) against a
+/// `--minimal-state-dir` base. `RUST_LOG` is dropped so the default `info`
+/// filter applies and these tests observe the info lines every install gets.
 fn run_minvmd(base: &Path, args: &[&str]) -> BinRun {
     let out = Command::new(minvmd_bin())
         .arg("--minimal-state-dir")
