@@ -82,6 +82,9 @@
 #   skip_scaffold                    the daemon-scaffolded blueprint upload lane
 #   sandbox                          interactive attach: in-sandbox `min add`
 #   restart                          daemon stop → autospawn, hooks survive
+#   native_resolution_without_proxy_env
+#                                    NET-009/122/123: the advisory, the probe,
+#                                    and host-OS resolution with no proxies
 #   min_internal_names_through_proxy NET-001..004 through the shipped proxy
 #
 # Usage: scripts/session-e2e.sh [case]
@@ -117,6 +120,8 @@ HOOK_SEED_DIR="" # seeded by the lifecycle-hooks proof below; removed on teardow
 PATCH_SRC_DIR="" # patch sources for the patch-modes proof; removed on teardown
 SKIP_SEED_DIR="" # seeded by the skip-lane scaffold proof below; removed on teardown
 OWNIP_SEED_DIR="" # seeded by the own-IP proof below; removed on teardown
+NATIVE_SEED_DIR="" # seeded by the native-resolution proof below; removed on teardown
+NATIVE_REVERT_LINK="" # the link that proof pointed the host resolver at; reverted on teardown
 PROXY_SEED_DIR="" # seeded by the min.internal proxy proof; removed on teardown
 PROXY_OWN_SEED_DIR="" # its own-address box's seed; removed on teardown
 PROXY_HOST_DIR="" # the host-loopback dir that proof serves; removed on teardown
@@ -331,6 +336,14 @@ teardown() {
   [ -n "$PATCH_SRC_DIR" ] && rm -rf "$PATCH_SRC_DIR"
   [ -n "$SKIP_SEED_DIR" ] && rm -rf "$SKIP_SEED_DIR"
   [ -n "$OWNIP_SEED_DIR" ] && rm -rf "$OWNIP_SEED_DIR"
+  [ -n "$NATIVE_SEED_DIR" ] && rm -rf "$NATIVE_SEED_DIR"
+  # The native-resolution proof points the HOST resolver at the daemon's
+  # answerer; a run that died between that and its own revert must not leave
+  # the change behind. `resolvectl revert` restores the link's configured
+  # state, whatever this host had before.
+  if [ -n "$NATIVE_REVERT_LINK" ]; then
+    sudo -n resolvectl revert "$NATIVE_REVERT_LINK" >/dev/null 2>&1 || true
+  fi
   [ -n "$PROXY_SEED_DIR" ] && rm -rf "$PROXY_SEED_DIR"
   [ -n "$PROXY_OWN_SEED_DIR" ] && rm -rf "$PROXY_OWN_SEED_DIR"
   [ -n "$PROXY_HOST_DIR" ] && rm -rf "$PROXY_HOST_DIR"
@@ -1755,6 +1768,280 @@ fi
 }
 
 # ---------------------------------------------------------------------------
+# Native host-OS resolution of a box name, with no proxy settings anywhere
+# (NET-009, with the client halves of NET-122 and NET-123).
+#
+# The session-start advisory (NET-122) must print on a host whose resolver is
+# not configured for the zone, and name the EXACT command that points it at
+# the daemon's zone answerer — this case runs the text it printed, verbatim,
+# not a reconstruction of it, so what the user would have copied is what is
+# proved. And session start must never prompt: this case drives `min session
+# activate` from a script with no answers to give, so the activate completing
+# at all is half the proof. The other half, where this host can run it: after
+# the command, a plain `getent hosts` — any process, through the host's
+# NATIVE resolver — resolves the session's name with every proxy variable
+# stripped, which is the whole point of pointing the resolver at the
+# answerer instead of exporting proxies (NET-009).
+#
+# NET-123's present arm is asserted from the daemon's own record: the
+# session-start bind probe ran at this create and picked the reserved local
+# range, not the 127.0.0.1 interim (on Linux the probe always succeeds — the
+# whole 127/8 is `lo`'s — so the interim arm itself is macOS-only and is
+# pinned by the minimald unit tests, with the CLI advisory carrying no
+# interim sentence on these lanes, asserted alongside). The probe record is
+# INFO, and the lane runs its daemon at warn, so this case (like the proxy
+# case after it, which is ordered LAST on purpose) restarts with its own
+# RUST_LOG first; no session is live here, and the restart proof pins that
+# they survive regardless.
+#
+# Lane gating, by observed fact as ever:
+#   * The advisory and its command assert on EVERY lane — the CLI detects the
+#     hook host-side, whatever side the daemon is on.
+#   * The daemon's probe record and the host half (run the command, resolve)
+#     are native-only: a VM lane's daemon and answerer live in the guest, so
+#     its log is guest-side (`hook_log_readable`) and its answerer is not
+#     this host's loopback. The KVM/macOS lanes assert the advisory; the
+#     native lane proves the whole path.
+#   * The host half needs `resolvectl`, `getent` and passwordless `sudo`, and
+#     a skip is only honest on a developer host (the proxy case's gate
+#     doctrine); a CI native lane that cannot run the command is a red lane.
+#   * A dev host that already routes the zone to THIS daemon's answerer sees
+#     the advisory correctly quiet (NET-122's only quiet state, once the
+#     interim is out of the picture); the resolution check below still runs
+#     there, and passing it is the assertion that the quiet was right.
+# ---------------------------------------------------------------------------
+proof_native_resolution_without_proxy_env() {
+  echo "::group::native min.internal resolution with no proxy settings (NET-009, NET-122, NET-123)"
+
+  # The daemon's file log, newest first (one file per calendar day).
+  native_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null \
+      | sort | tail -n1
+  }
+
+  NATIVE_NAME="e2e-native"
+  # What this run actually asserted, for the closing line — a degraded run
+  # must not claim the halves it skipped.
+  native_proved=""
+  NATIVE_SEED_DIR="$(hook_mktemp /tmp/mnlnr.XXXXXX)"
+  hook_seed_preamble > "$NATIVE_SEED_DIR/minimal.toml"
+  mkdir "$NATIVE_SEED_DIR/.git"
+
+  # Restart with the daemon's rpc module at INFO, so this create's probe
+  # record is written; the poll below re-spawns the daemon under it.
+  if hook_log_readable; then
+    mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
+    export RUST_LOG="warn,minimald::rpc=info"
+  fi
+
+  # Warm the daemon and wait until its answerer is on record, so the
+  # advisory's trigger — the create response carrying the answerer port —
+  # cannot race the listener the daemon spawns beside it (the proxy case's
+  # degradation is this same race, read from the other end).
+  native_port=""
+  for _ in $(seq 1 40); do
+    native_port="$(mnl ls 2>/dev/null \
+      | sed -n 's/^ZONE ANSWERER: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | head -n1)"
+    [ -n "$native_port" ] && break
+    sleep 0.25
+  done
+  if [ -z "$native_port" ]; then
+    if [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; then
+      echo "::warning::native-resolution proof SKIPPED — this host's daemon never owned its zone answerer"
+      echo "  (a dev host running another minimald holds the ports; with no answerer port there"
+      echo "   is no command to name, and NET-122's advisory correctly stays quiet)"
+      rm -rf "$NATIVE_SEED_DIR"; NATIVE_SEED_DIR=""
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::the daemon's zone answerer never came up (no ZONE ANSWERER line in min ls)"
+    fail
+  fi
+
+  # NET-122: the advisory, on the activate's stderr. No prompt anywhere in
+  # the path — this script could not answer one.
+  native_err="$WORK/native-activate.err"
+  native_sid="$(cd "$NATIVE_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$NATIVE_NAME" 2>"$native_err")" || {
+    echo "::error::'min session activate' for the native-resolution proof failed"
+    echo "--- stderr ---"; cat "$native_err" 2>/dev/null || true
+    fail
+  }
+  native_sid="$(printf '%s\n' "$native_sid" | tail -n1 | tr -d '\r')"
+  echo "activated $NATIVE_NAME ($native_sid); answerer on 127.0.0.1:$native_port"
+
+  # The command the advisory named: the line after its lead-in, de-indented —
+  # exactly what a user would have copied off the terminal.
+  native_cmd="$(grep -A1 -F -- "Configure the host's resolver for the zone with:" \
+    "$native_err" 2>/dev/null | tail -n1 | sed 's/^  //')"
+
+  if [ -n "$native_cmd" ]; then
+    # The command must name this platform's mechanism and THIS daemon's
+    # answerer port, and be a command (sudo) the user runs, not one this
+    # session start ran for them.
+    case "$(uname -s)" in
+      Linux)
+        native_want_a="resolvectl"
+        native_want_b="127.0.0.1:$native_port"
+        ;;
+      Darwin)
+        native_want_a="/etc/resolver/min.internal"
+        native_want_b="port $native_port"
+        ;;
+      *)
+        native_want_a=""; native_want_b=""
+        ;;
+    esac
+    if [ -n "$native_want_a" ]; then
+      case "$native_cmd" in
+        *"$native_want_a"*) ;;
+        *)
+          echo "::error::the advisory's command does not name $native_want_a (got: '$native_cmd')"
+          echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
+          fail
+          ;;
+      esac
+      case "$native_cmd" in
+        *"$native_want_b"*) ;;
+        *)
+          echo "::error::the advisory's command does not name this answerer, $native_want_b (got: '$native_cmd')"
+          echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
+          fail
+          ;;
+      esac
+    fi
+    case "$native_cmd" in
+      sudo*) ;;
+      *) echo "::error::the advisory's command is not one the user runs (got: '$native_cmd')"; fail ;;
+    esac
+    echo "advisory named the exact command: $native_cmd"
+    native_proved="advised"
+
+    # NET-123's present arm, client side: a probe that found the reserved
+    # range adds no interim sentence to the advisory. On the lanes that run
+    # Linux daemons (native guest, or the Linux host of a VM lane) the
+    # probe always succeeds, so the word must be absent.
+    if [ "$(uname -s)" = Linux ] && grep -q -- interim "$native_err"; then
+      echo "::error::the advisory names the 127.0.0.1 interim where the probe found the reserved range"
+      echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
+      fail
+    fi
+  else
+    # No advisory. NET-122's only quiet state is a hook that already routes
+    # this answerer's port (the create carried the port — warmed above — and
+    # no Linux lane reports the interim), so this is a dev host that
+    # configured the zone against this daemon before. CI's fresh runners
+    # never see it, which is why it is an error there.
+    if [ -n "${CI:-}" ] || [ -n "$E2E_VM" ]; then
+      echo "::error::no advisory on the activate's stderr, and this lane's resolver is not configured for the zone (NET-122)"
+      echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
+      fail
+    fi
+    echo "::warning::no advisory printed — this host's resolver already routes the zone to this answerer (NET-122's quiet state)"
+    echo "  the resolution check below is then the assertion that the quiet was right"
+  fi
+
+  # NET-123's present arm, daemon side: the session-start probe record this
+  # create produced, with the surface it picked.
+  if hook_log_readable; then
+    native_probe=""
+    for _ in $(seq 1 20); do
+      native_probe="$(grep -h -- 'picked the publish surface' "$(native_log)" 2>/dev/null \
+        | grep -F -- "$native_sid" | tail -n1 || true)"
+      [ -n "$native_probe" ] && break
+      sleep 0.25
+    done
+    if [ -z "$native_probe" ]; then
+      echo "::error::no session-start loopback-probe record for $native_sid in the daemon log"
+      echo "--- daemon log (tail) ---"; tail -20 "$(native_log)" 2>/dev/null || true
+      fail
+    fi
+    echo "daemon log: $native_probe"
+    native_proved="${native_proved:+$native_proved, }probed"
+    case "$native_probe" in
+      *reserved-range*) ;;
+      *)
+        echo "::error::the session-start probe did not pick the reserved range (got: '$native_probe')"
+        fail
+        ;;
+    esac
+    if ! printf '%s' "$native_probe" | grep -Eq -- 'interim_loopback" *: *false'; then
+      echo "::error::the probe record does not read interim_loopback=false (got: '$native_probe')"
+      fail
+    fi
+  fi
+
+  # ---- the host half: run the command, then resolve with no proxy env -----
+  if [ -n "$E2E_VM" ]; then
+    echo "host half SKIPPED (VM-backed target: the answerer is guest-side; the native lane proves it)"
+  elif ! command -v resolvectl >/dev/null 2>&1 \
+       || ! command -v getent >/dev/null 2>&1 \
+       || ! sudo -n true >/dev/null 2>&1; then
+    if [ -z "${CI:-}" ]; then
+      echo "::warning::native-resolution host half SKIPPED — this host cannot run the advisory's command"
+      echo "  (needs resolvectl, getent and passwordless sudo; CI's native lane has all three)"
+      echo "  asserted here: the advisory's exact command and the daemon's probe record above"
+    else
+      echo "::error::a CI native lane must be able to run the advisory's command (resolvectl, getent, passwordless sudo)"
+      fail
+    fi
+  else
+    if [ -n "$native_cmd" ]; then
+      # Run the exact command the advisory printed — verbatim, as the user
+      # would have. Passwordless sudo is the gate above, so it cannot prompt.
+      if ! sh -c "$native_cmd" >"$WORK/native-cmd.out" 2>"$WORK/native-cmd.err"; then
+        echo "::error::the advisory's command did not run (does it name this host's link?)"
+        echo "--- command ---"; echo "$native_cmd"
+        echo "--- output ---"; cat "$WORK/native-cmd.out" "$WORK/native-cmd.err" 2>/dev/null || true
+        fail
+      fi
+      echo "ran the advisory's command"
+      # Undo it afterwards: `resolvectl revert` restores the link's
+      # configured state, whatever this host had before the proof touched it.
+      NATIVE_REVERT_LINK="$(printf '%s\n' "$native_cmd" \
+        | sed -n 's/.*resolvectl dns \([^ ][^ ]*\) .*/\1/p')"
+    else
+      echo "no command to run (the advisory was quiet); the resolution check below is the assertion"
+    fi
+
+    # NET-009: any process on the host, through the host's NATIVE resolver,
+    # with every proxy variable stripped from its environment.
+    native_resolved="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy getent hosts "$NATIVE_NAME.min.internal" 2>/dev/null || true)"
+    if [ -z "$native_resolved" ]; then
+      echo "::error::$NATIVE_NAME.min.internal did not resolve on the host with no proxy settings"
+      echo "--- resolvectl domain ---"; resolvectl domain 2>&1 || true
+      echo "--- resolvectl dns ---"; resolvectl dns 2>&1 || true
+      fail
+    fi
+    echo "resolved $NATIVE_NAME.min.internal with no proxy settings: $native_resolved"
+    case "$native_resolved" in
+      *127.0.0.1*|*127.64.0.*) ;;
+      *)
+        echo "::error::the name resolved outside the box zone's loopback (got: '$native_resolved')"
+        fail
+        ;;
+    esac
+
+    native_proved="${native_proved:+$native_proved, }resolved"
+
+    if [ -n "$NATIVE_REVERT_LINK" ]; then
+      if sudo resolvectl revert "$NATIVE_REVERT_LINK" >/dev/null 2>&1; then
+        echo "reverted the routing domain on $NATIVE_REVERT_LINK"
+      else
+        echo "::warning::could not revert the routing domain on $NATIVE_REVERT_LINK (this host's resolver still carries it)"
+      fi
+      NATIVE_REVERT_LINK=""
+    fi
+  fi
+
+  mnl session destroy --force "$native_sid" >/dev/null 2>&1 || true
+  echo "native min.internal resolution with no proxy settings OK (${native_proved:-advisory race} — each printed)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # `min.internal` names through the shipped hostname proxy, end to end
 # (NET-001..NET-004). The proxy minimald already serves — the :7654 egress
 # proxy, the one a client reaches as an HTTP(S)_PROXY — is the only thing
@@ -2352,17 +2639,20 @@ case "${1:-}" in
     proof_skip_scaffold
     proof_sandbox
     proof_restart
+    proof_native_resolution_without_proxy_env
     proof_min_internal_names_through_proxy
     ;;
   lifecycle | session_exec | guest_egress | own_ip | task_run | hooks \
-    | skip_scaffold | sandbox | restart | min_internal_names_through_proxy)
+    | skip_scaffold | sandbox | restart | native_resolution_without_proxy_env \
+    | min_internal_names_through_proxy)
     "proof_$1"
     ;;
   *)
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
     echo "  cases: lifecycle session_exec guest_egress own_ip task_run hooks"
-    echo "         skip_scaffold sandbox restart min_internal_names_through_proxy"
+    echo "         skip_scaffold sandbox restart native_resolution_without_proxy_env"
+    echo "         min_internal_names_through_proxy"
     exit 2
     ;;
 esac

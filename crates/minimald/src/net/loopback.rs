@@ -202,10 +202,17 @@ mod tests {
         assert_eq!(probe.surface(), "127.0.0.1-interim");
         assert_eq!(
             probe.first_failure,
-            Some((Ipv4Addr::new(127, 64, 0, 1), io::ErrorKind::AddrNotAvailable)),
+            Some((
+                Ipv4Addr::new(127, 64, 0, 1),
+                io::ErrorKind::AddrNotAvailable
+            )),
             "the first missing alias is the one the summary names"
         );
-        assert!(probe.summary().contains("first refusal 127.64.0.1"), "{}", probe.summary());
+        assert!(
+            probe.summary().contains("first refusal 127.64.0.1"),
+            "{}",
+            probe.summary()
+        );
     }
 
     #[test]
@@ -232,7 +239,10 @@ mod tests {
         });
         assert_eq!(probe.probed, 254);
         assert_eq!(probe.bound, 253);
-        assert!(!probe.present(), "the one missing alias fails the whole range");
+        assert!(
+            !probe.present(),
+            "the one missing alias fails the whole range"
+        );
         assert!(probe.interim());
         assert_eq!(
             probe.first_failure.map(|(a, _)| a),
