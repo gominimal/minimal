@@ -68,14 +68,14 @@
 # the dispatch at the bottom). With NO argument every block runs, in exactly
 # the order below; with a case name only that proof runs, standalone, against
 # the same fresh state dir and seeds the full lane gets. Most proofs mint (and
-# destroy) the sessions they need themselves; `session_exec`, `guest_egress`
-# and `sandbox` instead share the one `lifecycle` activates first in a
-# whole-lane run — and mint an equivalent session of their own when they run
-# alone (see proof_shared_session), so every case name below is runnable by
-# itself.
+# destroy) the sessions they need themselves; `session_exec`,
+# `session_outbound_request` and `sandbox` instead share the one `lifecycle`
+# activates first in a whole-lane run — and mint an equivalent session of their
+# own when they run alone (see proof_shared_session), so every case name below
+# is runnable by itself.
 #   lifecycle                        cold activate → list → warm → destroy
 #   session_exec                     `min session exec` in the session's namespaces
-#   guest_egress                     curl from inside the session to the internet
+#   session_outbound_request         an outbound request from inside the session (NET-107)
 #   own_ip                           `--network own_ip` tap + switch attach
 #   task_run                         `min task run` / `min session run` loop
 #   hooks                            lifecycle hooks, loadouts, patches, shells
@@ -101,7 +101,7 @@ E2E_VM="${E2E_VM:-}"
 ADD_TOOL="jq"
 ADD_TOOL_MARKER="jq-1"
 
-# The name of the session `lifecycle` activates and the exec/egress/sandbox
+# The name of the session `lifecycle` activates and the exec/outbound/sandbox
 # proofs share (see proof_shared_session).
 SESSION_NAME="e2e-banner"
 
@@ -211,7 +211,17 @@ export XDG_CONFIG_HOME="$WORK/config"
 # main.rs), so at the default level the autospawn INFO lines interleave with
 # the session id `activate` prints for piping. Quiet the logs; the last-line
 # extraction below stays defensive in case a level sneaks through.
-export RUST_LOG="${RUST_LOG:-warn}"
+#
+# The one exception is the daemon's exec records: `minimald::exec` logs one
+# INFO line per accepted exec naming the command (crates/minimald/src/exec.rs,
+# "exec request"), and that line is the only record of what a lane asked a
+# session to run once the session is gone — which is exactly what the outbound
+# case (NET-107) owes its diagnostics: when its probe fails, the `min bug`
+# bundle's daemon-log tail carries the probe's exec lines. `minimald::…` names
+# a daemon module, so the CLI's own stdout stays at warn and the extraction
+# above is untouched. The daemon inherits this RUST_LOG at autospawn, so a
+# whole-lane run and a standalone case both get it.
+export RUST_LOG="${RUST_LOG:-warn,minimald::exec=info}"
 
 # Millisecond clock: GNU date on Linux; macOS `date` has no %N, use perl.
 if [ -z "$(date +%s%3N | tr -d '0-9')" ]; then
@@ -466,7 +476,7 @@ if [ -z "$E2E_VM" ] && [ "$(uname -s)" = Linux ] \
   fi
 fi
 
-# Mint (and validate) the session the exec, egress and sandbox proofs share
+# Mint (and validate) the session the exec, outbound and sandbox proofs share
 # with `lifecycle`. `min session activate` must auto-spawn the target's daemon
 # and print the new session id on stdout; the id is the LAST stdout line (any
 # log lines that slip through the RUST_LOG filter precede it), validated as a
@@ -578,14 +588,22 @@ echo "::endgroup::"
 }
 
 # ---------------------------------------------------------------------------
-# Guest egress proof. Every VM lane wires the gvproxy switch for the guest's
-# egress (NAT + DNS), yet nothing else here asserts it works — and gvproxy
-# resolution is best-effort and never errors, so a lane that silently loses the
-# switch boots switchless, has no egress, and still reports green. The symptom
-# then reaches a user as a bogus "could not resolve host" that is not a DNS
-# problem. Prove reachability from inside the live session: the `shell` stack
-# composes curl, so no package is added. Gated on a seed we own, because only
-# then is the shell stack (and thus curl) guaranteed present.
+# Session outbound request (NET-107): WHILE a session runs with network access,
+# an outbound request from inside it must complete. The case runs after the
+# cold activate — `lifecycle` mints the session it probes in a whole-lane run,
+# and the case mints an equivalent one itself when it runs alone
+# (proof_shared_session) — then curls a public host from inside that session.
+#
+# Every VM lane wires the gvproxy switch for the guest's egress (NAT + DNS),
+# yet nothing else here asserts it works — and gvproxy resolution is
+# best-effort and never errors, so a lane that silently loses the switch boots
+# switchless, has no egress, and still reports green. A switchless boot has no
+# NAT and no DNS, so it fails every host on every attempt and the case fails —
+# that is the thing this case exists to catch, and one host answering cannot
+# mask it. The symptom otherwise reaches a user as a bogus "could not resolve
+# host" that is not a DNS problem. The `shell` stack composes curl, so no
+# package is added. Gated on a seed we own, because only then is the shell
+# stack (and thus curl) guaranteed present.
 #
 # What is asserted is what the symptom is: THIS SESSION can reach the internet.
 # So the bar is one host answering, over several hosts and several attempts —
@@ -596,17 +614,24 @@ echo "::endgroup::"
 # had already proven DNS, NAT and TLS all worked, so the run failed on weather.
 # Requiring every host to answer has the same flaw at a longer timescale: an
 # endpoint down for the whole retry window still fails a session with provably
-# working egress. A switchless boot has no NAT and no DNS, so it fails every
-# host on every attempt and is caught exactly as before — that is the thing
-# this proof exists to catch, and one host answering cannot mask it.
+# working egress.
 #
 # The cost is that a partial fault — one name resolving, another not — lands as
 # a warning rather than a failure. That is the intended trade: the lane is a
 # gate on the session, and no CI gate should turn red because example.org is
 # having a bad minute.
-proof_guest_egress() {
+#
+# Observability: every host tried is printed with its outcome — the host, the
+# HTTP code it answered, and the attempt it answered on — so the transcript
+# reads the probe instead of only its summary.
+#
+# Diagnostics: the daemon logs one INFO record per accepted exec naming the
+# command (`minimald::exec`, admitted by the RUST_LOG default above), so when
+# this case fails, the `min bug` bundle's daemon-log tail carries the probe's
+# exec lines.
+proof_session_outbound_request() {
 if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
-  echo "::group::guest egress proof (curl from inside the session)"
+  echo "::group::session outbound request proof (NET-107: an outbound request completes from inside the session)"
   proof_shared_session
   egress_ok=0
   egress_total=0
@@ -626,27 +651,28 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
       # Not ::error:: — a retried attempt is not a lane failure, and annotating
       # it would put a red mark on a run that goes on to pass.
       if [ "$egress_try" -lt 3 ]; then
-        echo "guest egress to https://$egress_host failed on attempt ${egress_try}/3 (exec status ${egress_status}, got '${egress_out:-<none>}'); retrying in $((egress_try * 3))s"
+        echo "session outbound to https://$egress_host failed on attempt ${egress_try}/3 (exec status ${egress_status}, got '${egress_out:-<none>}'); retrying in $((egress_try * 3))s"
         cat "$WORK/egress.err" 2>/dev/null || true
         sleep "$((egress_try * 3))"
       fi
     done
     if [ "$egress_status" -eq 0 ] && [ "$egress_out" = "HTTP:200" ]; then
       egress_ok=$((egress_ok + 1))
+      echo "session outbound to https://$egress_host: HTTP 200 (attempt ${egress_try}/3)"
     else
       egress_failed="${egress_failed} https://$egress_host (exec status ${egress_status}, got '${egress_out:-<none>}')"
       # Warned, not failed: another host answering proves the session's egress,
       # which makes this that endpoint's problem and not the lane's. Still
       # surfaced, so a partial fault is visible instead of silently absorbed.
-      echo "::warning::guest egress to https://$egress_host failed all 3 attempts (exec status ${egress_status}, got '${egress_out:-<none>}', want HTTP:200); not fatal while another host still proves the session has egress."
+      echo "::warning::session outbound to https://$egress_host failed all 3 attempts (exec status ${egress_status}, got '${egress_out:-<none>}', want HTTP:200); not fatal while another host still proves the session reaches the network."
       echo "--- curl stderr ($egress_host) ---"; cat "$WORK/egress.err" 2>/dev/null || true
     fi
   done
   if [ "$egress_ok" -eq 0 ]; then
-    echo "::error::guest egress failed every attempt against all ${egress_total} hosts —${egress_failed}: the session has no working egress. On a VM lane (E2E_VM='${E2E_VM:-}') a lost gvproxy switch is one hypothesis — a switchless boot has no NAT/DNS — but a nonzero exec status or a non-200 code can equally be a DNS, TLS/CA, or exec-transport failure; the per-host curl stderr is above and the guest boot console follows in the diagnostics."
+    echo "::error::the outbound request failed every attempt against all ${egress_total} hosts —${egress_failed}: the session has no working egress (NET-107). On a VM lane (E2E_VM='${E2E_VM:-}') a lost gvproxy switch is one hypothesis — a switchless boot has no NAT/DNS and fails every host — but a nonzero exec status or a non-200 code can equally be a DNS, TLS/CA, or exec-transport failure; the per-host curl stderr is above and the guest boot console follows in the diagnostics."
     fail
   fi
-  echo "guest egress proof OK (DNS + HTTPS reachable from the session; ${egress_ok}/${egress_total} hosts answered)"
+  echo "session outbound request OK (DNS + HTTPS reachable from the session; ${egress_ok}/${egress_total} hosts answered)"
   echo "::endgroup::"
 fi
 }
@@ -2345,7 +2371,7 @@ case "${1:-}" in
   "")
     proof_lifecycle
     proof_session_exec
-    proof_guest_egress
+    proof_session_outbound_request
     proof_own_ip
     proof_task_run
     proof_hooks
@@ -2354,14 +2380,14 @@ case "${1:-}" in
     proof_restart
     proof_min_internal_names_through_proxy
     ;;
-  lifecycle | session_exec | guest_egress | own_ip | task_run | hooks \
+  lifecycle | session_exec | session_outbound_request | own_ip | task_run | hooks \
     | skip_scaffold | sandbox | restart | min_internal_names_through_proxy)
     "proof_$1"
     ;;
   *)
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
-    echo "  cases: lifecycle session_exec guest_egress own_ip task_run hooks"
+    echo "  cases: lifecycle session_exec session_outbound_request own_ip task_run hooks"
     echo "         skip_scaffold sandbox restart min_internal_names_through_proxy"
     exit 2
     ;;
