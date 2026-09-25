@@ -694,12 +694,13 @@ async fn dial_in_box(
         }
     };
     let mut command = match host_handle
-        .command_in_session(
+        .command_in_session_env(
             "socat",
             [
                 "-".to_string(),
                 format!("TCP:{host}:{port},connect-timeout=10"),
             ],
+            relay_extra_env(),
         )
         .await
     {
@@ -736,6 +737,42 @@ async fn dial_in_box(
     };
     Ok(ChildStdio::new(child))
 }
+
+/// The envp the in-box dial layers over the session's own variables.
+///
+/// Production layers nothing: the relay is the box's own `socat`, on the
+/// box's own `PATH`, and the dial deliberately inherits the session's
+/// environment and nothing else. This exists for the other build: under
+/// test the harness's "in-session" command runs host-side with the mock
+/// session's *empty* environment (see the `cfg(test)` swap in
+/// [`crate::session_host`]), so `socat` would resolve through the libc
+/// default path (`/bin:/usr/bin`) — which has it on hosts that happen to
+/// install it, but not on a bare CI runner. The in-box-dial test instead
+/// points the dial at its own `socat` stand-in through the `PATH` it
+/// publishes in [`TEST_RELAY_PATH_VAR`].
+#[cfg(test)]
+fn relay_extra_env() -> BTreeMap<String, String> {
+    match std::env::var(TEST_RELAY_PATH_VAR) {
+        Ok(path) => BTreeMap::from([("PATH".to_string(), path)]),
+        Err(_) => BTreeMap::new(),
+    }
+}
+
+/// The production half of [`relay_extra_env`]: the box's own environment,
+/// nothing layered. Same statement the two-argument
+/// `command_in_session` would make, said in the form the one call site
+/// shares with the test build.
+#[cfg(not(test))]
+fn relay_extra_env() -> BTreeMap<String, String> {
+    BTreeMap::new()
+}
+
+/// The `PATH` the in-box dial's relay resolves through, under test.
+///
+/// Read only by [`relay_extra_env`]; set only by the in-box-dial test, to
+/// the directory holding its `socat` stand-in ahead of the ambient `PATH`.
+#[cfg(test)]
+const TEST_RELAY_PATH_VAR: &str = "MINIMALD_TEST_RELAY_PATH";
 
 /// The box-side half of an in-box dial: the piped stdio of the injected
 /// relay process. Reads are the bytes the box port sent back; writes are the
@@ -943,17 +980,93 @@ mod tests {
         );
     }
 
+    /// A `socat` stand-in for the in-box dial, written where the test puts
+    /// the dial's `PATH`.
+    ///
+    /// Production runs the real `socat` in-session — a baseline package,
+    /// so every box has it — but the harness's "in-session" command runs
+    /// host-side, and the host is not a box: a bare CI runner ships no
+    /// socat. The stand-in implements exactly the one argv the dial passes
+    /// (`-`, relaying stdio, and `TCP:host:port[,options]`), so what
+    /// reaches it is the production argv, resolved as `socat` through the
+    /// [`PATH`](super::TEST_RELAY_PATH_VAR) the test supplies.
+    ///
+    /// bash is the one interpreter every Linux test host can count on
+    /// (`/dev/tcp` is a bash feature, on in the default build). One
+    /// simplification, on purpose: when the channel side closes, the
+    /// stand-in stops at once instead of draining a half-closed TCP
+    /// socket — bash cannot `shutdown(2)` a write half a child still holds
+    /// — and this test never asks for that shape: teardown kills the relay
+    /// child, and the channel's EOF comes from that.
+    fn write_socat_standin(dir: &std::path::Path) {
+        const STANDIN: &str = r#"#!/bin/bash
+target=${2#TCP:}
+target=${target%%,*}
+exec 3<>"/dev/tcp/${target%:*}/${target##*:}" || exit 1
+cat <&3 &
+peer=$!
+cat >&3
+kill "$peer" 2>/dev/null
+"#;
+        let standin = dir.join("socat");
+        std::fs::write(&standin, STANDIN).expect("write the socat stand-in");
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&standin, std::fs::Permissions::from_mode(0o755))
+            .expect("make the socat stand-in executable");
+    }
+
+    /// Points the in-box dial's `socat` at the test's stand-in until the
+    /// test ends, panic or not.
+    ///
+    /// The `unsafe` is 2024-edition ceremony around touching the process
+    /// environment, not a hazard: the variable is this test's alone — the
+    /// dial path is the only reader, and nothing else in this binary
+    /// exercises it — and nextest, the workspace's runner, gives every
+    /// test its own process besides. The guard restores what was there so
+    /// a threaded `cargo test` run leaves the seam unset for its siblings.
+    struct RelayPathGuard(Option<std::ffi::OsString>);
+
+    impl RelayPathGuard {
+        fn set_to(standin_dir: &std::path::Path) -> Self {
+            let dir = standin_dir.to_string_lossy();
+            // The stand-in comes first, so the dial resolves it as
+            // `socat`; the ambient PATH follows, so the stand-in's own
+            // `bash`/`cat` calls resolve as usual.
+            let path = match std::env::var("PATH") {
+                Ok(ambient) if !ambient.is_empty() => format!("{dir}:{ambient}"),
+                _ => dir.into_owned(),
+            };
+            let previous = std::env::var_os(TEST_RELAY_PATH_VAR);
+            // SAFETY: see the doc comment on this type.
+            unsafe { std::env::set_var(TEST_RELAY_PATH_VAR, path) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for RelayPathGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                // SAFETY: see the doc comment on this type.
+                Some(previous) => unsafe { std::env::set_var(TEST_RELAY_PATH_VAR, previous) },
+                // SAFETY: see the doc comment on this type.
+                None => unsafe { std::env::remove_var(TEST_RELAY_PATH_VAR) },
+            }
+        }
+    }
+
     /// A session with a network namespace of its own (`none`) dials its box
     /// port from inside the box: `127.0.0.1` in the box is not the daemon's
     /// loopback, so the dial goes out through the one sanctioned door into
     /// the box's namespaces — a command run in-session — and comes back as
     /// the relay's box-side stdio. In this harness the in-session command is
     /// the host-side stand-in (MockLauncher builds it host-side under
-    /// `cfg(test)`); what the test pins is the path the production dial takes:
-    /// the session's host is minted, the relay program is `socat` (a baseline
-    /// package, so every box has it), and the channel relays through it. The
-    /// open line then records where the dial ran, and destroying the session
-    /// aborts the forward with it (NET-105's daemon half).
+    /// `cfg(test)`), so the `socat` the dial resolves is the stand-in above —
+    /// real socat is a box baseline, not something a bare test host has.
+    /// What the test pins is the path the production dial takes: the
+    /// session's host is minted, the relay program is `socat` with the
+    /// dial's argv, and the channel relays through it. The open line then
+    /// records where the dial ran, and destroying the session aborts the
+    /// forward with it (NET-105's daemon half).
     #[tokio::test]
     async fn direct_tcpip_dials_inside_box_netns() {
         use russh::keys::PublicKeyOrCertificate;
@@ -964,6 +1077,13 @@ mod tests {
         // Install the capture subscriber before the open happens: the global
         // subscriber must already exist when the info line is emitted.
         let log = captured_log();
+
+        // The `socat` the dial runs: resolved through the PATH below, so
+        // the in-box dial is exercised on every host — those that ship
+        // socat and those (the CI runner) that do not — identically.
+        let standin_dir = tempfile::tempdir().expect("tempdir for the socat stand-in");
+        write_socat_standin(standin_dir.path());
+        let _relay_path = RelayPathGuard::set_to(standin_dir.path());
 
         // The box port: a loopback listener echoing whatever it receives.
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
