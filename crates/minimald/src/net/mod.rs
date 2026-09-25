@@ -596,6 +596,10 @@ mod tests {
         assert!(cfg.contains(&format!("\"{}\": \"{}\"", lease.ip, lease.mac)));
         // Host alias is NAT'd to loopback and never allocated.
         assert!(cfg.contains("\"100.64.255.254\": \"127.0.0.1\""));
+        // NET-003: the static zone entry the bundle's switch-configuration copy
+        // shows — `host` answered in `min.internal.` at the NAT'd alias.
+        assert!(cfg.contains("    - name: \"min.internal.\"\n"));
+        assert!(cfg.contains("        - name: \"host\"\n          ip: \"100.64.255.254\"\n"));
     }
 
     #[test]
