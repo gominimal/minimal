@@ -181,6 +181,23 @@ impl BindFailure {
     pub fn reported(&self) -> String {
         format!("{}. Remedy: {}", self.reason, self.remedy)
     }
+
+    /// Whether the listen address was busy — the one bind failure a
+    /// default-then-select port policy relocates from (NET-025): any other
+    /// failure (an address that cannot be assigned, a permission the daemon
+    /// lacks) is not another daemon holding the port, and moving the listener
+    /// would hide it, so the caller keeps retrying the address it named
+    /// (NET-021).
+    ///
+    /// Read off the reason's rendered OS error: the failure is a human-facing
+    /// report and the OS error is carried inside it, rendered the same way by
+    /// both bind paths that produce one ([`bind_listener`] and the answerer's
+    /// UDP bind). The daemon builds only on Linux, where `EADDRINUSE` renders
+    /// as this text on every libc.
+    #[must_use]
+    pub fn is_addr_in_use(&self) -> bool {
+        self.reason.contains("Address already in use")
+    }
 }
 
 /// Binds the egress-proxy listener at `addr`, returning it on success. On a

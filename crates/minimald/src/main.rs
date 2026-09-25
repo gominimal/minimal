@@ -782,6 +782,9 @@ async fn async_main() -> Result<(), MainError> {
         hostname_proxy_port: cli.listen_args().unwrap().hostname_proxy_port,
         // The answerer's port, given the same treatment.
         zone_answerer_port: cli.listen_args().unwrap().zone_answerer_port,
+        // The daemon derives its switch /24 from its instance id (NET-027);
+        // no CLI flag pins one yet.
+        switch_subnet_octet: None,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.

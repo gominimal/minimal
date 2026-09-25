@@ -199,14 +199,6 @@ pub struct Manager {
     /// `HostNet` PTasks register on launch and withdraw on teardown.
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
-    /// This daemon's loopback allocator: the slice of the reserved local
-    /// range its own gvproxy's subnet indexes (see [`LoopbackAllocator`]).
-    /// Held beside the registry — both are per-daemon state derived from the
-    /// switch at init — for the publish path NET-010/NET-129 bind; no
-    /// caller is wired to this yet.
-    #[cfg(target_os = "linux")]
-    #[allow(dead_code)] // No publish path is wired to this yet.
-    loopback: LoopbackAllocator,
 }
 
 impl Manager {
@@ -258,11 +250,12 @@ impl Manager {
                 on_switch,
             )))
         };
-        // This daemon's slice of the reserved local range, drawn from **its
-        // own** gvproxy's subnet — never a shared constant two daemons would
-        // both draw the same range from (see [`LoopbackAllocator`], NET-027).
-        #[cfg(target_os = "linux")]
-        let loopback = LoopbackAllocator::for_switch_subnet(net_switch.lock().await.subnet());
+        // This daemon's slice of the reserved local range is a pure function
+        // of its own gvproxy's subnet — see [`LoopbackAllocator`], and the
+        // daemon-start line in `crate::server` that logs it (NET-027). It is
+        // not held here: the publish path that spends these addresses
+        // (NET-010/NET-129) is what will own the allocator, and it is another
+        // task's.
         let handle = ManagerHandle {
             sender,
             #[cfg(target_os = "linux")]
@@ -283,8 +276,6 @@ impl Manager {
             net_switch,
             #[cfg(target_os = "linux")]
             hostnames,
-            #[cfg(target_os = "linux")]
-            loopback,
         };
 
         tokio::spawn(mngr.mainloop());
@@ -303,12 +294,17 @@ impl Manager {
 /// would both start at: a second daemon on the host gets a second gvproxy
 /// on a different subnet, and with it a disjoint slice, which is what lets
 /// both route their own names at the same time without one publishing over
-/// the other's addresses. The full arbitration is NET-010's host-global
-/// allocation; this is the per-daemon half of it, and the publish path that
-/// spends these addresses (NET-129) reads it from the manager.
+/// the other's addresses. The daemon's start line reads exactly this
+/// function to name the slice in its log (see `crate::server`), so a
+/// reader of two daemons' logs can see the two hold disjoint halves.
+///
+/// The full arbitration is NET-010's host-global allocation; this is the
+/// per-daemon half of it. The publish path that **spends** these addresses
+/// (NET-129) is another task's and is not wired yet — until it lands,
+/// nothing calls [`LoopbackAllocator::allocate`], and the manager holds no
+/// allocator of its own.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
-#[allow(dead_code)] // No publish path is wired to this yet; see the doc above.
 pub struct LoopbackAllocator {
     /// The slice's first address, as a `u32` so hand-out is `next += 1`.
     first: u32,
@@ -336,7 +332,6 @@ const LOOPBACK_SLICE_PREFIX: u8 = 27;
 const LOOPBACK_SLICES: u32 = 1 << (LOOPBACK_SLICE_PREFIX - crate::net::dns::RESERVED_LOCAL_RANGE.1);
 
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // No publish path is wired to this yet; see the doc above.
 impl LoopbackAllocator {
     /// The slice of the reserved local range for a daemon whose switch runs
     /// on `subnet`: one /27, indexed by the third octet of the subnet's
@@ -366,6 +361,13 @@ impl LoopbackAllocator {
     /// The next address to publish a box at, or `None` once this daemon's
     /// slice is spent. Never reuses: a withdrawn name's address stays
     /// retired until the daemon restarts.
+    ///
+    /// No caller yet, on purpose: the publish path that spends these
+    /// addresses (NET-129, arbitrated host-globally by NET-010) is another
+    /// task's, and it — not the daemon's start line — is what will call
+    /// this. Until it lands the slice is derived and announced, never drawn
+    /// from.
+    #[allow(dead_code)] // The publish path (NET-129/NET-010) is another task's.
     pub fn allocate(&mut self) -> Option<Ipv4Addr> {
         if self.next > self.last {
             return None;

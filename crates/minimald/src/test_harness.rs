@@ -132,6 +132,9 @@ impl TestServer {
             // drives the proxy startup itself.
             hostname_proxy_port: None,
             zone_answerer_port: None,
+            // `None` derives the switch /24 from the instance id, the same
+            // start path a real daemon takes.
+            switch_subnet_octet: None,
         };
         let state = ServerStateHandle::new(config, None).await.unwrap();
         // `Server::run` installs the housekeeping actor; a harness server never
