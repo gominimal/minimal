@@ -133,10 +133,6 @@ jobs:
                   scripts/set-channel.sh \
                     --channel nightly \
                     --version "$SHA" \
-              run: |
-                  scripts/set-channel.sh \
-                    --channel nightly \
-                    --version "$SHA" \
                     --bucket gs://minimal-one
 
     # --- Channel packages: publish the nightly channel's AUR and Homebrew
