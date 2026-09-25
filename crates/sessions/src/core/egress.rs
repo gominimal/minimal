@@ -776,7 +776,8 @@ mod tests {
 /// Tiers): exhaustive over every value the decision reads — the fragment
 /// offset, the protocol, the destination and the L4 destination port of an
 /// IPv4 frame — under rule lists of zero or two rules per dimension, at an
-/// unwind bound of 4.
+/// unwind bound of 6 (the `[u8; 4]` address comparisons lower to a 4-trip
+/// `memcmp` loop; see the harness).
 ///
 /// The scope is deliberate. This module's first form was exhaustive over a
 /// fully symbolic 40-byte header and rule lists of symbolic *length*, and
@@ -838,11 +839,16 @@ mod kani_proofs {
     /// declared dimensions conjunctively — so a verdict that checks in a
     /// different order, or that reads `None` as deny-all, fails here.
     ///
-    /// The unwind bound is 4 because every loop this proof unwinds — the
-    /// rule scans in `verdict` and in the restatement, over lists of at
-    /// most two rules — has exited by its third check at the latest.
+    /// The unwind bound is 6, with one loop to spare over the longest
+    /// this proof unwinds: comparing `[u8; 4]` addresses lowers to
+    /// CBMC's builtin `memcmp`, a 4-trip loop, so a bound of 4 fails an
+    /// unwinding assertion even though every loop the harness itself
+    /// writes (the rule scans in `verdict` and below, over lists of at
+    /// most two rules) has exited by its third check. The bound has to
+    /// clear every trip the compiler generates, not only the ones the
+    /// source shows.
     #[kani::proof]
-    #[kani::unwind(4)]
+    #[kani::unwind(6)]
     fn kani_frame_verdict_admits_nothing_undeclared() {
         // One 54-byte Ethernet frame — a 14-byte header and a 40-byte IPv4
         // region, 20 bytes of IPv4 header plus 20 of L4 — the shape the
