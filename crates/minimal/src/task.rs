@@ -1,12 +1,14 @@
 //! `min task run <task>`: run a declared project task in an ephemeral
 //! session.
 //!
-//! The activate→exec→destroy loop as one command: create a session for the
+//! The activate→exec→end loop as one command: create a session for the
 //! project (named `task-<task>-<hex>`), upload the project per the normal
 //! activate rules, exec the canonical in-box `min task run <task>` over the
 //! native SSH exec channel with the task's output streamed through, exit
-//! with the task's exit code, and destroy the session afterwards — success,
-//! failure, or Ctrl-C — unless `--keep` retains it as an attachable session.
+//! with the task's exit code, and leave the session's end to the daemon —
+//! it owns the box the run created, so it destroys it once the task's exit
+//! status is on the wire (NET-131), whether or not this client is still
+//! here — unless `--keep` retains it as an attachable session.
 //!
 //! Deliberately composed from the same client/RPC primitives `cmd_activate`
 //! uses (`SessionConfig`, `CreateSession`, the upload gates,
@@ -50,6 +52,19 @@ fn exit_outcome(code: Option<u32>) -> Result<(), anyhow::Error> {
         None => Err(anyhow::anyhow!(
             "task ended without reporting an exit status"
         )),
+    }
+}
+
+/// The exec request a task run sends: the task, plus the owns-box flag —
+/// set unless `--keep` retains the session (NET-131). The flag is what moves
+/// the destroy off this client: with it set, the daemon ends the session
+/// once the task's exit status is on the wire, whether or not this process
+/// is still there. `--keep` withholds it, because a kept session is meant to
+/// outlive the run — its end stays with whoever holds it.
+fn task_run_request(task: &str, keep: bool) -> minimald_rpc::exec::ExecRequest {
+    minimald_rpc::exec::ExecRequest::TaskRun {
+        task: task.to_string(),
+        owns_box: !keep,
     }
 }
 
@@ -482,8 +497,8 @@ async fn bridge_exec(
 }
 
 /// Run a declared task in an ephemeral session: create, upload, exec the
-/// canonical in-box `min task run <task>`, relay its exit code, destroy —
-/// or keep with `--keep`.
+/// canonical in-box `min task run <task>`, relay its exit code, and let the
+/// daemon end the session with the run (NET-131) — or keep it with `--keep`.
 pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), anyhow::Error> {
     // Same project-path resolution as `cmd_activate`: explicit path, then
     // `-C`/`--repo-dir`, then the cwd.
@@ -828,21 +843,30 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     let outcome = match client
         .open_session_exec_channel(
             id,
-            &minimald_rpc::exec::ExecRequest::TaskRun(args.task.clone()).encode(),
+            &task_run_request(&args.task, args.keep).encode(),
             &task_env,
         )
         .await
     {
         Ok(channel) => bridge_exec(channel).await,
-        Err(e) => Err(e),
+        // The exec never started, so the daemon's owns-box destroy will
+        // never fire either (NET-131 ends the box when the run's command
+        // exits, and there is no run): resolve the box here, as the client
+        // always did. A run that bridged leaves its box to the daemon.
+        Err(e) => {
+            if !args.keep {
+                crate::best_effort_destroy(&mut client, id).await;
+            }
+            Err(e)
+        }
     };
 
-    // Resolve the box — success, failure, or exec error alike — before the
-    // exit code (or error) propagates.
+    // A run that bridged ends its own box from the daemon's side of the
+    // exec's exit (NET-131) — destroying here too would race it and undo
+    // the point of the flag: a client killed mid-run must strand nothing.
+    // `--keep` retains the session as an attachable box instead.
     if args.keep {
         eprintln!("Session {session_name} kept — attach with: min session attach {session_name}");
-    } else {
-        crate::best_effort_destroy(&mut client, id).await;
     }
     drop(run_guard);
 
@@ -948,6 +972,42 @@ mod tests {
             "got: {err}"
         );
         assert!(err.downcast_ref::<TaskExit>().is_none());
+    }
+
+    /// NET-131 from the client side: a `min task run` that does not `--keep`
+    /// sends the owns-box flag, which is what moves the destroy to the
+    /// daemon — it ends the session once the task's exit status is on the
+    /// wire, whether or not this client is still there. `--keep` withholds
+    /// the flag, because a kept session is meant to outlive the run; its end
+    /// stays with whoever holds it. The daemon-backed half — the box actually
+    /// ending — needs a live daemon and is covered by the `minimald` exec
+    /// tests and the session e2e, not a unit test.
+    #[test]
+    fn task_run_leaves_destroy_to_daemon() {
+        use minimald_rpc::exec::ExecRequest;
+
+        // A normal run: the request names the box as the run's own.
+        let req = task_run_request("build", false);
+        assert_eq!(
+            req,
+            ExecRequest::TaskRun {
+                task: "build".to_string(),
+                owns_box: true
+            }
+        );
+        // The flag is carried, not inferred: it survives the wire.
+        assert_eq!(ExecRequest::parse(&req.encode()), Ok(req.clone()));
+
+        // `--keep` keeps the box: no owns-box flag, nothing ends it here.
+        let kept = task_run_request("build", true);
+        assert_eq!(
+            kept,
+            ExecRequest::TaskRun {
+                task: "build".to_string(),
+                owns_box: false
+            }
+        );
+        assert_eq!(ExecRequest::parse(&kept.encode()), Ok(kept));
     }
 
     /// The empty `[vars]` policy — a fresh install, where nothing is
