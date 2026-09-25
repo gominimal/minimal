@@ -7,6 +7,8 @@ name: publish-packages
 #      versioned release build parked (release.yml). Publishing a draft is
 #      what creates the tag: v<semver> lands on the commit the draft targets
 #      — already built, staged, smoked, and promoted — and triggers no build.
+#      A release that is already public (a re-run to publish the packages
+#      later, or a rollback) is left as it is, once its tag checks out.
 #   2. publish-aur — the PKGBUILD keys on the staged versions/<semver>/ row.
 #   3. publish-brew — the formula keys on the GitHub Release published in 1.
 #
@@ -60,16 +62,29 @@ jobs:
                       exit 0 ;;
                   esac
                   tag="v$semver"
-                  # The draft must exist: the versioned release build parks it
-                  # with the notes and every artifact attached. A missing or
-                  # already-published release is a pipeline invariant broken
-                  # upstream, not something to paper over here.
+                  # The release must exist: the versioned release build parks a
+                  # draft with the notes and every artifact attached. A missing
+                  # release is a pipeline invariant broken upstream, not
+                  # something to paper over here.
                   state="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,targetCommitish --jq '"\(.isDraft) \(.targetCommitish)"' 2>/dev/null)" \
                     || { echo "::error::no GitHub Release $tag — was $semver cut by a versioned release build (release.yml versioned: true)?"; exit 1; }
                   read -r is_draft target <<<"$state"
                   if [ "$is_draft" != "true" ]; then
-                    echo "::error::GitHub Release $tag is already published (target $target); refusing to re-publish"
-                    exit 1
+                    # Already public: a re-run to publish the packages later, or
+                    # a rollback. Leave the release as it is (no --latest, which
+                    # would take the badge from a newer release), but only when
+                    # its tag exists and sits on the commit the release targets.
+                    tagged="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha 2>/dev/null)" \
+                      || { echo "::error::GitHub Release $tag is public but tag $tag does not exist"; exit 1; }
+                    if [[ "$target" =~ ^[0-9a-f]{40}$ ]]; then
+                      [ "$tagged" = "$target" ] \
+                        || { echo "::error::tag $tag is at $tagged, but its GitHub Release targets $target"; exit 1; }
+                    else
+                      # A tag-first release (0.5.x) targets a branch name; its
+                      # tag is the only record of the commit it was built from.
+                      echo "::notice::$tag targets '$target', not a commit; trusting the tag at $tagged"
+                    fi
+                    echo "::notice::GitHub Release $tag is already published at $tagged; leaving it as it is"
                   fi
                   # A prerelease (a `-` tail, judged before any `+build`
                   # metadata) never becomes "Latest" and never reaches the AUR
@@ -83,10 +98,12 @@ jobs:
                          echo "::notice::$tag is a prerelease — GitHub Release published; AUR and Homebrew skipped" ;;
                     *)   extra+=(--latest) ;;
                   esac
-                  gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false "${extra[@]}"
-                  # The tag now exists at the draft's target; say where.
-                  tagged="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)"
-                  echo "published $tag at $tagged (draft targeted $target)"
+                  if [ "$is_draft" = "true" ]; then
+                    gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false "${extra[@]}"
+                    # The tag now exists at the draft's target; say where.
+                    tagged="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)"
+                    echo "published $tag at $tagged (draft targeted $target)"
+                  fi
                   echo "semver=$publish_semver" >> "$GITHUB_OUTPUT"
 
     publish-aur:
