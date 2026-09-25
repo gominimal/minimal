@@ -34,6 +34,9 @@ native-dir   := scratch / "native-state"
 # Linux-only): scope to the darwin-capable crates there; `just test-cross`
 # covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
 scope      := if os() == "macos" { "-p minvmd -p sessions" } else { "--workspace" }
+# `clippy-strict` scope: macOS cannot build the Linux-only crates, so pin it
+# there. On Linux the script derives the crates you touched from the diff.
+strict-scope := if os() == "macos" { "-p minvmd -p sessions" } else { "" }
 # Crates carrying a `fuzz/` workspace. `rcache` is Linux-only: it pulls in
 # `lcache`, which uses the Linux-only `common::renameat2`.
 fuzz-crates := if os() == "macos" { "args common diagnostics graph mfile paths" } else { "args common diagnostics graph mfile paths rcache" }
@@ -289,13 +292,13 @@ clippy:
 #
 # The lints below are the ones the tree is not yet clean for: CI's clippy job
 # runs `-D warnings`, so they live here rather than in Cargo.toml and only the
-# lines you changed are reported. Run it after every change, fix what it reports
-# in the files you touched, and promote each lint into [workspace.lints.clippy]
-# as its count reaches zero.
+# lines you changed are reported. Run it once your change is ready, fix what it
+# reports in the files you touched, and promote each lint into
+# [workspace.lints.clippy] as its count reaches zero.
 #
-# Strict Clippy on the lines this branch changed (BASE defaults to merge-base with main).
+# Strict Clippy on the lines this branch changed, scoped to the crates you touched.
 clippy-strict BASE="":
-    scripts/clippy-strict.sh "{{BASE}}" {{scope}}
+    scripts/clippy-strict.sh "{{BASE}}" {{strict-scope}}
 
 # A local advisories failure may just mean newer RUSTSEC data than CI's last run.
 # CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).

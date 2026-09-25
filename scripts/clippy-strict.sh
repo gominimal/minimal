@@ -12,13 +12,18 @@
 # Because the flags are passed on the command line rather than in Cargo.toml,
 # plain `cargo clippy` / `just clippy` is unaffected and `just ci` stays green.
 #
+# Cost: Clippy cannot lint a subset of lines, so the whole selected crates are
+# compiled and the filter below discards what did not change. The selection is
+# therefore the crates the changed files belong to, not the workspace, so a
+# short-lived sandbox does not pay for every crate.
+#
 # Usage: scripts/clippy-strict.sh [BASE] [CARGO_SCOPE...]
 #
 # BASE defaults to the merge-base with the main branch; only diagnostics whose
 # primary span falls on a line added or changed since BASE are reported. Edits
 # that are not committed yet count, as do untracked files. Any further arguments
-# are passed to `cargo clippy` as the crate scope (the justfile supplies its
-# per-OS `scope`); the whole workspace is the default.
+# are passed to `cargo clippy` as the crate scope, overriding the derived one
+# (the justfile pins it on macOS, where the Linux-only crates do not build).
 set -euo pipefail
 
 lints=(
@@ -56,12 +61,7 @@ if [ -z "$base" ]; then
     base="$(git merge-base main HEAD 2>/dev/null || git merge-base origin/main HEAD)"
 fi
 
-# macOS cannot build the Linux-only crates, so the caller passes the justfile's
-# per-OS scope; default to the whole workspace.
-cargo_scope=("$@")
-if [ "${#cargo_scope[@]}" -eq 0 ]; then
-    cargo_scope=(--workspace)
-fi
+explicit_scope=("$@")
 
 lint_args=()
 for lint in "${lints[@]}"; do
@@ -94,6 +94,27 @@ if [ ! -s "$diff_file" ] && [ ! -s "$untracked_file" ]; then
     echo "clippy-strict: no Rust changes since ${base}"
     exit 0
 fi
+
+# Scope: an explicit scope wins. Otherwise lint only the crates the changed
+# files belong to, which is the difference between a few minutes and a cold
+# workspace build. `-p` still checks every dependency of those crates, so a
+# warning in a shared crate is caught. Paths outside `crates/` leave the scope
+# empty, which falls back to the workspace.
+cargo_scope=("${explicit_scope[@]}")
+if [ "${#cargo_scope[@]}" -eq 0 ]; then
+    # One crate name per line out of `crates/<name>/...`; other paths ignored.
+    crates=$( { git diff --name-only --no-ext-diff "$merge_base" -- '*.rs'
+                cat "$untracked_file"; } \
+        | sed -n 's|^crates/\([^/][^/]*\)/.*|\1|p' | sort -u )
+    # shellcheck disable=SC2086
+    for crate in $crates; do
+        cargo_scope+=(-p "$crate")
+    done
+fi
+if [ "${#cargo_scope[@]}" -eq 0 ]; then
+    cargo_scope=(--workspace)
+fi
+echo "clippy-strict: scope ${cargo_scope[*]}" >&2
 
 # -W lints never fail the run, so a non-zero exit here is a build or tooling
 # failure (a compile error, a stale Cargo.lock under --locked, no toolchain).
