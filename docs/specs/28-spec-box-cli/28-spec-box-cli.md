@@ -100,10 +100,13 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal task_logs_follow
 
-- **BCLI-013** WHEN `min box wait <box>` runs THE SYSTEM SHALL return the `exit_code` BOX-011 stores for the box, reading the stored `exited` event when the box has already ended, and for a `stopped` record with no `exit_code` return 128 plus the number of the signal that ended the entrypoint.
+- **BCLI-013** WHEN `min box wait <box>` runs THE SYSTEM SHALL return the `exit_code` BOX-011 stores for the box, reading the stored `exited` event when the box has already ended, and for a `stopped` record with no `exit_code` return 128 plus the `signal` BOX-011 and BOX-013 store for it.
   <!-- was BOX-036 -->
   tier:     T0
-  verify:   cargo nextest run -p minimal box_wait_returns_retained_exit_code
+  verify:   cargo nextest run -p minimal box_wait_returns_retained_exit_code_or_128_plus_signal
+  - WHEN `min box wait` reads a `stopped` record with neither `exit_code` nor `signal` (BOX-154) THE SYSTEM SHALL return 137, the shell's code for a SIGKILL end.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_wait_orphaned_stopped_record_returns_137
 
 - **BCLI-014** IF a box ends with `exited.reason = "timeout"` THEN THE SYSTEM SHALL emit a machine-mode error with `code = "timeout"` and return 124 from `min run` and from `min box wait`.
   <!-- split from BOX-037: the CLI half; the timeout reason stays in BOX. `min box wait` added in cycle 4 -->
@@ -329,11 +332,14 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal host_show_socket_and_version
 
-- **BCLI-049** WHEN `min host stop <host>` runs THE SYSTEM SHALL stop each running box on that host as BOX-013 defines, using BOX-013's forced stop under `--force`, then stop that daemon, and its VM where one exists.
+- **BCLI-049** WHEN `min host stop <host>` runs THE SYSTEM SHALL stop each running box on that host as BOX-013 defines, then stop that daemon, and its VM where one exists.
   <!-- was BOX-115 -->
   tier:     T0
-  verify:   cargo nextest run -p minimal host_stop_stops_daemon_and_vm
+  verify:   cargo nextest run -p minimal host_stop_stops_boxes_then_daemon_and_vm
   <!-- runs on the VM lane (NET-107): the behaviour exists only with the VM host daemon in the loop -->
+  - WHERE `--force` is given THE SYSTEM SHALL stop each running box with BOX-013's forced stop and then stop the daemon without waiting for its clean shutdown.
+    tier:   T0
+    verify: cargo nextest run -p minimal host_stop_force_forces_boxes_and_daemon
 
 - **BCLI-050** THE SYSTEM SHALL map bare `min stop`, a BCLI-042 alias, to `min host stop` on the local host for one release, after which BCLI-042 applies.
   <!-- was BOX-116 -->
@@ -369,7 +375,9 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 **Resume restarts processes; enrolled identity composes with it.** BCLI-007 and BCLI-009 drive BOX-025 and BOX-030's restart of a stopped or exited box's processes, and the refusal is only for restarting the processes of a non-PTY box, whose restart is a new `min run`. Under enrollment, re-establishing identity for any box, non-PTY included, is Gatehouse §6.3.3's (which names `min box resume <box>` among its paths); it composes with this, as BOX's Design reasoning states.
 
-**`min host stop` stops the boxes first.** BCLI-049 stops each running box as BOX-013 defines, forced under `--force`, then the daemon; refusing while boxes run was rejected because it would make stopping the host a two-step chore, and every stopped box stays resumable. A record left `running` by a daemon that did not get to stop it becomes `stopped` on restart (BOX-154).
+**`min host stop` stops the boxes first.** The owner decided on 2026-09-25 that BCLI-049 stops each running box as BOX-013 defines and then the daemon, and that `--force` forces both, so a host shuts down in one step and every stopped record resumes later. The alternative, refusing while any box runs, was rejected by the owner. A record left `running` by a daemon that did not get to stop it becomes `stopped` on restart (BOX-154).
+
+**`min box wait` returns 128 plus the stored signal.** The owner decided on 2026-09-25 that a stop ended by a signal stores that signal (BOX-011, BOX-013) and that BCLI-013 returns 128 plus it, the shell convention: 143 for SIGTERM, 137 for SIGKILL. The alternative, a fixed reserved code for every stop, was rejected by the owner. A record BOX-154 set to `stopped` stores no signal, because the daemon that ended it is gone; BCLI-013 returns 137 for it, the code of a process killed outright, which is what an unclean daemon end amounts to.
 
 **`min shell` with several entries and no `default` is a usage error.** Starting the first entry in file order would depend on layout; prompting was rejected as more code for the daily loop. Listing the candidates matches the ambiguous-name rule (BCLI-002, BCLI-031).
 
@@ -387,7 +395,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 ## Open questions
 
-- [NEEDS CLARIFICATION (MEDIUM): the architecture's exit-code table has no row for a timeout or for a box ended by a stop; BCLI-014 returns 124 by convention beside 137 for OOM, and BCLI-013 returns 128 plus the signal for a stopped box with no exit code, both needing a row (gominimal/arch#97).]
+- [NEEDS CLARIFICATION (MEDIUM): the architecture's exit-code table has no row for a timeout or for a box ended by a stop; BCLI-014 returns 124 by convention beside 137 for OOM, and BCLI-013 returns 128 plus the stored signal for a stopped box with no exit code, and 137 for a stopped record with no stored signal (BOX-154), each needing a row (gominimal/arch#97).]
 - [NEEDS CLARIFICATION (MEDIUM): BCLI-007 gives `min box resume` a process-restart meaning beyond the architecture's gloss ("re-establish identity for a stopped/host-resumed box"); the architecture needs one line saying the verb also restarts a PTY box's processes (gominimal/arch#98).]
 - [NEEDS CLARIFICATION (MEDIUM): NET-035 binds `--help` to `min session activate`, and NET-061 and the draft GWI-003 cite `min session policy`; both are BCLI-042 aliases for one release, and NET-035, NET-061 and GWI-003 should re-cite `min session start` and `min box show --network` (BCLI-025) before the aliases are removed.]
 - [NEEDS CLARIFICATION (LOW): the architecture's `min box prune` has no `--dry-run` (BCLI-006), and no create verb carries `--network` or `--ingress` overrides (BCLI-024); both are this spec's additions pending one architecture line each (gominimal/arch#98).]
