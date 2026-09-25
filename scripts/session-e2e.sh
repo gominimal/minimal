@@ -2524,10 +2524,14 @@ echo "::group::retired surfaces gone (ssh-forward, login, :7655, direct-tcpip)"
   echo "session: $retired_sid (the daemon is up: this run owns the listeners now)"
 
   # ---- the retired listener: nothing answers on :7655 ------------------------
-  # The daemon is up, so the absence is this DAEMON's absence, not an idle
-  # host's. Deliberately ungated: another minimald on this host would hold
-  # :7654 (the proxy case above degrades on that), but an OLD daemon would
-  # hold :7655 — and that is the regression this probe catches.
+  # Natively the daemon is up on this host, so the absence is this DAEMON's
+  # absence, not an idle host's. Deliberately ungated: another minimald on
+  # this host would hold :7654 (the proxy case above degrades on that), but an
+  # OLD daemon would hold :7655 — and that is the regression this probe
+  # catches. On a VM lane the daemon is guest-side and this probe sees only
+  # the host loopback, where the retired proxy was published through the
+  # switch's forwarder: what it asserts there is that nothing publishes :7655
+  # on the host any more, and the success line says so.
   curl -sS --max-time 5 -o /dev/null "http://127.0.0.1:$RETIRED_PROXY_PORT/" \
     >"$WORK/retired-proxy.out" 2>"$WORK/retired-proxy.err"
   retired_proxy_rc=$?
@@ -2537,7 +2541,11 @@ echo "::group::retired surfaces gone (ssh-forward, login, :7655, direct-tcpip)"
     echo "--- curl ---"; cat "$WORK/retired-proxy.out" 2>/dev/null || true
     fail
   fi
-  echo "retired surface: HTTPS reverse proxy :$RETIRED_PROXY_PORT → nothing answers (curl exit $retired_proxy_rc: $(head -n1 "$WORK/retired-proxy.err" 2>/dev/null || true))"
+  if [ -n "$E2E_VM" ]; then
+    echo "retired surface: HTTPS reverse proxy :$RETIRED_PROXY_PORT → nothing published on the host loopback (guest-side daemon; curl exit $retired_proxy_rc: $(head -n1 "$WORK/retired-proxy.err" 2>/dev/null || true))"
+  else
+    echo "retired surface: HTTPS reverse proxy :$RETIRED_PROXY_PORT → nothing answers (curl exit $retired_proxy_rc: $(head -n1 "$WORK/retired-proxy.err" 2>/dev/null || true))"
+  fi
 
   # ---- capability gate: what THIS host can run -------------------------------
   # The forward's responder runs in the box, so the box's sandbox must run.
