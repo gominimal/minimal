@@ -20,6 +20,16 @@
 //! `<session>.<host-id>.min.internal` (default host id `local`), resolving it
 //! to the same entry with a deprecation notice (NET-002), for one release.
 //!
+//! The registry is also the box zone's table of record. The zone answerer
+//! ([`super::answerer`]) serves host-OS resolution (NET-009) from
+//! [`HostnameRegistry::zone_entry`], which says held-without-A apart from
+//! absent: a name a box or node holds is NODATA — never NXDOMAIN, since
+//! negative caching is name-wide and NXDOMAIN would poison a live box's name
+//! — while a name nothing holds is NXDOMAIN (NET-124, NET-125). The address a
+//! held name may answer with is gated by [`is_host_answerable`] (NET-127).
+//! [`HostnameRegistry::zone_table`] renders the same view for the daemon's
+//! state dump.
+//!
 //! A route is where a request to the name forwards:
 //!
 //! - A `HostNet` PTask's listeners are on host loopback, so its name routes
@@ -48,6 +58,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use serde::Serialize;
 use sessions::SessionId;
 
 /// The DNS suffix every PTask box name carries (see the module docs).
@@ -61,6 +72,54 @@ pub const DEFAULT_HOST_ID: &str = "local";
 /// The loopback address a `HostNet` PTask's name routes to (R3.6), and the
 /// published-loopback forwarder an `OwnIp` PTask keeps on a native host.
 const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+/// The reserved local range published box addresses come from on the host:
+/// `127.64.0.0/24` (design §7.1), as network address and prefix. Loopback
+/// space, so it never leaves the machine, with one address per published box
+/// (NET-010's host-global allocation). Kept as a pair rather than a CIDR type
+/// — the only question asked of it is membership, which
+/// [`is_host_answerable`] answers with octet math.
+pub const RESERVED_LOCAL_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 64, 0, 0), 24);
+
+/// The TTL every box-zone answer carries, and the ceiling on it (NET-126):
+/// 15 s, short enough that a box published a moment ago is found without
+/// reloading the host resolver. Also the `minimum` the zone's SOA reports for
+/// negatives, so the host resolver caches them at all (NET-124): an
+/// uncacheable negative stalls every lookup on a macOS host, not only the
+/// zone's.
+pub const ANSWER_TTL_SECS: u32 = 15;
+
+/// Whether `addr` is one an A answer in the box zone may carry when the lookup
+/// originates on the host OS (NET-127): an address from the reserved local
+/// range, `127.0.0.1` itself, or one of the node's own addresses.
+///
+/// `node` is the set of addresses this daemon's host publishes at. Today the
+/// daemon holds none — a native node's boxes mirror `127.0.0.1` and a VM
+/// node's publish from the reserved range (NET-129) — so the set travels empty
+/// from every caller; the guard is where a node's own addresses will land when
+/// that changes. Anything else — a box's switch lease, an address another host
+/// holds — is not answerable from the host, and a name held only there answers
+/// NODATA rather than leaking the address.
+#[must_use]
+pub fn is_host_answerable(addr: Ipv4Addr, node: &[Ipv4Addr]) -> bool {
+    if addr == Ipv4Addr::LOCALHOST || node.contains(&addr) {
+        return true;
+    }
+    in_reserved_local_range(addr)
+}
+
+/// Whether `addr` falls in the reserved local range [`RESERVED_LOCAL_RANGE`].
+fn in_reserved_local_range(addr: Ipv4Addr) -> bool {
+    let (network, prefix) = RESERVED_LOCAL_RANGE;
+    let host_bits = 32 - u32::from(prefix);
+    // A /0 range would mean "every address"; the shift below needs a network
+    // part to keep.
+    if host_bits >= 32 {
+        return true;
+    }
+    let mask = u32::MAX << host_bits;
+    u32::from(network) & mask == u32::from(addr) & mask
+}
 
 /// A registered PTask box name of the form `<session>.min.internal`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -169,6 +228,23 @@ impl Route {
             Target::Lease { lease, .. } => IpAddr::V4(*lease),
         }
     }
+
+    /// The A answer this route's name carries in the box zone when the lookup
+    /// originates on the host OS (NET-127): the route's address when it is one
+    /// the host may be told, `None` when it is not. A box's switch lease, which
+    /// routes requests inside the fabric, is not reachable from the host OS, so
+    /// a name held only there answers NODATA, never NXDOMAIN — the box exists,
+    /// and a name-wide negative would poison it (NET-124, NET-128).
+    ///
+    /// `node` is the set of addresses this daemon's host publishes at (see
+    /// [`is_host_answerable`]).
+    #[must_use]
+    pub fn zone_address(&self, node: &[Ipv4Addr]) -> Option<Ipv4Addr> {
+        let IpAddr::V4(addr) = self.address() else {
+            return None;
+        };
+        is_host_answerable(addr, node).then_some(addr)
+    }
 }
 
 /// A live registration: the box name minted for a session, plus the stable
@@ -189,6 +265,41 @@ struct OwnAddress {
     lease: Ipv4Addr,
     /// The box's ingress declaration as an external→internal port map.
     ports: BTreeMap<u16, u16>,
+}
+
+/// What the box zone holds for a name, as the answerer answers from it. The
+/// distinction a negative turns on: **held-without-A is not absent.** A box or
+/// node that holds a name without a host-answerable address gets NODATA (an
+/// empty NOERROR), never NXDOMAIN — negative caching is name-wide, and
+/// NXDOMAIN would poison the name the box already owns (NET-124, NET-128).
+/// Only a name nothing holds is NXDOMAIN (NET-125).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZoneEntry {
+    /// No box or node holds the name: NXDOMAIN (NET-125).
+    Absent,
+    /// A box or node holds the name.
+    Held {
+        /// The session that owns it (its owner in the zone table).
+        owner: String,
+        /// The A answer a host-OS lookup gets (NET-127), or `None` when the
+        /// name is held at an address the host may not be told: NODATA.
+        address: Option<Ipv4Addr>,
+    },
+}
+
+/// One row of the box-zone table the daemon's state dump carries (NET-006's
+/// "which names does this daemon hold"): the name, the A address it answers at
+/// on the host — `null` when held without one, so the table reports the box
+/// exists without claiming it is published on the host — and the session that
+/// owns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ZoneRow {
+    /// The full `<name>.min.internal` name.
+    pub name: String,
+    /// The host-answerable A address, if the name has one.
+    pub address: Option<Ipv4Addr>,
+    /// The session that owns the name.
+    pub owner: String,
 }
 
 /// An in-memory registry of live PTask box names, owned by the sessions manager
@@ -382,6 +493,54 @@ impl HostnameRegistry {
         host.strip_suffix(&legacy_suffix)
             .filter(|name| !name.is_empty())
             .map(|name| format!("{name}.{HOSTNAME_SUFFIX}"))
+    }
+
+    /// What the box zone holds for a full zone name (`<name>.min.internal`,
+    /// or its deprecated three-label form): the held/absent distinction
+    /// [`ZoneEntry`] documents, which is the difference between NODATA and
+    /// NXDOMAIN in the answerer's reply (NET-124, NET-125). Matching is the
+    /// same case-insensitive lookup — with the same deprecated three-label
+    /// fallback — that [`Self::resolve`] routes by (NET-002), so a name
+    /// answers exactly while it routes.
+    ///
+    /// `node` is the set of addresses this daemon's host publishes at (see
+    /// [`is_host_answerable`], NET-127).
+    #[must_use]
+    pub fn zone_entry(&self, host: &str, node: &[Ipv4Addr]) -> ZoneEntry {
+        let host = host.to_ascii_lowercase();
+        let entry = |route: &Route| ZoneEntry::Held {
+            owner: route.session().to_string(),
+            address: route.zone_address(node),
+        };
+        match self.by_host.get(&Hostname(host.clone())) {
+            Some(route) => entry(route),
+            None => self
+                .legacy_two_label(&host)
+                .and_then(|two_label| self.by_host.get(&Hostname(two_label)))
+                .map_or(ZoneEntry::Absent, entry),
+        }
+    }
+
+    /// Every live name in the zone as a [`ZoneRow`] — the zone table the
+    /// daemon's state dump carries, one row per live name in name order. The
+    /// address column is the A answer a host-OS lookup gets (NET-127) or
+    /// `None` when the name is held at an address the host may not be told.
+    ///
+    /// `node` is the set of addresses this daemon's host publishes at (see
+    /// [`is_host_answerable`]).
+    #[must_use]
+    pub fn zone_table(&self, node: &[Ipv4Addr]) -> Vec<ZoneRow> {
+        let mut rows: Vec<ZoneRow> = self
+            .by_host
+            .iter()
+            .map(|(name, route)| ZoneRow {
+                name: name.as_str().to_string(),
+                owner: route.session().to_string(),
+                address: route.zone_address(node),
+            })
+            .collect();
+        rows.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        rows
     }
 }
 
