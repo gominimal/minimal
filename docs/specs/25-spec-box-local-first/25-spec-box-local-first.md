@@ -22,7 +22,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 ## Users and stories
 
 
-**Roles:** developer who scripts against Minimal, developer, developer or a script, developer or an orchestrating script, developer editing `minimal.toml`, developer or platform engineer, developer or a reviewer, developer declaring a box, and as the networking and egress-proxy epics, developer on a stock install
+**Roles:** developers who run sessions and tasks on a stock install; developers and scripts that automate against the daemon; developers and platform engineers who declare boxes and Box Types in `minimal.toml`; reviewers who read a box's expanded spec; the networking and egress-proxy specs, which bind their configuration into that spec.
 
 - AS A developer who scripts against Minimal, I WANT every box to carry a UUIDv7 `box_id`, a type, and a parent from creation, with its name as an alias, SO THAT a rename, a re-creation under the same name, or a second host never changes what my script refers to.
 - AS A developer, I WANT `stop` to end a box's processes and keep its record and files, and `rm` and `prune` to be the only things that delete them, SO THAT I can read an exit code, pull results, and decide when disk is reclaimed.

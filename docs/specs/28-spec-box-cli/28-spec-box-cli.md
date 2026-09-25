@@ -21,7 +21,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 ## Users and stories
 
-**Roles:** developer or an agent, developer debugging any box, developer with scripts and muscle memory, developer
+**Roles:** developers and agents who drive boxes from the shell; developers debugging a box; developers with scripts and muscle memory on the current session verbs; developers who operate the local daemons and providers.
 
 - AS A developer or an agent, I WANT `min box start|run|list|show|spec|stop|rm|prune|resume|logs|wait|events|cp|exec` for any box and `min session list|start|attach|stop|rm`, `min task run|list|logs|stop|rm` as aliases, with `min shell`, `min run`, `min attach`, and `min ls` as the daily shortcuts, SO THAT one verb means one thing under every noun, and a script written for a session works for a task.
 - AS A developer debugging any box, I WANT `min box exec <box> [-t] [--detach] -- <cmd>` to run a command inside a running box under its own namespaces, limits, and posture, with a re-attachable PTY when I ask for one, SO THAT I can get a shell into a task or check a session without another mechanism.
