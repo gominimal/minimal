@@ -74,15 +74,21 @@ jobs:
                     # a rollback. Leave the release as it is (no --latest, which
                     # would take the badge from a newer release), but only when
                     # its tag exists and sits on the commit the release targets.
-                    tagged="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha 2>/dev/null)" \
+                    # refs/tags/ so a branch that shares the tag's name never
+                    # stands in for a missing tag.
+                    tagged="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$tag" --jq .sha 2>/dev/null)" \
                       || { echo "::error::GitHub Release $tag is public but tag $tag does not exist"; exit 1; }
                     if [[ "$target" =~ ^[0-9a-f]{40}$ ]]; then
                       [ "$tagged" = "$target" ] \
                         || { echo "::error::tag $tag is at $tagged, but its GitHub Release targets $target"; exit 1; }
-                    else
+                    elif [[ "$semver" == 0.5.* ]]; then
                       # A tag-first release (0.5.x) targets a branch name; its
                       # tag is the only record of the commit it was built from.
+                      # Every later release's draft is pinned to a commit.
                       echo "::notice::$tag targets '$target', not a commit; trusting the tag at $tagged"
+                    else
+                      echo "::error::GitHub Release $tag targets '$target', not a commit; cannot check its tag"
+                      exit 1
                     fi
                     echo "::notice::GitHub Release $tag is already published at $tagged; leaving it as it is"
                   fi
