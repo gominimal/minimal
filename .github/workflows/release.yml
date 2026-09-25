@@ -1423,8 +1423,10 @@ jobs:
         # so "these bytes were smoked" is checked directly rather than inferred
         # from a workflow run id, and a re-staged row can never inherit a stale
         # blessing. Needs every gate green: staged and smoked. Only then does
-        # `unstable` advance: a channel never points at bytes that have not
-        # passed the smoke. A dry run stages nothing, so `needs` alone already
+        # `unstable` advance, and only for a sha-keyed build: a channel never
+        # points at bytes that have not passed the smoke, and a versioned
+        # build never moves `unstable` (it follows main; a staged release
+        # reaches a channel only through promote). A dry run stages nothing, so `needs` alone already
         # skips this job (a skipped dependency skips its dependents); the
         # explicit `if` says so where a reader looks for it.
         needs: [assert-version, stage-installer, smoke-success]
@@ -1456,10 +1458,13 @@ jobs:
                     --sha "$GITHUB_SHA" \
                     --bucket gs://minimal-one
             - name: Point unstable channel at this release
-              # `unstable` auto-advances to every fresh, smoked build — it is
-              # the bleeding-edge channel, so no approval gate, but it advances
-              # only here, after the smokes and the marker. Promotion to
-              # `stable` is the manual, gated promote-cli workflow.
+              # `unstable` auto-advances to every fresh, smoked sha-keyed build
+              # — it is the bleeding-edge channel, so no approval gate, but it
+              # advances only here, after the smokes and the marker. A
+              # versioned build leaves it alone: it may come from a release
+              # branch behind main. Promotion to `stable` is the manual, gated
+              # promote-cli workflow.
+              if: ${{ needs.assert-version.outputs.release_version == '' }}
               env:
                   VERSION: ${{ needs.assert-version.outputs.version }}
               run: |
