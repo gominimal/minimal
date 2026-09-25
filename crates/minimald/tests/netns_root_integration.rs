@@ -52,8 +52,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use minimald::net::switch::{attach_to_switch, open_tap, tap_netns_commands};
+use minimald::net::switch::{SessionGate, attach_to_switch, open_tap, tap_netns_commands};
 use minimald::net::{PtaskLease, SwitchClient, SwitchSubnet};
+use sessions::SessionPolicy;
 
 /// Whether the gate env var is set; when absent both proofs early-return so the
 /// default `cargo test` run (and this sandbox) never attempts privileged netns
@@ -552,12 +553,18 @@ async fn netns_nonet_refuses_egress() {
 /// Drives the real switch lifecycle ([`SwitchClient`]), address allocation,
 /// tap creation ([`open_tap`]) and switch relay ([`attach_to_switch`]); none of
 /// these exist on the base branch, so the proof cannot pass against an empty PR.
+/// Both relays are gated by their box's policy the way a session's own attach is
+/// (A declares no egress — allow-all, the shipped default; B declares the
+/// listener's port inbound), so the connection also proves the egress verdict
+/// admits a declared peer and the inbound gate admits a declared port.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs netns + gvproxy; gated on MINIMALD_NETNS_TEST; runs in the ci-linux-native netns job"]
 async fn netns_ownip_ptask_to_ptask() {
     if !gated() {
         return;
     }
+    use sessions::{IngressPolicy, IpProto, PortMapping};
+
     let state = tempfile::tempdir().expect("switch state dir");
 
     let mut switch = SwitchClient::new(gvproxy_bin(), state.path());
@@ -572,12 +579,27 @@ async fn netns_ownip_ptask_to_ptask() {
     assert_ne!(lease_a.ip, lease_b.ip);
     let sock = switch.control_socket();
 
-    let mut a = Ptask::provision("peer-a", lease_a, subnet, &sock).await;
-    let mut b = Ptask::provision("peer-b", lease_b, subnet, &sock).await;
+    // PTask A declares nothing — allow-all egress (the shipped default), no
+    // inbound listeners. PTask B declares the port its listener sits on inbound,
+    // which is what the inbound gate needs to admit A's connection.
+    const PORT: u16 = 9009;
+    let mut a = Ptask::provision("peer-a", lease_a, subnet, &sock, &SessionPolicy::default()).await;
+    let b_policy = SessionPolicy {
+        ingress: Some(IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: PORT,
+                internal_port: PORT,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        }),
+        egress: None,
+    };
+    let mut b = Ptask::provision("peer-b", lease_b, subnet, &sock, &b_policy).await;
 
     // PTask B listens on its switch address; PTask A connects to it. The traffic
     // crosses the gvproxy L2 switch entirely in userspace.
-    const PORT: u16 = 9009;
     let mut server = b.spawn_listener(PORT);
 
     // Retry the connect until the listener is ready and the switch has learned
@@ -646,7 +668,24 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
 
     let minimald::net::AttachResult { lease, .. } = switch.attach().await.expect("attach PTask");
     let sock = switch.control_socket();
-    let mut ptask = Ptask::provision("ingress", lease, subnet, &sock).await;
+
+    // The relay is gated the way a session's own attach is, and the forward
+    // targets the PTask's `INTERNAL` listener — so the inbound gate must see
+    // that port declared or the proof's own gate would drop the connection it
+    // exists to expose.
+    let gate_policy = SessionPolicy {
+        ingress: Some(IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: EXTERNAL,
+                internal_port: INTERNAL,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        }),
+        egress: None,
+    };
+    let mut ptask = Ptask::provision("ingress", lease, subnet, &sock, &gate_policy).await;
 
     // A listener inside the PTask, bound to its switch address on the internal
     // port the forward targets.
@@ -739,11 +778,17 @@ struct Ptask {
 }
 
 impl Ptask {
+    /// Provisions the PTask and attaches its tap to the switch through a relay
+    /// gated by `policy` — the same gating a session's own attach applies
+    /// (egress verdict on the outbound leg, inbound default-block on the
+    /// other), so the proofs exercise the enforcement the production path
+    /// ships rather than the daemon's own ungated relay.
     async fn provision(
         name: &str,
         lease: PtaskLease,
         subnet: SwitchSubnet,
         api_sock: &std::path::Path,
+        policy: &SessionPolicy,
     ) -> Self {
         let tap = format!("tap-{name}");
         let _ = sudo(&["ip", "link", "del", &tap]);
@@ -780,7 +825,8 @@ impl Ptask {
             sudo_ok("configure PTask tap", &strs);
         }
 
-        let relay = attach_to_switch(fd, api_sock, None, subnet)
+        let gate = SessionGate::for_session(lease.ip.to_string(), policy, subnet);
+        let relay = attach_to_switch(fd, api_sock, Some(gate), subnet)
             .await
             .expect("attach tap to switch");
 

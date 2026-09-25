@@ -2050,11 +2050,11 @@ mod tests {
             plan.resolver(),
             sandbox2::Resolver::Nameservers(_)
         ));
-        // Its own identity on the switch, and none of the session's ingress:
+        // Its own identity on the switch, and none of the session's policy:
         // the session's PTask is attached at the same time.
         let described = format!("{own_ip:?}");
         assert!(
-            described.contains("\"web-task\"") && described.contains("has_ingress: false"),
+            described.contains("\"web-task\"") && described.contains("has_policy: false"),
             "got {described}"
         );
         own_ip.abandon().await;

@@ -1,5 +1,6 @@
 pub mod compose;
 pub mod decision;
+pub mod egress;
 pub mod enumerate;
 pub mod expansion;
 pub mod hooks;

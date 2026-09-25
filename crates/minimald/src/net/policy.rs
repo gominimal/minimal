@@ -13,16 +13,20 @@
 //!   forwards.
 //!
 //! The same spike established that gvproxy v0.8.9 has **no per-client egress
-//! ACL API**, so egress *enforcement* (R2.2) is deliberately not implemented
-//! here — it is split to #553 (relay-layer frame inspection). What R2.7 needs
-//! from this Unit is the warning plumbing ([`PolicyWarnLimiter`]); the call
-//! site that fires it on a real dropped frame lands with that enforcement.
+//! ACL API**, so egress *enforcement* (R2.2, NET-062) lives in the relay
+//! layer ([`switch`](super::switch)) — it inspects each frame against the
+//! pure verdict in `sessions::core::egress` and drops what the box did not
+//! declare. What this module carries for that enforcement is the warning
+//! plumbing: [`PolicyWarnLimiter`], whose rate limit is keyed by box and
+//! rule, and [`Proto`], the transport a dropped frame is logged under.
 
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use std::collections::HashMap;
 
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -448,38 +452,113 @@ impl fmt::Display for Direction {
     }
 }
 
+/// The transport a policy-violating frame is logged under, for R2.7's `proto`
+/// structured field.
+///
+/// Wider than [`IpProto`] because a dropped frame is not always an IP packet
+/// whose protocol number is one of the three a policy can name: IPv6 is
+/// dropped as a whole family (NET-082) with no single L4 protocol to name, a
+/// truncated or non-IP frame has no header to read one from, and a policy can
+/// be violated by a protocol Minimal does not model (any other IPv4 number).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Proto {
+    /// `IpProto::Tcp` — IPv4 protocol 6.
+    Tcp,
+    /// `IpProto::Udp` — IPv4 protocol 17.
+    Udp,
+    /// `IpProto::Icmp` — IPv4 protocol 1.
+    Icmp,
+    /// Any other IPv4 protocol number, logged as `ip-<number>`.
+    Other(u8),
+    /// An IPv6 frame, dropped as a family (NET-082) before any L4 protocol is
+    /// read.
+    Ipv6,
+    /// Nothing to name: a frame with no IPv4 header to read a protocol from
+    /// (a truncated or non-IP frame), or a protocol Minimal does not model
+    /// under a name.
+    None,
+}
+
+impl Proto {
+    /// The transport Minimal's policies name, for a frame whose protocol is
+    /// one of the three declared ones. `IpProto` is `#[non_exhaustive]`, so a
+    /// variant a later sessions adds has no rendering here yet and logs as
+    /// `none` — the drop still names its rule.
+    #[must_use]
+    pub fn from_ipproto(proto: IpProto) -> Self {
+        match proto {
+            IpProto::Tcp => Self::Tcp,
+            IpProto::Udp => Self::Udp,
+            IpProto::Icmp => Self::Icmp,
+            _ => Self::None,
+        }
+    }
+
+    /// The transport of an IPv4 frame carrying protocol number `number`: the
+    /// three declared protocols by name, any other number by number.
+    #[must_use]
+    pub fn from_ipv4_number(number: u8) -> Self {
+        match number {
+            6 => Self::Tcp,
+            17 => Self::Udp,
+            1 => Self::Icmp,
+            other => Self::Other(other),
+        }
+    }
+}
+
+impl fmt::Display for Proto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tcp => f.write_str("tcp"),
+            Self::Udp => f.write_str("udp"),
+            Self::Icmp => f.write_str("icmp"),
+            Self::Other(n) => write!(f, "ip-{n}"),
+            Self::Ipv6 => f.write_str("ipv6"),
+            Self::None => f.write_str("none"),
+        }
+    }
+}
+
 /// Rate-limited emitter plumbing for policy-violation warnings (R2.7).
 ///
-/// This carries the rate limiter so the egress-enforcement work (#553) only has
-/// to call [`warn`](Self::warn) at the point it drops a frame; the limiter keeps
-/// a per-violation-source `tracing::warn!` from firing more than once per
-/// [`WARN_MIN_INTERVAL`]. It is intentionally unused on the policy-application
-/// path that ships in this Unit — enforcement, and therefore the firing site,
-/// is split to #553.
+/// The rate limit is keyed by **box and rule** (NET-062: "first drop per
+/// PTask per rule per minute"): one box's flood never silences another box's
+/// single drop, and a box hitting several rules in the same minute is still
+/// heard once per rule. The relay's egress enforcement
+/// ([`switch`](super::switch)) and its ingress counterpart share one limiter
+/// per session gate, each under its own rule key.
 #[derive(Debug, Default)]
 pub struct PolicyWarnLimiter {
-    last: Mutex<Option<Instant>>,
+    last: Mutex<HashMap<String, HashMap<String, Instant>>>,
 }
 
 impl PolicyWarnLimiter {
-    /// A fresh limiter that has never emitted.
+    /// A fresh limiter that has never emitted for any box or rule.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Whether enough time has elapsed since the last emission to warn again at
-    /// `now`, recording `now` as the last emission when it returns `true`.
+    /// Whether enough time has elapsed since the last emission for `session_id`
+    /// under `rule` to warn again at `now`, recording `now` as that pair's last
+    /// emission when it returns `true`.
     ///
     /// Split from [`warn`](Self::warn) so the rate-limit decision is testable
     /// without a real clock or a `tracing` subscriber.
     #[must_use]
-    pub fn should_warn_at(&self, now: Instant) -> bool {
+    pub fn should_warn_at(&self, session_id: &str, rule: &str, now: Instant) -> bool {
         let mut last = self.last.lock().expect("PolicyWarnLimiter mutex poisoned");
-        match *last {
-            Some(prev) if now.duration_since(prev) < WARN_MIN_INTERVAL => false,
+        let Some(emit) = last.get_mut(session_id) else {
+            last.entry(session_id.to_string())
+                .or_default()
+                .insert(rule.to_string(), now);
+            return true;
+        };
+        match emit.get(rule) {
+            Some(prev) if now.duration_since(*prev) < WARN_MIN_INTERVAL => false,
             _ => {
-                *last = Some(now);
+                emit.insert(rule.to_string(), now);
                 true
             }
         }
@@ -487,23 +566,30 @@ impl PolicyWarnLimiter {
 
     /// Emits a rate-limited `tracing::warn!` for a policy violation, carrying
     /// R2.7's required structured fields: the `session_id`, the `direction` of
-    /// the offending traffic, the `remote_addr` it was to/from, its `proto`, and
-    /// the `rule_matched`. Returns whether a warning was emitted (vs. suppressed
-    /// by the rate limit).
+    /// the offending traffic, the `remote_addr` it was to/from (rendered as
+    /// `none` when the frame had no IP destination to read, as for an IPv6 or
+    /// truncated drop), its `proto`, the `dst_port` the traffic targeted
+    /// (`None` when the drop is not about a port), and the `rule_matched`.
+    /// The port is a structured field only, never part of `rule_matched`: it
+    /// must not fragment the per-rule rate-limit key. Returns whether a warning
+    /// was emitted (vs. suppressed by the rate limit).
     pub fn warn(
         &self,
         session_id: &str,
         direction: Direction,
-        remote_addr: SocketAddr,
-        proto: IpProto,
+        remote_addr: Option<SocketAddr>,
+        proto: Proto,
+        dst_port: Option<u16>,
         rule_matched: &str,
     ) -> bool {
-        if self.should_warn_at(Instant::now()) {
+        if self.should_warn_at(session_id, rule_matched, Instant::now()) {
+            let remote_addr = remote_addr.map_or_else(|| "none".to_string(), |a| a.to_string());
             tracing::warn!(
                 session_id,
                 %direction,
                 %remote_addr,
                 %proto,
+                dst_port,
                 rule_matched,
                 "network policy violation"
             );
@@ -581,10 +667,54 @@ mod tests {
         let limiter = PolicyWarnLimiter::new();
         let t0 = Instant::now();
         // First emission at t0 is allowed; a second within the interval is not.
-        assert!(limiter.should_warn_at(t0));
-        assert!(!limiter.should_warn_at(t0 + Duration::from_millis(10)));
+        assert!(limiter.should_warn_at("box", "egress-undeclared-subnet", t0));
+        assert!(!limiter.should_warn_at(
+            "box",
+            "egress-undeclared-subnet",
+            t0 + Duration::from_millis(10)
+        ));
         // Once the interval has elapsed it warns again.
-        assert!(limiter.should_warn_at(t0 + WARN_MIN_INTERVAL));
+        assert!(limiter.should_warn_at("box", "egress-undeclared-subnet", t0 + WARN_MIN_INTERVAL));
+    }
+
+    #[test]
+    fn warn_limiter_keys_by_box_and_rule() {
+        // NET-062 rate-limits "per PTask per rule": one box's flood never
+        // silences another box's single drop, and a box hitting several rules in
+        // the same minute is still heard once per rule.
+        let limiter = PolicyWarnLimiter::new();
+        let t0 = Instant::now();
+        assert!(limiter.should_warn_at("box-a", "rule-1", t0));
+        // A different box under the same rule is not silenced by box-a's drop…
+        assert!(limiter.should_warn_at("box-b", "rule-1", t0));
+        // …and neither is the same box under a different rule.
+        assert!(limiter.should_warn_at("box-a", "rule-2", t0));
+        // But the same pair within the interval still is.
+        assert!(!limiter.should_warn_at("box-a", "rule-1", t0 + Duration::from_secs(1)));
+        assert!(!limiter.should_warn_at("box-b", "rule-1", t0 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn warn_limiter_keys_ingress_drops_by_rule_not_port() {
+        // The destination port is a structured field, not part of the rule
+        // key: a port scan against one box is one rule hit per minute, not one
+        // emission per probed port.
+        let limiter = PolicyWarnLimiter::new();
+        let src = Some(SocketAddr::from(([100, 64, 0, 9], 40000)));
+        let emitted = [80u16, 8080]
+            .into_iter()
+            .filter(|&dst_port| {
+                limiter.warn(
+                    "box",
+                    Direction::Ingress,
+                    src,
+                    Proto::from_ipproto(IpProto::Tcp),
+                    Some(dst_port),
+                    "no ingress mapping",
+                )
+            })
+            .count();
+        assert_eq!(emitted, 1);
     }
 
     #[test]
@@ -592,6 +722,19 @@ mod tests {
         // R2.7 spells the `direction` structured field `egress`/`ingress`.
         assert_eq!(Direction::Egress.to_string(), "egress");
         assert_eq!(Direction::Ingress.to_string(), "ingress");
+    }
+
+    #[test]
+    fn proto_renders_the_r2_7_field_values() {
+        // R2.7 names the three declared protocols `tcp`/`udp`/`icmp`; anything
+        // else a box can send is rendered as its IPv4 protocol number, and the
+        // family/truncation drops (which carry no L4 protocol) as `ipv6`/`none`.
+        assert_eq!(Proto::from_ipproto(IpProto::Tcp).to_string(), "tcp");
+        assert_eq!(Proto::from_ipproto(IpProto::Udp).to_string(), "udp");
+        assert_eq!(Proto::from_ipproto(IpProto::Icmp).to_string(), "icmp");
+        assert_eq!(Proto::from_ipv4_number(47).to_string(), "ip-47");
+        assert_eq!(Proto::Ipv6.to_string(), "ipv6");
+        assert_eq!(Proto::None.to_string(), "none");
     }
 
     #[test]
