@@ -399,6 +399,23 @@ pub fn format_ls(
         writeln!(out)?;
     }
 
+    // NET-026: say where this daemon's names route from. The port travels on
+    // the reply because a daemon that auto-selected is on an OS-chosen one,
+    // and the address is what an `HTTP(S)_PROXY` export needs — especially on
+    // a machine running two daemons. Absent while the daemon is still bringing
+    // its proxy up, or from a daemon too old to carry the field: nothing to
+    // print then. `--raw` and `--json` stay machine-readable-only, so a port
+    // line never lands in a pipeline.
+    if !args.raw
+        && let Some(port) = resp.hostname_proxy_port
+    {
+        writeln!(
+            out,
+            "HOSTNAME PROXY:  listening on 127.0.0.1:{port} · <name>.min.internal routes through it"
+        )?;
+        writeln!(out)?;
+    }
+
     if resp.sessions.is_empty() {
         if !args.raw {
             writeln!(out, "No active sessions.")?;
