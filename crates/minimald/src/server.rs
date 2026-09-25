@@ -1756,12 +1756,33 @@ async fn expose_proxy_on_host(
     port: u16,
     protocol: &'static str,
 ) -> Option<HostPublishFailure> {
-    use crate::net::policy::{ControlChannel, ExposeRequest, post_json};
+    publish_listener_on_control(
+        &crate::net::policy::ControlChannel::Vsock {
+            cid: crate::net::VSOCK_HOST_CID,
+            port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+        },
+        daemon_ip,
+        port,
+        protocol,
+    )
+    .await
+}
 
-    let control = ControlChannel::Vsock {
-        cid: crate::net::VSOCK_HOST_CID,
-        port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-    };
+/// [`expose_proxy_on_host`]'s publish, over whichever control channel the
+/// forwarder is reached on: the vsock shuttle from inside a microVM, a unix
+/// control socket on a native host — and, in a test, whichever stand-in the
+/// classifier's two arms need. The control channel is the only thing the
+/// caller picks; the request shape, the bound, the report, and the
+/// taken-versus-transient classification are the same on every channel.
+#[cfg(target_os = "linux")]
+async fn publish_listener_on_control(
+    control: &crate::net::policy::ControlChannel,
+    daemon_ip: std::net::Ipv4Addr,
+    port: u16,
+    protocol: &'static str,
+) -> Option<HostPublishFailure> {
+    use crate::net::policy::{ExposeRequest, post_json};
+
     let request = ExposeRequest {
         local: format!("127.0.0.1:{port}"),
         remote: format!("{daemon_ip}:{port}"),
@@ -1769,7 +1790,7 @@ async fn expose_proxy_on_host(
     };
     match tokio::time::timeout(
         HOST_EXPOSE_PUBLISH_TIMEOUT,
-        post_json(&control, "/services/forwarder/expose", &request),
+        post_json(control, "/services/forwarder/expose", &request),
     )
     .await
     {
@@ -2834,6 +2855,121 @@ mod tests {
         assert!(
             state.hostname_proxy_port().await.is_none(),
             "a proxy whose publish keeps failing must not report serving"
+        );
+    }
+
+    /// Serves one gvproxy-shaped control channel at `path`: every request is
+    /// read to its end-of-head marker and answered with `status` and `body`,
+    /// the connection held open the way the real forwarder holds its
+    /// keep-alive exchange (see `net::policy::post_json`).
+    #[cfg(target_os = "linux")]
+    async fn spawn_control_channel_answering(
+        path: std::path::PathBuf,
+        status: &'static str,
+        body: &'static str,
+    ) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 1024];
+                    let _ = sock.read(&mut scratch).await;
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    // `sock` stays alive to the end of this task only; the
+                    // client reads its Content-Length and closes first.
+                });
+            }
+        });
+    }
+
+    /// The publish classifier's *taken* arm: a forwarder that answers and
+    /// refuses — it could not take the host-side port, which on this endpoint
+    /// is a host port some other process holds — is the one publish failure a
+    /// guest-chosen port re-picks from. Driven over a unix control channel
+    /// standing in for the shuttle, answering with the HTTP error status
+    /// `post_json` folds into an io::Error, so the arm is reached without a
+    /// host gvproxy to answer.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_forwarder_refusal_classifies_the_host_port_as_taken() {
+        let dir = TempDir::new().unwrap();
+        let control = dir.path().join("gvproxy.sock");
+        spawn_control_channel_answering(
+            control.clone(),
+            "409 Conflict",
+            "port already in use",
+        )
+        .await;
+
+        let failure = publish_listener_on_control(
+            &crate::net::policy::ControlChannel::Unix(control),
+            std::net::Ipv4Addr::new(100, 64, 0, 2),
+            7654,
+            "tcp",
+        )
+        .await
+        .expect("a refused publish must report a failure");
+
+        assert!(
+            failure.port_taken,
+            "a forwarder that answered and refused has taken the host port, got: {}",
+            failure.report
+        );
+        assert!(
+            failure.report.contains("returned HTTP 409"),
+            "the taken arm's report must name the status the forwarder answered with, got: {}",
+            failure.report
+        );
+        assert!(
+            failure.report.contains("Remedy:"),
+            "the report must carry the remedy, got: {}",
+            failure.report
+        );
+    }
+
+    /// The publish classifier's *transient* arm: a forwarder that never
+    /// answered — here, nothing listening where the control channel points,
+    /// the exact shape a daemon that starts before its host gvproxy (minvmd)
+    /// sees — says nothing about the host port, so it must not read as taken:
+    /// a transient failure that re-picked would move a VM daemon off its
+    /// documented default at every boot race.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_unreachable_forwarder_classifies_the_failure_as_transient() {
+        let dir = TempDir::new().unwrap();
+        // Nothing binds this path: the control channel points where no
+        // forwarder is.
+        let control = dir.path().join("absent.sock");
+
+        let failure = publish_listener_on_control(
+            &crate::net::policy::ControlChannel::Unix(control),
+            std::net::Ipv4Addr::new(100, 64, 0, 2),
+            7654,
+            "tcp",
+        )
+        .await
+        .expect("a failed publish must report a failure");
+
+        assert!(
+            !failure.port_taken,
+            "a forwarder that never answered has not taken the host port, got: {}",
+            failure.report
+        );
+        assert!(
+            !failure.report.contains("returned HTTP"),
+            "a failure that never got an answer must not be classified as a refusal, got: {}",
+            failure.report
+        );
+        assert!(
+            failure.report.contains("could not publish port 7654"),
+            "the report must name the port and the failure, got: {}",
+            failure.report
         );
     }
 
