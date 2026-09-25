@@ -208,6 +208,38 @@ async fn serve_get_session_record(
 /// anonymous session, and an absent field reads like a logging bug.
 const ANONYMOUS_SESSION: &str = "<anonymous>";
 
+/// The egress rule counts a session config parses to, one per egress field.
+/// Logged beside the record the daemon stores at session start, they are the
+/// diagnostic for what a session actually activated with: a count of `0`
+/// means the field — or the whole `egress` section — carries no rules.
+#[derive(Debug, Clone, Copy)]
+struct EgressRuleCounts {
+    allow_subnets: usize,
+    allow_protocols: usize,
+    allow_dns_hosts: usize,
+    deny_subnets: usize,
+}
+
+impl EgressRuleCounts {
+    fn of(policy: &minimald_rpc::SessionPolicy) -> Self {
+        let egress = policy.egress.as_ref();
+        Self {
+            allow_subnets: egress
+                .and_then(|e| e.allow_subnets.as_ref())
+                .map_or(0, Vec::len),
+            allow_protocols: egress
+                .and_then(|e| e.allow_protocols.as_ref())
+                .map_or(0, Vec::len),
+            allow_dns_hosts: egress
+                .and_then(|e| e.allow_dns_hosts.as_ref())
+                .map_or(0, Vec::len),
+            deny_subnets: egress
+                .and_then(|e| e.deny_subnets.as_ref())
+                .map_or(0, Vec::len),
+        }
+    }
+}
+
 /// `CreateSession`: allocates the session's record and brings its actor
 /// up, replying with the assigned id. The loadout is composed separately,
 /// by the `ConfigureLoadout` that follows.
@@ -236,6 +268,10 @@ async fn serve_create_session(
             // manager: the success record below needs it, and the reply
             // carries only the assigned id.
             let session_name = req.config.name.clone();
+            // Read the egress rule counts off the config for the same reason:
+            // the manager consumes it, and the stored record's egress is what
+            // the counts below report beside the "session created" line.
+            let egress_counts = EgressRuleCounts::of(&req.config.policy);
 
             Ok(match mngr.create_session(req.config, ssh_username).await {
                 Ok(id) => {
@@ -247,6 +283,10 @@ async fn serve_create_session(
                     tracing::info!(
                         session_id = %id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
+                        egress_allow_subnets = egress_counts.allow_subnets,
+                        egress_allow_protocols = egress_counts.allow_protocols,
+                        egress_allow_dns_hosts = egress_counts.allow_dns_hosts,
+                        egress_deny_subnets = egress_counts.deny_subnets,
                         "session created"
                     );
                     Errorable::Ok(minimald_rpc::CreateSessionResponse {
@@ -2687,6 +2727,7 @@ mod tests {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             allow_dns_hosts: None,
             allow_protocols: None,
+            deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
         };
         let created_id = client
             .call::<CreateSession>(&CreateSessionRequest {
@@ -2788,19 +2829,22 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        // R2.1: an egress policy on a non-`OwnIp` PTask is rejected at
-        // declaration time, so the invalid session is never stored.
+        // NET-065: an egress policy on a none (`NoNet`) box is rejected at
+        // declaration time, so the invalid session is never stored. Egress on
+        // a host-address box is accepted (NET-120), so `NoNet` is the only
+        // mode that still refuses it.
         let egress = EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             allow_dns_hosts: None,
             allow_protocols: None,
+            deny_subnets: None,
         };
         let resp = client
             .call::<CreateSession>(&CreateSessionRequest {
                 config: minimald_rpc::SessionConfig {
                     name: Some("bad-policy".to_string()),
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: NetworkMode::HostNet,
+                    network: NetworkMode::NoNet,
                     policy: SessionPolicy::new(Some(egress), None),
                     hooks_enabled: true,
                     attrs: Default::default(),
@@ -2811,7 +2855,8 @@ mod tests {
         assert_eq!(
             resp,
             Errorable::Err {
-                error: "egress policy is only valid for an own-IP PTask, not HostNet".to_string()
+                error: "egress policy is only valid for an own-IP or host-address PTask, not NoNet"
+                    .to_string()
             }
         );
 
