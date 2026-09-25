@@ -15,6 +15,7 @@ use sessions::SessionId;
 use minimald::test_harness::unwrap_ready;
 
 use serde_json_lenient::Value;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 // --- version ---
 
@@ -1366,4 +1367,246 @@ async fn create_session_with_policy(
         camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
     let abs_path = paths::HostAbsPath::try_new(project_path).unwrap();
     create_session_with(daemon, name, abs_path, network, policy).await
+}
+
+// --- net forward (NET-104/NET-105) ---
+
+/// The service the forward reaches: a loopback echo server, bound to an
+/// ephemeral port, echoing every accepted connection back byte for byte.
+async fn spawn_echo_server() -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((conn, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let (mut read, mut write) = tokio::io::split(conn);
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+    (port, server)
+}
+
+/// A loopback port nothing is bound to, for the forward's laptop-side
+/// listener. Probed rather than guessed: bind :0, read the port, drop the
+/// socket.
+async fn free_loopback_port() -> u16 {
+    let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    port
+}
+
+/// Connects to `127.0.0.1:port`, retrying briefly: the forward runs as a
+/// concurrent task, so its listener appears a moment after the spawn.
+async fn connect_with_retry(port: u16) -> tokio::net::TcpStream {
+    let mut last = None;
+    for _ in 0..500 {
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(stream) => return stream,
+            Err(e) => {
+                last = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+    panic!("nothing ever listened on 127.0.0.1:{port}: {last:?}");
+}
+
+/// A `GlobalArgs` pointing at the same daemon as `args`, but built to move
+/// into a spawned task: the shared one stays with the test body.
+fn global_args_for_task(args: &GlobalArgs) -> GlobalArgs {
+    GlobalArgs {
+        minimal_dir: args.minimal_dir.clone(),
+        ..Default::default()
+    }
+}
+
+/// `min net forward web 8080:3000` answers on `localhost:8080` (NET-104):
+/// the session is `host_ip`, so the box shares this process's network
+/// namespace, and the echo server below stands in for the in-box service the
+/// forward reaches. Bytes written to the laptop-side port come back over the
+/// session's SSH channel, on the forward's own connections — twice, to show
+/// each accepted connection gets its own channel.
+#[tokio::test]
+async fn net_forward_relays_over_ssh_channel() {
+    let (daemon, args) = setup().await;
+    let _id = create_session_with_policy(
+        &daemon,
+        "web",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    let (box_port, echo) = spawn_echo_server().await;
+    let local_port = free_loopback_port().await;
+    let forward_args = global_args_for_task(&args);
+    let forward = tokio::spawn(async move {
+        cmd_net_forward(
+            &forward_args,
+            NetForwardArgs {
+                session: "web".to_string(),
+                spec: format!("{local_port}:{box_port}"),
+            },
+        )
+        .await
+    });
+
+    for round in 0..2 {
+        let mut conn = connect_with_retry(local_port).await;
+        conn.write_all(b"ping").await.expect("write to the forward");
+        let mut echoed = [0u8; 4];
+        conn.read_exact(&mut echoed)
+            .await
+            .expect("read the box's answer back through the forward");
+        assert_eq!(
+            echoed, *b"ping",
+            "connection {round} must relay through the box port"
+        );
+    }
+
+    forward.abort();
+    echo.abort();
+}
+
+/// A connection whose box port refuses ends that connection and nothing
+/// else (NET-104): the channel open runs in the connection's own task, so a
+/// refused dial costs one connection while the listener keeps accepting —
+/// and the very next connection, once the box port has a listener, relays.
+#[tokio::test]
+async fn net_forward_survives_a_refused_box_port() {
+    let (daemon, args) = setup().await;
+    let _id = create_session_with_policy(
+        &daemon,
+        "web",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    // Nothing is listening on the box port yet: the first connection's dial
+    // is refused by the box.
+    let box_port = free_loopback_port().await;
+    let local_port = free_loopback_port().await;
+    let forward_args = global_args_for_task(&args);
+    let forward = tokio::spawn(async move {
+        cmd_net_forward(
+            &forward_args,
+            NetForwardArgs {
+                session: "web".to_string(),
+                spec: format!("{local_port}:{box_port}"),
+            },
+        )
+        .await
+    });
+
+    // The refused connection is accepted — the forward's listener is up — and
+    // then closed by the refusal, not hung. It ends with a reset or with a
+    // clean EOF, whichever side of the race the bytes the client sent land
+    // on: a socket dropped with unread data in its receive queue resets,
+    // one dropped after the bytes arrived and were read ends cleanly. Either
+    // way the connection is over, which is the point.
+    let mut refused = connect_with_retry(local_port).await;
+    refused.write_all(b"ping").await.unwrap();
+    let mut seen = Vec::new();
+    match refused.read_to_end(&mut seen).await {
+        Ok(n) => assert_eq!(
+            n, 0,
+            "a refused dial must close the connection, got: {seen:?}"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("a refused dial must close the connection, got: {e}"),
+    }
+    drop(refused);
+
+    // The service comes up on the box port, and the forward that survived
+    // the refusal reaches it.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", box_port))
+        .await
+        .expect("the box port is free for the service to take");
+    let echo = tokio::spawn(async move {
+        loop {
+            let Ok((conn, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let (mut read, mut write) = tokio::io::split(conn);
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+
+    let mut conn = connect_with_retry(local_port).await;
+    conn.write_all(b"ping").await.expect("write to the forward");
+    let mut echoed = [0u8; 4];
+    conn.read_exact(&mut echoed)
+        .await
+        .expect("read the box's answer back through the forward");
+    assert_eq!(echoed, *b"ping", "the forward must relay after a refusal");
+
+    forward.abort();
+    echo.abort();
+}
+
+/// The forward closes with its session (NET-105): once `min session destroy`
+/// takes the session down, the forward's future ends on its own — the
+/// listener goes with it rather than outliving the session it forwards for.
+#[tokio::test]
+async fn net_forward_closes_with_session() {
+    let (daemon, args) = setup().await;
+    let _id = create_session_with_policy(
+        &daemon,
+        "web",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    let (box_port, echo) = spawn_echo_server().await;
+    let local_port = free_loopback_port().await;
+    let forward_args = global_args_for_task(&args);
+    let forward = tokio::spawn(async move {
+        cmd_net_forward(
+            &forward_args,
+            NetForwardArgs {
+                session: "web".to_string(),
+                spec: format!("{local_port}:{box_port}"),
+            },
+        )
+        .await
+    });
+
+    // The listener is up: the forward is live, not just spawned.
+    let mut conn = connect_with_retry(local_port).await;
+    conn.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    conn.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(echoed, *b"ping");
+    drop(conn);
+
+    cmd_destroy(
+        &args,
+        DestroyArgs {
+            session: Some("web".to_string()),
+            all: false,
+            force: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), forward)
+        .await
+        .expect("the forward must end once its session is destroyed")
+        .expect("the forward task must not panic")
+        .expect("the forward must exit cleanly");
+    echo.abort();
 }

@@ -222,6 +222,25 @@ impl Client {
     /// `vm-up` line, and bounds the handshake by [`HANDSHAKE_TIMEOUT`] so a
     /// wedged daemon behind an accepting socket fails instead of hanging.
     pub async fn connect(sock_path: &Path) -> Result<Self, anyhow::Error> {
+        Self::connect_as(sock_path, "minimal-cli").await
+    }
+
+    /// Connect scoped to one session: the SSH username is the session's
+    /// UUID.
+    ///
+    /// The daemon's `direct-tcpip` handler parses the SSH username as the
+    /// session a channel belongs to, so channels opened on this connection
+    /// dial from that session's box (its own network namespace, when it has
+    /// one) rather than from the daemon's. Everything else — retries,
+    /// handshake deadline, RPC vocabulary — is [`Client::connect`].
+    pub async fn connect_scoped(
+        sock_path: &Path,
+        session: sessions::SessionId,
+    ) -> Result<Self, anyhow::Error> {
+        Self::connect_as(sock_path, &session.to_string()).await
+    }
+
+    async fn connect_as(sock_path: &Path, username: &str) -> Result<Self, anyhow::Error> {
         let stream = {
             let mut conn = None;
             let mut last_err = None;
@@ -258,7 +277,7 @@ impl Client {
                 .context("ssh connect")?;
 
             let auth = handle
-                .authenticate_none("minimal-cli")
+                .authenticate_none(username)
                 .await
                 .context("authenticate")?;
 
@@ -278,6 +297,25 @@ impl Client {
             })??;
 
         Ok(Client { handle })
+    }
+
+    /// Open a `direct-tcpip` channel to `host:port`, as seen from the
+    /// session this connection is scoped to.
+    ///
+    /// On a [`Client::connect_scoped`] connection the daemon relays the
+    /// channel onto the address as dialed from the session's box, so
+    /// `127.0.0.1` is the box's own loopback — which is the point: a service
+    /// bound inside the box answers as if the request had come from there.
+    /// The caller owns both halves of the relay from here.
+    pub async fn open_direct_tcpip(
+        &mut self,
+        host: &str,
+        port: u16,
+    ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
+        self.handle
+            .channel_open_direct_tcpip(host, u32::from(port), "127.0.0.1", 0)
+            .await
+            .with_context(|| format!("open direct-tcpip channel to {host}:{port}"))
     }
 
     /// Issue a oneshot RPC: open a channel, request the subsystem, write the
