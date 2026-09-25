@@ -91,6 +91,15 @@ int main(int argc, char **argv) {
         int fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) { perror("AF_UNIX after attach"); return 20; }
         close(fd);
+
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd >= 0) { close(fd); fprintf(stderr, "AF_INET after attach unexpectedly succeeded\n"); return 21; }
+        if (errno != EAFNOSUPPORT) { fprintf(stderr, "AF_INET after attach wrong errno %d\n", errno); return 22; }
+
+        fd = socket(AF_VSOCK, SOCK_STREAM, 0);
+        if (fd >= 0) { close(fd); fprintf(stderr, "AF_VSOCK after attach unexpectedly succeeded\n"); return 23; }
+        if (errno != EAFNOSUPPORT) { fprintf(stderr, "AF_VSOCK after attach wrong errno %d\n", errno); return 24; }
+
         return 0;
     }
 
@@ -114,8 +123,9 @@ int main(int argc, char **argv) {
 }
 "#;
 
-/// Compile the socket-family probe statically and return its path.
-fn compile_socket_probe(base: &Path) -> PathBuf {
+/// Compile the socket-family probe statically and return its path, or `None`
+/// if no C compiler is available on this host.
+fn compile_socket_probe(base: &Path) -> Option<PathBuf> {
     let src = base.join("socket_probe.c");
     let bin = base.join("socket_probe");
     std::fs::write(&src, SOCKET_PROBE_C).expect("writing socket probe source");
@@ -123,13 +133,20 @@ fn compile_socket_probe(base: &Path) -> PathBuf {
         .args(["-static", "-o"])
         .arg(&bin)
         .arg(&src)
-        .status()
-        .expect("spawning gcc to compile socket probe");
+        .status();
+    let status = match status {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping netns proof: gcc not found");
+            return None;
+        }
+        Err(e) => panic!("spawning gcc to compile socket probe: {e}"),
+    };
     assert!(
         status.success(),
         "gcc failed to compile socket probe: {status:?}"
     );
-    bin
+    Some(bin)
 }
 
 /// Create a minimal rootfs directory containing the static probe at
@@ -177,7 +194,9 @@ async fn network_none_blocks_all_outside_sockets() {
     }
 
     let rootfs_tmp = tempfile::tempdir_in("/tmp").expect("rootfs temp dir under /tmp");
-    let probe = compile_socket_probe(rootfs_tmp.path());
+    let Some(probe) = compile_socket_probe(rootfs_tmp.path()) else {
+        return;
+    };
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
 
@@ -199,11 +218,23 @@ async fn network_none_blocks_all_outside_sockets() {
         .expect("building none-box container");
 
     let mut child = sandbox
-        .command(&container, "/usr/bin/probe", [""; 0], [("", "")])
+        .command(
+            &container,
+            "/usr/bin/probe",
+            [""; 0],
+            std::iter::empty::<(&str, &str)>(),
+        )
         .expect("building probe command")
         .spawn()
         .expect("spawning probe in none box");
-    let status = child.wait().expect("waiting for probe");
+    let status = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || child.wait()),
+    )
+    .await
+    .expect("waiting for probe timed out")
+    .expect("spawn_blocking join")
+    .expect("waiting for probe");
     assert!(
         status.success(),
         "probe in none box did not report all outside sockets blocked: {status:?}"
@@ -224,7 +255,9 @@ async fn network_none_attach_works() {
     use minimald::nsenter::{Injection, session_leader_pid};
 
     let rootfs_tmp = tempfile::tempdir_in("/tmp").expect("rootfs temp dir under /tmp");
-    let probe = compile_socket_probe(rootfs_tmp.path());
+    let Some(probe) = compile_socket_probe(rootfs_tmp.path()) else {
+        return;
+    };
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
 
@@ -243,7 +276,12 @@ async fn network_none_attach_works() {
         .expect("building none-box container");
 
     let mut child = sandbox
-        .command(&container, "/usr/bin/probe", ["hold"], [("", "")])
+        .command(
+            &container,
+            "/usr/bin/probe",
+            ["hold"],
+            std::iter::empty::<(&str, &str)>(),
+        )
         .expect("building hold command")
         .spawn()
         .expect("spawning hold process in none box");
@@ -251,19 +289,32 @@ async fn network_none_attach_works() {
     let leader =
         session_leader_pid(child.id()).expect("resolving the none box's session leader pid");
 
-    let output = tokio::task::spawn_blocking(move || {
-        Injection::new(leader, "/usr/bin/probe", ["attach"])
-            .with_shim(shim())
-            .command()
-            .expect("building injection command")
-            .output()
-            .expect("running injected attach probe")
-    })
+    let injection = Injection::new(leader, "/usr/bin/probe", ["attach"])
+        .with_shim(shim())
+        .seal_none_box();
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            injection
+                .command()
+                .expect("building injection command")
+                .output()
+                .expect("running injected attach probe")
+        }),
+    )
     .await
+    .expect("injected attach probe timed out")
     .expect("spawn_blocking join");
 
     let _ = child.kill();
-    let _ = child.wait();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || child.wait()),
+    )
+    .await
+    .expect("waiting for hold process timed out")
+    .expect("spawn_blocking join")
+    .expect("waiting for hold process");
 
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
