@@ -81,6 +81,7 @@ pub(crate) async fn activate_session(
         ingress: (!port_mappings.is_empty()).then_some(sessions::IngressPolicy {
             port_mappings,
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         }),
     };
 
@@ -279,7 +280,6 @@ pub(crate) async fn activate_session(
         created.hostname_routing_unavailable.as_deref(),
         "min session activate",
     );
-    warn_if_mtls_proxy_down(created.mtls_proxy_unavailable.as_deref());
     let id = created.id;
 
     // From here the session exists on the daemon in an unfinalized state.
@@ -972,7 +972,10 @@ pub fn format_policy(
         match &policy.ingress {
             None => writeln!(out, "  deny all")?,
             Some(ingress) => {
-                if ingress.port_mappings.is_empty() && ingress.dynamic_allowed_range.is_none() {
+                if ingress.port_mappings.is_empty()
+                    && ingress.dynamic_allowed_range.is_none()
+                    && ingress.dynamic_ingress.is_none()
+                {
                     writeln!(out, "  deny all")?;
                 }
                 for mapping in &ingress.port_mappings {
@@ -984,6 +987,9 @@ pub fn format_policy(
                 }
                 if let Some((lo, hi)) = ingress.dynamic_allowed_range {
                     writeln!(out, "  dynamic ports  {lo}–{hi}")?;
+                }
+                if let Some(mode) = ingress.dynamic_ingress {
+                    writeln!(out, "  dynamic ingress  {mode}")?;
                 }
             }
         }
@@ -1646,5 +1652,75 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
         minimald_rpc::Errorable::Err { error } => {
             bail!("RenameSession failed: {error}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sessions::{
+        DynamicIngress, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
+    };
+
+    #[test]
+    fn format_policy_dynamic_ingress_allow_prints_row_not_deny_all() {
+        let policy = SessionPolicy::new(
+            None,
+            Some(IngressPolicy {
+                port_mappings: vec![],
+                dynamic_allowed_range: None,
+                dynamic_ingress: Some(DynamicIngress::Allow),
+            }),
+        );
+        let mut out = Vec::new();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  dynamic ingress  allow"),
+            "dynamic ingress row must be printed: {rendered}"
+        );
+        assert!(
+            !rendered.contains("  deny all"),
+            "a policy with an explicit dynamic ingress setting must not print 'deny all': {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_policy_dynamic_ingress_prints_beside_static_mapping() {
+        let policy = SessionPolicy::new(
+            None,
+            Some(IngressPolicy {
+                port_mappings: vec![PortMapping {
+                    external_port: 8080,
+                    internal_port: 80,
+                    proto: IpProto::Tcp,
+                }],
+                dynamic_allowed_range: None,
+                dynamic_ingress: Some(DynamicIngress::Ask),
+            }),
+        );
+        let mut out = Vec::new();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  tcp  :8080 → :80"),
+            "static mapping must still render: {rendered}"
+        );
+        assert!(
+            rendered.contains("  dynamic ingress  ask"),
+            "dynamic ingress row must render alongside mapping: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_policy_egress_rows_default_when_unset() {
+        let policy = SessionPolicy::default();
+        let mut out = Vec::new();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("egress\n"), "{rendered}");
+        assert!(rendered.contains("  allow all\n"), "{rendered}");
+        assert!(rendered.contains("ingress\n"), "{rendered}");
+        assert!(rendered.contains("  deny all\n"), "{rendered}");
     }
 }

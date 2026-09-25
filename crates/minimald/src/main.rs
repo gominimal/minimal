@@ -427,16 +427,6 @@ fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
 }
 
 async fn async_main() -> Result<(), MainError> {
-    // With `networking-proxy` on, both the `ring` (workspace rustls) and the
-    // `aws-lc-rs` (google-cloud) providers are compiled in, so rustls cannot
-    // auto-pick one and panics ("no process-level CryptoProvider") the first time
-    // a config is built — e.g. when a session build reaches the remote-cache
-    // HTTPS client, off the proxy's own install path. Install ring explicitly
-    // here (idempotent; the proxy's later install no-ops). Without
-    // networking-proxy only one provider is present and rustls auto-installs it.
-    #[cfg(feature = "networking-proxy")]
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     // Use hardcoded configuration if we are the init process (`argv[0] == "/init"`), which
     // would indicate we are operating in a single-purpose micro-vm.
     //
@@ -846,9 +836,9 @@ async fn async_main() -> Result<(), MainError> {
     if !cli.listen_args().unwrap().vsock {
         // standard path, listening on UDS socket.
         //
-        // The B5 host-side egress proxy (:7654) and B8 mTLS reverse proxy
-        // (:7655) are bound and served by `Server::run` for both DM2 (here) and
-        // DM1 (the vsock path below), so no separate startup bind happens here.
+        // The B5 host-side egress proxy (:7654) is bound and served by
+        // `Server::run` for both DM2 (here) and DM1 (the vsock path below), so
+        // no separate startup bind happens here.
 
         if let Err(e) = std::fs::remove_file(cli.listen_on())
             && e.kind() != std::io::ErrorKind::NotFound

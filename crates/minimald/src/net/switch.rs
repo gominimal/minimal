@@ -1066,6 +1066,7 @@ mod tests {
                     },
                 ],
                 dynamic_allowed_range: None,
+                dynamic_ingress: None,
             }),
             egress: None,
         };
@@ -1156,6 +1157,7 @@ mod tests {
                     proto: sessions::IpProto::Tcp,
                 }],
                 dynamic_allowed_range: None,
+                dynamic_ingress: None,
             }),
             egress: None,
         };
