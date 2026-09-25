@@ -1842,6 +1842,20 @@ fi
 proof_hostnames_recover_and_two_daemons_route() {
   echo "::group::hostnames recover, and two daemons share a machine (NET-020..NET-027)"
 
+  # Beat D's in-box responders (the proxy proof's socat form, below). Their
+  # ports are fixed, never OS-assigned: a daemon that finds its port taken
+  # relocates by asking the OS for a free one (crates/minimald/src/server.rs
+  # binds port 0), and the OS only ever hands out ephemeral-range ports — so
+  # neither daemon can land on these, and a responder can never collide with
+  # a proxy listener. The band sits beside the proxy proof's 18080-18082,
+  # which runs only after this proof has torn its boxes down. Both boxes
+  # answer with one marker: the URL's port names the box, so a 200 carrying
+  # it proves the request reached a box of this run through the daemon it
+  # named.
+  RECOVER_BOX_PORT=18080                 # box A's (e2e-recover) responder
+  SECOND_BOX_PORT=18081                  # box B's (e2e-second) responder
+  RECOVER_BOX_MARKER="RECOVER_ROUTED_OK" # what the in-box responders answer
+
   # The daemon log readers. The log dir is per state base, so the two
   # daemons of beat D read from different dirs — the helper takes the base;
   # the first daemon's is this run's $XDG_STATE_HOME/minimal, the second's
