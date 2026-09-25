@@ -866,10 +866,94 @@ pub(crate) trait SessionProcess: Send + 'static {
     /// `hakoniwa`'s account of how the process ended, available once
     /// [`Self::try_wait`] has returned `Some` or [`Self::wait`] has returned.
     ///
-    /// `None` before the reap, and for the test double, which has no abnormal
-    /// end to model — so the default keeps every mock impl untouched.
+    /// `None` until the reap; [`HostProcess`] caches the reason at that point
+    /// and answers from it thereafter.
+    fn exit_reason(&self) -> Option<ExitReason>;
+}
+
+/// A backend's answer to a reap: the portable code a [`SessionProcess`] reduces
+/// the child's status to, plus the account to cache for
+/// [`SessionProcess::exit_reason`].
+pub(crate) struct ExitReport {
+    /// The code `wait`/`try_wait` returns.
+    code: i32,
+    /// The account cached on the first reap.
+    reason: ExitReason,
+}
+
+/// The process-creation backend behind [`HostProcess`]: the one part of a
+/// [`SessionProcess`] that differs between the real sandboxed child and the
+/// test double. Everything else — the exit-reason cache and its record-once
+/// policy — lives in [`HostProcess`] and is shared.
+pub(crate) trait ProcessBackend: Send + 'static {
+    /// See [`SessionProcess::container_pid`].
+    fn container_pid(&self) -> u32;
+    /// See [`SessionProcess::try_wait`]; `Ok(None)` while the process runs.
+    fn try_wait(&mut self) -> io::Result<Option<ExitReport>>;
+    /// See [`SessionProcess::wait`].
+    fn wait(&mut self) -> io::Result<ExitReport>;
+    /// See [`SessionProcess::kill`].
+    fn kill(&mut self) -> io::Result<()>;
+    /// Logs the backend's account of an observed exit. Called exactly once per
+    /// session by [`HostProcess::record_exit`]; the default is silent, so a
+    /// backend with nothing to say (the mock) need not implement it.
+    fn log_exit(_reason: &ExitReason) {}
+}
+
+/// The single [`SessionProcess`] implementation, generic over the backend that
+/// owns the actual child. Holds the exit reason cached at the first reap, so
+/// [`SessionProcess::exit_reason`] can answer after the fact for both the real
+/// sandboxed child and the test double.
+pub(crate) struct HostProcess<B: ProcessBackend> {
+    backend: B,
+    /// The reason captured at the reap; `None` until then.
+    exit: Option<ExitReason>,
+}
+
+impl<B: ProcessBackend> HostProcess<B> {
+    fn new(backend: B) -> Self {
+        Self {
+            backend,
+            exit: None,
+        }
+    }
+
+    /// Logs the backend's account of an observed exit and caches it for
+    /// [`SessionProcess::exit_reason`], returning the portable code.
+    ///
+    /// Caches and logs on the first reap only, not on every subsequent one: the
+    /// child caches its own status, so a `wait` following a `try_wait` that
+    /// already saw the death would otherwise log the same end twice.
+    fn record_exit(&mut self, report: ExitReport) -> i32 {
+        if self.exit.is_none() {
+            B::log_exit(&report.reason);
+            self.exit = Some(report.reason);
+        }
+        report.code
+    }
+}
+
+impl<B: ProcessBackend> SessionProcess for HostProcess<B> {
+    fn container_pid(&self) -> u32 {
+        self.backend.container_pid()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<i32>> {
+        let report = self.backend.try_wait()?;
+        Ok(report.map(|r| self.record_exit(r)))
+    }
+
+    fn wait(&mut self) -> io::Result<i32> {
+        let report = self.backend.wait()?;
+        Ok(self.record_exit(report))
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.backend.kill()
+    }
+
     fn exit_reason(&self) -> Option<ExitReason> {
-        None
+        self.exit.clone()
     }
 }
 
@@ -941,7 +1025,7 @@ pub(crate) struct Launched<P, G> {
     guard: G,
     /// The per-sandbox network attachment (own-IP switch wiring), if any. Torn
     /// down explicitly via [`sandbox2::NetGuard::teardown`] at session end.
-    /// `None` for `HostNet`/`NoNet` and for the mock launcher.
+    /// `None` for `HostNet`/`NoNet` and for the plain mock.
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
     /// Path of the session PTY's slave side, so hooks can open the
     /// terminal briefly rather than the host retaining a descriptor.
@@ -1393,7 +1477,8 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
 
     // The per-sandbox network attachment (own-IP switch wiring), if any. Torn
     // down explicitly in `mainloop` when the session ends, before `_guard` (and
-    // thus the sandbox files) is dropped. `None` for `HostNet`/`NoNet` and tests.
+    // thus the sandbox files) is dropped. `None` for `HostNet`/`NoNet` and
+    // net-guard-less tests.
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
 
     /// Path of the session PTY's slave side. Attach and detach hooks
@@ -1613,70 +1698,42 @@ async fn run_hook_plan(plan: HookPlan) {
     }
 }
 
-/// A launched session process backed by a sandboxed [`hakoniwa::Child`].
+/// The real sandboxed child backend: a [`hakoniwa::Child`].
 #[cfg(not(test))]
-pub(crate) struct SandboxProcess {
+pub(crate) struct SandboxBackend {
     child: hakoniwa::Child,
-    /// `hakoniwa`'s account of the exit, captured at the reap. `hakoniwa`
-    /// caches the status itself but only ever hands it back through a
-    /// `wait`/`try_wait` call, so the host would otherwise have no way to ask
-    /// *why* after the fact — which is exactly when it needs to know, since
-    /// the binding is told to tear down after the reap.
-    exit: Option<ExitReason>,
 }
 
 #[cfg(not(test))]
-impl SandboxProcess {
-    /// Logs `hakoniwa`'s account of an observed exit and caches it for
-    /// [`SessionProcess::exit_reason`], returning the portable code.
-    ///
-    /// Logs on every exit, not just the non-zero ones, and exactly once per
-    /// session: `hakoniwa` caches the status, so a `wait` following a
-    /// `try_wait` that already saw it would otherwise log the same death
-    /// twice.
-    fn record_exit(&mut self, s: hakoniwa::ExitStatus) -> i32 {
-        let code = s.code;
-        if self.exit.is_none() {
-            if s.code != 0 {
-                tracing::warn!(
-                    code = s.code,
-                    exit_code = ?s.exit_code,
-                    reason = %s.reason,
-                    "DIAG hakoniwa container/process exited non-zero"
-                );
-            } else {
-                tracing::info!(
-                    code = s.code,
-                    exit_code = ?s.exit_code,
-                    reason = %s.reason,
-                    "hakoniwa container/process exited"
-                );
-            }
-            self.exit = Some(ExitReason {
+impl SandboxBackend {
+    /// Reduces `hakoniwa`'s account of an exit to the shared [`ExitReport`].
+    fn report(s: hakoniwa::ExitStatus) -> ExitReport {
+        ExitReport {
+            code: s.code,
+            reason: ExitReason {
                 code: s.code,
                 exit_code: s.exit_code,
                 reason: s.reason,
-            });
+            },
         }
-        code
     }
 }
 
 #[cfg(not(test))]
-impl SessionProcess for SandboxProcess {
+impl ProcessBackend for SandboxBackend {
     fn container_pid(&self) -> u32 {
         self.child.id()
     }
 
-    fn try_wait(&mut self) -> io::Result<Option<i32>> {
+    fn try_wait(&mut self) -> io::Result<Option<ExitReport>> {
         let status = self
             .child
             .try_wait()
             .map_err(|e| io::Error::other(format!("wait failed: {e}")))?;
-        Ok(status.map(|s| self.record_exit(s)))
+        Ok(status.map(Self::report))
     }
 
-    fn wait(&mut self) -> io::Result<i32> {
+    fn wait(&mut self) -> io::Result<ExitReport> {
         // The blocking reap the pty/step error path takes — in practice the
         // one that fires, since the master's `EIO` beats the loop's `try_wait`
         // poll to every ordinary exit.
@@ -1684,7 +1741,7 @@ impl SessionProcess for SandboxProcess {
             .child
             .wait()
             .map_err(|e| io::Error::other(format!("wait failed: {e}")))?;
-        Ok(self.record_exit(s))
+        Ok(Self::report(s))
     }
 
     fn kill(&mut self) -> io::Result<()> {
@@ -1693,10 +1750,32 @@ impl SessionProcess for SandboxProcess {
             .map_err(|e| io::Error::other(format!("kill failed: {e}")))
     }
 
-    fn exit_reason(&self) -> Option<ExitReason> {
-        self.exit.clone()
+    /// Logs on every exit, not just the non-zero ones, exactly once per session
+    /// (gated by [`HostProcess::record_exit`]'s cache): `hakoniwa` caches the
+    /// status, so a `wait` following a `try_wait` that already saw it would
+    /// otherwise log the same death twice.
+    fn log_exit(reason: &ExitReason) {
+        if reason.code != 0 {
+            tracing::warn!(
+                code = reason.code,
+                exit_code = ?reason.exit_code,
+                reason = %reason.reason,
+                "DIAG hakoniwa container/process exited non-zero"
+            );
+        } else {
+            tracing::info!(
+                code = reason.code,
+                exit_code = ?reason.exit_code,
+                reason = %reason.reason,
+                "hakoniwa container/process exited"
+            );
+        }
     }
 }
+
+/// A launched session process backed by a sandboxed [`hakoniwa::Child`].
+#[cfg(not(test))]
+pub(crate) type SandboxProcess = HostProcess<SandboxBackend>;
 
 /// Packages every session sandbox gets unconditionally, regardless of
 /// the client's contribution: `base` for the shell, `coreutils` for
@@ -2299,10 +2378,9 @@ impl SessionLauncher for SandboxLauncher {
 
         Ok(Launched {
             master,
-            process: SandboxProcess {
+            process: SandboxProcess::new(SandboxBackend {
                 child: process.release(),
-                exit: None,
-            },
+            }),
             guard: env,
             net_guard,
             tty_path,
@@ -2311,69 +2389,63 @@ impl SessionLauncher for SandboxLauncher {
     }
 }
 
-/// A launched session process backed by a plain host [`std::process::Child`].
+/// The test backend: a plain host [`std::process::Child`].
 #[cfg(test)]
-pub(crate) struct MockProcess {
+pub(crate) struct MockBackend {
     child: std::process::Child,
-    /// Mirrors [`SandboxProcess`]'s cache so a test can drive the same
-    /// reap-then-notify path a real session takes.
-    exit: Option<ExitReason>,
 }
 
 #[cfg(test)]
-impl MockProcess {
+impl MockBackend {
     /// Translates a plain process status into the shape `hakoniwa` reports, so
     /// the host cannot tell a mock reap from a sandboxed one: a signalled
     /// process has no exit code of its own and carries the container's 125.
     ///
-    /// Returns the portable code unchanged from what this mock always
-    /// returned, so the reap value every existing test asserts on is
-    /// untouched.
-    fn record_exit(&mut self, s: std::process::ExitStatus) -> i32 {
+    /// The report's `code` is unchanged from what this mock always returned, so
+    /// the reap value every existing test asserts on is untouched.
+    fn report(s: std::process::ExitStatus) -> ExitReport {
         use std::os::unix::process::ExitStatusExt;
         let code = s.code().unwrap_or(-1);
-        if self.exit.is_none() {
-            self.exit = Some(match s.signal() {
-                Some(sig) => ExitReason {
-                    code: 125,
-                    exit_code: None,
-                    reason: format!("process(mock) received signal {sig}"),
-                },
-                None => ExitReason {
-                    code,
-                    exit_code: Some(code),
-                    reason: format!("process(mock) exited with code {code}"),
-                },
-            });
-        }
-        code
+        let reason = match s.signal() {
+            Some(sig) => ExitReason {
+                code: 125,
+                exit_code: None,
+                reason: format!("process(mock) received signal {sig}"),
+            },
+            None => ExitReason {
+                code,
+                exit_code: Some(code),
+                reason: format!("process(mock) exited with code {code}"),
+            },
+        };
+        ExitReport { code, reason }
     }
 }
 
 #[cfg(test)]
-impl SessionProcess for MockProcess {
+impl ProcessBackend for MockBackend {
     fn container_pid(&self) -> u32 {
         self.child.id()
     }
 
-    fn try_wait(&mut self) -> io::Result<Option<i32>> {
+    fn try_wait(&mut self) -> io::Result<Option<ExitReport>> {
         let status = self.child.try_wait()?;
-        Ok(status.map(|s| self.record_exit(s)))
+        Ok(status.map(Self::report))
     }
 
-    fn wait(&mut self) -> io::Result<i32> {
+    fn wait(&mut self) -> io::Result<ExitReport> {
         let s = self.child.wait()?;
-        Ok(self.record_exit(s))
+        Ok(Self::report(s))
     }
 
     fn kill(&mut self) -> io::Result<()> {
         self.child.kill()
     }
-
-    fn exit_reason(&self) -> Option<ExitReason> {
-        self.exit.clone()
-    }
 }
+
+/// A launched session process backed by a plain host [`std::process::Child`].
+#[cfg(test)]
+pub(crate) type MockProcess = HostProcess<MockBackend>;
 
 /// The sentinel stdin line that makes [`MockLauncher`]'s program exit; any
 /// other line is echoed back. Lets a test observe an echo round trip while the
@@ -2391,7 +2463,23 @@ pub(crate) const MOCK_EXIT_LINE: &str = "quit";
 /// stdin delivery and stdout forwarding before deterministically triggering
 /// process-exit teardown.
 #[cfg(test)]
-pub(crate) struct MockLauncher;
+#[derive(Default)]
+pub(crate) struct MockLauncher {
+    /// Attached to the launched process as `Launched::net_guard`, so a test can
+    /// observe network teardown; `None` for the plain mock (mirroring
+    /// `HostNet`/`NoNet`).
+    net_guard: Option<Box<dyn sandbox2::NetGuard>>,
+}
+
+#[cfg(test)]
+impl MockLauncher {
+    /// A mock that attaches `net_guard`, for the network-teardown tests.
+    pub(crate) fn with_net_guard(net_guard: Box<dyn sandbox2::NetGuard>) -> Self {
+        Self {
+            net_guard: Some(net_guard),
+        }
+    }
+}
 
 #[cfg(test)]
 impl SessionLauncher for MockLauncher {
@@ -2422,12 +2510,9 @@ impl SessionLauncher for MockLauncher {
 
         Ok(Launched {
             master,
-            process: MockProcess {
-                child: process,
-                exit: None,
-            },
+            process: MockProcess::new(MockBackend { child: process }),
             guard: (),
-            net_guard: None,
+            net_guard: self.net_guard,
             tty_path,
             seal_injection: false,
         })
@@ -2845,7 +2930,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
 
         // Tear down the per-sandbox network attachment explicitly (own-IP switch
         // detach + ingress removal) on this live runtime, before `_guard` drops
-        // the sandbox files. No-op for `HostNet`/`NoNet` and the mock launcher.
+        // the sandbox files. No-op for `HostNet`/`NoNet` and net-guard-less mocks.
         if let Some(net_guard) = self.net_guard.take() {
             net_guard.teardown().await;
         }
