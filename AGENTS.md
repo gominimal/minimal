@@ -204,6 +204,7 @@ rationale) and
 | `release` | Manual (or nightly-called) build/sign/stage/smoke of all shipped artifacts; `versioned: true` builds with `MINIMAL_RELEASE_VERSION`, packages, stages `versions/<semver>/`, and parks a draft GitHub Release. Records smoke provenance on the staged row. Its verify-ci gate requires the five lane aggregators green on the commit. |
 | `promote` | Manual, gated pointer flip of the `stable`/`unstable` channels to a staged, smoked version; a stable promotion of a semver calls `publish-packages`. |
 | `publish-packages` | Reusable, called by `promote`: publishes the draft GitHub Release (which creates the `v<semver>` tag, last), then the AUR and Homebrew publishers. |
+| `package-smoke` | Manual (or `workflow_call`): install-tests the AUR package and Homebrew formula a stable promotion would publish for a staged semver, from the publishers' dry-run output (`scripts/publish-smoke.sh`); pushes nothing. |
 | `docs-hotfix` | Manual: repoint the public docs on `gominimal/webapp` to a chosen `main` sha between releases, without cutting or promoting a binary release. |
 | `prune-releases` | Scheduled housekeeping: deletes aged auto-cut `release-<sha>` GitHub Releases (never tagged `vX.Y.Z` releases). |
 

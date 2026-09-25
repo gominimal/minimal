@@ -1,0 +1,72 @@
+name: package-smoke
+
+# Install-test the AUR package and the Homebrew formula that a stable
+# promotion would publish for a staged versioned release, BEFORE publishing.
+# Both jobs run scripts/publish-smoke.sh (also `just publish-smoke`): it drives
+# the real publishers in --dry-run mode against the real public remotes, applies
+# the diff they would push to a fresh clone, and installs the result. No
+# secrets: nothing is pushed anywhere.
+#
+# Run it after release.yml (versioned: true) has staged versions/<semver>/ and
+# before the promote run that publishes. workflow_call lets release.yml or
+# promote.yml gate on it later.
+#
+# Coverage: the AUR job builds the x86_64 package only (hosted runners are
+# x86_64; the aarch64 sources are checksummed by makepkg but not installed).
+# The brew job installs from the staged row, not the draft GitHub Release (its
+# assets are not public until publishing), so the formula's real URLs are
+# proved only by installing from the tap after publishing.
+on:
+    workflow_dispatch:
+        inputs:
+            version:
+                description: "Staged semver to test (X.Y.Z, from a versioned release build)"
+                required: true
+                type: string
+    workflow_call:
+        inputs:
+            version:
+                required: true
+                type: string
+
+permissions:
+    contents: read
+
+jobs:
+    aur:
+        runs-on: ubuntu-latest
+        container: archlinux:base-devel
+        timeout-minutes: 30
+        steps:
+            - name: Install git and openssh
+              run: pacman -Syu --noconfirm --needed git openssh
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Install-test minimal-bin from the rendered PKGBUILD
+              env:
+                  PKGVER: ${{ inputs.version }}
+              run: scripts/publish-smoke.sh aur
+
+    brew:
+        runs-on: macos-latest
+        timeout-minutes: 60
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Install-test the rendered Homebrew formula
+              env:
+                  PKGVER: ${{ inputs.version }}
+              run: scripts/publish-smoke.sh brew
+
+    package-smoke-success:
+        if: always()
+        needs: [aur, brew]
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - name: Verify both package smokes passed
+              if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+              run: exit 1
+            - run: echo "package smoke green"

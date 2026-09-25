@@ -196,6 +196,16 @@ pkg-nfpm pkgver:
 pkg-smoke pkgdir="dist" *args:
     scripts/pkg-smoke.sh --pkg-dir {{quote(pkgdir)}} {{args}}
 
+# The package comes from the publishers' own dry-run output, so it is what a
+# stable promotion would push. aur runs on Arch, or anywhere with docker
+# (archlinux:base-devel); brew needs macOS arm64 and installs, tests, then
+# removes the formula from a throwaway local tap. CI runs the same script in
+# package-smoke.yml. See scripts/publish-smoke.sh.
+#
+# Install-test the AUR package or Homebrew formula for a staged semver (e.g. `just publish-smoke aur 0.6.0`).
+publish-smoke kind pkgver:
+    PKGVER={{quote(pkgver)}} scripts/publish-smoke.sh {{quote(kind)}}
+
 # Restage an already-shipped release under its semver so the command above can
 # see it (the one-time fix for releases staged before the semver-row
 # convention, e.g. `just backfill-version-row abc12345 0.5.3`).
