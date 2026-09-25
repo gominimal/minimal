@@ -323,7 +323,11 @@ fn run_foreground() -> Result<()> {
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
-            match crate::net::HostGvproxy::spawn(binary, switch_sock) {
+            match crate::net::HostGvproxy::spawn(
+                binary,
+                switch_sock,
+                crate::net::DEFAULT_DATAPATH_CHECK_INTERVAL,
+            ) {
                 Ok(gvproxy) => {
                     tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");
                     Some(gvproxy)
