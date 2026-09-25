@@ -223,10 +223,18 @@ impl Manager {
         let (sender, receiver) = mpsc::channel(8);
         // Shared so the host-side proxies can resolve `Host:` headers directly;
         // a clone is held by both the actor (which mutates it) and the handle
-        // (which hands it to the proxies via `hostnames()`).
+        // (which hands it to the proxies via `hostnames()`). Whether the
+        // daemon sits on the gvproxy switch decides how an own-address box's
+        // name routes: straight to its lease on a VM host (the daemon holds a
+        // tap on the switch), or through the published-loopback forwarder on a
+        // native host (NET-001).
         #[cfg(target_os = "linux")]
         let hostnames = Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
             crate::net::dns::DEFAULT_HOST_ID,
+            matches!(
+                net_switch.lock().await.transport(),
+                crate::net::SwitchTransport::HostShuttle { .. }
+            ),
         )));
         let handle = ManagerHandle {
             sender,

@@ -181,164 +181,28 @@ pub fn cmd_mesh_leave(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     }
 }
 
-/// Establish an SSH `LocalForward` tunnel from a local port to a remote
-/// address inside the named PTask's network namespace (R4.8, R4.9).
+/// Print that there is nothing to mint.
 ///
-/// The forward spec is `<local-port>:<remote-host>:<remote-port>`. The
-/// command shells out to `ssh -L` (the same mechanism as `cmd_attach`).
-/// The `-N` flag keeps the tunnel alive without opening an interactive
-/// shell.
-#[cfg(feature = "remote-access")]
-pub async fn cmd_ssh_forward(
-    global: &GlobalArgs,
-    args: SshForwardArgs,
+/// `min login` once called the daemon's certificate-issuing RPC and wrote
+/// the key and CA to the config directory; that surface is retired, so the
+/// verb now writes nothing and asks the daemon for nothing — it does not
+/// spawn one. It stays as the home of the sign-in that replaces it.
+///
+/// The notice goes to the caller's writer rather than to stdout directly,
+/// so the test can capture it and hold the verb to what it actually emits.
+pub async fn cmd_login<W: std::io::Write>(
+    _global: &GlobalArgs,
+    _args: LoginArgs,
+    out: &mut W,
 ) -> Result<(), anyhow::Error> {
-    ensure_daemon(global)?;
-
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
-        .context("Failed to resolve daemon socket path")?;
-
-    // Look up the session to validate it exists and to obtain its UUID for the
-    // server-side auth gate (passed as the SSH username so `direct-tcpip` can
-    // verify the session without a per-channel env handshake).
-    let mut daemon_client = client::Client::connect(&sock)
-        .await
-        .context("Failed to connect to minimald")?;
-    // Gated: like `cmd_attach`, this hands off into a live session — the
-    // forward's server-side auth gate is keyed on wire types both builds have
-    // to agree on. Asserted off the lookup this command already makes.
-    let record = resolve_session_version_gated(&mut daemon_client, &args.session).await?;
-
-    // Validate the forward spec format: local:remote_host:remote_port.
-    // We accept either `local_port:host:port` (3 components, last two joined by
-    // the final colon) or the more compact form where host is an IPv4 address.
-    let parts: Vec<&str> = args.forward.splitn(3, ':').collect();
-    if parts.len() != 3 {
-        bail!(
-            "invalid forward spec {:?}: expected LOCAL_PORT:REMOTE_HOST:REMOTE_PORT",
-            args.forward
-        );
-    }
-    let local_port = parts[0];
-    let remote_host = parts[1];
-    let remote_port = parts[2];
-    let forward_arg = format!("{local_port}:{remote_host}:{remote_port}");
-
-    let exe = std::env::current_exe().context("cannot determine current exe")?;
-    let proxy_cmd = format!(
-        "{} proxy --socket {}",
-        minimal_client::attach::shell_quote(&exe.display().to_string()),
-        minimal_client::attach::shell_quote(&sock.display().to_string()),
-    );
-
-    let session_id = record.id.to_string();
-    // Host-key checking is disabled here, so the alias is cosmetic; still derive
-    // it from the provider dir (`local-minimald<N>` / `local-minvmd<N>`) to match
-    // the rest of the CLI rather than hard-coding a name.
-    let host_alias = sock
-        .parent()
-        .and_then(std::path::Path::file_name)
-        .and_then(|n| n.to_str())
-        .context("daemon socket path has no provider-dir parent")?;
-    // Use `-N` (no command) so the foreground ssh keeps the tunnel alive after
-    // `exec()` replaces this process. `-o ExitOnForwardFailure=yes` makes ssh
-    // exit immediately if the local port cannot be bound rather than silently
-    // succeeding without a tunnel.
-    let mut ssh = std::process::Command::new("ssh");
-    ssh.args([
-        "-L",
-        &forward_arg,
-        "-N",
-        "-l",
-        &session_id,
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-o",
-        &format!("ProxyCommand={proxy_cmd}"),
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        host_alias,
-    ]);
-
-    // exec() replaces the process, so this call only returns on failure.
-    let err = std::os::unix::process::CommandExt::exec(&mut ssh);
-    bail!("failed to exec ssh: {err}");
+    writeln!(out, "{}", login_nothing_to_mint_line()).context("writing the login notice")?;
+    Ok(())
 }
 
-/// Obtain an mTLS client certificate from minimald (R4.4).
-///
-/// Calls the `IssueClientCert` RPC, which has minimald generate a key pair,
-/// sign the certificate with its internal CA, and return both. The cert, key,
-/// and CA cert are written to `<cert_dir>/{client.pem,client.key,ca.pem}`.
-pub async fn cmd_login(global: &GlobalArgs, args: LoginArgs) -> Result<(), anyhow::Error> {
-    ensure_daemon(global)?;
-
-    let mut client = connect_daemon(global).await?;
-
-    let subject_cn = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "minimal-client".to_string());
-
-    use minimald_rpc::{IssueClientCert, IssueClientCertRequest};
-    let resp = client
-        .oneshot_rpc::<IssueClientCert>(IssueClientCertRequest { subject_cn })
-        .await
-        .context("IssueClientCert RPC failed")?;
-
-    let cert_resp = match resp {
-        minimald_rpc::Errorable::Ok(r) => r,
-        minimald_rpc::Errorable::Err { error } => {
-            bail!("IssueClientCert failed: {error}");
-        }
-    };
-
-    // Determine the cert directory. Honors `--cert-dir` first, then
-    // routes through the shared config-dir helper so `--config-dir`
-    // moves the certs alongside `config.toml` and `loadouts/`.
-    let cert_dir = match args.cert_dir {
-        Some(d) => d,
-        None => config::resolve_minimal_config_dir(global),
-    };
-    std::fs::create_dir_all(&cert_dir)
-        .with_context(|| format!("cannot create cert dir {}", cert_dir.display()))?;
-
-    let client_cert_path = cert_dir.join("client.pem");
-    let client_key_path = cert_dir.join("client.key");
-    let ca_cert_path = cert_dir.join("ca.pem");
-
-    std::fs::write(&client_cert_path, cert_resp.cert_pem.as_bytes())
-        .with_context(|| format!("writing {}", client_cert_path.display()))?;
-    {
-        use std::io::Write as _;
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-        let mut f = opts
-            .open(&client_key_path)
-            .with_context(|| format!("writing {}", client_key_path.display()))?;
-        f.write_all(cert_resp.key_pem.as_bytes())
-            .with_context(|| format!("writing {}", client_key_path.display()))?;
-    }
-    std::fs::write(&ca_cert_path, cert_resp.ca_cert_pem.as_bytes())
-        .with_context(|| format!("writing {}", ca_cert_path.display()))?;
-
-    println!("Saved client certificate to {}", client_cert_path.display());
-    println!("Saved client key to {}", client_key_path.display());
-    println!("Saved CA certificate to {}", ca_cert_path.display());
-    println!();
-    println!(
-        "To use the HTTPS proxy:\n  curl --cacert {} --cert {} --key {} https://localhost:7655/",
-        ca_cert_path.display(),
-        client_cert_path.display(),
-        client_key_path.display(),
-    );
-
-    Ok(())
+/// The one line `min login` prints. A person who runs the verb out of habit
+/// is owed the reason it is now a no-op, not a silent exit.
+pub(crate) fn login_nothing_to_mint_line() -> &'static str {
+    "Nothing to mint: the HTTPS reverse proxy is retired, so no client certificate is issued and no key is written."
 }
 
 // ---------------------------------------------------------------------------
