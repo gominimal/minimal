@@ -37,11 +37,13 @@
 #                       gominimal/minimal v$PKGVER). Overridable so a local
 #                       fixture can drive --dry-run without network access; the
 #                       rendered formula still declares the GitHub Release url.
-#   MINIMAL_BUCKET_URL  Public base URL of the installer bucket in channel mode
-#                       (default: https://storage.googleapis.com/minimal-one).
-#                       Assets and the canonical `version` file are fetched from
-#                       <base>/versions/$PKGVER/. Overridable so a local file://
-#                       fixture can drive --dry-run without network access.
+#   MINIMAL_BUCKET_URL  Public base URL of the installer bucket (default:
+#                       https://storage.googleapis.com/minimal-one). The staged
+#                       row's canonical `version` file is ALWAYS read from
+#                       <base>/versions/$PKGVER/version; in channel mode the
+#                       assets are fetched from there too. Overridable so a
+#                       local file:// fixture can drive --dry-run without
+#                       network access.
 #
 # Credentials (env/ssh-agent only — never hardcoded or echoed here):
 #   - an ssh-agent holding a key with push access to the tap (for the SSH
@@ -97,6 +99,18 @@ case "$CHANNEL" in
     *)        die "unknown --channel '$CHANNEL' (want stable, unstable, or nightly)" ;;
 esac
 
+# conflicts_with names every channel formula but this one: all three install the
+# same bin/min, so brew must refuse two of them at once. The template stamps the
+# quoted, comma-separated list as-is (the renderer requires it non-empty).
+CONFLICTS_WITH=""
+for name in minimal minimal-unstable minimal-nightly; do
+    [ "$name" = "$PKGNAME" ] && continue
+    # The escaped double quotes are literal Ruby string syntax, not shell
+    # quoting: they must survive into conflicts_with ... via the renderer.
+    # shellcheck disable=SC2089
+    CONFLICTS_WITH="${CONFLICTS_WITH:+$CONFLICTS_WITH, }\"$name\""
+done
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATE="$ROOT/packaging/homebrew/minimal.rb.tmpl"
 RENDER="$ROOT/scripts/render-packaging.sh"
@@ -136,7 +150,11 @@ if [ "$CHANNEL" = "stable" ]; then
     # dry run while the rendered formula keeps the real download URL.
     URL_BASE="https://github.com/gominimal/minimal/releases/download/v$PKGVER"
     FETCH_BASE="${MINIMAL_RELEASE_URL:-$URL_BASE}"
-    VERSION="$PKGVER"
+    # Stable is not exempt from the row-version rule below: the row is the
+    # promoted semver, and reading its `version` file turns "the tag and the
+    # bytes it installs agree" from an assumption into an assertion.
+    ROW="$PKGVER"
+    BUCKET_URL="${MINIMAL_BUCKET_URL:-https://storage.googleapis.com/minimal-one}"
     LIVECHECK="$LIVECHECK_STABLE"
     asset_err="cannot download @@URL@@ — is v$PKGVER a GitHub Release of gominimal/minimal carrying the macOS arm64 assets?"
 else
@@ -152,6 +170,7 @@ else
     # rendered urls and the downloads together, or they diverge silently.
     URL_BASE="$BUCKET_URL/versions/$PKGVER"
     FETCH_BASE="$URL_BASE"
+    ROW="$PKGVER"
 
     # The row name (a sha) is not a version any package manager accepts; the
     # canonical built version lives in the row's `version` file (see the fetch
@@ -192,21 +211,24 @@ sha256_file() {
 dist="$workdir/dist"
 mkdir -p "$dist"
 
-# Channel mode: resolve the canonical built version from the row's `version`
-# file before anything else, so a missing row fails with one clear message
-# rather than four asset-download errors. The row name is a sha; only this file
-# carries the version the formula declares.
-if [ "$CHANNEL" != "stable" ]; then
-    version_file="$workdir/row-version"
-    curl -fsSL --retry 3 -o "$version_file" "$FETCH_BASE/version" \
-        || die "cannot download $FETCH_BASE/version — is row $PKGVER staged with a version file? (see stage-release.sh)"
-    canonical="$(cat "$version_file")"
-    [ -n "$canonical" ] || die "the version file for row $PKGVER is empty ($FETCH_BASE/version)"
-    # - is legal in a Homebrew version, so brew normalization is the identity;
-    # running it through the shared helper keeps the charset rule in one place.
-    VERSION="$("$VERSION_TOOL" --format brew "$canonical")" \
-        || die "cannot normalize canonical version '$canonical' for Homebrew"
+# Resolve the canonical built version from the row's `version` file before
+# anything else, so a missing row fails with one clear message rather than four
+# asset-download errors. EVERY channel reads it, stable included: the row name
+# is a sha on a channel and the promoted semver on stable, and only this file
+# carries the version the formula must declare. On stable the read doubles as
+# an assertion that the row agrees with the semver being published.
+version_file="$workdir/row-version"
+curl -fsSL --retry 3 -o "$version_file" "$BUCKET_URL/versions/$ROW/version" \
+    || die "cannot download $BUCKET_URL/versions/$ROW/version — is row $ROW staged with a version file? (see stage-release.sh)"
+canonical="$(cat "$version_file")"
+[ -n "$canonical" ] || die "the version file for row $ROW is empty ($BUCKET_URL/versions/$ROW/version)"
+if [ "$CHANNEL" = "stable" ] && [ "$canonical" != "$PKGVER" ]; then
+    die "row $ROW holds binaries reporting '$canonical', not '$PKGVER' — refusing to publish a formula whose version contradicts what it installs"
 fi
+# - is legal in a Homebrew version, so brew normalization is the identity;
+# running it through the shared helper keeps the charset rule in one place.
+VERSION="$("$VERSION_TOOL" --format brew "$canonical")" \
+    || die "cannot normalize canonical version '$canonical' for Homebrew"
 
 for entry in "${ASSETS[@]}"; do
     IFS='|' read -r name var <<<"$entry"
@@ -219,7 +241,8 @@ done
 
 # The renderer stamps from the environment (VERSION, CLASS, URL_BASE, ... are
 # the @@TOKEN@@s the template carries; PKGVER stays for error messages).
-export PKGVER PKGNAME CLASS VERSION URL_BASE LIVECHECK
+# shellcheck disable=SC2090  # CONFLICTS_WITH carries literal Ruby quotes by design (see above)
+export PKGVER PKGNAME CLASS VERSION URL_BASE LIVECHECK CONFLICTS_WITH
 export SHA256 SHA_MINVMD SHA_GVPROXY SHA_LIBKRUN
 
 # Never let git hang on an interactive https credential prompt.

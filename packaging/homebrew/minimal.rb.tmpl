@@ -13,10 +13,6 @@ class @@CLASS@@ < Formula
 
 @@LIVECHECK@@
 
-  # Homebrew has no formula-conflict mechanism, so only one channel formula can
-  # be linked at a time: minimal, minimal-unstable, and minimal-nightly all
-  # install the same bin/min (unlink one before linking another).
-  #
   # The macOS release is Apple Silicon only (no darwin x86_64 artifact exists).
   depends_on arch: :arm64
 
@@ -30,6 +26,14 @@ class @@CLASS@@ < Formula
   # -macos-arm64.dylib from the release assets) under the load command's
   # expected name, reproducing the installer's bin/lib sibling layout.
   depends_on "slp/krun/libkrun"
+
+  # Every channel formula installs the same bin/min, so each names the other
+  # channels as conflicts: brew then refuses the install rather than linking
+  # one and leaving the other unlinked. Siblings are named explicitly rather
+  # than through a shared virtual, because a formula installed before channels
+  # existed declares nothing. Must sit after depends_on and before the first
+  # resource (FormulaAudit/ComponentsOrder).
+  conflicts_with @@CONFLICTS_WITH@@
 
   resource "minvmd" do
     url "@@URL_BASE@@/minvmd-macos-arm64"

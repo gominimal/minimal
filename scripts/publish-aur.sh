@@ -39,12 +39,15 @@
 #                       addresses are not checked into this repo.
 #
 # Version resolution:
-#   stable   _row = pkgver = the promoted semver PKGVER.
+#   Every channel reads <bucket>/versions/$ROW/version and refuses a row that
+#   lacks it: it must be staged by a build that writes the version file.
+#   stable   _row = the promoted semver PKGVER; pkgver is the aur-normalized
+#            form of the canonical version, and the file is additionally
+#            asserted to equal PKGVER, so a row whose binaries disagree with
+#            the tag being published is refused rather than packaged.
 #   channel  _row = PKGVER (the sha row); pkgver is the aur-normalized form of
-#            the canonical version read from <bucket>/versions/$ROW/version
-#            (scripts/package-version.sh --format aur). A row missing that file
-#            is refused: it must be staged by a build that writes the version
-#            file.
+#            the canonical version read from that file
+#            (scripts/package-version.sh --format aur).
 #
 # Credentials (env/ssh-agent only — never hardcoded or echoed here):
 #   - an ssh-agent holding the bot's AUR key (SSH_AUTH_SOCK set), or
@@ -64,7 +67,8 @@
 # package actually builds, not merely that its metadata parses. The CI publish
 # jobs use it.
 #
-# Requires: bash, git, curl, sha256sum; makepkg (Arch) for .SRCINFO — without
+# Requires: bash, git, curl, and a sha256 tool (sha256sum, shasum, or openssl);
+# makepkg (Arch) for .SRCINFO — without
 # it, .SRCINFO is skipped with a warning (the CI container is
 # archlinux:base-devel, which has it).
 
@@ -144,7 +148,8 @@ VERSION_HELPER="$ROOT/scripts/package-version.sh"
 [ -x "$RENDER" ] || die "renderer missing or not executable: $RENDER"
 [ -x "$VERSION_HELPER" ] || die "version helper missing or not executable: $VERSION_HELPER"
 
-# Resolve the bucket row and its canonical built version.
+# Resolve the bucket row. Both channels then read the row's canonical `version`
+# file below — stable included.
 case "$CHANNEL" in
     stable)
         # Today's behavior: pkgver IS the promoted semver, and the row is it.
@@ -158,7 +163,6 @@ case "$CHANNEL" in
         printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$' \
             || die "PKGVER '$PKGVER' is not a RELEASED semver X.Y.Z (optional +build; prereleases and shas are rejected: pacman's pkgver forbids hyphens)"
         ROW="$PKGVER"
-        VERSION="$PKGVER"
         ;;
     *)
         # Channel: PKGVER is the sha row. A versioned row is the stable
@@ -169,15 +173,22 @@ case "$CHANNEL" in
         printf '%s\n' "$PKGVER" | grep -qE '^[0-9a-f]{7,40}$' \
             || die "PKGVER '$PKGVER' is not a 7-40 char lowercase-hex sha row"
         ROW="$PKGVER"
-        # The canonical built version lives beside the row's artifacts. A row
-        # staged without it predates channel packaging and cannot publish:
-        # pkgver would fall back to the raw sha, which pacman rejects.
-        version_url="$BUCKET_URL/versions/$ROW/version"
-        VERSION="$(curl -fsSL --retry 3 "$version_url")" \
-            || die "cannot download $version_url — row '$ROW' must be staged by a build that writes the version file"
-        [ -n "$VERSION" ] || die "empty version file at $version_url for row '$ROW'"
         ;;
 esac
+
+# The canonical built version lives beside the row's artifacts, on EVERY
+# channel. A row staged without it predates channel packaging and cannot
+# publish: pkgver would fall back to the raw sha, which pacman rejects. On
+# stable the read doubles as an assertion that the row agrees with the semver
+# being published — the row is already required by the artifact fetches below,
+# so this adds no new dependency.
+version_url="$BUCKET_URL/versions/$ROW/version"
+VERSION="$(curl -fsSL --retry 3 "$version_url")" \
+    || die "cannot download $version_url — row '$ROW' must be staged by a build that writes the version file"
+[ -n "$VERSION" ] || die "empty version file at $version_url for row '$ROW'"
+if [ "$CHANNEL" = "stable" ] && [ "$VERSION" != "$PKGVER" ]; then
+    die "row '$ROW' holds binaries reporting '$VERSION', not '$PKGVER' — refusing to publish a package whose version contradicts what it installs"
+fi
 
 # pkgver must be pacman-legal: the helper turns a dev build's `-` into `.`
 # (identity for a released semver), so both channels pass through it. VERSION
@@ -186,6 +197,19 @@ PKGVER="$("$VERSION_HELPER" --format aur "$VERSION")"
 
 workdir="$(mktemp -d 2>/dev/null || mktemp -d -t publish-aur)"
 trap 'rm -rf "$workdir"' EXIT
+
+# Bare lowercase hex digest of file $1. sha256sum (Linux CI), shasum (macOS),
+# or openssl anywhere — a publish run should work from a Mac too. Mirrors
+# publish-brew.sh's helper.
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        openssl dgst -sha256 "$1" | awk '{print $NF}'
+    fi
+}
 
 # artifact basename under versions/$ROW/ | env var holding its sha256.
 # The variable names must match the @@SHA_*@@ tokens the template stamps; the
@@ -214,7 +238,13 @@ for entry in "${ARTIFACTS[@]}"; do
     url="$BUCKET_URL/versions/$ROW/$name"
     curl -fsSL --retry 3 -o "$dist/$name" "$url" \
         || die "cannot download $url — is row $ROW staged in the bucket? (see stage-release.sh)"
-    printf -v "$var" '%s' "$(sha256sum "$dist/$name" | cut -d' ' -f1)"
+    # Assign through a variable so a missing sha256 tool fails HERE rather than
+    # stamping an empty SHA_* and dying later in the renderer with a message
+    # that names the wrong thing (a command substitution's status cannot reach
+    # printf -v).
+    sha="$(sha256_file "$dist/$name")" || die "cannot sha256 $dist/$name"
+    [ -n "$sha" ] || die "empty sha256 for $dist/$name"
+    printf -v "$var" '%s' "$sha"
 done
 
 # The renderer stamps from the environment. BUCKET_URL is the token behind

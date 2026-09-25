@@ -141,8 +141,9 @@ else
         *[!0-9a-f]*) die "PKGVER '$PKGVER' is not a commit sha — the $CHANNEL channel ships sha rows only (a versioned row's bytes are represented by the stable package)" ;;
     esac
     len="${#PKGVER}"
-    [ "$len" -ge 7 ] && [ "$len" -le 40 ] \
-        || die "PKGVER '$PKGVER' is not a 7-40 character commit sha on the $CHANNEL channel"
+    if [ "$len" -lt 7 ] || [ "$len" -gt 40 ]; then
+        die "PKGVER '$PKGVER' is not a 7-40 character commit sha on the $CHANNEL channel"
+    fi
 fi
 
 BUCKET_URL="${MINIMAL_BUCKET_URL:-https://storage.googleapis.com/minimal-one}"

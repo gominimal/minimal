@@ -25,7 +25,9 @@ url="https://minimal.dev"
 license=("Apache-2.0")
 depends=(git)
 # The channel packages all install the same /usr/bin files; conflicts (and no
-# replaces) makes pacman refuse two of them installed at once.
+# replaces) makes pacman refuse two of them installed at once. provides lets a
+# dependent require Minimal regardless of which channel is installed.
+provides=(minimal)
 conflicts=(@@CONFLICTS@@)
 optdepends=(
     "bash: shell integration and completions"

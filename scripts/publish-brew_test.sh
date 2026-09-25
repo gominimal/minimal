@@ -3,13 +3,14 @@
 # publish-brew_test.sh — test harness for scripts/publish-brew.sh.
 #
 # Drives the publisher end to end against fixtures: a local bare "tap" repo to
-# clone and a local file:// asset base (MINIMAL_RELEASE_URL for stable,
-# MINIMAL_BUCKET_URL for channels), with no GITHUB_TOKEN and no ssh-agent.
-# Asserts that a dry run downloads the four macOS assets, checksums them,
-# renders the formula fully stamped — including the libkrun dylib installed
-# into the prefix's lib/, which @loader_path/../lib resolves — and pushes
-# nothing. Covers the stable formula (GitHub Release url) and a channel formula
-# (bucket row url, explicit version, `livecheck { skip }`), plus the refusals.
+# clone and a local file:// base (MINIMAL_RELEASE_URL for the stable release
+# assets, MINIMAL_BUCKET_URL for every channel's staged row and version file),
+# with no GITHUB_TOKEN and no ssh-agent. Asserts that a dry run downloads the
+# four macOS assets, checksums them, renders the formula fully stamped —
+# including the libkrun dylib installed into the prefix's lib/, which
+# @loader_path/../lib resolves — and pushes nothing. Covers the stable formula
+# (GitHub Release url) and a channel formula (bucket row url, explicit version,
+# `livecheck { skip }`), the channel conflicts_with, plus the refusals.
 # Run directly or via `just test-shell`.
 
 set -euo pipefail
@@ -65,6 +66,14 @@ for a in "${assets[@]}"; do
     printf 'mach-o payload of %s at %s\n' "$a" "$row" >"$rowdir/$a"
 done
 
+# The stable rows: the promoted semver's row carries a `version` file holding
+# the semver itself — the stable publisher reads and asserts it. 0.9.9 holds a
+# disagreeing version for the refusal below.
+mkdir -p "$bucket/versions/0.5.4"
+printf '%s\n' 0.5.4 >"$bucket/versions/0.5.4/version"
+mkdir -p "$bucket/versions/0.9.9"
+printf '%s\n' 0.9.8 >"$bucket/versions/0.9.9/version"
+
 # A bare "tap" repo with a committed formula to diff against.
 tap="$root/tap.git"
 git init -q --bare -b main "$tap"
@@ -105,6 +114,7 @@ run_dry() {
         PKGVER="$ver" \
         BREW_TAP_REPO="file://$tap" \
         MINIMAL_RELEASE_URL="file://$root/releases/v$ver" \
+        MINIMAL_BUCKET_URL="file://$root/bucket" \
         "$script" --dry-run
 }
 
@@ -148,6 +158,11 @@ if [[ "$out" == *'bin.install "minimal-macos-arm64" => "min"'* ]]; then
     ok "the CLI installs as bin/min (not a bin/min directory)"
 else
     bad "the CLI installs as bin/min (not a bin/min directory)"
+fi
+if [[ "$out" == *'conflicts_with "minimal-unstable", "minimal-nightly"'* ]]; then
+    ok "the stable formula conflicts with the other channel formulae"
+else
+    bad "the stable formula conflicts with the other channel formulae (out: $out)"
 fi
 
 # Every 64-hex digest in the diff must be one of the fixture assets'.
@@ -213,6 +228,11 @@ if [[ "$out" == *'b/Formula/minimal-nightly.rb'* ]]; then
 else
     bad "the nightly formula renders to Formula/minimal-nightly.rb (out: $out)"
 fi
+if [[ "$out" == *'conflicts_with "minimal", "minimal-unstable"'* ]]; then
+    ok "the nightly formula conflicts with the other channel formulae"
+else
+    bad "the nightly formula conflicts with the other channel formulae (out: $out)"
+fi
 
 # Every 64-hex digest in the diff must be one of the channel row's assets'.
 digests="$(for a in "${assets[@]}"; do sha256_file "$rowdir/$a"; done)"
@@ -241,7 +261,11 @@ expect 1 "not a RELEASED semver" "prerelease PKGVER is refused by --channel stab
     env -u SSH_AUTH_SOCK -u GITHUB_TOKEN PKGVER=0.6.0-rc.1 BREW_TAP_REPO="file://$tap" \
         MINIMAL_RELEASE_URL="file://$root/releases/v0.6.0-rc.1" "$script" --dry-run
 
-expect 1 "cannot download" "a missing release asset fails the run" -- run_dry 9.9.9
+expect 1 "cannot download" "a missing row fails the run" -- run_dry 9.9.9
+
+expect 1 "contradicts what it installs" "a stable row whose version file disagrees with the semver is refused" -- \
+    env -u SSH_AUTH_SOCK -u GITHUB_TOKEN PKGVER=0.9.9 BREW_TAP_REPO="file://$tap" \
+        MINIMAL_BUCKET_URL="file://$root/bucket" "$script" --dry-run
 
 expect 1 "sha row, not the semver" "a semver row with --channel nightly is refused" -- \
     env -u SSH_AUTH_SOCK -u GITHUB_TOKEN PKGVER=0.6.0 BREW_TAP_REPO="file://$tap" \

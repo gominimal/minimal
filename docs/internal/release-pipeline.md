@@ -240,9 +240,10 @@ installs one version at a time and there is no file-conflict problem.
 every channel PKGBUILD declares the other two in `conflicts=` (no `replaces=`)
 so pacman refuses two at once — they all install the same `/usr/bin` files.
 
-**Homebrew: separate formulae in one tap.** Homebrew has no formula-conflict
-mechanism, so installing two channel formulae leaves the second unlinked: only
-one channel can be linked at a time.
+**Homebrew: separate formulae in one tap.** Every channel formula declares the
+other two in `conflicts_with`, so `brew install` refuses a second channel rather
+than linking one and leaving the others unlinked — they all install the same
+`bin/min`.
 
 **Version normalization.** A channel package's version is the built version
 string the binaries report, normalized per manager by

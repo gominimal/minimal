@@ -8,7 +8,8 @@
 # that a dry run downloads, checksums, renders the PKGBUILD fully stamped (the
 # reviewer-visible failure mode was five template defects reaching review
 # unexercised), regenerates .SRCINFO, and pushes nothing — plus that a
-# prerelease PKGVER is refused. A second block drives the channel path
+# prerelease PKGVER is refused, and the stable row's version file is read and
+# asserted. A second block drives the channel path
 # (--channel nightly, sha row, version file): the channel package name, _row,
 # normalized pkgver, the conflicts list, the renamed install hook, and the
 # LICENSE copy, plus the channel refusals. Run directly or via `just test-shell`.
@@ -36,6 +37,16 @@ trap 'rm -rf "$root"' EXIT
 # dir is 0700, which would hide it).
 chmod a+rx "$root"
 
+# The digest routine must match the publisher's (portable across
+# sha256sum/shasum/openssl — this harness also runs on hosts without
+# sha256sum), so it is extracted rather than copied: one definition.
+# shellcheck source=scripts/publish-aur.sh
+eval "$(sed -n '/^sha256_file()/,/^}/p' "$script")"
+[ "$(type -t sha256_file)" = "function" ] || {
+    echo "publish-aur_test: cannot extract sha256_file from publish-aur.sh" >&2
+    exit 1
+}
+
 # --- fixtures -----------------------------------------------------------------
 
 # The versioned artifacts, each with distinct content so the sha256s differ.
@@ -50,6 +61,12 @@ artifacts=(
 for a in "${artifacts[@]}"; do
     printf 'payload of %s\n' "$a" >"$bucket/$a"
 done
+# The stable row's canonical version file: the publisher reads it and asserts
+# it equals the promoted semver.
+printf '0.5.4\n' >"$bucket/version"
+# A row whose version file disagrees with its name, for the refusal below.
+mkdir -p "$root/bucket/versions/0.9.9"
+printf '0.9.8\n' >"$root/bucket/versions/0.9.9/version"
 
 # A channel row: the same 13 artifacts (distinct content, so distinct digests)
 # plus the canonical-version file the publisher reads to derive pkgver. The sha
@@ -158,11 +175,16 @@ if [[ "$out" == *'minvmd'* ]]; then
 else
     bad "the package ships minvmd (source entries and checksums rendered)"
 fi
+if [[ "$out" == *'+provides=(minimal)'* ]]; then
+    ok "the package provides=(minimal)"
+else
+    bad "the package provides=(minimal) (out: $out)"
+fi
 
 # Assert the checksums are the real digests of the fixture artifacts: every
 # 64-hex digest in the diff must be one of the fixture artifacts', and all 13
 # must be there.
-digests="$(for a in "${artifacts[@]}"; do sha256sum "$bucket/$a"; done | cut -d' ' -f1)"  # sha256sum: a stated requirement of the publisher
+digests="$(for a in "${artifacts[@]}"; do sha256_file "$bucket/$a"; done)"
 stamped_ok=1
 count=0
 while IFS= read -r sha; do
@@ -222,6 +244,11 @@ if [[ "$out" == *"+conflicts=('minimal-bin' 'minimal-unstable-bin')"* ]]; then
 else
     bad "channel conflicts with the other two channel packages (out: $out)"
 fi
+if [[ "$out" == *'+provides=(minimal)'* ]]; then
+    ok "the channel package provides=(minimal)"
+else
+    bad "the channel package provides=(minimal) (out: $out)"
+fi
 if [[ "$out" == *'+install=minimal-nightly-bin.install'* ]]; then
     ok "channel install hook is named for the package"
 else
@@ -248,8 +275,12 @@ expect 1 "not a RELEASED semver" "prerelease PKGVER is refused" -- \
     env PKGVER=0.6.0-rc.1 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
         "$script" --dry-run
 
-expect 1 "cannot download" "a missing bucket artifact fails the run" -- \
+expect 1 "cannot download" "a missing row fails the run" -- \
     env PKGVER=9.9.9 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
+        AUR_SSH_PRIVATE_KEY=k "$script" --dry-run
+
+expect 1 "contradicts what it installs" "a stable row whose version file disagrees with the semver is refused" -- \
+    env PKGVER=0.9.9 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
         AUR_SSH_PRIVATE_KEY=k "$script" --dry-run
 
 expect 1 "versioned row" "a semver row on a channel is refused" -- \
