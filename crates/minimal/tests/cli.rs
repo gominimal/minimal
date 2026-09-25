@@ -45,7 +45,6 @@ fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
-        mtls_proxy_unavailable: None,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -82,7 +81,6 @@ fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
-        mtls_proxy_unavailable: None,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -1091,6 +1089,134 @@ async fn ls_warning_clears_on_recovery() {
         !after.contains("warning: session hostnames will not route"),
         "the warning must clear without a daemon restart, got: {after}"
     );
+}
+
+// --- retired surfaces (NET-109 / NET-110) ---
+
+/// No build of the daemon carries the retired mTLS reverse proxy, its
+/// client-certificate RPC, or the `ssh-forward` feature that compiled
+/// `direct-tcpip` out (NET-109, NET-110). A client crate cannot reach the
+/// daemon's build flags from here, so assert on its sources and manifests —
+/// the same source-scan approach `minimal`'s own `login_mints_no_certificate`
+/// uses to prove a verb dropped a surface.
+#[test]
+fn retired_surfaces_absent() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crates/minimal sits two levels below the workspace root");
+
+    let source = |rel: &str| {
+        std::fs::read_to_string(root.join(rel))
+            .unwrap_or_else(|e| panic!("readable source {rel}: {e}"))
+    };
+
+    let retired_surfaces: &[(&str, &[&str])] = &[
+        // The proxy serves plain HTTP only: no TLS port, no certificate
+        // authority, no TLS-terminating serve loop, no TLS deps.
+        (
+            "crates/minimald/src/net/proxy.rs",
+            &[
+                "HTTPS_PROXY_PORT",
+                "CertAuthority",
+                "serve_https",
+                "tokio_rustls",
+                "networking-proxy",
+            ],
+        ),
+        // The daemon opens one routing listener and keeps no proxy state.
+        (
+            "crates/minimald/src/server.rs",
+            &["mtls", "7655", "cert_authority", "networking-proxy"],
+        ),
+        // No client-certificate RPC handler or dispatch arm, and no
+        // mTLS field on the replies.
+        (
+            "crates/minimald/src/rpc.rs",
+            &[
+                "IssueClientCert",
+                "mtls_proxy_unavailable",
+                "networking-proxy",
+            ],
+        ),
+        // No crypto-provider install for the removed feature, and no
+        // second-proxy comment in the startup path.
+        ("crates/minimald/src/main.rs", &["networking-proxy", "7655"]),
+        // direct-tcpip is served in every build: neither the handler nor
+        // the relay is behind a feature gate anymore.
+        (
+            "crates/minimald/src/connection.rs",
+            &[
+                "feature = \"ssh-forward\"",
+                "feature = \"networking-proxy\"",
+            ],
+        ),
+        // Both features and their optional TLS deps are gone from the
+        // manifest, so no build can turn them back on.
+        (
+            "crates/minimald/Cargo.toml",
+            &[
+                "networking-proxy",
+                "ssh-forward",
+                "rcgen",
+                "rustls",
+                "tokio-rustls",
+            ],
+        ),
+        // The wire contract carries no client-certificate types and no
+        // mTLS-unavailable fields.
+        (
+            "crates/minimald-rpc/src/lib.rs",
+            &["IssueClientCert", "mtls_proxy_unavailable"],
+        ),
+        // The workspace drops the certificate generator only minimald used.
+        ("Cargo.toml", &["rcgen"]),
+        // Nothing passes a removed feature to the daemon builds.
+        ("justfile", &["networking-proxy", "{{features}}"]),
+    ];
+    for (rel, retired) in retired_surfaces.iter().copied() {
+        let text = source(rel);
+        for &token in retired {
+            assert!(
+                !text.contains(token),
+                "{rel} still names the retired surface `{token}` (NET-109)"
+            );
+        }
+    }
+}
+
+/// The daemon's `ListSessions` reply no longer carries the mTLS field, and a
+/// reply without it decodes: `min ls` keeps reading the list, and never
+/// prints an mTLS warning again (NET-109). A reply from an older daemon that
+/// still sends the field decodes too — an unknown field is skipped, so the
+/// version skew never breaks the list.
+#[test]
+fn session_list_decodes_without_mtls_field() {
+    let resp = ListSessionsResponse {
+        daemon_version: Some("test".to_string()),
+        hostname_routing_unavailable: None,
+        resource_pool: None,
+        sessions: vec![],
+    };
+
+    // The reply this build's daemon sends carries no mtls field.
+    let json = serde_json_lenient::to_string(&resp).unwrap();
+    assert!(
+        !json.contains("mtls_proxy_unavailable"),
+        "the serialized reply must not carry the retired field: {json}"
+    );
+
+    // And it decodes back through the client's own type.
+    let decoded: ListSessionsResponse = serde_json_lenient::from_str(&json).unwrap();
+    assert_eq!(decoded.daemon_version.as_deref(), Some("test"));
+    assert!(decoded.sessions.is_empty());
+
+    // An older daemon's reply, still carrying the field, decodes as well:
+    // the extra field is ignored rather than fatal.
+    let older = r#"{"daemon_version":"old","mtls_proxy_unavailable":"still here","sessions":[]}"#;
+    let from_older: ListSessionsResponse = serde_json_lenient::from_str(older).unwrap();
+    assert_eq!(from_older.daemon_version.as_deref(), Some("old"));
+    assert!(from_older.sessions.is_empty());
 }
 
 // --- helpers ---

@@ -279,7 +279,6 @@ pub(crate) async fn activate_session(
         created.hostname_routing_unavailable.as_deref(),
         "min session activate",
     );
-    warn_if_mtls_proxy_down(created.mtls_proxy_unavailable.as_deref());
     let id = created.id;
 
     // From here the session exists on the daemon in an unfinalized state.
