@@ -1418,10 +1418,54 @@ fn activate_help_shows_network_flags() {
     );
 }
 
+/// Runs `f` with the process's stderr redirected into a pipe and returns
+/// what it wrote alongside `f`'s result.
+///
+/// The capture watches the real fd 2, so it observes what `eprintln!` prints
+/// while it prints — a dropped or rerouted diagnostic fails the caller's
+/// assertion instead of only going missing for users.
+///
+/// Serialized by a process-wide lock: plain `cargo test` shares fd 2 across
+/// test threads, so two captures must never overlap. Under nextest — the lane
+/// this crate's tests run in — every test owns its process to begin with.
+fn capture_stderr<T>(f: impl FnOnce() -> T) -> (String, T) {
+    use std::io::Read as _;
+
+    static STDERR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    let _lock = STDERR_LOCK.lock().expect("stderr capture lock");
+
+    let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe to capture stderr");
+    // Save the current stderr first: the guard restores it even when `f`
+    // panics with fd 2 still pointed at the pipe.
+    struct RestoreStderr(std::os::fd::OwnedFd);
+    impl Drop for RestoreStderr {
+        fn drop(&mut self) {
+            nix::unistd::dup2_stderr(&self.0).expect("restore stderr after capture");
+        }
+    }
+    let restore =
+        RestoreStderr(nix::unistd::dup(std::io::stderr()).expect("dup stderr for capture"));
+    nix::unistd::dup2_stderr(&write_fd).expect("redirect stderr into the capture pipe");
+    // fd 2 now holds a copy of the write end; close the original so the read
+    // below reaches EOF once the restore has taken fd 2 back.
+    drop(write_fd);
+
+    let result = f();
+
+    drop(restore);
+    let mut captured = String::new();
+    std::fs::File::from(read_fd)
+        .read_to_string(&mut captured)
+        .expect("read captured stderr");
+    (captured, result)
+}
+
 /// Every legacy `--network` spelling still parses to the mode its current
-/// spelling names (NET-037), and carries a hint naming both the spelling
-/// typed and the one to use; the current spellings carry no hint, the
-/// default stays the shared-host network, and anything else is refused.
+/// spelling names (NET-037), and the parser prints the hint to the process's
+/// stderr — exactly one line naming both spellings, captured around the real
+/// clap parse so the print itself is under test. The current spellings and
+/// the default print nothing, and anything else is refused.
 #[test]
 fn legacy_network_spellings_parse_with_hint() {
     use clap::Parser as _;
@@ -1440,12 +1484,18 @@ fn legacy_network_spellings_parse_with_hint() {
         ("host-net", "host_ip", CliNetworkMode::HostNet),
         ("own-ip", "own_ip", CliNetworkMode::OwnIp),
     ] {
-        let args = activate_args(&["min", "session", "activate", "--network", legacy]);
+        let hint = legacy_network_hint(legacy).expect("a legacy spelling carries a hint");
+        let (stderr, args) =
+            capture_stderr(|| activate_args(&["min", "session", "activate", "--network", legacy]));
         assert_eq!(
             args.network, mode,
             "--network {legacy} must parse to {current}'s mode"
         );
-        let hint = legacy_network_hint(legacy).expect("a legacy spelling carries a hint");
+        assert_eq!(
+            stderr,
+            format!("{hint}\n"),
+            "--network {legacy} must print exactly the hint line to stderr"
+        );
         assert!(
             hint.contains(legacy),
             "the hint must name the spelling typed: {hint}"
@@ -1461,16 +1511,21 @@ fn legacy_network_spellings_parse_with_hint() {
         ("host_ip", CliNetworkMode::HostNet),
         ("own_ip", CliNetworkMode::OwnIp),
     ] {
-        let args = activate_args(&["min", "session", "activate", "--network", current]);
+        let (stderr, args) =
+            capture_stderr(|| activate_args(&["min", "session", "activate", "--network", current]));
         assert_eq!(args.network, mode);
         assert!(
-            legacy_network_hint(current).is_none(),
-            "a current spelling must not carry a hint"
+            stderr.is_empty(),
+            "a current spelling must print nothing to stderr: {stderr:?}"
         );
     }
 
-    let args = activate_args(&["min", "session", "activate"]);
+    let (stderr, args) = capture_stderr(|| activate_args(&["min", "session", "activate"]));
     assert_eq!(args.network, CliNetworkMode::HostNet);
+    assert!(
+        stderr.is_empty(),
+        "the default network mode must print nothing to stderr: {stderr:?}"
+    );
 
     let err = Cli::try_parse_from(["min", "session", "activate", "--network", "bogus"])
         .map(|_| ())
