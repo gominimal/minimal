@@ -789,7 +789,7 @@ mod kani_proofs {
     /// itself symbolic, so the proof covers both the undeclared dimension
     /// and the declared one.
     fn bounded_protocols() -> Option<Vec<u8>> {
-        if !kani::any() {
+        if !kani::any::<bool>() {
             return None;
         }
         let n: usize = kani::any();
@@ -805,7 +805,7 @@ mod kani_proofs {
 
     /// [`bounded_protocols`] for a CIDR dimension.
     fn bounded_cidrs() -> Option<Vec<super::Ipv4Cidr>> {
-        if !kani::any() {
+        if !kani::any::<bool>() {
             return None;
         }
         let n: usize = kani::any();
