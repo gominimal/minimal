@@ -31,9 +31,11 @@
 //! `MINIMALD_NETNS_TEST=1 GVPROXY_BIN=... cargo test -p minimald --test netns_root_integration -- --include-ignored`
 #![cfg(target_os = "linux")]
 
+use sandbox2::NetPlan;
 use sandbox2::Network as _;
+use sandbox2::config::{Config, SandboxMapped};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
@@ -66,6 +68,90 @@ fn sudo(args: &[&str]) -> Output {
         .unwrap_or_else(|e| panic!("spawn `sudo {}`: {e}", args.join(" ")))
 }
 
+/// C source for a tiny static probe that checks which socket families a
+/// process may create.  When run with no arguments it asserts `AF_UNIX` is
+/// allowed and `AF_INET`, `AF_INET6`, and `AF_VSOCK` are refused with
+/// `EAFNOSUPPORT`.  With argument `hold` it sleeps forever so the sandbox stays
+/// alive for attach tests; with argument `attach` it checks that `AF_UNIX` is
+/// still usable inside an injected process.
+const SOCKET_PROBE_C: &str = r#"
+#include <sys/socket.h>
+#include <errno.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "hold") == 0) {
+        while (1) sleep(60);
+    }
+
+    if (argc > 1 && strcmp(argv[1], "attach") == 0) {
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) { perror("AF_UNIX after attach"); return 20; }
+        close(fd);
+        return 0;
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { perror("AF_UNIX"); return 1; }
+    close(fd);
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd >= 0) { close(fd); fprintf(stderr, "AF_INET unexpectedly succeeded\n"); return 2; }
+    if (errno != EAFNOSUPPORT) { fprintf(stderr, "AF_INET wrong errno %d\n", errno); return 3; }
+
+    fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd >= 0) { close(fd); fprintf(stderr, "AF_INET6 unexpectedly succeeded\n"); return 4; }
+    if (errno != EAFNOSUPPORT) { fprintf(stderr, "AF_INET6 wrong errno %d\n", errno); return 5; }
+
+    fd = socket(AF_VSOCK, SOCK_STREAM, 0);
+    if (fd >= 0) { close(fd); fprintf(stderr, "AF_VSOCK unexpectedly succeeded\n"); return 6; }
+    if (errno != EAFNOSUPPORT) { fprintf(stderr, "AF_VSOCK wrong errno %d\n", errno); return 7; }
+
+    return 0;
+}
+"#;
+
+/// Compile the socket-family probe statically and return its path.
+fn compile_socket_probe(base: &Path) -> PathBuf {
+    let src = base.join("socket_probe.c");
+    let bin = base.join("socket_probe");
+    std::fs::write(&src, SOCKET_PROBE_C).expect("writing socket probe source");
+    let status = Command::new("gcc")
+        .args(["-static", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .expect("spawning gcc to compile socket probe");
+    assert!(
+        status.success(),
+        "gcc failed to compile socket probe: {status:?}"
+    );
+    bin
+}
+
+/// Create a minimal rootfs directory containing the static probe at
+/// `/usr/bin/probe`.  The sandbox layer symlinks `/bin -> /usr/bin` when
+/// `/bin` is absent, so `/usr/bin` must exist.  `usr/lib` is also present so the
+/// layer can create the `usr/lib64 -> lib` symlink.
+fn probe_rootfs(dir: &Path, probe: &Path) {
+    let usr_bin = dir.join("usr").join("bin");
+    std::fs::create_dir_all(&usr_bin).expect("create rootfs usr/bin dir");
+    std::fs::copy(probe, usr_bin.join("probe")).expect("copy probe into rootfs");
+    std::fs::create_dir_all(dir.join("usr").join("lib")).expect("create rootfs usr/lib dir");
+    // An empty /etc satisfies hakoniwa's rootfs setup without forcing a host
+    // /etc bind that could trip over locked mount flags in restricted CI
+    // runners.
+    std::fs::create_dir_all(dir.join("etc")).expect("create rootfs etc dir");
+}
+
+/// The `minimald` binary under test, used as the namespace-joining shim.
+fn shim() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_minimald"))
+}
+
 /// Runs `sudo <args...>` and asserts it succeeded.
 fn sudo_ok(label: &str, args: &[&str]) {
     let out = sudo(args);
@@ -75,6 +161,115 @@ fn sudo_ok(label: &str, args: &[&str]) {
         args.join(" "),
         out.status.code(),
         String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// NET-038. A none box refuses every socket family that reaches outside the
+/// sandbox, `AF_VSOCK` included.  The test builds a real sandbox with an
+/// isolated `NetPlan`, installs the production socket-family filter, and runs
+/// a static probe inside that asserts `AF_INET`, `AF_INET6`, and `AF_VSOCK`
+/// all fail with `EAFNOSUPPORT` while `AF_UNIX` still works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a network namespace; gated on MINIMALD_NETNS_TEST; runs in the ci-linux-native netns job"]
+async fn network_none_blocks_all_outside_sockets() {
+    if !gated() {
+        return;
+    }
+
+    let rootfs_tmp = tempfile::tempdir_in("/tmp").expect("rootfs temp dir under /tmp");
+    let probe = compile_socket_probe(rootfs_tmp.path());
+    let source = rootfs_tmp.path().join("rootfs-src");
+    probe_rootfs(&source, &probe);
+
+    let config = Config::new("none-sockets")
+        .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+        .with_dns(false)
+        .with_plan(NetPlan::isolated());
+    // Build the sandbox in /tmp rather than the default (/home is a read-only
+    // ext4 bind with locked nosuid, which breaks the unprivileged remounts
+    // hakoniwa does inside the user namespace).
+    let tmp = tempfile::tempdir_in("/tmp").expect("sandbox temp dir under /tmp");
+    let mut sandbox = config
+        .build(tmp.path().join("sandbox"), ())
+        .await
+        .expect("building none-box sandbox");
+    let plan = sandbox.built_in_plan();
+    let container = sandbox
+        .new_container(&plan)
+        .expect("building none-box container");
+
+    let mut child = sandbox
+        .command(&container, "/usr/bin/probe", [""; 0], [("", "")])
+        .expect("building probe command")
+        .spawn()
+        .expect("spawning probe in none box");
+    let status = child.wait().expect("waiting for probe");
+    assert!(
+        status.success(),
+        "probe in none box did not report all outside sockets blocked: {status:?}"
+    );
+}
+
+/// NET-039. A none box stays attachable.  The test launches a long-lived none
+/// box, injects a second process into its namespaces with the production
+/// nsenter shim, and verifies that the injected process can still create an
+/// `AF_UNIX` socket — the local family the minenv socket and `min` helper rely
+/// on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a network namespace; gated on MINIMALD_NETNS_TEST; runs in the ci-linux-native netns job"]
+async fn network_none_attach_works() {
+    if !gated() {
+        return;
+    }
+    use minimald::nsenter::{Injection, session_leader_pid};
+
+    let rootfs_tmp = tempfile::tempdir_in("/tmp").expect("rootfs temp dir under /tmp");
+    let probe = compile_socket_probe(rootfs_tmp.path());
+    let source = rootfs_tmp.path().join("rootfs-src");
+    probe_rootfs(&source, &probe);
+
+    let config = Config::new("none-attach")
+        .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+        .with_dns(false)
+        .with_plan(NetPlan::isolated());
+    let tmp = tempfile::tempdir_in("/tmp").expect("sandbox temp dir under /tmp");
+    let mut sandbox = config
+        .build(tmp.path().join("sandbox"), ())
+        .await
+        .expect("building none-box sandbox");
+    let plan = sandbox.built_in_plan();
+    let container = sandbox
+        .new_container(&plan)
+        .expect("building none-box container");
+
+    let mut child = sandbox
+        .command(&container, "/usr/bin/probe", ["hold"], [("", "")])
+        .expect("building hold command")
+        .spawn()
+        .expect("spawning hold process in none box");
+
+    let leader =
+        session_leader_pid(child.id()).expect("resolving the none box's session leader pid");
+
+    let output = tokio::task::spawn_blocking(move || {
+        Injection::new(leader, "/usr/bin/probe", ["attach"])
+            .with_shim(shim())
+            .command()
+            .expect("building injection command")
+            .output()
+            .expect("running injected attach probe")
+    })
+    .await
+    .expect("spawn_blocking join");
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "attach probe in none box failed: status={:?}\nstderr={stderr}",
+        output.status.code(),
     );
 }
 
