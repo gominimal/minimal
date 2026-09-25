@@ -773,8 +773,19 @@ mod tests {
 
 /// The frame-level admit-or-drop harness NET-016, NET-062, NET-064,
 /// NET-069, NET-070, NET-081's failure case and NET-084 share (spec NET,
-/// Tiers): exhaustive over a 40-byte IPv4+L4 header and at most 4 rules per
-/// dimension, at an unwind bound of 4.
+/// Tiers): exhaustive over every value the decision reads — the fragment
+/// offset, the protocol, the destination and the L4 destination port of an
+/// IPv4 frame — under rule lists of zero or two rules per dimension, at an
+/// unwind bound of 4.
+///
+/// The scope is deliberate. This module's first form was exhaustive over a
+/// fully symbolic 40-byte header and rule lists of symbolic *length*, and
+/// its solve outlived the CI lane — one 60-minute job timeout, then two
+/// runs cancelled nine minutes in (gominimal/minimal#1700) — because CBMC
+/// unwound each rule scan without being able to see it end. The harness
+/// below pins what the decision never reads and keeps every list at a
+/// concrete length; what is pinned, and why each pin is sound, is
+/// documented there.
 ///
 /// Run: `cargo kani -p sessions` (or `./scripts/kani.sh`). Kani pinned at
 /// 0.68.0 in CI.
@@ -782,41 +793,42 @@ mod tests {
 mod kani_proofs {
     use super::{
         DNS_PORT, ETH_HDR, ETHERTYPE_IPV4, EgressRules, FrameFamily, FrameVerdict, IPPROTO_UDP,
-        summarize, verdict,
+        Ipv4Cidr, summarize, verdict,
     };
 
-    /// At most 4 symbolic rules of one dimension: `None` (allow-all) is
-    /// itself symbolic, so the proof covers both the undeclared dimension
-    /// and the declared one.
-    fn bounded_protocols() -> Option<Vec<u8>> {
-        if !kani::any::<bool>() {
-            return None;
+    /// One dimension's rules under every declaration the compile can
+    /// produce: `None` (the dimension is undeclared, so it allows all),
+    /// `Some(vec![])` (declared empty, so it allows nothing — the deny-all
+    /// box the resolver carve-out must still resolve), or `Some` of two
+    /// fully symbolic rules.
+    ///
+    /// Every arm carries a CONCRETE length, and that is the point: a list
+    /// of symbolic element count is what made this proof unaffordable (see
+    /// the module doc), because CBMC unwound each scan without being able
+    /// to read its trip count off the code. Two rules is what catches a
+    /// scan that reads only one element or stops one short of the end; a
+    /// third adds no failure shape.
+    fn two_protocols() -> Option<Vec<u8>> {
+        match (kani::any::<bool>(), kani::any::<bool>()) {
+            (false, _) => None,
+            (true, false) => Some(Vec::new()),
+            (true, true) => Some(Vec::from([kani::any::<u8>(), kani::any::<u8>()])),
         }
-        let n: usize = kani::any();
-        kani::assume(n <= 4);
-        let mut list = Vec::with_capacity(4);
-        for i in 0..4 {
-            if i < n {
-                list.push(kani::any());
-            }
-        }
-        Some(list)
     }
 
-    /// [`bounded_protocols`] for a CIDR dimension.
-    fn bounded_cidrs() -> Option<Vec<super::Ipv4Cidr>> {
-        if !kani::any::<bool>() {
-            return None;
+    /// [`two_protocols`] for a CIDR dimension: subnets fully symbolic,
+    /// prefix lengths included, so the proof also covers the out-of-range
+    /// prefixes [`Ipv4Cidr::contains`] must survive — its shift is guarded
+    /// at both ends.
+    fn two_cidrs() -> Option<Vec<Ipv4Cidr>> {
+        match (kani::any::<bool>(), kani::any::<bool>()) {
+            (false, _) => None,
+            (true, false) => Some(Vec::new()),
+            (true, true) => Some(Vec::from([
+                kani::any::<Ipv4Cidr>(),
+                kani::any::<Ipv4Cidr>(),
+            ])),
         }
-        let n: usize = kani::any();
-        kani::assume(n <= 4);
-        let mut list = Vec::with_capacity(4);
-        for i in 0..4 {
-            if i < n {
-                list.push(kani::any());
-            }
-        }
-        Some(list)
     }
 
     /// A frame is admitted exactly when it is declared: stated as an iff so
@@ -825,31 +837,58 @@ mod kani_proofs {
     /// rules — the resolver carve-out first (NET-079), then the three
     /// declared dimensions conjunctively — so a verdict that checks in a
     /// different order, or that reads `None` as deny-all, fails here.
-    // The rule lists are at most 4 long (`bounded_*` assume `n <= 4`), so
-    // every loop over them — the harness's own pushes, the compile in
-    // `EgressRules::new`, the `any` scans in the verdict and in the
-    // restatement below — exits by its fifth check. Without this bound
-    // CBMC keeps unwinding a symbolic-length scan and never returns.
+    ///
+    /// The unwind bound is 4 because every loop this proof unwinds — the
+    /// rule scans in `verdict` and in the restatement, over lists of at
+    /// most two rules — has exited by its third check at the latest.
     #[kani::proof]
-    #[kani::unwind(5)]
+    #[kani::unwind(4)]
     fn kani_frame_verdict_admits_nothing_undeclared() {
-        // The 40-byte IPv4+L4 region of an Ethernet frame — a 20-byte IPv4
-        // header plus 20 bytes of L4 — fully symbolic, under a fixed IPv4
-        // EtherType: every header shape the relay can hand the verdict.
-        let ip_l4: [u8; 40] = kani::any();
+        // One 54-byte Ethernet frame — a 14-byte header and a 40-byte IPv4
+        // region, 20 bytes of IPv4 header plus 20 of L4 — the shape the
+        // relay hands the verdict for every IPv4 packet it forwards.
+        //
+        // Symbolic: the fragment offset, the protocol, the destination and
+        // the L4 destination port — every value the decision reads.
+        //
+        // Pinned to constants: the EtherType (IPv4, the one family the
+        // rules decide; the families decided without rules each have their
+        // own pinned-frame unit test) and the version/IHL (4/5, the
+        // 20-byte header every real guest emits, which is what puts the
+        // L4 port at a readable offset). A fragment with no readable port
+        // — the case that must keep the carve-out closed — is still in the
+        // proof, via the symbolic fragment offset.
+        //
+        // Pinned to zero: the two MACs and every byte of the L4 around the
+        // port, which the decision never reads and CBMC would otherwise
+        // pay for bit by bit.
+        let frag: u16 = kani::any();
+        let proto: u8 = kani::any();
+        let dst: [u8; 4] = kani::any();
+        let port: u16 = kani::any();
         let mut frame = [0u8; ETH_HDR + 40];
-        frame[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
-        frame[ETH_HDR..].copy_from_slice(&ip_l4);
+        let ethertype = ETHERTYPE_IPV4.to_be_bytes();
+        frame[12] = ethertype[0];
+        frame[13] = ethertype[1];
+        let ip = ETH_HDR;
+        frame[ip] = 0x45; // version 4, IHL 5
+        let frag_bytes = frag.to_be_bytes();
+        frame[ip + 6] = frag_bytes[0]; // flags + fragment offset
+        frame[ip + 7] = frag_bytes[1];
+        frame[ip + 9] = proto;
+        frame[ip + 16] = dst[0];
+        frame[ip + 17] = dst[1];
+        frame[ip + 18] = dst[2];
+        frame[ip + 19] = dst[3];
+        let port_bytes = port.to_be_bytes();
+        frame[ip + 22] = port_bytes[0]; // the L4 destination port
+        frame[ip + 23] = port_bytes[1];
 
         let summary = summarize(&frame);
         assert!(matches!(summary.family(), FrameFamily::Ipv4));
 
-        let rules = EgressRules::new(
-            bounded_protocols(),
-            bounded_cidrs(),
-            bounded_cidrs(),
-            kani::any(),
-        );
+        let resolver: [u8; 4] = kani::any();
+        let rules = EgressRules::new(two_protocols(), two_cidrs(), two_cidrs(), resolver);
 
         let admitted = matches!(verdict(&summary, &rules), FrameVerdict::Admit);
 
