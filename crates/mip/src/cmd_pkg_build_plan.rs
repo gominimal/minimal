@@ -15,7 +15,7 @@ pub async fn cmd_pkg_build_plan(args: PkgBuildPlanArgs, ctx: &mut Context) -> Re
         ctx.graph_from_package_names(args.packages.clone())?
     } else {
         let mut g = ctx.graph_from_all_packages()?;
-        g.top_levels = g.from_origin(&ctx.repo_origin()).collect();
+        g.top_levels = g.from_origin(&ctx.repo_origin()?).collect();
         g
     };
     let cache = ctx.local_cache();
@@ -26,7 +26,7 @@ pub async fn cmd_pkg_build_plan(args: PkgBuildPlanArgs, ctx: &mut Context) -> Re
         // both local and remote cache
         (false, false) => {
             let local_adapter = CacheBinProvider::new(&graph, cache.clone());
-            let remote_cache = ctx.remote_cache(false, false).await.unwrap();
+            let remote_cache = ctx.remote_cache(false, false).await?;
             let remote_adapter = RemoteBinProvider::new(&graph, &remote_cache);
             print_plan(
                 &graph,
@@ -37,7 +37,7 @@ pub async fn cmd_pkg_build_plan(args: PkgBuildPlanArgs, ctx: &mut Context) -> Re
 
         // Only remote cache
         (true, false) => {
-            let remote_cache = ctx.remote_cache(false, false).await.unwrap();
+            let remote_cache = ctx.remote_cache(false, false).await?;
             let remote_adapter = RemoteBinProvider::new(&graph, &remote_cache);
             print_plan(
                 &graph,

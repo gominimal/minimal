@@ -126,8 +126,7 @@ impl<C: Channel> Sandbox<C> {
     /// Exposed so a caller that runs a process in this sandbox by some route
     /// other than [`Self::command`] — minimald joining a live session's
     /// namespaces — starts it where the sandbox's own process started.
-    #[must_use]
-    pub fn command_cwd(&self) -> String {
+    pub fn command_cwd(&self) -> Result<String, Error> {
         self.config.command_cwd()
     }
 
@@ -410,7 +409,7 @@ impl Container {
         // process injected into a *running* sandbox (minimald's `nsenter`) can
         // reproduce the same working directory and environment without a second
         // definition of them drifting from this one.
-        command.current_dir(sandbox.config.command_cwd());
+        command.current_dir(sandbox.config.command_cwd()?);
         command.envs(sandbox.config.command_env());
         for (k, v) in envs.into_iter() {
             command.env(k.as_ref(), v.as_ref());
@@ -753,10 +752,15 @@ impl<C: Channel> Sandbox<C> {
             WdSetup::BoundDir {
                 path, read_only, ..
             } => {
-                let container_path = format!(
-                    "/{}",
-                    self.config.wd.bound_dir_sandbox_cwd().to_str().unwrap()
-                );
+                let sandbox_cwd = self.config.wd.bound_dir_sandbox_cwd();
+                let sandbox_cwd = sandbox_cwd.to_str().ok_or_else(|| {
+                    Error::IO(
+                        "bound-dir cwd is not valid UTF-8",
+                        sandbox_cwd.to_path_buf(),
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 path"),
+                    )
+                })?;
+                let container_path = format!("/{sandbox_cwd}");
                 let opts = BindOpts {
                     recursive: true,
                     read_only: *read_only,
@@ -872,19 +876,21 @@ impl<C: Channel> Sandbox<C> {
         let mut program = program.to_string();
 
         // Add /usr/bin/ for commands that are not absolute, and don't shadow anything in cwd
-        if !program.starts_with("/")
-            && !fs::exists(
-                match &self.config.wd {
-                    WdSetup::Isolated { .. } => self.base_dir.join("build"),
-                    WdSetup::BoundDir { path, .. } => path.clone(),
-                    WdSetup::Session { working, .. } => working.clone(),
-                }
-                .join(&program),
-            )
-            .unwrap()
-            && fs::exists(rootfs.join("usr/bin").join(&program)).unwrap()
-        {
-            program = format!("/usr/bin/{program}");
+        if !program.starts_with("/") {
+            let cwd = match &self.config.wd {
+                WdSetup::Isolated { .. } => self.base_dir.join("build"),
+                WdSetup::BoundDir { path, .. } => path.clone(),
+                WdSetup::Session { working, .. } => working.clone(),
+            };
+            let in_cwd = cwd.join(&program);
+            let in_usr_bin = rootfs.join("usr/bin").join(&program);
+            if !fs::exists(&in_cwd)
+                .map_err(|e| Error::IO("checking program in cwd", in_cwd.clone(), e))?
+                && fs::exists(&in_usr_bin)
+                    .map_err(|e| Error::IO("checking program in usr/bin", in_usr_bin.clone(), e))?
+            {
+                program = format!("/usr/bin/{program}");
+            }
         }
 
         container.command_inner(self, &program, args, env_vars)
