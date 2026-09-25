@@ -41,11 +41,11 @@ After this ships, every box declares its size or takes the host's default, the h
   property: For every ram and ram_reserved pair of u64 bytes, validation accepts iff ram_reserved <= ram, with no overflow.
   harness:  mfile `ram_reserved_le_ram_no_overflow` over `kani::any::<(u64,u64)>()`, unwind 1
 
-- **BRES-004** WHEN a box is admitted THE SYSTEM SHALL check `cpu_arch` exactly and `cpus`, resolved `ram` and `disk` against the host's allocatable, and the summed reservations against allocatable, counting an omitted reservation as at most the box's resolved `ram`, without clamping or rounding.
+- **BRES-004** WHEN a box is admitted THE SYSTEM SHALL check `cpu_arch` exactly and `cpus`, resolved `ram` and `disk` against the host's allocatable, and the summed reservations against allocatable, counting an omitted reservation as the host's overcommit-policy value (all of the box's resolved `ram` on a host that does not overcommit, the floor the host reports on a host that overcommits by design, such as LocalVM), capped at the box's resolved `ram` (architecture Box Resources › `ram_reserved`), without clamping or rounding.
   tier:     T2
   verify:   cargo nextest run -p minimald admission_checks_fit_and_reservations
-  property: For every host allocatable and every set of boxes' reservations, admission admits a new box iff each dimension fits and the summed reservations, each omitted one capped at its box's resolved ram, do not exceed allocatable, computed without overflow.
-  harness:  minimald/src/admission.rs `admit_iff_fit_and_reservations` over a host and at most 8 boxes of `kani::any::<u64>()` sizes, unwind 8
+  property: For every host allocatable, overcommit policy and set of boxes' reservations, admission admits a new box iff each dimension fits and the summed reservations, each omitted one taken as the policy's value (the resolved ram when the host does not overcommit, else the policy's floor) and capped at its box's resolved ram, do not exceed allocatable, computed without overflow.
+  harness:  minimald/src/admission.rs `admit_iff_fit_and_reservations` over a host with `kani::any::<bool>()` overcommit and a `kani::any::<u64>()` floor, and at most 8 boxes of `kani::any::<u64>()` sizes, unwind 8
 
 - **BRES-005** IF admission finds a dimension the host cannot hold THEN THE SYSTEM SHALL fail with exit 8 and `code = "insufficient_resources"`, carrying the dimension, the requested size and its layer, the host's allocatable and allocated, and the remedy.
   tier:     T2

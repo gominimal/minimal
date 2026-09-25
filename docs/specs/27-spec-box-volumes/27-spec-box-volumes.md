@@ -86,9 +86,9 @@ This spec is the first backing: a volume lives on the host that runs the box, in
 
 **Volumes are keyed by project and name.** The architecture scopes volume names to the project (AT21), so two projects on one host that both declare `cache` get two volumes (BVOL-009). A host-wide name would have let one project's compromised run poison another's cache.
 
-**A write hold lasts as long as the box record.** The hold persists across stop, exit and resume and is released when the box is reaped (BVOL-010), so a stopped session always resumes with its volume and resume needs no second check. `min volume prune` skips a held volume for the same reason (BVOL-012). The alternative, releasing the hold on stop and re-checking it on resume, was rejected because a stopped box could then fail to resume after another box took its volume. The cost is that a second writer waits for the first box's `rm`, not its stop.
+**A write hold lasts as long as the box record.** The owner decided on 2026-09-25 that the hold persists across stop, exit and resume and is released when the box is reaped (BVOL-010), so a stopped session always resumes with its volume and resume needs no second check. `min volume prune` skips a held volume for the same reason (BVOL-012). The alternative, releasing the hold on stop and re-checking it on resume, was rejected by the owner because a stopped box could then fail to resume after another box took its volume. The cost is that a second writer waits for the first box's `rm`, not its stop.
 
-**A bare volume name means read-write.** `volumes = ["cache"]` stays the common case and holds the volume for writing; `{ name, mode = "ro" }` is the reader form (BVOL-011). Defaulting to read-only was rejected because a cache nobody can write never fills.
+**A bare volume name means read-write.** The owner decided on 2026-09-25 that `volumes = ["cache"]` stays the common case and holds the volume for writing; `{ name, mode = "ro" }` is the reader form (BVOL-011). The alternative, a bare name meaning read-only, was rejected by the owner because a cache nobody can write never fills.
 
 **Generality:** a second backing fits because the requirements name the interface (the `volumes` key, the single-writer rule, the `min volume` verbs, survival past `min box rm`), not the directory.
 
