@@ -72,7 +72,12 @@ impl NetGuard for OwnIpGuard {
 ///
 /// The relay is gated by the session's whole policy: the egress leg enforces
 /// its declared egress rules (NET-062/063/064), the ingress leg its declared
-/// inbound ports.
+/// inbound ports. The gate also carries the session's DNS dimension — its
+/// `egress.allow_dns_hosts` and `egress.deny_subnets` ride the same
+/// [`SessionGate`](crate::net::switch::SessionGate) into the relay, where
+/// the DNS gate pins the addresses those names resolve to for their
+/// admission window (NET-066), refuses the ones that land in denied ranges
+/// (NET-067), and answers AAAA/HTTPS/SVCB lookups NODATA (NET-136).
 ///
 /// The lease was already allocated and gvproxy already ensured-running by the
 /// provider's plan, so this only does the post-spawn relay + ingress. A failure

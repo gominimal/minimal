@@ -598,6 +598,34 @@ impl PolicyWarnLimiter {
             false
         }
     }
+
+    /// Emits a rate-limited `tracing::warn!` for a DNS answer the rebinding
+    /// intersection refused (NET-067): an address a name the box's policy
+    /// allowed resolved into the box's `deny_subnets` or the infrastructure
+    /// deny set, and so is never admitted — the name and the answer, the two
+    /// things the spec requires the refusal to carry. Rate-limited under the
+    /// same per-box-per-`rule` key as the frame drops, so a burst of the same
+    /// refusal is one line, not one per answer.
+    pub fn warn_dns_refusal(
+        &self,
+        session_id: &str,
+        name: &str,
+        answer: Ipv4Addr,
+        rule_matched: &str,
+    ) -> bool {
+        if self.should_warn_at(session_id, rule_matched, Instant::now()) {
+            tracing::warn!(
+                session_id,
+                name,
+                %answer,
+                rule_matched,
+                "an allowed name resolved into a refused range"
+            );
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]

@@ -28,6 +28,12 @@ pub mod switch;
 pub(crate) mod gvproxy_network;
 pub(crate) mod provider;
 
+// The DNS gate the relay legs share: pins the addresses a box's allowed
+// names resolved to for their admission window (NET-066), refuses denied
+// ranges at resolution time (NET-067), and answers AAAA/HTTPS/SVCB empty
+// (NET-136). Relay-internal, so no more public than this.
+pub(crate) mod dns_gate;
+
 // WireGuard mesh peer (Unit 4). Compiled only under `networking-wg` so the
 // default build carries no WireGuard code (R4.7).
 #[cfg(feature = "networking-wg")]
