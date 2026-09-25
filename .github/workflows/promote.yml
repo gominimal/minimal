@@ -4,7 +4,8 @@ name: promote-cli
 # Promoting a semver row to `stable` also publishes it: the draft GitHub
 # Release the versioned build parked is published — which creates the
 # v<semver> tag, last, on the already-smoked commit — and the AUR / Homebrew
-# publishers run (publish-packages.yml).
+# publishers run (publish-packages.yml), unless the `publish` input is
+# unchecked.
 on:
     workflow_dispatch:
         inputs:
@@ -30,6 +31,11 @@ on:
                 required: false
                 type: boolean
                 default: false
+            publish:
+                description: "Stable semver promotions only: after the channel flip, publish the draft GitHub Release (creating the v<semver> tag) and the AUR and Homebrew packages. Uncheck to flip the channel only."
+                required: false
+                type: boolean
+                default: true
 
 env:
     # Single source of truth for the gate's approver allowlist.
@@ -63,6 +69,7 @@ jobs:
                   TARGET_INPUT: ${{ inputs.target }}
                   DRY_RUN: ${{ inputs.dry_run }}
                   OVERRIDE_PROVENANCE: ${{ inputs.override_provenance }}
+                  PUBLISH: ${{ inputs.publish }}
               run: |
                   set -euo pipefail
                   BODY="**Repo:** \`${REPO}\`
@@ -72,6 +79,7 @@ jobs:
                   **Version input:** \`${VERSION_INPUT:-<latest staged nightly sha>}\`
                   **Target channel:** \`${TARGET_INPUT}\`
                   **Dry run:** \`${DRY_RUN}\`
+                  **Publish (stable semver only):** \`${PUBLISH}\`
                   **Smoke-provenance override (EMERGENCY):** \`${OVERRIDE_PROVENANCE}\`
 
                   Comment **\`approved\`** to proceed or **\`denied\`** to cancel.
@@ -294,9 +302,10 @@ jobs:
         # — then the AUR and Homebrew publishers run. publish-packages.yml
         # skips itself with a notice when the promoted version is a nightly
         # sha (nothing versioned to publish). A rehearsal promotion (dry_run)
-        # publishes nothing anywhere.
+        # publishes nothing anywhere. Unchecking `publish` flips the channel
+        # without publishing.
         needs: promote
-        if: ${{ inputs.target == 'stable' && !inputs.dry_run }}
+        if: ${{ inputs.target == 'stable' && !inputs.dry_run && inputs.publish }}
         permissions:
             contents: write # publishing the draft release creates the tag
         uses: ./.github/workflows/publish-packages.yml
