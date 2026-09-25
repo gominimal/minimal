@@ -2572,6 +2572,92 @@ mod tests {
         drop(held);
     }
 
+    /// NET-025's other edge: only a *busy* address relocates. Any other bind
+    /// failure keeps the address it named and retries with backoff (NET-021),
+    /// because it is not another daemon holding the port and moving the
+    /// listener would hide the report. Driven with an address the host cannot
+    /// assign — the shape a half-up or misconfigured interface gives — which
+    /// fails with `EADDRNOTAVAIL` under glibc and musl alike, so this also
+    /// holds for the musl guest build the busy-port predicate once missed.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_non_busy_bind_failure_keeps_its_address() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        // A free port stands in for the documented default, as in the other
+        // retry tests: what fails here is the address, not the port.
+        let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let default_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
+        let retrier = tokio::spawn(drive_proxy_until_serving(
+            state.clone(),
+            HostProxyStartup::Egress {
+                // `192.0.2.1` is TEST-NET-1: no interface holds it, so every
+                // bind fails `EADDRNOTAVAIL`, deterministically, root or not.
+                bind_base: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                port: ProxyPort::DefaultThenSelect {
+                    default: default_port,
+                },
+            },
+            false,
+            HostExpose::Shuttle,
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        ));
+
+        // At least two failed binds on the *same* address — no relocation
+        // line, and the note stays, because the failure is not a busy port.
+        let mut saw_two_failures = false;
+        for _ in 0..200 {
+            if buf
+                .contents()
+                .matches("could not bind its listener")
+                .count()
+                >= 2
+            {
+                saw_two_failures = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let logged = buf.contents();
+        assert!(
+            saw_two_failures,
+            "a non-busy bind failure must keep retrying loudly, got: {logged}"
+        );
+        assert!(
+            !logged.contains("selecting a free one"),
+            "a bind failure that is not a busy port must not relocate, got: {logged}"
+        );
+        assert!(
+            logged
+                .matches(&format!("addr=192.0.2.1:{default_port}"))
+                .count()
+                >= 2,
+            "the retries must keep the address the report names, got: {logged}"
+        );
+        assert!(
+            state.proxy_unavailable().await.is_some(),
+            "the bind failure must stay reported as unavailable"
+        );
+        assert!(
+            state.hostname_proxy_port().await.is_none(),
+            "a proxy that never bound must not report serving"
+        );
+        retrier.abort();
+    }
+
     /// NET-027's publish half: a guest-chosen port the host *could not
     /// take* is released and a fresh one picked, not retried forever — two
     /// VMs on one host whose ports collide at the host's loopback are

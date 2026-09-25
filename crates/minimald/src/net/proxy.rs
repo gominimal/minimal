@@ -172,6 +172,12 @@ pub struct BindFailure {
     pub reason: String,
     /// The remedy: free the listen address so the daemon's retry can bind it.
     pub remedy: String,
+    /// The OS error's [`io::ErrorKind`], carried beside the rendered text so
+    /// the busy-port predicate ([`Self::is_addr_in_use`]) matches the *kind*,
+    /// never the text: the daemon runs under two libcs — glibc on a native
+    /// host, musl in the guest the initramfs cross-builds — and they do not
+    /// agree on how `EADDRINUSE` reads.
+    pub kind: io::ErrorKind,
 }
 
 impl BindFailure {
@@ -189,14 +195,20 @@ impl BindFailure {
     /// would hide it, so the caller keeps retrying the address it named
     /// (NET-021).
     ///
-    /// Read off the reason's rendered OS error: the failure is a human-facing
-    /// report and the OS error is carried inside it, rendered the same way by
-    /// both bind paths that produce one ([`bind_listener`] and the answerer's
-    /// UDP bind). The daemon builds only on Linux, where `EADDRINUSE` renders
-    /// as this text on every libc.
+    /// Compared on the carried [`io::ErrorKind`], never on the rendered text:
+    /// the reason is a human-facing report and the OS error inside it is
+    /// rendered by the libc, which differs — glibc spells `EADDRINUSE`
+    /// "Address already in use", musl (the `*-linux-musl` guest build) "Address
+    /// in use", so a text match never fires inside a microVM and a guest
+    /// daemon whose default port is busy would loop on the retry instead of
+    /// relocating. Both bind paths that build a failure
+    /// ([`bind_listener`] and the answerer's UDP bind) hold the `io::Error`
+    /// the kernel answered with, so its kind is the one fact both libcs agree
+    /// on. Ruled out by the kind: a `TimedOut` bind attempt, an `Other`
+    /// wrapped by a test.
     #[must_use]
     pub fn is_addr_in_use(&self) -> bool {
-        self.reason.contains("Address already in use")
+        self.kind == io::ErrorKind::AddrInUse
     }
 }
 
@@ -220,7 +232,8 @@ impl BindFailure {
 /// # Errors
 ///
 /// Returns a [`BindFailure`] when the address cannot be bound; the OS error is
-/// carried inside the failure's reason.
+/// carried inside the failure's reason, and its kind beside it
+/// ([`BindFailure::kind`]).
 pub async fn bind_listener(addr: SocketAddr) -> Result<TcpListener, BindFailure> {
     match TcpListener::bind(addr).await {
         Ok(listener) => {
@@ -238,6 +251,7 @@ pub async fn bind_listener(addr: SocketAddr) -> Result<TcpListener, BindFailure>
                 "free the listen address; `lsof -nP -iTCP:{} -sTCP:LISTEN` names the holder",
                 addr.port()
             ),
+            kind: error.kind(),
         }),
     }
 }
@@ -830,6 +844,63 @@ mod tests {
         assert!(
             logged.is_empty(),
             "bind_listener must not log on failure; the caller owns the log line, got: {logged}"
+        );
+    }
+
+    /// A real bind's failure carries its OS error's *kind*, so the busy-port
+    /// predicate holds under both libcs this daemon runs as — glibc on a
+    /// native host, musl in the `*-linux-musl` guest build, whose
+    /// `EADDRINUSE` reads "Address in use" where glibc's reads "Address
+    /// already in use". A predicate matching the rendered text never fires in
+    /// a microVM, and a guest daemon whose default port is busy loops on the
+    /// retry instead of relocating (NET-025).
+    #[tokio::test]
+    async fn busy_port_predicate_matches_the_error_kind_not_the_text() {
+        // The two libcs' renderings of one `EADDRINUSE`: either must read as
+        // busy, whatever text the daemon's libc put in the report.
+        for text in ["Address already in use", "Address in use"] {
+            let failure = BindFailure {
+                reason: format!("the daemon could not bind 127.0.0.1:7654: {text}"),
+                remedy: "free the listen address".to_owned(),
+                kind: io::ErrorKind::AddrInUse,
+            };
+            assert!(
+                failure.is_addr_in_use(),
+                "an EADDRINUSE is busy whatever its libc renders, got: {text}"
+            );
+        }
+
+        // And the other way round: a report whose text happens to carry the
+        // busy phrase is not busy when the kernel said otherwise. An address
+        // that cannot be assigned, or a permission the daemon lacks, is not
+        // another daemon holding the port — moving the listener would hide it
+        // (NET-021), so the failure must not read as busy.
+        let not_busy = BindFailure {
+            reason:
+                "the daemon could not bind 192.0.2.1:7654: Cannot assign requested \
+                 address — not Address already in use"
+                    .to_owned(),
+            remedy: "free the listen address".to_owned(),
+            kind: io::ErrorKind::AddrNotAvailable,
+        };
+        assert!(
+            !not_busy.is_addr_in_use(),
+            "a non-busy bind failure must not read as busy, whatever its text"
+        );
+
+        // The live path: a bind against a held address reports the kind the
+        // kernel answered with, beside the text.
+        let held = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = held.local_addr().unwrap();
+        let failure = bind_listener(addr)
+            .await
+            .expect_err("a bind to a held address must fail");
+        drop(held);
+        assert_eq!(
+            failure.kind,
+            io::ErrorKind::AddrInUse,
+            "a held listen address must report EADDRINUSE, got: {:?}",
+            failure.kind
         );
     }
 
