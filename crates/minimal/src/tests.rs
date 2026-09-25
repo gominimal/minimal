@@ -327,6 +327,7 @@ async fn login_mints_no_certificate() {
         config_dir: Some(config.clone()),
         provider: None,
         no_input: true,
+        vm: None,
     };
 
     // No daemon is running and none may be spawned: with the certificate
@@ -1480,6 +1481,7 @@ async fn stop_is_a_no_op_when_the_daemon_is_already_down() {
         config_dir: None,
         provider: None,
         no_input: true,
+        vm: None,
     };
 
     cmd_stop(&global, StopArgs { force: false })
