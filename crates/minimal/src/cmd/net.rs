@@ -20,13 +20,16 @@ const SESSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// is the session's UUID, which is how the daemon knows which box's loopback
 /// to dial — and ends when either side closes it.
 ///
-/// The forward follows the *session*, not the box's process. A box whose
-/// process is down — never started, exited with its entrypoint, or stopped by
-/// a daemon shutdown — is brought up to serve the forward, exactly as
-/// `min session attach` brings one up to serve a terminal: a session record
-/// that outlives its box is the normal state after `min stop`, which keeps
-/// records, so refusing would strand a forward against every session that
-/// survived a restart. What ends the forward is the session ending — it is
+/// The forward follows the *session*, not the box's process. A session
+/// record that outlives its box is the normal state after `min stop`, which
+/// keeps records, so a forward that refused a box-less session would be
+/// stranded against every session that survived a restart. Where the dial
+/// has to run inside the box — an isolated session's own network namespace
+/// — the daemon brings a box that isn't running up for the dial, exactly as
+/// `min session exec` brings one up for a command; a shared-namespace
+/// (`host_ip`) box is dialed from the daemon's own namespaces, where no box
+/// needs to exist, so a session nothing has started answers with a refused
+/// connection instead. What ends the forward is the session ending — it is
 /// destroyed, or the daemon it lives behind goes away (the transport is the
 /// daemon's, so a `min stop` that succeeds ends the forward with it) — or a
 /// Ctrl-C, and the listener and every open relay close with it (NET-105).

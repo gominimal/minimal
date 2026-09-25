@@ -305,17 +305,23 @@ the session answers on the laptop with nothing else installed or configured
 on the remote side. `min net forward web 8080:3000` puts the box's port 3000
 on `localhost:8080`.
 
-Each accepted connection gets its own SSH channel, dialed from inside the
-box's network namespace — the box's own `127.0.0.1`, not the daemon's — so
-the command works for every network mode a session can have.
+Each accepted connection gets its own SSH channel, and the daemon dials
+`127.0.0.1:<PORT>` on the box's side of the session: inside the box's own
+network namespace when it has one (`--network none`, `--network own_ip`), or
+the namespace it shares with the daemon when it does not (`--network
+host_ip`). Either way the port reached is the one the box's service binds,
+so the command works for every network mode a session can have.
 
-The forward follows the session, not the box's process. A session whose box
-is down — never started, exited with its entrypoint, or stopped by a daemon
-shutdown — is brought up to serve the forward, exactly as
-[`session attach`](#session-attach) brings one up to serve a terminal: a
-session record that outlives its box is the normal state after
-[`stop`](#stop), which keeps records, so a forward that refused would be
-stranded against every session that survived a daemon restart.
+The forward follows the session, not the box's process: a session record
+that outlives its box is the normal state after [`stop`](#stop), which keeps
+records, and a forward that refused such a session would be stranded against
+every session that survived a daemon restart. Where the dial has to run
+inside the box — an isolated session's own network namespace — the daemon
+brings a box that isn't running up for the dial, exactly as
+[`session exec`](#session-exec) brings one up for a command. A
+`--network host_ip` box shares the daemon's namespace, so its dial needs no
+box up: a session nothing has started answers with a refused connection
+until something starts the box.
 
 The forward stays in the foreground and ends on `Ctrl-C`, when the session
 is destroyed, or when the daemon goes away; the listener and every open relay
