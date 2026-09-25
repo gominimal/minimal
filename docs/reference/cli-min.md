@@ -309,9 +309,27 @@ Each accepted connection gets its own SSH channel, dialed from inside the
 box's network namespace — the box's own `127.0.0.1`, not the daemon's — so
 the command works for every network mode a session can have.
 
+The forward follows the session, not the box's process. A session whose box
+is down — never started, exited with its entrypoint, or stopped by a daemon
+shutdown — is brought up to serve the forward, exactly as
+[`session attach`](#session-attach) brings one up to serve a terminal: a
+session record that outlives its box is the normal state after
+[`stop`](#stop), which keeps records, so a forward that refused would be
+stranded against every session that survived a daemon restart.
+
 The forward stays in the foreground and ends on `Ctrl-C`, when the session
-is destroyed, or when the daemon goes away; the listener and every open
-relay close with it.
+is destroyed, or when the daemon goes away; the listener and every open relay
+close with it. `stop` is not a destroy: it ends a forward only because the
+daemon's exit does, and it keeps every session record, so a later
+`min net forward` reaches those sessions again.
+
+What the tree proves today is the host-address mode (`--network host_ip`)
+end to end: the `net_forward_*` tests drive a real daemon and relay bytes
+through a live laptop-side listener. The in-box dial that the isolated modes
+(`--network none`, `--network own_ip`) take — a `socat` relay injected into
+the box's namespaces — is exercised by the daemon's harness test with a
+host-side stand-in relay rather than a real box; a root-integration proof of
+that leg (`just test-root-integration`) is still owed to the root lane.
 
 ### `stop`
 
