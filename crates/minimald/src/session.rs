@@ -384,6 +384,11 @@ enum SessionMessage {
     /// Hand back an `Arc` clone of this session's hook-scripts-upload lock,
     /// see [`Session::hook_scripts_upload_lock`].
     GetHookScriptsUploadLock(oneshot::Sender<Arc<Mutex<()>>>),
+    /// Register a live direct-tcpip forward relay as belonging to this
+    /// session, so teardown takes it down too: a session that goes away
+    /// aborts its forwards rather than leaving relays pointing into a box
+    /// that no longer exists.
+    TrackForward(tokio::task::AbortHandle),
     /// Kick off a background package build as a session side-op. Replies with
     /// the receiver end of the build's event stream.
     StartBuild {
@@ -480,6 +485,12 @@ pub struct Session {
     /// What brought the currently held host up, which decides whether an
     /// interactive attach may respawn it. See [`HostOrigin`].
     host_origin: HostOrigin,
+
+    /// The live direct-tcpip forwards opened for this session: one abort
+    /// handle per relay the connection layer spawned. Pruned as relays
+    /// finish; every live one is aborted by [`Session::stop_running`], so a
+    /// session that goes away takes its forwards down with it (NET-105).
+    forwards: Vec<tokio::task::AbortHandle>,
 }
 
 /// Why a session host was launched.
@@ -543,6 +554,9 @@ impl Session {
             // conservative default — it is the one value that never licenses
             // a respawn.
             host_origin: HostOrigin::Interactive,
+            // Forwards are registered as their channels open; a session
+            // starts with none.
+            forwards: Vec::new(),
             #[cfg(target_os = "linux")]
             hostnames,
         }
@@ -901,6 +915,12 @@ impl Session {
             }
             SessionMessage::GetHookScriptsUploadLock(r) => {
                 let _ = r.send(Arc::clone(&self.hook_scripts_upload_lock));
+            }
+            SessionMessage::TrackForward(forward) => {
+                // Prune the ones that have finished on their own, so the
+                // list holds the live forwards and nothing else.
+                self.forwards.retain(|h| !h.is_finished());
+                self.forwards.push(forward);
             }
             SessionMessage::StartBuild {
                 rebuild,
@@ -1445,6 +1465,14 @@ impl Session {
     /// the daemon-shutdown message (and a terminal reset) rather than a bare
     /// disconnect when the session dies because the daemon is going away.
     async fn stop_running(&mut self, for_shutdown: bool) {
+        // The session's forwards relay into its box: a session that is going
+        // away takes them with it, rather than leaving live relays pointed at
+        // a box that is being torn down. Both teardown paths — `Stop` and
+        // `Destroy` — come through here.
+        for forward in std::mem::take(&mut self.forwards) {
+            forward.abort();
+        }
+
         let inner = match &mut self.inner {
             SessionInner::Active { host, sops, .. } => Some((host.take(), std::mem::take(sops))),
             SessionInner::Draft { .. } => None,
@@ -2753,6 +2781,19 @@ impl SessionHandle {
                 "session actor terminated before the host could be launched",
             ))),
         }
+    }
+
+    /// Registers a forward relay with the session it forwards for, so the
+    /// session aborts it at teardown.
+    ///
+    /// Best-effort by design: a send error means the session actor is
+    /// already gone, in which case the relay is about to learn the same
+    /// thing its client does — there is no session to outlive. The
+    /// connection layer ignores the outcome.
+    pub async fn track_forward(&self, forward: tokio::task::AbortHandle) {
+        // Ignore send errors - a session that is gone has nothing left to
+        // track, and the forward ends with it.
+        let _ = self.0.send(SessionMessage::TrackForward(forward)).await;
     }
 
     pub async fn attach(

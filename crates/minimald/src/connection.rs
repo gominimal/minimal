@@ -5,7 +5,9 @@ use russh::{
 use sessions::SessionId;
 use std::{
     collections::BTreeMap,
+    pin::Pin,
     sync::{Arc, LazyLock},
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::{
@@ -507,8 +509,11 @@ impl russh::server::Handler for ConnectionHandler {
             return Ok(());
         };
         let mngr = serv.sessions_manager().await;
-        match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
-            Ok(Some(_)) => {}
+        let session = match mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+        {
+            Ok(Some(session)) => session,
             Ok(None) => {
                 tracing::warn!(
                     %session_id,
@@ -530,7 +535,7 @@ impl russh::server::Handler for ConnectionHandler {
                     .await;
                 return Ok(());
             }
-        }
+        };
 
         let host = host_to_connect.to_string();
         let port = match u16::try_from(port_to_connect) {
@@ -542,33 +547,69 @@ impl russh::server::Handler for ConnectionHandler {
             }
         };
 
-        // Connect to the target before accepting the channel. If the target is
-        // unreachable within the grace period, reject rather than leaving the
-        // client with an open-but-dead channel.
-        let upstream = match tokio::time::timeout(
-            Duration::from_secs(10),
-            TcpStream::connect((host.as_str(), port)),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(error)) => {
+        // Where the dial runs: a `host_ip` box shares the daemon's network
+        // namespace, so the daemon can open the socket itself, but a box with
+        // its own netns (`none`, `own_ip`) has a loopback of its own — a dial
+        // from the daemon would reach the daemon, not the box — so there the
+        // dial runs inside the box's namespaces.
+        let site = match session.record().await {
+            Ok(record) => dial_site(record.network),
+            Err(e) => {
                 tracing::warn!(
-                    %host,
-                    port,
-                    %error,
-                    "direct-tcpip: could not connect to target"
+                    %session_id,
+                    error = %e,
+                    "direct-tcpip rejected: session record unreadable"
                 );
-                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                reply
+                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
                 return Ok(());
             }
-            Err(_) => {
-                tracing::warn!(
-                    %host,
-                    port,
-                    "direct-tcpip: connection to target timed out"
-                );
-                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+        };
+
+        // Bring the box-side half of the relay up before accepting the
+        // channel, so a shared-netns dial can still refuse with `ConnectFailed`
+        // rather than leaving an open-but-dead channel. The in-box dial cannot
+        // be observed from here — the in-box process connects after the accept
+        // — so it is accepted with the spawn, and a box port that refuses
+        // surfaces as the relay ending at once: the client sees the connection
+        // close, which is what a refused dial looks like.
+        enum Upstream {
+            Shared(TcpStream),
+            InBox(ChildStdio),
+        }
+        let upstream = match site {
+            DialSite::Shared => match tokio::time::timeout(
+                Duration::from_secs(10),
+                TcpStream::connect((host.as_str(), port)),
+            )
+            .await
+            {
+                Ok(Ok(s)) => Ok(Upstream::Shared(s)),
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        %host,
+                        port,
+                        %error,
+                        "direct-tcpip: could not connect to target"
+                    );
+                    Err(russh::ChannelOpenFailure::ConnectFailed)
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        %host,
+                        port,
+                        "direct-tcpip: connection to target timed out"
+                    );
+                    Err(russh::ChannelOpenFailure::ConnectFailed)
+                }
+            },
+            DialSite::InBox => dial_in_box(&session, uname, &host, port).await.map(Upstream::InBox),
+        };
+        let upstream = match upstream {
+            Ok(upstream) => upstream,
+            Err(failure) => {
+                reply.reject(failure).await;
                 return Ok(());
             }
         };
@@ -578,18 +619,177 @@ impl russh::server::Handler for ConnectionHandler {
         // One info line per served channel open (NET-110): the daemon log —
         // and the diagnostics bundle's tail of it — names every direct-tcpip
         // channel that relays, with the session it forwarded for and the box
-        // port it reached.
+        // port it reached, and where the dial ran.
         tracing::info!(
             session_id = %session_id,
             host = %host,
             port,
+            dial = ?site,
             "direct-tcpip channel open: relaying bytes to the box port"
         );
 
-        // Relay bytes bidirectionally: SSH channel ↔ upstream TCP.
-        tokio::spawn(relay_streams(channel.into_stream(), upstream));
+        // Relay bytes bidirectionally: SSH channel ↔ upstream. The relay is
+        // the session's to abort at teardown, so a session that goes away
+        // takes its forwards down with it.
+        let relay = match upstream {
+            Upstream::Shared(socket) => {
+                tokio::spawn(relay_streams(channel.into_stream(), socket))
+            }
+            Upstream::InBox(child) => tokio::spawn(relay_streams(channel.into_stream(), child)),
+        };
+        session.track_forward(relay.abort_handle()).await;
 
         Ok(())
+    }
+}
+
+/// Where a direct-tcpip dial must run, decided by the session's network mode.
+#[derive(Debug, PartialEq, Eq)]
+enum DialSite {
+    /// The box shares the daemon's network namespace (`host_ip`): the daemon
+    /// opens the socket itself.
+    Shared,
+    /// The box has a network namespace of its own (`none`, `own_ip`), whose
+    /// `127.0.0.1` is not the daemon's: the dial runs inside the box's
+    /// namespaces.
+    InBox,
+}
+
+fn dial_site(network: sessions::NetworkMode) -> DialSite {
+    match network {
+        sessions::NetworkMode::HostNet => DialSite::Shared,
+        // The modes this daemon knows, and any a newer config carries:
+        // `127.0.0.1` always means inside the box, and dialing there from
+        // the box is the one reading that holds for every isolated mode.
+        sessions::NetworkMode::NoNet | sessions::NetworkMode::OwnIp | _ => DialSite::InBox,
+    }
+}
+
+/// Dials `host:port` from inside the box's namespaces, returning the relay's
+/// box-side half on success and the SSH open failure to reject the channel
+/// with otherwise.
+///
+/// The box's namespaces are reached the one sanctioned way — a command run
+/// in-session, which is the nsenter injection joining every namespace the
+/// box unshared, netns included — and the dial itself is a `socat` relaying
+/// the box port onto its stdio. `socat` is a baseline package, so every box
+/// has it.
+///
+/// `session` is the session the channel is being opened for; `conn_username`
+/// is its SSH username (the session's UUID), passed to `ensure_host` the way
+/// the exec path does.
+async fn dial_in_box(
+    session: &crate::session::SessionHandle,
+    conn_username: &str,
+    host: &str,
+    port: u16,
+) -> Result<ChildStdio, russh::ChannelOpenFailure> {
+    let host_handle = match session.ensure_host(conn_username.to_string()).await {
+        Ok(host_handle) => host_handle,
+        Err(e) => {
+            tracing::warn!(
+                host,
+                port,
+                error = %e,
+                "direct-tcpip: could not bring the box up to dial from"
+            );
+            return Err(russh::ChannelOpenFailure::AdministrativelyProhibited);
+        }
+    };
+    let mut command = match host_handle
+        .command_in_session(
+            "socat",
+            [
+                "-".to_string(),
+                format!("TCP:{host}:{port},connect-timeout=10"),
+            ],
+        )
+        .await
+    {
+        Ok(command) => command,
+        Err(e) => {
+            tracing::warn!(
+                host,
+                port,
+                error = %e,
+                "direct-tcpip: could not build the in-box dial"
+            );
+            return Err(russh::ChannelOpenFailure::ConnectFailed);
+        }
+    };
+    use std::process::Stdio;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let child = match tokio::process::Command::from(command)
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!(
+                host,
+                port,
+                error = %e,
+                "direct-tcpip: could not start the in-box dial"
+            );
+            return Err(russh::ChannelOpenFailure::ConnectFailed);
+        }
+    };
+    Ok(ChildStdio::new(child))
+}
+
+/// The box-side half of an in-box dial: the piped stdio of the injected
+/// relay process. Reads are the bytes the box port sent back; writes are the
+/// bytes being forwarded to it.
+///
+/// The child is held — boxed, so this stays `Unpin` for [`relay_streams`] —
+/// because its drop is the kill: `kill_on_drop` on the injection shim, whose
+/// PDEATHSIG takes the in-box program with it. Never read on purpose.
+struct ChildStdio {
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+    _child: Pin<Box<tokio::process::Child>>,
+}
+
+impl ChildStdio {
+    fn new(mut child: tokio::process::Child) -> Self {
+        let stdin = child.stdin.take().expect("stdin was piped");
+        let stdout = child.stdout.take().expect("stdout was piped");
+        Self {
+            stdin,
+            stdout,
+            _child: Box::pin(child),
+        }
+    }
+}
+
+impl AsyncRead for ChildStdio {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdout).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ChildStdio {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stdin).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdin).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdin).poll_shutdown(cx)
     }
 }
 
@@ -744,5 +944,174 @@ mod tests {
             line.contains(&format!("port={port}")),
             "the open line must name the box port, got: {line}"
         );
+    }
+
+    /// A session with a network namespace of its own (`none`) dials its box
+    /// port from inside the box: `127.0.0.1` in the box is not the daemon's
+    /// loopback, so the dial goes out through the one sanctioned door into
+    /// the box's namespaces — a command run in-session — and comes back as
+    /// the relay's box-side stdio. In this harness the in-session command is
+    /// the host-side stand-in (MockLauncher builds it host-side under
+    /// `cfg(test)`); what the test pins is the path the production dial takes:
+    /// the session's host is minted, the relay program is `socat` (a baseline
+    /// package, so every box has it), and the channel relays through it. The
+    /// open line then records where the dial ran, and destroying the session
+    /// aborts the forward with it (NET-105's daemon half).
+    #[tokio::test]
+    async fn direct_tcpip_dials_inside_box_netns() {
+        use russh::keys::PublicKeyOrCertificate;
+        use tokio::net::{TcpListener, UnixStream};
+
+        use crate::test_harness::{TestServer, captured_log, create_session_req, unwrap_ready};
+
+        // Install the capture subscriber before the open happens: the global
+        // subscriber must already exist when the info line is emitted.
+        let log = captured_log();
+
+        // The box port: a loopback listener echoing whatever it receives.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sock.write_all(&buf[..n]).await.unwrap(),
+                }
+            }
+        });
+
+        let server = TestServer::new().await;
+
+        // An `Active` session with its own netns. The create flow is inlined
+        // because the request must carry `none` — the harness's builders
+        // default to the shared-netns mode the release test covers.
+        let mut req = create_session_req("direct-tcpip-netns", "/tmp");
+        req.config.network = sessions::NetworkMode::NoNet;
+        use minimald_rpc::{
+            ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+            FinalizeSessionRequest,
+        };
+        let mut client = server.connect().await;
+        let session_id = match client.call::<CreateSession>(&req).await {
+            Errorable::Ok(r) => r.id,
+            Errorable::Err { error } => panic!("CreateSession failed: {error}"),
+        };
+        unwrap_ready(
+            client
+                .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                    session_id,
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
+        match client
+            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id })
+            .await
+        {
+            Errorable::Ok(_) => {}
+            Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+        }
+
+        // `TestClient` keeps its russh handle private and this test needs the
+        // raw `channel_open_direct_tcpip`, so drive both halves of the
+        // connection the way `TestServer::connect` does.
+        struct ForwardHandler;
+        impl russh::client::Handler for ForwardHandler {
+            type Error = russh::Error;
+            async fn check_server_key(
+                &mut self,
+                _key: &PublicKeyOrCertificate,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+        }
+
+        let host_key = server.state.host_key().await.unwrap();
+        let russh_config = Arc::new(russh::server::Config {
+            keys: vec![host_key],
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            nodelay: true,
+            ..Default::default()
+        });
+        let (server_side, client_side) = UnixStream::pair().unwrap();
+        let server_setup = {
+            let state = server.state.clone();
+            let russh_config = russh_config.clone();
+            async move {
+                let (_conn, session_fut) =
+                    Connection::from_stream(server_side, russh_config, state, true)
+                        .await
+                        .expect("handshake over the in-memory pair");
+                tokio::spawn(session_fut);
+            }
+        };
+        let client_setup = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_side,
+            ForwardHandler,
+        );
+        let (_, handle) = tokio::join!(server_setup, client_setup);
+        let mut handle = handle.unwrap();
+        let auth = handle
+            .authenticate_none(&session_id.to_string())
+            .await
+            .unwrap();
+        assert!(auth.success(), "auth_none should succeed on local UDS");
+
+        // The point of the test: the channel dials through the box's
+        // namespaces, and bytes relay through it to the box port and back.
+        let channel = handle
+            .channel_open_direct_tcpip("127.0.0.1", port.into(), "127.0.0.1", 0)
+            .await
+            .expect("the in-box dial must open the channel");
+        let mut channel = channel.into_stream();
+        channel.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        channel.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(
+            &echoed, b"ping",
+            "the box port must echo the relayed bytes through the in-box dial"
+        );
+
+        // Observability: the open's info line names the session, the box
+        // port, and where the dial ran.
+        let logged = log.contents();
+        let line = logged
+            .lines()
+            .find(|l| l.contains("direct-tcpip channel open"))
+            .unwrap_or_else(|| {
+                panic!("expected a direct-tcpip channel-open info line, got: {logged}")
+            });
+        assert!(
+            line.contains(&format!("session_id={session_id}")),
+            "the open line must name the session, got: {line}"
+        );
+        assert!(
+            line.contains(&format!("port={port}")),
+            "the open line must name the box port, got: {line}"
+        );
+        assert!(
+            line.contains("dial=InBox"),
+            "the open line must record the dial as in-box, got: {line}"
+        );
+
+        // NET-105's daemon half: teardown aborts the session's forwards, so
+        // the channel the forward was relaying ends with the session.
+        let mngr = server.state.sessions_manager().await;
+        let session = mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("the session exists until destroyed");
+        session.destroy().await.unwrap();
+        let mut end = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), channel.read(&mut end))
+            .await
+            .expect("the channel must close with the session")
+            .expect("read on the channel after teardown");
+        assert_eq!(n, 0, "the forward's channel must see EOF, not more bytes");
     }
 }
