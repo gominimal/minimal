@@ -13,16 +13,16 @@ updated: 2026-09-25
 
 A session and a task are the same kind of thing in the architecture of record: a box, described by one expanded spec, named by one grammar, retained after it ends. The daemon today holds a session model with three live states and no exit, a task that is an ephemeral session the client destroys, a `minimal.toml` with a single `[session]` table, and a CLI with no `box` noun. The networking and egress-proxy specs (NET, BEP) bind their configuration "in the box spec" and have no schema to bind to; the remote-host specs were parked until the local story is settled; the Box Provider API draft requires the built-in local providers to serve the same surface as a remote one.
 
-After this ships, a developer on a stock install with no identity plane runs sessions and tasks as boxes: each has a stable id, a type, a spec they can read before it runs, and a record that survives its exit and can be resumed, inspected, or reaped. The daemon admits a box only when the machine can hold it and holds every box to its own memory limit. The record, spec, projection and provider surface are the ones a remote host reads later, so nothing here is redone when boxes leave the laptop. Surfaces: the CLI, the daemon, the config expander, the TUI, and the local provider.
+After this ships, a developer on a stock install with no identity plane runs sessions and tasks as boxes: each has a stable id, a type, a spec they can read before it runs, and a record that survives its exit and can be resumed, inspected, or reaped. The record, spec, projection and provider surface are the ones a remote host reads later, so nothing here is redone when boxes leave the laptop. Surfaces: the CLI, the daemon, the config expander, and the local provider's host commands.
 
-**Success:** on one machine with no identity plane, `min shell`, `min run`, `min box list|show|spec|stop|rm|prune|resume`, and `min dash` all operate on the same box records; a stopped session resumes with its files; a task leaves an exited box whose exit code and files are readable; a box the host cannot hold is refused with exit 8; and the same `minimal.toml` expands to identical bytes whether the host is enrolled or not.
+**Success:** on one machine with no identity plane, `min shell`, `min run`, and `min box list|show|spec|stop|rm|prune|resume` all operate on the same box records; a stopped session resumes with its files; a task leaves an exited box whose exit code and files are readable; and the same `minimal.toml` expands to identical bytes whether the host is enrolled or not.
 
-**First slice:** every existing session becomes a box with a stable id, type, parent and the `stopped`/`exited` states, listed by `min ls` and `min box list` with provider and host, stoppable and resumable, on today's create path and before any schema change (epic stories S1, S2, S3, S10 and S5).
+**First slice:** every existing session becomes a box with a stable id, type, parent and the `stopped`/`exited` states, listed by `min ls` and `min box list` with provider and host, and stoppable, on today's create path and before any schema change (BOX-001, BOX-003, BOX-006, BOX-011, BOX-013, BOX-112 and BOX-117). Resume follows the stored spec (BOX-068).
 
 ## Users and stories
 
 
-**Roles:** developer who scripts against Minimal, developer, developer or a script, developer or an orchestrating script, developer editing `minimal.toml`, developer or platform engineer, developer or a reviewer, developer declaring a box, and as the networking and egress-proxy epics, developer or an agent, developer debugging any box, developer with scripts and muscle memory, developer living in the dash, developer running several boxes on one laptop, developer, and as the CLI's provider client, developer on a stock install, maintainer, developer whose builds benefit from cached state across boxes
+**Roles:** developer who scripts against Minimal, developer, developer or a script, developer or an orchestrating script, developer editing `minimal.toml`, developer or platform engineer, developer or a reviewer, developer declaring a box, and as the networking and egress-proxy epics, developer or an agent, developer debugging any box, developer with scripts and muscle memory, developer on a stock install
 
 - AS A developer who scripts against Minimal, I WANT every box to carry a UUIDv7 `box_id`, a type, and a parent from creation, with its name as an alias, SO THAT a rename, a re-creation under the same name, or a second host never changes what my script refers to.
 - AS A developer, I WANT `stop` to end a box's processes and keep its record and files, and `rm` and `prune` to be the only things that delete them, SO THAT I can read an exit code, pull results, and decide when disk is reclaimed.
@@ -37,12 +37,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - AS A developer debugging any box, I WANT `min box exec <box> [-t] [--detach] -- <cmd>` to run a command inside a running box under its own namespaces, limits, and posture, with a re-attachable PTY when I ask for one, SO THAT I can get a shell into a task or check a session without another mechanism.
 - AS A developer with scripts and muscle memory, I WANT `min session activate`, `min session destroy`, `min session exec`, and bare `min stop` to keep working for one release with a hint naming the new verb, SO THAT the rename is a migration I can schedule, not a break I discover.
 - AS A developer, I WANT `min provider list --all` to show `local0` and `local-minvmd0`, and `min host list|show|stop` to work on them, SO THAT the daemon I stop, the VM I look at, and the provider a remote box will come from are one vocabulary.
-- AS A developer living in the dash, I WANT it to list every box on every local provider with type and state, resume a stopped session, and create from an entry, SO THAT the TUI and the CLI show the same world.
-- AS A developer running several boxes on one laptop, I WANT each box's `ram` to be a real memory limit and the host to refuse a box it cannot hold, SO THAT one runaway box hits its own ceiling and never squeezes the daemon or my desktop.
-- AS A developer, and as the CLI's provider client, I WANT `local0` and `local-minvmd0` to serve the Box Provider API's static profile over their local socket, with honest `egress_pin` and `MemoryPolicy`, SO THAT `min host list` reads local and remote hosts through one API and no local side channel exists to unlearn.
 - AS A developer on a stock install, I WANT everything above to work with no Gatehouse and no per-box identity, and the same `minimal.toml` to work unchanged when my host is later enrolled, SO THAT local-first costs nothing now and remote costs no rewrite later.
-- AS A maintainer, I WANT every requirement above to have a named test, and the local-first guardrails to fail a build when broken, SO THAT a change that keys on a name, drifts the expansion, or skips admission cannot merge.
-- AS A developer whose builds benefit from cached state across boxes, I WANT to declare a named volume on an entry that is created on first use, reattached by name, single-writer, and listable and removable on its own, SO THAT package downloads and build caches are not redone every time a box is created.
 
 
 ## Requirements
@@ -59,7 +54,8 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 - **BOX-002** WHERE the box host is a VM THE SYSTEM SHALL mint the `box_id` in the VM host daemon and pass it to the in-VM daemon at creation.
   tier:     T0
-  verify:   cargo nextest run -p minvmd vm_host_mints_box_id_before_in_vm_create   # VM lane (NET-107)
+  verify:   cargo nextest run -p minvmd vm_host_mints_box_id_before_in_vm_create
+  <!-- runs on the VM lane (NET-107): the behaviour exists only with the VM host daemon in the loop -->
 
 - **BOX-003** WHEN the daemon starts and finds a record without `box_type` or `parent` THE SYSTEM SHALL migrate it once to `box_type = "session"` with no parent, assigning a fresh id only when the stored id is nil, and leave it unchanged on any later start.
   tier:     T0
@@ -96,10 +92,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p sessions rename_changes_only_alias_and_records_event
   property: For every box and every new name, rename leaves id, spec and filesystem path equal before and after, preserves every prior event, and appends exactly one `renamed` event.
 
-- **BOX-011** THE SYSTEM SHALL hold every box record in exactly one of the states `pending`, `materializing`, `running`, `stopped`, or `exited`, with `exited` carrying `exit_code` and a `reason` of `exit`, `timeout`, `oom`, or `stopped`, and render the state in `min box show`.
+- **BOX-011** THE SYSTEM SHALL hold every box record in exactly one of the states `pending`, `materializing`, `running`, `stopped`, or `exited`, with `stopped` and `exited` records carrying `exit_code` and a `reason` (`stopped` for a `stopped` record; `exit`, `timeout` or `oom` for an `exited` one), and render the state in `min box show`.
   tier:     T2
   verify:   cargo nextest run -p sessions record_state_is_one_of_five_with_exit_reason
-  property: For every reachable store state, each record is in exactly one state, and `exited` records carry an exit code and one of the four reasons.
+  property: For every reachable store state, each record is in exactly one state, `stopped` records carry an exit code and reason `stopped`, and `exited` records carry an exit code and one of `exit`, `timeout` or `oom`.
   harness:  sessions/src/core/record.rs `state_is_exactly_one` over `kani::any::<Record>()`, unwind 1
 
 - **BOX-012** WHEN the daemon restarts THE SYSTEM SHALL reap only records in `pending` or `materializing`.
@@ -120,7 +116,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimald daemon_never_stops_for_idle_or_client_loss
 
-- **BOX-016** WHEN a PTY client disconnects THE SYSTEM SHALL record a detach and leave the box running.
+- **BOX-016** WHEN a PTY client disconnects THE SYSTEM SHALL record a `detached` event and leave the box running.
   tier:     T0
   verify:   cargo nextest run -p minimald pty_client_loss_records_detach
 
@@ -164,7 +160,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal shell_resume_attaches
 
-- **BOX-027** WHEN a box resumes THE SYSTEM SHALL run no lifecycle hook other than `on_attach` on attach.
+- **BOX-027** WHEN a box resumes THE SYSTEM SHALL run no lifecycle hook other than `on_attach` on attach, unless BOX-028 applies.
   tier:     T0
   verify:   cargo nextest run -p minimald resume_runs_only_on_attach_hook
 
@@ -216,7 +212,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal task_list_shows_exited_until_pruned
 
-- **BOX-040** THE SYSTEM SHALL write `created`, `started`, `exec_started`, `exec_exited`, `oom_killed`, `exited`, `renamed` and `resumed` events into the box record outside the box filesystem.
+- **BOX-040** THE SYSTEM SHALL write `created`, `started`, `exec_started`, `exec_exited`, `oom_killed`, `exited`, `renamed`, `resumed` and `detached` events into the box record outside the box filesystem.
   tier:     T0
   verify:   cargo nextest run -p minimald events_written_outside_box_filesystem
 
@@ -301,10 +297,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p mfile box_type_resolves_to_builtin_root
   property: For every type graph whose chains terminate at a built-in, resolution yields that built-in as the root.
 
-- **BOX-060** IF a project type lacks `extends`, forms a cycle, or redefines a built-in name THEN THE SYSTEM SHALL fail with exit 3 naming both definitions.
+- **BOX-060** IF a project type lacks `extends`, forms a cycle, or redefines a built-in name THEN THE SYSTEM SHALL fail with exit 3 naming the type, and for a redefinition both definitions.
   tier:     T1
   verify:   cargo nextest run -p mfile box_type_missing_extends_cycle_or_redefinition_exit3
-  property: For every type graph with a missing extends, a cycle, or a built-in name redefinition, resolution fails naming both definitions.
+  property: For every type graph with a missing extends, a cycle, or a built-in name redefinition, resolution fails naming the type, and for a redefinition both definitions.
 
 - **BOX-061** IF an entry sets a value a type constrains to a different value THEN THE SYSTEM SHALL fail with exit 3 naming the type.
   tier:     T1
@@ -346,14 +342,13 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal box_spec_box_renders_stored_copy
 
-- **BOX-070** WHEN `min box spec self` runs inside a box THE SYSTEM SHALL render the containing box's stored spec.
-  tier:     T0
-  verify:   cargo nextest run -p minimald box_spec_self_renders_containing_spec
-
-- **BOX-071** WHEN a box is created THE SYSTEM SHALL compute, in both the client and the daemon, the Gatehouse §6.3.2 projection over the expanded spec (RFC 8785 JCS, SHA-256) including `type.name`, `type.source`, `type.root`, network mode, `loadout_mode`, `pty_enabled`, `lifetime` and the `[nesting]` bounds, and store the daemon's recomputation beside the client's.
+- **BOX-071** WHEN a box is created THE SYSTEM SHALL compute, in both the client and the daemon, the Gatehouse §6.3.2 Box Spec projection of the expanded spec, exactly the §6.3.2 field set (`v`; `type.name`, `type.source`, `type.root`, and `type.registry` when the source is `org`; `network.mode`, `egress_dns`, `egress_subnets`, `ingress_ports` and `quic443`; `bep.steering`; `registry_pinned`; `registry_commit`; `loadout_mode`; `pty_enabled`; `lifetime`; the `[nesting]` bounds; `secret_grants`), and digest it as SHA-256 over its RFC 8785 JCS bytes.
+  - WHEN a box is created THE SYSTEM SHALL store the daemon's recomputed digest beside the client's in the record.
+    tier:   T0
+    verify: cargo nextest run -p minimald projection_digests_stored_side_by_side
   tier:     T1
-  verify:   cargo nextest run -p mfile projection_computed_both_sides_and_stored
-  property: For every expanded spec, the projection depends only on the listed fields: changing any other field leaves the digest unchanged, and changing a listed field changes it.
+  verify:   cargo nextest run -p mfile projection_is_the_6_3_2_field_set
+  property: For every expanded spec, the digest equals SHA-256 over the RFC 8785 JCS bytes of the §6.3.2 record built from that spec: changing a field outside the §6.3.2 set leaves the digest unchanged, and changing one inside it changes the digest.
 
 - **BOX-072** IF the client's and the daemon's projection digests differ THEN THE SYSTEM SHALL refuse creation.
   tier:     T0
@@ -370,6 +365,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-075** IF the client's expander version differs from the daemon's THEN THE SYSTEM SHALL report both versions before creation and continue, leaving BOX-072's digest comparison as the check that refuses.
   tier:     T0
   verify:   cargo nextest run -p minimal expander_skew_reports_and_continues
+
+- **BOX-145** THE SYSTEM SHALL pin golden vectors for the canonical expanded spec of the example `minimal.toml`, its projection digest, and the six built-in types' rendered definitions.
+  tier:     T0
+  verify:   cargo nextest run -p mfile golden_vectors_pinned
 
 - **BOX-076** THE SYSTEM SHALL accept every Box Spec section with the keys and value types of the architecture's `box.toml`, except that `[network]` egress keys take the nested `egress.*` shape the networking and egress-proxy specs bind.
   tier:     T0
@@ -522,7 +521,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal local_provider_names_and_aliases
 
-- **BOX-113** WHEN `min host list` runs THE SYSTEM SHALL render each local host with name, state, capacity, allocatable, allocated, default box size, and whether memory enforcement is `enforced` or `advisory`.
+- **BOX-113** WHEN `min host list` runs THE SYSTEM SHALL render each local host with name, state, capacity, allocatable and allocated.
   tier:     T0
   verify:   cargo nextest run -p minimal host_list_columns
 
@@ -532,9 +531,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 - **BOX-115** WHEN `min host stop <host>` runs THE SYSTEM SHALL stop that daemon, and its VM where one exists, once its boxes are stopped, or at once under `--force`.
   tier:     T0
-  verify:   cargo nextest run -p minimal host_stop_stops_daemon_and_vm   # VM lane (NET-107)
+  verify:   cargo nextest run -p minimal host_stop_stops_daemon_and_vm
+  <!-- runs on the VM lane (NET-107): the behaviour exists only with the VM host daemon in the loop -->
 
-- **BOX-116** THE SYSTEM SHALL accept bare `min stop` as the alias of `min host stop` for the local host.
+- **BOX-116** THE SYSTEM SHALL map bare `min stop`, a BOX-107 alias, to `min host stop` on the local host for one release, after which BOX-109 applies.
   tier:     T0
   verify:   cargo nextest run -p minimal bare_stop_aliases_host_stop
 
@@ -542,105 +542,11 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimal list_shows_host_per_box
 
-- **BOX-118** THE SYSTEM SHALL list every box in `min dash` with type, state (with exit code), provider and host, showing stopped and exited boxes until pruned and letting the user filter them out.
+- **BOX-147** WHEN `min provider list --all` runs THE SYSTEM SHALL list every well-known local provider present on the machine.
   tier:     T0
-  verify:   cargo nextest run -p minimal-tui dash_lists_type_state_provider_host
+  verify:   cargo nextest run -p minimal provider_list_all_shows_local_providers
 
-- **BOX-119** WHEN Enter is pressed on a stopped session in `min dash` THE SYSTEM SHALL resume it and attach.
-  tier:     T0
-  verify:   cargo nextest run -p minimal-tui dash_enter_resumes_and_attaches
-
-- **BOX-120** WHEN `d` is pressed on a stopped or exited box in `min dash` THE SYSTEM SHALL reap it.
-  tier:     T0
-  verify:   cargo nextest run -p minimal-tui dash_d_reaps_stopped_box
-
-- **BOX-121** WHEN `n` is pressed on an entry in `min dash` THE SYSTEM SHALL start it.
-  tier:     T0
-  verify:   cargo nextest run -p minimal-tui dash_n_starts_entry
-
-- **BOX-122** THE SYSTEM SHALL offer the project's entries by name in the dash create form.
-  tier:     T0
-  verify:   cargo nextest run -p minimal-tui dash_create_form_offers_entries
-
-- **BOX-123** THE SYSTEM SHALL serve `min dash` over the same RPCs as `min box list` and `min box show` and compute no field the CLI does not render.
-  tier:     T0
-  verify:   cargo nextest run -p minimal-tui dash_uses_cli_rpcs_only
-
-
-### O4 Resources
-
-- **BOX-124** THE SYSTEM SHALL accept `[machine] cpu_arch`, `cpus`, `ram`, `ram_reserved` and `disk` flat on an entry, with sizes in IEC units only.
-  tier:     T0
-  verify:   cargo nextest run -p mfile machine_keys_flat_iec_units
-
-- **BOX-125** IF a size is written in a non-IEC unit THEN THE SYSTEM SHALL fail with exit 3 and a did-you-mean hint.
-  tier:     T0
-  verify:   cargo nextest run -p mfile non_iec_size_exit3_with_hint
-
-- **BOX-126** IF `ram_reserved` exceeds a written `ram` THEN THE SYSTEM SHALL fail with exit 3.
-  tier:     T2
-  verify:   cargo nextest run -p mfile ram_reserved_over_ram_exit3
-  property: For every ram and ram_reserved pair of u64 bytes, validation accepts iff ram_reserved <= ram, with no overflow.
-  harness:  mfile `ram_reserved_le_ram_no_overflow` over `kani::any::<(u64,u64)>()`, unwind 1
-
-- **BOX-127** WHEN a box is admitted THE SYSTEM SHALL check `cpu_arch` exactly and `cpus`, resolved `ram` and `disk` against the host's allocatable, and the summed reservations against allocatable, without clamping or rounding.
-  tier:     T2
-  verify:   cargo nextest run -p minimald admission_checks_fit_and_reservations
-  property: For every host allocatable and every set of boxes' reservations, admission admits a new box iff each dimension fits and the summed reservations do not exceed allocatable, computed without overflow.
-  harness:  minimald/src/admission.rs `admit_iff_fit_and_reservations` over a host and at most 8 boxes of `kani::any::<u64>()` sizes, unwind 8
-
-- **BOX-128** IF admission finds a dimension the host cannot hold THEN THE SYSTEM SHALL fail with exit 8 and `code = "insufficient_resources"`, carrying the dimension, the requested size and its layer, the host's allocatable and allocated, and the remedy.
-  tier:     T2
-  verify:   cargo nextest run -p minimald admission_miss_exit8_with_figures
-  property: For every rejected admission, the error carries the first failing dimension, the requested size, and the host's allocatable and allocated figures.
-  harness:  minimald/src/admission.rs `rejection_names_first_failing_dimension`, same bounds
-
-- **BOX-129** WHEN `ram` is `"auto"` THE SYSTEM SHALL resolve it to the host's default box size and report in `min box show` the resolved limit and whether it came from the spec or the host.
-  tier:     T0
-  verify:   cargo nextest run -p minimald ram_auto_resolves_to_host_default
-
-- **BOX-130** WHERE the host's memory enforcement is `enforced` THE SYSTEM SHALL place every box's memory cgroup in one boxes subtree capped at allocatable, with the daemon outside it, setting `memory.max` to the box's `ram` and `memory.min` to its reservation.
-  tier:     T0
-  verify:   cargo nextest run -p minimald boxes_subtree_memory_max_and_min   # VM lane (NET-107)
-
-- **BOX-131** WHERE the host's memory enforcement is `enforced` THE SYSTEM SHALL reject any write to a box's memory limit that originates from a process inside the box's namespaces, including one running as root inside the box.
-  tier:     T0
-  verify:   cargo nextest run -p minimald in_box_root_cannot_raise_memory_limit
-
-- **BOX-132** THE SYSTEM SHALL run exec commands and lifecycle hooks in the box's own cgroup.
-  tier:     T0
-  verify:   cargo nextest run -p minimald exec_and_hooks_share_box_cgroup
-
-- **BOX-133** IF the kernel kills a process in a box for memory THEN THE SYSTEM SHALL apply `on_oom` (`kill_process` or `end_box`, defaulted by type), record an `oom_killed` event naming the task name, and write a one-line notice to any attached PTY.
-  tier:     T0
-  verify:   cargo nextest run -p minimald oom_applies_on_oom_and_records_event
-
-- **BOX-134** IF an OOM kill ends a box THEN THE SYSTEM SHALL record `exited.reason = "oom"` and return 137 from `min run` and `min box wait`.
-  tier:     T0
-  verify:   cargo nextest run -p minimald oom_ending_box_exits_137
-
-- **BOX-135** THE SYSTEM SHALL decide `enforced` or `advisory` memory enforcement from the host's capabilities, never from configuration, and report it in `min host show` and `min box show`.
-  tier:     T0
-  verify:   cargo nextest run -p minimald memory_policy_from_capabilities_not_config
-
-- **BOX-136** WHILE a native host has no delegated memory controller THE SYSTEM SHALL report `advisory`, perform admission accounting, and apply no memory cgroup limit.
-  tier:     T0
-  verify:   cargo nextest run -p minimald native_without_controller_is_advisory
-
-
-### O5 The local provider, un-enrolled (BOX-137 to BOX-139 wait on arch PR #45)
-
-- **BOX-137** THE SYSTEM SHALL serve, from the client, `ProviderService.GetProviderInfo`, `GetQuotas`, `GetUsage`, `HostService.ListHosts` and `GetHost` for each local provider in the `minimal.provider.v1` shape with `profile = "static"` and no `CreateHost`.
-  tier:     none
-  verify:   none, waits on the Box Provider API draft (gominimal/arch#45) settling the local transport and auth; test will be `cargo nextest run -p minimal local_provider_serves_static_profile`
-
-- **BOX-138** THE SYSTEM SHALL carry, in each local host record, `host_id` (UUIDv7), `name`, class `standard`, a state of `READY` while the daemon's socket answers and `TERMINATED` after `min host stop`, `capacity`, `allocatable`, `allocated`, `MemoryPolicy`, an `SshEndpoint` whose address is the daemon's local socket, and an `egress_pin` of `pinned` on the VM provider only once the host-side egress filter is present and `none` otherwise.
-  tier:     none
-  verify:   none, waits on the Box Provider API draft (gominimal/arch#45) settling the local transport and auth; test will be `cargo nextest run -p minimal local_host_record_fields`
-
-- **BOX-139** THE SYSTEM SHALL source `min host list`, `min host show` and `min provider show` from the local provider API and nothing else.
-  tier:     none
-  verify:   none, waits on the Box Provider API draft (gominimal/arch#45) settling the local transport and auth; test will be `cargo nextest run -p minimal host_commands_read_provider_api_only`
+### O5 Un-enrolled
 
 - **BOX-140** WHILE no identity plane is configured THE SYSTEM SHALL perform creation, stop, resume, exec, events, cp and prune over the local socket's file-mode trust, omit `identity.sock` from the box, and report `identity: none` in `min box show`.
   tier:     T0
@@ -660,28 +566,17 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p sessions nothing_keys_on_box_name
   property: For every id-addressed operation in the record, event and audit APIs, the result is invariant under renaming any box; a name lookup resolves the current alias and only the current alias.
 
-
-### O6 Prove it
-
-- **BOX-144** THE SYSTEM SHALL carry one named nextest test per requirement in the crate that owns the behaviour, and run the VM-host cases on the VM lane.
-  tier:     T0
-  verify:   cargo nextest run -p minimal every_requirement_has_named_test
-
-- **BOX-145** THE SYSTEM SHALL pin golden vectors for the canonical expanded spec of the example `minimal.toml`, its projection digest, and the six built-in types' rendered definitions.
-  tier:     T0
-  verify:   cargo nextest run -p mfile golden_vectors_pinned
-
-- **BOX-146** THE SYSTEM SHALL assert in tests that a re-created name gets a new id, a rename preserves id and events, a stop retains files readable by `cp`, a `[machine] ram` over allocatable is exit 8 with the documented JSON, each legacy table hints once, and each alias hints.
-  tier:     T0
-  verify:   cargo nextest run -p minimald guardrail_assertions
-
 ## Non-goals
 
 - Network enforcement, box names in DNS, port publication, forwarding, ingress, and the VM egress filter: the networking spec, `docs/specs/18-spec-box-networking` (NET), and its epic gominimal/minimal#1437. This spec accepts and passes the `[network]` section (BOX-076 to BOX-084); NET enforces it.
 - Credentialed egress, the node-local egress proxy, `[network.bep]`, `[secrets]` resolution, `min auth`, `min secret`, and `min box audit`: the egress-proxy spec, `docs/specs/24-spec-box-egress-proxy` (BEP), and gominimal/minimal#1501.
 - Behaviour specific to the `agent`, `service`, `build`, and `container-build` types beyond expansion and validation (`service restart`, the agent harness, hermetic builds): the Agent Box epic gominimal/inbox#678 and successors.
-- Nesting, the `local-box` provider, and running `min` inside a box: gominimal/inbox#568.
-- Box Volumes: the epic's stretch story S19, outside its committed set.
+- Nesting, the `local-box` provider, and running `min` inside a box, including `min box spec self`: gominimal/inbox#568.
+- Memory and resource declaration, admission, the per-box cgroup limit, OOM handling and `enforced`/`advisory` reporting (epic story S15): the sibling spec `docs/specs/26-spec-box-resources`.
+- The dash (epic story S14: type, state, provider and host columns; resume, reap and start from the list; the create form over entries): an amendment to `docs/specs/07-spec-min-dash-tui`.
+- The local providers serving the Box Provider API (epic story S16, BPA-013): they wait on gominimal/arch#45 and are specified once it settles transport and authentication.
+- A test-suite requirement per requirement (epic story S18): every requirement's `tier:` and `verify:` lines carry it, and the golden vectors are BOX-145.
+- Box Volumes: the sibling spec `docs/specs/27-spec-box-volumes`.
 - Remote creation, attach, listing, and providers, and any enrolled-host identity: the parked CRA, RHC and Box Provider API epics (gominimal/inbox#668, #669, arch PR #45).
 - Any automatic reaper or retention TTL: gominimal/arch#75.
 - Guest VM sizing and the reserve left to the workstation: gominimal/inbox#698.
@@ -691,11 +586,11 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 **One spec, one codebase.** The epic's surfaces (CLI, daemon, expander, TUI, local provider) live in one codebase, and its four amendments to the architecture of record are one-line changes with no spec process of their own. The alternatives were a sibling spec in the architecture repository, rejected because it would carry four lines under a second prefix, and a sibling in the identity plane, rejected because the un-enrolled path changes nothing there. The amendments are Open questions here and issues on the architecture repository.
 
-**Host-agnostic requirements, exercised on the two local providers.** Every requirement is written for any host a daemon runs on and verified on `local0` and `local-minvmd0`; a remote host inherits them unchanged, which is what makes the local box the remote box. The alternative, naming the local providers in the requirements, was rejected because the remote work would then re-specify the same behaviours.
+**Host-agnostic requirements, exercised on the two local providers.** Every requirement is written for any host a daemon runs on and verified on `local0` and `local-minvmd0`; a remote host inherits them unchanged, which is what makes the local box the remote box. The alternative, naming the local providers in the requirements, was rejected because the remote work would then re-specify the same behaviours. Three exceptions are deliberate: BOX-112 and BOX-147 name the well-known local providers because those names are the behaviour, BOX-002 applies only where the host is a VM, and BOX-140 names `identity.sock` because its absence is what un-enrolled means inside a box.
 
-**The local Box Provider API is bound but not yet verifiable.** BOX-137 to BOX-139 state the obligations BPA-013 places on the built-in providers and carry `tier: none` until the API draft (gominimal/arch#45) settles the transport and authentication a client-built provider uses. Leaving them out as a non-goal was rejected because it would drop the local-provider obligations from the document; writing T0 tests against an undecided transport was rejected as certain rework.
+**The local Box Provider API, resources and the dash moved out on the author's review.** The epic committed all three. The local providers' obligations under the Box Provider API wait on gominimal/arch#45's transport and authentication decision; memory and resource declaration, admission, limits and OOM handling are the sibling spec `docs/specs/26-spec-box-resources`; and the dash is an amendment to `docs/specs/07-spec-min-dash-tui`. Each non-goal names its destination.
 
-**VM-host behaviours run on the VM lane.** Minting the id outside the VM, memory admission against the guest, and the VM host's `pinned` egress exist only with the VM host daemon in the loop, so their tests name the VM lane (NET-107) rather than `tier: none`. The alternative left the VM path unverified.
+**VM-host behaviours run on the VM lane.** Minting the id outside the VM and stopping a VM host exist only with the VM host daemon in the loop, so their tests name the VM lane (NET-107) rather than `tier: none`. The alternative left the VM path unverified.
 
 **Stop states the order, not the duration.** `min box stop` is SIGTERM, a wait, SIGKILL; the length of the wait is the daemon's and is an open question. Fixing ten seconds would have made a test own a number the architecture does not state; a per-entry `stop_grace` key would add schema the architecture lacks.
 
@@ -707,11 +602,11 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 **Expander version skew reports and continues.** The projection digest comparison (BOX-072) is the check that refuses; a version difference is reported so an operator can act, but compatible skews across an upgrade are not blocked.
 
-**The event log and the memory limit are out of reach of in-box root.** Both sit outside the box's mount and cgroup namespaces, so the requirement is stated for every process in the box's namespaces including one running as root inside, and is testable as such. Limiting it to ordinary processes was rejected as a weaker claim than the mechanism already provides.
+**The event log is out of reach of in-box root.** It sits outside the box's mount namespace, so the requirement is stated for every process in the box's namespaces including one running as root inside, and is testable as such. Limiting it to ordinary processes was rejected as a weaker claim than the mechanism already provides.
 
-**Tiers.** Expansion and merge (BOX-048, 064, 065, 142) and type constraints (BOX-059 to 062) are T1 property tests, which constrains the expander and the type resolver to pure functions over in-memory inputs; names and ids (BOX-004, 005, 010, 143) are T1 over operation sequences, which forbids any name-keyed index; the record state machine (BOX-011, 012) and admission arithmetic (BOX-126 to 128) are T2 Kani harnesses, which constrains transitions and the admission decision to pure functions separate from disk and cgroup writes, the shape the daemon's policy harnesses already use. T3 is refused throughout: there is no Lean project, and the surrounding behaviour is not safe sequential Rust.
+**Tiers.** Expansion and merge (BOX-048, 064, 065, 142) and type constraints (BOX-059 to 062) are T1 property tests, which constrains the expander and the type resolver to pure functions over in-memory inputs; names and ids (BOX-004, 005, 010, 143) are T1 over operation sequences, which forbids any name-keyed index; the record state machine (BOX-011, 012) is a T2 Kani harness, which constrains transitions to a pure function separate from disk writes, the shape the daemon's policy harnesses already use. T3 is refused throughout: there is no Lean project, and the surrounding behaviour is not safe sequential Rust.
 
-**Generality:** a second implementation of the daemon, on a second provider or platform, fits: every requirement names the surface (record, spec, projection, grammar, admission) and none names a provider, a kernel feature, or a file path; the identity-plane requirements are written for the un-enrolled case and the enrolled case is the same spec bytes (BOX-142). What breaks if not: a host that cannot delegate a memory controller reports `advisory` rather than failing (BOX-136), and a provider that cannot pin egress reports `none` (BOX-138).
+**Generality:** a second implementation of the daemon, on a second provider or platform, fits: every requirement names the surface (record, spec, projection, grammar), and none names a provider or a file path apart from the exceptions under host-agnostic requirements above; the identity-plane requirements are written for the un-enrolled case and the enrolled case is the same spec bytes (BOX-142). What breaks if not: a host that cannot mint the id outside a VM cannot be a VM host (BOX-002), and a host whose expander disagrees with the client's refuses creation (BOX-072).
 
 ## Security considerations
 
@@ -727,19 +622,18 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **Invariant:** THE SYSTEM SHALL let a Box Type constraint only narrow a spec, never widen it.
   enforced by: constraint intersection at expansion (architecture design principle 9; Policy layers and precedence)
   covered by: BOX-061, BOX-062
-- **Invariant:** THE SYSTEM SHALL keep a box's events stream, and on an `enforced` host its memory limit, unwritable from any process in the box's namespaces.
-  enforced by: the record and the cgroup files live outside the box's mount and cgroup namespaces
-  covered by: BOX-041, BOX-131
+- **Invariant:** THE SYSTEM SHALL keep a box's events stream unwritable from any process in the box's namespaces.
+  enforced by: the record lives outside the box's mount namespace
+  covered by: BOX-041
 - **Invariant:** THE SYSTEM SHALL fail a brokered secret reference on an un-enrolled host with no node-local proxy rather than resolve it by other means.
-  enforced by: the expander's `gatehouse_unenrolled_node` refusal (Gatehouse §6.2)
+  enforced by: minimald's `gatehouse_unenrolled_node` refusal at creation, not the expander, so expansion stays identical across host facts (Gatehouse §6.2; BOX-142)
   covered by: BOX-081
 
 ## Open questions
 
 - [NEEDS CLARIFICATION (MEDIUM): the stop grace duration between SIGTERM and SIGKILL (BOX-013, BOX-103) is unstated in the architecture; the daemon owns it until an architecture line fixes it (gominimal/arch#98).]
 - [NEEDS CLARIFICATION (MEDIUM): the architecture's exit-code table has no row for a task timeout; BOX-037 uses 124 by convention beside 137 for OOM and needs the row added (gominimal/arch#97).]
-- [NEEDS CLARIFICATION (MEDIUM): the architecture's command tree lacks `min box rename` and `min host stop`, its event list lacks `renamed` and `resumed`, `box.toml` lacks `hooks_on_resume`, and it names no box states; BOX-010, BOX-011, BOX-028, BOX-040 and BOX-115 are written to this spec's additions pending one architecture line each (gominimal/arch#98).]
+- [NEEDS CLARIFICATION (MEDIUM): the architecture's command tree lacks `min box rename` and `min host stop`, its event list lacks `renamed`, `resumed` and `detached`, `box.toml` lacks `hooks_on_resume`, and it names no box states; BOX-010, BOX-011, BOX-016, BOX-028, BOX-040 and BOX-115 are written to this spec's additions pending one architecture line each (gominimal/arch#98).]
 - [NEEDS CLARIFICATION (MEDIUM): `box.toml` writes flat `egress_allow_*` keys while NET-060 and BEP-008 bind nested `egress.*`; BOX-076 follows the two merged specs and `box.toml` needs aligning (gominimal/arch#99).]
 - [NEEDS CLARIFICATION (LOW): how the host surfaces `[params]` values to the entrypoint (file, path, format key); BOX-085 accepts and renders only, and `box.toml` says only JSON/YAML/TOML (gominimal/arch#100).]
-- [NEEDS CLARIFICATION (HIGH): the transport and authentication a provider built into the client uses to serve the Box Provider API; BOX-137 to BOX-139 wait on gominimal/arch#45 (comment posted there with the socket-with-file-mode-trust reading and the one-provider-per-daemon naming).]
 - [NEEDS CLARIFICATION (LOW): `[io] exec_enabled` is still marked proposed in the architecture; BOX-105 honours it from the stored spec and follows whatever the architecture rules.]
