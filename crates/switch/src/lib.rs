@@ -41,9 +41,11 @@ pub const DEFAULT_SUBNET: SwitchSubnet = SwitchSubnet {
 /// service claims, so a box published on the host answers there without
 /// colliding with the host's own `127.0.0.1` services.
 ///
-/// The same block the daemon's DNS zone answers published names from
-/// (`minimald::net::dns::RESERVED_LOCAL_RANGE`); defined here so the plan
-/// below and the answerer cannot drift on where published addresses live.
+/// The one definition of the range. The daemon's DNS zone re-exports it as
+/// `minimald::net::dns::RESERVED_LOCAL_RANGE` rather than restating it, so
+/// the plan below and the answerer cannot drift on where published
+/// addresses live: the range the plan publishes from is, by construction,
+/// the range the zone answers.
 pub const RESERVED_LOCAL_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 64, 0, 0), 24);
 
 /// Prefix of the reserved local range slice each switch (one gvproxy) publishes
@@ -428,8 +430,12 @@ impl AddressPlan {
     /// How many switches this plan serves on one host: the reserved local range
     /// holds exactly one slice per switch, so the capacity *is* the slice
     /// count — eight on the default plan.
+    ///
+    /// `const` so a caller can size its own state from it at compile time —
+    /// `minimald`'s per-daemon slice arithmetic derives its wrap-around from
+    /// this rather than restating the prefix.
     #[must_use]
-    pub fn switch_capacity(self) -> usize {
+    pub const fn switch_capacity(self) -> usize {
         1usize << (self.slice_prefix - self.reserved_local_range.1)
     }
 

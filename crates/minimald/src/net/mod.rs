@@ -592,7 +592,10 @@ mod tests {
         );
         // The plan's reserved local range — where those boxes' published
         // addresses come from on the host's loopback — is the same block the
-        // zone's published names answer at (NET-127), so the two cannot drift.
+        // zone's published names answer at (NET-127). One definition now: the
+        // answerer re-exports the switch crate's constant, so this asserts the
+        // plan is built from the range it serves rather than bridging two
+        // constants that could drift.
         assert_eq!(
             plan.reserved_local_range(),
             crate::net::dns::RESERVED_LOCAL_RANGE

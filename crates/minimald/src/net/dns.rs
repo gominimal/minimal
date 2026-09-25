@@ -79,7 +79,11 @@ const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// (NET-010's host-global allocation). Kept as a pair rather than a CIDR type
 /// — the only question asked of it is membership, which
 /// [`is_host_answerable`] answers with octet math.
-pub const RESERVED_LOCAL_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 64, 0, 0), 24);
+///
+/// Re-exported from the `switch` crate, which owns the range — the default
+/// address plan publishes boxes from it — so the zone's answers and the
+/// published addresses are the one definition and cannot drift.
+pub use ::switch::RESERVED_LOCAL_RANGE;
 
 /// The TTL every box-zone answer carries, and the ceiling on it (NET-126):
 /// 15 s, short enough that a box published a moment ago is found without
