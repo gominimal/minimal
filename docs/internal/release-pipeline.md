@@ -324,6 +324,29 @@ Retrying a publish, per channel:
   full re-run re-opens the approval gate and then fails at `publish-release`,
   which refuses an already-published release.
 
+**The stable package switch.** `vars.PUBLISH_STABLE_PACKAGES` — a repository
+variable, absent by default, so **off** — gates every path by which a *stable*
+release hands packages to users:
+
+- `publish-packages.yml`'s `publish-channel-stable`: the AUR `minimal-bin` and
+  the `gominimal/minimal` tap's `minimal` formula;
+- `release.yml`'s attachment of the `.deb`/`.rpm`/`.apk` to the published
+  Release, and its staging of `versions/<semver>/pkg/`, which the infra repo
+  turns into the apt/dnf/apk trees users install from.
+
+Off is the point: stable publishing must not start until the channel packages
+have been proven on unstable/nightly, because publishing a package nobody has
+installed yet is how we break users. The packages are still **built and
+smoked** on every release (`smoke-packages`); they are just not shipped. Set the
+variable to `true` to turn the stable paths on — no code change.
+
+A stable promote is otherwise unaffected: it still publishes the draft Release
+(which creates the tag) and still moves the `stable` pointer, so `minimal
+0.6.0` reaches `curl | sh` users immediately. Only the packages wait.
+
+Channel publishing is deliberately **not** gated — it is where the packages get
+proven.
+
 ## prune-releases.yml: GitHub Release housekeeping
 
 [`.github/workflows/prune-releases.yml`](../../.github/workflows/prune-releases.yml)

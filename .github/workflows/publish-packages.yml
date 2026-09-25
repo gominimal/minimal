@@ -145,10 +145,18 @@ jobs:
         #
         # tolerate is NOT set (defaults false): a failed stable publish must fail
         # loudly. Retry it with `gh workflow run publish-packages.yml -f
-        # version=X.Y.Z`; the publishers are
-        # idempotent. See docs/internal/release-pipeline.md.
+        # version=X.Y.Z`; the publishers are idempotent. See
+        # docs/internal/release-pipeline.md.
+        #
+        # OFF until `vars.PUBLISH_STABLE_PACKAGES` is 'true'. Stable package
+        # publishing must not start until the channel packages have been proven
+        # on unstable/nightly: publishing a package nobody has installed is how
+        # we break users. The switch is a repo variable so it can be flipped the
+        # moment the channel packages are validated, with no code change. A
+        # stable promote still publishes the draft Release (creating the tag)
+        # and still moves the `stable` pointer — only the packages wait.
         needs: publish-release
-        if: ${{ needs.publish-release.outputs.semver != '' }}
+        if: ${{ needs.publish-release.outputs.semver != '' && vars.PUBLISH_STABLE_PACKAGES == 'true' }}
         permissions:
             contents: read
         uses: ./.github/workflows/publish-channel.yml

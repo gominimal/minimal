@@ -963,11 +963,23 @@ jobs:
                   RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
                   NOTES: ${{ runner.temp }}/notes.md
                   DIST: ${{ runner.temp }}/dist
+                  PUBLISH_STABLE_PACKAGES: ${{ vars.PUBLISH_STABLE_PACKAGES }}
               run: |
                   set -euo pipefail
                   tar -C artifacts/completions -czf artifacts/completions.tar.gz .
                   if [ -n "$RELEASE_VERSION" ]; then
-                    cp "$DIST"/* artifacts/
+                    # A versioned release ships its .deb/.rpm/.apk to users by
+                    # attaching them here, so this is stable package publishing
+                    # and it obeys the same switch as the AUR/Homebrew
+                    # publishers (see publish-packages.yml). The packages are
+                    # still BUILT above and smoked by smoke-packages either way
+                    # — they are simply not handed out until the channel
+                    # packages have been proven on unstable/nightly.
+                    if [ "$PUBLISH_STABLE_PACKAGES" = "true" ]; then
+                      cp "$DIST"/* artifacts/
+                    else
+                      echo "::notice::PUBLISH_STABLE_PACKAGES is not 'true' — attaching no distro packages to $REL_TAG (they are built and smoked, just not shipped)"
+                    fi
                   fi
                   if [ "$DRY_RUN" = "true" ]; then
                     echo "::notice::dry_run — assembled release artifacts but skipping GitHub release create"
@@ -1067,14 +1079,24 @@ jobs:
               # versioned build that failed after staging.
               env:
                   VERSION: ${{ needs.assert-version.outputs.version }}
+                  RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
                   RESTAGE: ${{ inputs.restage }}
                   NOTES: ${{ runner.temp }}/notes/notes.md
                   DIST: ${{ runner.temp }}/dist
+                  PUBLISH_STABLE_PACKAGES: ${{ vars.PUBLISH_STABLE_PACKAGES }}
               run: |
                   set -euo pipefail
                   args=(--artifacts-dir artifacts --version "$VERSION" --bucket gs://minimal-one)
                   args+=(--extra scripts/install.sh --extra "$NOTES" --extra "$RUNNER_TEMP/version")
-                  args+=(--pkg-dir "$DIST")
+                  # A VERSIONED row's pkg/ is what the infra repo turns into the
+                  # apt/dnf/apk trees users install from, so staging it is stable
+                  # package publishing and obeys the same switch as the AUR and
+                  # Homebrew publishers. A sha (channel) row's pkg/ is unaffected.
+                  if [ -n "$RELEASE_VERSION" ] && [ "$PUBLISH_STABLE_PACKAGES" != "true" ]; then
+                    echo "::notice::PUBLISH_STABLE_PACKAGES is not 'true' — not staging versions/$VERSION/pkg/ (no apt/dnf/apk repo trees for this release)"
+                  else
+                    args+=(--pkg-dir "$DIST")
+                  fi
                   [ "$RESTAGE" != "true" ] || args+=(--restage)
                   scripts/stage-release.sh "${args[@]}"
 
