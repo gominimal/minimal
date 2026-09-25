@@ -1,15 +1,13 @@
 use futures::StreamExt as _;
-#[cfg(feature = "networking-proxy")]
-use minimald_rpc::IssueClientCertResponse;
 use minimald_rpc::{
     AbortSession, AbortSessionResponse, CleanCacheRequest, CleanCacheUpdate, CreateSession,
     DestroySession, DestroySessionResponse, Errorable, FinalizeSession, FinalizeSessionResponse,
     GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
     GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen, GetVersion,
-    GetVersionResponse, IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry,
-    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
-    RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
-    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
+    GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
+    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool, SessionDelta,
+    SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest, ShutdownResponse,
+    SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -128,7 +126,6 @@ async fn serve_list_sessions(
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
-                mtls_proxy_unavailable: s.mtls_unavailable().await,
                 hostname_proxy_port: s.hostname_proxy_port().await,
                 resource_pool,
                 // `git` is left `None`: the daemon cannot probe it — on
@@ -294,7 +291,6 @@ async fn serve_create_session(
                         id,
                         daemon_version: Some(OWN_VERSION.to_string()),
                         hostname_routing_unavailable: s.proxy_unavailable().await,
-                        mtls_proxy_unavailable: s.mtls_unavailable().await,
                         hostname_proxy_port: s.hostname_proxy_port().await,
                     })
                 }
@@ -724,48 +720,6 @@ async fn serve_get_session_screen(
                 None => Errorable::Err {
                     error: "session is not active".to_string(),
                 },
-            })
-        })
-        .await
-}
-
-/// Signs a fresh client certificate for the `minimal login` flow and returns
-/// the cert PEM, key PEM, and CA cert PEM so the client can authenticate to
-/// the HTTPS reverse proxy. Only compiled when the `networking-proxy` feature
-/// is enabled.
-#[cfg(feature = "networking-proxy")]
-async fn serve_issue_client_cert(
-    s: ServerStateHandle,
-    c: RuChannel<Msg>,
-) -> Result<(), ConnectionError> {
-    IssueClientCert
-        .handle_channel(c, async |req: IssueClientCertRequest| {
-            let ca = s.cert_authority().await;
-            match ca.sign_client_cert(&req.subject_cn) {
-                Ok((cert_pem, key_pem)) => Ok(Errorable::Ok(IssueClientCertResponse {
-                    cert_pem,
-                    key_pem,
-                    ca_cert_pem: ca.ca_cert_pem.clone(),
-                })),
-                Err(e) => Ok(Errorable::Err {
-                    error: e.to_string(),
-                }),
-            }
-        })
-        .await
-}
-
-/// Replies to an `IssueClientCert` request with a readable error when the
-/// `networking-proxy` feature is compiled out, so the client sees "feature not
-/// enabled" instead of an opaque EOF/channel-close on the response stream.
-#[cfg(not(feature = "networking-proxy"))]
-async fn serve_issue_client_cert_unavailable(c: RuChannel<Msg>) -> Result<(), ConnectionError> {
-    IssueClientCert
-        .handle_channel(c, async |_req: IssueClientCertRequest| {
-            Ok(Errorable::Err {
-                error: "minimald was built without the networking-proxy feature; \
-                        client certificate issuance is unavailable"
-                    .to_string(),
             })
         })
         .await
@@ -1629,8 +1583,7 @@ pub async fn handle_ssh_rpc(
         | STREAM_WORKSPACE_PATCHES
         | STREAM_WORKSPACE_HOOK_SCRIPTS
         | minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
-        | minimald_rpc::CLEAN_CACHE_SUBSYSTEM
-        | IssueClientCert::NAME => {
+        | minimald_rpc::CLEAN_CACHE_SUBSYSTEM => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
                 None => {
@@ -1718,19 +1671,6 @@ pub async fn handle_ssh_rpc(
             serve!(crate::diag::serve_stream_diag_bundle(s, config, channel))
         }
         minimald_rpc::CLEAN_CACHE_SUBSYSTEM => serve!(serve_clean_cache(s, channel)),
-        IssueClientCert::NAME => {
-            #[cfg(feature = "networking-proxy")]
-            serve!(serve_issue_client_cert(s, channel));
-            #[cfg(not(feature = "networking-proxy"))]
-            {
-                tracing::warn!(
-                    "IssueClientCert RPC called but the networking-proxy \
-                     feature is not enabled; replying with an error"
-                );
-                drop(s);
-                serve!(serve_issue_client_cert_unavailable(channel));
-            }
-        }
         _ => unreachable!(),
     };
 
@@ -2685,9 +2625,9 @@ mod tests {
         assert_eq!(created.daemon_version.as_deref(), Some(OWN_VERSION));
     }
 
-    /// The two read RPCs the attach / exec / setup-zed / ssh-forward paths
-    /// gate on must report the daemon's build, or those paths have nothing to
-    /// assert against and would have to spend a `GetVersion` to find out.
+    /// The two read RPCs the attach / exec / setup-zed paths gate on must
+    /// report the daemon's build, or those paths have nothing to assert
+    /// against and would have to spend a `GetVersion` to find out.
     #[tokio::test]
     async fn the_read_rpcs_report_the_daemon_build() {
         let server = TestServer::new().await;

@@ -245,18 +245,6 @@ pub struct ListSessionsResponse {
     /// daemon log, and the user is at a terminal watching curl fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_routing_unavailable: Option<String>,
-    /// Why the mTLS reverse proxy (`:7655`) is not serving, when it is not.
-    ///
-    /// Separate from [`Self::hostname_routing_unavailable`] because they are
-    /// different services with different consumers: losing `:7654` costs every
-    /// session its hostname, losing `:7655` costs whatever terminates TLS
-    /// against it. Reporting them through one field would tell a user their
-    /// hostnames are broken when they are not.
-    ///
-    /// Always `None` from a daemon built without the `networking-proxy`
-    /// feature, which is the default — there is no proxy to be unavailable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mtls_proxy_unavailable: Option<String>,
     /// The port the host-side hostname proxy is serving on, so a client can
     /// tell a user where `<name>.min.internal` resolves from. The daemon
     /// listens on the port it was configured with, or on an OS-selected
@@ -454,15 +442,6 @@ pub struct CreateSessionResponse {
     /// looking healthy either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_routing_unavailable: Option<String>,
-    /// Why the mTLS reverse proxy is not serving, when it is not — see
-    /// [`ListSessionsResponse::mtls_proxy_unavailable`].
-    ///
-    /// Here for the same reason as the field above it: both proxies are
-    /// daemon-wide rather than session-scoped, so the thing that decides
-    /// whether activation should mention them is whether the person
-    /// activating is about to depend on one, and that is not ours to know.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mtls_proxy_unavailable: Option<String>,
     /// The port the host-side hostname proxy is serving on — see
     /// [`ListSessionsResponse::hostname_proxy_port`].
     ///
@@ -860,43 +839,6 @@ impl OneshotSshRpc for DynamicPortMap {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "DynamicPortMap");
     type Request<'a> = DynamicPortMapRequest;
     type Response = Errorable<DynamicPortMapResponse>;
-}
-
-// ---------------------------------------------------------------------------
-// mTLS client certificate issuance (R4.4 / `minimal login`).
-// ---------------------------------------------------------------------------
-
-/// An RPC that signs and returns a fresh client certificate for use with the
-/// HTTPS reverse proxy's mTLS authentication (R4.4). The caller supplies a
-/// subject common name; the daemon generates a key pair, signs the certificate
-/// with its internal CA, and returns PEM-encoded certificate and private key.
-/// The CA certificate PEM is also returned so the client can add it to
-/// its trust store.
-pub struct IssueClientCert;
-
-/// Request for the [`IssueClientCert`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IssueClientCertRequest {
-    /// Subject common name for the client certificate (e.g. the OS username).
-    pub subject_cn: String,
-}
-
-/// Response for the [`IssueClientCert`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct IssueClientCertResponse {
-    /// PEM-encoded client certificate signed by the daemon's CA.
-    pub cert_pem: String,
-    /// PEM-encoded PKCS#8 private key matching the certificate.
-    pub key_pem: String,
-    /// PEM-encoded CA certificate, so the client can trust the HTTPS proxy's
-    /// server certificate.
-    pub ca_cert_pem: String,
-}
-
-impl OneshotSshRpc for IssueClientCert {
-    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "IssueClientCert");
-    type Request<'a> = IssueClientCertRequest;
-    type Response = Errorable<IssueClientCertResponse>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1464,7 +1406,6 @@ mod tests {
             id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: None,
-            mtls_proxy_unavailable: None,
             hostname_proxy_port: None,
         };
         assert_eq!(round_trip(&resp), resp);
@@ -1480,7 +1421,6 @@ mod tests {
             serde_json_lenient::from_str(r#"{"sessions":[],"daemon_version":"0.5.0"}"#)
                 .expect("a pre-field ListSessions reply must still decode");
         assert!(list.hostname_routing_unavailable.is_none());
-        assert!(list.mtls_proxy_unavailable.is_none());
         assert!(list.hostname_proxy_port.is_none());
 
         let create: Errorable<CreateSessionResponse> = serde_json_lenient::from_str(
@@ -1490,7 +1430,6 @@ mod tests {
         match create {
             Errorable::Ok(c) => {
                 assert!(c.hostname_routing_unavailable.is_none());
-                assert!(c.mtls_proxy_unavailable.is_none());
                 assert!(c.hostname_proxy_port.is_none());
             }
             Errorable::Err { error } => panic!("expected Ok, got {error}"),
@@ -1505,7 +1444,6 @@ mod tests {
         let resp = ListSessionsResponse {
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: None,
-            mtls_proxy_unavailable: None,
             hostname_proxy_port: None,
             resource_pool: None,
             sessions: vec![],
@@ -1514,10 +1452,6 @@ mod tests {
         assert!(
             !json.contains("hostname_routing_unavailable"),
             "healthy reply should omit the field, got {json}"
-        );
-        assert!(
-            !json.contains("mtls_proxy_unavailable"),
-            "healthy reply should omit the mTLS field too, got {json}"
         );
         assert!(
             !json.contains("hostname_proxy_port"),
