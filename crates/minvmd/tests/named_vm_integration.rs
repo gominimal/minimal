@@ -333,11 +333,21 @@ fn named_vm_under_per_name_subdirectory() {
         "the named VM must not act on the provider dir itself"
     );
 
-    // A name that is not a single path component never resolves anywhere: each
-    // of these would otherwise reach outside the provider dir. In a fresh
-    // state dir, a rejected name creates nothing at all.
+    // A name outside the allowlist never resolves anywhere: each of these
+    // would otherwise reach outside the provider dir, or shadow the provider
+    // dir's own entries (`guest`). In a fresh state dir, a rejected name
+    // creates nothing at all.
     let fresh = tempfile::tempdir().unwrap();
-    for bad in ["a/b", "..", "."] {
+    let over_long = "a".repeat(25);
+    for bad in [
+        "a/b",
+        "..",
+        ".",
+        "a b",
+        "Alpha",
+        "guest",
+        over_long.as_str(),
+    ] {
         let rejected = run_minvmd(fresh.path(), &["--vm", bad, "status"]);
         assert_ne!(
             rejected.status.code(),
@@ -350,6 +360,20 @@ fn named_vm_under_per_name_subdirectory() {
             rejected.output()
         );
     }
+    // A leading `-` is refused by the allowlist too. Clap reads a separate
+    // `--vm <name>` token starting with `-` as flags, so the value form is
+    // the one that reaches the validator.
+    let rejected = run_minvmd(fresh.path(), &["--vm=-alpha", "status"]);
+    assert_ne!(
+        rejected.status.code(),
+        Some(0),
+        "`--vm -alpha` must be rejected"
+    );
+    assert!(
+        rejected.stderr.contains("invalid VM name"),
+        "the rejection must name the problem: {}",
+        rejected.output()
+    );
     assert!(
         !fresh.path().join("providers").exists(),
         "a rejected name must not create any directory"

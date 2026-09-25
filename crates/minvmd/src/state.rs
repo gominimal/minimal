@@ -55,13 +55,13 @@ pub fn state_dir_override() -> Option<&'static DaemonAbsPath> {
 
 /// Set the `--vm <NAME>` name of the VM this process serves (NET-052). First
 /// call wins; must be called before any path resolution, so every path the
-/// process derives already names the right VM. A name that is not a single
-/// path component ([`paths::validate_vm_name`]) is rejected here rather than
-/// resolved into a directory outside the provider dir.
+/// process derives already names the right VM. A name outside the allowlist
+/// ([`paths::validate_vm_name`]) is rejected here rather than resolved into a
+/// directory outside the provider dir.
 ///
 /// # Errors
 ///
-/// [`paths::Error::InvalidVmName`] when `vm` is not a single path component.
+/// [`paths::Error::InvalidVmName`] when `vm` breaks the naming rule.
 pub fn set_vm_name(vm: &str) -> Result<(), paths::Error> {
     paths::validate_vm_name(vm)?;
     let _ = VM_NAME.set(vm.to_owned());
@@ -95,9 +95,9 @@ pub fn state_base_dir() -> DaemonAbsPath {
 ///
 /// # Panics
 ///
-/// Panics when `vm` is not a single path component. The CLI validates the
-/// name at parse time ([`set_vm_name`]) before any path resolution, so this
-/// is a caller bug, never user input.
+/// Panics when `vm` breaks the naming rule ([`paths::validate_vm_name`]).
+/// The CLI validates the name at parse time ([`set_vm_name`]) before any
+/// path resolution, so this is a caller bug, never user input.
 pub fn provider_dir_for(base: &DaemonAbsPath, vm: &str) -> PathBuf {
     paths::provider_instance_dir_named(base, paths::ProviderKind::Minvmd, 0, vm)
         .expect("VM name is validated at parse time")

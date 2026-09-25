@@ -208,16 +208,43 @@ pub fn provider_instance_dir(
 /// rather than a per-name subdirectory.
 pub const DEFAULT_VM_NAME: &str = "default";
 
-/// Validate a VM name (`--vm <NAME>`): it names a directory, so it must be a
-/// single path component — non-empty, no `/`, not `.` or `..`. That is the
-/// whole guarantee a name needs: it can only select a subdirectory *under*
-/// the provider dir, never escape it.
+/// The longest VM name [`validate_vm_name`] accepts. The cap keeps a named
+/// VM's socket paths inside the platform's unix-socket budget at the default
+/// state dir: the 104-byte macOS `sun_path` leaves about this much for the
+/// name under `.../providers/local-minvmd0/<name>/gvproxy-switch.sock`.
+const MAX_VM_NAME_BYTES: usize = 24;
+
+/// The VM name reserved for the in-guest diagnostic bundle's directory inside
+/// a provider dir (`providers/<provider>/guest/`, see the `min` diag
+/// collector): a VM named `guest` would collide with it and be invisible to
+/// every diagnostic listing.
+const RESERVED_VM_NAME: &str = "guest";
+
+/// Whether one byte of a VM name is inside the allowed character set.
+fn vm_name_byte_allowed(b: u8) -> bool {
+    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'
+}
+
+/// Validate a VM name (`--vm <NAME>`): it names a directory under the provider
+/// dir, so the rule is an allowlist, not a sanitiser — ASCII lowercase
+/// letters, digits and `-`, at most [`MAX_VM_NAME_BYTES`] bytes, starting
+/// with a letter or digit, and never the reserved [`RESERVED_VM_NAME`]. A name
+/// that fits can only select a subdirectory *under* the provider dir: it can
+/// never escape it, and it can never shadow one of the provider dir's own
+/// files (`ssh.sock`, the payload `guest/` dir).
 ///
 /// # Errors
 ///
-/// [`Error::InvalidVmName`] when `vm` is not a single path component.
+/// [`Error::InvalidVmName`] when `vm` breaks any rule above; the error's
+/// message states the whole rule.
 pub fn validate_vm_name(vm: &str) -> Result<(), Error> {
-    if vm.is_empty() || vm == "." || vm == ".." || vm.contains('/') {
+    let bytes = vm.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > MAX_VM_NAME_BYTES
+        || bytes[0] == b'-'
+        || vm == RESERVED_VM_NAME
+        || !bytes.iter().all(|b| vm_name_byte_allowed(*b))
+    {
         return Err(Error::InvalidVmName(vm.to_owned()));
     }
     Ok(())
@@ -234,7 +261,8 @@ pub fn validate_vm_name(vm: &str) -> Result<(), Error> {
 ///
 /// # Errors
 ///
-/// [`Error::InvalidVmName`] when `vm` is not a single path component.
+/// [`Error::InvalidVmName`] when `vm` breaks the naming rule (see
+/// [`validate_vm_name`]).
 pub fn provider_instance_dir_named(
     state_dir: &DaemonAbsPath,
     kind: ProviderKind,
@@ -505,10 +533,11 @@ pub enum Error {
     /// re-validate.
     #[error("path contains a `..` traversal component: {0}")]
     ContainsParentDir(Utf8PathBuf),
-    /// A VM name was not a single path component (empty, contained `/`, or
-    /// was `.`/`..`), so it cannot name a per-VM subdirectory.
+    /// A VM name broke the naming rule, so it cannot name a per-VM
+    /// subdirectory. The message states the whole rule so the rejection
+    /// points at what a valid name is.
     #[error(
-        "invalid VM name `{0}`: must be a single non-empty path component without `/` (`..` and `.` are not names)"
+        "invalid VM name `{0}`: names are at most 24 bytes of ASCII lowercase letters, digits and `-`, start with a letter or digit, and `guest` is reserved"
     )]
     InvalidVmName(String),
 }
@@ -1929,8 +1958,9 @@ mod tests {
 
     /// A named VM's provider dir nests under a per-name subdirectory
     /// (NET-054); the default VM's is the provider dir itself, unchanged
-    /// (NET-053); and a name that is not a single path component is rejected
-    /// rather than resolved somewhere outside the provider dir.
+    /// (NET-053); and a name outside the allowlist is rejected rather than
+    /// resolved somewhere outside the provider dir — one from every class
+    /// the allowlist exists to catch.
     #[test]
     fn provider_instance_dir_accepts_a_name() {
         let state = DaemonAbsPath::try_new("/state/minimal").unwrap();
@@ -1956,12 +1986,47 @@ mod tests {
             provider_instance_dir(&state, ProviderKind::Minimald, 2).as_str(),
         );
 
-        // A name that is not a single path component must not resolve at all:
-        // each of these would otherwise escape the provider dir.
-        for bad in ["", ".", "..", "a/b", "../sibling"] {
+        // The length cap is inclusive: 24 bytes still resolves.
+        let capped = "a".repeat(24);
+        assert!(
+            provider_instance_dir_named(&state, ProviderKind::Minvmd, 0, &capped).is_ok(),
+            "a 24-byte name is at the cap, not over it"
+        );
+
+        // Rejected names, one from every class: not a single path component
+        // (empty, `.`, `..`, embedded `/`), outside the character set
+        // (whitespace, uppercase, the `.` in `ssh.sock`), a leading `-`,
+        // over the cap, and the reserved `guest` (which would shadow the
+        // in-guest diag bundle's directory).
+        let bad_names: Vec<String> = [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "../sibling",
+            "a b",
+            "Alpha",
+            "-alpha",
+            "ssh.sock",
+            "guest",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(std::iter::once("a".repeat(25)))
+        .collect();
+        for bad in &bad_names {
             let err = provider_instance_dir_named(&state, ProviderKind::Minvmd, 0, bad)
-                .expect_err("a non-component name must be rejected");
-            assert_eq!(err, Error::InvalidVmName(bad.to_owned()));
+                .expect_err("an invalid VM name must be rejected");
+            assert_eq!(err, Error::InvalidVmName(bad.clone()));
+        }
+
+        // And the rejection points at the rule a valid name has to fit.
+        let rule = Error::InvalidVmName(String::new()).to_string();
+        for expected in ["24 bytes", "lowercase", "letter or digit", "`guest`"] {
+            assert!(
+                rule.contains(expected),
+                "the rejection must state the rule, missing {expected:?}: {rule}"
+            );
         }
     }
 

@@ -30,13 +30,14 @@ static VM_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Set the process-wide VM name (`--vm <NAME>`) so every provider dir this
 /// process resolves names the same VM (NET-052). First call wins; must be
-/// called at command dispatch, before any path resolution. A name that is not
-/// a single path component is rejected here rather than resolved to a
-/// directory outside the provider dir.
+/// called at command dispatch, before any path resolution. A name outside
+/// the allowlist is rejected here rather than resolved to a directory outside
+/// the provider dir.
 ///
 /// # Errors
 ///
-/// [`paths::Error::InvalidVmName`] when `vm` is not a single path component.
+/// [`paths::Error::InvalidVmName`] when `vm` breaks the naming rule
+/// ([`paths::validate_vm_name`]).
 pub fn set_vm_name(vm: &str) -> Result<(), paths::Error> {
     paths::validate_vm_name(vm)?;
     let _ = VM_NAME.set(vm.to_owned());
@@ -1124,12 +1125,16 @@ pub fn resolve_provider_dir(
 /// subdirectory of the provider dir (NET-052/NET-054):
 /// `<state dir>/providers/local-minvmd0/<name>`; the default VM keeps the
 /// provider dir itself (NET-053). The native `minimald` backend hosts no VMs,
-/// so a name selects nothing there and the base provider dir is returned.
+/// so a named VM is an error there rather than a silent fall-back to the base
+/// provider dir — a `--vm` that resolves to the default daemon's directory
+/// would mean a different VM than the one asked for.
 ///
 /// # Errors
 ///
-/// [`std::io::Error`] with [`paths::Error::InvalidVmName`] when `vm` is not a
-/// single path component, or when `minimal_dir_override` is not usable.
+/// [`std::io::Error`] with [`paths::Error::InvalidVmName`] when `vm` breaks
+/// the naming rule, with a "named VMs need the minvmd provider" message when
+/// the backend is native `minimald`, or when `minimal_dir_override` is not
+/// usable.
 pub fn resolve_provider_dir_named(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
@@ -1137,6 +1142,12 @@ pub fn resolve_provider_dir_named(
 ) -> std::io::Result<std::path::PathBuf> {
     let base = resolve_state_base(minimal_dir_override)?;
     let kind = client_provider_kind(use_minvmd);
+    if kind != paths::ProviderKind::Minvmd && vm != paths::DEFAULT_VM_NAME {
+        return Err(std::io::Error::other(
+            "named VMs need the minvmd provider (`--provider local-minvmd`); \
+             the native local-minimald backend hosts no VMs",
+        ));
+    }
     let dir = if kind == paths::ProviderKind::Minvmd {
         paths::provider_instance_dir_named(&base, kind, 0, vm).map_err(std::io::Error::other)?
     } else {
@@ -1393,24 +1404,52 @@ mod tests {
         }
     }
 
-    /// The native `minimald` backend hosts no VMs: a name must select nothing
-    /// there, so the base provider dir keeps serving the single daemon.
+    /// The native `minimald` backend hosts no VMs, so a named VM must be
+    /// refused there rather than silently resolved to the base provider dir:
+    /// `min --vm alpha` against the native backend would otherwise talk to
+    /// the default daemon while claiming to talk to alpha. The default VM
+    /// still resolves — it is the only VM that backend has.
+    ///
+    /// Linux-only: `client_provider_kind` forces Minvmd on macOS, so a
+    /// `false` there is not the native backend.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn native_backend_ignores_the_vm_name() {
-        let dir =
+    fn native_backend_refuses_a_named_vm() {
+        let err =
             super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), false, "alpha")
-                .unwrap();
+                .expect_err("a named VM on the native backend must be refused");
+        assert!(
+            err.to_string()
+                .contains("named VMs need the minvmd provider"),
+            "the refusal must say what a named VM needs: {err}"
+        );
+
         assert_eq!(
-            dir,
+            super::resolve_provider_dir_named(
+                Some(Path::new("/tmp/minimal-test")),
+                false,
+                paths::DEFAULT_VM_NAME,
+            )
+            .unwrap(),
             Path::new("/tmp/minimal-test/providers/local-minimald0")
         );
     }
 
-    /// A VM name that is not a single path component must be refused, not
-    /// resolved to a directory outside the provider dir.
+    /// A VM name outside the allowlist must be refused, not resolved to a
+    /// directory outside the provider dir; the refusal states the rule.
     #[test]
-    fn vm_name_must_be_a_single_path_component() {
-        for name in ["", ".", "..", "a/b", "../sibling"] {
+    fn vm_name_must_fit_the_allowlist() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "../sibling",
+            "a b",
+            "Alpha",
+            "-alpha",
+            "guest",
+        ] {
             let err =
                 super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), true, name)
                     .unwrap_err();
@@ -1423,21 +1462,41 @@ mod tests {
     }
 
     /// `--vm` published at dispatch must steer every default-arg resolve this
-    /// process makes (NET-052). Nextest runs each test in its own process, so
-    /// setting the global here cannot leak into the default-VM tests above.
+    /// process makes (NET-052). The global is process-wide and first-call-wins,
+    /// so the assertion runs in a spawned copy of this test binary: under
+    /// plain `cargo test` the crate's tests share one process, and a global
+    /// set in this test would leak into the default-VM tests above (nextest
+    /// isolates per test, but the crate must pass under both).
     #[test]
     fn set_vm_name_steers_the_default_resolvers() {
-        super::set_vm_name("alpha").unwrap();
-        assert_eq!(super::vm_name(), "alpha");
-        let dir = resolve_provider_dir(Some(Path::new("/tmp/minimal-test")), true).unwrap();
-        assert_eq!(
-            dir,
-            Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha")
-        );
-        let sock = resolve_socket_path(Some(Path::new("/tmp/minimal-test")), true).unwrap();
-        assert_eq!(
-            sock,
-            Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha/ssh.sock")
+        const CHILD: &str = "MINIMAL_CLIENT_VM_STEER_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // The child, whose process-global starts unset: the assertion.
+            super::set_vm_name("alpha").unwrap();
+            assert_eq!(super::vm_name(), "alpha");
+            let dir = resolve_provider_dir(Some(Path::new("/tmp/minimal-test")), true).unwrap();
+            assert_eq!(
+                dir,
+                Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha")
+            );
+            let sock = resolve_socket_path(Some(Path::new("/tmp/minimal-test")), true).unwrap();
+            assert_eq!(
+                sock,
+                Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha/ssh.sock")
+            );
+            return;
+        }
+        // The parent: re-run just this test in a child process carrying the
+        // marker, so the global is set — and stays — in the child alone.
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("set_vm_name_steers_the_default_resolvers")
+            .env(CHILD, "1")
+            .output()
+            .expect("spawning the test binary for the steering assertion");
+        assert!(
+            out.status.success(),
+            "the steering assertion failed in the child:\n{}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 

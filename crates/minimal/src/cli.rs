@@ -421,8 +421,9 @@ pub struct GlobalArgs {
     ///
     /// A named VM keeps its own state directory, socket, and in-VM daemon
     /// under a per-name subdirectory of the provider dir, so several VMs can
-    /// run side by side on one host. No effect on the native `local-minimald`
-    /// backend, which hosts no VMs, and no effect on the default VM's paths
+    /// run side by side on one host. Refused on the native `local-minimald`
+    /// backend, which hosts no VMs — named VMs need
+    /// `--provider local-minvmd` — and no effect on the default VM's paths
     /// when the name is `default` or omitted.
     #[arg(long, global = true, value_name = "NAME")]
     pub vm: Option<String>,
@@ -442,7 +443,8 @@ impl GlobalArgs {
     ///
     /// # Errors
     ///
-    /// [`anyhow::Error`] when the name is not a single path component.
+    /// [`anyhow::Error`] when the name breaks the naming rule
+    /// ([`paths::validate_vm_name`]).
     pub fn publish_vm_name(&self) -> anyhow::Result<()> {
         match &self.vm {
             Some(vm) => {

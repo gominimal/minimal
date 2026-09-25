@@ -570,11 +570,12 @@ pub async fn provider_dirs(state: &Path) -> Result<Vec<(String, PathBuf)>, std::
 }
 
 /// The named VMs under one minvmd provider dir, as
-/// (`<provider>/<vm>`, state dir) entries. A subdirectory is a VM unless it is
-/// the guest bootstrap payload or not a valid VM name — an unnamed directory a
-/// tool left behind must not be reported as a VM. An unreadable provider dir
-/// yields no VMs rather than failing the whole listing: the provider entry
-/// above still says what it holds.
+/// (`<provider>/<vm>`, state dir) entries. A subdirectory is a VM only when
+/// its name is a valid VM name — an unnamed directory a tool left behind must
+/// not be reported as a VM, and the in-guest diagnostic bundle's `guest/`
+/// directory is among the names the validator reserves, so it never reads as
+/// a VM either. An unreadable provider dir yields no VMs rather than failing
+/// the whole listing: the provider entry above still says what it holds.
 async fn named_vms(provider: &str, dir: &Path) -> Vec<(String, PathBuf)> {
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
@@ -588,7 +589,7 @@ async fn named_vms(provider: &str, dir: &Path) -> Vec<(String, PathBuf)> {
         let Some(vm) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if vm == "guest" || paths::validate_vm_name(&vm).is_err() {
+        if paths::validate_vm_name(&vm).is_err() {
             continue;
         }
         vms.push((format!("{provider}/{vm}"), entry.path()));
