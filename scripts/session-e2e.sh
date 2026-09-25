@@ -826,6 +826,7 @@ proof_fresh_install_own_ip_ingress_publishes_loopback() {
 local fi_arch fi_gvproxy fi_root fi_home fi_bucket fi_stubbin fi_seed fi_out
 local fi_h_minimald fi_h_minimal fi_h_gvmin fi_sid fi_sid2 fi_log fi_rec
 local fi_ready fi_answered fi_status fi_bucket_host fi_hport fi_portpat
+local fi_lane_minimald fi_restore_profile
 if [ -n "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
   echo "fresh-install loopback publish SKIPPED (VM-backed lane: the pair this proof installs lives host-side)"
   return 0
@@ -866,6 +867,15 @@ if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$fi_hport/" 2>/dev/null;
   echo "127.0.0.1:8080 is already answering on this host — publishing the mapping on the fallback port $fi_hport instead (the box still serves its internal 8080)"
 fi
 fi_portpat="\"port\":$fi_hport"
+
+# The daemon THIS lane was driving, resolved before the proof swaps PATH and
+# HOME over to the installed pair. On a host that restricts unprivileged user
+# namespaces (stock Ubuntu 24.04+) the harness's start-up block attached the
+# minimald AppArmor profile to this binary, and attaching it to anything else
+# REPLACES the recorded set — so the re-attach inside the proof must name this
+# one too, or the proofs that follow would lose the profile and with it every
+# sandbox they fork.
+fi_lane_minimald="$(command -v minimald 2>/dev/null || true)"
 
 # The switch binary the fresh install will ship. `just e2e` and a dev who ran
 # `just gvproxy` already have one; otherwise fetch the pinned release — the
@@ -975,6 +985,44 @@ if (
     echo "::error::the fresh install did not ship an executable gvproxy-min"
     exit 1
   }
+
+  # A host that restricts unprivileged user namespaces confines the permission
+  # to the executable paths the minimald profile names, and this proof's pair
+  # sits under a fresh mktemp home that none of the stock tunables can cover
+  # (`@{HOME}/.local/bin/minimald` matches a real home, not a nested one) — so
+  # the INSTALLED daemon comes up unconfined and every sandbox it forks dies
+  # writing /proc/self/uid_map with EPERM, far from the cause: the first thing
+  # this proof would see is the socat probe below failing with nothing in its
+  # stderr that names it. Attach it exactly as the installer's own advisory
+  # tells a user to, before the pair is driven. `--path` replaces the recorded
+  # set, so the lane's binary is named alongside it (see fi_lane_minimald); the
+  # EXIT trap below puts the set back on the way out.
+  fi_restore_profile=0
+  if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
+    fi_attach_args=()
+    for fi_p in "$fi_home/.local/bin/minimald" "$fi_lane_minimald"; do
+      [ -n "$fi_p" ] && [ -e "$fi_p" ] && fi_attach_args+=(--path "$fi_p")
+    done
+    if ! sudo -n "$ROOT/scripts/install-apparmor-profile.sh" "${fi_attach_args[@]}"; then
+      echo "::error::this host restricts unprivileged user namespaces and the minimald AppArmor profile could not be attached to the installed pair, so its session sandbox cannot start (see docs/reference/linux-host-setup.md)"
+      exit 1
+    fi
+    fi_restore_profile=1
+    echo "restricted host: minimald AppArmor profile attached to the installed pair ($fi_home/.local/bin/minimald)"
+  fi
+  # One EXIT trap for the whole subshell, so every path out of it — the early
+  # exits above included — undoes both things the proof staged on the host: the
+  # package-path switch (the /usr/bin/gvproxy-min half below) and the profile
+  # attachment set it widened above.
+  # shellcheck disable=SC2329 # invoked as the subshell's EXIT trap, which shellcheck cannot see through a subshell
+  fi_cleanup() {
+    rm -f /usr/bin/gvproxy-min 2>/dev/null || true
+    if [ "${fi_restore_profile:-0}" = 1 ] && [ -n "$fi_lane_minimald" ]; then
+      sudo -n "$ROOT/scripts/install-apparmor-profile.sh" \
+        --path "$fi_lane_minimald" >/dev/null 2>&1 || echo "::warning::could not restore the minimald AppArmor profile's attachment set (sudo -n failed); it still names the installed pair's path, which this proof deletes with its work dir" >&2
+    fi
+  }
+  trap fi_cleanup EXIT
 
   # Drive the INSTALLED pair: its dir goes first on PATH (the CLI autospawns
   # its daemon by bare name, so the pair must resolve from one dir) and HOME
@@ -1090,10 +1138,9 @@ if (
   # The system-package half: the daemon must serve the same mapping when the
   # only switch binary it can find is /usr/bin/gvproxy-min (the nfpm/AUR
   # dest), not the one the installer placed in ~/.local/bin. Gated on what
-  # this lane permits — never over an existing binary — and this subshell's
-  # own EXIT trap removes the staged one on every path out of the proof.
+  # this lane permits — never over an existing binary — and the subshell's
+  # EXIT trap (set above) removes the staged one on every path out of the proof.
   if [ -w /usr/bin ] && [ ! -e /usr/bin/gvproxy-min ]; then
-    trap 'rm -f /usr/bin/gvproxy-min 2>/dev/null || true' EXIT
     cp "$fi_home/.local/bin/gvproxy-min" /usr/bin/gvproxy-min
     rm -f "$fi_home/.local/bin/gvproxy-min"
     fi_sid2="$(cd "$fi_seed" && RUST_LOG=info mnl session activate . --no-prompt \
