@@ -483,11 +483,14 @@ fn render_policy(model: &Model, key: &SessionKey, frame: &mut Frame, area: Rect)
 fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
     let detail = model.details.get(key);
     let record = detail.and_then(|d| d.record.as_ref());
+    let network = record.map(|r| r.network);
     let mut lines: Vec<Line> = Vec::new();
 
-    if record.is_some() && record.map(|r| r.network) != Some(sessions::NetworkMode::OwnIp) {
+    if network == Some(sessions::NetworkMode::NoNet) {
+        // A none box has no network, so it can carry no egress or ingress
+        // declaration at all — nothing here would describe anything real.
         lines.push(Line::styled(
-            "No network policy (HostNet/NoNet)",
+            "No network policy (NoNet)",
             Style::default().fg(Color::Gray),
         ));
     } else {
@@ -517,28 +520,45 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                                     .join(", ")
                             ))),
                         }
+                        // The denied ranges are subtractive — carved out of
+                        // what the allow fields admit — so unlike the allow
+                        // fields an unset row means "nothing denied", not
+                        // "allow all".
+                        match &egress.deny_subnets {
+                            None => lines.push(Line::raw("  deny subnets  (none)")),
+                            Some(subnets) => lines.push(Line::raw(format!(
+                                "  deny subnets  {}",
+                                subnets.join(", ")
+                            ))),
+                        }
                     }
                 }
-                lines.push(Line::styled(
-                    "ingress",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
-                match &policy.ingress {
-                    None => lines.push(Line::raw("  deny all")),
-                    Some(ingress) => {
-                        if ingress.port_mappings.is_empty()
-                            && ingress.dynamic_allowed_range.is_none()
-                        {
-                            lines.push(Line::raw("  deny all"));
-                        }
-                        for mapping in &ingress.port_mappings {
-                            lines.push(Line::raw(format!(
-                                "  {}  :{} → :{}",
-                                mapping.proto, mapping.external_port, mapping.internal_port
-                            )));
-                        }
-                        if let Some((lo, hi)) = ingress.dynamic_allowed_range {
-                            lines.push(Line::raw(format!("  dynamic ports  {lo}–{hi}")));
+                // Ingress is an own-address surface: the switch's static
+                // forwarder is the only per-session ingress minimald applies,
+                // and a host-address box shares its host's namespace, so
+                // there is no per-session ingress policy to show for it.
+                if network != Some(sessions::NetworkMode::HostNet) {
+                    lines.push(Line::styled(
+                        "ingress",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                    match &policy.ingress {
+                        None => lines.push(Line::raw("  deny all")),
+                        Some(ingress) => {
+                            if ingress.port_mappings.is_empty()
+                                && ingress.dynamic_allowed_range.is_none()
+                            {
+                                lines.push(Line::raw("  deny all"));
+                            }
+                            for mapping in &ingress.port_mappings {
+                                lines.push(Line::raw(format!(
+                                    "  {}  :{} → :{}",
+                                    mapping.proto, mapping.external_port, mapping.internal_port
+                                )));
+                            }
+                            if let Some((lo, hi)) = ingress.dynamic_allowed_range {
+                                lines.push(Line::raw(format!("  dynamic ports  {lo}–{hi}")));
+                            }
                         }
                     }
                 }

@@ -212,6 +212,7 @@ fn detail_pane_with_policy() {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                     allow_dns_hosts: None,
                     allow_protocols: None,
+                    deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
                 }),
                 Some(sessions::IngressPolicy {
                     port_mappings: vec![sessions::PortMapping {
