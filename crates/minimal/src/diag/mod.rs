@@ -71,12 +71,17 @@ pub struct PortalArgs {
     /// you were doing when it stopped working.
     #[arg(long)]
     pub context: Option<String>,
-    /// GitHub token to upload with
+    /// GitHub user token to upload with
     ///
     /// Defaults to `$GITHUB_TOKEN`, then `$GH_TOKEN`, then whatever
     /// `gh auth token` prints. The portal uses it once to ask GitHub which
     /// account it belongs to — that account is what its daily quota counts —
     /// and never stores it.
+    ///
+    /// It must be a *user* token. The `GITHUB_TOKEN` a GitHub Actions job is
+    /// handed automatically is an app installation token, which names no
+    /// user, so a workflow that uploads needs a personal access token in the
+    /// environment instead.
     #[arg(long)]
     pub token: Option<String>,
     /// The portal's base URL

@@ -39,24 +39,43 @@ pub struct Uploaded {
     pub status_url: String,
 }
 
+/// What the portal will not accept, checked here before anything is read.
+///
+/// `min bug --upload` sends an archive it just wrote, about a megabyte of it.
+/// `min diag upload` takes whatever path it is given, so without this the
+/// refusal would arrive from the portal after the whole file had been pulled
+/// into memory to be hashed.
+const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Sends a bundle and returns where its diagnosis will appear.
 ///
-/// The bundle is read whole. `min bug` writes about a megabyte and the portal
-/// refuses anything past sixty-four, so the memory is bounded and known, and
-/// a stream would buy nothing but a length this has to compute anyway: the
-/// portal is told the exact byte count up front and holds the upload to it.
+/// The bundle is read whole, which is sound because [`MAX_BUNDLE_BYTES`] is
+/// checked against the file's length first. A stream would buy nothing after
+/// that: the create request declares the exact byte count and sha256 up front,
+/// and computing those means reading every byte regardless.
 pub async fn upload(
     path: &Path,
     endpoint: &str,
     token: &str,
     note: &str,
 ) -> Result<Uploaded, anyhow::Error> {
+    let size = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?
+        .len();
+    if size == 0 {
+        bail!("{} is empty; there is nothing to diagnose", path.display());
+    }
+    if size > MAX_BUNDLE_BYTES {
+        bail!(
+            "{} is {size} bytes; the portal takes at most {MAX_BUNDLE_BYTES}. Collect with a smaller \
+             --log-tail-bytes, or send it to the dev team directly",
+            path.display()
+        );
+    }
     let bytes = tokio::fs::read(path)
         .await
         .with_context(|| format!("reading {}", path.display()))?;
-    if bytes.is_empty() {
-        bail!("{} is empty; there is nothing to diagnose", path.display());
-    }
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -65,7 +84,15 @@ pub async fn upload(
 
     // Trimmed once, here, so the two URLs below cannot differ by a slash.
     let base = endpoint.trim_end_matches('/');
-    let client = reqwest::Client::new();
+    // Redirects are not followed. Keeping the bundle on the host the operator
+    // named is the point of joining the portal's path to `base` rather than
+    // following whatever URL it returns, and a 3xx would walk straight around
+    // that: reqwest follows up to ten by default, to any host. A portal that
+    // wants the bytes elsewhere can say so in the path it hands back.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building the HTTP client")?;
 
     let created = client
         .post(format!("{base}/diag/api/diagnoses"))
@@ -143,7 +170,7 @@ fn refusal(body: &str) -> String {
         .unwrap_or_else(|| body.chars().take(200).collect())
 }
 
-/// The GitHub token to upload with, from the first place that has one.
+/// The GitHub user token to upload with, from the first place that has one.
 ///
 /// The rungs are where a developer or an agent already keeps one, ordered so
 /// that a deliberate choice outranks an ambient one: the flag, then the two
@@ -180,7 +207,11 @@ pub async fn resolve_token(explicit: Option<&str>) -> Result<String, anyhow::Err
             return Ok(token);
         }
     }
-    bail!("no GitHub token to upload with: pass --token, set $GITHUB_TOKEN, or run `gh auth login`")
+    bail!(
+        "no GitHub token to upload with: pass --token, set $GITHUB_TOKEN, or run `gh auth login`. \
+         It must be a user token; a GitHub Actions job's own GITHUB_TOKEN is an app installation \
+         token and the portal refuses it"
+    )
 }
 
 #[cfg(test)]
@@ -207,6 +238,40 @@ mod tests {
         // Valid JSON, but not a refusal: there is no sentence to lift, so the
         // body itself is the most informative thing left.
         assert_eq!(refusal(r#"{"state":"queued"}"#), r#"{"state":"queued"}"#);
+    }
+
+    /// Both refusals happen on the file's length, before a byte is read and
+    /// before the network is touched: the endpoint below is unroutable, so a
+    /// test that reached it would hang rather than pass.
+    #[tokio::test]
+    async fn a_bundle_the_portal_cannot_take_is_refused_before_it_is_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let empty = dir.path().join("empty.tar.zst");
+        tokio::fs::File::create(&empty).await.unwrap();
+        let err = upload(&empty, "http://127.0.0.1:1", "t", "")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty"), "{err}");
+
+        // Sparse: `set_len` past the cap costs no disk and no memory, which is
+        // exactly the cost this check exists to avoid paying.
+        let huge = dir.path().join("huge.tar.zst");
+        tokio::fs::File::create(&huge)
+            .await
+            .unwrap()
+            .set_len(MAX_BUNDLE_BYTES + 1)
+            .await
+            .unwrap();
+        let err = upload(&huge, "http://127.0.0.1:1", "t", "")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&MAX_BUNDLE_BYTES.to_string()),
+            "the refusal must name the ceiling: {err}"
+        );
     }
 
     #[tokio::test]
