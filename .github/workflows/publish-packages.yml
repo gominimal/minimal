@@ -10,6 +10,8 @@ name: publish-packages
 #   2. publish-aur — the PKGBUILD keys on the staged versions/<semver>/ row.
 #   3. publish-brew — the formula keys on the GitHub Release published in 1.
 #
+# Steps 2 and 3 run only when `publish_packages` is true (off by default).
+#
 # The apt/dnf/apk repo trees are built by the infra repo from the staged
 # versions/<semver>/pkg/ row and are not this workflow's concern.
 #
@@ -22,6 +24,11 @@ on:
                 description: "The promoted version: a semver (X.Y.Z[-pre]) publishes; anything else skips with a notice."
                 required: true
                 type: string
+            publish_packages:
+                description: "Also publish the AUR and Homebrew packages. Off by default: only the GitHub Release is published."
+                required: false
+                type: boolean
+                default: false
 
 permissions:
     contents: read
@@ -87,7 +94,7 @@ jobs:
         # from versions/<semver>/ in the installer bucket, which the versioned
         # release build staged and the promotion just verified.
         needs: publish-release
-        if: ${{ needs.publish-release.outputs.semver != '' }}
+        if: ${{ inputs.publish_packages && needs.publish-release.outputs.semver != '' }}
         runs-on: ubuntu-latest
         container: archlinux:base-devel
         timeout-minutes: 30
@@ -117,7 +124,7 @@ jobs:
         # repo must exist and BREW_TAP_TOKEN (a fine-grained PAT with write
         # access to it) must be set (user actions).
         needs: publish-release
-        if: ${{ needs.publish-release.outputs.semver != '' }}
+        if: ${{ inputs.publish_packages && needs.publish-release.outputs.semver != '' }}
         runs-on: ubuntu-latest
         timeout-minutes: 20
         permissions:

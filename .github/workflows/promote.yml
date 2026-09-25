@@ -1,10 +1,10 @@
 name: promote-cli
 
 # Point a channel at a staged, SMOKED version behind a human approval gate.
-# Promoting a semver row to `stable` can also publish it: the draft GitHub
+# Promoting a semver row to `stable` also publishes it: the draft GitHub
 # Release the versioned build parked is published — which creates the
-# v<semver> tag, last, on the already-smoked commit — and the AUR / Homebrew
-# publishers run (publish-packages.yml), when the `publish` input is
+# v<semver> tag, last, on the already-smoked commit (publish-packages.yml).
+# The AUR / Homebrew publishers run only when the `publish_packages` input is
 # checked (off by default).
 on:
     workflow_dispatch:
@@ -31,8 +31,8 @@ on:
                 required: false
                 type: boolean
                 default: false
-            publish:
-                description: "Stable semver promotions only: after the channel flip, publish the draft GitHub Release (creating the v<semver> tag) and the AUR and Homebrew packages. Off by default: the channel flips without publishing."
+            publish_packages:
+                description: "Stable semver promotions only: also publish the AUR and Homebrew packages after the GitHub Release. Off by default: the GitHub Release is published, the packages are not."
                 required: false
                 type: boolean
                 default: false
@@ -69,7 +69,7 @@ jobs:
                   TARGET_INPUT: ${{ inputs.target }}
                   DRY_RUN: ${{ inputs.dry_run }}
                   OVERRIDE_PROVENANCE: ${{ inputs.override_provenance }}
-                  PUBLISH: ${{ inputs.publish }}
+                  PUBLISH_PACKAGES: ${{ inputs.publish_packages }}
               run: |
                   set -euo pipefail
                   BODY="**Repo:** \`${REPO}\`
@@ -79,7 +79,7 @@ jobs:
                   **Version input:** \`${VERSION_INPUT:-<latest staged nightly sha>}\`
                   **Target channel:** \`${TARGET_INPUT}\`
                   **Dry run:** \`${DRY_RUN}\`
-                  **Publish (stable semver only):** \`${PUBLISH}\`
+                  **Publish AUR + Homebrew (stable semver only):** \`${PUBLISH_PACKAGES}\`
                   **Smoke-provenance override (EMERGENCY):** \`${OVERRIDE_PROVENANCE}\`
 
                   Comment **\`approved\`** to proceed or **\`denied\`** to cancel.
@@ -299,16 +299,17 @@ jobs:
     publish:
         # A stable promotion of a versioned (semver) row publishes it: the
         # draft GitHub Release is published — creating the v<semver> tag, last
-        # — then the AUR and Homebrew publishers run. publish-packages.yml
-        # skips itself with a notice when the promoted version is a nightly
-        # sha (nothing versioned to publish). A rehearsal promotion (dry_run)
-        # publishes nothing anywhere. Publishing is opt-in: `publish` is off by
-        # default, so a promotion flips the channel without publishing.
+        # — then, when `publish_packages` is checked (off by default), the AUR
+        # and Homebrew publishers run. publish-packages.yml skips itself with a
+        # notice when the promoted version is a nightly sha (nothing versioned
+        # to publish). A rehearsal promotion (dry_run) publishes nothing
+        # anywhere.
         needs: promote
-        if: ${{ inputs.target == 'stable' && !inputs.dry_run && inputs.publish }}
+        if: ${{ inputs.target == 'stable' && !inputs.dry_run }}
         permissions:
             contents: write # publishing the draft release creates the tag
         uses: ./.github/workflows/publish-packages.yml
         with:
             version: ${{ needs.promote.outputs.version }}
+            publish_packages: ${{ inputs.publish_packages }}
         secrets: inherit # zizmor: ignore[secrets-inherit] first-party same-repo reusable workflow needs the AUR/brew publishing secrets
