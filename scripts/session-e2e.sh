@@ -1874,18 +1874,24 @@ proof_min_internal_names_through_proxy() {
     proxy_request "$1" "$2: host.min.internal reaches the host's loopback" \
       "http://host.min.internal:$PROXY_HOST_PORT/marker" direct ""
     proxy_want 200 "$PROXY_HOST_MARKER" ""
-    # What the box resolved the name to. Native: 127.0.0.1, written into the
-    # box's /etc/hosts by the HostNet plan — asserted, it is pinned. VM: the
-    # switch zone's host alias, which gvproxy NATs to the host's loopback —
-    # printed, not asserted, so a lane on a custom subnet does not fail here.
-    mnl session exec "$1" \
-      "curl -sv --max-time 10 -o /dev/null http://host.min.internal:$PROXY_HOST_PORT/marker" \
-      >/dev/null 2>"$WORK/proxy-hostresolve.err" || true
-    proxy_resolved="$(grep -m1 'Connected to host.min.internal' "$WORK/proxy-hostresolve.err" || true)"
+    # What the box resolved the name to — read from curl's write-out, not its
+    # verbose trace. `%{remote_ip}` is the address of the connection curl made,
+    # and write-out spelling has been stable for a decade; the -v trace has not:
+    # the proof's first CI run grepped its `Connected to host (ip) port N`
+    # line, which the curl every box ships (upstream pins 8.22) stopped
+    # printing — it says `Established connection to host (ip port N) from local
+    # port M` — so the grep came back empty and the whole lane failed. Native:
+    # 127.0.0.1, written into the box's /etc/hosts by the HostNet plan —
+    # asserted, it is pinned. VM: the switch zone's host alias, which gvproxy
+    # NATs to the host's loopback — printed, not asserted, so a lane on a
+    # custom subnet does not fail here.
+    proxy_resolved="$(mnl session exec "$1" \
+      "curl -sS --max-time 10 -o /dev/null -w '%{remote_ip}' http://host.min.internal:$PROXY_HOST_PORT/marker" \
+      2>"$WORK/proxy-hostresolve.err" | tail -n1 | tr -d '\r\n')" || true
     echo "$2: host.min.internal resolved in the box: ${proxy_resolved:-<curl never connected>}"
-    if hook_log_readable && [[ "$proxy_resolved" != *"127.0.0.1"* ]]; then
-      echo "::error::host.min.internal did not resolve to the host's loopback in the box (expected 127.0.0.1)"
-      echo "--- curl -v ---"; cat "$WORK/proxy-hostresolve.err" 2>/dev/null || true
+    if hook_log_readable && [ "${proxy_resolved:-}" != "127.0.0.1" ]; then
+      echo "::error::host.min.internal did not resolve to the host's loopback in the box (expected 127.0.0.1, got '${proxy_resolved:-<none>}')"
+      echo "--- curl stderr ---"; cat "$WORK/proxy-hostresolve.err" 2>/dev/null || true
       fail
     fi
   }
