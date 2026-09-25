@@ -6,6 +6,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{UnixListener, UnixStream};
+// The host-side proxies and their startup retry live behind the Linux gate
+// with the `net` module they route against.
+#[cfg(target_os = "linux")]
+use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -327,10 +335,25 @@ impl ServerStateHandle {
         self.0.lock().await.proxy_unavailable.clone()
     }
 
+    /// Clears the hostname-routing unavailability note: the proxy's startup
+    /// retry bound and published it, so `ListSessions` stops reporting the
+    /// reason and `min ls` stops printing the warning — without a daemon
+    /// restart (NET-022).
+    pub(crate) async fn clear_proxy_unavailable(&self) {
+        self.0.lock().await.proxy_unavailable = None;
+    }
+
     /// Records why the mTLS reverse proxy is not serving.
     #[cfg_attr(not(feature = "networking-proxy"), expect(dead_code))]
     pub(crate) async fn set_mtls_unavailable(&self, reason: String) {
         self.0.lock().await.mtls_unavailable = Some(reason);
+    }
+
+    /// Clears the mTLS unavailability note: the proxy's startup retry bound
+    /// and published it.
+    #[cfg_attr(not(feature = "networking-proxy"), expect(dead_code))]
+    pub(crate) async fn clear_mtls_unavailable(&self) {
+        self.0.lock().await.mtls_unavailable = None;
     }
 
     /// Why the mTLS reverse proxy is not serving, or `None` if it is.
@@ -739,15 +762,19 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
 /// PTask hostname registry. In a microVM they bind the daemon's switch IP
 /// ([`DEFAULT_SUBNET`](crate::net::DEFAULT_SUBNET)`.daemon_ip()`) so the host
 /// gvproxy forward can reach them; on native Linux (DM2) they bind host loopback
-/// directly. A bind failure warns and is skipped — the daemon keeps serving. The
-/// serve loops run on detached tasks; this returns once the listeners are bound
-/// and (DM1) exposed.
+/// directly.
+///
+/// Each proxy's startup — the bind, and in a microVM the host-loopback
+/// publish — runs on a detached task that retries with backoff until it
+/// succeeds ([`drive_proxy_until_serving`], NET-021) and then clears the
+/// unavailable note `min ls` warns from (NET-022). Nothing here is awaited:
+/// a proxy whose port some other process holds must not hold the SSH accept
+/// loop hostage — the daemon starts serving regardless, reports the reason on
+/// its state, and the proxy comes up on its own once the address frees.
 #[cfg(target_os = "linux")]
 async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
-    use crate::net::proxy::{self, Router};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr};
 
-    let registry = state.sessions_manager().await.hostnames();
     // DM1 (in-VM): bind 0.0.0.0 so the listener comes up regardless of whether
     // eth0 has finished coming up, then publish the port on the host loopback via
     // the gvproxy forwarder. DM2: bind host loopback directly, no host-expose.
@@ -761,41 +788,12 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
     // `<name>.min.internal` not routing, so both are recorded on the
     // state where `ListSessions` can reach them — a daemon that keeps serving
     // without its proxy looks identical to a healthy one otherwise.
-    let egress_addr = SocketAddr::new(bind_base, proxy::EGRESS_PROXY_PORT);
-    let bound = proxy::bind_listener(egress_addr)
-        .await
-        .map(|listener| {
-            let router = Router::new(registry.clone());
-            tokio::spawn(async move {
-                if let Err(error) = proxy::serve(listener, router).await {
-                    tracing::error!(%error, "egress proxy accept loop exited");
-                }
-            })
-        })
-        .is_some();
-
-    if !bound {
-        // DM2: something else on the host holds the port.
-        state
-            .set_proxy_unavailable(format!(
-                "the daemon could not bind {egress_addr}; another process is \
-                 holding it. Check with: lsof -nP -iTCP:{} -sTCP:LISTEN",
-                proxy::EGRESS_PROXY_PORT
-            ))
-            .await;
-    } else if in_microvm {
-        // DM1: the guest bind cannot collide with a host process, so the
-        // failure moves to the publish instead. Only publish a port whose
-        // listener actually bound.
-        if let Some(reason) = expose_proxy_on_host(
-            crate::net::DEFAULT_SUBNET.daemon_ip(),
-            proxy::EGRESS_PROXY_PORT,
-        )
-        .await
-        {
-            state.set_proxy_unavailable(reason).await;
-        }
-    }
+    let egress_addr = SocketAddr::new(bind_base, crate::net::proxy::EGRESS_PROXY_PORT);
+    tokio::spawn(drive_proxy_until_serving(
+        state.clone(),
+        HostProxyStartup::Egress { addr: egress_addr },
+        RetryBackoff::production(),
+    ));
 
     // B8 mTLS reverse proxy (:7655), under the networking-proxy feature.
     #[cfg(feature = "networking-proxy")]
@@ -804,41 +802,20 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
         // were silent: the TLS config failing to build, the bind failing, and
         // the publish failing. The daemon carries on in every case, so only a
         // reported reason distinguishes "no mTLS proxy configured" from "the
-        // mTLS proxy is broken".
-        let https_addr = SocketAddr::new(bind_base, proxy::HTTPS_PROXY_PORT);
+        // mTLS proxy is broken". A TLS config that cannot build is not
+        // retryable — the CA material does not change under the retry — so it
+        // is reported once, here, and only the bind and publish retry.
+        let https_addr = SocketAddr::new(bind_base, crate::net::proxy::HTTPS_PROXY_PORT);
         match state.cert_authority().await.build_server_config() {
             Ok(tls_config) => {
-                let bound = proxy::bind_listener(https_addr)
-                    .await
-                    .map(|listener| {
-                        let router = Router::new(registry.clone());
-                        tokio::spawn(async move {
-                            if let Err(error) =
-                                proxy::serve_https(listener, router, tls_config).await
-                            {
-                                tracing::error!(%error, "mTLS proxy accept loop exited");
-                            }
-                        })
-                    })
-                    .is_some();
-
-                if !bound {
-                    state
-                        .set_mtls_unavailable(format!(
-                            "the daemon could not bind {https_addr}; another process is \
-                             holding it. Check with: lsof -nP -iTCP:{} -sTCP:LISTEN",
-                            proxy::HTTPS_PROXY_PORT
-                        ))
-                        .await;
-                } else if in_microvm
-                    && let Some(reason) = expose_proxy_on_host(
-                        crate::net::DEFAULT_SUBNET.daemon_ip(),
-                        proxy::HTTPS_PROXY_PORT,
-                    )
-                    .await
-                {
-                    state.set_mtls_unavailable(reason).await;
-                }
+                tokio::spawn(drive_proxy_until_serving(
+                    state.clone(),
+                    HostProxyStartup::Mtls {
+                        addr: https_addr,
+                        tls_config,
+                    },
+                    RetryBackoff::production(),
+                ));
             }
             Err(error) => {
                 tracing::warn!(%error, "could not build TLS config for the mTLS reverse proxy");
@@ -853,28 +830,267 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
     }
 }
 
-/// Upper bound on the best-effort host-loopback publish in
+/// The retry schedule a host-side proxy's startup uses while its bind (or, in
+/// a microVM, its host-loopback publish) keeps failing: each retry waits twice
+/// as long as the one before, from `initial` up to `max`. Tests pass a
+/// compressed schedule so a retry loop's worth of failures costs milliseconds
+/// instead of seconds.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+pub struct RetryBackoff {
+    initial: Duration,
+    max: Duration,
+}
+
+#[cfg(target_os = "linux")]
+impl RetryBackoff {
+    /// Builds a schedule that doubles from `initial` and never waits longer
+    /// than `max`.
+    #[must_use]
+    pub const fn new(initial: Duration, max: Duration) -> Self {
+        Self { initial, max }
+    }
+
+    /// The daemon's schedule: the first retry 1 s after the failure, doubling
+    /// to a 30 s ceiling. Fast enough that a port freed moments after boot is
+    /// serving again in seconds; slow enough that a port held for good costs
+    /// one warning per 30 s, not a spin.
+    #[must_use]
+    pub const fn production() -> Self {
+        Self::new(Duration::from_secs(1), Duration::from_secs(30))
+    }
+
+    /// The wait before retry `attempt` (0-based: the wait after the first
+    /// failure), doubling from `initial` and capped at `max`.
+    fn delay(&self, attempt: u32) -> Duration {
+        let factor = 1u32.checked_shl(attempt.min(30)).unwrap_or(u32::MAX);
+        self.initial
+            .checked_mul(factor)
+            .unwrap_or(self.max)
+            .min(self.max)
+    }
+}
+
+/// Which host-side proxy a startup retry drives. The two differ in what serves
+/// a bound listener and which state note a failure lands on; the retry loop
+/// itself is shared.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum HostProxyStartup {
+    /// The B5 egress/DNS proxy: plain HTTP routing through the shared router.
+    Egress { addr: SocketAddr },
+    /// The B8 mTLS reverse proxy: the same routing behind TLS termination.
+    #[cfg(feature = "networking-proxy")]
+    Mtls {
+        addr: SocketAddr,
+        tls_config: Arc<rustls::ServerConfig>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+impl HostProxyStartup {
+    /// The address the listener binds.
+    fn addr(&self) -> SocketAddr {
+        match self {
+            Self::Egress { addr } => *addr,
+            #[cfg(feature = "networking-proxy")]
+            Self::Mtls { addr, .. } => *addr,
+        }
+    }
+
+    /// The `component` log field this proxy's startup events carry, matching
+    /// what its serve loop logs.
+    fn component(&self) -> &'static str {
+        match self {
+            Self::Egress { .. } => "dns-proxy",
+            #[cfg(feature = "networking-proxy")]
+            Self::Mtls { .. } => "https-proxy",
+        }
+    }
+
+    /// Spawns the serve loop for a bound listener. Runs for the daemon's
+    /// lifetime; the startup retry never rebinds a bound-and-served listener.
+    async fn spawn_serve(&self, state: &ServerStateHandle, listener: TcpListener) {
+        #[cfg(feature = "networking-proxy")]
+        use crate::net::proxy::serve_https;
+        use crate::net::proxy::{Router, serve};
+
+        let router = Router::new(state.sessions_manager().await.hostnames());
+        match self {
+            Self::Egress { .. } => {
+                tokio::spawn(async move {
+                    if let Err(error) = serve(listener, router).await {
+                        tracing::error!(%error, "egress proxy accept loop exited");
+                    }
+                });
+            }
+            #[cfg(feature = "networking-proxy")]
+            Self::Mtls { tls_config, .. } => {
+                let tls_config = Arc::clone(tls_config);
+                tokio::spawn(async move {
+                    if let Err(error) = serve_https(listener, router, tls_config).await {
+                        tracing::error!(%error, "mTLS proxy accept loop exited");
+                    }
+                });
+            }
+        }
+    }
+
+    /// Records a failure's reason-and-remedy report on the state note the
+    /// `ListSessions` RPC serves (NET-020).
+    async fn record_unavailable(&self, state: &ServerStateHandle, report: String) {
+        match self {
+            Self::Egress { .. } => state.set_proxy_unavailable(report).await,
+            #[cfg(feature = "networking-proxy")]
+            Self::Mtls { .. } => state.set_mtls_unavailable(report).await,
+        }
+    }
+
+    /// Clears the failure note: bound and published, the proxy is serving.
+    async fn clear_unavailable(&self, state: &ServerStateHandle) {
+        match self {
+            Self::Egress { .. } => state.clear_proxy_unavailable().await,
+            #[cfg(feature = "networking-proxy")]
+            Self::Mtls { .. } => state.clear_mtls_unavailable().await,
+        }
+    }
+}
+
+/// Drives the hostname-routing proxy (the B5 egress proxy — the listener
+/// `*.min.internal` hostnames route through) to serving: binds `addr`,
+/// retrying bind — and, in a microVM, the host-loopback publish — with
+/// `retry`'s backoff until both succeed, then keeps serving and clears the
+/// daemon's `proxy_unavailable` note so `min ls` stops warning (NET-021,
+/// NET-022).
+///
+/// Detached for the daemon's lifetime by `start_host_proxies`; also spawned
+/// directly by tests, which hold the address and watch the retry recover.
+#[cfg(any(test, feature = "test-support"))]
+#[cfg(target_os = "linux")]
+pub async fn retry_hostname_proxy_until_serving(
+    state: ServerStateHandle,
+    addr: SocketAddr,
+    retry: RetryBackoff,
+) {
+    drive_proxy_until_serving(state, HostProxyStartup::Egress { addr }, retry).await;
+}
+
+/// Drives one host-side proxy to serving, retrying with backoff (NET-021).
+///
+/// Two gates stand between daemon start and a serving proxy, in order: the
+/// listener must bind, and — in a microVM (DM1), where the listener binds
+/// inside the guest — the port must then be published on the host loopback via
+/// the gvproxy forwarder. Each failed attempt logs one warning carrying the
+/// failure's reason and remedy and the next retry delay, and records it on the
+/// state note the `ListSessions` RPC serves, so `min ls` and
+/// `min session activate` print it (NET-020). Once both gates pass the note is
+/// cleared and — when any attempt failed — one info line marks the recovery
+/// (NET-022): the warning disappears from `min ls` without a daemon restart.
+///
+/// The serve loop starts as soon as the listener binds and stays up while the
+/// publish retries; the bind gate never runs again once it has passed, so a
+/// bound-and-served listener is never dropped and rebound.
+#[cfg(target_os = "linux")]
+async fn drive_proxy_until_serving(
+    state: ServerStateHandle,
+    proxy: HostProxyStartup,
+    retry: RetryBackoff,
+) {
+    let addr = proxy.addr();
+    let component = proxy.component();
+    // DM1 only: the bind happens in-guest, so the host loopback is reachable
+    // only through the gvproxy forwarder's publish. DM2 binds host loopback
+    // directly and has no second gate.
+    let publish_port = state.in_microvm().await.then_some(addr.port());
+
+    let mut bound = false;
+    let mut attempt: u32 = 0;
+    let mut failed_before = false;
+    loop {
+        if !bound {
+            match crate::net::proxy::bind_listener(addr).await {
+                Ok(listener) => {
+                    proxy.spawn_serve(&state, listener).await;
+                    bound = true;
+                    if publish_port.is_none() {
+                        break;
+                    }
+                }
+                Err(failure) => {
+                    let report = failure.reported();
+                    let next_retry = retry.delay(attempt);
+                    tracing::warn!(
+                        component,
+                        %addr,
+                        status = "unavailable",
+                        reason = %report,
+                        next_retry = ?next_retry,
+                        "host-side proxy could not bind its listener; retrying with backoff"
+                    );
+                    proxy.record_unavailable(&state, report).await;
+                    failed_before = true;
+                    attempt += 1;
+                    tokio::time::sleep(next_retry).await;
+                    continue;
+                }
+            }
+        }
+        // Bound and serving. Only the host-loopback publish can still be
+        // pending: a bind success with no publish gate broke out above.
+        let Some(port) = publish_port else {
+            break;
+        };
+        match expose_proxy_on_host(crate::net::DEFAULT_SUBNET.daemon_ip(), port).await {
+            None => break,
+            Some(report) => {
+                let next_retry = retry.delay(attempt);
+                tracing::warn!(
+                    component,
+                    %port,
+                    status = "unavailable",
+                    %report,
+                    next_retry = ?next_retry,
+                    "host-side proxy could not publish on the host loopback; retrying with backoff"
+                );
+                proxy.record_unavailable(&state, report).await;
+                failed_before = true;
+                attempt += 1;
+                tokio::time::sleep(next_retry).await;
+            }
+        }
+    }
+
+    if failed_before {
+        tracing::info!(
+            component,
+            %addr,
+            status = "recovered",
+            "host-side proxy is serving after retrying"
+        );
+    }
+    proxy.clear_unavailable(&state).await;
+}
+
+/// Upper bound on one host-loopback publish attempt in
 /// [`expose_proxy_on_host`]. Deliberately far below `post_json`'s gvproxy
-/// control timeout: the publish is awaited on [`Server::run`]'s boot path
-/// *before* the SSH accept loop starts serving. When the forwarder control
-/// request does not complete promptly — it times out at the full 5 s even with a
-/// host gvproxy present, since the forwarder control path is not reachable over
-/// the shuttle in every deployment — the accept loop must not be held that long:
-/// the cold `minimal ls` connect-retry deadline expires first and the first list
-/// fails (`ssh connect: Disconnected`). A reachable forwarder answers in well
-/// under this bound.
+/// control timeout: the startup retry's failed attempts must not each cost the
+/// full 5 s before the next try — when the forwarder control path is not
+/// reachable over the shuttle in every deployment, a retry every 5 s would
+/// spend nearly all its time waiting instead of checking. A reachable
+/// forwarder answers in well under this bound.
 #[cfg(target_os = "linux")]
 const HOST_EXPOSE_PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Publishes a guest-side proxy bound on `daemon_ip:port` onto the macOS host's
 /// loopback (`127.0.0.1:port`) via the host gvproxy forwarder, reached over the
 /// vsock shuttle (DM1). Best-effort in that it never fails the daemon, since
-/// the host gvproxy may be absent. Capped at [`HOST_EXPOSE_PUBLISH_TIMEOUT`] so
-/// it never stalls [`Server::run`]'s SSH accept loop.
+/// the host gvproxy may be absent; capped at [`HOST_EXPOSE_PUBLISH_TIMEOUT`]
+/// per attempt so a stalled forwarder cannot stretch the retry cadence.
 ///
-/// Returns `Some(reason)` when the publish did not happen, so the caller can
-/// tell a client rather than leaving the loss in the daemon log — on DM1 this
-/// is the path a host process holding the port actually breaks.
+/// Returns `Some(report)` when the publish did not happen — the reason and the
+/// remedy as one text, which the startup retry logs with its next retry and
+/// records on the state note for `min ls` / `min session activate` to print —
+/// and `None` once published.
 #[cfg(target_os = "linux")]
 async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) -> Option<String> {
     use crate::net::policy::{ControlChannel, ExposeRequest, post_json};
@@ -895,28 +1111,16 @@ async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) -> Optio
     .await
     {
         Ok(Ok(_)) => None,
-        Ok(Err(error)) => {
-            tracing::warn!(
-                %port,
-                %error,
-                "could not publish host-side proxy on the host loopback via gvproxy forwarder"
-            );
-            Some(format!(
-                "the daemon could not publish port {port} on the host loopback \
-                 via the gvproxy forwarder: {error}"
-            ))
-        }
-        Err(_) => {
-            tracing::warn!(
-                %port,
-                timeout = ?HOST_EXPOSE_PUBLISH_TIMEOUT,
-                "host-side proxy publish did not complete in time; continuing (best-effort)"
-            );
-            Some(format!(
-                "publishing port {port} on the host loopback did not complete within \
-                 {HOST_EXPOSE_PUBLISH_TIMEOUT:?}"
-            ))
-        }
+        Ok(Err(error)) => Some(format!(
+            "the daemon could not publish port {port} on the host loopback via \
+             the gvproxy forwarder: {error}. Remedy: check that the host \
+             gvproxy (minvmd) is running and reachable over the shuttle"
+        )),
+        Err(_) => Some(format!(
+            "publishing port {port} on the host loopback did not complete within \
+             {HOST_EXPOSE_PUBLISH_TIMEOUT:?}. Remedy: check that the host \
+             gvproxy (minvmd) is running and reachable over the shuttle"
+        )),
     }
 }
 
@@ -1097,5 +1301,150 @@ mod tests {
             .call::<Shutdown>(&ShutdownRequest { force: false })
             .await;
         let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+    }
+
+    /// A `MakeWriter` accumulating everything written into a shared buffer, so
+    /// a test can assert on the structured fields a `tracing` event emitted.
+    /// Local twin of the helper the `net::proxy` tests used before the bind
+    /// failure's log line moved to the startup retry that owns the schedule.
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(target_os = "linux")]
+    impl CaptureWriter {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The `next_retry=<delay>` values the startup retry's failure warnings
+    /// carried, in the order they were logged.
+    #[cfg(target_os = "linux")]
+    fn logged_next_retries(log: &str) -> Vec<&str> {
+        log.match_indices("next_retry=")
+            .map(|(start, _)| {
+                let rest = &log[start + "next_retry=".len()..];
+                rest.split([' ', '\n', ',']).next().unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// The hostname proxy's startup retry keeps trying a held listen address:
+    /// each failed bind warns once with the reason, the remedy, and the next
+    /// (doubling, capped) retry delay and records the reason-and-remedy report
+    /// on the state note (NET-021); once the address frees, the next attempt
+    /// binds, the note clears, and the recovery is logged (NET-022) — no
+    /// daemon restart anywhere.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn listener_retries_with_backoff() {
+        // Hold an address so the startup retry's binds fail deterministically.
+        let held = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = held.local_addr().unwrap();
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
+        // A compressed schedule: first retry 5 ms after the failure, doubling
+        // to a 20 ms cap, so a loop's worth of failures costs milliseconds.
+        let retrier = tokio::spawn(drive_proxy_until_serving(
+            state.clone(),
+            HostProxyStartup::Egress { addr },
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        ));
+
+        // Three failures are enough to see the doubling and the cap.
+        let mut saw_three_warnings = false;
+        for _ in 0..200 {
+            if buf
+                .contents()
+                .matches("could not bind its listener")
+                .count()
+                >= 3
+            {
+                saw_three_warnings = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            saw_three_warnings,
+            "expected three failure warnings while the address is held, got: {}",
+            buf.contents()
+        );
+        let note = state
+            .proxy_unavailable()
+            .await
+            .expect("a held address must be recorded as the unavailable note");
+        assert!(
+            note.contains("could not bind") && note.contains("Remedy"),
+            "the note must carry the reason and the remedy, got: {note}"
+        );
+
+        // The retry delays double from the schedule's initial wait and cap at
+        // its max: 5 ms, 10 ms, then 20 ms for as long as the address stays
+        // held.
+        let logged = buf.contents();
+        let delays = logged_next_retries(&logged);
+        assert_eq!(
+            &delays[..3.min(delays.len())],
+            &["5ms", "10ms", "20ms"][..3.min(delays.len())],
+            "retry delays must grow with backoff and cap, got: {delays:?}"
+        );
+        assert!(
+            delays.iter().skip(3).all(|d| *d == "20ms"),
+            "retries past the cap must wait the cap, got: {delays:?}"
+        );
+
+        // Freeing the address lets the next attempt bind: the retry task
+        // resolves, the note clears, and the recovery is on the log.
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), retrier)
+            .await
+            .expect("the retry must finish once the address frees")
+            .expect("the retry task must not panic");
+        assert!(
+            state.proxy_unavailable().await.is_none(),
+            "recovery must clear the unavailable note without a restart"
+        );
+        let logged = buf.contents();
+        assert!(
+            logged.contains(r#"status="recovered""#),
+            "the recovery must be logged, got: {logged}"
+        );
+        assert!(
+            logged.contains(r#"status="reachable""#),
+            "the successful bind must be logged as reachable, got: {logged}"
+        );
     }
 }
