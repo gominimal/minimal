@@ -1832,10 +1832,11 @@ mod tests {
         // this frame leave — so the published port still serves (NET-001).
         let syn_ack = egress_tcp_segment(80, SYN | ACK, LEASE, PEER, 40000);
         harness.box_end.write_all(&syn_ack).unwrap();
-        let answered = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-            .await
-            .expect("the box's reply to an admitted flow is forwarded")
-            .expect("the switch side stays open");
+        let answered =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                .await
+                .expect("the box's reply to an admitted flow is forwarded")
+                .expect("the switch side stays open");
         assert_eq!(answered, syn_ack, "the reply is forwarded verbatim");
         assert!(
             !capture.contents().contains("remote_addr=100.64.0.5:40000"),
