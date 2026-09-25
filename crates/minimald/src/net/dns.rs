@@ -28,7 +28,10 @@
 //!   gvproxy switch. On a VM host (DM1/3/4) the daemon holds its own tap on the
 //!   switch, so the name routes **straight to the box's lease** (NET-001), with
 //!   the box's ingress declaration carried as an external→internal port map so
-//!   a URL naming a published port reaches the internal one behind it. On a
+//!   a URL naming a published port reaches the internal one behind it. A URL
+//!   naming a port the declaration does not publish routes nowhere: the proxy
+//!   refuses it (the box has not published it), matching the ingress gate that
+//!   denies an inbound SYN to any undeclared port on the switch too. On a
 //!   native host (DM2) the daemon is off the switch and the name keeps the
 //!   **published-loopback** model: the box's gvproxy forwarder binds
 //!   `127.0.0.1:<external>` → `lease:<internal>`, and the client selects the
@@ -104,8 +107,9 @@ enum Target {
     /// the switch, so a request reaches the box itself instead of the guest
     /// loopback. `ports` is the box's ingress declaration as an
     /// external→internal map, so a URL naming a published port reaches the
-    /// internal one behind it; a port outside the map passes through, because
-    /// the whole box is directly addressable at its lease.
+    /// internal one behind it; a port outside the map routes nowhere — the box
+    /// has not published it, and the ingress gate denies an inbound SYN to any
+    /// undeclared port on the switch besides (NET-001).
     Lease {
         lease: Ipv4Addr,
         ports: BTreeMap<u16, u16>,
@@ -134,15 +138,21 @@ impl Route {
         }
     }
 
-    /// The upstream socket a request for `port` forwards to.
+    /// The upstream socket a request for `port` forwards to, or `None` when
+    /// this route does not carry that port. A published external port
+    /// translates through the ingress declaration's external→internal map; a
+    /// port outside the map has no upstream — the proxy refuses the request
+    /// rather than dialing a port the box's ingress gate would drop, whose
+    /// silent SYN drop is a connect hang instead of a refusal (NET-001,
+    /// NET-014).
     #[must_use]
-    pub fn target(&self, port: u16) -> SocketAddr {
+    pub fn upstream(&self, port: u16) -> Option<SocketAddr> {
         match &self.target {
-            Target::Loopback => SocketAddr::new(LOOPBACK, port),
-            Target::Lease { lease, ports } => SocketAddr::new(
-                IpAddr::V4(*lease),
-                ports.get(&port).copied().unwrap_or(port),
-            ),
+            Target::Loopback => Some(SocketAddr::new(LOOPBACK, port)),
+            Target::Lease { lease, ports } => {
+                let internal = ports.get(&port).copied()?;
+                Some(SocketAddr::new(IpAddr::V4(*lease), internal))
+            }
         }
     }
 
@@ -423,13 +433,13 @@ mod tests {
         let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         assert_eq!(
             reg.resolve("myservice.min.internal")
-                .map(|r| r.target(8080)),
-            Some(loopback)
+                .map(|r| r.upstream(8080)),
+            Some(Some(loopback))
         );
         assert_eq!(
             reg.resolve("myservice.min.internal:8080")
-                .map(|r| r.target(8080)),
-            Some(loopback)
+                .map(|r| r.upstream(8080)),
+            Some(Some(loopback))
         );
         assert_eq!(
             reg.resolve("myservice.min.internal")
@@ -471,7 +481,10 @@ mod tests {
         let route = reg
             .resolve("web.min.internal")
             .expect("routes after the report");
-        assert_eq!(route.target(18080), SocketAddr::new(loopback_addr(), 18080));
+        assert_eq!(
+            route.upstream(18080),
+            Some(SocketAddr::new(loopback_addr(), 18080))
+        );
         assert_eq!(route.session(), "web");
 
         // A rename withdraws and re-registers against the same lease.
@@ -497,8 +510,10 @@ mod tests {
 
     /// On a VM host (the daemon on the switch) an `OwnIp` box's name routes
     /// straight to its lease, translating the published external port through
-    /// the ingress declaration's external→internal map; a port outside the map
-    /// passes through (NET-001).
+    /// the ingress declaration's external→internal map; a port the declaration
+    /// does not publish — an unrelated one or the internal number behind the
+    /// map — routes nowhere (NET-001), matching the ingress gate that denies
+    /// an inbound SYN to any undeclared port on the switch.
     #[test]
     fn own_ip_on_a_vm_host_routes_to_the_lease_through_the_ingress_map() {
         let mut reg = HostnameRegistry::new("dev", true);
@@ -507,12 +522,19 @@ mod tests {
 
         let route = reg.resolve("web.min.internal:18080").expect("routes");
         assert_eq!(
-            route.target(18080),
-            SocketAddr::new(IpAddr::V4(lease), 8080)
+            route.upstream(18080),
+            Some(SocketAddr::new(IpAddr::V4(lease), 8080))
         );
-        // A port the ingress declaration does not publish passes through.
-        assert_eq!(route.target(9000), SocketAddr::new(IpAddr::V4(lease), 9000));
         assert_eq!(route.session(), "web");
+
+        // A port the ingress declaration does not publish routes nowhere — both
+        // an unrelated port and the box's internal port number behind the map.
+        assert_eq!(route.upstream(9000), None, "unrelated port is unpublished");
+        assert_eq!(
+            route.upstream(8080),
+            None,
+            "the internal port behind the map is not itself addressable"
+        );
     }
 
     /// The deprecated three-label form resolves to the same entry as the

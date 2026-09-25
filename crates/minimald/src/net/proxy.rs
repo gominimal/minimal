@@ -114,12 +114,14 @@ impl<T: HostRoute> Router<T> {
     }
 
     /// Routes an HTTP authority to its upstream socket address, or `None` if no
-    /// live PTask owns the host. The authority's optional `:port` selects the
-    /// upstream port; absent, [`DEFAULT_UPSTREAM_PORT`] is used. An `OwnIp` box
-    /// on a VM host translates the requested port through its ingress
-    /// declaration's external→internal map — a published port reaches the
-    /// internal one behind it — and a port outside the map passes through,
-    /// because the whole box is directly addressable at its lease (NET-001).
+    /// live PTask owns the host or the host does not carry the requested port.
+    /// The authority's optional `:port` selects the upstream port; absent,
+    /// [`DEFAULT_UPSTREAM_PORT`] is used. An `OwnIp` box on a VM host translates
+    /// a published external port through its ingress declaration's
+    /// external→internal map — the published port reaches the internal one
+    /// behind it — and a port the declaration does not publish routes nowhere:
+    /// the proxy refuses it, matching the ingress gate that denies an inbound
+    /// SYN to any undeclared port on the switch (NET-001).
     ///
     /// The registry gates on the host, not the port: the upstream port comes
     /// entirely from the client-supplied authority, so a registered `HostNet`
@@ -132,8 +134,8 @@ impl<T: HostRoute> Router<T> {
     #[must_use]
     pub fn route(&self, authority: &str) -> Option<SocketAddr> {
         let (host, port) = split_authority(authority);
-        let route = self.resolve(host)?;
-        Some(route.target(port.unwrap_or(DEFAULT_UPSTREAM_PORT)))
+        self.resolve(host)?
+            .upstream(port.unwrap_or(DEFAULT_UPSTREAM_PORT))
     }
 
     /// The route the authority's host resolves to, or `None` if no live PTask
@@ -277,23 +279,41 @@ where
         return write_status(&mut client, "502 Bad Gateway").await;
     };
     let kind = request.kind;
+    let port = port.unwrap_or(DEFAULT_UPSTREAM_PORT);
 
-    let mut upstream =
-        match TcpStream::connect(route.target(port.unwrap_or(DEFAULT_UPSTREAM_PORT))).await {
-            Ok(upstream) => upstream,
-            Err(error) => {
-                tracing::warn!(
-                    component = "dns-proxy",
-                    host = %host,
-                    session = route.session(),
-                    %error,
-                    reason = "the upstream box refused the connection",
-                    status = "502 Bad Gateway",
-                    "refused a proxied request"
-                );
-                return write_status(&mut client, "502 Bad Gateway").await;
-            }
-        };
+    // A lease route carries only the ports the box's ingress declaration
+    // publishes; a request for any other port routes nowhere. Refuse it here,
+    // where the host, the session and the port are all in hand, rather than
+    // dialing a port the box's ingress gate would drop — a dropped SYN is a
+    // silent connect hang, not a refusal (NET-001, NET-014).
+    let Some(upstream_addr) = route.upstream(port) else {
+        tracing::warn!(
+            component = "dns-proxy",
+            host,
+            session = route.session(),
+            port,
+            reason = "the box has not published this port",
+            status = "403 Forbidden",
+            "refused a proxied request"
+        );
+        return write_status(&mut client, "403 Forbidden").await;
+    };
+
+    let mut upstream = match TcpStream::connect(upstream_addr).await {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            tracing::warn!(
+                component = "dns-proxy",
+                host = %host,
+                session = route.session(),
+                %error,
+                reason = "the upstream box refused the connection",
+                status = "502 Bad Gateway",
+                "refused a proxied request"
+            );
+            return write_status(&mut client, "502 Bad Gateway").await;
+        }
+    };
 
     match kind {
         // Tunnel: acknowledge the CONNECT, then splice raw bytes both ways.
@@ -385,8 +405,9 @@ async fn write_status<C: AsyncWrite + Unpin>(client: &mut C, status: &str) -> io
 /// timeout and unparseable-head refusals cannot have — the reason, and the
 /// status sent, so the daemon log (and the diagnostics bundle's tail of it)
 /// names every refused request. A refusal whose host resolved but whose
-/// upstream refused the connection is logged by its own call site, which adds
-/// the session it resolved to.
+/// request still cannot be forwarded — the box has not published the port, or
+/// its upstream refused the connection — is logged by its own call site, which
+/// adds the session it resolved to.
 fn log_refusal(host: Option<&str>, reason: &str, status: &str) {
     match host {
         Some(host) => tracing::warn!(
@@ -814,6 +835,74 @@ mod tests {
         assert!(
             routed.contains("200 OK"),
             "expected the own-address box's published port to reach its internal listener, got: {routed}"
+        );
+    }
+
+    /// A lease route carries only the ports the box's ingress declaration
+    /// publishes (NET-001): a request naming any other port — an unrelated one
+    /// or the internal port number behind the map — is refused with
+    /// `403 Forbidden` and a warn line naming the host, the session, the port
+    /// and the reason, instead of dialing a port the box's ingress gate would
+    /// drop (a dropped SYN is a silent connect hang, not a refusal).
+    #[tokio::test]
+    async fn proxy_refuses_an_unpublished_port_and_logs_why() {
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, true);
+        let mut ports = BTreeMap::new();
+        ports.insert(18080, 8080);
+        reg.report_own_address(SessionId::nil(), "web", Ipv4Addr::LOCALHOST, ports);
+        let router = Router::new(Arc::new(reg));
+
+        // The published external port routes; the internal number behind it and
+        // an unrelated port route nowhere.
+        assert_eq!(
+            router.route("web.min.internal:18080"),
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080))
+        );
+        assert_eq!(
+            router.route("web.min.internal:8080"),
+            None,
+            "the internal port behind the map is not itself addressable"
+        );
+        assert_eq!(router.route("web.min.internal:9000"), None);
+
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve(proxy, router));
+
+        let refused = proxy_get(proxy_addr, "web.min.internal:9000").await;
+        assert!(
+            refused.contains("403 Forbidden"),
+            "expected the unpublished port to be refused, got: {refused}"
+        );
+
+        drop(_guard);
+        let logged = buf.contents();
+        assert!(
+            logged.contains(r#"host="web.min.internal""#),
+            "expected the refusal to name the host, got: {logged}"
+        );
+        assert!(
+            logged.contains(r#"session="web""#),
+            "expected the refusal to name the resolved session, got: {logged}"
+        );
+        assert!(
+            logged.contains("port=9000"),
+            "expected the refusal to name the blocked port, got: {logged}"
+        );
+        assert!(
+            logged.contains("the box has not published this port"),
+            "expected the unpublished-port reason, got: {logged}"
+        );
+        assert!(
+            logged.contains(r#"status="403 Forbidden""#),
+            "expected the refusal to name the status it sent, got: {logged}"
         );
     }
 
