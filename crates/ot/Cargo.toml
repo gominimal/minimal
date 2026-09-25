@@ -23,3 +23,6 @@ tokio = { workspace = true, features = ["sync"] }
 # (see the `indicatif` feature), so this stays out of the production deps.
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

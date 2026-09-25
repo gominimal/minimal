@@ -1,0 +1,12 @@
+# Clippy configuration for the workspace.
+#
+# The `*-in-tests` keys below exist so the panic-family lints stay quiet in test
+# code, where a panicking unwrap is the idiomatic way to fail a test. Those lints
+# are not in `[workspace.lints]` (the tree is not clean for them yet); they run
+# only on changed lines, via `just clippy-strict`. See scripts/clippy-strict.sh.
+
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true

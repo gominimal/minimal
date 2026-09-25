@@ -28,3 +28,6 @@ args.workspace = true
 common.workspace = true
 mfile.workspace = true
 stdlib.workspace = true
+
+[lints]
+workspace = true
