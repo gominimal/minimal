@@ -219,13 +219,10 @@ impl FetchResponse for Result<google_cloud_storage::read_object::ReadObjectRespo
     fn status_code(&self) -> usize {
         match self {
             Ok(_) => 200,
-            Err(e) => {
-                if let Some(sc) = e.http_status_code() {
-                    sc as usize
-                } else {
-                    panic!("non-status error: {:?}", e);
-                }
-            }
+            // A transport error (DNS, connect, timeout) has no HTTP status.
+            // 0 is never a success or a 404, so callers take their error path
+            // and `error_for_status` returns the error itself.
+            Err(e) => e.http_status_code().map_or(0, |sc| sc as usize),
         }
     }
     fn content_length(&self) -> Option<u64> {
@@ -516,5 +513,20 @@ mod any_backend_tests {
         // never a silent wrong fetch.
         let backend = AnyBackend::Https(Client::new());
         let _ = backend.get(gcs("o"));
+    }
+}
+
+#[cfg(test)]
+mod transport_error_tests {
+    use super::*;
+
+    /// A GCS read that fails below HTTP (the res-server lost DNS) must come back
+    /// as an error the caller can report, not a panic in the request handler.
+    #[test]
+    fn gcs_transport_error_is_an_error_not_a_panic() {
+        let resp = AnyResponse::Gcs(Err(GcsError::exhausted("dns error")));
+        assert!(!FetchResponse::is_success(&resp));
+        assert_ne!(FetchResponse::status_code(&resp), 404);
+        assert!(FetchResponse::error_for_status(resp).is_err());
     }
 }
