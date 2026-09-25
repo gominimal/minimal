@@ -110,5 +110,9 @@ expect 1 "not a canonical" "a two-part version is refused" -- "$script" --format
 # apk alone has no `+build` separator: refusing beats shipping a package apk
 # will not install.
 expect 1 "not a valid apk version" "apk refuses build metadata (+dirty)" -- "$script" --format apk 0.6.0+dirty
+# The plain-prerelease passthrough keeps any word, but apk only knows the fixed
+# suffix vocabulary: a word outside it is refused here rather than by apk days
+# later (the veto enforces the vocabulary its message names).
+expect 1 "not a valid apk version" "apk refuses a non-vocabulary prerelease word" -- "$script" --format apk 0.6.0-next
 
 finish

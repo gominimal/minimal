@@ -12,7 +12,10 @@
 # asserted. A second block drives the channel path
 # (--channel nightly, sha row, version file): the channel package name, _row,
 # normalized pkgver, the conflicts list, the renamed install hook, and the
-# LICENSE copy, plus the channel refusals. Run directly or via `just test-shell`.
+# LICENSE copy. A third drives a channel advanced to a versioned row (--channel
+# unstable, semver row): _row and pkgver are the semver, and the version file is
+# asserted to agree with it. Plus the refusals. Run directly or via
+# `just test-shell`.
 
 set -euo pipefail
 
@@ -117,6 +120,18 @@ run_channel_dry() {
         MINIMAL_BUCKET_URL="file://$root/bucket" \
         AUR_SSH_PRIVATE_KEY="not-a-real-key" \
         "$script" --channel nightly --dry-run
+}
+
+run_versioned_channel_dry() {
+    # A channel advanced to a versioned row (record-smoked points `unstable` at
+    # the semver row of every smoked release): PKGVER IS the row, and pkgver
+    # comes from the row's version file, which must equal it.
+    env -u SSH_AUTH_SOCK \
+        PKGVER=0.5.4 \
+        AUR_REPO_URL="file://$aur" \
+        MINIMAL_BUCKET_URL="file://$root/bucket" \
+        AUR_SSH_PRIVATE_KEY="not-a-real-key" \
+        "$script" --channel unstable --dry-run
 }
 
 # --- the dry run --------------------------------------------------------------
@@ -241,6 +256,36 @@ else
     bad "the fixture remote is untouched after the channel run (advanced to $pushed)"
 fi
 
+# --- a channel advanced to a versioned row ------------------------------------
+# `unstable` follows a versioned release to its semver row (record-smoked points
+# it there), so its package is published from that row: _row and pkgver are the
+# semver, and the version file must agree with it.
+
+out="$(run_versioned_channel_dry 2>&1)"
+rc=$?
+
+if [ "$rc" -eq 0 ]; then ok "versioned-row channel dry run succeeds against fixtures"; else bad "versioned-row channel dry run succeeds against fixtures (rc=$rc; out: $out)"; fi
+if [[ "$out" == *'+pkgname=minimal-unstable-bin'* ]]; then
+    ok "versioned-row channel renders the unstable pkgname"
+else
+    bad "versioned-row channel renders the unstable pkgname (out: $out)"
+fi
+if [[ "$out" == *'+_row=0.5.4'* ]]; then
+    ok "versioned-row channel points _row at the semver row"
+else
+    bad "versioned-row channel points _row at the semver row (out: $out)"
+fi
+if [[ "$out" == *'+pkgver=0.5.4'* ]]; then
+    ok "versioned-row channel stamps the row's semver pkgver"
+else
+    bad "versioned-row channel stamps the row's semver pkgver (out: $out)"
+fi
+if [[ "$out" == *"+conflicts=('minimal-bin' 'minimal-nightly-bin')"* ]]; then
+    ok "versioned-row channel conflicts with the other two channel packages"
+else
+    bad "versioned-row channel conflicts with the other two channel packages (out: $out)"
+fi
+
 # --- refusals -----------------------------------------------------------------
 
 expect 1 "not a RELEASED semver" "prerelease PKGVER is refused" -- \
@@ -255,8 +300,12 @@ expect 1 "contradicts what it installs" "a stable row whose version file disagre
     env PKGVER=0.9.9 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
         AUR_SSH_PRIVATE_KEY=k "$script" --dry-run
 
-expect 1 "versioned row" "a semver row on a channel is refused" -- \
-    env PKGVER=0.6.0 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
+expect 1 "contradicts what it installs" "a channel row whose version file disagrees with its name is refused" -- \
+    env PKGVER=0.9.9 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
+        AUR_SSH_PRIVATE_KEY=k "$script" --channel unstable --dry-run
+
+expect 1 "neither a 7-40 char lowercase-hex sha row nor a released semver" "a channel row that is neither is refused" -- \
+    env PKGVER=not-a-row AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
         AUR_SSH_PRIVATE_KEY=k "$script" --channel nightly --dry-run
 
 expect 1 "must be staged by a build that writes the version file" "a channel row with no version file is refused" -- \

@@ -25,11 +25,16 @@
 #                                           and so is a prerelease (-rc.1 tail):
 #                                           a prerelease should never overwrite
 #                                           the stable formula for every user.
-#                         unstable/nightly  the staged ROW, a 7-40 char
-#                                           lowercase-hex short SHA (the row is
-#                                           versions/<sha>/ in the bucket). A
-#                                           semver row is rejected: a versioned
-#                                           release is the stable formula's job.
+#                         unstable/nightly  the staged ROW: normally a 7-40
+#                                           character lowercase-hex short SHA
+#                                           (the row is versions/<sha>/ in the
+#                                           bucket). `unstable` also advances
+#                                           to a versioned (released-semver)
+#                                           row when a versioned release is
+#                                           smoked, and its formula is then
+#                                           published from that row too, so the
+#                                           channel pointer and the formula
+#                                           describe the same bytes.
 #   BREW_TAP_REPO       git URL to clone/push
 #                       (default: git@github.com:gominimal/homebrew-minimal.git)
 #   MINIMAL_RELEASE_URL Base URL the release assets are FETCHED from in stable
@@ -158,13 +163,22 @@ if [ "$CHANNEL" = "stable" ]; then
     LIVECHECK="$LIVECHECK_STABLE"
     asset_err="cannot download @@URL@@ — is v$PKGVER a GitHub Release of gominimal/minimal carrying the macOS arm64 assets?"
 else
-    # Channel formulae are sha-row-only: a versioned release is represented by
-    # the stable formula, so a semver row here is a caller mistake, named as such.
+    # Channel formulae are pinned to a staged row: normally a sha row, but
+    # `unstable` also advances to a versioned row when a versioned release is
+    # smoked, and its formula is then published from that row too, so the
+    # channel pointer and the formula describe the same bytes.
+    case "$PKGVER" in
+        v*) die "PKGVER must not carry the v prefix: '$PKGVER' (use ${PKGVER#v})" ;;
+    esac
     if printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
-        die "--channel $CHANNEL takes a staged sha row, not the semver '$PKGVER' — a versioned release is represented by the stable formula"
+        # A versioned row: a released semver, the shape a versioned build
+        # stages (a prerelease is not a release and never reaches a channel).
+        printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$' \
+            || die "PKGVER '$PKGVER' is not a RELEASED semver X.Y.Z (optional +build; prereleases and shas are rejected)"
+    else
+        printf '%s\n' "$PKGVER" | grep -qE '^[0-9a-f]{7,40}$' \
+            || die "--channel $CHANNEL row '$PKGVER' must be a 7-40 character lowercase-hex sha or a released semver X.Y.Z"
     fi
-    printf '%s\n' "$PKGVER" | grep -qE '^[0-9a-f]{7,40}$' \
-        || die "--channel $CHANNEL row '$PKGVER' must be a 7-40 character lowercase-hex sha"
     BUCKET_URL="${MINIMAL_BUCKET_URL:-https://storage.googleapis.com/minimal-one}"
     # Here URL_BASE is also the fetch base: the bucket override must move the
     # rendered urls and the downloads together, or they diverge silently.
@@ -215,15 +229,16 @@ mkdir -p "$dist"
 # anything else, so a missing row fails with one clear message rather than four
 # asset-download errors. EVERY channel reads it, stable included: the row name
 # is a sha on a channel and the promoted semver on stable, and only this file
-# carries the version the formula must declare. On stable the read doubles as
-# an assertion that the row agrees with the semver being published.
+# carries the version the formula must declare. On a versioned row — stable, or
+# a channel advanced to a versioned row — the read doubles as an assertion that
+# the row agrees with the version it is named for.
 version_file="$workdir/row-version"
 curl -fsSL --retry 3 -o "$version_file" "$BUCKET_URL/versions/$ROW/version" \
     || die "cannot download $BUCKET_URL/versions/$ROW/version — is row $ROW staged with a version file? (see stage-release.sh)"
 canonical="$(cat "$version_file")"
 [ -n "$canonical" ] || die "the version file for row $ROW is empty ($BUCKET_URL/versions/$ROW/version)"
-if [ "$CHANNEL" = "stable" ] && [ "$canonical" != "$PKGVER" ]; then
-    die "row $ROW holds binaries reporting '$canonical', not '$PKGVER' — refusing to publish a formula whose version contradicts what it installs"
+if printf '%s\n' "$ROW" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$' && [ "$canonical" != "$ROW" ]; then
+    die "row $ROW holds binaries reporting '$canonical', not '$ROW' — refusing to publish a formula whose version contradicts what it installs"
 fi
 # - is legal in a Homebrew version, so brew normalization is the identity;
 # running it through the shared helper keeps the charset rule in one place.
@@ -236,7 +251,13 @@ for entry in "${ASSETS[@]}"; do
     # asset_err is a per-channel template with one @@URL@@ placeholder.
     curl -fsSL --retry 3 -o "$dist/$name" "$url" \
         || die "${asset_err//@@URL@@/$url}"
-    printf -v "$var" '%s' "$(sha256_file "$dist/$name")"
+    # Assign through a variable so a missing sha256 tool fails HERE rather than
+    # stamping an empty SHA_* and dying later in the renderer with a message
+    # that names the wrong thing (a command substitution's status cannot reach
+    # printf -v). Mirrors publish-aur.sh.
+    sha="$(sha256_file "$dist/$name")" || die "cannot sha256 $dist/$name"
+    [ -n "$sha" ] || die "empty sha256 for $dist/$name"
+    printf -v "$var" '%s' "$sha"
 done
 
 # The renderer stamps from the environment (VERSION, CLASS, URL_BASE, ... are

@@ -137,16 +137,17 @@ done
 case "$PKGVER" in
     v*) die "PKGVER must not carry the v prefix: '$PKGVER' (use ${PKGVER#v})" ;;
 esac
-# stable is a versioned release: the row IS a released semver. A channel row is
-# a commit sha (nightly/unstable are sha-row-only — the stable package already
-# represents a versioned row's bytes), so the row name alone cannot be the
-# version and the built version comes from the row's `version` file below.
+# stable is a versioned release: the row IS a released semver. The nfpm caller
+# (release.yml) picks the channel by row shape — `stable` for a versioned row,
+# `unstable` for a sha row — so a channel row here is always a commit sha: the
+# row name alone cannot be the version, and the built version comes from the
+# row's `version` file below.
 if [ "$CHANNEL" = stable ]; then
     printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' \
         || die "PKGVER '$PKGVER' is not a semver X.Y.Z (optional -prerelease/+build) on the stable channel"
 else
     case "$PKGVER" in
-        *[!0-9a-f]*) die "PKGVER '$PKGVER' is not a commit sha — the $CHANNEL channel ships sha rows only (a versioned row's bytes are represented by the stable package)" ;;
+        *[!0-9a-f]*) die "PKGVER '$PKGVER' is not a commit sha — release.yml builds channel nfpm packages for sha rows only (it passes --channel stable for a versioned row)" ;;
     esac
     len="${#PKGVER}"
     if [ "$len" -lt 7 ] || [ "$len" -gt 40 ]; then

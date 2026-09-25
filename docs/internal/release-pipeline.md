@@ -266,7 +266,9 @@ still carries its true `0.6.0-dev.<N>.g<sha>`.
 where a pointer advances:
 
 - `unstable` — release.yml's `publish-channel-unstable` job, after
-  `record-smoked` advanced the pointer, publishes with `channel: unstable`.
+  `record-smoked` advanced the pointer, publishes with `channel: unstable` for
+  the row the pointer now names — a sha row, or the semver row of a versioned
+  release.
 - `nightly` — nightly.yml's `publish-channel-nightly`, after `promote-nightly`
   ran `verify-smoked.sh` and flipped the pointer, publishes with
   `channel: nightly`.
@@ -276,9 +278,15 @@ where a pointer advances:
 The order is always **build → smoke → publish**, never the reverse. The
 publishers are per-name and idempotent (the AUR publisher no-ops when the
 PKGBUILD is unchanged, the tap publisher when the formula is), so a re-run or
-a skipped night is safe. Channel publishers are **sha-row only**: a versioned
-row's bytes are what the stable package represents, so its `pkg/` row is
-already in place and the channel packages are built and published for sha rows.
+a skipped night is safe. A channel publishes from **the same row its pointer
+was advanced to**: normally a sha row, but `unstable` also advances to a
+versioned row when a versioned release is smoked, and its packages are then
+published from that semver row too. Every publisher reads
+`versions/<row>/version`, so a versioned row needs no special case, and the
+channel pointer and the channel packages never describe different bytes. (The
+stable *package* is still its own thing: `pkg/` for a versioned row is staged
+for the apt/dnf/apk trees under the `PUBLISH_STABLE_PACKAGES` switch, not by
+these publishers.)
 
 All three call one reusable workflow, `publish-channel.yml`, which runs the AUR
 and Homebrew publishers as its two jobs — the block that used to be copied into
@@ -308,9 +316,12 @@ failure skips the install instead of "proving" a formula that was never pushed.
 
 Retrying a publish, per channel:
 
-- `unstable` / `nightly` — "Re-run failed jobs" on the run: both publishers are
-  idempotent and no-op when nothing changed. Locally the same scripts CI runs
-  are one recipe away: `just publish-brew <channel> <row>` (and `just
+- `unstable` / `nightly` — the `just` recipes below are the retry: because
+  `tolerate: true` leaves a failed publisher's job concluding success (only the
+  step is annotated), GitHub's "Re-run failed jobs" has nothing to re-run, and
+  only a full workflow re-run or a `workflow_dispatch` can retry it in CI. Both
+  publishers are idempotent and no-op when nothing changed, and the same scripts
+  CI runs are one recipe away: `just publish-brew <channel> <row>` (and `just
   publish-aur <channel> <row> --verify-build`) forward their args verbatim, so
   `--dry-run` is the credential-free rehearsal and a real push needs
   credentials.

@@ -25,9 +25,12 @@
 #                       pacman forbids hyphens in pkgver, so an RC could never
 #                       be published here anyway. The AUR stable package tracks
 #                       promoted semver releases.
-#                       On the unstable/nightly channels: the 7-40 char
-#                       lowercase-hex sha row. A semver row is refused — a
-#                       versioned row is represented by the stable package.
+#                       On the unstable/nightly channels: normally the 7-40
+#                       char lowercase-hex sha row. `unstable` also advances to
+#                       a versioned (released-semver) row when a versioned
+#                       release is smoked, and its package is then published
+#                       from that row too, so the channel pointer and the
+#                       channel package describe the same bytes.
 #   AUR_REPO_URL        git URL to clone/push
 #                       (default: ssh://aur@aur.archlinux.org/$PKGNAME.git).
 #                       --dry-run without credentials falls back to the public
@@ -45,9 +48,12 @@
 #            form of the canonical version, and the file is additionally
 #            asserted to equal PKGVER, so a row whose binaries disagree with
 #            the tag being published is refused rather than packaged.
-#   channel  _row = PKGVER (the sha row); pkgver is the aur-normalized form of
-#            the canonical version read from that file
-#            (scripts/package-version.sh --format aur).
+#   channel  _row = PKGVER (the sha row, or a versioned row on `unstable`);
+#            pkgver is the aur-normalized form of the canonical version read
+#            from that file (scripts/package-version.sh --format aur). A
+#            versioned row is asserted to equal its own name, exactly as on
+#            stable: a sha row's name is not a version, so only a versioned row
+#            can carry that check.
 #
 # Credentials (env/ssh-agent only — never hardcoded or echoed here):
 #   - an ssh-agent holding the bot's AUR key (SSH_AUTH_SOCK set), or
@@ -165,29 +171,40 @@ case "$CHANNEL" in
         ROW="$PKGVER"
         ;;
     *)
-        # Channel: PKGVER is the sha row. A versioned row is the stable
-        # package's job, so refuse one by name rather than downloading it.
+        # Channel: PKGVER is the row to publish. Normally a sha row; `unstable`
+        # also advances to a versioned row when a versioned (stable-cut)
+        # release is smoked, and its package is published from that row too, so
+        # the channel pointer and the channel package describe the same bytes.
+        case "$PKGVER" in
+            v*) die "PKGVER must not carry the v prefix: '$PKGVER' (use ${PKGVER#v})" ;;
+        esac
         if printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
-            die "PKGVER '$PKGVER' is a versioned row; --channel $CHANNEL publishes sha rows only (a versioned row is represented by the stable minimal-bin package)"
+            # A versioned row: a released semver, the shape a versioned build
+            # stages. Held to the stable rule — pacman's pkgver forbids
+            # hyphens, so a prerelease could never publish anyway.
+            printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$' \
+                || die "PKGVER '$PKGVER' is not a RELEASED semver X.Y.Z (optional +build; prereleases and shas are rejected: pacman's pkgver forbids hyphens)"
+        else
+            printf '%s\n' "$PKGVER" | grep -qE '^[0-9a-f]{7,40}$' \
+                || die "PKGVER '$PKGVER' is neither a 7-40 char lowercase-hex sha row nor a released semver X.Y.Z"
         fi
-        printf '%s\n' "$PKGVER" | grep -qE '^[0-9a-f]{7,40}$' \
-            || die "PKGVER '$PKGVER' is not a 7-40 char lowercase-hex sha row"
         ROW="$PKGVER"
         ;;
 esac
 
 # The canonical built version lives beside the row's artifacts, on EVERY
 # channel. A row staged without it predates channel packaging and cannot
-# publish: pkgver would fall back to the raw sha, which pacman rejects. On
-# stable the read doubles as an assertion that the row agrees with the semver
-# being published — the row is already required by the artifact fetches below,
-# so this adds no new dependency.
+# publish: pkgver would fall back to the raw sha, which pacman rejects. On a
+# versioned row — stable, or a channel advanced to a versioned row — the read
+# doubles as an assertion that the row agrees with the version it is named for;
+# the row is already required by the artifact fetches below, so this adds no
+# new dependency.
 version_url="$BUCKET_URL/versions/$ROW/version"
 VERSION="$(curl -fsSL --retry 3 "$version_url")" \
     || die "cannot download $version_url — row '$ROW' must be staged by a build that writes the version file"
 [ -n "$VERSION" ] || die "empty version file at $version_url for row '$ROW'"
-if [ "$CHANNEL" = "stable" ] && [ "$VERSION" != "$PKGVER" ]; then
-    die "row '$ROW' holds binaries reporting '$VERSION', not '$PKGVER' — refusing to publish a package whose version contradicts what it installs"
+if printf '%s\n' "$ROW" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$' && [ "$VERSION" != "$ROW" ]; then
+    die "row '$ROW' holds binaries reporting '$VERSION', not '$ROW' — refusing to publish a package whose version contradicts what it installs"
 fi
 
 # pkgver must be pacman-legal: the helper turns a dev build's `-` into `.`

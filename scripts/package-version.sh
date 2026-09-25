@@ -155,7 +155,7 @@ fi
 # (so build metadata is refused here instead of producing a package apk will
 # not install).
 if [ "$FORMAT" = "apk" ]; then
-    printf '%s\n' "$out" | grep -qE '^[0-9]+(\.[0-9]+)*[a-z]?(_[a-z]+[0-9]*)*$' \
+    printf '%s\n' "$out" | grep -qE '^[0-9]+(\.[0-9]+)*[a-z]?(_(alpha|beta|pre|rc|cvs|svn|git|hg|p)[0-9]*)*$' \
         || die "'$out' (from '$VERSION' as apk) is not a valid apk version — apk suffixes are alpha, beta, pre, rc, cvs, svn, git, hg, p only, and there is no +build separator"
 else
     # The allowed set is the union that is legal somewhere; `-` is legal only in

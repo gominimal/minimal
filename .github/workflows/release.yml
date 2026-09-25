@@ -1580,13 +1580,17 @@ jobs:
     # freeze the nightly channel over a transient push error, long after staging,
     # smoke, provenance and the pointer had all succeeded. See publish-channel.yml.
     #
-    # SHA-ROW ONLY: a versioned row's bytes are what the stable package
-    # represents, so the channel packages are built and published for sha rows
-    # alone (the nfpm packages for a versioned row already exist in its pkg/,
-    # and set-channel has pointed unstable at that same row).
+    # EVERY row, versioned included: record-smoked advances `unstable` to the row
+    # of every smoked release, so a versioned (stable-cut) release moves the
+    # pointer to its semver row too. Publishing here for that row is what keeps
+    # the channel pointer and the channel packages describing the SAME bytes — a
+    # sha-row-only gate would leave a pacman/brew unstable user on the previous
+    # nightly while a curl|sh unstable user got the new release. The publishers
+    # read versions/<row>/version on every channel, so a versioned row needs no
+    # special case.
     publish-channel-unstable:
         needs: [assert-version, record-smoked]
-        if: ${{ !inputs.dry_run && needs.assert-version.outputs.release_version == '' }}
+        if: ${{ !inputs.dry_run }}
         permissions:
             contents: read
         uses: ./.github/workflows/publish-channel.yml

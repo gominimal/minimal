@@ -9,9 +9,9 @@
 # four macOS assets, checksums them, renders the formula fully stamped —
 # including the libkrun dylib installed into the prefix's lib/, which
 # @loader_path/../lib resolves — and pushes nothing. Covers the stable formula
-# (GitHub Release url) and a channel formula (bucket row url, explicit version,
-# `livecheck { skip }`), the channel conflicts_with, plus the refusals.
-# Run directly or via `just test-shell`.
+# (GitHub Release url), a channel formula (bucket row url, explicit version,
+# `livecheck { skip }`), a channel advanced to a versioned row, the channel
+# conflicts_with, plus the refusals. Run directly or via `just test-shell`.
 
 set -euo pipefail
 
@@ -58,9 +58,13 @@ done
 
 # The stable rows: the promoted semver's row carries a `version` file holding
 # the semver itself — the stable publisher reads and asserts it. 0.9.9 holds a
-# disagreeing version for the refusal below.
+# disagreeing version for the refusal below. 0.5.4 also carries the four assets
+# so it can double as the versioned row a channel (unstable) has advanced to.
 mkdir -p "$bucket/versions/0.5.4"
 printf '%s\n' 0.5.4 >"$bucket/versions/0.5.4/version"
+for a in "${assets[@]}"; do
+    printf 'mach-o payload of %s at 0.5.4\n' "$a" >"$bucket/versions/0.5.4/$a"
+done
 mkdir -p "$bucket/versions/0.9.9"
 printf '%s\n' 0.9.8 >"$bucket/versions/0.9.9/version"
 
@@ -235,6 +239,44 @@ else
     bad "the nightly dry run left the fixture remote untouched (advanced to $pushed)"
 fi
 
+# --- a channel advanced to a versioned row ------------------------------------
+# `unstable` follows a versioned release to its semver row (record-smoked points
+# it there), so its formula is published from that row — bucket urls, the row's
+# own version, livecheck skipped — keeping the channel pointer and the formula
+# describing the same bytes.
+
+out="$(run_dry_channel unstable 0.5.4 2>&1)"
+rc=$?
+
+if [ "$rc" -eq 0 ]; then ok "unstable dry run from a versioned row succeeds"; else bad "unstable dry run from a versioned row succeeds (rc=$rc; out: $out)"; fi
+if [[ "$out" == *'class MinimalUnstable < Formula'* ]]; then
+    ok "the versioned-row formula declares class MinimalUnstable"
+else
+    bad "the versioned-row formula declares class MinimalUnstable (out: $out)"
+fi
+if [[ "$out" == *'version "0.5.4"'* ]]; then
+    ok "the versioned-row formula pins the row's version"
+else
+    bad "the versioned-row formula pins the row's version (out: $out)"
+fi
+if [[ "$out" == *"file://$root/bucket/versions/0.5.4/minimal-macos-arm64"* ]]; then
+    ok "the versioned-row formula urls point at the bucket row"
+else
+    bad "the versioned-row formula urls point at the bucket row (out: $out)"
+fi
+if [[ "$out" == *'b/Formula/minimal-unstable.rb'* ]]; then
+    ok "the versioned-row formula renders to Formula/minimal-unstable.rb"
+else
+    bad "the versioned-row formula renders to Formula/minimal-unstable.rb (out: $out)"
+fi
+
+pushed="$(git -C "$seed" fetch -q origin && git -C "$seed" rev-parse origin/main)"
+if [ "$pushed" = "$seeded" ]; then
+    ok "the versioned-row dry run left the fixture remote untouched"
+else
+    bad "the versioned-row dry run left the fixture remote untouched (advanced to $pushed)"
+fi
+
 # --- refusals -----------------------------------------------------------------
 
 expect 1 "not a RELEASED semver" "prerelease PKGVER is refused by --channel stable" -- \
@@ -247,9 +289,11 @@ expect 1 "contradicts what it installs" "a stable row whose version file disagre
     env -u SSH_AUTH_SOCK -u GITHUB_TOKEN PKGVER=0.9.9 BREW_TAP_REPO="file://$tap" \
         MINIMAL_BUCKET_URL="file://$root/bucket" "$script" --dry-run
 
-expect 1 "sha row, not the semver" "a semver row with --channel nightly is refused" -- \
-    env -u SSH_AUTH_SOCK -u GITHUB_TOKEN PKGVER=0.6.0 BREW_TAP_REPO="file://$tap" \
-        MINIMAL_BUCKET_URL="file://$root/bucket" "$script" --channel nightly --dry-run
+expect 1 "contradicts what it installs" "a channel row whose version file disagrees with its name is refused" -- \
+    run_dry_channel unstable 0.9.9
+
+expect 1 "lowercase-hex sha or a released semver" "a channel row that is neither is refused" -- \
+    run_dry_channel unstable not-a-row
 
 expect 1 "version file" "a channel row missing its version file is refused" -- \
     run_dry_channel nightly deadbeef

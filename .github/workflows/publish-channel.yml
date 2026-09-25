@@ -31,7 +31,7 @@ on:
                 required: true
                 type: string
             row:
-                description: "The bucket row: a released semver on stable, a staged sha on a channel."
+                description: "The bucket row: a released semver on stable, a staged sha on a channel (or a released semver when `unstable` has advanced to a versioned row)."
                 required: true
                 type: string
             tolerate:
