@@ -304,6 +304,10 @@ impl Drop for SwitchRelay {
 /// Attaches `tap_fd` to the gvproxy switch listening on `api_sock` (DM2, native
 /// Linux) and starts relaying frames between them.
 ///
+/// `subnet` is the switch's subnet — the subnet gvproxy was configured with —
+/// from which the egress leg derives the deprecated host-alias literal a gated
+/// relay notices (NET-004); the daemon relay (`gate` is `None`) ignores it.
+///
 /// Spawns two background tasks — tap→switch and switch→tap — and returns a
 /// [`SwitchRelay`] handle whose lifetime keeps the attachment alive.
 ///
@@ -316,11 +320,12 @@ pub async fn attach_to_switch(
     tap_fd: OwnedFd,
     api_sock: &Path,
     gate: Option<IngressGate>,
+    subnet: SwitchSubnet,
 ) -> io::Result<SwitchRelay> {
     let mut sock = UnixStream::connect(api_sock).await?;
     sock.write_all(CONNECT_REQUEST).await?;
     let (sock_rx, sock_tx) = sock.into_split();
-    spawn_relay(tap_fd, sock_rx, sock_tx, gate)
+    spawn_relay(tap_fd, sock_rx, sock_tx, gate, subnet)
 }
 
 /// Attaches `tap_fd` to the **host** gvproxy switch over AF_VSOCK (DM1/3/4) and
@@ -343,6 +348,7 @@ pub async fn attach_to_switch_vsock(
     cid: u32,
     port: u32,
     gate: Option<IngressGate>,
+    subnet: SwitchSubnet,
 ) -> io::Result<SwitchRelay> {
     // Bound the connect + `/connect` upgrade: a wedged or absent host gvproxy
     // must fail the attach fast, not stall OwnIp bring-up forever.
@@ -366,13 +372,17 @@ pub async fn attach_to_switch_vsock(
         )
     })??;
     let (sock_rx, sock_tx) = tokio::io::split(sock);
-    spawn_relay(tap_fd, sock_rx, sock_tx, gate)
+    spawn_relay(tap_fd, sock_rx, sock_tx, gate, subnet)
 }
 
 /// Wires `tap_fd` into the bidirectional frame relay against an already-connected,
 /// `/connect`-upgraded switch stream split into `sock_rx`/`sock_tx`.
 ///
-/// Shared by the DM2 UDS path ([`attach_to_switch`]) and the DM1/3/4 vsock path
+/// `subnet` is the switch this relay is attached to — the subnet the switch was
+/// configured with — and a gated relay derives NET-004's deprecated host-alias
+/// literal from it, so the notice always watches the address this switch (and
+/// no other) NATs to the host's loopback. Shared by the DM2 UDS path
+/// ([`attach_to_switch`]) and the DM1/3/4 vsock path
 /// ([`attach_to_switch_vsock`]); the relay loops are transport-agnostic
 /// (`AsyncRead`/`AsyncWrite`), so only the connect step differs.
 fn spawn_relay<R, W>(
@@ -380,6 +390,7 @@ fn spawn_relay<R, W>(
     sock_rx: R,
     sock_tx: W,
     gate: Option<IngressGate>,
+    subnet: SwitchSubnet,
 ) -> io::Result<SwitchRelay>
 where
     R: AsyncReadExt + Unpin + Send + 'static,
@@ -398,10 +409,17 @@ where
     // Share the UDP flow tracker with the egress leg so a reply to the PTask's own
     // UDP egress is recognized as solicited by the inbound gate (finding #2, UDP).
     let egress_conntrack = gate.as_ref().map(|g| Arc::clone(&g.conntrack));
+    // NET-004: a session relay tells its box — rate-limited — that frames to the
+    // literal host-alias address are deprecated. The daemon's own relay (`gate`
+    // is `None`) is not a box and gets no notice.
+    let legacy_notice = gate
+        .as_ref()
+        .map(|gate| LegacyHostNotice::for_gate(gate, subnet));
     let tap_to_switch = tokio::spawn(relay_tap_to_switch(
         Arc::clone(&tap),
         sock_tx,
         egress_conntrack,
+        legacy_notice,
     ));
     let switch_to_tap = tokio::spawn(relay_switch_to_tap(sock_rx, tap, gate));
     Ok(SwitchRelay {
@@ -411,13 +429,15 @@ where
 }
 
 /// tap → switch: read a raw Ethernet frame, record any outbound UDP flow (so its
-/// reply is allowed back in — finding #2, UDP), prepend its 2-byte LE length, and
-/// write the framed packet to the control socket. `conntrack` is `None` for the
-/// daemon relay, which has no ingress gate.
+/// reply is allowed back in — finding #2, UDP), notice frames to the deprecated
+/// literal host address (NET-004), prepend its 2-byte LE length, and write the
+/// framed packet to the control socket. `conntrack` and `notice` are `None` for
+/// the daemon relay, which has no ingress gate.
 async fn relay_tap_to_switch<W>(
     tap: Arc<AsyncFd<std::fs::File>>,
     mut sock: W,
     conntrack: Option<Arc<UdpConntrack>>,
+    notice: Option<LegacyHostNotice>,
 ) -> io::Result<()>
 where
     W: AsyncWriteExt + Unpin,
@@ -454,6 +474,14 @@ where
         {
             ct.record_egress(&pkt);
         }
+        // NET-004: the literal host address still routes — the switch's `nat`
+        // table maps it to the host's loopback — but the relay says, once per
+        // interval, that `host.min.internal` is the name to use instead.
+        if let Some(notice) = &notice
+            && is_legacy_host_literal(&buf[..n], notice.alias)
+        {
+            notice.emit();
+        }
         // One combined write keeps the length prefix and frame atomic even if
         // the socket closes between writes.
         let mut framed = Vec::with_capacity(2 + n);
@@ -472,6 +500,66 @@ const ETHERTYPE_IPV4: u16 = 0x0800;
 const IPPROTO_TCP: u8 = 6;
 /// IPv4 protocol number for UDP.
 const IPPROTO_UDP: u8 = 17;
+
+/// The zone record name a box can resolve the host by (NET-003) — the name the
+/// deprecation notice tells a box to use instead of the literal.
+const HOST_MIN_INTERNAL: &str = "host.min.internal";
+
+/// True when an Ethernet II frame is an IPv4 packet addressed to `alias` —
+/// NET-004's deprecated literal host address, the address the switch's `nat`
+/// table maps to the host's loopback. Any protocol counts: the notice is about
+/// the destination address, not the transport.
+fn is_legacy_host_literal(frame: &[u8], alias: Ipv4Addr) -> bool {
+    // EtherType at 12..14; the IPv4 destination address at 14+16..14+20.
+    frame.len() >= ETH_HDR + 20
+        && frame[12..14] == ETHERTYPE_IPV4.to_be_bytes()
+        && frame[30..34] == alias.octets()
+}
+
+/// Emits NET-004's deprecation notice on the egress relay leg: when a session
+/// box sends frames to the literal host-alias address, the relay says so —
+/// rate-limited, naming the box and [`HOST_MIN_INTERNAL`] — instead of letting
+/// the connection pass silently on an address the code should not keep using.
+struct LegacyHostNotice {
+    /// The box's switch IP — the relay gate's `session_id` label, the same
+    /// identity the policy warnings name.
+    label: String,
+    /// The literal address the notice watches for.
+    alias: Ipv4Addr,
+    /// A limiter of the notice's own, so a policy warning on the same relay
+    /// never consumes a deprecation notice's interval and vice versa.
+    limiter: PolicyWarnLimiter,
+}
+
+impl LegacyHostNotice {
+    /// Builds the notice from the relay's ingress gate, which carries the box's
+    /// session label, and the subnet of the switch the relay is attached to,
+    /// whose host alias is the deprecated literal — never a hardcoded default,
+    /// so a custom-subnet switch's literal is watched too. The gate itself is
+    /// not kept: the notice is egress-side.
+    fn for_gate(gate: &IngressGate, subnet: SwitchSubnet) -> Self {
+        Self {
+            label: gate.label.clone(),
+            alias: subnet.host_alias(),
+            limiter: PolicyWarnLimiter::new(),
+        }
+    }
+
+    /// Logs the notice if the rate limiter allows. Returns whether it fired.
+    fn emit(&self) -> bool {
+        if !self.limiter.should_warn_at(Instant::now()) {
+            return false;
+        }
+        tracing::info!(
+            session = %self.label,
+            deprecated = %self.alias,
+            replacement = HOST_MIN_INTERNAL,
+            "connection to the deprecated literal host address; \
+             use host.min.internal instead"
+        );
+        true
+    }
+}
 
 /// A per-PTask inbound ingress filter for the `switch → tap` relay leg.
 ///
@@ -1036,6 +1124,80 @@ mod tests {
             joined
                 .iter()
                 .any(|c| c.contains(&format!("address {}", lease.mac)))
+        );
+    }
+
+    /// NET-004: a frame a session box sends to the old literal host address is
+    /// noticed — one rate-limited line naming the box and the name to use
+    /// instead — while frames to any other destination, or to the literal from
+    /// a relay without a gate, notice nothing.
+    #[test]
+    fn legacy_host_literal_routes_with_deprecation() {
+        // The literal is the attached switch's host alias — the address its
+        // nat table routes to the host's loopback. Routing is the existing nat
+        // table's job; what is new is the notice.
+        let alias = SwitchSubnet::default().host_alias();
+        assert_eq!(alias, Ipv4Addr::new(100, 64, 255, 254));
+
+        let gate = IngressGate::for_session("100.64.0.9".into(), None);
+        let notice = LegacyHostNotice::for_gate(&gate, SwitchSubnet::default());
+        assert_eq!(notice.alias, alias, "the notice watches the switch's alias");
+
+        // The alias comes from the switch the relay is attached to, never a
+        // hardcoded default: a custom-subnet switch's literal is the one
+        // noticed, and the default alias is not.
+        let custom = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap();
+        let custom_notice =
+            LegacyHostNotice::for_gate(&IngressGate::for_session("10.0.0.9".into(), None), custom);
+        assert_eq!(custom_notice.alias, custom.host_alias());
+        assert_ne!(custom_notice.alias, alias);
+        assert!(is_legacy_host_literal(
+            &udp_frame(SRC, 40000, custom.host_alias(), 53),
+            custom_notice.alias
+        ));
+        assert!(!is_legacy_host_literal(
+            &udp_frame(SRC, 40000, alias, 53),
+            custom_notice.alias
+        ));
+
+        // A frame to the literal is noticed; one to the gateway is not; a
+        // truncated frame and a non-IPv4 ethertype are not.
+        assert!(is_legacy_host_literal(
+            &udp_frame(SRC, 40000, alias, 53),
+            alias
+        ));
+        assert!(!is_legacy_host_literal(
+            &udp_frame(SRC, 40000, Ipv4Addr::new(100, 64, 0, 1), 53),
+            alias
+        ));
+        assert!(!is_legacy_host_literal(
+            &udp_frame(SRC, 40000, alias, 53)[..14],
+            alias
+        ));
+        assert!(!is_legacy_host_literal(
+            &tcp_frame(0x0806, IPPROTO_TCP, SYN, SRC, 53),
+            alias
+        ));
+
+        // Rate-limited through the limiter: the first connection to the literal
+        // notices, a second one inside the interval does not.
+        assert!(
+            notice.emit(),
+            "the first frames to the literal emit a notice"
+        );
+        assert!(
+            !notice.emit(),
+            "the notice is rate-limited within the interval"
+        );
+
+        // The notice's limiter is its own: a policy warning on the same relay
+        // does not consume the deprecation notice's interval.
+        let gate = IngressGate::for_session("100.64.0.10".into(), None);
+        assert!(gate.limiter.should_warn_at(Instant::now()));
+        let notice = LegacyHostNotice::for_gate(&gate, SwitchSubnet::default());
+        assert!(
+            notice.emit(),
+            "a policy warning must not suppress the deprecation notice"
         );
     }
 }
