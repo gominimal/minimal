@@ -74,6 +74,10 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Run(args)) => task::cmd_run(&args),
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
+        Some(Command::Diag(diag::DiagArgs { command })) => match command {
+            diag::DiagCommand::Collect(args) => diag::cmd_bug(&cli.global_args, args).await,
+            diag::DiagCommand::Upload(args) => diag::cmd_diag_upload(args).await,
+        },
         #[cfg(feature = "remote-access")]
         Some(Command::Mesh(MeshArgs { command })) => match command {
             MeshCommand::Status => cmd_mesh_status(&cli.global_args).await,

@@ -1,4 +1,5 @@
-//! `min bug` — collect a diagnostic bundle for the minimal dev team.
+//! `min bug` — collect a diagnostic bundle for the minimal dev team, and
+//! optionally hand it to the portal that diagnoses one (see [`upload`]).
 //!
 //! One command, one artifact: a `minimal-diag-<timestamp>.tar.zst` containing
 //! the logs, config (redacted), state listings, process/network state, and
@@ -7,23 +8,81 @@
 //! still yields a valid archive whose `manifest.json` explains what's
 //! missing. Nothing here mutates state or autospawns daemons — diagnosing a
 //! wedged system must not change it.
+//!
+//! Collecting is local and stays local; only `--upload` sends anything, and
+//! only after the archive is safely on disk.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use clap::Args;
+use clap::{Args, Subcommand};
 
 pub mod collect;
 pub mod guest;
 pub mod net;
 pub mod project;
 pub mod redact;
+pub mod upload;
 
 use collect::DiagPaths;
 use diagnostics::{BundleWriter, LOG_TAIL_CAP, MAX_LOG_TAIL_BYTES, Redaction};
 
 use crate::GlobalArgs;
+use upload::DEFAULT_ENDPOINT;
+
+#[derive(Debug, Args)]
+pub struct DiagArgs {
+    #[command(subcommand)]
+    pub command: DiagCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DiagCommand {
+    /// Collect a diagnostic bundle (what `min bug` does)
+    Collect(BugArgs),
+    /// Send a bundle collected earlier to the diag portal
+    ///
+    /// Prints where the diagnosis will appear. Use this for a bundle someone
+    /// handed you, or one collected before the portal was reachable;
+    /// `min diag collect --upload` does both steps in one.
+    Upload(UploadArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct UploadArgs {
+    /// The bundle to send
+    pub path: PathBuf,
+    #[command(flatten)]
+    pub portal: PortalArgs,
+}
+
+/// How to reach the portal, shared by the two commands that do.
+///
+/// Flattened rather than repeated so that `min diag collect --upload` and
+/// `min diag upload` cannot drift into spelling the same three things
+/// differently.
+#[derive(Debug, Args)]
+pub struct PortalArgs {
+    /// What went wrong, in a sentence; shown beside the report and given to
+    /// the agent that reads the bundle
+    ///
+    /// Worth writing. The agent is told what the bundle contains but not what
+    /// you were doing when it stopped working.
+    #[arg(long)]
+    pub context: Option<String>,
+    /// GitHub token to upload with
+    ///
+    /// Defaults to `$GITHUB_TOKEN`, then `$GH_TOKEN`, then whatever
+    /// `gh auth token` prints. The portal uses it once to ask GitHub which
+    /// account it belongs to — that account is what its daily quota counts —
+    /// and never stores it.
+    #[arg(long)]
+    pub token: Option<String>,
+    /// The portal's base URL
+    #[arg(long, default_value = DEFAULT_ENDPOINT)]
+    pub endpoint: String,
+}
 
 #[derive(Debug, Args)]
 pub struct BugArgs {
@@ -45,6 +104,16 @@ pub struct BugArgs {
     /// start well after the incident.
     #[arg(long, default_value_t = LOG_TAIL_CAP, value_parser = parse_log_tail_bytes)]
     pub log_tail_bytes: u64,
+    /// Send the bundle to the diag portal and print where its diagnosis will
+    /// appear
+    ///
+    /// The bundle leaves this machine. It is the same archive either way —
+    /// secret-shaped values redacted, file contents never included — but
+    /// collecting one is local and this is not.
+    #[arg(long)]
+    pub upload: bool,
+    #[command(flatten)]
+    pub portal: PortalArgs,
 }
 
 /// Parses `--log-tail-bytes`, refusing anything the bundle writer cannot
@@ -238,8 +307,42 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
             ""
         },
     );
-    println!("Review the contents before sharing; send it to the minimal dev team.");
+    if !args.upload {
+        println!("Review the contents before sharing; send it to the minimal dev team.");
+        return Ok(());
+    }
+    // After the bundle is on disk, never instead of it. An upload that fails
+    // — no token, a spent allowance, no network from a machine broken enough
+    // to be worth diagnosing — must still leave the archive behind, because
+    // collecting it again is the expensive half.
+    let sent = send(&out_path, &args.portal).await?;
+    println!("Report:  {}", sent.report_url);
+    println!("Status:  {}", sent.status_url);
     Ok(())
+}
+
+/// `min diag upload` — hand a bundle collected earlier to the portal.
+pub async fn cmd_diag_upload(args: UploadArgs) -> Result<(), anyhow::Error> {
+    let sent = send(&args.path, &args.portal).await?;
+    println!("Sent {}", args.path.display());
+    println!("Report:  {}", sent.report_url);
+    println!("Status:  {}", sent.status_url);
+    Ok(())
+}
+
+/// The upload both commands do: find a token, then send.
+async fn send(
+    path: &std::path::Path,
+    portal: &PortalArgs,
+) -> Result<upload::Uploaded, anyhow::Error> {
+    let token = upload::resolve_token(portal.token.as_deref()).await?;
+    upload::upload(
+        path,
+        &portal.endpoint,
+        &token,
+        portal.context.as_deref().unwrap_or_default(),
+    )
+    .await
 }
 
 /// Reduces what the provider loop learned to the single fact the held-back log
@@ -407,6 +510,75 @@ mod tests {
                 "the error must name the ceiling it broke: {err}"
             );
         }
+    }
+
+    /// `--upload` is off unless asked for, and the portal's address is a
+    /// default rather than something every caller has to know.
+    #[test]
+    fn collecting_does_not_upload_unless_asked() {
+        let plain = parse(&[]).unwrap();
+        assert!(!plain.upload);
+        assert_eq!(plain.portal.endpoint, DEFAULT_ENDPOINT);
+        assert_eq!(plain.portal.context, None);
+        assert!(parse(&["--upload"]).unwrap().upload);
+    }
+
+    #[test]
+    fn the_portal_can_be_pointed_somewhere_else() {
+        let args = parse(&[
+            "--upload",
+            "--endpoint",
+            "http://localhost:8787",
+            "--context",
+            "min up hangs",
+        ])
+        .unwrap();
+        assert_eq!(args.portal.endpoint, "http://localhost:8787");
+        assert_eq!(args.portal.context.as_deref(), Some("min up hangs"));
+    }
+
+    /// The two spellings are the same command, and `min bug` keeps working:
+    /// it is what every existing bug report asks for.
+    #[test]
+    fn min_bug_and_min_diag_collect_are_one_command() {
+        use crate::cli::{Cli, Command};
+        let bug = Cli::try_parse_from(["min", "bug", "--upload"])
+            .unwrap()
+            .command;
+        let collect = Cli::try_parse_from(["min", "diag", "collect", "--upload"])
+            .unwrap()
+            .command;
+        let (
+            Some(Command::Bug(bug)),
+            Some(Command::Diag(DiagArgs {
+                command: DiagCommand::Collect(collect),
+            })),
+        ) = (bug, collect)
+        else {
+            panic!("`min bug` and `min diag collect` must parse to the same arguments");
+        };
+        assert!(bug.upload && collect.upload);
+        assert_eq!(bug.portal.endpoint, collect.portal.endpoint);
+    }
+
+    /// `min diag upload` takes the bundle to send as its one positional, so
+    /// an agent that already has a bundle does not have to collect another.
+    #[test]
+    fn uploading_a_bundle_collected_earlier_takes_its_path() {
+        use crate::cli::{Cli, Command};
+        let Some(Command::Diag(DiagArgs {
+            command: DiagCommand::Upload(args),
+        })) = Cli::try_parse_from(["min", "diag", "upload", "b.tar.zst", "--token", "t"])
+            .unwrap()
+            .command
+        else {
+            panic!("`min diag upload <path>` must parse");
+        };
+        assert_eq!(args.path, PathBuf::from("b.tar.zst"));
+        assert_eq!(args.portal.token.as_deref(), Some("t"));
+        // A path is not optional: uploading "whatever is lying around" is a
+        // guess, and the bundle is named after the minute it was collected.
+        assert!(Cli::try_parse_from(["min", "diag", "upload"]).is_err());
     }
 
     #[test]
