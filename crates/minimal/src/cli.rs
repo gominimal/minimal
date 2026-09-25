@@ -464,8 +464,8 @@ pub struct ActivateArgs {
     pub ingress: Vec<String>,
     /// Allowed destination subnets in CIDR form (`egress.allow_subnets`),
     /// e.g. `10.0.0.0/8`. Repeatable; unset means allow-all subnets. Valid on
-    /// an own-address (`--network own-ip`) or host-address
-    /// (`--network host-net`) box; a none box rejects the whole egress
+    /// an own-address (`--network own_ip`) or host-address
+    /// (`--network host_ip`) box; a none box rejects the whole egress
     /// declaration.
     #[arg(long = "allow-subnets", value_name = "CIDR")]
     pub allow_subnets: Vec<String>,
