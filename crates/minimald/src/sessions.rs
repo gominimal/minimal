@@ -11,6 +11,8 @@ use crate::{
 use common::SpecHash;
 use paths::DaemonAbsPath;
 use sessions::SessionId;
+#[cfg(target_os = "linux")]
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
@@ -228,14 +230,30 @@ impl Manager {
         // name routes: straight to its lease on a VM host (the daemon holds a
         // tap on the switch), or through the published-loopback forwarder on a
         // native host (NET-001).
+        //
+        // The registry mints its names under this daemon instance's host id —
+        // the same one the switch carries, seeded from the daemon id — so two
+        // daemons on one host mint distinct names and route both sets at the
+        // same time (NET-027) instead of the second daemon's registrations
+        // overwriting the first's under the shared `local` label.
         #[cfg(target_os = "linux")]
-        let hostnames = Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
-            crate::net::dns::DEFAULT_HOST_ID,
-            matches!(
-                net_switch.lock().await.transport(),
+        let hostnames = {
+            let switch = net_switch.lock().await;
+            let on_switch = matches!(
+                switch.transport(),
                 crate::net::SwitchTransport::HostShuttle { .. }
-            ),
-        )));
+            );
+            Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
+                switch.host_id().to_owned(),
+                on_switch,
+            )))
+        };
+        // This daemon's slice of the reserved local range is a pure function
+        // of its own slice octet — see [`LoopbackAllocator`], and the
+        // daemon-start line in `crate::server` that logs it (NET-027). It is
+        // not held here: the publish path that spends these addresses
+        // (NET-010/NET-129) is what will own the allocator, and it is another
+        // task's.
         let handle = ManagerHandle {
             sender,
             #[cfg(target_os = "linux")]
@@ -260,6 +278,120 @@ impl Manager {
 
         tokio::spawn(mngr.mainloop());
         Ok(handle)
+    }
+}
+
+/// The address-assignment side of the daemon-scoped switch: which slice of
+/// the reserved local range ([`crate::net::dns::RESERVED_LOCAL_RANGE`])
+/// this daemon's published boxes come from.
+///
+/// The range is host-global — every daemon on the machine draws from the
+/// same `127.64.0.0/24` — so the slice a daemon draws from must be a
+/// function of **its own** identity (the same per-daemon identity that
+/// names its zone, NET-027), never a constant two daemons would both start
+/// at. That identity is the daemon's *slice octet*: the octet a deployment
+/// pins, else the one its instance id derives
+/// (`crate::server::octet_for_daemon_id`). On a native host the octet is
+/// also the third octet of the /24 this daemon's own gvproxy runs on, so a
+/// daemon's switch leases and its publish slice move together; a daemon in
+/// a microVM does **not** own its switch (its boxes tap the gvproxy
+/// `minvmd` runs, on the default /16 every VM on the host shares), so its
+/// slice is keyed by the octet alone and two VM daemons on one host still
+/// draw from two different slices — the primary NET-027 case. Keying the
+/// slice on the switch *subnet* instead would collapse every microVM
+/// daemon onto the default subnet's octet, and with it onto one shared
+/// slice. The daemon's start line reads exactly this function to name the
+/// slice in its log (see `crate::server`), so a reader of two daemons'
+/// logs can compare the two slices — and see the wrap-around
+/// [`LoopbackAllocator::for_slice_octet`] names where it lands the pair
+/// on one.
+///
+/// The full arbitration is NET-010's host-global allocation; this is the
+/// per-daemon half of it. The publish path that **spends** these addresses
+/// (NET-129) is another task's and is not wired yet — until it lands,
+/// nothing calls [`LoopbackAllocator::allocate`], and the manager holds no
+/// allocator of its own.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct LoopbackAllocator {
+    /// The slice's first address, as a `u32` so hand-out is `next += 1`.
+    first: u32,
+    /// The slice's last address, inclusive.
+    last: u32,
+    /// The next address to hand out. Only ever advances — a published box
+    /// holds its address for its whole life, so reuse would collide with a
+    /// name that is still routed.
+    next: u32,
+}
+
+/// How many addresses one daemon's slice of the reserved local range holds:
+/// a /27 gives each daemon 32 published boxes' worth of room, and the octet
+/// indexes eight daemons' worth of distinct slices before the wrap-around the
+/// doc on [`LoopbackAllocator::for_slice_octet`] names.
+#[cfg(target_os = "linux")]
+const LOOPBACK_SLICE_PREFIX: u8 = 27;
+
+/// How many slices the reserved local range holds: it is one /24 (256
+/// addresses, see [`crate::net::dns::RESERVED_LOCAL_RANGE`]) carved into
+/// /27s — eight slices — so a slice octet mod this many indexes every
+/// slice there is. `pub(crate)` for the daemon-start tests, which assert
+/// two daemons' slices against exactly this wrap-around.
+#[cfg(target_os = "linux")]
+pub(crate) const LOOPBACK_SLICES: u32 =
+    1 << (LOOPBACK_SLICE_PREFIX - crate::net::dns::RESERVED_LOCAL_RANGE.1);
+
+#[cfg(target_os = "linux")]
+impl LoopbackAllocator {
+    /// The slice of the reserved local range for a daemon whose slice octet
+    /// is `octet`: one /27, indexed by `octet % `[`LOOPBACK_SLICES`] — the
+    /// octet a native daemon's own `100.64.x.0/24` switch differs in, and
+    /// the one a microVM daemon's instance id derives, since its switch
+    /// (the host's default /16, which `minvmd` renders) is the same for
+    /// every VM on the host and cannot differ. Two daemons whose octets
+    /// differ therefore hand out disjoint addresses, except across the
+    /// wrap-around this doc exists to name: octets that differ by a
+    /// multiple of [`LOOPBACK_SLICES`] index one shared slice, so those
+    /// two daemons hand out the same addresses — a pair of derived octets
+    /// lands there about one time in eight. The daemon's start line
+    /// prints the slice's range, so the wrap is visible rather than
+    /// hidden (two daemons' logs carry the same `loopback_slice`), and
+    /// NET-010's host-global allocation is what arbitrates when it binds.
+    #[must_use]
+    pub fn for_slice_octet(octet: u8) -> Self {
+        let (range_base, _) = crate::net::dns::RESERVED_LOCAL_RANGE;
+        let slice_size = 1u32 << (32 - u32::from(LOOPBACK_SLICE_PREFIX));
+        let index = u32::from(octet) % LOOPBACK_SLICES;
+        let first = u32::from(range_base) + index * slice_size;
+        Self {
+            first,
+            last: first + slice_size - 1,
+            next: first,
+        }
+    }
+
+    /// The next address to publish a box at, or `None` once this daemon's
+    /// slice is spent. Never reuses: a withdrawn name's address stays
+    /// retired until the daemon restarts.
+    ///
+    /// No caller yet, on purpose: the publish path that spends these
+    /// addresses (NET-129, arbitrated host-globally by NET-010) is another
+    /// task's, and it — not the daemon's start line — is what will call
+    /// this. Until it lands the slice is derived and announced, never drawn
+    /// from.
+    #[allow(dead_code)] // The publish path (NET-129/NET-010) is another task's.
+    pub fn allocate(&mut self) -> Option<Ipv4Addr> {
+        if self.next > self.last {
+            return None;
+        }
+        let addr = Ipv4Addr::from(self.next);
+        self.next += 1;
+        Some(addr)
+    }
+
+    /// The slice this daemon draws from, first and last address inclusive.
+    #[must_use]
+    pub fn range(&self) -> (Ipv4Addr, Ipv4Addr) {
+        (Ipv4Addr::from(self.first), Ipv4Addr::from(self.last))
     }
 }
 
@@ -2218,6 +2350,74 @@ pub(crate) mod tests {
         assert!(
             err.to_string().contains("no-such-output"),
             "the error must name the output that was asked for, got {err}"
+        );
+    }
+
+    /// NET-027's address half: each daemon's loopback allocator draws from
+    /// the slice of the reserved local range its own slice octet indexes —
+    /// for a native daemon the third octet of its own gvproxy's /24, for a
+    /// microVM daemon the octet its instance id derives, since its switch is
+    /// the host's default /16 and is the same for every VM on the host. Two
+    /// daemons whose octets differ draw from disjoint ranges — save octets
+    /// that differ by a multiple of the slice count, which index one
+    /// shared slice (the wrap the last assertion pins) — and every address
+    /// one hands out stays inside its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn loopback_allocators_follow_the_daemon_s_slice_octet() {
+        // A native daemon on its own /24, a VM daemon whose id derived the
+        // same octet, and a second daemon on the octet next door.
+        let daemon_a = LoopbackAllocator::for_slice_octet(1);
+        let daemon_b = LoopbackAllocator::for_slice_octet(9);
+        let daemon_c = LoopbackAllocator::for_slice_octet(0);
+
+        let (first_a, last_a) = daemon_a.range();
+        let (first_b, last_b) = daemon_b.range();
+        let (first_c, last_c) = daemon_c.range();
+        assert_ne!(
+            first_a, first_c,
+            "two daemons must not draw from the same slice"
+        );
+        assert!(
+            first_c > last_a || first_a > last_c,
+            "the slices must be disjoint: {}..={} and {}..={}",
+            first_a,
+            last_a,
+            first_c,
+            last_c
+        );
+        // Octets 1 and 9 are eight slices apart, so they wrap onto the same
+        // one — the documented wrap-around NET-010's host-global allocation
+        // is the layer that arbitrates; it must stay a wrap, not a widening.
+        assert_eq!(
+            (first_a, last_a),
+            (first_b, last_b),
+            "octets eight slices apart must share a slice, not split one"
+        );
+        for addr in [first_a, last_a, first_b, last_b, first_c, last_c] {
+            assert_eq!(
+                addr.octets()[0],
+                127,
+                "every published address stays in the reserved local range"
+            );
+        }
+
+        // Hand-out never reuses and never leaves the slice.
+        let mut allocator = daemon_a;
+        let mut handed = std::collections::BTreeSet::new();
+        while let Some(addr) = allocator.allocate() {
+            assert!(handed.insert(addr), "an address is handed out once");
+            assert!(addr >= first_a && addr <= last_a, "inside the slice");
+        }
+        assert_eq!(
+            handed.len(),
+            32,
+            "a /27 slice holds 32 published addresses' worth of room"
+        );
+        assert_eq!(
+            allocator.allocate(),
+            None,
+            "a spent slice yields no more addresses"
         );
     }
 }

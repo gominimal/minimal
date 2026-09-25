@@ -46,6 +46,8 @@ fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -82,6 +84,8 @@ fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -922,23 +926,29 @@ async fn policy_shows_effective_egress() {
 
 /// Runs the compiled `min` with the harness daemon's `--minimal-dir`, an empty
 /// `--config-dir` (the developer's own loadouts and policy stay out of the
-/// run), and `--no-input`, plus `extra` as the command, and returns stderr.
+/// run), and `--no-input`, plus `extra` as the command, and returns its
+/// captured output.
 #[cfg(target_os = "linux")]
-async fn run_min_stderr(args: &GlobalArgs, extra: &[&str]) -> String {
+async fn run_min(args: &GlobalArgs, extra: &[&str]) -> std::process::Output {
     let minimal_dir = args
         .minimal_dir
         .as_ref()
         .expect("setup points at a tempdir");
     let config_dir = tempfile::TempDir::new().unwrap();
-    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
         .args(extra)
         .output()
         .await
-        .expect("the min binary should be invocable");
-    String::from_utf8_lossy(&out.stderr).into_owned()
+        .expect("the min binary should be invocable")
+}
+
+/// [`run_min`]'s stderr — the warning path's tests read what the user sees.
+#[cfg(target_os = "linux")]
+async fn run_min_stderr(args: &GlobalArgs, extra: &[&str]) -> String {
+    String::from_utf8_lossy(&run_min(args, extra).await.stderr).into_owned()
 }
 
 /// Polls `ListSessions` until the daemon reports hostname routing down — the
@@ -1092,6 +1102,90 @@ async fn ls_warning_clears_on_recovery() {
     );
 }
 
+/// NET-026: a daemon that auto-selected its hostname-proxy port tells `min`
+/// which one it landed on, and `min ls` prints the address — the one an
+/// `HTTP(S)_PROXY` export needs, and the thing that cannot stay a constant on
+/// a machine running two daemons. The box-zone answerer's UDP port prints
+/// beside it, since pointing the host's resolver at that port is the other
+/// half of the same discovery. Driven through the compiled binary so the
+/// assertion is on what the user actually sees.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn min_prints_discovered_proxy_port() {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use minimald::server::{
+        RetryBackoff, retry_hostname_proxy_until_serving, retry_zone_answerer_until_serving,
+    };
+    use minimald_rpc::ListSessions;
+
+    let (daemon, args) = setup().await;
+    // Auto-select — no port configured — through the same startup loop
+    // `start_host_proxies` spawns, with a compressed backoff.
+    let compressed = RetryBackoff::new(
+        std::time::Duration::from_millis(5),
+        std::time::Duration::from_millis(40),
+    );
+    tokio::join!(
+        retry_hostname_proxy_until_serving(
+            daemon.server.state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        ),
+        retry_zone_answerer_until_serving(
+            daemon.server.state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        ),
+    );
+
+    // The reply `min ls` renders carries the ports both listeners bound.
+    let mut client = connect_daemon(&args).await.unwrap();
+    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    let port = resp
+        .hostname_proxy_port
+        .expect("the daemon must report the port its proxy ended up on");
+    assert_ne!(port, 0, "port 0 is a request for a port, not an answer");
+    let answerer_port = resp
+        .zone_answerer_port
+        .expect("the daemon must report the port its answerer ended up on");
+    assert_ne!(
+        answerer_port, 0,
+        "port 0 is a request for a port, not an answer"
+    );
+    assert!(
+        resp.hostname_routing_unavailable.is_none(),
+        "auto-selecting a port is not a fault, got: {:?}",
+        resp.hostname_routing_unavailable
+    );
+
+    // The printed addresses are real: the proxy accepts on its port.
+    tokio::net::TcpStream::connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+        .await
+        .expect("the discovered port must be listening");
+
+    let out = run_min(&args, &["ls"]).await;
+    let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        ls_stdout.contains(&format!("HOSTNAME PROXY:  listening on 127.0.0.1:{port}")),
+        "`min ls` must print the discovered port, got: {ls_stdout}"
+    );
+    assert!(
+        ls_stdout.contains("routes through it"),
+        "the line must say what the port is for, got: {ls_stdout}"
+    );
+    assert!(
+        ls_stdout.contains(&format!(
+            "ZONE ANSWERER:   listening on 127.0.0.1:{answerer_port} (UDP)"
+        )),
+        "`min ls` must print the answerer's port beside the proxy's, got: {ls_stdout}"
+    );
+    assert!(
+        ls_stdout.contains("point the host's resolver at it"),
+        "the answerer line must say what the port is for, got: {ls_stdout}"
+    );
+}
+
 // --- retired surfaces (NET-109 / NET-110) ---
 
 /// No build of the daemon carries the retired mTLS reverse proxy, its
@@ -1196,6 +1290,8 @@ fn session_list_decodes_without_mtls_field() {
     let resp = ListSessionsResponse {
         daemon_version: Some("test".to_string()),
         hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
         resource_pool: None,
         sessions: vec![],
     };
