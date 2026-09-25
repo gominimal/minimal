@@ -36,6 +36,9 @@ clap.workspace = true
 clap_complete.workspace = true
 constcat.workspace = true
 fd-lock.workspace = true
+# DNS message parsing/encoding for the box-zone answerer (`net::answerer`).
+# Message types only: no resolver, no server, no runtime features.
+hickory-proto.workspace = true
 futures.workspace = true
 size.workspace = true
 hakoniwa.workspace = true

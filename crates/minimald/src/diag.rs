@@ -342,6 +342,11 @@ async fn build_bundle(
             diagnostics::net::PROC_NET_ROUTE_TABLES
         )
     );
+    // The box zone's table: every live `*.min.internal` name with the address
+    // it answers at on the host and the session that owns it — the names this
+    // daemon holds, beside the interfaces and routes they ride.
+    #[cfg(target_os = "linux")]
+    collect_step!(w, "net.zone", zone_table(&mut w, s));
     if s.in_microvm().await {
         collect_step!(w, "net.gvproxy", gvproxy_probe(&mut w));
     }
@@ -769,6 +774,32 @@ async fn gvproxy_probe<W: BundleSink>(w: &mut BundleWriter<W>) -> Result<(), any
         .await
 }
 
+/// The box-zone table ([`crate::net::dns::HostnameRegistry::zone_table`]):
+/// every live `*.min.internal` name, the A address it answers at on the host
+/// (`null` when the name is held at an address the host may not be told, so
+/// the table says the box exists without claiming it is published there), and
+/// the session that owns it. Read from the same shared registry the answerer
+/// and the routing proxies serve — a dump and a lookup can never disagree.
+///
+/// The node's own addresses travel empty today (see
+/// [`crate::net::dns::is_host_answerable`]).
+#[cfg(target_os = "linux")]
+async fn zone_table<W: BundleSink>(
+    w: &mut BundleWriter<W>,
+    s: &ServerStateHandle,
+) -> Result<(), anyhow::Error> {
+    let hostnames = s.sessions_manager().await.hostnames();
+    // Poison recovery matches the answerer's and the proxies' reads of the
+    // same lock: silently reporting nothing would hide every live box.
+    let rows = match hostnames.read() {
+        Ok(registry) => registry.zone_table(&[]),
+        Err(poisoned) => poisoned.into_inner().zone_table(&[]),
+    };
+    let json =
+        serde_json_lenient::to_vec_pretty(&rows).context("serializing the box-zone table")?;
+    w.add_bytes("net/zone.json", &json, Redaction::None).await
+}
+
 #[derive(Serialize)]
 struct Filesystem {
     path: String,
@@ -919,6 +950,47 @@ mod tests {
         }
         // Not in a microVM: no gvproxy probe entry.
         assert!(!files.contains_key("net/gvproxy.json"));
+    }
+
+    /// The bundle carries the box zone's table (NET-006's "which names does
+    /// this daemon hold"): every live name with the address it answers at on
+    /// the host and the session that owns it, read from the same shared
+    /// registry the answerer and the routing proxies serve.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn diag_bundle_carries_the_box_zone_table() {
+        use sessions::SessionId;
+
+        let server = TestServer::new().await;
+        server
+            .state
+            .sessions_manager()
+            .await
+            .hostnames()
+            .write()
+            .expect("registry lock")
+            .register_host_net(SessionId::nil(), "web");
+
+        let files = fetch_bundle(&server).await;
+        let zone: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["net/zone.json"]).expect("zone table is JSON");
+        let web = zone
+            .as_array()
+            .expect("the zone table is a row per name")
+            .iter()
+            .find(|row| row["name"].as_str() == Some("web.min.internal"))
+            .expect("a registered box has a row");
+        assert_eq!(web["address"].as_str(), Some("127.0.0.1"));
+        assert_eq!(web["owner"].as_str(), Some("web"));
+
+        // A name no box holds has no row: the table is what the zone holds.
+        assert!(
+            zone.as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["name"].as_str() != Some("ghost.min.internal")),
+            "an unheld name has no row"
+        );
     }
 
     /// R6.6: the guest-side incident trio, all of it binary-free `/proc`.
