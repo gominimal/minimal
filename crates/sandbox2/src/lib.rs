@@ -514,17 +514,6 @@ fn execve_in_child(
     Ok(())
 }
 
-// Work around the `command_from_closure` signature on non-Linux hosts where
-// the function is cfg'd out.
-#[cfg(not(target_os = "linux"))]
-fn install_filter_in_command(
-    _container: &hakoniwa::Container,
-    _command: &mut hakoniwa::Command,
-    _filter: &'static SocketFamilyFilter,
-) -> Result<(), Error> {
-    Ok(())
-}
-
 /// Options for [`Sandbox::bind_mount`].
 #[derive(Debug, Default, Clone, Copy)]
 #[cfg(target_os = "linux")]
@@ -649,12 +638,6 @@ impl<C: Channel> Sandbox<C> {
             tracing::info!(network_plan = %plan, "sandbox launch: network plan is open, no socket-family filter");
             None
         };
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = plan;
-        }
-        #[cfg(not(target_os = "linux"))]
-        let socket_family_filter: Option<&'static SocketFamilyFilter> = None;
 
         // Have hakoniwa create + configure the TAP inside the sandbox's user+net
         // namespace (rootless). `network()` does not imply the netns unshare,
