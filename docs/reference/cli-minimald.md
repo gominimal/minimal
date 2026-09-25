@@ -40,6 +40,16 @@ Runs the minimald server in the foreground.
 | `--detach` | Daemonize: spawn minimald in a new session (setsid) and return once the SSH socket accepts connections, or an 8s timeout elapses. Used by the `min` CLI to auto-start a native daemon on Linux |
 | `--gvproxy-bin <PATH>` | Path to the gvproxy ("gvisor-tap-vsock") binary used for networking. Defaults to the installed location: the user-local `bin/gvproxy-min` the installer stamps, else the system install path. |
 
+When the daemon brings its host-side listeners up it logs **two** serving
+lines, one per listener: the hostname proxy (`component=dns-proxy`, TCP) and
+the box-zone answerer (`component=zone-answerer`, UDP). Each names the port
+it came up on and a `port_source` field saying how the port was chosen —
+`configured` (pinned by flag), `default` (the documented default was free),
+or `selected` (the default was busy, a publish was refused, or the bind asked
+the OS outright). Both ports also travel to clients: `min ls` prints a line
+for each, with the answerer's marked `(UDP)` since it is the one a host
+resolver is pointed at rather than an `HTTP(S)_PROXY` export.
+
 ### `completions`
 
 ```
