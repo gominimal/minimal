@@ -158,11 +158,38 @@ fn split_authority(authority: &str) -> (&str, Option<u16>) {
     (host, port)
 }
 
-/// Binds the egress-proxy listener at `addr`, returning it on success. On a bind
-/// failure it emits the `component = "dns-proxy"` reachability warning and
-/// returns `None`: the proxy is unavailable and PTask hostnames will not route
-/// until the address is free. This is the daemon-startup reachability check that
-/// supersedes the former systemd-resolved probe (R3.4).
+/// Why a host-side proxy listener could not bind its address, carrying the
+/// reason and the one remedy that clears it.
+///
+/// The pair is authored once here so every surface reads the same text: the
+/// startup retry's warning, the daemon's `proxy_unavailable` note the
+/// `ListSessions` RPC serves, and the warning `min ls` and
+/// `min session activate` print (NET-020).
+#[derive(Debug, Clone)]
+pub struct BindFailure {
+    /// What failed, named for a human: the address and the OS error.
+    pub reason: String,
+    /// The remedy: free the listen address so the daemon's retry can bind it.
+    pub remedy: String,
+}
+
+impl BindFailure {
+    /// The reason and remedy as the one report the daemon's unavailable note
+    /// and the CLI warning carry.
+    #[must_use]
+    pub fn reported(&self) -> String {
+        format!("{}. Remedy: {}", self.reason, self.remedy)
+    }
+}
+
+/// Binds the egress-proxy listener at `addr`, returning it on success. On a
+/// bind failure it returns a [`BindFailure`] carrying the reason (the address
+/// and the OS error) and the remedy that clears it, and logs nothing: the
+/// caller owns the failure's log line, because only it knows the retry
+/// schedule that line reports — `server::start_host_proxies` retries with
+/// backoff until the bind succeeds (NET-021), so one failed bind is one
+/// warning, not a silent fallback. This is the daemon-startup reachability
+/// check that supersedes the former systemd-resolved probe (R3.4).
 ///
 /// The returned listener is the caller's to either serve (via [`serve`]) or
 /// drop. The success event reports the address as `reachable` rather than
@@ -171,7 +198,12 @@ fn split_authority(authority: &str) -> (&str, Option<u16>) {
 /// serve it (see `server::start_host_proxies`); this said otherwise, and reading
 /// it as a bind-and-drop probe is what made gominimal/inbox#560 look like a
 /// false alarm on macOS.
-pub async fn bind_listener(addr: SocketAddr) -> Option<TcpListener> {
+///
+/// # Errors
+///
+/// Returns a [`BindFailure`] when the address cannot be bound; the OS error is
+/// carried inside the failure's reason.
+pub async fn bind_listener(addr: SocketAddr) -> Result<TcpListener, BindFailure> {
     match TcpListener::bind(addr).await {
         Ok(listener) => {
             tracing::info!(
@@ -180,19 +212,15 @@ pub async fn bind_listener(addr: SocketAddr) -> Option<TcpListener> {
                 status = "reachable",
                 "host-side egress proxy listen address is bindable"
             );
-            Some(listener)
+            Ok(listener)
         }
-        Err(error) => {
-            tracing::warn!(
-                component = "dns-proxy",
-                %addr,
-                status = "unavailable",
-                error = %error,
-                remedy = "free the listen address; PTask *.min.internal hostnames will not route until the egress proxy can bind",
-                "host-side egress proxy could not bind its listener"
-            );
-            None
-        }
+        Err(error) => Err(BindFailure {
+            reason: format!("the daemon could not bind {addr}: {error}"),
+            remedy: format!(
+                "free the listen address; `lsof -nP -iTCP:{} -sTCP:LISTEN` names the holder",
+                addr.port()
+            ),
+        }),
     }
 }
 
@@ -1030,15 +1058,16 @@ mod tests {
         let listener = bind_listener(addr).await;
         drop(guard);
 
-        assert!(listener.is_none(), "a bind to a held address must fail");
+        let failure = listener.expect_err("a bind to a held address must fail");
+        assert!(
+            failure.reported().contains("could not bind"),
+            "the failure must name the bind failure, got: {}",
+            failure.reported()
+        );
         let logged = buf.contents();
         assert!(
-            logged.contains(r#"component="dns-proxy""#),
-            "expected the dns-proxy component field, got: {logged}"
-        );
-        assert!(
-            logged.contains(r#"status="unavailable""#),
-            "expected the unavailable status field, got: {logged}"
+            logged.is_empty(),
+            "bind_listener must not log on failure; the caller owns the log line, got: {logged}"
         );
     }
 
