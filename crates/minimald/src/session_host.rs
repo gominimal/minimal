@@ -1937,6 +1937,10 @@ pub(crate) struct SandboxLauncher {
     /// `OwnIp` PTask attaches, removed on exit. `None` for other
     /// network modes.
     pub(crate) ingress: Option<sessions::IngressPolicy>,
+    /// The proxy-routing-table handle the `OwnIp` lease is reported through
+    /// on attach, so the box's `<name>.min.internal` route exists exactly
+    /// while the box does (NET-001). Ignored by every other network mode.
+    pub(crate) own_address: Option<crate::net::provider::OwnAddressReporter>,
     /// Composition to merge into the launcher's baseline packages and
     /// vars. Patches and lifecycle hooks are ignored today.
     pub(crate) composition: Option<std::sync::Arc<sessions::core::compose::Composition>>,
@@ -2031,6 +2035,7 @@ impl SessionLauncher for SandboxLauncher {
         let ingress = self.ingress;
         let network_mode = self.network_mode;
         let net_switch = self.net_switch;
+        let own_address = self.own_address;
         // The session name, registered as this PTask's `*.min.internal` hostname on
         // an own-IP attach (finding #3 / UC6); cloned because `name` is consumed by
         // the sandbox env below.
@@ -2059,6 +2064,7 @@ impl SessionLauncher for SandboxLauncher {
             &net_switch,
             &session_name,
             ingress.clone(),
+            own_address,
         ))
         .await
         .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;
