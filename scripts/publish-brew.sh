@@ -343,4 +343,17 @@ remote_url="$(git remote get-url origin)"
 # the name of the first push).
 git push origin HEAD:refs/heads/main
 
-echo "publish-brew: pushed $commit_subject to $remote_url"
+# Post-push assertion. Guards the failure this publisher cannot otherwise see:
+# a push that reports success while the tap never receives the formula — the tap
+# sat empty for weeks and nothing noticed, because nothing checked the END
+# state. So assert the REMOTE now carries exactly the commit we rendered (not
+# merely that git exited 0), and that the formula in it declares the version we
+# meant to publish.
+pushed_sha="$(git rev-parse HEAD)"
+remote_sha="$(git ls-remote "$remote_url" refs/heads/main | cut -f1)"
+[ "$remote_sha" = "$pushed_sha" ] \
+    || die "pushed $pushed_sha but $remote_url refs/heads/main is ${remote_sha:-<missing>} — the formula did not land"
+git show "HEAD:Formula/$PKGNAME.rb" | grep -qF "version \"$VERSION\"" \
+    || die "$remote_url landed $pushed_sha, but Formula/$PKGNAME.rb does not declare version \"$VERSION\""
+
+echo "publish-brew: pushed and verified $commit_subject to $remote_url (refs/heads/main at $pushed_sha)"

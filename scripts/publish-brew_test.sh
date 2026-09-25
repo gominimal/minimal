@@ -258,4 +258,43 @@ expect 1 "unknown --channel" "an unknown channel is refused" -- \
     env -u SSH_AUTH_SOCK -u GITHUB_TOKEN PKGVER="$row" BREW_TAP_REPO="file://$tap" \
         MINIMAL_BUCKET_URL="file://$root/bucket" "$script" --channel beta --dry-run
 
+# --- the real push path, and its post-push verification -----------------------
+# Everything above exercises --dry-run. This is the only case that commits and
+# pushes, so it is the only one that reaches the post-push assertion — which is
+# the check that would have caught the tap sitting empty while every run
+# reported success. The file:// fixture remote is the tap; after the push the
+# REMOTE must carry the formula, not just our local clone.
+seeded_before="$(git -C "$seed" rev-parse main)"
+out="$(env -u SSH_AUTH_SOCK -u GITHUB_TOKEN \
+    PKGVER=0.5.4 BREW_TAP_REPO="file://$tap" \
+    MINIMAL_RELEASE_URL="file://$root/releases/v0.5.4" \
+    MINIMAL_BUCKET_URL="file://$root/bucket" \
+    "$script" 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ]; then ok "the push path publishes without --dry-run"; else bad "the push path publishes without --dry-run (rc=$rc; out: $out)"; fi
+if [[ "$out" == *"pushed and verified"* ]]; then
+    ok "the publisher verifies the pushed remote"
+else
+    bad "the publisher verifies the pushed remote (out: $out)"
+fi
+
+# The END state: the remote branch holds exactly the rendered formula.
+pushed="$(git -C "$seed" fetch -q origin && git -C "$seed" rev-parse origin/main)"
+if [ "$pushed" != "$seeded_before" ]; then
+    ok "the push advanced the fixture remote"
+else
+    bad "the push advanced the fixture remote (still $pushed)"
+fi
+formula="$(git -C "$seed" show origin/main:Formula/minimal.rb 2>/dev/null || true)"
+if [[ "$formula" == *'version "0.5.4"'* ]]; then
+    ok "the remote formula declares the published version"
+else
+    bad "the remote formula declares the published version (remote Formula/minimal.rb: $formula)"
+fi
+if [[ "$formula" != *'@@'* ]]; then
+    ok "the remote formula carries no unrendered @@tokens@@"
+else
+    bad "the remote formula carries no unrendered @@tokens@@"
+fi
+
 finish

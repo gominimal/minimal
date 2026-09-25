@@ -421,4 +421,15 @@ case "$remote_url" in
 esac
 git push origin HEAD:master
 
-echo "publish-aur: pushed $PKGNAME $VERSION to $remote_url"
+# Post-push assertion, for the same reason as publish-brew.sh's: assert the AUR
+# remote now carries exactly the commit we rendered (not merely that git exited
+# 0), and that the PKGBUILD in it declares the pkgver we published. Without it a
+# push that never lands is indistinguishable from one that did.
+pushed_sha="$(git rev-parse HEAD)"
+remote_sha="$(git ls-remote "$remote_url" refs/heads/master | cut -f1)"
+[ "$remote_sha" = "$pushed_sha" ] \
+    || die "pushed $pushed_sha but $remote_url refs/heads/master is ${remote_sha:-<missing>} — the PKGBUILD did not land"
+git show "HEAD:PKGBUILD" | grep -qF "pkgver=$PKGVER" \
+    || die "$remote_url landed $pushed_sha, but PKGBUILD does not declare pkgver=$PKGVER"
+
+echo "publish-aur: pushed and verified $PKGNAME $VERSION to $remote_url (refs/heads/master at $pushed_sha)"

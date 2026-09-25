@@ -267,4 +267,11 @@ expect 1 "unknown --channel" "an unknown channel is refused" -- \
     env PKGVER=0.5.4 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
         AUR_SSH_PRIVATE_KEY=k "$script" --channel beta --dry-run
 
+# NOTE: publish-aur.sh's push path is deliberately NOT exercised here, and its
+# post-push verification (the remote must carry the commit we rendered) is
+# therefore unproven by this harness: the script refuses any remote that is not
+# aur.archlinux.org, which is the guard that keeps a stray `origin` from
+# receiving a package, so no fixture can reach `git push`. publish-brew_test.sh
+# covers the equivalent check against a file:// tap.
+
 finish
