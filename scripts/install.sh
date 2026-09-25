@@ -232,7 +232,11 @@ else
                 version_arg="$2"; version_set=1
                 shift
                 argn=$((argn - 1)) ;;
-            --version=*)  version_arg="${1#--version=}"; version_set=1 ;;
+            --version=*)
+                version_arg="${1#--version=}"; version_set=1
+                case "$version_arg" in
+                    ''|-*) die "--version needs a value (e.g. --version 0.6.0)" ;;
+                esac ;;
             *)            set -- "$@" "$1" ;;
         esac
         shift

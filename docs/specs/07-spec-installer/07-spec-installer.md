@@ -136,8 +136,8 @@ than misparsing.
 **R2.5**, `--version VER` (or `--version=VER`) names the version directly and
 replaces R2.1 and R2.2: the script fetches no pointer and goes straight to the
 manifest (R2.3). The value is validated like a target, `^[A-Za-z0-9._-]+$`
-with `.` and `..` rejected, before any fetch. A missing value, or a target
-passed alongside it (positional or `MINIMAL_INSTALL_TARGET_OVERRIDE`), exits
+with `.` and `..` rejected, before any fetch. A missing value or one starting
+with `-` (in either form), or a target passed alongside it (positional or `MINIMAL_INSTALL_TARGET_OVERRIDE`), exits
 with an error. This installs a staged version that no channel points at.
 
 **Proof artifacts**:
@@ -147,8 +147,8 @@ with an error. This installs a staged version that no channel points at.
 - **Test**: A manifest whose `# format:` line names an unsupported version exits
   non-zero with a message naming the supported version.
 - **Test**: `--version v1` installs `v1` with the pointer file absent;
-  `--version ..`, `--version` with no value, and a target plus `--version`
-  exit non-zero.
+  `--version ..`, `--version` with no value, `--version=` and
+  `--version=--force-stop`, and a target plus `--version` exit non-zero.
 
 ### Unit 3 - Manifest format and field extraction
 

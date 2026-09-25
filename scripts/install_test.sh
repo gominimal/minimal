@@ -527,6 +527,12 @@ check 1 "$rc" "--version without a value exits non-zero (R2.5)"
 run versionflag "$HV" --version --force-stop
 check 1 "$rc" "--version followed by a flag exits non-zero (R2.5)"
 want_ok "a flag is not taken as the version (R2.5)" grep -q "needs a value" "$OUT"
+run versioneqnone "$HV" --version=
+check 1 "$rc" "--version= without a value exits non-zero (R2.5)"
+want_ok "an empty --version= needs a value (R2.5)" grep -q "needs a value" "$OUT"
+run versioneqflag "$HV" --version=--force-stop
+check 1 "$rc" "--version=-FLAG exits non-zero (R2.5)"
+want_ok "a flag is not taken as the --version= value (R2.5)" grep -q "needs a value" "$OUT"
 run versionboth "$HV" unstable --version v1
 check 1 "$rc" "a target plus --version exits non-zero (R2.5)"
 want_ok "the conflict is named (R2.5)" grep -q "not both" "$OUT"
