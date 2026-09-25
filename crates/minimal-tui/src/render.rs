@@ -545,6 +545,7 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                         Some(ingress) => {
                             if ingress.port_mappings.is_empty()
                                 && ingress.dynamic_allowed_range.is_none()
+                                && ingress.dynamic_ingress.is_none()
                             {
                                 lines.push(Line::raw("  deny all"));
                             }
@@ -556,6 +557,9 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                             }
                             if let Some((lo, hi)) = ingress.dynamic_allowed_range {
                                 lines.push(Line::raw(format!("  dynamic ports  {lo}–{hi}")));
+                            }
+                            if let Some(mode) = ingress.dynamic_ingress {
+                                lines.push(Line::raw(format!("  dynamic ingress  {mode}")));
                             }
                         }
                     }

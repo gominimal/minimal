@@ -17,7 +17,9 @@ pub mod exec;
 pub mod taskenv;
 pub mod trace;
 
-pub use sessions::{EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy};
+pub use sessions::{
+    DynamicIngress, EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
+};
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
 
@@ -1208,6 +1210,7 @@ mod tests {
         let ingress = IngressPolicy {
             port_mappings: vec![mapping],
             dynamic_allowed_range: Some((10000, 20000)),
+            dynamic_ingress: Some(sessions::DynamicIngress::Ask),
         };
         let json = serde_json_lenient::to_string(&ingress).unwrap();
         let rt: IngressPolicy = serde_json_lenient::from_str(&json).unwrap();
@@ -1230,6 +1233,7 @@ mod tests {
             json.contains("\"dynamic_allowed_range\":null"),
             "got: {json}"
         );
+        assert!(json.contains("\"dynamic_ingress\":null"), "got: {json}");
     }
 
     fn round_trip<T>(value: &T) -> T
