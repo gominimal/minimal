@@ -798,7 +798,8 @@ async fn session_policy_succeeds() {
 /// resolved to its default instead of a bare `null`. The policy is stored
 /// through the daemon and fetched the way the command fetches it;
 /// `format_policy` is the rendering the command prints. The same egress on a
-/// host-address box is still shown, but with no ingress block.
+/// host-address box is still shown, but with no ingress block, and a none
+/// box shows no blocks at all — just the note the TUI shows in their place.
 #[tokio::test]
 async fn policy_shows_effective_egress() {
     let (daemon, args) = setup().await;
@@ -882,6 +883,34 @@ async fn policy_shows_effective_egress() {
     assert!(
         !text.contains("ingress"),
         "a host-address session has no per-session ingress policy to show:\n{text}"
+    );
+
+    // A none box has no network, so it can carry no egress or ingress
+    // declaration at all — the whole policy is replaced by the one-line
+    // note the TUI's detail pane shows, since `egress / allow all` there
+    // would claim a reach a box with no network does not have.
+    let none_id = create_session_with_policy(
+        &daemon,
+        "egress-policy-none",
+        sessions::NetworkMode::NoNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+    let resp = client
+        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(none_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+    };
+    let mut out = Vec::new();
+    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(
+        text,
+        "No network policy (NoNet)\n",
+        "a none session prints the note in place of both blocks:\n{text}"
     );
 }
 

@@ -917,17 +917,26 @@ pub async fn cmd_session_policy(
 /// Render a session policy as its effective rules: each egress dimension
 /// resolved to its list or its default (`allow all`; `deny subnets` reads
 /// `(none)` when nothing is denied), the ingress mappings spelled out.
-/// `network` is the session's network mode, because ingress is an
-/// own-address surface — the block is omitted entirely for a host-address
-/// session, which shares its host's namespace and so has no per-session
-/// ingress policy to show (the same case the TUI's detail pane leaves
-/// blank). Shared by `min session policy`'s printer and the integration
+/// `network` is the session's network mode, and the modes without a surface
+/// to describe are held to the TUI's detail pane: a none box has no network
+/// at all, so it prints the pane's one-line note in place of both blocks
+/// (`allow all` egress would claim a reach a box with no network does not
+/// have), and a host-address session shares its host's namespace, so it has
+/// no per-session ingress policy to show and the block is omitted entirely.
+/// Shared by `min session policy`'s printer and the integration
 /// test that pins the rendering (NET-061).
 pub fn format_policy(
     out: &mut impl std::io::Write,
     policy: &sessions::SessionPolicy,
     network: sessions::NetworkMode,
 ) -> Result<(), anyhow::Error> {
+    // A none box has no network, so it can carry no egress or ingress
+    // declaration at all — nothing the blocks print would describe anything
+    // real (the same case the TUI's detail pane replaces with this note).
+    if network == sessions::NetworkMode::NoNet {
+        writeln!(out, "No network policy (NoNet)")?;
+        return Ok(());
+    }
     writeln!(out, "egress")?;
     match &policy.egress {
         None => writeln!(out, "  allow all")?,
