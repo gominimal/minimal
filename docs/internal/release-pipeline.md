@@ -149,14 +149,28 @@ The AUR and Homebrew packages do not change by default. The
 `publish_packages` input is off. You publish them in step 7.
 
 If the release publish job fails, fix the cause and use **Re-run failed jobs**
-on the same run. Do not start a new run. The release publish job refuses a
-release that is already public, so a new run fails at that job.
+on the same run.
 
 ### 7. Publish the AUR and Homebrew packages
 
-Start when the release is public and the `vX.Y.Z` tag exists. A maintainer
-who holds the AUR key and the tap token runs the two publishers by hand, from
-the tagged commit:
+Run the promotion again for the same version, with `publish_packages` on:
+
+```sh
+gh workflow run promote.yml -f target=stable -f version=X.Y.Z -f publish_packages=true
+```
+
+The run goes through approval and the smoke check again. It writes the
+`stable` pointer again, which changes nothing while `stable` points at
+`X.Y.Z`. The release is already public, so the release publish job checks
+that the `vX.Y.Z` tag is on the release commit and changes nothing. Then the
+run publishes the AUR package and the Homebrew formula. If a package job
+fails, fix the cause and use **Re-run failed jobs** on the same run.
+
+When both publishers work for a real release, publish the packages in step 6
+instead: add `-f publish_packages=true` to the promotion.
+
+If the workflow cannot publish the packages, run the two publishers by hand.
+You need the AUR key and the tap token. Run them from the tagged commit:
 
 ```sh
 PKGVER=X.Y.Z AUR_SSH_PRIVATE_KEY="$(cat aur-key)" scripts/publish-aur.sh
@@ -167,9 +181,6 @@ PKGVER=X.Y.Z BREW_TAP_REPO=https://github.com/gominimal/homebrew-minimal.git \
 The AUR publisher needs `makepkg`, so run it on an Arch host or in an
 `archlinux:base-devel` container. Run each publisher with `--dry-run` first to
 read the diff that it pushes.
-
-When both publishers work for a real release, publish the packages in step 6
-instead: add `-f publish_packages=true` to the promotion.
 
 ### 8. Clean up
 
@@ -187,6 +198,10 @@ Run the promotion again with `target=stable` and an earlier version that has a
 smoke record. The promotion refuses a version without a smoke record. Choose
 your rollback version before you promote. Use `override_provenance=true` only
 in an emergency. The approval issue shows that you used it.
+
+Keep `publish_packages` off for a rollback. If it is on, the run publishes the
+earlier version to the AUR and Homebrew, which downgrades the users of those
+packages.
 
 ## We test every artifact we release
 
@@ -381,9 +396,11 @@ A `stable` promotion that is not a dry run calls
 The AUR and Homebrew jobs run only with `publish_packages=true`.
 
 - `publish-release` publishes the draft `vX.Y.Z`. Publication creates the tag
-  on the release commit. It does not start a build. The job fails if no draft exists
-  or if the release is already public. For a nightly commit hash, it prints a
-  notice and does nothing.
+  on the release commit. It does not start a build. The job fails if the
+  release does not exist. If the release is already public, the job changes
+  nothing, but it fails if the `vX.Y.Z` tag is missing or is not on the
+  release commit. For a nightly commit hash, it prints a notice and does
+  nothing.
 - `publish-aur` publishes `minimal-bin` to the AUR from the staged folder.
 - `publish-brew` updates the formula in `gominimal/homebrew-minimal` from the
   GitHub Release.
