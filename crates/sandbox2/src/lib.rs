@@ -627,7 +627,7 @@ impl<C: Channel> Sandbox<C> {
         // credentials but before exec, using `prctl` + `seccomp` via libc only.
         #[cfg(target_os = "linux")]
         let socket_family_filter = if plan.blocks_outside_sockets() {
-            let filter = build_socket_family_filter(plan);
+            let filter = build_socket_family_filter();
             tracing::info!(
                 network_plan = %plan,
                 sealed_families = %filter.sealed_families,
@@ -1525,18 +1525,6 @@ fn isolation_decision(plan: &network::NetPlan, netns_available: bool) -> Result<
     Ok(plan.isolates_netns())
 }
 
-/// Allowed socket families for a none-box (isolated, no tap).  Only
-/// `AF_UNIX` is permitted: every other family — including `AF_VSOCK`, which
-/// ignores the network namespace — is refused by the seccomp filter installed
-/// at launch.
-#[cfg(target_os = "linux")]
-const ALLOWED_NONE_FAMILIES: &[u32] = &[libc::AF_UNIX as u32];
-
-/// Human-readable label used in the launch log for the families a none box
-/// still permits.
-#[cfg(target_os = "linux")]
-const ALLOWED_NONE_FAMILIES_LABEL: &str = "unix";
-
 /// The audit-architecture identifier of the ABI this binary is built for.  A
 /// kernel ABI constant (`AUDIT_ARCH_*` in `linux/audit.h`) that the `libc`
 /// crate does not expose; chosen at compile time so an unsupported target
@@ -1560,9 +1548,8 @@ const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 #[derive(Clone, Debug)]
 pub struct SocketFamilyFilter {
     program: Vec<libc::sock_filter>,
-    sealed_families: String,
-    #[allow(dead_code)]
-    default_action: u32,
+    /// The families a none box still permits, named for the launch log.
+    sealed_families: &'static str,
 }
 
 /// Syscall numbers for the socket-family filters.  `libc` exposes these per-arch.
@@ -1571,15 +1558,15 @@ const SYS_SOCKET: i64 = libc::SYS_socket;
 #[cfg(target_os = "linux")]
 const SYS_SOCKETPAIR: i64 = libc::SYS_socketpair;
 
-/// Build a classic BPF seccomp filter that allows only the socket families in
-/// [`ALLOWED_NONE_FAMILIES`] and refuses all other `socket()`/`socketpair()`
-/// calls with `EAFNOSUPPORT`.  This seals the namespace bypass families
-/// (`AF_VSOCK` in particular) while leaving local Unix sockets working so the
-/// in-sandbox `min` helper and the minenv socket keep functioning.
+/// Build the none-box filter: a classic BPF seccomp program that allows only
+/// `AF_UNIX` and refuses every other `socket()`/`socketpair()` family with
+/// `EAFNOSUPPORT`.  This seals the namespace-bypass families (`AF_VSOCK` in
+/// particular) while leaving local Unix sockets working so the in-sandbox
+/// `min` helper and the minenv socket keep functioning.
 #[cfg(target_os = "linux")]
-fn build_socket_family_filter(_plan: &network::NetPlan) -> SocketFamilyFilter {
+fn build_socket_family_filter() -> SocketFamilyFilter {
     // Return the selected action for a socket() or socketpair() whose arg0 (the
-    // address family) is not in ALLOWED_NONE_FAMILIES.
+    // address family) is not AF_UNIX.
     let refuse_action = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
     // Return the default allow action when the syscall is not one we restrict
     // or when the address family is allowed.
@@ -1658,16 +1645,9 @@ fn build_socket_family_filter(_plan: &network::NetPlan) -> SocketFamilyFilter {
     // 12: allow: not a socket-creating syscall.
     filter.push(ret(allow_action));
 
-    let label = if ALLOWED_NONE_FAMILIES.len() == 1 {
-        ALLOWED_NONE_FAMILIES_LABEL.to_string()
-    } else {
-        ALLOWED_NONE_FAMILIES_LABEL.to_string() + ",..."
-    };
-
     SocketFamilyFilter {
-        default_action: libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32),
         program: filter,
-        sealed_families: label,
+        sealed_families: "unix",
     }
 }
 
@@ -1717,7 +1697,7 @@ pub unsafe fn install_socket_family_filter(filter: &SocketFamilyFilter) -> std::
 #[must_use]
 pub fn socket_family_filter_for_none_box() -> &'static SocketFamilyFilter {
     static FILTER: std::sync::OnceLock<SocketFamilyFilter> = std::sync::OnceLock::new();
-    FILTER.get_or_init(|| build_socket_family_filter(&network::NetPlan::isolated()))
+    FILTER.get_or_init(build_socket_family_filter)
 }
 
 /// Puts the plan's resolver into `<rootfs>/etc/resolv.conf`. The host's is
@@ -2285,52 +2265,101 @@ mod tests {
         );
     }
 
-    /// NET-038. A none-box filter built from an isolated network plan refuses
-    /// `AF_VSOCK` sockets (which bypass the network namespace) while still allowing
-    /// the local `AF_UNIX` sockets the sandbox's own minenv socket depends on.
-    /// The production runtime effect is proved by
+    /// Runs a classic BPF seccomp program over one synthetic `seccomp_data`
+    /// and returns the action it terminates with.  Supports exactly the
+    /// opcodes [`build_socket_family_filter`] emits: `LD|W|ABS`, `JMP|JEQ|K`,
+    /// `JMP|JGE|K`, and `RET|K`.
+    #[cfg(target_os = "linux")]
+    fn run_seccomp_program(program: &[libc::sock_filter], nr: u32, arch: u32, arg0: u32) -> u32 {
+        let (mut pc, mut acc) = (0usize, 0u32);
+        loop {
+            let insn = &program[pc];
+            pc += 1;
+            let code = u32::from(insn.code);
+            if code == libc::BPF_LD | libc::BPF_W | libc::BPF_ABS {
+                // Offsets into `struct seccomp_data`: nr, arch, args[0] low word.
+                acc = match insn.k {
+                    0 => nr,
+                    4 => arch,
+                    16 => arg0,
+                    other => panic!("unexpected seccomp_data offset {other}"),
+                };
+            } else if code == libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K {
+                pc += usize::from(if acc == insn.k { insn.jt } else { insn.jf });
+            } else if code == libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K {
+                pc += usize::from(if acc >= insn.k { insn.jt } else { insn.jf });
+            } else if code == libc::BPF_RET | libc::BPF_K {
+                return insn.k;
+            } else {
+                panic!("unexpected BPF opcode {code:#x} at {}", pc - 1);
+            }
+        }
+    }
+
+    /// NET-038. The none-box filter refuses `AF_VSOCK` sockets (which bypass the
+    /// network namespace) while still allowing the local `AF_UNIX` sockets the
+    /// sandbox's own minenv socket depends on, leaves every other syscall alone,
+    /// and kills a caller on a foreign ABI rather than letting it through.  The
+    /// production runtime effect is proved by
     /// `network_none_blocks_all_outside_sockets` in the minimald root integration
-    /// harness; this unit test verifies the filter shape produced by
-    /// [`build_socket_family_filter`].
+    /// harness; this unit test evaluates the program
+    /// [`build_socket_family_filter`] produces.
     #[cfg(target_os = "linux")]
     #[test]
     fn none_plan_refuses_vsock_family() {
         let plan = network::NetPlan::isolated();
-        let filter = build_socket_family_filter(&plan);
-
         assert!(
             plan.blocks_outside_sockets(),
             "an isolated plan with no tap must block outside sockets"
         );
+
+        let filter = build_socket_family_filter();
         assert_eq!(
             filter.sealed_families, "unix",
             "the launch log must name the only allowed socket family"
         );
-        assert_eq!(
-            filter.default_action,
-            libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32),
-            "the default action must refuse unsupported socket families"
-        );
 
-        // The filter program should contain an architecture check, the syscall
-        // numbers for socket and socketpair, and the AF_UNIX constant (family 1).
-        // It must not contain an allow/check for AF_VSOCK (family 40).
-        let words: Vec<u32> = filter.program.iter().map(|i| i.k).collect();
-        assert!(
-            words.contains(&(libc::AF_UNIX as u32)),
-            "filter must reference AF_UNIX; got words: {words:?}"
+        let run = |nr: i64, arch: u32, arg0: u32| {
+            run_seccomp_program(&filter.program, nr as u32, arch, arg0)
+        };
+        let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
+        // AUDIT_ARCH_I386: the compat ABI an x86_64 kernel also answers to.
+        const FOREIGN_ARCH: u32 = 0x4000_0003;
+
+        assert_eq!(
+            run(libc::SYS_socket, AUDIT_ARCH, libc::AF_VSOCK as u32),
+            refuse,
+            "socket(AF_VSOCK) must fail with EAFNOSUPPORT"
         );
-        assert!(
-            words.contains(&(SYS_SOCKET as u32)),
-            "filter must reference SYS_socket; got words: {words:?}"
+        assert_eq!(
+            run(libc::SYS_socketpair, AUDIT_ARCH, libc::AF_INET as u32),
+            refuse,
+            "socketpair(AF_INET) must fail with EAFNOSUPPORT"
         );
-        assert!(
-            words.contains(&(SYS_SOCKETPAIR as u32)),
-            "filter must reference SYS_socketpair; got words: {words:?}"
+        assert_eq!(
+            run(libc::SYS_socket, AUDIT_ARCH, libc::AF_UNIX as u32),
+            libc::SECCOMP_RET_ALLOW,
+            "socket(AF_UNIX) must stay allowed"
         );
-        assert!(
-            !words.contains(&40u32),
-            "filter must not reference AF_VSOCK (family 40); got words: {words:?}"
+        assert_eq!(
+            run(libc::SYS_read, AUDIT_ARCH, 0),
+            libc::SECCOMP_RET_ALLOW,
+            "a syscall that creates no socket must stay allowed"
+        );
+        assert_eq!(
+            run(libc::SYS_socket, FOREIGN_ARCH, libc::AF_VSOCK as u32),
+            libc::SECCOMP_RET_KILL_PROCESS,
+            "a foreign-ABI caller must be killed, not allowed"
+        );
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            run(
+                libc::SYS_socket | i64::from(X32_SYSCALL_BIT),
+                AUDIT_ARCH,
+                libc::AF_VSOCK as u32
+            ),
+            libc::SECCOMP_RET_KILL_PROCESS,
+            "an x32 caller must be killed, not allowed"
         );
     }
 
