@@ -102,6 +102,9 @@ decode.workspace = true
 indoc.workspace = true
 # `maintenance.rs`'s tests seed the local cache the clean reclaims.
 lcache.workspace = true
+# Property tests over the request parsers (NET spec, tiers: the T1 lane adds
+# this dev-dependency; see `net/proxy.rs` for the first property test).
+proptest.workspace = true
 
 # The guest (initramfs pid-1) boot path is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]

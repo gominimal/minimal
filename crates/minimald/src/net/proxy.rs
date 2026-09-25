@@ -1084,6 +1084,46 @@ mod tests {
         assert_eq!(forward.authority, "web.min.internal:8080");
     }
 
+    // -----------------------------------------------------------------------
+    // Property test over the request-head parser. The first consumer of the
+    // workspace's `proptest` dependency (the tiered spec's T1 lane): whatever
+    // the method, path, header casing, or surrounding whitespace, the parser
+    // reads back exactly the authority the head was built with — `CONNECT`
+    // from its request line, any other method from its `Host:` header — and
+    // classifies the kind to match.
+    // -----------------------------------------------------------------------
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn property_check_runs(
+            host in r"[a-z0-9-]{1,8}(\.[a-z0-9-]{1,8}){0,3}",
+            port in any::<u16>(),
+            method in prop::sample::select(vec![
+                "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH",
+            ]),
+            path in r"/[!-~]{0,16}",
+            header_name in prop::sample::select(vec!["Host", "host", "HOST", "hOsT"]),
+            pad in prop::sample::select(vec!["", " ", "  ", "\t"]),
+        ) {
+            let authority = format!("{host}:{port}");
+
+            let connect_head = format!("CONNECT {authority} HTTP/1.1\r\n\r\n");
+            let connect = parse_request(connect_head.as_bytes())
+                .expect("a CONNECT head carrying an authority must parse");
+            prop_assert!(matches!(connect.kind, RequestKind::Connect));
+            prop_assert_eq!(connect.authority, authority.as_str());
+
+            let forward_head = format!(
+                "{method} {path} HTTP/1.1\r\n{header_name}:{pad}{authority}{pad}\r\n\r\n"
+            );
+            let forward = parse_request(forward_head.as_bytes())
+                .expect("a forward head carrying a Host header must parse");
+            prop_assert!(matches!(forward.kind, RequestKind::Forward));
+            prop_assert_eq!(forward.authority, authority);
+        }
+    }
+
     /// A forward request from an `HTTP_PROXY`-configured client carries an
     /// absolute-form request target (`GET http://web.min.internal/path HTTP/1.1`).
     /// The proxy routes it by `Host:` header and replays the buffered head
