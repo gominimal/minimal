@@ -1438,6 +1438,10 @@ fn write_resolv_conf(rootfs: &Path, resolver: &network::Resolver) -> Result<(), 
 /// place, unlinking first for the same reason [`write_resolv_conf`] does: the
 /// rootfs is a hardlink farm over the package cache, and an in-place append
 /// would write through the link into the cached package.
+///
+/// Idempotent: `new_container` runs once per task invocation over the same
+/// rootfs, so an entry a previous invocation already wrote is skipped instead
+/// of growing the file a line per exec.
 fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry]) -> Result<(), Error> {
     if hosts.is_empty() {
         return Ok(());
@@ -1455,6 +1459,9 @@ fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry]) -> Result<(), Error>
         body.push('\n');
     }
     for entry in hosts {
+        if hosts_entry_present(&body, entry) {
+            continue;
+        }
         body.push_str(&format!("{}\t{}\n", entry.address, entry.name));
     }
     match fs::remove_file(&etc_hosts) {
@@ -1463,6 +1470,17 @@ fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry]) -> Result<(), Error>
         Err(e) => return Err(Error::IO("replacing /etc/hosts", etc_hosts.clone(), e)),
     }
     fs::write(&etc_hosts, body).map_err(|e| Error::IO("writing /etc/hosts", etc_hosts, e))
+}
+
+/// Whether `body` already answers `entry` — a line whose whitespace-separated
+/// fields carry both the address and the name, in tab- or space-separated
+/// form, and whether it was written by this function or shipped by the rootfs.
+fn hosts_entry_present(body: &str, entry: &network::HostEntry) -> bool {
+    let address = entry.address.to_string();
+    body.lines().any(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        fields.contains(&address.as_str()) && fields.contains(&entry.name.as_str())
+    })
 }
 
 #[cfg(test)]
@@ -1769,6 +1787,14 @@ mod tests {
             fs::read_to_string(&etc_hosts).unwrap(),
             "127.0.0.1\tlocalhost\n127.0.0.1\thost.min.internal\n",
             "shipped content kept, entry appended"
+        );
+        // `new_container` runs once per task invocation on the same rootfs, so
+        // a second write over an already-present entry must not duplicate it.
+        write_hosts(rootfs, hosts).unwrap();
+        assert_eq!(
+            fs::read_to_string(&etc_hosts).unwrap(),
+            "127.0.0.1\tlocalhost\n127.0.0.1\thost.min.internal\n",
+            "a repeat write does not grow the file a line per invocation"
         );
         assert_eq!(
             fs::read_to_string(&cache).unwrap(),
