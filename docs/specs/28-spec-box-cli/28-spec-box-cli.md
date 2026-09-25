@@ -71,7 +71,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   <!-- split from BOX-025: which verbs resume; the resume itself stays in BOX -->
   tier:     T0
   verify:   cargo nextest run -p minimal shell_attach_and_resume_verbs_resume_stopped_session
-  - IF `min shell`, `min attach` or `min box resume` would resume a box whose name a running box on the same host holds THEN THE SYSTEM SHALL report BOX-025's refusal with exit 2 ahead of BVOL-013's volume refusal, which exits 5 only when no running box holds the name, naming the running box, with a hint to rename the running box with `min box rename` or to resume this box by its `box_id` after renaming it, and noting that the running box may also hold a volume this box declares `rw`, which BVOL-013 would then refuse with exit 5.
+  - IF `min shell`, `min attach` or `min box resume` would resume a box whose spec sets `pty_enabled` and whose name a running box on the same host holds THEN THE SYSTEM SHALL report BOX-025's refusal with exit 2, naming the running box, in the order BOX-025 states. Its hint says to rename the running box with `min box rename`, or to resume this box by its `box_id` after renaming it, and notes that another box may also hold a volume this box declares `rw`, which BVOL-013 then refuses with exit 5.
     tier:   T0
     verify: cargo nextest run -p minimal resume_name_conflict_exit2_names_holder
 
@@ -80,7 +80,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal shell_resume_attaches
 
-- **BCLI-009** IF `min shell`, `min attach` or `min box resume` would restart the processes of a stopped or exited box whose spec does not set `pty_enabled` THEN THE SYSTEM SHALL report BOX-030's refusal with exit 2 naming `min run`.
+- **BCLI-009** IF `min shell`, `min attach` or `min box resume` would restart the processes of a stopped or exited box whose spec does not set `pty_enabled` THEN THE SYSTEM SHALL report BOX-030's refusal with exit 2 naming `min run`, in the order BOX-025 states, so a non-PTY resume whose name a running box holds reports this refusal and not BCLI-007's name hint.
   <!-- was the sub-bullet of BOX-030; the refusal itself returned to BOX-030 in cycle 4. Identity re-establishment under enrollment is Gatehouse §6.3.3's and composes with this (see Design reasoning) -->
   tier:     T0
   verify:   cargo nextest run -p minimal resume_non_pty_box_exit2_names_run

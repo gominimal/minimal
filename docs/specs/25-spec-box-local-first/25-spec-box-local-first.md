@@ -139,7 +139,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   - IF a resuming box's stored spec can no longer be satisfied THEN THE SYSTEM SHALL refuse with the exit code creation would give and leave the box's state unchanged.
     tier:   T0
     verify: cargo nextest run -p minimald resume_refuses_unsatisfiable_spec_keeps_state
-  - IF a stopped or exited box is resumed while a running box on the same host holds its name THEN THE SYSTEM SHALL refuse the resume, naming the running box, and leave the state unchanged, evaluating this name check before BVOL-013's volume-hold check.
+  - IF a stopped or exited box is resumed while a running box on the same host holds its name THEN THE SYSTEM SHALL refuse the resume, naming the running box, and leave the state unchanged, evaluating a resume's refusals in the order BOX-030's PTY check, then this name check, then BVOL-013's volume-hold check, so the first that applies decides the refusal.
     tier:   T0
     verify: cargo nextest run -p minimald resume_refuses_when_name_held_by_running_box
 
