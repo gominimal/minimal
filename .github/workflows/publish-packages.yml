@@ -2,14 +2,15 @@ name: publish-packages
 
 # Publish an already-promoted versioned release. Called by promote.yml after a
 # `stable` promotion; also dispatchable by hand to retry a failed AUR/Homebrew
-# push (with release_already_published=true). Three steps, in order:
+# push (with release_already_published=true). Two steps, in order:
 #
 #   1. publish-release — publish the DRAFT GitHub Release `v<semver>` the
 #      versioned release build parked (release.yml). Publishing a draft is
 #      what creates the tag: v<semver> lands on the commit the draft targets
 #      — already built, staged, smoked, and promoted — and triggers no build.
-#   2. publish-aur — the PKGBUILD keys on the staged versions/<semver>/ row.
-#   3. publish-brew — the formula keys on the GitHub Release published in 1.
+#   2. publish-channel-stable — the AUR and Homebrew publishers, in
+#      publish-channel.yml (PKGBUILD keys on the staged versions/<semver>/ row;
+#      the formula keys on the GitHub Release published in 1).
 #
 # The apt/dnf/apk repo trees are built by the infra repo from the staged
 # versions/<semver>/pkg/ row and are not this workflow's concern.
@@ -119,53 +120,29 @@ jobs:
                   echo "published $tag at $tagged (draft targeted $target)"
                   echo "semver=$publish_semver" >> "$GITHUB_OUTPUT"
 
-    publish-aur:
-        # The AUR package tracks stable semver releases; its PKGBUILD fetches
+    publish-channel-stable:
+        # The AUR package tracks stable semver releases (its PKGBUILD fetches
         # from versions/<semver>/ in the installer bucket, which the versioned
-        # release build staged and the promotion just verified.
+        # release build staged and the promotion just verified). Homebrew has no
+        # channels, so the tap is stable-only and publishes on the stable promote
+        # — never on a tag, where a release (or an RC) would overwrite the tap's
+        # only formula for every user with no way to opt out, bypassing the
+        # promotion gate. The formula fetches the GitHub Release v<semver>, hence
+        # `needs: publish-release`. The tap repo must exist and BREW_TAP_TOKEN (a
+        # fine-grained PAT with write access to it) must be set (user actions).
+        #
+        # tolerate is NOT set (defaults false): a failed stable publish must fail
+        # loudly. Retry it with `gh workflow run publish-packages.yml -f
+        # version=X.Y.Z -f release_already_published=true`; the publishers are
+        # idempotent. See docs/internal/release-pipeline.md.
         needs: publish-release
         if: ${{ needs.publish-release.outputs.semver != '' }}
-        runs-on: ubuntu-latest
-        container: archlinux:base-devel
-        timeout-minutes: 30
         permissions:
             contents: read
-        steps:
-            - name: Install git and openssh
-              # base-devel carries neither. curl is already in the image (the
-              # publish script uses it to fetch versioned artifacts from the
-              # public bucket).
-              run: pacman -Syu --noconfirm --needed git openssh
-            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-              with:
-                  persist-credentials: false
-            - name: Publish minimal-bin to the AUR
-              env:
-                  PKGVER: ${{ needs.publish-release.outputs.semver }}
-                  AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-              run: scripts/publish-aur.sh --verify-build
-
-    publish-brew:
-        # Homebrew has no channels, so the tap is stable-only and publishes on
-        # the stable promote — never on a tag, where a release (or an RC)
-        # would overwrite the tap's only formula for every user with no way
-        # to opt out, bypassing the promotion gate. The formula fetches the
-        # GitHub Release v<semver>, hence `needs: publish-release`. The tap
-        # repo must exist and BREW_TAP_TOKEN (a fine-grained PAT with write
-        # access to it) must be set (user actions).
-        needs: publish-release
-        if: ${{ needs.publish-release.outputs.semver != '' }}
-        runs-on: ubuntu-latest
-        timeout-minutes: 20
-        permissions:
-            contents: read
-        steps:
-            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-              with:
-                  persist-credentials: false
-            - name: Publish minimal to gominimal/homebrew-minimal
-              env:
-                  PKGVER: ${{ needs.publish-release.outputs.semver }}
-                  BREW_TAP_REPO: https://github.com/gominimal/homebrew-minimal.git
-                  GITHUB_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}
-              run: scripts/publish-brew.sh
+        uses: ./.github/workflows/publish-channel.yml
+        with:
+            channel: stable
+            row: ${{ needs.publish-release.outputs.semver }}
+        secrets:
+            AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+            BREW_TAP_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}

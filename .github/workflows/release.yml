@@ -1543,64 +1543,33 @@ jobs:
 
     # --- Channel packages: publish the unstable channel's AUR and Homebrew
     # packages, AFTER the smoke and the pointer advance above. The invariant is
-    # build -> smoke -> publish: a package may never be published for bytes
-    # that have not passed their smoke. Both jobs are idempotent (the AUR
-    # publisher no-ops when the PKGBUILD is unchanged, the tap publisher when
-    # the formula is), so a re-run or a skipped night is safe.
+    # build -> smoke -> publish: a package may never be published for bytes that
+    # have not passed their smoke. Both publishers are idempotent (the AUR
+    # publisher no-ops when the PKGBUILD is unchanged, the tap publisher when the
+    # formula is), so a re-run or a skipped night is safe.
+    #
+    # tolerate: true is load-bearing here: these run AFTER record-smoked advanced
+    # the `unstable` pointer, so a failed push is a stale mirror, not a failed
+    # release. Tolerated, this called workflow still concludes success; without
+    # it the failure would make release.yml conclude `failure`, and nightly.yml's
+    # promote-nightly (which skips on needs.release.result == 'failure') would
+    # freeze the nightly channel over a transient push error, long after staging,
+    # smoke, provenance and the pointer had all succeeded. See publish-channel.yml.
     #
     # SHA-ROW ONLY: a versioned row's bytes are what the stable package
     # represents, so the channel packages are built and published for sha rows
     # alone (the nfpm packages for a versioned row already exist in its pkg/,
     # and set-channel has pointed unstable at that same row).
-    publish-aur-unstable:
+    publish-channel-unstable:
         needs: [assert-version, record-smoked]
         if: ${{ !inputs.dry_run && needs.assert-version.outputs.release_version == '' }}
-        # NON-GATING on purpose (as is publish-brew-unstable below): these run
-        # AFTER record-smoked advanced the `unstable` pointer, so a publish
-        # failure means a stale mirror, not a failed release. Without this the
-        # failure would make the CALLED workflow's conclusion `failure`, and
-        # nightly.yml's promote-nightly (which skips on needs.release.result ==
-        # 'failure') would freeze the nightly channel for a transient push error
-        # long after staging, smoke, provenance and the pointer all succeeded.
-        # continue-on-error keeps needs.<job>.result == 'success' (the run stays
-        # green) while the failing step is still annotated in the run.
-        # RESIDUAL TRADE: a --verify-build failure is tolerated too. Fix a
-        # tolerated failure with "Re-run failed jobs" (idempotent), or locally
-        # with `just publish-aur unstable <row> --verify-build`.
-        continue-on-error: true
-        runs-on: ubuntu-latest
-        container: archlinux:base-devel
-        timeout-minutes: 30
         permissions:
             contents: read
-        steps:
-            - name: Install git and openssh
-              # base-devel carries neither; curl is already in the image.
-              run: pacman -Syu --noconfirm --needed git openssh
-            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-              with:
-                  persist-credentials: false
-            - name: Publish minimal-unstable-bin to the AUR
-              env:
-                  PKGVER: ${{ needs.assert-version.outputs.version }}
-                  AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-              run: scripts/publish-aur.sh --channel unstable --verify-build
-
-    publish-brew-unstable:
-        needs: [assert-version, record-smoked]
-        if: ${{ !inputs.dry_run && needs.assert-version.outputs.release_version == '' }}
-        continue-on-error: true # non-gating, as explained on publish-aur-unstable above
-        runs-on: ubuntu-latest
-        timeout-minutes: 20
-        permissions:
-            contents: read
-        steps:
-            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-              with:
-                  persist-credentials: false
-            - name: Publish minimal-unstable to gominimal/homebrew-minimal
-              env:
-                  PKGVER: ${{ needs.assert-version.outputs.version }}
-                  BREW_TAP_REPO: https://github.com/gominimal/homebrew-minimal.git
-                  GITHUB_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}
-              run: scripts/publish-brew.sh --channel unstable
+        uses: ./.github/workflows/publish-channel.yml
+        with:
+            channel: unstable
+            row: ${{ needs.assert-version.outputs.version }}
+            tolerate: true
+        secrets:
+            AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+            BREW_TAP_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}

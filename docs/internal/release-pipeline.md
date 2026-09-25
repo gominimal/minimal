@@ -265,12 +265,13 @@ still carries its true `0.6.0-dev.<N>.g<sha>`.
 **Cadence, and the smoke-before-publish invariant.** Channel packages publish
 where a pointer advances:
 
-- `unstable` — release.yml's `record-smoked` job, after the smoke aggregator
-  and the pointer advance, runs the AUR and Homebrew publishers with
-  `--channel unstable`.
-- `nightly` — nightly.yml's `promote-nightly`, after `verify-smoked.sh` and
-  the pointer flip, runs the same publishers with `--channel nightly`.
-- `stable` — unchanged: `promote.yml` → `publish-packages.yml`, approval-gated.
+- `unstable` — release.yml's `publish-channel-unstable` job, after
+  `record-smoked` advanced the pointer, publishes with `channel: unstable`.
+- `nightly` — nightly.yml's `publish-channel-nightly`, after `promote-nightly`
+  ran `verify-smoked.sh` and flipped the pointer, publishes with
+  `channel: nightly`.
+- `stable` — unchanged: `promote.yml` → `publish-packages.yml`
+  (`publish-channel-stable`), approval-gated.
 
 The order is always **build → smoke → publish**, never the reverse. The
 publishers are per-name and idempotent (the AUR publisher no-ops when the
@@ -279,20 +280,31 @@ a skipped night is safe. Channel publishers are **sha-row only**: a versioned
 row's bytes are what the stable package represents, so its `pkg/` row is
 already in place and the channel packages are built and published for sha rows.
 
+All three call one reusable workflow, `publish-channel.yml`, which runs the AUR
+and Homebrew publishers as its two jobs — the block that used to be copied into
+each caller, where a channel's package name or `--verify-build` could be (and
+once was) forgotten.
+
 **A publish failure never gates a release.** The pointer has already advanced
 by the time either publisher runs, so a failed push is a stale mirror, not a
-failed release — and it must not stop the channel from moving. For `unstable`
-that is load-bearing: `release.yml`'s `publish-{aur,brew}-unstable` jobs carry
-`continue-on-error: true`, because they are terminal jobs inside a workflow
-`nightly.yml` calls. Untolerated, their failure would make the *called*
-workflow's conclusion `failure`, and nightly.yml's `promote-nightly` (which
-skips on `needs.release.result == 'failure'`) would freeze the `nightly`
-channel over a transient push error — long after staging, smoke, provenance and
-the pointer had all succeeded. `continue-on-error` keeps the run green while
-the failing step stays annotated; the residual trade is that a `--verify-build`
-failure is tolerated too. The `nightly` publishers (`nightly.yml`) and the
-stable ones (`publish-packages.yml`) are terminal with nothing gating on them,
-so a red run there is a red run, not a blocked release.
+failed release — and it must not stop the channel from moving. That is
+load-bearing for `unstable`: `release.yml`'s publisher runs inside a workflow
+`nightly.yml` calls, and an uncalled-workflow failure there would make
+release.yml conclude `failure`, which skips nightly.yml's `promote-nightly`
+(its guard is `needs.release.result != 'failure'`) and freezes the `nightly`
+channel over a transient push error, long after staging, smoke, provenance and
+the pointer had all succeeded. `nightly` tolerates for the same reason.
+
+Tolerance is a `tolerate` input on `publish-channel.yml`, applied as
+`continue-on-error` on the **publish step** (a tolerated step leaves the job —
+and the called workflow — concluding success, with the failing step still
+annotated in the run). `unstable` and `nightly` pass `tolerate: true`; **stable
+does not**, so a failed stable publish still fails loudly and is retried
+deliberately (below). Because the tolerance hides the step's failure from the
+job result, `publish-channel.yml` also exports each publisher's *real* outcome
+(`steps.<id>.outcome`, the result before `continue-on-error`); nightly.yml's
+`brew-install-nightly` proof gates on `brew_published`, so a tolerated brew push
+failure skips the install instead of "proving" a formula that was never pushed.
 
 Retrying a publish, per channel:
 

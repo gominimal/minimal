@@ -138,57 +138,36 @@ jobs:
     # --- Channel packages: publish the nightly channel's AUR and Homebrew
     # packages, AFTER promote-nightly verified the smoke and moved the pointer.
     # build -> smoke -> publish, never the reverse. Both are idempotent, and a
-    # no-op night (release skipped, pointer unmoved) re-publishes the same row
-    # to a no-op. A nightly always targets a sha row, so the sha-row-only rule
-    # the publishers enforce is satisfied by construction.
-    publish-aur-nightly:
+    # no-op night (release skipped, pointer unmoved) re-publishes the same row to
+    # a no-op. A nightly always targets a sha row, so the sha-row-only rule the
+    # publishers enforce is satisfied by construction. tolerate: true keeps a
+    # failed push from failing this run (a stale mirror is not a failed release);
+    # brew_published still reports the real outcome for the install proof below.
+    publish-channel-nightly:
         needs: [check, promote-nightly]
         if: ${{ always() && needs.check.result == 'success' && needs.promote-nightly.result == 'success' }}
-        runs-on: ubuntu-latest
-        container: archlinux:base-devel
-        timeout-minutes: 30
         permissions:
             contents: read
-        steps:
-            - name: Install git and openssh
-              # base-devel carries neither; curl is already in the image.
-              run: pacman -Syu --noconfirm --needed git openssh
-            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-              with:
-                  persist-credentials: false
-            - name: Publish minimal-nightly-bin to the AUR
-              env:
-                  PKGVER: ${{ needs.check.outputs.sha }}
-                  AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-              run: scripts/publish-aur.sh --channel nightly --verify-build
+        uses: ./.github/workflows/publish-channel.yml
+        with:
+            channel: nightly
+            row: ${{ needs.check.outputs.sha }}
+            tolerate: true
+        secrets:
+            AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+            BREW_TAP_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}
 
-    publish-brew-nightly:
-        needs: [check, promote-nightly]
-        if: ${{ always() && needs.check.result == 'success' && needs.promote-nightly.result == 'success' }}
-        runs-on: ubuntu-latest
-        timeout-minutes: 20
-        permissions:
-            contents: read
-        steps:
-            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-              with:
-                  persist-credentials: false
-            - name: Publish minimal-nightly to gominimal/homebrew-minimal
-              env:
-                  PKGVER: ${{ needs.check.outputs.sha }}
-                  BREW_TAP_REPO: https://github.com/gominimal/homebrew-minimal.git
-                  GITHUB_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}
-              run: scripts/publish-brew.sh --channel nightly
-
-    # Real install proof of the formula publish-brew-nightly just pushed: tap
+    # Real install proof of the formula publish-channel-nightly just pushed: tap
     # the real tap and let Homebrew install the published formula, so the
     # macOS path is exercised end to end (formula syntax, asset URLs,
     # checksums, post-install symlinks) rather than only by the stubbed
     # harness. Self-hosted Apple Silicon only, skip-tolerant on the same
-    # RUN_MACOS_CI kill-switch as the other macOS jobs.
+    # RUN_MACOS_CI kill-switch as the other macOS jobs. brew_published is the
+    # publisher's REAL outcome: a tolerated push failure must skip this, or it
+    # would "prove" a formula that was never pushed.
     brew-install-nightly:
-        needs: [check, publish-brew-nightly]
-        if: ${{ always() && vars.RUN_MACOS_CI != 'false' && needs.publish-brew-nightly.result == 'success' }}
+        needs: [check, publish-channel-nightly]
+        if: ${{ always() && vars.RUN_MACOS_CI != 'false' && needs.publish-channel-nightly.outputs.brew_published == 'true' }}
         runs-on: [self-hosted, macOS, ARM64]
         timeout-minutes: 30
         permissions:

@@ -1,0 +1,114 @@
+name: publish-channel
+
+# Publish one channel's AUR and Homebrew packages. This is the single home for a
+# block that release.yml (unstable), nightly.yml (nightly), and
+# publish-packages.yml (stable) each carried a copy of — one place where a
+# channel's package name or `--verify-build` can be dropped.
+#
+# TOLERANCE. With `tolerate: true` the install and publish steps carry
+# continue-on-error, so a failed push leaves the job — and therefore this called
+# workflow — concluding success, while the failing step stays annotated in the
+# run. That is
+# load-bearing for the channels: the unstable publisher runs after record-smoked
+# has already advanced the `unstable` pointer, so a failure is a stale mirror,
+# not a failed release. A called workflow that concluded `failure` would make
+# release.yml conclude `failure`, which skips nightly.yml's promote-nightly and
+# freezes the `nightly` channel over a transient push error, long after staging,
+# smoke, provenance and the pointer had all succeeded. `nightly` passes it too
+# for the same reason. STABLE does NOT: a failed stable publish must fail loudly
+# — retry it with the publish-packages.yml dispatch (see
+# docs/internal/release-pipeline.md).
+#
+# The outputs carry each publisher's REAL outcome (steps.<id>.outcome, the
+# result before continue-on-error), so a caller with a follow-up proof job —
+# nightly.yml's brew-install-nightly — can still tell a failed push from a good
+# one and skip rather than install a stale formula.
+on:
+    workflow_call:
+        inputs:
+            channel:
+                description: "Channel to publish: stable, unstable, or nightly."
+                required: true
+                type: string
+            row:
+                description: "The bucket row: a released semver on stable, a staged sha on a channel."
+                required: true
+                type: string
+            tolerate:
+                description: "Tolerate a failed push (annotated step, green run). Required on unstable, which would otherwise gate the nightly advance; keep false on stable."
+                required: false
+                default: false
+                type: boolean
+        outputs:
+            aur_published:
+                description: "'true' when the AUR push succeeded."
+                value: ${{ jobs.publish-aur.outputs.published }}
+            brew_published:
+                description: "'true' when the Homebrew push succeeded."
+                value: ${{ jobs.publish-brew.outputs.published }}
+        secrets:
+            AUR_SSH_PRIVATE_KEY:
+                required: true
+            BREW_TAP_TOKEN:
+                required: true
+
+permissions:
+    contents: read
+
+jobs:
+    publish-aur:
+        # The AUR package keys on the staged versions/<row>/ PKGBUILD sources;
+        # base-devel carries neither git nor openssh, and curl is already in the
+        # image (the publisher fetches the artifacts from the public bucket).
+        runs-on: ubuntu-latest
+        container: archlinux:base-devel
+        timeout-minutes: 30
+        permissions:
+            contents: read
+        outputs:
+            published: ${{ steps.publish.outcome == 'success' && 'true' || 'false' }}
+        steps:
+            - name: Install git and openssh
+              # Tolerated alongside the publish step when `tolerate` is set: a
+              # flaky Arch mirror must not gate the channel either (the publish
+              # step, itself tolerated, then reports the consequential failure).
+              continue-on-error: ${{ inputs.tolerate }}
+              run: pacman -Syu --noconfirm --needed git openssh
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Publish to the AUR
+              id: publish
+              continue-on-error: ${{ inputs.tolerate }}
+              env:
+                  # Via env, not interpolated into the run block: `inputs` is
+                  # caller-controlled, and a reusable workflow must not splice it
+                  # into a shell command (zizmor template-injection).
+                  CHANNEL: ${{ inputs.channel }}
+                  PKGVER: ${{ inputs.row }}
+                  AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+              # --verify-build always: every caller wants a publish to prove the
+              # PKGBUILD builds, not merely that its metadata parses.
+              run: scripts/publish-aur.sh --channel "$CHANNEL" --verify-build
+
+    publish-brew:
+        # Homebrew has no channels: one tap, one formula per channel name.
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        permissions:
+            contents: read
+        outputs:
+            published: ${{ steps.publish.outcome == 'success' && 'true' || 'false' }}
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Publish to the Homebrew tap
+              id: publish
+              continue-on-error: ${{ inputs.tolerate }}
+              env:
+                  CHANNEL: ${{ inputs.channel }}
+                  PKGVER: ${{ inputs.row }}
+                  BREW_TAP_REPO: https://github.com/gominimal/homebrew-minimal.git
+                  GITHUB_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}
+              run: scripts/publish-brew.sh --channel "$CHANNEL"
