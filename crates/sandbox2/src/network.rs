@@ -70,6 +70,12 @@ pub enum Resolver {
 pub struct NetPlan {
     isolate_netns: bool,
     tap: Option<TapSpec>,
+    /// The plan promises no reach outside the sandbox at all, so socket
+    /// families the network namespace does not confine (`AF_VSOCK`) are
+    /// refused too. Set only by [`NetPlan::none`]: an isolated plan without a
+    /// tap may still be an own-address box whose tap the daemon moves in
+    /// after the process exists.
+    seal_sockets: bool,
     resolver: Resolver,
     hosts: Vec<HostEntry>,
 }
@@ -87,14 +93,14 @@ pub struct HostEntry {
 
 impl std::fmt::Display for NetPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.isolate_netns {
-            if self.tap.is_some() {
-                write!(f, "own_ip")
-            } else {
-                write!(f, "none")
-            }
-        } else {
+        if self.seal_sockets {
+            write!(f, "none")
+        } else if !self.isolate_netns {
             write!(f, "host_ip")
+        } else if self.tap.is_some() {
+            write!(f, "own_ip")
+        } else {
+            write!(f, "isolated")
         }
     }
 }
@@ -106,6 +112,7 @@ impl NetPlan {
         Self {
             isolate_netns: false,
             tap: None,
+            seal_sockets: false,
             resolver: Resolver::None,
             hosts: Vec::new(),
         }
@@ -118,6 +125,23 @@ impl NetPlan {
         Self {
             isolate_netns: true,
             tap: None,
+            seal_sockets: false,
+            resolver: Resolver::None,
+            hosts: Vec::new(),
+        }
+    }
+
+    /// A none box: an unshared network namespace that will never get a tap,
+    /// with every socket family the namespace does not confine refused as
+    /// well (`AF_VSOCK` reaches the host regardless of the namespace). Unlike
+    /// [`NetPlan::isolated`], which an own-address box also starts from when
+    /// its tap is moved in after spawn, this plan is the promise of no reach.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            isolate_netns: true,
+            tap: None,
+            seal_sockets: true,
             resolver: Resolver::None,
             hosts: Vec::new(),
         }
@@ -129,6 +153,7 @@ impl NetPlan {
         Self {
             isolate_netns: true,
             tap: Some(tap),
+            seal_sockets: false,
             resolver: Resolver::None,
             hosts: Vec::new(),
         }
@@ -158,13 +183,13 @@ impl NetPlan {
     }
 
     /// Whether this plan promises no network reach outside the sandbox and
-    /// therefore should refuse socket families that bypass the network namespace.
+    /// therefore refuses the socket families the network namespace does not
+    /// confine. Only [`NetPlan::none`] does: the shape of the plan cannot say,
+    /// because an own-address box whose tap is moved in after spawn is also
+    /// isolated with no tap at build time.
     #[must_use]
     pub fn blocks_outside_sockets(&self) -> bool {
-        // Only an isolated namespace with no tap can promise no outside reach.
-        // A host-namespace plan shares the host stack; an own-IP plan is wired
-        // to the switch and intentionally reaches the outside under policy.
-        self.isolate_netns && self.tap.is_none()
+        self.seal_sockets
     }
 
     /// The tap to build inside that namespace, if any.
@@ -341,7 +366,7 @@ pub struct NoNet;
 
 impl Network for NoNet {
     fn plan(&self) -> PlanFuture<'_> {
-        Box::pin(std::future::ready(Ok(NetPlan::isolated())))
+        Box::pin(std::future::ready(Ok(NetPlan::none())))
     }
 }
 

@@ -632,14 +632,13 @@ impl<C: Channel> Sandbox<C> {
         // credentials but before exec, using `prctl` + `seccomp` via libc only.
         #[cfg(target_os = "linux")]
         let socket_family_filter = if plan.blocks_outside_sockets() {
-            let filter = build_socket_family_filter();
+            let filter = socket_family_filter_for_none_box();
             tracing::info!(
                 network_plan = %plan,
                 sealed_families = %filter.sealed_families,
-                "sandbox launch: network plan is isolated, refusing non-allowed socket families"
+                "sandbox launch: network plan is a none box, refusing non-allowed socket families"
             );
-            let leaked: &'static SocketFamilyFilter = Box::leak(Box::new(filter));
-            Some(leaked)
+            Some(filter)
         } else {
             tracing::info!(network_plan = %plan, "sandbox launch: network plan is open, no socket-family filter");
             None
@@ -2310,13 +2309,36 @@ mod tests {
     /// `network_none_blocks_all_outside_sockets` in the minimald root integration
     /// harness; this unit test evaluates the program
     /// [`build_socket_family_filter`] produces.
+    /// Only a none plan seals sockets. An isolated plan without a tap is
+    /// also what an own-address box starts from inside a microVM, where the
+    /// daemon moves the tap in after spawn; sealing it would refuse the
+    /// `AF_INET` sockets that box exists to open.
+    #[test]
+    fn only_a_none_plan_seals_sockets() {
+        assert!(network::NetPlan::none().blocks_outside_sockets());
+        assert!(!network::NetPlan::isolated().blocks_outside_sockets());
+        assert!(!network::NetPlan::host().blocks_outside_sockets());
+        assert!(
+            !network::NetPlan::isolated_with_tap(network::TapSpec {
+                address: std::net::Ipv4Addr::new(10, 0, 0, 2),
+                netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
+                gateway: std::net::Ipv4Addr::new(10, 0, 0, 1),
+                mtu: 1500,
+            })
+            .blocks_outside_sockets()
+        );
+        assert_eq!(network::NetPlan::none().to_string(), "none");
+        assert_eq!(network::NetPlan::isolated().to_string(), "isolated");
+        assert_eq!(network::NetPlan::host().to_string(), "host_ip");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn none_plan_refuses_vsock_family() {
-        let plan = network::NetPlan::isolated();
+        let plan = network::NetPlan::none();
         assert!(
             plan.blocks_outside_sockets(),
-            "an isolated plan with no tap must block outside sockets"
+            "a none plan must block outside sockets"
         );
 
         let filter = build_socket_family_filter();

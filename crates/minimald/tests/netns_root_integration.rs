@@ -215,7 +215,7 @@ async fn network_none_blocks_all_outside_sockets() {
     let config = Config::new("none-sockets")
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
-        .with_plan(NetPlan::isolated());
+        .with_plan(NetPlan::none());
     // Build the sandbox in /tmp rather than the default (/home is a read-only
     // ext4 bind with locked nosuid, which breaks the unprivileged remounts
     // hakoniwa does inside the user namespace).
@@ -285,7 +285,7 @@ async fn network_none_attach_works() {
     let config = Config::new("none-attach")
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
-        .with_plan(NetPlan::isolated());
+        .with_plan(NetPlan::none());
     let tmp = tempfile::tempdir_in("/tmp").expect("sandbox temp dir under /tmp");
     let mut sandbox = config
         .build(tmp.path().join("sandbox"), ())
