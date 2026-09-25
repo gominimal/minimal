@@ -1064,6 +1064,7 @@ impl SessionLauncher for MockLauncherWithNet {
             },
             guard: (),
             tty_path,
+            seal_injection: false,
             net_guard: Some(Box::new(RecordingNetGuard {
                 torn_down: self.torn_down,
             })),
@@ -1290,4 +1291,120 @@ async fn stale_binding_generation_input_is_discarded() {
         .expect("mainloop should terminate after the shell exits")
         .expect("host task should not panic during teardown")
         .expect("mainloop should return the reaped exit status");
+}
+
+/// A composition with nothing in it. [`Host::hook_plan`] needs a composition
+/// to exist before it will plan a hook run, but no hook script is run by the
+/// plan itself, so an empty one is enough to test the wiring.
+fn bare_composition() -> Arc<sessions::core::compose::Composition> {
+    use sessions::wire::request::{COMPOSITION_SNAPSHOT_VERSION, WireComposition};
+    Arc::new(
+        sessions::core::compose::Composition::try_from(WireComposition {
+            version: COMPOSITION_SNAPSHOT_VERSION,
+            vars: Vec::new(),
+            patches: Vec::new(),
+            packages: Vec::new(),
+            lifecycle_hooks: Vec::new(),
+            orientation: Default::default(),
+        })
+        .expect("an empty composition snapshot converts back"),
+    )
+}
+
+/// A launcher that reports the given none-box seal and runs a stand-in shell
+/// with exactly one child, so [`Host::session_leader_pid`] resolves the way it
+/// does behind a real session.
+struct SealingMockLauncher {
+    seal_injection: bool,
+}
+
+impl SessionLauncher for SealingMockLauncher {
+    type Process = MockProcess;
+    type Guard = ();
+
+    async fn launch(
+        self,
+        _name: String,
+        _username: String,
+        _paths: SessionPaths,
+        sz: WinSize,
+    ) -> io::Result<Launched<MockProcess, ()>> {
+        let pty = Pty::open(sz)?;
+        // The `&` forces a fork, so the shell stays alive holding exactly one
+        // child for `session_leader_pid` to resolve.
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 30 & wait");
+        command.stdin(std::process::Stdio::from(pty.dup_slave_fd()?));
+        command.stdout(std::process::Stdio::from(pty.dup_slave_fd()?));
+        let tty_path = pty.slave_path().to_path_buf();
+        let (master, slave) = pty.into_fds();
+        command.stderr(std::process::Stdio::from(slave));
+
+        let process = command.spawn()?;
+
+        Ok(Launched {
+            master,
+            process: MockProcess {
+                child: process,
+                exit: None,
+            },
+            guard: (),
+            net_guard: None,
+            tty_path,
+            seal_injection: self.seal_injection,
+        })
+    }
+}
+
+/// The seal a lifecycle hook is injected with follows the session's own.
+/// `hook_plan` is the one place the daemon decides what a hook runs in, so it
+/// is where the none-box socket-family seal has to arrive: a hook joins the
+/// session's namespaces rather than being forked from the filtered shell, so
+/// without the flag it would land unfiltered and could open sockets —
+/// `AF_VSOCK` to the host included — from inside a sealed box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_injections_carry_the_session_s_none_box_seal() {
+    for (sealing, expected) in [(true, true), (false, false)] {
+        let (mut host, _handle) = Host::build(
+            SealingMockLauncher {
+                seal_injection: sealing,
+            },
+            HostParams {
+                name: "test-session".to_string(),
+                username: "user".to_string(),
+                paths: test_paths(),
+                sz: DEFAULT_SIZE,
+                channel: None,
+                control: None,
+                delta: None,
+                archives_dir: std::env::temp_dir(),
+                session_id: sessions::SessionId::nil(),
+                composition: Some(bare_composition()),
+                connection_env: ConnectionEnv::new(),
+            },
+        )
+        .await
+        .expect("failed to build host");
+
+        // The stand-in shell forks its child a moment after `spawn` returns,
+        // so the leader may not exist on the first ask. A real session runs
+        // its hooks long after launch; give the stand-in the same courtesy,
+        // bounded so a session that can never plan says so rather than hang.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let plan = loop {
+            if let Some(plan) = host.hook_plan(crate::hooks::HookEvent::Attach) {
+                break plan;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a live session with a composition never planned a hook run",
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let _ = host.process.kill();
+        assert_eq!(
+            plan.commands.seal_none_box, expected,
+            "the hook injection must carry the session's none-box seal",
+        );
+    }
 }
