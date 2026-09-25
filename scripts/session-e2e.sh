@@ -206,6 +206,44 @@ else
   now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; }
 fi
 
+# The CLI this script drives is THIS REPO'S `min`. Its callers put it on
+# PATH — CI's native lane exports `PATH="$PWD/target/debug:$PATH"`, `just
+# e2e`/`just e2e-native` build it first — but a `min` found on PATH is not
+# always that CLI: a host that is itself a minimal session box ships the
+# in-sandbox `min` HELPER (crates/mctx/src/min_helper.sh), a relay that
+# answers only add/task/search/check and prints its usage for every other
+# subcommand, and it shadows the real CLI — so the run dies at the first
+# `min session activate` with a bare `Usage: min <subcommand>` that names no
+# real cause. `--version` tells the two apart (the helper has none), so:
+# keep the PATH `min` when it is the real CLI, else fall back to a build of
+# this checkout — its own target dir first, then the environment's
+# CARGO_TARGET_DIR (an out-of-tree build cache) — and put the winning dir
+# ON PATH, because the CLI autospawns `minimald` by name
+# (crates/minimal/src/autospawn.rs) and the pair must come from one build.
+if command -v min >/dev/null 2>&1 && min --version >/dev/null 2>&1; then
+  :
+else
+  min_cli_dir=""
+  for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
+    if [ -x "$d/min" ]; then
+      min_cli_dir="$d"
+      break
+    fi
+  done
+  if [ -n "$min_cli_dir" ]; then
+    PATH="$min_cli_dir:$PATH"
+    export PATH
+  else
+    echo "::error::no usable 'min' CLI on this host: the 'min' on PATH is not" \
+      "the repo CLI (it takes no --version; on a session box it is the in-sandbox" \
+      "helper, which has no 'session' subcommands), and neither $ROOT/target/debug" \
+      "nor ${CARGO_TARGET_DIR:-\$CARGO_TARGET_DIR}/debug has a build of it." \
+      "Build one (just e2e-native, or cargo build -p minimal --bin min -p minimald" \
+      "--bin minimald --locked) and put its dir on PATH, as CI does." >&2
+    exit 1
+  fi
+fi
+
 # Every CLI call goes through this so E2E_MINIMAL_ARGS applies uniformly.
 # Word-splitting of the args is intended.
 mnl() {
