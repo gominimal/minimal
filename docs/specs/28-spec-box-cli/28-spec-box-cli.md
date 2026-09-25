@@ -238,6 +238,9 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal secrets_rendered_as_refs_in_every_output_mode
 
+- **BCLI-064** IF a box address given to any `min box`, `min session` or `min task` verb, or to `min attach`, resolves to no box under BOX-005 THEN THE SYSTEM SHALL fail with exit 4, naming the address, before any other check runs.
+  tier:     T0
+  verify:   cargo nextest run -p minimal unknown_box_address_exit4_names_address
 - **BCLI-034** THE SYSTEM SHALL use exit code 2 for usage errors, 3 for invalid configuration, 4 for not found, 5 for policy refusals, 7 for an unreachable host, 8 for insufficient resources, and 125 to 127 for runtime failures.
   <!-- was BOX-097 -->
   tier:     T0
