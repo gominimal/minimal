@@ -269,11 +269,19 @@ for i in "${!boxes[@]}"; do
 
     note "== $name: verifying binaries run =="
     # The binary reports the CANONICAL built version; the manager records the
-    # NORMALIZED one the filename carries. They differ on a channel package
-    # (0.6.0-dev.x vs 0.6.0~dev.x), so the expected value is either the one the
-    # caller passed or, for a released semver, the filename's version.
+    # NORMALIZED one the filename carries. They are identical only for a
+    # released semver (0.6.0-1 -> 0.6.0), which is why --built-version exists
+    # for channel packages: a dev build's normalized form (0.6.0~dev.…,
+    # 0.6.0_dev.…) can never match what the binary prints, so refuse the run
+    # rather than report a "binary check failed" that names the wrong cause.
     want_bin="$built_version"
-    [ -n "$want_bin" ] || want_bin="${want%%-*}"
+    if [ -z "$want_bin" ]; then
+        case "${want%%-*}" in
+            *[~_]*)
+                die "a channel package needs --built-version: '$(basename "${artifacts[$i]}")' carries the manager-normalized version, but the packaged binary reports the canonical one (e.g. --built-version 0.6.0-dev.10.g8e7e72c2)" ;;
+            *) want_bin="${want%%-*}" ;;
+        esac
+    fi
     if ! box "$i" sh -c "$(check_binaries | sed "s/PROBE_VERSION/${want_bin}/")"; then
         note "$name: binary check failed"
         failed=1

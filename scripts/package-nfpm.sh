@@ -173,7 +173,7 @@ elif [ -n "${ARTIFACTS_DIR:-}" ]; then
     VERSION="$PKGVER"
 else
     VERSION="$(curl -fsSL --retry 3 "$BUCKET_URL/versions/$ROW/version")" \
-        || die "cannot download $BUCKET_URL/versions/$ROW/version — a row staged before the version file existed cannot be packaged from the bucket (backfill it with --extra, see scripts/backfill-version-row.sh)"
+        || die "cannot download $BUCKET_URL/versions/$ROW/version — the row is missing its version file, so there is nothing to name the package after; restore it with scripts/backfill-version-row.sh (see its header)"
 fi
 printf '%s\n' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+_-]+)?$' \
     || die "resolved version '$VERSION' is not a canonical X.Y.Z (optional -prerelease/+build) version"

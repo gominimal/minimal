@@ -140,8 +140,8 @@ run_bucket() {
 # --- the anti-drift contract: both branches agree on a released semver --------
 
 al="$root/artifacts.log"; bl="$root/bucket.log"
-a_out="$(run_artifacts "$al" "$stable_row" 2>&1)"; a_rc=$?
-b_out="$(run_bucket "$bl" "$stable_row" 2>&1)"; b_rc=$?
+a_rc=0; a_out="$(run_artifacts "$al" "$stable_row" 2>&1)" || a_rc=$?
+b_rc=0; b_out="$(run_bucket "$bl" "$stable_row" 2>&1)" || b_rc=$?
 
 if [ "$a_rc" -eq 0 ]; then ok "ARTIFACTS_DIR mode succeeds"; else bad "ARTIFACTS_DIR mode succeeds (rc=$a_rc; out: $a_out)"; fi
 if [ "$b_rc" -eq 0 ]; then ok "bucket mode succeeds"; else bad "bucket mode succeeds (rc=$b_rc; out: $b_out)"; fi

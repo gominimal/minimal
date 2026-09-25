@@ -187,6 +187,14 @@ jobs:
                   set -euo pipefail
                   brew uninstall --force minimal minimal-unstable minimal-nightly 2>/dev/null || true
                   brew tap gominimal/minimal https://github.com/gominimal/homebrew-minimal
+                  # The runner is persistent and the tap is never removed: after
+                  # the first run `brew tap` is a no-op and
+                  # HOMEBREW_NO_AUTO_UPDATE=1 stops `brew install` from fetching,
+                  # so this would install an EARLIER night's formula and "prove"
+                  # a formula nobody pushed. Refresh the tap checkout first.
+                  tap_repo="$(brew --repository gominimal/minimal)"
+                  git -C "$tap_repo" fetch --quiet origin
+                  git -C "$tap_repo" reset --hard --quiet origin/HEAD
                   brew install gominimal/minimal/minimal-nightly
                   prefix="$(brew --prefix minimal-nightly)"
                   installed="$prefix/bin/min"
