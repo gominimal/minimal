@@ -1373,7 +1373,9 @@ async fn create_session_with_policy(
 /// The service the forward reaches: a loopback echo server, bound to an
 /// ephemeral port, echoing every accepted connection back byte for byte.
 async fn spawn_echo_server() -> (u16, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
         loop {
@@ -1393,7 +1395,9 @@ async fn spawn_echo_server() -> (u16, tokio::task::JoinHandle<()>) {
 /// listener. Probed rather than guessed: bind :0, read the port, drop the
 /// socket.
 async fn free_loopback_port() -> u16 {
-    let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let port = probe.local_addr().unwrap().port();
     drop(probe);
     port
@@ -1463,8 +1467,7 @@ async fn net_forward_relays_over_ssh_channel() {
             .await
             .expect("read the box's answer back through the forward");
         assert_eq!(
-            echoed,
-            *b"ping",
+            echoed, *b"ping",
             "connection {round} must relay through the box port"
         );
     }

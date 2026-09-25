@@ -509,10 +509,7 @@ impl russh::server::Handler for ConnectionHandler {
             return Ok(());
         };
         let mngr = serv.sessions_manager().await;
-        let session = match mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
-            .await
-        {
+        let session = match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
             Ok(Some(session)) => session,
             Ok(None) => {
                 tracing::warn!(
@@ -604,7 +601,9 @@ impl russh::server::Handler for ConnectionHandler {
                     Err(russh::ChannelOpenFailure::ConnectFailed)
                 }
             },
-            DialSite::InBox => dial_in_box(&session, uname, &host, port).await.map(Upstream::InBox),
+            DialSite::InBox => dial_in_box(&session, uname, &host, port)
+                .await
+                .map(Upstream::InBox),
         };
         let upstream = match upstream {
             Ok(upstream) => upstream,
@@ -632,9 +631,7 @@ impl russh::server::Handler for ConnectionHandler {
         // the session's to abort at teardown, so a session that goes away
         // takes its forwards down with it.
         let relay = match upstream {
-            Upstream::Shared(socket) => {
-                tokio::spawn(relay_streams(channel.into_stream(), socket))
-            }
+            Upstream::Shared(socket) => tokio::spawn(relay_streams(channel.into_stream(), socket)),
             Upstream::InBox(child) => tokio::spawn(relay_streams(channel.into_stream(), child)),
         };
         session.track_forward(relay.abort_handle()).await;

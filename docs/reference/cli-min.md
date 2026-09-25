@@ -292,6 +292,27 @@ first line; `--json` emits the full records.
 Answered from the persisted composition, so it works after a daemon restart
 and for a session nobody is attached to.
 
+### `net forward`
+
+```
+min net forward <SESSION> <LOCAL>:<PORT>
+```
+
+Forwards a port from a session's box to the laptop: binds
+`localhost:<LOCAL>` and relays every accepted connection over the session's
+SSH channel to `127.0.0.1:<PORT>` inside the box, so a service running in
+the session answers on the laptop with nothing else installed or configured
+on the remote side. `min net forward web 8080:3000` puts the box's port 3000
+on `localhost:8080`.
+
+Each accepted connection gets its own SSH channel, dialed from inside the
+box's network namespace — the box's own `127.0.0.1`, not the daemon's — so
+the command works for every network mode a session can have.
+
+The forward stays in the foreground and ends on `Ctrl-C`, when the session
+is destroyed, or when the daemon goes away; the listener and every open
+relay close with it.
+
 ### `stop`
 
 ```
