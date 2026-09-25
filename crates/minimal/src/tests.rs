@@ -330,8 +330,10 @@ async fn login_mints_no_certificate() {
     };
 
     // No daemon is running and none may be spawned: with the certificate
-    // RPC gone the verb has nothing to ask one for.
-    cmd_login(&global, LoginArgs {})
+    // RPC gone the verb has nothing to ask one for. The notice is captured
+    // from the verb itself, so the assertions below hold what it emits.
+    let mut out = Vec::new();
+    cmd_login(&global, LoginArgs {}, &mut out)
         .await
         .expect("a verb with nothing to mint succeeds without a daemon");
 
@@ -343,11 +345,18 @@ async fn login_mints_no_certificate() {
         );
     }
 
-    // The one line it prints names the retirement.
-    let line = login_nothing_to_mint_line();
+    // The one line it prints, read back out of what the verb wrote: a
+    // handler that stopped emitting it, printed something else, or printed
+    // it twice fails here rather than passing on the helper's own text.
+    let printed = String::from_utf8(out).expect("stdout is UTF-8");
     assert!(
-        line.contains("Nothing to mint"),
-        "the line must say there is nothing to mint, got: {line}"
+        printed.contains("Nothing to mint"),
+        "the line must say there is nothing to mint, got: {printed}"
+    );
+    assert_eq!(
+        printed,
+        format!("{}\n", login_nothing_to_mint_line()),
+        "the verb prints exactly the one required line"
     );
 
     // And the minting is gone from the verb's body, asserted on the source

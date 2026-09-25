@@ -187,8 +187,15 @@ pub fn cmd_mesh_leave(global: &GlobalArgs) -> Result<(), anyhow::Error> {
 /// the key and CA to the config directory; that surface is retired, so the
 /// verb now writes nothing and asks the daemon for nothing — it does not
 /// spawn one. It stays as the home of the sign-in that replaces it.
-pub async fn cmd_login(_global: &GlobalArgs, _args: LoginArgs) -> Result<(), anyhow::Error> {
-    println!("{}", login_nothing_to_mint_line());
+///
+/// The notice goes to the caller's writer rather than to stdout directly,
+/// so the test can capture it and hold the verb to what it actually emits.
+pub async fn cmd_login<W: std::io::Write>(
+    _global: &GlobalArgs,
+    _args: LoginArgs,
+    out: &mut W,
+) -> Result<(), anyhow::Error> {
+    writeln!(out, "{}", login_nothing_to_mint_line()).context("writing the login notice")?;
     Ok(())
 }
 

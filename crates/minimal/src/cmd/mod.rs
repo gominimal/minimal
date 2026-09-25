@@ -81,7 +81,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             MeshCommand::Leave => cmd_mesh_leave(&cli.global_args),
         },
         Some(Command::Proxy(args)) => cmd_proxy(&cli.global_args, args).await,
-        Some(Command::Login(args)) => cmd_login(&cli.global_args, args).await,
+        Some(Command::Login(args)) => {
+            cmd_login(&cli.global_args, args, &mut std::io::stdout().lock()).await
+        }
         Some(Command::Version) => cmd_version(&cli.global_args).await,
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
         Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
