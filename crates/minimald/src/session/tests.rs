@@ -2242,3 +2242,297 @@ async fn materializing_patches_carries_their_modes_into_the_home() {
         );
     }
 }
+
+// ---- a box outlives its client (NET-015) -----------------------------
+//
+// A box runs from activation until destroy whether or not a client is
+// attached. Three observations, one per clause: a running box with no
+// client anywhere keeps running; a client lost *abruptly* mid-attach
+// changes nothing about the entrypoint; and no idle interval ever stops
+// a box — stop is always something a client asked for.
+
+/// A `MakeWriter` accumulating everything written into a shared buffer,
+/// so a test can assert on the structured fields a `tracing` event
+/// emitted (the same capture `exec`'s end-to-end tests and `net::proxy`'s
+/// tests use).
+#[derive(Clone, Default)]
+struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CaptureWriter {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// A whole `Server::run` daemon on a real UDS in `dir`, spawned for the
+/// caller, alongside the socket path clients dial. The in-memory
+/// [`TestServer::connect`] harness discards the connection task's outcome,
+/// so the connection-level lines the accept loop logs — the client-loss
+/// record — never reach a capture wired to it; a test that asserts on
+/// them drives the real loop, the way `server`'s own tests do.
+async fn spawn_run_server(
+    dir: &tempfile::TempDir,
+) -> (
+    tokio::task::JoinHandle<Result<(), std::io::Error>>,
+    std::path::PathBuf,
+) {
+    let sock = dir.path().join("minimald.sock");
+    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+    let run = tokio::spawn(crate::server::Server::run(
+        crate::server::test_config(dir.path()),
+        listener,
+        None,
+    ));
+    (run, sock)
+}
+
+/// NET-015: a box keeps running whether or not a client is attached.
+///
+/// The box here is a headless one — `ensure_host` launches its
+/// entrypoint with nobody attached, the closed-laptop state — and the
+/// only client connection that ever existed is dropped outright. The
+/// shell keeps running (`is_alive` on the handle minted before the
+/// drop), and a brand-new client can attach and drive it. Nothing about
+/// the entrypoint depended on its creator's connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_survives_without_client() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+
+    // Launch the entrypoint with no client attached.
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a headless host");
+    assert!(host.is_alive());
+
+    // The only client connection ever is gone, abruptly.
+    drop(client);
+
+    // The box neither noticed nor stopped.
+    assert!(host.is_alive(), "the headless shell must keep running");
+
+    // A later attach lands on it and drives the same shell.
+    let mut fresh = server.connect().await;
+    let mut shell = fresh.open_shell(session_id).await;
+    await_echo(&mut shell).await;
+
+    assert_eq!(
+        record_status(&mut fresh, session_id).await,
+        Some(sessions::SessionStatus::Active),
+        "a box that outlived its client is still an Active record",
+    );
+}
+
+/// NET-015, lost-client clause: the attached client of a PTY box dies
+/// abruptly and the box's entrypoint keeps running, accepting a later
+/// attach — which finds the *same* shell, its pre-loss terminal state
+/// flushed on connect. A relaunched entrypoint would have an empty
+/// screen; seeing `got:hello` is the proof the old one never stopped.
+///
+/// Driven through a real `Server::run` accept loop so the connection's
+/// own close is logged the way the daemon logs it: the client-loss info
+/// line a diagnostic bundle's log tail reads the hang-up from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abrupt_client_loss_keeps_task() {
+    use crate::test_harness::connect_uds;
+
+    let capture = CaptureWriter::default();
+    // Global, not thread-local, and set before the server spawns so the
+    // accept loop's lines land too. Safe under nextest's
+    // one-process-per-test isolation; under a shared-process runner the
+    // assertions are `contains`, so a neighbour's records reaching the
+    // same buffer cost nothing.
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish(),
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (run, sock) = spawn_run_server(&dir).await;
+
+    let mut client = connect_uds(&sock).await;
+    let session_id = create_session(&mut client).await;
+
+    // Attach and drive the shell, so the terminal state holds
+    // `got:hello` when the client is lost.
+    let mut shell = client.open_shell(session_id).await;
+    await_echo(&mut shell).await;
+
+    // The client dies without a farewell: the channel and the connection
+    // both go with it.
+    drop(shell);
+    drop(client);
+
+    // The daemon logs the loss as what it is, not as an incident.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let logged = capture.contents();
+        if logged.contains("connection closed by peer") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon must log the abrupt client loss, got: {logged}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // A brand-new client attaches and finds the entrypoint still running:
+    // the pre-loss terminal state is flushed to it...
+    let mut fresh = connect_uds(&sock).await;
+    let mut shell = fresh.open_shell(session_id).await;
+    let flushed = recv_until(&mut shell, "got:hello").await;
+    assert!(
+        flushed.contains("got:hello"),
+        "the later attach must see the same shell's earlier output, got: {flushed:?}"
+    );
+
+    // ...and the shell answers as itself.
+    shell.data_bytes(b"ping\n".to_vec()).await.unwrap();
+    let echoed = recv_until(&mut shell, "got:ping").await;
+    assert!(
+        echoed.contains("got:ping"),
+        "the shell the lost client left running must still answer, got: {echoed:?}"
+    );
+
+    assert_eq!(
+        record_status(&mut fresh, session_id).await,
+        Some(sessions::SessionStatus::Active),
+    );
+
+    use minimald_rpc::{Shutdown, ShutdownRequest};
+    let _ = fresh
+        .call::<Shutdown>(&ShutdownRequest { force: false })
+        .await;
+    drop(fresh);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), run).await;
+}
+
+/// NET-015, stop-policy clause: a box stops only when its client asks,
+/// when its entrypoint exits, when the run it was created for ends, or
+/// when the host tears it down by force — never because it sat idle.
+///
+/// The box is detached by its client's own chord (the only kind of
+/// departure that leaves a session outliving its binding), then left
+/// with no client anywhere for an idle window. Any idle stop faster
+/// than the window would have fired; the daemon defines none at all, and
+/// the window's close finds the entrypoint still answering. The stop
+/// paths' log lines are asserted absent, not just the outcome — a silent
+/// kill would otherwise pass as a healthy idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_has_no_idle_stop() {
+    let server = TestServer::new().await;
+    let capture = CaptureWriter::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish(),
+    )
+    .unwrap();
+
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+
+    // Attach, drive, then detach by the client's own chord.
+    let mut shell = client.open_shell(session_id).await;
+    await_echo(&mut shell).await;
+    shell.data_bytes(vec![0x1d]).await.unwrap();
+    shell.data_bytes(vec![b'd']).await.unwrap();
+    let detach_out = collect_to_close(&mut shell).await;
+    assert!(
+        detach_out.contains("Detaching from session."),
+        "expected a detach notice before the channel closed, got: {detach_out:?}"
+    );
+
+    // The departure is logged, naming the session — the detach line the
+    // diagnostic bundle reads.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let logged = capture.contents();
+        let detach_line = logged
+            .lines()
+            .find(|line| line.contains("binding leaving mainloop"))
+            .map(str::to_string);
+        if let Some(line) = detach_line {
+            assert!(
+                line.contains("Detach"),
+                "the binding's exit must be logged as a detach, got: {line}"
+            );
+            assert!(
+                line.contains("shell-test"),
+                "the detach line must name the session, got: {line}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon must log the binding's detach, got: {logged}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Idle: no client attached to anything. Five seconds — every daemon
+    // timer that could plausibly reap an idle box would have fired, and
+    // none is defined in the first place.
+    drop(client);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // The box is exactly where the client left it.
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    assert!(
+        handle.get_attrs().await.is_some(),
+        "an idle box's entrypoint must still be running"
+    );
+    assert_eq!(
+        record_status(&mut server.connect().await, session_id).await,
+        Some(sessions::SessionStatus::Active),
+    );
+
+    // And none of the stop paths' lines is in the log.
+    let logged = capture.contents();
+    for stop_line in [
+        "session host killed on request",
+        "session process exited; reaped by the host loop",
+        "run box ended",
+        "reaped unfinalized session after its connection closed",
+    ] {
+        assert!(
+            !logged.contains(stop_line),
+            "an idle box must not be stopped, but the log carries {stop_line:?}:\n{logged}"
+        );
+    }
+}
