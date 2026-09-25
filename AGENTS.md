@@ -224,10 +224,6 @@ proves, `nightly` ships.
   [docs/commit-conventions.md](docs/commit-conventions.md).
 - **Rust standards**:
   [docs/rust-coding-standards.md](docs/rust-coding-standards.md).
-- **Clippy is a quality gate**: run `just clippy-strict` on your change and fix
-  every complaint it raises on the lines you touched. It lints only the crates
-  you changed, so it fits a short-lived sandbox. Full-workspace `just clippy`
-  belongs to `just ci`, not to every edit. `just fix` autofixes.
 - **Specs**: work carrying `kind:epic` gets one, at
   `docs/specs/NN-spec-<slug>/NN-spec-<slug>.md`. Start from
   [docs/specs/TEMPLATE.md](docs/specs/TEMPLATE.md); requirements are written as
@@ -244,7 +240,9 @@ The canonical pre-PR command is `just ci`, per
 [CONTRIBUTING.md](CONTRIBUTING.md#building-and-testing) ("Before opening a
 PR"): it runs the same gates the PR lanes run (fmt, clippy, cargo-deny,
 the test suite, doctests; plus `just test-ignored` on Linux), dispatched
-for your OS. Platform notes for agents:
+for your OS, and then `clippy-strict`, which applies a stricter lint set to
+the lines your branch changed. Run `just clippy-strict` alone to see just
+those. Platform notes for agents:
 
 - **macOS**: the workspace does not build natively (see
   [Platform matrix](#platform-matrix)); `just ci` runs the darwin-capable
