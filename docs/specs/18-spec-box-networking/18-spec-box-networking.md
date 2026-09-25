@@ -4,7 +4,7 @@ title: Box networking on the local host: preview by name and bounded egress
 owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md
-updated: 2026-09-23
+updated: 2026-09-25
 ---
 
 # NET — Box networking on the local host: preview by name and bounded egress
@@ -161,9 +161,9 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-010** WHERE the reserved local range is present on the host, WHEN an own-address or `none` box is published THE SYSTEM SHALL assign it a host loopback address of its own from the host-global allocation and publish its ports at the box's own port numbers.
   tier:     T2
   verify:   cargo nextest run -p minimald each_box_gets_own_loopback_address
-  property: for every host with the reserved local range present and every sequence of publish and withdraw operations from every daemon on it, up to 8 live boxes, no two live own-address or `none` boxes hold the same loopback address
+  property: for every host with the reserved local range present and every sequence of publish and withdraw operations from every allocator on it, up to 8 live boxes, no two live own-address or `none` boxes hold the same loopback address
   harness:  kani_loopback_alloc_injective, exhaustive to 8 live boxes across daemons; requires the allocator to be a pure function over one host-wide owned set of leased addresses, separate from the publish call and from any daemon's own state
-  <!-- S1b-2a; prose 6; event-driven; the no-collision clause is the universal for spec-tiers; "host-global" per design §7.1: allocation is arbitrated through the answerer's authenticated channel and no daemon self-assigns; host-address boxes mirror their node's address (NET-129); a host without the range publishes at `127.0.0.1` under NET-123's interim, outside this requirement -->
+  <!-- S1b-2a; prose 6; event-driven; the no-collision clause is the universal for spec-tiers; "host-global" per design §7.1: allocation is host-global through the answerer's authenticated channel for every allocator, the helper for each VM (NET-138) and each native daemon, and no in-VM daemon self-assigns; host-address boxes mirror their node's address (NET-129); a host without the range publishes at `127.0.0.1` under NET-123's interim, outside this requirement -->
 
 - **NET-011** WHEN a session is finalised THE SYSTEM SHALL register `<name>.min.internal` for the box's loopback address.
   tier:     T0
@@ -258,10 +258,10 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald proxy_listens_on_configured_port
   <!-- S2b/AC1; prose 16; event-driven -->
 
-- **NET-025** WHEN a daemon starts with no hostname-proxy port configured THE SYSTEM SHALL select a free port.
+- **NET-025** WHERE the daemon is not VM-hosted, WHEN it starts with no hostname-proxy port configured THE SYSTEM SHALL select a free port.
   tier:     T0
   verify:   cargo nextest run -p minimald proxy_auto_selects_free_port
-  <!-- S2b/AC1; prose 16; event-driven -->
+  <!-- S2b/AC1; prose 16; event-driven; on a VM-backed host the helper assigns the port (NET-138) -->
 
 - **NET-026** WHEN `min` connects to a daemon THE SYSTEM SHALL discover the hostname-proxy port in use and print it.
   tier:     T0
@@ -569,6 +569,41 @@ included, with every refusal logged (NET-001 to NET-004).
     property: for every frame leaving the VM whose source belongs to no box, the frame is dropped
     harness:  kani_frame_verdict_admits_nothing_undeclared; bound and purity constraint under Tiers in Design reasoning
     <!-- S10a/AC1; prose 51; unwanted -->
+  - WHERE the host is VM-backed, WHEN the in-VM daemon asks the switch to publish a port or a name THE SYSTEM SHALL apply the request only when the table NET-138 holds the request's switch address for a live box or the node and admits that port or that name for it.
+    tier:     T2
+    verify:   cargo nextest run -p sessions switch_request_applied_only_when_table_admits
+    property: for every switch request and every table, the request is applied exactly when the table holds its switch address for a live box or the node and admits every port and name it carries for that holder
+    harness:  kani_switch_request_applied_iff_table_admits; bound and purity constraint under Tiers in Design reasoning
+    <!-- S10a/AC1; prose 51; feature+event; the switch's forwarder and zone verbs ride the same channel as the frame relay, so without this rule a process inside the VM publishes any guest address on the host or shadows a zone name; the host-side gate is the one writer toward the switch; a request from a resident address to unpublish or re-point a sibling's entry among the table's addresses is in-boundary attribution noise, conceded by design §8 item 3 -->
+    - IF a request's switch address, or a port or name it carries, is not so held THEN THE SYSTEM SHALL refuse the whole request and log the refusal with its reason.
+      tier:   T0
+      verify: cargo nextest run -p minvmd switch_request_refused_and_logged
+      <!-- S10a/AC1; prose 51; unwanted; a zone request carrying several records is one request (NET-001's refusal form) -->
+
+- **NET-138** WHERE the host is VM-backed THE SYSTEM SHALL hold, outside the VM, one table of every published namespace on the node — each live box, the node itself and the host-address cohort — with its switch address, its host loopback address, its name, its admitted port set and its egress rules, filled from the host-side creator's expanded spec and the host-side helper's own allocation.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd host_table_holds_every_published_namespace
+  <!-- S10a/AC1; prose 51; optional-feature; design §7.1 (un-enrolled: the client-side helpers self-allocate locally; rules derive from the expanded specs the creator made), §7.6 (the helper accepts no rule change from a guest) and Gatehouse §6.10 (address-to-box facts from the host-side creator); the table is what the gate NET-081 decides by and what NET-133's attachments are read from; a box's admitted port set is its declared ports, its permitted ranges under `dynamic_ingress = allow`, and the ports the attached human answered yes to under `ask` (NET-045), which the client records in the table; the node's admitted set is the hostname proxy and the zone answerer at the ports the helper assigned, and any port while a host-address box is published; the cohort row carries the union of live host-address boxes' egress at the cohort address (design §4.3 rule 2) -->
+  - WHEN a box is created on a VM-backed host THE SYSTEM SHALL allocate its switch address and its host loopback address in the host-side helper and hand them to the in-VM daemon before the box's first connection.
+    tier:   T0
+    verify: cargo nextest run -p minvmd box_addresses_allocated_on_host_and_handed_to_daemon
+    <!-- S10a/AC1; prose 51; event-driven; the helper hands the lease and the gate admits only that address (design §4.2, un-enrolled self-allocation); the in-VM daemon configures the tap with the address it was handed and selects none; a native host has no helper and its daemon is the creator (NET-010's allocator, unchanged) -->
+  - WHEN the VM boots THE SYSTEM SHALL assign the hostname-proxy port and the zone-answerer port in the host-side helper, hand them to the in-VM daemon before it listens, and bind the daemon's hostname proxy and zone answerer to those ports and no other.
+    tier:   T0
+    verify: cargo nextest run -p minvmd node_ports_assigned_on_host_and_handed_to_daemon
+    <!-- S10a/AC1; prose 51; event-driven; NET-025's free-port selection stays the native daemon's; on a VM-backed host the selection moves to the helper so the node's row is host-authored; NET-026's discovery is unchanged, `min` still reads the port in use from the daemon -->
+  - IF the in-VM daemon reports an address, a name, a port or a rule for any row THEN THE SYSTEM SHALL keep it out of the table.
+    tier:   T0
+    verify: cargo nextest run -p minvmd host_table_never_sourced_from_guest
+    <!-- S10a/AC1; prose 51; unwanted; NET-133's discipline for the proxy's attachments, applied to the table the gate decides by; the daemon is what an escapee controls; a row's liveness is the host's own observation of the attachment, not a report -->
+  - WHEN a box's attachment to the switch ends or its creator destroys it THE SYSTEM SHALL withdraw its row within 60 seconds.
+    tier:   T0
+    verify: cargo nextest run -p minvmd host_table_row_withdrawn_within_60s_of_box_end
+    <!-- S10a/AC1; prose 51; event-driven; liveness is read at the host's end of the box's attachment, never from a daemon report; NET-133's withdrawal reads this row -->
+  - WHILE a host-address box is published THE SYSTEM SHALL admit the node's mirrored binds for it at the node's address at any port.
+    tier:   T0
+    verify: cargo nextest run -p minvmd host_address_mirrored_binds_admitted_unfiltered
+    <!-- S10a/AC1; prose 51; state-driven; design §7.1: on the host-address lane the parity rule does not filter, the node's forwarder mirrors the shared namespace's binds (NET-129); the cohort's reach is bounded by its NET-138 row and NET-078, never by port filtering -->
 
 - **NET-082** WHERE the host is VM-backed THE SYSTEM SHALL boot the guest with IPv6 disabled so that no IPv6 route ever appears in the guest.
   tier:     T0
@@ -579,6 +614,15 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p sandbox2 boxes_lack_cap_net_raw
   <!-- S10a/AC3; prose 53; ubiquitous -->
+
+- **NET-137** THE SYSTEM SHALL refuse a process in a box every socket whose family the box's network namespace does not confine, `AF_VSOCK` included, whatever the box's network mode.
+  tier:     T0
+  verify:   cargo nextest run -p sandbox2 every_box_refuses_namespace_bypass_families
+  <!-- S10a/AC3; prose 53; ubiquitous; design §4.1's precision rule (no reachable switch or tunnel control surface, by socket permissions) as the box-level seal: a vsock socket is not scoped by the box's network namespace and reaches the host-side helper's listeners directly, which is the seal a `none` box already carries (NET-038); own-address and host-address boxes keep their inet families -->
+  - WHEN the daemon starts a process inside a running box by joining its namespaces (exec, attach, a hook) THE SYSTEM SHALL apply the same refusal to that process.
+    tier:   T0
+    verify: cargo nextest run -p minimald joined_process_refuses_namespace_bypass_families
+    <!-- S10a/AC3; prose 53; event-driven; a seal set only at box start does not reach a process the daemon injects from outside -->
 
 - **NET-084** IF a frame on the egress relay carries a source address other than the box's lease THEN THE SYSTEM SHALL reject it.
   tier:     T2
@@ -604,7 +648,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-133** WHEN a box is created on a host running a node-local Box Egress Proxy THE SYSTEM SHALL give the proxy, from the host-side creator outside the VM and before the box's first connection, an attachment naming the box by its box id, with its addressing and the source address it arrives from.
   tier:     T0
   verify:   cargo nextest run -p minvmd proxy_attachment_given_before_first_connection
-  <!-- event-driven; design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the local analogue of the feed's `bep` audience, a v1 conformance requirement; the facts come from outside the VM escape boundary and never from the in-VM daemon, which an escapee controls; the proxy attributes a connection only to a live box it holds an attachment for; host-address boxes share one attachment as their cohort (NET-078) -->
+  <!-- event-driven; design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the local analogue of the feed's `bep` audience, a v1 conformance requirement; the facts come from outside the VM escape boundary and never from the in-VM daemon, which an escapee controls; the proxy attributes a connection only to a live box it holds an attachment for; host-address boxes share one attachment as their cohort (NET-078); the attachment is the box's NET-138 row, withdrawn with it -->
   - IF the in-VM daemon reports an address-to-box fact THEN THE SYSTEM SHALL keep it out of the proxy's attachments.
     tier:   T0
     verify: cargo nextest run -p minvmd proxy_attachment_never_sourced_from_guest
@@ -1016,7 +1060,14 @@ runs today. The seven frame-level requirements share one harness,
 `kani_frame_verdict_admits_nothing_undeclared`, exhaustive to an unwind bound
 of 4 over a 40-byte IPv4+L4 header and at most 4 rules; it requires the
 admit-or-drop decision to be a pure function over an owned frame summary and
-owned rules, separate from the relay loop. Proxy parity (NET-071) is T1 and adds a property-test dependency
+owned rules, separate from the relay loop. The switch-request decision
+(NET-081's publish rule) is T2 on the same reasoning and has its own harness,
+`kani_switch_request_applied_iff_table_admits`, in the `sessions` lane beside
+the frame harness: exhaustive over a request summary of one verb, one switch
+address and at most 4 records, each a port or an index into the table's name
+set, against a table of at most 4 rows with at most 4 admitted ports and 4
+names each; it requires the decision to be a pure function over an owned
+request summary and an owned table, separate from the request relay. Proxy parity (NET-071) is T1 and adds a property-test dependency
 the workspace does not have; that cost was accepted. T3 was refused for every
 candidate: the effect shells are async relay tasks, sockets, and a VM boundary,
 which fail the no-concurrency constraint, and the repository has no Lean
@@ -1056,10 +1107,11 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   escape boundary, root included, to the union of resident boxes' declared
   egress plus the node-plane baseline set (design §5.1).
   enforced by: per-box source-addressed rules applied outside the VM, boxes
-  without `CAP_NET_RAW`, the relay's source-address check, and guest IPv6
-  disabled
+  without `CAP_NET_RAW`, the relay's source-address check, guest IPv6
+  disabled, the host-side gate as the one writer toward the switch from a
+  host-authored table, and the namespace-bypass seal on every box
   ([design §4.3 rule 0 and §8][design])
-  covered by: NET-081, NET-082, NET-083, NET-084, NET-085, NET-130
+  covered by: NET-081, NET-082, NET-083, NET-084, NET-085, NET-130, NET-137, NET-138
 - **Invariant:** THE SYSTEM SHALL present each box to the node-local Box Egress
   Proxy from its own source address, and no other process from a box's.
   enforced by: the relay's source-address check, a proxy leg that keeps the
