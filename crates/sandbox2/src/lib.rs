@@ -616,8 +616,7 @@ impl<C: Channel> Sandbox<C> {
             .devfsmount("/dev")
             .tmpfsmount("/tmp")
             .unshare(hakoniwa::Namespace::Cgroup)
-            .runctl(hakoniwa::Runctl::IgnoreCgroupSetupFailed)
-            .runctl(hakoniwa::Runctl::MountFallback);
+            .runctl(hakoniwa::Runctl::IgnoreCgroupSetupFailed);
 
         // Network isolation (R1.4/R1.7). An isolating plan gets a fresh network
         // namespace with only a down `lo`; wiring it is the provider's job,
