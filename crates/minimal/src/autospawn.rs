@@ -168,6 +168,14 @@ pub fn ensure_minvmd_running(minimal_dir: Option<&Path>) -> io::Result<()> {
     if let Some(dir) = minimal_dir {
         cmd.arg("--minimal-state-dir").arg(dir);
     }
+    // Forward the VM name too, so the daemon this spawns serves the same
+    // named VM this client resolved its state dir and socket under
+    // (NET-052). The default VM needs no flag — its paths are unchanged
+    // (NET-053) — and a named one must not spawn a second default VM.
+    let vm = crate::client::vm_name();
+    if vm != paths::DEFAULT_VM_NAME {
+        cmd.arg("--vm").arg(vm);
+    }
     cmd.arg("run")
         .arg("--detach")
         .arg("--timeout")

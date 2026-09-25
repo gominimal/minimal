@@ -24,6 +24,35 @@ pub fn trace_context() -> &'static minimald_rpc::trace::TraceContext {
     CONTEXT.get_or_init(minimald_rpc::trace::TraceContext::mint)
 }
 
+// ── VM name ─────────────────────────────────────────────────────────────────
+
+static VM_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Set the process-wide VM name (`--vm <NAME>`) so every provider dir this
+/// process resolves names the same VM (NET-052). First call wins; must be
+/// called at command dispatch, before any path resolution. A name that is not
+/// a single path component is rejected here rather than resolved to a
+/// directory outside the provider dir.
+///
+/// # Errors
+///
+/// [`paths::Error::InvalidVmName`] when `vm` is not a single path component.
+pub fn set_vm_name(vm: &str) -> Result<(), paths::Error> {
+    paths::validate_vm_name(vm)?;
+    let _ = VM_NAME.set(vm.to_owned());
+    Ok(())
+}
+
+/// The VM this process talks to: the `--vm` name when set, else the default VM
+/// ([`paths::DEFAULT_VM_NAME`], whose paths are unchanged — NET-053).
+#[must_use]
+pub fn vm_name() -> &'static str {
+    VM_NAME
+        .get()
+        .map(String::as_str)
+        .unwrap_or(paths::DEFAULT_VM_NAME)
+}
+
 /// Build a spinner bar on the process-global `MultiProgress` with the house
 /// animation and a caller-chosen `template`.
 ///
@@ -1081,27 +1110,68 @@ pub fn migrate_legacy_provider_dirs(minimal_dir_override: Option<&std::path::Pat
 /// Resolve the provider-instance dir (`<state dir>/providers/local-<kind>0`) the
 /// daemon and CLI agree on: `--minimal-dir` when set, else the default minimal
 /// state dir. `use_minvmd` selects the backend's dir (see [`client_provider_kind`]).
+///
+/// This is the default VM ([`paths::DEFAULT_VM_NAME`]); [`vm_name()`] selects the
+/// process's VM, so call [`set_vm_name`] first to talk to a named VM.
 pub fn resolve_provider_dir(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
+    resolve_provider_dir_named(minimal_dir_override, use_minvmd, vm_name())
+}
+
+/// [`resolve_provider_dir`] for an explicit VM. A named VM nests under its own
+/// subdirectory of the provider dir (NET-052/NET-054):
+/// `<state dir>/providers/local-minvmd0/<name>`; the default VM keeps the
+/// provider dir itself (NET-053). The native `minimald` backend hosts no VMs,
+/// so a name selects nothing there and the base provider dir is returned.
+///
+/// # Errors
+///
+/// [`std::io::Error`] with [`paths::Error::InvalidVmName`] when `vm` is not a
+/// single path component, or when `minimal_dir_override` is not usable.
+pub fn resolve_provider_dir_named(
+    minimal_dir_override: Option<&std::path::Path>,
+    use_minvmd: bool,
+    vm: &str,
+) -> std::io::Result<std::path::PathBuf> {
     let base = resolve_state_base(minimal_dir_override)?;
-    Ok(
-        paths::provider_instance_dir(&base, client_provider_kind(use_minvmd), 0)
-            .as_utf8_path()
-            .as_std_path()
-            .to_path_buf(),
-    )
+    let kind = client_provider_kind(use_minvmd);
+    let dir = if kind == paths::ProviderKind::Minvmd {
+        paths::provider_instance_dir_named(&base, kind, 0, vm).map_err(std::io::Error::other)?
+    } else {
+        paths::provider_instance_dir(&base, kind, 0)
+    };
+    Ok(dir.as_utf8_path().as_std_path().to_path_buf())
 }
 
 /// Resolve the daemon socket path: `<provider dir>/ssh.sock`. Each backend
 /// serves this endpoint under its own provider dir, so `use_minvmd` must select
 /// the same backend the daemon was spawned as.
+///
+/// This is the default VM's socket; a named VM serves its own (see
+/// [`resolve_provider_dir_named`]).
 pub fn resolve_socket_path(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
-    Ok(resolve_provider_dir(minimal_dir_override, use_minvmd)?.join(paths::SSH_SOCK_FILE))
+    resolve_socket_path_named(minimal_dir_override, use_minvmd, vm_name())
+}
+
+/// [`resolve_socket_path`] for an explicit VM: `<named provider dir>/ssh.sock`.
+///
+/// # Errors
+///
+/// As [`resolve_provider_dir_named`].
+pub fn resolve_socket_path_named(
+    minimal_dir_override: Option<&std::path::Path>,
+    use_minvmd: bool,
+    vm: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    Ok(
+        resolve_provider_dir_named(minimal_dir_override, use_minvmd, vm)?
+            .join(paths::SSH_SOCK_FILE),
+    )
 }
 
 /// Sends the process trace context as a `TRACEPARENT` channel env request.
@@ -1206,7 +1276,7 @@ pub async fn fill_git_info(entries: &mut [minimald_rpc::ListSessionsEntry]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, resolve_socket_path};
+    use super::{Client, resolve_provider_dir, resolve_socket_path};
     use std::path::Path;
 
     /// The daemon-error accumulator is bounded: a daemon that sprays extended
@@ -1276,6 +1346,98 @@ mod tests {
         assert_eq!(
             sock,
             Path::new("/tmp/minimal-test/providers/local-minvmd0/ssh.sock")
+        );
+    }
+
+    /// A named VM must resolve to its own provider dir and socket under a
+    /// per-name subdirectory (NET-052/NET-054).
+    #[test]
+    fn named_vm_gets_its_own_dir_and_socket() {
+        let dir =
+            super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), true, "alpha")
+                .unwrap();
+        assert_eq!(
+            dir,
+            Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha")
+        );
+
+        let sock =
+            super::resolve_socket_path_named(Some(Path::new("/tmp/minimal-test")), true, "alpha")
+                .unwrap();
+        assert_eq!(
+            sock,
+            Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha/ssh.sock")
+        );
+    }
+
+    /// The default VM's paths must be byte-for-byte unchanged, whether the name
+    /// is spelled `default` or left unset (NET-053).
+    #[test]
+    fn default_vm_paths_are_unchanged() {
+        let base = Path::new("/tmp/minimal-test/providers/local-minvmd0");
+        for name in [None, Some("default")] {
+            let dir = super::resolve_provider_dir_named(
+                Some(Path::new("/tmp/minimal-test")),
+                true,
+                name.unwrap_or("default"),
+            )
+            .unwrap();
+            assert_eq!(dir, base);
+            let sock = super::resolve_socket_path_named(
+                Some(Path::new("/tmp/minimal-test")),
+                true,
+                name.unwrap_or("default"),
+            )
+            .unwrap();
+            assert_eq!(sock, base.join("ssh.sock"));
+        }
+    }
+
+    /// The native `minimald` backend hosts no VMs: a name must select nothing
+    /// there, so the base provider dir keeps serving the single daemon.
+    #[test]
+    fn native_backend_ignores_the_vm_name() {
+        let dir =
+            super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), false, "alpha")
+                .unwrap();
+        assert_eq!(
+            dir,
+            Path::new("/tmp/minimal-test/providers/local-minimald0")
+        );
+    }
+
+    /// A VM name that is not a single path component must be refused, not
+    /// resolved to a directory outside the provider dir.
+    #[test]
+    fn vm_name_must_be_a_single_path_component() {
+        for name in ["", ".", "..", "a/b", "../sibling"] {
+            let err =
+                super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), true, name)
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid VM name"),
+                "name {name:?} must be rejected as invalid, got: {err}"
+            );
+        }
+        assert!(super::set_vm_name("a/b").is_err());
+    }
+
+    /// `--vm` published at dispatch must steer every default-arg resolve this
+    /// process makes (NET-052). Nextest runs each test in its own process, so
+    /// setting the global here cannot leak into the default-VM tests above.
+    #[test]
+    fn set_vm_name_steers_the_default_resolvers() {
+        super::set_vm_name("alpha").unwrap();
+        assert_eq!(super::vm_name(), "alpha");
+        let dir = resolve_provider_dir(Some(Path::new("/tmp/minimal-test")), true).unwrap();
+        assert_eq!(
+            dir,
+            Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha")
+        );
+        let sock = resolve_socket_path(Some(Path::new("/tmp/minimal-test")), true).unwrap();
+        assert_eq!(
+            sock,
+            Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha/ssh.sock")
         );
     }
 
