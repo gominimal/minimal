@@ -373,6 +373,70 @@ echo "session exec proof OK"
 echo "::endgroup::"
 
 # ---------------------------------------------------------------------------
+# Session rename + policy proof. `min session rename` and `min session policy`
+# had no end-to-end coverage: the rename path is exercised here against the
+# live session (name change visible in `ls --json`, old name stops resolving,
+# a collision is refused, and rename-to-self is an error), and the policy
+# command's JSON contract is parsed. Ordered before the pty proof, which
+# deletes the session.
+echo "::group::session rename + policy proof"
+
+# Rename the live session; the new name must show up in `ls --json` and the
+# old name must stop resolving.
+RENAMED_NAME="e2e-renamed"
+mnl session rename "$sid" "$RENAMED_NAME" >/dev/null 2>"$WORK/rename.err" \
+  || { echo "::error::'min session rename $sid $RENAMED_NAME' failed"; cat "$WORK/rename.err" 2>/dev/null || true; fail; }
+
+ls_json="$(mnl ls --json 2>"$WORK/ls-json.err")" \
+  || { echo "::error::'min ls --json' failed"; cat "$WORK/ls-json.err" 2>/dev/null || true; fail; }
+# One python3 pass over the captured JSON — never `| grep -q`, whose early
+# exit SIGPIPEs the producer under pipefail and reads as "not found".
+if ! printf '%s' "$ls_json" | python3 -c '
+import json, sys
+names = [s.get("name") for s in json.load(sys.stdin)["sessions"]]
+want, old = sys.argv[1], sys.argv[2]
+if want not in names:
+    sys.exit("renamed name not listed")
+if old in names:
+    sys.exit("pre-rename name still listed")
+' "$RENAMED_NAME" "$SESSION_NAME"; then
+  echo "::error::'min ls --json' does not reflect the rename (want '$RENAMED_NAME', old '$SESSION_NAME' gone)"
+  echo "--- ls --json ---"; printf '%s\n' "$ls_json"
+  fail
+fi
+
+# The old name must no longer resolve to a session.
+if mnl session policy "$SESSION_NAME" >/dev/null 2>"$WORK/policy-old.err"; then
+  echo "::error::'min session policy $SESSION_NAME' still resolves after the rename"
+  fail
+fi
+
+# Rename-to-self must be an error, not a silent no-op.
+if mnl session rename "$sid" "$RENAMED_NAME" >/dev/null 2>"$WORK/rename-self.err"; then
+  echo "::error::'min session rename $sid $RENAMED_NAME' (rename-to-self) unexpectedly succeeded"
+  fail
+fi
+grep -q "session is already named" "$WORK/rename-self.err" \
+  || { echo "::error::rename-to-self error does not say 'session is already named'"; cat "$WORK/rename-self.err" 2>/dev/null || true; fail; }
+
+# `min session policy` must print parseable JSON for the renamed session.
+policy_json="$(mnl session policy "$sid" 2>"$WORK/policy.err")" \
+  || { echo "::error::'min session policy $sid' failed"; cat "$WORK/policy.err" 2>/dev/null || true; fail; }
+if ! printf '%s' "$policy_json" | python3 -c 'import json,sys; json.load(sys.stdin)'; then
+  echo "::error::'min session policy' output is not valid JSON"
+  echo "--- policy output ---"; printf '%s\n' "$policy_json"
+  fail
+fi
+
+# Restore the original name: the sandbox proof below asserts the orientation
+# banner interpolates $SESSION_NAME, so the session must carry it again.
+mnl session rename "$sid" "$SESSION_NAME" >/dev/null 2>"$WORK/rename-back.err" \
+  || { echo "::error::'min session rename $sid $SESSION_NAME' (restore) failed"; cat "$WORK/rename-back.err" 2>/dev/null || true; fail; }
+
+echo "session rename + policy proof OK"
+echo "::endgroup::"
+
+# ---------------------------------------------------------------------------
 # Guest egress proof. Every VM lane wires the gvproxy switch for the guest's
 # egress (NAT + DNS), yet nothing else here asserts it works — and gvproxy
 # resolution is best-effort and never errors, so a lane that silently loses the

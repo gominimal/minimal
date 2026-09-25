@@ -764,6 +764,27 @@ async fn rename_by_name() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn rename_to_self_is_an_error() {
+    let (daemon, args) = setup().await;
+    let session_id = create_session(&daemon, "same-name").await;
+
+    let err = cmd_rename(
+        &args,
+        RenameArgs {
+            session: session_id.to_string(),
+            new_name: "same-name".to_string(),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        err.to_string().contains("session is already named"),
+        "expected a rename-to-self error, got: {err}"
+    );
+}
+
 // --- session policy ---
 
 #[tokio::test]
@@ -779,6 +800,41 @@ async fn session_policy_succeeds() {
     )
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn session_policy_prints_valid_json() {
+    let (daemon, args) = setup().await;
+    let session_id = create_session(&daemon, "policy-json").await;
+
+    // `cmd_session_policy` writes the policy to the process's stdout, so
+    // drive the compiled binary to assert the JSON contract a script parses.
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args([
+            "--minimal-dir".as_ref(),
+            args.minimal_dir.as_ref().unwrap().as_os_str(),
+        ])
+        .args(["session", "policy"])
+        .arg(session_id.to_string())
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+
+    assert!(
+        out.status.success(),
+        "session policy must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let policy: Value = serde_json_lenient::from_str(stdout.trim())
+        .expect("session policy output must be valid JSON");
+    // A NoNet session has no egress/ingress config: both fields are null.
+    // `get` (not `["k"]`): indexing a missing key also yields `Null`, so the
+    // lookup must assert the field is present as well as null.
+    assert_eq!(policy.get("egress"), Some(&Value::Null));
+    assert_eq!(policy.get("ingress"), Some(&Value::Null));
 }
 
 // --- helpers ---
