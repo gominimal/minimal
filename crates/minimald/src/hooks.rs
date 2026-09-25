@@ -118,6 +118,13 @@ pub(crate) struct InjectedCommands {
     pub(crate) leader_pid: u32,
     pub(crate) cwd: String,
     pub(crate) vars: BTreeMap<String, String>,
+    /// Whether the process must reinstall the none-box socket-family filter
+    /// after joining the namespaces. The launch-time filter is inherited only
+    /// by children of the filtered process, and an injected hook is neither:
+    /// it joins later, so on a `--network none` session it has to load the
+    /// filter itself or it could open sockets — `AF_VSOCK` to the host
+    /// included — from inside a sealed box.
+    pub(crate) seal_none_box: bool,
 }
 
 impl SessionCommands for InjectedCommands {
@@ -129,11 +136,15 @@ impl SessionCommands for InjectedCommands {
     ) -> std::io::Result<std::process::Command> {
         let mut vars = self.vars.clone();
         vars.extend(extra_env);
-        crate::nsenter::Injection::new(self.leader_pid, program, args)
+        let injection = crate::nsenter::Injection::new(self.leader_pid, program, args)
             .with_cwd(self.cwd.clone())
-            .with_env(vars)
-            .command()
-            .map_err(std::io::Error::other)
+            .with_env(vars);
+        let injection = if self.seal_none_box {
+            injection.seal_none_box()
+        } else {
+            injection
+        };
+        injection.command().map_err(std::io::Error::other)
     }
 }
 
@@ -1413,5 +1424,60 @@ mod tests {
         let tail = tail_of(long.as_bytes(), b"");
         assert!(tail.len() <= OUTPUT_TAIL_BYTES + 2);
         assert!(long.ends_with(&tail));
+    }
+
+    /// The injected argv of a hook, as strings, so a test can ask what the
+    /// shim was told to do.
+    async fn injected_argv(seal_none_box: bool) -> Vec<String> {
+        // A plain host process shares every namespace with us, so the join set
+        // is empty and nothing privileged is asked of the runner.
+        let mut hold = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning a stand-in session leader");
+        let commands = InjectedCommands {
+            leader_pid: hold.id(),
+            cwd: String::new(),
+            vars: BTreeMap::new(),
+            seal_none_box,
+        };
+        let built = commands
+            .command("/bin/true", &[], BTreeMap::new())
+            .await
+            .expect("building the injected hook command");
+        let _ = hold.kill();
+        let _ = hold.wait();
+        built
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// A hook on a `--network none` session joins the session's namespaces
+    /// rather than being forked from the filtered shell, so the seal has to
+    /// ride along as an instruction to the shim: without `--seal-none-box` the
+    /// shim never installs the filter and the hook process can open
+    /// `AF_INET`/`AF_VSOCK` sockets from inside a sealed box.
+    #[tokio::test]
+    async fn a_none_box_hook_injection_carries_the_socket_seal() {
+        assert!(
+            injected_argv(true)
+                .await
+                .contains(&"--seal-none-box".to_string()),
+            "a sealing session must pass --seal-none-box to the hook's shim",
+        );
+    }
+
+    /// The flag is the none box's alone: a `host_ip` or `own_ip` session's
+    /// hooks keep the plain injection, so their sockets are governed by the
+    /// network namespace rather than refused by a socket-family filter.
+    #[tokio::test]
+    async fn a_networked_session_hook_injection_is_not_sealed() {
+        assert!(
+            !injected_argv(false)
+                .await
+                .contains(&"--seal-none-box".to_string()),
+            "only a none box may pass --seal-none-box to the hook's shim",
+        );
     }
 }
