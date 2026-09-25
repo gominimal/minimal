@@ -224,9 +224,10 @@ proves, `nightly` ships.
   [docs/commit-conventions.md](docs/commit-conventions.md).
 - **Rust standards**:
   [docs/rust-coding-standards.md](docs/rust-coding-standards.md).
-- **Clippy is a quality gate**: after every change run `just clippy` (and
-  `just clippy-strict`, which adds the stricter lints on the lines you changed)
-  and fix every complaint in the files you touched. `just fix` autofixes.
+- **Clippy is a quality gate**: run `just clippy-strict` on your change and fix
+  every complaint it raises on the lines you touched. It lints only the crates
+  you changed, so it fits a short-lived sandbox. Full-workspace `just clippy`
+  belongs to `just ci`, not to every edit. `just fix` autofixes.
 - **Specs**: work carrying `kind:epic` gets one, at
   `docs/specs/NN-spec-<slug>/NN-spec-<slug>.md`. Start from
   [docs/specs/TEMPLATE.md](docs/specs/TEMPLATE.md); requirements are written as
