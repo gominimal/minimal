@@ -288,12 +288,19 @@ async fn serve_create_session(
                         egress_deny_subnets = egress_counts.deny_subnets,
                         "session created"
                     );
+                    // NET-123: the session-start loopback probe, before any
+                    // of this session's names publish. One info line with the
+                    // probe result and the surface it picked; the interim
+                    // flag on the reply is what tells the client to surface
+                    // the naming advisory again (NET-122).
+                    let interim_loopback = session_start_loopback_probe(&id).await;
                     Errorable::Ok(minimald_rpc::CreateSessionResponse {
                         id,
                         daemon_version: Some(OWN_VERSION.to_string()),
                         hostname_routing_unavailable: s.proxy_unavailable().await,
                         hostname_proxy_port: s.hostname_proxy_port().await,
                         zone_answerer_port: s.zone_answerer_port().await,
+                        interim_loopback,
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
@@ -309,6 +316,56 @@ async fn serve_create_session(
             })
         })
         .await
+}
+
+/// The session-start loopback probe (NET-123): bind-probe the reserved local
+/// range before this session publishes, log the one session-start line with
+/// the probe result and the surface it picked, and return whether the
+/// session is published at the `127.0.0.1` interim — the reply flag that
+/// tells the client to surface the naming advisory again (NET-122).
+///
+/// The probe is 254 binds with port 0 — milliseconds for the whole range —
+/// and each bind is a blocking syscall, so it runs on the blocking pool
+/// rather than the connection's worker. A probe task that panics or is lost
+/// reads as absent: without a verdict the daemon may not publish at range
+/// addresses, so the session stays on the interim.
+#[cfg(target_os = "linux")]
+async fn session_start_loopback_probe(session_id: &sessions::SessionId) -> bool {
+    // The probe to run: the test stand-in when one is installed (a Linux
+    // host's real bind can never produce the absent arm), else the real
+    // bind probe.
+    #[cfg(any(test, feature = "test-support"))]
+    let probe_fn = crate::net::loopback::session_start_probe;
+    #[cfg(not(any(test, feature = "test-support")))]
+    let probe_fn = crate::net::loopback::probe;
+    let probe = tokio::task::spawn_blocking(probe_fn)
+        .await
+        .unwrap_or_else(|join| {
+            tracing::warn!(
+                error = %join,
+                "the session-start loopback probe did not run; treating \
+                 the reserved local range as absent"
+            );
+            crate::net::loopback::RangeProbe::failed_to_run()
+        });
+    let interim_loopback = probe.interim();
+    tracing::info!(
+        session_id = %session_id,
+        probe = %probe.summary(),
+        surface = %probe.surface(),
+        interim_loopback,
+        "session-start loopback probe picked the publish surface"
+    );
+    interim_loopback
+}
+
+/// Off Linux there is no reserved range to probe and no interim to publish
+/// at: the net module, its answerer and its range are Linux facts, so the
+/// flag reads "not interim" — the reply a client of a daemon without the
+/// naming surface must carry.
+#[cfg(not(target_os = "linux"))]
+async fn session_start_loopback_probe(_session_id: &sessions::SessionId) -> bool {
+    false
 }
 
 /// `ConfigureLoadout`: composes a created session's loadout from the
@@ -2656,6 +2713,151 @@ mod tests {
                 .daemon_version
                 .as_deref(),
             Some(OWN_VERSION)
+        );
+    }
+
+    /// Serializes the window in which a loopback-probe stand-in is installed:
+    /// the stand-in is process-global (`net::loopback`), so under libtest —
+    /// where every test in this binary shares one process — a create driven
+    /// by another test would read it too. Nextest runs each test in its own
+    /// process; the mutex keeps the in-process runner as safe.
+    static PROBE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The probe a host whose `lo0` carries no range alias reads: the stock
+    /// macOS the spike measured — every bind refused, first at `.1`.
+    fn absent_range_probe() -> crate::net::loopback::RangeProbe {
+        crate::net::loopback::RangeProbe {
+            bound: 0,
+            probed: 254,
+            first_failure: Some((
+                std::net::Ipv4Addr::new(127, 64, 0, 1),
+                std::io::ErrorKind::AddrNotAvailable,
+            )),
+        }
+    }
+
+    /// The one session-start probe line this session's create produced: the
+    /// record that carries the probe's result and the surface it picked
+    /// (NET-123's observability contract). Attributed by session id, because
+    /// under libtest the capture buffer is shared by every test in the
+    /// binary — assertions on it say `contains`, never `equals`.
+    fn probe_line(log: &str, session_id: &SessionId) -> String {
+        let message = "session-start loopback probe picked the publish surface";
+        let id = format!("session_id={session_id}");
+        log.lines()
+            .find(|line| line.contains(message) && line.contains(&id))
+            .unwrap_or_else(|| {
+                panic!("no session-start loopback probe record for {id}, got: {log}")
+            })
+            .to_string()
+    }
+
+    /// NET-123's reply flag: the create response carries the interim verdict
+    /// the session-start probe reached — `true` when the reserved range read
+    /// absent, `false` when it read present. The flag is the whole re-advise
+    /// contract: a client that reads `true` surfaces the naming advisory
+    /// again (NET-122).
+    // The stand-in window must cover the awaited create, so the mutex guard
+    // is held across the await on purpose.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn create_response_carries_interim_flag() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // The present verdict needs no stand-in: on Linux the whole 127/8 is
+        // local to `lo`, so the real probe finds the range present.
+        let present = client
+            .call::<CreateSession>(&req("interim-present", "/uwu"))
+            .await
+            .ok()
+            .expect("a create with the range present must publish");
+        assert!(
+            !present.interim_loopback,
+            "a present reserved range must not report the interim"
+        );
+
+        // The absent verdict does — no real bind on this host can produce it.
+        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap();
+        crate::net::loopback::install_probe_standin(absent_range_probe);
+        let absent = client
+            .call::<CreateSession>(&req("interim-absent", "/uwu"))
+            .await
+            .ok()
+            .expect("a create with the range absent must still publish");
+        crate::net::loopback::clear_probe_standin();
+        assert!(
+            absent.interim_loopback,
+            "an absent reserved range must report the interim on the reply"
+        );
+    }
+
+    /// NET-123's probe: session start bind-probes the reserved local range
+    /// before publishing, and the one session-start log line carries the
+    /// probe's result and the surface it picked. On this host the whole
+    /// `127/8` is local to `lo`, so the probe covers every address, finds
+    /// the range present, and the reply stays off the interim.
+    #[tokio::test]
+    async fn session_start_probes_reserved_range() {
+        let log = crate::test_harness::captured_log();
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let created = client
+            .call::<CreateSession>(&req("probe-covered", "/uwu"))
+            .await
+            .ok()
+            .expect("a create with a present range");
+        assert!(!created.interim_loopback);
+
+        let line = probe_line(&log.contents(), &created.id);
+        assert!(
+            line.contains("127.64.0.0/24 254/254 bound"),
+            "the probe covers the whole reserved range, and the line says so: {line}"
+        );
+        assert!(
+            line.contains("surface=reserved-range"),
+            "the surface the probe picked is named: {line}"
+        );
+    }
+
+    /// NET-123's absent arm: when the session-start probe finds the reserved
+    /// range absent the session publishes at the `127.0.0.1` interim — the
+    /// one address a host without the aliases can still reach — and the log
+    /// and the reply both say so, which is what makes the client surface the
+    /// naming advisory again. The stand-in stands in for that host; no real
+    /// bind on this Linux one can reproduce it.
+    // The stand-in window must cover the awaited create, so the mutex guard
+    // is held across the await on purpose.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn absent_range_publishes_interim_and_readvises() {
+        let log = crate::test_harness::captured_log();
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap();
+        crate::net::loopback::install_probe_standin(absent_range_probe);
+        let interim = client
+            .call::<CreateSession>(&req("interim-published", "/uwu"))
+            .await
+            .ok()
+            .expect("an absent range must not refuse the session");
+        crate::net::loopback::clear_probe_standin();
+
+        assert!(
+            interim.interim_loopback,
+            "the reply carries the interim — the flag a client re-surfaces \
+             the naming advisory on"
+        );
+        let line = probe_line(&log.contents(), &interim.id);
+        assert!(
+            line.contains("surface=127.0.0.1-interim"),
+            "the log names the interim as the surface chosen: {line}"
+        );
+        assert!(
+            line.contains("interim_loopback=true"),
+            "the interim verdict is on the line, for the log's reader: {line}"
         );
     }
 
