@@ -2435,22 +2435,18 @@ async fn box_has_no_idle_stop() {
         let logged = capture.contents();
         let detach_line = logged
             .lines()
-            .find(|line| line.contains("binding leaving mainloop"))
+            .find(|line| line.contains("binding leaving mainloop") && line.contains("shell-test"))
             .map(str::to_string);
         if let Some(line) = detach_line {
             assert!(
                 line.contains("Detach"),
                 "the binding's exit must be logged as a detach, got: {line}"
             );
-            assert!(
-                line.contains("shell-test"),
-                "the detach line must name the session, got: {line}"
-            );
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the daemon must log the binding's detach, got: {logged}"
+            "the daemon must log the binding's detach, naming the session, got: {logged}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
