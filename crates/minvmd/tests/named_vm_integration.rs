@@ -547,6 +547,26 @@ fn reap_scoped_per_checkout() {
             "missing pattern {expected:?} in:\n{lines}"
         );
     }
+    let bare_patterns = lines;
+
+    // `--vm default` is the default VM spelled out — and the default VM's
+    // processes carry no `--vm` flag (minvmd's re-exec and the CLI's autospawn
+    // omit it for the default name) and its switch socket sits in no per-name
+    // subdirectory, so the name-pinned patterns would match nothing and the
+    // script would exit 0 having reaped no VM. It must reap exactly what the
+    // bare invocation reaps.
+    std::fs::remove_file(&log).unwrap();
+    let out = run_reap(&["--vm", "default"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        recorded(),
+        bare_patterns,
+        "`--vm default` must reap the default VM like the bare invocation does"
+    );
 
     // By name: the patterns pin the same checkout *and* the one named VM —
     // minvmd processes by their `--vm alpha` argument, the VM's gvproxy

@@ -22,6 +22,12 @@
 # child), and the VM's gvproxy switch carries the per-name socket directory in
 # its argv (`.../local-minvmd0/<NAME>/gvproxy-switch.sock`). Other VMs of this
 # checkout — and every other checkout's VMs — keep running.
+#
+# `--vm default` is the bare invocation, not a name search: the default VM's
+# processes carry no `--vm` flag (minvmd and autospawn omit it for the default
+# name) and its switch socket sits in no per-name subdirectory, so the
+# name-pinned patterns would match nothing and the script would exit 0 having
+# reaped no VM at all.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -38,6 +44,14 @@ fi
 if [ "$#" -gt 0 ]; then
   echo "usage: $0 [--vm <NAME>]" >&2
   exit 2
+fi
+
+# `default` (paths::DEFAULT_VM_NAME) is the default VM, not a name to pin: its
+# processes carry no `--vm` flag and its switch socket sits in no per-name
+# subdirectory, so the name-pinned patterns would reap nothing. Clearing the
+# name makes the invocation the bare one, which does reap the default VM.
+if [ "$VM" = "default" ]; then
+  VM=""
 fi
 
 # Quote ERE metacharacters so a VM name matches literally in `pkill -f`.
