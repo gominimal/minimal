@@ -967,6 +967,7 @@ mod tests {
                 },
             ],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         let gate = IngressGate::for_session("100.64.0.9".into(), Some(&ingress));
         assert!(gate.allowed.contains(&80)); // TCP internal port
@@ -1050,6 +1051,7 @@ mod tests {
                 proto: sessions::IpProto::Tcp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         let gate = IngressGate::for_session(LEASE.to_string(), Some(&ingress));
         // New TCP connection to an undeclared port -> dropped, tagged Tcp.

@@ -132,9 +132,42 @@ fn first_invalid_cidr(entries: Option<&Vec<String>>) -> Option<&str> {
         .find(|cidr| !is_valid_cidr(cidr))
 }
 
+/// How dynamic ingress requests from inside a box are decided.
+///
+/// A request to publish a port from inside the box (e.g. `min net expose`)
+/// is either allowed automatically, denied, or routed to a prompt for the
+/// attached human. The default for an absent declaration is deny-all.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicIngress {
+    /// Dynamic ingress requests are published without prompting.
+    Allow,
+    /// Dynamic ingress requests are refused (the default when no setting is
+    /// declared).
+    #[default]
+    Deny,
+    /// Dynamic ingress requests prompt the attached human. If nobody is
+    /// attached, the request is refused.
+    Ask,
+}
+
+impl fmt::Display for DynamicIngress {
+    /// Renders the lowercase mode name, matching the `snake_case` serde
+    /// representation so the TUI and any structured log fields agree with the
+    /// wire format.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Ask => "ask",
+        })
+    }
+}
+
 /// Effective ingress policy for an `OwnIp` `PTask`.
 ///
-/// Default (empty `port_mappings`, no `dynamic_allowed_range`) is deny-all-external.
+/// Default (empty `port_mappings`, no `dynamic_allowed_range`, no
+/// `dynamic_ingress`) is deny-all-external.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct IngressPolicy {
     /// Static port mappings applied at `PTask` launch.
@@ -146,14 +179,23 @@ pub struct IngressPolicy {
     /// but **not yet enforced**: dynamic port-mapping is split to #553. Until
     /// then a set range is recorded configuration only, with no runtime effect.
     pub dynamic_allowed_range: Option<(u16, u16)>,
+    /// How dynamic port-mapping requests from inside the box are decided.
+    /// `None` means the default deny-all applies.
+    ///
+    /// Stored on the [`Record`] and returned verbatim by `GetSessionPolicy`,
+    /// but **not yet enforced**: the runtime evaluation is split to #553.
+    pub dynamic_ingress: Option<DynamicIngress>,
 }
 
 impl IngressPolicy {
     /// Whether this ingress policy configures any forwarding at all (a static
-    /// mapping or a dynamic range). An empty policy is the deny-all default.
+    /// mapping, a dynamic range, or an explicit dynamic-ingress setting). An
+    /// empty policy is the deny-all default.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.port_mappings.is_empty() && self.dynamic_allowed_range.is_none()
+        self.port_mappings.is_empty()
+            && self.dynamic_allowed_range.is_none()
+            && self.dynamic_ingress.is_none()
     }
 }
 
@@ -452,7 +494,8 @@ impl Record {
     /// `deny_subnets` entry is not, [`PolicyError::InvalidDynamicRange`] when
     /// the ingress `dynamic_allowed_range` lower bound exceeds its upper bound,
     /// or [`PolicyError::PrivilegedDynamicRange`] when that lower bound is a
-    /// privileged host port (< 1024).
+    /// privileged host port (< 1024). Does not validate `dynamic_ingress`, which
+    /// is accepted on an `OwnIp` `PTask` and serialized verbatim.
     pub fn validate_policy(&self) -> Result<(), PolicyError> {
         // gvproxy's static forwarder only exposes TCP and UDP, so an ingress
         // mapping with any other transport is a configuration error wherever it
@@ -675,6 +718,7 @@ mod tests {
                 proto: IpProto::Tcp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         let record = record_with(
             NetworkMode::HostNet,
@@ -700,6 +744,7 @@ mod tests {
                 proto: IpProto::Icmp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         assert_eq!(
             record_with(
@@ -725,6 +770,7 @@ mod tests {
                 proto: IpProto::Tcp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         assert_eq!(
             record_with(
@@ -747,6 +793,7 @@ mod tests {
                 proto: IpProto::Icmp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
         assert_eq!(
@@ -769,6 +816,7 @@ mod tests {
                 proto: IpProto::Tcp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
         assert_eq!(
@@ -788,6 +836,7 @@ mod tests {
                 proto: IpProto::Tcp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
         assert!(record.validate_policy().is_ok());
@@ -863,6 +912,7 @@ mod tests {
                 proto: IpProto::Tcp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         let record = record_with(
             NetworkMode::HostNet,
@@ -885,6 +935,7 @@ mod tests {
         let ingress = IngressPolicy {
             port_mappings: vec![],
             dynamic_allowed_range: Some((8443, 8000)),
+            dynamic_ingress: None,
         };
         let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
         assert_eq!(
@@ -905,6 +956,7 @@ mod tests {
             let ingress = IngressPolicy {
                 port_mappings: vec![],
                 dynamic_allowed_range: Some(range),
+                dynamic_ingress: None,
             };
             let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
             assert_eq!(
@@ -922,6 +974,7 @@ mod tests {
             let ingress = IngressPolicy {
                 port_mappings: vec![],
                 dynamic_allowed_range: Some(range),
+                dynamic_ingress: None,
             };
             let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
             assert!(record.validate_policy().is_ok());
@@ -940,6 +993,66 @@ mod tests {
             SessionPolicy::new(None, Some(IngressPolicy::default())),
         );
         assert!(record.validate_policy().is_ok());
+    }
+
+    #[test]
+    fn dynamic_ingress_setting_parses() {
+        // NET-043: a box spec declaring `dynamic_ingress` allow, deny or ask
+        // parses, and an unknown value is refused.
+        for (json, expected) in [
+            ("\"allow\"", DynamicIngress::Allow),
+            ("\"deny\"", DynamicIngress::Deny),
+            ("\"ask\"", DynamicIngress::Ask),
+        ] {
+            let parsed: DynamicIngress =
+                serde_json_lenient::from_str(json).expect("{json} must parse to {expected:?}");
+            assert_eq!(parsed, expected);
+        }
+
+        let err = serde_json_lenient::from_str::<DynamicIngress>("\"unknown\"").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown variant")
+                && msg.contains("allow")
+                && msg.contains("deny")
+                && msg.contains("ask"),
+            "unknown dynamic_ingress must name allowed variants: {msg}"
+        );
+
+        // A full ingress policy round-trips the setting.
+        let ingress = IngressPolicy {
+            port_mappings: vec![],
+            dynamic_allowed_range: Some((8000, 8443)),
+            dynamic_ingress: Some(DynamicIngress::Ask),
+        };
+        let json = serde_json_lenient::to_string(&ingress).unwrap();
+        let rt: IngressPolicy = serde_json_lenient::from_str(&json).unwrap();
+        assert_eq!(rt, ingress, "IngressPolicy must round-trip dynamic_ingress");
+
+        // An ingress policy with only the new field is valid on an OwnIp PTask.
+        let record = record_with(
+            NetworkMode::OwnIp,
+            SessionPolicy::new(None, Some(ingress.clone())),
+        );
+        assert!(
+            record.validate_policy().is_ok(),
+            "dynamic_ingress does not change validation"
+        );
+
+        // The field is not enough to make a HostNet ingress non-empty; setting
+        // `dynamic_ingress` alone still fails on a host-address box because
+        // ingress policy is own-address-only.
+        let record = record_with(
+            NetworkMode::HostNet,
+            SessionPolicy::new(None, Some(ingress.clone())),
+        );
+        assert_eq!(
+            record.validate_policy(),
+            Err(PolicyError::IngressRequiresOwnIp {
+                mode: NetworkMode::HostNet
+            }),
+            "dynamic_ingress alone is still an ingress policy on a host-address box"
+        );
     }
 
     /// On-disk records that predate the `status` field must

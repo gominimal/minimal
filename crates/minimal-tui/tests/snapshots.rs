@@ -221,6 +221,7 @@ fn detail_pane_with_policy() {
                         proto: sessions::IpProto::Tcp,
                     }],
                     dynamic_allowed_range: None,
+                    dynamic_ingress: Some(sessions::DynamicIngress::Ask),
                 }),
             )),
         },

@@ -81,6 +81,7 @@ pub(crate) async fn activate_session(
         ingress: (!port_mappings.is_empty()).then_some(sessions::IngressPolicy {
             port_mappings,
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         }),
     };
 
