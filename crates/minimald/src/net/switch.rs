@@ -494,6 +494,7 @@ where
                     Direction::Egress,
                     drop_remote(&summary),
                     drop_transport(&reason),
+                    None,
                     reason.rule(),
                 );
                 continue;
@@ -925,7 +926,8 @@ where
                 Direction::Ingress,
                 Some(SocketAddr::V4(src)),
                 Proto::from_ipproto(proto),
-                &format!("no ingress mapping for {proto} dst port {dst_port}"),
+                Some(dst_port),
+                "no ingress mapping",
             );
             continue;
         }

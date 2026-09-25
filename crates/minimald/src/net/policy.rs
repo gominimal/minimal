@@ -568,14 +568,18 @@ impl PolicyWarnLimiter {
     /// R2.7's required structured fields: the `session_id`, the `direction` of
     /// the offending traffic, the `remote_addr` it was to/from (rendered as
     /// `none` when the frame had no IP destination to read, as for an IPv6 or
-    /// truncated drop), its `proto`, and the `rule_matched`. Returns whether a
-    /// warning was emitted (vs. suppressed by the rate limit).
+    /// truncated drop), its `proto`, the `dst_port` the traffic targeted
+    /// (`None` when the drop is not about a port), and the `rule_matched`.
+    /// The port is a structured field only, never part of `rule_matched`: it
+    /// must not fragment the per-rule rate-limit key. Returns whether a warning
+    /// was emitted (vs. suppressed by the rate limit).
     pub fn warn(
         &self,
         session_id: &str,
         direction: Direction,
         remote_addr: Option<SocketAddr>,
         proto: Proto,
+        dst_port: Option<u16>,
         rule_matched: &str,
     ) -> bool {
         if self.should_warn_at(session_id, rule_matched, Instant::now()) {
@@ -585,6 +589,7 @@ impl PolicyWarnLimiter {
                 %direction,
                 %remote_addr,
                 %proto,
+                dst_port,
                 rule_matched,
                 "network policy violation"
             );
@@ -687,6 +692,29 @@ mod tests {
         // But the same pair within the interval still is.
         assert!(!limiter.should_warn_at("box-a", "rule-1", t0 + Duration::from_secs(1)));
         assert!(!limiter.should_warn_at("box-b", "rule-1", t0 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn warn_limiter_keys_ingress_drops_by_rule_not_port() {
+        // The destination port is a structured field, not part of the rule
+        // key: a port scan against one box is one rule hit per minute, not one
+        // emission per probed port.
+        let limiter = PolicyWarnLimiter::new();
+        let src = Some(SocketAddr::from(([100, 64, 0, 9], 40000)));
+        let emitted = [80u16, 8080]
+            .into_iter()
+            .filter(|&dst_port| {
+                limiter.warn(
+                    "box",
+                    Direction::Ingress,
+                    src,
+                    Proto::from_ipproto(IpProto::Tcp),
+                    Some(dst_port),
+                    "no ingress mapping",
+                )
+            })
+            .count();
+        assert_eq!(emitted, 1);
     }
 
     #[test]
