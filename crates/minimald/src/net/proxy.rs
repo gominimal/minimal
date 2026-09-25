@@ -201,11 +201,9 @@ impl BindFailure {
     /// "Address already in use", musl (the `*-linux-musl` guest build) "Address
     /// in use", so a text match never fires inside a microVM and a guest
     /// daemon whose default port is busy would loop on the retry instead of
-    /// relocating. Both bind paths that build a failure
-    /// ([`bind_listener`] and the answerer's UDP bind) hold the `io::Error`
-    /// the kernel answered with, so its kind is the one fact both libcs agree
-    /// on. Ruled out by the kind: a `TimedOut` bind attempt, an `Other`
-    /// wrapped by a test.
+    /// relocating. Both bind paths that build a failure ([`bind_listener`]
+    /// and the answerer's UDP bind) hold the `io::Error` the kernel answered
+    /// with, so its kind is the one fact both libcs agree on.
     #[must_use]
     pub fn is_addr_in_use(&self) -> bool {
         self.kind == io::ErrorKind::AddrInUse
