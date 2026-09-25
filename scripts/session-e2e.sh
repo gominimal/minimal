@@ -57,11 +57,12 @@
 #                       `--loadout dev` once the loadouts CLI lands, #686)
 #   E2E_VM              set to 1 for VM-backed targets (extra teardown +
 #                       diagnostics: minvmd stop, guest boot log)
-#   MINIMAL_E2E_MIN     the exact `min` this run drives, for a caller that must
-#                       smoke a SPECIFIC build (a release smoke) rather than
-#                       whatever this checkout has under target/; when set, the
-#                       repo-binary fallback in the min-resolution block is
-#                       skipped entirely (see there)
+#   MINIMAL_E2E_MIN     the exact `min` this run drives — an executable named
+#                       `min` with its matching daemon beside it — for a caller
+#                       that must smoke a SPECIFIC build (a release smoke)
+#                       rather than whatever this checkout has under target/;
+#                       when set, the repo-binary fallback in the min-resolution
+#                       block is skipped entirely (see there)
 #
 # Every proof this script can run, as one `case` on the first argument (see
 # the dispatch at the bottom). With NO argument every block runs, in exactly
@@ -231,24 +232,49 @@ fi
 # keep the PATH `min` when it is the real CLI, else fall back to a build of
 # this checkout — its own target dir first, then the environment's
 # CARGO_TARGET_DIR (an out-of-tree build cache) — and put the winning dir
-# ON PATH, because the CLI autospawns `minimald` by name
+# ON PATH, because the CLI autospawns its daemon by bare name
 # (crates/minimal/src/autospawn.rs) and the pair must come from one build.
+#
+# The daemon that name resolves to on THIS run is `minimald` on a native
+# run and `minvmd` on a VM-backed one: macOS is always VM-backed (no native
+# minimald builds there), and a Linux run is VM-backed exactly when
+# E2E_MINIMAL_ARGS carries `--provider local-minvmd`, which every VM lane
+# passes (the justfile's e2e-env, the KVM lane, the VM smokes) — E2E_VM
+# itself is deliberately not consulted: it marks teardown and log placement,
+# not the backend the CLI will spawn. Autospawn looks the daemon up on PATH
+# (a bare `Command::new`), never beside the CLI, so "findable" means ON
+# PATH. A `min` whose daemon is unfindable sails through a gate that does
+# not check this and dies only at the first activate's autospawn — an
+# error that names no real cause — so every branch below must leave the
+# daemon findable, and the gate after all of them holds each to it.
+min_daemon=minimald
+if [ "$(uname -s)" = Darwin ]; then
+  min_daemon=minvmd
+else
+  case "${E2E_MINIMAL_ARGS:-}" in
+    *local-minvmd*) min_daemon=minvmd ;;
+  esac
+fi
 #
 # That fallback picks this checkout's build for EVERY lane, release smokes
 # included, and a smoke must never find itself driving something other than
 # the artifact it exists to smoke. A caller that needs a SPECIFIC `min`
 # names it with MINIMAL_E2E_MIN (an executable named `min`, with its
-# matching `minimald` beside it): the choice is final, its dir goes on PATH,
-# and the fallback is skipped entirely.
+# matching daemon beside it — the sibling whose dir this branch puts FIRST
+# on PATH, so autospawn then resolves the pair from one build): the choice
+# is final, and the fallback is skipped entirely.
 if [ -n "${MINIMAL_E2E_MIN:-}" ]; then
-  if [ ! -x "$MINIMAL_E2E_MIN" ] || [ "$(basename -- "$MINIMAL_E2E_MIN")" != min ]; then
-    echo "::error::MINIMAL_E2E_MIN must be an executable named 'min' with its matching 'minimald' beside it (got: '$MINIMAL_E2E_MIN')" >&2
+  if [ ! -x "$MINIMAL_E2E_MIN" ] || [ "$(basename -- "$MINIMAL_E2E_MIN")" != min ] \
+     || [ ! -x "$(dirname -- "$MINIMAL_E2E_MIN")/$min_daemon" ]; then
+    echo "::error::MINIMAL_E2E_MIN must be an executable named 'min' with its matching '$min_daemon' beside it (got: '$MINIMAL_E2E_MIN')" >&2
     exit 1
   fi
   min_cli_dir="$(cd "$(dirname -- "$MINIMAL_E2E_MIN")" && pwd)"
   PATH="$min_cli_dir:$PATH"
   export PATH
-elif command -v min >/dev/null 2>&1 && min --version >/dev/null 2>&1; then
+elif command -v min >/dev/null 2>&1 && min --version >/dev/null 2>&1 \
+     && command -v "$min_daemon" >/dev/null 2>&1; then
+  # The PATH pair is whole — keep it, dir and all, exactly as found.
   :
 else
   min_cli_dir=""
@@ -261,15 +287,29 @@ else
   if [ -n "$min_cli_dir" ]; then
     PATH="$min_cli_dir:$PATH"
     export PATH
-  else
-    echo "::error::no usable 'min' CLI on this host: the 'min' on PATH is not" \
-      "the repo CLI (it takes no --version; on a session box it is the in-sandbox" \
-      "helper, which has no 'session' subcommands), and neither $ROOT/target/debug" \
-      "nor ${CARGO_TARGET_DIR:-\$CARGO_TARGET_DIR}/debug has a build of it." \
-      "Build one (just e2e-native, or cargo build -p minimal --bin min -p minimald" \
-      "--bin minimald --locked) and put its dir on PATH, as CI does." >&2
-    exit 1
   fi
+fi
+# One gate over all three branches: whatever won, `min` is the repo CLI and
+# the daemon it autospawns by name is findable on the PATH this run leaves
+# behind — the pair, checked here once, so a broken one fails NOW, naming
+# both halves, instead of at the first 'session activate'.
+if ! command -v min >/dev/null 2>&1 || ! min --version >/dev/null 2>&1; then
+  echo "::error::no usable 'min' CLI on this host: the 'min' on PATH is not" \
+    "the repo CLI (it takes no --version; on a session box it is the in-sandbox" \
+    "helper, which has no 'session' subcommands), and neither $ROOT/target/debug" \
+    "nor ${CARGO_TARGET_DIR:-\$CARGO_TARGET_DIR}/debug has a build of it." \
+    "Build one (just e2e, or cargo build -p minimal --bin min --locked) and" \
+    "put its dir on PATH, as CI does." >&2
+  exit 1
+fi
+if ! command -v "$min_daemon" >/dev/null 2>&1; then
+  echo "::error::no usable '$min_daemon' on this host: the 'min' this run drives" \
+    "autospawns it by bare name (crates/minimal/src/autospawn.rs), so it must be" \
+    "on PATH — the pair has to come from one build — or the first 'session" \
+    "activate' fails with no real cause named. Build the pair this lane drives" \
+    "('just e2e-native': min + minimald, native; 'just e2e': min + minvmd, VM)" \
+    "or put an existing '$min_daemon' dir on PATH, as CI does." >&2
+  exit 1
 fi
 
 # Every CLI call goes through this so E2E_MINIMAL_ARGS applies uniformly.
