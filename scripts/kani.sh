@@ -152,5 +152,5 @@ expect() { # crate expected_count
         exit 1
     }
 }
-expect sessions 7
+expect sessions 8
 expect rcache 3

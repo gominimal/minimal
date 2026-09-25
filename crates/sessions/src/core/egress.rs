@@ -29,6 +29,14 @@
 //! The rules are compiled once per box at attach
 //! ([`EgressRules::from_policy`]); the per-frame work is [`summarize`] plus
 //! [`verdict`], both allocation-free.
+//!
+//! Beside the frame verdict sits its name-level counterpart, the DNS
+//! rebinding intersection (NET-066, NET-067): the pure decision of which
+//! addresses a name *resolved to* may ever be admitted for a box, once the
+//! box's denies and the infrastructure deny set are subtracted. The relay
+//! (not this module) holds the admission window; what lives here is the
+//! arithmetic the window stores the results of, kept pure and free of
+//! resolver I/O so the NET-067 harness can exhaust it.
 
 use crate::{EgressPolicy, IpProto};
 
@@ -200,6 +208,14 @@ impl Ipv4Cidr {
         };
         (u32::from_be_bytes(ip) & mask) == (u32::from_be_bytes(self.addr) & mask)
     }
+
+    /// The single-address `/32` of one address: the shape the infrastructure
+    /// deny set holds a gateway's own addresses in, so they are named
+    /// individually rather than only through the plane that contains them.
+    #[must_use]
+    pub fn exact(addr: [u8; 4]) -> Self {
+        Self { addr, prefix: 32 }
+    }
 }
 
 /// A box's compiled egress rules: the three declaration dimensions of an
@@ -277,6 +293,23 @@ impl EgressRules {
     #[must_use]
     pub fn resolver(&self) -> [u8; 4] {
         self.resolver
+    }
+
+    /// The compiled `allow_subnets`, `None` when the dimension allows all —
+    /// the one dimension the rebinding intersection also reads, as the
+    /// RFC 1918 exemption's signal (NET-067): private space is admitted for
+    /// a name only where the box's own address declaration covers it.
+    #[must_use]
+    pub fn allow_subnets(&self) -> Option<&[Ipv4Cidr]> {
+        self.allow_subnets.as_deref()
+    }
+
+    /// The compiled `deny_subnets`, `None` when nothing is denied — the
+    /// deny half the rebinding intersection subtracts from every resolved
+    /// answer before anything is admitted (NET-067).
+    #[must_use]
+    pub fn deny_subnets(&self) -> Option<&[Ipv4Cidr]> {
+        self.deny_subnets.as_deref()
     }
 }
 
@@ -427,6 +460,187 @@ fn verdict_ipv4(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
         return FrameVerdict::Drop(DropReason::UndeclaredSubnet { dst, proto });
     }
     FrameVerdict::Admit
+}
+
+/// The infrastructure deny set of the DNS rebinding intersection (design
+/// §5.3, NET-067): the ranges an allowed name's answer may never be admitted
+/// into, whatever the box's own rules say — the fabric's own space and the
+/// ranges that stand for the host, not destinations.
+///
+/// Two classes, because one of them is conditional:
+///
+/// * **Fixed** — link-local and the metadata services living in it, loopback
+///   space, the whole `100.64.0.0/10` plane the switch fabric draws its
+///   subnets from (so no answer can ever name a box, the gateway, or the
+///   daemon itself), and the gateway's own two addresses: the answerer's (the
+///   resolver the box's carve-out is keyed to, NET-079) and the helper's (the
+///   deprecated host-alias literal, NET-004), each held as a `/32` so both
+///   are named individually rather than only through the plane containing
+///   them. Refused under every declaration.
+/// * **RFC 1918** — private space, refused *unless the box's
+///   `egress.allow_subnets` covers the answer*: a developer who wants a name
+///   to reach the LAN says so by allowing the range, so a name rule cannot
+///   become a way around leaving it undeclared.
+///
+/// Owned outright — no borrow of the policy survives the attach — which is
+/// what keeps [`rebinding_admits`] a pure function over owned addresses and
+/// CIDRs, separate from resolver I/O, as the NET-067 harness requires.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InfrastructureDenySet {
+    /// Ranges refused under every declaration.
+    fixed: Vec<Ipv4Cidr>,
+    /// RFC 1918 space, refused unless `allow_subnets` covers the answer.
+    rfc1918: Vec<Ipv4Cidr>,
+}
+
+impl InfrastructureDenySet {
+    /// The set for one box's attach: the always-refused ranges, plus the
+    /// gateway's `resolver` (where the box's own queries are answered) and
+    /// `host_alias` (the helper's address) as `/32`s.
+    ///
+    /// Both gateway addresses lie inside the plane today; they are named
+    /// individually so the set still refuses them if the plane is ever
+    /// renumbered out from under them.
+    ///
+    /// # Panics
+    ///
+    /// Never: every range is a constant that parses.
+    #[must_use]
+    pub fn new(resolver: [u8; 4], host_alias: [u8; 4]) -> Self {
+        // Every constant parses; the parses exist so the set's contents are
+        // spelled as ranges, not as byte arrays.
+        let cidr = |s: &'static str| Ipv4Cidr::parse(s).expect("a constant CIDR parses");
+        Self {
+            fixed: vec![
+                // Link-local, and the metadata services living in it.
+                cidr("169.254.0.0/16"),
+                // Loopback space.
+                cidr("127.0.0.0/8"),
+                // The plane the switch fabric draws subnets from.
+                cidr("100.64.0.0/10"),
+                Ipv4Cidr::exact(resolver),
+                Ipv4Cidr::exact(host_alias),
+            ],
+            rfc1918: vec![
+                cidr("10.0.0.0/8"),
+                cidr("172.16.0.0/12"),
+                cidr("192.168.0.0/16"),
+            ],
+        }
+    }
+}
+
+/// Why the rebinding intersection refused one resolved address, carrying the
+/// rule its rate-limited warning is keyed to (mirroring [`DropReason::rule`],
+/// the frame verdict's naming discipline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebindingRefusal {
+    /// The answer lies in the box's `deny_subnets`: a declared deny is
+    /// subtractive from every admission path, a name rule included.
+    DeniedSubnet,
+    /// The answer lies in the infrastructure deny set: a fixed range, or
+    /// RFC 1918 the box's `allow_subnets` does not cover.
+    Infrastructure,
+}
+
+impl RebindingRefusal {
+    /// The rule that refused the answer: the rate-limit key and the warning's
+    /// `rule_matched` field (NET-067).
+    #[must_use]
+    pub fn rule(&self) -> &'static str {
+        match self {
+            Self::DeniedSubnet => "dns-rebinding-denied-subnet",
+            Self::Infrastructure => "dns-rebinding-infrastructure",
+        }
+    }
+}
+
+/// The DNS rebinding intersection's decision for one resolved address
+/// (NET-066, NET-067): admitted — `Ok(())` — exactly when nothing refuses
+/// it, where RFC 1918 is the one infrastructure class an `allow_subnets`
+/// entry exempts.
+///
+/// Pure over owned addresses and CIDRs, and deliberately separate from any
+/// resolver: the daemon hands this function the addresses a resolver already
+/// returned and learns which of them may ever be admitted, which is what
+/// lets the Kani harness exhaust the decision without a socket in sight.
+///
+/// The order of the checks is part of the contract: the box's own denies
+/// first — a declared deny outranks every allowance — then the fixed
+/// infrastructure ranges, then RFC 1918 under its `allow_subnets` exemption.
+/// An undeclared `allow_subnets` (`None`, allow-all) counts as covering the
+/// answer: the box's address dimension is open, so the name path opens with
+/// it rather than refusing answers the box can already reach.
+///
+/// # Errors
+///
+/// [`RebindingRefusal`] — never an I/O or parse failure; the answer is
+/// refused exactly when a deny or the infrastructure set names it.
+pub fn rebinding_admits(
+    answer: [u8; 4],
+    allow: Option<&[Ipv4Cidr]>,
+    deny: Option<&[Ipv4Cidr]>,
+    infrastructure: &InfrastructureDenySet,
+) -> Result<(), RebindingRefusal> {
+    if let Some(denied) = deny
+        && denied.iter().any(|cidr| cidr.contains(answer))
+    {
+        return Err(RebindingRefusal::DeniedSubnet);
+    }
+    if infrastructure
+        .fixed
+        .iter()
+        .any(|cidr| cidr.contains(answer))
+    {
+        return Err(RebindingRefusal::Infrastructure);
+    }
+    if infrastructure
+        .rfc1918
+        .iter()
+        .any(|cidr| cidr.contains(answer))
+        && !allow.is_none_or(|list| list.iter().any(|cidr| cidr.contains(answer)))
+    {
+        return Err(RebindingRefusal::Infrastructure);
+    }
+    Ok(())
+}
+
+/// [`rebinding_intersection`]'s split of one name's resolved addresses:
+/// which may be admitted, and which are refused with the reason to log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RebindingSplit {
+    /// The addresses that may be admitted for the admission window, in the
+    /// order the answer carried them.
+    pub admitted: Vec<[u8; 4]>,
+    /// The refused addresses, each with the rule that refused it, in the
+    /// order the answer carried them.
+    pub refused: Vec<([u8; 4], RebindingRefusal)>,
+}
+
+/// Splits one name's resolved addresses by [`rebinding_admits`]: the
+/// addresses that may be admitted for the admission window, and the
+/// refusals to log — each refused address with its reason, in the order the
+/// answer carried them. This is the set-shaped wrapper the daemon calls
+/// once per DNS reply; the decision itself stays per-address, which is the
+/// shape the harness proves.
+#[must_use]
+pub fn rebinding_intersection(
+    answers: &[[u8; 4]],
+    allow: Option<&[Ipv4Cidr]>,
+    deny: Option<&[Ipv4Cidr]>,
+    infrastructure: &InfrastructureDenySet,
+) -> RebindingSplit {
+    let mut split = RebindingSplit {
+        admitted: Vec::with_capacity(answers.len()),
+        refused: Vec::with_capacity(answers.len()),
+    };
+    for answer in answers {
+        match rebinding_admits(*answer, allow, deny, infrastructure) {
+            Ok(()) => split.admitted.push(*answer),
+            Err(reason) => split.refused.push((*answer, reason)),
+        }
+    }
+    split
 }
 
 #[cfg(test)]
@@ -769,6 +983,149 @@ mod tests {
         let short_ip = eth_frame(ETHERTYPE_IPV4, &[0u8; 10]);
         assert_eq!(summarize(&short_ip).family, FrameFamily::Truncated);
     }
+
+    /// The default switch's host alias, the helper's address the
+    /// infrastructure deny set holds beside the resolver.
+    const HOST_ALIAS: [u8; 4] = [100, 64, 255, 254];
+
+    /// Compiles a CIDR list, the way [`EgressRules::from_policy`] does, for
+    /// the intersection tests below.
+    fn cidrs(entries: &[&str]) -> Vec<Ipv4Cidr> {
+        entries
+            .iter()
+            .map(|cidr| Ipv4Cidr::parse(cidr).expect("a declared CIDR parses"))
+            .collect()
+    }
+
+    /// NET-066/NET-067: the intersection admits exactly the resolved
+    /// addresses that no deny and no infrastructure range refuses — a
+    /// declared deny first, the fixed ranges under every declaration, and
+    /// RFC 1918 only where the box's own `allow_subnets` covers the answer.
+    #[test]
+    fn rebinding_intersection_admits_only_clean_answers() {
+        let infrastructure = InfrastructureDenySet::new(RESOLVER, HOST_ALIAS);
+        let admit = |answer: [u8; 4], allow: Option<&[Ipv4Cidr]>, deny: Option<&[Ipv4Cidr]>| {
+            rebinding_admits(answer, allow, deny, &infrastructure)
+        };
+
+        // A public answer is admitted with no declarations at all (NET-066).
+        assert!(admit([140, 82, 121, 3], None, None).is_ok());
+
+        // The box's own denies are subtracted from every name (NET-067).
+        let deny = cidrs(&["203.0.113.0/24"]);
+        assert_eq!(
+            admit([203, 0, 113, 7], None, Some(deny.as_slice())),
+            Err(RebindingRefusal::DeniedSubnet)
+        );
+
+        // The fixed infrastructure ranges are refused under every
+        // declaration — link-local and the metadata services in it, loopback,
+        // the plane, and the gateway's own two addresses.
+        for refused in [
+            [169, 254, 169, 254], // metadata, in link-local
+            [127, 0, 0, 1],       // loopback
+            [100, 64, 0, 9],      // the plane (a box's lease)
+            RESOLVER,             // the answerer's own address
+            HOST_ALIAS,           // the helper's own address
+        ] {
+            assert_eq!(
+                admit(refused, None, None),
+                Err(RebindingRefusal::Infrastructure),
+                "{refused:?} is infrastructure, refused under every declaration"
+            );
+            // And an explicit allow does not exempt them: the exemption is
+            // RFC 1918's alone.
+            let allow_all = cidrs(&["0.0.0.0/0"]);
+            assert_eq!(
+                admit(refused, Some(allow_all.as_slice()), None),
+                Err(RebindingRefusal::Infrastructure),
+                "{refused:?} stays refused even where allow_subnets covers it"
+            );
+        }
+
+        // RFC 1918 is admitted only where `allow_subnets` covers the answer:
+        // an open dimension covers it (the address dimension is open, so the
+        // name path opens with it), an allow-all entry covers it, an empty
+        // one does not, and a different private range does not.
+        let private = [10, 1, 2, 3];
+        assert!(admit(private, None, None).is_ok());
+        let allow_all = cidrs(&["0.0.0.0/0"]);
+        assert!(admit(private, Some(allow_all.as_slice()), None).is_ok());
+        let allow_lan = cidrs(&["10.0.0.0/8"]);
+        assert!(admit(private, Some(allow_lan.as_slice()), None).is_ok());
+        let allow_none = cidrs(&[]);
+        assert_eq!(
+            admit(private, Some(allow_none.as_slice()), None),
+            Err(RebindingRefusal::Infrastructure),
+            "a deny-all address declaration refuses private answers"
+        );
+        let allow_other_private = cidrs(&["192.168.0.0/16"]);
+        assert_eq!(
+            admit(private, Some(allow_other_private.as_slice()), None),
+            Err(RebindingRefusal::Infrastructure),
+            "a different private range is not a covering"
+        );
+    }
+
+    /// [`rebinding_intersection`] — the set-shaped wrapper the relay calls per
+    /// reply: it splits the answer set exactly (nothing dropped, nothing
+    /// duplicated, order preserved), each refusal carrying its reason.
+    #[test]
+    fn rebinding_intersection_splits_the_answer_set() {
+        let infrastructure = InfrastructureDenySet::new(RESOLVER, HOST_ALIAS);
+        let answers = [
+            [140, 82, 121, 3], // admitted: public
+            [203, 0, 113, 7],  // refused: the box's deny
+            [10, 1, 2, 3],     // refused: RFC 1918, uncovered
+            [169, 254, 1, 1],  // refused: fixed infrastructure
+            [140, 82, 121, 4], // admitted: public
+        ];
+        let allow = cidrs(&[]);
+        let deny = cidrs(&["203.0.113.0/24"]);
+        let split = rebinding_intersection(
+            &answers,
+            Some(allow.as_slice()),
+            Some(deny.as_slice()),
+            &infrastructure,
+        );
+        assert_eq!(
+            split.admitted,
+            [[140, 82, 121, 3], [140, 82, 121, 4]],
+            "the admitted addresses, in the order the answer carried them"
+        );
+        assert_eq!(
+            split.refused,
+            [
+                ([203, 0, 113, 7], RebindingRefusal::DeniedSubnet),
+                ([10, 1, 2, 3], RebindingRefusal::Infrastructure),
+                ([169, 254, 1, 1], RebindingRefusal::Infrastructure),
+            ]
+        );
+    }
+
+    /// The subnet accessors the rebinding intersection reads: they surface
+    /// the compiled dimensions of the policy, and stay `None` where the
+    /// policy left the dimension open.
+    #[test]
+    fn subnet_accessors_expose_the_compiled_dimensions() {
+        let policy = EgressPolicy {
+            allow_protocols: None,
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            allow_dns_hosts: None,
+            deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
+        };
+        let rules = EgressRules::from_policy(Some(&policy), RESOLVER);
+        let allow = rules.allow_subnets().expect("allow_subnets compiled");
+        assert_eq!(allow.len(), 1);
+        assert!(allow[0].contains([10, 200, 0, 1]));
+        assert!(!allow[0].contains([192, 168, 0, 1]));
+        let deny = rules.deny_subnets().expect("deny_subnets compiled");
+        assert_eq!(deny.len(), 1);
+        assert!(deny[0].contains([192, 168, 0, 1]));
+
+        let open = EgressRules::from_policy(None, RESOLVER);
+        assert!(open.allow_subnets().is_none() && open.deny_subnets().is_none());
+    }
 }
 
 /// The frame-level admit-or-drop harness NET-016, NET-062, NET-064,
@@ -778,6 +1135,11 @@ mod tests {
 /// IPv4 frame — under rule lists of zero or two rules per dimension, at an
 /// unwind bound of 6 (the `[u8; 4]` address comparisons lower to a 4-trip
 /// `memcmp` loop; see the harness).
+///
+/// The module also carries the rebinding intersection's harness (NET-067,
+/// [`kani_rebinding_intersection_admits_no_denied_address`]), which shares
+/// [`two_cidrs`] and its pinning rationale and runs at the tighter bound 4
+/// its own doc explains.
 ///
 /// The scope is deliberate. This module's first form was exhaustive over a
 /// fully symbolic 40-byte header and rule lists of symbolic *length*, and
@@ -794,7 +1156,8 @@ mod tests {
 mod kani_proofs {
     use super::{
         DNS_PORT, ETH_HDR, ETHERTYPE_IPV4, EgressRules, FrameFamily, FrameVerdict, IPPROTO_UDP,
-        Ipv4Cidr, summarize, verdict,
+        InfrastructureDenySet, Ipv4Cidr, rebinding_admits, rebinding_intersection, summarize,
+        verdict,
     };
 
     /// One dimension's rules under every declaration the compile can
@@ -921,5 +1284,89 @@ mod kani_proofs {
             _ => false,
         };
         assert_eq!(admitted, declared);
+    }
+
+    /// NET-067's property, the rebinding half: **for every resolved answer
+    /// set and every allow, deny, and infrastructure-deny CIDR set, the
+    /// admitted set contains no denied address** — proved in two parts that
+    /// share one set of rule lists:
+    ///
+    /// * the per-address decision, restated as an iff over one fully
+    ///   symbolic answer so neither arm can silently become unreachable (the
+    ///   rcache harness pattern) — this is the exhaustive half, over every
+    ///   IPv4 answer there is;
+    /// * the set-shaped wrapper, over an answer set of two symbolic
+    ///   addresses, asserting the split loses nothing (the counts match the
+    ///   oracle) and that every address the wrapper admitted passes the
+    ///   oracle — so no cross-answer coupling (admit one because another is
+    ///   clean) and no loss can hide.
+    ///
+    /// Every CIDR set rides [`two_cidrs`]: `None`, empty, or two symbolic
+    /// rules — at most 4 per set, per the harness's tier text — including
+    /// both halves of the infrastructure set.
+    ///
+    /// The unwind bound is 4. No loop this proof unwinds runs past its third
+    /// check: the set scans walk lists of at most two CIDRs, the answer-set
+    /// loop walks two answers, and — unlike the frame-verdict harness, whose
+    /// `[u8; 4]` comparisons lower to a 4-trip `memcmp` — every comparison
+    /// here is [`Ipv4Cidr::contains`]'s u32 mask arithmetic, so there is no
+    /// address-equality loop to buy extra trips for. (The wrapper's `Vec`s
+    /// are pre-sized to the answer count, so no growth copy enters the proof
+    /// either.)
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn kani_rebinding_intersection_admits_no_denied_address() {
+        let allow = two_cidrs();
+        let deny = two_cidrs();
+        let infrastructure = InfrastructureDenySet {
+            fixed: two_cidrs().unwrap_or_default(),
+            rfc1918: two_cidrs().unwrap_or_default(),
+        };
+        // The oracle's one question, restated over CIDR math alone: may this
+        // answer be admitted — not denied by the box, not in a fixed
+        // infrastructure range, and not in RFC 1918 that `allow_subnets`
+        // does not cover?
+        let admissible = |answer: [u8; 4]| {
+            let denied = deny
+                .as_deref()
+                .is_some_and(|list| list.iter().any(|cidr| cidr.contains(answer)));
+            let fixed = infrastructure
+                .fixed
+                .iter()
+                .any(|cidr| cidr.contains(answer));
+            let rfc1918 = infrastructure
+                .rfc1918
+                .iter()
+                .any(|cidr| cidr.contains(answer));
+            let covers = allow
+                .as_deref()
+                .is_none_or(|list| list.iter().any(|cidr| cidr.contains(answer)));
+            !denied && !fixed && (!rfc1918 || covers)
+        };
+
+        // Part one: the per-address decision, iff the oracle, over every
+        // IPv4 answer.
+        let answer: [u8; 4] = kani::any();
+        let admitted =
+            rebinding_admits(answer, allow.as_deref(), deny.as_deref(), &infrastructure).is_ok();
+        assert_eq!(admitted, admissible(answer));
+
+        // Part two: the wrapper over a two-answer set — the split is exact,
+        // and everything it admitted passes the oracle.
+        let answers = [kani::any::<[u8; 4]>(), kani::any::<[u8; 4]>()];
+        let split =
+            rebinding_intersection(&answers, allow.as_deref(), deny.as_deref(), &infrastructure);
+        let expected: usize = answers.iter().filter(|a| admissible(**a)).count();
+        assert_eq!(split.admitted.len(), expected);
+        assert_eq!(split.refused.len(), answers.len() - expected);
+        for address in &split.admitted {
+            assert!(
+                admissible(*address),
+                "the admitted set holds an address the oracle denies"
+            );
+        }
+        for (address, _) in &split.refused {
+            assert!(!admissible(*address), "an admissible answer was refused");
+        }
     }
 }
