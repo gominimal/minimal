@@ -51,9 +51,10 @@ package.rust-version = "1.95"
 # is handed it as MINIMAL_RELEASE_VERSION (asserted equal by build.rs and
 # scripts/assert-release-version.sh), and a no-.git build (source tarball)
 # reports it verbatim. See crates/version/src/scheme.rs.
-# Bump it when the commits since the last tag require it: `feat:` -> minor,
-# anything else -> patch; while the project is 0.x no breaking change bumps the
-# major (scripts/next-version.sh). `scripts/next-version.sh --check` (the
+# Bump it when the commits since the last tag require it: `feat:` -> minor, a
+# breaking change under any type -> minor, anything else -> patch; while the
+# project is 0.x a breaking change is a minor, never a major
+# (scripts/next-version.sh). `scripts/next-version.sh --check` (the
 # workspace `package_version` test, `just check-version`) fails the PR that
 # leaves it stale or not strictly greater than the newest v* tag.
 package.version = "0.6.0"
