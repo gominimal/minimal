@@ -29,13 +29,13 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::dns::HostnameRegistry;
 
-/// The port the host-side egress/DNS proxy listens on (TC3) when a
-/// deployment pins one — the documented default the recipes that export
-/// `HTTP(S)_PROXY` assume. A daemon that is started without a configured
-/// port does not bind this: it asks the OS for a free port, and publishes
-/// the port it got wherever clients need it (NET-025). The one routing
-/// listener the daemon opens: the mTLS reverse proxy that once took the
-/// next port up is retired (NET-109).
+/// The port the host-side egress/DNS proxy listens on (TC3): the documented
+/// default the recipes that export `HTTP(S)_PROXY` assume. A daemon started
+/// without a configured port tries this one first, so those recipes keep
+/// working on a quiet host; only when it is busy does it ask the OS for a
+/// free port, publishing the port it got wherever clients need it
+/// (NET-025). The one routing listener the daemon opens: the mTLS reverse
+/// proxy that once took the next port up is retired (NET-109).
 pub const DEFAULT_EGRESS_PROXY_PORT: u16 = 7654;
 
 /// The address a pinned deployment's clients are told to point

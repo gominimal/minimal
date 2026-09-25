@@ -127,6 +127,7 @@ async fn serve_list_sessions(
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
                 hostname_proxy_port: s.hostname_proxy_port().await,
+                zone_answerer_port: s.zone_answerer_port().await,
                 resource_pool,
                 // `git` is left `None`: the daemon cannot probe it — on
                 // macOS it runs in the minvmd guest, where the host's
@@ -292,6 +293,7 @@ async fn serve_create_session(
                         daemon_version: Some(OWN_VERSION.to_string()),
                         hostname_routing_unavailable: s.proxy_unavailable().await,
                         hostname_proxy_port: s.hostname_proxy_port().await,
+                        zone_answerer_port: s.zone_answerer_port().await,
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {

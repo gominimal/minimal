@@ -235,12 +235,22 @@ pub struct ListenArgs {
 
     /// Port the host-side hostname proxy must listen on, when this deployment
     /// pins one — the port clients point `HTTP(S)_PROXY` at, whose documented
-    /// default is 7654. Unset (the default) asks the OS for a free port, which
-    /// the daemon reports wherever a client needs it: `min ls` prints it, and
-    /// a second daemon on the same machine gets its own port instead of
-    /// silently losing hostname routing.
+    /// default is 7654. Unset (the default) tries that default first and only
+    /// when it is busy asks the OS for a free port, which the daemon reports
+    /// wherever a client needs it: `min ls` prints it, and a second daemon on
+    /// the same machine gets its own port instead of silently losing hostname
+    /// routing. A pinned port that is busy stays a hard failure — the
+    /// operator named it, and moving the listener would hide the loss.
     #[arg(long)]
     hostname_proxy_port: Option<u16>,
+
+    /// Port the box-zone answerer must listen on (UDP), when this deployment
+    /// pins one — the port the host's resolver is pointed at to answer
+    /// `*.min.internal`, whose documented default is 7656. Unset (the
+    /// default) gives it the same try-the-default-then-select treatment the
+    /// hostname proxy's flag documents.
+    #[arg(long)]
+    zone_answerer_port: Option<u16>,
 
     /// Daemonize: spawn minimald in a new session (setsid) and return once the
     /// SSH socket accepts connections, or an 8s timeout elapses. Used by the
@@ -462,8 +472,11 @@ async fn async_main() -> Result<(), MainError> {
                 // host with whatever native daemon runs there, and the host
                 // gvproxy publishes whichever port this guest ends up on, so
                 // the two route both sets of names at the same time (NET-027)
-                // rather than fighting over one pinned port.
+                // rather than fighting over one pinned port. `None` still
+                // tries the documented default first — it only relocates when
+                // something else on the machine holds it.
                 hostname_proxy_port: None,
+                zone_answerer_port: None,
             }),
             global_args: GlobalArgs {
                 minimal_state_dir: Some(DaemonAbsPath::try_new("/run/minimal").unwrap().into()),
@@ -764,8 +777,11 @@ async fn async_main() -> Result<(), MainError> {
         in_microvm: cli.listen_args().unwrap().vsock,
         state_volume_mounted,
         // The port the hostname proxy listens on when the deployment pins
-        // one; `None` means the OS picks a free port (NET-025).
+        // one; `None` tries the documented default and only when it is busy
+        // asks the OS for a free port (NET-024/NET-025).
         hostname_proxy_port: cli.listen_args().unwrap().hostname_proxy_port,
+        // The answerer's port, given the same treatment.
+        zone_answerer_port: cli.listen_args().unwrap().zone_answerer_port,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.

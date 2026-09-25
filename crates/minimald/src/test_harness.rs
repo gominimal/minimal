@@ -127,10 +127,11 @@ impl TestServer {
             in_microvm: false,
             state_volume_mounted: false,
             // A harness server never starts the host-side proxies, so there
-            // is no port to pin: `None` (auto-select) keeps the field absent
-            // from the RPC replies a test inspects unless a test drives the
-            // proxy startup itself.
+            // is no port to pin: `None` (default-then-select) keeps the field
+            // absent from the RPC replies a test inspects unless a test
+            // drives the proxy startup itself.
             hostname_proxy_port: None,
+            zone_answerer_port: None,
         };
         let state = ServerStateHandle::new(config, None).await.unwrap();
         // `Server::run` installs the housekeeping actor; a harness server never

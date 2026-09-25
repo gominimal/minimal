@@ -45,6 +45,7 @@ fn ls_shows_shared_resource_pool() {
         daemon_version: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
+        zone_answerer_port: None,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -82,6 +83,7 @@ fn ls_table_exposes_project_path_and_status() {
         daemon_version: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
+        zone_answerer_port: None,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -1259,6 +1261,7 @@ fn session_list_decodes_without_mtls_field() {
         daemon_version: Some("test".to_string()),
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
+        zone_answerer_port: None,
         resource_pool: None,
         sessions: vec![],
     };
