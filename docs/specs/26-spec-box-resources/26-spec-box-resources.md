@@ -27,7 +27,7 @@ After this ships, every box declares its size or takes the host's default, the h
 
 ## Requirements
 
-- **BRES-001** THE SYSTEM SHALL accept `[machine] cpu_arch`, `cpus`, `ram`, `ram_reserved` and `disk` flat on an entry, with sizes in IEC units only.
+- **BRES-001** THE SYSTEM SHALL accept `[machine] cpu_arch`, `cpus`, `ram`, `ram_reserved` and `disk`, and `[execution] on_oom` (`kill_process` or `end_box`), flat on an entry, with sizes in IEC units only.
   tier:     T0
   verify:   cargo nextest run -p mfile machine_keys_flat_iec_units
 
@@ -41,10 +41,10 @@ After this ships, every box declares its size or takes the host's default, the h
   property: For every ram and ram_reserved pair of u64 bytes, validation accepts iff ram_reserved <= ram, with no overflow.
   harness:  mfile `ram_reserved_le_ram_no_overflow` over `kani::any::<(u64,u64)>()`, unwind 1
 
-- **BRES-004** WHEN a box is admitted THE SYSTEM SHALL check `cpu_arch` exactly and `cpus`, resolved `ram` and `disk` against the host's allocatable, and the summed reservations against allocatable, without clamping or rounding.
+- **BRES-004** WHEN a box is admitted THE SYSTEM SHALL check `cpu_arch` exactly and `cpus`, resolved `ram` and `disk` against the host's allocatable, and the summed reservations against allocatable, counting an omitted reservation as at most the box's resolved `ram`, without clamping or rounding.
   tier:     T2
   verify:   cargo nextest run -p minimald admission_checks_fit_and_reservations
-  property: For every host allocatable and every set of boxes' reservations, admission admits a new box iff each dimension fits and the summed reservations do not exceed allocatable, computed without overflow.
+  property: For every host allocatable and every set of boxes' reservations, admission admits a new box iff each dimension fits and the summed reservations, each omitted one capped at its box's resolved ram, do not exceed allocatable, computed without overflow.
   harness:  minimald/src/admission.rs `admit_iff_fit_and_reservations` over a host and at most 8 boxes of `kani::any::<u64>()` sizes, unwind 8
 
 - **BRES-005** IF admission finds a dimension the host cannot hold THEN THE SYSTEM SHALL fail with exit 8 and `code = "insufficient_resources"`, carrying the dimension, the requested size and its layer, the host's allocatable and allocated, and the remedy.
@@ -57,12 +57,16 @@ After this ships, every box declares its size or takes the host's default, the h
   tier:     T0
   verify:   cargo nextest run -p minimald ram_auto_resolves_to_host_default
 
-- **BRES-007** THE SYSTEM SHALL place every box's memory cgroup in one boxes subtree capped at allocatable, with the daemon outside it, setting `memory.max` to the box's `ram` and, on an `enforced` host, `memory.min` to its reservation.
+- **BRES-007** WHERE the host's memory enforcement is `enforced` THE SYSTEM SHALL place every box's memory cgroup in one boxes subtree capped at allocatable, with the daemon outside it, setting `memory.max` to the box's `ram` and `memory.min` to its reservation.
+  - WHERE the enforced host is a VM THE SYSTEM SHALL apply the same subtree and limits inside the guest.
+    tier:   T0
+    verify: cargo nextest run -p minimald vm_boxes_subtree_memory_max_and_min
+    <!-- runs on the VM lane (NET-107): the behaviour exists only with the VM host daemon in the loop -->
   tier:     T0
   verify:   cargo nextest run -p minimald boxes_subtree_memory_max_and_min
-  <!-- runs on the VM lane (NET-107): the behaviour exists only with the VM host daemon in the loop -->
+  <!-- a root integration test on a native `local0` with a delegated memory controller -->
 
-- **BRES-008** THE SYSTEM SHALL reject any write to a box's memory limit that originates from a process inside the box's namespaces, including one running as root inside the box.
+- **BRES-008** WHERE the host's memory enforcement is `enforced` THE SYSTEM SHALL reject any write to a box's memory limit that originates from a process inside the box's namespaces, including one running as root inside the box.
   tier:     T0
   verify:   cargo nextest run -p minimald in_box_root_cannot_raise_memory_limit
 
@@ -82,13 +86,17 @@ After this ships, every box declares its size or takes the host's default, the h
   tier:     T0
   verify:   cargo nextest run -p minimald memory_policy_from_capabilities_not_config
 
-- **BRES-013** WHILE a native host has no delegated memory controller THE SYSTEM SHALL report `advisory` and still perform admission accounting.
+- **BRES-013** WHILE a native host has no delegated memory controller THE SYSTEM SHALL report `advisory`, apply no memory cgroup limit to its boxes, and still perform admission accounting.
   tier:     T0
   verify:   cargo nextest run -p minimald native_without_controller_is_advisory
 
-- **BRES-014** THE SYSTEM SHALL render, in `min host list` and `min host show`, each host's default box size and whether its memory enforcement is `enforced` or `advisory`.
+- **BRES-014** THE SYSTEM SHALL render, in `min host list` and `min host show`, each host's capacity, allocatable, allocated, default box size and whether its memory enforcement is `enforced` or `advisory`.
   tier:     T0
-  verify:   cargo nextest run -p minimal host_list_and_show_render_default_size_and_enforcement
+  verify:   cargo nextest run -p minimal host_list_and_show_render_resource_figures
+
+- **BRES-015** IF a written `ram_reserved` exceeds the `ram` that `"auto"` resolved to THEN THE SYSTEM SHALL fail admission with exit 8 and `code = "insufficient_resources"`, naming `ram` as the remedy.
+  tier:     T0
+  verify:   cargo nextest run -p minimald reserved_over_resolved_auto_ram_exit8
 
 ## Non-goals
 
@@ -102,13 +110,13 @@ After this ships, every box declares its size or takes the host's default, the h
 
 ## Design reasoning
 
-**Admission arithmetic is proved, not sampled.** BRES-003 to BRES-005 are T2 Kani harnesses, unwind 8 over at most eight boxes, with no u64 overflow in the sums; the author chose this over a property test in `minimald` and over named cases at the boundaries. The cost is a constraint on code not yet written: the admission decision is a pure function over the request, the host's allocatable figures and the existing reservations, separate from the cgroup writes that follow it, and the Kani lane gains that `minimald` module and `mfile`.
+**Admission arithmetic is proved, not sampled.** BRES-003 is a T2 Kani harness over one `(ram, ram_reserved)` pair at unwind 1; BRES-004 and BRES-005 are T2 harnesses at unwind 8 over at most eight boxes, with no u64 overflow in the sums; the author chose this over a property test in `minimald` and over named cases at the boundaries. The cost is a constraint on code not yet written: the admission decision is a pure function over the request, the host's allocatable figures and the existing reservations, separate from the cgroup writes that follow it, and the Kani lane gains that `minimald` module and `mfile`.
 
 **`enforced` or `advisory` comes from the host, never from configuration.** The architecture states this honesty rule (Box Resources › The host's side); this spec does not restate its rationale. BRES-012 makes it observable and BRES-013 keeps admission accounting on a host that cannot enforce, so a native `local0` without a delegated memory controller still refuses a box that does not fit.
 
 **The escape claim covers in-box root.** BRES-008 is written for every process in the box's namespaces including one running as root inside, and is testable as such. Limiting it to ordinary processes was rejected as a weaker claim than the mechanism provides.
 
-**VM-host behaviour runs on the VM lane.** The boxes subtree under the VM host (BRES-007) exists only with the VM host daemon in the loop, so its test names the VM lane (NET-107) rather than taking `tier: none`, which would have left the VM path unverified.
+**The boxes subtree is tested on both enforced host kinds.** The subtree (BRES-007) exists on any `enforced` host: a native `local0` with a delegated memory controller, and the guest of a VM host. The native case is a root integration test in `minimald`; the VM case exists only with the VM host daemon in the loop, so its test names the VM lane (NET-107) rather than taking `tier: none`, which would have left the VM path unverified.
 
 **Generality:** every requirement is written for any host a daemon runs on and exercised on `local0` and `local-minvmd0`; a remote host inherits them unchanged, and the architecture has every host report the same fields. What varies by host is only whether it can enforce, and that is reported rather than assumed (BRES-012), so a host with no memory controller fits as `advisory`.
 
@@ -124,3 +132,4 @@ After this ships, every box declares its size or takes the host's default, the h
 - [NEEDS CLARIFICATION (HIGH): where the exit 8 refusal lives, the daemon's `min/v1/error` surface or the provider API's `RESOURCE_EXHAUSTED` mapping (gominimal/arch#96 question 1). BRES-005 is written to the daemon's error surface.]
 - [NEEDS CLARIFICATION (MEDIUM): gominimal/arch#96 questions 4 and 6 touch this spec: how a scripted caller learns that an `advisory` host waived a written `ram` (BRES-012, BRES-013), and whether `allocated` sums implied reservations or only written `ram_reserved` (BRES-004).]
 - [NEEDS CLARIFICATION (HIGH): which side applies `memory.max`. gominimal/inbox#698 S3b has the guest daemon apply `[machine] ram` as its session leaf's bound and clamps a non-declared default to guest RAM minus the daemon reserve, while BRES-004 admits without clamping and BRES-007 sets `memory.max` in the boxes subtree. One of the two needs to cede the write and the clamp rule before either lands.]
+- [NEEDS CLARIFICATION (HIGH): gominimal/inbox#698 S3a-2 has every exec process and every daemon-run lifecycle hook join the session leaf, which is BRES-009, and S3a-1 bind-mounts the leaf read-only, which overlaps BRES-008. Question for the owner: does BRES keep BRES-008 and BRES-009 with #698 reusing them, or do they become non-goals pointing at #698 S3a-1 and S3a-2?]
