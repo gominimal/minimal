@@ -19,13 +19,13 @@ class @@CLASS@@ < Formula
   # macOS VM support. minvmd links libkrun via @rpath/libkrun.1.dylib and
   # carries an @loader_path/../lib rpath (scripts/rewrite-macos-linkage.sh
   # retargets the release binary to exactly that shape), so it resolves the
-  # library from THIS prefix's lib/ — a Cellar prefix sibling of bin/, not the
-  # slp/krun formula's Cellar, which @loader_path can never reach. depends_on
-  # pulls the formula in and gives the dylib its runtime deps; the resource
-  # below installs the same trimmed dylib the installer drops (libkrun
-  # -macos-arm64.dylib from the release assets) under the load command's
-  # expected name, reproducing the installer's bin/lib sibling layout.
-  depends_on "slp/krun/libkrun"
+  # library from THIS prefix's lib/ and nowhere else. The resource below
+  # installs the release's trimmed dylib (libkrun-macos-arm64.dylib, built from
+  # vendor/libkrun's lock and patches) under the load command's expected name,
+  # reproducing the installer's bin/lib sibling layout. There is deliberately no
+  # depends_on a libkrun formula: the shipped dylib links only system
+  # libraries, so an upstream copy would sit unused on disk, and a foreign
+  # libkrun formula from another tap can conflict with this install.
 
   # Every channel formula installs the same bin/min, so each names the other
   # channels as conflicts: brew then refuses the install rather than linking
@@ -90,10 +90,9 @@ class @@CLASS@@ < Formula
     end
 
     # The dylib goes into this prefix's lib/, the one directory minvmd's
-    # @loader_path/../lib rpath actually searches. (The slp/krun dependency
-    # installs its copy into ITS Cellar prefix, which @loader_path cannot
-    # reach; Homebrew's opt symlinks do not help either — dyld resolves
-    # @loader_path against the realpath of the installed binary.)
+    # @loader_path/../lib rpath actually searches. No other libkrun's Cellar is
+    # reachable from there — dyld resolves @loader_path against the realpath of
+    # the installed binary, and Homebrew's opt symlinks do not help.
     resource("libkrun").stage do
       lib.install "libkrun-macos-arm64.dylib" => "libkrun.1.dylib"
     end

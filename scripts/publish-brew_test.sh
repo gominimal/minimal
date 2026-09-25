@@ -164,6 +164,14 @@ if [[ "$out" == *'conflicts_with "minimal-unstable", "minimal-nightly"'* ]]; the
 else
     bad "the stable formula conflicts with the other channel formulae (out: $out)"
 fi
+# The formula installs the release dylib into its own lib/, which is the only
+# place minvmd's @loader_path/../lib rpath looks, so it must not pull in a
+# third-party libkrun tap (unused on disk, and it can conflict with another).
+if [[ "$out" != *'slp/krun'* ]]; then
+    ok "the formula does not depend on a third-party libkrun tap"
+else
+    bad "the formula does not depend on a third-party libkrun tap (out: $out)"
+fi
 
 # Every 64-hex digest in the diff must be one of the fixture assets'.
 digests="$(for a in "${assets[@]}"; do sha256_file "$release/$a"; done)"
