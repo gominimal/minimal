@@ -85,9 +85,8 @@ When the run passes, it did these things:
   that step 6 checks.
 - It created a draft GitHub Release `vX.Y.Z` with the notes and every
   artifact attached. A draft has no tag.
-- It moved the `unstable` channel to `X.Y.Z`. There is no approval step for
-  this. If your commit is older than the newest nightly build, unstable users
-  go back to it until the next nightly run moves `unstable` forward again.
+- It did not move any channel. `unstable` follows `main`, and only a
+  promotion points a channel at `X.Y.Z`.
 
 If the run fails after the staging job, fix the cause and run it again with
 `-f restage=true`. A restage deletes the smoke record first, so you cannot
@@ -101,17 +100,10 @@ Make sure that the smoke record exists:
 curl -fsS https://storage.googleapis.com/minimal-one/versions/X.Y.Z/smoked
 ```
 
-Install it the way a user does. The `unstable` channel points at it after
-step 4:
-
-```sh
-curl -fsSL https://go.minimal.dev/unstable | sh
-min --version
-```
-
-To test without the `unstable` channel, write a private pointer. Any name made
-of `A-Za-z0-9._-` works. You need write access to the bucket, and anyone who
-knows the name can install from it. Delete the pointer when you finish.
+No channel points at the staged release, so write a private pointer to
+install it the way a user does. Any name made of `A-Za-z0-9._-` works. You
+need write access to the bucket, and anyone who knows the name can install
+from it. Delete the pointer when you finish.
 
 ```sh
 scripts/set-channel.sh --channel rc --version X.Y.Z --bucket gs://minimal-one
@@ -350,8 +342,9 @@ lists what they do not cover.
 `versions/<version>/smoked`. The file holds the SHA-256 of the staged
 `components` manifest, the commit, and the run URL. The promotion compares
 this hash with the live manifest, so a folder that someone stages again does
-not keep an old result. Then `set-channel.sh` moves `unstable` to the version. `unstable` moves
-on every release run that passes, with no approval.
+not keep an old result. For a nightly or plain build, `set-channel.sh` then
+moves `unstable` to the version, with no approval. A versioned build does not
+move `unstable`.
 
 ### nightly.yml: the daily build
 

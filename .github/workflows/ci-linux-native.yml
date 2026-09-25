@@ -22,9 +22,9 @@ name: CI (Linux native)
 # in this lane — see the note on the tests job.
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "release/**"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "release/**"]
   workflow_dispatch:
 
 env:
@@ -36,10 +36,10 @@ env:
   MINIMAL_REMOTE_CACHE_URL: https://cache.minimal.dev/
   CARGO_TERM_COLOR: always
 
-# Cancel superseded runs on a branch; never cancel a run on main.
+# Cancel superseded runs on a branch; never cancel a run on main or release/*.
 concurrency:
   group: ci-linux-native-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
 
 permissions:
   contents: read
