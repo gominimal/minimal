@@ -749,11 +749,7 @@ impl Context {
     ) -> Result<(), Error> {
         let cache = self.local_cache();
         let rc = if self.daemon.config.use_remote_cache() {
-            Some(
-                self.remote_cache(false, false)
-                    .await
-                    .map_err(remote_error_to_error)?,
-            )
+            Some(self.remote_cache(false, false).await?)
         } else {
             None
         };
@@ -1065,12 +1061,7 @@ impl Context {
         graph: &Graph,
         pkgs: I,
     ) -> Result<(), Error> {
-        // `remote_error_to_error` renders the two arms differently on purpose —
-        // see its doc for why they are not interchangeable.
-        let rc = self
-            .remote_cache(false, true)
-            .await
-            .map_err(remote_error_to_error)?;
+        let rc = self.remote_cache(false, true).await?;
         let mut task_set = tokio::task::JoinSet::new();
         let fetch_start = SystemTime::now();
         let semaphore = Arc::new(Semaphore::new(8));
@@ -1225,23 +1216,6 @@ pub enum AddDepMode {
     TaskPackages { name: String },
     /// Add the specified packages to session.packages.
     SessionPackages,
-}
-
-/// Converts an [`rcache`] error into the context's error type, rendering
-/// [`RemoteError::Config`] by its inner message.
-///
-/// The two arms are NOT interchangeable, though they look it:
-/// `rcache::Error`'s `Display` is `write!(f, "{:?}", self)` — it Debug-formats
-/// itself — so the fallback arm renders a `Config` as
-/// `Config("MINIMAL_INDEX_SOURCE: unknown index source \"banana\" ...")`,
-/// variant name and escaped quotes included. Destructuring `Config` and
-/// formatting the inner `msg` is what yields the clean, user-facing message;
-/// collapsing this to one arm reintroduces the panic-era output this replaced.
-fn remote_error_to_error(e: RemoteError<AnyRespError>) -> Error {
-    match e {
-        RemoteError::Config(msg) => Error::Other(anyhow!("{msg}")),
-        other => Error::Other(anyhow!("{other}")),
-    }
 }
 
 fn upsert_toml_packages_list<T: TableLike>(t: &mut T, key: &str, upsert: &[String]) -> bool {
