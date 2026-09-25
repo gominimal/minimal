@@ -908,8 +908,7 @@ async fn policy_shows_effective_egress() {
     format_policy(&mut out, &policy, sessions::NetworkMode::NoNet).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert_eq!(
-        text,
-        "No network policy (NoNet)\n",
+        text, "No network policy (NoNet)\n",
         "a none session prints the note in place of both blocks:\n{text}"
     );
 }
