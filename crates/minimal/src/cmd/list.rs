@@ -304,7 +304,7 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // fault this severe — `--raw` most of all, since a script parsing bare ids
     // is exactly what will go on using hostnames that no longer resolve — and
     // stdout stays clean for the parser either way.
-    warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref());
+    warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref(), "min ls");
     warn_if_mtls_proxy_down(resp.mtls_proxy_unavailable.as_deref());
     format_ls(&mut std::io::stdout(), &args, &resp)?;
     Ok(())
@@ -314,14 +314,17 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
 /// reports hostname routing down: the daemon's reason and remedy for the
 /// failed bind or publish, plus what recovery looks like from here — the
 /// daemon retries with backoff and clears the warning on its own once the
-/// listener recovers (NET-020, NET-022). Pure, so tests can assert the wording
-/// without capturing stderr.
+/// listener recovers (NET-020, NET-022). `command` names the command the
+/// warning rides on: re-running it shows the warning while the listener is
+/// still down and nothing once it has recovered, so the recovery sentence
+/// tells the user to re-run the command they are already in, not some other
+/// one. Pure, so tests can assert the wording without capturing stderr.
 #[must_use]
-pub fn hostname_routing_warning(reason: &str) -> String {
+pub fn hostname_routing_warning(reason: &str, command: &str) -> String {
     format!(
         "warning: session hostnames will not route: {reason}. The daemon retries \
          with backoff and clears this warning on its own once the listener \
-         recovers; run `min ls` again to check."
+         recovers; run `{command}` again to check."
     )
 }
 
@@ -335,10 +338,12 @@ pub fn hostname_routing_warning(reason: &str) -> String {
 /// carries the reason and the remedy for the cause (a held port, a failed
 /// publish); the recovery is the daemon's job now — it retries with backoff
 /// and the warning goes away by itself, so the remedy says to check again
-/// rather than to restart anything.
-pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>) {
+/// rather than to restart anything. `command` names the command this runs
+/// from, so the recovery sentence fits it — `min ls` on the list, `min
+/// session activate` at activation.
+pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>, command: &str) {
     if let Some(reason) = reason {
-        eprintln!("{}", hostname_routing_warning(reason));
+        eprintln!("{}", hostname_routing_warning(reason, command));
     }
 }
 

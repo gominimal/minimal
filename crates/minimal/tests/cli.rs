@@ -882,6 +882,10 @@ async fn listener_failure_reported_with_remedy() {
         ls_stderr.contains("retries"),
         "ls must say the daemon recovers on its own, got: {ls_stderr}"
     );
+    assert!(
+        ls_stderr.contains("run `min ls` again to check"),
+        "ls must name the command its warning rides on, got: {ls_stderr}"
+    );
 
     // `min session activate` prints the same report on its path.
     let project = tempfile::TempDir::new().unwrap();
@@ -916,6 +920,10 @@ async fn listener_failure_reported_with_remedy() {
     assert!(
         activate_stderr.contains("Remedy"),
         "activate must print the remedy, got: {activate_stderr}"
+    );
+    assert!(
+        activate_stderr.contains("run `min session activate` again to check"),
+        "activate must name the command its warning rides on, got: {activate_stderr}"
     );
 
     drop(held);
