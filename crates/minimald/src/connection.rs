@@ -6,17 +6,13 @@ use sessions::SessionId;
 use std::{
     collections::BTreeMap,
     sync::{Arc, LazyLock},
+    time::Duration,
 };
-// Used only by the `ssh-forward` direct-tcpip handler.
-#[cfg(feature = "ssh-forward")]
-use std::time::Duration;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
     sync::{Mutex, MutexGuard},
 };
-// Used only by the `ssh-forward` direct-tcpip handler.
-#[cfg(feature = "ssh-forward")]
-use tokio::net::TcpStream;
 
 use crate::{
     ChannelConfig, RequestedPty, exec,
@@ -457,7 +453,9 @@ impl russh::server::Handler for ConnectionHandler {
     ///
     /// The connection attempt times out after 10 seconds; a failure rejects the
     /// channel so the SSH client receives a clean error rather than hanging.
-    #[cfg(feature = "ssh-forward")]
+    ///
+    /// Served in every build: the `ssh-forward` feature gate is retired
+    /// (NET-110), so a release build forwards ports too.
     async fn channel_open_direct_tcpip(
         &mut self,
         channel: RuChannel<Msg>,
@@ -577,36 +575,25 @@ impl russh::server::Handler for ConnectionHandler {
 
         reply.accept().await;
 
+        // One info line per served channel open (NET-110): the daemon log —
+        // and the diagnostics bundle's tail of it — names every direct-tcpip
+        // channel that relays, with the session it forwarded for and the box
+        // port it reached.
+        tracing::info!(
+            session_id = %session_id,
+            host = %host,
+            port,
+            "direct-tcpip channel open: relaying bytes to the box port"
+        );
+
         // Relay bytes bidirectionally: SSH channel ↔ upstream TCP.
         tokio::spawn(relay_streams(channel.into_stream(), upstream));
 
         Ok(())
     }
-
-    /// With the `ssh-forward` feature disabled, port-forwarding is compiled out.
-    /// Reject every `direct-tcpip` channel so forwarding fails **closed**, rather
-    /// than relying on whatever russh's default handler does (finding #4 / the
-    /// user decision to disable ssh-forward for now).
-    #[cfg(not(feature = "ssh-forward"))]
-    async fn channel_open_direct_tcpip(
-        &mut self,
-        _channel: RuChannel<Msg>,
-        _host_to_connect: &str,
-        _port_to_connect: u32,
-        _originator_address: &str,
-        _originator_port: u32,
-        reply: ChannelOpenHandle,
-        _session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        reply
-            .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
-            .await;
-        Ok(())
-    }
 }
 
 /// Relay bytes bidirectionally between two async streams, logging any relay error.
-#[cfg(feature = "ssh-forward")]
 async fn relay_streams<A, B>(mut a: A, mut b: B)
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -617,10 +604,7 @@ where
     }
 }
 
-// The only test here exercises `relay_streams`, which is itself behind
-// `ssh-forward`; gate the whole module so it (and its imports) compile out with
-// the feature.
-#[cfg(all(test, feature = "ssh-forward"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -641,5 +625,124 @@ mod tests {
         let mut buf2 = [0u8; 5];
         client.read_exact(&mut buf2).await.unwrap();
         assert_eq!(&buf2, b"world");
+    }
+
+    /// A `direct-tcpip` channel to a box port relays bytes in the default,
+    /// featureless build — the configuration a release build ships — because
+    /// nothing about the handler is behind a feature anymore (NET-110). The
+    /// open logs one info line naming the session it forwarded for and the
+    /// port it reached.
+    #[tokio::test]
+    async fn direct_tcpip_served_in_release() {
+        use russh::keys::PublicKeyOrCertificate;
+        use tokio::net::{TcpListener, UnixStream};
+
+        use crate::test_harness::{TestServer, captured_log, create_session_req};
+
+        // Install the capture subscriber before the open happens: the global
+        // subscriber must already exist when the info line is emitted.
+        let log = captured_log();
+
+        // The box port: a loopback listener echoing whatever it receives.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sock.write_all(&buf[..n]).await.unwrap(),
+                }
+            }
+        });
+
+        // The session the forward is scoped to: the SSH username carries its
+        // UUID, exactly as `ssh -l <uuid> -L ...` does.
+        let server = TestServer::new().await;
+        let req = create_session_req("direct-tcpip", "/tmp");
+        let session_id = server
+            .state
+            .sessions_manager()
+            .await
+            .create_session(req.config, None)
+            .await
+            .unwrap();
+
+        // `TestClient` keeps its russh handle private and this test needs the
+        // raw `channel_open_direct_tcpip`, so drive both halves of the
+        // connection the way `TestServer::connect` does.
+        struct ForwardHandler;
+        impl russh::client::Handler for ForwardHandler {
+            type Error = russh::Error;
+            async fn check_server_key(
+                &mut self,
+                _key: &PublicKeyOrCertificate,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+        }
+
+        let host_key = server.state.host_key().await.unwrap();
+        let russh_config = Arc::new(russh::server::Config {
+            keys: vec![host_key],
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            nodelay: true,
+            ..Default::default()
+        });
+        let (server_side, client_side) = UnixStream::pair().unwrap();
+        let server_setup = {
+            let state = server.state.clone();
+            let russh_config = russh_config.clone();
+            async move {
+                let (_conn, session_fut) =
+                    Connection::from_stream(server_side, russh_config, state, true)
+                        .await
+                        .expect("handshake over the in-memory pair");
+                tokio::spawn(session_fut);
+            }
+        };
+        let client_setup = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_side,
+            ForwardHandler,
+        );
+        let (_, handle) = tokio::join!(server_setup, client_setup);
+        let mut handle = handle.unwrap();
+        let auth = handle
+            .authenticate_none(&session_id.to_string())
+            .await
+            .unwrap();
+        assert!(auth.success(), "auth_none should succeed on local UDS");
+
+        // The point of the test: the channel opens in a build with no
+        // features, and bytes relay through it to the box port and back.
+        let channel = handle
+            .channel_open_direct_tcpip("127.0.0.1", port.into(), "127.0.0.1", 0)
+            .await
+            .expect("direct-tcpip must open in the default (release) build");
+        let mut channel = channel.into_stream();
+        channel.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        channel.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping", "the box port must echo the relayed bytes");
+
+        // Observability (NET-110): the open's info line names the session and
+        // the box port it reached.
+        let logged = log.contents();
+        let line = logged
+            .lines()
+            .find(|l| l.contains("direct-tcpip channel open"))
+            .unwrap_or_else(|| {
+                panic!("expected a direct-tcpip channel-open info line, got: {logged}")
+            });
+        assert!(
+            line.contains(&format!("session_id={session_id}")),
+            "the open line must name the session, got: {line}"
+        );
+        assert!(
+            line.contains(&format!("port={port}")),
+            "the open line must name the box port, got: {line}"
+        );
     }
 }
