@@ -333,7 +333,10 @@ Retrying a publish, per channel:
   promotion issue. A plain re-run cannot serve as the retry either: a
   failed-jobs re-run does not reliably retain the earlier job's outputs, and a
   full re-run re-opens the approval gate and then fails at `publish-release`,
-  which refuses an already-published release.
+  which refuses an already-published release. The dispatch only publishes while
+  `vars.PUBLISH_STABLE_PACKAGES` is `'true'`: with the switch off (the default)
+  `publish-channel-stable` is skipped and the run ships nothing, so check the
+  variable before treating a retry as done.
 
 **The stable package switch.** `vars.PUBLISH_STABLE_PACKAGES` — a repository
 variable, absent by default, so **off** — gates every path by which a *stable*
