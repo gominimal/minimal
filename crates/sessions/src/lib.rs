@@ -189,13 +189,13 @@ pub struct IngressPolicy {
 
 impl IngressPolicy {
     /// Whether this ingress policy configures any forwarding at all (a static
-    /// mapping, a dynamic range, or an explicit dynamic-ingress setting). An
+    /// mapping, a dynamic range, or a non-default dynamic-ingress setting). An
     /// empty policy is the deny-all default.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.port_mappings.is_empty()
             && self.dynamic_allowed_range.is_none()
-            && self.dynamic_ingress.is_none()
+            && self.dynamic_ingress.map_or(true, |d| d == DynamicIngress::Deny)
     }
 }
 
@@ -1039,20 +1039,41 @@ mod tests {
             "dynamic_ingress does not change validation"
         );
 
-        // The field is not enough to make a HostNet ingress non-empty; setting
-        // `dynamic_ingress` alone still fails on a host-address box because
-        // ingress policy is own-address-only.
-        let record = record_with(
-            NetworkMode::HostNet,
-            SessionPolicy::new(None, Some(ingress.clone())),
-        );
-        assert_eq!(
-            record.validate_policy(),
-            Err(PolicyError::IngressRequiresOwnIp {
-                mode: NetworkMode::HostNet
-            }),
-            "dynamic_ingress alone is still an ingress policy on a host-address box"
-        );
+        // An explicit `deny` is the default and is treated like `None` for
+        // the "ingress only on own-address" rule: it is accepted on a
+        // host-address box and on a none box too (NET-065).
+        let deny_ingress = IngressPolicy {
+            port_mappings: vec![],
+            dynamic_allowed_range: None,
+            dynamic_ingress: Some(DynamicIngress::Deny),
+        };
+        for network in [NetworkMode::HostNet, NetworkMode::NoNet] {
+            let record = record_with(
+                network,
+                SessionPolicy::new(None, Some(deny_ingress.clone())),
+            );
+            assert!(
+                record.validate_policy().is_ok(),
+                "dynamic_ingress = deny must be accepted on {network:?}"
+            );
+        }
+
+        // A non-deny `dynamic_ingress` alone is still an ingress policy on a
+        // non-own-address box and is refused there.
+        for network in [NetworkMode::HostNet, NetworkMode::NoNet] {
+            for mode in [DynamicIngress::Allow, DynamicIngress::Ask] {
+                let ingest = IngressPolicy {
+                    dynamic_ingress: Some(mode),
+                    ..IngressPolicy::default()
+                };
+                let record = record_with(network, SessionPolicy::new(None, Some(ingest)));
+                assert_eq!(
+                    record.validate_policy(),
+                    Err(PolicyError::IngressRequiresOwnIp { mode: network }),
+                    "dynamic_ingress = {mode} must be rejected on {network:?}"
+                );
+            }
+        }
     }
 
     /// On-disk records that predate the `status` field must
