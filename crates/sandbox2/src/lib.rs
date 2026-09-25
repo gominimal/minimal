@@ -431,11 +431,16 @@ impl Container {
 ///
 /// The closure runs after namespaces and credentials are configured but before
 /// the supervised program execs, which is the correct moment for seccomp.  It
-/// captures a pointer to the filter stored on the heap inside the `Container`;
-/// the filter outlives the closure because it is owned by the `Container` that
-/// constructs the command.  After loading the filter the closure execs the
-/// original program, since `command_from_closure` otherwise replaces the program
-/// entirely.
+/// captures the `&'static` filter owned by the `Container`, loads it, and then
+/// execs the original program, since `command_from_closure` otherwise replaces
+/// the program entirely.
+///
+/// `command_from_closure` starts a fresh `Command`, so the working directory
+/// and environment already set on `command` are carried over to it: hakoniwa
+/// `chdir`s and rebuilds the child's `environ` from the command it spawns, and
+/// the exec in the closure inherits both.  Whatever a caller sets on the
+/// returned command afterwards (`SHELL`, `PS1`, stdio) lands on the closure
+/// command and reaches the program the same way.
 #[cfg(target_os = "linux")]
 fn install_filter_in_command(
     container: &hakoniwa::Container,
@@ -444,12 +449,13 @@ fn install_filter_in_command(
 ) -> Result<(), Error> {
     let program = command.get_program().to_string();
     let args = command.get_args();
+    let current_dir = command.get_current_dir().map(Path::to_path_buf);
     let envs = command.get_envs();
     // SAFETY: `command_from_closure` is unsafe because the closure runs in a
     // forked child.  `filter` is `&'static`; it is leaked by the Container and
-    // outlives every command spawned from it.  `execve_in_child` is
+    // outlives every command spawned from it.  `execv_in_child` is
     // async-signal-safe and only uses libc.
-    let closure = unsafe {
+    let mut closure = unsafe {
         container.command_from_closure({
             move || {
                 if let Err(e) = install_socket_family_filter(filter) {
@@ -460,25 +466,27 @@ fn install_filter_in_command(
                 // `command_from_closure` replaces the program with this closure;
                 // exec into the real program so the spawn runs what the caller
                 // asked for, now with the seccomp filter installed.
-                if let Err(code) = execve_in_child(&program, &args, &envs) {
+                if let Err(code) = execv_in_child(&program, &args) {
                     return -code;
                 }
                 0
             }
         })
     };
+    if let Some(dir) = current_dir {
+        closure.current_dir(dir);
+    }
+    closure.envs(envs);
     *command = closure;
     Ok(())
 }
 
-/// Exec into `program` with `args` and `envs` using only libc, suitable for the
-/// forked child of a hakoniwa `command_from_closure` closure.
+/// Exec into `program` with `args` using only libc, suitable for the forked
+/// child of a hakoniwa `command_from_closure` closure.  The environment is
+/// not passed explicitly: `execv` hands the program the `environ` hakoniwa
+/// rebuilt from the command's final `envs` just before running the closure.
 #[cfg(target_os = "linux")]
-fn execve_in_child(
-    program: &str,
-    args: &[String],
-    envs: &std::collections::HashMap<String, String>,
-) -> Result<(), i32> {
+fn execv_in_child(program: &str, args: &[String]) -> Result<(), i32> {
     #[cfg_attr(target_os = "linux", allow(clippy::unnecessary_cast))]
     fn to_cstring(s: &str) -> std::result::Result<std::ffi::CString, i32> {
         std::ffi::CString::new(s).map_err(|_| libc::EINVAL)
@@ -487,7 +495,7 @@ fn execve_in_child(
     let program_c = to_cstring(program)?;
 
     // It is safe to keep pointers into these `CString`s because this process is
-    // about to be replaced by execve; no allocation is freed before the syscall.
+    // about to be replaced by execv; no allocation is freed before the syscall.
     let mut argv_c: Vec<std::ffi::CString> = Vec::with_capacity(args.len() + 1);
     argv_c.push(program_c.clone());
     for arg in args {
@@ -496,16 +504,9 @@ fn execve_in_child(
     let mut argv_ptrs: Vec<*const libc::c_char> = argv_c.iter().map(|s| s.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
 
-    let mut envp_c: Vec<std::ffi::CString> = Vec::with_capacity(envs.len());
-    for (k, v) in envs {
-        envp_c.push(to_cstring(&format!("{k}={v}"))?);
-    }
-    let mut envp_ptrs: Vec<*const libc::c_char> = envp_c.iter().map(|s| s.as_ptr()).collect();
-    envp_ptrs.push(std::ptr::null());
-
-    // SAFETY: execve only touches the C strings we just built; the vectors are
+    // SAFETY: execv only touches the C strings we just built; the vectors are
     // still alive for the call.
-    let rc = unsafe { libc::execve(program_c.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
+    let rc = unsafe { libc::execv(program_c.as_ptr(), argv_ptrs.as_ptr()) };
     if rc == -1 {
         return Err(std::io::Error::last_os_error()
             .raw_os_error()

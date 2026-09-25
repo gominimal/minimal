@@ -71,9 +71,10 @@ fn sudo(args: &[&str]) -> Output {
 /// C source for a tiny static probe that checks which socket families a
 /// process may create.  When run with no arguments it asserts `AF_UNIX` is
 /// allowed and `AF_INET`, `AF_INET6`, and `AF_VSOCK` are refused with
-/// `EAFNOSUPPORT`.  With argument `hold` it sleeps forever so the sandbox stays
-/// alive for attach tests; with argument `attach` it checks that `AF_UNIX` is
-/// still usable inside an injected process.
+/// `EAFNOSUPPORT`.  With argument `hold` it reports its working directory and
+/// `SHELL` on stdout, then sleeps forever so the sandbox stays alive for
+/// attach tests; with argument `attach` it checks that `AF_UNIX` is still
+/// usable inside an injected process and reports the same two lines.
 const SOCKET_PROBE_C: &str = r#"
 #include <sys/socket.h>
 #include <errno.h>
@@ -82,8 +83,19 @@ const SOCKET_PROBE_C: &str = r#"
 #include <stdio.h>
 #include <string.h>
 
+/* Two lines on stdout: the cwd hakoniwa chdir'd to and the SHELL it exported,
+ * both of which the seccomp closure must carry across its command swap. */
+static void report(void) {
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof cwd)) { perror("getcwd"); _exit(30); }
+    const char *shell = getenv("SHELL");
+    printf("cwd=%s\nshell=%s\n", cwd, shell ? shell : "");
+    fflush(stdout);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "hold") == 0) {
+        report();
         while (1) sleep(60);
     }
 
@@ -100,6 +112,7 @@ int main(int argc, char **argv) {
         if (fd >= 0) { close(fd); fprintf(stderr, "AF_VSOCK after attach unexpectedly succeeded\n"); return 23; }
         if (errno != EAFNOSUPPORT) { fprintf(stderr, "AF_VSOCK after attach wrong errno %d\n", errno); return 24; }
 
+        report();
         return 0;
     }
 
@@ -245,12 +258,22 @@ async fn network_none_blocks_all_outside_sockets() {
 /// nsenter shim, and verifies that the injected process can still create an
 /// `AF_UNIX` socket — the local family the minenv socket and `min` helper rely
 /// on.
+///
+/// Both processes also report their working directory and `SHELL`: the
+/// none-box launch swaps the built command for a seccomp closure, and the
+/// session host names the shell on the command *after* `Sandbox::command`
+/// returns, so a swap that dropped either would start every none box in `/`
+/// with no `SHELL`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn network_none_attach_works() {
     if !gated() {
         return;
     }
     use minimald::nsenter::{Injection, session_leader_pid};
+    use std::io::BufRead as _;
+
+    /// What the session host would set: the shell that is actually running.
+    const PROBE_SHELL: &str = "/usr/bin/probe";
 
     let rootfs_tmp = tempfile::tempdir_in("/tmp").expect("rootfs temp dir under /tmp");
     let Some(probe) = compile_socket_probe(rootfs_tmp.path()) else {
@@ -273,22 +296,53 @@ async fn network_none_attach_works() {
         .new_container(&plan)
         .expect("building none-box container");
 
-    let mut child = sandbox
+    let expected_cwd = sandbox.command_cwd();
+    let expected_report = vec![
+        format!("cwd={expected_cwd}"),
+        format!("shell={PROBE_SHELL}"),
+    ];
+
+    let mut hold = sandbox
         .command(
             &container,
             "/usr/bin/probe",
             ["hold"],
             std::iter::empty::<(&str, &str)>(),
         )
-        .expect("building hold command")
-        .spawn()
-        .expect("spawning hold process in none box");
+        .expect("building hold command");
+    // Set after `command()` returns, exactly as the session host sets `SHELL`.
+    hold.env("SHELL", PROBE_SHELL);
+    hold.stdout(hakoniwa::Stdio::MakePipe);
+    let mut child = hold.spawn().expect("spawning hold process in none box");
+
+    let hold_stdout = child.stdout.take().expect("hold process stdout pipe");
+    let hold_report = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            std::io::BufReader::new(hold_stdout)
+                .lines()
+                .take(2)
+                .collect::<Result<Vec<String>, _>>()
+                .expect("reading the hold process report")
+        }),
+    )
+    .await
+    .expect("hold process report timed out")
+    .expect("spawn_blocking join");
+    assert_eq!(
+        hold_report, expected_report,
+        "the none-box launch lost the command's cwd or SHELL across the seccomp closure swap"
+    );
 
     let leader =
         session_leader_pid(child.id()).expect("resolving the none box's session leader pid");
 
+    let mut env = sandbox.command_env();
+    env.insert("SHELL".to_string(), PROBE_SHELL.to_string());
     let injection = Injection::new(leader, "/usr/bin/probe", ["attach"])
         .with_shim(shim())
+        .with_cwd(expected_cwd)
+        .with_env(env)
         .seal_none_box();
     let output = tokio::time::timeout(
         Duration::from_secs(30),
@@ -319,6 +373,14 @@ async fn network_none_attach_works() {
         output.status.success(),
         "attach probe in none box failed: status={:?}\nstderr={stderr}",
         output.status.code(),
+    );
+    let attach_report: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        attach_report, expected_report,
+        "the injected process did not start in the box's cwd with its SHELL (stderr={stderr})"
     );
 }
 
