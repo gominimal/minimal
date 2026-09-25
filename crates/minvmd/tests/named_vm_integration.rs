@@ -396,18 +396,36 @@ fn stop_one_vm_leaves_other_running() {
         stop.output()
     );
 
-    // One info line per VM stop names the VM and its state directory
-    // (observability).
+    // The one-per-stop line (NET-055) belongs to the witness that observes
+    // the VM die — the `run` supervisor, or a foreground `boot` — so a real
+    // stop's line lands in that witness's log, never on the CLI's stdout.
+    // This libkrun-less harness cannot run a supervisor, so what it pins
+    // here is the CLI-side invariant that keeps the line one-per-stop: the
+    // CLI never emits it itself, so a supervised stop is not logged twice.
     assert!(
-        stop.output().contains("stopping VM"),
-        "a VM stop must be logged: {}",
+        !stop.output().contains("stopping VM"),
+        "the stop CLI must not log the one-per-stop line; the supervisor \
+         watching the VMM child exit is its only witness: {}",
         stop.output()
     );
+
+    // And a stop that stops nothing logs no stop line either: "stopping VM"
+    // for a VM that is already down would be a stop that never happened.
+    let noop = run_minvmd(base.path(), &["--vm", "beta", "stop"]);
     assert!(
-        stop.output().contains("vm=alpha")
-            && stop.output().contains(&_alpha.dir().display().to_string()),
-        "the stop line must name the VM and its state directory: {}",
-        stop.output()
+        noop.status.success(),
+        "stopping a never-booted VM must succeed: {}",
+        noop.output()
+    );
+    assert!(
+        noop.output().contains("minvmd is not running"),
+        "the no-op branch is the one under test: {}",
+        noop.output()
+    );
+    assert!(
+        !noop.output().contains("stopping VM"),
+        "a no-op stop must not log a stop line: {}",
+        noop.output()
     );
 
     // The stop dialed *alpha's* socket, the named VM's own: the best-effort

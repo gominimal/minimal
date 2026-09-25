@@ -533,9 +533,10 @@ fn run_foreground() -> Result<()> {
     let status = child.wait().context("waiting for VMM child")?;
     // The one-per-stop line (NET-055): the supervisor observes every stop of
     // its VM — `min stop`, `minvmd stop`, a guest poweroff, a crash — as the
-    // VMM child exiting, so this is where a `min stop` gets its stop line
-    // (the `minvmd stop` CLI logs its own before it signals). A crash still
-    // says so, as the error below.
+    // VMM child exiting, and it is the line's only witness: the `minvmd stop`
+    // CLI logs none of its own, because whenever it stops something this
+    // supervisor is alive and watching (it holds the alive lock `stop`
+    // requires). A crash still says so, as the error below.
     crate::cmd::log_stopping_vm(state_dir.dir());
 
     // ── Phase 4: Running → Stopped (under lock) ─────────────────────────────

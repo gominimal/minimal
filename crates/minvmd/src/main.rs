@@ -133,10 +133,13 @@ fn main() -> Result<()> {
             ConfigAction::Set { vcpus, ram_mib } => minvmd::cmd::config::run_set(vcpus, ram_mib),
         },
         Command::Stop => {
-            // One line per VM stop, naming the VM and its state directory:
-            // `stop` acts on exactly one VM, and which one is the whole
-            // question a person reading the log is asking (NET-055).
-            minvmd::cmd::log_stopping_vm(&minvmd::state::provider_dir());
+            // No stop line here (NET-055): the one-per-stop line belongs to
+            // the witness that observes the VM die — the `run` supervisor, or
+            // a foreground `boot` (see `log_stopping_vm`). `stop` only
+            // signals once a supervisor's alive lock says one is watching
+            // that very child, so a line here too would log one stop twice —
+            // and a no-op stop (already stopped, stale state) would log a
+            // stop that never happened.
             minvmd::cmd::stop::run()
         }
         Command::KrunVmm => minvmd::cmd::vmm_child::run(),

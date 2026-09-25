@@ -46,12 +46,15 @@ pub fn own_ip_requested() -> bool {
 /// The one-per-stop info line (NET-055): it names the VM being stopped and
 /// its state directory, so a stop in the log answers "which VM?" at a glance.
 ///
-/// Every stop funnels here: the `minvmd stop` CLI logs it before it signals,
-/// and the `run` supervisor and a foreground `boot` log it when they observe
-/// the VMM child exit — which is where a `min stop` (a Shutdown RPC the
-/// guest answers by powering off) surfaces, since only the supervisor sees
-/// that stop happen. One definition of the line, so the fields cannot drift
-/// between the paths that log it.
+/// Every stop funnels here, but only the process that observes the VM die
+/// logs it: the `run` supervisor and a foreground `boot`, when the VMM child
+/// exits — which is where a `min stop` (a Shutdown RPC the guest answers by
+/// powering off) surfaces, since only the supervisor sees that stop happen.
+/// The `minvmd stop` CLI does not: whenever it stops something, the
+/// supervisor is alive and watching (it holds the alive lock `stop`
+/// requires), so a CLI line too would log one stop twice — and a no-op stop
+/// would log a stop that never happened. One definition of the line, so the
+/// fields cannot drift between the witnesses that log it.
 pub fn log_stopping_vm(state_dir: &std::path::Path) {
     tracing::info!(
         vm = %crate::state::vm_name(),
