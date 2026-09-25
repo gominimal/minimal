@@ -57,12 +57,21 @@
 #                       `--loadout dev` once the loadouts CLI lands, #686)
 #   E2E_VM              set to 1 for VM-backed targets (extra teardown +
 #                       diagnostics: minvmd stop, guest boot log)
+#   MINIMAL_E2E_MIN     the exact `min` this run drives, for a caller that must
+#                       smoke a SPECIFIC build (a release smoke) rather than
+#                       whatever this checkout has under target/; when set, the
+#                       repo-binary fallback in the min-resolution block is
+#                       skipped entirely (see there)
 #
 # Every proof this script can run, as one `case` on the first argument (see
 # the dispatch at the bottom). With NO argument every block runs, in exactly
 # the order below; with a case name only that proof runs, standalone, against
-# the same fresh state dir and seeds the full lane gets. Each proof is
-# self-contained: it activates (and destroys) its own sessions.
+# the same fresh state dir and seeds the full lane gets. Most proofs mint (and
+# destroy) the sessions they need themselves; `session_exec`, `guest_egress`
+# and `sandbox` instead share the one `lifecycle` activates first in a
+# whole-lane run — and mint an equivalent session of their own when they run
+# alone (see proof_shared_session), so every case name below is runnable by
+# itself.
 #   lifecycle                        cold activate → list → warm → destroy
 #   session_exec                     `min session exec` in the session's namespaces
 #   guest_egress                     curl from inside the session to the internet
@@ -90,6 +99,10 @@ E2E_VM="${E2E_VM:-}"
 # never appears in the echoed command stream.
 ADD_TOOL="jq"
 ADD_TOOL_MARKER="jq-1"
+
+# The name of the session `lifecycle` activates and the exec/egress/sandbox
+# proofs share (see proof_shared_session).
+SESSION_NAME="e2e-banner"
 
 # Resolve + seed the project to activate. Since #748, `min session activate` UPLOADS the
 # project dir into the session, so the target must (a) carry a `minimal.toml`
@@ -220,7 +233,22 @@ fi
 # CARGO_TARGET_DIR (an out-of-tree build cache) — and put the winning dir
 # ON PATH, because the CLI autospawns `minimald` by name
 # (crates/minimal/src/autospawn.rs) and the pair must come from one build.
-if command -v min >/dev/null 2>&1 && min --version >/dev/null 2>&1; then
+#
+# That fallback picks this checkout's build for EVERY lane, release smokes
+# included, and a smoke must never find itself driving something other than
+# the artifact it exists to smoke. A caller that needs a SPECIFIC `min`
+# names it with MINIMAL_E2E_MIN (an executable named `min`, with its
+# matching `minimald` beside it): the choice is final, its dir goes on PATH,
+# and the fallback is skipped entirely.
+if [ -n "${MINIMAL_E2E_MIN:-}" ]; then
+  if [ ! -x "$MINIMAL_E2E_MIN" ] || [ "$(basename -- "$MINIMAL_E2E_MIN")" != min ]; then
+    echo "::error::MINIMAL_E2E_MIN must be an executable named 'min' with its matching 'minimald' beside it (got: '$MINIMAL_E2E_MIN')" >&2
+    exit 1
+  fi
+  min_cli_dir="$(cd "$(dirname -- "$MINIMAL_E2E_MIN")" && pwd)"
+  PATH="$min_cli_dir:$PATH"
+  export PATH
+elif command -v min >/dev/null 2>&1 && min --version >/dev/null 2>&1; then
   :
 else
   min_cli_dir=""
@@ -398,28 +426,42 @@ if [ -z "$E2E_VM" ] && [ "$(uname -s)" = Linux ] \
   fi
 fi
 
+# Mint (and validate) the session the exec, egress and sandbox proofs share
+# with `lifecycle`. `min session activate` must auto-spawn the target's daemon
+# and print the new session id on stdout; the id is the LAST stdout line (any
+# log lines that slip through the RUST_LOG filter precede it), validated as a
+# UUID. In a whole-lane run `lifecycle` has minted it already and this returns
+# immediately; standalone, the proof that needs one mints its own here, so
+# every case the dispatch accepts runs on its own.
+#
+# Explicit name: the sandbox proof asserts the orientation banner interpolates
+# the ACTUAL session name at the first prompt; an autogen name would make that
+# assertion a moving target. The state dir is fresh per run, so a fixed name
+# cannot collide.
+proof_shared_session() {
+  local out t0 t1
+  [ -n "${sid:-}" ] && return 0
+  echo "standalone case: activating the session this proof shares with 'lifecycle'"
+  t0=$(now_ms)
+  # shellcheck disable=SC2086
+  out="$(cd "$PROJECT_DIR" && mnl session activate . --name "$SESSION_NAME" ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
+    || { echo "::error::'min session activate' failed to auto-spawn the daemon / create a session"; fail; }
+  t1=$(now_ms)
+  sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+  echo "session: $sid (cold activate: $((t1 - t0))ms)"
+  if ! printf '%s' "$sid" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+    echo "::error::activate's last stdout line is not a session UUID: '$sid'"
+    echo "--- full activate stdout ---"; printf '%s\n' "$out"
+    fail
+  fi
+}
+
 # Cold: `min session activate` must auto-spawn the target's daemon and print the
-# new session id on stdout. The id is the LAST stdout line (any log lines
-# that slip through the RUST_LOG filter precede it), validated as a UUID.
+# new session id on stdout (proof_shared_session does the activation and the
+# UUID check; this proof then carries the listing and warm-call halves).
 proof_lifecycle() {
 echo "::group::cold activate (auto-spawns the daemon)"
-# Explicit name: the sandbox proof asserts the orientation banner
-# interpolates the ACTUAL session name at the first prompt; an autogen
-# name would make that assertion a moving target. The state dir is fresh
-# per run, so a fixed name cannot collide.
-SESSION_NAME="e2e-banner"
-t0=$(now_ms)
-# shellcheck disable=SC2086
-activate_out="$(cd "$PROJECT_DIR" && mnl session activate . --name "$SESSION_NAME" ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
-  || { echo "::error::cold 'min session activate' failed to auto-spawn the daemon / create a session"; fail; }
-t1=$(now_ms)
-sid="$(printf '%s\n' "$activate_out" | tail -n1 | tr -d '\r')"
-echo "session: $sid (cold activate: $((t1 - t0))ms)"
-if ! printf '%s' "$sid" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
-  echo "::error::activate's last stdout line is not a session UUID: '$sid'"
-  echo "--- full activate stdout ---"; printf '%s\n' "$activate_out"
-  fail
-fi
+proof_shared_session
 echo "::endgroup::"
 
 # The session must be listed.
@@ -443,6 +485,7 @@ echo "warm 'min ls': $((t1 - t0))ms"
 # Ordered before the pty proof, which deletes the session.
 proof_session_exec() {
 echo "::group::session exec proof (min session exec)"
+proof_shared_session
 # shellcheck disable=SC2016 # $PWD must expand in the SESSION's shell, not here.
 exec_out="$(mnl session exec "$sid" 'echo EXEC_OK $PWD' 2>"$WORK/exec.err")" || {
   echo "::error::'min session exec $sid' failed"
@@ -524,6 +567,7 @@ echo "::endgroup::"
 proof_guest_egress() {
 if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   echo "::group::guest egress proof (curl from inside the session)"
+  proof_shared_session
   egress_ok=0
   egress_total=0
   egress_failed=""
@@ -1500,6 +1544,7 @@ echo "::endgroup::"
 #      session, so it must then be delisted.
 proof_sandbox() {
 echo "::group::sandbox proof (interactive attach via pty: min add $ADD_TOOL + run)"
+proof_shared_session
 t0=$(now_ms)
 # shellcheck disable=SC2086
 attach_out="$(python3 "$ROOT/scripts/e2e-attach-pty.py" "$ADD_TOOL" \
@@ -1729,12 +1774,19 @@ proof_min_internal_names_through_proxy() {
     if [ -n "$f" ]; then wc -l < "$f"; else printf '0\n'; fi
   }
   # The lines the log gained since its first $1 — the record(s) ONE request
-  # produced. The file writer is asynchronous, so callers poll this.
+  # produced, and nothing else. The file writer is asynchronous, and the
+  # daemon logs plenty besides the request while one is in flight — on CI the
+  # `minimald::server` SSH-handshake warnings chief among them — so the window
+  # is filtered to the net modules this case is about (their `target`, the
+  # module path in the JSON record). That is also what makes a routed request
+  # print its gap instead of an unrelated record: the proxy logs every
+  # refusal and both deprecation notices, and nothing for a request it serves.
+  # Callers poll this.
   proxy_daemon_log_since() {
     local f
     f="$(proxy_daemon_log)"
     [ -n "$f" ] || return 0
-    tail -n "+$(($1 + 1))" "$f"
+    tail -n "+$(($1 + 1))" "$f" | grep -E -- '"target": *"minimald::net::' || true
   }
   # Prints the daemon record that registered $1's box name — the registration
   # that is WHY the name routes (NET-001's daemon half, the one piece of it
@@ -1944,8 +1996,17 @@ proof_min_internal_names_through_proxy() {
   # The proof's assertions are about a box, a proxy and a host loopback, and
   # a host can lack any of them. Both gates degrade by observed fact, not by
   # host detection, and say exactly what they skipped — the own-IP proof's
-  # switch gate is the precedent. CI's native lane runs everything.
+  # switch gate is the precedent.
   #
+  # A skip is only ever honest on a developer host: a lane that exists to run
+  # these assertions and cannot is a red lane, not a degraded proof, because a
+  # green run that asserted nothing is precisely the regression these gates
+  # must never hide. CI sets CI=true on every lane; E2E_VM marks the VM-backed
+  # targets, where the boxes live in the guest, so a tripped gate there is a
+  # lane-level fault by definition. Only a host with neither may skip, and it
+  # is told so in a warning annotation, never as part of a passing transcript.
+  proxy_gate_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
+
   # 1. The session's sandbox program. A host that is itself a sandbox — a
   #    plain container, or a session box like the ones this product hosts —
   #    denies the nested mount namespaces a box's rootfs needs, and the
@@ -1954,19 +2015,20 @@ proof_min_internal_names_through_proxy() {
   #    daemon half of NET-001 on its own.
   if ! mnl session exec "$proxy_sid" 'true' >"$WORK/proxy-execgate.err" 2>&1 \
      && ! { sleep 1; mnl session exec "$proxy_sid" 'true' >"$WORK/proxy-execgate.err" 2>&1; }; then
-    echo "min.internal proxy proof SKIPPED — this host cannot run a session sandbox"
-    echo "  (exec: $(head -n1 "$WORK/proxy-execgate.err" 2>/dev/null || true))"
-    if hook_log_readable; then
+    if proxy_gate_can_skip; then
+      echo "::warning::min.internal proxy proof SKIPPED — this host cannot run a session sandbox"
+      echo "  (exec: $(head -n1 "$WORK/proxy-execgate.err" 2>/dev/null || true))"
       echo "  asserted here: the registration record above, the daemon half of NET-001."
-      echo "  routing, refusals and the deprecation notices need a host whose boxes can"
-      echo "  run; the native CI lane runs all of them"
-    else
-      echo "  a VM lane's boxes run inside its guest, so this is a lane-level fault:"
-      echo "  nothing this case asserts can run without them"
+      echo "  routing, refusals and the deprecation notices need a host whose boxes can run;"
+      echo "  on CI or a VM lane this gate fails instead"
+      mnl session destroy --force "$proxy_sid" >/dev/null 2>&1 || true
+      echo "::endgroup::"
+      return 0
     fi
-    mnl session destroy --force "$proxy_sid" >/dev/null 2>&1 || true
-    echo "::endgroup::"
-    return 0
+    echo "::error::this lane cannot run a session sandbox, so no probe inside a box can run: nothing this case asserts can be asserted"
+    echo "  (exec: $(head -n1 "$WORK/proxy-execgate.err" 2>/dev/null || true))"
+    echo "  on a VM lane the boxes live in the guest, so this is a lane-level fault"
+    fail
   fi
 
   # 2. The hostname proxy's listen address. EGRESS_PROXY_PORT is fixed at
@@ -1980,25 +2042,30 @@ proof_min_internal_names_through_proxy() {
   #    this one must not read as a conflict — then degrades to the one name
   #    requirement that needs no listener at all.
   proxy_bind_taken=0
-  for _ in 1 2 3 4 5; do
+  for proxy_bind_try in 1 2 3 4 5; do
     proxy_ls_out="$(mnl ls 2>&1)"
     case "$proxy_ls_out" in
       *"session hostnames will not route"*) proxy_bind_taken=1 ;;
       *) proxy_bind_taken=0; break ;;
     esac
-    [ "$_" = 5 ] || sleep 3
+    [ "$proxy_bind_try" = 5 ] || sleep 3
   done
   if [ "$proxy_bind_taken" -eq 1 ]; then
-    proxy_start_host_listener
-    proxy_assert_host_by_name "$proxy_sid" "NET-003 (degraded)"
-    echo "min.internal proxy routing SKIPPED — another daemon owns 127.0.0.1:7654 on this host"
-    echo "  asserted here: host.min.internal, straight from the box"
-    hook_log_readable && echo "  and the registration record above, the daemon half of NET-001"
-    echo "  routing and the refusals need this run's daemon to own :7654, and the"
-    echo "  native CI lane has no such conflict"
-    mnl session destroy --force "$proxy_sid" >/dev/null 2>&1 || true
-    echo "::endgroup::"
-    return 0
+    if proxy_gate_can_skip; then
+      proxy_start_host_listener
+      proxy_assert_host_by_name "$proxy_sid" "NET-003 (degraded)"
+      echo "::warning::min.internal proxy routing SKIPPED — another daemon owns 127.0.0.1:7654 on this host"
+      echo "  asserted here: host.min.internal, straight from the box"
+      hook_log_readable && echo "  and the registration record above, the daemon half of NET-001"
+      echo "  routing and the refusals need this run's daemon to own :7654; on CI or a VM"
+      echo "  lane this gate fails instead"
+      mnl session destroy --force "$proxy_sid" >/dev/null 2>&1 || true
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::another daemon owns 127.0.0.1:7654, so this run's daemon cannot route session hostnames: every probe through the proxy would reach a daemon that knows nothing about this run's boxes"
+    echo "--- min ls ---"; printf '%s\n' "${proxy_ls_out:-}"
+    fail
   fi
 
   proxy_start_host_listener
@@ -2183,10 +2250,13 @@ proof_min_internal_names_through_proxy() {
     # NET-004: the deprecated literal itself. It must still reach the host's
     # loopback, and the box's egress relay must notice the connection — the
     # notice is the reason the address is deprecated. The relay runs in the
-    # daemon (in-guest on every switch lane today), so its record is
-    # readable exactly where the daemon is native; the lanes that have a
-    # switch and an in-guest daemon assert the routing and name the notice,
-    # which the switch.rs unit tests pin.
+    # daemon, and every lane that has a switch (MINVMD_GVPROXY_BIN, the gate
+    # around this half) also runs with E2E_VM=1 — the justfile's `e2e-env`
+    # and the KVM lane set the pair together — so the `hook_log_readable`
+    # branch below is UNREACHABLE FROM CI: it serves developer runs only, a
+    # host driving a native daemon against a switch by hand. The switch lanes
+    # CI does run assert the routing and name the notice, whose emission the
+    # switch.rs unit tests pin.
     proxy_request "$PROXY_OWN_SID" "NET-004: the deprecated literal still reaches the host's loopback" \
       "http://$PROXY_HOST_ALIAS:$PROXY_HOST_PORT/marker" direct ""
     proxy_want 200 "$PROXY_HOST_MARKER" ""
