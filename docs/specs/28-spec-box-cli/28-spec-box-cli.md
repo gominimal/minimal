@@ -67,7 +67,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal show_and_prune_dry_run_report_disk
 
-- **BCLI-007** WHEN `min shell`, `min attach`, or `min box resume` targets a stopped or exited session THE SYSTEM SHALL resume it as BOX-025 defines.
+- **BCLI-007** WHEN `min shell`, `min attach`, or `min box resume` targets a stopped or exited box whose spec sets `pty_enabled` THE SYSTEM SHALL resume it as BOX-025 defines.
   <!-- split from BOX-025: which verbs resume; the resume itself stays in BOX -->
   tier:     T0
   verify:   cargo nextest run -p minimal shell_attach_and_resume_verbs_resume_stopped_session
@@ -167,10 +167,10 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal box_spec_renders_unenforced_sections
 
-- **BCLI-024** THE SYSTEM SHALL document `--network` and `--ingress` on `min session start` and `min box start` as overrides of the entry's `[network]` keys.
+- **BCLI-024** WHEN `min session start` or `min box start` runs with `--network` or `--ingress` THE SYSTEM SHALL pass the flag's value to BOX-064's command-line override layer, applied last after loadouts, so the stored spec, its projection and `min box show --network` all carry the overridden `[network]` value, and document both flags as overrides of the entry's `[network]` keys.
   <!-- was BOX-082 -->
   tier:     T0
-  verify:   cargo nextest run -p minimal network_flags_documented_as_overrides
+  verify:   cargo nextest run -p minimal network_flags_override_stored_spec_and_projection
 
 - **BCLI-025** WHEN `min box show <box> --network` runs THE SYSTEM SHALL render the effective `[network]` section from the stored spec.
   <!-- was BOX-083 -->
@@ -230,6 +230,10 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   - IF a command fails in a machine output mode THEN THE SYSTEM SHALL write one JSON object to stderr carrying `code`, `message` and `hint`.
     tier:   T0
     verify: cargo nextest run -p minimal machine_mode_error_object_on_stderr
+
+- **BCLI-063** WHEN a `min` command renders a spec, a record, an event or an error object in any output mode THE SYSTEM SHALL write each secret as a reference only, never its value.
+  tier:     T0
+  verify:   cargo nextest run -p minimal secrets_rendered_as_refs_in_every_output_mode
 
 - **BCLI-034** THE SYSTEM SHALL use exit code 2 for usage errors, 3 for invalid configuration, 4 for not found, 5 for policy refusals, 7 for an unreachable host, 8 for insufficient resources, and 125 to 127 for runtime failures.
   <!-- was BOX-097 -->
@@ -301,7 +305,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   <!-- was BOX-107; the mapping follows epic S12. `session destroy` maps to the forced reap (BOX-019) so a live box is still stopped and removed and BEP-043's revoke-on-destroy fires; a bare `session rm` of a running box is refused (BCLI-004). -->
   tier:     T0
   verify:   cargo nextest run -p minimal legacy_session_verbs_alias_with_hint
-  - IF an alias from BCLI-041 or BCLI-042 is invoked after the release that accepted it THEN THE SYSTEM SHALL fail with exit 2 carrying the same hint.
+  - IF an alias from BCLI-041, BCLI-042 or BCLI-046 is invoked after the release that accepted it THEN THE SYSTEM SHALL fail with exit 2 carrying the same hint.
     tier:   T0
     verify: cargo nextest run -p minimal aliases_exit2_after_grace_release
 
@@ -394,12 +398,12 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 - **Invariant:** THE SYSTEM SHALL never write a secret value in any output mode.
   enforced by: every rendering of a spec or record carries a secret as a reference only (architecture Output conventions: secrets never appear in any output mode)
-  covered by: BCLI-021, BCLI-033
+  covered by: BCLI-021, BCLI-063
 
 ## Open questions
 
-- [NEEDS CLARIFICATION (MEDIUM): the architecture's exit-code table has no row for a timeout or for a box ended by a stop; BCLI-014 returns 124 by convention beside 137 for OOM, and BCLI-013 returns 128 plus the stored signal for a stopped box with no exit code, and 137 for a stopped record with no stored signal (BOX-154), each needing a row (gominimal/arch#97).]
-- [NEEDS CLARIFICATION (MEDIUM): BCLI-007 gives `min box resume` a process-restart meaning beyond the architecture's gloss ("re-establish identity for a stopped/host-resumed box"); the architecture needs one line saying the verb also restarts a PTY box's processes (gominimal/arch#98).]
+- [NEEDS CLARIFICATION (MEDIUM): the architecture's exit-code table has no row for a timeout or for a box ended by a stop; BCLI-014 returns 124 by convention beside 137 for OOM, and BCLI-013 returns 128 plus the stored signal for a stopped box with no exit code, and 137 for a stopped record with no stored signal (BOX-154), each needing a row (the timeout row in gominimal/arch#97; the 128-plus-signal and 137 stop rows raised on gominimal/arch#97 (comment)).]
+- [NEEDS CLARIFICATION (MEDIUM): BCLI-007 gives `min box resume` a process-restart meaning beyond the architecture's gloss ("re-establish identity for a stopped/host-resumed box"); the architecture needs one line saying the verb also restarts a PTY box's processes (raised on gominimal/arch#98 (comment)).]
 - [NEEDS CLARIFICATION (MEDIUM): NET-035 binds `--help` to `min session activate`, and NET-061 and the draft GWI-003 cite `min session policy`; both are BCLI-042 aliases for one release, and NET-035, NET-061 and GWI-003 should re-cite `min session start` and `min box show --network` (BCLI-025) before the aliases are removed.]
-- [NEEDS CLARIFICATION (LOW): the architecture's `min box prune` has no `--dry-run` (BCLI-006), and no create verb carries `--network` or `--ingress` overrides (BCLI-024); both are this spec's additions pending one architecture line each (gominimal/arch#98).]
+- [NEEDS CLARIFICATION (LOW): the architecture's `min box prune` has no `--dry-run` (BCLI-006), and no create verb carries `--network` or `--ingress` overrides (BCLI-024), nor does its expansion order have the command-line override layer those flags feed (BOX-064); each is this spec's addition pending one architecture line (raised on gominimal/arch#98 (comment)).]
 - [NEEDS CLARIFICATION (MEDIUM): the architecture's command tree lacks `min box rename`, the replacement BCLI-042 names for `session rename`, and `min host stop` (BCLI-049, BCLI-050); both are written to this spec's additions pending one architecture line each (gominimal/arch#98).]
