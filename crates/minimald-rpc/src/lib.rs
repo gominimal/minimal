@@ -1526,7 +1526,7 @@ mod tests {
 
         let down = ListSessionsResponse {
             hostname_routing_unavailable: Some("port 7654 is held".into()),
-            ..resp
+            ..resp.clone()
         };
         let json = serde_json_lenient::to_string(&down).expect("serializes");
         let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
@@ -1537,7 +1537,7 @@ mod tests {
 
         let discovered = ListSessionsResponse {
             hostname_proxy_port: Some(41234),
-            ..resp
+            ..resp.clone()
         };
         let json = serde_json_lenient::to_string(&discovered).expect("serializes");
         let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
