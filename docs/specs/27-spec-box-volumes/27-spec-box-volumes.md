@@ -15,7 +15,7 @@ Every box starts from an empty filesystem, so package downloads and build caches
 
 This spec is the first backing: a volume lives on the host that runs the box, in a directory under the host's state directory. The interface a developer sees, the `volumes` key and the `min volume` verbs, is the one the object-storage backing will serve, and does not change when it arrives.
 
-**Success:** in one project, a box created from an entry declaring `volumes = ["cache"]` after the previous such box is removed sees that box's files; a box of another project with the same declaration sees none of them; a second writer is refused with exit 5 naming the holder; `min volume list` shows the volume's size, last use and users; and removing every box leaves the volume in place.
+**Success:** in one project, a box created from an entry declaring `volumes = ["cache"]` after the previous such box is removed sees that box's files; a box of another project with the same declaration sees none of them; a second writer is refused with exit 5 naming the holder while the first box runs or is stopped, and admitted once the first box exits; `min volume list` shows the volume's size, last use and users; and removing every box leaves the volume in place.
 
 **First slice:** a declared volume is created on first use, mounted, and reattached by project and name in the next box (BVOL-001 to BVOL-003), listed by `min volume list` (BVOL-006), with no single-writer check yet.
 
@@ -63,13 +63,17 @@ This spec is the first backing: a volume lives on the host that runs the box, in
   tier:     T0
   verify:   cargo nextest run -p minimald volume_never_mounted_across_projects
 
-- **BVOL-010** THE SYSTEM SHALL keep a box's write hold on a volume for as long as the box's record exists, across stop, exit and resume, and release it when `min box rm` or `min box prune` reaps the box.
+- **BVOL-010** THE SYSTEM SHALL hold each volume a box declares `rw` for writing while the box is `pending`, `materializing`, `running` or `stopped`, and release that hold when the box reaches `exited` or is reaped.
   tier:     T0
-  verify:   cargo nextest run -p minimald write_hold_persists_until_box_reaped
+  verify:   cargo nextest run -p minimald write_hold_kept_while_stopped_released_on_exit
 
-- **BVOL-012** WHEN `min volume prune` runs THE SYSTEM SHALL skip every volume that a box holds for writing, whatever its last use.
+- **BVOL-013** IF an `exited` box is resumed while another box holds for writing a volume the resumed box declares `rw` THEN THE SYSTEM SHALL refuse the resume with exit 5, naming the holding box, and leave the record `exited`.
   tier:     T0
-  verify:   cargo nextest run -p minimald volume_prune_skips_held_volumes
+  verify:   cargo nextest run -p minimald resume_from_exited_refused_exit5_when_volume_held
+
+- **BVOL-012** WHEN `min volume prune` runs THE SYSTEM SHALL skip every volume that a box holds for writing under BVOL-010, whatever its last use, and treat a volume whose only writers have reached `exited` as unheld.
+  tier:     T0
+  verify:   cargo nextest run -p minimald volume_prune_skips_held_prunes_exited_writers
 
 - **BVOL-011** THE SYSTEM SHALL accept each `volumes` item as a bare name, meaning `mode = "rw"`, or as `{ name = "<name>", mode = "rw" | "ro" }`, holding an `rw` volume for writing and mounting an `ro` volume read-only.
   tier:     T0
@@ -86,7 +90,7 @@ This spec is the first backing: a volume lives on the host that runs the box, in
 
 **Volumes are keyed by project and name.** The architecture scopes volume names to the project (AT21), so two projects on one host that both declare `cache` get two volumes (BVOL-009). A host-wide name would have let one project's compromised run poison another's cache.
 
-**A write hold lasts as long as the box record.** The owner decided on 2026-09-25 that the hold persists across stop, exit and resume and is released when the box is reaped (BVOL-010), so a stopped session always resumes with its volume and resume needs no second check. `min volume prune` skips a held volume for the same reason (BVOL-012). The alternative, releasing the hold on stop and re-checking it on resume, was rejected by the owner because a stopped box could then fail to resume after another box took its volume. The cost is that a second writer waits for the first box's `rm`, not its stop.
+**A write hold ends when the box exits, not when it stops.** The owner decided on 2026-09-25 that a box keeps its write hold while `stopped` and releases it on reaching `exited` (BVOL-010), so a task re-run at once takes the volume its previous run just wrote, and a stopped session still resumes with its volume. The exited record and the volume's files stay readable; only the hold drops. `min volume prune` skips only a volume that is still held, so a volume whose writers have all exited can be pruned (BVOL-012). Two alternatives were rejected by the owner. Keeping the hold until the box is reaped, for every box, made each repeat run of a task fail with exit 5 until the previous run was pruned. Releasing on exit only for `until_complete` boxes had the same effect keyed on the lifetime, since a session is `until_complete` too. The accepted consequence is that a session whose shell exited, which is `exited` and still resumable as a PTY box (BOX-030), may find its volume held by another box on resume, and is then refused by the single-writer rule with exit 5 (BVOL-013).
 
 **A bare volume name means read-write.** The owner decided on 2026-09-25 that `volumes = ["cache"]` holds the volume for writing, matching the architecture's `volumes = ["dev"]` example, which implies a writer; `{ name, mode = "ro" }` is the reader form (BVOL-011). The alternative, a bare name meaning read-only, was rejected by the owner because it diverges from that example.
 
@@ -95,8 +99,8 @@ This spec is the first backing: a volume lives on the host that runs the box, in
 ## Security considerations
 
 - **Invariant:** THE SYSTEM SHALL never let two boxes hold one volume for writing at the same time.
-  enforced by: the host daemon's writer hold on each volume, checked when a box is created and held until the box is reaped
-  covered by: BVOL-004, BVOL-010
+  enforced by: the host daemon's writer hold on each volume, checked when a box is created or resumed from `exited`, and held until the box reaches `exited` or is reaped
+  covered by: BVOL-004, BVOL-010, BVOL-013
 
 - **Invariant:** THE SYSTEM SHALL never mount a volume created by one project into a box of another project.
   enforced by: the host daemon keys each volume on its project and name (architecture threat AT21, Box Volume poisoning)
