@@ -157,17 +157,28 @@ async fn finish_own_ip_attach(
     // One info line per exposed mapping (NET-040): the host address it is
     // reachable at, the port, and the session it belongs to — so the daemon
     // log tail (and the `min bug` bundle carrying it) shows each forwarder
-    // expose call and its result when a publish goes wrong. A successful
-    // apply is 1:1 with the requested mappings, so log from those; the host
-    // address is the loopback `expose_request` publishes at.
-    if let Some(ingress) = ingress {
-        for mapping in &ingress.port_mappings {
-            tracing::info!(
-                host = "127.0.0.1",
-                port = mapping.external_port,
+    // expose call and its result when a publish goes wrong. Reported from
+    // `exposed` — the forwards the switch actually accepted, 1:1 with the
+    // request since a failed apply rolls back and errors above — and from
+    // each forward's own `local` bind, never from the request: the record
+    // stays true to what the forwarder holds if the address `expose_request`
+    // binds ever moves off the loopback.
+    for mapping in &exposed {
+        match mapping.host_port() {
+            Some((host, port)) => tracing::info!(
+                host,
+                port,
                 session = session_name,
                 "exposed ingress port on the host loopback"
-            );
+            ),
+            // `expose_request` cannot build a `local` that splits into no
+            // host and port; if one ever appears, name what the forwarder
+            // holds rather than invent a port for it.
+            None => tracing::info!(
+                local = %mapping.local(),
+                session = session_name,
+                "exposed ingress port on the host loopback"
+            ),
         }
     }
 
