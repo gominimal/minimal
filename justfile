@@ -412,12 +412,12 @@ test-cross: (_need "cross" "cargo install cross --locked")
 #
 # The local PR gate set, cheapest first.
 [linux]
-ci: fmt-check check-version clippy deny test doctest test-ignored
+ci: fmt-check check-version clippy clippy-strict deny test doctest test-ignored
     @echo "ci: local PR gates green"
 
 # The local PR gate set, cheapest first (`just test-cross` covers the Linux-only crates).
 [macos]
-ci: fmt-check check-version clippy deny test doctest
+ci: fmt-check check-version clippy clippy-strict deny test doctest
     @echo "ci: local PR gates green"
 
 # Run the curl|sh installer's tests under every POSIX sh. CI: ci-shell-installer.yml.
