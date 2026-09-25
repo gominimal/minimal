@@ -194,6 +194,44 @@ fn preview_section_with_screen_snapshot() {
 }
 
 #[test]
+fn detail_pane_with_policy() {
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![entry(1, Some("api-staging"), "/src/api")],
+    )]);
+    let key = SessionKey {
+        provider: "host".to_string(),
+        id: id(1),
+    };
+    model.details.insert(
+        key,
+        Detail {
+            record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
+            policy: Some(sessions::SessionPolicy::new(
+                Some(sessions::EgressPolicy {
+                    allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                    allow_dns_hosts: None,
+                    allow_protocols: None,
+                    deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
+                }),
+                Some(sessions::IngressPolicy {
+                    port_mappings: vec![sessions::PortMapping {
+                        external_port: 8080,
+                        internal_port: 80,
+                        proto: sessions::IpProto::Tcp,
+                    }],
+                    dynamic_allowed_range: None,
+                    dynamic_ingress: None,
+                }),
+            )),
+        },
+    );
+    // Focus the session.
+    model.cursor = 1;
+    insta::assert_snapshot!(render(&mut model));
+}
+
+#[test]
 fn detail_pane_shows_dynamic_ingress() {
     let mut model = fixed_model(vec![provider(
         "host",
