@@ -60,12 +60,13 @@ git push origin <commit>:refs/heads/release/X.Y.Z
 ```
 
 Nothing in the pipeline reads the branch name. The draft release and the tag
-point at the commit.
+point at the commit. Steps 3 and 4 call this branch `<branch>`. It is `main`
+or `release/X.Y.Z`.
 
 ### 3. Rehearse the release run
 
 ```sh
-gh workflow run release.yml --ref release/X.Y.Z -f versioned=true -f dry_run=true
+gh workflow run release.yml --ref <branch> -f versioned=true -f dry_run=true
 ```
 
 A dry run builds, signs, packages, and smoke-tests everything. It uploads
@@ -74,7 +75,7 @@ nothing and does not use up the version number. Wait for it to pass.
 ### 4. Stage the release
 
 ```sh
-gh workflow run release.yml --ref release/X.Y.Z -f versioned=true -f dry_run=false
+gh workflow run release.yml --ref <branch> -f versioned=true -f dry_run=false
 ```
 
 When the run passes, it did these things:
@@ -169,6 +170,8 @@ that is already public, so a new run fails at its first publish job.
 
 ### 8. Clean up
 
+If you pushed a branch in step 2, delete it:
+
 ```sh
 git push origin --delete release/X.Y.Z
 ```
@@ -195,11 +198,12 @@ meet the policy yet.
 
 | Artifact | How the release run tests it |
 | --- | --- |
-| Linux amd64 `min`, `mip`, `minimald`, `minvmd`, `gvproxy-min` | `smoke-linux-amd64` runs the session e2e on the host daemon. `smoke-linux-kvm` runs it in a KVM microVM. |
+| Linux amd64 `min`, `minimald`, `minvmd`, `gvproxy-min` | `smoke-linux-amd64` runs the session e2e on the host daemon. `smoke-linux-kvm` runs it in a KVM microVM. |
 | amd64 guest kernel, rootfs, and initramfs | `smoke-linux-kvm` boots them. |
 | arm64 guest kernel, rootfs, and initramfs | `smoke-macos` boots them. |
-| macOS arm64 `min`, `minvmd`, `libkrun.1.dylib`, `gvproxy` | `smoke-macos` runs the session e2e with the signed files in the installer layout. **Gap:** when the `RUN_MACOS_CI` variable is `false`, this job skips and the run counts the skip as a pass. |
-| Linux arm64 `min`, `mip`, `minimald`, `minvmd`, `gvproxy-min` on a Linux host | **Gap.** No smoke job runs on a Linux arm64 host. |
+| macOS arm64 `min`, `minvmd`, `libkrun.1.dylib`, `gvproxy-min` | `smoke-macos` runs the session e2e with the signed files in the installer layout. **Gap:** when the `RUN_MACOS_CI` variable is `false`, this job skips and the run counts the skip as a pass. |
+| Linux arm64 `min`, `minimald`, `minvmd`, `gvproxy-min` on a Linux host | **Gap.** No smoke job runs on a Linux arm64 host. |
+| Linux `mip`, amd64 and arm64 | **Gap.** `smoke-linux-kvm` downloads `mip`, but no job runs it. |
 | amd64 `.deb` | `smoke-linux-amd64` installs it and checks that `min -V` shows the release version. Versioned runs only. |
 | arm64 `.deb`, every `.rpm`, every `.apk` | **Gap.** No job installs them. |
 | `install.sh` and the AppArmor profile installer | The `ci-shell-installer` lane tests both scripts on every PR. **Gap:** no release job installs the staged folder through `install.sh`. |
