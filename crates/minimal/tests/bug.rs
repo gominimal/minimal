@@ -83,6 +83,7 @@ fn global_args(state: &Path, config: &Path) -> GlobalArgs {
         config_dir: Some(config.to_path_buf()),
         provider: None,
         no_input: false,
+        vm: None,
     }
 }
 

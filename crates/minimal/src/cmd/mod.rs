@@ -19,11 +19,13 @@ use crate::*;
 
 mod admin;
 mod list;
+mod net;
 mod project;
 mod session;
 
 pub use admin::*;
 pub use list::*;
+pub use net::*;
 pub use project::*;
 pub use session::*;
 
@@ -72,6 +74,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
         },
         Some(Command::Run(args)) => task::cmd_run(&args),
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Forward(args),
+        })) => cmd_net_forward(&cli.global_args, args).await,
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         #[cfg(feature = "remote-access")]

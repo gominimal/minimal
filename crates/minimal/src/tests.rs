@@ -69,6 +69,7 @@ fn every_daemon_connection_is_classified() {
             "cmd/list.rs::cmd_bare = gated",
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
+            "cmd/net.rs::cmd_net_forward = gated",
             "cmd/session.rs::cmd_attach = gated",
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
@@ -327,6 +328,7 @@ async fn login_mints_no_certificate() {
         config_dir: Some(config.clone()),
         provider: None,
         no_input: true,
+        vm: None,
     };
 
     // No daemon is running and none may be spawned: with the certificate
@@ -1480,6 +1482,7 @@ async fn stop_is_a_no_op_when_the_daemon_is_already_down() {
         config_dir: None,
         provider: None,
         no_input: true,
+        vm: None,
     };
 
     cmd_stop(&global, StopArgs { force: false })

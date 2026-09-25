@@ -5,18 +5,16 @@ use russh::{
 use sessions::SessionId;
 use std::{
     collections::BTreeMap,
+    pin::Pin,
     sync::{Arc, LazyLock},
+    task::{Context, Poll},
+    time::Duration,
 };
-// Used only by the `ssh-forward` direct-tcpip handler.
-#[cfg(feature = "ssh-forward")]
-use std::time::Duration;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
     sync::{Mutex, MutexGuard},
 };
-// Used only by the `ssh-forward` direct-tcpip handler.
-#[cfg(feature = "ssh-forward")]
-use tokio::net::TcpStream;
 
 use crate::{
     ChannelConfig, RequestedPty, exec,
@@ -457,7 +455,9 @@ impl russh::server::Handler for ConnectionHandler {
     ///
     /// The connection attempt times out after 10 seconds; a failure rejects the
     /// channel so the SSH client receives a clean error rather than hanging.
-    #[cfg(feature = "ssh-forward")]
+    ///
+    /// Served in every build: the `ssh-forward` feature gate is retired
+    /// (NET-110), so a release build forwards ports too.
     async fn channel_open_direct_tcpip(
         &mut self,
         channel: RuChannel<Msg>,
@@ -509,8 +509,8 @@ impl russh::server::Handler for ConnectionHandler {
             return Ok(());
         };
         let mngr = serv.sessions_manager().await;
-        match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
-            Ok(Some(_)) => {}
+        let session = match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
+            Ok(Some(session)) => session,
             Ok(None) => {
                 tracing::warn!(
                     %session_id,
@@ -532,7 +532,7 @@ impl russh::server::Handler for ConnectionHandler {
                     .await;
                 return Ok(());
             }
-        }
+        };
 
         let host = host_to_connect.to_string();
         let port = match u16::try_from(port_to_connect) {
@@ -544,69 +544,303 @@ impl russh::server::Handler for ConnectionHandler {
             }
         };
 
-        // Connect to the target before accepting the channel. If the target is
-        // unreachable within the grace period, reject rather than leaving the
-        // client with an open-but-dead channel.
-        let upstream = match tokio::time::timeout(
-            Duration::from_secs(10),
-            TcpStream::connect((host.as_str(), port)),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(error)) => {
+        // Where the dial runs: a `host_ip` box shares the daemon's network
+        // namespace, so the daemon can open the socket itself, but a box with
+        // its own netns (`none`, `own_ip`) has a loopback of its own — a dial
+        // from the daemon would reach the daemon, not the box — so there the
+        // dial runs inside the box's namespaces.
+        let site = match session.record().await {
+            Ok(record) => dial_site(record.network),
+            Err(e) => {
                 tracing::warn!(
-                    %host,
-                    port,
-                    %error,
-                    "direct-tcpip: could not connect to target"
+                    %session_id,
+                    error = %e,
+                    "direct-tcpip rejected: session record unreadable"
                 );
-                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                reply
+                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
                 return Ok(());
             }
-            Err(_) => {
-                tracing::warn!(
-                    %host,
-                    port,
-                    "direct-tcpip: connection to target timed out"
-                );
-                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+        };
+
+        // Bring the box-side half of the relay up before accepting the
+        // channel, so a shared-netns dial can still refuse with `ConnectFailed`
+        // rather than leaving an open-but-dead channel. The in-box dial cannot
+        // be observed from here — the in-box process connects after the accept
+        // — so it is accepted with the spawn, and a box port that refuses
+        // surfaces as the relay ending at once: the client sees the connection
+        // close, which is what a refused dial looks like.
+        enum Upstream {
+            Shared(TcpStream),
+            InBox(ChildStdio),
+        }
+        let upstream = match site {
+            DialSite::Shared => match tokio::time::timeout(
+                Duration::from_secs(10),
+                TcpStream::connect((host.as_str(), port)),
+            )
+            .await
+            {
+                Ok(Ok(s)) => Ok(Upstream::Shared(s)),
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        %host,
+                        port,
+                        %error,
+                        "direct-tcpip: could not connect to target"
+                    );
+                    Err(russh::ChannelOpenFailure::ConnectFailed)
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        %host,
+                        port,
+                        "direct-tcpip: connection to target timed out"
+                    );
+                    Err(russh::ChannelOpenFailure::ConnectFailed)
+                }
+            },
+            DialSite::InBox => dial_in_box(&session, uname, &host, port)
+                .await
+                .map(Upstream::InBox),
+        };
+        let upstream = match upstream {
+            Ok(upstream) => upstream,
+            Err(failure) => {
+                reply.reject(failure).await;
                 return Ok(());
             }
         };
 
         reply.accept().await;
 
-        // Relay bytes bidirectionally: SSH channel ↔ upstream TCP.
-        tokio::spawn(relay_streams(channel.into_stream(), upstream));
+        // One info line per served channel open (NET-110): the daemon log —
+        // and the diagnostics bundle's tail of it — names every direct-tcpip
+        // channel that relays, with the session it forwarded for and the box
+        // port it reached, and where the dial ran.
+        tracing::info!(
+            session_id = %session_id,
+            host = %host,
+            port,
+            dial = ?site,
+            "direct-tcpip channel open: relaying bytes to the box port"
+        );
 
-        Ok(())
-    }
+        // Relay bytes bidirectionally: SSH channel ↔ upstream. The relay is
+        // the session's to abort at teardown, so a session that goes away
+        // takes its forwards down with it.
+        let relay = match upstream {
+            Upstream::Shared(socket) => tokio::spawn(relay_streams(channel.into_stream(), socket)),
+            Upstream::InBox(child) => tokio::spawn(relay_streams(channel.into_stream(), child)),
+        };
+        session.track_forward(relay.abort_handle()).await;
 
-    /// With the `ssh-forward` feature disabled, port-forwarding is compiled out.
-    /// Reject every `direct-tcpip` channel so forwarding fails **closed**, rather
-    /// than relying on whatever russh's default handler does (finding #4 / the
-    /// user decision to disable ssh-forward for now).
-    #[cfg(not(feature = "ssh-forward"))]
-    async fn channel_open_direct_tcpip(
-        &mut self,
-        _channel: RuChannel<Msg>,
-        _host_to_connect: &str,
-        _port_to_connect: u32,
-        _originator_address: &str,
-        _originator_port: u32,
-        reply: ChannelOpenHandle,
-        _session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        reply
-            .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
-            .await;
         Ok(())
     }
 }
 
+/// Where a direct-tcpip dial must run, decided by the session's network mode.
+#[derive(Debug, PartialEq, Eq)]
+enum DialSite {
+    /// The box shares the daemon's network namespace (`host_ip`): the daemon
+    /// opens the socket itself.
+    Shared,
+    /// The box has a network namespace of its own (`none`, `own_ip`), whose
+    /// `127.0.0.1` is not the daemon's: the dial runs inside the box's
+    /// namespaces.
+    InBox,
+}
+
+fn dial_site(network: sessions::NetworkMode) -> DialSite {
+    match network {
+        sessions::NetworkMode::HostNet => DialSite::Shared,
+        // The modes this daemon knows, and any a newer config carries:
+        // `127.0.0.1` always means inside the box, and dialing there from
+        // the box is the one reading that holds for every isolated mode.
+        sessions::NetworkMode::NoNet | sessions::NetworkMode::OwnIp | _ => DialSite::InBox,
+    }
+}
+
+/// socat's half-close linger (`-t`), in seconds, for the in-box dial.
+///
+/// socat's own default is half a second: the moment one side reaches EOF —
+/// a laptop client that half-closes its write half and waits for the reply is
+/// the common case — socat shuts the other side's write half down and gives
+/// the reply that long to arrive before exiting. A box slower than that
+/// loses its answer. Five is generous without holding a dead relay open:
+/// every other end of the dial is bounded by something else (the box's own
+/// refusal, the channel closing, the child's `kill_on_drop`), so the linger
+/// only widens the window a half-closing client has to hear the box.
+const IN_BOX_DIAL_LINGER_SECS: u32 = 5;
+
+/// Dials `host:port` from inside the box's namespaces, returning the relay's
+/// box-side half on success and the SSH open failure to reject the channel
+/// with otherwise.
+///
+/// The box's namespaces are reached the one sanctioned way — a command run
+/// in-session, which is the nsenter injection joining every namespace the
+/// box unshared, netns included — and the dial itself is a `socat` relaying
+/// the box port onto its stdio. `socat` is a baseline package, so every box
+/// has it.
+///
+/// `session` is the session the channel is being opened for; `conn_username`
+/// is its SSH username (the session's UUID), passed to `ensure_host` the way
+/// the exec path does.
+async fn dial_in_box(
+    session: &crate::session::SessionHandle,
+    conn_username: &str,
+    host: &str,
+    port: u16,
+) -> Result<ChildStdio, russh::ChannelOpenFailure> {
+    let host_handle = match session.ensure_host(conn_username.to_string()).await {
+        Ok(host_handle) => host_handle,
+        Err(e) => {
+            tracing::warn!(
+                host,
+                port,
+                error = %e,
+                "direct-tcpip: could not bring the box up to dial from"
+            );
+            return Err(russh::ChannelOpenFailure::AdministrativelyProhibited);
+        }
+    };
+    let mut command = match host_handle
+        .command_in_session_env(
+            "socat",
+            [
+                format!("-t{IN_BOX_DIAL_LINGER_SECS}"),
+                "-".to_string(),
+                format!("TCP:{host}:{port},connect-timeout=10"),
+            ],
+            relay_extra_env(),
+        )
+        .await
+    {
+        Ok(command) => command,
+        Err(e) => {
+            tracing::warn!(
+                host,
+                port,
+                error = %e,
+                "direct-tcpip: could not build the in-box dial"
+            );
+            return Err(russh::ChannelOpenFailure::ConnectFailed);
+        }
+    };
+    use std::process::Stdio;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let child = match tokio::process::Command::from(command)
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!(
+                host,
+                port,
+                error = %e,
+                "direct-tcpip: could not start the in-box dial"
+            );
+            return Err(russh::ChannelOpenFailure::ConnectFailed);
+        }
+    };
+    Ok(ChildStdio::new(child))
+}
+
+/// The envp the in-box dial layers over the session's own variables.
+///
+/// Production layers nothing: the relay is the box's own `socat`, on the
+/// box's own `PATH`, and the dial deliberately inherits the session's
+/// environment and nothing else. This exists for the other build: under
+/// test the harness's "in-session" command runs host-side with the mock
+/// session's *empty* environment (see the `cfg(test)` swap in
+/// [`crate::session_host`]), so `socat` would resolve through the libc
+/// default path (`/bin:/usr/bin`) — which has it on hosts that happen to
+/// install it, but not on a bare CI runner. The in-box-dial test instead
+/// points the dial at its own `socat` stand-in through the `PATH` it
+/// publishes in [`TEST_RELAY_PATH_VAR`].
+#[cfg(test)]
+fn relay_extra_env() -> BTreeMap<String, String> {
+    match std::env::var(TEST_RELAY_PATH_VAR) {
+        Ok(path) => BTreeMap::from([("PATH".to_string(), path)]),
+        Err(_) => BTreeMap::new(),
+    }
+}
+
+/// The production half of [`relay_extra_env`]: the box's own environment,
+/// nothing layered. Same statement the two-argument
+/// `command_in_session` would make, said in the form the one call site
+/// shares with the test build.
+#[cfg(not(test))]
+fn relay_extra_env() -> BTreeMap<String, String> {
+    BTreeMap::new()
+}
+
+/// The `PATH` the in-box dial's relay resolves through, under test.
+///
+/// Read only by [`relay_extra_env`]; set only by the in-box-dial test, to
+/// the directory holding its `socat` stand-in ahead of the ambient `PATH`.
+#[cfg(test)]
+const TEST_RELAY_PATH_VAR: &str = "MINIMALD_TEST_RELAY_PATH";
+
+/// The box-side half of an in-box dial: the piped stdio of the injected
+/// relay process. Reads are the bytes the box port sent back; writes are the
+/// bytes being forwarded to it.
+///
+/// The child is held — boxed, so this stays `Unpin` for [`relay_streams`] —
+/// because its drop is the kill: `kill_on_drop` on the injection shim, whose
+/// PDEATHSIG takes the in-box program with it. Never read on purpose.
+struct ChildStdio {
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+    _child: Pin<Box<tokio::process::Child>>,
+}
+
+impl ChildStdio {
+    fn new(mut child: tokio::process::Child) -> Self {
+        let stdin = child.stdin.take().expect("stdin was piped");
+        let stdout = child.stdout.take().expect("stdout was piped");
+        Self {
+            stdin,
+            stdout,
+            _child: Box::pin(child),
+        }
+    }
+}
+
+impl AsyncRead for ChildStdio {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdout).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ChildStdio {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stdin).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdin).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdin).poll_shutdown(cx)
+    }
+}
+
 /// Relay bytes bidirectionally between two async streams, logging any relay error.
-#[cfg(feature = "ssh-forward")]
 async fn relay_streams<A, B>(mut a: A, mut b: B)
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -617,10 +851,7 @@ where
     }
 }
 
-// The only test here exercises `relay_streams`, which is itself behind
-// `ssh-forward`; gate the whole module so it (and its imports) compile out with
-// the feature.
-#[cfg(all(test, feature = "ssh-forward"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -641,5 +872,413 @@ mod tests {
         let mut buf2 = [0u8; 5];
         client.read_exact(&mut buf2).await.unwrap();
         assert_eq!(&buf2, b"world");
+    }
+
+    /// A `direct-tcpip` channel to a box port relays bytes in the default,
+    /// featureless build — the configuration a release build ships — because
+    /// nothing about the handler is behind a feature anymore (NET-110). The
+    /// open logs one info line naming the session it forwarded for and the
+    /// port it reached.
+    #[tokio::test]
+    async fn direct_tcpip_served_in_release() {
+        use russh::keys::PublicKeyOrCertificate;
+        use tokio::net::{TcpListener, UnixStream};
+
+        use crate::test_harness::{TestServer, captured_log, create_session_req};
+
+        // Install the capture subscriber before the open happens: the global
+        // subscriber must already exist when the info line is emitted.
+        let log = captured_log();
+
+        // The box port: a loopback listener echoing whatever it receives.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sock.write_all(&buf[..n]).await.unwrap(),
+                }
+            }
+        });
+
+        // The session the forward is scoped to: the SSH username carries its
+        // UUID, exactly as `ssh -l <uuid> -L ...` does.
+        let server = TestServer::new().await;
+        let req = create_session_req("direct-tcpip", "/tmp");
+        let session_id = server
+            .state
+            .sessions_manager()
+            .await
+            .create_session(req.config, None)
+            .await
+            .unwrap();
+
+        // `TestClient` keeps its russh handle private and this test needs the
+        // raw `channel_open_direct_tcpip`, so drive both halves of the
+        // connection the way `TestServer::connect` does.
+        struct ForwardHandler;
+        impl russh::client::Handler for ForwardHandler {
+            type Error = russh::Error;
+            async fn check_server_key(
+                &mut self,
+                _key: &PublicKeyOrCertificate,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+        }
+
+        let host_key = server.state.host_key().await.unwrap();
+        let russh_config = Arc::new(russh::server::Config {
+            keys: vec![host_key],
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            nodelay: true,
+            ..Default::default()
+        });
+        let (server_side, client_side) = UnixStream::pair().unwrap();
+        let server_setup = {
+            let state = server.state.clone();
+            let russh_config = russh_config.clone();
+            async move {
+                let (_conn, session_fut) =
+                    Connection::from_stream(server_side, russh_config, state, true)
+                        .await
+                        .expect("handshake over the in-memory pair");
+                tokio::spawn(session_fut);
+            }
+        };
+        let client_setup = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_side,
+            ForwardHandler,
+        );
+        let (_, handle) = tokio::join!(server_setup, client_setup);
+        let mut handle = handle.unwrap();
+        let auth = handle
+            .authenticate_none(&session_id.to_string())
+            .await
+            .unwrap();
+        assert!(auth.success(), "auth_none should succeed on local UDS");
+
+        // The point of the test: the channel opens in a build with no
+        // features, and bytes relay through it to the box port and back.
+        let channel = handle
+            .channel_open_direct_tcpip("127.0.0.1", port.into(), "127.0.0.1", 0)
+            .await
+            .expect("direct-tcpip must open in the default (release) build");
+        let mut channel = channel.into_stream();
+        channel.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        channel.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping", "the box port must echo the relayed bytes");
+
+        // Observability (NET-110): the open's info line names the session and
+        // the box port it reached.
+        let logged = log.contents();
+        let line = logged
+            .lines()
+            .find(|l| l.contains("direct-tcpip channel open"))
+            .unwrap_or_else(|| {
+                panic!("expected a direct-tcpip channel-open info line, got: {logged}")
+            });
+        assert!(
+            line.contains(&format!("session_id={session_id}")),
+            "the open line must name the session, got: {line}"
+        );
+        assert!(
+            line.contains(&format!("port={port}")),
+            "the open line must name the box port, got: {line}"
+        );
+    }
+
+    /// A `socat` stand-in for the in-box dial, written where the test puts
+    /// the dial's `PATH`.
+    ///
+    /// Production runs the real `socat` in-session — a baseline package,
+    /// so every box has it — but the harness's "in-session" command runs
+    /// host-side, and the host is not a box: a bare CI runner ships no
+    /// socat. The stand-in implements the one contract the dial relies on —
+    /// relay stdio onto a `TCP:host:port[,options]` address — so what
+    /// reaches it is the production argv, resolved as `socat` through the
+    /// [`PATH`](super::TEST_RELAY_PATH_VAR) the test supplies. The address
+    /// is picked out by its prefix rather than its position: the dial's
+    /// options precede it, and what the test pins is the argv itself, so
+    /// the stand-in records that argv where the test can read it.
+    ///
+    /// bash is the one interpreter every Linux test host can count on
+    /// (`/dev/tcp` is a bash feature, on in the default build). One
+    /// simplification, on purpose: when the channel side closes, the
+    /// stand-in stops at once instead of draining a half-closed TCP
+    /// socket — bash cannot `shutdown(2)` a write half a child still holds
+    /// — and this test never asks for that shape: teardown kills the relay
+    /// child, and the channel's EOF comes from that.
+    fn write_socat_standin(dir: &std::path::Path) -> std::path::PathBuf {
+        let argv_path = dir.join("argv");
+        assert!(
+            !argv_path.to_string_lossy().contains('\''),
+            "the stand-in dir must be shell-quoting-safe: {}",
+            argv_path.display()
+        );
+        let standin_script = format!(
+            r#"#!/bin/bash
+printf '%s\n' "$@" >'{argv}'
+for arg in "$@"; do
+  case "$arg" in TCP:*) target=${{arg#TCP:}};; esac
+done
+target=${{target%%,*}}
+exec 3<>"/dev/tcp/${{target%:*}}/${{target##*:}}" || exit 1
+cat <&3 &
+peer=$!
+cat >&3
+kill "$peer" 2>/dev/null
+"#,
+            argv = argv_path.to_string_lossy(),
+        );
+        let standin = dir.join("socat");
+        std::fs::write(&standin, standin_script).expect("write the socat stand-in");
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&standin, std::fs::Permissions::from_mode(0o755))
+            .expect("make the socat stand-in executable");
+        argv_path
+    }
+
+    /// Points the in-box dial's `socat` at the test's stand-in until the
+    /// test ends, panic or not.
+    ///
+    /// The `unsafe` is 2024-edition ceremony around touching the process
+    /// environment, not a hazard: the variable is this test's alone — the
+    /// dial path is the only reader, and nothing else in this binary
+    /// exercises it — and nextest, the workspace's runner, gives every
+    /// test its own process besides. The guard restores what was there so
+    /// a threaded `cargo test` run leaves the seam unset for its siblings.
+    struct RelayPathGuard(Option<std::ffi::OsString>);
+
+    impl RelayPathGuard {
+        fn set_to(standin_dir: &std::path::Path) -> Self {
+            let dir = standin_dir.to_string_lossy();
+            // The stand-in comes first, so the dial resolves it as
+            // `socat`; the ambient PATH follows, so the stand-in's own
+            // `bash`/`cat` calls resolve as usual.
+            let path = match std::env::var("PATH") {
+                Ok(ambient) if !ambient.is_empty() => format!("{dir}:{ambient}"),
+                _ => dir.into_owned(),
+            };
+            let previous = std::env::var_os(TEST_RELAY_PATH_VAR);
+            // SAFETY: see the doc comment on this type.
+            unsafe { std::env::set_var(TEST_RELAY_PATH_VAR, path) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for RelayPathGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                // SAFETY: see the doc comment on this type.
+                Some(previous) => unsafe { std::env::set_var(TEST_RELAY_PATH_VAR, previous) },
+                // SAFETY: see the doc comment on this type.
+                None => unsafe { std::env::remove_var(TEST_RELAY_PATH_VAR) },
+            }
+        }
+    }
+
+    /// A session with a network namespace of its own (`none`) dials its box
+    /// port from inside the box: `127.0.0.1` in the box is not the daemon's
+    /// loopback, so the dial goes out through the one sanctioned door into
+    /// the box's namespaces — a command run in-session — and comes back as
+    /// the relay's box-side stdio. In this harness the in-session command is
+    /// the host-side stand-in (MockLauncher builds it host-side under
+    /// `cfg(test)`), so the `socat` the dial resolves is the stand-in above —
+    /// real socat is a box baseline, not something a bare test host has.
+    /// What the test pins is the path the production dial takes: the
+    /// session's host is minted, the relay program is `socat` with the
+    /// dial's argv, and the channel relays through it. The open line then
+    /// records where the dial ran, and destroying the session aborts the
+    /// forward with it (NET-105's daemon half).
+    #[tokio::test]
+    async fn direct_tcpip_dials_inside_box_netns() {
+        use russh::keys::PublicKeyOrCertificate;
+        use tokio::net::{TcpListener, UnixStream};
+
+        use crate::test_harness::{TestServer, captured_log, create_session_req, unwrap_ready};
+
+        // Install the capture subscriber before the open happens: the global
+        // subscriber must already exist when the info line is emitted.
+        let log = captured_log();
+
+        // The `socat` the dial runs: resolved through the PATH below, so
+        // the in-box dial is exercised on every host — those that ship
+        // socat and those (the CI runner) that do not — identically.
+        let standin_dir = tempfile::tempdir().expect("tempdir for the socat stand-in");
+        let argv_path = write_socat_standin(standin_dir.path());
+        let _relay_path = RelayPathGuard::set_to(standin_dir.path());
+
+        // The box port: a loopback listener echoing whatever it receives.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sock.write_all(&buf[..n]).await.unwrap(),
+                }
+            }
+        });
+
+        let server = TestServer::new().await;
+
+        // An `Active` session with its own netns. The create flow is inlined
+        // because the request must carry `none` — the harness's builders
+        // default to the shared-netns mode the release test covers.
+        let mut req = create_session_req("direct-tcpip-netns", "/tmp");
+        req.config.network = sessions::NetworkMode::NoNet;
+        use minimald_rpc::{
+            ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+            FinalizeSessionRequest,
+        };
+        let mut client = server.connect().await;
+        let session_id = match client.call::<CreateSession>(&req).await {
+            Errorable::Ok(r) => r.id,
+            Errorable::Err { error } => panic!("CreateSession failed: {error}"),
+        };
+        unwrap_ready(
+            client
+                .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                    session_id,
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
+        match client
+            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id })
+            .await
+        {
+            Errorable::Ok(_) => {}
+            Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+        }
+
+        // `TestClient` keeps its russh handle private and this test needs the
+        // raw `channel_open_direct_tcpip`, so drive both halves of the
+        // connection the way `TestServer::connect` does.
+        struct ForwardHandler;
+        impl russh::client::Handler for ForwardHandler {
+            type Error = russh::Error;
+            async fn check_server_key(
+                &mut self,
+                _key: &PublicKeyOrCertificate,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+        }
+
+        let host_key = server.state.host_key().await.unwrap();
+        let russh_config = Arc::new(russh::server::Config {
+            keys: vec![host_key],
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            nodelay: true,
+            ..Default::default()
+        });
+        let (server_side, client_side) = UnixStream::pair().unwrap();
+        let server_setup = {
+            let state = server.state.clone();
+            let russh_config = russh_config.clone();
+            async move {
+                let (_conn, session_fut) =
+                    Connection::from_stream(server_side, russh_config, state, true)
+                        .await
+                        .expect("handshake over the in-memory pair");
+                tokio::spawn(session_fut);
+            }
+        };
+        let client_setup = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_side,
+            ForwardHandler,
+        );
+        let (_, handle) = tokio::join!(server_setup, client_setup);
+        let mut handle = handle.unwrap();
+        let auth = handle
+            .authenticate_none(&session_id.to_string())
+            .await
+            .unwrap();
+        assert!(auth.success(), "auth_none should succeed on local UDS");
+
+        // The point of the test: the channel dials through the box's
+        // namespaces, and bytes relay through it to the box port and back.
+        let channel = handle
+            .channel_open_direct_tcpip("127.0.0.1", port.into(), "127.0.0.1", 0)
+            .await
+            .expect("the in-box dial must open the channel");
+        let mut channel = channel.into_stream();
+        channel.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        channel.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(
+            &echoed, b"ping",
+            "the box port must echo the relayed bytes through the in-box dial"
+        );
+
+        // The dial's argv, as the stand-in received it: the linger is
+        // explicit — socat's own 0.5 s default would cut a slow box reply
+        // short once the laptop side half-closes — and the relay really is
+        // stdio onto the box port, not some other shape the test happens
+        // to satisfy.
+        let argv = std::fs::read_to_string(&argv_path).expect("the stand-in records its argv");
+        assert!(
+            argv.lines()
+                .any(|a| a == format!("-t{IN_BOX_DIAL_LINGER_SECS}")),
+            "the in-box dial must pass socat an explicit linger, got: {argv}"
+        );
+        assert!(
+            argv.lines().any(|a| a == "-"),
+            "the in-box dial must relay stdio, got: {argv}"
+        );
+        assert!(
+            argv.lines()
+                .any(|a| a.starts_with("TCP:") && a.contains(&port.to_string())),
+            "the in-box dial must name the box port in a TCP: address, got: {argv}"
+        );
+
+        // Observability: the open's info line names the session, the box
+        // port, and where the dial ran.
+        let logged = log.contents();
+        let line = logged
+            .lines()
+            .find(|l| l.contains("direct-tcpip channel open"))
+            .unwrap_or_else(|| {
+                panic!("expected a direct-tcpip channel-open info line, got: {logged}")
+            });
+        assert!(
+            line.contains(&format!("session_id={session_id}")),
+            "the open line must name the session, got: {line}"
+        );
+        assert!(
+            line.contains(&format!("port={port}")),
+            "the open line must name the box port, got: {line}"
+        );
+        assert!(
+            line.contains("dial=InBox"),
+            "the open line must record the dial as in-box, got: {line}"
+        );
+
+        // NET-105's daemon half: teardown aborts the session's forwards, so
+        // the channel the forward was relaying ends with the session.
+        let mngr = server.state.sessions_manager().await;
+        let session = mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("the session exists until destroyed");
+        session.destroy().await.unwrap();
+        let mut end = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), channel.read(&mut end))
+            .await
+            .expect("the channel must close with the session")
+            .expect("read on the channel after teardown");
+        assert_eq!(n, 0, "the forward's channel must see EOF, not more bytes");
     }
 }
