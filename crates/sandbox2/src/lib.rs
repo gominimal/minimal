@@ -368,8 +368,9 @@ pub struct Container {
     /// The libc-only seccomp-BPF filter installed by this container before exec.
     /// Stored as a `&'static` because a hakoniwa command closure is `'static`
     /// and the filter must live as long as any command spawned from this
-    /// container.  The value is leaked into the global allocator with
-    /// `Box::leak`; a none-box filter is tiny and process-scoped.
+    /// container.  The value is the process-wide
+    /// [`socket_family_filter_for_none_box`] `OnceLock` build, shared by every
+    /// none-box container this process launches; nothing is leaked per sandbox.
     socket_family_filter: Option<&'static SocketFamilyFilter>,
 }
 
@@ -431,7 +432,7 @@ impl Container {
 ///
 /// The closure runs after namespaces and credentials are configured but before
 /// the supervised program execs, which is the correct moment for seccomp.  It
-/// captures the `&'static` filter owned by the `Container`, loads it, and then
+/// captures the `&'static` filter the `Container` holds, loads it, and then
 /// execs the original program, since `command_from_closure` otherwise replaces
 /// the program entirely.
 ///
@@ -452,8 +453,10 @@ fn install_filter_in_command(
     let current_dir = command.get_current_dir().map(Path::to_path_buf);
     let envs = command.get_envs();
     // SAFETY: `command_from_closure` is unsafe because the closure runs in a
-    // forked child.  `filter` is `&'static`; it is leaked by the Container and
-    // outlives every command spawned from it.  The closure is not
+    // forked child.  `filter` is `&'static`: it is the process-wide
+    // `socket_family_filter_for_none_box()` `OnceLock` value, owned for the
+    // process's whole life, so it outlives every command spawned from the
+    // container.  The closure is not
     // async-signal-safe: it allocates after the fork (the argv `CString`s, a
     // failure message), in kind with hakoniwa's own closure path, which
     // `format!`s its panic report at the same point.  The child is
