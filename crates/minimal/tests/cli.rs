@@ -800,10 +800,11 @@ async fn session_policy_succeeds() {
 /// `min session policy` shows the effective egress rules (NET-061): the four
 /// egress fields the session was activated with, each unset dimension
 /// resolved to its default instead of a bare `null`. The policy is stored
-/// through the daemon and fetched the way the command fetches it;
-/// `format_policy` is the rendering the command prints. The same egress on a
-/// host-address box is still shown, but with no ingress block, and a none
-/// box shows no blocks at all — just the note the TUI shows in their place.
+/// through the daemon and fetched the way the command fetches it — the
+/// effective-policy RPC (NET-074) — and `format_policy` is the rendering the
+/// command prints. The same egress on a host-address box is still shown,
+/// but with no ingress block, and a none box shows no blocks at all — just
+/// the note the TUI shows in their place.
 #[tokio::test]
 async fn policy_shows_effective_egress() {
     let (daemon, args) = setup().await;
@@ -822,18 +823,20 @@ async fn policy_shows_effective_egress() {
     .await;
 
     let mut client = connect_daemon(&args).await.unwrap();
-    use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
     let resp = client
-        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(session_id))
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(session_id))
         .await
         .unwrap();
     let policy = match resp {
         minimald_rpc::Errorable::Ok(policy) => policy,
-        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
     };
     assert_eq!(
         policy.egress,
-        Some(egress.clone()),
+        sessions::EffectiveEgress::Declared(egress.clone()),
         "the stored egress must survive the record round trip"
     );
 
@@ -870,12 +873,14 @@ async fn policy_shows_effective_egress() {
     )
     .await;
     let resp = client
-        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(host_id))
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(host_id))
         .await
         .unwrap();
     let policy = match resp {
         minimald_rpc::Errorable::Ok(policy) => policy,
-        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
     };
     let mut out = Vec::new();
     format_policy(&mut out, &policy, sessions::NetworkMode::HostNet).unwrap();
@@ -901,12 +906,14 @@ async fn policy_shows_effective_egress() {
     )
     .await;
     let resp = client
-        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(none_id))
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(none_id))
         .await
         .unwrap();
     let policy = match resp {
         minimald_rpc::Errorable::Ok(policy) => policy,
-        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
     };
     let mut out = Vec::new();
     format_policy(&mut out, &policy, sessions::NetworkMode::NoNet).unwrap();
@@ -914,6 +921,128 @@ async fn policy_shows_effective_egress() {
     assert_eq!(
         text, "No network policy (NoNet)\n",
         "a none session prints the note in place of both blocks:\n{text}"
+    );
+}
+
+/// `min session policy` shows the default in force for a bare own-address
+/// box (NET-075): the deny-all egress the daemon's gate now enforces
+/// (NET-074), reached the way the command reaches it, rendered the way the
+/// command renders it. A declared section still reads as its own rules, and
+/// the default is scoped to own-address boxes — a bare host-address box
+/// keeps the shipped allow-all, because the deny-all is a gate on the
+/// session's own address, not on its host's namespace.
+#[tokio::test]
+async fn policy_shows_deny_all_default() {
+    let (daemon, args) = setup().await;
+    let bare_id = create_session_with_policy(
+        &daemon,
+        "bare-own-ip",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
+    let resp = client
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(bare_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
+    };
+    assert_eq!(
+        policy.egress,
+        sessions::EffectiveEgress::DenyAll,
+        "a bare own-address box must resolve to deny-all in force"
+    );
+
+    let mut out = Vec::new();
+    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("egress\n  deny all\n"),
+        "a bare own-address box must print deny-all:\n{text}"
+    );
+    assert!(
+        !text.contains("allow all"),
+        "deny-all must not also print the allow-all row:\n{text}"
+    );
+
+    // The strict policy is untouched: the box declared nothing, and the
+    // record still holds that absence — only the effective view carries the
+    // default. `min session policy` shows the effective rules; the strict
+    // shape stays what the session was activated with.
+    use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
+    let strict = client
+        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(bare_id))
+        .await
+        .unwrap();
+    match strict {
+        minimald_rpc::Errorable::Ok(strict) => assert_eq!(
+            strict.egress, None,
+            "the stored policy must keep the absence the box declared"
+        ),
+        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+    }
+
+    // The default is scoped to own-address boxes (NET-074): a bare
+    // host-address session shares its host's namespace and the gate has no
+    // own address to hold, so it keeps the shipped allow-all.
+    let host_id = create_session_with_policy(
+        &daemon,
+        "bare-host-net",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+    let resp = client
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(host_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
+    };
+    assert_eq!(policy.egress, sessions::EffectiveEgress::AllowAll);
+    let mut out = Vec::new();
+    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("egress\n  allow all\n"),
+        "a bare host-address box keeps the shipped allow-all:\n{text}"
+    );
+}
+
+/// While the deny-all egress default is announced but not yet in force,
+/// `min session activate` prints the coming change (NET-076) — what turns
+/// for a bare own-address box, and how to keep the shipped default. The
+/// notice is phase-gated: once the default is in force it is no longer a
+/// coming change, and nothing prints.
+#[test]
+fn deny_all_announcement_printed() {
+    let notice = deny_all_default_notice(sessions::EgressDefaultPhase::Announced)
+        .expect("the announced phase must carry the coming-change notice");
+    assert!(
+        notice.contains("denies all external reach"),
+        "the notice must name the change:\n{notice}"
+    );
+    assert!(
+        notice.contains("own-address"),
+        "the notice must scope the change to own-address sessions:\n{notice}"
+    );
+    assert!(
+        notice.contains("--egress-deny-all-opt-out"),
+        "the notice must say how to keep the shipped default:\n{notice}"
+    );
+    assert!(
+        deny_all_default_notice(sessions::EgressDefaultPhase::InForce).is_none(),
+        "the notice must not print once the default is in force"
     );
 }
 
