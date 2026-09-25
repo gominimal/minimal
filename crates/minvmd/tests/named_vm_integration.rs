@@ -3,13 +3,19 @@
 //! directory, the default VM's paths are unchanged, stopping one VM leaves the
 //! other running, and reaping is scoped to this checkout's VMs.
 //!
-//! These tests run on hosts without libkrun — the stock Linux CI lane. A VM's
+//! These tests run on hosts with or without libkrun — every lane. A VM's
 //! *identity* is host-side state `minvmd` resolves before the hypervisor is ever
 //! reached, so the tests drive the real binary and the real lock/state
 //! machinery rather than a booted VM. Where a live "daemon" is needed it is a
 //! real child process holding the VM's alive lock and named as `vmm_pid` in the
 //! VM's state file — exactly what `run`/`boot` leave behind for every
 //! host-side observer (`status`, `stop`, the CLI's probes).
+//!
+//! Being a `*_integration.rs` harness, the VM lanes replay it from a nextest
+//! archive on a machine that did not build it (`--workspace-remap`, see
+//! ci-macos.yml/ci-linux-kvm.yml), so no path baked at build time exists
+//! there: the binary comes from [`minvmd_bin`]'s `MINVMD_BIN`, and the reap
+//! script travels inside the harness ([`REAP_SCRIPT`]).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -20,11 +26,25 @@ use minvmd::lifecycle::Lifecycle;
 use minvmd::state::{State, StateDir};
 use paths::{DaemonAbsPath, ProviderKind, SSH_SOCK_FILE};
 
+/// The `minvmd` binary under test: `MINVMD_BIN` when set — the VM lanes' split
+/// build/test runners, where the absolute path baked by `CARGO_BIN_EXE_minvmd`
+/// does not exist — else the compile-time cargo-built path (the same contract
+/// every other `*_integration` harness follows).
+fn minvmd_bin() -> std::ffi::OsString {
+    std::env::var_os("MINVMD_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_minvmd").into())
+}
+
+/// The `scripts/reap-vms.sh` under test, embedded at compile time: the VM lanes
+/// replay this harness from an archive on a machine whose checkout is not at
+/// this build's paths, and the script is what `reap_scoped_per_checkout`
+/// exercises.
+const REAP_SCRIPT: &str = include_str!("../../../scripts/reap-vms.sh");
+
 /// The `minvmd` binary this package builds, run against a `--minimal-state-dir`
 /// base. `RUST_LOG` is dropped so the default `info` filter applies and these
 /// tests observe the info lines every install gets.
 fn run_minvmd(base: &Path, args: &[&str]) -> BinRun {
-    let out = Command::new(env!("CARGO_BIN_EXE_minvmd"))
+    let out = Command::new(minvmd_bin())
         .arg("--minimal-state-dir")
         .arg(base)
         .args(args)
@@ -411,14 +431,14 @@ fn reap_scoped_per_checkout() {
 
     // A stand-in checkout: its own copy of the reap script, so the ROOT the
     // script derives is this directory and the recorded patterns prove the
-    // scoping rather than asserting on the real checkout's path.
+    // scoping rather than asserting on the real checkout's path. Written from
+    // the embedded copy because the VM lanes replay this harness on a machine
+    // where no path baked at build time exists.
     let checkout = tmp.path().join("a-checkout");
     std::fs::create_dir_all(checkout.join("scripts")).unwrap();
-    std::fs::copy(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/reap-vms.sh"),
-        checkout.join("scripts/reap-vms.sh"),
-    )
-    .unwrap();
+    let script = checkout.join("scripts/reap-vms.sh");
+    std::fs::write(&script, REAP_SCRIPT).unwrap();
+    set_executable(&script);
 
     // Stub `pkill` and `sudo` on a PATH in front of the real coreutils: they
     // record the patterns they were asked to match and never signal anything,
