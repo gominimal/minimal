@@ -71,6 +71,9 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   <!-- split from BOX-025: which verbs resume; the resume itself stays in BOX -->
   tier:     T0
   verify:   cargo nextest run -p minimal shell_attach_and_resume_verbs_resume_stopped_session
+  - IF `min shell`, `min attach` or `min box resume` would resume a box whose name a running box on the same host holds THEN THE SYSTEM SHALL report BOX-025's refusal with exit 2, naming the running box, and a hint to rename the running box with `min box rename` or to resume this box by its `box_id` after renaming it.
+    tier:   T0
+    verify: cargo nextest run -p minimal resume_name_conflict_exit2_names_holder
 
 - **BCLI-008** WHEN `min shell` resumes a session THE SYSTEM SHALL attach to it.
   <!-- was BOX-026 -->
@@ -373,7 +376,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 **Old spellings hint for one release, then fail.** The architecture's command tree is taken verbatim; the additions are `min box rename`, `min host stop`, `min box prune --dry-run` (BCLI-006) and the create-time `--network` and `--ingress` overrides (BCLI-024), each an open question below. `session destroy` maps to `box rm --force` rather than `session rm`, because a live session must still be stopped and removed and BEP-043's revoke-on-destroy must still fire. `session policy` stays reachable as an alias of `box show --network` (BCLI-025), the successor that carries NET-061's effective egress and the draft GWI-003's exposures. Every old spelling (the session verbs, `task run --keep`, bare `min stop`, and the `local-minimald` and `local-minvmd` provider values) stays as a hidden alias for one release, printing one hint naming its replacement, and fails with exit 2 and the same hint the release after (BCLI-041, BCLI-042, BCLI-046, BCLI-050). Bare `min stop` maps to `min host stop` because what it stops today is the daemon, not a box.
 
-**Resume restarts processes; enrolled identity composes with it.** BCLI-007 and BCLI-009 drive BOX-025 and BOX-030's restart of a stopped or exited box's processes, and the refusal is only for restarting the processes of a non-PTY box, whose restart is a new `min run`. Under enrollment, re-establishing identity for any box, non-PTY included, is Gatehouse §6.3.3's (which names `min box resume <box>` among its paths); it composes with this, as BOX's Design reasoning states.
+**Resume restarts processes; enrolled identity composes with it.** BCLI-007 and BCLI-009 drive BOX-025 and BOX-030's restart of a stopped or exited box's processes, and the refusal is only for restarting the processes of a non-PTY box, whose restart is a new `min run`. Under enrollment, re-establishing identity for any box, non-PTY included, is Gatehouse §6.3.3's (which names `min box resume <box>` among its paths); it composes with this, as BOX's Design reasoning states. A resume refused because a running box holds the name exits 2 by this spec's choice, as a usage-shaped refusal like the ambiguous-name error, rather than the policy exit 5.
 
 **`min host stop` stops the boxes first.** The owner decided on 2026-09-25 that BCLI-049 stops each running box as BOX-013 defines and then the daemon, and that `--force` forces both, so a host shuts down in one step and every stopped record resumes later. The alternative, refusing while any box runs, was rejected by the owner. A record left `running` by a daemon that did not get to stop it becomes `stopped` on restart (BOX-154).
 
