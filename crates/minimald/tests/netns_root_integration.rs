@@ -364,7 +364,7 @@ async fn network_none_attach_works() {
     // to carry the runctl to the child hakoniwa forks.
     container.set_session_leader();
 
-    let expected_cwd = sandbox.command_cwd();
+    let expected_cwd = sandbox.command_cwd().expect("resolving sandbox cwd");
     let expected_report = vec![
         format!("cwd={expected_cwd}"),
         format!("shell={PROBE_SHELL}"),

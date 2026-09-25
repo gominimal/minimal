@@ -235,8 +235,10 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                             let Some(symbol_name) = import.name().into_name() else {
                                 continue;
                             };
-                            let lib = String::from_utf8(import.library().to_vec()).unwrap();
-                            let symbol = String::from_utf8(symbol_name.to_vec()).unwrap();
+                            let lib = String::from_utf8(import.library().to_vec())
+                                .map_err(|e| Error::Other(e.into()))?;
+                            let symbol = String::from_utf8(symbol_name.to_vec())
+                                .map_err(|e| Error::Other(e.into()))?;
                             if lib.is_empty() {
                                 continue;
                             }

@@ -238,22 +238,33 @@ impl Config {
     /// The working directory a command in this sandbox starts in, as an
     /// absolute path inside the sandbox — `/workbench` for a session (unless
     /// the name is overridden), `/build` for a task.
-    #[must_use]
-    pub fn command_cwd(&self) -> String {
+    ///
+    /// Fails only for a [`WdSetup::BoundDir`] sandbox whose host path is not
+    /// valid UTF-8: the sandbox-side cwd is that path with the host prefix
+    /// stripped, so it cannot be rendered as a string.
+    pub fn command_cwd(&self) -> Result<String, Error> {
         match &self.wd {
             WdSetup::BoundDir { .. } => {
-                format!("/{}", self.wd.bound_dir_sandbox_cwd().to_str().unwrap())
+                let cwd = self.wd.bound_dir_sandbox_cwd();
+                let cwd = cwd.to_str().ok_or_else(|| {
+                    Error::IO(
+                        "sandbox cwd is not valid UTF-8",
+                        cwd.to_path_buf(),
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 path"),
+                    )
+                })?;
+                Ok(format!("/{cwd}"))
             }
-            WdSetup::Isolated { .. } => "/build".to_string(),
+            WdSetup::Isolated { .. } => Ok("/build".to_string()),
             WdSetup::Session {
                 working_name_override,
                 ..
-            } => format!(
+            } => Ok(format!(
                 "/{}",
                 working_name_override
                     .clone()
                     .unwrap_or_else(|| crate::SESSION_DEFAULT_WD.to_string())
-            ),
+            )),
         }
     }
 
@@ -651,7 +662,7 @@ mod tests {
     fn a_session_starts_in_workbench_with_its_login_identity() {
         let config = session_config();
 
-        assert_eq!(config.command_cwd(), "/workbench");
+        assert_eq!(config.command_cwd().unwrap(), "/workbench");
         let env = config.command_env();
         assert_eq!(env.get("HOME").map(String::as_str), Some("/home"));
         assert_eq!(env.get("USER").map(String::as_str), Some("dev"));
@@ -681,7 +692,7 @@ mod tests {
     fn a_build_sandbox_keeps_its_own_layout() {
         let config = Config::new("test");
 
-        assert_eq!(config.command_cwd(), "/build");
+        assert_eq!(config.command_cwd().unwrap(), "/build");
         let env = config.command_env();
         assert_eq!(env.get("HOME").map(String::as_str), Some("/state/home"));
         assert_eq!(env.get("SOURCE_DATE_EPOCH").map(String::as_str), Some("0"));
