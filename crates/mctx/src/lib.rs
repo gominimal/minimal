@@ -429,14 +429,14 @@ impl Context {
 
     /// Builds a [`ProjectSetup`] from this context, for running project-setup
     /// operations (e.g. [`op::UpdateProject`]) that refresh the `minimal.toml`.
-    pub fn project_setup(&self) -> ProjectSetup {
-        ProjectSetup::from_parts(
+    pub fn project_setup(&self) -> Result<ProjectSetup, Error> {
+        Ok(ProjectSetup::from_parts(
             self.daemon.config.clone(),
             self.daemon.vcs.clone(),
             self.daemon.stdlib_dir.clone(),
             self.mfile.clone(),
-            self.repo_dir().to_path_buf(),
-        )
+            self.repo_dir()?.to_path_buf(),
+        ))
     }
 
     /// Returns a handle to the local cache.
@@ -489,10 +489,22 @@ impl Context {
     }
 
     /// Returns the path to the root of the repo.
-    pub fn repo_dir(&self) -> &Path {
+    ///
+    /// The repo root is the minimal file's own directory when it has an on-disk
+    /// location, else the configured `-C` override. When neither is available —
+    /// the minimal file was decoded without a path and no override is set —
+    /// there is no repo root to name, so this reports it rather than panicking.
+    pub fn repo_dir(&self) -> Result<&Path, Error> {
         self.mfile
             .repo_path()
-            .unwrap_or_else(|| self.daemon.config.repo_dir_override().as_ref().unwrap())
+            .or_else(|| self.daemon.config.repo_dir_override())
+            .ok_or_else(|| {
+                Error::Other(anyhow!(
+                    "cannot determine the repository directory: the location of \
+                     the minimal file on disk is unknown and no repository \
+                     directory override is set"
+                ))
+            })
     }
     /// Returns a path to the standard library.
     pub fn stdlib_dir(&self) -> &PathBuf {
@@ -645,8 +657,8 @@ impl Context {
     }
 
     /// Returns a [SpecOrigin] representing the top-level repository.
-    pub fn repo_origin(&self) -> SpecOrigin {
-        SpecOrigin::from_dir(self.repo_dir())
+    pub fn repo_origin(&self) -> Result<SpecOrigin, Error> {
+        Ok(SpecOrigin::from_dir(self.repo_dir()?))
     }
     /// Returns the [OpTracker] to be used as the root for tracking long-running operations.
     pub fn op_tracker(&self) -> Option<OpTracker> {
@@ -672,17 +684,17 @@ impl Context {
     /// Builds & returns a graph of all packages for a specific target.
     pub fn graph_from_all_packages_with_target(&mut self, target: Target) -> Result<Graph, Error> {
         let start = SystemTime::now();
+        let repo_dir = self.repo_dir()?;
         let res = Graph::new_from_chain(
             self.vcs_manager(),
             &mut graph::LayerCacheDir(self.daemon.config.layer_cache_dir()),
             LinkConfig::Dir {
-                dir: self
-                    .repo_dir()
+                dir: repo_dir
                     .to_str()
                     .ok_or_else(|| {
                         Error::Other(anyhow!(
                             "repo path is not valid UTF-8: {}",
-                            self.repo_dir().display()
+                            repo_dir.display()
                         ))
                     })?
                     .to_string(),
@@ -737,10 +749,11 @@ impl Context {
     ) -> Result<(), Error> {
         let cache = self.local_cache();
         let rc = if self.daemon.config.use_remote_cache() {
-            Some(self.remote_cache(false, false).await.map_err(|e| match e {
-                RemoteError::Config(msg) => Error::Other(anyhow::anyhow!("{msg}")),
-                other => Error::Other(anyhow::anyhow!("{other}")),
-            })?)
+            Some(
+                self.remote_cache(false, false)
+                    .await
+                    .map_err(remote_error_to_error)?,
+            )
         } else {
             None
         };
@@ -919,7 +932,7 @@ impl Context {
         let wd = if let Some(wd) = wd {
             wd
         } else {
-            self.repo_dir().to_path_buf()
+            self.repo_dir()?.to_path_buf()
         };
         let state_base_dir = match state_key {
             Some(name) if !name.is_empty() => mfile
@@ -1052,18 +1065,12 @@ impl Context {
         graph: &Graph,
         pkgs: I,
     ) -> Result<(), Error> {
-        // The two arms are NOT interchangeable, though they look it.
-        // `rcache::Error`'s Display is `write!(f, "{:?}", self)` — it
-        // Debug-formats itself — so the fallback arm renders a Config as
-        // `Config("MINIMAL_INDEX_SOURCE: unknown index source \"banana\" ...")`,
-        // variant name and escaped quotes included. Destructuring Config and
-        // formatting the inner `msg` is what yields the clean, user-facing
-        // message. Collapsing this to one arm reintroduces the panic-era
-        // output this replaced.
-        let rc = self.remote_cache(false, true).await.map_err(|e| match e {
-            RemoteError::Config(msg) => Error::Other(anyhow::anyhow!("{msg}")),
-            other => Error::Other(anyhow::anyhow!("{other}")),
-        })?;
+        // `remote_error_to_error` renders the two arms differently on purpose —
+        // see its doc for why they are not interchangeable.
+        let rc = self
+            .remote_cache(false, true)
+            .await
+            .map_err(remote_error_to_error)?;
         let mut task_set = tokio::task::JoinSet::new();
         let fetch_start = SystemTime::now();
         let semaphore = Arc::new(Semaphore::new(8));
@@ -1218,6 +1225,23 @@ pub enum AddDepMode {
     TaskPackages { name: String },
     /// Add the specified packages to session.packages.
     SessionPackages,
+}
+
+/// Converts an [`rcache`] error into the context's error type, rendering
+/// [`RemoteError::Config`] by its inner message.
+///
+/// The two arms are NOT interchangeable, though they look it:
+/// `rcache::Error`'s `Display` is `write!(f, "{:?}", self)` — it Debug-formats
+/// itself — so the fallback arm renders a `Config` as
+/// `Config("MINIMAL_INDEX_SOURCE: unknown index source \"banana\" ...")`,
+/// variant name and escaped quotes included. Destructuring `Config` and
+/// formatting the inner `msg` is what yields the clean, user-facing message;
+/// collapsing this to one arm reintroduces the panic-era output this replaced.
+fn remote_error_to_error(e: RemoteError<AnyRespError>) -> Error {
+    match e {
+        RemoteError::Config(msg) => Error::Other(anyhow!("{msg}")),
+        other => Error::Other(anyhow!("{other}")),
+    }
 }
 
 fn upsert_toml_packages_list<T: TableLike>(t: &mut T, key: &str, upsert: &[String]) -> bool {

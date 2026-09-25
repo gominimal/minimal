@@ -300,7 +300,7 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
         Err(e) => return Err(e),
     };
 
-    let mut env = ctx.project_setup();
+    let mut env = ctx.project_setup()?;
     let report = op::UpdateProject.run(&mut env)?;
 
     if let Some(c) = &report.upstream {
