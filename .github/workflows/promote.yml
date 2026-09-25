@@ -302,4 +302,9 @@ jobs:
         uses: ./.github/workflows/publish-packages.yml
         with:
             version: ${{ needs.promote.outputs.version }}
+            # This is the approval-gated caller (the `gate` job above opened and
+            # waited on the promotion issue), so it is the one place allowed to
+            # publish the parked draft. A manual dispatch of publish-packages.yml
+            # cannot, and only retries the publishers.
+            publish_draft: true
         secrets: inherit # zizmor: ignore[secrets-inherit] first-party same-repo reusable workflow needs the AUR/brew publishing secrets

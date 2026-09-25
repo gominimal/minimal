@@ -315,11 +315,14 @@ Retrying a publish, per channel:
   `--dry-run` is the credential-free rehearsal and a real push needs
   credentials.
 - `stable` — dispatch `publish-packages.yml` by hand: `gh workflow run
-  publish-packages.yml -f version=X.Y.Z -f release_already_published=true`.
-  That skips re-publishing the already-published GitHub Release. A plain re-run
-  cannot: a failed-jobs re-run does not reliably retain the earlier job's
-  outputs, and a full re-run re-opens the promotion approval gate and then
-  fails at `publish-release`, which refuses an already-published release.
+  publish-packages.yml -f version=X.Y.Z`. A manual dispatch can only *retry*
+  the publishers: `publish-release` verifies the GitHub Release is already
+  published and refuses otherwise, so a dispatch cannot publish a draft (which
+  creates the tag) — that stays promote.yml's approval-gated job, behind the
+  promotion issue. A plain re-run cannot serve as the retry either: a
+  failed-jobs re-run does not reliably retain the earlier job's outputs, and a
+  full re-run re-opens the approval gate and then fails at `publish-release`,
+  which refuses an already-published release.
 
 ## prune-releases.yml: GitHub Release housekeeping
 

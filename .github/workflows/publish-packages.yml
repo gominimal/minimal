@@ -2,7 +2,7 @@ name: publish-packages
 
 # Publish an already-promoted versioned release. Called by promote.yml after a
 # `stable` promotion; also dispatchable by hand to retry a failed AUR/Homebrew
-# push (with release_already_published=true). Two steps, in order:
+# push (see the `on:` block). Two steps, in order:
 #
 #   1. publish-release — publish the DRAFT GitHub Release `v<semver>` the
 #      versioned release build parked (release.yml). Publishing a draft is
@@ -24,25 +24,27 @@ on:
                 description: "The promoted version: a semver (X.Y.Z[-pre]) publishes; anything else skips with a notice."
                 required: true
                 type: string
-    # A manual dispatch is the clean retry for a FAILED package publish. The
-    # normal path (promote.yml -> workflow_call) is unaffected: pass
-    # release_already_published=true to skip re-publishing the (already
-    # published) GitHub Release and go straight to the AUR/Homebrew publishers,
-    # which are idempotent. A failed-jobs re-run of a workflow_call cannot do
-    # this: the earlier job's outputs are not reliably retained, and a full
-    # re-run re-opens the promotion approval gate and then fails at
-    # publish-release, which refuses an already-published release.
-    workflow_dispatch:
-        inputs:
-            version:
-                description: "The released semver to (re)publish, without the v prefix."
-                required: true
-                type: string
-            release_already_published:
-                description: "Set true to retry only the AUR/Homebrew publishes; the GitHub Release is already published."
+            publish_draft:
+                description: "Publish the parked draft GitHub Release (which creates the tag). Set ONLY by promote.yml, the approval-gated path; leave false everywhere else."
                 required: false
                 default: false
                 type: boolean
+    # A manual dispatch retries a FAILED package publish and nothing else: it
+    # validates that the GitHub Release is already published and hands the
+    # version to the idempotent AUR/Homebrew publishers. It deliberately cannot
+    # publish a draft — that creates the tag and is promote.yml's job, behind
+    # its promotion-approval issue, so exposing it here would let anyone with
+    # write access ship a release the gate has not approved. (A failed-jobs
+    # re-run of the workflow_call path cannot serve as the retry either: the
+    # earlier job's outputs are not reliably retained, and a full re-run
+    # re-opens the approval gate and then fails at publish-release, which
+    # refuses an already-published release.)
+    workflow_dispatch:
+        inputs:
+            version:
+                description: "The released semver to retry the AUR/Homebrew publishes for, without the v prefix."
+                required: true
+                type: string
 
 permissions:
     contents: read
@@ -63,8 +65,10 @@ jobs:
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                   VERSION: ${{ inputs.version }}
-                  # Set only by a manual workflow_dispatch retry (see `on:`).
-                  RELEASE_ALREADY_PUBLISHED: ${{ github.event_name == 'workflow_dispatch' && inputs.release_already_published || 'false' }}
+                  # true only from promote.yml (the approval-gated caller). A
+                  # manual dispatch has no such input, so it lands on the retry
+                  # path below and can never publish a draft.
+                  PUBLISH_DRAFT: ${{ inputs.publish_draft || 'false' }}
               run: |
                   set -euo pipefail
                   semver=""
@@ -86,18 +90,26 @@ jobs:
                     *-*) publish_semver=""
                          echo "::notice::$tag is a prerelease — AUR and Homebrew skipped" ;;
                   esac
-                  if [ "$RELEASE_ALREADY_PUBLISHED" = "true" ]; then
-                    # Manual retry of a failed AUR/Homebrew push: the GitHub
-                    # Release was published by an earlier run, so there is
-                    # nothing to publish here — confirm the tag resolves (a typo
-                    # must fail here, not inside a publisher) and hand the
-                    # version to the idempotent publishers below.
-                    tagged="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2>/dev/null)" \
-                      || { echo "::error::no GitHub Release tag $tag — check the version input"; exit 1; }
+                  if [ "$PUBLISH_DRAFT" != "true" ]; then
+                    # Retry path (a manual dispatch, or any caller that did not
+                    # opt into draft publication): the GitHub Release was
+                    # published by an earlier run, so there is nothing to
+                    # publish here — confirm it really is published and hand the
+                    # version to the idempotent publishers below. The check is
+                    # on the RELEASE, not merely the tag: a tag exists
+                    # independently, and a still-draft Release would let the
+                    # publishers ship something users cannot download.
+                    draft="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" \
+                      || { echo "::error::no GitHub Release $tag — check the version input"; exit 1; }
+                    [ "$draft" = "false" ] \
+                      || { echo "::error::GitHub Release $tag is still a draft — publishing it is promote.yml's approval-gated path"; exit 1; }
+                    tagged="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)"
                     echo "release $tag already published at $tagged; retrying the package publishers"
                     echo "semver=$publish_semver" >> "$GITHUB_OUTPUT"
                     exit 0
                   fi
+                  # Past the retry path, so PUBLISH_DRAFT is true: promote.yml,
+                  # the approval-gated caller, asked for the draft publication.
                   # The draft must exist: the versioned release build parks it
                   # with the notes and every artifact attached. A missing or
                   # already-published release is a pipeline invariant broken
@@ -106,7 +118,7 @@ jobs:
                     || { echo "::error::no GitHub Release $tag — was $semver cut by a versioned release build (release.yml versioned: true)?"; exit 1; }
                   read -r is_draft target <<<"$state"
                   if [ "$is_draft" != "true" ]; then
-                    echo "::error::GitHub Release $tag is already published (target $target); refusing to re-publish — to retry only the package publishers, dispatch this workflow with release_already_published=true"
+                    echo "::error::GitHub Release $tag is already published (target $target); refusing to re-publish — to retry only the package publishers, run: gh workflow run publish-packages.yml -f version=$semver"
                     exit 1
                   fi
                   extra=()
@@ -133,7 +145,7 @@ jobs:
         #
         # tolerate is NOT set (defaults false): a failed stable publish must fail
         # loudly. Retry it with `gh workflow run publish-packages.yml -f
-        # version=X.Y.Z -f release_already_published=true`; the publishers are
+        # version=X.Y.Z`; the publishers are
         # idempotent. See docs/internal/release-pipeline.md.
         needs: publish-release
         if: ${{ needs.publish-release.outputs.semver != '' }}
