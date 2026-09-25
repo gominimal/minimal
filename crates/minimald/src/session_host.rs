@@ -2024,10 +2024,12 @@ pub(crate) struct SandboxLauncher {
     /// Shared per-host gvproxy switch. Used only for
     /// [`NetworkMode::OwnIp`] launches.
     pub(crate) net_switch: std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
-    /// Static ingress port mappings applied on the switch once this
-    /// `OwnIp` PTask attaches, removed on exit. `None` for other
+    /// The session's whole network policy — declared egress enforced by the
+    /// switch relay's outbound leg (NET-062/063/064), static ingress port
+    /// mappings applied on the switch once this `OwnIp` PTask attaches and
+    /// inbound ports gated on its other leg, removed on exit. Unused by other
     /// network modes.
-    pub(crate) ingress: Option<sessions::IngressPolicy>,
+    pub(crate) policy: sessions::SessionPolicy,
     /// The proxy-routing-table handle the `OwnIp` lease is reported through
     /// on attach, so the box's `<name>.min.internal` route exists exactly
     /// while the box does (NET-001). Ignored by every other network mode.
@@ -2121,9 +2123,9 @@ impl SessionLauncher for SandboxLauncher {
         sz: WinSize,
     ) -> io::Result<Launched<SandboxProcess, Self::Guard>> {
         let ctx = self.ctx;
-        // Move the ingress policy out of `self` up front so it can be applied
+        // Move the session policy out of `self` up front so it can be applied
         // after the switch attach below (the rest of `self` is consumed first).
-        let ingress = self.ingress;
+        let policy = self.policy;
         let network_mode = self.network_mode;
         let net_switch = self.net_switch;
         let own_address = self.own_address;
@@ -2154,7 +2156,7 @@ impl SessionLauncher for SandboxLauncher {
             network_mode,
             &net_switch,
             &session_name,
-            ingress.clone(),
+            Some(policy),
             own_address,
         ))
         .await
