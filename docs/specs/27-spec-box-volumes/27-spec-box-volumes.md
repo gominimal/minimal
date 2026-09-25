@@ -17,7 +17,7 @@ This spec is the first backing: a volume lives on the host that runs the box, in
 
 **Success:** in one project, a box created from an entry declaring `volumes = ["cache"]` after the previous such box is removed sees that box's files; a box of another project with the same declaration sees none of them; a second writer is refused with exit 5 naming the holder while the first box runs or is stopped, and admitted once the first box exits; `min volume list` shows the volume's size, last use and users; and removing every box leaves the volume in place.
 
-**First slice:** a declared volume is created on first use, mounted, and reattached by project and name in the next box (BVOL-001 to BVOL-003), listed by `min volume list` (BVOL-006), with no single-writer check yet.
+**First slice:** a declared volume is created on first use, mounted, and reattached by project and name in the next box (BVOL-001 to BVOL-003), listed by `min volume list` (BVOL-006), and refused to a second writer with exit 5 naming the holder (BVOL-004); the write hold's lifetime across stop and exit (BVOL-010, BVOL-013) and prune (BVOL-012) follow.
 
 ## Users and stories
 
