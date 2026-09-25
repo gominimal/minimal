@@ -2573,7 +2573,7 @@ mod tests {
 
         use crate::MINIMAL_SESSION_ID_ENV;
         use crate::test_harness::{
-            TestClient, TestServer, create_configured_session, create_session_req,
+            CaptureWriter, TestClient, TestServer, create_configured_session, create_session_req,
         };
 
         /// Creates a fresh session through the public CreateSession RPC
@@ -2698,36 +2698,6 @@ mod tests {
             }
 
             session_id
-        }
-
-        /// A `MakeWriter` accumulating everything written into a shared
-        /// buffer, so a test can assert on the structured fields a
-        /// `tracing` event emitted (the same capture `net::proxy`'s tests
-        /// use).
-        #[derive(Clone, Default)]
-        struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-        impl CaptureWriter {
-            fn contents(&self) -> String {
-                String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-            }
-        }
-
-        impl std::io::Write for CaptureWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-            type Writer = CaptureWriter;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
         }
 
         /// End-to-end happy path for `min run <task>`: an `echo` task is

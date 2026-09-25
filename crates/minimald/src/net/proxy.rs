@@ -689,37 +689,9 @@ mod tests {
     use std::sync::{Mutex, RwLock};
 
     use sessions::SessionId;
-    use tracing_subscriber::fmt::MakeWriter;
 
     use crate::net::dns::DEFAULT_HOST_ID;
-
-    /// A `MakeWriter` accumulating everything written into a shared buffer, so a
-    /// test can assert on the structured fields a `tracing` event emitted.
-    #[derive(Clone, Default)]
-    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl CaptureWriter {
-        fn contents(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
-
-    impl io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for CaptureWriter {
-        type Writer = CaptureWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
+    use crate::test_harness::CaptureWriter;
 
     /// Spawns a one-shot loopback backend that answers every connection with a
     /// fixed `200 OK` and closes, returning the port it listens on.

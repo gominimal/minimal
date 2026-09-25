@@ -17,8 +17,9 @@
 
 #![cfg(any(test, feature = "test-support"))]
 
+use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use camino::Utf8PathBuf;
 use paths::DaemonAbsPath;
@@ -26,11 +27,41 @@ use russh::keys::PublicKeyOrCertificate;
 use sessions::SessionId;
 use tempfile::TempDir;
 use tokio::net::{UnixListener, UnixStream};
+use tracing_subscriber::fmt::MakeWriter;
 
 use minimald_rpc::OneshotSshRpc;
 
 use crate::connection::Connection;
 use crate::server::{Config, HostKey, ServerStateHandle};
+
+/// A `MakeWriter` accumulating everything written into a shared buffer, so a
+/// test can assert on the structured fields a `tracing` event emitted.
+#[derive(Clone, Default)]
+pub struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl CaptureWriter {
+    /// Returns the captured bytes as a UTF-8 string.
+    pub fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 /// A minimald instance running against a tempdir, ready to accept
 /// in-memory ssh connections.

@@ -6,7 +6,7 @@ use sessions::SessionId;
 use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
 
 use crate::session_host::{HOST_MAILBOX_CAPACITY, HostHandle};
-use crate::test_harness::{TestClient, TestServer, create_configured_session};
+use crate::test_harness::{CaptureWriter, TestClient, TestServer, create_configured_session};
 
 /// Far longer than [`super::HOST_PROBE_TIMEOUT`], so under a paused
 /// clock the probe's own deadline is always the one that fires first.
@@ -2250,36 +2250,6 @@ async fn materializing_patches_carries_their_modes_into_the_home() {
 // client anywhere keeps running; a client lost *abruptly* mid-attach
 // changes nothing about the entrypoint; and no idle interval ever stops
 // a box — stop is always something a client asked for.
-
-/// A `MakeWriter` accumulating everything written into a shared buffer,
-/// so a test can assert on the structured fields a `tracing` event
-/// emitted (the same capture `exec`'s end-to-end tests and `net::proxy`'s
-/// tests use).
-#[derive(Clone, Default)]
-struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl CaptureWriter {
-    fn contents(&self) -> String {
-        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-    }
-}
-
-impl std::io::Write for CaptureWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-    type Writer = CaptureWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
 
 /// A whole `Server::run` daemon on a real UDS in `dir`, spawned for the
 /// caller, alongside the socket path clients dial. The in-memory
