@@ -1614,15 +1614,16 @@ fn build_socket_family_filter() -> SocketFamilyFilter {
     // next instruction").  Indices below are for x86_64; aarch64 has no x32
     // guard, so everything from the `SYS_socket` compare on sits two lower
     // (relative jumps in that tail are unchanged).
-    let mut filter: Vec<libc::sock_filter> = Vec::new();
-    // 0: load arch.
-    filter.push(load(OFFSET_ARCH));
-    // 1: native ABI -> 3; anything else -> 2.
-    filter.push(jeq(AUDIT_ARCH, 1, 0));
-    // 2: kill: foreign ABI.
-    filter.push(ret(kill_action));
-    // 3: load syscall number.
-    filter.push(load(OFFSET_NR));
+    let mut filter: Vec<libc::sock_filter> = vec![
+        // 0: load arch.
+        load(OFFSET_ARCH),
+        // 1: native ABI -> 3; anything else -> 2.
+        jeq(AUDIT_ARCH, 1, 0),
+        // 2: kill: foreign ABI.
+        ret(kill_action),
+        // 3: load syscall number.
+        load(OFFSET_NR),
+    ];
     #[cfg(target_arch = "x86_64")]
     {
         // 4: nr >= X32_SYSCALL_BIT -> 5; else -> 6.
