@@ -384,6 +384,11 @@ enum SessionMessage {
     /// Hand back an `Arc` clone of this session's hook-scripts-upload lock,
     /// see [`Session::hook_scripts_upload_lock`].
     GetHookScriptsUploadLock(oneshot::Sender<Arc<Mutex<()>>>),
+    /// Register a live direct-tcpip forward relay as belonging to this
+    /// session, so teardown takes it down too: a session that goes away
+    /// aborts its forwards rather than leaving relays pointing into a box
+    /// that no longer exists.
+    TrackForward(tokio::task::AbortHandle),
     /// Kick off a background package build as a session side-op. Replies with
     /// the receiver end of the build's event stream.
     StartBuild {
@@ -480,6 +485,12 @@ pub struct Session {
     /// What brought the currently held host up, which decides whether an
     /// interactive attach may respawn it. See [`HostOrigin`].
     host_origin: HostOrigin,
+
+    /// The live direct-tcpip forwards opened for this session: one abort
+    /// handle per relay the connection layer spawned. Pruned as relays
+    /// finish; every live one is aborted by [`Session::stop_running`], so a
+    /// session that goes away takes its forwards down with it (NET-105).
+    forwards: Vec<tokio::task::AbortHandle>,
 }
 
 /// Why a session host was launched.
@@ -543,6 +554,9 @@ impl Session {
             // conservative default — it is the one value that never licenses
             // a respawn.
             host_origin: HostOrigin::Interactive,
+            // Forwards are registered as their channels open; a session
+            // starts with none.
+            forwards: Vec::new(),
             #[cfg(target_os = "linux")]
             hostnames,
         }
@@ -901,6 +915,12 @@ impl Session {
             }
             SessionMessage::GetHookScriptsUploadLock(r) => {
                 let _ = r.send(Arc::clone(&self.hook_scripts_upload_lock));
+            }
+            SessionMessage::TrackForward(forward) => {
+                // Prune the ones that have finished on their own, so the
+                // list holds the live forwards and nothing else.
+                self.forwards.retain(|h| !h.is_finished());
+                self.forwards.push(forward);
             }
             SessionMessage::StartBuild {
                 rebuild,
@@ -1445,6 +1465,14 @@ impl Session {
     /// the daemon-shutdown message (and a terminal reset) rather than a bare
     /// disconnect when the session dies because the daemon is going away.
     async fn stop_running(&mut self, for_shutdown: bool) {
+        // The session's forwards relay into its box: a session that is going
+        // away takes them with it, rather than leaving live relays pointed at
+        // a box that is being torn down. Both teardown paths — `Stop` and
+        // `Destroy` — come through here.
+        for forward in std::mem::take(&mut self.forwards) {
+            forward.abort();
+        }
+
         let inner = match &mut self.inner {
             SessionInner::Active { host, sops, .. } => Some((host.take(), std::mem::take(sops))),
             SessionInner::Draft { .. } => None,
@@ -2198,6 +2226,12 @@ impl Session {
     /// Under test, swap in a mock launcher that runs a plain host process wired
     /// to the pty, exercising the session-host runtime without building a real
     /// sandbox (which needs packages unavailable in the unit-test tempdir).
+    ///
+    /// Kept separate from the production launcher: the two return *different*
+    /// launcher types (`SandboxLauncher` vs `MockLauncher`), each with its own
+    /// `SessionProcess`/`SessionGuard` associated types, and `SessionLauncher`
+    /// is not object-safe — merging them would force a boxed/dyn launcher
+    /// through the production spawn path.
     #[cfg(test)]
     async fn session_launcher(
         &mut self,
@@ -2211,7 +2245,7 @@ impl Session {
         record
             .validate_policy()
             .map_err(AttachError::InvalidPolicy)?;
-        Ok(session_host::MockLauncher)
+        Ok(session_host::MockLauncher::default())
     }
 
     /// Return this session's workspace-rooted [`mctx::Context`].
@@ -2247,7 +2281,7 @@ impl Session {
         if record.status != SessionStatus::Active {
             return Err(format!(
                 "session isn't attachable yet (status is {:?}, need Active — \
-                 finish the upload + FinalizeSession sequence first)",
+             finish the upload + FinalizeSession sequence first)",
                 record.status,
             ));
         }
@@ -2297,38 +2331,38 @@ impl Session {
         }
     }
 
-    /// The default `minimal.toml` [`Self::scaffold_mfile_if_missing`] writes:
-    /// `op::InitProject` detects the workspace's stack against the default
-    /// package repo, whose branch head it resolves over the network.
-    #[cfg(not(any(test, feature = "test-support")))]
+    /// The default `minimal.toml` [`Self::scaffold_mfile_if_missing`] writes.
+    ///
+    /// Production: `op::InitProject` detects the workspace's stack against the
+    /// default package repo, whose branch head it resolves over the network.
+    ///
+    /// Under `test`/`test-support`: stand in for that network round-trip. Tests
+    /// run offline, and what they need from the scaffold is that it lands before
+    /// the composition — not what stack detection would have picked. The two
+    /// packages are what `op::InitProject` falls back to when nothing matches.
     fn default_mfile_plan(
         &self,
         wsp: &DaemonAbsPath,
     ) -> Result<(std::path::PathBuf, String), String> {
-        let config = self.workspace_config(wsp)?;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            Ok((
+                wsp.as_utf8_path()
+                    .join(mfile::MFILE_NAME)
+                    .into_std_path_buf(),
+                "[session]\npackages = [\"base\", \"vim\"]\n".to_string(),
+            ))
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let config = self.workspace_config(wsp)?;
 
-        use op::ProjectOp as _;
-        let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
-        let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
+            use op::ProjectOp as _;
+            let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
+            let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
 
-        Ok((plan.toml_path, plan.content))
-    }
-
-    /// Under test, stand in for `op::InitProject`'s network round-trip: tests
-    /// run offline, and what they need from the scaffold is that it lands
-    /// before the composition — not what stack detection would have picked.
-    /// Same two packages `op::InitProject` falls back to when nothing matches.
-    #[cfg(any(test, feature = "test-support"))]
-    fn default_mfile_plan(
-        &self,
-        wsp: &DaemonAbsPath,
-    ) -> Result<(std::path::PathBuf, String), String> {
-        Ok((
-            wsp.as_utf8_path()
-                .join(mfile::MFILE_NAME)
-                .into_std_path_buf(),
-            "[session]\npackages = [\"base\", \"vim\"]\n".to_string(),
-        ))
+            Ok((plan.toml_path, plan.content))
+        }
     }
 
     /// Do the actual context construction: run [`mctx::Context::new`] against
@@ -2757,6 +2791,19 @@ impl SessionHandle {
                 "session actor terminated before the host could be launched",
             ))),
         }
+    }
+
+    /// Registers a forward relay with the session it forwards for, so the
+    /// session aborts it at teardown.
+    ///
+    /// Best-effort by design: a send error means the session actor is
+    /// already gone, in which case the relay is about to learn the same
+    /// thing its client does — there is no session to outlive. The
+    /// connection layer ignores the outcome.
+    pub async fn track_forward(&self, forward: tokio::task::AbortHandle) {
+        // Ignore send errors - a session that is gone has nothing left to
+        // track, and the forward ends with it.
+        let _ = self.0.send(SessionMessage::TrackForward(forward)).await;
     }
 
     pub async fn attach(

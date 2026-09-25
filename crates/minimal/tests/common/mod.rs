@@ -46,6 +46,7 @@ impl TestDaemon {
             config_dir: None,
             provider: None,
             no_input: false,
+            vm: None,
         }
     }
 }

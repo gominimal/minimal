@@ -15,6 +15,7 @@ use sessions::SessionId;
 use minimald::test_harness::unwrap_ready;
 
 use serde_json_lenient::Value;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 // --- version ---
 
@@ -32,6 +33,7 @@ async fn version_succeeds_without_daemon() {
         config_dir: None,
         provider: None,
         no_input: false,
+        vm: None,
     };
     // Should print client version and note daemon is unreachable, but return Ok.
     cmd_version(&args).await.unwrap();
@@ -44,6 +46,8 @@ fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -80,6 +84,8 @@ fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -920,23 +926,29 @@ async fn policy_shows_effective_egress() {
 
 /// Runs the compiled `min` with the harness daemon's `--minimal-dir`, an empty
 /// `--config-dir` (the developer's own loadouts and policy stay out of the
-/// run), and `--no-input`, plus `extra` as the command, and returns stderr.
+/// run), and `--no-input`, plus `extra` as the command, and returns its
+/// captured output.
 #[cfg(target_os = "linux")]
-async fn run_min_stderr(args: &GlobalArgs, extra: &[&str]) -> String {
+async fn run_min(args: &GlobalArgs, extra: &[&str]) -> std::process::Output {
     let minimal_dir = args
         .minimal_dir
         .as_ref()
         .expect("setup points at a tempdir");
     let config_dir = tempfile::TempDir::new().unwrap();
-    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
         .args(extra)
         .output()
         .await
-        .expect("the min binary should be invocable");
-    String::from_utf8_lossy(&out.stderr).into_owned()
+        .expect("the min binary should be invocable")
+}
+
+/// [`run_min`]'s stderr — the warning path's tests read what the user sees.
+#[cfg(target_os = "linux")]
+async fn run_min_stderr(args: &GlobalArgs, extra: &[&str]) -> String {
+    String::from_utf8_lossy(&run_min(args, extra).await.stderr).into_owned()
 }
 
 /// Polls `ListSessions` until the daemon reports hostname routing down — the
@@ -1090,6 +1102,90 @@ async fn ls_warning_clears_on_recovery() {
     );
 }
 
+/// NET-026: a daemon that auto-selected its hostname-proxy port tells `min`
+/// which one it landed on, and `min ls` prints the address — the one an
+/// `HTTP(S)_PROXY` export needs, and the thing that cannot stay a constant on
+/// a machine running two daemons. The box-zone answerer's UDP port prints
+/// beside it, since pointing the host's resolver at that port is the other
+/// half of the same discovery. Driven through the compiled binary so the
+/// assertion is on what the user actually sees.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn min_prints_discovered_proxy_port() {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use minimald::server::{
+        RetryBackoff, retry_hostname_proxy_until_serving, retry_zone_answerer_until_serving,
+    };
+    use minimald_rpc::ListSessions;
+
+    let (daemon, args) = setup().await;
+    // Auto-select — no port configured — through the same startup loop
+    // `start_host_proxies` spawns, with a compressed backoff.
+    let compressed = RetryBackoff::new(
+        std::time::Duration::from_millis(5),
+        std::time::Duration::from_millis(40),
+    );
+    tokio::join!(
+        retry_hostname_proxy_until_serving(
+            daemon.server.state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        ),
+        retry_zone_answerer_until_serving(
+            daemon.server.state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        ),
+    );
+
+    // The reply `min ls` renders carries the ports both listeners bound.
+    let mut client = connect_daemon(&args).await.unwrap();
+    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    let port = resp
+        .hostname_proxy_port
+        .expect("the daemon must report the port its proxy ended up on");
+    assert_ne!(port, 0, "port 0 is a request for a port, not an answer");
+    let answerer_port = resp
+        .zone_answerer_port
+        .expect("the daemon must report the port its answerer ended up on");
+    assert_ne!(
+        answerer_port, 0,
+        "port 0 is a request for a port, not an answer"
+    );
+    assert!(
+        resp.hostname_routing_unavailable.is_none(),
+        "auto-selecting a port is not a fault, got: {:?}",
+        resp.hostname_routing_unavailable
+    );
+
+    // The printed addresses are real: the proxy accepts on its port.
+    tokio::net::TcpStream::connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+        .await
+        .expect("the discovered port must be listening");
+
+    let out = run_min(&args, &["ls"]).await;
+    let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        ls_stdout.contains(&format!("HOSTNAME PROXY:  listening on 127.0.0.1:{port}")),
+        "`min ls` must print the discovered port, got: {ls_stdout}"
+    );
+    assert!(
+        ls_stdout.contains("routes through it"),
+        "the line must say what the port is for, got: {ls_stdout}"
+    );
+    assert!(
+        ls_stdout.contains(&format!(
+            "ZONE ANSWERER:   listening on 127.0.0.1:{answerer_port} (UDP)"
+        )),
+        "`min ls` must print the answerer's port beside the proxy's, got: {ls_stdout}"
+    );
+    assert!(
+        ls_stdout.contains("point the host's resolver at it"),
+        "the answerer line must say what the port is for, got: {ls_stdout}"
+    );
+}
+
 // --- retired surfaces (NET-109 / NET-110) ---
 
 /// No build of the daemon carries the retired mTLS reverse proxy, its
@@ -1194,6 +1290,8 @@ fn session_list_decodes_without_mtls_field() {
     let resp = ListSessionsResponse {
         daemon_version: Some("test".to_string()),
         hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
         resource_pool: None,
         sessions: vec![],
     };
@@ -1365,4 +1463,246 @@ async fn create_session_with_policy(
         camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
     let abs_path = paths::HostAbsPath::try_new(project_path).unwrap();
     create_session_with(daemon, name, abs_path, network, policy).await
+}
+
+// --- net forward (NET-104/NET-105) ---
+
+/// The service the forward reaches: a loopback echo server, bound to an
+/// ephemeral port, echoing every accepted connection back byte for byte.
+async fn spawn_echo_server() -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((conn, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let (mut read, mut write) = tokio::io::split(conn);
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+    (port, server)
+}
+
+/// A loopback port nothing is bound to, for the forward's laptop-side
+/// listener. Probed rather than guessed: bind :0, read the port, drop the
+/// socket.
+async fn free_loopback_port() -> u16 {
+    let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    port
+}
+
+/// Connects to `127.0.0.1:port`, retrying briefly: the forward runs as a
+/// concurrent task, so its listener appears a moment after the spawn.
+async fn connect_with_retry(port: u16) -> tokio::net::TcpStream {
+    let mut last = None;
+    for _ in 0..500 {
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(stream) => return stream,
+            Err(e) => {
+                last = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+    panic!("nothing ever listened on 127.0.0.1:{port}: {last:?}");
+}
+
+/// A `GlobalArgs` pointing at the same daemon as `args`, but built to move
+/// into a spawned task: the shared one stays with the test body.
+fn global_args_for_task(args: &GlobalArgs) -> GlobalArgs {
+    GlobalArgs {
+        minimal_dir: args.minimal_dir.clone(),
+        ..Default::default()
+    }
+}
+
+/// `min net forward web 8080:3000` answers on `localhost:8080` (NET-104):
+/// the session is `host_ip`, so the box shares this process's network
+/// namespace, and the echo server below stands in for the in-box service the
+/// forward reaches. Bytes written to the laptop-side port come back over the
+/// session's SSH channel, on the forward's own connections — twice, to show
+/// each accepted connection gets its own channel.
+#[tokio::test]
+async fn net_forward_relays_over_ssh_channel() {
+    let (daemon, args) = setup().await;
+    let _id = create_session_with_policy(
+        &daemon,
+        "web",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    let (box_port, echo) = spawn_echo_server().await;
+    let local_port = free_loopback_port().await;
+    let forward_args = global_args_for_task(&args);
+    let forward = tokio::spawn(async move {
+        cmd_net_forward(
+            &forward_args,
+            NetForwardArgs {
+                session: "web".to_string(),
+                spec: format!("{local_port}:{box_port}"),
+            },
+        )
+        .await
+    });
+
+    for round in 0..2 {
+        let mut conn = connect_with_retry(local_port).await;
+        conn.write_all(b"ping").await.expect("write to the forward");
+        let mut echoed = [0u8; 4];
+        conn.read_exact(&mut echoed)
+            .await
+            .expect("read the box's answer back through the forward");
+        assert_eq!(
+            echoed, *b"ping",
+            "connection {round} must relay through the box port"
+        );
+    }
+
+    forward.abort();
+    echo.abort();
+}
+
+/// A connection whose box port refuses ends that connection and nothing
+/// else (NET-104): the channel open runs in the connection's own task, so a
+/// refused dial costs one connection while the listener keeps accepting —
+/// and the very next connection, once the box port has a listener, relays.
+#[tokio::test]
+async fn net_forward_survives_a_refused_box_port() {
+    let (daemon, args) = setup().await;
+    let _id = create_session_with_policy(
+        &daemon,
+        "web",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    // Nothing is listening on the box port yet: the first connection's dial
+    // is refused by the box.
+    let box_port = free_loopback_port().await;
+    let local_port = free_loopback_port().await;
+    let forward_args = global_args_for_task(&args);
+    let forward = tokio::spawn(async move {
+        cmd_net_forward(
+            &forward_args,
+            NetForwardArgs {
+                session: "web".to_string(),
+                spec: format!("{local_port}:{box_port}"),
+            },
+        )
+        .await
+    });
+
+    // The refused connection is accepted — the forward's listener is up — and
+    // then closed by the refusal, not hung. It ends with a reset or with a
+    // clean EOF, whichever side of the race the bytes the client sent land
+    // on: a socket dropped with unread data in its receive queue resets,
+    // one dropped after the bytes arrived and were read ends cleanly. Either
+    // way the connection is over, which is the point.
+    let mut refused = connect_with_retry(local_port).await;
+    refused.write_all(b"ping").await.unwrap();
+    let mut seen = Vec::new();
+    match refused.read_to_end(&mut seen).await {
+        Ok(n) => assert_eq!(
+            n, 0,
+            "a refused dial must close the connection, got: {seen:?}"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("a refused dial must close the connection, got: {e}"),
+    }
+    drop(refused);
+
+    // The service comes up on the box port, and the forward that survived
+    // the refusal reaches it.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", box_port))
+        .await
+        .expect("the box port is free for the service to take");
+    let echo = tokio::spawn(async move {
+        loop {
+            let Ok((conn, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let (mut read, mut write) = tokio::io::split(conn);
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+
+    let mut conn = connect_with_retry(local_port).await;
+    conn.write_all(b"ping").await.expect("write to the forward");
+    let mut echoed = [0u8; 4];
+    conn.read_exact(&mut echoed)
+        .await
+        .expect("read the box's answer back through the forward");
+    assert_eq!(echoed, *b"ping", "the forward must relay after a refusal");
+
+    forward.abort();
+    echo.abort();
+}
+
+/// The forward closes with its session (NET-105): once `min session destroy`
+/// takes the session down, the forward's future ends on its own — the
+/// listener goes with it rather than outliving the session it forwards for.
+#[tokio::test]
+async fn net_forward_closes_with_session() {
+    let (daemon, args) = setup().await;
+    let _id = create_session_with_policy(
+        &daemon,
+        "web",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    let (box_port, echo) = spawn_echo_server().await;
+    let local_port = free_loopback_port().await;
+    let forward_args = global_args_for_task(&args);
+    let forward = tokio::spawn(async move {
+        cmd_net_forward(
+            &forward_args,
+            NetForwardArgs {
+                session: "web".to_string(),
+                spec: format!("{local_port}:{box_port}"),
+            },
+        )
+        .await
+    });
+
+    // The listener is up: the forward is live, not just spawned.
+    let mut conn = connect_with_retry(local_port).await;
+    conn.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    conn.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(echoed, *b"ping");
+    drop(conn);
+
+    cmd_destroy(
+        &args,
+        DestroyArgs {
+            session: Some("web".to_string()),
+            all: false,
+            force: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), forward)
+        .await
+        .expect("the forward must end once its session is destroyed")
+        .expect("the forward task must not panic")
+        .expect("the forward must exit cleanly");
+    echo.abort();
 }

@@ -387,6 +387,33 @@ pub fn format_ls(
         writeln!(out)?;
     }
 
+    // NET-026: say where this daemon's names route from — the TCP proxy an
+    // `HTTP(S)_PROXY` export points at, and beside it the UDP answerer the
+    // host's resolver would be pointed at for the same zone. Both ports
+    // travel on the reply because a daemon that auto-selected is on
+    // OS-chosen ones, and the addresses are what the exports need —
+    // especially on a machine running two daemons. Absent while the daemon
+    // is still bringing a listener up, or from a daemon too old to carry the
+    // field: nothing to print for it then. `--raw` and `--json` stay
+    // machine-readable-only, so a port line never lands in a pipeline.
+    if !args.raw {
+        if let Some(port) = resp.hostname_proxy_port {
+            writeln!(
+                out,
+                "HOSTNAME PROXY:  listening on 127.0.0.1:{port} · <name>.min.internal routes through it"
+            )?;
+        }
+        if let Some(answerer) = resp.zone_answerer_port {
+            writeln!(
+                out,
+                "ZONE ANSWERER:   listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal"
+            )?;
+        }
+        if resp.hostname_proxy_port.is_some() || resp.zone_answerer_port.is_some() {
+            writeln!(out)?;
+        }
+    }
+
     if resp.sessions.is_empty() {
         if !args.raw {
             writeln!(out, "No active sessions.")?;
