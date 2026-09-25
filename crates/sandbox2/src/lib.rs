@@ -126,8 +126,7 @@ impl<C: Channel> Sandbox<C> {
     /// Exposed so a caller that runs a process in this sandbox by some route
     /// other than [`Self::command`] — minimald joining a live session's
     /// namespaces — starts it where the sandbox's own process started.
-    #[must_use]
-    pub fn command_cwd(&self) -> String {
+    pub fn command_cwd(&self) -> Result<String, Error> {
         self.config.command_cwd()
     }
 
@@ -365,6 +364,13 @@ impl<C: Channel> Sandbox<C> {
 #[cfg(target_os = "linux")]
 pub struct Container {
     container: hakoniwa::Container,
+    /// The libc-only seccomp-BPF filter installed by this container before exec.
+    /// Stored as a `&'static` because a hakoniwa command closure is `'static`
+    /// and the filter must live as long as any command spawned from this
+    /// container.  The value is the process-wide
+    /// [`socket_family_filter_for_none_box`] `OnceLock` build, shared by every
+    /// none-box container this process launches; nothing is leaked per sandbox.
+    socket_family_filter: Option<&'static SocketFamilyFilter>,
 }
 
 #[cfg(target_os = "linux")]
@@ -403,13 +409,116 @@ impl Container {
         // process injected into a *running* sandbox (minimald's `nsenter`) can
         // reproduce the same working directory and environment without a second
         // definition of them drifting from this one.
-        command.current_dir(sandbox.config.command_cwd());
+        command.current_dir(sandbox.config.command_cwd()?);
         command.envs(sandbox.config.command_env());
         for (k, v) in envs.into_iter() {
             command.env(k.as_ref(), v.as_ref());
         }
 
+        // If this container was built with a socket-family filter, install it
+        // in the child immediately before exec.  This is the same moment hakoniwa
+        // would load a libseccomp-based filter, but we use `prctl` + `seccomp`
+        // through libc only.
+        if let Some(filter) = self.socket_family_filter {
+            install_filter_in_command(&self.container, &mut command, filter)?;
+        }
+
         Ok(command)
+    }
+}
+
+/// Install a seccomp-BPF filter into a hakoniwa command as a program-closure.
+///
+/// The closure runs after namespaces and credentials are configured but before
+/// the supervised program execs, which is the correct moment for seccomp.  It
+/// captures the `&'static` filter the `Container` holds, loads it, and then
+/// execs the original program, since `command_from_closure` otherwise replaces
+/// the program entirely.
+///
+/// `command_from_closure` starts a fresh `Command`, so the working directory
+/// and environment already set on `command` are carried over to it: hakoniwa
+/// `chdir`s and rebuilds the child's `environ` from the command it spawns, and
+/// the exec in the closure inherits both.  Whatever a caller sets on the
+/// returned command afterwards (`SHELL`, `PS1`, stdio) lands on the closure
+/// command and reaches the program the same way.
+#[cfg(target_os = "linux")]
+fn install_filter_in_command(
+    container: &hakoniwa::Container,
+    command: &mut hakoniwa::Command,
+    filter: &'static SocketFamilyFilter,
+) -> Result<(), Error> {
+    let program = command.get_program().to_string();
+    let args = command.get_args();
+    let current_dir = command.get_current_dir().map(Path::to_path_buf);
+    let envs = command.get_envs();
+    // SAFETY: `command_from_closure` is unsafe because the closure runs in a
+    // forked child.  `filter` is `&'static`: it is the process-wide
+    // `socket_family_filter_for_none_box()` `OnceLock` value, owned for the
+    // process's whole life, so it outlives every command spawned from the
+    // container.  The closure is not
+    // async-signal-safe: it allocates after the fork (the argv `CString`s, a
+    // failure message), in kind with hakoniwa's own closure path, which
+    // `format!`s its panic report at the same point.  The child is
+    // single-threaded, so no allocator lock can be held across the fork.  The
+    // closure never returns: it execs, or `_exit`s.
+    let mut closure = unsafe {
+        container.command_from_closure(move || {
+            if let Err(e) = install_socket_family_filter(filter) {
+                exit_child("installing the socket-family filter", &e);
+            }
+            // `command_from_closure` replaces the program with this closure;
+            // exec into the real program so the spawn runs what the caller
+            // asked for, now with the seccomp filter installed.
+            let e = execv_in_child(&program, &args);
+            exit_child(&format!("exec {program}"), &e)
+        })
+    };
+    if let Some(dir) = current_dir {
+        closure.current_dir(dir);
+    }
+    closure.envs(envs);
+    *command = closure;
+    Ok(())
+}
+
+/// Exec into `program` with `args` from the forked child of a hakoniwa
+/// `command_from_closure` closure; returns only when the exec failed.  The
+/// environment is not passed explicitly: `execv` hands the program the
+/// `environ` hakoniwa rebuilt from the command's final `envs` just before
+/// running the closure.
+#[cfg(target_os = "linux")]
+fn execv_in_child(program: &str, args: &[String]) -> std::io::Error {
+    let argv_c: Result<Vec<std::ffi::CString>, _> = std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(std::ffi::CString::new)
+        .collect();
+    let argv_c = match argv_c {
+        Ok(argv) => argv,
+        Err(_) => return std::io::Error::from_raw_os_error(libc::EINVAL),
+    };
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv_c.iter().map(|s| s.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+
+    // SAFETY: execv only touches the C strings we just built, which `argv_c`
+    // keeps alive for the call.
+    unsafe { libc::execv(argv_c[0].as_ptr(), argv_ptrs.as_ptr()) };
+    // execv returns only on failure.
+    std::io::Error::last_os_error()
+}
+
+/// Reports a failure of the forked child on its stderr and exits it with 127,
+/// the shell's "cannot run" status, so a spawn that never reached the program
+/// is distinguishable from the program's own exit codes.  Called after the
+/// fork, so it uses `write(2)` and `_exit(2)` rather than the Rust stdio and
+/// exit machinery.
+#[cfg(target_os = "linux")]
+fn exit_child(what: &str, err: &std::io::Error) -> ! {
+    let msg = format!("minimal: none box: {what} failed: {err}\n");
+    // SAFETY: `write` and `_exit` are async-signal-safe; `msg` outlives the
+    // write, and `_exit` does not return.
+    unsafe {
+        libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+        libc::_exit(127)
     }
 }
 
@@ -515,6 +624,27 @@ impl<C: Channel> Sandbox<C> {
         if isolate {
             container.unshare(hakoniwa::Namespace::Network);
         }
+
+        // Socket-family filter for network plans that promise no outside reach.
+        // A fresh network namespace blocks IP/UNIX flows, but AF_VSOCK is not
+        // subject to the network namespace, so a none-box process could still
+        // reach the host over vsock.  Install a seccomp-BPF filter that refuses
+        // socket()/socketpair() calls whose family is not AF_UNIX.  The filter is
+        // installed in the child after hakoniwa has set up namespaces and
+        // credentials but before exec, using `prctl` + `seccomp` via libc only.
+        #[cfg(target_os = "linux")]
+        let socket_family_filter = if plan.blocks_outside_sockets() {
+            let filter = socket_family_filter_for_none_box();
+            tracing::info!(
+                network_plan = %plan,
+                sealed_families = %filter.sealed_families,
+                "sandbox launch: network plan is a none box, refusing non-allowed socket families"
+            );
+            Some(filter)
+        } else {
+            tracing::info!(network_plan = %plan, "sandbox launch: network plan is open, no socket-family filter");
+            None
+        };
 
         // Have hakoniwa create + configure the TAP inside the sandbox's user+net
         // namespace (rootless). `network()` does not imply the netns unshare,
@@ -622,10 +752,15 @@ impl<C: Channel> Sandbox<C> {
             WdSetup::BoundDir {
                 path, read_only, ..
             } => {
-                let container_path = format!(
-                    "/{}",
-                    self.config.wd.bound_dir_sandbox_cwd().to_str().unwrap()
-                );
+                let sandbox_cwd = self.config.wd.bound_dir_sandbox_cwd();
+                let sandbox_cwd = sandbox_cwd.to_str().ok_or_else(|| {
+                    Error::IO(
+                        "bound-dir cwd is not valid UTF-8",
+                        sandbox_cwd.to_path_buf(),
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 path"),
+                    )
+                })?;
+                let container_path = format!("/{sandbox_cwd}");
                 let opts = BindOpts {
                     recursive: true,
                     read_only: *read_only,
@@ -715,7 +850,10 @@ impl<C: Channel> Sandbox<C> {
             });
         }
 
-        Ok(Container { container })
+        Ok(Container {
+            container,
+            socket_family_filter,
+        })
     }
 
     /// Initializes a hakoniwa command structure.
@@ -738,19 +876,21 @@ impl<C: Channel> Sandbox<C> {
         let mut program = program.to_string();
 
         // Add /usr/bin/ for commands that are not absolute, and don't shadow anything in cwd
-        if !program.starts_with("/")
-            && !fs::exists(
-                match &self.config.wd {
-                    WdSetup::Isolated { .. } => self.base_dir.join("build"),
-                    WdSetup::BoundDir { path, .. } => path.clone(),
-                    WdSetup::Session { working, .. } => working.clone(),
-                }
-                .join(&program),
-            )
-            .unwrap()
-            && fs::exists(rootfs.join("usr/bin").join(&program)).unwrap()
-        {
-            program = format!("/usr/bin/{program}");
+        if !program.starts_with("/") {
+            let cwd = match &self.config.wd {
+                WdSetup::Isolated { .. } => self.base_dir.join("build"),
+                WdSetup::BoundDir { path, .. } => path.clone(),
+                WdSetup::Session { working, .. } => working.clone(),
+            };
+            let in_cwd = cwd.join(&program);
+            let in_usr_bin = rootfs.join("usr/bin").join(&program);
+            if !fs::exists(&in_cwd)
+                .map_err(|e| Error::IO("checking program in cwd", in_cwd.clone(), e))?
+                && fs::exists(&in_usr_bin)
+                    .map_err(|e| Error::IO("checking program in usr/bin", in_usr_bin.clone(), e))?
+            {
+                program = format!("/usr/bin/{program}");
+            }
         }
 
         container.command_inner(self, &program, args, env_vars)
@@ -1398,6 +1538,182 @@ fn isolation_decision(plan: &network::NetPlan, netns_available: bool) -> Result<
     Ok(plan.isolates_netns())
 }
 
+/// The audit-architecture identifier of the ABI this binary is built for.  A
+/// kernel ABI constant (`AUDIT_ARCH_*` in `linux/audit.h`) that the `libc`
+/// crate does not expose; chosen at compile time so an unsupported target
+/// fails to build rather than panicking at launch.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const AUDIT_ARCH: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const AUDIT_ARCH: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
+
+/// The x32 ABI shares `AUDIT_ARCH_X86_64` and marks its syscalls by setting
+/// this bit in `nr`, so a plain compare against `SYS_socket` would let an x32
+/// caller through.  The filter kills any such call instead.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+
+/// The socket-family seccomp filter as a classic BPF program.  It is installed
+/// via `prctl(PR_SET_NO_NEW_PRIVS, 1)` and `seccomp(SECCOMP_SET_MODE_FILTER, 0,
+/// &prog)` by a pre-exec closure so it survives both the sandbox spawn and any
+/// later `nsenter` injection into a none box.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub struct SocketFamilyFilter {
+    program: Vec<libc::sock_filter>,
+    /// The families a none box still permits, named for the launch log.
+    sealed_families: &'static str,
+}
+
+/// Syscall numbers for the socket-family filters.  `libc` exposes these per-arch.
+#[cfg(target_os = "linux")]
+const SYS_SOCKET: i64 = libc::SYS_socket;
+#[cfg(target_os = "linux")]
+const SYS_SOCKETPAIR: i64 = libc::SYS_socketpair;
+
+/// Build the none-box filter: a classic BPF seccomp program that allows only
+/// `AF_UNIX` and refuses every other `socket()`/`socketpair()` family with
+/// `EAFNOSUPPORT`.  This seals the namespace-bypass families (`AF_VSOCK` in
+/// particular) while leaving local Unix sockets working so the in-sandbox
+/// `min` helper and the minenv socket keep functioning.
+#[cfg(target_os = "linux")]
+fn build_socket_family_filter() -> SocketFamilyFilter {
+    // Return the selected action for a socket() or socketpair() whose arg0 (the
+    // address family) is not AF_UNIX.
+    let refuse_action = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
+    // Return the default allow action when the syscall is not one we restrict
+    // or when the address family is allowed.
+    let allow_action = libc::SECCOMP_RET_ALLOW;
+    // A caller on a foreign ABI (another audit arch, or x32 on x86_64) is not
+    // something a none box ever runs legitimately, and the syscall numbers
+    // below would not mean the same thing there: kill it rather than guess.
+    let kill_action = libc::SECCOMP_RET_KILL_PROCESS;
+
+    // Offsets into struct seccomp_data in bytes:
+    //   int nr;                  // 0
+    //   __u32 arch;              // 4
+    //   __u64 instruction_pointer; // 8
+    //   __u64 args[6];           // 16
+    const OFFSET_NR: u32 = 0;
+    const OFFSET_ARCH: u32 = 4;
+    const OFFSET_ARG0: u32 = 16;
+
+    let load = |offset: u32| libc::sock_filter {
+        code: (libc::BPF_LD | libc::BPF_ABS | libc::BPF_W) as u16,
+        jt: 0,
+        jf: 0,
+        k: offset,
+    };
+    let jeq = |k: u32, jt: u8, jf: u8| libc::sock_filter {
+        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        jt,
+        jf,
+        k,
+    };
+    let ret = |action: u32| libc::sock_filter {
+        code: (libc::BPF_RET | libc::BPF_K) as u16,
+        jt: 0,
+        jf: 0,
+        k: action,
+    };
+
+    // Classic BPF seccomp program.  `jt` and `jf` are the number of
+    // instructions to skip after the current one (0 means "fall through to the
+    // next instruction").  Indices below are for x86_64; aarch64 has no x32
+    // guard, so everything from the `SYS_socket` compare on sits two lower
+    // (relative jumps in that tail are unchanged).
+    let mut filter: Vec<libc::sock_filter> = vec![
+        // 0: load arch.
+        load(OFFSET_ARCH),
+        // 1: native ABI -> 3; anything else -> 2.
+        jeq(AUDIT_ARCH, 1, 0),
+        // 2: kill: foreign ABI.
+        ret(kill_action),
+        // 3: load syscall number.
+        load(OFFSET_NR),
+    ];
+    #[cfg(target_arch = "x86_64")]
+    {
+        // 4: nr >= X32_SYSCALL_BIT -> 5; else -> 6.
+        filter.push(libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: X32_SYSCALL_BIT,
+        });
+        // 5: kill: x32 ABI.
+        filter.push(ret(kill_action));
+    }
+    // 6: socket() -> 8; else -> 7.
+    filter.push(jeq(SYS_SOCKET as u32, 1, 0));
+    // 7: socketpair() -> 8; anything else -> 12 (default allow).
+    filter.push(jeq(SYS_SOCKETPAIR as u32, 0, 4));
+    // 8: load arg0 (the address family).
+    filter.push(load(OFFSET_ARG0));
+    // 9: AF_UNIX -> 10; else -> 11.
+    filter.push(jeq(libc::AF_UNIX as u32, 0, 1));
+    // 10: allow: local socket family.
+    filter.push(ret(allow_action));
+    // 11: refuse: any other family, EAFNOSUPPORT.
+    filter.push(ret(refuse_action));
+    // 12: allow: not a socket-creating syscall.
+    filter.push(ret(allow_action));
+
+    SocketFamilyFilter {
+        program: filter,
+        sealed_families: "unix",
+    }
+}
+
+/// Install a seccomp-BPF filter in this process by enabling
+/// `PR_SET_NO_NEW_PRIVS` and loading the filter with the kernel.  This must run
+/// after the namespace/credential setup and before the supervised program
+/// starts, and it must be async-signal-safe (it only calls `prctl(2)` and
+/// `syscall(2)`).
+///
+/// # Safety
+///
+/// `filter` must remain valid and immutable for the duration of this call.
+/// The function is otherwise async-signal-safe and only uses libc syscalls.
+#[cfg(target_os = "linux")]
+pub unsafe fn install_socket_family_filter(filter: &SocketFamilyFilter) -> std::io::Result<()> {
+    // SAFETY: prctl is async-signal-safe and the arguments are valid.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let prog = libc::sock_fprog {
+        len: filter.program.len() as u16,
+        filter: filter.program.as_ptr().cast_mut(),
+    };
+
+    // SAFETY: syscall is async-signal-safe; the seccomp_set_mode_filter
+    // arguments point at a valid sock_fprog whose filter bytes are pinned.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER as i64,
+            0i64,
+            &prog as *const libc::sock_fprog as i64,
+        )
+    };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Returns a pointer to the built-in none-box socket-family filter.  This is
+/// used both when launching a none box and when re-installing the same filter
+/// during `nsenter` injection (the filter is inherited by children, not by
+/// processes that join the namespaces later).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn socket_family_filter_for_none_box() -> &'static SocketFamilyFilter {
+    static FILTER: std::sync::OnceLock<SocketFamilyFilter> = std::sync::OnceLock::new();
+    FILTER.get_or_init(build_socket_family_filter)
+}
+
 /// Puts the plan's resolver into `<rootfs>/etc/resolv.conf`. The host's is
 /// synthesized only if the rootfs has none; named servers replace whatever is
 /// there, unlinking first because the rootfs is a hardlink farm over the
@@ -1961,6 +2277,299 @@ mod tests {
             sandbox.state_dir, state_path,
             "state_dir should match the path supplied via with_state_dir"
         );
+    }
+
+    /// Runs a classic BPF seccomp program over one synthetic `seccomp_data`
+    /// and returns the action it terminates with.  Supports exactly the
+    /// opcodes [`build_socket_family_filter`] emits: `LD|W|ABS`, `JMP|JEQ|K`,
+    /// `JMP|JGE|K`, and `RET|K`.
+    #[cfg(target_os = "linux")]
+    fn run_seccomp_program(program: &[libc::sock_filter], nr: u32, arch: u32, arg0: u32) -> u32 {
+        let (mut pc, mut acc) = (0usize, 0u32);
+        loop {
+            let insn = &program[pc];
+            pc += 1;
+            let code = u32::from(insn.code);
+            if code == libc::BPF_LD | libc::BPF_W | libc::BPF_ABS {
+                // Offsets into `struct seccomp_data`: nr, arch, args[0] low word.
+                acc = match insn.k {
+                    0 => nr,
+                    4 => arch,
+                    16 => arg0,
+                    other => panic!("unexpected seccomp_data offset {other}"),
+                };
+            } else if code == libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K {
+                pc += usize::from(if acc == insn.k { insn.jt } else { insn.jf });
+            } else if code == libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K {
+                pc += usize::from(if acc >= insn.k { insn.jt } else { insn.jf });
+            } else if code == libc::BPF_RET | libc::BPF_K {
+                return insn.k;
+            } else {
+                panic!("unexpected BPF opcode {code:#x} at {}", pc - 1);
+            }
+        }
+    }
+
+    /// The socket families the filter's live-kernel behaviour is probed for,
+    /// in the order the probe child reports them.
+    #[cfg(target_os = "linux")]
+    const PROBED_FAMILIES: [(&str, i32); 4] = [
+        ("AF_UNIX", libc::AF_UNIX),
+        ("AF_INET", libc::AF_INET),
+        ("AF_INET6", libc::AF_INET6),
+        ("AF_VSOCK", libc::AF_VSOCK),
+    ];
+
+    /// Probes [`PROBED_FAMILIES`] in a forked child, installing the production
+    /// none-box filter first when `filtered`, and returns one errno byte per
+    /// family: `0` when the child created a socket of that family, the raw
+    /// errno otherwise.
+    ///
+    /// The child runs only async-signal-safe calls between the fork and its
+    /// `_exit` (`prctl`, the raw `seccomp` syscall, `socket`, `close`, `write`,
+    /// `_exit`), matching the pre-exec environment the production filter is
+    /// installed in; the parent owns every assertion, so a failure is reported
+    /// with the test's own messages rather than a bare child exit code.
+    #[cfg(target_os = "linux")]
+    fn probe_socket_families_in_child(filtered: bool) -> std::io::Result<[u8; 4]> {
+        let mut report = [0u8; 4];
+        let mut fds = [0; 2];
+        // SAFETY: `pipe(2)` writes two descriptors into `fds` and reads no
+        // memory of ours beyond it; the result is checked.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the fork runs in the test's process, and the child only
+        // touches async-signal-safe calls before its `_exit`, so no allocator
+        // or lock can be held across the fork by the child itself.
+        let pid = unsafe { libc::fork() };
+        if pid == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if pid == 0 {
+            // Child: the production filter, then one errno byte per family.
+            // SAFETY: the descriptors are the pipe's own ends.
+            unsafe { libc::close(fds[0]) };
+            if filtered {
+                // SAFETY: the filter is the `&'static` the process-wide
+                // OnceLock owns, valid and immutable for the child's lifetime.
+                if unsafe { install_socket_family_filter(socket_family_filter_for_none_box()) }
+                    .is_err()
+                {
+                    // Distinguishable in the parent's failure message: no
+                    // install, no probe. This host cannot launch none boxes.
+                    unsafe { libc::_exit(127) };
+                }
+            }
+            for (i, &(_, family)) in PROBED_FAMILIES.iter().enumerate() {
+                // SAFETY: `socket(2)` reads only its arguments.
+                let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
+                report[i] = if fd >= 0 {
+                    // SAFETY: `close(2)` consumes the descriptor just created.
+                    unsafe { libc::close(fd) };
+                    0
+                } else {
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(1) as u8
+                };
+            }
+            // SAFETY: `write(2)` reads `report`, which outlives the call, and
+            // `_exit(2)` never returns, so the child ends here.
+            unsafe {
+                libc::write(fds[1], report.as_ptr().cast(), report.len());
+                libc::_exit(0);
+            }
+        }
+        // Parent: drain the report, then reap the child.
+        // SAFETY: the write end is the parent's to close.
+        unsafe { libc::close(fds[1]) };
+        let mut filled = 0;
+        while filled < report.len() {
+            // SAFETY: `read(2)` writes only into the unfilled tail of
+            // `report`, and the length is bounded by the same slice.
+            let n = unsafe {
+                libc::read(
+                    fds[0],
+                    report[filled..].as_mut_ptr().cast(),
+                    report.len() - filled,
+                )
+            };
+            if n <= 0 {
+                break; // The child is gone; its exit status below names it.
+            }
+            filled += n as usize;
+        }
+        let mut status = 0;
+        // SAFETY: `waitpid(2)` waits on the child this function forked.
+        if unsafe { libc::waitpid(pid, &mut status, 0) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+            return Err(std::io::Error::other(format!(
+                "the socket-family probe child exited with status {status} \
+                 (127 means installing the filter failed, so this host cannot \
+                 launch none boxes at all)"
+            )));
+        }
+        if filled != report.len() {
+            return Err(std::io::Error::other(format!(
+                "the socket-family probe child reported {filled} of {} bytes",
+                report.len()
+            )));
+        }
+        Ok(report)
+    }
+
+    /// NET-038. The none-box filter refuses `AF_VSOCK` sockets (which bypass the
+    /// network namespace) while still allowing the local `AF_UNIX` sockets the
+    /// sandbox's own minenv socket depends on, leaves every other syscall alone,
+    /// and kills a caller on a foreign ABI rather than letting it through.  The
+    /// production runtime effect is proved by
+    /// `network_none_blocks_all_outside_sockets` in the minimald root integration
+    /// harness; this unit test evaluates the program
+    /// [`build_socket_family_filter`] produces and installs the production
+    /// filter against the live kernel this test runs on, so the shipped BPF is
+    /// exercised by real `socket(2)` calls on every host that runs the suite,
+    /// not only where the root harness can.
+    /// Only a none plan seals sockets. An isolated plan without a tap is
+    /// also what an own-address box starts from inside a microVM, where the
+    /// daemon moves the tap in after spawn; sealing it would refuse the
+    /// `AF_INET` sockets that box exists to open.
+    #[test]
+    fn only_a_none_plan_seals_sockets() {
+        assert!(network::NetPlan::none().blocks_outside_sockets());
+        assert!(!network::NetPlan::isolated().blocks_outside_sockets());
+        assert!(!network::NetPlan::host().blocks_outside_sockets());
+        assert!(
+            !network::NetPlan::isolated_with_tap(network::TapSpec {
+                address: std::net::Ipv4Addr::new(10, 0, 0, 2),
+                netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
+                gateway: std::net::Ipv4Addr::new(10, 0, 0, 1),
+                mtu: 1500,
+            })
+            .blocks_outside_sockets()
+        );
+        assert_eq!(network::NetPlan::none().to_string(), "none");
+        assert_eq!(network::NetPlan::isolated().to_string(), "isolated");
+        assert_eq!(network::NetPlan::host().to_string(), "host_ip");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn none_plan_refuses_vsock_family() {
+        let plan = network::NetPlan::none();
+        assert!(
+            plan.blocks_outside_sockets(),
+            "a none plan must block outside sockets"
+        );
+
+        // The provider is the consumer-facing surface: `network_for` maps every
+        // no-net consumer — a `--network none` session's interactive box and a
+        // no-net task's sandbox alike (`task_network` goes through the same
+        // mapping) — to `NoNet`, so pinning that its plan seals is pinning the
+        // task path, not just the session path.
+        let no_net = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("building a current-thread runtime for the provider pin")
+            .block_on(network::NoNet.plan())
+            .expect("NoNet plans do not fail");
+        assert!(
+            no_net.blocks_outside_sockets(),
+            "the NoNet provider must yield the sealing plan for every consumer it plans"
+        );
+
+        let filter = build_socket_family_filter();
+        assert_eq!(
+            filter.sealed_families, "unix",
+            "the launch log must name the only allowed socket family"
+        );
+
+        let run = |nr: i64, arch: u32, arg0: u32| {
+            run_seccomp_program(&filter.program, nr as u32, arch, arg0)
+        };
+        let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
+        // AUDIT_ARCH_I386: the compat ABI an x86_64 kernel also answers to.
+        const FOREIGN_ARCH: u32 = 0x4000_0003;
+
+        assert_eq!(
+            run(libc::SYS_socket, AUDIT_ARCH, libc::AF_VSOCK as u32),
+            refuse,
+            "socket(AF_VSOCK) must fail with EAFNOSUPPORT"
+        );
+        assert_eq!(
+            run(libc::SYS_socketpair, AUDIT_ARCH, libc::AF_INET as u32),
+            refuse,
+            "socketpair(AF_INET) must fail with EAFNOSUPPORT"
+        );
+        assert_eq!(
+            run(libc::SYS_socket, AUDIT_ARCH, libc::AF_UNIX as u32),
+            libc::SECCOMP_RET_ALLOW,
+            "socket(AF_UNIX) must stay allowed"
+        );
+        assert_eq!(
+            run(libc::SYS_read, AUDIT_ARCH, 0),
+            libc::SECCOMP_RET_ALLOW,
+            "a syscall that creates no socket must stay allowed"
+        );
+        assert_eq!(
+            run(libc::SYS_socket, FOREIGN_ARCH, libc::AF_VSOCK as u32),
+            libc::SECCOMP_RET_KILL_PROCESS,
+            "a foreign-ABI caller must be killed, not allowed"
+        );
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            run(
+                libc::SYS_socket | i64::from(X32_SYSCALL_BIT),
+                AUDIT_ARCH,
+                libc::AF_VSOCK as u32
+            ),
+            libc::SECCOMP_RET_KILL_PROCESS,
+            "an x32 caller must be killed, not allowed"
+        );
+
+        // The program above is what ships; these probes run the shipped
+        // filter against the kernel this test executes on, exactly the way a
+        // none-box child experiences it: install via `prctl` + `seccomp`,
+        // then call `socket(2)` for real.  A control child runs unfiltered,
+        // so a family the kernel itself cannot create (no AF_VSOCK driver,
+        // say) is told apart from one the filter refused.
+        let unfiltered = probe_socket_families_in_child(false)
+            .expect("running the unfiltered socket-family probe");
+        let filtered =
+            probe_socket_families_in_child(true).expect("running the filtered socket-family probe");
+        let [unix, inet, inet6, vsock] = filtered;
+        assert_eq!(
+            unix, 0,
+            "the filter must keep AF_UNIX sockets working (errno {unix})"
+        );
+        assert_eq!(
+            inet,
+            libc::EAFNOSUPPORT as u8,
+            "the filter must refuse AF_INET with EAFNOSUPPORT"
+        );
+        assert_eq!(
+            inet6,
+            libc::EAFNOSUPPORT as u8,
+            "the filter must refuse AF_INET6 with EAFNOSUPPORT"
+        );
+        assert_eq!(
+            vsock,
+            libc::EAFNOSUPPORT as u8,
+            "the filter must refuse AF_VSOCK with EAFNOSUPPORT — the family \
+             that bypasses the network namespace is the point of the seal"
+        );
+        // Where the control child could create the family at all, the filter
+        // is what refused it; where the kernel never could, the refusal above
+        // matches what the kernel already answers and says so, so a missing
+        // driver on the host is never mistaken for the seal working.
+        for (i, (name, _)) in PROBED_FAMILIES.iter().enumerate().skip(1) {
+            if unfiltered[i] != 0 {
+                eprintln!(
+                    "note: this kernel creates no {name} sockets (errno {}), \
+                     so the filtered refusal matches what it already answers",
+                    unfiltered[i]
+                );
+            }
+        }
     }
 
     /// After a successful `Sandbox::new`, the minenv Unix socket must be connectable.
