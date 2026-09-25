@@ -25,8 +25,8 @@ Follow these steps in order. The examples use version `X.Y.Z` and commit
   approve your own run.
 - Make sure that the repository secrets `AUR_SSH_PRIVATE_KEY` and
   `BREW_TAP_TOKEN` exist, and that the `gominimal/homebrew-minimal` repository
-  exists. No check reads them before step 7. If one is missing, a publish job
-  fails in step 7.
+  exists, before you promote with `publish_packages=true`. No check reads
+  them before that. If one is missing, its publish job fails.
 - A version number is permanent. After step 4 stages `X.Y.Z`, that number
   always means that build. To release a later fix, bump `package.version` in
   a PR and cut the next version.
@@ -47,7 +47,7 @@ git switch --detach <commit>
 just check-version
 ```
 
-Do not push a `v*` tag. The publish run in step 7 creates the tag.
+Do not push a `v*` tag. The promotion in step 6 creates the tag.
 
 ### 2. Give the commit a branch
 
@@ -142,37 +142,21 @@ on it. Then the workflow does these things, in this order:
 2. It moves `stable` to `X.Y.Z`. Users of the install script get the new
    version from this point.
 3. It tells the docs site to rebuild from the release commit.
-
-The promotion does not publish anything by default. The `publish` input is
-off, so the GitHub Release stays a draft and the AUR and Homebrew packages do
-not change. You publish in step 7.
-
-### 7. Publish the release
-
-Run the promotion again for the same version, with `publish` on:
-
-```sh
-gh workflow run promote.yml -f target=stable -f version=X.Y.Z -f publish=true
-```
-
-The run goes through approval and the smoke check again. It writes the
-`stable` pointer again, which changes nothing while `stable` points at
-`X.Y.Z`. If `stable` now points at a different version, this run moves it
-back to `X.Y.Z`. Then the run does these things, in this order:
-
-1. It publishes the draft GitHub Release, which creates the `vX.Y.Z` tag and
+4. It publishes the draft GitHub Release, which creates the `vX.Y.Z` tag and
    marks the release Latest.
-2. It publishes the AUR package and the Homebrew formula.
 
-If a publish job fails, fix the cause and use **Re-run failed jobs** on the
-same run. Do not start a new run. The release publish job refuses a release
-that is already public, so a new run fails at its first publish job.
+The AUR and Homebrew packages do not change by default. The
+`publish_packages` input is off. You publish them in step 7.
 
-The release publish job makes the release public before it reads the new tag.
-If the job fails after that point, a re-run fails at the same check, and the
-AUR and Homebrew jobs do not run. To recover, make sure that the release is
-public and that the `vX.Y.Z` tag exists. Then a maintainer who holds the AUR
-key and the tap token runs the two publishers by hand, from the tagged commit:
+If the release publish job fails, fix the cause and use **Re-run failed jobs**
+on the same run. Do not start a new run. The release publish job refuses a
+release that is already public, so a new run fails at that job.
+
+### 7. Publish the AUR and Homebrew packages
+
+Start when the release is public and the `vX.Y.Z` tag exists. A maintainer
+who holds the AUR key and the tap token runs the two publishers by hand, from
+the tagged commit:
 
 ```sh
 PKGVER=X.Y.Z AUR_SSH_PRIVATE_KEY="$(cat aur-key)" scripts/publish-aur.sh
@@ -183,6 +167,9 @@ PKGVER=X.Y.Z BREW_TAP_REPO=https://github.com/gominimal/homebrew-minimal.git \
 The AUR publisher needs `makepkg`, so run it on an Arch host or in an
 `archlinux:base-devel` container. Run each publisher with `--dry-run` first to
 read the diff that it pushes.
+
+When both publishers work for a real release, publish the packages in step 6
+instead: add `-f publish_packages=true` to the promotion.
 
 ### 8. Clean up
 
@@ -250,10 +237,10 @@ A release run makes a nightly build or a versioned release:
 | Folder name | Short commit hash, such as `versions/9b763dd5/` | Version number, such as `versions/0.6.0/` |
 | Started by | `nightly.yml` every day, or a manual run without `versioned` | A manual run with `versioned: true` |
 | Version the binaries report | `0.6.0-dev.70.g9b763dd5` | `0.6.0` |
-| GitHub Release | `release-<sha>`, deleted later by `prune-releases` | Draft `vX.Y.Z`, published in step 7 |
-| Git tag | None | `vX.Y.Z`, created in step 7 |
+| GitHub Release | `release-<sha>`, deleted later by `prune-releases` | Draft `vX.Y.Z`, published in step 6 |
+| Git tag | None | `vX.Y.Z`, created in step 6 |
 | Packages (`.deb`, `.rpm`, `.apk`) | None | In `pkg/` and on the GitHub Release |
-| Stable promotion with `publish=true` publishes | Nothing | GitHub Release, AUR, and Homebrew |
+| Stable promotion publishes | Nothing | GitHub Release, plus AUR and Homebrew with `publish_packages=true` |
 
 ### release.yml: build, test, stage
 
@@ -367,7 +354,7 @@ See [docs/ci-strategy.md](../ci-strategy.md).
 
 [`.github/workflows/promote.yml`](../../.github/workflows/promote.yml), named
 `promote-cli` in the Actions list, moves `stable` or `unstable`. Its inputs are
-`version`, `target`, `dry_run`, `override_provenance`, and `publish`. `version` is a
+`version`, `target`, `dry_run`, `override_provenance`, and `publish_packages`. `version` is a
 version number or a nightly commit hash. When you leave it empty, the
 workflow uses the newest staged nightly build.
 
@@ -389,8 +376,9 @@ commit, and the docs site at docs.minimal.dev rebuilds from that commit.
 
 ### publish-packages.yml: publish a stable release
 
-A `stable` promotion with `publish=true` that is not a dry run calls
+A `stable` promotion that is not a dry run calls
 [`.github/workflows/publish-packages.yml`](../../.github/workflows/publish-packages.yml).
+The AUR and Homebrew jobs run only with `publish_packages=true`.
 
 - `publish-release` publishes the draft `vX.Y.Z`. Publication creates the tag
   on the release commit. It does not start a build. The job fails if no draft exists
