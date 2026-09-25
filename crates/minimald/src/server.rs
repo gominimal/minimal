@@ -755,25 +755,31 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
     }
 }
 
-/// Binds and serves minimald's two host-side proxies for the daemon's lifetime
+/// Binds and serves minimald's host-side listeners — the egress and mTLS
+/// proxies, and beside them the box-zone answerer — for the daemon's lifetime
 /// and, in a microVM (DM1), publishes them on the macOS host loopback.
 ///
-/// Both proxies route by `Host:` header through the sessions manager's shared
-/// PTask hostname registry. In a microVM they bind the daemon's switch IP
+/// The proxies route by `Host:` header through the sessions manager's shared
+/// PTask hostname registry; the answerer serves the same registry as DNS,
+/// answering `*.min.internal` for the host OS (NET-009). In a microVM they
+/// bind the daemon's switch IP
 /// ([`DEFAULT_SUBNET`](crate::net::DEFAULT_SUBNET)`.daemon_ip()`) so the host
-/// gvproxy forward can reach them; on native Linux (DM2) they bind host loopback
-/// directly.
+/// gvproxy forward can reach them; on native Linux (DM2) they bind host
+/// loopback directly.
 ///
-/// Each proxy's startup — the bind, and in a microVM the host-loopback
-/// publish — runs on a detached task that retries with backoff until it
-/// succeeds ([`drive_proxy_until_serving`], NET-021) and then clears the
-/// unavailable note `min ls` warns from (NET-022). Nothing here is awaited:
-/// a proxy whose port some other process holds must not hold the SSH accept
-/// loop hostage — the daemon starts serving regardless, reports the reason on
-/// its state, and the proxy comes up on its own once the address frees.
+/// Each startup — the bind, and in a microVM the host-loopback publish —
+/// runs on a detached task that retries with backoff until it succeeds
+/// ([`drive_proxy_until_serving`], [`drive_answerer_until_serving`], NET-021)
+/// and then clears the unavailable note `min ls` warns from (NET-022).
+/// Nothing here is awaited: a listener whose port some other process holds
+/// must not hold the SSH accept loop hostage — the daemon starts serving
+/// regardless, reports the reason on its state, and the listener comes up on
+/// its own once the address frees.
 #[cfg(target_os = "linux")]
 async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
     use std::net::{IpAddr, Ipv4Addr};
+
+    use crate::net::answerer::{AnswerScope, ZoneAnswerer};
 
     // DM1 (in-VM): bind 0.0.0.0 so the listener comes up regardless of whether
     // eth0 has finished coming up, then publish the port on the host loopback via
@@ -792,6 +798,28 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
     tokio::spawn(drive_proxy_until_serving(
         state.clone(),
         HostProxyStartup::Egress { addr: egress_addr },
+        RetryBackoff::production(),
+    ));
+
+    // The box-zone answerer (UDP :7656), beside the hostname proxy: the
+    // loopback answerer the host's resolver is routed to for `*.min.internal`
+    // (design §7.1, NET-009). Same bind rule as the proxies, and the same
+    // publish on a VM host — over UDP, which is how the host resolver's
+    // datagrams travel. The on-machine gate is the answerer's own: loopback
+    // peers natively, and in a VM the host-local switch fabric the gvproxy
+    // forwarder rides (NET-006).
+    let answerer_scope = if in_microvm {
+        AnswerScope::Microvm {
+            subnet: crate::net::DEFAULT_SUBNET,
+        }
+    } else {
+        AnswerScope::Native
+    };
+    let answerer = ZoneAnswerer::new(state.sessions_manager().await.hostnames(), answerer_scope);
+    tokio::spawn(drive_answerer_until_serving(
+        answerer,
+        SocketAddr::new(bind_base, crate::net::answerer::ANSWERER_PORT),
+        in_microvm,
         RetryBackoff::production(),
     ));
 
@@ -1040,7 +1068,7 @@ async fn drive_proxy_until_serving(
         let Some(port) = publish_port else {
             break;
         };
-        match expose_proxy_on_host(crate::net::DEFAULT_SUBNET.daemon_ip(), port).await {
+        match expose_proxy_on_host(crate::net::DEFAULT_SUBNET.daemon_ip(), port, "tcp").await {
             None => break,
             Some(report) => {
                 let next_retry = retry.delay(attempt);
@@ -1071,6 +1099,113 @@ async fn drive_proxy_until_serving(
     proxy.clear_unavailable(&state).await;
 }
 
+/// Drives the box-zone answerer to serving, the same two gates and the same
+/// backoff the routing proxies take ([`drive_proxy_until_serving`], NET-021):
+/// binds `addr`, and — in a microVM (DM1), where the socket binds inside the
+/// guest — publishes the port on the host loopback through the gvproxy
+/// forwarder's **UDP** path, the transport the host resolver's datagrams
+/// travel on. Once both gates pass, [`crate::net::answerer::serve`] runs for
+/// the daemon's lifetime.
+///
+/// The daemon log names the listener's address and port at start (the bind's
+/// `reachable` event, the serving event here) and each failure warns once
+/// with its reason, remedy and next retry. Unlike a routing proxy, the
+/// answerer records no `min ls` note: a box's routing does not depend on it
+/// (the proxies carry that), and its failures are the host's resolver config
+/// to read in the log.
+#[cfg(target_os = "linux")]
+async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
+    answerer: crate::net::answerer::ZoneAnswerer<T>,
+    addr: SocketAddr,
+    in_microvm: bool,
+    retry: RetryBackoff,
+) {
+    const COMPONENT: &str = "zone-answerer";
+
+    let mut attempt: u32 = 0;
+    let mut failed_before = false;
+    let mut bound = false;
+    loop {
+        if !bound {
+            match crate::net::answerer::bind_answerer(addr).await {
+                Ok(socket) => {
+                    // Serving from the moment the socket is bound, like the
+                    // proxies: the publish can still retry behind it. The
+                    // serve loop takes a clone; the registry inside is the
+                    // daemon's one either way.
+                    tracing::info!(
+                        component = COMPONENT,
+                        %addr,
+                        status = "listening",
+                        "box-zone answerer is serving"
+                    );
+                    let serve_answerer = answerer.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            crate::net::answerer::serve(socket, serve_answerer).await
+                        {
+                            tracing::error!(
+                                component = COMPONENT,
+                                %error,
+                                "box-zone answerer receive loop exited"
+                            );
+                        }
+                    });
+                    bound = true;
+                    if !in_microvm {
+                        break;
+                    }
+                }
+                Err(failure) => {
+                    let report = failure.reported();
+                    let next_retry = retry.delay(attempt);
+                    tracing::warn!(
+                        component = COMPONENT,
+                        %addr,
+                        status = "unavailable",
+                        reason = %report,
+                        next_retry = ?next_retry,
+                        "box-zone answerer could not bind its socket; retrying with backoff"
+                    );
+                    failed_before = true;
+                    attempt += 1;
+                    tokio::time::sleep(next_retry).await;
+                    continue;
+                }
+            }
+        }
+        // Bound and serving; only the host-loopback publish can still be
+        // pending (a bind success with no publish gate broke out above).
+        match expose_proxy_on_host(crate::net::DEFAULT_SUBNET.daemon_ip(), addr.port(), "udp").await
+        {
+            None => break,
+            Some(report) => {
+                let next_retry = retry.delay(attempt);
+                tracing::warn!(
+                    component = COMPONENT,
+                    %addr,
+                    status = "unavailable",
+                    %report,
+                    next_retry = ?next_retry,
+                    "box-zone answerer could not publish on the host loopback; retrying with backoff"
+                );
+                failed_before = true;
+                attempt += 1;
+                tokio::time::sleep(next_retry).await;
+            }
+        }
+    }
+
+    if failed_before {
+        tracing::info!(
+            component = COMPONENT,
+            %addr,
+            status = "recovered",
+            "box-zone answerer is serving after retrying"
+        );
+    }
+}
+
 /// Upper bound on one host-loopback publish attempt in
 /// [`expose_proxy_on_host`]. Deliberately far below `post_json`'s gvproxy
 /// control timeout: the startup retry's failed attempts must not each cost the
@@ -1081,18 +1216,24 @@ async fn drive_proxy_until_serving(
 #[cfg(target_os = "linux")]
 const HOST_EXPOSE_PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Publishes a guest-side proxy bound on `daemon_ip:port` onto the macOS host's
-/// loopback (`127.0.0.1:port`) via the host gvproxy forwarder, reached over the
-/// vsock shuttle (DM1). Best-effort in that it never fails the daemon, since
-/// the host gvproxy may be absent; capped at [`HOST_EXPOSE_PUBLISH_TIMEOUT`]
-/// per attempt so a stalled forwarder cannot stretch the retry cadence.
+/// Publishes a guest-side listener bound on `daemon_ip:port` — a routing
+/// proxy, or the box-zone answerer (`protocol` says which transport) — onto
+/// the macOS host's loopback (`127.0.0.1:port`) via the host gvproxy
+/// forwarder, reached over the vsock shuttle (DM1). Best-effort in that it
+/// never fails the daemon, since the host gvproxy may be absent; capped at
+/// [`HOST_EXPOSE_PUBLISH_TIMEOUT`] per attempt so a stalled forwarder cannot
+/// stretch the retry cadence.
 ///
 /// Returns `Some(report)` when the publish did not happen — the reason and the
 /// remedy as one text, which the startup retry logs with its next retry and
 /// records on the state note for `min ls` / `min session activate` to print —
 /// and `None` once published.
 #[cfg(target_os = "linux")]
-async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) -> Option<String> {
+async fn expose_proxy_on_host(
+    daemon_ip: std::net::Ipv4Addr,
+    port: u16,
+    protocol: &'static str,
+) -> Option<String> {
     use crate::net::policy::{ControlChannel, ExposeRequest, post_json};
 
     let control = ControlChannel::Vsock {
@@ -1102,7 +1243,7 @@ async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) -> Optio
     let request = ExposeRequest {
         local: format!("127.0.0.1:{port}"),
         remote: format!("{daemon_ip}:{port}"),
-        protocol: "tcp".to_string(),
+        protocol: protocol.to_string(),
     };
     match tokio::time::timeout(
         HOST_EXPOSE_PUBLISH_TIMEOUT,
@@ -1445,6 +1586,91 @@ mod tests {
         assert!(
             logged.contains(r#"status="reachable""#),
             "the successful bind must be logged as reachable, got: {logged}"
+        );
+    }
+
+    /// The box-zone answerer starts beside the hostname proxy and serves the
+    /// zone on loopback (NET-009): `drive_answerer_until_serving` binds the
+    /// address, the log names the listener's address and port at start, and a
+    /// real UDP exchange over the bound socket answers a box name with its
+    /// local address.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn answerer_starts_and_serves_the_zone_on_loopback() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        use ::sessions::SessionId;
+        use hickory_proto::op::{Message, ResponseCode};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{RData, RecordType};
+
+        use crate::net::answerer::{AnswerScope, ZoneAnswerer, encode_query};
+
+        // A free port, handed to the driver the way startup hands it a fixed
+        // one: bound and dropped, uncontended in a test binary.
+        let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
+        let hostnames = state.sessions_manager().await.hostnames();
+        hostnames
+            .write()
+            .expect("registry lock")
+            .register_host_net(SessionId::nil(), "web");
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let answerer = ZoneAnswerer::new(hostnames, AnswerScope::Native);
+        tokio::spawn(drive_answerer_until_serving(
+            answerer,
+            addr,
+            false,
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        ));
+
+        // Poll until the driver's bind lands, then do one real exchange.
+        let client = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let query = encode_query("web.min.internal.", RecordType::A);
+        let mut scratch = [0u8; 512];
+        let mut reply = None;
+        for _ in 0..200 {
+            client.send_to(&query, addr).await.unwrap();
+            if let Ok(Ok((bytes, _))) =
+                tokio::time::timeout(Duration::from_millis(25), client.recv_from(&mut scratch))
+                    .await
+            {
+                reply = Some(scratch[..bytes].to_vec());
+                break;
+            }
+        }
+        let bytes = reply.expect("the answerer must answer once the driver binds it");
+        let reply = Message::from_vec(&bytes).expect("the reply decodes");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        let [answer] = &reply.answers[..] else {
+            panic!("an A lookup on a held name answers once")
+        };
+        let RData::A(A(address)) = &answer.data else {
+            panic!("the answer is an A record")
+        };
+        assert_eq!(*address, Ipv4Addr::LOCALHOST);
+
+        // The daemon log names the answerer's listener address and port.
+        let logged = buf.contents();
+        assert!(
+            logged.contains("zone-answerer") && logged.contains(&format!("{addr}")),
+            "the answerer's start must name its listener, got: {logged}"
         );
     }
 }

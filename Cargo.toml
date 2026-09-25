@@ -113,6 +113,10 @@ google-cloud-storage = "1.17"
 # Tracked as a git rev, not the crates.io release, update when they publish next.
 # Current rev is master @ 2026-08-03.
 hakoniwa = { features = ["cgroups", "rustslirp"], git = "https://github.com/souk4711/hakoniwa.git", rev = "0810ffa37620ef5c57de263c8eaa1f4d7633c14a" }
+# DNS message parsing/encoding only (the box-zone answerer in `minimald`): no
+# resolver, no server, no async runtime features — the message types are all
+# `net::answerer` needs, and `default-features = false` keeps them that way.
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 http-body = "1"
 hex = "0.4"
 indicatif = "0.18"
