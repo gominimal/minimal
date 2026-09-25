@@ -100,6 +100,14 @@ the current directory).
 | `--no-hooks` | | Run none of the session's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from either the loadouts or the project's `minimal.toml`. Recorded on the session, so it applies to the later attach, detach, and destroy transitions too |
 | `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy can't auto-decide; implied when stdin/stderr isn't a TTY |
 | `--attach` | | Automatically attach after creation |
+| `--allow-subnets <CIDR>` | | Destination subnet the box may reach, in CIDR form (e.g. `10.0.0.0/8`). Repeatable; unset means allow all. Valid on an own-address (`--network own_ip`) or host-address (`--network host_ip`) box; a `--network none` box rejects the whole egress declaration |
+| `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable; unset means allow all |
+| `--allow-protocols <PROTO>` | | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable; unset means allow all |
+| `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied |
+
+Together the four `--allow-*`/`--deny-*` flags form the box's `egress`
+declaration; naming any one of them stores it on the session, and `min
+session policy` shows what the session ended up with.
 
 Activating a path that already has a session is allowed, but warns: `min` names
 the existing session and creates a second one anyway. With two sessions on one
@@ -230,9 +238,36 @@ Renames an existing session.
 min session policy <SESSION>
 ```
 
-Prints the effective networking policy for `SESSION` (a UUID or session
-name) as JSON — an object with `egress` and `ingress` fields, each null
-when unset. Resolved from the daemon.
+Prints the effective networking rules for `SESSION` (a UUID or session
+name). Resolved from the daemon, which answers from the policy stored at
+activation; each rule line shows what the session ended up with, not just
+what was typed.
+
+The egress block resolves every dimension of the box's `egress` declaration
+to its rule or its default:
+
+```
+egress
+  subnets  10.0.0.0/8
+  dns hosts  allow all
+  protocols  tcp, udp
+  deny subnets  169.254.169.254/32
+```
+
+`subnets`, `dns hosts`, and `protocols` each read `allow all` when the
+matching flag was not given; `deny subnets` reads `(none)` when nothing is
+denied. The ingress block lists the published port mappings the session's
+`--ingress` flags declared (or `deny all` when none were), plus the dynamic
+port range when one is configured:
+
+```
+ingress
+  tcp  :8080 → :80
+```
+
+A host-address (`--network host_ip`) session prints no ingress block at all:
+it shares its host's network namespace, so minimald applies no per-session
+ingress to it and there is no rule to state.
 
 ### `session hooks`
 
@@ -256,6 +291,51 @@ first line; `--json` emits the full records.
 
 Answered from the persisted composition, so it works after a daemon restart
 and for a session nobody is attached to.
+
+### `net forward`
+
+```
+min net forward <SESSION> <LOCAL>:<PORT>
+```
+
+Forwards a port from a session's box to the laptop: binds
+`localhost:<LOCAL>` and relays every accepted connection over the session's
+SSH channel to `127.0.0.1:<PORT>` inside the box, so a service running in
+the session answers on the laptop with nothing else installed or configured
+on the remote side. `min net forward web 8080:3000` puts the box's port 3000
+on `localhost:8080`.
+
+Each accepted connection gets its own SSH channel, and the daemon dials
+`127.0.0.1:<PORT>` on the box's side of the session: inside the box's own
+network namespace when it has one (`--network none`, `--network own_ip`), or
+the namespace it shares with the daemon when it does not (`--network
+host_ip`). Either way the port reached is the one the box's service binds,
+so the command works for every network mode a session can have.
+
+The forward follows the session, not the box's process: a session record
+that outlives its box is the normal state after [`stop`](#stop), which keeps
+records, and a forward that refused such a session would be stranded against
+every session that survived a daemon restart. Where the dial has to run
+inside the box — an isolated session's own network namespace — the daemon
+brings a box that isn't running up for the dial, exactly as
+[`session exec`](#session-exec) brings one up for a command. A
+`--network host_ip` box shares the daemon's namespace, so its dial needs no
+box up: a session nothing has started answers with a refused connection
+until something starts the box.
+
+The forward stays in the foreground and ends on `Ctrl-C`, when the session
+is destroyed, or when the daemon goes away; the listener and every open relay
+close with it. `stop` is not a destroy: it ends a forward only because the
+daemon's exit does, and it keeps every session record, so a later
+`min net forward` reaches those sessions again.
+
+What the tree proves today is the host-address mode (`--network host_ip`)
+end to end: the `net_forward_*` tests drive a real daemon and relay bytes
+through a live laptop-side listener. The in-box dial that the isolated modes
+(`--network none`, `--network own_ip`) take — a `socat` relay injected into
+the box's namespaces — is exercised by the daemon's harness test with a
+host-side stand-in relay rather than a real box; a root-integration proof of
+that leg (`just test-root-integration`) is still owed to the root lane.
 
 ### `stop`
 

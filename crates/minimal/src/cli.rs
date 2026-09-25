@@ -54,6 +54,8 @@ pub enum Command {
     /// Task subcommands: run declared project tasks in ephemeral sessions
     #[command(visible_alias = "tasks")]
     Task(TaskArgs),
+    /// Network subcommands: bring a box's services to the laptop
+    Net(NetArgs),
     /// Muscle-memory catch for the in-box `min run <task>`: always errors,
     /// naming the canonical `min task run <task>` (host) and
     /// `min session attach --command 'min task run <task>'` (in-box) forms.
@@ -417,6 +419,16 @@ pub struct GlobalArgs {
     /// stdin/stdout is not a terminal.
     #[arg(long, global = true, default_value_t = false)]
     pub no_input: bool,
+    /// Talk to this named minvmd VM instead of the default one.
+    ///
+    /// A named VM keeps its own state directory, socket, and in-VM daemon
+    /// under a per-name subdirectory of the provider dir, so several VMs can
+    /// run side by side on one host. Refused on the native `local-minimald`
+    /// backend, which hosts no VMs — named VMs need
+    /// `--provider local-minvmd` — and no effect on the default VM's paths
+    /// when the name is `default` or omitted.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub vm: Option<String>,
 }
 
 impl GlobalArgs {
@@ -424,6 +436,24 @@ impl GlobalArgs {
     /// `--provider local-minvmd`.
     pub fn use_minvmd(&self) -> bool {
         matches!(self.provider, Some(Provider::LocalMinvmd))
+    }
+
+    /// Publish `--vm` as this process's VM name so every provider dir the
+    /// command resolves — socket, state dir, autospawn — names the same VM
+    /// (NET-052). Called once at dispatch, before any path resolution; the
+    /// default VM is untouched when the flag is absent (NET-053).
+    ///
+    /// # Errors
+    ///
+    /// [`anyhow::Error`] when the name breaks the naming rule
+    /// ([`paths::validate_vm_name`]).
+    pub fn publish_vm_name(&self) -> anyhow::Result<()> {
+        match &self.vm {
+            Some(vm) => {
+                crate::client::set_vm_name(vm).map_err(|err| anyhow::anyhow!("--vm: {err}"))
+            }
+            None => Ok(()),
+        }
     }
 }
 
@@ -462,6 +492,26 @@ pub struct ActivateArgs {
     /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
     pub ingress: Vec<String>,
+    /// Allowed destination subnets in CIDR form (`egress.allow_subnets`),
+    /// e.g. `10.0.0.0/8`. Repeatable; unset means allow-all subnets. Valid on
+    /// an own-address (`--network own_ip`) or host-address
+    /// (`--network host_ip`) box; a none box rejects the whole egress
+    /// declaration.
+    #[arg(long = "allow-subnets", value_name = "CIDR")]
+    pub allow_subnets: Vec<String>,
+    /// Allowed destination DNS hostnames (`egress.allow_dns_hosts`), e.g.
+    /// `github.com`. Repeatable; unset means allow-all hosts.
+    #[arg(long = "allow-dns-hosts", value_name = "HOST")]
+    pub allow_dns_hosts: Vec<String>,
+    /// Allowed outbound transport protocols (`egress.allow_protocols`):
+    /// tcp, udp, or icmp. Repeatable; unset means allow all protocols.
+    #[arg(long = "allow-protocols", value_name = "PROTO")]
+    pub allow_protocols: Vec<String>,
+    /// Denied destination subnets in CIDR form (`egress.deny_subnets`),
+    /// subtracted from the allowed set. Repeatable; unset means nothing is
+    /// denied.
+    #[arg(long = "deny-subnets", value_name = "CIDR")]
+    pub deny_subnets: Vec<String>,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
     /// Repeatable. If any `--loadout` is specified, defaults from
     /// `[loadouts].default_loadouts` in the client config are ignored.
@@ -610,6 +660,36 @@ pub(crate) fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyh
     }
 }
 
+/// Parse an `--allow-protocols <PROTO>` spec into an [`sessions::IpProto`].
+/// Egress rules name any transport the policy type carries, so unlike the
+/// ingress parser (whose vocabulary is gvproxy's static forwarder's), icmp is
+/// accepted here.
+pub(crate) fn parse_egress_proto(proto: &str) -> Result<sessions::IpProto, anyhow::Error> {
+    match proto.to_ascii_lowercase().as_str() {
+        "tcp" => Ok(sessions::IpProto::Tcp),
+        "udp" => Ok(sessions::IpProto::Udp),
+        "icmp" => Ok(sessions::IpProto::Icmp),
+        other => Err(anyhow::anyhow!(
+            "egress: unsupported protocol '{other}' (use tcp, udp, or icmp)"
+        )),
+    }
+}
+
+/// Parse a `net forward <LOCAL>:<PORT>` spec into its laptop-side listener
+/// port and its box-side target port.
+pub(crate) fn parse_forward_spec(spec: &str) -> Result<(u16, u16), anyhow::Error> {
+    let (local, port) = spec
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("forward '{spec}': expected LOCAL:PORT"))?;
+    let local_port = local
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("forward '{spec}': invalid local port '{local}'"))?;
+    let box_port = port
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("forward '{spec}': invalid box port '{port}'"))?;
+    Ok((local_port, box_port))
+}
+
 #[derive(Debug, Args)]
 pub struct AttachArgs {
     /// Session identifier (UUID or session name). When omitted, `min session attach`
@@ -643,6 +723,36 @@ pub struct DestroyArgs {
     /// Skip the destroy confirmation
     #[arg(long, short)]
     pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct NetArgs {
+    #[command(subcommand)]
+    pub command: NetCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NetCommand {
+    /// Forward a box port to the laptop over the session
+    ///
+    /// Binds `localhost:<LOCAL>` and relays every accepted connection over
+    /// the session's SSH channel to `127.0.0.1:<PORT>` inside the box, so a
+    /// service running in the session answers on the laptop with nothing
+    /// installed or configured on the remote side. Stays in the foreground
+    /// and closes with the session.
+    Forward(NetForwardArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct NetForwardArgs {
+    /// Session identifier (UUID or session name)
+    #[arg(add = completion::session_completer())]
+    pub session: String,
+    /// Ports to relay, as `<LOCAL>:<PORT>` — the laptop-side listener and
+    /// the box-side port it forwards to (`8080:3000` answers on
+    /// `localhost:8080` from port 3000 in the box)
+    #[arg(value_name = "LOCAL:PORT")]
+    pub spec: String,
 }
 
 #[derive(Debug, Args)]

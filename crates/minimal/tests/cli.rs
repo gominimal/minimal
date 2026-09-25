@@ -15,6 +15,7 @@ use sessions::SessionId;
 use minimald::test_harness::unwrap_ready;
 
 use serde_json_lenient::Value;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 // --- version ---
 
@@ -32,6 +33,7 @@ async fn version_succeeds_without_daemon() {
         config_dir: None,
         provider: None,
         no_input: false,
+        vm: None,
     };
     // Should print client version and note daemon is unreachable, but return Ok.
     cmd_version(&args).await.unwrap();
@@ -44,7 +46,8 @@ fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
-        mtls_proxy_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -81,7 +84,8 @@ fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
         daemon_version: None,
         hostname_routing_unavailable: None,
-        mtls_proxy_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -271,6 +275,10 @@ async fn activate_creates_session() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        allow_subnets: vec![],
+        allow_dns_hosts: vec![],
+        allow_protocols: vec![],
+        deny_subnets: vec![],
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -314,6 +322,10 @@ async fn activate_uploads_project_files() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        allow_subnets: vec![],
+        allow_dns_hosts: vec![],
+        allow_protocols: vec![],
+        deny_subnets: vec![],
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -396,6 +408,10 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        allow_subnets: vec![],
+        allow_dns_hosts: vec![],
+        allow_protocols: vec![],
+        deny_subnets: vec![],
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -781,6 +797,126 @@ async fn session_policy_succeeds() {
     .unwrap();
 }
 
+/// `min session policy` shows the effective egress rules (NET-061): the four
+/// egress fields the session was activated with, each unset dimension
+/// resolved to its default instead of a bare `null`. The policy is stored
+/// through the daemon and fetched the way the command fetches it;
+/// `format_policy` is the rendering the command prints. The same egress on a
+/// host-address box is still shown, but with no ingress block, and a none
+/// box shows no blocks at all — just the note the TUI shows in their place.
+#[tokio::test]
+async fn policy_shows_effective_egress() {
+    let (daemon, args) = setup().await;
+    let egress = sessions::EgressPolicy {
+        allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+        allow_dns_hosts: Some(vec!["github.com".to_string()]),
+        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+        deny_subnets: Some(vec!["169.254.169.254/32".to_string()]),
+    };
+    let session_id = create_session_with_policy(
+        &daemon,
+        "egress-policy",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::new(Some(egress.clone()), None),
+    )
+    .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
+    let resp = client
+        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(session_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+    };
+    assert_eq!(
+        policy.egress,
+        Some(egress.clone()),
+        "the stored egress must survive the record round trip"
+    );
+
+    let mut out = Vec::new();
+    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("subnets  10.0.0.0/8"),
+        "allowed subnets missing:\n{text}"
+    );
+    assert!(
+        text.contains("dns hosts  github.com"),
+        "allowed hosts missing:\n{text}"
+    );
+    assert!(
+        text.contains("protocols  tcp"),
+        "allowed protocols missing:\n{text}"
+    );
+    assert!(
+        text.contains("deny subnets  169.254.169.254/32"),
+        "denied subnets missing:\n{text}"
+    );
+
+    // The same egress is accepted on a host-address box (NET-120), but the
+    // ingress block is suppressed there: a host-address session shares its
+    // host's namespace, so minimald applies no per-session ingress to it and
+    // a `deny all` row would claim a deny-rule that does not exist. The TUI's
+    // detail pane suppresses the block for the same reason.
+    let host_id = create_session_with_policy(
+        &daemon,
+        "egress-policy-host",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::new(Some(egress.clone()), None),
+    )
+    .await;
+    let resp = client
+        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(host_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+    };
+    let mut out = Vec::new();
+    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("subnets  10.0.0.0/8"),
+        "the host-address egress rules are still shown:\n{text}"
+    );
+    assert!(
+        !text.contains("ingress"),
+        "a host-address session has no per-session ingress policy to show:\n{text}"
+    );
+
+    // A none box has no network, so it can carry no egress or ingress
+    // declaration at all — the whole policy is replaced by the one-line
+    // note the TUI's detail pane shows, since `egress / allow all` there
+    // would claim a reach a box with no network does not have.
+    let none_id = create_session_with_policy(
+        &daemon,
+        "egress-policy-none",
+        sessions::NetworkMode::NoNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+    let resp = client
+        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(none_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+    };
+    let mut out = Vec::new();
+    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(
+        text, "No network policy (NoNet)\n",
+        "a none session prints the note in place of both blocks:\n{text}"
+    );
+}
+
 // --- hostname routing warning (NET-020/NET-021/NET-022) ---
 //
 // The startup retry lives in `minimald::server` behind the Linux gate with the
@@ -790,23 +926,29 @@ async fn session_policy_succeeds() {
 
 /// Runs the compiled `min` with the harness daemon's `--minimal-dir`, an empty
 /// `--config-dir` (the developer's own loadouts and policy stay out of the
-/// run), and `--no-input`, plus `extra` as the command, and returns stderr.
+/// run), and `--no-input`, plus `extra` as the command, and returns its
+/// captured output.
 #[cfg(target_os = "linux")]
-async fn run_min_stderr(args: &GlobalArgs, extra: &[&str]) -> String {
+async fn run_min(args: &GlobalArgs, extra: &[&str]) -> std::process::Output {
     let minimal_dir = args
         .minimal_dir
         .as_ref()
         .expect("setup points at a tempdir");
     let config_dir = tempfile::TempDir::new().unwrap();
-    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
         .args(extra)
         .output()
         .await
-        .expect("the min binary should be invocable");
-    String::from_utf8_lossy(&out.stderr).into_owned()
+        .expect("the min binary should be invocable")
+}
+
+/// [`run_min`]'s stderr — the warning path's tests read what the user sees.
+#[cfg(target_os = "linux")]
+async fn run_min_stderr(args: &GlobalArgs, extra: &[&str]) -> String {
+    String::from_utf8_lossy(&run_min(args, extra).await.stderr).into_owned()
 }
 
 /// Polls `ListSessions` until the daemon reports hostname routing down — the
@@ -960,6 +1102,220 @@ async fn ls_warning_clears_on_recovery() {
     );
 }
 
+/// NET-026: a daemon that auto-selected its hostname-proxy port tells `min`
+/// which one it landed on, and `min ls` prints the address — the one an
+/// `HTTP(S)_PROXY` export needs, and the thing that cannot stay a constant on
+/// a machine running two daemons. The box-zone answerer's UDP port prints
+/// beside it, since pointing the host's resolver at that port is the other
+/// half of the same discovery. Driven through the compiled binary so the
+/// assertion is on what the user actually sees.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn min_prints_discovered_proxy_port() {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use minimald::server::{
+        RetryBackoff, retry_hostname_proxy_until_serving, retry_zone_answerer_until_serving,
+    };
+    use minimald_rpc::ListSessions;
+
+    let (daemon, args) = setup().await;
+    // Auto-select — no port configured — through the same startup loop
+    // `start_host_proxies` spawns, with a compressed backoff.
+    let compressed = RetryBackoff::new(
+        std::time::Duration::from_millis(5),
+        std::time::Duration::from_millis(40),
+    );
+    tokio::join!(
+        retry_hostname_proxy_until_serving(
+            daemon.server.state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        ),
+        retry_zone_answerer_until_serving(
+            daemon.server.state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        ),
+    );
+
+    // The reply `min ls` renders carries the ports both listeners bound.
+    let mut client = connect_daemon(&args).await.unwrap();
+    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    let port = resp
+        .hostname_proxy_port
+        .expect("the daemon must report the port its proxy ended up on");
+    assert_ne!(port, 0, "port 0 is a request for a port, not an answer");
+    let answerer_port = resp
+        .zone_answerer_port
+        .expect("the daemon must report the port its answerer ended up on");
+    assert_ne!(
+        answerer_port, 0,
+        "port 0 is a request for a port, not an answer"
+    );
+    assert!(
+        resp.hostname_routing_unavailable.is_none(),
+        "auto-selecting a port is not a fault, got: {:?}",
+        resp.hostname_routing_unavailable
+    );
+
+    // The printed addresses are real: the proxy accepts on its port.
+    tokio::net::TcpStream::connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+        .await
+        .expect("the discovered port must be listening");
+
+    let out = run_min(&args, &["ls"]).await;
+    let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        ls_stdout.contains(&format!("HOSTNAME PROXY:  listening on 127.0.0.1:{port}")),
+        "`min ls` must print the discovered port, got: {ls_stdout}"
+    );
+    assert!(
+        ls_stdout.contains("routes through it"),
+        "the line must say what the port is for, got: {ls_stdout}"
+    );
+    assert!(
+        ls_stdout.contains(&format!(
+            "ZONE ANSWERER:   listening on 127.0.0.1:{answerer_port} (UDP)"
+        )),
+        "`min ls` must print the answerer's port beside the proxy's, got: {ls_stdout}"
+    );
+    assert!(
+        ls_stdout.contains("point the host's resolver at it"),
+        "the answerer line must say what the port is for, got: {ls_stdout}"
+    );
+}
+
+// --- retired surfaces (NET-109 / NET-110) ---
+
+/// No build of the daemon carries the retired mTLS reverse proxy, its
+/// client-certificate RPC, or the `ssh-forward` feature that compiled
+/// `direct-tcpip` out (NET-109, NET-110). A client crate cannot reach the
+/// daemon's build flags from here, so assert on its sources and manifests —
+/// the same source-scan approach `minimal`'s own `login_mints_no_certificate`
+/// uses to prove a verb dropped a surface.
+#[test]
+fn retired_surfaces_absent() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crates/minimal sits two levels below the workspace root");
+
+    let source = |rel: &str| {
+        std::fs::read_to_string(root.join(rel))
+            .unwrap_or_else(|e| panic!("readable source {rel}: {e}"))
+    };
+
+    let retired_surfaces: &[(&str, &[&str])] = &[
+        // The proxy serves plain HTTP only: no TLS port, no certificate
+        // authority, no TLS-terminating serve loop, no TLS deps.
+        (
+            "crates/minimald/src/net/proxy.rs",
+            &[
+                "HTTPS_PROXY_PORT",
+                "CertAuthority",
+                "serve_https",
+                "tokio_rustls",
+                "networking-proxy",
+            ],
+        ),
+        // The daemon opens one routing listener and keeps no proxy state.
+        (
+            "crates/minimald/src/server.rs",
+            &["mtls", "7655", "cert_authority", "networking-proxy"],
+        ),
+        // No client-certificate RPC handler or dispatch arm, and no
+        // mTLS field on the replies.
+        (
+            "crates/minimald/src/rpc.rs",
+            &[
+                "IssueClientCert",
+                "mtls_proxy_unavailable",
+                "networking-proxy",
+            ],
+        ),
+        // No crypto-provider install for the removed feature, and no
+        // second-proxy comment in the startup path.
+        ("crates/minimald/src/main.rs", &["networking-proxy", "7655"]),
+        // direct-tcpip is served in every build: neither the handler nor
+        // the relay is behind a feature gate anymore.
+        (
+            "crates/minimald/src/connection.rs",
+            &[
+                "feature = \"ssh-forward\"",
+                "feature = \"networking-proxy\"",
+            ],
+        ),
+        // Both features and their optional TLS deps are gone from the
+        // manifest, so no build can turn them back on.
+        (
+            "crates/minimald/Cargo.toml",
+            &[
+                "networking-proxy",
+                "ssh-forward",
+                "rcgen",
+                "rustls",
+                "tokio-rustls",
+            ],
+        ),
+        // The wire contract carries no client-certificate types and no
+        // mTLS-unavailable fields.
+        (
+            "crates/minimald-rpc/src/lib.rs",
+            &["IssueClientCert", "mtls_proxy_unavailable"],
+        ),
+        // The workspace drops the certificate generator only minimald used.
+        ("Cargo.toml", &["rcgen"]),
+        // Nothing passes a removed feature to the daemon builds.
+        ("justfile", &["networking-proxy", "{{features}}"]),
+    ];
+    for (rel, retired) in retired_surfaces.iter().copied() {
+        let text = source(rel);
+        for &token in retired {
+            assert!(
+                !text.contains(token),
+                "{rel} still names the retired surface `{token}` (NET-109)"
+            );
+        }
+    }
+}
+
+/// The daemon's `ListSessions` reply no longer carries the mTLS field, and a
+/// reply without it decodes: `min ls` keeps reading the list, and never
+/// prints an mTLS warning again (NET-109). A reply from an older daemon that
+/// still sends the field decodes too — an unknown field is skipped, so the
+/// version skew never breaks the list.
+#[test]
+fn session_list_decodes_without_mtls_field() {
+    let resp = ListSessionsResponse {
+        daemon_version: Some("test".to_string()),
+        hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
+        resource_pool: None,
+        sessions: vec![],
+    };
+
+    // The reply this build's daemon sends carries no mtls field.
+    let json = serde_json_lenient::to_string(&resp).unwrap();
+    assert!(
+        !json.contains("mtls_proxy_unavailable"),
+        "the serialized reply must not carry the retired field: {json}"
+    );
+
+    // And it decodes back through the client's own type.
+    let decoded: ListSessionsResponse = serde_json_lenient::from_str(&json).unwrap();
+    assert_eq!(decoded.daemon_version.as_deref(), Some("test"));
+    assert!(decoded.sessions.is_empty());
+
+    // An older daemon's reply, still carrying the field, decodes as well:
+    // the extra field is ignored rather than fatal.
+    let older = r#"{"daemon_version":"old","mtls_proxy_unavailable":"still here","sessions":[]}"#;
+    let from_older: ListSessionsResponse = serde_json_lenient::from_str(older).unwrap();
+    assert_eq!(from_older.daemon_version.as_deref(), Some("old"));
+    assert!(from_older.sessions.is_empty());
+}
+
 // --- helpers ---
 
 /// Creates a session whose workspace mfile declares a `[session.vars]`
@@ -1022,13 +1378,32 @@ async fn create_session_at(
     name: &str,
     project_path: paths::HostAbsPath,
 ) -> SessionId {
+    create_session_with(
+        daemon,
+        name,
+        project_path,
+        sessions::NetworkMode::NoNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await
+}
+
+/// Like [`create_session`] but with the network mode and policy the caller
+/// chooses, so a test can store a policy the CLI surfaces must render.
+async fn create_session_with(
+    daemon: &common::TestDaemon,
+    name: &str,
+    project_path: paths::HostAbsPath,
+    network: sessions::NetworkMode,
+    policy: sessions::SessionPolicy,
+) -> SessionId {
     let mut client = daemon.server.connect().await;
 
     let config = minimald_rpc::SessionConfig {
         name: Some(name.to_string()),
         project_path,
-        network: sessions::NetworkMode::NoNet,
-        policy: Default::default(),
+        network,
+        policy,
         hooks_enabled: true,
         attrs: Default::default(),
     };
@@ -1074,4 +1449,260 @@ async fn create_session_at(
         }
     }
     id
+}
+
+/// Like [`create_session`] but with the network mode and policy the caller
+/// chooses.
+async fn create_session_with_policy(
+    daemon: &common::TestDaemon,
+    name: &str,
+    network: sessions::NetworkMode,
+    policy: sessions::SessionPolicy,
+) -> SessionId {
+    let project_path =
+        camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
+    let abs_path = paths::HostAbsPath::try_new(project_path).unwrap();
+    create_session_with(daemon, name, abs_path, network, policy).await
+}
+
+// --- net forward (NET-104/NET-105) ---
+
+/// The service the forward reaches: a loopback echo server, bound to an
+/// ephemeral port, echoing every accepted connection back byte for byte.
+async fn spawn_echo_server() -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((conn, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let (mut read, mut write) = tokio::io::split(conn);
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+    (port, server)
+}
+
+/// A loopback port nothing is bound to, for the forward's laptop-side
+/// listener. Probed rather than guessed: bind :0, read the port, drop the
+/// socket.
+async fn free_loopback_port() -> u16 {
+    let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    port
+}
+
+/// Connects to `127.0.0.1:port`, retrying briefly: the forward runs as a
+/// concurrent task, so its listener appears a moment after the spawn.
+async fn connect_with_retry(port: u16) -> tokio::net::TcpStream {
+    let mut last = None;
+    for _ in 0..500 {
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(stream) => return stream,
+            Err(e) => {
+                last = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+    panic!("nothing ever listened on 127.0.0.1:{port}: {last:?}");
+}
+
+/// A `GlobalArgs` pointing at the same daemon as `args`, but built to move
+/// into a spawned task: the shared one stays with the test body.
+fn global_args_for_task(args: &GlobalArgs) -> GlobalArgs {
+    GlobalArgs {
+        minimal_dir: args.minimal_dir.clone(),
+        ..Default::default()
+    }
+}
+
+/// `min net forward web 8080:3000` answers on `localhost:8080` (NET-104):
+/// the session is `host_ip`, so the box shares this process's network
+/// namespace, and the echo server below stands in for the in-box service the
+/// forward reaches. Bytes written to the laptop-side port come back over the
+/// session's SSH channel, on the forward's own connections — twice, to show
+/// each accepted connection gets its own channel.
+#[tokio::test]
+async fn net_forward_relays_over_ssh_channel() {
+    let (daemon, args) = setup().await;
+    let _id = create_session_with_policy(
+        &daemon,
+        "web",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    let (box_port, echo) = spawn_echo_server().await;
+    let local_port = free_loopback_port().await;
+    let forward_args = global_args_for_task(&args);
+    let forward = tokio::spawn(async move {
+        cmd_net_forward(
+            &forward_args,
+            NetForwardArgs {
+                session: "web".to_string(),
+                spec: format!("{local_port}:{box_port}"),
+            },
+        )
+        .await
+    });
+
+    for round in 0..2 {
+        let mut conn = connect_with_retry(local_port).await;
+        conn.write_all(b"ping").await.expect("write to the forward");
+        let mut echoed = [0u8; 4];
+        conn.read_exact(&mut echoed)
+            .await
+            .expect("read the box's answer back through the forward");
+        assert_eq!(
+            echoed, *b"ping",
+            "connection {round} must relay through the box port"
+        );
+    }
+
+    forward.abort();
+    echo.abort();
+}
+
+/// A connection whose box port refuses ends that connection and nothing
+/// else (NET-104): the channel open runs in the connection's own task, so a
+/// refused dial costs one connection while the listener keeps accepting —
+/// and the very next connection, once the box port has a listener, relays.
+#[tokio::test]
+async fn net_forward_survives_a_refused_box_port() {
+    let (daemon, args) = setup().await;
+    let _id = create_session_with_policy(
+        &daemon,
+        "web",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    // Nothing is listening on the box port yet: the first connection's dial
+    // is refused by the box.
+    let box_port = free_loopback_port().await;
+    let local_port = free_loopback_port().await;
+    let forward_args = global_args_for_task(&args);
+    let forward = tokio::spawn(async move {
+        cmd_net_forward(
+            &forward_args,
+            NetForwardArgs {
+                session: "web".to_string(),
+                spec: format!("{local_port}:{box_port}"),
+            },
+        )
+        .await
+    });
+
+    // The refused connection is accepted — the forward's listener is up — and
+    // then closed by the refusal, not hung. It ends with a reset or with a
+    // clean EOF, whichever side of the race the bytes the client sent land
+    // on: a socket dropped with unread data in its receive queue resets,
+    // one dropped after the bytes arrived and were read ends cleanly. Either
+    // way the connection is over, which is the point.
+    let mut refused = connect_with_retry(local_port).await;
+    refused.write_all(b"ping").await.unwrap();
+    let mut seen = Vec::new();
+    match refused.read_to_end(&mut seen).await {
+        Ok(n) => assert_eq!(
+            n, 0,
+            "a refused dial must close the connection, got: {seen:?}"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("a refused dial must close the connection, got: {e}"),
+    }
+    drop(refused);
+
+    // The service comes up on the box port, and the forward that survived
+    // the refusal reaches it.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", box_port))
+        .await
+        .expect("the box port is free for the service to take");
+    let echo = tokio::spawn(async move {
+        loop {
+            let Ok((conn, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let (mut read, mut write) = tokio::io::split(conn);
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+
+    let mut conn = connect_with_retry(local_port).await;
+    conn.write_all(b"ping").await.expect("write to the forward");
+    let mut echoed = [0u8; 4];
+    conn.read_exact(&mut echoed)
+        .await
+        .expect("read the box's answer back through the forward");
+    assert_eq!(echoed, *b"ping", "the forward must relay after a refusal");
+
+    forward.abort();
+    echo.abort();
+}
+
+/// The forward closes with its session (NET-105): once `min session destroy`
+/// takes the session down, the forward's future ends on its own — the
+/// listener goes with it rather than outliving the session it forwards for.
+#[tokio::test]
+async fn net_forward_closes_with_session() {
+    let (daemon, args) = setup().await;
+    let _id = create_session_with_policy(
+        &daemon,
+        "web",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    let (box_port, echo) = spawn_echo_server().await;
+    let local_port = free_loopback_port().await;
+    let forward_args = global_args_for_task(&args);
+    let forward = tokio::spawn(async move {
+        cmd_net_forward(
+            &forward_args,
+            NetForwardArgs {
+                session: "web".to_string(),
+                spec: format!("{local_port}:{box_port}"),
+            },
+        )
+        .await
+    });
+
+    // The listener is up: the forward is live, not just spawned.
+    let mut conn = connect_with_retry(local_port).await;
+    conn.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    conn.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(echoed, *b"ping");
+    drop(conn);
+
+    cmd_destroy(
+        &args,
+        DestroyArgs {
+            session: Some("web".to_string()),
+            all: false,
+            force: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), forward)
+        .await
+        .expect("the forward must end once its session is destroyed")
+        .expect("the forward task must not panic")
+        .expect("the forward must exit cleanly");
+    echo.abort();
 }

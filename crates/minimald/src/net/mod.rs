@@ -212,6 +212,11 @@ pub struct SwitchClient {
     /// How PTask taps reach the switch: local spawn (DM2) or a
     /// vsock shuttle to the host gvproxy (DM1/3/4).
     transport: SwitchTransport,
+    /// Which daemon instance this switch belongs to, as a hostname label:
+    /// the daemon's own id, which the `OwnIp` attach path registers its
+    /// DNS names under so two daemons on one host mint distinct ones
+    /// (NET-027). Defaults to the single-daemon id `local`.
+    host_id: String,
 }
 
 impl SwitchClient {
@@ -238,7 +243,24 @@ impl SwitchClient {
             child: None,
             exit_tx,
             transport: SwitchTransport::default(),
+            host_id: crate::net::dns::DEFAULT_HOST_ID.to_owned(),
         }
+    }
+
+    /// Names this daemon instance's DNS registrations under a host id other
+    /// than the single-daemon default. The daemon passes its own instance
+    /// id, so a second daemon on the same host registers under its own
+    /// label instead of overwriting the first's records.
+    #[must_use]
+    pub fn with_host_id(mut self, host_id: impl Into<String>) -> Self {
+        self.host_id = host_id.into();
+        self
+    }
+
+    /// The host id this daemon's `OwnIp` DNS names register under.
+    #[must_use]
+    pub fn host_id(&self) -> &str {
+        &self.host_id
     }
 
     /// Sets how PTask taps reach the switch. The DM2 default is

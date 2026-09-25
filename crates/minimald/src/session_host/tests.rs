@@ -189,7 +189,7 @@ fn teardown_from(rx: &mut mpsc::Receiver<BindingMsg>) -> Option<(TeardownCause, 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
     let (mut host, _handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -245,7 +245,7 @@ async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stalled_binding_does_not_wedge_the_host_loop() {
     let (mut host, handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -363,7 +363,7 @@ async fn await_forwarded(rx: &mut mpsc::Receiver<BindingMsg>, needle: &[u8]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
     let (mut host, _handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -423,7 +423,7 @@ async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
     let (host, _handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -471,7 +471,7 @@ async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_kill_tells_the_binding_nothing() {
     let (mut host, handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -861,7 +861,7 @@ async fn get_attrs_tracks_title_and_io_times() {
     // through a clone of the host's own remote sender, then drive its
     // runtime loop on a background task.
     let (host, handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -936,7 +936,7 @@ async fn get_attrs_tracks_title_and_io_times() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kill_tears_down_host_and_reaps_process() {
     let (host, handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -1026,51 +1026,6 @@ impl sandbox2::NetGuard for RecordingNetGuard {
     }
 }
 
-/// Like [`MockLauncher`], but attaches a [`RecordingNetGuard`] so a test can
-/// observe network teardown. The shared `torn_down` flag lets the test assert
-/// when the network is released relative to detach vs. exit.
-struct MockLauncherWithNet {
-    torn_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl SessionLauncher for MockLauncherWithNet {
-    type Process = MockProcess;
-    type Guard = ();
-
-    async fn launch(
-        self,
-        _name: String,
-        _username: String,
-        _paths: SessionPaths,
-        sz: WinSize,
-    ) -> std::io::Result<Launched<MockProcess, ()>> {
-        let pty = Pty::open(sz)?;
-        let script = format!(
-            r#"while read line; do [ "$line" = {MOCK_EXIT_LINE} ] && exit 0; printf 'got:%s\n' "$line"; done"#
-        );
-        let mut command = std::process::Command::new("/bin/sh");
-        command.arg("-c").arg(&script);
-        command.stdin(std::process::Stdio::from(pty.dup_slave_fd()?));
-        command.stdout(std::process::Stdio::from(pty.dup_slave_fd()?));
-        let tty_path = pty.slave_path().to_path_buf();
-        let (master, slave) = pty.into_fds();
-        command.stderr(std::process::Stdio::from(slave));
-        let process = command.spawn()?;
-        Ok(Launched {
-            master,
-            process: MockProcess {
-                child: process,
-                exit: None,
-            },
-            guard: (),
-            tty_path,
-            net_guard: Some(Box::new(RecordingNetGuard {
-                torn_down: self.torn_down,
-            })),
-        })
-    }
-}
-
 fn test_paths() -> SessionPaths {
     SessionPaths {
         working: DaemonAbsPath::root(),
@@ -1088,9 +1043,9 @@ fn test_paths() -> SessionPaths {
 async fn exit_releases_the_network() {
     let torn_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (host, _handle) = Host::build(
-        MockLauncherWithNet {
+        MockLauncher::with_net_guard(Box::new(RecordingNetGuard {
             torn_down: torn_down.clone(),
-        },
+        })),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -1141,9 +1096,9 @@ async fn exit_releases_the_network() {
 async fn detach_keystroke_holds_the_session_and_network() {
     let torn_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (host, handle) = Host::build(
-        MockLauncherWithNet {
+        MockLauncher::with_net_guard(Box::new(RecordingNetGuard {
             torn_down: torn_down.clone(),
-        },
+        })),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -1243,7 +1198,7 @@ fn queue_stdin_appends_after_unwritten_remainder() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_binding_generation_input_is_discarded() {
     let (host, _handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -1290,4 +1245,117 @@ async fn stale_binding_generation_input_is_discarded() {
         .expect("mainloop should terminate after the shell exits")
         .expect("host task should not panic during teardown")
         .expect("mainloop should return the reaped exit status");
+}
+
+/// A composition with nothing in it. [`Host::hook_plan`] needs a composition
+/// to exist before it will plan a hook run, but no hook script is run by the
+/// plan itself, so an empty one is enough to test the wiring.
+fn bare_composition() -> Arc<sessions::core::compose::Composition> {
+    use sessions::wire::request::{COMPOSITION_SNAPSHOT_VERSION, WireComposition};
+    Arc::new(
+        sessions::core::compose::Composition::try_from(WireComposition {
+            version: COMPOSITION_SNAPSHOT_VERSION,
+            vars: Vec::new(),
+            patches: Vec::new(),
+            packages: Vec::new(),
+            lifecycle_hooks: Vec::new(),
+            orientation: Default::default(),
+        })
+        .expect("an empty composition snapshot converts back"),
+    )
+}
+
+/// A launcher that reports the given none-box seal and runs a stand-in shell
+/// with exactly one child, so [`Host::session_leader_pid`] resolves the way it
+/// does behind a real session.
+struct SealingMockLauncher {
+    seal_injection: bool,
+}
+
+impl SessionLauncher for SealingMockLauncher {
+    type Process = MockProcess;
+    type Guard = ();
+
+    async fn launch(
+        self,
+        _name: String,
+        _username: String,
+        _paths: SessionPaths,
+        sz: WinSize,
+    ) -> io::Result<Launched<MockProcess, ()>> {
+        let pty = Pty::open(sz)?;
+        // The `&` forces a fork, so the shell stays alive holding exactly one
+        // child for `session_leader_pid` to resolve.
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 30 & wait");
+        command.stdin(std::process::Stdio::from(pty.dup_slave_fd()?));
+        command.stdout(std::process::Stdio::from(pty.dup_slave_fd()?));
+        let tty_path = pty.slave_path().to_path_buf();
+        let (master, slave) = pty.into_fds();
+        command.stderr(std::process::Stdio::from(slave));
+
+        let process = command.spawn()?;
+
+        Ok(Launched {
+            master,
+            process: MockProcess::new(MockBackend { child: process }),
+            guard: (),
+            net_guard: None,
+            tty_path,
+            seal_injection: self.seal_injection,
+        })
+    }
+}
+
+/// The seal a lifecycle hook is injected with follows the session's own.
+/// `hook_plan` is the one place the daemon decides what a hook runs in, so it
+/// is where the none-box socket-family seal has to arrive: a hook joins the
+/// session's namespaces rather than being forked from the filtered shell, so
+/// without the flag it would land unfiltered and could open sockets —
+/// `AF_VSOCK` to the host included — from inside a sealed box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_injections_carry_the_session_s_none_box_seal() {
+    for (sealing, expected) in [(true, true), (false, false)] {
+        let (mut host, _handle) = Host::build(
+            SealingMockLauncher {
+                seal_injection: sealing,
+            },
+            HostParams {
+                name: "test-session".to_string(),
+                username: "user".to_string(),
+                paths: test_paths(),
+                sz: DEFAULT_SIZE,
+                channel: None,
+                control: None,
+                delta: None,
+                archives_dir: std::env::temp_dir(),
+                session_id: sessions::SessionId::nil(),
+                composition: Some(bare_composition()),
+                connection_env: ConnectionEnv::new(),
+            },
+        )
+        .await
+        .expect("failed to build host");
+
+        // The stand-in shell forks its child a moment after `spawn` returns,
+        // so the leader may not exist on the first ask. A real session runs
+        // its hooks long after launch; give the stand-in the same courtesy,
+        // bounded so a session that can never plan says so rather than hang.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let plan = loop {
+            if let Some(plan) = host.hook_plan(crate::hooks::HookEvent::Attach) {
+                break plan;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a live session with a composition never planned a hook run",
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let _ = host.process.kill();
+        assert_eq!(
+            plan.commands.seal_none_box, expected,
+            "the hook injection must carry the session's none-box seal",
+        );
+    }
 }

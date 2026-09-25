@@ -280,9 +280,10 @@ The `assert-version` job reads `package.version` for a versioned run. It
 refuses a version that already has a tag. It also runs
 [`scripts/next-version.sh --check`](../../scripts/next-version.sh), the same
 check that runs on every PR. That script reads the full commit messages since
-the last release tag. A `feat:` commit requires a minor bump, and anything
-else a patch. A breaking change appears first in the notes. At 0.x it does not bump the
-major version. The same check runs as the
+the last release tag. A `feat:` commit requires a minor bump. A breaking
+change under any type also requires a minor bump, and appears first in the
+notes. At 0.x it does not bump the major version. Anything else requires a
+patch. The same check runs as the
 workspace `package_version` test and as `just check-version`. It fails a PR
 whose `package.version` is stale or not above the newest `v*` tag.
 
