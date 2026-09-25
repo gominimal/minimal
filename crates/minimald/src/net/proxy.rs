@@ -29,17 +29,21 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::dns::HostnameRegistry;
 
-/// Port the B5 host-side egress/DNS proxy listens on (TC3). Clients reach it
-/// via `HTTP(S)_PROXY`.
-pub const EGRESS_PROXY_PORT: u16 = 7654;
+/// The port the B5 host-side egress/DNS proxy listens on (TC3) when a
+/// deployment pins one — the documented default the recipes that export
+/// `HTTP(S)_PROXY` assume. A daemon that is started without a configured
+/// port does not bind this: it asks the OS for a free port, and publishes
+/// the port it got wherever clients need it (NET-025).
+pub const DEFAULT_EGRESS_PROXY_PORT: u16 = 7654;
 
 /// Port the B8 mTLS reverse proxy listens on (TC7).
 pub const HTTPS_PROXY_PORT: u16 = 7655;
 
-/// Default address the egress proxy listens on: loopback, where every
-/// `*.min.internal` name is reachable. Clients reach it via `HTTP(S)_PROXY`.
+/// The address a pinned deployment's clients are told to point
+/// `HTTP(S)_PROXY` at: loopback, where every `*.min.internal` name is
+/// reachable, on [`DEFAULT_EGRESS_PROXY_PORT`].
 pub const DEFAULT_PROXY_ADDR: SocketAddr =
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), EGRESS_PROXY_PORT);
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_EGRESS_PROXY_PORT);
 
 /// Upstream port used when a routed authority carries no explicit `:port`.
 const DEFAULT_UPSTREAM_PORT: u16 = 80;

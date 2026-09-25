@@ -139,15 +139,14 @@ async fn finish_own_ip_attach(
     // form beside it (NET-002) — pointing at its current lease, so peer
     // sessions can resolve it (finding #3 / UC6). Done for *every* own-IP
     // PTask, even with no ingress: resolvable names are how peers find each other,
-    // and the ingress gate independently governs reachability. Best-effort — a DNS
+    // and the ingress gate independently governs reachability. The host label
+    // is this daemon instance's own id — carried by the switch, same as the
+    // proxy's registry — so a second daemon on the host registers beside the
+    // first's names instead of over them (NET-027). Best-effort — a DNS
     // hiccup must not fail an otherwise-working attach.
-    if let Err(e) = crate::net::policy::register_dns_name(
-        &control,
-        crate::net::dns::DEFAULT_HOST_ID,
-        session_name,
-        lease_ip,
-    )
-    .await
+    let host_id = switch.lock().await.host_id().to_owned();
+    if let Err(e) =
+        crate::net::policy::register_dns_name(&control, &host_id, session_name, lease_ip).await
     {
         tracing::warn!(error = %e, session = session_name, "registering *.min.internal name on gvproxy");
     }

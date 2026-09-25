@@ -233,6 +233,15 @@ pub struct ListenArgs {
     #[clap(hide = true)]
     timekeep_listener_port: Option<u32>,
 
+    /// Port the host-side hostname proxy must listen on, when this deployment
+    /// pins one — the port clients point `HTTP(S)_PROXY` at, whose documented
+    /// default is 7654. Unset (the default) asks the OS for a free port, which
+    /// the daemon reports wherever a client needs it: `min ls` prints it, and
+    /// a second daemon on the same machine gets its own port instead of
+    /// silently losing hostname routing.
+    #[arg(long)]
+    hostname_proxy_port: Option<u16>,
+
     /// Daemonize: spawn minimald in a new session (setsid) and return once the
     /// SSH socket accepts connections, or an 8s timeout elapses. Used by the
     /// `min` CLI to auto-start a native daemon on Linux.
@@ -459,6 +468,12 @@ async fn async_main() -> Result<(), MainError> {
                 // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
                 // vsock shuttle, so no in-guest gvproxy binary path is needed.
                 gvproxy_bin: None,
+                // Auto-select the hostname proxy's port: a VM daemon shares its
+                // host with whatever native daemon runs there, and the host
+                // gvproxy publishes whichever port this guest ends up on, so
+                // the two route both sets of names at the same time (NET-027)
+                // rather than fighting over one pinned port.
+                hostname_proxy_port: None,
             }),
             global_args: GlobalArgs {
                 minimal_state_dir: Some(DaemonAbsPath::try_new("/run/minimal").unwrap().into()),
@@ -758,6 +773,9 @@ async fn async_main() -> Result<(), MainError> {
         // not spawn gvproxy in-guest. The UDS path is DM2.
         in_microvm: cli.listen_args().unwrap().vsock,
         state_volume_mounted,
+        // The port the hostname proxy listens on when the deployment pins
+        // one; `None` means the OS picks a free port (NET-025).
+        hostname_proxy_port: cli.listen_args().unwrap().hostname_proxy_port,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.

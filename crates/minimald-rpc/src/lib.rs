@@ -257,6 +257,14 @@ pub struct ListSessionsResponse {
     /// feature, which is the default — there is no proxy to be unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtls_proxy_unavailable: Option<String>,
+    /// The port the host-side hostname proxy is serving on, so a client can
+    /// tell a user where `<name>.min.internal` resolves from. The daemon
+    /// listens on the port it was configured with, or on an OS-selected
+    /// free port when it was not given one — which is why the port has to
+    /// travel instead of staying a constant. `None` from a daemon that
+    /// predates the field, or while the proxy has not come up yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname_proxy_port: Option<u16>,
 }
 
 impl OneshotSshRpc for ListSessions {
@@ -455,6 +463,14 @@ pub struct CreateSessionResponse {
     /// activating is about to depend on one, and that is not ours to know.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtls_proxy_unavailable: Option<String>,
+    /// The port the host-side hostname proxy is serving on — see
+    /// [`ListSessionsResponse::hostname_proxy_port`].
+    ///
+    /// Carried on the activation reply as well as the list for the same
+    /// reason as `hostname_routing_unavailable`: activation is where the
+    /// user is about to rely on the names this port routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname_proxy_port: Option<u16>,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -1449,6 +1465,7 @@ mod tests {
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: None,
             mtls_proxy_unavailable: None,
+            hostname_proxy_port: None,
         };
         assert_eq!(round_trip(&resp), resp);
     }
@@ -1464,6 +1481,7 @@ mod tests {
                 .expect("a pre-field ListSessions reply must still decode");
         assert!(list.hostname_routing_unavailable.is_none());
         assert!(list.mtls_proxy_unavailable.is_none());
+        assert!(list.hostname_proxy_port.is_none());
 
         let create: Errorable<CreateSessionResponse> = serde_json_lenient::from_str(
             r#"{"id":"00000000-0000-0000-0000-000000000001","daemon_version":"0.5.0"}"#,
@@ -1473,6 +1491,7 @@ mod tests {
             Errorable::Ok(c) => {
                 assert!(c.hostname_routing_unavailable.is_none());
                 assert!(c.mtls_proxy_unavailable.is_none());
+                assert!(c.hostname_proxy_port.is_none());
             }
             Errorable::Err { error } => panic!("expected Ok, got {error}"),
         }
@@ -1487,6 +1506,7 @@ mod tests {
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: None,
             mtls_proxy_unavailable: None,
+            hostname_proxy_port: None,
             resource_pool: None,
             sessions: vec![],
         };
@@ -1499,6 +1519,10 @@ mod tests {
             !json.contains("mtls_proxy_unavailable"),
             "healthy reply should omit the mTLS field too, got {json}"
         );
+        assert!(
+            !json.contains("hostname_proxy_port"),
+            "a reply that has not discovered its port should omit the field, got {json}"
+        );
 
         let down = ListSessionsResponse {
             hostname_routing_unavailable: Some("port 7654 is held".into()),
@@ -1510,6 +1534,14 @@ mod tests {
             back.hostname_routing_unavailable.as_deref(),
             Some("port 7654 is held")
         );
+
+        let discovered = ListSessionsResponse {
+            hostname_proxy_port: Some(41234),
+            ..resp
+        };
+        let json = serde_json_lenient::to_string(&discovered).expect("serializes");
+        let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
+        assert_eq!(back.hostname_proxy_port, Some(41234));
     }
 
     /// The reply a daemon that predates `daemon_version` sends must still

@@ -228,14 +228,24 @@ impl Manager {
         // name routes: straight to its lease on a VM host (the daemon holds a
         // tap on the switch), or through the published-loopback forwarder on a
         // native host (NET-001).
+        //
+        // The registry mints its names under this daemon instance's host id —
+        // the same one the switch carries, seeded from the daemon id — so two
+        // daemons on one host mint distinct names and route both sets at the
+        // same time (NET-027) instead of the second daemon's registrations
+        // overwriting the first's under the shared `local` label.
         #[cfg(target_os = "linux")]
-        let hostnames = Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
-            crate::net::dns::DEFAULT_HOST_ID,
-            matches!(
-                net_switch.lock().await.transport(),
+        let hostnames = {
+            let switch = net_switch.lock().await;
+            let on_switch = matches!(
+                switch.transport(),
                 crate::net::SwitchTransport::HostShuttle { .. }
-            ),
-        )));
+            );
+            Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
+                switch.host_id().to_owned(),
+                on_switch,
+            )))
+        };
         let handle = ManagerHandle {
             sender,
             #[cfg(target_os = "linux")]

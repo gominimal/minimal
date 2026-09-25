@@ -61,6 +61,17 @@ pub struct Config {
     /// microVM booted without a data volume, must never unmount its state dir).
     #[serde(default)]
     pub state_volume_mounted: bool,
+    /// The port the host-side hostname proxy must listen on, when this
+    /// deployment pins one — the documented default clients' `HTTP(S)_PROXY`
+    /// recipes assume is [`crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT`].
+    ///
+    /// `None` is the normal state and means the daemon asks the OS for a free
+    /// port (it binds port 0), then publishes the port it got wherever a
+    /// client needs it (NET-024/NET-025). Deliberately *not* defaulted to the
+    /// old constant: a second daemon that silently lost its hostname routing
+    /// is exactly what the requirement rules out.
+    #[serde(default)]
+    pub hostname_proxy_port: Option<u16>,
 }
 
 impl Config {
@@ -176,6 +187,15 @@ pub struct ServerState {
     /// macOS, which is the platform the failure was reported from.
     proxy_unavailable: Option<String>,
 
+    /// The port the hostname proxy is actually listening on, once its
+    /// startup retry has bound (and, in a microVM, published) it: the
+    /// configured port when the deployment pinned one, else the
+    /// OS-selected free port the bind asked for (NET-024/NET-025). `None`
+    /// until then — which is also what a client talking to a
+    /// pre-discovery daemon sees — and on a state whose proxies were never
+    /// started (unit-test states).
+    hostname_proxy_port: Option<u16>,
+
     /// Why the mTLS reverse proxy is not serving, if it is not. Kept apart
     /// from [`Self::proxy_unavailable`] so a client is not told its hostnames
     /// are broken when only TLS termination is. Never set without the
@@ -226,7 +246,12 @@ impl ServerState {
                 config.gvproxy_bin_path(),
                 minimal_state_dir.as_utf8_path().join("gvproxy"),
             )
-            .with_transport(transport),
+            .with_transport(transport)
+            // This switch belongs to *this* daemon instance: its `OwnIp`
+            // DNS registrations carry the instance id as their host label,
+            // so a second daemon on the same host registers its own names
+            // instead of overwriting the first's records (NET-027).
+            .with_host_id(daemon_id.clone()),
         ));
 
         // Generate the TLS CA once at daemon startup so the HTTPS proxy and the
@@ -270,6 +295,7 @@ impl ServerState {
             log_release,
             host_key: None,
             proxy_unavailable: None,
+            hostname_proxy_port: None,
             mtls_unavailable: None,
             #[cfg(feature = "networking-proxy")]
             cert_authority,
@@ -341,6 +367,20 @@ impl ServerStateHandle {
     /// restart (NET-022).
     pub(crate) async fn clear_proxy_unavailable(&self) {
         self.0.lock().await.proxy_unavailable = None;
+    }
+
+    /// Records the port the hostname proxy actually listens on, once its
+    /// startup has bound (and, in a microVM, published) it.
+    pub(crate) async fn set_hostname_proxy_port(&self, port: u16) {
+        self.0.lock().await.hostname_proxy_port = Some(port);
+    }
+
+    /// The port the hostname proxy listens on, or `None` while it is still
+    /// coming up. Filled on the `ListSessions` and `CreateSession` replies
+    /// so a client can print — and point `HTTP(S)_PROXY` at — the port this
+    /// daemon is on (NET-026).
+    pub(crate) async fn hostname_proxy_port(&self) -> Option<u16> {
+        self.0.lock().await.hostname_proxy_port
     }
 
     /// Records why the mTLS reverse proxy is not serving.
@@ -539,17 +579,19 @@ impl Server {
         log_release: Option<DaemonLogRelease>,
     ) -> Result<(), std::io::Error> {
         // `config` is moved into the state below; capture the deployment-model
-        // flag the proxy startup needs first.
+        // flag and the pinned hostname-proxy port the proxy startup needs first.
         #[cfg(target_os = "linux")]
         let in_microvm = config.in_microvm;
+        #[cfg(target_os = "linux")]
+        let hostname_proxy_port = config.hostname_proxy_port;
         let state = ServerStateHandle::new(config, log_release).await?;
 
-        // Start minimald's two host-side proxies (B5 egress :7654, B8 mTLS
-        // :7655) for the server's lifetime and, in a microVM (DM1), publish them
+        // Start minimald's two host-side proxies (B5 egress, B8 mTLS :7655)
+        // for the server's lifetime and, in a microVM (DM1), publish them
         // on the macOS host loopback. minimald is Linux-only, and the PTask
         // hostname registry they route against only exists on Linux.
         #[cfg(target_os = "linux")]
-        start_host_proxies(&state, in_microvm).await;
+        start_host_proxies(&state, in_microvm, hostname_proxy_port).await;
 
         let russh_config = build_russh_config(&state)
             .await
@@ -776,7 +818,11 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
 /// regardless, reports the reason on its state, and the listener comes up on
 /// its own once the address frees.
 #[cfg(target_os = "linux")]
-async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
+async fn start_host_proxies(
+    state: &ServerStateHandle,
+    in_microvm: bool,
+    hostname_proxy_port: Option<u16>,
+) {
     use std::net::{IpAddr, Ipv4Addr};
 
     use crate::net::answerer::{AnswerScope, ZoneAnswerer};
@@ -790,11 +836,12 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
         Ipv4Addr::LOCALHOST.into()
     };
 
-    // B5 egress/DNS proxy (:7654), always. Both ways this can fail end with
-    // `<name>.min.internal` not routing, so both are recorded on the
-    // state where `ListSessions` can reach them — a daemon that keeps serving
-    // without its proxy looks identical to a healthy one otherwise.
-    let egress_addr = SocketAddr::new(bind_base, crate::net::proxy::EGRESS_PROXY_PORT);
+    // B5 egress/DNS proxy, always. The port is the one the deployment pinned
+    // (NET-024), or port 0 when it did not — which asks the OS for a free one,
+    // so a second daemon on the same host takes its own port instead of
+    // silently losing routing (NET-025). The driver records the port it
+    // ended up on where the RPCs a client discovers it from can read it.
+    let egress_addr = SocketAddr::new(bind_base, hostname_proxy_port.unwrap_or(0));
     tokio::spawn(drive_proxy_until_serving(
         state.clone(),
         HostProxyStartup::Egress { addr: egress_addr },
@@ -982,6 +1029,46 @@ impl HostProxyStartup {
             Self::Mtls { .. } => state.clear_mtls_unavailable().await,
         }
     }
+
+    /// Reports the bound-and-published proxy on the state: the port the
+    /// hostname proxy actually listens on is what the discovery fields of
+    /// the `ListSessions` and `CreateSession` replies carry, so a client
+    /// can find — and point `HTTP(S)_PROXY` at — this daemon's port
+    /// (NET-026). The one info line beside it is the diagnostics-bundle
+    /// answer to "which port is this daemon on, and who chose it": the
+    /// bundle tails the daemon log, and two daemons on one host (NET-027)
+    /// is exactly when the question gets asked.
+    ///
+    /// `requested_port` is the port the bind asked for: `0` means the OS
+    /// chose (no port was configured), anything else means the deployment
+    /// pinned it. The mTLS proxy keeps its documented constant port, so it
+    /// has nothing to record.
+    async fn record_serving(
+        &self,
+        state: &ServerStateHandle,
+        bound_port: u16,
+        requested_port: u16,
+    ) {
+        match self {
+            Self::Egress { .. } => {
+                let port_source = if requested_port == 0 {
+                    "selected"
+                } else {
+                    "configured"
+                };
+                tracing::info!(
+                    component = self.component(),
+                    port = bound_port,
+                    port_source,
+                    status = "serving",
+                    "hostname proxy is serving on its {port_source} port"
+                );
+                state.set_hostname_proxy_port(bound_port).await;
+            }
+            #[cfg(feature = "networking-proxy")]
+            Self::Mtls { .. } => {}
+        }
+    }
 }
 
 /// Drives the hostname-routing proxy (the B5 egress proxy — the listener
@@ -1014,6 +1101,10 @@ pub async fn retry_hostname_proxy_until_serving(
 /// `min session activate` print it (NET-020). Once both gates pass the note is
 /// cleared and — when any attempt failed — one info line marks the recovery
 /// (NET-022): the warning disappears from `min ls` without a daemon restart.
+/// The port the listener ended up on — the configured one, or the
+/// OS-selected one when `addr`'s port was 0 — is recorded on the state for
+/// the RPC replies' discovery field, and named in one startup info line
+/// (NET-025, NET-026).
 ///
 /// The serve loop starts as soon as the listener binds and stays up while the
 /// publish retries; the bind gate never runs again once it has passed, so a
@@ -1029,7 +1120,12 @@ async fn drive_proxy_until_serving(
     // DM1 only: the bind happens in-guest, so the host loopback is reachable
     // only through the gvproxy forwarder's publish. DM2 binds host loopback
     // directly and has no second gate.
-    let publish_port = state.in_microvm().await.then_some(addr.port());
+    let publish_on_host = state.in_microvm().await;
+    // The port the bind asked for: 0 means "OS, pick a free one" (NET-025).
+    // The port the proxy *ended up* on can only be read off the bound
+    // listener, because the chosen one lives there and nowhere else.
+    let requested_port = addr.port();
+    let mut bound_port = requested_port;
 
     let mut bound = false;
     let mut attempt: u32 = 0;
@@ -1038,10 +1134,38 @@ async fn drive_proxy_until_serving(
         if !bound {
             match crate::net::proxy::bind_listener(addr).await {
                 Ok(listener) => {
-                    proxy.spawn_serve(&state, listener).await;
-                    bound = true;
-                    if publish_port.is_none() {
-                        break;
+                    // Auto-selected ports are only discoverable here, off the
+                    // bound socket — and the publish below needs the real one:
+                    // forwarding port 0 forwards nothing.
+                    match listener.local_addr() {
+                        Ok(local) => {
+                            bound_port = local.port();
+                            proxy.spawn_serve(&state, listener).await;
+                            bound = true;
+                            if !publish_on_host {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let report = format!(
+                                "the proxy's listener bound but would not report its address: \
+                                 {error}"
+                            );
+                            let next_retry = retry.delay(attempt);
+                            tracing::warn!(
+                                component,
+                                %addr,
+                                status = "unavailable",
+                                reason = %report,
+                                next_retry = ?next_retry,
+                                "host-side proxy could not bind its listener; retrying with backoff"
+                            );
+                            proxy.record_unavailable(&state, report).await;
+                            failed_before = true;
+                            attempt += 1;
+                            tokio::time::sleep(next_retry).await;
+                            continue;
+                        }
                     }
                 }
                 Err(failure) => {
@@ -1065,7 +1189,7 @@ async fn drive_proxy_until_serving(
         }
         // Bound and serving. Only the host-loopback publish can still be
         // pending: a bind success with no publish gate broke out above.
-        let Some(port) = publish_port else {
+        let Some(port) = publish_on_host.then_some(bound_port) else {
             break;
         };
         match expose_proxy_on_host(crate::net::DEFAULT_SUBNET.daemon_ip(), port, "tcp").await {
@@ -1097,6 +1221,9 @@ async fn drive_proxy_until_serving(
         );
     }
     proxy.clear_unavailable(&state).await;
+    proxy
+        .record_serving(&state, bound_port, requested_port)
+        .await;
 }
 
 /// Drives the box-zone answerer to serving, the same two gates and the same
@@ -1279,6 +1406,7 @@ pub(crate) fn test_config(dir: &std::path::Path) -> Config {
         gvproxy_bin: None,
         in_microvm: false,
         state_volume_mounted: false,
+        hostname_proxy_port: None,
     }
 }
 
@@ -1586,6 +1714,312 @@ mod tests {
         assert!(
             logged.contains(r#"status="reachable""#),
             "the successful bind must be logged as reachable, got: {logged}"
+        );
+    }
+
+    /// Spawns a loopback backend that answers every request with a `200 OK`
+    /// whose body is `body`, returning the port it listens on. Local twin of
+    /// `net::proxy`'s one-shot helper, with a body so the two-daemon test can
+    /// tell its backends apart.
+    #[cfg(target_os = "linux")]
+    async fn spawn_backend_saying(body: &'static str) -> u16 {
+        use std::net::Ipv4Addr;
+
+        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = backend.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+                    let mut scratch = [0u8; 1024];
+                    let _ = sock.read(&mut scratch).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    // `sock` drops here, closing the upstream side.
+                });
+            }
+        });
+        port
+    }
+
+    /// Drives the hostname proxy with a `GET` carrying `Host: <authority>`
+    /// and returns the raw response the client read back — the proxy's own
+    /// test-facing shape, driven through the port a daemon's startup bound.
+    #[cfg(target_os = "linux")]
+    async fn proxy_get(proxy_addr: SocketAddr, authority: &str) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let request = format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// Waits until the state reports the port its hostname proxy ended up on.
+    #[cfg(target_os = "linux")]
+    async fn wait_for_proxy_port(state: &ServerStateHandle) -> u16 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(port) = state.hostname_proxy_port().await {
+                    return port;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the hostname proxy must bind and report its port")
+    }
+
+    /// NET-024: a daemon configured with a hostname-proxy port listens on
+    /// exactly that one. The startup binds it rather than re-picking, records
+    /// it as the port the RPC replies discover, names it in the startup line
+    /// as configured, and a registered name answers through it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn proxy_listens_on_configured_port() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        // Reserve a free port, then hand it to the daemon the way a pinned
+        // deployment does: unheld, for its own bind.
+        let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            hostname_proxy_port: Some(port),
+            ..test_config(&dir)
+        };
+        let state = ServerStateHandle::new(config, None).await.unwrap();
+        start_host_proxies(&state, false, Some(port)).await;
+
+        let bound = wait_for_proxy_port(&state).await;
+        assert_eq!(
+            bound, port,
+            "a configured port must be listened on, not re-picked"
+        );
+
+        // And it really is a listener there: a registered name routes through
+        // that port to its box.
+        let backend = spawn_backend_saying("configured").await;
+        state
+            .sessions_manager()
+            .await
+            .hostnames()
+            .write()
+            .unwrap()
+            .register_host_net(::sessions::SessionId::nil(), "web");
+        let authority = format!("web.min.internal:{backend}");
+        let routed = proxy_get(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound),
+            &authority,
+        )
+        .await;
+        assert!(
+            routed.contains("200 OK"),
+            "the configured port must route a name, got: {routed}"
+        );
+
+        let logged = buf.contents();
+        assert!(
+            logged.contains(&format!("port={bound}")),
+            "the startup line must name the port, got: {logged}"
+        );
+        assert!(
+            logged.contains(r#"port_source="configured""#),
+            "the startup line must say the port was configured, got: {logged}"
+        );
+    }
+
+    /// NET-025: a daemon started without a configured port picks a free one.
+    /// The documented default stays reserved for deployments that pin it —
+    /// here it is held by someone else, and the daemon still comes up, on its
+    /// own port, routing. That is what lets a second daemon on the same host
+    /// keep its names instead of silently losing routing.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn proxy_auto_selects_free_port() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        // Hold the documented default so the choice is observable: an
+        // auto-selecting daemon must neither wait for it nor take it. `None`
+        // means something else on this host already holds it, which is the
+        // same situation from this daemon's side.
+        let held = TcpListener::bind((
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
+        ))
+        .await
+        .ok();
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
+        start_host_proxies(&state, false, None).await;
+
+        let bound = wait_for_proxy_port(&state).await;
+        assert_ne!(bound, 0, "port 0 is a request for a port, not an answer");
+        assert_ne!(
+            bound,
+            crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
+            "an auto-selecting daemon must not take the documented default"
+        );
+        assert!(
+            state.proxy_unavailable().await.is_none(),
+            "auto-selection must not report the proxy unavailable"
+        );
+
+        // The picked port is a real listener, and the startup line says the
+        // port was selected rather than configured.
+        let backend = spawn_backend_saying("selected").await;
+        state
+            .sessions_manager()
+            .await
+            .hostnames()
+            .write()
+            .unwrap()
+            .register_host_net(::sessions::SessionId::nil(), "web");
+        let authority = format!("web.min.internal:{backend}");
+        let routed = proxy_get(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound),
+            &authority,
+        )
+        .await;
+        assert!(
+            routed.contains("200 OK"),
+            "the selected port must route a name, got: {routed}"
+        );
+
+        let logged = buf.contents();
+        assert!(
+            logged.contains(&format!("port={bound}")),
+            "the startup line must name the port, got: {logged}"
+        );
+        assert!(
+            logged.contains(r#"port_source="selected""#),
+            "the startup line must say the port was selected, got: {logged}"
+        );
+        drop(held);
+    }
+
+    /// NET-027: two daemons on one machine route both sets of names at the
+    /// same time. Neither was given a port, so each startup ends up on its
+    /// own; each mints its names under its own instance id, so the second
+    /// daemon's `web` registers beside the first's rather than over it; and a
+    /// request through either proxy reaches that daemon's own box while the
+    /// other daemon is serving its own traffic too.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn two_daemons_route_hostnames_concurrently() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        use ::sessions::SessionId;
+
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let a = ServerStateHandle::new(test_config(&dir_a), None)
+            .await
+            .unwrap();
+        let b = ServerStateHandle::new(test_config(&dir_b), None)
+            .await
+            .unwrap();
+
+        // Two daemon instances: distinct ids, or the names they mint below
+        // would not be distinct either.
+        let id_a = a.daemon_id().await;
+        let id_b = b.daemon_id().await;
+        assert_ne!(id_a, id_b, "two daemon instances must mint two host ids");
+
+        // Neither daemon was configured with a port, so each drives its own
+        // startup on the auto-select address and ends up on its own.
+        let auto = || SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let compressed = RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20));
+        let (_, _) = tokio::join!(
+            retry_hostname_proxy_until_serving(a.clone(), auto(), compressed),
+            retry_hostname_proxy_until_serving(b.clone(), auto(), compressed),
+        );
+        let port_a = wait_for_proxy_port(&a).await;
+        let port_b = wait_for_proxy_port(&b).await;
+        assert_ne!(port_a, port_b, "two daemons must not land on one port");
+
+        // Each daemon's box: the same two-label name, in each daemon's own
+        // registry, each routing to its own box.
+        let backend_a = spawn_backend_saying("daemon-a").await;
+        let backend_b = spawn_backend_saying("daemon-b").await;
+        let registry_a = a.sessions_manager().await.hostnames();
+        let registry_b = b.sessions_manager().await.hostnames();
+        registry_a
+            .write()
+            .unwrap()
+            .register_host_net(SessionId::nil(), "web");
+        registry_b
+            .write()
+            .unwrap()
+            .register_host_net(SessionId::nil(), "web");
+
+        // The names the two daemons mint are distinct: each registry answers
+        // its own instance's three-label form and not the other daemon's.
+        let own_a = format!("web.{id_a}.min.internal:8080");
+        let own_b = format!("web.{id_b}.min.internal:8080");
+        assert!(
+            registry_a.read().unwrap().resolve(&own_a).is_some(),
+            "daemon A must answer its own instance's name"
+        );
+        assert!(
+            registry_a.read().unwrap().resolve(&own_b).is_none(),
+            "daemon A must not answer daemon B's name"
+        );
+        assert!(
+            registry_b.read().unwrap().resolve(&own_b).is_some(),
+            "daemon B must answer its own instance's name"
+        );
+        assert!(
+            registry_b.read().unwrap().resolve(&own_a).is_none(),
+            "daemon B must not answer daemon A's name"
+        );
+
+        // Both sets of names route at the same time: a request through each
+        // daemon's proxy reaches that daemon's own box, concurrently.
+        let authority_a = format!("web.min.internal:{backend_a}");
+        let authority_b = format!("web.min.internal:{backend_b}");
+        let (routed_a, routed_b) = tokio::join!(
+            proxy_get(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a),
+                &authority_a
+            ),
+            proxy_get(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b),
+                &authority_b
+            ),
+        );
+        assert!(
+            routed_a.contains("daemon-a"),
+            "daemon A's proxy must reach its own box, got: {routed_a}"
+        );
+        assert!(
+            routed_b.contains("daemon-b"),
+            "daemon B's proxy must reach its own box, got: {routed_b}"
         );
     }
 
