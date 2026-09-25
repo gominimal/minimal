@@ -32,6 +32,7 @@ async fn version_succeeds_without_daemon() {
         config_dir: None,
         provider: None,
         no_input: false,
+        vm: None,
     };
     // Should print client version and note daemon is unreachable, but return Ok.
     cmd_version(&args).await.unwrap();

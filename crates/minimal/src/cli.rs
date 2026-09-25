@@ -417,6 +417,16 @@ pub struct GlobalArgs {
     /// stdin/stdout is not a terminal.
     #[arg(long, global = true, default_value_t = false)]
     pub no_input: bool,
+    /// Talk to this named minvmd VM instead of the default one.
+    ///
+    /// A named VM keeps its own state directory, socket, and in-VM daemon
+    /// under a per-name subdirectory of the provider dir, so several VMs can
+    /// run side by side on one host. Refused on the native `local-minimald`
+    /// backend, which hosts no VMs — named VMs need
+    /// `--provider local-minvmd` — and no effect on the default VM's paths
+    /// when the name is `default` or omitted.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub vm: Option<String>,
 }
 
 impl GlobalArgs {
@@ -424,6 +434,24 @@ impl GlobalArgs {
     /// `--provider local-minvmd`.
     pub fn use_minvmd(&self) -> bool {
         matches!(self.provider, Some(Provider::LocalMinvmd))
+    }
+
+    /// Publish `--vm` as this process's VM name so every provider dir the
+    /// command resolves — socket, state dir, autospawn — names the same VM
+    /// (NET-052). Called once at dispatch, before any path resolution; the
+    /// default VM is untouched when the flag is absent (NET-053).
+    ///
+    /// # Errors
+    ///
+    /// [`anyhow::Error`] when the name breaks the naming rule
+    /// ([`paths::validate_vm_name`]).
+    pub fn publish_vm_name(&self) -> anyhow::Result<()> {
+        match &self.vm {
+            Some(vm) => {
+                crate::client::set_vm_name(vm).map_err(|err| anyhow::anyhow!("--vm: {err}"))
+            }
+            None => Ok(()),
+        }
     }
 }
 
