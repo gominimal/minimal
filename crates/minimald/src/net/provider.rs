@@ -65,13 +65,18 @@ impl OwnAddressReporter {
 /// lease, a tap and a switch attach. An unrecognised mode (`NetworkMode` is
 /// `#[non_exhaustive]`) gets the empty namespace, the safe direction.
 ///
-/// `own_address` carries the registry handle an own-address launch reports its
-/// lease through once the box attaches (NET-001); a task launch passes `None`.
+/// `policy` is the launch's whole session policy — the own-IP relay gate carries
+/// it in both directions (egress verdict per NET-062/063/064, inbound
+/// default-block per finding #2), while other modes have no relay to gate;
+/// `None` attaches ungated, which is what a task launch passes (a task is not a
+/// declared box). `own_address` carries the registry handle an own-address
+/// launch reports its lease through once the box attaches (NET-001); a task
+/// launch passes `None` for that too.
 pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
-    ingress: Option<sessions::IngressPolicy>,
+    policy: Option<sessions::SessionPolicy>,
     own_address: Option<OwnAddressReporter>,
 ) -> Arc<dyn Network> {
     match mode {
@@ -81,7 +86,7 @@ pub(crate) fn network_for(
         NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
             switch: Arc::clone(switch),
             identity: identity.to_string(),
-            ingress,
+            policy,
             own_address,
             reserved: std::sync::Mutex::new(None),
         }),
@@ -229,14 +234,16 @@ struct Reserved {
 }
 
 /// An own-IP network: leases an address from the per-host gvproxy switch before
-/// the sandbox starts, then relays the sandbox's own tap onto that switch and
-/// applies its static ingress forwards (R1.5/R2.3).
+/// the sandbox starts, then relays the sandbox's own tap onto that switch,
+/// gated by the session's policy — its declared egress enforced on the
+/// relay's outbound leg, its static ingress forwards applied and inbound
+/// ports gated on the other (R1.5/R2.3, NET-062).
 struct OwnIpNetwork {
     switch: Arc<Mutex<SwitchClient>>,
     /// Registered as the PTask's `*.min.internal` hostname on attach (R3.1).
     identity: String,
-    /// Static ingress port mappings to apply once attached.
-    ingress: Option<sessions::IngressPolicy>,
+    /// The launch's whole session policy, carried into the relay gate.
+    policy: Option<sessions::SessionPolicy>,
     /// The registry handle the lease is reported through on attach, so the
     /// box's proxy route exists exactly while the lease does (NET-001). `None`
     /// for a task launch, which owns no proxy route.
@@ -250,7 +257,7 @@ impl std::fmt::Debug for OwnIpNetwork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OwnIpNetwork")
             .field("identity", &self.identity)
-            .field("has_ingress", &self.ingress.is_some())
+            .field("has_policy", &self.policy.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -328,7 +335,7 @@ impl Network for OwnIpNetwork {
                 reserved.control,
                 reserved.lease.ip,
                 &self.identity,
-                self.ingress.as_ref(),
+                self.policy.as_ref(),
                 self.own_address.as_ref(),
             )
             .await

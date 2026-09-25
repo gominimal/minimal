@@ -10,9 +10,9 @@ name: CI (macOS)
 # "Expected" forever and wedges the PR; do NOT add trigger-level `paths:`.
 on:
     push:
-        branches: ["main"]
+        branches: ["main", "release/**"]
     pull_request:
-        branches: ["main"]
+        branches: ["main", "release/**"]
     workflow_dispatch:
     # Reusable so the nightly test tier can run the macOS/HVF e2e on a schedule
     # (nightly-tests.yml `macos-e2e`). On a scheduled call `github.event_name`
@@ -33,7 +33,7 @@ env:
 # Cancel a superseded run so the single runner isn't backed up by stale commits.
 concurrency:
     group: ci-macos-${{ github.ref }}
-    cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
 
 # Least privilege: this workflow only checks out and builds.
 permissions:
