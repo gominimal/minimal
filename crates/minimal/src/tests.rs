@@ -1520,3 +1520,174 @@ async fn proxy_exits_when_the_daemon_closes_the_socket() {
     .expect("proxy must exit once the socket closes, not hang on open stdin")
     .expect("a bridge that ends on a closed socket is not an error");
 }
+
+/// `--network` and `--ingress` are visible in `min session activate --help`
+/// (NET-035), with the `--network` value advertising the current
+/// `none|host_ip|own_ip` spellings.
+#[test]
+fn activate_help_shows_network_flags() {
+    use clap::CommandFactory as _;
+
+    let mut cmd = Cli::command();
+    let activate = cmd
+        .find_subcommand_mut("session")
+        .expect("`session` stays a subcommand")
+        .find_subcommand_mut("activate")
+        .expect("`session activate` stays a subcommand");
+    let help = activate.render_help().to_string();
+    assert!(
+        help.contains("--network <none|host_ip|own_ip>"),
+        "--help must advertise the network modes and their spellings: {help}"
+    );
+    assert!(
+        help.contains("--ingress <EXT:INT[/PROTO]>"),
+        "--help must show the ingress flag: {help}"
+    );
+}
+
+/// Runs `f` with the process's stderr redirected into a pipe and returns
+/// what it wrote alongside `f`'s result.
+///
+/// The capture watches the real fd 2, so it observes what `eprintln!` prints
+/// while it prints — a dropped or rerouted diagnostic fails the caller's
+/// assertion instead of only going missing for users.
+///
+/// Serialized by a process-wide lock: plain `cargo test` shares fd 2 across
+/// test threads, so two captures must never overlap. Under nextest — the lane
+/// this crate's tests run in — every test owns its process to begin with.
+fn capture_stderr<T>(f: impl FnOnce() -> T) -> (String, T) {
+    use std::io::Read as _;
+
+    static STDERR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    let _lock = STDERR_LOCK.lock().expect("stderr capture lock");
+
+    let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe to capture stderr");
+    // Save the current stderr first: the guard restores it even when `f`
+    // panics with fd 2 still pointed at the pipe.
+    struct RestoreStderr(std::os::fd::OwnedFd);
+    impl Drop for RestoreStderr {
+        fn drop(&mut self) {
+            nix::unistd::dup2_stderr(&self.0).expect("restore stderr after capture");
+        }
+    }
+    let restore =
+        RestoreStderr(nix::unistd::dup(std::io::stderr()).expect("dup stderr for capture"));
+    nix::unistd::dup2_stderr(&write_fd).expect("redirect stderr into the capture pipe");
+    // fd 2 now holds a copy of the write end; close the original so the read
+    // below reaches EOF once the restore has taken fd 2 back.
+    drop(write_fd);
+
+    let result = f();
+
+    drop(restore);
+    let mut captured = String::new();
+    std::fs::File::from(read_fd)
+        .read_to_string(&mut captured)
+        .expect("read captured stderr");
+    (captured, result)
+}
+
+/// Every legacy `--network` spelling still parses to the mode its current
+/// spelling names (NET-037), and the parser prints the hint to the process's
+/// stderr — exactly one line naming both spellings, captured around the real
+/// clap parse so the print itself is under test. The current spellings and
+/// the default print nothing, and anything else is refused.
+#[test]
+fn legacy_network_spellings_parse_with_hint() {
+    use clap::Parser as _;
+
+    let activate_args = |args: &[&str]| -> ActivateArgs {
+        match Cli::try_parse_from(args).unwrap().command {
+            Some(Command::Session(SessionArgs {
+                command: SessionCommand::Activate(a),
+            })) => a,
+            _ => panic!("expected an activate command for {args:?}"),
+        }
+    };
+
+    for (legacy, current, mode) in [
+        ("no-net", "none", CliNetworkMode::NoNet),
+        ("host-net", "host_ip", CliNetworkMode::HostNet),
+        ("own-ip", "own_ip", CliNetworkMode::OwnIp),
+    ] {
+        let hint = legacy_network_hint(legacy).expect("a legacy spelling carries a hint");
+        let (stderr, args) =
+            capture_stderr(|| activate_args(&["min", "session", "activate", "--network", legacy]));
+        assert_eq!(
+            args.network, mode,
+            "--network {legacy} must parse to {current}'s mode"
+        );
+        assert_eq!(
+            stderr,
+            format!("{hint}\n"),
+            "--network {legacy} must print exactly the hint line to stderr"
+        );
+        assert!(
+            hint.contains(legacy),
+            "the hint must name the spelling typed: {hint}"
+        );
+        assert!(
+            hint.contains(current),
+            "the hint must name the current spelling: {hint}"
+        );
+    }
+
+    for (current, mode) in [
+        ("none", CliNetworkMode::NoNet),
+        ("host_ip", CliNetworkMode::HostNet),
+        ("own_ip", CliNetworkMode::OwnIp),
+    ] {
+        let (stderr, args) =
+            capture_stderr(|| activate_args(&["min", "session", "activate", "--network", current]));
+        assert_eq!(args.network, mode);
+        assert!(
+            stderr.is_empty(),
+            "a current spelling must print nothing to stderr: {stderr:?}"
+        );
+    }
+
+    let (stderr, args) = capture_stderr(|| activate_args(&["min", "session", "activate"]));
+    assert_eq!(args.network, CliNetworkMode::HostNet);
+    assert!(
+        stderr.is_empty(),
+        "the default network mode must print nothing to stderr: {stderr:?}"
+    );
+
+    let err = Cli::try_parse_from(["min", "session", "activate", "--network", "bogus"])
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("none, host_ip, own_ip"),
+        "the error must name the accepted spellings: {err}"
+    );
+}
+
+/// The CLI reference documents the network flags on `session activate`
+/// (NET-036), read from the real file so a docs edit cannot silently drop
+/// either row.
+#[test]
+fn cli_reference_documents_network_flags() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/cli-min.md");
+    let doc = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let section = doc
+        .split_once("### `session activate`")
+        .expect("a `session activate` section in the CLI reference")
+        .1;
+    let section = section.split("### ").next().unwrap();
+    // Table cells escape their pipes as `\|`; compare against the rendered
+    // form.
+    let section = section.replace("\\|", "|");
+    for row in [
+        "--network <none|host_ip|own_ip>",
+        "--ingress <EXT:INT[/PROTO]>",
+    ] {
+        assert!(
+            section.contains(row),
+            "the CLI reference's `session activate` rows must document `{row}`"
+        );
+    }
+}
