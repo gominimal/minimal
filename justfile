@@ -165,23 +165,26 @@ minimald-build:
 dist-build target:
     scripts/dist-build.sh {{quote(target)}}
 
-# Build the .deb/.rpm/.apk packages for a staged release row from the
-# installer bucket via the pinned nfpm (fetched + sha256-verified by the
-# script). Packages land in dist/. The package NAME is always `minimal`; the
+# One script (scripts/package-nfpm.sh) backs both this recipe and release.yml's
+# `build-packages` job, in two artifact modes: the bucket-row mode here by
+# default, and ARTIFACTS_DIR (release.yml's mode — it packages before staging)
+# when artifacts_dir is passed. The package NAME is always `minimal`; the
 # channel argument picks the row semantics and the version normalization:
 # `stable` takes a promoted semver, `unstable`/`nightly` take a staged sha row
 # and read the row's version file (scripts/package-version.sh turns a dev
-# version into the manager's charset — `~` on deb/rpm, `_` on apk). (The
-# release workflow builds them from its own artifacts instead — ARTIFACTS_DIR
-# mode — before the row is staged.)
+# version into the manager's charset — `~` on deb/rpm, `_` on apk). A channel
+# in artifacts_dir mode also needs BUILT_VERSION (release.yml has it; here pass
+# it in the environment).
 #
 # The row must exist and carry a `version` file: every release build stages
 # both now; older rows need scripts/backfill-version-row.sh first. Linux-only
 # for the same host-check reason as dist-build: the script downloads static
-# musl ELFs and runs the downloaded `min` to generate completions.
+# musl ELFs and runs the staged `min` to generate completions.
+#
+# Build the .deb/.rpm/.apk packages for a staged row or a local build output.
 [linux]
-pkg-nfpm pkgver channel="stable":
-    PKGVER={{quote(pkgver)}} scripts/package-nfpm.sh --channel {{quote(channel)}}
+pkg-nfpm pkgver channel="stable" artifacts_dir="":
+    PKGVER={{quote(pkgver)}} {{ if artifacts_dir == "" { "" } else { "ARTIFACTS_DIR=" + quote(artifacts_dir) + " " } }}scripts/package-nfpm.sh --channel {{quote(channel)}}
 
 # Install-smoke packages built by pkg-nfpm (default OUT_DIR: dist/) in
 # throwaway distrobox boxes named min-test-{deb,rpm,apk}: the package manager
@@ -198,6 +201,34 @@ pkg-nfpm pkgver channel="stable":
 [linux]
 pkg-smoke pkgdir="dist" *args:
     scripts/pkg-smoke.sh --pkg-dir {{quote(pkgdir)}} {{args}}
+
+# The same script the publish jobs run (scripts/publish-aur.sh: clone the AUR
+# repo, stamp the PKGBUILD, push) driven from here, so a failed channel push
+# (e.g. one tolerated by release.yml's non-gating unstable publisher) has a local
+# one-liner. PKGVER is the bucket row: a released semver on stable, a staged sha
+# on unstable/nightly. Args are forwarded verbatim, so `--dry-run` is the
+# credential-free rehearsal (prints the PKGBUILD diff, pushes nothing) and
+# `--verify-build` proves the package builds with makepkg first. A real push
+# needs credentials (an ssh-agent key, or AUR_SSH_PRIVATE_KEY) and dies without
+# them, so a rehearsal cannot push by accident.
+# Linux-only: --verify-build wants makepkg (an Arch container, as CI uses).
+#
+# Rehearse (`--dry-run`) or publish a channel's AUR package: publish-aur <channel> <row>.
+[linux]
+publish-aur channel row *args:
+    PKGVER={{quote(row)}} scripts/publish-aur.sh --channel {{quote(channel)}} {{args}}
+
+# The same script the publish jobs run (scripts/publish-brew.sh: clone the tap,
+# stamp the formula, push) driven from here, so a failed channel push has a local
+# one-liner. PKGVER is the bucket row: a released semver on stable, a staged sha
+# on unstable/nightly. Args are forwarded verbatim, so `--dry-run` is the
+# credential-free rehearsal (prints the formula diff, pushes nothing). A real
+# push needs credentials (GITHUB_TOKEN, or an ssh-agent key) and fails without
+# them. Not Linux-only: the publisher runs on a Mac as well as Linux.
+#
+# Rehearse (`--dry-run`) or publish a channel's Homebrew formula: publish-brew <channel> <row>.
+publish-brew channel row *args:
+    PKGVER={{quote(row)}} scripts/publish-brew.sh --channel {{quote(channel)}} {{args}}
 
 # Restage an already-shipped release under its semver so the command above can
 # see it (the one-time fix for releases staged before the semver-row
