@@ -148,10 +148,10 @@ Verified against the current tree; sources in parentheses.
   resolutions. The fetch scripts warn explicitly: do not run it as part of
   artifact fetching (`scripts/fetch-libkrun.sh`).
 - **Initramfs features come from the `FEATURES` env.**
-  `scripts/build-initramfs.sh` compiles the guest `minimald` with
-  `FEATURES` (empty by default; the justfile passes `networking-proxy`).
-  Calling the script directly yields a guest daemon without networking
-  features; with a prebuilt `MINIMALD_BIN`, `TARGET`/`FEATURES` are ignored.
+  `scripts/build-initramfs.sh` still honours `FEATURES` when it compiles the
+  guest `minimald`, but the justfile passes none, so every guest daemon the
+  recipes ship carries the default feature set; with a prebuilt
+  `MINIMALD_BIN`, `TARGET`/`FEATURES` are ignored.
 - **macOS `--output` must stay under the repo.** On macOS the `minimal` shim
   runs the CLI inside a VM and only syncs the project dir back to the host,
   so `materialize --output` paths outside the repo tree are not visible to
