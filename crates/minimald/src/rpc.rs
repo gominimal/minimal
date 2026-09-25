@@ -2757,11 +2757,14 @@ mod tests {
     /// absent, `false` when it read present. The flag is the whole re-advise
     /// contract: a client that reads `true` surfaces the naming advisory
     /// again (NET-122).
-    // The stand-in window must cover the awaited create, so the mutex guard
-    // is held across the await on purpose.
+    // The guard is taken before the server is even built: both creates read
+    // the process-global probe, the first because it *must not* see another
+    // test's stand-in, the second because it must. It is held across both
+    // awaited creates on purpose.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn create_response_carries_interim_flag() {
+        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
@@ -2778,7 +2781,6 @@ mod tests {
         );
 
         // The absent verdict does — no real bind on this host can produce it.
-        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap();
         crate::net::loopback::install_probe_standin(absent_range_probe);
         let absent = client
             .call::<CreateSession>(&req("interim-absent", "/uwu"))
@@ -2797,8 +2799,13 @@ mod tests {
     /// probe's result and the surface it picked. On this host the whole
     /// `127/8` is local to `lo`, so the probe covers every address, finds
     /// the range present, and the reply stays off the interim.
+    // The guard covers the awaited create for the same reason it covers the
+    // absent arm's window: this test drives no stand-in of its own, so
+    // another test's installed one must not leak into its create.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn session_start_probes_reserved_range() {
+        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let log = crate::test_harness::captured_log();
         let server = TestServer::new().await;
         let mut client = server.connect().await;
@@ -2836,7 +2843,7 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap();
+        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         crate::net::loopback::install_probe_standin(absent_range_probe);
         let interim = client
             .call::<CreateSession>(&req("interim-published", "/uwu"))
