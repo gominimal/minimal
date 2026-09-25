@@ -1,5 +1,20 @@
 #!/usr/bin/bash
 
+# Columns of the terminal stdout writes to, for clipping a progress line so
+# it does not wrap. A wrapped line breaks the in-place redraw. Measured
+# through fd 3, which the caller points at stdout: inside `$(...)` stdout is
+# the capture pipe. 80 when the size cannot be read.
+__min_term_cols() {
+    local size cols
+    size=$(stty size <&3 2>/dev/null) || size=""
+    cols=${size##* }
+    if [[ "$cols" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s' "$cols"
+    else
+        printf '80'
+    fi
+}
+
 __min_rpc() {
     local method="$1"
     shift
@@ -7,12 +22,37 @@ __min_rpc() {
 
     local error="false"
     local env_pairs=()
+    local bar_open=0
 
     while IFS= read -r line; do
         local tag="${line%%:*}"
         local rest="${line#*:}"
         case "$tag" in
+            bar)
+                # One live meter. The daemon sends a fresh line per paint;
+                # reprint it on the same row, and clear the row on an empty
+                # one. A pipe or a log keeps the one-shot `msg:` lines and
+                # drops the redraws. The width is re-read per paint so a
+                # resize mid-download does not wrap the row.
+                if [[ -t 1 ]]; then
+                    if [[ -n "$rest" ]]; then
+                        local cols
+                        { cols=$(__min_term_cols); } 3>&1
+                        printf '\r\033[K%.*s' "$((cols - 1))" "$rest"
+                        bar_open=1
+                    elif [[ "$bar_open" -eq 1 ]]; then
+                        printf '\r\033[K'
+                        bar_open=0
+                    fi
+                fi
+                ;;
             msg)
+                # Clear the meter rather than leave its last frame behind;
+                # the daemon repaints it below this line.
+                if [[ "$bar_open" -eq 1 ]]; then
+                    printf '\r\033[K'
+                    bar_open=0
+                fi
                 echo "$rest"
                 ;;
             set_env)
@@ -25,12 +65,20 @@ __min_rpc() {
                 break
                 ;;
             error)
+                if [[ "$bar_open" -eq 1 ]]; then
+                    printf '\r\033[K'
+                    bar_open=0
+                fi
                 echo "error:$rest" >&2
                 error="true"
                 break
                 ;;
         esac
     done < <(echo "${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
+
+    if [[ "$bar_open" -eq 1 ]]; then
+        printf '\r\033[K'
+    fi
 
     if [[ ${#env_pairs[@]} -gt 0 ]]; then
         echo ""
