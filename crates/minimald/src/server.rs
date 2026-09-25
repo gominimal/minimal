@@ -89,6 +89,12 @@ pub struct Config {
     /// that needs a deterministic pair — pins the octet instead; pinning it
     /// does not check what other daemons on the host hold, which is the
     /// host-global arbitration NET-010's allocation adds.
+    ///
+    /// Only a daemon that owns its gvproxy — a native host, DM2 — can honor
+    /// this: a daemon in a microVM attaches to the host gvproxy `minvmd`
+    /// owns, whose config the guest cannot change, so it carries that
+    /// switch's default /16 whatever this field says (see
+    /// [`switch_subnet_for`]).
     #[serde(default)]
     pub switch_subnet_octet: Option<u8>,
 }
@@ -254,15 +260,10 @@ impl ServerState {
         } else {
             crate::net::SwitchTransport::LocalSpawn
         };
-        // This daemon's own /24 inside the default switch /16 — configured
-        // when a deployment (or a test) pins the octet, else derived from the
-        // instance id — never the shared default two daemons would both hand
-        // leases out of (NET-027).
-        let switch_subnet = switch_subnet_for_octet(
-            config
-                .switch_subnet_octet
-                .unwrap_or_else(|| octet_for_daemon_id(&daemon_id)),
-        );
+        // The subnet this daemon's switch carries — decided by who owns the
+        // gvproxy it attaches to; see [`switch_subnet_for`].
+        let switch_subnet =
+            switch_subnet_for(config.in_microvm, config.switch_subnet_octet, &daemon_id);
         let net_switch = Arc::new(Mutex::new(
             crate::net::SwitchClient::with_subnet(
                 config.gvproxy_bin_path(),
@@ -276,19 +277,19 @@ impl ServerState {
             // instead of overwriting the first's records (NET-027).
             .with_host_id(daemon_id.clone()),
         ));
-        // One line at daemon start naming the switch subnet this instance
-        // owns and the slice of the reserved local range that subnet indexes
-        // — the pair of facts a reader of two daemons' logs (a diagnostics
-        // bundle tails exactly this log) checks to see the two hold
-        // disjoint halves of the machine.
+        // One line at daemon start naming the switch subnet this instance's
+        // boxes lease on and the slice of the reserved local range that
+        // subnet indexes — the pair of facts a reader of two daemons' logs
+        // (a diagnostics bundle tails exactly this log) checks to see the
+        // two hold disjoint halves of the machine.
         let (slice_first, slice_last) =
             sessions::LoopbackAllocator::for_switch_subnet(switch_subnet).range();
         tracing::info!(
             daemon_id = %daemon_id,
             subnet = %switch_subnet,
             loopback_slice = %format!("{slice_first}-{slice_last}"),
-            "gvproxy switch draws OwnIp leases from this daemon's own /24; \
-             published boxes will come from its slice of the reserved local range"
+            "gvproxy switch this daemon's boxes lease on; published boxes \
+             will come from its slice of the reserved local range"
         );
 
         // Build a daemon-scoped mctx config from what the daemon
@@ -333,16 +334,48 @@ impl ServerState {
     }
 }
 
-/// The per-daemon switch subnet: the /24 inside the default switch /16
-/// ([`crate::net::DEFAULT_SUBNET`]) whose third octet `octet` names. Two
-/// daemons on one machine take two different octets — configured, or derived
-/// from the instance id by [`octet_for_daemon_id`] — and with them two
-/// disjoint `OwnIp` PTask-lease ranges and two disjoint slices of the
-/// reserved local range (NET-027).
+/// The subnet this daemon's [`SwitchClient`](crate::net::SwitchClient)
+/// carries, decided by who owns the gvproxy it attaches to.
 ///
-/// The /24 stays inside the default /16 on purpose: on a VM host (DM1) the
-/// gvproxy `minvmd` owns runs the whole /16, so a lease drawn from any /24
-/// inside it is a valid address on the switch the tap actually attaches to.
+/// A daemon that owns its switch (DM2, a native host: it spawns gvproxy
+/// from a config it renders itself) takes its own /24 inside the default
+/// switch /16 — the octet a deployment pins, else the one its instance id
+/// derives — so two daemons on one machine take two different octets and
+/// with them two disjoint `OwnIp` PTask-lease ranges and two disjoint
+/// slices of the reserved local range (NET-027).
+///
+/// A daemon in a microVM (DM1/3/4) does **not** own its switch: it attaches
+/// its boxes' taps to the host gvproxy `minvmd` owns, whose config the
+/// guest can neither read nor change — `minvmd` renders it with
+/// [`crate::net::DEFAULT_SUBNET`], the default /16. Every address the
+/// guest derives from its switch must be one that gvproxy actually answers
+/// at: an `OwnIp` box's lease *and* its gateway and DNS server (the
+/// switch's `network + 1`, where gvproxy answers DNS), the resolver a
+/// host-address box gets, and the legacy host literal
+/// [`crate::net::switch`](crate::net::switch)'s relay watches
+/// (the subnet's `broadcast - 1` — the /16's `100.64.255.254` is the
+/// literal NET-004 names). A derived /24 here would point every box at
+/// `100.64.<octet>.1` — an address no gvproxy answers — and the boxes in
+/// the VM lose all egress, DNS first: the guest root tap
+/// ([`crate::guest::bring_up_root_egress`]) is configured from the same
+/// /16, and a `switch_subnet_octet` pinned onto a microVM daemon is
+/// ignored for the same reason — the guest cannot move a switch it does
+/// not own onto it.
+fn switch_subnet_for(
+    in_microvm: bool,
+    pinned_octet: Option<u8>,
+    daemon_id: &str,
+) -> crate::net::SwitchSubnet {
+    if in_microvm {
+        return crate::net::DEFAULT_SUBNET;
+    }
+    switch_subnet_for_octet(pinned_octet.unwrap_or_else(|| octet_for_daemon_id(daemon_id)))
+}
+
+/// The per-daemon switch subnet a native daemon's own gvproxy runs: the /24
+/// inside the default switch /16 ([`crate::net::DEFAULT_SUBNET`]) whose
+/// third octet `octet` names — see [`switch_subnet_for`] for who may take
+/// one.
 fn switch_subnet_for_octet(octet: u8) -> crate::net::SwitchSubnet {
     let [first, second, _, _] = crate::net::DEFAULT_SUBNET.network().octets();
     crate::net::SwitchSubnet::new(std::net::Ipv4Addr::new(first, second, octet, 0), 24)
@@ -3078,6 +3111,76 @@ mod tests {
         let octets = subnet.network().octets();
         assert_eq!(&octets[..2], &[100, 64], "the /24 must stay in 100.64/16");
         assert_eq!(octets[3], 0, "a /24's network address ends in 0");
+    }
+
+    /// The other half of the ownership rule [`switch_subnet_for`] states —
+    /// the half the macOS e2e caught: a daemon in a microVM does not own its
+    /// gvproxy (it attaches its boxes' taps to the one `minvmd` runs on the
+    /// host, whose config renders the default /16), so the guest must carry
+    /// that switch's subnet, never derive a /24 of its own. Every address a
+    /// guest daemon derives from its switch must be one that switch answers
+    /// at: the gateway is where a box's default route and DNS server live
+    /// (a host-address box's resolver is the switch's DNS server, an
+    /// own-IP box's tap carries the subnet's gateway and netmask), and a
+    /// derived /24's gateway — `100.64.<octet>.1` — is an address no
+    /// gvproxy answers, so every box in the VM lost egress, DNS first.
+    /// Read off the daemon's own start line, which names the subnet its
+    /// switch carries, with an octet pinned to show the pin cannot move a
+    /// switch the guest does not own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_microvm_daemon_attaches_to_the_host_switch_s_own_subnet() {
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(
+            Config {
+                in_microvm: true,
+                switch_subnet_octet: Some(37),
+                ..test_config(&dir)
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let id = state.daemon_id().await;
+        let logged = buf.contents();
+        let line = logged
+            .lines()
+            .find(|l| l.contains("loopback_slice=") && l.contains(&format!("daemon_id={id}")))
+            .unwrap_or_else(|| panic!("no start line for daemon {id}, got: {logged}"));
+        assert!(
+            line.contains("subnet=100.64.0.0/16"),
+            "a microVM daemon must carry the host gvproxy's /16, got: {line}"
+        );
+
+        // The mapping's native arms beside it: a native daemon honors the
+        // pin — it renders its own gvproxy's config — and an unpinned one
+        // derives its /24 from its instance id (NET-027).
+        assert_eq!(
+            switch_subnet_for(false, Some(37), &id).to_string(),
+            "100.64.37.0/24",
+            "a pinned native daemon owns its switch and takes the pinned /24"
+        );
+        assert_eq!(
+            switch_subnet_for(false, None, &id),
+            switch_subnet_for_octet(octet_for_daemon_id(&id)),
+            "an unpinned native daemon derives its own /24"
+        );
+        // And the address that broke the e2e follows: the /16's gateway is
+        // where the host gvproxy answers DNS, and a native /24's is inside
+        // the /16's span but is no switch's address.
+        assert_eq!(
+            crate::net::DEFAULT_SUBNET.dns_server().to_string(),
+            "100.64.0.1",
+            "the host switch's /16 answers DNS at its own gateway"
+        );
     }
 
     /// The box-zone answerer starts beside the hostname proxy and serves the
