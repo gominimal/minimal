@@ -1,8 +1,10 @@
 //! State persistence for `minvmd` (R4.1, R4.6).
 //!
-//! All runtime files live in the minvmd provider-instance directory
-//! (`<minimal_state_dir>/providers/local-minvmd0/`, see
-//! [`paths::provider_instance_dir`]):
+//! All runtime files live in the VM's state directory — the minvmd
+//! provider-instance dir (`<minimal_state_dir>/providers/local-minvmd0/`,
+//! see [`paths::provider_instance_dir`]) for the default VM, or its per-name
+//! subdirectory `local-minvmd0/<vm>/` for a named one (see
+//! [`vm_name`], [`provider_dir_for`]):
 //!
 //! - `minvmd.toml` — serialised [`State`] (lifecycle, pid, timestamp).
 //! - `lifecycle.lock` — advisory lock guarding concurrent transitions (R4.6).
@@ -24,6 +26,7 @@ use std::{
     io::{self, Write},
     os::fd::AsRawFd,
     path::{Path, PathBuf},
+    process::Command,
     sync::OnceLock,
 };
 
@@ -36,6 +39,7 @@ use crate::lifecycle::Lifecycle;
 // ── State dir resolution ─────────────────────────────────────────────────────
 
 static STATE_DIR_OVERRIDE: OnceLock<DaemonAbsPath> = OnceLock::new();
+static VM_NAME: OnceLock<String> = OnceLock::new();
 
 /// Set the `--minimal-state-dir` override. First call wins; must be called
 /// before any path resolution.
@@ -49,6 +53,31 @@ pub fn state_dir_override() -> Option<&'static DaemonAbsPath> {
     STATE_DIR_OVERRIDE.get()
 }
 
+/// Set the `--vm <NAME>` name of the VM this process serves (NET-052). First
+/// call wins; must be called before any path resolution, so every path the
+/// process derives already names the right VM. A name that is not a single
+/// path component ([`paths::validate_vm_name`]) is rejected here rather than
+/// resolved into a directory outside the provider dir.
+///
+/// # Errors
+///
+/// [`paths::Error::InvalidVmName`] when `vm` is not a single path component.
+pub fn set_vm_name(vm: &str) -> Result<(), paths::Error> {
+    paths::validate_vm_name(vm)?;
+    let _ = VM_NAME.set(vm.to_owned());
+    Ok(())
+}
+
+/// The name of the VM this process serves: the `--vm` override when set, else
+/// the default VM ([`paths::DEFAULT_VM_NAME`], whose paths are unchanged —
+/// NET-053).
+pub fn vm_name() -> &'static str {
+    VM_NAME
+        .get()
+        .map(String::as_str)
+        .unwrap_or(paths::DEFAULT_VM_NAME)
+}
+
 /// The state-dir base every minvmd path derives from: the
 /// `--minimal-state-dir` override when set, else [`paths::minimal_state_dir`].
 pub fn state_base_dir() -> DaemonAbsPath {
@@ -58,13 +87,56 @@ pub fn state_base_dir() -> DaemonAbsPath {
         .unwrap_or_else(paths::minimal_state_dir)
 }
 
-/// The provider-instance dir holding all minvmd runtime files:
-/// `<minimal_state_dir>/providers/local-minvmd0`.
-pub fn provider_dir() -> PathBuf {
-    paths::provider_instance_dir(&state_base_dir(), paths::ProviderKind::Minvmd, 0)
+/// The state directory holding one VM's runtime files (NET-052, NET-054),
+/// for an explicit state-dir base and VM name. Pure — no process-global
+/// state — so a named VM's layout is unit-testable:
+/// `<base>/providers/local-minvmd0/<vm>/` for a named VM, the provider
+/// instance dir itself for the default VM.
+///
+/// # Panics
+///
+/// Panics when `vm` is not a single path component. The CLI validates the
+/// name at parse time ([`set_vm_name`]) before any path resolution, so this
+/// is a caller bug, never user input.
+pub fn provider_dir_for(base: &DaemonAbsPath, vm: &str) -> PathBuf {
+    paths::provider_instance_dir_named(base, paths::ProviderKind::Minvmd, 0, vm)
+        .expect("VM name is validated at parse time")
         .as_utf8_path()
         .as_std_path()
         .to_path_buf()
+}
+
+/// The state directory holding this process's VM's runtime files:
+/// `<minimal_state_dir>/providers/local-minvmd0[/<vm>/]`.
+pub fn provider_dir() -> PathBuf {
+    provider_dir_for(&state_base_dir(), vm_name())
+}
+
+/// The argv a re-exec'd child needs to resolve the same VM's state directory
+/// this process does (NET-052): `--minimal-state-dir <dir>` when overridden,
+/// `--vm <name>` when the VM is not the default. The default VM forwards
+/// nothing, so a default invocation re-execs byte-for-byte as before
+/// (NET-053). Pure, so the forwarding is unit-testable.
+fn reexec_vm_args<'a>(state_dir: Option<&'a DaemonAbsPath>, vm: &'a str) -> Vec<&'a str> {
+    let mut args = Vec::new();
+    if let Some(dir) = state_dir {
+        args.extend(["--minimal-state-dir", dir.as_str()]);
+    }
+    if vm != paths::DEFAULT_VM_NAME {
+        args.extend(["--vm", vm]);
+    }
+    args
+}
+
+/// Forward this process's state-dir override and VM name onto `cmd`, a
+/// re-exec'd child (the detached `run` supervisor, the `__krun-vmm` VMM
+/// child), so the child resolves exactly the per-VM state directory this
+/// process did — and, for a named VM, re-appears in `ps` carrying its name,
+/// which is also what `scripts/reap-vms.sh --vm` matches on (NET-056).
+pub fn forward_identity(cmd: &mut Command) {
+    for arg in reexec_vm_args(STATE_DIR_OVERRIDE.get(), vm_name()) {
+        cmd.arg(arg);
+    }
 }
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -439,6 +511,52 @@ mod tests {
         assert_eq!(s.lifecycle, Lifecycle::NotProvisioned);
         assert!(s.vmm_pid.is_none());
         assert!(s.started_at.is_none());
+    }
+
+    // ── Named VM state directories (NET-052..NET-054) ───────────────────────
+
+    /// A VM's state directory for an explicit base and name — the per-name
+    /// subdirectory the named VM keeps its own state, socket, and daemon
+    /// under, and the unchanged provider dir for the default VM.
+    #[test]
+    fn provider_dir_for_nests_a_named_vm_and_pins_the_default() {
+        let base = DaemonAbsPath::try_new("/state/minimal").unwrap();
+        let default = paths::provider_instance_dir(&base, paths::ProviderKind::Minvmd, 0)
+            .as_str()
+            .to_owned();
+
+        // NET-054: a named VM nests under a per-name subdirectory.
+        assert_eq!(
+            provider_dir_for(&base, "alpha").to_str().unwrap(),
+            format!("{default}/alpha"),
+        );
+        // NET-053: the default VM's paths are unchanged, with and without the
+        // explicit default name.
+        assert_eq!(
+            provider_dir_for(&base, paths::DEFAULT_VM_NAME)
+                .to_str()
+                .unwrap(),
+            default
+        );
+    }
+
+    /// A re-exec'd child is told which VM it serves: the state-dir override
+    /// and a non-default `--vm` are forwarded, and the default VM forwards
+    /// neither, so a default invocation re-execs unchanged (NET-053).
+    #[test]
+    fn reexec_args_forward_state_dir_and_vm_name() {
+        let base = DaemonAbsPath::try_new("/state/minimal").unwrap();
+        assert_eq!(
+            reexec_vm_args(Some(&base), "alpha"),
+            ["--minimal-state-dir", "/state/minimal", "--vm", "alpha"],
+        );
+        // The default VM forwards its name nowhere: no args at all.
+        assert!(reexec_vm_args(None, paths::DEFAULT_VM_NAME).is_empty());
+        // An override alone still forwards, with no `--vm` pinned on.
+        assert_eq!(
+            reexec_vm_args(Some(&base), paths::DEFAULT_VM_NAME),
+            ["--minimal-state-dir", "/state/minimal"],
+        );
     }
 
     #[test]

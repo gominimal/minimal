@@ -41,6 +41,19 @@ pub fn run(detach: bool, timeout_secs: Option<u64>) -> Result<()> {
     }
     let timeout_secs = timeout_secs.unwrap_or(DEFAULT_DETACH_TIMEOUT_SECS);
 
+    // One line per VM start, naming the VM and its state directory
+    // (NET-052). Only the process that will actually supervise the VM logs
+    // it: a `--detach` caller re-execs `minvmd run` (without `--detach`) for
+    // the real start, so the line is written once, by the process that owns
+    // the boot.
+    if !detach {
+        tracing::info!(
+            vm = %crate::state::vm_name(),
+            state_dir = %crate::state::provider_dir().display(),
+            "starting VM"
+        );
+    }
+
     #[cfg(minvmd_libkrun)]
     return run_supervisor(detach, timeout_secs);
 
@@ -121,9 +134,9 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("run");
-    if let Some(dir) = crate::state::state_dir_override() {
-        cmd.args(["--minimal-state-dir", dir.as_str()]);
-    }
+    // Forward the state-dir override and VM name so the re-exec'd supervisor
+    // resolves the same per-VM state dir this process did.
+    crate::state::forward_identity(&mut cmd);
     // Mark the child as detached so it routes tracing to the daily-rotated
     // log file (`<state>/logs/minvmd.log`) instead of stdout.
     cmd.env(crate::DETACHED_ENV, "1");
@@ -378,9 +391,9 @@ fn run_foreground() -> Result<()> {
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("__krun-vmm");
-    if let Some(dir) = crate::state::state_dir_override() {
-        cmd.args(["--minimal-state-dir", dir.as_str()]);
-    }
+    // Forward the state-dir override and VM name so the VMM child resolves the
+    // same per-VM state dir this supervisor does.
+    crate::state::forward_identity(&mut cmd);
     alive_lock.inherit_into(&mut cmd);
     let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
