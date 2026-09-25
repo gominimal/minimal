@@ -316,6 +316,12 @@ impl EnvArgs {
 /// thus the sandbox's backing files).
 pub struct Env {
     sandbox: Sandbox<BridgeChannel>,
+    /// The working directory commands in this session start in, resolved from
+    /// the sandbox config once at build time. Fixed for the sandbox's lifetime,
+    /// so resolving it here keeps the [`command_environment`] accessor total.
+    ///
+    /// [`command_environment`]: Self::command_environment
+    command_cwd: String,
     /// The command-channel actor task. `Some` until [`Drop`] aborts it.
     actor: Option<JoinHandle<()>>,
     /// Variables the channel actor has added since launch; see
@@ -490,6 +496,7 @@ impl Env {
         }
         install_min_helpers(&sandbox.rootfs()).map_err(std::io::Error::other)?;
         sandbox.keep_dir(false);
+        let command_cwd = sandbox.command_cwd().map_err(sandbox_err_to_io)?;
 
         let runtime_env = RuntimeEnv::default();
         let channel = SessionChannel {
@@ -512,6 +519,7 @@ impl Env {
 
         Ok(Self {
             sandbox,
+            command_cwd,
             actor: Some(actor),
             runtime_env,
             _temp_dirs: Vec::new(),
@@ -571,7 +579,7 @@ impl Env {
         let mut vars = self.sandbox.command_env();
         vars.extend(self.runtime_env.snapshot());
         crate::session_host::SessionEnvironment {
-            cwd: self.sandbox.command_cwd(),
+            cwd: self.command_cwd.clone(),
             vars,
         }
     }
