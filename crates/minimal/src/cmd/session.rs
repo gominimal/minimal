@@ -258,7 +258,10 @@ pub(crate) async fn activate_session(
     // loadout, and the finalize that #1251 died at, and with the session left
     // unfinalized for the daemon to reap when this connection drops.
     ensure_version_reported(created.daemon_version.as_deref())?;
-    warn_if_hostname_routing_down(created.hostname_routing_unavailable.as_deref());
+    warn_if_hostname_routing_down(
+        created.hostname_routing_unavailable.as_deref(),
+        "min session activate",
+    );
     warn_if_mtls_proxy_down(created.mtls_proxy_unavailable.as_deref());
     let id = created.id;
 
