@@ -887,6 +887,12 @@ pub async fn cmd_session_policy(
 
     let mut client = connect_daemon(global).await?;
 
+    // The policy reply carries only the rules, but the ingress block is
+    // suppressed for host-address sessions (see [`format_policy`]), so the
+    // command also resolves the record the policy rides on for its network
+    // mode.
+    let record = resolve_session(&mut client, &args.session).await?;
+
     use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
     let lookup: GetSessionPolicyRequest = SessionLookup::parse(&args.session).into();
 
@@ -898,7 +904,7 @@ pub async fn cmd_session_policy(
     match resp {
         minimald_rpc::Errorable::Ok(policy) => {
             let mut out = std::io::stdout();
-            format_policy(&mut out, &policy)?;
+            format_policy(&mut out, &policy, record.network)?;
             out.flush().context("Failed to write policy")?;
             Ok(())
         }
@@ -910,12 +916,17 @@ pub async fn cmd_session_policy(
 
 /// Render a session policy as its effective rules: each egress dimension
 /// resolved to its list or its default (`allow all`; `deny subnets` reads
-/// `(none)` when nothing is denied), the ingress mappings spelled out. Shared
-/// by `min session policy`'s printer and the integration test that pins the
-/// rendering (NET-061).
+/// `(none)` when nothing is denied), the ingress mappings spelled out.
+/// `network` is the session's network mode, because ingress is an
+/// own-address surface — the block is omitted entirely for a host-address
+/// session, which shares its host's namespace and so has no per-session
+/// ingress policy to show (the same case the TUI's detail pane leaves
+/// blank). Shared by `min session policy`'s printer and the integration
+/// test that pins the rendering (NET-061).
 pub fn format_policy(
     out: &mut impl std::io::Write,
     policy: &sessions::SessionPolicy,
+    network: sessions::NetworkMode,
 ) -> Result<(), anyhow::Error> {
     writeln!(out, "egress")?;
     match &policy.egress {
@@ -943,22 +954,28 @@ pub fn format_policy(
             write_rules(out, "deny subnets", egress.deny_subnets.as_ref(), "(none)")?;
         }
     }
-    writeln!(out, "ingress")?;
-    match &policy.ingress {
-        None => writeln!(out, "  deny all")?,
-        Some(ingress) => {
-            if ingress.port_mappings.is_empty() && ingress.dynamic_allowed_range.is_none() {
-                writeln!(out, "  deny all")?;
-            }
-            for mapping in &ingress.port_mappings {
-                writeln!(
-                    out,
-                    "  {}  :{} → :{}",
-                    mapping.proto, mapping.external_port, mapping.internal_port
-                )?;
-            }
-            if let Some((lo, hi)) = ingress.dynamic_allowed_range {
-                writeln!(out, "  dynamic ports  {lo}–{hi}")?;
+    // Ingress is an own-address surface: the switch's static forwarder is the
+    // only per-session ingress minimald applies, and a host-address box
+    // shares its host's namespace, so there is no per-session ingress policy
+    // to show for it — "deny all" there would claim a deny-rule exists.
+    if network != sessions::NetworkMode::HostNet {
+        writeln!(out, "ingress")?;
+        match &policy.ingress {
+            None => writeln!(out, "  deny all")?,
+            Some(ingress) => {
+                if ingress.port_mappings.is_empty() && ingress.dynamic_allowed_range.is_none() {
+                    writeln!(out, "  deny all")?;
+                }
+                for mapping in &ingress.port_mappings {
+                    writeln!(
+                        out,
+                        "  {}  :{} → :{}",
+                        mapping.proto, mapping.external_port, mapping.internal_port
+                    )?;
+                }
+                if let Some((lo, hi)) = ingress.dynamic_allowed_range {
+                    writeln!(out, "  dynamic ports  {lo}–{hi}")?;
+                }
             }
         }
     }

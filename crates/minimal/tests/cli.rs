@@ -797,7 +797,8 @@ async fn session_policy_succeeds() {
 /// egress fields the session was activated with, each unset dimension
 /// resolved to its default instead of a bare `null`. The policy is stored
 /// through the daemon and fetched the way the command fetches it;
-/// `format_policy` is the rendering the command prints.
+/// `format_policy` is the rendering the command prints. The same egress on a
+/// host-address box is still shown, but with no ingress block.
 #[tokio::test]
 async fn policy_shows_effective_egress() {
     let (daemon, args) = setup().await;
@@ -827,12 +828,12 @@ async fn policy_shows_effective_egress() {
     };
     assert_eq!(
         policy.egress,
-        Some(egress),
+        Some(egress.clone()),
         "the stored egress must survive the record round trip"
     );
 
     let mut out = Vec::new();
-    format_policy(&mut out, &policy).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -849,6 +850,38 @@ async fn policy_shows_effective_egress() {
     assert!(
         text.contains("deny subnets  169.254.169.254/32"),
         "denied subnets missing:\n{text}"
+    );
+
+    // The same egress is accepted on a host-address box (NET-120), but the
+    // ingress block is suppressed there: a host-address session shares its
+    // host's namespace, so minimald applies no per-session ingress to it and
+    // a `deny all` row would claim a deny-rule that does not exist. The TUI's
+    // detail pane suppresses the block for the same reason.
+    let host_id = create_session_with_policy(
+        &daemon,
+        "egress-policy-host",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::new(Some(egress.clone()), None),
+    )
+    .await;
+    let resp = client
+        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(host_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+    };
+    let mut out = Vec::new();
+    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("subnets  10.0.0.0/8"),
+        "the host-address egress rules are still shown:\n{text}"
+    );
+    assert!(
+        !text.contains("ingress"),
+        "a host-address session has no per-session ingress policy to show:\n{text}"
     );
 }
 

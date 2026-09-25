@@ -265,6 +265,10 @@ ingress
   tcp  :8080 → :80
 ```
 
+A host-address (`--network host_ip`) session prints no ingress block at all:
+it shares its host's network namespace, so minimald applies no per-session
+ingress to it and there is no rule to state.
+
 ### `session hooks`
 
 ```
