@@ -470,6 +470,20 @@ pub struct CreateSessionResponse {
     /// daemon's ports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone_answerer_port: Option<u16>,
+    /// Whether the daemon published this session at the `127.0.0.1` interim —
+    /// true when its session-start bind probe found the reserved local range
+    /// absent, so the session's names answer on the shared host loopback
+    /// address instead of the range (NET-123).
+    ///
+    /// A client that reads `true` surfaces the naming advisory again
+    /// (NET-122): the advisory's privileged step also reserves the range,
+    /// which is what ends the interim. `false` from a daemon that predates
+    /// the field is the safe read — nothing downstream is gated on it; the
+    /// advisory a client prints from its own host-resolver detection is not,
+    /// and the [`Self::daemon_version`] gate already refuses a daemon that
+    /// old.
+    #[serde(default)]
+    pub interim_loopback: bool,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -1430,6 +1444,9 @@ mod tests {
             hostname_routing_unavailable: None,
             hostname_proxy_port: None,
             zone_answerer_port: None,
+            // The interim flag survives the wire: the re-advise a client
+            // prints on it (NET-123) must not be able to silently drop off.
+            interim_loopback: true,
         };
         assert_eq!(round_trip(&resp), resp);
     }
@@ -1456,6 +1473,11 @@ mod tests {
                 assert!(c.hostname_routing_unavailable.is_none());
                 assert!(c.hostname_proxy_port.is_none());
                 assert!(c.zone_answerer_port.is_none());
+                // The interim flag's legacy default is `false`, the read that
+                // changes nothing: an older daemon's reply is not evidence the
+                // reserved range is absent, and nothing downstream is gated
+                // on the flag.
+                assert!(!c.interim_loopback);
             }
             Errorable::Err { error } => panic!("expected Ok, got {error}"),
         }
