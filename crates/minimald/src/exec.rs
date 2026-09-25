@@ -2573,7 +2573,7 @@ mod tests {
 
         use crate::MINIMAL_SESSION_ID_ENV;
         use crate::test_harness::{
-            CaptureWriter, TestClient, TestServer, create_configured_session, create_session_req,
+            TestClient, TestServer, create_configured_session, create_session_req,
         };
 
         /// Creates a fresh session through the public CreateSession RPC
@@ -2758,20 +2758,7 @@ mod tests {
             let server = TestServer::new().await;
             let mut client = server.connect().await;
 
-            let capture = CaptureWriter::default();
-            // Global, not thread-local: the box's end runs on whatever
-            // worker the daemon spawned the exec task on, which a
-            // thread-local default would not cover. Safe under nextest's
-            // one-process-per-test isolation; under a shared-process runner
-            // the assertions below are `contains`, so a neighbour's records
-            // reaching the same buffer cost nothing.
-            tracing::subscriber::set_global_default(
-                tracing_subscriber::fmt()
-                    .with_writer(capture.clone())
-                    .with_ansi(false)
-                    .finish(),
-            )
-            .unwrap();
+            let capture = crate::test_harness::captured_log();
 
             let session_id =
                 active_session_with_echo_task(&server, &mut client, "run-box-ends").await;

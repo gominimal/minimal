@@ -19,7 +19,7 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use camino::Utf8PathBuf;
 use paths::DaemonAbsPath;
@@ -61,6 +61,30 @@ impl<'a> MakeWriter<'a> for CaptureWriter {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
+}
+
+static CAPTURE: OnceLock<CaptureWriter> = OnceLock::new();
+
+/// The process-wide capture buffer. Installs the global `tracing`
+/// subscriber on first call (`set_global_default` accepts one subscriber
+/// per process, so a second install returns `Err`), and every later call
+/// returns the same buffer. Under nextest each test is its own process;
+/// under libtest (`just test-cross`) every test in the binary shares this
+/// one subscriber, so assertions on the buffer must use `contains`.
+pub fn captured_log() -> CaptureWriter {
+    CAPTURE
+        .get_or_init(|| {
+            let capture = CaptureWriter::default();
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(capture.clone())
+                    .with_ansi(false)
+                    .finish(),
+            )
+            .expect("first global subscriber install in this process");
+            capture
+        })
+        .clone()
 }
 
 /// A minimald instance running against a tempdir, ready to accept

@@ -6,7 +6,7 @@ use sessions::SessionId;
 use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
 
 use crate::session_host::{HOST_MAILBOX_CAPACITY, HostHandle};
-use crate::test_harness::{CaptureWriter, TestClient, TestServer, create_configured_session};
+use crate::test_harness::{TestClient, TestServer, create_configured_session};
 
 /// Far longer than [`super::HOST_PROBE_TIMEOUT`], so under a paused
 /// clock the probe's own deadline is always the one that fires first.
@@ -2310,6 +2310,10 @@ async fn box_survives_without_client() {
     let mut fresh = server.connect().await;
     let mut shell = fresh.open_shell(session_id).await;
     await_echo(&mut shell).await;
+    assert!(
+        host.is_alive(),
+        "the later attach must land on the pre-drop host, not a relaunched one",
+    );
 
     assert_eq!(
         record_status(&mut fresh, session_id).await,
@@ -2331,19 +2335,7 @@ async fn box_survives_without_client() {
 async fn abrupt_client_loss_keeps_task() {
     use crate::test_harness::connect_uds;
 
-    let capture = CaptureWriter::default();
-    // Global, not thread-local, and set before the server spawns so the
-    // accept loop's lines land too. Safe under nextest's
-    // one-process-per-test isolation; under a shared-process runner the
-    // assertions are `contains`, so a neighbour's records reaching the
-    // same buffer cost nothing.
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish(),
-    )
-    .unwrap();
+    let capture = crate::test_harness::captured_log();
 
     let dir = tempfile::tempdir().unwrap();
     let (run, sock) = spawn_run_server(&dir).await;
@@ -2420,14 +2412,7 @@ async fn abrupt_client_loss_keeps_task() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn box_has_no_idle_stop() {
     let server = TestServer::new().await;
-    let capture = CaptureWriter::default();
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish(),
-    )
-    .unwrap();
+    let capture = crate::test_harness::captured_log();
 
     let mut client = server.connect().await;
     let session_id = create_session(&mut client).await;
