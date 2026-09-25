@@ -195,7 +195,9 @@ impl IngressPolicy {
     pub fn is_empty(&self) -> bool {
         self.port_mappings.is_empty()
             && self.dynamic_allowed_range.is_none()
-            && self.dynamic_ingress.map_or(true, |d| d == DynamicIngress::Deny)
+            && self
+                .dynamic_ingress
+                .is_none_or(|d| d == DynamicIngress::Deny)
     }
 }
 
