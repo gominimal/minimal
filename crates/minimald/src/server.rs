@@ -81,20 +81,23 @@ pub struct Config {
     pub zone_answerer_port: Option<u16>,
     /// The third octet of the /24 inside the default switch /16
     /// ([`crate::net::DEFAULT_SUBNET`]) that this daemon's gvproxy switch
-    /// draws its `OwnIp` PTask leases — and, with them, this daemon's slice
-    /// of the reserved local range — from. `None` (the default) derives the
-    /// octet from the daemon instance id, so two daemons on one machine
-    /// take two different /24s and never hand out colliding lease addresses
-    /// or overlapping publish slices (NET-027). A deployment — or a test
-    /// that needs a deterministic pair — pins the octet instead; pinning it
-    /// does not check what other daemons on the host hold, which is the
-    /// host-global arbitration NET-010's allocation adds.
+    /// draws its `OwnIp` PTask leases — and, keyed on the same octet, this
+    /// daemon's slice of the reserved local range — from. `None` (the
+    /// default) derives the octet from the daemon instance id, so two
+    /// daemons on one machine take two different octets and never hand out
+    /// colliding lease addresses or overlapping publish slices (NET-027).
+    /// A deployment — or a test that needs a deterministic pair — pins the
+    /// octet instead; pinning it does not check what other daemons on the
+    /// host hold, which is the host-global arbitration NET-010's allocation
+    /// adds.
     ///
     /// Only a daemon that owns its gvproxy — a native host, DM2 — can honor
-    /// this: a daemon in a microVM attaches to the host gvproxy `minvmd`
-    /// owns, whose config the guest cannot change, so it carries that
-    /// switch's default /16 whatever this field says (see
-    /// [`switch_subnet_for`]).
+    /// this for its *switch*: a daemon in a microVM attaches to the host
+    /// gvproxy `minvmd` owns, whose config the guest cannot change, so it
+    /// carries that switch's default /16 whatever this field says (see
+    /// [`switch_subnet_for`]). Its *slice* still follows the octet, derived
+    /// when unpinned: the slice is the daemon's own state, not the switch's,
+    /// and two VM daemons on one host must not meet on one slice.
     #[serde(default)]
     pub switch_subnet_octet: Option<u8>,
 }
@@ -260,10 +263,20 @@ impl ServerState {
         } else {
             crate::net::SwitchTransport::LocalSpawn
         };
+        // This daemon's slice octet — pinned by the deployment, else derived
+        // from its instance id — names *both* halves of its address space:
+        // the /24 a switch it owns runs on (a native host, DM2), and its
+        // slice of the reserved local range. Keeping one octet for both is
+        // what keeps the two aligned on a native host, where the octet is the
+        // third octet of the switch's own /24, while letting a microVM daemon
+        // — whose switch it does not own stays on the default /16 — still draw
+        // from a slice of its own: two VM daemons on one host take two
+        // distinct octets and never meet on one slice (NET-027).
+        let slice_octet =
+            config.switch_subnet_octet.unwrap_or_else(|| octet_for_daemon_id(&daemon_id));
         // The subnet this daemon's switch carries — decided by who owns the
         // gvproxy it attaches to; see [`switch_subnet_for`].
-        let switch_subnet =
-            switch_subnet_for(config.in_microvm, config.switch_subnet_octet, &daemon_id);
+        let switch_subnet = switch_subnet_for(config.in_microvm, slice_octet);
         let net_switch = Arc::new(Mutex::new(
             crate::net::SwitchClient::with_subnet(
                 config.gvproxy_bin_path(),
@@ -278,18 +291,19 @@ impl ServerState {
             .with_host_id(daemon_id.clone()),
         ));
         // One line at daemon start naming the switch subnet this instance's
-        // boxes lease on and the slice of the reserved local range that
-        // subnet indexes — the pair of facts a reader of two daemons' logs
-        // (a diagnostics bundle tails exactly this log) checks to see the
-        // two hold disjoint halves of the machine.
+        // boxes lease on, the octet its published boxes' slice is keyed to,
+        // and that slice of the reserved local range — the facts a reader of
+        // two daemons' logs (a diagnostics bundle tails exactly this log)
+        // checks to see the two hold disjoint halves of the machine.
         let (slice_first, slice_last) =
-            sessions::LoopbackAllocator::for_switch_subnet(switch_subnet).range();
+            sessions::LoopbackAllocator::for_slice_octet(slice_octet).range();
         tracing::info!(
             daemon_id = %daemon_id,
             subnet = %switch_subnet,
+            slice_octet = slice_octet,
             loopback_slice = %format!("{slice_first}-{slice_last}"),
             "gvproxy switch this daemon's boxes lease on; published boxes \
-             will come from its slice of the reserved local range"
+             will come from the slice this daemon's octet indexes"
         );
 
         // Build a daemon-scoped mctx config from what the daemon
@@ -338,11 +352,12 @@ impl ServerState {
 /// carries, decided by who owns the gvproxy it attaches to.
 ///
 /// A daemon that owns its switch (DM2, a native host: it spawns gvproxy
-/// from a config it renders itself) takes its own /24 inside the default
-/// switch /16 — the octet a deployment pins, else the one its instance id
-/// derives — so two daemons on one machine take two different octets and
-/// with them two disjoint `OwnIp` PTask-lease ranges and two disjoint
-/// slices of the reserved local range (NET-027).
+/// from a config it renders itself) runs it on the /24 inside the default
+/// switch /16 whose third octet is `octet` — the octet a deployment pins,
+/// else the one its instance id derives — so two daemons on one machine take
+/// two different /24s and with them two disjoint `OwnIp` PTask-lease ranges
+/// and, keyed on the same octet, two disjoint slices of the reserved local
+/// range (NET-027).
 ///
 /// A daemon in a microVM (DM1/3/4) does **not** own its switch: it attaches
 /// its boxes' taps to the host gvproxy `minvmd` owns, whose config the
@@ -358,18 +373,16 @@ impl ServerState {
 /// `100.64.<octet>.1` — an address no gvproxy answers — and the boxes in
 /// the VM lose all egress, DNS first: the guest root tap
 /// ([`crate::guest::bring_up_root_egress`]) is configured from the same
-/// /16, and a `switch_subnet_octet` pinned onto a microVM daemon is
-/// ignored for the same reason — the guest cannot move a switch it does
-/// not own onto it.
-fn switch_subnet_for(
-    in_microvm: bool,
-    pinned_octet: Option<u8>,
-    daemon_id: &str,
-) -> crate::net::SwitchSubnet {
+/// /16, so a microVM daemon carries that /16 whatever octet it was given —
+/// the guest cannot move a switch it does not own onto another. Its
+/// **slice** still follows the octet: the slice is the daemon's own state,
+/// not the switch's, and keying it on the switch subnet would collapse
+/// every VM on the host onto one shared slice of the reserved local range.
+fn switch_subnet_for(in_microvm: bool, octet: u8) -> crate::net::SwitchSubnet {
     if in_microvm {
         return crate::net::DEFAULT_SUBNET;
     }
-    switch_subnet_for_octet(pinned_octet.unwrap_or_else(|| octet_for_daemon_id(daemon_id)))
+    switch_subnet_for_octet(octet)
 }
 
 /// The per-daemon switch subnet a native daemon's own gvproxy runs: the /24
@@ -3018,11 +3031,19 @@ mod tests {
     /// NET-027: two daemons on one machine must not draw published boxes
     /// from one slice of the reserved local range — a shared slice is a
     /// shared address space, the collision that has one daemon's published
-    /// box answer a name the other daemon routed. Each daemon's gvproxy
-    /// switch takes its own /24 inside the host's `100.64/16` — configured
-    /// onto two daemons here, derived from the instance id on a third —
-    /// and each names the slice it draws from on its own start line, where
-    /// a reader of two daemons' logs can see the two hold disjoint halves.
+    /// box answer a name the other daemon routed. Each daemon's slice is
+    /// keyed to its own octet — configured onto two daemons here, derived
+    /// from the instance id on a third — which on a native host is also the
+    /// /24 its own gvproxy runs on, and each names the slice it draws from on
+    /// its own start line, where a reader of two daemons' logs can see the
+    /// two hold disjoint halves.
+    ///
+    /// The `in_microvm: true` pair is the primary case for exactly this
+    /// keying: a VM daemon does not own its switch — its boxes tap the host
+    /// gvproxy, on the default /16 every VM on the host shares — so a slice
+    /// keyed on the switch *subnet* would put every VM on the machine on one
+    /// slice. Keyed on the octet, the two VM daemons here hold the same two
+    /// disjoint slices as their native twins on the same octets.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn two_daemons_draw_disjoint_loopback_slices() {
@@ -3065,25 +3086,45 @@ mod tests {
             },
         )
         .await;
+        // Two VM daemons on the same octets as the native pair above: the
+        // switch they attach to is the host's, so only the octet can tell
+        // their slices apart. Built as `two_daemons_route_hostnames_concurrently`
+        // builds its pair — the state alone, which is what logs the start
+        // line.
+        let vm_host = |dir: &TempDir, octet: Option<u8>| Config {
+            in_microvm: true,
+            switch_subnet_octet: octet,
+            ..test_config(dir)
+        };
+        let dir_d = TempDir::new().unwrap();
+        let state_d = ServerStateHandle::new(vm_host(&dir_d, Some(37)), None)
+            .await
+            .unwrap();
+        let dir_e = TempDir::new().unwrap();
+        let state_e = ServerStateHandle::new(vm_host(&dir_e, Some(52)), None)
+            .await
+            .unwrap();
 
         // The start lines are logged as each daemon comes up; wait for all
-        // three before reading the slice back out of them.
+        // five before reading the slice back out of them.
         let logged = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let logged = buf.contents();
-                if logged.matches("loopback_slice=").count() >= 3 {
+                if logged.matches("loopback_slice=").count() >= 5 {
                     return logged;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("all three daemons must log the slice they draw from");
+        .expect("all five daemons must log the slice they draw from");
 
         // Each daemon's start line, found by the field that identifies the
         // daemon: the configured /24 for the two pinned ones, the instance id
         // for the deriving one.
         let id_c = state_c.daemon_id().await;
+        let id_d = state_d.daemon_id().await;
+        let id_e = state_e.daemon_id().await;
         let line_of = |marker: &str| {
             logged
                 .lines()
@@ -3094,6 +3135,8 @@ mod tests {
         let line_a = line_of("subnet=100.64.37.0/24");
         let line_b = line_of("subnet=100.64.52.0/24");
         let line_c = line_of(&format!("daemon_id={id_c}"));
+        let line_d = line_of(&format!("daemon_id={id_d}"));
+        let line_e = line_of(&format!("daemon_id={id_e}"));
 
         // The `loopback_slice=` field is the first and last address of the
         // slice the daemon's published boxes come from.
@@ -3118,6 +3161,8 @@ mod tests {
         let slice_a = slice_of(&line_a);
         let slice_b = slice_of(&line_b);
         let slice_c = slice_of(&line_c);
+        let slice_d = slice_of(&line_d);
+        let slice_e = slice_of(&line_e);
 
         // Octet 37 indexes slice 5 of the /24, octet 52 slice 4: two pinned
         // daemons announce two disjoint slices, not one shared start.
@@ -3145,11 +3190,46 @@ mod tests {
         // The deriving daemon's slice is exactly the one its own instance id
         // derives: the same id names the same /24 and the same slice, start
         // after start.
-        let subnet_c = switch_subnet_for_octet(octet_for_daemon_id(&id_c));
+        let octet_c = octet_for_daemon_id(&id_c);
         assert_eq!(
             slice_c,
-            sessions::LoopbackAllocator::for_switch_subnet(subnet_c).range(),
-            "an unpinned daemon's slice must follow its derived switch subnet"
+            sessions::LoopbackAllocator::for_slice_octet(octet_c).range(),
+            "an unpinned daemon's slice must follow its derived octet"
+        );
+
+        // The VM pair keeps the host's switch — both start lines carry the
+        // default /16, which no native daemon's does — and still draws from
+        // the octet each was pinned to: the same slices as their native
+        // twins, and *not* the one slice the shared switch's own third octet
+        // (0) would index, which is what every VM on the host would have
+        // announced when the slice followed the switch subnet.
+        for line in [&line_d, &line_e] {
+            assert!(
+                line.contains("subnet=100.64.0.0/16"),
+                "a VM daemon's switch stays on the host's default /16, got: {line}"
+            );
+        }
+        assert_eq!(
+            slice_d,
+            slice_a,
+            "a VM daemon pinned to octet 37 draws from that octet's slice, \
+             not its switch's"
+        );
+        assert_eq!(
+            slice_e,
+            slice_b,
+            "a VM daemon pinned to octet 52 draws from that octet's slice, \
+             not its switch's"
+        );
+        let switch_shared_slice =
+            sessions::LoopbackAllocator::for_slice_octet(0).range();
+        assert_ne!(
+            slice_d, switch_shared_slice,
+            "two VM daemons must not share one slice of the reserved local range"
+        );
+        assert!(
+            slice_d.1 < slice_e.0 || slice_e.1 < slice_d.0,
+            "the two VM daemons' slices must be disjoint, got {slice_d:?} and {slice_e:?}"
         );
 
         run_a.abort();
@@ -3212,7 +3292,8 @@ mod tests {
     /// gvproxy answers, so every box in the VM lost egress, DNS first.
     /// Read off the daemon's own start line, which names the subnet its
     /// switch carries, with an octet pinned to show the pin cannot move a
-    /// switch the guest does not own.
+    /// switch the guest does not own — while its slice still follows that
+    /// octet, which is the daemon's own state and not the switch's.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_microvm_daemon_attaches_to_the_host_switch_s_own_subnet() {
@@ -3250,14 +3331,22 @@ mod tests {
         // pin — it renders its own gvproxy's config — and an unpinned one
         // derives its /24 from its instance id (NET-027).
         assert_eq!(
-            switch_subnet_for(false, Some(37), &id).to_string(),
+            switch_subnet_for(false, 37).to_string(),
             "100.64.37.0/24",
             "a pinned native daemon owns its switch and takes the pinned /24"
         );
         assert_eq!(
-            switch_subnet_for(false, None, &id),
+            switch_subnet_for(false, octet_for_daemon_id(&id)),
             switch_subnet_for_octet(octet_for_daemon_id(&id)),
             "an unpinned native daemon derives its own /24"
+        );
+        // The octet the microVM daemon was pinned to does not reach its
+        // switch, but it is still its own: the slice it draws from is keyed
+        // on the octet, not the subnet (NET-027's address half).
+        assert!(
+            line.contains("loopback_slice=127.64.0.160-127.64.0.191"),
+            "a microVM daemon pinned to octet 37 draws from that octet's \
+             slice, not its switch's, got: {line}"
         );
         // And the address that broke the e2e follows: the /16's gateway is
         // where the host gvproxy answers DNS, and a native /24's is inside
