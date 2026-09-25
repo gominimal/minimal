@@ -441,7 +441,7 @@ fi
 proof_shared_session() {
   local out t0 t1
   [ -n "${sid:-}" ] && return 0
-  echo "standalone case: activating the session this proof shares with 'lifecycle'"
+  echo "activating the shared session ($SESSION_NAME)"
   t0=$(now_ms)
   # shellcheck disable=SC2086
   out="$(cd "$PROJECT_DIR" && mnl session activate . --name "$SESSION_NAME" ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
