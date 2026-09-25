@@ -16,6 +16,11 @@ Staging is inert; flipping a pointer is the single, cheap, reversible action
 that ships (or rolls back) a version. All GCS writes authenticate via GitHub
 OIDC / Workload Identity Federation.
 
+Every advanced row also carries **channel packages** — `.deb`/`.rpm`/`.apk`, an
+AUR `PKGBUILD`, and a Homebrew formula — so the native package-manager paths
+are exercised continuously rather than only at a stable cut. See
+[Channel packages](#channel-packages) below.
+
 ## release.yml: build, sign, stage
 
 [`.github/workflows/release.yml`](../../.github/workflows/release.yml) runs on
@@ -32,7 +37,9 @@ binary reports the release version on an untagged commit; packages the
 `.deb`/`.rpm`/`.apk` from the same bytes; generates the release notes; stages
 `versions/<semver>/`; and parks a **draft** GitHub Release `v<semver>` with
 everything attached. Both then smoke the shipped artifacts in the same run
-and record the smoke against the staged row.
+and record the smoke against the staged row. Distro packages are built for
+**every** row, not only versioned ones, so a nightly ships channel packages
+too — see [Channel packages](#channel-packages).
 
 **verify-ci gate.** The `verify-ci` job requires the five lane aggregators,
 `ci-success`, `ci-linux-native-success`, `ci-linux-kvm-success`,
@@ -102,10 +109,12 @@ strictly above the newest `v*` tag.
 **release job.** Downloads everything, generates the release notes
 ([`scripts/next-version.sh --notes`](../../scripts/next-version.sh): full
 commit bodies since the last released tag, breaking changes first),
-generates shell completions for `mip`, `min`, and `minimald`, and on a
-versioned build packages the `.deb`/`.rpm`/`.apk` for both Linux arches from
-this run's binaries ([`scripts/package-nfpm.sh`](../../scripts/package-nfpm.sh)
-in `ARTIFACTS_DIR` mode, pinned nfpm). Then:
+generates shell completions for `mip`, `min`, and `minimald`, and packages the
+`.deb`/`.rpm`/`.apk` for both Linux arches from this run's binaries
+([`scripts/package-nfpm.sh`](../../scripts/package-nfpm.sh) in
+`ARTIFACTS_DIR` mode, pinned nfpm) — for every row, with the version string
+normalized per package manager (see [Channel packages](#channel-packages)).
+Then:
 
 - uploads a legacy `minimalone-<sha>.tar.zst` bundle to
   `gs://minimal-shim/archives/`, retained for backward compatibility with
@@ -124,22 +133,27 @@ in `ARTIFACTS_DIR` mode, pinned nfpm). Then:
   its SHA-256, kind, and install destination: the authoritative per-platform
   component list), a version-pinned copy of
   [`scripts/install.sh`](../../scripts/install.sh) so each version's install
-  path is self-contained, the release notes as `notes.md`, and (versioned)
-  `pkg/` with the packages. Immutable is enforced, not assumed: a version
-  whose `components` manifest already exists fails before any upload, and
-  every upload carries `--if-generation-match=0` so an existing object is
-  never replaced. The `restage` input (`--restage`) is the explicit, logged
-  opt-in for re-running a versioned build that failed after staging; it
-  deletes the row's `smoked` marker before its first upload, so a restage is
-  unpromotable until its own smoke passes.
+  path is self-contained, the release notes as `notes.md`, the canonical
+  built version as `version`, and `pkg/` with the packages. Immutable is
+  enforced, not assumed: a version whose `components` manifest already exists
+  fails before any upload, and every upload carries `--if-generation-match=0`
+  so an existing object is never replaced. The `restage` input (`--restage`)
+  is the explicit, logged opt-in for re-running a versioned build that failed
+  after staging; it deletes the row's `smoked` marker before its first upload,
+  so a restage is unpromotable until its own smoke passes.
 
 **smoke jobs.** Three jobs run the shared session e2e
 ([`scripts/session-e2e.sh`](../../scripts/session-e2e.sh)) against the
 **shipped** artifacts: the native Linux daemon, Linux + KVM microVM, and the
 signed macOS binaries assembled in the installer layout (skip-tolerant: the
-`RUN_MACOS_CI` kill-switch). On a versioned build the native job also installs
-the `.deb` and checks `/usr/bin/min -V` reports the release version. They run
-on dry runs too; only the recording below is skipped.
+`RUN_MACOS_CI` kill-switch). The native job also installs the `.deb` the run
+packaged and checks both the version the manager records and the version
+`/usr/bin/min -V` reports. A fourth job, `smoke-packages`, install-smokes
+every `.deb`/`.rpm`/`.apk` in a throwaway distrobox
+([`scripts/pkg-smoke.sh`](../../scripts/pkg-smoke.sh)): real package-manager
+installs on Debian, Fedora, and Alpine, asserting the recorded version, the
+shipped paths, that the binaries run on each box's libc, and an uninstall
+round-trip. They run on dry runs too; only the recording below is skipped.
 
 **record-smoked job.** After the smokes and the staging succeed,
 [`scripts/record-smoked.sh`](../../scripts/record-smoked.sh) writes
@@ -150,7 +164,9 @@ smoked" is checked directly rather than inferred from a workflow run id, and
 a re-staged row can never inherit a stale blessing. Only then does
 [`scripts/set-channel.sh`](../../scripts/set-channel.sh) point the `unstable`
 channel at the row: `unstable` auto-advances on every smoked release with no
-approval gate, but never at bytes that have not passed the smoke.
+approval gate, but never at bytes that have not passed the smoke. With the
+pointer advanced, the `unstable` channel packages publish — after the smoke,
+never before.
 
 ## nightly.yml: daily cut + smoke + nightly channel
 
@@ -162,7 +178,10 @@ described above. Only if that whole run succeeds (or was skipped as a no-op)
 does `promote-nightly` run, and it verifies the row's `smoked` marker
 (`verify-smoked.sh`) before flipping the `nightly` pointer via
 set-channel.sh — so a no-op night cannot bless a row an earlier run staged
-but failed to smoke.
+but failed to smoke. After the pointer moves, the `nightly` AUR and Homebrew
+packages publish, and a `brew-install-nightly` job (self-hosted Apple
+Silicon, `RUN_MACOS_CI`-gated) taps the real tap and `brew install`s the
+published formula as a real end-to-end proof.
 `nightly-tests.yml` is the separate 06:00 UTC nightly *test* tier, unrelated
 to releasing; see [docs/ci-strategy.md](../ci-strategy.md).
 
@@ -201,6 +220,147 @@ tap, which cannot carry one. A promoted nightly sha has nothing versioned to
 publish and the workflow says so. The docs rebuild dispatched by `promote`
 pins to the row's commit: the nightly sha itself, or the commit the versioned
 row's `smoked` marker records.
+
+## Channel packages
+
+Each channel ships native packages as well as the curl|sh installer, and the
+same packages are produced for every row so breakage surfaces on a nightly
+rather than on a stable cut.
+
+| Channel  | nfpm (`deb`/`rpm`/`apk`) | AUR | Homebrew |
+|---|---|---|---|
+| stable   | `minimal` | `minimal-bin` | `minimal` |
+| unstable | `minimal` | `minimal-unstable-bin` | `minimal-unstable` |
+| nightly  | `minimal` | `minimal-nightly-bin` | `minimal-nightly` |
+
+**nfpm: one name, channel-scoped suites.** The Linux packages keep the single
+name `minimal`; a channel is a repo/suite on the consuming side, so a user
+installs one version at a time and there is no file-conflict problem.
+
+**AUR: one repo per channel.** Each channel has its own AUR repository, and
+every channel PKGBUILD declares the other two in `conflicts=` (no `replaces=`)
+so pacman refuses two at once — they all install the same `/usr/bin` files.
+
+**Homebrew: separate formulae in one tap.** Every channel formula declares the
+other two in `conflicts_with`, so `brew install` refuses a second channel rather
+than linking one and leaving the others unlinked — they all install the same
+`bin/min`.
+
+**Version normalization.** A channel package's version is the built version
+string the binaries report, normalized per manager by
+[`scripts/package-version.sh`](../../scripts/package-version.sh):
+
+| Manager | `0.6.0-dev.10.g8e7e72c2` becomes | Why |
+|---|---|---|
+| deb / rpm | `0.6.0~dev.10.g8e7e72c2` | rpm forbids `-` in `Version:`; `~` sorts below the release, so enabling a channel suite never silently upgrades a stable user |
+| apk | `0.6.0_pre10` | apk allows only the suffixes alpha/beta/pre/rc/cvs/svn/git/hg/p, so neither the `dev` word nor the git hash is expressible; `pre` sorts below the release and `<N>` keeps the series ordered (the hash is dropped — a trailing hash must be lowercase hex and would read onto `<N>` ambiguously). A plain `0.6.0-rc1` keeps its word as `0.6.0_rc1`. |
+| aur | `0.6.0.dev.10.g8e7e72c2` | pacman's `pkgver` forbids `-` |
+| brew | `0.6.0-dev.10.g8e7e72c2` | Homebrew versions may carry `-` |
+
+For a released semver the normalization is the identity (`0.6.0`), which keeps
+the stable nfpm packages byte-identical to the ones built before channels
+existed. The canonical version is never re-derived from the row name: it is
+staged into the row as `versions/<row>/version`, so a nightly row (a bare sha)
+still carries its true `0.6.0-dev.<N>.g<sha>`.
+
+**Cadence, and the smoke-before-publish invariant.** Channel packages publish
+where a pointer advances:
+
+- `unstable` — release.yml's `publish-channel-unstable` job, after
+  `record-smoked` advanced the pointer, publishes with `channel: unstable` for
+  the row the pointer now names — a sha row, or the semver row of a versioned
+  release.
+- `nightly` — nightly.yml's `publish-channel-nightly`, after `promote-nightly`
+  ran `verify-smoked.sh` and flipped the pointer, publishes with
+  `channel: nightly`.
+- `stable` — unchanged: `promote.yml` → `publish-packages.yml`
+  (`publish-channel-stable`), approval-gated.
+
+The order is always **build → smoke → publish**, never the reverse. The
+publishers are per-name and idempotent (the AUR publisher no-ops when the
+PKGBUILD is unchanged, the tap publisher when the formula is), so a re-run or
+a skipped night is safe. A channel publishes from **the same row its pointer
+was advanced to**: normally a sha row, but `unstable` also advances to a
+versioned row when a versioned release is smoked, and its packages are then
+published from that semver row too. Every publisher reads
+`versions/<row>/version`, so a versioned row needs no special case, and the
+channel pointer and the channel packages never describe different bytes. (The
+stable *package* is still its own thing: `pkg/` for a versioned row is staged
+for the apt/dnf/apk trees under the `PUBLISH_STABLE_PACKAGES` switch, not by
+these publishers.)
+
+All three call one reusable workflow, `publish-channel.yml`, which runs the AUR
+and Homebrew publishers as its two jobs — the block that used to be copied into
+each caller, where a channel's package name or `--verify-build` could be (and
+once was) forgotten.
+
+**A publish failure never gates a release.** The pointer has already advanced
+by the time either publisher runs, so a failed push is a stale mirror, not a
+failed release — and it must not stop the channel from moving. That is
+load-bearing for `unstable`: `release.yml`'s publisher runs inside a workflow
+`nightly.yml` calls, and an uncalled-workflow failure there would make
+release.yml conclude `failure`, which skips nightly.yml's `promote-nightly`
+(its guard is `needs.release.result != 'failure'`) and freezes the `nightly`
+channel over a transient push error, long after staging, smoke, provenance and
+the pointer had all succeeded. `nightly` tolerates for the same reason.
+
+Tolerance is a `tolerate` input on `publish-channel.yml`, applied as
+`continue-on-error` on the **publish step** (a tolerated step leaves the job —
+and the called workflow — concluding success, with the failing step still
+annotated in the run). `unstable` and `nightly` pass `tolerate: true`; **stable
+does not**, so a failed stable publish still fails loudly and is retried
+deliberately (below). Because the tolerance hides the step's failure from the
+job result, `publish-channel.yml` also exports each publisher's *real* outcome
+(`steps.<id>.outcome`, the result before `continue-on-error`); nightly.yml's
+`brew-install-nightly` proof gates on `brew_published`, so a tolerated brew push
+failure skips the install instead of "proving" a formula that was never pushed.
+
+Retrying a publish, per channel:
+
+- `unstable` / `nightly` — the `just` recipes below are the retry: because
+  `tolerate: true` leaves a failed publisher's job concluding success (only the
+  step is annotated), GitHub's "Re-run failed jobs" has nothing to re-run, and
+  only a full workflow re-run or a `workflow_dispatch` can retry it in CI. Both
+  publishers are idempotent and no-op when nothing changed, and the same scripts
+  CI runs are one recipe away: `just publish-brew <channel> <row>` (and `just
+  publish-aur <channel> <row> --verify-build`) forward their args verbatim, so
+  `--dry-run` is the credential-free rehearsal and a real push needs
+  credentials.
+- `stable` — dispatch `publish-packages.yml` by hand: `gh workflow run
+  publish-packages.yml -f version=X.Y.Z`. A manual dispatch can only *retry*
+  the publishers: `publish-release` verifies the GitHub Release is already
+  published and refuses otherwise, so a dispatch cannot publish a draft (which
+  creates the tag) — that stays promote.yml's approval-gated job, behind the
+  promotion issue. A plain re-run cannot serve as the retry either: a
+  failed-jobs re-run does not reliably retain the earlier job's outputs, and a
+  full re-run re-opens the approval gate and then fails at `publish-release`,
+  which refuses an already-published release. The dispatch only publishes while
+  `vars.PUBLISH_STABLE_PACKAGES` is `'true'`: with the switch off (the default)
+  `publish-channel-stable` is skipped and the run ships nothing, so check the
+  variable before treating a retry as done.
+
+**The stable package switch.** `vars.PUBLISH_STABLE_PACKAGES` — a repository
+variable, absent by default, so **off** — gates every path by which a *stable*
+release hands packages to users:
+
+- `publish-packages.yml`'s `publish-channel-stable`: the AUR `minimal-bin` and
+  the `gominimal/minimal` tap's `minimal` formula;
+- `release.yml`'s attachment of the `.deb`/`.rpm`/`.apk` to the published
+  Release, and its staging of `versions/<semver>/pkg/`, which the infra repo
+  turns into the apt/dnf/apk trees users install from.
+
+Off is the point: stable publishing must not start until the channel packages
+have been proven on unstable/nightly, because publishing a package nobody has
+installed yet is how we break users. The packages are still **built and
+smoked** on every release (`smoke-packages`); they are just not shipped. Set the
+variable to `true` to turn the stable paths on — no code change.
+
+A stable promote is otherwise unaffected: it still publishes the draft Release
+(which creates the tag) and still moves the `stable` pointer, so `minimal
+0.6.0` reaches `curl | sh` users immediately. Only the packages wait.
+
+Channel publishing is deliberately **not** gated — it is where the packages get
+proven.
 
 ## prune-releases.yml: GitHub Release housekeeping
 

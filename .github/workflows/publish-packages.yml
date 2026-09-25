@@ -1,14 +1,16 @@
 name: publish-packages
 
 # Publish an already-promoted versioned release. Called by promote.yml after a
-# `stable` promotion; never runs on its own. Three steps, in order:
+# `stable` promotion; also dispatchable by hand to retry a failed AUR/Homebrew
+# push (see the `on:` block). Two steps, in order:
 #
 #   1. publish-release — publish the DRAFT GitHub Release `v<semver>` the
 #      versioned release build parked (release.yml). Publishing a draft is
 #      what creates the tag: v<semver> lands on the commit the draft targets
 #      — already built, staged, smoked, and promoted — and triggers no build.
-#   2. publish-aur — the PKGBUILD keys on the staged versions/<semver>/ row.
-#   3. publish-brew — the formula keys on the GitHub Release published in 1.
+#   2. publish-channel-stable — the AUR and Homebrew publishers, in
+#      publish-channel.yml (PKGBUILD keys on the staged versions/<semver>/ row;
+#      the formula keys on the GitHub Release published in 1).
 #
 # The apt/dnf/apk repo trees are built by the infra repo from the staged
 # versions/<semver>/pkg/ row and are not this workflow's concern.
@@ -20,6 +22,27 @@ on:
         inputs:
             version:
                 description: "The promoted version: a semver (X.Y.Z[-pre]) publishes; anything else skips with a notice."
+                required: true
+                type: string
+            publish_draft:
+                description: "Publish the parked draft GitHub Release (which creates the tag). Set ONLY by promote.yml, the approval-gated path; leave false everywhere else."
+                required: false
+                default: false
+                type: boolean
+    # A manual dispatch retries a FAILED package publish and nothing else: it
+    # validates that the GitHub Release is already published and hands the
+    # version to the idempotent AUR/Homebrew publishers. It deliberately cannot
+    # publish a draft — that creates the tag and is promote.yml's job, behind
+    # its promotion-approval issue, so exposing it here would let anyone with
+    # write access ship a release the gate has not approved. (A failed-jobs
+    # re-run of the workflow_call path cannot serve as the retry either: the
+    # earlier job's outputs are not reliably retained, and a full re-run
+    # re-opens the approval gate and then fails at publish-release, which
+    # refuses an already-published release.)
+    workflow_dispatch:
+        inputs:
+            version:
+                description: "The released semver to retry the AUR/Homebrew publishes for, without the v prefix."
                 required: true
                 type: string
 
@@ -42,6 +65,10 @@ jobs:
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                   VERSION: ${{ inputs.version }}
+                  # true only from promote.yml (the approval-gated caller). A
+                  # manual dispatch has no such input, so it lands on the retry
+                  # path below and can never publish a draft.
+                  PUBLISH_DRAFT: ${{ inputs.publish_draft || 'false' }}
               run: |
                   set -euo pipefail
                   semver=""
@@ -53,6 +80,36 @@ jobs:
                       exit 0 ;;
                   esac
                   tag="v$semver"
+                  # A prerelease (a `-` tail, judged before any `+build`
+                  # metadata) never becomes "Latest" and never reaches the AUR
+                  # or the tap: pacman forbids a hyphen in pkgver, Homebrew has
+                  # no channel to keep an rc off, and both publish scripts
+                  # reject the tail. Its GitHub Release is still published.
+                  publish_semver="$semver"
+                  case "${semver%%+*}" in
+                    *-*) publish_semver=""
+                         echo "::notice::$tag is a prerelease — AUR and Homebrew skipped" ;;
+                  esac
+                  if [ "$PUBLISH_DRAFT" != "true" ]; then
+                    # Retry path (a manual dispatch, or any caller that did not
+                    # opt into draft publication): the GitHub Release was
+                    # published by an earlier run, so there is nothing to
+                    # publish here — confirm it really is published and hand the
+                    # version to the idempotent publishers below. The check is
+                    # on the RELEASE, not merely the tag: a tag exists
+                    # independently, and a still-draft Release would let the
+                    # publishers ship something users cannot download.
+                    draft="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" \
+                      || { echo "::error::no GitHub Release $tag — check the version input"; exit 1; }
+                    [ "$draft" = "false" ] \
+                      || { echo "::error::GitHub Release $tag is still a draft — publishing it is promote.yml's approval-gated path"; exit 1; }
+                    tagged="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)"
+                    echo "release $tag already published at $tagged; retrying the package publishers"
+                    echo "semver=$publish_semver" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
+                  # Past the retry path, so PUBLISH_DRAFT is true: promote.yml,
+                  # the approval-gated caller, asked for the draft publication.
                   # The draft must exist: the versioned release build parks it
                   # with the notes and every artifact attached. A missing or
                   # already-published release is a pipeline invariant broken
@@ -61,19 +118,12 @@ jobs:
                     || { echo "::error::no GitHub Release $tag — was $semver cut by a versioned release build (release.yml versioned: true)?"; exit 1; }
                   read -r is_draft target <<<"$state"
                   if [ "$is_draft" != "true" ]; then
-                    echo "::error::GitHub Release $tag is already published (target $target); refusing to re-publish"
+                    echo "::error::GitHub Release $tag is already published (target $target); refusing to re-publish — to retry only the package publishers, run: gh workflow run publish-packages.yml -f version=$semver"
                     exit 1
                   fi
-                  # A prerelease (a `-` tail, judged before any `+build`
-                  # metadata) never becomes "Latest" and never reaches the AUR
-                  # or the tap: pacman forbids a hyphen in pkgver, Homebrew has
-                  # no channel to keep an rc off, and both publish scripts
-                  # reject the tail. Its GitHub Release is still published.
                   extra=()
-                  publish_semver="$semver"
                   case "${semver%%+*}" in
-                    *-*) publish_semver=""
-                         echo "::notice::$tag is a prerelease — GitHub Release published; AUR and Homebrew skipped" ;;
+                    *-*) ;;
                     *)   extra+=(--latest) ;;
                   esac
                   gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false "${extra[@]}"
@@ -82,53 +132,37 @@ jobs:
                   echo "published $tag at $tagged (draft targeted $target)"
                   echo "semver=$publish_semver" >> "$GITHUB_OUTPUT"
 
-    publish-aur:
-        # The AUR package tracks stable semver releases; its PKGBUILD fetches
+    publish-channel-stable:
+        # The AUR package tracks stable semver releases (its PKGBUILD fetches
         # from versions/<semver>/ in the installer bucket, which the versioned
-        # release build staged and the promotion just verified.
+        # release build staged and the promotion just verified). Homebrew has no
+        # channels, so the tap is stable-only and publishes on the stable promote
+        # — never on a tag, where a release (or an RC) would overwrite the tap's
+        # only formula for every user with no way to opt out, bypassing the
+        # promotion gate. The formula fetches the GitHub Release v<semver>, hence
+        # `needs: publish-release`. The tap repo must exist and BREW_TAP_TOKEN (a
+        # fine-grained PAT with write access to it) must be set (user actions).
+        #
+        # tolerate is NOT set (defaults false): a failed stable publish must fail
+        # loudly. Retry it with `gh workflow run publish-packages.yml -f
+        # version=X.Y.Z`; the publishers are idempotent. See
+        # docs/internal/release-pipeline.md.
+        #
+        # OFF until `vars.PUBLISH_STABLE_PACKAGES` is 'true'. Stable package
+        # publishing must not start until the channel packages have been proven
+        # on unstable/nightly: publishing a package nobody has installed is how
+        # we break users. The switch is a repo variable so it can be flipped the
+        # moment the channel packages are validated, with no code change. A
+        # stable promote still publishes the draft Release (creating the tag)
+        # and still moves the `stable` pointer — only the packages wait.
         needs: publish-release
-        if: ${{ needs.publish-release.outputs.semver != '' }}
-        runs-on: ubuntu-latest
-        container: archlinux:base-devel
-        timeout-minutes: 30
+        if: ${{ needs.publish-release.outputs.semver != '' && vars.PUBLISH_STABLE_PACKAGES == 'true' }}
         permissions:
             contents: read
-        steps:
-            - name: Install git and openssh
-              # base-devel carries neither. curl is already in the image (the
-              # publish script uses it to fetch versioned artifacts from the
-              # public bucket).
-              run: pacman -Syu --noconfirm --needed git openssh
-            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-              with:
-                  persist-credentials: false
-            - name: Publish minimal-bin to the AUR
-              env:
-                  PKGVER: ${{ needs.publish-release.outputs.semver }}
-                  AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-              run: scripts/publish-aur.sh
-
-    publish-brew:
-        # Homebrew has no channels, so the tap is stable-only and publishes on
-        # the stable promote — never on a tag, where a release (or an RC)
-        # would overwrite the tap's only formula for every user with no way
-        # to opt out, bypassing the promotion gate. The formula fetches the
-        # GitHub Release v<semver>, hence `needs: publish-release`. The tap
-        # repo must exist and BREW_TAP_TOKEN (a fine-grained PAT with write
-        # access to it) must be set (user actions).
-        needs: publish-release
-        if: ${{ needs.publish-release.outputs.semver != '' }}
-        runs-on: ubuntu-latest
-        timeout-minutes: 20
-        permissions:
-            contents: read
-        steps:
-            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-              with:
-                  persist-credentials: false
-            - name: Publish minimal to gominimal/homebrew-minimal
-              env:
-                  PKGVER: ${{ needs.publish-release.outputs.semver }}
-                  BREW_TAP_REPO: https://github.com/gominimal/homebrew-minimal.git
-                  GITHUB_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}
-              run: scripts/publish-brew.sh
+        uses: ./.github/workflows/publish-channel.yml
+        with:
+            channel: stable
+            row: ${{ needs.publish-release.outputs.semver }}
+        secrets:
+            AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+            BREW_TAP_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}

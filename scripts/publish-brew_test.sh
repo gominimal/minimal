@@ -3,26 +3,25 @@
 # publish-brew_test.sh — test harness for scripts/publish-brew.sh.
 #
 # Drives the publisher end to end against fixtures: a local bare "tap" repo to
-# clone and a local file:// release-asset base (MINIMAL_RELEASE_URL), with no
-# GITHUB_TOKEN and no ssh-agent. Asserts that a dry run downloads the four
-# macOS assets, checksums them, renders the formula fully stamped — including
-# the libkrun dylib installed into the prefix's lib/, which @loader_path/../lib
-# resolves — and pushes nothing. Run directly or via `just test-shell`.
+# clone and a local file:// base (MINIMAL_RELEASE_URL for the stable release
+# assets, MINIMAL_BUCKET_URL for every channel's staged row and version file),
+# with no GITHUB_TOKEN and no ssh-agent. Asserts that a dry run downloads the
+# four macOS assets, checksums them, renders the formula fully stamped —
+# including the libkrun dylib installed into the prefix's lib/, which
+# @loader_path/../lib resolves — and pushes nothing. Covers the stable formula
+# (GitHub Release url), a channel formula (bucket row url, explicit version,
+# `livecheck { skip }`), a channel advanced to a versioned row, the channel
+# conflicts_with, plus the refusals. Run directly or via `just test-shell`.
 
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/publish-brew.sh"
 [ -f "$script" ] || { echo "cannot find publish-brew.sh next to test" >&2; exit 1; }
+# shellcheck disable=SC1091  # dynamic path: testlib.sh sits beside this harness
+. "$here/testlib.sh"
 
-missing=""
-for tool in git curl; do
-    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
-done
-if [ -n "$missing" ]; then
-    echo "publish-brew_test: skipping, no$missing on PATH"
-    exit 0
-fi
+require_tools git curl
 
 root="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-brewtest)"
 trap 'rm -rf "$root"' EXIT
@@ -30,12 +29,7 @@ trap 'rm -rf "$root"' EXIT
 # The digest routine must match the publisher's (portable across
 # sha256sum/shasum/openssl — this harness also runs on hosts without
 # sha256sum), so it is extracted rather than copied: one definition.
-# shellcheck source=scripts/publish-brew.sh
-eval "$(sed -n '/^sha256_file()/,/^}/p' "$script")"
-[ "$(type -t sha256_file)" = "function" ] || {
-    echo "publish-brew_test: cannot extract sha256_file from publish-brew.sh" >&2
-    exit 1
-}
+source_function "$script" sha256_file
 
 # --- fixtures -----------------------------------------------------------------
 
@@ -48,6 +42,31 @@ assets=(minimal-macos-arm64 minvmd-macos-arm64 gvproxy-darwin-arm64 libkrun-maco
 for a in "${assets[@]}"; do
     printf 'mach-o payload of %s\n' "$a" >"$release/$a"
 done
+
+# The channel fixture: an immutable staged row versions/<short-sha>/ holding a
+# `version` file (the canonical built version) and the same four asset
+# basenames. Content differs from the release assets so the digests do, too.
+bucket="$root/bucket"
+row="8e7e72c2"                       # 8-char lowercase-hex short sha row
+canonical="0.6.0-dev.10.g8e7e72c2"   # what the row's version file holds
+rowdir="$bucket/versions/$row"
+mkdir -p "$rowdir"
+printf '%s\n' "$canonical" >"$rowdir/version"
+for a in "${assets[@]}"; do
+    printf 'mach-o payload of %s at %s\n' "$a" "$row" >"$rowdir/$a"
+done
+
+# The stable rows: the promoted semver's row carries a `version` file holding
+# the semver itself — the stable publisher reads and asserts it. 0.9.9 holds a
+# disagreeing version for the refusal below. 0.5.4 also carries the four assets
+# so it can double as the versioned row a channel (unstable) has advanced to.
+mkdir -p "$bucket/versions/0.5.4"
+printf '%s\n' 0.5.4 >"$bucket/versions/0.5.4/version"
+for a in "${assets[@]}"; do
+    printf 'mach-o payload of %s at 0.5.4\n' "$a" >"$bucket/versions/0.5.4/$a"
+done
+mkdir -p "$bucket/versions/0.9.9"
+printf '%s\n' 0.9.8 >"$bucket/versions/0.9.9/version"
 
 # A bare "tap" repo with a committed formula to diff against.
 tap="$root/tap.git"
@@ -62,24 +81,6 @@ git -C "$seed" add -A
 git -C "$seed" commit -q -m seed
 git -C "$seed" push -q origin main
 
-pass=0 fail=0
-ok()  { pass=$((pass + 1)); printf 'ok   - %s\n' "$*"; }
-bad() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$*"; }
-
-# expect <want_rc> <want_substring> <description> -- <command...>
-expect() {
-    local want_rc="$1" want_msg="$2" desc="$3"; shift 3
-    [ "${1:-}" = "--" ] || { bad "$desc (test bug: missing -- separator)"; return; }
-    shift
-    local out rc=0
-    out="$("$@" 2>&1)" || rc=$?
-    if [ "$rc" -eq "$want_rc" ] && [[ "$out" == *"$want_msg"* ]]; then
-        ok "$desc"
-    else
-        bad "$desc (want rc=$want_rc and '$want_msg'; got rc=$rc, out: $out)"
-    fi
-}
-
 run_dry() {
     local ver="${1:?usage: run_dry <version>}"
     # No GITHUB_TOKEN, no SSH_AUTH_SOCK: the publisher must reach the dry-run
@@ -89,7 +90,18 @@ run_dry() {
         PKGVER="$ver" \
         BREW_TAP_REPO="file://$tap" \
         MINIMAL_RELEASE_URL="file://$root/releases/v$ver" \
+        MINIMAL_BUCKET_URL="file://$root/bucket" \
         "$script" --dry-run
+}
+
+run_dry_channel() {
+    local channel="${1:?usage: run_dry_channel <channel> <row>}" row="${2:?}"
+    # Same no-credential shape, but the asset base is the bucket's versions/<row>.
+    env -u SSH_AUTH_SOCK -u GITHUB_TOKEN \
+        PKGVER="$row" \
+        BREW_TAP_REPO="file://$tap" \
+        MINIMAL_BUCKET_URL="file://$root/bucket" \
+        "$script" --channel "$channel" --dry-run
 }
 
 # --- the dry run --------------------------------------------------------------
@@ -123,6 +135,19 @@ if [[ "$out" == *'bin.install "minimal-macos-arm64" => "min"'* ]]; then
 else
     bad "the CLI installs as bin/min (not a bin/min directory)"
 fi
+if [[ "$out" == *'conflicts_with "minimal-unstable", "minimal-nightly"'* ]]; then
+    ok "the stable formula conflicts with the other channel formulae"
+else
+    bad "the stable formula conflicts with the other channel formulae (out: $out)"
+fi
+# The formula installs the release dylib into its own lib/, which is the only
+# place minvmd's @loader_path/../lib rpath looks, so it must not pull in a
+# third-party libkrun tap (unused on disk, and it can conflict with another).
+if [[ "$out" != *'slp/krun'* ]]; then
+    ok "the formula does not depend on a third-party libkrun tap"
+else
+    bad "the formula does not depend on a third-party libkrun tap (out: $out)"
+fi
 
 # Every 64-hex digest in the diff must be one of the fixture assets'.
 digests="$(for a in "${assets[@]}"; do sha256_file "$release/$a"; done)"
@@ -146,13 +171,174 @@ else
     bad "the fixture remote is untouched (advanced to $pushed)"
 fi
 
+# --- the channel dry run ------------------------------------------------------
+
+out="$(run_dry_channel nightly "$row" 2>&1)"
+rc=$?
+
+if [ "$rc" -eq 0 ]; then ok "nightly dry run succeeds without credentials"; else bad "nightly dry run succeeds without credentials (rc=$rc; out: $out)"; fi
+if [[ "$out" == *"nothing committed, nothing pushed"* ]]; then
+    ok "nightly dry run commits and pushes nothing"
+else
+    bad "nightly dry run commits and pushes nothing (out: $out)"
+fi
+if grep -qE '^\+.*@@' <<<"$out"; then
+    bad "nightly formula carries unrendered @@tokens@@"
+else
+    ok "nightly formula carries no @@tokens@@"
+fi
+if [[ "$out" == *'class MinimalNightly < Formula'* ]]; then
+    ok "nightly formula declares class MinimalNightly"
+else
+    bad "nightly formula declares class MinimalNightly (out: $out)"
+fi
+if [[ "$out" == *"version \"$canonical\""* ]]; then
+    ok "nightly formula pins the canonical built version"
+else
+    bad "nightly formula pins the canonical built version (out: $out)"
+fi
+if [[ "$out" == *'livecheck do'* && "$out" == *'skip'* ]]; then
+    ok "nightly formula skips livecheck (pinned to one staged row)"
+else
+    bad "nightly formula skips livecheck (out: $out)"
+fi
+if [[ "$out" == *"file://$root/bucket/versions/$row/minimal-macos-arm64"* ]]; then
+    ok "nightly formula urls point at the bucket row"
+else
+    bad "nightly formula urls point at the bucket row (out: $out)"
+fi
+if [[ "$out" == *'b/Formula/minimal-nightly.rb'* ]]; then
+    ok "the nightly formula renders to Formula/minimal-nightly.rb"
+else
+    bad "the nightly formula renders to Formula/minimal-nightly.rb (out: $out)"
+fi
+if [[ "$out" == *'conflicts_with "minimal", "minimal-unstable"'* ]]; then
+    ok "the nightly formula conflicts with the other channel formulae"
+else
+    bad "the nightly formula conflicts with the other channel formulae (out: $out)"
+fi
+
+# Every 64-hex digest in the diff must be one of the channel row's assets'.
+digests="$(for a in "${assets[@]}"; do sha256_file "$rowdir/$a"; done)"
+stamped_ok=1
+count=0
+while IFS= read -r sha; do
+    count=$((count + 1))
+    grep -qx "$sha" <<<"$digests" || stamped_ok=0
+done < <(grep -oE '[0-9a-f]{64}' <<<"$out" | sort -u)
+if [ "$count" -eq "${#assets[@]}" ] && [ "$stamped_ok" -eq 1 ]; then
+    ok "nightly checksums in the diff are the row assets' real digests"
+else
+    bad "nightly checksums in the diff are the row assets' real digests (found $count distinct, want ${#assets[@]})"
+fi
+
+pushed="$(git -C "$seed" fetch -q origin && git -C "$seed" rev-parse origin/main)"
+if [ "$pushed" = "$seeded" ]; then
+    ok "the nightly dry run left the fixture remote untouched"
+else
+    bad "the nightly dry run left the fixture remote untouched (advanced to $pushed)"
+fi
+
+# --- a channel advanced to a versioned row ------------------------------------
+# `unstable` follows a versioned release to its semver row (record-smoked points
+# it there), so its formula is published from that row — bucket urls, the row's
+# own version, livecheck skipped — keeping the channel pointer and the formula
+# describing the same bytes.
+
+out="$(run_dry_channel unstable 0.5.4 2>&1)"
+rc=$?
+
+if [ "$rc" -eq 0 ]; then ok "unstable dry run from a versioned row succeeds"; else bad "unstable dry run from a versioned row succeeds (rc=$rc; out: $out)"; fi
+if [[ "$out" == *'class MinimalUnstable < Formula'* ]]; then
+    ok "the versioned-row formula declares class MinimalUnstable"
+else
+    bad "the versioned-row formula declares class MinimalUnstable (out: $out)"
+fi
+if [[ "$out" == *'version "0.5.4"'* ]]; then
+    ok "the versioned-row formula pins the row's version"
+else
+    bad "the versioned-row formula pins the row's version (out: $out)"
+fi
+if [[ "$out" == *"file://$root/bucket/versions/0.5.4/minimal-macos-arm64"* ]]; then
+    ok "the versioned-row formula urls point at the bucket row"
+else
+    bad "the versioned-row formula urls point at the bucket row (out: $out)"
+fi
+if [[ "$out" == *'b/Formula/minimal-unstable.rb'* ]]; then
+    ok "the versioned-row formula renders to Formula/minimal-unstable.rb"
+else
+    bad "the versioned-row formula renders to Formula/minimal-unstable.rb (out: $out)"
+fi
+
+pushed="$(git -C "$seed" fetch -q origin && git -C "$seed" rev-parse origin/main)"
+if [ "$pushed" = "$seeded" ]; then
+    ok "the versioned-row dry run left the fixture remote untouched"
+else
+    bad "the versioned-row dry run left the fixture remote untouched (advanced to $pushed)"
+fi
+
 # --- refusals -----------------------------------------------------------------
 
-expect 1 "not a RELEASED semver" "prerelease PKGVER is refused (Homebrew has no channels)" -- \
+expect 1 "not a RELEASED semver" "prerelease PKGVER is refused by --channel stable" -- \
     env -u SSH_AUTH_SOCK -u GITHUB_TOKEN PKGVER=0.6.0-rc.1 BREW_TAP_REPO="file://$tap" \
         MINIMAL_RELEASE_URL="file://$root/releases/v0.6.0-rc.1" "$script" --dry-run
 
-expect 1 "cannot download" "a missing release asset fails the run" -- run_dry 9.9.9
+expect 1 "cannot download" "a missing row fails the run" -- run_dry 9.9.9
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
-[ "$fail" -eq 0 ]
+expect 1 "contradicts what it installs" "a stable row whose version file disagrees with the semver is refused" -- \
+    env -u SSH_AUTH_SOCK -u GITHUB_TOKEN PKGVER=0.9.9 BREW_TAP_REPO="file://$tap" \
+        MINIMAL_BUCKET_URL="file://$root/bucket" "$script" --dry-run
+
+expect 1 "contradicts what it installs" "a channel row whose version file disagrees with its name is refused" -- \
+    run_dry_channel unstable 0.9.9
+
+expect 1 "lowercase-hex sha or a released semver" "a channel row that is neither is refused" -- \
+    run_dry_channel unstable not-a-row
+
+expect 1 "version file" "a channel row missing its version file is refused" -- \
+    run_dry_channel nightly deadbeef
+
+expect 1 "unknown --channel" "an unknown channel is refused" -- \
+    env -u SSH_AUTH_SOCK -u GITHUB_TOKEN PKGVER="$row" BREW_TAP_REPO="file://$tap" \
+        MINIMAL_BUCKET_URL="file://$root/bucket" "$script" --channel beta --dry-run
+
+# --- the real push path, and its post-push verification -----------------------
+# Everything above exercises --dry-run. This is the only case that commits and
+# pushes, so it is the only one that reaches the post-push assertion — which is
+# the check that would have caught the tap sitting empty while every run
+# reported success. The file:// fixture remote is the tap; after the push the
+# REMOTE must carry the formula, not just our local clone.
+seeded_before="$(git -C "$seed" rev-parse main)"
+out="$(env -u SSH_AUTH_SOCK -u GITHUB_TOKEN \
+    PKGVER=0.5.4 BREW_TAP_REPO="file://$tap" \
+    MINIMAL_RELEASE_URL="file://$root/releases/v0.5.4" \
+    MINIMAL_BUCKET_URL="file://$root/bucket" \
+    "$script" 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ]; then ok "the push path publishes without --dry-run"; else bad "the push path publishes without --dry-run (rc=$rc; out: $out)"; fi
+if [[ "$out" == *"pushed and verified"* ]]; then
+    ok "the publisher verifies the pushed remote"
+else
+    bad "the publisher verifies the pushed remote (out: $out)"
+fi
+
+# The END state: the remote branch holds exactly the rendered formula.
+pushed="$(git -C "$seed" fetch -q origin && git -C "$seed" rev-parse origin/main)"
+if [ "$pushed" != "$seeded_before" ]; then
+    ok "the push advanced the fixture remote"
+else
+    bad "the push advanced the fixture remote (still $pushed)"
+fi
+formula="$(git -C "$seed" show origin/main:Formula/minimal.rb 2>/dev/null || true)"
+if [[ "$formula" == *'version "0.5.4"'* ]]; then
+    ok "the remote formula declares the published version"
+else
+    bad "the remote formula declares the published version (remote Formula/minimal.rb: $formula)"
+fi
+if [[ "$formula" != *'@@'* ]]; then
+    ok "the remote formula carries no unrendered @@tokens@@"
+else
+    bad "the remote formula carries no unrendered @@tokens@@"
+fi
+
+finish

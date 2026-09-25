@@ -8,23 +8,25 @@
 # that a dry run downloads, checksums, renders the PKGBUILD fully stamped (the
 # reviewer-visible failure mode was five template defects reaching review
 # unexercised), regenerates .SRCINFO, and pushes nothing — plus that a
-# prerelease PKGVER is refused. Run directly or via `just test-shell`.
+# prerelease PKGVER is refused, and the stable row's version file is read and
+# asserted. A second block drives the channel path
+# (--channel nightly, sha row, version file): the channel package name, _row,
+# normalized pkgver, the conflicts list, the renamed install hook, and the
+# LICENSE copy. A third drives a channel advanced to a versioned row (--channel
+# unstable, semver row): _row and pkgver are the semver, and the version file is
+# asserted to agree with it. Plus the refusals. Run directly or via
+# `just test-shell`.
 
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/publish-aur.sh"
 [ -f "$script" ] || { echo "cannot find publish-aur.sh next to test" >&2; exit 1; }
+# shellcheck disable=SC1091  # dynamic path: testlib.sh sits beside this harness
+. "$here/testlib.sh"
 
 # The harness needs git (fixture remotes) and curl (file:// fetches).
-missing=""
-for tool in git curl; do
-    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
-done
-if [ -n "$missing" ]; then
-    echo "publish-aur_test: skipping, no$missing on PATH"
-    exit 0
-fi
+require_tools git curl
 
 root="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-aurtest)"
 trap 'rm -rf "$root"' EXIT
@@ -32,6 +34,11 @@ trap 'rm -rf "$root"' EXIT
 # runuser/su nobody stand-in must reach the makepkg stub on PATH (a mktemp
 # dir is 0700, which would hide it).
 chmod a+rx "$root"
+
+# The digest routine must match the publisher's (portable across
+# sha256sum/shasum/openssl — this harness also runs on hosts without
+# sha256sum), so it is extracted rather than copied: one definition.
+source_function "$script" sha256_file
 
 # --- fixtures -----------------------------------------------------------------
 
@@ -47,6 +54,23 @@ artifacts=(
 for a in "${artifacts[@]}"; do
     printf 'payload of %s\n' "$a" >"$bucket/$a"
 done
+# The stable row's canonical version file: the publisher reads it and asserts
+# it equals the promoted semver.
+printf '0.5.4\n' >"$bucket/version"
+# A row whose version file disagrees with its name, for the refusal below.
+mkdir -p "$root/bucket/versions/0.9.9"
+printf '0.9.8\n' >"$root/bucket/versions/0.9.9/version"
+
+# A channel row: the same 13 artifacts (distinct content, so distinct digests)
+# plus the canonical-version file the publisher reads to derive pkgver. The sha
+# is the one in the plan's example version string.
+chrow="8e7e72c2"
+cbucket="$root/bucket/versions/$chrow"
+mkdir -p "$cbucket"
+for a in "${artifacts[@]}"; do
+    printf 'channel payload of %s\n' "$a" >"$cbucket/$a"
+done
+printf '0.6.0-dev.10.g8e7e72c2\n' >"$cbucket/version"
 
 # A bare "AUR" repo with a committed PKGBUILD + .SRCINFO to diff against.
 aur="$root/aur.git"
@@ -75,24 +99,6 @@ EOF
 chmod +x "$root/bin/makepkg"
 export PATH="$root/bin:$PATH"
 
-pass=0 fail=0
-ok()  { pass=$((pass + 1)); printf 'ok   - %s\n' "$*"; }
-bad() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$*"; }
-
-# expect <want_rc> <want_substring> <description> -- <command...>
-expect() {
-    local want_rc="$1" want_msg="$2" desc="$3"; shift 3
-    [ "${1:-}" = "--" ] || { bad "$desc (test bug: missing -- separator)"; return; }
-    shift
-    local out rc=0
-    out="$("$@" 2>&1)" || rc=$?
-    if [ "$rc" -eq "$want_rc" ] && [[ "$out" == *"$want_msg"* ]]; then
-        ok "$desc"
-    else
-        bad "$desc (want rc=$want_rc and '$want_msg'; got rc=$rc, out: $out)"
-    fi
-}
-
 run_dry() {
     # SSH_AUTH_SOCK is dropped so the harness never depends on (or uses) an
     # ambient agent's real key: the publisher falls back to the dummy
@@ -103,6 +109,29 @@ run_dry() {
         MINIMAL_BUCKET_URL="file://$root/bucket" \
         AUR_SSH_PRIVATE_KEY="not-a-real-key" \
         "$script" --dry-run
+}
+
+run_channel_dry() {
+    # Same shape, but a channel: PKGVER is the sha row, and pkgver comes from
+    # the row's version file rather than from PKGVER itself.
+    env -u SSH_AUTH_SOCK \
+        PKGVER="$chrow" \
+        AUR_REPO_URL="file://$aur" \
+        MINIMAL_BUCKET_URL="file://$root/bucket" \
+        AUR_SSH_PRIVATE_KEY="not-a-real-key" \
+        "$script" --channel nightly --dry-run
+}
+
+run_versioned_channel_dry() {
+    # A channel advanced to a versioned row (record-smoked points `unstable` at
+    # the semver row of every smoked release): PKGVER IS the row, and pkgver
+    # comes from the row's version file, which must equal it.
+    env -u SSH_AUTH_SOCK \
+        PKGVER=0.5.4 \
+        AUR_REPO_URL="file://$aur" \
+        MINIMAL_BUCKET_URL="file://$root/bucket" \
+        AUR_SSH_PRIVATE_KEY="not-a-real-key" \
+        "$script" --channel unstable --dry-run
 }
 
 # --- the dry run --------------------------------------------------------------
@@ -133,11 +162,16 @@ if [[ "$out" == *'minvmd'* ]]; then
 else
     bad "the package ships minvmd (source entries and checksums rendered)"
 fi
+if [[ "$out" == *'+provides=(minimal)'* ]]; then
+    ok "the package provides=(minimal)"
+else
+    bad "the package provides=(minimal) (out: $out)"
+fi
 
 # Assert the checksums are the real digests of the fixture artifacts: every
 # 64-hex digest in the diff must be one of the fixture artifacts', and all 13
 # must be there.
-digests="$(for a in "${artifacts[@]}"; do sha256sum "$bucket/$a"; done | cut -d' ' -f1)"  # sha256sum: a stated requirement of the publisher
+digests="$(for a in "${artifacts[@]}"; do sha256_file "$bucket/$a"; done)"
 stamped_ok=1
 count=0
 while IFS= read -r sha; do
@@ -161,15 +195,132 @@ else
     bad "the fixture remote is untouched (advanced to $pushed)"
 fi
 
+# --- the channel dry run ------------------------------------------------------
+
+out="$(run_channel_dry 2>&1)"
+rc=$?
+
+if [ "$rc" -eq 0 ]; then ok "channel dry run succeeds against fixtures"; else bad "channel dry run succeeds against fixtures (rc=$rc; out: $out)"; fi
+if [[ "$out" == *"nothing committed, nothing pushed"* ]]; then
+    ok "channel dry run commits and pushes nothing"
+else
+    bad "channel dry run commits and pushes nothing (out: $out)"
+fi
+if grep -qE '^\+.*@@' <<<"$out"; then
+    bad "channel PKGBUILD carries unrendered @@tokens@@"
+else
+    ok "channel PKGBUILD carries no @@tokens@@"
+fi
+if [[ "$out" == *'+pkgname=minimal-nightly-bin'* ]]; then
+    ok "channel renders the nightly pkgname"
+else
+    bad "channel renders the nightly pkgname (out: $out)"
+fi
+if [[ "$out" == *"+_row=$chrow"* ]]; then
+    ok "channel points _row at the sha row"
+else
+    bad "channel points _row at the sha row (out: $out)"
+fi
+if [[ "$out" == *'+pkgver=0.6.0.dev.10.g8e7e72c2'* ]]; then
+    ok "channel derives the normalized pkgver from the version file"
+else
+    bad "channel derives the normalized pkgver from the version file (out: $out)"
+fi
+if [[ "$out" == *"+conflicts=('minimal-bin' 'minimal-unstable-bin')"* ]]; then
+    ok "channel conflicts with the other two channel packages"
+else
+    bad "channel conflicts with the other two channel packages (out: $out)"
+fi
+if [[ "$out" == *'+provides=(minimal)'* ]]; then
+    ok "the channel package provides=(minimal)"
+else
+    bad "the channel package provides=(minimal) (out: $out)"
+fi
+if [[ "$out" == *'+install=minimal-nightly-bin.install'* ]]; then
+    ok "channel install hook is named for the package"
+else
+    bad "channel install hook is named for the package (out: $out)"
+fi
+if [[ "$out" == *'a/LICENSE b/LICENSE'* ]]; then
+    ok "channel copies LICENSE into the AUR clone"
+else
+    bad "channel copies LICENSE into the AUR clone (out: $out)"
+fi
+
+# The channel dry run pushed nothing either.
+pushed="$(git -C "$seed" fetch -q origin && git -C "$seed" rev-parse origin/master)"
+seeded="$(git -C "$seed" rev-parse master)"
+if [ "$pushed" = "$seeded" ]; then
+    ok "the fixture remote is untouched after the channel run"
+else
+    bad "the fixture remote is untouched after the channel run (advanced to $pushed)"
+fi
+
+# --- a channel advanced to a versioned row ------------------------------------
+# `unstable` follows a versioned release to its semver row (record-smoked points
+# it there), so its package is published from that row: _row and pkgver are the
+# semver, and the version file must agree with it.
+
+out="$(run_versioned_channel_dry 2>&1)"
+rc=$?
+
+if [ "$rc" -eq 0 ]; then ok "versioned-row channel dry run succeeds against fixtures"; else bad "versioned-row channel dry run succeeds against fixtures (rc=$rc; out: $out)"; fi
+if [[ "$out" == *'+pkgname=minimal-unstable-bin'* ]]; then
+    ok "versioned-row channel renders the unstable pkgname"
+else
+    bad "versioned-row channel renders the unstable pkgname (out: $out)"
+fi
+if [[ "$out" == *'+_row=0.5.4'* ]]; then
+    ok "versioned-row channel points _row at the semver row"
+else
+    bad "versioned-row channel points _row at the semver row (out: $out)"
+fi
+if [[ "$out" == *'+pkgver=0.5.4'* ]]; then
+    ok "versioned-row channel stamps the row's semver pkgver"
+else
+    bad "versioned-row channel stamps the row's semver pkgver (out: $out)"
+fi
+if [[ "$out" == *"+conflicts=('minimal-bin' 'minimal-nightly-bin')"* ]]; then
+    ok "versioned-row channel conflicts with the other two channel packages"
+else
+    bad "versioned-row channel conflicts with the other two channel packages (out: $out)"
+fi
+
 # --- refusals -----------------------------------------------------------------
 
 expect 1 "not a RELEASED semver" "prerelease PKGVER is refused" -- \
     env PKGVER=0.6.0-rc.1 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
         "$script" --dry-run
 
-expect 1 "cannot download" "a missing bucket artifact fails the run" -- \
+expect 1 "cannot download" "a missing row fails the run" -- \
     env PKGVER=9.9.9 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
         AUR_SSH_PRIVATE_KEY=k "$script" --dry-run
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
-[ "$fail" -eq 0 ]
+expect 1 "contradicts what it installs" "a stable row whose version file disagrees with the semver is refused" -- \
+    env PKGVER=0.9.9 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
+        AUR_SSH_PRIVATE_KEY=k "$script" --dry-run
+
+expect 1 "contradicts what it installs" "a channel row whose version file disagrees with its name is refused" -- \
+    env PKGVER=0.9.9 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
+        AUR_SSH_PRIVATE_KEY=k "$script" --channel unstable --dry-run
+
+expect 1 "neither a 7-40 char lowercase-hex sha row nor a released semver" "a channel row that is neither is refused" -- \
+    env PKGVER=not-a-row AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
+        AUR_SSH_PRIVATE_KEY=k "$script" --channel nightly --dry-run
+
+expect 1 "must be staged by a build that writes the version file" "a channel row with no version file is refused" -- \
+    env PKGVER=deadbeef AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
+        AUR_SSH_PRIVATE_KEY=k "$script" --channel nightly --dry-run
+
+expect 1 "unknown --channel" "an unknown channel is refused" -- \
+    env PKGVER=0.5.4 AUR_REPO_URL="file://$aur" MINIMAL_BUCKET_URL="file://$root/bucket" \
+        AUR_SSH_PRIVATE_KEY=k "$script" --channel beta --dry-run
+
+# NOTE: publish-aur.sh's push path is deliberately NOT exercised here, and its
+# post-push verification (the remote must carry the commit we rendered) is
+# therefore unproven by this harness: the script refuses any remote that is not
+# aur.archlinux.org, which is the guard that keeps a stray `origin` from
+# receiving a package, so no fixture can reach `git push`. publish-brew_test.sh
+# covers the equivalent check against a file:// tap.
+
+finish

@@ -3,30 +3,52 @@
 # publish-brew.sh — clone the gominimal/homebrew-minimal tap, stamp the
 # Formula, push.
 #
-# The monorepo is the source of truth for the Homebrew formula; the tap repo
-# is generated output. Each run shallow-clones a fresh copy, downloads the
-# four macOS arm64 assets (min, minvmd, gvproxy, and the libkrun dylib) from
-# the GitHub Release v$PKGVER to compute their sha256s, renders
-# packaging/homebrew/minimal.rb.tmpl into Formula/minimal.rb, and commits +
-# pushes.
+# The monorepo is the source of truth for the Homebrew formulae; the tap repo
+# is generated output. Each run shallow-clones a fresh copy, downloads the four
+# macOS arm64 assets (min, minvmd, gvproxy, and the libkrun dylib) to compute
+# their sha256s, renders packaging/homebrew/minimal.rb.tmpl into
+# Formula/<name>.rb, and commits + pushes. One tap, three channel formulae:
+# stable -> Formula/minimal.rb, unstable -> Formula/minimal-unstable.rb,
+# nightly -> Formula/minimal-nightly.rb.
 #
-# Usage: scripts/publish-brew.sh [--dry-run]
+# Usage: scripts/publish-brew.sh [--channel stable|unstable|nightly] [--dry-run]
 #
 # Env:
-#   PKGVER              Required. A RELEASED semver WITHOUT the v prefix
-#                       (X.Y.Z, optional +build tail). Assets are fetched from
-#                       the GitHub Release v$PKGVER of gominimal/minimal. A
-#                       bare short SHA is rejected: the tap tracks promoted
-#                       semver releases, not nightly builds. A prerelease
-#                       (-rc.1 tail) is rejected too: Homebrew has no
-#                       channels, so an RC would overwrite the only formula
-#                       for every user with no way to opt out.
+#   PKGVER              Required. What it means depends on --channel:
+#                         stable            a RELEASED semver WITHOUT the v
+#                                           prefix (X.Y.Z, optional +build
+#                                           tail). Assets are fetched from the
+#                                           GitHub Release v$PKGVER of
+#                                           gominimal/minimal. A bare short SHA
+#                                           is rejected (the stable formula
+#                                           tracks promoted semver releases),
+#                                           and so is a prerelease (-rc.1 tail):
+#                                           a prerelease should never overwrite
+#                                           the stable formula for every user.
+#                         unstable/nightly  the staged ROW: normally a 7-40
+#                                           character lowercase-hex short SHA
+#                                           (the row is versions/<sha>/ in the
+#                                           bucket). `unstable` also advances
+#                                           to a versioned (released-semver)
+#                                           row when a versioned release is
+#                                           smoked, and its formula is then
+#                                           published from that row too, so the
+#                                           channel pointer and the formula
+#                                           describe the same bytes.
 #   BREW_TAP_REPO       git URL to clone/push
 #                       (default: git@github.com:gominimal/homebrew-minimal.git)
-#   MINIMAL_RELEASE_URL Base URL the release assets are fetched from
-#                       (default: the GitHub Release download URL for
+#   MINIMAL_RELEASE_URL Base URL the release assets are FETCHED from in stable
+#                       mode (default: the GitHub Release download URL for
 #                       gominimal/minimal v$PKGVER). Overridable so a local
-#                       fixture can drive --dry-run without network access.
+#                       fixture can drive --dry-run without network access; the
+#                       rendered formula still declares the GitHub Release url.
+#   MINIMAL_BUCKET_URL  Public base URL of the installer bucket (default:
+#                       https://storage.googleapis.com/minimal-one). The staged
+#                       row's canonical `version` file is ALWAYS read from
+#                       <base>/versions/$PKGVER/version; in channel mode the
+#                       assets are fetched from there too. Overridable so a
+#                       local file:// fixture can drive --dry-run without
+#                       network access.
 #
 # Credentials (env/ssh-agent only — never hardcoded or echoed here):
 #   - an ssh-agent holding a key with push access to the tap (for the SSH
@@ -61,32 +83,118 @@ usage() {
 }
 
 DRY_RUN=0
-for arg in "$@"; do
-    case "$arg" in
-        --dry-run) DRY_RUN=1 ;;
+CHANNEL="stable"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1; shift ;;
+        --channel)
+            [ -n "${2:-}" ] || die "--channel needs a value (stable, unstable, or nightly)"
+            CHANNEL="$2"; shift 2 ;;
         -h|--help) usage 0 ;;
-        *)         die "unknown argument: $arg (try --help)" ;;
+        *)         die "unknown argument: $1 (try --help)" ;;
     esac
 done
 
-[ -n "${PKGVER:-}" ] || die "PKGVER is required (the promoted semver, without the v prefix)"
-case "$PKGVER" in
-    v*) die "PKGVER must not carry the v prefix: '$PKGVER' (use ${PKGVER#v})" ;;
+# The channel picks the formula filename and its Ruby class; all three live in
+# the one tap.
+case "$CHANNEL" in
+    stable)   PKGNAME="minimal";          CLASS="Minimal" ;;
+    unstable) PKGNAME="minimal-unstable"; CLASS="MinimalUnstable" ;;
+    nightly)  PKGNAME="minimal-nightly";  CLASS="MinimalNightly" ;;
+    *)        die "unknown --channel '$CHANNEL' (want stable, unstable, or nightly)" ;;
 esac
-# A release only: no prerelease tail (Homebrew has no channels — an RC would
-# overwrite the one formula for every user), no bare sha. A +build tail is a
-# valid release version and passes.
-printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$' \
-    || die "PKGVER '$PKGVER' is not a RELEASED semver X.Y.Z (optional +build; prereleases and shas are rejected: Homebrew has no channels)"
 
-BREW_TAP_REPO="${BREW_TAP_REPO:-git@github.com:gominimal/homebrew-minimal.git}"
-RELEASE_URL_BASE="${MINIMAL_RELEASE_URL:-https://github.com/gominimal/minimal/releases/download/v$PKGVER}"
+# conflicts_with names every channel formula but this one: all three install the
+# same bin/min, so brew must refuse two of them at once. The template stamps the
+# quoted, comma-separated list as-is (the renderer requires it non-empty).
+CONFLICTS_WITH=""
+for name in minimal minimal-unstable minimal-nightly; do
+    [ "$name" = "$PKGNAME" ] && continue
+    # The escaped double quotes are literal Ruby string syntax, not shell
+    # quoting: they must survive into conflicts_with ... via the renderer.
+    # shellcheck disable=SC2089
+    CONFLICTS_WITH="${CONFLICTS_WITH:+$CONFLICTS_WITH, }\"$name\""
+done
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATE="$ROOT/packaging/homebrew/minimal.rb.tmpl"
 RENDER="$ROOT/scripts/render-packaging.sh"
+VERSION_TOOL="$ROOT/scripts/package-version.sh"
 [ -f "$TEMPLATE" ] || die "no such template: $TEMPLATE"
 [ -x "$RENDER" ] || die "renderer missing or not executable: $RENDER"
+[ -x "$VERSION_TOOL" ] || die "version normalizer missing or not executable: $VERSION_TOOL"
+
+# The livecheck block differs by channel: a released semver has a GitHub Release
+# to check against; a channel formula is pinned to one immutable staged row and
+# must not chase a moving channel pointer. The template carries a bare
+# @@LIVECHECK@@ token, so the value supplies its own leading indentation.
+LIVECHECK_STABLE='  # The default livecheck (the GitHub Releases API strategy) applies:
+  # the url is a GitHub Release asset, so livecheck reads the newest tag from
+  # the Releases API. No explicit livecheck block is needed for a released semver.'
+# shellcheck disable=SC2016  # @@ROW@@ is our own placeholder, not a shell expression
+LIVECHECK_CHANNEL='  # Pinned to one immutable staged row (versions/@@ROW@@/), which is not a
+  # GitHub Release and has no livecheck strategy: skip it so `brew livecheck`
+  # reports nothing instead of erroring on a version it cannot parse.
+  livecheck do
+    skip
+  end'
+
+[ -n "${PKGVER:-}" ] || die "PKGVER is required (stable: a promoted semver; unstable/nightly: a staged sha row)"
+
+if [ "$CHANNEL" = "stable" ]; then
+    case "$PKGVER" in
+        v*) die "PKGVER must not carry the v prefix: '$PKGVER' (use ${PKGVER#v})" ;;
+    esac
+    # A release only: no prerelease tail (an RC would overwrite the one stable
+    # formula for every user, and there is no channel formula for it), no bare
+    # sha. A +build tail is a valid release version and passes.
+    printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$' \
+        || die "PKGVER '$PKGVER' is not a RELEASED semver X.Y.Z (optional +build; prereleases and shas are rejected by --channel stable)"
+    # URL_BASE is what the formula declares (the public GitHub Release URL);
+    # MINIMAL_RELEASE_URL only redirects the FETCH, so a fixture can drive a
+    # dry run while the rendered formula keeps the real download URL.
+    URL_BASE="https://github.com/gominimal/minimal/releases/download/v$PKGVER"
+    FETCH_BASE="${MINIMAL_RELEASE_URL:-$URL_BASE}"
+    # Stable is not exempt from the row-version rule below: the row is the
+    # promoted semver, and reading its `version` file turns "the tag and the
+    # bytes it installs agree" from an assumption into an assertion.
+    ROW="$PKGVER"
+    BUCKET_URL="${MINIMAL_BUCKET_URL:-https://storage.googleapis.com/minimal-one}"
+    LIVECHECK="$LIVECHECK_STABLE"
+    asset_err="cannot download @@URL@@ — is v$PKGVER a GitHub Release of gominimal/minimal carrying the macOS arm64 assets?"
+else
+    # Channel formulae are pinned to a staged row: normally a sha row, but
+    # `unstable` also advances to a versioned row when a versioned release is
+    # smoked, and its formula is then published from that row too, so the
+    # channel pointer and the formula describe the same bytes.
+    case "$PKGVER" in
+        v*) die "PKGVER must not carry the v prefix: '$PKGVER' (use ${PKGVER#v})" ;;
+    esac
+    if printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+        # A versioned row: a released semver, the shape a versioned build
+        # stages (a prerelease is not a release and never reaches a channel).
+        printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$' \
+            || die "PKGVER '$PKGVER' is not a RELEASED semver X.Y.Z (optional +build; prereleases and shas are rejected)"
+    else
+        printf '%s\n' "$PKGVER" | grep -qE '^[0-9a-f]{7,40}$' \
+            || die "--channel $CHANNEL row '$PKGVER' must be a 7-40 character lowercase-hex sha or a released semver X.Y.Z"
+    fi
+    BUCKET_URL="${MINIMAL_BUCKET_URL:-https://storage.googleapis.com/minimal-one}"
+    # Here URL_BASE is also the fetch base: the bucket override must move the
+    # rendered urls and the downloads together, or they diverge silently.
+    URL_BASE="$BUCKET_URL/versions/$PKGVER"
+    FETCH_BASE="$URL_BASE"
+    ROW="$PKGVER"
+
+    # The row name (a sha) is not a version any package manager accepts; the
+    # canonical built version lives in the row's `version` file (see the fetch
+    # below), which is what the formula must declare — the URL carries no
+    # version Homebrew could infer.
+    LIVECHECK="${LIVECHECK_CHANNEL//@@ROW@@/$PKGVER}"
+    asset_err="cannot download @@URL@@ — is row $PKGVER staged in the bucket? (see stage-release.sh)"
+fi
+
+BREW_TAP_REPO="${BREW_TAP_REPO:-git@github.com:gominimal/homebrew-minimal.git}"
 
 # One release asset per sha256 the Formula declares: the url asset plus each
 # resource. Same names as the GitHub Release (release.yml's release job
@@ -116,18 +224,46 @@ sha256_file() {
 
 dist="$workdir/dist"
 mkdir -p "$dist"
+
+# Resolve the canonical built version from the row's `version` file before
+# anything else, so a missing row fails with one clear message rather than four
+# asset-download errors. EVERY channel reads it, stable included: the row name
+# is a sha on a channel and the promoted semver on stable, and only this file
+# carries the version the formula must declare. On a versioned row — stable, or
+# a channel advanced to a versioned row — the read doubles as an assertion that
+# the row agrees with the version it is named for.
+version_file="$workdir/row-version"
+curl -fsSL --retry 3 -o "$version_file" "$BUCKET_URL/versions/$ROW/version" \
+    || die "cannot download $BUCKET_URL/versions/$ROW/version — is row $ROW staged with a version file? (see stage-release.sh)"
+canonical="$(cat "$version_file")"
+[ -n "$canonical" ] || die "the version file for row $ROW is empty ($BUCKET_URL/versions/$ROW/version)"
+if printf '%s\n' "$ROW" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$' && [ "$canonical" != "$ROW" ]; then
+    die "row $ROW holds binaries reporting '$canonical', not '$ROW' — refusing to publish a formula whose version contradicts what it installs"
+fi
+# - is legal in a Homebrew version, so brew normalization is the identity;
+# running it through the shared helper keeps the charset rule in one place.
+VERSION="$("$VERSION_TOOL" --format brew "$canonical")" \
+    || die "cannot normalize canonical version '$canonical' for Homebrew"
+
 for entry in "${ASSETS[@]}"; do
     IFS='|' read -r name var <<<"$entry"
-    url="$RELEASE_URL_BASE/$name"
+    url="$FETCH_BASE/$name"
+    # asset_err is a per-channel template with one @@URL@@ placeholder.
     curl -fsSL --retry 3 -o "$dist/$name" "$url" \
-        || die "cannot download $url — is v$PKGVER a GitHub Release of gominimal/minimal carrying the macOS arm64 assets?"
-    printf -v "$var" '%s' "$(sha256_file "$dist/$name")"
+        || die "${asset_err//@@URL@@/$url}"
+    # Assign through a variable so a missing sha256 tool fails HERE rather than
+    # stamping an empty SHA_* and dying later in the renderer with a message
+    # that names the wrong thing (a command substitution's status cannot reach
+    # printf -v). Mirrors publish-aur.sh.
+    sha="$(sha256_file "$dist/$name")" || die "cannot sha256 $dist/$name"
+    [ -n "$sha" ] || die "empty sha256 for $dist/$name"
+    printf -v "$var" '%s' "$sha"
 done
 
-# The renderer stamps from the environment (VERSION for the @@VERSION@@
-# token; PKGVER stays for error messages).
-export PKGVER
-export VERSION="$PKGVER"
+# The renderer stamps from the environment (VERSION, CLASS, URL_BASE, ... are
+# the @@TOKEN@@s the template carries; PKGVER stays for error messages).
+# shellcheck disable=SC2090  # CONFLICTS_WITH carries literal Ruby quotes by design (see above)
+export PKGVER PKGNAME CLASS VERSION URL_BASE LIVECHECK CONFLICTS_WITH
 export SHA256 SHA_MINVMD SHA_GVPROXY SHA_LIBKRUN
 
 # Never let git hang on an interactive https credential prompt.
@@ -188,7 +324,7 @@ if ! git clone --depth 1 "$BREW_TAP_REPO" "$workdir/tap" 2>"$clone_err"; then
 fi
 
 mkdir -p "$workdir/tap/Formula"
-"$RENDER" "$TEMPLATE" "$workdir/tap/Formula/minimal.rb"
+"$RENDER" "$TEMPLATE" "$workdir/tap/Formula/$PKGNAME.rb"
 
 cd "$workdir/tap"
 
@@ -199,8 +335,13 @@ git config user.email >/dev/null || git config user.email "minimal-ci@users.nore
 
 git add -A
 
+# The versioned form is "<formula-name> <version>": stable renders as
+# "minimal 0.5.4" (what the tap historically recorded), channels as e.g.
+# "minimal-nightly 0.6.0-dev.10.g8e7e72c2".
+commit_subject="$PKGNAME $VERSION"
+
 if [ "$DRY_RUN" -eq 1 ]; then
-    echo "publish-brew: [dry-run] diff that would be committed as 'minimal $PKGVER':"
+    echo "publish-brew: [dry-run] diff that would be committed as '$commit_subject':"
     # --no-ext-diff: machine-checked output, shape must not depend on the
     # runner's git config (see publish-aur.sh).
     git --no-pager diff --cached --no-ext-diff
@@ -209,11 +350,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 if git diff --cached --quiet; then
-    echo "publish-brew: tap already at $PKGVER; nothing to push"
+    echo "publish-brew: tap already at $commit_subject; nothing to push"
     exit 0
 fi
 
-git commit -m "minimal $PKGVER"
+git commit -m "$commit_subject"
 
 # Sanity guard: only ever push to the tap repo we cloned.
 remote_url="$(git remote get-url origin)"
@@ -223,4 +364,17 @@ remote_url="$(git remote get-url origin)"
 # the name of the first push).
 git push origin HEAD:refs/heads/main
 
-echo "publish-brew: pushed minimal $PKGVER to $remote_url"
+# Post-push assertion. Guards the failure this publisher cannot otherwise see:
+# a push that reports success while the tap never receives the formula — the tap
+# sat empty for weeks and nothing noticed, because nothing checked the END
+# state. So assert the REMOTE now carries exactly the commit we rendered (not
+# merely that git exited 0), and that the formula in it declares the version we
+# meant to publish.
+pushed_sha="$(git rev-parse HEAD)"
+remote_sha="$(git ls-remote "$remote_url" refs/heads/main | cut -f1)"
+[ "$remote_sha" = "$pushed_sha" ] \
+    || die "pushed $pushed_sha but $remote_url refs/heads/main is ${remote_sha:-<missing>} — the formula did not land"
+git show "HEAD:Formula/$PKGNAME.rb" | grep -qF "version \"$VERSION\"" \
+    || die "$remote_url landed $pushed_sha, but Formula/$PKGNAME.rb does not declare version \"$VERSION\""
+
+echo "publish-brew: pushed and verified $commit_subject to $remote_url (refs/heads/main at $pushed_sha)"

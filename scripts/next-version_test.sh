@@ -16,6 +16,8 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/next-version.sh"
 [ -f "$script" ] || { echo "cannot find next-version.sh next to test" >&2; exit 1; }
+# shellcheck disable=SC1091  # dynamic path: testlib.sh sits beside this harness
+. "$here/testlib.sh"
 
 root="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-nexttest)"
 trap 'rm -rf "$root"' EXIT
@@ -43,25 +45,6 @@ commit() {
 # cargo_toml <version-line> — write a fixture Cargo.toml carrying the given package.version.
 cargo_toml() {
     printf '[package]\nname = "minimal"\nversion = "0.0.0"\npackage.version = "%s"\n' "$1" >"$root/Cargo.toml"
-}
-
-pass=0 fail=0
-# ok / bad <description> — count and print one passing / failing case.
-ok()  { pass=$((pass + 1)); printf 'ok   - %s\n' "$*"; }
-bad() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$*"; }
-
-# expect <want_rc> <want_substring> <description> -- <command...>
-expect() {
-    local want_rc="$1" want_msg="$2" desc="$3"; shift 3
-    [ "${1:-}" = "--" ] || { bad "$desc (test bug: missing -- separator)"; return; }
-    shift
-    local out rc=0
-    out="$("$@" 2>&1)" || rc=$?
-    if [ "$rc" -eq "$want_rc" ] && [[ "$out" == *"$want_msg"* ]]; then
-        ok "$desc"
-    else
-        bad "$desc (want rc=$want_rc and '$want_msg'; got rc=$rc, out: $out)"
-    fi
 }
 
 # expect_out <want_stdout> <description> -- <command...>
@@ -294,5 +277,4 @@ expect 1 "could not extract package.version" "--check with no package.version fa
     nv --check --cargo-toml "$root/Cargo.toml"
 expect 1 "unknown argument" "unknown flags are rejected" -- nv --bogus
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
-[ "$fail" -eq 0 ]
+finish

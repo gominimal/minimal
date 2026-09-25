@@ -19,7 +19,9 @@ record="$here/record-smoked.sh"
 verify="$here/verify-smoked.sh"
 [ -f "$record" ] || { echo "cannot find record-smoked.sh next to test" >&2; exit 1; }
 [ -f "$verify" ] || { echo "cannot find verify-smoked.sh next to test" >&2; exit 1; }
-command -v jq >/dev/null 2>&1 || { echo "jq not installed — skipping smoked_test.sh"; exit 0; }
+# shellcheck disable=SC1091  # dynamic path: testlib.sh sits beside this harness
+. "$here/testlib.sh"
+require_tools jq
 
 root="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-smokedtest)"
 trap 'rm -rf "$root"' EXIT
@@ -56,24 +58,7 @@ export PATH="$root/bin:$PATH"
 export GCLOUD_STUB_BUCKET="$root/bucket"
 unset VERSION RUN_URL RUN_ID BUCKET
 
-pass=0 fail=0
-# ok / bad <description> — count and print one passing / failing case.
-ok()  { pass=$((pass + 1)); printf 'ok   - %s\n' "$*"; }
-bad() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$*"; }
-
-# expect <want_rc> <want_substring> <description> -- <command...>
-expect() {
-    local want_rc="$1" want_msg="$2" desc="$3"; shift 3
-    [ "${1:-}" = "--" ] || { bad "$desc (test bug: missing -- separator)"; return; }
-    shift
-    local out rc=0
-    out="$("$@" 2>&1)" || rc=$?
-    if [ "$rc" -eq "$want_rc" ] && [[ "$out" == *"$want_msg"* ]]; then
-        ok "$desc"
-    else
-        bad "$desc (want rc=$want_rc and '$want_msg'; got rc=$rc, out: $out)"
-    fi
-}
+# --- assertions ---------------------------------------------------------------
 
 # stage_row <version> <sha256> — write a one-row components manifest into the fake bucket.
 stage_row() {
@@ -150,5 +135,4 @@ expect 1 "characters outside" "a version with a slash is rejected" -- "$verify" 
 expect 1 "unknown argument" "unknown flags are rejected" -- "$verify" --version 0.6.0 --bogus
 expect 1 "missing value for --version" "a trailing valueless flag is a usable error" -- "$verify" --version
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
-[ "$fail" -eq 0 ]
+finish

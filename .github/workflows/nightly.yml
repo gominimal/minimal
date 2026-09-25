@@ -134,3 +134,89 @@ jobs:
                     --channel nightly \
                     --version "$SHA" \
                     --bucket gs://minimal-one
+
+    # --- Channel packages: publish the nightly channel's AUR and Homebrew
+    # packages, AFTER promote-nightly verified the smoke and moved the pointer.
+    # build -> smoke -> publish, never the reverse. Both are idempotent, and a
+    # no-op night (release skipped, pointer unmoved) re-publishes the same row to
+    # a no-op. A nightly always targets a sha row. tolerate: true keeps a
+    # failed push from failing this run (a stale mirror is not a failed release);
+    # brew_published still reports the real outcome for the install proof below.
+    publish-channel-nightly:
+        needs: [check, promote-nightly]
+        if: ${{ always() && needs.check.result == 'success' && needs.promote-nightly.result == 'success' }}
+        permissions:
+            contents: read
+        uses: ./.github/workflows/publish-channel.yml
+        with:
+            channel: nightly
+            row: ${{ needs.check.outputs.sha }}
+            tolerate: true
+        secrets:
+            AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+            BREW_TAP_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}
+
+    # Real install proof of the formula publish-channel-nightly just pushed: tap
+    # the real tap and let Homebrew install the published formula, so the
+    # macOS path is exercised end to end (formula syntax, asset URLs,
+    # checksums, post-install symlinks) rather than only by the stubbed
+    # harness. Self-hosted Apple Silicon only, skip-tolerant on the same
+    # RUN_MACOS_CI kill-switch as the other macOS jobs. brew_published is the
+    # publisher's REAL outcome: a tolerated push failure must skip this, or it
+    # would "prove" a formula that was never pushed.
+    brew-install-nightly:
+        needs: [check, publish-channel-nightly]
+        if: ${{ always() && vars.RUN_MACOS_CI != 'false' && needs.publish-channel-nightly.outputs.brew_published == 'true' }}
+        runs-on: [self-hosted, macOS, ARM64]
+        timeout-minutes: 30
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Install the published channel formula with Homebrew
+              # `minimal` and a channel formula cannot both be linked (they
+              # install the same bin/min), so clear any of them first. --force
+              # is needed when only the link is left behind.
+              env:
+                  HOMEBREW_NO_AUTO_UPDATE: "1"
+                  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+                  SHA: ${{ needs.check.outputs.sha }}
+              run: |
+                  set -euo pipefail
+                  brew uninstall --force minimal minimal-unstable minimal-nightly 2>/dev/null || true
+                  brew tap gominimal/minimal https://github.com/gominimal/homebrew-minimal
+                  # The runner is persistent and the tap is never removed: after
+                  # the first run `brew tap` is a no-op and
+                  # HOMEBREW_NO_AUTO_UPDATE=1 stops `brew install` from fetching,
+                  # so this would install an EARLIER night's formula and "prove"
+                  # a formula nobody pushed. Refresh the tap checkout first.
+                  tap_repo="$(brew --repository gominimal/minimal)"
+                  git -C "$tap_repo" fetch --quiet origin
+                  git -C "$tap_repo" reset --hard --quiet origin/HEAD
+                  brew install gominimal/minimal/minimal-nightly
+                  prefix="$(brew --prefix minimal-nightly)"
+                  installed="$prefix/bin/min"
+                  [ -x "$installed" ] || { echo "::error::$installed not installed by the formula"; exit 1; }
+                  # Bind the proof to THIS run's formula. There is no
+                  # workflow-level concurrency, so a later nightly could have
+                  # re-pushed the tap between our publish and this install, and
+                  # the tap is refreshed to whatever is current above. The row's
+                  # version file is what the formula we published declares, and
+                  # the built version carries the commit count and sha, so only
+                  # this run's row can match.
+                  expected="$(curl -fsSL --retry 3 "https://storage.googleapis.com/minimal-one/versions/$SHA/version")"
+                  [ -n "$expected" ] || { echo "::error::empty version file for row $SHA"; exit 1; }
+                  version_out="$("$installed" --version)"
+                  echo "$version_out"
+                  case "$version_out" in
+                    *"$expected"*) ;;
+                    *) echo "::error::installed $installed reports '$version_out', not row $SHA's version '$expected' — the tap served a different night's formula"; exit 1 ;;
+                  esac
+                  echo "brew-installed $installed"
+            - name: Uninstall the channel formula
+              if: always()
+              env:
+                  HOMEBREW_NO_AUTO_UPDATE: "1"
+              run: brew uninstall --force minimal minimal-unstable minimal-nightly 2>/dev/null || true
