@@ -1476,6 +1476,81 @@ async fn net_forward_relays_over_ssh_channel() {
     echo.abort();
 }
 
+/// A connection whose box port refuses ends that connection and nothing
+/// else (NET-104): the channel open runs in the connection's own task, so a
+/// refused dial costs one connection while the listener keeps accepting —
+/// and the very next connection, once the box port has a listener, relays.
+#[tokio::test]
+async fn net_forward_survives_a_refused_box_port() {
+    let (daemon, args) = setup().await;
+    let _id = create_session_with_policy(
+        &daemon,
+        "web",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    // Nothing is listening on the box port yet: the first connection's dial
+    // is refused by the box.
+    let box_port = free_loopback_port().await;
+    let local_port = free_loopback_port().await;
+    let forward_args = global_args_for_task(&args);
+    let forward = tokio::spawn(async move {
+        cmd_net_forward(
+            &forward_args,
+            NetForwardArgs {
+                session: "web".to_string(),
+                spec: format!("{local_port}:{box_port}"),
+            },
+        )
+        .await
+    });
+
+    // The refused connection is accepted — the forward's listener is up —
+    // and then closed by the refusal, not hung.
+    let mut refused = connect_with_retry(local_port).await;
+    refused.write_all(b"ping").await.unwrap();
+    let mut seen = Vec::new();
+    let n = refused
+        .read_to_end(&mut seen)
+        .await
+        .expect("read the refused connection to its end");
+    assert_eq!(
+        n, 0,
+        "a refused dial must close the connection, got: {seen:?}"
+    );
+    drop(refused);
+
+    // The service comes up on the box port, and the forward that survived
+    // the refusal reaches it.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", box_port))
+        .await
+        .expect("the box port is free for the service to take");
+    let echo = tokio::spawn(async move {
+        loop {
+            let Ok((conn, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let (mut read, mut write) = tokio::io::split(conn);
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+
+    let mut conn = connect_with_retry(local_port).await;
+    conn.write_all(b"ping").await.expect("write to the forward");
+    let mut echoed = [0u8; 4];
+    conn.read_exact(&mut echoed)
+        .await
+        .expect("read the box's answer back through the forward");
+    assert_eq!(echoed, *b"ping", "the forward must relay after a refusal");
+
+    forward.abort();
+    echo.abort();
+}
+
 /// The forward closes with its session (NET-105): once `min session destroy`
 /// takes the session down, the forward's future ends on its own — the
 /// listener goes with it rather than outliving the session it forwards for.
