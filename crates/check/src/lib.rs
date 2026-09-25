@@ -450,16 +450,29 @@ fn package_check_futures(packages_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Che
         Err(e) => return Err(Error::IO("reading package dirs", packages_dir.clone(), e)),
     }
     .into_iter()
-    // Filter based on any given filter names
-    .filter_map(|fpath| {
-        let dir = fpath.parent().unwrap();
-        let pkg = dir.file_name().unwrap().to_str().unwrap().to_string();
-        if ctx.filter_names.is_empty() || ctx.filter_names.contains(&pkg) {
-            Some((pkg, dir.to_path_buf()))
-        } else {
-            None
-        }
+    .map(|fpath| {
+        let dir = fpath.parent().ok_or_else(|| {
+            Error::Other(anyhow!(
+                "package declaration has no parent directory: {}",
+                fpath.display()
+            ))
+        })?;
+        let pkg = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                Error::Other(anyhow!(
+                    "package directory name is not valid UTF-8: {}",
+                    dir.display()
+                ))
+            })?
+            .to_string();
+        Ok((pkg, dir.to_path_buf()))
     })
+    .collect::<Result<Vec<_>, Error>>()?
+    // Filter based on any given filter names
+    .into_iter()
+    .filter(|(pkg, _)| ctx.filter_names.is_empty() || ctx.filter_names.contains(pkg))
     .collect();
 
     Ok(package_dirs
@@ -485,32 +498,30 @@ fn package_check_futures(packages_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Che
 
 #[tracing::instrument(skip_all, err)]
 fn stack_check_futures(stacks_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFuture>, Error> {
-    let dirs: Vec<std::ffi::OsString> = match std::fs::read_dir(&stacks_dir) {
+    let dirs: Vec<String> = match std::fs::read_dir(&stacks_dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(Error::IO("reading stack dirs", stacks_dir.clone(), e)),
         Ok(dirs) => dirs
-            .filter_map(|e| match e {
-                Err(e) => Some(Err(e)),
-                Ok(e) => {
-                    if !e.file_type().unwrap().is_dir() {
-                        None
-                    } else {
-                        Some(Ok(e.file_name()))
-                    }
-                }
+            .map(|e| {
+                let e = e?;
+                Ok(e.file_type()?.is_dir().then(|| e.file_name()))
             })
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<Result<Vec<_>, std::io::Error>>()
             .map_err(|e| Error::IO("listing stack", stacks_dir.clone(), e))?
             .into_iter()
-            // Filter based on any given filter names
-            .filter_map(|dir| {
-                let n = dir.as_os_str().to_str().unwrap().to_string();
-                if ctx.filter_names.is_empty() || ctx.filter_names.contains(&n) {
-                    Some(dir)
-                } else {
-                    None
-                }
+            .flatten()
+            .map(|dir| {
+                dir.into_string().map_err(|dir| {
+                    Error::Other(anyhow!(
+                        "stack directory name is not valid UTF-8: {}",
+                        dir.to_string_lossy()
+                    ))
+                })
             })
+            .collect::<Result<Vec<String>, Error>>()?
+            // Filter based on any given filter names
+            .into_iter()
+            .filter(|n| ctx.filter_names.is_empty() || ctx.filter_names.contains(n))
             .collect(),
     };
 
@@ -521,7 +532,7 @@ fn stack_check_futures(stacks_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFu
             let stacks_dir = stacks_dir.clone();
 
             Box::pin(async move {
-                let name = pd.to_str().unwrap().to_string();
+                let name = pd;
                 let _permit = tokio::select! {
                     biased;
                     _ = ctx.cancel.cancelled() => {
@@ -716,12 +727,16 @@ impl FileBasedChecker for ParseCheck {
             ),
         ]));
 
+        let build_ncl = pkg_dir.join("build.ncl");
+        let build_ncl = build_ncl.to_str().ok_or_else(|| {
+            Error::Other(anyhow!(
+                "package build file path is not valid UTF-8: {}",
+                build_ncl.display()
+            ))
+        })?;
         let program_res: Result<Program<CacheImpl>, _> = ProgramBuilder::new()
             .add_source(
-                std::io::Cursor::new(format!(
-                    "import \"{}\"",
-                    pkg_dir.join("build.ncl").as_os_str().to_str().unwrap()
-                )),
+                std::io::Cursor::new(format!("import \"{build_ncl}\"")),
                 "toplevel",
             )
             .add_import_paths([ctx.stdlib_dir.as_path()].iter())
