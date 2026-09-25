@@ -88,25 +88,31 @@ cargo fmt --all
 # Without either block it falls back to the plan survey's `just test-one`,
 # which has no filter to run.
 #
-# rustfmt, clippy, and the test suite of each crate the coder touched, read
-# off `MINIMAL_CHANGED_PATHS` — the changed files the runtime puts in this
-# task's env, one per line. No paths means no suites; clippy still runs.
+# rustfmt, then clippy and the test suite of each crate the coder touched,
+# read off `MINIMAL_CHANGED_PATHS` — the changed files the runtime puts in
+# this task's env, one per line. No paths means no suites and a
+# workspace-wide clippy. Clippy is scoped like nextest because a cold
+# workspace clippy alone ran 9 m 10 s of the gate's 600 s on #1673 and the
+# gate was stopped before nextest began; `-p` still checks every dependency
+# of the touched crates, so a warning there is still caught.
 [tasks.agent-verify]
 description = "the gate the agent runtime runs after a task's test lines"
 inherit_cwd = true
 bash = """
 set -e
 cargo fmt --all -- --check
-cargo clippy --all-targets --locked -- -D warnings
 
 # Crate names out of `crates/<name>/...`, deduplicated; other paths ignored.
 crates=$(printf '%s\\n' "${MINIMAL_CHANGED_PATHS:-}" \\
   | sed -n 's|^crates/\\([^/][^/]*\\)/.*|\\1|p' \\
   | sort -u)
 
+args=""
+for c in $crates; do args="$args -p $c"; done
+# shellcheck disable=SC2086 - the package flags are meant to split
+cargo clippy --all-targets --locked $args -- -D warnings
+
 if [ -n "$crates" ]; then
-  args=""
-  for c in $crates; do args="$args -p $c"; done
   # shellcheck disable=SC2086 - the package flags are meant to split
   cargo nextest run --locked $args
 fi
