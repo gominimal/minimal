@@ -2475,8 +2475,16 @@ async fn box_has_no_idle_stop() {
         Some(sessions::SessionStatus::Active),
     );
 
-    // And none of the stop paths' lines is in the log.
-    let logged = capture.contents();
+    // And none of the stop paths' lines is in the log for this session.
+    // Scoped to lines naming it (by name, or by id for the reap line, which
+    // carries no name): under libtest the buffer is shared with neighbours.
+    let session_str = session_id.to_string();
+    let logged: String = capture
+        .contents()
+        .lines()
+        .filter(|line| line.contains("idle-stop-test") || line.contains(&session_str))
+        .map(|line| format!("{line}\n"))
+        .collect();
     for stop_line in [
         "session host killed on request",
         "session process exited; reaped by the host loop",
