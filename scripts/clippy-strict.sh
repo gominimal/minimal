@@ -215,9 +215,14 @@ for path, line, code, text in hits:
     print(f"{path}:{line}: {text} [{code}]")
 
 if hits:
+    # Flush first: stdout is block-buffered under a pipe, stderr is not, so
+    # without this the guidance lands above the diagnostics it refers to.
+    sys.stdout.flush()
     print(
-        f"\nclippy-strict: {len(hits)} diagnostic(s) on changed lines "
-        f"(fix these, or suppress with #[expect(..., reason = \"...\")])",
+        f"\nclippy-strict: {len(hits)} diagnostic(s) on the lines your branch "
+        f"changed.\nThese lints are stricter than the repo-wide set, so a "
+        f"failure here is about this change: fix them, or suppress a single one\n"
+        f'with #[expect(<lint>, reason = "...")]. Re-run: just clippy-strict',
         file=sys.stderr,
     )
     sys.exit(1)
