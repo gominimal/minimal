@@ -1064,15 +1064,22 @@ fn session_run_takes_a_session_then_a_task() {
 
 /// The task reaches the daemon as a named form, so a task whose name
 /// collides with a program on the session's `PATH` is still a task —
-/// nothing is inferred from the text (gominimal/inbox#558).
+/// nothing is inferred from the text (gominimal/inbox#558). `min session
+/// run` sends no owns-box flag (NET-131): the task runs in a session
+/// someone else keeps.
 #[test]
 fn session_run_encodes_a_task_form_not_a_command() {
-    let wire = minimald_rpc::exec::ExecRequest::TaskRun("check".to_string()).encode();
+    let request = minimald_rpc::exec::ExecRequest::TaskRun {
+        task: "check".to_string(),
+        owns_box: false,
+    };
+    let wire = request.encode();
     assert_eq!(
         minimald_rpc::exec::ExecRequest::parse(&wire),
-        Ok(minimald_rpc::exec::ExecRequest::TaskRun(
-            "check".to_string()
-        ))
+        Ok(minimald_rpc::exec::ExecRequest::TaskRun {
+            task: "check".to_string(),
+            owns_box: false,
+        })
     );
 }
 
