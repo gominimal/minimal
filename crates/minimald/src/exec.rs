@@ -607,6 +607,11 @@ pub struct TokioExec {
     pub argv: String,
     pub cwd: DaemonAbsPath,
     pub env: BTreeMap<String, String>,
+    /// Environment variables to strip from the child process. Used to
+    /// keep Git repository-location variables inherited from the daemon
+    /// from redirecting `git init` / `git upload-pack` away from the
+    /// session workspace.
+    pub drop_env: BTreeSet<String>,
 }
 
 impl Exec for TokioExec {
@@ -623,10 +628,36 @@ impl Exec for TokioExec {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
+            for name in &self.drop_env {
+                cmd.env_remove(name);
+            }
             cmd.spawn().map(TokioProcess)
         })
         .boxed()
     }
+}
+
+/// Git environment variables that relocate a repository away from the
+/// process working directory. Inheriting any of these from the daemon
+/// would make `git init` / `git upload-pack` target a repository other
+/// than the session workspace, so they are stripped from the child
+/// process.
+fn git_repo_location_env() -> BTreeSet<String> {
+    [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_QUARANTINE_PATH",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 /// What to run inside the session, and whether a shell stands between the
@@ -1208,6 +1239,8 @@ where
 ///  * `git-receive-pack min://<session ID>` - handles a git receive-pack, routing
 ///    with the trailing session ID. Matched before the vocabulary below, and
 ///    not part of it: git speaks the pack protocol, not exec requests.
+///  * `git-upload-pack min://<session ID>` - handles a git upload-pack, routing
+///    with the trailing session ID the same way.
 ///  * a [`minimald_rpc::exec::ExecRequest`], which is where the rest of the
 ///    vocabulary is defined. The daemon-serviced forms — `min://task/run`,
 ///    `min://package/build` and `min://check` — are each routed via a
@@ -1242,6 +1275,10 @@ pub(crate) async fn handle_exec(
 
     if let Some(ident) = argv.strip_prefix("git-receive-pack min://") {
         return handle_git_receive(ident, serv, conn, id, session, channel, config).await;
+    }
+
+    if let Some(ident) = argv.strip_prefix("git-upload-pack min://") {
+        return handle_git_upload(ident, serv, conn, id, session, channel, config).await;
     }
 
     if config.pty.is_some() {
@@ -1835,10 +1872,119 @@ async fn handle_git_receive(
                 ),
                 cwd: paths.working,
                 env: BTreeMap::new(),
+                drop_env: git_repo_location_env(),
             },
         };
         exec_task.run(channel).await;
         drop(hooks_tmp);
+    });
+
+    Ok(())
+}
+
+async fn handle_git_upload(
+    ident: &str,
+    serv: ServerStateHandle,
+    conn: ConnectionHandle,
+    id: ChannelId,
+    session: &mut Session,
+    channel: Channel<Msg>,
+    config: ChannelConfig,
+) -> Result<(), ConnectionError> {
+    let session_pred = {
+        match config.env_vars.get(MINIMAL_SESSION_ID_ENV) {
+            Some(id_str) => match SessionId::parse_str(id_str) {
+                Ok(id) => SessionKeyPredicate::Id(id),
+                Err(_e) => {
+                    tracing::warn!(
+                        value = %id_str,
+                        "git-upload-pack rejected on channel {id}: {MINIMAL_SESSION_ID_ENV} is not a uuid",
+                    );
+                    session.channel_failure(id)?;
+                    return Ok(());
+                }
+            },
+            None => match SessionId::parse_str(ident) {
+                Ok(id) => SessionKeyPredicate::Id(id),
+                Err(_e) => SessionKeyPredicate::Name(ident.to_string()),
+            },
+        }
+    };
+
+    let mngr = serv.sessions_manager().await;
+    let session_handle = match mngr.get_session(session_pred).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            tracing::warn!("git-upload-pack rejected: unknown session");
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "git-upload-pack rejected: lookup failed");
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+    };
+    session.channel_success(id)?;
+
+    spawn(async move {
+        let paths = match session_handle.paths().await {
+            Ok(paths) => paths,
+            Err(e) => {
+                tracing::warn!(error = %e, "git-upload-pack aborted: session is gone");
+                return;
+            }
+        };
+
+        let dotgit_dir = paths.working.as_utf8_path().join(".git");
+        if let Ok(false) = tokio::fs::try_exists(&dotgit_dir).await {
+            // A fresh session can reach upload-pack before any receive-pack
+            // request, so the workspace may not be a Git repository yet.
+            // Initialize it the same way handle_git_receive does, otherwise
+            // clone, fetch, and ls-remote fail on a non-repo directory.
+            let mut init = tokio::process::Command::new("git");
+            init.arg("init").current_dir(paths.working.as_utf8_path());
+            for name in git_repo_location_env() {
+                init.env_remove(name);
+            }
+            let res = init.output().await;
+            match res {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    // `git init` ran but failed: report the cause to the
+                    // client instead of running upload-pack against a
+                    // non-repository directory.
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    tracing::warn!(status = %out.status, "git init failed: {stderr}");
+                    let _ = channel.extended_data(1, stderr.as_bytes()).await;
+                    let _ = channel
+                        .exit_status(out.status.code().unwrap_or(1).max(0) as u32)
+                        .await;
+                    let _ = channel.eof().await;
+                    let _ = channel.close().await;
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "git init failed");
+                    channel.close().await.unwrap();
+                    return;
+                }
+            }
+        }
+
+        let exec_task = ExecTask {
+            conn,
+            serv,
+            session: session_handle,
+            channel_id: id,
+            exec: TokioExec {
+                argv: "git upload-pack .".to_string(),
+                cwd: paths.working,
+                env: BTreeMap::new(),
+                drop_env: git_repo_location_env(),
+            },
+        };
+        exec_task.run(channel).await;
     });
 
     Ok(())
