@@ -5,6 +5,64 @@ use std::fs;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
+/// The uid every box execs as inside its user namespace.
+///
+/// `Sandbox::new_container` maps exactly this uid (and [`BOX_GID`]) onto the
+/// daemon's own uid and gid, so the process a box execs is not root inside its
+/// user namespace and the kernel therefore clears its effective and permitted
+/// capability sets at exec. The same uid is the one
+/// `common::synth_user_group_config` writes the box's `/etc/passwd` entry for,
+/// so the name the box reports and the uid it holds agree.
+pub const BOX_UID: u32 = 1000;
+
+/// The gid every box execs as inside its user namespace, mapped onto the
+/// daemon's own gid the same way [`BOX_UID`] is mapped onto its uid.
+pub const BOX_GID: u32 = 1000;
+
+/// A capability no box may hold: its kernel number (these are ABI, assigned
+/// once and never reused) and its name, for the launch log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForbiddenCapability {
+    /// The capability's name, `CAP_NET_RAW` and friends.
+    pub name: &'static str,
+    /// The capability's number in the kernel's capability ABI.
+    pub number: u32,
+}
+
+/// The capabilities no box may hold, in the order the launch log line names
+/// them, `CAP_NET_RAW` first: it is the one that would let a box write packets
+/// whose source address is not the address its plan — and the relay's
+/// source-address check — say it has, which is the reach the escape bound is
+/// about. `CAP_NET_ADMIN` is on the same list for the same reason one layer
+/// up: it would let a box re-address its own interface, the address that
+/// identifies it.
+///
+/// The launch path drops these from the box's capability *bounding* set, the
+/// one capability set an exec does not clear, so a dropped capability cannot
+/// come back even if a file capability or a setuid bit would grant it — both
+/// of which the box's `no_new_privs` bit makes the kernel ignore anyway.
+pub const BOX_FORBIDDEN_CAPABILITIES: &[ForbiddenCapability] = &[
+    ForbiddenCapability {
+        name: "CAP_NET_RAW",
+        number: 13,
+    },
+    ForbiddenCapability {
+        name: "CAP_NET_ADMIN",
+        number: 12,
+    },
+];
+
+/// The forbidden capabilities as the sandbox launch log line names them, e.g.
+/// `CAP_NET_RAW, CAP_NET_ADMIN` — the bounding set every box is launched with.
+#[must_use]
+pub fn forbidden_capability_names() -> String {
+    BOX_FORBIDDEN_CAPABILITIES
+        .iter()
+        .map(|cap| cap.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Something in the FS that needs to be mapped into the sandbox.
 #[derive(Debug)]
 pub enum SandboxMapped {
