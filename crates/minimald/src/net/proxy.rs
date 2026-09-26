@@ -636,6 +636,13 @@ fn head_lines(headers: &[u8]) -> Vec<&[u8]> {
 
 /// The `(name, value)` of one header line, or `None` for the request line, the
 /// end-of-head line, or anything else with no `:` to split a name from.
+///
+/// Both slices are cut at `colon`, which `position` returned as an index inside
+/// `line`, so neither range can be out of bounds.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "cut at `colon`, an index `position` found inside `line`"
+)]
 fn header_parts(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let line = line
         .strip_suffix(b"\r\n")
@@ -674,6 +681,13 @@ fn carries_h2c(lines: &[&[u8]]) -> bool {
 
 /// One header line rebuilt to carry only `tokens`, preserving the original
 /// name's case and each token's own bytes, and the original line's terminator.
+///
+/// `body` is `line` with a suffix stripped, so its length is a valid start in
+/// `line` and the terminator slice cannot be out of bounds.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "`body` is `line` less a suffix, so its length starts a valid slice"
+)]
 fn rewritten_header<'a>(line: &'a [u8], name: &'a [u8], tokens: &[&[u8]]) -> Vec<u8> {
     let body = line
         .strip_suffix(b"\r\n")
@@ -2001,30 +2015,38 @@ mod tests {
 
             // No reach a direct connection would not have: where the target
             // has a gate, the port the forwarded connection terminates on is
-            // one its own declaration admits.
-            if mode != TargetMode::HostAddress
-                && let ProxiedRequest::Forward(upstream) = &observed
+            // one its own declaration admits. A host-address target has no
+            // gate to compare with — a direct connection to it is ungated, so
+            // its proxied requests are too — so only the two own-address
+            // forms name a port to check.
+            if let ProxiedRequest::Forward(upstream) = &observed
                 && let SocketAddr::V4(up) = upstream
             {
-                let internal = match mode {
-                    TargetMode::OwnAddressOnSwitch => up.port(),
-                    TargetMode::OwnAddressNative => {
+                let terminated_on = match mode {
+                    TargetMode::HostAddress => None,
+                    TargetMode::OwnAddressOnSwitch => Some(up.port()),
+                    TargetMode::OwnAddressNative => Some(
                         // The forwarder carries the published external port;
                         // the connection terminates on the internal one.
                         mappings
                             .iter()
                             .find(|m| m.external_port == up.port())
                             .map(|m| m.internal_port)
-                            .expect("a forwarded request names a published port")
-                    }
-                    TargetMode::HostAddress => unreachable!("excluded above"),
+                            .expect("a forwarded request names a published port"),
+                    ),
                 };
-                let gate =
-                    SessionGate::for_session("web".to_string(), target_lease, &target_policy, subnet);
-                prop_assert!(
-                    gate.admits_direct_tcp(internal),
-                    "the proxy forwarded to port {internal}, which the target's gate refuses"
-                );
+                if let Some(internal) = terminated_on {
+                    let gate = SessionGate::for_session(
+                        "web".to_string(),
+                        target_lease,
+                        &target_policy,
+                        subnet,
+                    );
+                    prop_assert!(
+                        gate.admits_direct_tcp(internal),
+                        "the proxy forwarded to port {internal}, which the target's gate refuses"
+                    );
+                }
             }
         }
     }
@@ -2157,6 +2179,13 @@ mod tests {
                     let mut buf = [0u8; 2048];
                     let n = sock.read(&mut buf).await.unwrap_or(0);
                     sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                    // The recorded head is what this backend exists for; a
+                    // failed write just closes the connection the test then
+                    // reads to its end, which is its success path.
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the answer's fate is not what this backend records"
+                    )]
                     let _ = sock
                         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                         .await;

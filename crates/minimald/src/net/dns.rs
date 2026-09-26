@@ -59,8 +59,8 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use serde::Serialize;
-use sessions::{SessionId, SessionPolicy};
 use sessions::core::egress::EgressRules;
+use sessions::{SessionId, SessionPolicy};
 
 use super::SwitchSubnet;
 

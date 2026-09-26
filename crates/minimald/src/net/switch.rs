@@ -963,7 +963,16 @@ const SYNTH_L4_HDR: usize = 4;
 /// and a 4-byte L4 header, with EtherType, IHL, protocol, source address,
 /// destination address and destination port set at the offsets `summarize`
 /// extracts them from. `src` is the box's lease the rules carry (NET-084).
+///
+/// [`egress::summarize`] reads a frame, so a frame is what stands for the
+/// connection — but only the fields it extracts are written, and every index
+/// below is a constant offset inside a fixed-size array sized for exactly
+/// those fields, so none of them can be out of bounds.
 #[must_use]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "constant offsets into a fixed-size array sized for exactly these fields"
+)]
 fn tcp_frame_summary(src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16) -> FrameSummary {
     let mut frame = [0u8; SYNTH_ETH_HDR + SYNTH_IPV4_HDR + SYNTH_L4_HDR];
     frame[12..14].copy_from_slice(&[0x08, 0x00]); // EtherType: IPv4.
