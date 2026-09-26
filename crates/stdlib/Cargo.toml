@@ -9,3 +9,6 @@ publish.workspace = true
 [dependencies]
 fd-lock.workspace = true
 tempfile.workspace = true
+
+[lints]
+workspace = true
