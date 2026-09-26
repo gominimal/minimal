@@ -152,12 +152,26 @@ impl Exec for TaskExec {
 /// own name and carries none of the session's ingress — forwards a task
 /// applied would come down again at its teardown. It carries no registry
 /// handle either: a task owns no proxy route of its own, so no lease is ever
-/// reported for it. `deny_all_opt_out` is the daemon's opt-out (NET-077),
-/// read through the session handle so a task resolves its egress — under the
-/// rollout phase this build ships — exactly as the launcher did.
+/// reported for it. `phase` is the rollout phase to resolve the egress under
+/// — both callers pass [`sessions::EGRESS_DEFAULT_PHASE`], the phase this
+/// build ships, while the tests pass the phase by name so the posture the
+/// rollout ends at stays proven while the default is only announced
+/// (NET-076) — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
+/// read through the session handle so a task resolves its egress exactly as
+/// the launcher did.
+///
+/// A gate is attached only where that egress has rules to enforce: the
+/// deny-all section the in-force default resolves an absent declaration to,
+/// or the box's own declaration. An absent section — the allow-all the
+/// announced phase and the opt-out both leave in place — passes `None`, as
+/// every task did before the deny-all default: a gate with no ingress
+/// declaration blocks a task's *inbound* too (`allowed`/`udp_allowed` empty),
+/// so attaching one where nothing needs gating would change behaviour an
+/// announcement is not allowed to.
 pub(crate) fn task_network(
     record: &sessions::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
+    phase: sessions::EgressDefaultPhase,
     deny_all_opt_out: bool,
 ) -> std::sync::Arc<dyn sandbox2::Network> {
     let id = record.id.to_string();
@@ -165,14 +179,14 @@ pub(crate) fn task_network(
     let egress = crate::session::effective_egress_section(
         &record.policy,
         record.network,
-        sessions::EGRESS_DEFAULT_PHASE,
+        phase,
         deny_all_opt_out,
     );
     crate::net::provider::network_for(
         record.network,
         switch,
         &format!("{session}-task"),
-        Some(sessions::SessionPolicy::new(egress, None)),
+        egress.map(|section| sessions::SessionPolicy::new(Some(section), None)),
         None,
     )
 }
@@ -282,6 +296,7 @@ async fn task_producer(
         let network = task_network(
             &session.record().await?,
             &session.net_switch().await?,
+            sessions::EGRESS_DEFAULT_PHASE,
             session.deny_all_opt_out().await?,
         );
         // A task's `~/` resolves against the session's home, the same
@@ -2047,19 +2062,27 @@ mod tests {
                 }),
         ));
 
-        let host =
-            super::task_network(&record_with(sessions::NetworkMode::HostNet), &switch, false);
+        let host = super::task_network(
+            &record_with(sessions::NetworkMode::HostNet),
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
         assert!(!host.plan().await.unwrap().isolates_netns());
 
-        let no_net =
-            super::task_network(&record_with(sessions::NetworkMode::NoNet), &switch, false);
+        let no_net = super::task_network(
+            &record_with(sessions::NetworkMode::NoNet),
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
         let plan = no_net.plan().await.unwrap();
         assert!(plan.isolates_netns() && plan.tap().is_none());
 
         let mut record = record_with(sessions::NetworkMode::OwnIp);
         record.name = Some("web".to_string());
         record.policy.ingress = Some(sessions::IngressPolicy::default());
-        let own_ip = super::task_network(&record, &switch, false);
+        let own_ip = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
         let plan = own_ip.plan().await.unwrap();
         assert!(
             plan.isolates_netns(),
@@ -2073,18 +2096,109 @@ mod tests {
         // egress (NET-074) — resolved under the phase this build ships, so
         // the same rules the session's own gate enforces, whatever the
         // rollout leaves in force — but none of its ingress, because the
-        // session's PTask is attached at the same time.
+        // session's PTask is attached at the same time. The gate exists only
+        // where that egress has rules, so the answer follows the shipped
+        // phase rather than a literal a cutover would invalidate.
+        let gated = crate::session::effective_egress_section(
+            &record.policy,
+            record.network,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        )
+        .is_some();
         let described = format!("{own_ip:?}");
         assert!(
-            described.contains("\"web-task\"") && described.contains("has_policy: true"),
+            described.contains("\"web-task\"")
+                && described.contains(&format!("has_policy: {gated}")),
             "got {described}"
         );
         own_ip.abandon().await;
 
         // No name: the session id, rather than an empty hostname.
-        let unnamed =
-            super::task_network(&record_with(sessions::NetworkMode::OwnIp), &switch, false);
+        let unnamed = super::task_network(
+            &record_with(sessions::NetworkMode::OwnIp),
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
         assert!(format!("{unnamed:?}").contains(&sessions::SessionId::nil().to_string()));
+    }
+
+    /// NET-074/NET-076/NET-077 for the task path: a task runs under the same
+    /// egress default its session does, and nothing else changes with it. A
+    /// gate is attached only where the effective egress has rules to enforce,
+    /// because a gate with no ingress declaration blocks a task's *inbound*
+    /// too — so under Announced, with no opt-out, a bare own-address task
+    /// attaches ungated exactly as every task did before the deny-all
+    /// default: the announcement may change nothing yet. Under InForce the
+    /// same bare box's task carries the deny-all gate.
+    ///
+    /// The phase is passed by name, not read from the shipped constant, so
+    /// the in-force posture stays proven while the default is only
+    /// announced. `own_ip_default_deny_all` proves what the deny-all section
+    /// itself enforces.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_task_gate_follows_the_egress_default() {
+        use std::sync::Arc;
+
+        let switch = Arc::new(tokio::sync::Mutex::new(
+            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                }),
+        ));
+        // A bare own-address box: no egress declaration, so its egress is
+        // whatever the default resolves for an absent one.
+        let record = record_with(sessions::NetworkMode::OwnIp);
+
+        // Announced, no opt-out: an absent section still allows all, so the
+        // task gets no gate at all — its inbound stays as open as it was
+        // before the default was announced.
+        assert_eq!(
+            crate::session::effective_egress_section(
+                &record.policy,
+                record.network,
+                sessions::EgressDefaultPhase::Announced,
+                false,
+            ),
+            None,
+            "an announced default resolves an absent section to allow-all"
+        );
+        let announced = super::task_network(
+            &record,
+            &switch,
+            sessions::EgressDefaultPhase::Announced,
+            false,
+        );
+        assert!(
+            format!("{announced:?}").contains("has_policy: false"),
+            "an announced default gates nothing: {announced:?}"
+        );
+
+        // In force, no opt-out: the same absent section is the deny-all one,
+        // and the task carries the gate built from it.
+        assert_eq!(
+            crate::session::effective_egress_section(
+                &record.policy,
+                record.network,
+                sessions::EgressDefaultPhase::InForce,
+                false,
+            ),
+            Some(sessions::EgressPolicy::deny_all()),
+            "the in-force default resolves an absent section to deny-all"
+        );
+        let in_force = super::task_network(
+            &record,
+            &switch,
+            sessions::EgressDefaultPhase::InForce,
+            false,
+        );
+        assert!(
+            format!("{in_force:?}").contains("has_policy: true"),
+            "the in-force default gates a bare box's task: {in_force:?}"
+        );
     }
 
     /// 017-005. An own-IP task whose attach is refused stops with the

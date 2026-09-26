@@ -1234,7 +1234,12 @@ impl SessionChannel {
             let record = session.record().await.map_err(gone)?;
             let switch = session.net_switch().await.map_err(gone)?;
             let opt_out = session.deny_all_opt_out().await.map_err(gone)?;
-            let network = crate::exec::task_network(&record, &switch, opt_out);
+            let network = crate::exec::task_network(
+                &record,
+                &switch,
+                sessions::EGRESS_DEFAULT_PHASE,
+                opt_out,
+            );
             let mut env = ctx
                 .make_env_with_network(
                     task_name,
