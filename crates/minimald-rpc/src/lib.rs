@@ -475,8 +475,12 @@ pub struct CreateSessionResponse {
     /// shared `127.0.0.1` interim rather than the range (NET-123).
     ///
     /// A client that reads `true` surfaces the naming advisory again
-    /// (NET-122): the advisory's privileged step also reserves the range,
-    /// which is what ends the interim. `false` from a daemon that predates
+    /// (NET-122): a session on the interim is a fact nothing else shows.
+    /// The advisory it re-surfaces names the command that configures the
+    /// host's resolver hook, which is not a step that ends the interim —
+    /// the range is installed by a host-side step the command is not, so
+    /// the interim needs nothing of the user until that step exists.
+    /// `false` from a daemon that predates
     /// the field is the safe read — nothing downstream is gated on it; the
     /// advisory a client prints from its own host-resolver detection is not,
     /// and the [`Self::daemon_version`] gate already refuses a daemon that

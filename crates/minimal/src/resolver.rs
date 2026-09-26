@@ -724,8 +724,13 @@ pub(crate) fn command(port: u16) -> String {
 /// advisory says what is missing and names the exact command. The interim
 /// re-surfaces the advisory even when the hook routes (NET-123: "re-surface
 /// the advisory of NET-122"): a session on the interim is a fact the user
-/// has no other way to see, and the advisory command is the same privileged
-/// step that ends it. String assembly only.
+/// has no other way to see. The interim fact says what there is to do
+/// about it — nothing: the interim ends when a host-side step installs the
+/// range, never by configuring the resolver, which is all the command the
+/// advisory names ever does. Without that severance a user on the interim
+/// who ran the advised command would be re-advised at every later session
+/// start, the command being the one step the advisory never claims ends
+/// it. String assembly only.
 ///
 /// `blocker` names why the command would do nothing on this host — a host
 /// whose lookups never reach the resolver the command configures — in which
@@ -749,6 +754,17 @@ pub(crate) fn advisory_at(
              reserved local range {} is not installed on this host",
             range_text()
         ));
+        // What there is to do about the interim: nothing. The command the
+        // advisory names configures the resolver, never the range — a
+        // host-side step installs that — so this fact says both, or a
+        // user on the interim would take the command as the step that
+        // ends the interim and be re-advised at every session start,
+        // command run and range still absent.
+        facts.push(
+            "nothing is needed for the interim — it ends when a host-side \
+             step installs the range, never by configuring the resolver"
+                .to_string(),
+        );
     }
     if !hook.routes(port) {
         facts.push(format!(
@@ -987,6 +1003,20 @@ mod tests {
             "the interim advisory must name the interim: {interim}"
         );
         assert!(interim.contains(&range_text()));
+        // The interim fact must say what there is to do about it — nothing,
+        // until a host-side step installs the range — and never leave the
+        // command to be read as the step that ends the interim: the command
+        // configures the resolver, and a user who ran it expecting the
+        // interim to end would be re-advised at every session start.
+        assert!(
+            interim.contains("nothing is needed for the interim"),
+            "the interim advisory must say nothing is needed: {interim}"
+        );
+        assert!(
+            interim.contains("host-side step installs the range"),
+            "the interim advisory must name what ends it, a host-side \
+             step: {interim}"
+        );
         for marker in command_markers(port) {
             assert!(
                 interim.contains(&marker),
