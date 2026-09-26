@@ -600,8 +600,9 @@ const ETH_HDR: usize = 14;
 /// EtherType for IPv4. Frames carrying anything else (ARP `0x0806`, IPv6
 /// `0x86DD`, VLAN-tagged `0x8100`) are outside the gate's scope and pass through.
 const ETHERTYPE_IPV4: u16 = 0x0800;
-/// IPv4 protocol number for TCP.
-const IPPROTO_TCP: u8 = 6;
+/// IPv4 protocol number for TCP. `pub(crate)`: the DNS gate's tests build
+/// their own flow identities with it.
+pub(crate) const IPPROTO_TCP: u8 = 6;
 /// IPv4 protocol number for UDP. `pub(crate)`: the DNS gate's tests build
 /// their own UDP frames with it.
 pub(crate) const IPPROTO_UDP: u8 = 17;
@@ -797,6 +798,14 @@ impl SessionGate {
     #[cfg(test)]
     pub(crate) fn shrink_admission_window(&mut self, window: Duration) {
         self.dns.shrink_window(window);
+    }
+
+    /// Shrinks the DNS gate's flow idle cap — the window hook's twin, for
+    /// the relay-level proofs that an established flow is *released* by
+    /// idleness, which cannot be written against a day-long one.
+    #[cfg(test)]
+    pub(crate) fn shrink_flow_idle_cap(&mut self, cap: Duration) {
+        self.dns.shrink_flow_idle_cap(cap);
     }
 
     /// The inbound-gate decision for one Ethernet frame: `Some((proto, dst_port,
@@ -1476,8 +1485,9 @@ pub(crate) mod tests {
 
     /// [`spawn_test_relay`] with the session gate handed to `configure`
     /// before the relay takes it: the DNS-gate proofs are the callers, for
-    /// the one thing a policy cannot say — a window short enough that its
-    /// expiry is observable inside a test.
+    /// the things a policy cannot say — the admission window and the flow
+    /// idle cap, shrunk short enough that their expiry is observable inside
+    /// a test.
     pub(crate) fn spawn_test_relay_with(
         policy: &sessions::SessionPolicy,
         configure: impl FnOnce(&mut SessionGate),

@@ -22,11 +22,12 @@
 //!
 //!   A pin the box *used* outlives its window. The first frame a pin
 //!   admits establishes its flow, and an established flow keeps its
-//!   admitted destination past window expiry until the flow ends (design
-//!   §5.3's conntrack-aware retention): a `git clone` or a long keep-alive
-//!   to an allowed name is not severed at the window's edge, while a *new*
-//!   connection to the same address after the window is refused until the
-//!   box re-resolves ([`admits_flow`]).
+//!   admitted destination past window expiry until the flow ends — a FIN
+//!   or RST, or [`FLOW_IDLE_CAP`] reclaiming a flow nothing has ridden for
+//!   a day (design §5.3's conntrack-aware retention): a `git clone` or a
+//!   long keep-alive to an allowed name is not severed at the window's
+//!   edge, while a *new* connection to the same address after the window
+//!   is refused until the box re-resolves ([`admits_flow`]).
 //! * **Refusing denied ranges** (NET-067) — an answer the intersection
 //!   refuses never enters the table, and each refusal says so through the
 //!   session's rate limiter with the name and the answer, once per name per
@@ -168,16 +169,23 @@ const TCP_FIN: u8 = 0x01;
 const TCP_RST: u8 = 0x04;
 
 /// How long an established flow keeps its pinned destination with no frame
-/// riding it (design §5.3): the retention's one memory bound. A day is
-/// past any live transport's keep-alive interval and past every
-/// retransmission schedule, so an idle day is a flow that ended without a
-/// FIN — the bound exists so a flow the box leaked cannot hold its pin for
-/// the rest of the box's uptime, which ends the whole table anyway.
+/// riding it (design §5.3): the retention's one staleness bound, enforced at
+/// every lookup — the conntrack's pattern, `UdpConntrack::allows_ingress` in
+/// `super::switch`, which reads its TTL on every lookup — and not only by the
+/// sweep under table pressure. A day is past any live transport's keep-alive
+/// interval and past every retransmission schedule, so an idle day is a flow
+/// that ended without a FIN — and it is the only release a UDP flow ever
+/// gets, since UDP carries no close signal for [`admits_flow`] to read
+/// (`tcp_flags` is zero for it). The bound exists so a flow the box leaked
+/// cannot hold its pin for the rest of the box's uptime, which ends the whole
+/// table anyway.
 const FLOW_IDLE_CAP: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Sweep idle flows once the table crosses this many entries, bounding
-/// memory under a box that opens more flows than it closes (the conntrack's
-/// pattern again).
+/// Sweep idle flows once the table crosses this many entries: the bound's
+/// *memory* half, reclaiming entries no frame ever comes back to look up.
+/// The *staleness* half is [`FLOW_IDLE_CAP`], checked at lookup, so this
+/// sweep only decides when the table is walked, never what it admits (the
+/// conntrack's pattern again).
 const FLOW_SWEEP_AT: usize = 4096;
 
 /// Largest DNS datagram the gate reads — the answerer's bound: a DNS message
@@ -237,6 +245,10 @@ pub(crate) struct DnsGate {
     /// the relay-level proof of the retention can shrink it: expiry cannot
     /// be observed in a test that would have to wait five minutes.
     window: Duration,
+    /// The flow idle cap, [`FLOW_IDLE_CAP`] in production. A field for the
+    /// same reason as [`Self::window`]: the release of an idle flow cannot
+    /// be observed in a test that would have to wait a day for it.
+    flow_idle_cap: Duration,
     /// The box's switch IP, the `session_id` of every log line and the
     /// limiter's key.
     label: String,
@@ -272,6 +284,7 @@ impl DnsGate {
             admitted: Mutex::new(HashMap::new()),
             flows: Mutex::new(HashMap::new()),
             window: ADMISSION_WINDOW,
+            flow_idle_cap: FLOW_IDLE_CAP,
             label: label.to_string(),
             limiter,
         }
@@ -283,6 +296,15 @@ impl DnsGate {
     #[cfg(test)]
     pub(crate) fn shrink_window(&mut self, window: Duration) {
         self.window = window;
+    }
+
+    /// Shrinks the flow idle cap — the window hook's twin, for the proofs
+    /// that an established flow is *released* by idleness: a flow that
+    /// went idle past the cap loses its pin, which cannot be written
+    /// against a day-long one.
+    #[cfg(test)]
+    pub(crate) fn shrink_flow_idle_cap(&mut self, cap: Duration) {
+        self.flow_idle_cap = cap;
     }
 
     /// Whether `name` is one the box's policy allowed — the trigger for
@@ -538,9 +560,12 @@ impl DnsGate {
     /// is done at the first segment and the flow carries itself from there —
     /// and every later frame refreshes it. The flow ends when the box sends
     /// a FIN or RST on it, whose own segment is admitted as the flow's last
-    /// frame, or when [`FLOW_IDLE_CAP`] reclaims a flow nothing has ridden
-    /// for a day. `pkt` is `None` for a frame with no L4 header to read: no
-    /// ports, no flow identity, so only the window can admit it.
+    /// frame, or when [`FLOW_IDLE_CAP`] reclaims it at the lookup of the
+    /// first frame to ride it after a day idle — the conntrack's pattern, so
+    /// the bound holds however small the table is, and the only release a
+    /// UDP flow, which carries no close signal to read, ever gets. `pkt` is
+    /// `None` for a frame with no L4 header to read: no ports, no flow
+    /// identity, so only the window can admit it.
     pub(crate) fn admits_flow(&self, dst: [u8; 4], pkt: Option<&L4Packet>, now: Instant) -> bool {
         let Some(pkt) = pkt else {
             return self.admits_destination(dst, now);
@@ -557,13 +582,26 @@ impl DnsGate {
         let ends = pkt.tcp_flags & (TCP_FIN | TCP_RST) != 0;
         {
             let mut flows = self.flows.lock().expect("DNS flow table mutex poisoned");
-            if flows.get(&key).is_some() {
-                if ends {
-                    flows.remove(&key);
-                } else {
-                    flows.insert(key, now);
+            match flows.get(&key).copied() {
+                // A live flow: the retention carries this frame, and the
+                // frame refreshes the clock the idle bound reads.
+                Some(seen) if now.duration_since(seen) < self.flow_idle_cap => {
+                    if ends {
+                        flows.remove(&key);
+                    } else {
+                        flows.insert(key, now);
+                    }
+                    return true;
                 }
-                return true;
+                // Idle past the cap: the flow is reclaimed here, at the
+                // lookup of the frame that would have ridden it — not by the
+                // sweep alone, which never runs under 4096 entries — and the
+                // frame falls through to the window, which is what decides
+                // whether the box may open this flow again.
+                Some(_) => {
+                    flows.remove(&key);
+                }
+                None => {}
             }
         }
         if !self.admits_destination(dst, now) {
@@ -577,7 +615,7 @@ impl DnsGate {
         let mut flows = self.flows.lock().expect("DNS flow table mutex poisoned");
         flows.insert(key, now);
         if flows.len() > FLOW_SWEEP_AT {
-            flows.retain(|_, seen| now.duration_since(*seen) < FLOW_IDLE_CAP);
+            flows.retain(|_, seen| now.duration_since(*seen) < self.flow_idle_cap);
         }
         true
     }
@@ -612,6 +650,23 @@ mod tests {
         sessions::SessionPolicy {
             egress: Some(sessions::EgressPolicy {
                 allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: Some(vec!["github.com".to_string()]),
+                deny_subnets: None,
+            }),
+            ingress: None,
+        }
+    }
+
+    /// The box that allows `github.com` over UDP: the same name-only grant as
+    /// [`github_only_egress`], with the one protocol a UDP flow needs declared
+    /// — the idle-bound proofs' box, since a UDP flow is the one that carries
+    /// no close signal for the gate to read and so can only ever be released
+    /// by idleness.
+    fn github_udp_egress() -> sessions::SessionPolicy {
+        sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy {
+                allow_protocols: Some(vec![sessions::IpProto::Udp]),
                 allow_subnets: Some(Vec::new()),
                 allow_dns_hosts: Some(vec!["github.com".to_string()]),
                 deny_subnets: None,
@@ -918,7 +973,10 @@ mod tests {
     /// The window is the gate's own production constant, so the relay is
     /// spawned with a window short enough for its expiry to happen inside
     /// the test; the retention being proved is the part that does not
-    /// depend on the window's length.
+    /// depend on the window's length. The *idle* cap is left at its
+    /// production length here — the flow this test leaves idle for two
+    /// seconds is a ridden flow inside it — and the two tests below prove
+    /// that cap itself.
     #[tokio::test]
     async fn established_flow_keeps_its_pin_past_the_window() {
         const PINNED: Ipv4Addr = Ipv4Addr::new(140, 82, 121, 3);
@@ -1044,6 +1102,305 @@ mod tests {
             .expect("a re-resolved name opens a new flow")
             .expect("the switch side stays open");
         assert_eq!(out, reopen, "re-resolution admits the address again");
+    }
+
+    /// [`FLOW_IDLE_CAP`]'s edge, against a fresh gate's own clock and the
+    /// production constants, where no sleep is needed to reach it: a flow the
+    /// box *rides* keeps its pin past the window and up to the cap, and the
+    /// same flow left *idle* past the cap is released — the distinction the
+    /// relay-level drops below rest on. `pkt` is the transport the caller is
+    /// proving, because the bound is the flow's, not the transport's.
+    fn assert_released_at_the_idle_cap(gate: &DnsGate, pkt: &L4Packet, pinned: [u8; 4]) {
+        let t0 = Instant::now();
+        gate.admit("github.com", &[pinned], t0);
+        assert!(
+            gate.admits_flow(pinned, Some(pkt), t0),
+            "the pin admits the flow's first frame"
+        );
+        let ridden = t0 + ADMISSION_WINDOW + Duration::from_secs(1);
+        assert!(
+            gate.admits_flow(pinned, Some(pkt), ridden),
+            "a flow past the window is retained while it is ridden"
+        );
+        let idle_at = ridden + FLOW_IDLE_CAP - Duration::from_secs(1);
+        assert!(
+            gate.admits_flow(pinned, Some(pkt), idle_at),
+            "the flow holds up to the cap while it is ridden"
+        );
+        assert!(
+            !gate.admits_flow(
+                pinned,
+                Some(pkt),
+                idle_at + FLOW_IDLE_CAP + Duration::from_nanos(1)
+            ),
+            "an idle flow past the cap is released at the lookup of its next frame"
+        );
+        assert!(
+            !gate.admits_flow(
+                pinned,
+                Some(pkt),
+                idle_at + FLOW_IDLE_CAP + Duration::from_secs(1)
+            ),
+            "the release holds until the box re-resolves"
+        );
+    }
+
+    /// [`FLOW_IDLE_CAP`] is read at the lookup of every frame, the conntrack's
+    /// pattern, and not only by the sweep that runs once the table crosses
+    /// [`FLOW_SWEEP_AT`] — which it never does for an ordinary box. So the one
+    /// flow a UDP resolution opens is released by idleness alone: UDP carries
+    /// no FIN or RST for the gate to read, so without this bound the box's
+    /// first pinned datagram would hold its destination for the rest of the
+    /// box's uptime.
+    ///
+    /// The relay is spawned with a window of a second and a cap of three, so
+    /// both edges land inside the test: the flow is ridden past the window
+    /// while it stays under the cap, goes idle past the cap, and the datagram
+    /// that would have ridden it is dropped. The unit half pins the same
+    /// boundary against the gate's own clock.
+    #[tokio::test]
+    async fn udp_flow_past_the_idle_cap_is_released() {
+        const PINNED: Ipv4Addr = Ipv4Addr::new(140, 82, 121, 3);
+        let mut harness = spawn_test_relay_with(&github_udp_egress(), |gate| {
+            gate.shrink_admission_window(Duration::from_secs(1));
+            gate.shrink_flow_idle_cap(Duration::from_secs(3));
+        });
+
+        // The box resolves github.com and the reply admits its address.
+        let query = udp_payload_frame(
+            LEASE,
+            40000,
+            RESOLVER,
+            53,
+            &dns_query("github.com.", RecordType::A),
+        );
+        harness.box_end.write_all(&query).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the query is forwarded");
+        let response = dns_response("github.com.", &[PINNED]);
+        let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, 40000, &response);
+        harness
+            .switch
+            .write_all(&wire_frame(&response_frame))
+            .await
+            .unwrap();
+        let _ = read_box_frame(&harness)
+            .await
+            .expect("the reply itself passes through to the box");
+
+        // A datagram to the pinned address rides the pin and establishes the
+        // flow — the only "connection" UDP ever opens.
+        let datagram = udp_payload_frame(LEASE, 40000, PINNED, 443, b"egress");
+        harness.box_end.write_all(&datagram).unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the pinned datagram is admitted")
+            .expect("the switch side stays open");
+        assert_eq!(out, datagram, "the flow's first datagram is admitted");
+
+        // The window passes while the flow is still ridden: the retention, not
+        // the window, carries the next datagram.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        harness.box_end.write_all(&datagram).unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("a ridden flow keeps its pin past the window")
+            .expect("the switch side stays open");
+        assert_eq!(
+            out, datagram,
+            "the flow is past the window and under the idle cap"
+        );
+
+        // Then it goes idle past the cap, and the datagram that would have
+        // ridden it is dropped — the release happens at the lookup of the
+        // frame itself, on a table of one flow.
+        tokio::time::sleep(Duration::from_millis(4200)).await;
+        let sentinel = arp_frame();
+        harness.box_end.write_all(&datagram).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay keeps deciding")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "a UDP flow idle past the cap loses its pin at the next lookup"
+        );
+
+        // The release was the idle bound, not a refusal of the address: the
+        // box re-resolves the name and the same flow opens again.
+        let requery = udp_payload_frame(
+            LEASE,
+            40002,
+            RESOLVER,
+            53,
+            &dns_query("github.com.", RecordType::A),
+        );
+        harness.box_end.write_all(&requery).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the re-query is forwarded");
+        harness
+            .switch
+            .write_all(&wire_frame(&udp_payload_frame(
+                RESOLVER,
+                53,
+                LEASE,
+                40002,
+                &dns_response("github.com.", &[PINNED]),
+            )))
+            .await
+            .unwrap();
+        let _ = read_box_frame(&harness)
+            .await
+            .expect("the re-resolution reaches the box");
+        harness.box_end.write_all(&datagram).unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("a re-resolved name opens the flow again")
+            .expect("the switch side stays open");
+        assert_eq!(out, datagram, "re-resolution admits the flow again");
+
+        // The bound itself, at its edge, against the gate's own clock: a
+        // ridden UDP flow is retained, an idle one released.
+        let gate = gate_for(&github_udp_egress());
+        assert_released_at_the_idle_cap(
+            &gate,
+            &L4Packet {
+                src: SocketAddrV4::new(LEASE, 40000),
+                dst: SocketAddrV4::new(PINNED, 443),
+                proto: crate::net::switch::IPPROTO_UDP,
+                tcp_flags: 0,
+            },
+            PINNED.octets(),
+        );
+    }
+
+    /// The TCP half of the same bound: a flow that ends without a FIN or RST
+    /// the relay ever sees — the box leaked it, or its close never made it
+    /// back — is released by idleness rather than holding its pin for the
+    /// rest of the box's uptime. A TCP flow that *is* ended is released by its
+    /// own last segment, which [`established_flow_keeps_its_pin_past_the_window`]
+    /// proves.
+    #[tokio::test]
+    async fn idle_tcp_flow_without_a_fin_is_released() {
+        const PINNED: Ipv4Addr = Ipv4Addr::new(140, 82, 121, 3);
+        let mut harness = spawn_test_relay_with(&github_only_egress(), |gate| {
+            gate.shrink_admission_window(Duration::from_secs(1));
+            gate.shrink_flow_idle_cap(Duration::from_secs(3));
+        });
+
+        // The box resolves github.com and the reply admits its address.
+        let query = udp_payload_frame(
+            LEASE,
+            40000,
+            RESOLVER,
+            53,
+            &dns_query("github.com.", RecordType::A),
+        );
+        harness.box_end.write_all(&query).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the query is forwarded");
+        let response = dns_response("github.com.", &[PINNED]);
+        let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, 40000, &response);
+        harness
+            .switch
+            .write_all(&wire_frame(&response_frame))
+            .await
+            .unwrap();
+        let _ = read_box_frame(&harness)
+            .await
+            .expect("the reply itself passes through to the box");
+
+        // The connection opens inside the window and its flow is established.
+        let syn = egress_tcp_segment(LEASE, 40000, PINNED, 443, SYN);
+        harness.box_end.write_all(&syn).unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the pinned connection opens")
+            .expect("the switch side stays open");
+        assert_eq!(out, syn, "the flow's SYN is admitted inside the window");
+
+        // The window passes while the flow is ridden: an ordinary segment
+        // still rides it.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let data = egress_tcp_segment(LEASE, 40000, PINNED, 443, ACK);
+        harness.box_end.write_all(&data).unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("a ridden flow keeps its pin past the window")
+            .expect("the switch side stays open");
+        assert_eq!(
+            out, data,
+            "the flow is past the window and under the idle cap"
+        );
+
+        // The box never closes the connection: no FIN, no RST, nothing rides
+        // the flow for the cap's length. The segment that would have ridden
+        // it next is dropped, released by idleness alone.
+        tokio::time::sleep(Duration::from_millis(4200)).await;
+        let sentinel = arp_frame();
+        harness.box_end.write_all(&data).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay keeps deciding")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "an idle TCP flow with no FIN is released at the idle cap"
+        );
+
+        // And re-resolution opens the flow again: the release was the idle
+        // bound, not a refusal of the address.
+        let requery = udp_payload_frame(
+            LEASE,
+            40002,
+            RESOLVER,
+            53,
+            &dns_query("github.com.", RecordType::A),
+        );
+        harness.box_end.write_all(&requery).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the re-query is forwarded");
+        harness
+            .switch
+            .write_all(&wire_frame(&udp_payload_frame(
+                RESOLVER,
+                53,
+                LEASE,
+                40002,
+                &dns_response("github.com.", &[PINNED]),
+            )))
+            .await
+            .unwrap();
+        let _ = read_box_frame(&harness)
+            .await
+            .expect("the re-resolution reaches the box");
+        let reopen = egress_tcp_segment(LEASE, 40000, PINNED, 443, ACK);
+        harness.box_end.write_all(&reopen).unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("a re-resolved name opens the flow again")
+            .expect("the switch side stays open");
+        assert_eq!(out, reopen, "re-resolution admits the flow again");
+
+        // The bound itself, at its edge, against the gate's own clock: an
+        // idle TCP segment is released as a UDP datagram is.
+        let gate = test_gate();
+        assert_released_at_the_idle_cap(
+            &gate,
+            &L4Packet {
+                src: SocketAddrV4::new(LEASE, 40000),
+                dst: SocketAddrV4::new(PINNED, 443),
+                proto: crate::net::switch::IPPROTO_TCP,
+                tcp_flags: ACK,
+            },
+            PINNED.octets(),
+        );
     }
 
     /// An allowed name that resolves into a denied range is refused: the
