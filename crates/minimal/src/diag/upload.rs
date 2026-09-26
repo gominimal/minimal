@@ -61,7 +61,8 @@ pub async fn upload(
     token: &str,
     note: &str,
 ) -> Result<Uploaded, anyhow::Error> {
-    let base = &checked_base(endpoint)?;
+    let (base, local_only) = checked_base(endpoint)?;
+    let base = &base;
     let size = tokio::fs::metadata(path)
         .await
         .with_context(|| format!("reading {}", path.display()))?
@@ -90,10 +91,15 @@ pub async fn upload(
     // following whatever URL it returns, and a 3xx would walk straight around
     // that: reqwest follows up to ten by default, to any host. A portal that
     // wants the bytes elsewhere can say so in the path it hands back.
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("building the HTTP client")?;
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    // The loopback exception is only sound if the request actually stays on
+    // the machine. reqwest honours HTTP_PROXY by default, so without this a
+    // proxy in the environment would carry the token off the host through the
+    // very case that was allowed for being local.
+    if local_only {
+        builder = builder.no_proxy();
+    }
+    let client = builder.build().context("building the HTTP client")?;
 
     let created = client
         .post(format!("{base}/diag/api/diagnoses"))
@@ -157,7 +163,7 @@ pub async fn upload(
     })
 }
 
-/// The endpoint to upload to, once it is known not to leak the token.
+/// The endpoint to upload to, and whether the client must refuse proxies.
 ///
 /// The upload presents a GitHub token, so the scheme is the caller's to get
 /// wrong and this function's to refuse. Plain HTTP is allowed only to a
@@ -167,8 +173,10 @@ pub async fn upload(
 /// reason the length is: a refusal should not cost a file read.
 ///
 /// The trailing slash is trimmed here too, so the URLs built below cannot
-/// differ by one.
-fn checked_base(endpoint: &str) -> Result<String, anyhow::Error> {
+/// differ by one. The flag returned alongside it is true for the loopback
+/// case, which the caller turns into a client that ignores HTTP_PROXY: the
+/// exception is granted for the request staying on the machine, so it has to.
+fn checked_base(endpoint: &str) -> Result<(String, bool), anyhow::Error> {
     let base = endpoint.trim_end_matches('/');
     let url = Url::parse(base).with_context(|| format!("{base} is not a URL"))?;
     let loopback = match url.host() {
@@ -177,15 +185,15 @@ fn checked_base(endpoint: &str) -> Result<String, anyhow::Error> {
         Some(Host::Ipv6(ip)) => ip.is_loopback(),
         None => false,
     };
-    match url.scheme() {
-        "https" => {}
-        "http" if loopback => {}
+    let local_only = match url.scheme() {
+        "https" => false,
+        "http" if loopback => true,
         "http" => {
             bail!("{base} is plain http, and the upload carries a token; name an https portal")
         }
         scheme => bail!("{base} speaks {scheme}; the portal is reached over https"),
-    }
-    Ok(base.to_owned())
+    };
+    Ok((base.to_owned(), local_only))
 }
 
 /// The portal's own words for a refusal.
@@ -278,13 +286,16 @@ mod tests {
     fn a_portal_that_would_leak_the_token_is_refused() {
         // Loopback is how the portal is served while it is being worked on,
         // and nothing leaves the machine, so plain http is allowed there.
-        for ok in [
-            "https://agents.minimal.farm",
-            "http://127.0.0.1:8787",
-            "http://localhost:8787",
-            "http://[::1]:8787",
+        // The flag is what makes the loopback exception safe: the caller
+        // turns it into a client that ignores HTTP_PROXY, so an http upload
+        // cannot be carried off the machine by a proxy in the environment.
+        for (ok, local_only) in [
+            ("https://agents.minimal.farm", false),
+            ("http://127.0.0.1:8787", true),
+            ("http://localhost:8787", true),
+            ("http://[::1]:8787", true),
         ] {
-            assert!(checked_base(ok).is_ok(), "{ok}");
+            assert_eq!(checked_base(ok).unwrap().1, local_only, "{ok}");
         }
 
         let err = checked_base("http://agents.minimal.farm")
@@ -305,7 +316,7 @@ mod tests {
     #[test]
     fn a_trailing_slash_is_trimmed() {
         assert_eq!(
-            checked_base("https://agents.minimal.farm/").unwrap(),
+            checked_base("https://agents.minimal.farm/").unwrap().0,
             "https://agents.minimal.farm"
         );
     }
