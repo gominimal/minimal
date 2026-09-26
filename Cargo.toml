@@ -59,6 +59,44 @@ package.rust-version = "1.95"
 # leaves it stale or not strictly greater than the newest v* tag.
 package.version = "0.6.0"
 
+# Workspace lint policy. A crate opts in with `[lints] workspace = true`.
+#
+# Only lints already clean across the workspace live here: CI's clippy job runs
+# `-D warnings`, which promotes a `warn` lint into a hard error, so a single
+# remaining hit would fail every PR. These 15 have zero hits today and act as
+# tripwires against new ones. The stricter lints that still have legacy sites
+# (unwrap_used, indexing_slicing, let_underscore_must_use, ...) are enforced on
+# changed lines by `just clippy-strict` instead — see scripts/clippy-strict.sh —
+# and should be promoted here as their counts reach zero. Test code is exempt
+# from the panic family in clippy.toml.
+[workspace.lints.rust]
+# The kani proof harnesses (sessions, rcache) are gated on `cfg(kani)`, a
+# custom cfg. Declaring it once here keeps rustc's unexpected_cfgs lint quiet
+# on the normal (non-kani) builds without every crate repeating the check-cfg.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[workspace.lints.clippy]
+# Panic / silent-failure tripwires.
+unchecked_time_subtraction = "warn"
+let_underscore_future = "warn"
+# Holding a lock across .await.
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+# Safety documentation hygiene.
+unnecessary_safety_doc = "warn"
+# Numeric correctness.
+float_cmp = "warn"
+float_cmp_const = "warn"
+lossy_float_literal = "warn"
+invalid_upcast_comparisons = "warn"
+# Easily-avoided footguns.
+rc_mutex = "warn"
+debug_assert_with_mut_call = "warn"
+iter_not_returning_iterator = "warn"
+expl_impl_clone_on_copy = "warn"
+infallible_try_from = "warn"
+dbg_macro = "warn"
+
 [profile.release]
 strip = true
 lto = true
