@@ -17,6 +17,7 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use serde_json_lenient::{Value, json};
@@ -48,6 +49,17 @@ pub struct Uploaded {
 /// refusal would arrive from the portal after the whole file had been pulled
 /// into memory to be hashed.
 const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How long to wait for the portal to answer at all.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long to wait between bytes once it has.
+///
+/// The deadline is on inactivity rather than on the whole request because a
+/// bundle is up to [`MAX_BUNDLE_BYTES`] and may be going over a slow link: an
+/// upload that is merely slow has to be allowed to finish, while a portal that
+/// accepts the connection and then says nothing must not hang the command.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Sends a bundle and returns where its diagnosis will appear.
 ///
@@ -91,7 +103,10 @@ pub async fn upload(
     // following whatever URL it returns, and a 3xx would walk straight around
     // that: reqwest follows up to ten by default, to any host. A portal that
     // wants the bytes elsewhere can say so in the path it hands back.
-    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT);
     // The loopback exception is only sound if the request actually stays on
     // the machine. reqwest honours HTTP_PROXY by default, so without this a
     // proxy in the environment would carry the token off the host through the
