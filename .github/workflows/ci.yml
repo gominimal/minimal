@@ -47,8 +47,8 @@ jobs:
               # and pushes to main / dispatches run everything regardless.
               # `code` = anything that is not documentation; the negations
               # mirror the old paths-ignore list. `workflows` = anything under
-              # .github/ (workflows, composite actions, and the actionlint /
-              # zizmor configs, listed explicitly), which gates `workflow-lint`.
+              # .github/: the `**` glob covers workflows, composite actions and
+              # the actionlint / zizmor configs alike; it gates `workflow-lint`.
               if: github.event_name == 'pull_request'
               uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d
               with:
@@ -62,8 +62,6 @@ jobs:
                         - "!LICENSE"
                       workflows:
                         - ".github/**"
-                        - ".github/actionlint.yaml"
-                        - ".github/zizmor.yml"
 
     fmt:
         needs: [changes]
