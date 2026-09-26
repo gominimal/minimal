@@ -1820,7 +1820,10 @@ mod tests {
     /// A minimal Ethernet II + IPv4 + TCP frame to `dst:port`, built byte by
     /// byte in the shape the relay's egress leg reads: 14-byte Ethernet
     /// header, EtherType 0x0800, minimum IPv4 header with protocol 6 and the
-    /// destination at offset 16, and the L4 destination port behind it.
+    /// destination at offset 16, and the L4 destination port behind the IPv4
+    /// header, at `ip[ihl + 2..ihl + 4]` — the same offset
+    /// `switch::tcp_frame_summary` writes and `egress::summarize` reads, so
+    /// the parity property compares two frames that name the same port.
     fn tcp_frame_to(dst: Ipv4Addr, port: u16) -> Vec<u8> {
         let mut frame = [0u8; 14 + 20 + 4];
         frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
@@ -1828,7 +1831,7 @@ mod tests {
         ip[0] = 0x45;
         ip[9] = 6;
         ip[16..20].copy_from_slice(&dst.octets());
-        ip[20..22].copy_from_slice(&port.to_be_bytes());
+        ip[22..24].copy_from_slice(&port.to_be_bytes());
         frame.to_vec()
     }
 

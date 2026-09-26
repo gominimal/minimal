@@ -850,7 +850,10 @@ fn tcp_frame_summary(dst: Ipv4Addr, dst_port: u16) -> FrameSummary {
     ip[0] = 0x45; // IPv4, IHL 5 (the 20-byte header below).
     ip[9] = IPPROTO_TCP;
     ip[16..20].copy_from_slice(&dst.octets());
-    ip[SYNTH_IPV4_HDR..SYNTH_IPV4_HDR + 2].copy_from_slice(&dst_port.to_be_bytes());
+    // The L4 destination port, at the offset `summarize` reads it from
+    // (`ip[ihl + 2..ihl + 4]`) — the two bytes *after* the 20-byte IPv4
+    // header, not the source-port slot inside it.
+    ip[SYNTH_IPV4_HDR + 2..SYNTH_IPV4_HDR + 4].copy_from_slice(&dst_port.to_be_bytes());
     egress::summarize(&frame)
 }
 
@@ -1278,6 +1281,32 @@ mod tests {
             SwitchSubnet::default(),
         );
         assert!(empty.allowed.is_empty() && empty.udp_allowed.is_empty());
+    }
+
+    /// The synthesized frame the proxy's verdict reads names the connection's
+    /// destination port: `tcp_frame_summary` writes it at the offset
+    /// `egress::summarize` extracts it from (`ip[ihl + 2..ihl + 4]`, the two
+    /// bytes after the IPv4 header), not the L4 source-port slot inside it, so
+    /// the summary a proxied request is put to and the one a direct
+    /// connection's frame carries are the same at the port level (NET-070,
+    /// NET-071) and a port-shaped rule the egress verdict ever grows sees the
+    /// port the request named.
+    #[test]
+    fn tcp_frame_summary_names_the_destination_port() {
+        let dst = Ipv4Addr::new(100, 64, 0, 9);
+        for port in [1u16, 53, 1024, 8080, u16::MAX] {
+            assert_eq!(
+                tcp_frame_summary(dst, port).destination_port(),
+                port,
+                "the summary must carry destination port {port}"
+            );
+        }
+        // The rest of the summary is the frame's own: the address and protocol
+        // the verdict decides by, and no port to read when there is none.
+        let summary = tcp_frame_summary(dst, 8080);
+        assert_eq!(summary.destination(), Some(dst.octets()));
+        assert_eq!(summary.protocol(), Some(IPPROTO_TCP));
+        assert_eq!(tcp_frame_summary(dst, 0).destination_port(), 0);
     }
 
     /// Builds an Ethernet II + IPv4 + UDP frame for the conntrack tests.
