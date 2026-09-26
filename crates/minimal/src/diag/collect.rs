@@ -694,19 +694,29 @@ struct VolumeInfo {
     exists: bool,
     apparent_bytes: Option<u64>,
     allocated_bytes: Option<u64>,
+    /// A non-`NotFound` stat failure (permission, I/O). "Absent" and
+    /// "unreadable" are different diagnoses and must not collapse into the
+    /// same `exists: false`, mirroring `guest::volume_fallback`.
+    error: Option<String>,
 }
 
 /// Reads the data volume image's sizes, best-effort: an absent image is
-/// `exists: false` with `None` sizes, never an error.
+/// `exists: false` with `None` sizes, while a non-`NotFound` stat failure is
+/// preserved in `error` rather than reported as a missing image.
 fn volume_info(dir: &Path) -> VolumeInfo {
     use std::os::unix::fs::MetadataExt as _;
     let image = dir.join("data-vol.raw");
-    let meta = std::fs::metadata(&image).ok();
+    let (meta, error) = match std::fs::metadata(&image) {
+        Ok(m) => (Some(m), None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(e) => (None, Some(e.to_string())),
+    };
     VolumeInfo {
         path: image.display().to_string(),
         exists: meta.is_some(),
         apparent_bytes: meta.as_ref().map(std::fs::Metadata::len),
         allocated_bytes: meta.as_ref().map(|m| m.blocks() * 512),
+        error,
     }
 }
 
