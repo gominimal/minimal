@@ -13,7 +13,8 @@ use std::path::Path;
 
 use common::setup;
 use minimal::GlobalArgs;
-use minimal::diag::{BugArgs, cmd_bug};
+use minimal::diag::upload::DEFAULT_ENDPOINT;
+use minimal::diag::{BugArgs, PortalArgs, cmd_bug};
 
 /// Unpacks a `.tar.zst` bundle and returns `path-inside-archive -> contents`
 /// (paths include the bundle's root directory).
@@ -93,6 +94,12 @@ fn bug_args(out: &Path) -> BugArgs {
         no_guest: false,
         guest_timeout_secs: 60,
         log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+        upload: false,
+        portal: PortalArgs {
+            context: None,
+            token: None,
+            endpoint: DEFAULT_ENDPOINT.to_string(),
+        },
     }
 }
 

@@ -3970,6 +3970,7 @@ dependencies = [
  "clap_complete",
  "diagnostics",
  "dirs",
+ "hex",
  "inquire",
  "mctx",
  "mfile",
@@ -3982,10 +3983,12 @@ dependencies = [
  "op",
  "ot",
  "paths",
+ "reqwest",
  "russh",
  "serde",
  "serde_json_lenient",
  "sessions",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -3993,6 +3996,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "url",
  "version",
 ]
 
