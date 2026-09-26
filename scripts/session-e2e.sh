@@ -2079,6 +2079,23 @@ proof_native_resolution_without_proxy_env() {
     fi
   else
     if [ -n "$native_cmd" ]; then
+      # Record the link BEFORE running the command, so a half-failed run
+      # still leaves the teardown a link to remove: the command creates
+      # the dedicated link and then configures DNS on it, so the creation
+      # can succeed while a later `resolvectl` step fails — and a teardown
+      # with no link recorded would skip the undo below and leave the link
+      # on a host the soak's next iteration expects to find as this one
+      # did. Undoing is the teardown's `resolvectl revert` on this link —
+      # restoring its DNS state, whatever this host had before the proof
+      # touched it — and `ip link del`, removing the dedicated link the
+      # command created.
+      NATIVE_REVERT_LINK="$(printf '%s\n' "$native_cmd" \
+        | sed -n 's/.*resolvectl dns \([^ ][^ ]*\) .*/\1/p')"
+      if [ -z "$NATIVE_REVERT_LINK" ]; then
+        echo "::error::could not find the link in the advisory's command, so it was not run — this run cannot undo a command it cannot name (got: '$native_cmd')"
+        echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
+        fail
+      fi
       # Run the exact command the advisory printed — verbatim, as the user
       # would have. Passwordless sudo is the gate above, so it cannot prompt.
       if ! sh -c "$native_cmd" >"$WORK/native-cmd.out" 2>"$WORK/native-cmd.err"; then
@@ -2088,12 +2105,6 @@ proof_native_resolution_without_proxy_env() {
         fail
       fi
       echo "ran the advisory's command"
-      # Undo it afterwards: the teardown runs `resolvectl revert` on this
-      # link — restoring its DNS state, whatever this host had before the
-      # proof touched it — and `ip link del`, removing the dedicated link
-      # the command created.
-      NATIVE_REVERT_LINK="$(printf '%s\n' "$native_cmd" \
-        | sed -n 's/.*resolvectl dns \([^ ][^ ]*\) .*/\1/p')"
     elif [ -n "$native_bypassed" ]; then
       echo "no command to run: this host's lookups bypass systemd-resolved's stub, so no routing-domain command could reach them"
     else
