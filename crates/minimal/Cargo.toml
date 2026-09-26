@@ -73,6 +73,9 @@ toml.workspace = true
 toml_edit.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Parsing the diag portal's endpoint to check its scheme before the
+# upload puts a bearer token on the wire.
+url.workspace = true
 version.workspace = true
 
 # default-features = false drops minvmd's `libkrun` feature: the CLI only uses

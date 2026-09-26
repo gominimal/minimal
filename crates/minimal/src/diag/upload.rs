@@ -21,6 +21,7 @@ use std::process::Stdio;
 use anyhow::{Context as _, bail};
 use serde_json_lenient::{Value, json};
 use sha2::{Digest as _, Sha256};
+use url::{Host, Url};
 
 /// Where the portal lives.
 ///
@@ -60,6 +61,7 @@ pub async fn upload(
     token: &str,
     note: &str,
 ) -> Result<Uploaded, anyhow::Error> {
+    let base = &checked_base(endpoint)?;
     let size = tokio::fs::metadata(path)
         .await
         .with_context(|| format!("reading {}", path.display()))?
@@ -83,8 +85,6 @@ pub async fn upload(
         .with_context(|| format!("{} has no file name to tell the portal", path.display()))?;
     let sha256 = hex::encode(Sha256::digest(&bytes));
 
-    // Trimmed once, here, so the two URLs below cannot differ by a slash.
-    let base = endpoint.trim_end_matches('/');
     // Redirects are not followed. Keeping the bundle on the host the operator
     // named is the point of joining the portal's path to `base` rather than
     // following whatever URL it returns, and a 3xx would walk straight around
@@ -155,6 +155,37 @@ pub async fn upload(
         report_url: format!("{base}/diag/{id}"),
         status_url: format!("{base}/diag/api/diagnoses/{id}"),
     })
+}
+
+/// The endpoint to upload to, once it is known not to leak the token.
+///
+/// The upload presents a GitHub token, so the scheme is the caller's to get
+/// wrong and this function's to refuse. Plain HTTP is allowed only to a
+/// loopback host, which is how the portal is served while it is being worked
+/// on; anything else must be HTTPS, because a bearer credential does not go
+/// on the wire in clear. Checked before the bundle is read, for the same
+/// reason the length is: a refusal should not cost a file read.
+///
+/// The trailing slash is trimmed here too, so the URLs built below cannot
+/// differ by one.
+fn checked_base(endpoint: &str) -> Result<String, anyhow::Error> {
+    let base = endpoint.trim_end_matches('/');
+    let url = Url::parse(base).with_context(|| format!("{base} is not a URL"))?;
+    let loopback = match url.host() {
+        Some(Host::Domain(host)) => host == "localhost",
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        "http" => {
+            bail!("{base} is plain http, and the upload carries a token; name an https portal")
+        }
+        scheme => bail!("{base} speaks {scheme}; the portal is reached over https"),
+    }
+    Ok(base.to_owned())
 }
 
 /// The portal's own words for a refusal.
@@ -239,6 +270,44 @@ mod tests {
         // Valid JSON, but not a refusal: there is no sentence to lift, so the
         // body itself is the most informative thing left.
         assert_eq!(refusal(r#"{"state":"queued"}"#), r#"{"state":"queued"}"#);
+    }
+
+    /// The bundle is uploaded with a bearer token, so an endpoint that would
+    /// put that token on the wire in clear is refused rather than used.
+    #[test]
+    fn a_portal_that_would_leak_the_token_is_refused() {
+        // Loopback is how the portal is served while it is being worked on,
+        // and nothing leaves the machine, so plain http is allowed there.
+        for ok in [
+            "https://agents.minimal.farm",
+            "http://127.0.0.1:8787",
+            "http://localhost:8787",
+            "http://[::1]:8787",
+        ] {
+            assert!(checked_base(ok).is_ok(), "{ok}");
+        }
+
+        let err = checked_base("http://agents.minimal.farm")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plain http"), "{err}");
+
+        // Not a transport that can carry the request at all, and `file://`
+        // would read the local disk rather than reach a portal.
+        let err = checked_base("file:///etc/passwd").unwrap_err().to_string();
+        assert!(err.contains("speaks file"), "{err}");
+
+        assert!(checked_base("agents.minimal.farm").is_err());
+    }
+
+    /// The trailing slash is trimmed once, so the two URLs the upload builds
+    /// cannot differ by one.
+    #[test]
+    fn a_trailing_slash_is_trimmed() {
+        assert_eq!(
+            checked_base("https://agents.minimal.farm/").unwrap(),
+            "https://agents.minimal.farm"
+        );
     }
 
     /// Both refusals happen on the file's length, before a byte is read and
