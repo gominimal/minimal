@@ -638,7 +638,7 @@ impl Session {
         // (R3.1/R3.6). A `Draft` session has nothing to route to yet, so
         // `register_hostname` no-ops until its loadout finalizes.
         #[cfg(target_os = "linux")]
-        actor.register_hostname(obj.record());
+        actor.register_hostname(obj.record()).await;
 
         tokio::spawn(actor.mainloop());
         Ok(SessionHandle(sender))
@@ -649,23 +649,46 @@ impl Session {
     /// path has reported its lease — at spawn that report has not happened
     /// yet, so this registers nothing and the route appears when the box
     /// attaches (NET-001); on a rename or re-finalize the reported lease is
-    /// already on file and the name re-registers against it. A NoNet PTask
-    /// exposes no services, so it is not registered — and neither is a
+    /// already on file and the name re-registers against it, carrying the
+    /// ports the session's ingress declaration publishes (NET-069) — an empty
+    /// set, and so a deny-all gate, when the box declares no ingress: that is
+    /// the posture its own relay gate gives a direct connection, and the
+    /// proxy's must match on every host form (NET-071). A NoNet
+    /// PTask exposes no services, so it is not registered — and neither is a
     /// `Draft` session, which has nothing to route to until its composition
     /// finalizes.
+    ///
+    /// An `OwnIp` PTask is also recorded as the *caller* a proxied request
+    /// from it is checked against (NET-070): its egress declaration, over the
+    /// switch its own relay is attached to, is kept until the box's lease
+    /// joins onto it, and the rules built there are the ones its own outbound
+    /// frames are decided by on the switch
+    /// ([`crate::net::switch::compiled_egress`] over the switch's subnet, so
+    /// the resolver carve-out matches too, and with the box's lease, so the
+    /// verdict's source check does too — NET-084), so a request from the box
+    /// through the hostname proxy meets its own declaration — exactly what a
+    /// direct connection from it meets (NET-071).
     #[cfg(target_os = "linux")]
-    fn register_hostname(&self, record: &Record) {
+    async fn register_hostname(&self, record: &Record) {
         if !self.owns_hostname_route(record) {
             return;
         }
         let name = registry_name(record);
+        // Scoped: the switch lock is dropped before the registry is taken, so
+        // no path holds both.
+        let subnet = self.net_switch.lock().await.subnet();
         let mut reg = self
             .hostnames
             .write()
             .expect("hostname registry lock poisoned");
         match record.network {
             sessions::NetworkMode::OwnIp => {
-                reg.register_own_ip(record.id, &name);
+                reg.register_caller(record.id, &name, &record.policy, subnet);
+                reg.register_own_ip(
+                    record.id,
+                    &name,
+                    crate::net::switch::declared_request_ports(Some(&record.policy)),
+                );
             }
             sessions::NetworkMode::HostNet => {
                 reg.register_host_net(record.id, &name);
@@ -1352,7 +1375,7 @@ impl Session {
                 record.status = SessionStatus::Active;
                 self.record.write(record.clone()).await?;
                 #[cfg(target_os = "linux")]
-                self.register_hostname(&record);
+                self.register_hostname(&record).await;
                 Ok(ran)
             }
             SessionStatus::Pending => Err(std::io::Error::new(
@@ -1517,7 +1540,8 @@ impl Session {
         self.register_hostname(match &written {
             Ok(_) => &new_record,
             Err(_) => &record,
-        });
+        })
+        .await;
 
         written
     }
