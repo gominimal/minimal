@@ -95,7 +95,11 @@ fn announce_to_the_runner(proof: &str) {
             } else {
                 "a panic carrying no message".to_string()
             };
-            let reason: String = reason.replace(['\r', '\n'], " ").chars().take(512).collect();
+            let reason: String = reason
+                .replace(['\r', '\n'], " ")
+                .chars()
+                .take(512)
+                .collect();
             if let Some(location) = info.location() {
                 tell_the_runner(&format!(
                     "::error file={},line={},title={proof}::capability proof failed: {reason}",
