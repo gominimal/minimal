@@ -249,7 +249,9 @@ of file paths to be mapped in, and the corresponding map mode. The map mode may 
 string "read-only" / "ro" for read-only mappings, or the string "read-write" / "rw" for writeable
 mappings.
 
-If a mapped file or directory does not exist on the host, an empty file or directory is created.
+If a mapped file or directory does not exist on the host, a read-write mapping creates an empty
+file or directory. A read-only mapping never creates its source: the path must already exist, and a
+missing read-only source is an error naming the task and the patch declaration.
 
 Mapped paths must be absolute or start with `~/`, in which case the tilde is expanded to the user's
 home directory.
