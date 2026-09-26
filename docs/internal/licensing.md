@@ -20,8 +20,8 @@ for the exceptions explained below.
 
 ### malachite family: document-and-accept
 
-Five crates (`malachite`, `malachite-base`, `malachite-float`,
-`malachite-nz`, `malachite-q`) are licensed LGPL-3.0-only and are
+The crates `malachite`, `malachite-base`, `malachite-float`,
+`malachite-nz`, and `malachite-q` are licensed LGPL-3.0-only and are
 statically linked into our binaries. They are pulled in transitively via
 the `nickel-lang-core` git dependency; we do not depend on them
 directly.
