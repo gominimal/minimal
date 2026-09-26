@@ -245,16 +245,20 @@ const SUN_PATH_MAX: usize = 107;
 /// for, because a box there cannot be built at all.
 fn base_dir() -> PathBuf {
     let mut refusals = Vec::new();
-    for candidate in base_dir_candidates() {
-        match hosts_a_box(&candidate) {
-            Ok(()) => return candidate,
-            Err(reason) => refusals.push(format!("{}: {}", candidate.display(), reason)),
-        }
-    }
-    panic!(
+    let chosen = base_dir_candidates()
+        .into_iter()
+        .find(|candidate| match hosts_a_box(candidate) {
+            Ok(()) => true,
+            Err(reason) => {
+                refusals.push(format!("{}: {}", candidate.display(), reason));
+                false
+            }
+        });
+    let no_candidate = format!(
         "no directory on this host can host a box: {}",
         refusals.join("; ")
     );
+    chosen.expect(&no_candidate)
 }
 
 /// The directories to try, in preference order: the host's tmp first — the
