@@ -77,6 +77,38 @@ pub(crate) const RESOLV_CONF: &str = "/etc/resolv.conf";
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const RESOLVED_STUB: &str = "127.0.0.53";
 
+/// `/etc/nsswitch.conf`: the file that names the sources a host lookup
+/// consults, in the order it consults them — the routing the stub-bypass
+/// blocker reads before it decides a foreign `/etc/resolv.conf` can keep
+/// this host's lookups from systemd-resolved.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const NSSWITCH_CONF: &str = "/etc/nsswitch.conf";
+
+/// The `resolve` NSS source's module, by the exact name glibc dlopen's for
+/// it: the file whose presence makes a `resolve` entry in the `hosts:` chain
+/// a source host lookups can consult at all.
+#[cfg(any(test, not(target_os = "macos")))]
+const NSS_RESOLVE_MODULE: &str = "libnss_resolve.so.2";
+
+/// The directories glibc finds NSS service modules in, on the layouts the
+/// shipped hosts run: Debian and Ubuntu's multiarch directories, then the
+/// `/usr/lib64` layout Fedora and Alpine use, then the unmerged `/lib` and
+/// the plain `/usr/lib` of a 32-bit host. A host with the module somewhere
+/// else keeps the blocker — the safe arm, naming no command rather than
+/// naming one this cannot prove the chain reaches.
+#[cfg(any(test, not(target_os = "macos")))]
+const NSS_MODULE_DIRS: &[&str] = &[
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    "/usr/lib/powerpc64le-linux-gnu",
+    "/usr/lib/riscv64-linux-gnu",
+    "/usr/lib/s390x-linux-gnu",
+    "/usr/lib64",
+    "/lib64",
+    "/lib",
+    "/usr/lib",
+];
+
 /// The state of the host resolver's hook for [`ZONE`]: what was read, and
 /// the port it points the zone's lookups at, if any.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -253,9 +285,232 @@ pub(crate) fn routing_domain_hook(domain_output: Option<&str>, dns_output: Optio
     }
 }
 
+/// What an `nsswitch.conf` action rule makes the chain do after the source
+/// it follows reports a status.
+#[cfg(any(test, not(target_os = "macos")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainAction {
+    /// Stop the walk and return what this source reported.
+    Return,
+    /// Walk on to the next source.
+    Continue,
+    /// Take this source's answer and walk on anyway.
+    Merge,
+}
+
+/// One status an NSS source reports for a lookup, as `nsswitch.conf`'s
+/// action rules name them.
+#[cfg(any(test, not(target_os = "macos")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LookupStatus {
+    Success,
+    NotFound,
+    Unavail,
+    TryAgain,
+}
+
+impl LookupStatus {
+    /// The statuses a source that does not hold the zone's names can report
+    /// for one: the misses. A rule that returns on a miss ends the walk
+    /// before any source after it is reached.
+    fn misses() -> [LookupStatus; 3] {
+        [
+            LookupStatus::NotFound,
+            LookupStatus::Unavail,
+            LookupStatus::TryAgain,
+        ]
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        match word.to_ascii_lowercase().as_str() {
+            "success" => Some(LookupStatus::Success),
+            "notfound" => Some(LookupStatus::NotFound),
+            "unavail" => Some(LookupStatus::Unavail),
+            "tryagain" => Some(LookupStatus::TryAgain),
+            _ => None,
+        }
+    }
+}
+
+/// One `[STATUS=action]` rule of `nsswitch.conf`, the `!` negation included.
+#[cfg(any(test, not(target_os = "macos")))]
+struct HostsRule {
+    /// The status the rule names, or `None` when it names none.
+    status: Option<LookupStatus>,
+    /// Whether the rule decides every status *but* the one it names.
+    negated: bool,
+    action: ChainAction,
+}
+
+impl HostsRule {
+    /// Whether this rule is the one that decides `status`: a plain rule
+    /// decides the status it names, a negated one every status except it.
+    fn decides(&self, status: LookupStatus) -> bool {
+        match self.status {
+            None => true,
+            Some(named) => (named == status) != self.negated,
+        }
+    }
+}
+
+/// One source of an `nsswitch.conf` `hosts:` chain: its name and the action
+/// rules written after it.
+#[cfg(any(test, not(target_os = "macos")))]
+struct HostsSource {
+    name: String,
+    rules: Vec<HostsRule>,
+}
+
+impl HostsSource {
+    /// What the chain does after this source reports `status`: the last rule
+    /// that decides it, else glibc's default — the walk returns on a hit and
+    /// continues past a miss, which is what makes `hosts: files dns` consult
+    /// `dns` at all.
+    fn action_for(&self, status: LookupStatus) -> ChainAction {
+        let mut action = match status {
+            LookupStatus::Success => ChainAction::Return,
+            _ => ChainAction::Continue,
+        };
+        for rule in &self.rules {
+            if rule.decides(status) {
+                action = rule.action;
+            }
+        }
+        action
+    }
+
+    /// Whether a lookup this source cannot answer walks on to the next one:
+    /// every miss continues, the defaults included.
+    fn passes_a_miss_by(&self) -> bool {
+        LookupStatus::misses()
+            .iter()
+            .all(|miss| self.action_for(*miss) == ChainAction::Continue)
+    }
+}
+
+/// The rules inside one bracket group, comma-separated as `nsswitch.conf`
+/// writes them. `None` when one does not parse: a chain carrying a rule this
+/// cannot read is a chain this cannot speak for.
+#[cfg(any(test, not(target_os = "macos")))]
+fn parse_hosts_rules(rules: &str) -> Option<Vec<HostsRule>> {
+    rules
+        .split(',')
+        .filter(|rule| !rule.is_empty())
+        .map(|rule| {
+            let (status, action) = rule.trim().split_once('=')?;
+            let status = status.trim();
+            let (negated, status) = match status.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, status),
+            };
+            Some(HostsRule {
+                status: LookupStatus::parse(status),
+                negated,
+                action: match action.trim().to_ascii_lowercase().as_str() {
+                    "return" => ChainAction::Return,
+                    "continue" => ChainAction::Continue,
+                    "merge" => ChainAction::Merge,
+                    _ => return None,
+                },
+            })
+        })
+        .collect()
+}
+
+/// The `hosts:` chain of an `/etc/nsswitch.conf`, as the sources a host
+/// lookup walks, in order. `None` when the file carries no such line — or
+/// carries one this cannot read: a chain that is not understood proves
+/// nothing about where this host's lookups go.
+#[cfg(any(test, not(target_os = "macos")))]
+fn hosts_chain(nsswitch: &str) -> Option<Vec<HostsSource>> {
+    let line = nsswitch.lines().map(str::trim).find(|line| {
+        line.split_once(':')
+            .is_some_and(|(database, _)| database.trim().eq_ignore_ascii_case("hosts"))
+    })?;
+    let mut chain: Vec<HostsSource> = Vec::new();
+    for token in line.split_once(':')?.1.split_whitespace() {
+        if token.starts_with('#') {
+            break; // a trailing comment: nothing after it is a source
+        }
+        if let Some(rules) = token.strip_prefix('[') {
+            let rules = rules.strip_suffix(']')?;
+            chain.last_mut()?.rules.extend(parse_hosts_rules(rules)?);
+            continue;
+        }
+        if token.contains('=') {
+            return None; // a rule outside its brackets: not a form this reads
+        }
+        chain.push(HostsSource {
+            name: token.to_ascii_lowercase(),
+            rules: Vec::new(),
+        });
+    }
+    Some(chain)
+}
+
+/// Whether this host's `hosts:` lookups consult systemd-resolved — the fact
+/// that decides a foreign `/etc/resolv.conf` is not the bypass it looks like.
+/// The `resolve` NSS source asks resolved directly, never the file's
+/// servers, so where a lookup reaches it, a host process's question reaches
+/// resolved however the file is written and the routing-domain command
+/// works.
+///
+/// Proved only in its strictest form, because what this clears is the
+/// blocker that withholds NET-122's command: `resolve` is in the chain and
+/// its module is installed; the walk reaches it — nothing before it asks
+/// `/etc/resolv.conf`'s servers (`dns`, the bypass this names, whose answer
+/// or search-domain guess could end the walk before resolved is asked), and
+/// no rule before it returns on a miss; and the walk stops where it answers
+/// (`[SUCCESS=continue]` lets the sources after it answer after resolved
+/// already has). Anything else — a chain with no `resolve`, a missing
+/// module, a rule that passes it by, or no chain this could read at all —
+/// leaves the blocker standing, so the advisory withholds a command it
+/// cannot prove works rather than naming one that does nothing.
+#[cfg(any(test, not(target_os = "macos")))]
+fn lookups_reach_resolved(nsswitch: Option<&str>, module_installed: bool) -> bool {
+    let Some(chain) = nsswitch.and_then(hosts_chain) else {
+        return false;
+    };
+    let Some(at) = chain.iter().position(|source| source.name == "resolve") else {
+        return false;
+    };
+    module_installed
+        && chain[at].action_for(LookupStatus::Success) == ChainAction::Return
+        && chain[..at]
+            .iter()
+            .all(|source| source.name != "dns" && source.passes_a_miss_by())
+}
+
+/// The paths the `resolve` source's module could be installed at, in the
+/// order they are tried.
+#[cfg(any(test, not(target_os = "macos")))]
+fn resolve_module_candidates() -> impl Iterator<Item = String> {
+    NSS_MODULE_DIRS
+        .iter()
+        .map(|dir| format!("{dir}/{NSS_RESOLVE_MODULE}"))
+}
+
+/// Whether the `resolve` source's module is installed where glibc finds it:
+/// one `stat` per candidate directory, read-only. glibc dlopen's
+/// `libnss_<source>.so.2` for every source the chain names, and a missing
+/// module reads as UNAVAIL — the walk passes `resolve` by and lands on the
+/// foreign `/etc/resolv.conf` servers, which is exactly the bypass the
+/// blocker names, so a chain that names `resolve` without the module
+/// clears nothing.
+#[cfg(not(target_os = "macos"))]
+async fn resolve_module_installed() -> bool {
+    for path in resolve_module_candidates() {
+        if tokio::fs::metadata(&path).await.is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Why no routing-domain command would reach this host's lookups, when none
 /// would: `/etc/resolv.conf` names a resolver other than systemd-resolved's
-/// stub, so a host process's lookup never travels through resolved and a
+/// stub, and the `hosts:` chain a host lookup walks does not consult
+/// `nss-resolve` first, so the lookup never travels through resolved and a
 /// link's routing domain — however exactly it is configured — never applies
 /// to it. The command NET-122's advisory names configures resolved; on this
 /// host that is configuration nothing consults, so the advisory says this
@@ -263,14 +518,18 @@ pub(crate) fn routing_domain_hook(domain_output: Option<&str>, dns_output: Optio
 ///
 /// `domain_read` is whether `resolvectl domain` answered: a host with no
 /// resolved at all has no routing-domain command to withhold, so the blocker
-/// is absent there. `None` also when the stub is named (the command works,
-/// alone or beside foreign servers — glibc asks every listed resolver), or
-/// when the file could not be read or names nothing. Pure over the reads, so
-/// it is unit-tested on every platform the suite runs on.
+/// is absent there. Also `None` when the stub is named (the command works,
+/// alone or beside foreign servers — glibc asks every listed resolver), when
+/// the file could not be read or names nothing, and when the chain consults
+/// `nss-resolve` (see [`lookups_reach_resolved`]): there the command reaches
+/// host lookups whatever the file names. Pure over the reads, so it is
+/// unit-tested on every platform the suite runs on.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn stub_bypass_blocker(
     domain_read: Option<&str>,
     resolv_conf: Option<&str>,
+    nsswitch: Option<&str>,
+    resolve_module: bool,
 ) -> Option<String> {
     let text = resolv_conf?;
     let mut servers = Vec::new();
@@ -288,6 +547,9 @@ pub(crate) fn stub_bypass_blocker(
         servers.push(server.to_string());
     }
     if servers.is_empty() || domain_read.is_none() {
+        return None;
+    }
+    if lookups_reach_resolved(nsswitch, resolve_module) {
         return None;
     }
     Some(format!(
@@ -320,8 +582,8 @@ async fn resolvectl(args: &[&str]) -> Option<String> {
 
 /// Reads the host's current hook state (NET-122's detection proper) and the
 /// reason no zone command would reach this host's lookups, when there is one.
-/// Detection is read-only and never prompts: two `resolvectl` queries and one
-/// file read on Linux, one file read on macOS.
+/// Detection is read-only and never prompts: two `resolvectl` queries and
+/// three file reads on Linux, one file read on macOS.
 pub(crate) async fn session_detection() -> (Hook, Option<String>) {
     host_detection().await
 }
@@ -338,9 +600,16 @@ async fn host_detection() -> (Hook, Option<String>) {
     let domain = resolvectl(&["domain"]).await;
     let dns = resolvectl(&["dns"]).await;
     let resolv_conf = tokio::fs::read_to_string(RESOLV_CONF).await.ok();
+    let nsswitch = tokio::fs::read_to_string(NSSWITCH_CONF).await.ok();
+    let resolve_module = resolve_module_installed().await;
     (
         routing_domain_hook(domain.as_deref(), dns.as_deref()),
-        stub_bypass_blocker(domain.as_deref(), resolv_conf.as_deref()),
+        stub_bypass_blocker(
+            domain.as_deref(),
+            resolv_conf.as_deref(),
+            nsswitch.as_deref(),
+            resolve_module,
+        ),
     )
 }
 
@@ -471,9 +740,10 @@ pub(crate) fn advisory_at(
 /// cannot work. `interim_loopback` is the daemon's NET-123 verdict: its
 /// session-start bind probe found the reserved range absent and it
 /// published this session at the 127.0.0.1 interim. On a host whose
-/// `/etc/resolv.conf` bypasses systemd-resolved's stub, the advisory says
-/// so and names no command (see [`session_detection`]): none would reach
-/// host lookups there.
+/// `/etc/resolv.conf` bypasses systemd-resolved's stub *and* whose
+/// `hosts:` lookups do not consult `nss-resolve`, the advisory says so and
+/// names no command (see [`session_detection`]): none would reach host
+/// lookups there.
 ///
 /// Printed once per session start, to stderr; never prompts.
 pub(crate) async fn session_advisory(
@@ -885,10 +1155,12 @@ mod tests {
     fn a_stub_bypassing_host_is_advised_without_a_dead_command() {
         let domain = "Global Domains: ~.\nLink 2 (enp3s0): lab.example.com\n";
         // A resolv.conf naming anything but resolved's stub, on a host whose
-        // resolved answered: host lookups bypass it, and the routing-domain
+        // resolved answered and whose lookups walk a chain with no `resolve`
+        // source in it: host lookups bypass resolved, and the routing-domain
         // command would configure nothing they consult.
         let resolv_conf = "search example.com\nnameserver 192.168.1.1\nnameserver 1.1.1.1\n";
-        let blocker = stub_bypass_blocker(Some(domain), Some(resolv_conf))
+        let nsswitch = "hosts: files dns myhostname\n";
+        let blocker = stub_bypass_blocker(Some(domain), Some(resolv_conf), Some(nsswitch), false)
             .expect("a stub-bypassing host must block the command");
         assert!(blocker.contains("bypass systemd-resolved"), "{blocker}");
         assert!(blocker.contains("192.168.1.1 1.1.1.1"), "{blocker}");
@@ -913,11 +1185,21 @@ mod tests {
 
         // The stub named — alone or beside foreign servers — is a host the
         // command works on: no blocker, the command is named.
-        assert!(stub_bypass_blocker(Some(domain), Some("nameserver 127.0.0.53\n")).is_none());
         assert!(
             stub_bypass_blocker(
                 Some(domain),
-                Some("nameserver 192.168.1.1\nnameserver 127.0.0.53\n")
+                Some("nameserver 127.0.0.53\n"),
+                Some(nsswitch),
+                false
+            )
+            .is_none()
+        );
+        assert!(
+            stub_bypass_blocker(
+                Some(domain),
+                Some("nameserver 192.168.1.1\nnameserver 127.0.0.53\n"),
+                Some(nsswitch),
+                false
             )
             .is_none()
         );
@@ -925,14 +1207,138 @@ mod tests {
         // No resolved to configure — `resolvectl domain` did not run — no
         // routing-domain command to withhold, however foreign the file: the
         // advisory's mechanism question does not arise on that host.
-        assert!(stub_bypass_blocker(None, Some(resolv_conf)).is_none());
+        assert!(stub_bypass_blocker(None, Some(resolv_conf), Some(nsswitch), false).is_none());
 
         // An unreadable or empty resolv.conf is no evidence against the stub:
         // the command is named rather than withheld for no reason.
-        assert!(stub_bypass_blocker(Some(domain), None).is_none());
+        assert!(stub_bypass_blocker(Some(domain), None, Some(nsswitch), false).is_none());
         assert!(
-            stub_bypass_blocker(Some(domain), Some("search example.com\n")).is_none(),
+            stub_bypass_blocker(
+                Some(domain),
+                Some("search example.com\n"),
+                Some(nsswitch),
+                false
+            )
+            .is_none(),
             "a file naming no resolver blocks nothing"
+        );
+    }
+
+    // A host whose `hosts:` lookups consult `nss-resolve` is a host the
+    // routing-domain command reaches however its `/etc/resolv.conf` is
+    // written: the `resolve` source asks resolved directly, never the file's
+    // servers. The blocker clears on that chain only, never on a bare
+    // `resolve` token — the finding this answers: the token alone used to
+    // read as a bypass and withheld a command the host's lookups could use.
+    #[cfg(any(test, not(target_os = "macos")))]
+    #[test]
+    fn nss_resolved_lookups_clear_the_stub_bypass_blocker() {
+        let domain = "Global Domains: ~.\n";
+        let resolv_conf = "search example.com\nnameserver 192.168.1.1\nnameserver 1.1.1.1\n";
+        // systemd's own recommended chain: `files` first, `resolve` before
+        // `dns`, with `!UNAVAIL=return` so a resolved that is down falls
+        // through to `dns` — a hit still ends the walk, and `files`'s miss
+        // walks on. The negated rule is lower-case on purpose: the statuses
+        // and actions are matched case-insensitively, as they are written.
+        let resolved_host =
+            "passwd: files systemd\nhosts: files resolve [!unavail=Return] dns myhostname\n";
+        assert!(
+            stub_bypass_blocker(Some(domain), Some(resolv_conf), Some(resolved_host), true)
+                .is_none(),
+            "a chain whose lookups reach resolved is not a bypassing host"
+        );
+
+        // Which is the whole point: that host's advisory names the command.
+        let hook = Hook::absent("test", "no link carries a routing domain for the zone");
+        let advisory = advisory_at(&hook, 15353, false, None)
+            .expect("an nss-resolve host is advised the command");
+        assert!(
+            advisory.contains("sudo"),
+            "the command is named, not withheld: {advisory}"
+        );
+
+        // A bare `resolve` token clears nothing without the module behind
+        // it: glibc reads a missing module as UNAVAIL and walks on to `dns`,
+        // the file's foreign servers.
+        assert!(
+            stub_bypass_blocker(Some(domain), Some(resolv_conf), Some(resolved_host), false)
+                .is_some(),
+            "a `resolve` token without libnss_resolve is a bypassing host"
+        );
+        // Nor does a chain that names no `resolve` source at all.
+        assert!(
+            stub_bypass_blocker(
+                Some(domain),
+                Some(resolv_conf),
+                Some("hosts: files mdns4_minimal dns\n"),
+                true
+            )
+            .is_some()
+        );
+        // Nor one whose earlier rule ends the walk on a miss before it: for
+        // the zone's names `mdns4_minimal` passes by, but the rule cannot be
+        // read as passing them, and the blocker is the arm that withholds
+        // what this cannot prove works.
+        assert!(
+            stub_bypass_blocker(
+                Some(domain),
+                Some(resolv_conf),
+                Some("hosts: files mdns4_minimal [NOTFOUND=return] resolve dns\n"),
+                true
+            )
+            .is_some()
+        );
+        // Nor one that asks the file's servers before it.
+        assert!(
+            stub_bypass_blocker(
+                Some(domain),
+                Some(resolv_conf),
+                Some("hosts: files dns resolve [!UNAVAIL=return]\n"),
+                true
+            )
+            .is_some()
+        );
+        // Nor one whose rules walk past resolved's own answer.
+        assert!(
+            stub_bypass_blocker(
+                Some(domain),
+                Some(resolv_conf),
+                Some("hosts: files resolve [SUCCESS=continue] dns\n"),
+                true
+            )
+            .is_some()
+        );
+        // Nor a chain this cannot read at all.
+        assert!(
+            stub_bypass_blocker(Some(domain), Some(resolv_conf), None, true).is_some(),
+            "no `hosts:` chain to read proves nothing about where lookups go"
+        );
+        assert!(
+            stub_bypass_blocker(
+                Some(domain),
+                Some(resolv_conf),
+                Some("hosts: files resolve [a rule this cannot read]\n"),
+                true
+            )
+            .is_some(),
+            "a chain with an unreadable rule proves nothing either"
+        );
+    }
+
+    // glibc dlopen's an NSS source's module by the exact name
+    // `libnss_<source>.so.2`, out of the directories it searches, so the
+    // paths this probes are load-bearing: a wrong name or a relative
+    // directory is a host whose blocker never clears.
+    #[cfg(any(test, not(target_os = "macos")))]
+    #[test]
+    fn the_resolve_module_is_looked_up_under_glibcs_module_name() {
+        let candidates: Vec<String> = resolve_module_candidates().collect();
+        assert!(!candidates.is_empty());
+        assert!(
+            candidates
+                .iter()
+                .all(|path| path.starts_with('/') && path.ends_with("/libnss_resolve.so.2")),
+            "every candidate is the module's name under an absolute directory: {candidates:?}"
         );
     }
 
