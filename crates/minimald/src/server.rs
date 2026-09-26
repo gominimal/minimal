@@ -1241,8 +1241,19 @@ impl HostProxyStartup {
         listener: TcpListener,
     ) -> tokio::task::JoinHandle<()> {
         use crate::net::proxy::{Router, serve};
+        use crate::net::switch::proxied_request_verdict;
 
-        let router = Router::new(state.sessions_manager().await.hostnames());
+        // The verdict each proxied request is put to before the proxy dials
+        // anything (NET-069 to NET-071): the same function the switch's relay
+        // gates by, so a hostname-routing surface gives no reach a direct
+        // connection would not, and a proxied refusal logs the same rule name
+        // a direct one's drop does. Handed to the router here, where the
+        // daemon's live registry is, so the routing core itself stays pure
+        // over the registry's facts.
+        let router = Router::new(
+            state.sessions_manager().await.hostnames(),
+            proxied_request_verdict,
+        );
         match self {
             Self::Egress { .. } => tokio::spawn(async move {
                 if let Err(error) = serve(listener, router).await {
