@@ -258,7 +258,20 @@ fn base_dir() -> PathBuf {
         "no directory on this host can host a box: {}",
         refusals.join("; ")
     );
-    chosen.expect(&no_candidate)
+    let chosen = chosen.expect(&no_candidate);
+    // Say where the box went, and why everywhere else was refused: nextest
+    // shows a test's stderr only when the test fails, which is exactly when
+    // this is the context a failure needs.
+    if refusals.is_empty() {
+        eprintln!("box base: {}", chosen.display());
+    } else {
+        eprintln!(
+            "box base: {} (refused: {})",
+            chosen.display(),
+            refusals.join("; ")
+        );
+    }
+    chosen
 }
 
 /// The directories to try, in preference order: the host's tmp first — the
