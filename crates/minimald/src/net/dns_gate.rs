@@ -88,7 +88,15 @@
 //!   negative; the gate's empty answer serves the box's own resolver
 //!   stack, which holds no cache to warm (the same fact the window's
 //!   rationale rests on), so the omission costs one more relay ride per
-//!   lookup and asserts no authority the gate lacks.
+//!   lookup and asserts no authority the gate lacks. Borrowing the
+//!   answerer's SOA would not close that gap but lie in it: the reply is
+//!   already non-authoritative (`Metadata::response_from_request` clears
+//!   the AA bit), and RFC 2308's negative answer carries the SOA of the
+//!   zone holding the *asked* name — so `min.internal`'s SOA on a
+//!   `github.com` answer is a record its owner does not cover, one a
+//!   caching resolver either discards (back to no negative cache) or
+//!   treats as a broken reply, which is a worse outcome than the honest
+//!   empty answer that keeps `getaddrinfo` degrading to IPv4.
 //! * Reply matching is loose, and the source check is the whole defence:
 //!   the gate reads a reply's first question for the name and nothing
 //!   else — not the query id, not the qtype, and not whether the box ever
