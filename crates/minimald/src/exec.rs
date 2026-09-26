@@ -1208,6 +1208,8 @@ where
 ///  * `git-receive-pack min://<session ID>` - handles a git receive-pack, routing
 ///    with the trailing session ID. Matched before the vocabulary below, and
 ///    not part of it: git speaks the pack protocol, not exec requests.
+///  * `git-upload-pack min://<session ID>` - handles a git upload-pack, routing
+///    with the trailing session ID the same way.
 ///  * a [`minimald_rpc::exec::ExecRequest`], which is where the rest of the
 ///    vocabulary is defined. The daemon-serviced forms — `min://task/run`,
 ///    `min://package/build` and `min://check` — are each routed via a
@@ -1242,6 +1244,10 @@ pub(crate) async fn handle_exec(
 
     if let Some(ident) = argv.strip_prefix("git-receive-pack min://") {
         return handle_git_receive(ident, serv, conn, id, session, channel, config).await;
+    }
+
+    if let Some(ident) = argv.strip_prefix("git-upload-pack min://") {
+        return handle_git_upload(ident, serv, conn, id, session, channel, config).await;
     }
 
     if config.pty.is_some() {
@@ -1839,6 +1845,77 @@ async fn handle_git_receive(
         };
         exec_task.run(channel).await;
         drop(hooks_tmp);
+    });
+
+    Ok(())
+}
+
+async fn handle_git_upload(
+    ident: &str,
+    serv: ServerStateHandle,
+    conn: ConnectionHandle,
+    id: ChannelId,
+    session: &mut Session,
+    channel: Channel<Msg>,
+    config: ChannelConfig,
+) -> Result<(), ConnectionError> {
+    let session_pred = {
+        match config.env_vars.get(MINIMAL_SESSION_ID_ENV) {
+            Some(id_str) => match SessionId::parse_str(id_str) {
+                Ok(id) => SessionKeyPredicate::Id(id),
+                Err(_e) => {
+                    tracing::warn!(
+                        value = %id_str,
+                        "git-upload-pack rejected on channel {id}: {MINIMAL_SESSION_ID_ENV} is not a uuid",
+                    );
+                    session.channel_failure(id)?;
+                    return Ok(());
+                }
+            },
+            None => match SessionId::parse_str(ident) {
+                Ok(id) => SessionKeyPredicate::Id(id),
+                Err(_e) => SessionKeyPredicate::Name(ident.to_string()),
+            },
+        }
+    };
+
+    let mngr = serv.sessions_manager().await;
+    let session_handle = match mngr.get_session(session_pred).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            tracing::warn!("git-upload-pack rejected: unknown session");
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "git-upload-pack rejected: lookup failed");
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+    };
+    session.channel_success(id)?;
+
+    spawn(async move {
+        let paths = match session_handle.paths().await {
+            Ok(paths) => paths,
+            Err(e) => {
+                tracing::warn!(error = %e, "git-upload-pack aborted: session is gone");
+                return;
+            }
+        };
+
+        let exec_task = ExecTask {
+            conn,
+            serv,
+            session: session_handle,
+            channel_id: id,
+            exec: TokioExec {
+                argv: "git upload-pack .".to_string(),
+                cwd: paths.working,
+                env: BTreeMap::new(),
+            },
+        };
+        exec_task.run(channel).await;
     });
 
     Ok(())
