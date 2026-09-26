@@ -15,6 +15,10 @@
 //! * `network_none_attach_works` — a none box launched the way the session
 //!   host launches it, session leader and pty included, keeps its terminal
 //!   and still accepts an injected process.
+//! * `injected_process_lacks_cap_net_raw` — a process injected into a box
+//!   execs with the box's credentials: the box uid and gid, `no_new_privs`,
+//!   and the same empty capability sets the box's own processes exec with,
+//!   so joining a running box cannot open a raw socket either.
 //!
 //! The own-IP proofs drive the **production** switch-attach wiring rather than a
 //! hand-rolled `ip netns` sequence: each task's namespace is created by the same
@@ -30,7 +34,12 @@
 //! default `cargo test` run (and this sandbox) never attempts privileged netns
 //! operations; the three netns/gvproxy tests are additionally `#[ignore]`,
 //! while the two none-box proofs are not, so the surveyed nextest lines can
-//! name them. The own-IP proofs read the gvproxy binary from `GVPROXY_BIN`,
+//! name them. The injected-process capability proof is the exception: it needs
+//! no sudo, no gvproxy and no network namespace, only the unprivileged user
+//! namespace every sandbox starts by unsharing, so it is gated on the host
+//! allowing that instead — and skips, with the reason, on a host (stock Ubuntu
+//! 24.04) that would deny it, rather than fail the lane that cannot run it.
+//! The own-IP proofs read the gvproxy binary from `GVPROXY_BIN`,
 //! and the none-box proofs compile their socket probe with `gcc` — a gated
 //! host that lacks either fails the proof rather than skipping it into a
 //! false green. Auto-discovered by the native lane's `minimald-root-integration`
@@ -46,8 +55,9 @@
 
 use sandbox2::NetPlan;
 use sandbox2::Network as _;
-use sandbox2::config::{Config, SandboxMapped};
+use sandbox2::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -91,6 +101,7 @@ fn sudo(args: &[&str]) -> Output {
 /// usable inside an injected process and reports the same two lines.
 const SOCKET_PROBE_C: &str = r#"
 #include <sys/socket.h>
+#include <netinet/in.h>
 #include <errno.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -111,6 +122,33 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "hold") == 0) {
         report();
         while (1) sleep(60);
+    }
+
+    /* The identity and capability sets the process exec'd with, then the one
+     * capability-dependent operation: a raw socket, which NET-083 is about,
+     * and a stream socket, which needs no capability and therefore still
+     * works. One `key: value` line per fact, parsed by the caller. */
+    if (argc > 1 && strcmp(argv[1], "caps") == 0) {
+        FILE *status = fopen("/proc/self/status", "r");
+        if (!status) { perror("fopen /proc/self/status"); return 30; }
+        char line[256];
+        while (fgets(line, sizeof line, status)) {
+            if (strncmp(line, "Uid:", 4) == 0 || strncmp(line, "Gid:", 4) == 0 ||
+                strncmp(line, "Cap", 3) == 0 || strncmp(line, "NoNewPrivs:", 11) == 0) {
+                fputs(line, stdout);
+            }
+        }
+        fclose(status);
+
+        int fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+        printf("raw_socket_errno: %d\n", fd >= 0 ? 0 : errno);
+        if (fd >= 0) close(fd);
+
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        printf("stream_socket_errno: %d\n", fd >= 0 ? 0 : errno);
+        if (fd >= 0) close(fd);
+        fflush(stdout);
+        return 0;
     }
 
     if (argc > 1 && strcmp(argv[1], "attach") == 0) {
@@ -152,11 +190,12 @@ int main(int argc, char **argv) {
 
 /// Compile the socket-family probe statically and return its path.
 ///
-/// Panics when no C compiler is on `PATH` instead of skipping: this proof is
-/// only reached behind `MINIMALD_NETNS_TEST`, so a host that sets the gate is
-/// a host that promised to run it, and a skip here would be a vacuous green on
-/// a security proof — the same shape the CI job's own fail-fast netns check
-/// exists to prevent.
+/// Panics when no C compiler is on `PATH` instead of skipping: every proof
+/// that reaches this is on a host that promised to run it (the netns proofs by
+/// setting `MINIMALD_NETNS_TEST`, the capability proof by allowing the
+/// unprivileged user namespace its gate checks), and a skip here would be a
+/// vacuous green on a security proof — the same shape the CI job's own
+/// fail-fast netns check exists to prevent.
 fn compile_socket_probe(base: &Path) -> PathBuf {
     let src = base.join("socket_probe.c");
     let bin = base.join("socket_probe");
@@ -507,6 +546,267 @@ async fn network_none_attach_works() {
     assert_eq!(
         attach_report, expected_report,
         "the injected process did not start in the box's cwd with its SHELL (stderr={stderr})"
+    );
+}
+
+/// Where the injected-process capability proof builds its box: the cargo
+/// target directory, never `/tmp`.
+///
+/// The other proofs here build under `/tmp`, which is fine on the CI lane's
+/// runners — but a host whose `/tmp` is a `nosuid,nodev` tmpfs cannot host a
+/// box at all: a bind remount inside a user namespace may only repeat flags
+/// the underlying mount already has, and hakoniwa's read-only remount asks
+/// for `MS_RDONLY|MS_NOSUID` without `nodev`, so a bind whose source carries
+/// a locked `nodev` is refused. This proof is gated on the user namespace
+/// alone, so it must run on such hosts too; the target directory sits on the
+/// checkout's own filesystem, which carries no such lock, and is ignored by
+/// git like everything under `target/`.
+fn caps_base_dir() -> PathBuf {
+    // The target directory this build uses; cargo points test targets at its
+    // own tmp through CARGO_TARGET_DIR, and a checkout that lets cargo
+    // default has one at its root.
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(|dir| PathBuf::from(dir).join("tmp"))
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp"));
+    std::fs::create_dir_all(&target).expect("creating the target tmp dir");
+    target
+}
+
+/// The credential state a process must exec with, read from the probe's
+/// report: the box uid and gid in every id field, `no_new_privs` set, every
+/// capability set exec clears empty, and the bounding set — the one set an
+/// exec does not clear — holding none of the capabilities no box may hold.
+fn assert_box_credentials(report: &BTreeMap<String, String>, what: &str) {
+    // The box uid and gid in every id field the status file reports (real,
+    // effective, saved, fs): a box process is never root inside its own user
+    // namespace, which is what makes exec clear the capability sets at all.
+    for (key, expected) in [("Uid", BOX_UID), ("Gid", BOX_GID)] {
+        let value = reported(report, key, what);
+        let fields: Vec<&str> = value.split_ascii_whitespace().collect();
+        assert_eq!(
+            fields.len(),
+            4,
+            "{what}: {key} must carry the real, effective, saved and fs ids: {value}"
+        );
+        for field in &fields {
+            let id: u32 = field
+                .parse()
+                .unwrap_or_else(|e| panic!("{what}: {key} field {field} is not a number: {e}"));
+            assert_eq!(
+                id, expected,
+                "{what}: the process must exec as the box uid/gid {expected} in every \
+                 {key} field: {value}"
+            );
+        }
+    }
+
+    assert_eq!(
+        reported(report, "NoNewPrivs", what),
+        "1",
+        "{what}: the no_new_privs bit must be set, so no file capability or \
+         setuid bit can restore a privilege"
+    );
+
+    // The sets exec clears: empty by construction, whatever the credentials
+    // the joining process arrived with.
+    for set in ["CapPrm", "CapEff", "CapInh", "CapAmb"] {
+        let mask = capability_mask(report, set, what);
+        assert_eq!(
+            mask, 0,
+            "{what}: {set} must be empty — the process execs as the \
+             unprivileged box uid with no_new_privs set, so exec clears it"
+        );
+    }
+
+    // The bounding set, the one set exec does not clear: it must hold none of
+    // the capabilities no box may hold. A capability left in it is one a file
+    // capability in the box could hand back.
+    let mask = capability_mask(report, "CapBnd", what);
+    for cap in BOX_FORBIDDEN_CAPABILITIES {
+        assert_eq!(
+            mask & (1 << cap.number),
+            0,
+            "{what}: CapBnd must not hold {} (bit {}): the bounding set \
+             survives exec, so a capability left in it is one a file \
+             capability in the box could restore",
+            cap.name,
+            cap.number
+        );
+    }
+}
+
+/// The probe's report: one entry per `key: value` line it printed.
+fn parse_report(stdout: &str) -> BTreeMap<String, String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            line.split_once(':')
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// The probe's report line for `key`, or a panic naming what never arrived: a
+/// report that does not show up is the failure to show, not a mystery.
+fn reported<'a>(report: &'a BTreeMap<String, String>, key: &str, what: &str) -> &'a str {
+    report
+        .get(key)
+        .unwrap_or_else(|| panic!("{what}: the probe did not report {key}"))
+}
+
+/// The errno the probe reported for `key`, e.g. `raw_socket_errno`.
+fn reported_errno(report: &BTreeMap<String, String>, key: &str, what: &str) -> i32 {
+    reported(report, key, what)
+        .parse()
+        .unwrap_or_else(|e| panic!("{what}: {key} is not a number: {e}"))
+}
+
+/// One capability-set mask from the probe's report, e.g. `CapBnd:
+/// 000001ffffffffff`.
+fn capability_mask(report: &BTreeMap<String, String>, set: &str, what: &str) -> u64 {
+    let value = reported(report, set, what);
+    let mask = value
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("{what}: {set} must carry one hex mask: {value}"));
+    u64::from_str_radix(mask, 16)
+        .unwrap_or_else(|e| panic!("{what}: {set} is not a hex mask ({mask}): {e}"))
+}
+
+/// NET-083, the injected-process half: a process a client attaches into a
+/// running box — the `nsenter` shim, joined to the box's namespaces — execs
+/// with the box's credentials, so joining a box is not a way around the
+/// posture every box process already execs with.
+///
+/// The box is an *open* one (a host plan, no socket-family filter), so the
+/// only thing that can refuse the injected process a raw socket is the missing
+/// capability: the refusal this proof pins is the one NET-083 is about. The
+/// hold process keeps the box alive for the injection and reports first,
+/// which is also how the proof tells a launch that never reached the program
+/// (exit 125 in hakoniwa's mount setup, no report) from one that did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn injected_process_lacks_cap_net_raw() {
+    if let Some(reason) = sandbox2::user_namespaces_restriction() {
+        eprintln!(
+            "skipping injected_process_lacks_cap_net_raw: this host denies the \
+             unprivileged user namespace every sandbox starts by unsharing: \
+             {reason}"
+        );
+        return;
+    }
+    use minimald::nsenter::{Injection, session_leader_pid};
+    use std::io::BufRead as _;
+
+    let base = tempfile::tempdir_in(caps_base_dir())
+        .unwrap_or_else(|e| panic!("base temp dir under {}: {e}", caps_base_dir().display()));
+    let probe = compile_socket_probe(base.path());
+    let source = base.path().join("rootfs-src");
+    probe_rootfs(&source, &probe);
+
+    let config = Config::new("caps-inject")
+        .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+        .with_dns(false)
+        .with_plan(NetPlan::host());
+    let sandbox_base = tempfile::tempdir_in(caps_base_dir())
+        .unwrap_or_else(|e| panic!("sandbox temp dir under {}: {e}", caps_base_dir().display()));
+    let mut sandbox = config
+        .build(sandbox_base.path().join("sandbox"), ())
+        .await
+        .expect("building the open-box sandbox");
+    let plan = sandbox.built_in_plan();
+    let container = sandbox
+        .new_container(&plan)
+        .expect("building the open-box container");
+
+    let mut hold = sandbox
+        .command(
+            &container,
+            "/usr/bin/probe",
+            ["hold"],
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .expect("building hold command");
+    hold.stdout(hakoniwa::Stdio::MakePipe);
+    let mut child = hold.spawn().expect("spawning hold process in open box");
+
+    // The hold report is what proves the launch reached the program the
+    // injection is aimed at; a host that cannot build the box exits 125 in
+    // hakoniwa's mount setup, before any report.
+    let hold_stdout = child.stdout.take().expect("hold process stdout pipe");
+    let hold_report = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            std::io::BufReader::new(hold_stdout)
+                .lines()
+                .take(2)
+                .collect::<Result<Vec<String>, _>>()
+                .expect("reading the hold process report")
+        }),
+    )
+    .await
+    .expect("hold process report timed out")
+    .expect("spawn_blocking join");
+    assert!(
+        hold_report
+            .first()
+            .is_some_and(|line| line.starts_with("cwd=")),
+        "the hold process did not report: {hold_report:?}"
+    );
+
+    let leader = session_leader_pid(child.id()).expect("resolving the open box's program pid");
+
+    let injection = Injection::new(leader, "/usr/bin/probe", ["caps"])
+        .with_shim(shim())
+        .with_cwd(sandbox.command_cwd().expect("resolving sandbox cwd"))
+        .with_env(sandbox.command_env());
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            injection
+                .command()
+                .expect("building injection command")
+                .output()
+                .expect("running injected capability probe")
+        }),
+    )
+    .await
+    .expect("injected capability probe timed out")
+    .expect("spawn_blocking join");
+
+    let _ = child.kill();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || child.wait()),
+    )
+    .await
+    .expect("waiting for hold process timed out")
+    .expect("spawn_blocking join")
+    .expect("waiting for hold process");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "capability probe injected into an open box failed: status={:?}\nstderr={stderr}",
+        output.status.code(),
+    );
+    let report = parse_report(&String::from_utf8_lossy(&output.stdout));
+    assert_box_credentials(&report, "the injected process");
+
+    // The capability-dependent operation itself. An open box's network is the
+    // host's and carries no family filter, so a raw socket refused with
+    // anything but EPERM is a capability that survived the join.
+    let raw = reported_errno(&report, "raw_socket_errno", "the injected process");
+    assert_eq!(
+        raw,
+        libc::EPERM,
+        "the injected process's raw socket attempt must be refused for lack \
+         of the capability, not by a filter or a missing network"
+    );
+    let stream = reported_errno(&report, "stream_socket_errno", "the injected process");
+    assert_eq!(
+        stream, 0,
+        "the injected process must still be able to open an ordinary socket: \
+         the box's posture denies capabilities, not networking"
     );
 }
 
