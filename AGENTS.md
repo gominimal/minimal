@@ -202,7 +202,9 @@ The canonical pre-PR command is `just ci`, per
 [CONTRIBUTING.md](CONTRIBUTING.md#building-and-testing) ("Before opening a
 PR"): it runs the same gates the PR lanes run (fmt, clippy, cargo-deny,
 the test suite, doctests; plus `just test-ignored` on Linux), dispatched
-for your OS. Platform notes for agents:
+for your OS, and then `clippy-strict`, which applies a stricter lint set to
+the lines your branch changed. Run `just clippy-strict` alone to see just
+those. Platform notes for agents:
 
 - **macOS**: the workspace does not build natively (see
   [Platform matrix](#platform-matrix)); `just ci` runs the darwin-capable
@@ -211,6 +213,7 @@ for your OS. Platform notes for agents:
   is unverified until `just test-cross` has run.
 - **VM/daemon-path changes**: also run `just e2e` (the session proof)
   and/or `just test-vm` (the VM integration harnesses).
-- **Tight iteration loops**: `just fix` (fmt → `clippy --fix` → fmt, with
-  `--allow-dirty` so it runs mid-edit) then `just test`. Both carry this
-  host's scope; neither needs a hand-written `cargo` line.
+- **Tight iteration loops**: `just fix` (fmt → `clippy --fix` → fmt, then the
+  strict clippy gate, with `--allow-dirty` so it runs mid-edit) then
+  `just test`. Both carry this host's scope; neither needs a hand-written
+  `cargo` line.

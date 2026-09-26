@@ -34,6 +34,10 @@ native-dir   := scratch / "native-state"
 # Linux-only): scope to the darwin-capable crates there; `just test-cross`
 # covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
 scope      := if os() == "macos" { "-p minvmd -p sessions" } else { "--workspace" }
+# The strict gate's scope on macOS: the same pair `clippy` and `test` already
+# use, because the Linux-only crates do not build there. The script reports any
+# changed crate this leaves out, so the scope is never silently narrower.
+strict-scope := if os() == "macos" { "-p minvmd -p sessions" } else { "" }
 # Crates carrying a `fuzz/` workspace. `rcache` is Linux-only: it pulls in
 # `lcache`, which uses the Linux-only `common::renameat2`.
 fuzz-crates := if os() == "macos" { "args common diagnostics graph mfile paths" } else { "args common diagnostics graph mfile paths rcache" }
@@ -267,11 +271,18 @@ fmt:
 # clean-worktree check — the usual case here is running mid-edit with
 # staged/unstaged work.
 #
-# Autofix pass: fmt, clippy --fix, fmt again (safe to run mid-edit).
+# Autofix pass: fmt, clippy --fix, fmt again, then the strict clippy gate (runnable mid-edit).
 fix:
     cargo fmt --all
     cargo clippy {{scope}} --all-targets --fix --allow-dirty -- -D warnings
     cargo fmt --all
+    # No autofix for the strict set, and a hit fails this recipe. `clippy --fix`
+    # rewrites every hit in the selected crates and cannot be scoped to changed
+    # lines, so autofixing it would sweep legacy sites in every crate it
+    # touches. Most of the set has no machine-applicable suggestion anyway (6%
+    # of current hits, none of the four largest lints), so these are judgement
+    # calls, not rewrites.
+    scripts/clippy-strict.sh "" {{strict-scope}}
 
 # CI: ci.yml `fmt`.
 #
@@ -284,6 +295,18 @@ fmt-check:
 # Clippy over all targets at this host's scope, warnings denied.
 clippy:
     cargo clippy {{scope}} --all-targets --locked -- -D warnings
+
+# CI: none — this is a local gate (scripts/clippy-strict.sh).
+#
+# The lints below are the ones the tree is not yet clean for: CI's clippy job
+# runs `-D warnings`, so they live here rather than in Cargo.toml and only the
+# lines you changed are reported. Run it once your change is ready, fix what it
+# reports in the files you touched, and promote each lint into
+# [workspace.lints.clippy] as its count reaches zero.
+#
+# Strict Clippy on the lines this branch changed, scoped to the crates you touched.
+clippy-strict BASE="":
+    scripts/clippy-strict.sh "{{BASE}}" {{strict-scope}}
 
 # A local advisories failure may just mean newer RUSTSEC data than CI's last run.
 # CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).
@@ -397,12 +420,12 @@ test-cross: (_need "cross" "cargo install cross --locked")
 #
 # The local PR gate set, cheapest first.
 [linux]
-ci: fmt-check check-version clippy deny test doctest test-ignored
+ci: fmt-check check-version clippy clippy-strict deny test doctest test-ignored
     @echo "ci: local PR gates green"
 
 # The local PR gate set, cheapest first (`just test-cross` covers the Linux-only crates).
 [macos]
-ci: fmt-check check-version clippy deny test doctest
+ci: fmt-check check-version clippy clippy-strict deny test doctest
     @echo "ci: local PR gates green"
 
 # Run the curl|sh installer's tests under every POSIX sh. CI: ci-shell-installer.yml.

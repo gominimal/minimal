@@ -25,3 +25,6 @@ graph.workspace = true
 lcache.workspace = true
 op.workspace = true
 ot.workspace = true
+
+[lints]
+workspace = true
