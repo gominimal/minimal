@@ -251,6 +251,7 @@ those. Platform notes for agents:
   is unverified until `just test-cross` has run.
 - **VM/daemon-path changes**: also run `just e2e` (the session proof)
   and/or `just test-vm` (the VM integration harnesses).
-- **Tight iteration loops**: `just fix` (fmt → `clippy --fix` → fmt, with
-  `--allow-dirty` so it runs mid-edit) then `just test`. Both carry this
-  host's scope; neither needs a hand-written `cargo` line.
+- **Tight iteration loops**: `just fix` (fmt → `clippy --fix` → fmt, then the
+  report-only strict gate, with `--allow-dirty` so it runs mid-edit) then
+  `just test`. Both carry this host's scope; neither needs a hand-written
+  `cargo` line.

@@ -270,11 +270,18 @@ fmt:
 # clean-worktree check — the usual case here is running mid-edit with
 # staged/unstaged work.
 #
-# Autofix pass: fmt, clippy --fix, fmt again (safe to run mid-edit).
+# Autofix pass: fmt, clippy --fix, fmt again, then the report-only strict gate (safe mid-edit).
 fix:
     cargo fmt --all
     cargo clippy {{scope}} --all-targets --fix --allow-dirty -- -D warnings
     cargo fmt --all
+    # Report-only, deliberately. `clippy --fix` rewrites every hit in the
+    # selected crates and cannot be scoped to changed lines, so autofixing the
+    # strict set would sweep legacy sites in each crate it touches. Most of the
+    # set has no machine-applicable suggestion anyway (only 6% of the current
+    # hits do, and none of the four largest lints), so the fixes here are
+    # judgement calls rather than rewrites.
+    scripts/clippy-strict.sh "" {{strict-scope}}
 
 # CI: ci.yml `fmt`.
 #
