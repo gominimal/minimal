@@ -607,6 +607,11 @@ pub struct TokioExec {
     pub argv: String,
     pub cwd: DaemonAbsPath,
     pub env: BTreeMap<String, String>,
+    /// Environment variables to strip from the child process. Used to
+    /// keep Git repository-location variables inherited from the daemon
+    /// from redirecting `git init` / `git upload-pack` away from the
+    /// session workspace.
+    pub drop_env: BTreeSet<String>,
 }
 
 impl Exec for TokioExec {
@@ -623,10 +628,36 @@ impl Exec for TokioExec {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
+            for name in &self.drop_env {
+                cmd.env_remove(name);
+            }
             cmd.spawn().map(TokioProcess)
         })
         .boxed()
     }
+}
+
+/// Git environment variables that relocate a repository away from the
+/// process working directory. Inheriting any of these from the daemon
+/// would make `git init` / `git upload-pack` target a repository other
+/// than the session workspace, so they are stripped from the child
+/// process.
+fn git_repo_location_env() -> BTreeSet<String> {
+    [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_QUARANTINE_PATH",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 /// What to run inside the session, and whether a shell stands between the
@@ -1841,6 +1872,7 @@ async fn handle_git_receive(
                 ),
                 cwd: paths.working,
                 env: BTreeMap::new(),
+                drop_env: git_repo_location_env(),
             },
         };
         exec_task.run(channel).await;
@@ -1910,15 +1942,33 @@ async fn handle_git_upload(
             // request, so the workspace may not be a Git repository yet.
             // Initialize it the same way handle_git_receive does, otherwise
             // clone, fetch, and ls-remote fail on a non-repo directory.
-            let res = tokio::process::Command::new("git")
-                .arg("init")
-                .current_dir(paths.working.as_utf8_path())
-                .output()
-                .await;
-            if let Err(e) = res {
-                tracing::warn!(error = %e, "git init failed");
-                channel.close().await.unwrap();
-                return;
+            let mut init = tokio::process::Command::new("git");
+            init.arg("init").current_dir(paths.working.as_utf8_path());
+            for name in git_repo_location_env() {
+                init.env_remove(name);
+            }
+            let res = init.output().await;
+            match res {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    // `git init` ran but failed: report the cause to the
+                    // client instead of running upload-pack against a
+                    // non-repository directory.
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    tracing::warn!(status = %out.status, "git init failed: {stderr}");
+                    let _ = channel.extended_data(1, stderr.as_bytes()).await;
+                    let _ = channel
+                        .exit_status(out.status.code().unwrap_or(1).max(0) as u32)
+                        .await;
+                    let _ = channel.eof().await;
+                    let _ = channel.close().await;
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "git init failed");
+                    channel.close().await.unwrap();
+                    return;
+                }
             }
         }
 
@@ -1931,6 +1981,7 @@ async fn handle_git_upload(
                 argv: "git upload-pack .".to_string(),
                 cwd: paths.working,
                 env: BTreeMap::new(),
+                drop_env: git_repo_location_env(),
             },
         };
         exec_task.run(channel).await;
