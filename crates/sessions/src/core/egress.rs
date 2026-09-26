@@ -1296,7 +1296,7 @@ mod tests {
         };
 
         // A public answer is admitted with no declarations at all (NET-066).
-        assert!(admit([140, 82, 121, 3], None, None).is_ok());
+        admit([140, 82, 121, 3], None, None).unwrap();
 
         // The box's own denies are subtracted from every name (NET-067).
         let deny = cidrs(&["203.0.113.0/24"]);
@@ -1335,11 +1335,11 @@ mod tests {
         // name path opens with it), an allow-all entry covers it, an empty
         // one does not, and a different private range does not.
         let private = [10, 1, 2, 3];
-        assert!(admit(private, None, None).is_ok());
+        admit(private, None, None).unwrap();
         let allow_all = cidrs(&["0.0.0.0/0"]);
-        assert!(admit(private, Some(allow_all.as_slice()), None).is_ok());
+        admit(private, Some(allow_all.as_slice()), None).unwrap();
         let allow_lan = cidrs(&["10.0.0.0/8"]);
-        assert!(admit(private, Some(allow_lan.as_slice()), None).is_ok());
+        admit(private, Some(allow_lan.as_slice()), None).unwrap();
         let allow_none = cidrs(&[]);
         assert_eq!(
             admit(private, Some(allow_none.as_slice()), None),

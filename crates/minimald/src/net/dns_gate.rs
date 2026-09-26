@@ -861,7 +861,7 @@ mod tests {
 
         // The cap is per name: a second name's addresses are admitted
         // beside the first name's full set.
-        let second: Vec<[u8; 4]> = (0..4).map(|host| [203, 0, 113, host as u8]).collect();
+        let second: Vec<[u8; 4]> = (0u8..4).map(|host| [203, 0, 113, host]).collect();
         gate.admit("second.example", &second, later);
         for address in &second {
             assert!(
@@ -1002,9 +1002,10 @@ mod tests {
             &dns_query("github.com.", RecordType::A),
         );
         harness.box_end.write_all(&query).unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+        tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
             .await
-            .expect("the query is forwarded");
+            .expect("the query is forwarded")
+            .expect("the switch side stays open");
         let response = dns_response("github.com.", &[PINNED]);
         let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, 40000, &response);
         harness
@@ -1087,9 +1088,10 @@ mod tests {
             &dns_query("github.com.", RecordType::A),
         );
         harness.box_end.write_all(&requery).unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+        tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
             .await
-            .expect("the re-query is forwarded");
+            .expect("the re-query is forwarded")
+            .expect("the switch side stays open");
         harness
             .switch
             .write_all(&wire_frame(&udp_payload_frame(
@@ -1184,9 +1186,10 @@ mod tests {
             &dns_query("github.com.", RecordType::A),
         );
         harness.box_end.write_all(&query).unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+        tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
             .await
-            .expect("the query is forwarded");
+            .expect("the query is forwarded")
+            .expect("the switch side stays open");
         let response = dns_response("github.com.", &[PINNED]);
         let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, 40000, &response);
         harness
@@ -1247,9 +1250,10 @@ mod tests {
             &dns_query("github.com.", RecordType::A),
         );
         harness.box_end.write_all(&requery).unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+        tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
             .await
-            .expect("the re-query is forwarded");
+            .expect("the re-query is forwarded")
+            .expect("the switch side stays open");
         harness
             .switch
             .write_all(&wire_frame(&udp_payload_frame(
@@ -1309,9 +1313,10 @@ mod tests {
             &dns_query("github.com.", RecordType::A),
         );
         harness.box_end.write_all(&query).unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+        tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
             .await
-            .expect("the query is forwarded");
+            .expect("the query is forwarded")
+            .expect("the switch side stays open");
         let response = dns_response("github.com.", &[PINNED]);
         let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, 40000, &response);
         harness
@@ -1372,9 +1377,10 @@ mod tests {
             &dns_query("github.com.", RecordType::A),
         );
         harness.box_end.write_all(&requery).unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+        tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
             .await
-            .expect("the re-query is forwarded");
+            .expect("the re-query is forwarded")
+            .expect("the switch side stays open");
         harness
             .switch
             .write_all(&wire_frame(&udp_payload_frame(
@@ -1523,9 +1529,10 @@ mod tests {
             &dns_query("example.com.", RecordType::A),
         );
         harness.box_end.write_all(&query).unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+        tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
             .await
-            .expect("the query is forwarded");
+            .expect("the query is forwarded")
+            .expect("the switch side stays open");
 
         let response = dns_response(
             "example.com.",
@@ -1822,9 +1829,10 @@ mod tests {
             &dns_query("anything.example.", RecordType::A),
         );
         harness.box_end.write_all(&query).unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+        tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
             .await
-            .expect("the query is forwarded");
+            .expect("the query is forwarded")
+            .expect("the switch side stays open");
         let response = dns_response("anything.example.", &[Ipv4Addr::new(203, 0, 113, 20)]);
         let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, 40000, &response);
         harness

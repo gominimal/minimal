@@ -470,6 +470,10 @@ where
 /// deprecated literal host address (NET-004), prepend its 2-byte LE length,
 /// and write the framed packet to the control socket. `gate` is `None` for the
 /// daemon relay, which is not a box and forwards its own frames unchecked.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every `buf[..n]` is bounded by `n`, the count this loop's own read of `buf` returned"
+)]
 async fn relay_tap_to_switch<W>(
     tap: Arc<AsyncFd<std::fs::File>>,
     mut sock: W,
@@ -1138,11 +1142,16 @@ fn udp_payload<'a>(frame: &'a [u8], pkt: &L4Packet) -> Option<&'a [u8]> {
 /// relay's inbound hot path — mostly a peer's TCP frames, which the DNS gate
 /// can never observe — spends three comparisons per frame instead of the full
 /// [`udp_datagram`] parse. A frame that says UDP here is still parsed and
-/// length-checked before the gate reads a word of it.
+/// length-checked before the gate reads a word of it. Both reads are
+/// bounds-checked with `get`, the way [`udp_payload`] reads its headers, so a
+/// frame shorter than either field is "not UDP" rather than a panic.
 fn is_ipv4_udp(frame: &[u8]) -> bool {
-    frame.len() > ETH_HDR + 9
-        && frame[12..14] == ETHERTYPE_IPV4.to_be_bytes()
-        && frame[ETH_HDR + 9] == IPPROTO_UDP
+    frame
+        .get(12..14)
+        .is_some_and(|ether| *ether == ETHERTYPE_IPV4.to_be_bytes())
+        && frame
+            .get(ETH_HDR + 9)
+            .is_some_and(|proto| *proto == IPPROTO_UDP)
 }
 
 /// The IPv4 header checksum of `header` (a whole header, the checksum field
@@ -1150,12 +1159,20 @@ fn is_ipv4_udp(frame: &[u8]) -> bool {
 /// words. The box's kernel verifies it on every received frame, so the
 /// replies the relay synthesizes must carry an honest one.
 fn ipv4_checksum(header: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    for word in header.chunks_exact(2) {
-        sum += u16::from_be_bytes([word[0], word[1]]) as u32;
-    }
-    if header.len() % 2 == 1 {
-        sum += u32::from(header[header.len() - 1]) << 8;
+    let mut words = header.chunks_exact(2);
+    let mut sum: u32 = words
+        .by_ref()
+        .map(|word| {
+            u32::from(u16::from_be_bytes(
+                // `chunks_exact(2)` yields two-byte words by definition, so
+                // this conversion cannot fail.
+                word.try_into().expect("chunks_exact(2) yields two bytes"),
+            ))
+        })
+        .sum();
+    // An odd header's final byte is the high half of a padded last word.
+    if let Some(tail) = words.remainder().first() {
+        sum += u32::from(*tail) << 8;
     }
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -1176,9 +1193,16 @@ fn udp_reply_frame(request: &[u8], pkt: &L4Packet, payload: &[u8]) -> Vec<u8> {
     let total = 20 + 8 + payload.len();
     let mut frame = Vec::with_capacity(ETH_HDR + total);
     // Ethernet: the reply's destination is the request's source and vice
-    // versa, the way any answer looks to the box.
-    frame.extend_from_slice(&request[6..12]);
-    frame.extend_from_slice(&request[0..6]);
+    // versa, the way any answer looks to the box. A request that parsed far
+    // enough to yield `pkt` carries the whole header, so both MACs are here.
+    let (requested_dst, rest) = request
+        .split_first_chunk::<6>()
+        .expect("a parsed datagram carries an Ethernet header");
+    let (requested_src, _) = rest
+        .split_first_chunk::<6>()
+        .expect("an Ethernet header carries a source MAC too");
+    frame.extend_from_slice(requested_src);
+    frame.extend_from_slice(requested_dst);
     frame.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
     // IPv4, IHL 5: the resolver the box asked is the source, the box the
     // destination; the checksum covers the header the box's kernel verifies.
@@ -1205,6 +1229,10 @@ fn udp_reply_frame(request: &[u8], pkt: &L4Packet, payload: &[u8]) -> Vec<u8> {
 /// switch → tap: read a 2-byte LE length, then that many bytes of Ethernet
 /// frame, apply the inbound ingress gate (finding #2), and write the frame to the
 /// tap device.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every `frame[..n]` is bounded by the explicit `n > frame.len()` rejection above"
+)]
 async fn relay_switch_to_tap<R>(
     mut sock: R,
     tap: Arc<AsyncFd<std::fs::File>>,
