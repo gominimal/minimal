@@ -53,13 +53,24 @@ const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
 /// How long to wait for the portal to answer at all.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long to wait between bytes once it has.
+/// How long to wait between reads once it has.
 ///
-/// The deadline is on inactivity rather than on the whole request because a
-/// bundle is up to [`MAX_BUNDLE_BYTES`] and may be going over a slow link: an
-/// upload that is merely slow has to be allowed to finish, while a portal that
-/// accepts the connection and then says nothing must not hang the command.
+/// This bounds a portal that accepts the connection and then says nothing. It
+/// does not bound a stalled write, so the two requests below carry an overall
+/// deadline as well.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Overall deadline for the create request, which carries no bundle.
+const CREATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Overall deadline for the request that carries the bundle.
+///
+/// Generous, because it has to cover [`MAX_BUNDLE_BYTES`] over a slow link
+/// and cutting off an upload that is merely slow would be the worse failure.
+/// It is here so that a peer which accepts the connection and then stops
+/// reading is bounded at all: neither the connect nor the read deadline
+/// covers a write that never drains.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Sends a bundle and returns where its diagnosis will appear.
 ///
@@ -118,6 +129,7 @@ pub async fn upload(
 
     let created = client
         .post(format!("{base}/diag/api/diagnoses"))
+        .timeout(CREATE_TIMEOUT)
         .bearer_auth(token)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(
@@ -156,6 +168,7 @@ pub async fn upload(
 
     let sent = client
         .put(format!("{base}{put_path}"))
+        .timeout(UPLOAD_TIMEOUT)
         .bearer_auth(token)
         .header(reqwest::header::CONTENT_TYPE, "application/zstd")
         .header(reqwest::header::CONTENT_LENGTH, bytes.len())
