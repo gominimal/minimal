@@ -18,6 +18,8 @@
 
 use serde::Serialize;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+#[cfg(any(test, not(target_os = "macos")))]
+use std::time::Duration;
 
 /// The zone the daemon's answerer holds. Mirrors
 /// `minimald::net::dns::HOSTNAME_SUFFIX`; the CLI does not depend on the
@@ -570,29 +572,55 @@ pub(crate) fn stub_bypass_blocker(
     ))
 }
 
-/// One read-only `resolvectl` query, or `None` when the binary is missing,
-/// the call failed, or its output is not UTF-8. Reading through
-/// systemd-resolved's read API writes nothing, so it cannot prompt.
+/// How long one `resolvectl` query may run before detection gives up on
+/// it. A healthy systemd-resolved answers in milliseconds, but a wedged
+/// one — or its D-Bus bus — blocks the call indefinitely, and the session
+/// start this detection runs inside must neither prompt nor hang
+/// (NET-123); a query that outlives the bound reads as absent, the arm
+/// the advisory is safe under, instead of wedging the activate. Generous
+/// on purpose: a loaded host's slow-but-healthy query must not misread.
 #[cfg(not(target_os = "macos"))]
-async fn resolvectl(args: &[&str]) -> Option<String> {
-    let output = tokio::process::Command::new("resolvectl")
+const RESOLVECTL_BOUND: Duration = Duration::from_secs(5);
+
+/// One read-only query of `program`, or `None` when the binary is missing,
+/// the call failed, it outlived `bound`, or its output is not UTF-8.
+/// Reading through systemd-resolved's read API writes nothing, so it
+/// cannot prompt. `kill_on_drop` reaps the query the bound abandons, so a
+/// wedged call leaves no process behind on the host it hung.
+#[cfg(any(test, not(target_os = "macos")))]
+async fn bounded_query(program: &str, args: &[&str], bound: Duration) -> Option<String> {
+    let query = tokio::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(bound, query).await {
+        Ok(output) => output.ok()?,
+        Err(_outlived_the_bound) => return None,
+    };
     if !output.status.success() {
         return None;
     }
     String::from_utf8(output.stdout).ok()
 }
 
+/// One read-only `resolvectl` query, or `None` when the binary is missing,
+/// the call failed, it outlived [`RESOLVECTL_BOUND`], or its output is not
+/// UTF-8. Reading through systemd-resolved's read API writes nothing, so
+/// it cannot prompt.
+#[cfg(not(target_os = "macos"))]
+async fn resolvectl(args: &[&str]) -> Option<String> {
+    bounded_query("resolvectl", args, RESOLVECTL_BOUND).await
+}
+
 /// Reads the host's current hook state (NET-122's detection proper) and the
 /// reason no zone command would reach this host's lookups, when there is one.
-/// Detection is read-only and never prompts: two `resolvectl` queries and
-/// three file reads on Linux, one file read on macOS.
+/// Detection is read-only and never prompts: two `resolvectl` queries —
+/// each bounded by [`RESOLVECTL_BOUND`], so a wedged systemd-resolved
+/// reads as absent rather than hanging the activate — and three file reads
+/// on Linux, one file read on macOS.
 pub(crate) async fn session_detection() -> (Hook, Option<String>) {
     host_detection().await
 }
@@ -1392,5 +1420,40 @@ mod tests {
         assert!(json.contains("127.64.0.0/24"), "{json}");
         assert!(json.contains("\"interim_loopback\": false"), "{json}");
         assert!(json.contains("\"port\": 15353"), "{json}");
+    }
+
+    // The bound on every `resolvectl` read: a wedged systemd-resolved — or
+    // its D-Bus bus — blocks the call indefinitely, and the activate that
+    // awaits it must neither prompt nor hang (NET-123). A call past its
+    // bound reads as absent, the arm the advisory is safe under.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn a_query_outliving_its_bound_reads_absent_instead_of_hanging() {
+        let started = std::time::Instant::now();
+        let read = bounded_query("sleep", &["30"], Duration::from_millis(50)).await;
+        assert_eq!(read, None, "a call past its bound must read as absent");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the bound must give up on the call, not wait it out: {:?}",
+            started.elapsed()
+        );
+    }
+
+    // The arms besides the bound: a query that answers within it reads as
+    // its stdout, and a binary that does not exist reads as absent — the
+    // call a host with no systemd-resolved at all makes.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn a_query_within_its_bound_reads_and_a_missing_one_reads_absent() {
+        let read = bounded_query("printf", &["resolvectl answered"], RESOLVECTL_BOUND)
+            .await
+            .expect("a call within its bound must be read");
+        assert_eq!(read.trim(), "resolvectl answered");
+        assert!(
+            bounded_query("minimal-no-such-binary", &[], RESOLVECTL_BOUND)
+                .await
+                .is_none(),
+            "a missing binary must read as absent"
+        );
     }
 }
