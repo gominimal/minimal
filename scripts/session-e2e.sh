@@ -86,6 +86,9 @@
 #                                    a real install.sh run ships the switch;
 #                                    own-IP ingress answers at 127.0.0.1:8080
 #   min_internal_names_through_proxy NET-001..004 through the shipped proxy
+#   proxy_refuses_like_direct        the proxy refuses exactly as the switch
+#                                    does: paired direct/proxied attempts,
+#                                    h2 closed, h2c stripped (NET-069..071, 135)
 #   hostnames_recover_and_two_daemons_route NET-020..027 warning, recovery,
 #                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
@@ -128,6 +131,9 @@ PROXY_SEED_DIR="" # seeded by the min.internal proxy proof; removed on teardown
 PROXY_OWN_SEED_DIR="" # its own-address box's seed; removed on teardown
 PROXY_HOST_DIR="" # the host-loopback dir that proof serves; removed on teardown
 PROXY_HOST_SRV_PID="" # the host-loopback server it starts; killed on teardown
+PAR_SEED_DIR="" # seeded by the proxy-parity proof below; removed on teardown
+PAR_OWN_SEED_DIR="" # its own-address target box's seed; removed on teardown
+PAR_CALLER_SEED_DIR="" # its denied-caller box's seed; removed on teardown
 RECOVER_SEED_DIR="" # the hostnames-recovery proof's seed; removed on teardown
 SECOND_SEED_DIR="" # its second-daemon box's seed; removed on teardown
 RECOVER_STATE2_DIR="" # the second daemon's state base; `mnl2 stop` on teardown
@@ -362,6 +368,9 @@ teardown() {
   if [ -n "$PROXY_HOST_SRV_PID" ]; then
     kill "$PROXY_HOST_SRV_PID" 2>/dev/null || true
   fi
+  [ -n "$PAR_SEED_DIR" ] && rm -rf "$PAR_SEED_DIR"
+  [ -n "$PAR_OWN_SEED_DIR" ] && rm -rf "$PAR_OWN_SEED_DIR"
+  [ -n "$PAR_CALLER_SEED_DIR" ] && rm -rf "$PAR_CALLER_SEED_DIR"
   # The hostnames-recovery proof's extras: the port holder it starts, the
   # second daemon it brings up (its sessions were destroyed in the proof,
   # but the daemon itself outlives them), and the switch socket beat C may
@@ -3435,6 +3444,504 @@ proof_min_internal_names_through_proxy() {
 }
 
 # ---------------------------------------------------------------------------
+# The hostname proxy honours the switch's rules, end to end (NET-069, NET-070,
+# NET-071, NET-135). The rule is parity, and parity is proved by PAIRS: the
+# same target attempted directly and through the proxy, the two attempts
+# printed side by side with the refusal each got. A readable-log lane also
+# prints the daemon record a refusal left, so the transcript shows the proxy's
+# answer beside the direct leg's; on a VM lane the records are the guest
+# daemon's, and the `min bug` bundle a failing run writes (see `fail`) carries
+# them — the statuses pair the refusals meanwhile.
+#
+# The pairing covers three shapes:
+#   * an undeclared port — refused by the OS on the direct leg (host-address
+#     box: nothing listens), refused by the proxy with that same refusal as
+#     its reason (502), and on a VM lane refused by the target's ingress
+#     declaration on BOTH legs (dropped SYN direct, 403 proxied);
+#   * a caller whose egress rules deny the target — the caller's own gate
+#     drops its direct SYN, and the proxy refuses its request before dialing
+#     (403), against the same request routing from an ungated box;
+#   * the protocol discipline (NET-135) — the HTTP/2 prior-knowledge preface
+#     is closed without a status where a direct connection is served, and an
+#     h2c upgrade offer is stripped where a direct connection passes it
+#     through, both read from the upstream's own echo.
+proof_proxy_refuses_like_direct() {
+  echo "::group::the hostname proxy honours the switch's rules (NET-069/070/071, NET-135)"
+
+  # The daemon's file log, newest first, and the net-module records it gained
+  # since line $1 — the window ONE paired attempt produces. Same shape as the
+  # min.internal proof's helpers above, whose filtering note applies here too
+  # (the daemon logs plenty besides a request; only the net modules are this
+  # case's business). Callers poll for a pattern.
+  par_daemon_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null \
+      | sort | tail -n1
+  }
+  par_log_lines() {
+    local f
+    f="$(par_daemon_log)"
+    if [ -n "$f" ]; then wc -l < "$f"; else printf '0\n'; fi
+  }
+  par_log_since() {
+    local f
+    f="$(par_daemon_log)"
+    [ -n "$f" ] || return 0
+    tail -n "+$(($1 + 1))" "$f" | grep -E -- '"target": *"minimald::net::' || true
+  }
+  # The window that has gained a record matching $2 within ~5s (the file
+  # writer is asynchronous), else the last window — so the failing assert
+  # below prints what actually landed.
+  par_log_wait() {
+    local before="$1" want="$2" i w=""
+    for i in $(seq 1 20); do
+      w="$(par_log_since "$before")"
+      case "$w" in *"$want"*) break ;; esac
+      sleep 0.25
+    done
+    printf '%s\n' "$w"
+  }
+
+  # One DIRECT attempt from a box: curl's exit code and its stderr ARE the
+  # refusal a direct connection gets — an OS-refused connection is curl 7, a
+  # SYN a target's gate silently dropped is a connect timeout, curl 28.
+  par_direct() { # $1 box, $2 url, $3 max-time
+    mnl session exec "$1" "curl -sS --max-time $3 -o /dev/null '$2'" \
+      2>"$WORK/par-direct.err"
+    PAR_RC=$?
+  }
+  # One proxied attempt from a box: the status line and the body, via the
+  # proxy at $3 — host loopback from a host-address box, the daemon's own
+  # switch address from a box with a lease.
+  par_proxied() { # $1 box, $2 url, $3 proxy address, $4 max-time
+    local out
+    out="$(mnl session exec "$1" \
+      "curl -sS --max-time $4 -x http://$3 -o /home/par.body -w '%{http_code}' '$2'" \
+      2>"$WORK/par-proxied.err")" || true
+    PAR_STATUS="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r\n')"
+    PAR_BODY="$(mnl session exec "$1" 'cat /home/par.body' 2>/dev/null || true)"
+  }
+  # The paired print — the two lines this case owes the transcript per pair.
+  par_pair() { # $1 label, $2 the direct attempt's line, $3 the proxied one
+    printf 'pair %s\n' "$1"
+    printf '  direct:  %s\n' "$2"
+    printf '  proxied: %s\n' "$3"
+  }
+
+  # The names and ports. Ports are fixed on purpose (the execs that start and
+  # probe the responders must agree) and high enough to need no privilege;
+  # 18080-18084 and 19090/19091 belong to the proofs around this one.
+  PAR_NAME="e2e-par"                # the origin box, host-address, every lane
+  PAR_OWN_NAME="e2e-par-own"        # the target box, own-address, VM lanes
+  PAR_CALLER_NAME="e2e-par-caller"  # the denied caller, own-address, VM lanes
+  PAR_ECHO_PORT=18085               # the in-box echo responder (served + routed)
+  PAR_DEAD_PORT=18086               # nothing listens: the OS refusal, both legs
+  PAR_OWN_PORT=18087                # the target's published port (ext == int)
+  PAR_OWN_CLOSED_PORT=18088         # never published: dropped direct, 403 proxied
+  PAR_OWN_MARKER="PAR_OWN_ROUTED_OK"
+
+  # The request origin: a host-address box, sharing its host's loopback —
+  # which is how it reaches the proxy at 127.0.0.1:7654, on every lane.
+  PAR_SEED_DIR="$(hook_mktemp /tmp/mnlpd.XXXXXX)"
+  hook_seed_preamble > "$PAR_SEED_DIR/minimal.toml"
+  mkdir "$PAR_SEED_DIR/.git"
+  par_sid="$(cd "$PAR_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$PAR_NAME" 2>"$WORK/par-activate.err")" || {
+    echo "::error::'min session activate' for the parity proof's origin box failed"
+    echo "--- stderr ---"; cat "$WORK/par-activate.err" 2>/dev/null || true
+    fail
+  }
+  par_sid="$(printf '%s\n' "$par_sid" | tail -n1 | tr -d '\r')"
+
+  # ---- capability gates: what THIS host can run ---------------------------
+  # The same two gates the min.internal proof runs, for the same reasons; a
+  # skip is honest only on a developer host (no CI, no VM lane).
+  par_gate_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
+
+  # 1. The session's sandbox program. A host that is itself a sandbox denies
+  #    the nested mount namespaces a box's rootfs needs: no probe inside a
+  #    box can run, and nothing this case asserts can be asserted.
+  if ! mnl session exec "$par_sid" 'true' >"$WORK/par-execgate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$par_sid" 'true' >"$WORK/par-execgate.err" 2>&1; }; then
+    if par_gate_can_skip; then
+      echo "::warning::proxy parity proof SKIPPED — this host cannot run a session sandbox"
+      echo "  (exec: $(head -n1 "$WORK/par-execgate.err" 2>/dev/null || true))"
+      mnl session destroy --force "$par_sid" >/dev/null 2>&1 || true
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::this lane cannot run a session sandbox, so no probe inside a box can run: nothing this case asserts can be asserted"
+    echo "  (exec: $(head -n1 "$WORK/par-execgate.err" 2>/dev/null || true))"
+    echo "  on a VM lane the boxes live in the guest, so this is a lane-level fault"
+    fail
+  fi
+
+  # 2. The hostname proxy's listen address (:7654, EGRESS_PROXY_PORT). A host
+  #    that already runs a minimald has it taken, and every probe through the
+  #    proxy would reach a daemon that knows nothing about this run's boxes.
+  par_bind_taken=0
+  for par_bind_try in 1 2 3 4 5; do
+    par_ls_out="$(mnl ls 2>&1)"
+    case "$par_ls_out" in
+      *"session hostnames will not route"*) par_bind_taken=1 ;;
+      *) par_bind_taken=0; break ;;
+    esac
+    [ "$par_bind_try" = 5 ] || sleep 3
+  done
+  if [ "$par_bind_taken" -eq 1 ]; then
+    if par_gate_can_skip; then
+      echo "::warning::proxy parity proof SKIPPED — another daemon owns 127.0.0.1:7654 on this host"
+      echo "  every probe through the proxy would reach a daemon that knows nothing about this run's boxes"
+      mnl session destroy --force "$par_sid" >/dev/null 2>&1 || true
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::another daemon owns 127.0.0.1:7654, so this run's daemon cannot route session hostnames: every probe through the proxy would reach a daemon that knows nothing about this run's boxes"
+    echo "--- min ls ---"; printf '%s\n' "${par_ls_out:-}"
+    fail
+  fi
+
+  # socat carries the responders below and base64 carries the echo script in;
+  # both are launcher-baseline packages (crates/minimald/src/session_host.rs
+  # BASELINE_PACKAGES), at /usr/bin — packages install with --prefix=/usr and
+  # the generic rootfs has no /bin, so the absolute paths are the daemon's own
+  # convention for in-box argv.
+  mnl session exec "$par_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
+    || { echo "::error::the session has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; fail; }
+  mnl session exec "$par_sid" 'test -x /usr/bin/base64' >/dev/null 2>&1 \
+    || { echo "::error::the session has no base64 at /usr/bin/base64 (a coreutils package — every box ships it)"; fail; }
+
+  # The echo responder the protocol pairs need: it answers every head with a
+  # 200 whose body is the head it received, lines joined with '|'. The body is
+  # the assertion: what the UPSTREAM received is what the echo carries, so the
+  # strip's effect — and the direct leg's pass-through — is read from the box
+  # that would have had to honour the upgrade. Delivered through base64
+  # (python3 encodes it host-side; python3 is an e2e prerequisite on every
+  # lane), because a shell-quoted delivery would fight the script's own
+  # quoting.
+  par_echo_script="$(cat <<'PAR_EO'
+head=
+while IFS= read -r line; do
+  line=${line%$'\r'}
+  [ -n "$line" ] || break
+  head="$head|$line"
+done
+printf 'HTTP/1.1 200 OK\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' "${#head}" "$head"
+PAR_EO
+)"
+  par_echo_b64="$(printf '%s' "$par_echo_script" | python3 -c \
+    'import base64,sys; sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode())')"
+  mnl session exec "$par_sid" "printf %s '$par_echo_b64' | /usr/bin/base64 -d > /home/par-echo.sh" \
+    >/dev/null 2>"$WORK/par-echo.err" \
+    || { echo "::error::could not write the echo responder's script"; cat "$WORK/par-echo.err" 2>/dev/null || true; fail; }
+  # `nohup ... &` is the documented detach form (docs/reference/cli-min.md,
+  # `session exec`): the responder has to outlive the exec that starts it.
+  mnl session exec "$par_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$PAR_ECHO_PORT,reuseaddr,fork SYSTEM:'/usr/bin/bash /home/par-echo.sh' >/dev/null 2>&1 &" \
+    >/dev/null 2>"$WORK/par-echo.err" \
+    || { echo "::error::could not start the echo responder"; cat "$WORK/par-echo.err" 2>/dev/null || true; fail; }
+  par_ready=""
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$par_sid" \
+      "curl -sS --max-time 5 -o /home/par-ready.body -w '%{http_code}' http://127.0.0.1:$PAR_ECHO_PORT/" \
+      2>/dev/null || true)" = "200" ]; then
+      par_ready=1; break
+    fi
+    sleep 0.25
+  done
+  [ -n "$par_ready" ] || {
+    echo "::error::the echo responder never answered a direct curl — the proxy is not in the picture yet"
+    echo "--- socat exec stderr ---"; cat "$WORK/par-echo.err" 2>/dev/null || true
+    fail
+  }
+
+  # ---- the baseline: a published port routes ------------------------------
+  # Every refusal below is the proxy's decision, not a broken route; this is
+  # the clean 200 that says the routing machinery is live when they are read.
+  # The echo body carries the request the upstream received.
+  par_proxied "$par_sid" "http://$PAR_NAME.min.internal:$PAR_ECHO_PORT/" "127.0.0.1:7654" 20
+  echo "routed baseline: GET http://$PAR_NAME.min.internal:$PAR_ECHO_PORT/ via the proxy -> HTTP ${PAR_STATUS:-<none>}"
+  [ "${PAR_STATUS:-}" = 200 ] || {
+    echo "::error::the routed baseline did not return 200 (got '${PAR_STATUS:-<none>}')"
+    echo "--- curl stderr ---"; cat "$WORK/par-proxied.err" 2>/dev/null || true
+    fail
+  }
+  case "$PAR_BODY" in *"$PAR_NAME.min.internal"*) ;; *)
+    echo "::error::the routed baseline's answer does not echo the request that reached the upstream"
+    echo "--- body ---"; printf '%s\n' "$PAR_BODY" | head -5
+    fail ;;
+  esac
+
+  # ---- pair 1 (NET-069, NET-071): an undeclared port, host-address box ----
+  # The box declares no ingress at all, so the switch has no gate to sit
+  # between: the OS refuses the DIRECT connection (nothing listens), and the
+  # proxy must hand the request to exactly that refusal — a 502 whose reason
+  # is the upstream's refusal — instead of swallowing it or dialing wide.
+  par_before="$(par_log_lines)"
+  par_direct "$par_sid" "http://127.0.0.1:$PAR_DEAD_PORT/" 5
+  par_direct_rc="$PAR_RC"
+  par_direct_line="GET http://127.0.0.1:$PAR_DEAD_PORT/ -> curl exit $PAR_RC: $(head -n1 "$WORK/par-direct.err" 2>/dev/null || true)"
+  par_proxied "$par_sid" "http://$PAR_NAME.min.internal:$PAR_DEAD_PORT/" "127.0.0.1:7654" 20
+  par_pair "an undeclared port, host-address box" \
+    "$par_direct_line" \
+    "GET http://$PAR_NAME.min.internal:$PAR_DEAD_PORT/ via the proxy -> HTTP ${PAR_STATUS:-<none>} ($(head -n1 "$WORK/par-proxied.err" 2>/dev/null || true))"
+  [ "$par_direct_rc" -eq 7 ] || {
+    echo "::error::the direct attempt to the undeclared port did not end in a refused connection (curl exit $par_direct_rc, expected 7)"
+    echo "--- curl stderr ---"; cat "$WORK/par-direct.err" 2>/dev/null || true
+    fail
+  }
+  [ "${PAR_STATUS:-}" = 502 ] || {
+    echo "::error::the proxied attempt to the undeclared port did not get the proxy's 502 (got '${PAR_STATUS:-<none>}')"
+    echo "--- curl stderr ---"; cat "$WORK/par-proxied.err" 2>/dev/null || true
+    fail
+  }
+  if hook_log_readable; then
+    par_pair_log="$(par_log_wait "$par_before" 'the upstream box refused the connection')"
+    printf '%s\n' "$par_pair_log" | sed 's/^/  daemon log: /'
+    case "$par_pair_log" in *"the upstream box refused the connection"*) ;; *)
+      echo "::error::the proxy did not log the upstream refusal beside the direct attempt's refusal"
+      echo "--- daemon log (tail) ---"; tail -20 "$(par_daemon_log)" 2>/dev/null || true
+      fail ;;
+    esac
+    case "$par_pair_log" in *'"host":"'"$PAR_NAME.min.internal"'"'*) ;; *)
+      echo "::error::the refusal record does not name the host the request asked for"
+      echo "--- record ---"; printf '%s\n' "$par_pair_log"
+      fail ;;
+    esac
+  else
+    echo "  (the refusal record is the guest daemon's on this lane — a failing run's diagnostics bundle carries it)"
+  fi
+
+  # ---- pair 2 (NET-135): the HTTP/2 prior-knowledge preface ---------------
+  # The same bytes to both: to the echo upstream directly (an HTTP/1.1 server
+  # serves them as a request head, which is what the direct half shows) and
+  # to the proxy, which routes HTTP/1.1 requests and CONNECT tunnels only —
+  # it closes instead of answering, because there is no protocol switch
+  # behind it to offer and tunneling one would bypass the routing core's
+  # refusals entirely.
+  par_before="$(par_log_lines)"
+  par_h2_direct="$(mnl session exec "$par_sid" \
+    "printf 'PRI * HTTP/2.0\r\n\r\n' | /usr/bin/socat -t 3 - TCP:127.0.0.1:$PAR_ECHO_PORT" \
+    2>"$WORK/par-h2-direct.err" || true)"
+  par_h2_proxied="$(mnl session exec "$par_sid" \
+    "printf 'PRI * HTTP/2.0\r\n\r\n' | /usr/bin/socat -t 3 - TCP:127.0.0.1:7654" \
+    2>"$WORK/par-h2-proxy.err" || true)"
+  par_pair "the HTTP/2 prior-knowledge preface" \
+    "the preface to the echo upstream -> $(printf '%s' "$par_h2_direct" | head -n1)" \
+    "the preface to the proxy -> $(if [ -n "$par_h2_proxied" ]; then printf '%s' "$par_h2_proxied" | head -n1; else printf '<no bytes: the connection closed without a status>'; fi)"
+  case "$par_h2_direct" in *"200 OK"*) ;; *)
+    echo "::error::the echo upstream did not serve the preface as an HTTP/1.1 head — the pair's direct half is broken, not the proxy's close"
+    echo "--- socat stderr ---"; cat "$WORK/par-h2-direct.err" 2>/dev/null || true
+    fail ;;
+  esac
+  case "$par_h2_proxied" in
+    *"HTTP/"*)
+      echo "::error::the proxy answered the HTTP/2 prior-knowledge preface instead of closing it (got: '$(printf '%s' "$par_h2_proxied" | head -n1)')"
+      echo "--- socat stderr ---"; cat "$WORK/par-h2-proxy.err" 2>/dev/null || true
+      fail ;;
+  esac
+  echo "  the proxy closed the preface connection: $(printf '%s' "$par_h2_proxied" | wc -c | tr -d ' ') bytes came back"
+  if hook_log_readable; then
+    par_pair_log="$(par_log_wait "$par_before" 'closed an HTTP/2 prior-knowledge connection')"
+    printf '%s\n' "$par_pair_log" | sed 's/^/  daemon log: /'
+    case "$par_pair_log" in *"closed an HTTP/2 prior-knowledge connection"*) ;; *)
+      echo "::error::the proxy did not log closing the HTTP/2 prior-knowledge connection"
+      echo "--- daemon log (tail) ---"; tail -20 "$(par_daemon_log)" 2>/dev/null || true
+      fail ;;
+    esac
+  fi
+
+  # ---- pair 3 (NET-135): an h2c upgrade offer -----------------------------
+  # The SAME head to both legs, differing only in where it is dialed: the
+  # request line is absolute-form (what a request through a proxy carries)
+  # and carries `Upgrade: h2c` with its paired `HTTP2-Settings`. Direct, the
+  # echo upstream receives the offer verbatim; through the proxy, the offer
+  # must be GONE — the request routed as the HTTP/1.1 request it is, so the
+  # upstream cannot answer a protocol switch the proxy cannot splice.
+  par_h2c_head() { # $1 the authority the head names, $2 the dial target
+    printf "printf 'GET http://%s/ HTTP/1.1\\r\\nHost: %s\\r\\nUpgrade: h2c\\r\\nHTTP2-Settings: AAMAAABkAAQAAP__\\r\\nConnection: Upgrade, HTTP2-Settings\\r\\n\\r\\n' | /usr/bin/socat -t 3 - TCP:%s" \
+      "$1" "$1" "$2"
+  }
+  par_h2c_direct="$(mnl session exec "$par_sid" \
+    "$(par_h2c_head "$PAR_NAME.min.internal:$PAR_ECHO_PORT" "127.0.0.1:$PAR_ECHO_PORT")" \
+    2>"$WORK/par-h2c-direct.err" || true)"
+  par_h2c_proxied="$(mnl session exec "$par_sid" \
+    "$(par_h2c_head "$PAR_NAME.min.internal:$PAR_ECHO_PORT" "127.0.0.1:7654")" \
+    2>"$WORK/par-h2c-proxy.err" || true)"
+  par_pair "an h2c upgrade offer" \
+    "the same head, direct to the echo upstream -> $(printf '%s' "$par_h2c_direct" | head -n1)" \
+    "the same head, via the proxy -> $(printf '%s' "$par_h2c_proxied" | head -n1)"
+  echo "  what the direct upstream received: $(printf '%s' "$par_h2c_direct" | tr -d '\r' | tr '\n' ' ' | cut -c1-160)"
+  echo "  what the proxied upstream received: $(printf '%s' "$par_h2c_proxied" | tr -d '\r' | tr '\n' ' ' | cut -c1-160)"
+  case "$par_h2c_direct" in *"Upgrade: h2c"*) ;; *)
+    echo "::error::the echo upstream did not echo the upgrade offer verbatim — the pair's direct half is broken, not the proxy's strip"
+    echo "--- socat stderr ---"; cat "$WORK/par-h2c-direct.err" 2>/dev/null || true
+    fail ;;
+  esac
+  case "$par_h2c_proxied" in *"200 OK"*) ;; *)
+    echo "::error::the h2c request did not route as plain HTTP/1.1 (got: '$(printf '%s' "$par_h2c_proxied" | head -n1)')"
+    echo "--- socat stderr ---"; cat "$WORK/par-h2c-proxy.err" 2>/dev/null || true
+    fail ;;
+  esac
+  case "$par_h2c_proxied" in
+    *h2c*|*"HTTP2-Settings"*)
+      echo "::error::the h2c upgrade offer reached the upstream through the proxy — the echo of what it received carries it"
+      fail ;;
+  esac
+
+  # ---- the switch halves (NET-069/NET-070 across boxes) -------------------
+  # Gated on E2E_VM, and the gate is the address fabric these pairs route
+  # over, not the switch binary: the pairs go BETWEEN boxes — an own-address
+  # target's lease, and a caller whose lease the egress verdict reads. On a
+  # VM lane both boxes stand on the switch and the daemon serves the proxy
+  # from inside it (a denied caller reaches it at the daemon's own switch
+  # address). On a native host the daemon is off the switch — a lease is
+  # deliberately not host-answerable (NET-127/128) — so a direct attempt from
+  # the host's namespace cannot route to a box's lease, and the pair would
+  # not be honest to run there.
+  if [ -n "$E2E_VM" ]; then
+    PAR_OWN_SEED_DIR="$(hook_mktemp /tmp/mnlpx.XXXXXX)"
+    hook_seed_preamble > "$PAR_OWN_SEED_DIR/minimal.toml"
+    mkdir "$PAR_OWN_SEED_DIR/.git"
+    PAR_OWN_SID="$(cd "$PAR_OWN_SEED_DIR" && mnl session activate . --no-prompt \
+      --name "$PAR_OWN_NAME" --network own_ip \
+      --ingress "$PAR_OWN_PORT:$PAR_OWN_PORT" 2>"$WORK/par-own.err")" || {
+      echo "::error::'min session activate --network own_ip --ingress ...' for the parity proof's target box failed"
+      echo "--- stderr ---"; cat "$WORK/par-own.err" 2>/dev/null || true
+      fail
+    }
+    PAR_OWN_SID="$(printf '%s\n' "$PAR_OWN_SID" | tail -n1 | tr -d '\r')"
+
+    # The target's published-port responder: one fixed 200 whose body is the
+    # marker, on the INTERNAL port the ingress declaration publishes (the
+    # proxy dials the lease at the mapped internal port, and the box's
+    # ingress gate admits exactly those) — the min.internal proof's pattern.
+    mnl session exec "$PAR_OWN_SID" \
+      "body=$PAR_OWN_MARKER; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/par-own200" \
+      >/dev/null 2>"$WORK/par-own-resp.err" \
+      || { echo "::error::could not write the target box's response"; cat "$WORK/par-own-resp.err" 2>/dev/null || true; fail; }
+    mnl session exec "$PAR_OWN_SID" \
+      "nohup /usr/bin/socat TCP-LISTEN:$PAR_OWN_PORT,reuseaddr,fork SYSTEM:\"cat /home/par-own200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>"$WORK/par-own-resp.err" \
+      || { echo "::error::could not start the target box's responder"; cat "$WORK/par-own-resp.err" 2>/dev/null || true; fail; }
+    par_own_ready=""
+    for _ in $(seq 1 40); do
+      if [ "$(mnl session exec "$PAR_OWN_SID" \
+        "curl -sS --max-time 5 -o /home/par-ready.body -w '%{http_code}' http://127.0.0.1:$PAR_OWN_PORT/" \
+        2>/dev/null || true)" = "200" ]; then
+        par_own_ready=1; break
+      fi
+      sleep 0.25
+    done
+    [ -n "$par_own_ready" ] || {
+      echo "::error::the target box's responder never answered a direct curl"
+      echo "--- socat exec stderr ---"; cat "$WORK/par-own-resp.err" 2>/dev/null || true
+      fail
+    }
+
+    # The published port routes (the baseline the refusals below pair with).
+    par_proxied "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "127.0.0.1:7654" 20
+    echo "target baseline: GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/ via the proxy -> HTTP ${PAR_STATUS:-<none>}"
+    [ "${PAR_STATUS:-}" = 200 ] || {
+      echo "::error::the target's published port did not route (got '${PAR_STATUS:-<none>}')"
+      echo "--- curl stderr ---"; cat "$WORK/par-proxied.err" 2>/dev/null || true
+      fail
+    }
+    case "$PAR_BODY" in *"$PAR_OWN_MARKER"*) ;; *)
+      echo "::error::the routed answer is not the target box's marker response"
+      echo "--- body ---"; printf '%s\n' "$PAR_BODY" | head -3
+      fail ;;
+    esac
+
+    # ---- pair 4: an undeclared port, own-address target --------------------
+    # Both legs are refused by the ONE declaration: the proxy refuses the
+    # request before dialing (403, where the host, the session and the port
+    # are all in hand), and the target's ingress gate drops the direct SYN —
+    # a drop is not a reset, so the direct leg is a connect timeout, which is
+    # itself the assertion that the gate sat between.
+    par_direct "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/" 5
+    par_direct_rc="$PAR_RC"
+    par_direct_line="GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/ -> curl exit $PAR_RC: $(head -n1 "$WORK/par-direct.err" 2>/dev/null || true)"
+    par_proxied "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/" "127.0.0.1:7654" 20
+    par_pair "an undeclared port, own-address box" \
+      "$par_direct_line" \
+      "GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/ via the proxy -> HTTP ${PAR_STATUS:-<none>} ($(head -n1 "$WORK/par-proxied.err" 2>/dev/null || true))"
+    [ "$par_direct_rc" -eq 28 ] || {
+      echo "::error::the direct attempt to the target's unpublished port did not end in a connect timeout (curl exit $par_direct_rc, expected 28) — the target's ingress gate did not drop it, or something answered"
+      echo "--- curl stderr ---"; cat "$WORK/par-direct.err" 2>/dev/null || true
+      fail
+    }
+    [ "${PAR_STATUS:-}" = 403 ] || {
+      echo "::error::the proxied attempt to the target's unpublished port did not get the proxy's 403 (got '${PAR_STATUS:-<none>}')"
+      echo "--- curl stderr ---"; cat "$WORK/par-proxied.err" 2>/dev/null || true
+      fail
+    }
+
+    # ---- pair 5 (NET-070): a caller whose egress rules deny the target -----
+    # The caller is an own-address box whose ONE allowed destination is the
+    # daemon's own address on the switch — where the in-guest proxy listens.
+    # The switch's resolver and ARP keep their built-in carve-outs, so the
+    # box still resolves names; every other destination, the target's lease
+    # chief among them, is denied by the caller's own compiled rules. The
+    # literal is the default switch subnet's daemon address (the subnet every
+    # lane this script runs on uses; the alias literal the min.internal proof
+    # prints carries the same posture).
+    PAR_CALLER_SEED_DIR="$(hook_mktemp /tmp/mnlpy.XXXXXX)"
+    hook_seed_preamble > "$PAR_CALLER_SEED_DIR/minimal.toml"
+    mkdir "$PAR_CALLER_SEED_DIR/.git"
+    PAR_CALLER_SID="$(cd "$PAR_CALLER_SEED_DIR" && mnl session activate . --no-prompt \
+      --name "$PAR_CALLER_NAME" --network own_ip \
+      --allow-subnets 100.64.255.253/32 2>"$WORK/par-caller.err")" || {
+      echo "::error::'min session activate --network own_ip --allow-subnets ...' for the parity proof's denied caller failed"
+      echo "--- stderr ---"; cat "$WORK/par-caller.err" 2>/dev/null || true
+      fail
+    }
+    PAR_CALLER_SID="$(printf '%s\n' "$PAR_CALLER_SID" | tail -n1 | tr -d '\r')"
+
+    # The control: the SAME request from the ungated origin box routes. The
+    # denial below is the caller's rules, not the target's port map — this
+    # names the published port, which the pair above proved routes.
+    par_proxied "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "127.0.0.1:7654" 20
+    echo "caller control: the same proxied request from an ungated box -> HTTP ${PAR_STATUS:-<none>}"
+    [ "${PAR_STATUS:-}" = 200 ] || {
+      echo "::error::the control request from the ungated origin box did not route (got '${PAR_STATUS:-<none>}') — the refusals below would not be the caller's"
+      echo "--- curl stderr ---"; cat "$WORK/par-proxied.err" 2>/dev/null || true
+      fail
+    }
+
+    par_direct "$PAR_CALLER_SID" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" 5
+    par_direct_rc="$PAR_RC"
+    par_direct_line="GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/ -> curl exit $PAR_RC: $(head -n1 "$WORK/par-direct.err" 2>/dev/null || true)"
+    par_proxied "$PAR_CALLER_SID" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "100.64.255.253:7654" 20
+    par_pair "a caller whose egress rules deny the target" \
+      "$par_direct_line" \
+      "GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/ via the proxy at the daemon's switch address -> HTTP ${PAR_STATUS:-<none>} ($(head -n1 "$WORK/par-proxied.err" 2>/dev/null || true))"
+    [ "$par_direct_rc" -eq 28 ] || {
+      echo "::error::the denied caller's direct attempt did not end in a connect timeout (curl exit $par_direct_rc, expected 28) — the caller's egress gate did not drop it"
+      echo "--- curl stderr ---"; cat "$WORK/par-direct.err" 2>/dev/null || true
+      fail
+    }
+    [ "${PAR_STATUS:-}" = 403 ] || {
+      echo "::error::the denied caller's proxied attempt did not get the proxy's 403 (got '${PAR_STATUS:-<none>}')"
+      echo "--- curl stderr ---"; cat "$WORK/par-proxied.err" 2>/dev/null || true
+      fail
+    }
+    echo "  (both pairs' refusals are one rule each — no ingress mapping for pair 4, egress-undeclared-subnet for pair 5 —"
+    echo "   decided by the same compiled policy on both legs; the records are the guest daemon's on this lane and ride"
+    echo "   the diagnostics bundle a failing run writes)"
+
+    mnl session destroy --force "$PAR_CALLER_SID" >/dev/null 2>&1 || true
+    mnl session destroy --force "$PAR_OWN_SID" >/dev/null 2>&1 || true
+  else
+    echo "switch halves SKIPPED (no E2E_VM: the between-box pairs need the guest fabric — a direct attempt"
+    echo "  to a box's lease, and the proxy at the daemon's own switch address — which a host-side daemon has none of)"
+  fi
+
+  mnl session destroy --force "$par_sid" >/dev/null 2>&1 || true
+  echo "the hostname proxy honours the switch's rules OK (each pair printed with both refusals; the readable lanes' records beside them)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # The retired surfaces are gone, end to end (NET-109, NET-110). The mTLS/OIDC
 # HTTPS reverse proxy, its daemon-issued client certificates and the
 # `min ssh-forward` verb came out of the tree, `min login` stopped minting,
@@ -3797,12 +4304,13 @@ case "${1:-}" in
     proof_fresh_install_own_ip_ingress_publishes_loopback
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
+    proof_proxy_refuses_like_direct
     proof_retired_surfaces_gone
     ;;
   lifecycle | session_exec | session_outbound_request | own_ip | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | hostnames_recover_and_two_daemons_route \
-    | min_internal_names_through_proxy | retired_surfaces_gone)
+    | min_internal_names_through_proxy | proxy_refuses_like_direct | retired_surfaces_gone)
     "proof_$1"
     ;;
   *)
@@ -3811,7 +4319,7 @@ case "${1:-}" in
     echo "  cases: lifecycle session_exec session_outbound_request own_ip task_run hooks"
     echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         hostnames_recover_and_two_daemons_route"
-    echo "         min_internal_names_through_proxy retired_surfaces_gone"
+    echo "         min_internal_names_through_proxy proxy_refuses_like_direct retired_surfaces_gone"
     exit 2
     ;;
 esac
