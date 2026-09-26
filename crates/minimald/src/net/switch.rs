@@ -521,18 +521,18 @@ where
         // shared switch. A dropped frame is simply not written on — nothing is
         // sent back toward the box either, a drop is not a reset — and the drop
         // says so once per box per rule per minute (R2.7).
-        if let Some(gate) = &gate {
-            if let FrameVerdict::Drop(reason) = egress::verdict(&summary, &gate.egress) {
-                gate.limiter.warn(
-                    &gate.label,
-                    Direction::Egress,
-                    drop_remote(&summary),
-                    drop_transport(&reason),
-                    None,
-                    reason.rule(),
-                );
-                continue;
-            }
+        if let Some(gate) = &gate
+            && let FrameVerdict::Drop(reason) = egress::verdict(&summary, &gate.egress)
+        {
+            gate.limiter.warn(
+                &gate.label,
+                Direction::Egress,
+                drop_remote(&summary),
+                drop_transport(&reason),
+                None,
+                reason.rule(),
+            );
+            continue;
         }
         // Track outbound UDP so the inbound gate recognizes its reply as
         // solicited. Only a frame the verdict admitted gets a window: an
