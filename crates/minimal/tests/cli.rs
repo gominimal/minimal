@@ -1195,12 +1195,13 @@ async fn setup_opted_out() -> (
     GlobalArgs,
     tempfile::TempDir,
 ) {
-    let server =
-        minimald::test_harness::TestServer::new_opted_out_in(tempfile::TempDir::new().unwrap())
-            .await;
-    let temp = tempfile::TempDir::new().unwrap();
+    let server = minimald::test_harness::TestServer::new_opted_out_in(
+        tempfile::TempDir::new().expect("the harness's tempdir for the opted-out daemon"),
+    )
+    .await;
+    let temp = tempfile::TempDir::new().expect("a tempdir for the client side of the test");
     let sock_dir = temp.path().join("providers/local-minimald0");
-    std::fs::create_dir_all(&sock_dir).unwrap();
+    std::fs::create_dir_all(&sock_dir).expect("the provider socket dir is a fresh tempdir path");
     server.listen_on_uds(&sock_dir.join("ssh.sock")).await;
     let args = GlobalArgs {
         repo_dir: None,

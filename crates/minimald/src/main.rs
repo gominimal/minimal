@@ -804,7 +804,10 @@ async fn async_main() -> Result<(), MainError> {
         switch_subnet_octet: None,
         // NET-077: the deployment's opt-out of the deny-all egress default —
         // the one daemon-side knob the default has.
-        deny_all_opt_out: cli.listen_args().unwrap().egress_deny_all_opt_out,
+        deny_all_opt_out: cli
+            .listen_args()
+            .expect("the daemon path is `run`, which carries listen args")
+            .egress_deny_all_opt_out,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.

@@ -1035,6 +1035,10 @@ impl Session {
                 let _ = r.send(Arc::clone(&self.net_switch));
             }
             SessionMessage::GetDenyAllOptOut(r) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
                 let _ = r.send(self.deny_all_opt_out);
             }
             #[cfg(test)]
@@ -2731,7 +2735,15 @@ impl SessionHandle {
     pub(crate) async fn deny_all_opt_out(&self) -> Result<bool, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the actor may already be gone; the recv below reports that"
+        )]
         let _ = self.0.send(SessionMessage::GetDenyAllOptOut(send)).await;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "a closed oneshot carries no cause beyond the actor being gone"
+        )]
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })

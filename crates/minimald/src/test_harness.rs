@@ -261,9 +261,11 @@ impl TestServer {
 /// harness server but an opted-out one runs — is what a daemon started
 /// without the flag gets.
 fn config_in(temp: &TempDir, deny_all_opt_out: bool) -> Config {
-    let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-    let state_dir = DaemonAbsPath::try_new(path.clone()).unwrap();
-    let cache_dir = DaemonAbsPath::try_new(path).unwrap();
+    let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf())
+        .expect("a tempdir path is utf-8 on every host the harness runs on");
+    let state_dir = DaemonAbsPath::try_new(path.clone())
+        .expect("the tempdir lives under the host's tmp root, an absolute path");
+    let cache_dir = DaemonAbsPath::try_new(path).expect("as above: the tempdir path is absolute");
     Config {
         host_key: HostKey::Ephemeral,
         minimal_state_dir: state_dir,
