@@ -1054,8 +1054,11 @@ async fn policy_shows_deny_all_default() {
 /// sees; the phase this build ships is announced, so the notice is the
 /// shipped path, and its scoping is exercised with it: a bare own-address
 /// activate prints, a host-address one (a box the change does not reach)
-/// does not. The other phase is gated by construction — once the default is
-/// in force the change is no longer coming, and the notice is `None`.
+/// does not, and a daemon that opted out (NET-077 — a deployment the change
+/// is not coming for, and one that has already taken the remedy the notice
+/// names) is not announced at either. The other phase is gated by
+/// construction — once the default is in force the change is no longer
+/// coming, and the notice is `None`.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn deny_all_announcement_printed() {
@@ -1133,12 +1136,81 @@ async fn deny_all_announcement_printed() {
          at:\n{host_net_stderr}"
     );
 
+    // And scoped to the daemons the change is coming for: an opted-out
+    // daemon (NET-077) has already chosen to keep the shipped default —
+    // the exact remedy this notice names — so announcing at it would tell
+    // it to do what it has done. The opt-out is the daemon's own fact, so
+    // this half runs against a second daemon started with the flag.
+    let (_opted_out, opted_out_args, _opted_out_dir) = setup_opted_out().await;
+    let opted_out = run_min(
+        &opted_out_args,
+        &[
+            "session",
+            "activate",
+            project.path().to_str().unwrap(),
+            "--name",
+            "notice-opted-out",
+            "--network",
+            "own_ip",
+            "--sync",
+            "tarball",
+            "--no-prompt",
+        ],
+    )
+    .await;
+    assert!(
+        opted_out.status.success(),
+        "activating a bare own-address box must still succeed on an opted-out \
+         daemon, but the binary exited {}:\n{}",
+        opted_out.status,
+        String::from_utf8_lossy(&opted_out.stderr),
+    );
+    let opted_out_stderr = String::from_utf8_lossy(&opted_out.stderr).into_owned();
+    assert!(
+        !opted_out_stderr.contains("Heads-up"),
+        "a daemon that has already taken the notice's remedy must not be \
+         told to take it:\n{opted_out_stderr}"
+    );
+
     // The other phase, gated by construction: once the default is in
     // force the change is no longer coming, and nothing prints.
     assert!(
         deny_all_default_notice(sessions::EgressDefaultPhase::InForce).is_none(),
         "the notice must not print once the default is in force"
     );
+}
+
+/// [`setup`] on a daemon that opted out of the deny-all egress default
+/// (NET-077): the same UDS-listening harness server, but one whose boxes
+/// with no `egress` section keep the shipped allow-all. Only the
+/// announcement test needs a daemon with the other rollout posture, so the
+/// builder stays here beside it rather than in the shared harness.
+///
+/// The caller must keep both returned values alive for as long as it talks
+/// to the daemon: the server owns the daemon's state, the tempdir the
+/// socket path lives in.
+#[cfg(target_os = "linux")]
+async fn setup_opted_out() -> (
+    minimald::test_harness::TestServer,
+    GlobalArgs,
+    tempfile::TempDir,
+) {
+    let server =
+        minimald::test_harness::TestServer::new_opted_out_in(tempfile::TempDir::new().unwrap())
+            .await;
+    let temp = tempfile::TempDir::new().unwrap();
+    let sock_dir = temp.path().join("providers/local-minimald0");
+    std::fs::create_dir_all(&sock_dir).unwrap();
+    server.listen_on_uds(&sock_dir.join("ssh.sock")).await;
+    let args = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(temp.path().to_path_buf()),
+        config_dir: None,
+        provider: None,
+        no_input: false,
+        vm: None,
+    };
+    (server, args, temp)
 }
 
 // --- hostname routing warning (NET-020/NET-021/NET-022) ---

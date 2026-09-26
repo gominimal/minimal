@@ -294,6 +294,12 @@ async fn serve_create_session(
                         hostname_routing_unavailable: s.proxy_unavailable().await,
                         hostname_proxy_port: s.hostname_proxy_port().await,
                         zone_answerer_port: s.zone_answerer_port().await,
+                        // The rollout's one fact the client cannot know from
+                        // its own build (NET-077), carried on the reply the
+                        // activation path already holds so the coming-change
+                        // notice (NET-076) can stay off a deployment that has
+                        // already chosen to keep the shipped default.
+                        deny_all_opt_out: Some(s.deny_all_opt_out().await),
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
@@ -2766,14 +2772,15 @@ mod tests {
         assert_eq!(policy.ingress, None);
     }
 
-    /// Creates an own-address session carrying `policy` and returns its id —
-    /// the box shape the deny-all default is about (NET-074): an
-    /// own-address box, whatever its egress declaration.
-    async fn own_ip_session(
+    /// Creates an own-address session carrying `policy` and returns the
+    /// whole create reply — the box shape the deny-all default is about
+    /// (NET-074): an own-address box, whatever its egress declaration.
+    /// Tests that only need the box take [`own_ip_session`].
+    async fn own_ip_create_reply(
         client: &mut TestClient,
         name: &str,
         policy: SessionPolicy,
-    ) -> SessionId {
+    ) -> minimald_rpc::CreateSessionResponse {
         client
             .call::<CreateSession>(&CreateSessionRequest {
                 config: minimald_rpc::SessionConfig {
@@ -2788,7 +2795,16 @@ mod tests {
             })
             .await
             .unwrap()
-            .id
+    }
+
+    /// Creates an own-address session carrying `policy` and returns its id —
+    /// [`own_ip_create_reply`] for a caller that needs only the box.
+    async fn own_ip_session(
+        client: &mut TestClient,
+        name: &str,
+        policy: SessionPolicy,
+    ) -> SessionId {
+        own_ip_create_reply(client, name, policy).await.id
     }
 
     /// NET-074/NET-075: `GetEffectiveSessionPolicy` answers, over the real
@@ -2957,6 +2973,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(declared.egress, EffectiveEgress::Declared(egress));
+    }
+
+    /// NET-076/NET-077: the create reply carries the daemon's opt-out —
+    /// the rollout's one fact the client cannot know from its own build,
+    /// since the phase is a build-time constant both sides share and the
+    /// flag is set on the daemon alone. `min session activate` reads it to
+    /// keep its coming-change notice off a deployment that has already
+    /// chosen to keep the shipped default; the create reply is the RPC the
+    /// activation path already holds, so the answer costs no extra round
+    /// trip. An opted-out daemon says `true`, a daemon without the flag
+    /// says `false` — never `None`, which is reserved for a daemon that
+    /// predates the field and so cannot have opted out.
+    #[tokio::test]
+    async fn create_reply_reports_the_deny_all_opt_out() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        assert_eq!(
+            own_ip_create_reply(
+                &mut client,
+                "opt-out-reply-default",
+                SessionPolicy::default()
+            )
+            .await
+            .deny_all_opt_out,
+            Some(false),
+            "a daemon without the flag must say it did not opt out",
+        );
+
+        let server = TestServer::new_opted_out_in(tempfile::tempdir().unwrap()).await;
+        let mut client = server.connect().await;
+        assert_eq!(
+            own_ip_create_reply(&mut client, "opt-out-reply-set", SessionPolicy::default())
+                .await
+                .deny_all_opt_out,
+            Some(true),
+            "an opted-out daemon must say so, so the notice can stay off",
+        );
     }
 
     #[tokio::test]

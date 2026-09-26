@@ -284,12 +284,17 @@ pub(crate) async fn activate_session(
 
     // The coming-change notice (NET-076), printed while the deny-all egress
     // default is announced but not yet in force. Scoped to the box it would
-    // change — an own-address session that declared no egress — and silent
-    // once the phase turns (see [`deny_all_default_notice`]). Printed after
-    // the session exists and before the work on it, so the warning is not
-    // lost above a failed activate's output.
+    // change — an own-address session that declared no egress — on a daemon
+    // that has not opted out of the change (NET-077): the opt-out is the
+    // one rollout fact this side cannot know, so it is read off the create
+    // reply above, and a daemon that has already set the flag has already
+    // taken the remedy the notice names. Silent once the phase turns (see
+    // [`deny_all_default_notice`]). Printed after the session exists and
+    // before the work on it, so the warning is not lost above a failed
+    // activate's output.
     if config.network == minimald_rpc::NetworkMode::OwnIp
         && config.policy.egress.is_none()
+        && created.deny_all_opt_out != Some(true)
         && let Some(notice) = deny_all_default_notice(sessions::EGRESS_DEFAULT_PHASE)
     {
         eprintln!("{notice}");
@@ -940,6 +945,11 @@ pub async fn cmd_session_policy(
 /// deployment keeps the shipped default while it moves. `None` in every
 /// other phase — once the default is in force the change is no longer
 /// coming, and a box that reaches nothing needs no note about it.
+///
+/// The opt-out half of the scope is the caller's to check: the daemon, not
+/// the client, knows whether it set `--egress-deny-all-opt-out` (NET-077),
+/// so [`activate_session`] reads it off the create reply and stays silent
+/// for a deployment the change is not coming for.
 pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'static str> {
     match phase {
         sessions::EgressDefaultPhase::Announced => Some(
