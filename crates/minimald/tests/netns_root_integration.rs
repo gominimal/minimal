@@ -825,8 +825,8 @@ impl Ptask {
             sudo_ok("configure PTask tap", &strs);
         }
 
-        let gate = SessionGate::for_session(lease.ip.to_string(), policy, subnet);
-        let relay = attach_to_switch(fd, api_sock, Some(gate), subnet)
+        let gate = SessionGate::for_session(lease.ip.to_string(), lease.ip, policy, subnet);
+        let relay = attach_to_switch(fd, api_sock, Some(gate), lease.ip, subnet)
             .await
             .expect("attach tap to switch");
 
