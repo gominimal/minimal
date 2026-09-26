@@ -459,7 +459,7 @@ jobs:
                   toolchain: stable
                   components: clippy
             - name: Cache cargo registry and build artifacts
-              uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+              uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 # zizmor: ignore[cache-poisoning] test-only lane, nothing published; save-if keeps every non-main ref read-only
               with:
                   shared-key: mac-unit
                   # PR branches restore but never save, so PR churn cannot
