@@ -381,7 +381,7 @@ async fn network_none_blocks_all_outside_sockets() {
     announce_to_the_runner("network_none_blocks_all_outside_sockets");
 
     let rootfs_tmp =
-        tempfile::tempdir_in(proof_base_dir()).expect("rootfs temp dir under the target tmp");
+        tempfile::tempdir_in(proof_base_dir()).expect("rootfs temp dir under the box base");
     let probe = compile_socket_probe(rootfs_tmp.path());
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
@@ -399,12 +399,9 @@ async fn network_none_blocks_all_outside_sockets() {
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
         .with_plan(no_net);
-    // Build the sandbox under the target directory rather than the default
-    // (`/home` here can be a read-only ext4 bind with locked nosuid, and
-    // `/tmp` a `nosuid,nodev` tmpfs; both break the unprivileged remounts
-    // hakoniwa does inside the user namespace — see `proof_base_dir`).
-    let tmp =
-        tempfile::tempdir_in(proof_base_dir()).expect("sandbox temp dir under the target tmp");
+    // The sandbox goes where every proof builds its box; `proof_base_dir`
+    // says what that has to satisfy and why.
+    let tmp = tempfile::tempdir_in(proof_base_dir()).expect("sandbox temp dir under the box base");
     let mut sandbox = config
         .build(tmp.path().join("sandbox"), ())
         .await
@@ -471,7 +468,7 @@ async fn network_none_attach_works() {
     const PROBE_SHELL: &str = "/usr/bin/probe";
 
     let rootfs_tmp =
-        tempfile::tempdir_in(proof_base_dir()).expect("rootfs temp dir under the target tmp");
+        tempfile::tempdir_in(proof_base_dir()).expect("rootfs temp dir under the box base");
     let probe = compile_socket_probe(rootfs_tmp.path());
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
@@ -480,8 +477,7 @@ async fn network_none_attach_works() {
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
         .with_plan(NetPlan::none());
-    let tmp =
-        tempfile::tempdir_in(proof_base_dir()).expect("sandbox temp dir under the target tmp");
+    let tmp = tempfile::tempdir_in(proof_base_dir()).expect("sandbox temp dir under the box base");
     let mut sandbox = config
         .build(tmp.path().join("sandbox"), ())
         .await
@@ -641,28 +637,124 @@ async fn network_none_attach_works() {
     );
 }
 
-/// Where the proofs that build a box build it: the cargo target directory,
-/// never `/tmp`.
+/// What a box's base directory has to leave room for below itself: the
+/// `sandbox` level the proofs nest under it, the directory the layer's
+/// `Config::build` makes inside that (`<name>-<timestamp>-<attempt>-<pid>`,
+/// with `none-sockets` the longest name the proofs pass), and the box's
+/// environment socket under it.
 ///
-/// `/tmp` works on the CI lane's runners, but a host whose `/tmp` is a
-/// `nosuid,nodev` tmpfs cannot host a box at all: a bind remount inside a user
-/// namespace may only repeat flags the underlying mount already has, and
-/// hakoniwa's read-only remount asks for `MS_RDONLY|MS_NOSUID` without
-/// `nodev`, so a bind whose source carries a locked `nodev` is refused. The
-/// capability proof is gated on the user namespace alone, so it has to run on
-/// such hosts; the none-box proofs go through the same place so a host that
-/// can run one can run all of them. The target directory sits on the
-/// checkout's own filesystem, which carries no such lock, and is ignored by
-/// git like everything under `target/`.
+/// The socket is what the room is for: its path goes into the kernel's
+/// 108-byte `sockaddr_un::sun_path`, and the bind is refused with `EINVAL` —
+/// "path must be shorter than SUN_LEN" — when it does not fit. That is what
+/// the CI lane failed on for four rounds, with every box the proofs build
+/// sitting under the checkout.
+const BELOW_BASE: &str = "/sandbox/none-sockets-1790441721-0-1048576/run/minenv_sock";
+
+/// The longest path an `AF_UNIX` socket may take: `sockaddr_un::sun_path`
+/// holds 108 bytes including the terminating NUL.
+const SUN_PATH_MAX: usize = 107;
+
+/// Where the proofs that build a box build it: the first directory on this
+/// host that can host one.
+///
+/// A base directory has to satisfy two constraints no single choice satisfies
+/// on every host these proofs run on:
+///
+/// * **Short.** The box's environment socket lives at
+///   `<base>/run/minenv_sock`, and a checkout is long enough to push that past
+///   what an `AF_UNIX` path may be on both this host and the CI runners — so
+///   the cargo target directory is the last candidate, not the default.
+///
+/// * **On a filesystem hakoniwa can bind from.** Hakoniwa bind-mounts every
+///   subdirectory of the rootfs read-only (`RDONLY|NOSUID|BIND|REC`) and then
+///   re-issues those flags with `MS_REMOUNT`, and a remount inside a user
+///   namespace may not *clear* a flag the underlying mount holds — so a
+///   `nodev` tmpfs, which is what an ordinary `/tmp` is, refuses it with
+///   `EPERM`, and a `noexec` filesystem could not run the probe inside the box
+///   either. The layer's own binds survive this because it asks for the
+///   source mount's flags in every bind; hakoniwa's rootfs binds do not, so
+///   the filesystem itself has to be clean.
+///
+/// So each proof asks the candidates — the host's tmp first, then the
+/// conventional scratch and runtime directories, the cargo target directory's
+/// tmp last — whether one takes a tempdir, carries no `nodev` or `noexec`, and
+/// leaves the socket's path room, and builds under the first one that does.
+/// On the CI runners that is `/tmp` (one filesystem, nothing locked); on a
+/// host whose `/tmp` is a `nodev` tmpfs over a read-only `/` it is `/run` or
+/// `/state`. A host that has nowhere is told what every candidate was refused
+/// for, because a box there cannot be built at all.
+///
+/// Every proof builds its rootfs source and its sandbox under the one base it
+/// gets from here, so the two keep sharing a filesystem — the layer assembles
+/// the rootfs as a hardlink farm over the source.
 fn proof_base_dir() -> PathBuf {
-    // The target directory this build uses; cargo points test targets at its
-    // own tmp through CARGO_TARGET_DIR, and a checkout that lets cargo
-    // default has one at its root.
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(|dir| PathBuf::from(dir).join("tmp"))
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp"));
-    std::fs::create_dir_all(&target).expect("creating the target tmp dir");
-    target
+    let mut refusals = Vec::new();
+    for candidate in proof_base_dir_candidates() {
+        match hosts_a_box(&candidate) {
+            Ok(()) => return candidate,
+            Err(reason) => refusals.push(format!("{}: {}", candidate.display(), reason)),
+        }
+    }
+    panic!(
+        "no directory on this host can host a box: {}",
+        refusals.join("; ")
+    );
+}
+
+/// The directories to try, in preference order: the host's tmp first — the
+/// conventional place, and the right one on the CI runners — then the
+/// conventional scratch and runtime directories a sandboxed host provisions,
+/// then the cargo target directory's tmp.
+fn proof_base_dir_candidates() -> Vec<PathBuf> {
+    vec![
+        std::env::temp_dir(),
+        PathBuf::from("/var/tmp"),
+        PathBuf::from("/run"),
+        PathBuf::from("/state"),
+        // The target directory this build uses; cargo points test targets at
+        // its own tmp through CARGO_TARGET_DIR, and a checkout that lets
+        // cargo default has one at its root.
+        std::env::var_os("CARGO_TARGET_DIR")
+            .map(|dir| PathBuf::from(dir).join("tmp"))
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp")),
+    ]
+}
+
+/// Whether a box can be built under `candidate`.
+fn hosts_a_box(candidate: &Path) -> Result<(), String> {
+    use nix::sys::statfs::statfs;
+    use nix::sys::statvfs::FsFlags;
+
+    // A tempdir of the proof's own proves the directory is writable and gives
+    // the path the proof's own tempdirs there will have.
+    let probe = tempfile::tempdir_in(candidate)
+        .map_err(|e| format!("cannot create a temp dir here: {e}"))?;
+    let flags = statfs(probe.path())
+        .map_err(|e| format!("statfs failed: {e}"))?
+        .flags();
+    if flags.contains(FsFlags::ST_NODEV) {
+        return Err(
+            "the filesystem is mounted nodev, so the read-only remounts \
+             hakoniwa does on every rootfs subdirectory inside the user \
+             namespace are refused with EPERM"
+                .to_string(),
+        );
+    }
+    if flags.contains(FsFlags::ST_NOEXEC) {
+        return Err(
+            "the filesystem is mounted noexec, so the box could not run the \
+             probe"
+                .to_string(),
+        );
+    }
+    let socket_len = probe.path().as_os_str().len() + BELOW_BASE.len();
+    if socket_len > SUN_PATH_MAX {
+        return Err(format!(
+            "the box's socket path under it would be {socket_len} bytes, \
+             past the {SUN_PATH_MAX} an AF_UNIX path may be"
+        ));
+    }
+    Ok(())
 }
 
 /// The credential state a process must exec with, read from the probe's
