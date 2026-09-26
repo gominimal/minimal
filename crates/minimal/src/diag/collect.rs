@@ -42,6 +42,17 @@ pub async fn system(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
     let info = diagnostics::system_info(&[&paths.state, &paths.cache, &paths.cwd]).await;
     let json = serde_json_lenient::to_vec_pretty(&info).context("serializing system info")?;
     w.add_bytes("host/system.json", &json, Redaction::None)
+        .await?;
+
+    // NET-122/NET-123: the host's naming surface — the resolver hook state
+    // (the macOS resolver file or the Linux routing-domain link), the
+    // reserved range's loopback aliases as a bind probe found them, and
+    // whether the host is on the 127.0.0.1 interim. Ports and interface
+    // names are all it holds, so nothing needs redacting.
+    let naming = crate::resolver::naming_surface().await;
+    let json = serde_json_lenient::to_vec_pretty(&naming)
+        .context("serializing the host naming surface")?;
+    w.add_bytes("host/net-naming.json", &json, Redaction::None)
         .await
 }
 

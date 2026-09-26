@@ -280,6 +280,19 @@ pub(crate) async fn activate_session(
         created.hostname_routing_unavailable.as_deref(),
         "min session activate",
     );
+    // NET-122/NET-123: the naming advisory, printed once per session start —
+    // after the create, and re-surfaced when the daemon reports this session
+    // at the 127.0.0.1 interim because its session-start bind probe found
+    // the reserved range absent. It only ever names the command that
+    // points the host's resolver at the answerer; running it (and any
+    // privilege prompt it carries) is the user's act, never the session
+    // start's.
+    if let Some(advisory) =
+        crate::resolver::session_advisory(created.zone_answerer_port, created.interim_loopback)
+            .await
+    {
+        eprintln!("{advisory}");
+    }
     let id = created.id;
 
     // From here the session exists on the daemon in an unfinalized state.
