@@ -95,24 +95,47 @@ if [ ! -s "$diff_file" ] && [ ! -s "$untracked_file" ]; then
     exit 0
 fi
 
-# Scope: an explicit scope wins. Otherwise lint only the crates the changed
-# files belong to, which is the difference between a few minutes and a cold
-# workspace build. `-p` still checks every dependency of those crates, so a
-# warning in a shared crate is caught. Paths outside `crates/` leave the scope
-# empty, which falls back to the workspace.
+# The crates the changed files belong to, one name per line out of
+# `crates/<name>/...` with other paths ignored. This drives the scope, and it
+# also lets the gate say what a pinned scope leaves out. Selecting crates is the
+# difference between a few minutes and a cold workspace build; `-p` still checks
+# every dependency of those crates, so a warning in a shared crate is caught.
+# Paths outside `crates/` leave the list empty, which falls back to the
+# workspace.
+# shellcheck disable=SC2086
+changed_crates=$( { git diff --name-only --no-ext-diff "$merge_base" -- '*.rs'
+                    cat "$untracked_file"; } \
+    | sed -n 's|^crates/\([^/][^/]*\)/.*|\1|p' | sort -u )
+
+# An explicit scope wins: macOS pins one because the Linux-only crates do not
+# build there.
 cargo_scope=("${explicit_scope[@]}")
 if [ "${#cargo_scope[@]}" -eq 0 ]; then
-    # One crate name per line out of `crates/<name>/...`; other paths ignored.
-    crates=$( { git diff --name-only --no-ext-diff "$merge_base" -- '*.rs'
-                cat "$untracked_file"; } \
-        | sed -n 's|^crates/\([^/][^/]*\)/.*|\1|p' | sort -u )
     # shellcheck disable=SC2086
-    for crate in $crates; do
+    for crate in $changed_crates; do
         cargo_scope+=(-p "$crate")
     done
 fi
 if [ "${#cargo_scope[@]}" -eq 0 ]; then
     cargo_scope=(--workspace)
+fi
+
+# A pinned scope is narrower than the change. Say so: "a gate that silently
+# narrows itself is worse than one that says what it covers"
+# (.minimal/minimal.toml). The Linux lanes are what cover the rest.
+uncovered=""
+if [ "${#explicit_scope[@]}" -gt 0 ]; then
+    # shellcheck disable=SC2086
+    for crate in $changed_crates; do
+        case " ${explicit_scope[*]} " in
+            *" -p $crate "*) ;;
+            *) uncovered="$uncovered $crate" ;;
+        esac
+    done
+fi
+if [ -n "$uncovered" ]; then
+    echo "clippy-strict: scope pinned to ${explicit_scope[*]};" \
+        "changed crates not covered here:$uncovered" >&2
 fi
 echo "clippy-strict: scope ${cargo_scope[*]}" >&2
 

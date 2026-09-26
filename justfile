@@ -34,8 +34,9 @@ native-dir   := scratch / "native-state"
 # Linux-only): scope to the darwin-capable crates there; `just test-cross`
 # covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
 scope      := if os() == "macos" { "-p minvmd -p sessions" } else { "--workspace" }
-# `clippy-strict` scope: macOS cannot build the Linux-only crates, so pin it
-# there. On Linux the script derives the crates you touched from the diff.
+# The strict gate's scope on macOS: the same pair `clippy` and `test` already
+# use, because the Linux-only crates do not build there. The script reports any
+# changed crate this leaves out, so the scope is never silently narrower.
 strict-scope := if os() == "macos" { "-p minvmd -p sessions" } else { "" }
 # Crates carrying a `fuzz/` workspace. `rcache` is Linux-only: it pulls in
 # `lcache`, which uses the Linux-only `common::renameat2`.
@@ -270,17 +271,17 @@ fmt:
 # clean-worktree check — the usual case here is running mid-edit with
 # staged/unstaged work.
 #
-# Autofix pass: fmt, clippy --fix, fmt again, then the report-only strict gate (safe mid-edit).
+# Autofix pass: fmt, clippy --fix, fmt again, then the strict clippy gate (runnable mid-edit).
 fix:
     cargo fmt --all
     cargo clippy {{scope}} --all-targets --fix --allow-dirty -- -D warnings
     cargo fmt --all
-    # Report-only, deliberately. `clippy --fix` rewrites every hit in the
-    # selected crates and cannot be scoped to changed lines, so autofixing the
-    # strict set would sweep legacy sites in each crate it touches. Most of the
-    # set has no machine-applicable suggestion anyway (only 6% of the current
-    # hits do, and none of the four largest lints), so the fixes here are
-    # judgement calls rather than rewrites.
+    # No autofix for the strict set, and a hit fails this recipe. `clippy --fix`
+    # rewrites every hit in the selected crates and cannot be scoped to changed
+    # lines, so autofixing it would sweep legacy sites in every crate it
+    # touches. Most of the set has no machine-applicable suggestion anyway (6%
+    # of current hits, none of the four largest lints), so these are judgement
+    # calls, not rewrites.
     scripts/clippy-strict.sh "" {{strict-scope}}
 
 # CI: ci.yml `fmt`.
