@@ -57,6 +57,9 @@ pub enum AttachError {
     /// client still owes a patches upload + `FinalizeSession`
     /// before a shell can be minted.
     SessionPending,
+    /// The session host is alive but busy (its mailbox stayed full past the
+    /// attach deadline). The client should retry.
+    SessionBusy,
 }
 
 impl std::error::Error for AttachError {
@@ -84,6 +87,9 @@ impl fmt::Display for AttachError {
                 "session isn't attachable yet (still awaiting either \
                  SubmitVerdict or FinalizeSession)"
             ),
+            AttachError::SessionBusy => {
+                write!(f, "session host is busy; retry the attach once it drains")
+            }
         }
     }
 }
@@ -1434,27 +1440,33 @@ impl Session {
     /// act on it are bounded: `HostHandle::kill`'s `send_timeout` only bounds
     /// the wait for mailbox *capacity*, so a loop parked mid-`step()` (mailbox
     /// nearly empty) queues the kill yet never processes it, and awaiting that
-    /// loop unbounded would park the caller behind it forever. So a kill that
-    /// cannot be queued, or a loop that does not finish within
-    /// `HOST_PROBE_TIMEOUT` of accepting it, aborts the loop instead of
-    /// waiting on it.
+    /// loop unbounded would park the caller behind it forever.
     ///
-    /// Aborting drops the loop at its await point, so the awaited `NetGuard`
-    /// teardown in `Host::mainloop` is skipped and the wedged host's sandbox
-    /// process and network are orphaned rather than reclaimed here;
-    /// reclamation is a tracked follow-up.
+    /// When the kill cannot be queued the loop is aborted. When the kill
+    /// landed but the loop does not finish within `HOST_PROBE_TIMEOUT`, the
+    /// task is detached rather than aborted so the `NetGuard` teardown at the
+    /// end of `Host::mainloop` can still run once the loop drains.
     async fn kill_and_stop_loop(
         host: &session_host::HostHandle,
         task: &mut JoinHandle<Result<i32, std::io::Error>>,
         for_shutdown: bool,
     ) {
         let killed = host.kill(for_shutdown).await.is_ok();
-        if !killed
-            || tokio::time::timeout(HOST_PROBE_TIMEOUT, &mut *task)
-                .await
-                .is_err()
-        {
+        if !killed {
+            // The kill could not be queued — the host is wedged past the
+            // mailbox-capacity deadline. Abort the loop; the NetGuard
+            // teardown in mainloop is skipped, but the host was already
+            // unreachable.
             task.abort();
+        } else if tokio::time::timeout(HOST_PROBE_TIMEOUT, &mut *task)
+            .await
+            .is_err()
+        {
+            // The kill landed but the loop did not finish within the
+            // deadline. Detach rather than abort: the task continues
+            // running and will run the NetGuard teardown at the end of
+            // mainloop once it drains. Dropping the JoinHandle (when the
+            // caller's `task` binding goes out of scope) detaches it.
         }
     }
 
@@ -1732,8 +1744,9 @@ impl Session {
                     .await
                 {
                     Ok(()) => Ok(()),
-                    Err((channel, sz)) => {
-                        // The host is gone, or wedged past the attach deadline.
+                    Err(session_host::HostAttachError::Closed(channel, sz)) => {
+                        // The host's loop has ended; mint a fresh one from the
+                        // channel it handed back.
                         self.mint_session_host(
                             session_hnd,
                             conn_username,
@@ -1743,6 +1756,14 @@ impl Session {
                             session_keys,
                         )
                         .await
+                    }
+                    Err(session_host::HostAttachError::Timeout) => {
+                        // The host is alive but its mailbox stayed full past
+                        // the attach deadline. Re-minting here would abort a
+                        // busy-but-healthy shell, orphaning its processes and
+                        // skipping its NetGuard teardown. Refuse instead: the
+                        // client can retry once the host drains.
+                        Err(AttachError::SessionBusy)
                     }
                 }
             }
