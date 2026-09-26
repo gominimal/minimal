@@ -97,13 +97,16 @@ fi
 
 # The crates the changed files belong to, one name per line out of
 # `crates/<name>/...` with other paths ignored. This drives the scope, and it
-# also lets the gate say what a pinned scope leaves out. Selecting crates is the
+# also lets the gate say what a pinned scope leaves out. Deleted paths are
+# filtered out, or a crate the branch removed would reach `cargo clippy -p` and
+# fail the run before the remaining change was checked. Selecting crates is the
 # difference between a few minutes and a cold workspace build; `-p` still checks
 # every dependency of those crates, so a warning in a shared crate is caught.
 # Paths outside `crates/` leave the list empty, which falls back to the
 # workspace.
 # shellcheck disable=SC2086
-changed_crates=$( { git diff --name-only --no-ext-diff "$merge_base" -- '*.rs'
+changed_crates=$( { git diff --name-only --no-ext-diff --diff-filter=d \
+                        "$merge_base" -- '*.rs'
                     cat "$untracked_file"; } \
     | sed -n 's|^crates/\([^/][^/]*\)/.*|\1|p' | sort -u )
 
