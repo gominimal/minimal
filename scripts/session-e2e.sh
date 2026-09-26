@@ -1050,8 +1050,12 @@ if (
   # One EXIT trap for the whole subshell, so every path out of it — the early
   # exits above included — undoes both things the proof staged on the host: the
   # package-path switch (the /usr/bin/gvproxy-min half below) and the profile
-  # attachment set it widened above.
-  # shellcheck disable=SC2329 # invoked as the subshell's EXIT trap, which shellcheck cannot see through a subshell
+  # attachment set it widened above. Neither way this function is reached is
+  # visible to shellcheck — `trap` calls it out of a subshell shellcheck
+  # cannot follow (SC2317, on older shellchecks) and the subshell's own
+  # fall-through calls it too (SC2329, on newer ones) — so the directive below
+  # silences both, and it covers the whole definition, body included.
+  # shellcheck disable=SC2317,SC2329
   fi_cleanup() {
     rm -f /usr/bin/gvproxy-min 2>/dev/null || true
     if [ "${fi_restore_profile:-0}" = 1 ] && [ -n "$fi_lane_minimald" ]; then
