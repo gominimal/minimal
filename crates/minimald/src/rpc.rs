@@ -320,16 +320,19 @@ async fn serve_create_session(
 
 /// The session-start loopback probe (NET-123): bind-probe the reserved local
 /// range before this session publishes, log the one session-start line with
-/// the probe result and the surface it picked, and return whether the
-/// session is published at the `127.0.0.1` interim — the reply flag that
-/// tells the client to surface the naming advisory again (NET-122).
+/// the probe result and the surface it picked, and return the interim
+/// verdict — whether the range read absent — as the reply flag that tells
+/// the client to surface the naming advisory again (NET-122).
 ///
 /// The probe is 254 binds with port 0 — milliseconds for the whole range —
 /// and each bind is a blocking syscall, so it runs on the blocking pool
 /// rather than the connection's worker. A probe task that panics or is lost
-/// reads as absent: without a verdict the daemon may not publish at range
-/// addresses, so the session stays on the interim.
-#[cfg(target_os = "linux")]
+/// reads as absent: without a verdict the daemon may not report the range
+/// present, so the reply carries the interim.
+///
+/// The probe measures the daemon's own host and nothing else — whose
+/// loopback that is on each platform, and why there is no per-target arm
+/// here, is `net::loopback`'s module doc.
 async fn session_start_loopback_probe(session_id: &sessions::SessionId) -> bool {
     // The probe to run: the test stand-in when one is installed (a Linux
     // host's real bind can never produce the absent arm), else the real
@@ -357,15 +360,6 @@ async fn session_start_loopback_probe(session_id: &sessions::SessionId) -> bool 
         "session-start loopback probe picked the publish surface"
     );
     interim_loopback
-}
-
-/// Off Linux there is no reserved range to probe and no interim to publish
-/// at: the net module, its answerer and its range are Linux facts, so the
-/// flag reads "not interim" — the reply a client of a daemon without the
-/// naming surface must carry.
-#[cfg(not(target_os = "linux"))]
-async fn session_start_loopback_probe(_session_id: &sessions::SessionId) -> bool {
-    false
 }
 
 /// `ConfigureLoadout`: composes a created session's loadout from the
@@ -2829,11 +2823,12 @@ mod tests {
     }
 
     /// NET-123's absent arm: when the session-start probe finds the reserved
-    /// range absent the session publishes at the `127.0.0.1` interim — the
-    /// one address a host without the aliases can still reach — and the log
-    /// and the reply both say so, which is what makes the client surface the
-    /// naming advisory again. The stand-in stands in for that host; no real
-    /// bind on this Linux one can reproduce it.
+    /// range absent the reply carries the interim and the log names it as the
+    /// surface picked — the two things that make the client surface the
+    /// naming advisory again. The stand-in stands in for the host without
+    /// the aliases; no real bind on this Linux one can reproduce it, and the
+    /// flag itself still switches no published address (see
+    /// `net::loopback`'s module doc for what the verdict carries).
     // The stand-in window must cover the awaited create, so the mutex guard
     // is held across the await on purpose.
     #[allow(clippy::await_holding_lock)]

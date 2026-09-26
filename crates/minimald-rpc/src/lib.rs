@@ -470,10 +470,9 @@ pub struct CreateSessionResponse {
     /// daemon's ports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone_answerer_port: Option<u16>,
-    /// Whether the daemon published this session at the `127.0.0.1` interim —
-    /// true when its session-start bind probe found the reserved local range
-    /// absent, so the session's names answer on the shared host loopback
-    /// address instead of the range (NET-123).
+    /// Whether the daemon's session-start bind probe found the reserved local
+    /// range absent — the interim verdict, true when this session is on the
+    /// shared `127.0.0.1` interim rather than the range (NET-123).
     ///
     /// A client that reads `true` surfaces the naming advisory again
     /// (NET-122): the advisory's privileged step also reserves the range,

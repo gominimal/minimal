@@ -281,9 +281,9 @@ pub(crate) async fn activate_session(
         "min session activate",
     );
     // NET-122/NET-123: the naming advisory, printed once per session start —
-    // after the create, and re-surfaced when the daemon published this
-    // session at the 127.0.0.1 interim because its session-start bind probe
-    // found the reserved range absent. It only ever names the command that
+    // after the create, and re-surfaced when the daemon reports this session
+    // at the 127.0.0.1 interim because its session-start bind probe found
+    // the reserved range absent. It only ever names the command that
     // points the host's resolver at the answerer; running it (and any
     // privilege prompt it carries) is the user's act, never the session
     // start's.

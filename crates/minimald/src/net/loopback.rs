@@ -1,6 +1,7 @@
 //! The session-start loopback probe (NET-123): bind-probe the reserved local
-//! range before publishing, and publish at the `127.0.0.1` interim when it
-//! is absent.
+//! range before publishing, and report the `127.0.0.1` interim when it is
+//! absent — the verdict the `CreateSession` reply carries and the one the
+//! client re-surfaces the naming advisory on (NET-122).
 //!
 //! One TCP `bind` with port 0 per address of the reserved local range — a
 //! few milliseconds for the whole /24 (2.53 ms over 256 addresses, measured
@@ -9,20 +10,31 @@
 //! microseconds either way: where the address exists it succeeds, where it
 //! does not it fails with `EADDRNOTAVAIL` — the "range absent" verdict. A
 //! *connect* to an absent address would instead hang to timeout, never
-//! refuse, which is why the interim exists: until the probe passes, the
-//! answerer must not hand out range addresses, because every fetch to one
-//! would time out rather than fail.
+//! refuse, which is why the interim exists: until the aliases are installed,
+//! a box must not be handed out at an address its fetches would time out on
+//! rather than fail — the requirement this verdict is the input for.
 //!
 //! The probe is deliberately whole-range: a partial alias set — some
 //! addresses aliased on `lo0`, some not — must read as absent, since the
 //! allocator could otherwise hand out exactly the address that hangs.
 //!
-//! Whose loopback the probe measures: the daemon's own host. On Linux the
-//! whole `127/8` is local to `lo`, so a native daemon finds the range present
-//! and the absent arm is a macOS concern — where a daemon in a libkrun VM
-//! probes its *guest's* `lo` and the host-side probe belongs to the microVM
-//! host (`minvmd`). Until that lands, a VM-backed daemon's flag stays the
-//! guest's verdict.
+//! Whose loopback the probe measures: the daemon's own host, and only that
+//! host. This daemon is a Linux process — running natively, or as the guest
+//! of a libkrun microVM — and on Linux the whole `127/8` is local to `lo`, so
+//! its probe always reads the range present. The absent verdict is a fact
+//! about a *macOS* host's `lo0`, the aliases the privileged step installs,
+//! and the probe that can see them belongs to the microVM host (`minvmd`);
+//! until that lands, a VM-backed daemon's flag stays the guest's verdict.
+//! Nothing about a port-0 bind is Linux-specific, so the probe itself is not
+//! gated by target OS — on whatever host it runs, it measures that host.
+//!
+//! What the verdict carries in this change: the reply flag and the one
+//! session-start log line, no more. It does not switch the addresses a
+//! session's boxes publish — those still follow the node (a native node's
+//! boxes already mirror `127.0.0.1`; a VM node's publish their switch
+//! leases), so NET-123's "publish the box at `127.0.0.1`" is the change this
+//! verdict feeds rather than one the flag makes. `rpc.rs`'s create handler is
+//! where the verdict is read.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
@@ -51,8 +63,8 @@ pub struct RangeProbe {
 impl RangeProbe {
     /// The verdict for a probe that never ran (a panicking or lost blocking
     /// task): conservative on purpose. A probe without an answer must not
-    /// let the daemon publish at range addresses it never verified, so it
-    /// reads as absent and the session stays on the `127.0.0.1` interim.
+    /// let the daemon report the range present, so it reads as absent — the
+    /// reply then carries the interim.
     pub fn failed_to_run() -> Self {
         RangeProbe {
             bound: 0,
@@ -67,11 +79,12 @@ impl RangeProbe {
         self.bound == self.probed && self.probed > 0
     }
 
-    /// Whether the daemon published at the `127.0.0.1` interim (NET-123):
-    /// the range is absent, so this session's boxes share the host loopback
-    /// address until the advisory command's privileged step installs the
-    /// range. This is the flag the `CreateSession` reply carries, and the
-    /// one that re-surfaces the naming advisory on the client (NET-122).
+    /// Whether the reserved range read absent — the interim verdict
+    /// (NET-123). This is the flag the `CreateSession` reply carries and the
+    /// one that re-surfaces the naming advisory on the client (NET-122): a
+    /// host that reports it is a host whose loopback carries none of the
+    /// range, the per-host state the privileged step that installs the range
+    /// supersedes.
     pub fn interim(&self) -> bool {
         !self.present()
     }
@@ -198,7 +211,7 @@ mod tests {
         assert_eq!(probe.probed, 254, "the probe covers every usable host");
         assert_eq!(probe.bound, 0);
         assert!(!probe.present());
-        assert!(probe.interim(), "an absent range publishes at the interim");
+        assert!(probe.interim(), "an absent range reads as the interim");
         assert_eq!(probe.surface(), "127.0.0.1-interim");
         assert_eq!(
             probe.first_failure,
