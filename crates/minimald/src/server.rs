@@ -1918,8 +1918,8 @@ pub(crate) fn test_config(dir: &std::path::Path) -> Config {
         hostname_proxy_port: None,
         zone_answerer_port: None,
         switch_subnet_octet: None,
-        // The default every unit-test daemon runs: the deny-all default in
-        // force, not opted out.
+        // The default every unit-test daemon runs: the rollout phase this
+        // build ships, not opted out.
         deny_all_opt_out: false,
     }
 }

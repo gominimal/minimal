@@ -626,6 +626,25 @@ async fn serve_get_session_policy(
         .await
 }
 
+/// The `GetEffectiveSessionPolicy` reply for one record's policy and network
+/// mode: the egress half resolved to what the gate enforces, the ingress half
+/// verbatim. `phase` is the rollout phase to resolve under — the handler
+/// serves [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships,
+/// while the tests pass [`sessions::EgressDefaultPhase::InForce`] so the
+/// deny-all posture the rollout ends at stays proven while the default is
+/// only announced (NET-076).
+pub(crate) fn effective_policy_reply(
+    policy: &sessions::SessionPolicy,
+    network: sessions::NetworkMode,
+    phase: sessions::EgressDefaultPhase,
+    opt_out: bool,
+) -> minimald_rpc::EffectiveSessionPolicy {
+    minimald_rpc::EffectiveSessionPolicy {
+        egress: sessions::effective_egress(policy.egress.as_ref(), network, phase, opt_out),
+        ingress: policy.ingress.clone(),
+    }
+}
+
 /// `GetEffectiveSessionPolicy`: the same record
 /// [`serve_get_session_policy`] serves, with the egress half resolved to what
 /// the gate enforces — the answer `min session policy` renders (NET-075).
@@ -634,9 +653,10 @@ async fn serve_get_session_policy(
 /// daemon's own facts: the rollout phase its build ships
 /// ([`sessions::EGRESS_DEFAULT_PHASE`]) and its opt-out flag (NET-077). An
 /// own-address box with no `egress` section answers `deny_all` once the
-/// default is in force (NET-074) and `allow_all` behind the opt-out; a
-/// declared section answers verbatim; the strict declaration the record
-/// holds is never rewritten to say any of this.
+/// default is in force (NET-074) and `allow_all` behind the opt-out or while
+/// the default is only announced; a declared section answers verbatim; the
+/// strict declaration the record holds is never rewritten to say any of
+/// this.
 async fn serve_get_effective_session_policy(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -657,15 +677,12 @@ async fn serve_get_effective_session_policy(
                 None => Ok(Errorable::Err {
                     error: "no session found".to_string(),
                 }),
-                Some(record) => Ok(Errorable::Ok(minimald_rpc::EffectiveSessionPolicy {
-                    egress: sessions::effective_egress(
-                        record.policy.egress.as_ref(),
-                        record.network,
-                        sessions::EGRESS_DEFAULT_PHASE,
-                        opt_out,
-                    ),
-                    ingress: record.policy.ingress,
-                })),
+                Some(record) => Ok(Errorable::Ok(effective_policy_reply(
+                    &record.policy,
+                    record.network,
+                    sessions::EGRESS_DEFAULT_PHASE,
+                    opt_out,
+                ))),
             }
         })
         .await
@@ -2775,13 +2792,17 @@ mod tests {
     }
 
     /// NET-074/NET-075: `GetEffectiveSessionPolicy` answers, over the real
-    /// SSH wire, what the gate enforces. An own-address box with no `egress`
-    /// section answers `deny_all` — the default this build ships is in
-    /// force, and this daemon has not opted out — while the strict
-    /// `GetSessionPolicy` reply still carries the absent section as `None`:
-    /// the default reaches the client without rewriting the record. A box
-    /// that declared its own egress answers it verbatim, survived the JSON
-    /// round trip, with its ingress beside it.
+    /// SSH wire, what the gate enforces. This build ships the deny-all
+    /// default as announced (NET-076), so the wire half asserts the reply
+    /// the shipped phase resolves, while the in-force posture the rollout
+    /// ends at is proven by passing the phase explicitly to the same
+    /// resolver the handler serves. In force, an own-address box with no
+    /// `egress` section answers `deny_all` — reported as the posture, not as
+    /// a materialized section — and that reply survives the wire codec it
+    /// travels as, while the strict `GetSessionPolicy` reply still carries
+    /// the absent section as `None`: the default reaches the client without
+    /// rewriting the record. A box that declared its own egress answers it
+    /// verbatim, survived the JSON round trip, with its ingress beside it.
     #[tokio::test]
     async fn effective_policy_response_round_trips() {
         let server = TestServer::new().await;
@@ -2801,20 +2822,59 @@ mod tests {
         .await;
         let bare_id = own_ip_session(&mut client, "bare-egress", SessionPolicy::default()).await;
 
-        // The default's own case: an own-address box that declared nothing
-        // is deny-all (NET-074), reported as the posture, not as a
-        // materialized section.
+        // The default's own case, with the phase passed explicitly
+        // (NET-074): an own-address box that declared nothing is deny-all
+        // once the default is in force.
+        assert_eq!(
+            super::effective_policy_reply(
+                &SessionPolicy::default(),
+                NetworkMode::OwnIp,
+                sessions::EgressDefaultPhase::InForce,
+                false,
+            ),
+            EffectiveSessionPolicy {
+                egress: EffectiveEgress::DenyAll,
+                ingress: None,
+            },
+            "an own-address box with no egress section must answer deny-all in force",
+        );
+
+        // The response carries that posture across the wire codec it
+        // travels as — the strict shape untouched beside it: the effective
+        // reply spells the default, `deny_all`, and decodes back to the
+        // same value.
+        let deny_all = EffectiveSessionPolicy {
+            egress: EffectiveEgress::DenyAll,
+            ingress: None,
+        };
+        let wire = serde_json_lenient::to_string(&minimald_rpc::Errorable::Ok(deny_all.clone()))
+            .expect("the deny-all reply must serialize");
+        assert!(
+            wire.contains(r#""egress":"deny_all""#),
+            "the wire must carry the deny-all posture, got: {wire}",
+        );
+        assert_eq!(
+            serde_json_lenient::from_str::<minimald_rpc::Errorable<EffectiveSessionPolicy>>(&wire)
+                .expect("the deny-all reply must decode back"),
+            minimald_rpc::Errorable::Ok(deny_all),
+        );
+
+        // Over the real wire, the reply follows the phase this build ships:
+        // whatever [`sessions::EGRESS_DEFAULT_PHASE`] resolves for a bare
+        // own-address box is what the daemon answers.
         let bare = client
             .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(bare_id))
             .await
             .unwrap();
         assert_eq!(
             bare,
-            EffectiveSessionPolicy {
-                egress: EffectiveEgress::DenyAll,
-                ingress: None,
-            },
-            "an own-address box with no egress section must answer deny-all",
+            super::effective_policy_reply(
+                &SessionPolicy::default(),
+                NetworkMode::OwnIp,
+                sessions::EGRESS_DEFAULT_PHASE,
+                false,
+            ),
+            "the wire must answer the shipped phase's resolution for a bare box",
         );
 
         // The strict reply is unchanged: the declaration the box was
@@ -2841,8 +2901,10 @@ mod tests {
     /// NET-077: a daemon started with the deny-all opt-out keeps the shipped
     /// allow-all default — an own-address box with no `egress` section
     /// answers `allow_all` where the same box on an opted-in daemon answers
-    /// `deny_all` — and its gate resolves no section, so nothing is
-    /// enforced. A box that declared its own egress keeps it either way.
+    /// `deny_all` once the default is in force (that half passes the phase
+    /// explicitly, since this build ships the default as announced) — and
+    /// its gate resolves no section, so nothing is enforced. A box that
+    /// declared its own egress keeps it either way.
     #[tokio::test]
     async fn deny_all_opt_out_keeps_prior_default() {
         let server = TestServer::new_opted_out_in(tempfile::tempdir().unwrap()).await;
@@ -2873,12 +2935,15 @@ mod tests {
             "behind the opt-out, an absent egress section keeps the shipped allow-all",
         );
 
-        // The report and the gate agree: the same resolution the launcher
-        // applies materializes no section to enforce.
+        // The report and the gate agree, even in force: the same resolution
+        // the launcher applies materializes no section to enforce. The phase
+        // is passed explicitly so the opt-out is proven against the posture
+        // it exists to defer, not only against the announced build.
         assert_eq!(
             crate::session::effective_egress_section(
                 &sessions::SessionPolicy::default(),
                 NetworkMode::OwnIp,
+                sessions::EgressDefaultPhase::InForce,
                 true,
             ),
             None,

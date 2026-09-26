@@ -139,8 +139,13 @@ pub(crate) struct SessionConfig {
 /// The egress *section* the gate compiles for a session: the materialized
 /// form of [`sessions::effective_egress`]'s answer — `None` for the shipped
 /// allow-all, the deny-all section for an absent declaration under the
-/// in-force default (NET-074), and a declaration verbatim. `opt_out` is the
-/// daemon's deny-all opt-out (NET-077), threaded from the server config.
+/// in-force default (NET-074), and a declaration verbatim. `phase` is the
+/// rollout phase to resolve under — the launcher and the task path pass
+/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
+/// tests pass [`sessions::EgressDefaultPhase::InForce`] so the posture the
+/// rollout ends at stays proven while the default is only announced
+/// (NET-076). `opt_out` is the daemon's deny-all opt-out (NET-077), threaded
+/// from the server config.
 ///
 /// Shared by the session launcher (the box's own gate) and the task path
 /// ([`crate::exec::task_network`]), so a task runs under the same egress
@@ -148,14 +153,10 @@ pub(crate) struct SessionConfig {
 pub(crate) fn effective_egress_section(
     policy: &sessions::SessionPolicy,
     network: sessions::NetworkMode,
+    phase: sessions::EgressDefaultPhase,
     opt_out: bool,
 ) -> Option<sessions::EgressPolicy> {
-    match sessions::effective_egress(
-        policy.egress.as_ref(),
-        network,
-        sessions::EGRESS_DEFAULT_PHASE,
-        opt_out,
-    ) {
+    match sessions::effective_egress(policy.egress.as_ref(), network, phase, opt_out) {
         sessions::EffectiveEgress::DenyAll => Some(sessions::EgressPolicy::deny_all()),
         sessions::EffectiveEgress::AllowAll => None,
         sessions::EffectiveEgress::Declared(section) => Some(section),
@@ -167,16 +168,18 @@ pub(crate) fn effective_egress_section(
 /// deny-all section for an own-address box with no `egress` section once the
 /// default is in force (NET-074), the shipped allow-all for everything an
 /// opt-out (NET-077) or an earlier phase leaves in place, and a declaration
-/// verbatim. The declaration on the record is left untouched: the strict
+/// verbatim. `phase` resolves under, exactly as [`effective_egress_section`]
+/// documents. The declaration on the record is left untouched: the strict
 /// `SessionPolicy` a client reads back stays exactly what the box was
 /// launched with.
 pub(crate) fn effective_session_policy(
     policy: &sessions::SessionPolicy,
     network: sessions::NetworkMode,
+    phase: sessions::EgressDefaultPhase,
     opt_out: bool,
 ) -> sessions::SessionPolicy {
     sessions::SessionPolicy {
-        egress: effective_egress_section(policy, network, opt_out),
+        egress: effective_egress_section(policy, network, phase, opt_out),
         ingress: policy.ingress.clone(),
     }
 }
@@ -2287,8 +2290,12 @@ impl Session {
         // default is in force, this daemon's opt-out excepted (NET-077) —
         // while the record keeps the declaration untouched for the strict
         // `GetSessionPolicy` reply.
-        let policy =
-            effective_session_policy(&record.policy, record.network, self.deny_all_opt_out);
+        let policy = effective_session_policy(
+            &record.policy,
+            record.network,
+            sessions::EGRESS_DEFAULT_PHASE,
+            self.deny_all_opt_out,
+        );
         Ok(session_host::SandboxLauncher {
             ctx: match phase {
                 LaunchPhase::Attached => self.context(true).await,

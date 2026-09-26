@@ -141,10 +141,11 @@ impl Exec for TaskExec {
 
 /// The network a task gets: the provider for its session's mode (017-005),
 /// carrying the session's *effective* egress (NET-074) — a task in an
-/// own-address session that declared nothing runs under the deny-all default
-/// like the session itself does — and none of its ingress. Shared by the two
-/// ways a task starts — over an exec channel here, and from inside the
-/// session (`env::SessionChannel::run_task`).
+/// own-address session runs under whatever the session's own gate enforces:
+/// the deny-all default once it is in force, the shipped allow-all while it
+/// is only announced — and none of its ingress. Shared by the two ways a
+/// task starts — over an exec channel here, and from inside the session
+/// (`env::SessionChannel::run_task`).
 ///
 /// The mode, not the identity: an own-IP task is a second PTask beside the
 /// session's, on the same switch at the same time, so it registers under its
@@ -152,8 +153,8 @@ impl Exec for TaskExec {
 /// applied would come down again at its teardown. It carries no registry
 /// handle either: a task owns no proxy route of its own, so no lease is ever
 /// reported for it. `deny_all_opt_out` is the daemon's opt-out (NET-077),
-/// read through the session handle so a task resolves its egress exactly as
-/// the launcher did.
+/// read through the session handle so a task resolves its egress — under the
+/// rollout phase this build ships — exactly as the launcher did.
 pub(crate) fn task_network(
     record: &sessions::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
@@ -161,8 +162,12 @@ pub(crate) fn task_network(
 ) -> std::sync::Arc<dyn sandbox2::Network> {
     let id = record.id.to_string();
     let session = record.name.as_deref().unwrap_or(&id);
-    let egress =
-        crate::session::effective_egress_section(&record.policy, record.network, deny_all_opt_out);
+    let egress = crate::session::effective_egress_section(
+        &record.policy,
+        record.network,
+        sessions::EGRESS_DEFAULT_PHASE,
+        deny_all_opt_out,
+    );
     crate::net::provider::network_for(
         record.network,
         switch,
@@ -2065,9 +2070,10 @@ mod tests {
             sandbox2::Resolver::Nameservers(_)
         ));
         // Its own identity on the switch, and the session's *effective*
-        // egress — deny-all here: no declaration, the default in force
-        // (NET-074) — but none of its ingress, because the session's PTask
-        // is attached at the same time.
+        // egress (NET-074) — resolved under the phase this build ships, so
+        // the same rules the session's own gate enforces, whatever the
+        // rollout leaves in force — but none of its ingress, because the
+        // session's PTask is attached at the same time.
         let described = format!("{own_ip:?}");
         assert!(
             described.contains("\"web-task\"") && described.contains("has_policy: true"),
