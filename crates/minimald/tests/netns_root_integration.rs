@@ -652,9 +652,10 @@ fn parse_report(stdout: &str) -> BTreeMap<String, String> {
 }
 
 /// The probe's report line for `key`, or a panic naming what never arrived: a
-/// report that does not show up is the failure to show, not a mystery.
+/// report that does not show up is the failure to show, not a mystery, so the
+/// panic carries the report that did arrive, whatever shape it is in.
 fn reported<'a>(report: &'a BTreeMap<String, String>, key: &str, what: &str) -> &'a str {
-    let never_arrived = format!("{what}: the probe did not report {key}");
+    let never_arrived = format!("{what}: the probe did not report {key}: {report:?}");
     report.get(key).expect(&never_arrived)
 }
 
@@ -672,6 +673,76 @@ fn capability_mask(report: &BTreeMap<String, String>, set: &str, what: &str) -> 
     let mask = value.split_ascii_whitespace().next().expect(&no_mask);
     let not_a_mask = format!("{what}: {set} is not a hex mask: {mask}");
     u64::from_str_radix(mask, 16).expect(&not_a_mask)
+}
+
+/// A box a proof holds up for an injection, stopped on every exit path.
+///
+/// hakoniwa's supervisor is the proof's own child and the program it holds
+/// dies from the supervisor's `PDEATHSIG`, so a proof that fails between
+/// spawning the box and its own cleanup — a launch that never reports, an
+/// injection that does not answer — leaves a live box behind in the proof's
+/// process group, and the runner reports the process it found still running
+/// instead of the assertion that actually failed. `LiveBox` stops the box on
+/// drop as well as on request, so every exit path ends with the box gone:
+/// SIGKILL reaches the supervisor, `wait` reaps it, and the program — not the
+/// proof's child, so nothing else reaps it — is given a moment to take its
+/// `PDEATHSIG` before the proof returns.
+struct LiveBox {
+    child: hakoniwa::Child,
+    /// The program the injection targets, once the box has reported; only
+    /// then can stopping the box wait for the program to be gone.
+    leader: Option<u32>,
+}
+
+impl LiveBox {
+    fn new(child: hakoniwa::Child) -> Self {
+        Self {
+            child,
+            leader: None,
+        }
+    }
+
+    /// Records the pid the injection is aimed at, so `stop` can tell the
+    /// program is gone rather than merely the supervisor that ran it.
+    fn holds(&mut self, leader: u32) {
+        self.leader = Some(leader);
+    }
+
+    /// The supervisor's pid, which the session leader is looked up from.
+    fn child_id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Stops the box and waits out what it held. Safe to call twice: hakoniwa
+    /// ignores `kill` on an already-reaped child and `wait` returns the status
+    /// it collected, so the drop after an explicit stop is a no-op.
+    fn stop(&mut self) -> hakoniwa::Result<hakoniwa::ExitStatus> {
+        let _signalled = self.child.kill();
+        let status = self.child.wait()?;
+        if let Some(leader) = self.leader {
+            let program = format!("/proc/{leader}");
+            // The program dies from the supervisor's PDEATHSIG the moment the
+            // SIGKILL lands, so the loop body almost never runs; it exists so
+            // a scheduling hiccup cannot turn a passing proof into a live
+            // process left behind.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while Path::new(&program).exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if Path::new(&program).exists() {
+                eprintln!("warning: program {leader} outlived the box that ran it");
+            }
+        }
+        Ok(status)
+    }
+}
+
+impl Drop for LiveBox {
+    fn drop(&mut self) {
+        // Best effort: a stop that fails is reported by whatever failure made
+        // the proof drop the box mid-flight.
+        let _stopped = self.stop();
+    }
 }
 
 /// NET-083, the injected-process half: a process a client attaches into a
@@ -696,7 +767,7 @@ async fn injected_process_lacks_cap_net_raw() {
         return;
     }
     use minimald::nsenter::{Injection, session_leader_pid};
-    use std::io::BufRead as _;
+    use std::io::{BufRead as _, Read as _};
 
     let proofs = proof_base_dir();
     let no_base_dir = format!("base temp dir under {}", proofs.display());
@@ -729,12 +800,19 @@ async fn injected_process_lacks_cap_net_raw() {
         )
         .expect("building hold command");
     hold.stdout(hakoniwa::Stdio::MakePipe);
+    hold.stderr(hakoniwa::Stdio::MakePipe);
     let mut child = hold.spawn().expect("spawning hold process in open box");
 
     // The hold report is what proves the launch reached the program the
     // injection is aimed at; a host that cannot build the box exits 125 in
     // hakoniwa's mount setup, before any report.
     let hold_stdout = child.stdout.take().expect("hold process stdout pipe");
+    // The box's launch path — hakoniwa's setup, the program it execs — says
+    // on stderr what went wrong when it goes wrong, so the proof takes the
+    // stream to say it in its own failure instead of leaving it in the log's
+    // margin.
+    let mut hold_stderr = child.stderr.take().expect("hold process stderr pipe");
+    let mut guard = LiveBox::new(child);
     let hold_report = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {
@@ -748,14 +826,24 @@ async fn injected_process_lacks_cap_net_raw() {
     .await
     .expect("hold process report timed out")
     .expect("spawn_blocking join");
-    assert!(
-        hold_report
-            .first()
-            .is_some_and(|line| line.starts_with("cwd=")),
-        "the hold process did not report: {hold_report:?}"
-    );
+    if !hold_report
+        .first()
+        .is_some_and(|line| line.starts_with("cwd="))
+    {
+        // Stop the box before saying why, so the failure names how the launch
+        // ended and what the box printed, not only the absence of a report.
+        let end = guard.stop();
+        let mut stderr = Vec::new();
+        let _drained = hold_stderr.read_to_end(&mut stderr);
+        panic!(
+            "the hold process did not report: {hold_report:?}\nstatus: {end:?}\nstderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
 
-    let leader = session_leader_pid(child.id()).expect("resolving the open box's program pid");
+    let leader =
+        session_leader_pid(guard.child_id()).expect("resolving the open box's program pid");
+    guard.holds(leader);
 
     let injection = Injection::new(leader, "/usr/bin/probe", ["caps"])
         .with_shim(shim())
@@ -775,17 +863,12 @@ async fn injected_process_lacks_cap_net_raw() {
     .expect("injected capability probe timed out")
     .expect("spawn_blocking join");
 
-    // Best effort: the hold process may already be gone, and the wait below
-    // says how the launch actually ended.
-    let _killed = child.kill();
-    let _ = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::task::spawn_blocking(move || child.wait()),
-    )
-    .await
-    .expect("waiting for hold process timed out")
-    .expect("spawn_blocking join")
-    .expect("waiting for hold process");
+    // Stop the box the proof no longer needs: SIGKILL to the supervisor —
+    // which the program dies from — then the reap. The wait after the signal
+    // cannot hang, the supervisor being the proof's own child, and it hands
+    // the program the moment it needs to be gone before the proof returns;
+    // the rest of the proof asserts over output already collected.
+    let _stopped = guard.stop();
 
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(

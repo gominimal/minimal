@@ -327,9 +327,10 @@ fn parse_report(stdout: &str) -> BTreeMap<String, String> {
 }
 
 /// The probe's report line for `key`, or a panic naming what never arrived: a
-/// report that does not show up is the failure to show, not a mystery.
+/// report that does not show up is the failure to show, not a mystery, so the
+/// panic carries the report that did arrive, whatever shape it is in.
 fn reported<'a>(report: &'a BTreeMap<String, String>, key: &str, what: &str) -> &'a str {
-    let never_arrived = format!("{what}: the probe did not report {key}");
+    let never_arrived = format!("{what}: the probe did not report {key}: {report:?}");
     report.get(key).expect(&never_arrived)
 }
 
