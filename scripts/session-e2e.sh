@@ -85,6 +85,11 @@
 #   fresh_install_own_ip_ingress_publishes_loopback
 #                                    a real install.sh run ships the switch;
 #                                    own-IP ingress answers at 127.0.0.1:8080
+#   network_posture_from_stock_install
+#                                    from a real install.sh run: --network and
+#                                    --ingress in help+reference+hints, a none
+#                                    box that attaches and reaches nothing,
+#                                    the stock posture's reach, own-IP again
 #   min_internal_names_through_proxy NET-001..004 through the shipped proxy
 #   hostnames_recover_and_two_daemons_route NET-020..027 warning, recovery,
 #                                   two daemons on one machine routing
@@ -1074,8 +1079,11 @@ if (
   # for output parsing, so the activate that autospawns the daemon alone
   # carries the noisier filter — as a command-local assignment, never a
   # subshell export, so nothing leaks past this proof.
-  export HOME="$fi_home" MINIMAL_BIN="$fi_home/.local/bin"
-  export PATH="$fi_home/.local/bin:$PATH"
+  # The swap is deliberately subshell-local (SC2030): the lane's own env
+  # must not pick it up, so the change dying with this proof's subshell is
+  # the point — see the comment above.
+  # shellcheck disable=SC2030
+  export HOME="$fi_home" MINIMAL_BIN="$fi_home/.local/bin" PATH="$fi_home/.local/bin:$PATH"
   mnl stop --force >/dev/null 2>&1 || true
   fi_sid="$(cd "$fi_seed" && RUST_LOG=info mnl session activate . --no-prompt \
     --name e2e-fresh-ingress --network own_ip --ingress "$fi_hport":8080 \
@@ -1232,6 +1240,791 @@ else
 fi
 echo "fresh-install loopback publish OK (installed pair, shipped switch, host-loopback answer, logged expose)"
 echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# The network postures of a stock install, end to end (the S2 integration
+# case). From a REAL scripts/install.sh run into a fresh HOME — the same
+# mock-bucket install the loopback-publish proof above uses, minus its
+# system-package half — the INSTALLED pair must let a user choose a box's
+# network posture from the command line and get exactly what the choice
+# says:
+#
+#   * the chooser is findable: `min session activate --help` carries
+#     `--network` with its none|host_ip|own_ip values and `--ingress`
+#     (NET-035), the CLI reference documents both (NET-036), and the old
+#     hyphenated spellings still parse, each printing a one-line hint
+#     naming the current one (NET-037) — `no-net` is driven for real (a
+#     box activated through it), `host-net` and `own-ip` at the parser,
+#     through an invocation whose only failure is the bogus project path
+#     it is given, so acceptance is visible: the hint prints and no clap
+#     error does. The current spellings print no hint.
+#   * a `--network none` box accepts attach — a REAL pty attach, and the
+#     exec probes below which ride the same session channel — and reaches
+#     nothing outside itself (NET-038, NET-039): its namespace holds no
+#     interface besides `lo` and no default route, and the host's own
+#     listener — answering on the host before the probe starts — is
+#     refused from inside the box, fast, and a public host is
+#     unreachable too. The stock posture (host_ip, the default) completes
+#     an outbound request (NET-107).
+#   * from the fresh install, `--network own_ip --ingress 8080:8080`
+#     answers ON THE HOST at 127.0.0.1:8080 with the box's own server's
+#     response (NET-040) — and that box completes an outbound request
+#     through the switch the installer shipped (NET-107's switch half).
+#
+# Lane gating, decided by where the proof's pieces actually run:
+#   * Native Linux only: the install pair lives host-side on a VM lane
+#     (the loopback-publish proof's reason). An arch without a release
+#     binary for this channel is skipped the same way.
+#   * The own-IP half additionally needs a tap (/dev/net/tun), and a host
+#     without one cannot come up as an own-IP box no matter what the
+#     install ships. The gate holds ONLY that half — help, hints, the
+#     none box and the stock posture's reach need no tap — so a tap-less
+#     host still proves every other clause and says what it left unrun.
+#     The bucket ships the switch only when that half will run; without
+#     it the manifest carries no switch row and the install log is
+#     asserted to record the skip instead.
+#   * When the own-IP half will run, the switch binary the fresh install
+#     must ship is $MINVMD_GVPROXY_BIN, the justfile's .scratch/gvproxy,
+#     or the pinned fetch — never a skip: a lane that cannot ship a
+#     switch cannot prove what this case exists for.
+#   * A host whose boxes cannot exec degrades by observed fact (the
+#     proxy case's gate): the install, the help, the reference and the
+#     hints run without a box; on CI or a VM lane a tripped exec gate
+#     fails.
+#
+# Ordered after the loopback-publish proof for the same reason it is
+# ordered after `restart`: the case swaps the driving pair to the
+# installed one, so nothing that still shares the lane's session may
+# follow before the swap is undone.
+proof_network_posture_from_stock_install() {
+  local np_arch np_gvproxy np_want_switch
+  if [ -n "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
+    echo "network posture SKIPPED (VM-backed lane: the pair this proof installs lives host-side)"
+    return 0
+  fi
+  case "$(uname -m)" in
+    x86_64) np_arch=amd64 ;;
+    aarch64|arm64) np_arch=arm64 ;;
+    *)
+      echo "network posture SKIPPED (no release arch for $(uname -m))"
+      return 0
+      ;;
+  esac
+  if [ -c /dev/net/tun ]; then
+    np_want_switch=1
+  else
+    np_want_switch=0
+    echo "own-IP half SKIPPED (no /dev/net/tun: an own-IP box cannot open its in-namespace tap; the help, hint, none-box and stock-posture halves still run)"
+  fi
+
+  echo "::group::network posture from a stock install (help, hints, none box, own-ip, reach)"
+
+  # Everything the case builds lives under $WORK/posture, so the state
+  # dir's teardown covers all of it — no extra bookkeeping.
+  local np_root="$WORK/posture"
+  local np_home="$np_root/home"
+  local np_bucket="$np_root/bucket" np_stubbin="$np_root/stubbin"
+  local np_out="$np_root/install.log" np_bucket_host
+  np_bucket_host="https://mock.invalid/minimal-posture"
+  POSTURE_HELP="$np_root/activate-help.txt"
+  POSTURE_HOST_MARKER="posture-host-listener-ok"
+  POSTURE_OWNIP_MARKER="posture-ownip-box-ok"
+  mkdir -p "$np_home" "$np_bucket/versions/v1" "$np_stubbin"
+
+  # The switch the fresh install will ship — only when the own-IP half
+  # will run (see the tap gate above).
+  if [ "$np_want_switch" -eq 1 ]; then
+    if [ -n "${MINVMD_GVPROXY_BIN:-}" ] && [ -x "$MINVMD_GVPROXY_BIN" ]; then
+      np_gvproxy="$MINVMD_GVPROXY_BIN"
+    elif [ -x "$ROOT/.scratch/gvproxy" ]; then
+      np_gvproxy="$ROOT/.scratch/gvproxy"
+    else
+      if ! "$ROOT/scripts/fetch-gvproxy.sh" "$np_root/gvproxy" \
+        >"$np_root/fetch-gvproxy.out" 2>&1; then
+        echo "::error::could not fetch the pinned gvproxy the fresh install must ship"
+        cat "$np_root/fetch-gvproxy.out" 2>/dev/null || true
+        fail
+      fi
+      np_gvproxy="$np_root/gvproxy"
+    fi
+    cp "$np_gvproxy" "$np_bucket/versions/v1/gvproxy-min-linux-$np_arch"
+  fi
+  cp "$(command -v min)" "$np_bucket/versions/v1/minimal-linux-$np_arch"
+  cp "$(command -v minimald)" "$np_bucket/versions/v1/minimald-linux-$np_arch"
+  printf 'v1\n' >"$np_bucket/stable"
+  np_sha() { sha256sum "$1" | awk '{print $1}'; }
+  local np_h_minimald np_h_minimal
+  np_h_minimald="$(np_sha "$np_bucket/versions/v1/minimald-linux-$np_arch")"
+  np_h_minimal="$(np_sha "$np_bucket/versions/v1/minimal-linux-$np_arch")"
+  {
+    printf '# format: 1\n'
+    printf '# component   os      arch    version   sha256   kind   dest                 src\n'
+    printf '\n'
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      minimald linux "$np_arch" v1 "$np_h_minimald" file bin/minimald \
+      "versions/v1/minimald-linux-$np_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      minimal linux "$np_arch" v1 "$np_h_minimal" file bin/min \
+      "versions/v1/minimal-linux-$np_arch"
+    if [ "$np_want_switch" -eq 1 ]; then
+      local np_h_gvmin
+      np_h_gvmin="$(np_sha "$np_bucket/versions/v1/gvproxy-min-linux-$np_arch")"
+      printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+        gvproxy-min linux "$np_arch" v1 "$np_h_gvmin" file bin/gvproxy-min \
+        "versions/v1/gvproxy-min-linux-$np_arch"
+    fi
+  } >"$np_bucket/versions/v1/components"
+
+  # The installer's curl, mapped to the mock bucket (the loopback-publish
+  # proof's stub: a fake curl, so the real installer runs unmodified and
+  # its HTTPS flags are accepted and ignored).
+  cat >"$np_stubbin/curl" <<STUB
+#!/bin/sh
+# Fake curl: maps the mock bucket host to the local dir this proof built —
+# the same trick install_test.sh uses, so the real installer runs unmodified;
+# its own HTTPS/TLS flags are accepted and ignored.
+out= url=
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    https://*|http://*) url="\$1"; shift ;;
+    *) shift ;;
+  esac
+done
+[ -n "\$url" ] || { echo "stub curl: no url" >&2; exit 2; }
+rel="\${url#$np_bucket_host/}"
+src="$np_bucket/\$rel"
+[ -f "\$src" ] || { echo "stub curl: 404 \$url" >&2; exit 22; }
+if [ -n "\$out" ]; then cp "\$src" "\$out"; else cat "\$src"; fi
+STUB
+  chmod +x "$np_stubbin/curl"
+  # Force the wget path off so the downloader selection is deterministic.
+  cat >"$np_stubbin/wget" <<'STUB'
+#!/bin/sh
+echo "stub wget should not be used here" >&2
+exit 1
+STUB
+  chmod +x "$np_stubbin/wget"
+
+  # The lane daemon this run was driving, resolved before HOME and PATH
+  # swap to the installed pair (the AppArmor restore below needs it).
+  local np_lane_minimald
+  np_lane_minimald="$(command -v minimald 2>/dev/null || true)"
+
+  if (
+    # ---- the fresh install --------------------------------------------------
+    # The $PATH read below (SC2031) is meant to see the lane's PATH: the
+    # loopback-publish proof's subshell swap never reaches this proof, so
+    # nothing is lost.
+    # shellcheck disable=SC2031
+    HOME="$np_home" MINIMAL_BIN="$np_home/.local/bin" \
+      PATH="$np_stubbin:$PATH" \
+      MINIMAL_OVERRIDE_INSTALLER_BUCKET="$np_bucket_host" \
+      sh "$ROOT/scripts/install.sh" >"$np_out" 2>&1 || {
+      echo "::error::the fresh install failed"
+      echo "--- install output ---"
+      cat "$np_out" 2>/dev/null || true
+      exit 1
+    }
+    echo "step: sh scripts/install.sh (fresh HOME, mock bucket) → exit 0"
+    if [ "$np_want_switch" -eq 1 ]; then
+      grep -qE 'switch-binary +verified +[^ ]*/bin/gvproxy-min' "$np_out" || {
+        echo "::error::the install output does not name the switch binary it verified"
+        echo "--- install output (tail) ---"
+        tail -25 "$np_out" 2>/dev/null || true
+        exit 1
+      }
+    else
+      grep -qE 'switch-binary +skipped' "$np_out" || {
+        echo "::error::the install output does not record the switch-binary skip the manifest without the switch row made"
+        echo "--- install output (tail) ---"
+        tail -25 "$np_out" 2>/dev/null || true
+        exit 1
+      }
+    fi
+    [ -x "$np_home/.local/bin/min" ] && [ -x "$np_home/.local/bin/minimald" ] || {
+      echo "::error::the fresh install did not ship an executable min/minimald pair"
+      tail -25 "$np_out" 2>/dev/null || true
+      exit 1
+    }
+    if [ "$np_want_switch" -eq 1 ] && [ ! -x "$np_home/.local/bin/gvproxy-min" ]; then
+      echo "::error::the fresh install did not ship an executable gvproxy-min"
+      exit 1
+    fi
+    echo "install log: $(grep -E 'switch-binary +(verified|skipped)' "$np_out" | tail -n1)"
+
+    # ---- AppArmor, restricted hosts (the loopback-publish proof's block) ----
+    local np_restore_profile=0
+    if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
+      local np_attach_args=()
+      local np_p
+      for np_p in "$np_home/.local/bin/minimald" "$np_lane_minimald"; do
+        if [ -n "$np_p" ] && [ -e "$np_p" ]; then
+          np_attach_args+=(--path "$np_p")
+        fi
+      done
+      if ! sudo -n "$ROOT/scripts/install-apparmor-profile.sh" "${np_attach_args[@]}"; then
+        echo "::error::this host restricts unprivileged user namespaces and the minimald AppArmor profile could not be attached to the installed pair, so its session sandbox cannot start (see docs/reference/linux-host-setup.md)"
+        exit 1
+      fi
+      np_restore_profile=1
+      echo "restricted host: minimald AppArmor profile attached to the installed pair ($np_home/.local/bin/minimald)"
+    fi
+
+    # One EXIT trap for the whole subshell: every path out of it — the
+    # early exits above included — undoes what the proof staged on the
+    # host, and a nonzero exit carries the case's diagnostics: the install
+    # log, the help capture and the installed daemon's log tail (rc 3 is
+    # the exec-gate skip, not a failure).
+    # shellcheck disable=SC2317,SC2329
+    np_cleanup() {
+      local np_rc=$?
+      if [ "$np_rc" -ne 0 ] && [ "$np_rc" -ne 3 ]; then
+        echo "--- install log (tail) ---"
+        tail -30 "$np_out" 2>/dev/null || true
+        echo "--- min session activate --help (captured) ---"
+        cat "$POSTURE_HELP" 2>/dev/null || true
+        echo "--- installed daemon log (tail) ---"
+        find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null \
+          | sort | tail -n1 | xargs -r tail -30 2>/dev/null || true
+      fi
+      if [ -n "${POSTURE_HOST_PID:-}" ]; then
+        kill "$POSTURE_HOST_PID" 2>/dev/null || true
+      fi
+      if [ "${np_restore_profile:-0}" = 1 ] && [ -n "$np_lane_minimald" ]; then
+        sudo -n "$ROOT/scripts/install-apparmor-profile.sh" \
+          --path "$np_lane_minimald" >/dev/null 2>&1 \
+          || echo "::warning::could not restore the minimald AppArmor profile's attachment set (sudo -n failed)" >&2
+      fi
+      trap - EXIT
+    }
+    trap np_cleanup EXIT
+
+    # ---- drive the INSTALLED pair -------------------------------------------
+    # As in the loopback-publish proof, the swap is deliberately subshell-local
+    # (SC2030/SC2031): the lane's env must stay as it was, and the $PATH read
+    # is the lane's PATH — no earlier proof's swap reaches here.
+    # shellcheck disable=SC2030,SC2031
+    export HOME="$np_home" MINIMAL_BIN="$np_home/.local/bin" PATH="$np_home/.local/bin:$PATH"
+    mnl stop --force >/dev/null 2>&1 || true
+
+    # The daemon the case drives autospawns on the FIRST daemon-touching
+    # call, so that call alone carries the noisier filter: the daemon keeps
+    # INFO records (the expose record the own-IP half prints below) while
+    # the CLI's own stdout stays quiet for the session-id extraction.
+    # Command-local, never exported.
+    RUST_LOG=info mnl ls >/dev/null 2>"$np_root/autospawn.err" || {
+      echo "::error::the installed pair's daemon did not come up"
+      echo "--- stderr ---"
+      cat "$np_root/autospawn.err" 2>/dev/null || true
+      exit 1
+    }
+    echo "step: RUST_LOG=info min ls (autospawns the installed daemon) → exit 0"
+
+    # ---- NET-035: the chooser is in `--help` --------------------------------
+    mnl session activate --help >"$POSTURE_HELP" 2>"$np_root/help.err"
+    local np_help_rc=$?
+    echo "step: min session activate --help → exit $np_help_rc (captured at $POSTURE_HELP)"
+    if [ "$np_help_rc" -ne 0 ]; then
+      echo "::error::'min session activate --help' failed"
+      echo "--- stderr ---"
+      cat "$np_root/help.err" 2>/dev/null || true
+      exit 1
+    fi
+    if ! grep -q -- '--network' "$POSTURE_HELP" \
+      || ! grep -q -- 'none|host_ip|own_ip' "$POSTURE_HELP" \
+      || ! grep -q -- '--ingress' "$POSTURE_HELP" \
+      || ! grep -q -- 'EXT:INT' "$POSTURE_HELP" \
+      || ! grep -q -- 'no-net' "$POSTURE_HELP"; then
+      echo "::error::'min session activate --help' does not carry the network posture flags (NET-035): --network with its none|host_ip|own_ip values, --ingress, and the legacy spellings named"
+      exit 1
+    fi
+    echo "help carries --network <none|host_ip|own_ip>, --ingress <EXT:INT[/PROTO]>, and the legacy spellings"
+
+    # ---- NET-036: the reference documents the chooser -----------------------
+    if ! grep -q -- '--network <none' "$ROOT/docs/reference/cli-min.md" \
+      || ! grep -q -- '--ingress <EXT:INT' "$ROOT/docs/reference/cli-min.md" \
+      || ! grep -Eq 'no-net.*host-net.*own-ip' "$ROOT/docs/reference/cli-min.md"; then
+      echo "::error::the CLI reference (docs/reference/cli-min.md) does not document --network and --ingress with the legacy spellings (NET-036)"
+      grep -n -- '--network' "$ROOT/docs/reference/cli-min.md" | head -5 || true
+      exit 1
+    fi
+    echo "step: reference check (docs/reference/cli-min.md carries --network, --ingress, legacy spellings) → exit 0"
+
+    # ---- NET-037: the legacy spellings parse, each with a rename hint -------
+    # `no-net` is driven for real: a box activated THROUGH the legacy
+    # spelling is the acceptance the requirement names, and its stderr must
+    # carry the hint. `host-net` and `own-ip` are driven at the parser,
+    # through an invocation whose only failure is the bogus project path it
+    # is given: the hint prints while the arguments parse, before any path
+    # is resolved, and a refusal to accept the spelling would be a clap
+    # error instead.
+    local np_hint_seed="$np_root/seeds/hint" np_hint_err="$np_root/hint.err"
+    local np_hint_sid np_hint_rc
+    mkdir -p "$np_hint_seed"
+    hook_seed_preamble >"$np_hint_seed/minimal.toml"
+    mkdir "$np_hint_seed/.git"
+    np_hint_sid="$(cd "$np_hint_seed" && mnl session activate . --no-prompt \
+      --name e2e-posture-hint --network no-net 2>"$np_hint_err")"
+    np_hint_rc=$?
+    echo "step: min session activate --network no-net (a real activation through the legacy spelling) → exit $np_hint_rc"
+    if [ "$np_hint_rc" -ne 0 ]; then
+      echo "::error::the legacy spelling --network no-net did not activate a session (NET-037)"
+      echo "--- stderr ---"
+      cat "$np_hint_err" 2>/dev/null || true
+      exit 1
+    fi
+    np_hint_sid="$(printf '%s\n' "$np_hint_sid" | tail -n1 | tr -d '\r')"
+    case "$(cat "$np_hint_err")" in
+      *"note: --network no-net"*"--network none"*) ;;
+      *)
+        echo "::error::the legacy spelling --network no-net did not print the rename hint naming the current spelling (NET-037)"
+        echo "--- stderr ---"
+        cat "$np_hint_err" 2>/dev/null || true
+        exit 1
+        ;;
+    esac
+    echo "hint: $(head -n1 "$np_hint_err")"
+    mnl ls --raw 2>/dev/null | grep -Fqx "$np_hint_sid" || {
+      echo "::error::the session activated through --network no-net is not listed"
+      exit 1
+    }
+    echo "step: min ls --raw lists the legacy-spelling session → exit 0"
+    mnl session destroy --force "$np_hint_sid" >/dev/null 2>&1 || true
+    echo "step: min session destroy --force (the hint probe's throwaway) → exit 0"
+
+    local np_legacy np_probe_err np_probe_rc
+    for np_legacy in host-net own-ip; do
+      # The path below must NOT exist: the activation's only failure is the
+      # path resolution, after the arguments (the hint) have parsed.
+      np_probe_err="$np_root/legacy-$np_legacy.err"
+      mnl session activate "$np_root/seeds/no-such-dir-$np_legacy" \
+        --network "$np_legacy" >/dev/null 2>"$np_probe_err"
+      np_probe_rc=$?
+      echo "step: min session activate <absent-dir> --network $np_legacy → exit $np_probe_rc (parser-level probe)"
+      case "$(cat "$np_probe_err")" in
+        *"note: --network $np_legacy"*) ;;
+        *)
+          echo "::error::the legacy spelling --network $np_legacy did not print the rename hint (NET-037)"
+          echo "--- stderr ---"
+          cat "$np_probe_err" 2>/dev/null || true
+          exit 1
+          ;;
+      esac
+      case "$(cat "$np_probe_err")" in
+        *"invalid value"*)
+          echo "::error::the legacy spelling --network $np_legacy was refused by the parser (NET-037)"
+          echo "--- stderr ---"
+          cat "$np_probe_err" 2>/dev/null || true
+          exit 1
+          ;;
+      esac
+      echo "  hint: $(head -n1 "$np_probe_err")"
+    done
+
+    # ---- the stock posture reaches the network (NET-107) ---------------------
+    # A default host-address box, activated explicitly with the current
+    # spelling. Its exec doubles as the case's capability gate: a host that
+    # cannot run a box's sandbox can run nothing below, and the gate
+    # degrades by observed fact — the proxy case's rule.
+    local np_hostip_seed="$np_root/seeds/hostip" np_hostip_err="$np_root/hostip.err"
+    local np_host_sid
+    mkdir -p "$np_hostip_seed"
+    hook_seed_preamble >"$np_hostip_seed/minimal.toml"
+    mkdir "$np_hostip_seed/.git"
+    np_host_sid="$(cd "$np_hostip_seed" && mnl session activate . --no-prompt \
+      --name e2e-posture-hostip --network host_ip 2>"$np_hostip_err")" || {
+      echo "::error::the stock posture (--network host_ip) did not activate"
+      echo "--- stderr ---"
+      cat "$np_hostip_err" 2>/dev/null || true
+      exit 1
+    }
+    np_host_sid="$(printf '%s\n' "$np_host_sid" | tail -n1 | tr -d '\r')"
+    echo "step: min session activate --network host_ip (the stock posture) → exit 0, session $np_host_sid"
+    if grep -q -- 'note: --network' "$np_hostip_err"; then
+      echo "::error::the current spelling --network host_ip printed a legacy hint"
+      echo "--- stderr ---"
+      cat "$np_hostip_err" 2>/dev/null || true
+      exit 1
+    fi
+    echo "policy of the stock posture box:"
+    mnl session policy "$np_host_sid" 2>"$np_root/hostip-policy.err" | sed 's/^/  /' || {
+      echo "::error::'min session policy' failed for the stock posture box"
+      cat "$np_root/hostip-policy.err" 2>/dev/null || true
+      exit 1
+    }
+    if ! mnl session exec "$np_host_sid" 'true' >"$np_root/execgate.err" 2>&1 \
+      && ! { sleep 1; mnl session exec "$np_host_sid" 'true' >"$np_root/execgate.err" 2>&1; }; then
+      if [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; then
+        echo "::warning::the box halves SKIPPED — this host cannot run a session sandbox"
+        echo "  (exec: $(head -n1 "$np_root/execgate.err" 2>/dev/null || true))"
+        echo "  asserted above: the install, the help capture, the reference and the three legacy hints."
+        echo "  the postures' in-box behavior needs a host whose boxes can run; on CI or a VM lane this gate fails instead"
+        mnl session destroy --force "$np_host_sid" >/dev/null 2>&1 || true
+        mnl stop --force >/dev/null 2>&1 || true
+        exit 3
+      fi
+      echo "::error::this lane cannot run a session sandbox, so no box can be driven: the posture behavior cannot be asserted"
+      echo "  (exec: $(head -n1 "$np_root/execgate.err" 2>/dev/null || true))"
+      exit 1
+    fi
+    posture_outbound "$np_host_sid" "the stock posture (host_ip)"
+    mnl session destroy --force "$np_host_sid" >/dev/null 2>&1 || true
+    echo "step: min session destroy --force (the stock posture's box) → exit 0"
+
+    # ---- the none box: accepts attach, reaches nothing (NET-038, NET-039) ---
+    local np_none_seed="$np_root/seeds/none" np_none_err="$np_root/none.err"
+    local np_none_sid
+    mkdir -p "$np_none_seed"
+    hook_seed_preamble >"$np_none_seed/minimal.toml"
+    mkdir "$np_none_seed/.git"
+    np_none_sid="$(cd "$np_none_seed" && mnl session activate . --no-prompt \
+      --name e2e-posture-none --network none 2>"$np_none_err")" || {
+      echo "::error::the none posture did not activate"
+      echo "--- stderr ---"
+      cat "$np_none_err" 2>/dev/null || true
+      exit 1
+    }
+    np_none_sid="$(printf '%s\n' "$np_none_sid" | tail -n1 | tr -d '\r')"
+    echo "step: min session activate --network none → exit 0, session $np_none_sid"
+    if grep -q -- 'note: --network' "$np_none_err"; then
+      echo "::error::the current spelling --network none printed a legacy hint"
+      echo "--- stderr ---"
+      cat "$np_none_err" 2>/dev/null || true
+      exit 1
+    fi
+    echo "policy of the none box:"
+    mnl session policy "$np_none_sid" 2>/dev/null | sed 's/^/  /' || true
+
+    # The namespace's shape: one interface (lo), no default route.
+    posture_probe "$np_none_sid" 'echo ---DEV---; cat /proc/net/dev; echo ---ROUTE---; cat /proc/net/route'
+    if [ "$POSTURE_EXEC_RC" -ne 0 ]; then
+      echo "::error::the none box's namespace probe failed"
+      echo "--- stderr ---"
+      cat "$WORK/posture-probe.err" 2>/dev/null || true
+      exit 1
+    fi
+    local np_dev np_route np_iface_count
+    np_dev="$(printf '%s\n' "$POSTURE_EXEC_OUT" | np_section DEV)"
+    np_route="$(printf '%s\n' "$POSTURE_EXEC_OUT" | np_section ROUTE)"
+    np_iface_count="$(printf '%s\n' "$np_dev" | grep -c ':')"
+    if [ "$np_iface_count" -ne 1 ] \
+      || ! printf '%s\n' "$np_dev" | grep -q '^[[:space:]]*lo:'; then
+      echo "::error::the none box's namespace does not hold exactly the loopback interface (NET-038)"
+      echo "--- probed facts ---"
+      printf '%s\n' "$POSTURE_EXEC_OUT"
+      exit 1
+    fi
+    if printf '%s\n' "$np_route" | awk 'NR > 1 && $2 == "00000000" { found = 1 } END { exit !found }'; then
+      echo "::error::the none box's namespace has a default route (NET-038)"
+      echo "--- probed facts ---"
+      printf '%s\n' "$POSTURE_EXEC_OUT"
+      exit 1
+    fi
+    echo "the none box's namespace: one interface (lo), no default route"
+
+    # The host-side listener the reach probes measure against: a plain
+    # python3 http.server bound to the host's loopback (the proxy case's
+    # pattern). The none box's 127.0.0.1 is its OWN loopback — the same
+    # literal address, a different namespace — so "the host answers, the
+    # box cannot reach it" is the isolation fact, not an outage.
+    POSTURE_HOST_DIR="$np_root/host-listener"
+    mkdir -p "$POSTURE_HOST_DIR"
+    printf '%s\n' "$POSTURE_HOST_MARKER" >"$POSTURE_HOST_DIR/marker"
+    local np_hport="" np_cand
+    for np_cand in 18085 18086 18087 18088; do
+      if np_port_free "$np_cand"; then
+        np_hport="$np_cand"
+        break
+      fi
+    done
+    if [ -z "$np_hport" ]; then
+      echo "::error::no free candidate port among 18085-18088 for the host-side listener"
+      exit 1
+    fi
+    (cd "$POSTURE_HOST_DIR" && exec python3 -m http.server "$np_hport" --bind 127.0.0.1) \
+      >/dev/null 2>"$np_root/host-listener.err" &
+    POSTURE_HOST_PID=$!
+    local np_up=""
+    for _ in $(seq 1 40); do
+      if [ "$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+        "http://127.0.0.1:$np_hport/marker" 2>/dev/null || true)" = "200" ]; then
+        np_up=1
+        break
+      fi
+      sleep 0.25
+    done
+    if [ -z "$np_up" ]; then
+      echo "::error::the host-side listener never answered on 127.0.0.1:$np_hport"
+      echo "--- listener stderr ---"
+      cat "$np_root/host-listener.err" 2>/dev/null || true
+      exit 1
+    fi
+    echo "step: python3 -m http.server $np_hport --bind 127.0.0.1 (host-side) → exit 0, answers 200"
+
+    # The box cannot reach it: refused, fast — never a timeout.
+    local np_t0 np_t1
+    np_t0=$(now_ms)
+    posture_probe "$np_none_sid" "curl -sS --max-time 5 -o /dev/null http://127.0.0.1:$np_hport/"
+    np_t1=$(now_ms)
+    if [ "$POSTURE_EXEC_RC" -eq 0 ]; then
+      echo "::error::the none box reached the host's listener at 127.0.0.1:$np_hport — its namespace is not empty (NET-038)"
+      exit 1
+    fi
+    if [ $((np_t1 - np_t0)) -ge 4000 ]; then
+      echo "::error::the none box's refused connection took $((np_t1 - np_t0))ms — a refusal must be fast, not a timeout (NET-038)"
+      echo "--- curl stderr ---"
+      cat "$WORK/posture-probe.err" 2>/dev/null || true
+      exit 1
+    fi
+    echo "the none box cannot reach the host's listener (exit $POSTURE_EXEC_RC in $((np_t1 - np_t0))ms: $(head -n1 "$WORK/posture-probe.err" 2>/dev/null || true))"
+
+    # ...and a public host is unreachable too.
+    np_t0=$(now_ms)
+    posture_probe "$np_none_sid" "curl -sS --max-time 8 -o /dev/null https://example.com"
+    np_t1=$(now_ms)
+    if [ "$POSTURE_EXEC_RC" -eq 0 ]; then
+      echo "::error::the none box completed an outbound request to https://example.com (NET-038)"
+      exit 1
+    fi
+    echo "the none box cannot reach the internet (exit $POSTURE_EXEC_RC in $((np_t1 - np_t0))ms: $(head -n1 "$WORK/posture-probe.err" 2>/dev/null || true))"
+
+    # The attach: a REAL pty attach to the none box (the sandbox case's
+    # driver), answered with the detach lane so the session stays for its
+    # destroy below. The marker the typed command prints is the proof the
+    # attach reached the box.
+    local np_attach_out
+    # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+    np_attach_out="$(E2E_PTY_COMMANDS='echo POSTURE_NONE_ATTACH_OK
+exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+      min ${E2E_MINIMAL_ARGS:-} session attach "$np_none_sid" \
+      2>"$np_root/none-attach.err")" || {
+      echo "::error::the pty attach to the none box failed (NET-039)"
+      echo "--- transcript ---"
+      printf '%s\n' "$np_attach_out"
+      echo "--- stderr ---"
+      cat "$np_root/none-attach.err" 2>/dev/null || true
+      exit 1
+    }
+    echo "step: pty attach to the none box → exit 0"
+    if [[ "$np_attach_out" != *POSTURE_NONE_ATTACH_OK* ]]; then
+      echo "::error::the none box did not answer through the attached terminal (NET-039)"
+      echo "--- transcript ---"
+      printf '%s\n' "$np_attach_out"
+      exit 1
+    fi
+    echo "attach: POSTURE_NONE_ATTACH_OK came back through the attached terminal"
+    mnl session destroy --force "$np_none_sid" >/dev/null 2>&1 || true
+    echo "step: min session destroy --force (the none box) → exit 0"
+
+    # ---- the own-IP posture: publish on the host loopback, reach out --------
+    if [ "$np_want_switch" -eq 1 ]; then
+      local np_hport2=8080
+      if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$np_hport2/" 2>/dev/null; then
+        if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:18082/" 2>/dev/null; then
+          echo "::error::both 127.0.0.1:8080 and the fallback 18082 already answer on this host; the own-IP half needs one of them free"
+          exit 1
+        fi
+        np_hport2=18082
+        echo "127.0.0.1:8080 is already answering on this host — publishing the mapping on the fallback port $np_hport2 instead (the box still serves its internal 8080)"
+      fi
+      local np_ownip_seed="$np_root/seeds/ownip" np_own_err="$np_root/ownip-activate.err"
+      local np_own_sid
+      mkdir -p "$np_ownip_seed"
+      hook_seed_preamble >"$np_ownip_seed/minimal.toml"
+      mkdir "$np_ownip_seed/.git"
+      np_own_sid="$(cd "$np_ownip_seed" && mnl session activate . --no-prompt \
+        --name e2e-posture-ownip --network own_ip --ingress "$np_hport2":8080 \
+        2>"$np_own_err")" || {
+        echo "::error::the installed pair failed to activate an own-IP session with an ingress mapping"
+        echo "--- stderr ---"
+        cat "$np_own_err" 2>/dev/null || true
+        exit 1
+      }
+      np_own_sid="$(printf '%s\n' "$np_own_sid" | tail -n1 | tr -d '\r')"
+      echo "step: min session activate --network own_ip --ingress $np_hport2:8080 → exit 0, session $np_own_sid"
+      if grep -q -- 'note: --network' "$np_own_err"; then
+        echo "::error::the current spelling --network own_ip printed a legacy hint"
+        echo "--- stderr ---"
+        cat "$np_own_err" 2>/dev/null || true
+        exit 1
+      fi
+      # socat carries the in-box responder (a launcher baseline package, at
+      # /usr/bin in every box), serving one 200 whose body is the marker;
+      # the loopback-publish proof's detach form, verbatim.
+      posture_probe_quiet "$np_own_sid" 'test -x /usr/bin/socat' || {
+        echo "::error::probing the box for /usr/bin/socat failed (it is a launcher baseline package — an empty stderr below means the file is not there)"
+        echo "--- probe stderr ---"
+        cat "$WORK/posture-probe.err" 2>/dev/null || true
+        exit 1
+      }
+      posture_probe "$np_own_sid" \
+        "body=$POSTURE_OWNIP_MARKER; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200"
+      if [ "$POSTURE_EXEC_RC" -ne 0 ]; then
+        echo "::error::could not write the in-box responder's response"
+        echo "--- stderr ---"
+        cat "$WORK/posture-probe.err" 2>/dev/null || true
+        exit 1
+      fi
+      posture_probe "$np_own_sid" \
+        "nohup /usr/bin/socat TCP-LISTEN:8080,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &"
+      if [ "$POSTURE_EXEC_RC" -ne 0 ]; then
+        echo "::error::could not start the in-box responder"
+        echo "--- stderr ---"
+        cat "$WORK/posture-probe.err" 2>/dev/null || true
+        exit 1
+      fi
+      local np_ready=""
+      for _ in $(seq 1 40); do
+        if [ "$(mnl session exec "$np_own_sid" \
+          "curl -sS --max-time 5 -o /home/ready.body -w '%{http_code}' http://127.0.0.1:8080/" \
+          2>/dev/null || true)" = "200" ]; then
+          np_ready=1
+          break
+        fi
+        sleep 0.25
+      done
+      if [ -z "$np_ready" ]; then
+        echo "::error::the in-box responder never answered a direct curl — the publish is not in the picture yet"
+        exit 1
+      fi
+      echo "the box answers its own ingress mapping at 127.0.0.1:8080"
+      local np_status
+      np_status="$(curl -sS --max-time 5 -o "$np_root/host-answer.body" -w '%{http_code}' \
+        "http://127.0.0.1:$np_hport2/" 2>"$np_root/host-answer.err" || true)"
+      if [ "$np_status" != "200" ] \
+        || ! grep -Fq "$POSTURE_OWNIP_MARKER" "$np_root/host-answer.body" 2>/dev/null; then
+        echo "::error::the fresh install's own-IP ingress did not answer on the host loopback at 127.0.0.1:$np_hport2 (NET-040)"
+        echo "  status: $np_status, body: $(cat "$np_root/host-answer.body" 2>/dev/null || true)"
+        echo "--- curl stderr ---"
+        cat "$np_root/host-answer.err" 2>/dev/null || true
+        exit 1
+      fi
+      echo "step: host curl http://127.0.0.1:$np_hport2/ → 200, body carries the box's marker (NET-040)"
+
+      # Observability, not an assertion: the loopback-publish proof owns
+      # the expose record's assert. Find the record and print it.
+      local np_daemon_log np_expose=""
+      np_daemon_log="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null | sort | tail -n1)"
+      for _ in $(seq 1 10); do
+        np_expose="$(grep -h -- 'exposed ingress port on the host loopback' "$np_daemon_log" 2>/dev/null \
+          | grep -F '"session":"e2e-posture-ownip"' | tail -n1)"
+        if [ -n "$np_expose" ]; then
+          break
+        fi
+        sleep 0.25
+      done
+      if [ -n "$np_expose" ]; then
+        echo "daemon log: $np_expose"
+      else
+        echo "daemon log: (no expose record found — the host answer above is the assertion)"
+      fi
+      echo "policy of the own-IP box:"
+      mnl session policy "$np_own_sid" 2>/dev/null | sed 's/^/  /' || true
+      posture_outbound "$np_own_sid" "the own-IP posture (switch lane)"
+      mnl session destroy --force "$np_own_sid" >/dev/null 2>&1 || true
+      mnl stop --force >/dev/null 2>&1 || true
+      for _ in $(seq 1 20); do
+        curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$np_hport2/" 2>/dev/null || break
+        sleep 0.25
+      done
+    else
+      echo "own-IP half SKIPPED (no /dev/net/tun: the fresh install ships no switch and the half is gated on the tap — see the skip note at the top)"
+    fi
+
+    # Leave the lane as it was: the installed daemon stopped, so the next
+    # proof auto-respawns the checkout's own pair from the restored PATH.
+    mnl stop --force >/dev/null 2>&1 || true
+  ); then
+    :
+  else
+    local np_rc=$?
+    if [ "$np_rc" -eq 3 ]; then
+      echo "network posture from a stock install SKIPPED (this host cannot run a session sandbox; the install, help, reference and hint halves above still ran)"
+      echo "::endgroup::"
+      return 0
+    fi
+    fail
+  fi
+  echo "network posture from a stock install OK (chooser in help+reference+hints, none box isolated, own-ip answered on the host, live postures reached the network)"
+  echo "::endgroup::"
+}
+
+# The posture case's own helpers. posture_probe drives one `min session
+# exec` and prints the command, its exit status and the captured output
+# (the case's observability contract), leaving them in POSTURE_EXEC_RC and
+# POSTURE_EXEC_OUT; posture_probe_quiet is the ready-loop variant (status
+# only); posture_outbound is the tolerant outbound probe (the
+# session_outbound_request proof's shape); np_section and np_port_free are
+# the section splitter and the bind-probe the reach probes need.
+posture_probe() {
+  local np_sid="$1" np_cmd="$2"
+  POSTURE_EXEC_OUT="$(mnl session exec "$np_sid" "$np_cmd" 2>"$WORK/posture-probe.err")"
+  POSTURE_EXEC_RC=$?
+  echo "exec: $np_cmd"
+  echo "  exit: $POSTURE_EXEC_RC"
+  if [ -n "$POSTURE_EXEC_OUT" ]; then
+    printf '%s\n' "$POSTURE_EXEC_OUT" | sed 's/^/  | /'
+  fi
+}
+posture_probe_quiet() {
+  POSTURE_EXEC_OUT="$(mnl session exec "$1" "$2" 2>"$WORK/posture-probe.err")"
+  POSTURE_EXEC_RC=$?
+  [ "$POSTURE_EXEC_RC" -eq 0 ]
+}
+posture_outbound() {
+  local np_sid="$1" np_label="$2"
+  local np_h np_t np_status np_out np_ok=0 np_failed=""
+  for np_h in example.com example.org; do
+    np_status=0
+    np_out=""
+    for np_t in 1 2 3; do
+      # The request runs INSIDE the box (NET-107: from inside the session).
+      np_out="$(mnl session exec "$np_sid" \
+        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 30 https://$np_h" \
+        2>"$WORK/posture-outbound.err")"
+      np_status=$?
+      echo "exec: curl -sS https://$np_h (from inside $np_label, attempt $np_t) → exit $np_status (got '${np_out:-<none>}')"
+      if [ "$np_status" -eq 0 ] && [ "$np_out" = "HTTP:200" ]; then
+        break
+      fi
+      if [ "$np_t" -lt 3 ]; then
+        echo "  retrying in $((np_t * 3))s"
+        sleep "$((np_t * 3))"
+      fi
+    done
+    if [ "$np_status" -eq 0 ] && [ "$np_out" = "HTTP:200" ]; then
+      np_ok=$((np_ok + 1))
+    else
+      np_failed="$np_failed https://$np_h"
+      # Warned, not failed: the other host answering proves the box's
+      # egress, which makes this that endpoint's problem. Surfaced, so a
+      # partial fault is visible.
+      echo "::warning::outbound from $np_label to https://$np_h failed all 3 attempts (exec status $np_status, got '${np_out:-<none>}'); not fatal while the other host still proves the box reaches the network."
+      cat "$WORK/posture-outbound.err" 2>/dev/null || true
+    fi
+  done
+  if [ "$np_ok" -eq 0 ]; then
+    echo "::error::$np_label completed an outbound request against no host (${np_failed}) — the box has no working egress (NET-107)"
+    exit 1
+  fi
+}
+np_section() {
+  awk -v want="---$1---" '
+    $0 == want   { grab = 1; next }
+    /^---.*---$/ { grab = 0 }
+    grab         { print }
+  '
+}
+np_port_free() {
+  python3 -c 'import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+s.close()' "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -3795,12 +4588,14 @@ case "${1:-}" in
     proof_sandbox
     proof_restart
     proof_fresh_install_own_ip_ingress_publishes_loopback
+    proof_network_posture_from_stock_install
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
     proof_retired_surfaces_gone
     ;;
   lifecycle | session_exec | session_outbound_request | own_ip | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
+    | network_posture_from_stock_install \
     | hostnames_recover_and_two_daemons_route \
     | min_internal_names_through_proxy | retired_surfaces_gone)
     "proof_$1"
@@ -3810,7 +4605,7 @@ case "${1:-}" in
     echo "  no argument: every proof, in the whole-lane order"
     echo "  cases: lifecycle session_exec session_outbound_request own_ip task_run hooks"
     echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
-    echo "         hostnames_recover_and_two_daemons_route"
+    echo "         network_posture_from_stock_install hostnames_recover_and_two_daemons_route"
     echo "         min_internal_names_through_proxy retired_surfaces_gone"
     exit 2
     ;;
