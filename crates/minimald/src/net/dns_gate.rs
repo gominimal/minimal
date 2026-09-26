@@ -1615,7 +1615,9 @@ mod tests {
     /// NET-136: AAAA, HTTPS (65) and SVCB (64) queries toward this box's
     /// resolver are answered NODATA by the relay itself — a DNS reply with
     /// no answers — and never reach the switch, while an A query is
-    /// forwarded, so the box can resolve at all.
+    /// forwarded, so the box can resolve at all. The intercepted query opens
+    /// no conntrack window (nothing was sent, so no reply is solicited); the
+    /// forwarded one opens the window its reply returns through.
     #[tokio::test]
     async fn aaaa_https_and_svcb_queries_are_nodata() {
         let mut harness = spawn_test_relay(&github_only_egress());
@@ -1677,6 +1679,32 @@ mod tests {
                 next, sentinel,
                 "the {rtype:?} query never reached the switch"
             );
+
+            // The interception opened no conntrack window either: the query
+            // never reached the resolver, so a datagram from the resolver back
+            // to the query's own source port is unsolicited — the ingress gate
+            // drops it, and the ARP sentinel behind it is all the box sees.
+            let bogus = udp_payload_frame(
+                RESOLVER,
+                53,
+                LEASE,
+                40000,
+                &dns_response("github.com.", &[Ipv4Addr::new(140, 82, 121, 3)]),
+            );
+            harness.switch.write_all(&wire_frame(&bogus)).await.unwrap();
+            let passer = arp_frame();
+            harness
+                .switch
+                .write_all(&wire_frame(&passer))
+                .await
+                .unwrap();
+            let next = read_box_frame(&harness)
+                .await
+                .expect("the ingress gate keeps deciding");
+            assert_eq!(
+                next, passer,
+                "an intercepted {rtype:?} query opened no conntrack window"
+            );
         }
 
         // An A query is forwarded, not intercepted — resolution is the one
@@ -1698,6 +1726,21 @@ mod tests {
             forwarded, a_query,
             "only the empty-records types are intercepted"
         );
+
+        // And the query the leg *did* forward opens the window its reply
+        // needs: keeping the intercepted queries out of the conntrack must not
+        // take the forwarded query's reply with them.
+        let reply = dns_response("github.com.", &[Ipv4Addr::new(140, 82, 121, 3)]);
+        let reply_frame = udp_payload_frame(RESOLVER, 53, LEASE, 40001, &reply);
+        harness
+            .switch
+            .write_all(&wire_frame(&reply_frame))
+            .await
+            .unwrap();
+        let passed = read_box_frame(&harness)
+            .await
+            .expect("a forwarded query's reply returns to the box");
+        assert_eq!(passed, reply_frame, "a forwarded query opens a window");
     }
 
     /// The NODATA reply carries the question's own id, so the box's resolver

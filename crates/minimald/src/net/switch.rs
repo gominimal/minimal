@@ -444,11 +444,13 @@ where
 
 /// tap → switch: read a raw Ethernet frame, apply the session's egress verdict
 /// to it (NET-062 — dropped frames never reach the switch and are not answered),
-/// record any admitted outbound UDP flow (so its reply is allowed back in —
-/// finding #2, UDP; only a declared frame opens a window), notice frames to the
-/// deprecated literal host address (NET-004), prepend its 2-byte LE length, and
-/// write the framed packet to the control socket. `gate` is `None` for the daemon
-/// relay, which is not a box and forwards unchecked.
+/// answer the box's own AAAA/HTTPS/SVCB lookups (NET-136), record the outbound
+/// UDP flow of every datagram this leg actually forwards (so its reply is
+/// allowed back in — finding #2, UDP; only a declared, forwarded datagram opens
+/// a window), notice frames to the deprecated literal host address (NET-004),
+/// prepend its 2-byte LE length, and write the framed packet to the control
+/// socket. `gate` is `None` for the daemon relay, which is not a box and
+/// forwards unchecked.
 async fn relay_tap_to_switch<W>(
     tap: Arc<AsyncFd<std::fs::File>>,
     mut sock: W,
@@ -525,17 +527,11 @@ where
             }
         }
         // The frame's UDP addressing, parsed once for both of this leg's UDP
-        // consumers below: the conntrack window and the DNS gate's NODATA
-        // interception. A frame that is not IPv4+UDP — most of a box's
-        // traffic — reaches neither, and costs no second parse here.
+        // consumers below: the DNS gate's NODATA interception and the conntrack
+        // window. A frame that is not IPv4+UDP — most of a box's traffic —
+        // reaches neither, and costs no second parse here.
         if let Some(gate) = &gate {
             let udp = parse_ipv4_l4(&buf[..n]).filter(|pkt| pkt.proto == IPPROTO_UDP);
-            // Track outbound UDP so the inbound gate recognizes its reply as
-            // solicited. Only a frame the verdict admitted gets a window: an
-            // undeclared datagram must not punch a hole in the inbound gate.
-            if let Some(pkt) = &udp {
-                gate.conntrack.record_egress(pkt);
-            }
             // NET-136: the box's AAAA, HTTPS and SVCB lookups toward this
             // switch's resolver are answered NODATA by the relay itself and
             // never reach the switch. The box gets its empty answer — its own
@@ -548,6 +544,17 @@ where
                 let frame = udp_reply_frame(&buf[..n], pkt, &reply);
                 write_tap_frame(&tap, &frame).await?;
                 continue;
+            }
+            // Track outbound UDP so the inbound gate recognizes its reply as
+            // solicited — after the interception, so a datagram this leg
+            // answered itself opens no window: it never reached the resolver,
+            // so nothing replies to it, and a window keyed to it would be dead
+            // state whose only effect is to let an unsolicited inbound
+            // datagram pass as solicited for the TTL. A frame the verdict did
+            // not admit never gets here either: an undeclared datagram must
+            // not punch a hole in the inbound gate.
+            if let Some(pkt) = &udp {
+                gate.conntrack.record_egress(pkt);
             }
         }
         // NET-004: the literal host address still routes — the switch's `nat`
@@ -718,7 +725,8 @@ pub struct SessionGate {
     udp_allowed: HashSet<u16>,
     /// Outbound-UDP flow tracker, shared between the relay legs so a reply to
     /// the PTask's own UDP egress (DNS, QUIC, …) is allowed back in — and an
-    /// undeclared datagram cannot open a window.
+    /// undeclared datagram, or one the relay answered itself (NET-136), cannot
+    /// open a window.
     conntrack: Arc<UdpConntrack>,
     /// The target PTask's switch IP, carried as the R2.7 log's `session_id`.
     label: String,
@@ -924,7 +932,10 @@ struct UdpConntrack {
 
 impl UdpConntrack {
     /// Records an outbound UDP datagram (`pkt.src` = local lease, `pkt.dst` =
-    /// remote) so its reply may return.
+    /// remote) so its reply may return. The caller passes only a datagram it is
+    /// forwarding: one the relay answered itself never reaches the remote, so
+    /// no reply is coming and a window keyed to it would admit unsolicited
+    /// inbound traffic for the TTL.
     fn record_egress(&self, pkt: &L4Packet) {
         let key = (*pkt.dst.ip(), pkt.dst.port(), pkt.src.port());
         let now = Instant::now();
