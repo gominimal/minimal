@@ -22,16 +22,96 @@
 //! To run locally you need a host that allows unprivileged user namespaces and
 //! a C compiler:
 //! `cargo nextest run -p sandbox2 boxes_lack_cap_net_raw`
+//!
+//! A failing run of the CI lane that runs this proof reports an exit code and
+//! nothing else unless the proof names itself: nextest captures what a test
+//! prints and indents it four spaces in the step log, which hides `::error`
+//! workflow commands from the Actions annotation parser, and the step log
+//! itself is admin-only besides. So the first line of the proof past its gates
+//! is `announce_to_the_runner`, which says it started and, on the panic that
+//! fails it, posts proof, site and reason through the one stream that is
+//! neither captured nor indented — reaching the parser as an annotation on the
+//! check run that every reader of the pull request can see.
 #![cfg(target_os = "linux")]
 
 use sandbox2::NetPlan;
 use sandbox2::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
 
 use std::collections::BTreeMap;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+
+/// One line straight into the log stream nextest prints to. What a proof prints
+/// itself never reaches the Actions annotation parser: nextest captures each
+/// test's stdout and stderr and indents them four spaces in the step log, and
+/// the parser only reads a command that starts a line. Nextest forks this proof
+/// from its per-binary fork server, so `/proc/<ppid>/fd/1` is that server's own
+/// stdout — the stream nextest prints to unindented, and the one the parser does
+/// read. Best effort in every direction: away from the CI runner, or where the
+/// path will not open, nothing is written and the proof behaves exactly as it
+/// did without this.
+fn tell_the_runner(line: &str) {
+    if std::env::var("GITHUB_ACTIONS").ok().as_deref() != Some("true") {
+        return;
+    }
+    // SAFETY: getppid() reads the calling process's parent pid; it has no side
+    // effects and cannot fail.
+    let ppid = unsafe { libc::getppid() };
+    if let Ok(mut log) = std::fs::File::create(format!("/proc/{ppid}/fd/1")) {
+        let _written = writeln!(log, "{line}");
+    }
+}
+
+/// Announces `proof` on the CI runner, so a failing run of the lane names the
+/// proof that failed. Two lines of insurance: a start line — a run that dies
+/// without a panic (a hang, a proof the slow-timeout kills) still names the
+/// last proof that began, to whoever reads the step log — and a panic hook,
+/// installed once, that posts the proof's name, panic site and reason as an
+/// `::error` workflow command the runner turns into an annotation on the check
+/// run. The step log holds the full detail but is admin-only; the annotation is
+/// the part every reader of the pull request can see. The hook chains the one
+/// before it, so nextest still reports the failure exactly as it did.
+fn announce_to_the_runner(proof: &str) {
+    // Nextest runs each test in a process of its own, so a process-wide name
+    // names this proof on whichever thread the panic comes from — the test
+    // thread or a runtime worker the proof spawned onto.
+    static RUNNING_PROOF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    let _named = RUNNING_PROOF.set(proof.to_owned());
+    HOOK.call_once(|| {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let proof = RUNNING_PROOF
+                .get()
+                .map(String::as_str)
+                .unwrap_or("an unnamed proof");
+            let payload = info.payload();
+            let reason = if let Some(reason) = payload.downcast_ref::<&str>() {
+                (*reason).to_string()
+            } else if let Some(reason) = payload.downcast_ref::<String>() {
+                reason.clone()
+            } else {
+                "a panic carrying no message".to_string()
+            };
+            let reason: String = reason.replace(['\r', '\n'], " ").chars().take(512).collect();
+            if let Some(location) = info.location() {
+                tell_the_runner(&format!(
+                    "::error file={},line={},title={proof}::capability proof failed: {reason}",
+                    location.file(),
+                    location.line(),
+                ));
+            } else {
+                tell_the_runner(&format!(
+                    "::error title={proof}::capability proof failed: {reason}"
+                ));
+            }
+            previous_hook(info);
+        }));
+    });
+    tell_the_runner(&format!("sandbox2 capability proof started: {proof}"));
+}
 
 /// C source for a tiny static probe that reports a box's identity and
 /// capability sets from its status file, then the errno of a raw socket attempt
@@ -228,6 +308,7 @@ async fn boxes_lack_cap_net_raw() {
         );
         return;
     }
+    announce_to_the_runner("boxes_lack_cap_net_raw");
 
     let open = box_report(NetPlan::host()).await;
     assert_box_credentials(&open, "an open box");
