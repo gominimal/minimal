@@ -589,6 +589,31 @@ fn declared_by(packages: &BTreeMap<String, String>, declared: &str, task: &str) 
     }
 }
 
+/// Attributes a sandbox fs-mapping failure to the declaration behind the
+/// expanded path it names, so "create mapped file /.claude.json: EROFS" on
+/// its own sends nobody anywhere useful (#1204). A read-only mapping is never
+/// created, so a missing source surfaces as `"fs mapping"` and gets a distinct
+/// message; creation failures keep the existing wording.
+fn attribute_fs_mapping_error(
+    e: &sandbox2::Error,
+    declarations: &BTreeMap<String, &String>,
+    fs_mapping_packages: &BTreeMap<String, String>,
+    task: &str,
+) -> Option<Error> {
+    let sandbox2::Error::IO(op, path, _) = e else {
+        return None;
+    };
+    let declared = path.to_str().and_then(|p| declarations.get(p))?;
+    let by = declared_by(fs_mapping_packages, declared, task);
+    let msg = match *op {
+        "fs mapping" => {
+            format!("{e}; read-only patch source `{declared}` does not exist (declared by {by})")
+        }
+        _ => format!("{e}; mapped in by {by}, which declares it as `{declared}`"),
+    };
+    Some(Error::Other(anyhow::anyhow!(msg)))
+}
+
 /// The home directory this environment's `~/`-rooted patch paths expand
 /// against, and that its sandbox reports as `$HOME`.
 ///
@@ -701,11 +726,14 @@ impl<'a> Env<'a> {
             ))
         })?;
         // Expanded path → the declaration behind it. sandbox2 only ever sees
-        // the expanded form, so its "create mapped file" failures name a path
-        // nobody wrote down; this puts the package and its `~/`-rooted
-        // declaration back into the message.
-        let declarations: BTreeMap<String, &String> = fs_mapping_packages
+        // the expanded form, so its fs-mapping failures name a path nobody
+        // wrote down; this puts the `~/`-rooted declaration back into the
+        // message. Built from the merged patch set so the task's own `patch`
+        // table is covered alongside package-declared mappings.
+        let declarations: BTreeMap<String, &String> = patch
+            .dir
             .keys()
+            .chain(patch.file.keys())
             .filter_map(|declared| {
                 Some((
                     EnvPatches::expand_home(declared, home.as_deref()).ok()?,
@@ -757,20 +785,8 @@ impl<'a> Env<'a> {
             )
             .await
             .map_err(|e| {
-                // Sandbox setup creates every mapped file it doesn't find. If
-                // that failed on a path we mapped in, say whose declaration it
-                // was — "create mapped file /.claude.json: EROFS" on its own
-                // sends nobody anywhere useful (#1204).
-                let sandbox2::Error::IO(_, path, _) = &e else {
-                    return e.into();
-                };
-                match path.to_str().and_then(|p| declarations.get(p)) {
-                    Some(declared) => Error::Other(anyhow::anyhow!(
-                        "{e}; mapped in by {}, which declares it as `{declared}`",
-                        declared_by(&fs_mapping_packages, declared, args.name)
-                    )),
-                    None => e.into(),
-                }
+                attribute_fs_mapping_error(&e, &declarations, &fs_mapping_packages, args.name)
+                    .unwrap_or_else(|| e.into())
             })?;
         for want_dir in state_dirs {
             std::fs::create_dir_all(args.state_base_dir.join(&want_dir)).map_err(|e| {
@@ -1014,6 +1030,51 @@ mod tests {
             declared_by(&packages, "~/.npmrc", "test"),
             "task `test`",
             "a path no package declared came from the task's own patch table"
+        );
+    }
+
+    /// A missing read-only patch source surfaces as `"fs mapping"` and must
+    /// name the declaration and its owner; a creation failure keeps the
+    /// existing wording. The task's own `patch` table is attributed to the
+    /// task, not a package.
+    #[test]
+    fn attribute_fs_mapping_error_names_the_declaration() {
+        let declared = "~/.aws".to_string();
+        let declarations = BTreeMap::from_iter([("/home/dev/.aws".to_string(), &declared)]);
+        let packages = BTreeMap::new();
+
+        let missing = sandbox2::Error::IO(
+            "fs mapping",
+            PathBuf::from("/home/dev/.aws"),
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        let msg = format!(
+            "{}",
+            attribute_fs_mapping_error(&missing, &declarations, &packages, "deploy")
+                .expect("a missing read-only source must be attributed")
+        );
+        assert!(
+            msg.contains("read-only patch source `~/.aws` does not exist"),
+            "missing read-only source must be named, got: {msg}"
+        );
+        assert!(
+            msg.contains("declared by task `deploy`"),
+            "task-own patch entry must be attributed to the task, got: {msg}"
+        );
+
+        let create = sandbox2::Error::IO(
+            "create mapped file",
+            PathBuf::from("/home/dev/.aws"),
+            std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem),
+        );
+        let msg = format!(
+            "{}",
+            attribute_fs_mapping_error(&create, &declarations, &packages, "deploy")
+                .expect("a creation failure must be attributed")
+        );
+        assert!(
+            msg.contains("mapped in by task `deploy`, which declares it as `~/.aws`"),
+            "creation failure keeps the existing wording, got: {msg}"
         );
     }
 
