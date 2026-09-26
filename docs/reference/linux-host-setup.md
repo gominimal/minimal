@@ -95,7 +95,7 @@ grants `userns` to whichever binary it is attached to, so attach it to
 `mip` the same way — pass the binary's path with `--path`:
 
 ```console
-$ sudo scripts/install-apparmor-profile.sh --path "$PWD/target/debug/mip"
+$ sudo scripts/install-apparmor-profile.sh --path "$PWD/target/debug/minimald" --path "$PWD/target/debug/mip"
 ```
 
 The installer's `--path` accepts any binary path, so this works for a
