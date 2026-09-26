@@ -309,6 +309,13 @@ enum LookupStatus {
     TryAgain,
 }
 
+// The NSS-chain machinery (this impl, `HostsRule`'s and `HostsSource`'s, the
+// parsers below) is Linux-only, but gated `any(test, …)` so the suite unit-
+// tests it everywhere — the macOS unit lane builds this crate's *lib* with
+// no test cfg (`cargo test -p minimal` is off there: the CLI's dev-deps pull
+// the Linux-only daemon), so the three impls carry the same cfg as their
+// types or that lane dies on `cannot find type`.
+#[cfg(any(test, not(target_os = "macos")))]
 impl LookupStatus {
     /// The statuses a source that does not hold the zone's names can report
     /// for one: the misses. A rule that returns on a miss ends the walk
@@ -342,6 +349,7 @@ struct HostsRule {
     action: ChainAction,
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 impl HostsRule {
     /// Whether this rule is the one that decides `status`: a plain rule
     /// decides the status it names, a negated one every status except it.
@@ -361,6 +369,7 @@ struct HostsSource {
     rules: Vec<HostsRule>,
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 impl HostsSource {
     /// What the chain does after this source reports `status`: the last rule
     /// that decides it, else glibc's default — the walk returns on a hit and
