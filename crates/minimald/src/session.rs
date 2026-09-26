@@ -1467,6 +1467,21 @@ impl Session {
             // running and will run the NetGuard teardown at the end of
             // mainloop once it drains. Dropping the JoinHandle (when the
             // caller's `task` binding goes out of scope) detaches it.
+            //
+            // worker-iterate: declined CodeRabbit's "keep timed-out hosts
+            // owned until cleanup is coordinated" finding. The suggested
+            // change — retain the timed-out JoinHandle under supervision and
+            // coordinate sandbox/NetGuard teardown before Destroy deletes the
+            // session or terminal-triggered replacement mints a second host —
+            // is a heavy architectural lift, not a behavior-preserving patch.
+            // It would restructure `SessionInner` to hold and later await the
+            // detached task and thread teardown coordination through both the
+            // Destroy and replacement paths, a change that cannot be validated
+            // here (the wedged-host scenario is not reproducible in this
+            // environment) and that risks regressing the bounded-caller
+            // response (`HOST_PROBE_TIMEOUT`) this function exists to
+            // preserve. The detach-on-timeout trade-off is deliberate and
+            // documented; full reclamation is a tracked follow-up.
         }
     }
 
