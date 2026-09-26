@@ -243,6 +243,13 @@ so list entries only make sense with per-entry dests or glob entries):
   with `~/`.
 - Glob patterns must have a literal directory prefix to walk from:
   `~/dotfiles/**/*.lua` is fine, a bare `**/*.pem` is rejected.
+- A plain directory path (no glob metacharacters) is shorthand for
+  `dir/**/*`: `source = "~/dotfiles"` copies the whole tree. Common
+  VCS and dependency directories (`.git`, `.hg`, `.svn`, `CVS`, `.jj`,
+  `node_modules`) are excluded by default, and the total size of a
+  plain-directory source is capped at 100 MiB — a larger tree fails the
+  activation rather than being copied silently. Use an explicit glob to
+  narrow the copy.
 - `..` components are rejected wherever they appear.
 - A source path that does not exist on the host is dropped with a warning
   at activation rather than failing it, so opportunistically patching a

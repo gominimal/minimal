@@ -170,6 +170,15 @@ pub enum PatchError {
     /// carry the lossy form for the error message.
     #[error("canonical path is not valid UTF-8: {path_lossy}")]
     NonUtf8CanonicalPath { path_lossy: String },
+    /// A plain-directory patch source exceeded the total size cap.
+    /// The walker stops enumerating at this point to prevent
+    /// accidentally copying an unbounded tree into a session.
+    #[error(
+        "patch source {root} exceeds the {limit_bytes} byte size cap \
+         for plain-directory sources; split it into narrower globs \
+         or raise the cap"
+    )]
+    SizeCapExceeded { root: Utf8PathBuf, limit_bytes: u64 },
 }
 
 // =====================================================================
