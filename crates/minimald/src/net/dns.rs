@@ -59,8 +59,10 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use serde::Serialize;
-use sessions::SessionId;
+use sessions::{SessionId, SessionPolicy};
 use sessions::core::egress::EgressRules;
+
+use super::SwitchSubnet;
 
 /// The DNS suffix every PTask box name carries (see the module docs).
 pub const HOSTNAME_SUFFIX: &str = "min.internal";
@@ -331,7 +333,9 @@ pub struct Caller {
     /// The caller's session name, for the refusal log.
     name: String,
     /// The caller's compiled egress rules, as the relay decides its own
-    /// frames by ([`super::switch::compiled_egress`]).
+    /// frames by ([`super::switch::compiled_egress`]) — compiled at the join
+    /// with this lease, so the verdict's source check (NET-084) reads the
+    /// frame a request stands for as the box's own.
     egress: EgressRules,
 }
 
@@ -356,13 +360,23 @@ impl Caller {
     }
 }
 
-/// The name and compiled egress rules of a live session, kept by stable id
+/// The name and egress declaration of a live session, kept by stable id
 /// ([`HostnameRegistry::callers`]) until its lease joins onto them and either
-/// ends.
+/// ends. The declaration is held uncompiled: the lease that completes it
+/// arrives by a different path than the registration does, so the rules are
+/// compiled at the join ([`HostnameRegistry::caller_at`]) — with the lease that
+/// names the caller, through the same [`super::switch::compiled_egress`] the
+/// relay's gate compiles its own rules by — and the two surfaces can never
+/// disagree about whose frame a request from that lease stands for.
 #[derive(Debug, Clone)]
 struct CallerFacts {
     name: String,
-    egress: EgressRules,
+    /// The caller's policy as launch recorded it — the egress half is what a
+    /// request from it is put to; the ingress half is not read here.
+    policy: SessionPolicy,
+    /// The switch the box's relay is attached to, whose resolver its egress
+    /// carve-out is keyed to (NET-079).
+    subnet: SwitchSubnet,
 }
 
 /// What the box zone holds for a name, as the answerer answers from it. The
@@ -424,7 +438,7 @@ pub struct HostnameRegistry {
     by_session: HashMap<String, Registration>,
     /// Reported `OwnIp` leases, by stable session id (see [`OwnAddress`]).
     own: HashMap<SessionId, OwnAddress>,
-    /// The name and compiled egress rules of every live session, by stable id
+    /// The name and egress declaration of every live session, by stable id
     /// — the facts that check a proxied request's *caller* (NET-070).
     /// Recorded by [`Self::register_caller`] at hostname registration, before
     /// the box has a lease, so the join is ready the moment it attaches.
@@ -537,31 +551,41 @@ impl HostnameRegistry {
     }
 
     /// Records the facts that check this session as the *caller* of a proxied
-    /// request (NET-070): its name and the compiled egress rules its own
-    /// outbound frames are decided by — the rules a request from it is put
-    /// to, exactly as a direct connection from it would be. Recorded at
-    /// hostname registration, before the box has a lease; the join that
-    /// names it as a caller happens in [`Self::report_own_address`], which
-    /// maps the lease onto the stable id.
+    /// request (NET-070): its name and its egress declaration, as launch
+    /// recorded it, over the switch its own relay is attached to — so the
+    /// rules a request from it is put to are the ones its own outbound frames
+    /// are decided by, exactly as a direct connection from it would be. The
+    /// declaration is held uncompiled and the rules are built at the join
+    /// ([`Self::caller_at`]): recorded here at hostname registration, before
+    /// the box has a lease, and completed by the lease that names it once the
+    /// attach path reports one ([`Self::report_own_address`], which maps the
+    /// lease onto the stable id).
     pub fn register_caller(
         &mut self,
         session_id: SessionId,
         session_name: &str,
-        egress: EgressRules,
+        policy: &SessionPolicy,
+        subnet: SwitchSubnet,
     ) {
         self.callers.insert(
             session_id,
             CallerFacts {
                 name: session_name.to_string(),
-                egress,
+                policy: policy.clone(),
+                subnet,
             },
         );
     }
 
     /// The live caller at `lease`, if one is (NET-070): the session whose box
-    /// holds that lease, with its name and its compiled egress rules. `None`
-    /// when the lease names no session — which is what a host-side caller
-    /// (the developer's browser, the daemon's own lanes) is, and what a
+    /// holds that lease, with its name and its compiled egress rules — built
+    /// here, from the declaration recorded at registration and the `lease`
+    /// that names it, by the same compilation the relay's gate makes
+    /// ([`super::switch::compiled_egress`]), so the caller's rules carry the
+    /// lease a request from it is put to as the one source its frames may
+    /// carry (NET-084) and the two surfaces decide by one rule set (NET-071).
+    /// `None` when the lease names no session — which is what a host-side
+    /// caller (the developer's browser, the daemon's own lanes) is, and what a
     /// host-address session is too: neither has a box on the switch, and
     /// neither's egress is gated on a direct connection either.
     #[must_use]
@@ -571,7 +595,7 @@ impl HostnameRegistry {
         Some(Caller {
             lease,
             name: facts.name.clone(),
-            egress: facts.egress.clone(),
+            egress: super::switch::compiled_egress(Some(&facts.policy), facts.subnet, lease),
         })
     }
 

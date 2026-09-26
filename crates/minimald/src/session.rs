@@ -659,12 +659,15 @@ impl Session {
     /// finalizes.
     ///
     /// An `OwnIp` PTask is also recorded as the *caller* a proxied request
-    /// from it is checked against (NET-070): its compiled egress rules are
-    /// the ones its own outbound frames are decided by on the switch
+    /// from it is checked against (NET-070): its egress declaration, over the
+    /// switch its own relay is attached to, is kept until the box's lease
+    /// joins onto it, and the rules built there are the ones its own outbound
+    /// frames are decided by on the switch
     /// ([`crate::net::switch::compiled_egress`] over the switch's subnet, so
-    /// the resolver carve-out matches too), so a request from the box through
-    /// the hostname proxy meets its own declaration — exactly what a direct
-    /// connection from it meets (NET-071).
+    /// the resolver carve-out matches too, and with the box's lease, so the
+    /// verdict's source check does too — NET-084), so a request from the box
+    /// through the hostname proxy meets its own declaration — exactly what a
+    /// direct connection from it meets (NET-071).
     #[cfg(target_os = "linux")]
     async fn register_hostname(&self, record: &Record) {
         if !self.owns_hostname_route(record) {
@@ -680,11 +683,7 @@ impl Session {
             .expect("hostname registry lock poisoned");
         match record.network {
             sessions::NetworkMode::OwnIp => {
-                reg.register_caller(
-                    record.id,
-                    &name,
-                    crate::net::switch::compiled_egress(Some(&record.policy), subnet),
-                );
+                reg.register_caller(record.id, &name, &record.policy, subnet);
                 reg.register_own_ip(
                     record.id,
                     &name,

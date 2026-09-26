@@ -1588,7 +1588,12 @@ mod tests {
         // The direct half: the relay's own gate for the same declaration —
         // the shared `declared_ingress_ports` derivation — admits the port
         // the declaration's connections terminate on, and refuses any other.
-        let gate = SessionGate::for_session("web".to_string(), &policy, SwitchSubnet::default());
+        let gate = SessionGate::for_session(
+            "web".to_string(),
+            Ipv4Addr::LOCALHOST,
+            &policy,
+            SwitchSubnet::default(),
+        );
         assert!(
             gate.admits_direct_tcp(backend_port),
             "the declaration's own port is the one a direct connection terminates on"
@@ -1667,9 +1672,10 @@ mod tests {
             BTreeMap::from([(18080, backend_port)]),
         );
         // The callers, as the session actor records them and the attach path
-        // joins them: compiled egress rules by stable id, then the lease that
-        // names them.
-        for (id, name, lease, egress) in [
+        // joins them: the egress declaration by stable id, then the lease
+        // that names them — and the rules the proxy checks a request from that
+        // lease against are built at the join, with the lease as their source.
+        for (id, name, lease, policy) in [
             (client, "client", CALLER_LEASE, egress_denying_the_target()),
             (
                 allowed,
@@ -1678,11 +1684,7 @@ mod tests {
                 egress_allowing_the_target(),
             ),
         ] {
-            reg.register_caller(
-                id,
-                name,
-                crate::net::switch::compiled_egress(Some(&egress), subnet),
-            );
+            reg.register_caller(id, name, &policy, subnet);
             reg.report_own_address(id, name, lease, BTreeMap::new());
         }
         let router = Router::new(Arc::new(reg), proxied_request_verdict);
@@ -1817,19 +1819,22 @@ mod tests {
         }
     }
 
-    /// A minimal Ethernet II + IPv4 + TCP frame to `dst:port`, built byte by
-    /// byte in the shape the relay's egress leg reads: 14-byte Ethernet
-    /// header, EtherType 0x0800, minimum IPv4 header with protocol 6 and the
-    /// destination at offset 16, and the L4 destination port behind the IPv4
-    /// header, at `ip[ihl + 2..ihl + 4]` — the same offset
-    /// `switch::tcp_frame_summary` writes and `egress::summarize` reads, so
-    /// the parity property compares two frames that name the same port.
-    fn tcp_frame_to(dst: Ipv4Addr, port: u16) -> Vec<u8> {
+    /// A minimal Ethernet II + IPv4 + TCP frame from `src` to `dst:port`, built
+    /// byte by byte in the shape the relay's egress leg reads: 14-byte
+    /// Ethernet header, EtherType 0x0800, minimum IPv4 header with protocol 6,
+    /// the source at offset 12, the destination at offset 16, and the L4
+    /// destination port behind the IPv4 header, at `ip[ihl + 2..ihl + 4]` —
+    /// the same offsets `switch::tcp_frame_summary` writes and
+    /// `egress::summarize` reads, so the parity property compares two frames
+    /// that name the same source and port. `src` is the caller's lease, the
+    /// one its compiled rules carry (NET-084).
+    fn tcp_frame_to(src: Ipv4Addr, dst: Ipv4Addr, port: u16) -> Vec<u8> {
         let mut frame = [0u8; 14 + 20 + 4];
         frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
         let ip = &mut frame[14..];
         ip[0] = 0x45;
         ip[9] = 6;
+        ip[12..16].copy_from_slice(&src.octets());
         ip[16..20].copy_from_slice(&dst.octets());
         ip[22..24].copy_from_slice(&port.to_be_bytes());
         frame.to_vec()
@@ -1931,18 +1936,20 @@ mod tests {
                     );
                 }
             }
-            // The caller, when the request is a box's: its compiled egress
-            // rules and its lease, as the session actor records them.
+            // The caller, when the request is a box's: its egress declaration
+            // as the session actor records it, and its lease, which the join
+            // compiles the rules with.
             let caller = from_a_box.then(|| {
                 let client = SessionId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
-                let egress = crate::net::switch::compiled_egress(
-                    Some(&SessionPolicy {
+                reg.register_caller(
+                    client,
+                    "client",
+                    &SessionPolicy {
                         egress: Some(stance_egress(stance)),
                         ingress: None,
-                    }),
+                    },
                     subnet,
                 );
-                reg.register_caller(client, "client", egress);
                 reg.report_own_address(client, "client", CALLER_LEASE, BTreeMap::new());
                 reg.caller_at(CALLER_LEASE)
                     .expect("the reported lease names the registered caller")
@@ -1953,15 +1960,15 @@ mod tests {
                 .expect("the target's name resolves");
 
             // The direct connection's verdict: the caller's egress half on a
-            // real frame to the target, decided by the same pure verdict the
-            // relay applies — over the caller's own compiled rules, the ones
-            // the registry hands the proxy — then the target's ingress half
-            // by its declared ports. A host-side caller has no egress half:
-            // its direct connections are ungated, so its proxied requests
-            // are too.
+            // real frame to the target, from its own lease, decided by the
+            // same pure verdict the relay applies — over the caller's own
+            // compiled rules, the ones the registry hands the proxy — then
+            // the target's ingress half by its declared ports. A host-side
+            // caller has no egress half: its direct connections are ungated,
+            // so its proxied requests are too.
             let mut expected = None;
             if let Some(caller) = &caller {
-                let frame = tcp_frame_to(route.address(), request_port);
+                let frame = tcp_frame_to(caller.lease(), route.address(), request_port);
                 if let FrameVerdict::Drop(reason) =
                     egress::verdict(&egress::summarize(&frame), caller.egress())
                 {
@@ -2012,7 +2019,8 @@ mod tests {
                     }
                     TargetMode::HostAddress => unreachable!("excluded above"),
                 };
-                let gate = SessionGate::for_session("web".to_string(), &target_policy, subnet);
+                let gate =
+                    SessionGate::for_session("web".to_string(), target_lease, &target_policy, subnet);
                 prop_assert!(
                     gate.admits_direct_tcp(internal),
                     "the proxy forwarded to port {internal}, which the target's gate refuses"
@@ -2043,7 +2051,12 @@ mod tests {
         };
         // The direct half: the relay's own gate for that declaration refuses
         // every new inbound connection — the own-IP default-block posture.
-        let gate = SessionGate::for_session("web".to_string(), &policy, SwitchSubnet::default());
+        let gate = SessionGate::for_session(
+            "web".to_string(),
+            Ipv4Addr::LOCALHOST,
+            &policy,
+            SwitchSubnet::default(),
+        );
         assert!(
             !gate.admits_direct_tcp(18080),
             "a box that declares no ingress admits no direct connection"
@@ -2059,10 +2072,8 @@ mod tests {
             reg.register_caller(
                 client,
                 "client",
-                crate::net::switch::compiled_egress(
-                    Some(&egress_allowing_the_target()),
-                    SwitchSubnet::default(),
-                ),
+                &egress_allowing_the_target(),
+                SwitchSubnet::default(),
             );
             reg.report_own_address(client, "client", CALLER_LEASE, BTreeMap::new());
             let caller = reg
