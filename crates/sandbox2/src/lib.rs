@@ -465,9 +465,8 @@ fn install_box_credentials(
     // single-threaded, so no allocator lock can be held across the fork.  The
     // closure never returns: it execs, or `_exit`s.
     let mut closure = unsafe {
-        container.command_from_closure(move || {
-            exec_box_program(&program, &args, socket_family_filter)
-        })
+        container
+            .command_from_closure(move || exec_box_program(&program, &args, socket_family_filter))
     };
     if let Some(dir) = current_dir {
         closure.current_dir(dir);
@@ -551,8 +550,15 @@ pub unsafe fn assume_box_credentials() -> std::io::Result<()> {
     // exec, so it is the only set that has to be dropped rather than cleared.
     for cap in config::BOX_FORBIDDEN_CAPABILITIES {
         // SAFETY: prctl with valid arguments; async-signal-safe.
-        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, libc::c_ulong::from(cap.number), 0, 0, 0) }
-            == -1
+        if unsafe {
+            libc::prctl(
+                libc::PR_CAPBSET_DROP,
+                libc::c_ulong::from(cap.number),
+                0,
+                0,
+                0,
+            )
+        } == -1
         {
             return Err(std::io::Error::last_os_error());
         }
@@ -602,7 +608,15 @@ fn clear_capability_sets() -> std::io::Result<()> {
     }
     // SAFETY: prctl with valid arguments; async-signal-safe, and clearing the
     // ambient set needs no privilege either.
-    if unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) } == -1
+    if unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    } == -1
     {
         return Err(std::io::Error::last_os_error());
     }

@@ -24,8 +24,8 @@
 //! `cargo nextest run -p sandbox2 boxes_lack_cap_net_raw`
 #![cfg(target_os = "linux")]
 
-use sandbox2::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
 use sandbox2::NetPlan;
+use sandbox2::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -79,7 +79,11 @@ fn compile_cap_probe(base: &Path) -> PathBuf {
     let src = base.join("cap_probe.c");
     let bin = base.join("cap_probe");
     std::fs::write(&src, CAP_PROBE_C).expect("writing capability probe source");
-    let status = Command::new("gcc").args(["-static", "-o"]).arg(&bin).arg(&src).status();
+    let status = Command::new("gcc")
+        .args(["-static", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status();
     let status = match status {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -130,9 +134,7 @@ fn base_dir() -> PathBuf {
     // has one at its root, ignored by git like everything under target/.
     let target = std::env::var_os("CARGO_TARGET_DIR")
         .map(|dir| PathBuf::from(dir).join("tmp"))
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp")
-        });
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp"));
     std::fs::create_dir_all(&target).expect("creating the target tmp dir");
     target
 }
