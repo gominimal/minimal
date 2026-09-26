@@ -116,26 +116,20 @@ impl TestServer {
     /// one server's [`Self::into_state_dir`] to a second server to prove
     /// per-session state survives a restart.
     pub async fn new_in(temp: TempDir) -> Self {
-        let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let state_dir = DaemonAbsPath::try_new(path.clone()).unwrap();
-        let cache_dir = DaemonAbsPath::try_new(path).unwrap();
-        let config = Config {
-            host_key: HostKey::Ephemeral,
-            minimal_state_dir: state_dir,
-            minimal_cache_dir: cache_dir,
-            gvproxy_bin: None,
-            in_microvm: false,
-            state_volume_mounted: false,
-            // A harness server never starts the host-side proxies, so there
-            // is no port to pin: `None` (default-then-select) keeps the field
-            // absent from the RPC replies a test inspects unless a test
-            // drives the proxy startup itself.
-            hostname_proxy_port: None,
-            zone_answerer_port: None,
-            // `None` derives the switch /24 from the instance id, the same
-            // start path a real daemon takes.
-            switch_subnet_octet: None,
-        };
+        Self::over(config_in(&temp, false), temp).await
+    }
+
+    /// [`Self::new_in`] on a daemon that opted out of the deny-all egress
+    /// default (NET-077): the same server, but one whose boxes with no
+    /// `egress` section keep the shipped allow-all. Every other harness
+    /// server runs the default this build ships — in force.
+    pub async fn new_opted_out_in(temp: TempDir) -> Self {
+        Self::over(config_in(&temp, true), temp).await
+    }
+
+    /// Boots a server on `config`, owning `temp` for its lifetime. The two
+    /// public constructors differ only in the config's `deny_all_opt_out`.
+    async fn over(config: Config, temp: TempDir) -> Self {
         let state = ServerStateHandle::new(config, None).await.unwrap();
         // `Server::run` installs the housekeeping actor; a harness server never
         // runs it, so do the same here — otherwise the `CleanCache` RPC has
@@ -256,6 +250,39 @@ impl TestServer {
         )
         .await
         .expect("seeding the workspace mfile should succeed");
+    }
+}
+
+/// The harness's `Config` for `temp`: every field where a test server
+/// follows a real daemon's start path — ephemeral host key, the tempdir's
+/// state and cache, a switch /24 derived from the instance id. The one
+/// field a test chooses is `deny_all_opt_out` (NET-077): whether this
+/// server opts out of the deny-all egress default. `false` — what every
+/// harness server but an opted-out one runs — is what a daemon started
+/// without the flag gets.
+fn config_in(temp: &TempDir, deny_all_opt_out: bool) -> Config {
+    let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf())
+        .expect("a tempdir path is utf-8 on every host the harness runs on");
+    let state_dir = DaemonAbsPath::try_new(path.clone())
+        .expect("the tempdir lives under the host's tmp root, an absolute path");
+    let cache_dir = DaemonAbsPath::try_new(path).expect("as above: the tempdir path is absolute");
+    Config {
+        host_key: HostKey::Ephemeral,
+        minimal_state_dir: state_dir,
+        minimal_cache_dir: cache_dir,
+        gvproxy_bin: None,
+        in_microvm: false,
+        state_volume_mounted: false,
+        // A harness server never starts the host-side proxies, so there
+        // is no port to pin: `None` (default-then-select) keeps the field
+        // absent from the RPC replies a test inspects unless a test
+        // drives the proxy startup itself.
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
+        // `None` derives the switch /24 from the instance id, the same
+        // start path a real daemon takes.
+        switch_subnet_octet: None,
+        deny_all_opt_out,
     }
 }
 

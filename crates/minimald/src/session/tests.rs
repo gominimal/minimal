@@ -2497,3 +2497,153 @@ async fn box_has_no_idle_stop() {
         );
     }
 }
+
+/// An Ethernet II frame carrying an IPv4 packet to `dst` under `proto`, with
+/// `dst_port` where the L4 header has one — the shape
+/// [`sessions::core::egress::summarize`] extracts a verdict's inputs from.
+/// Everything the verdict reads is filled in; the unread fields are zeroes.
+fn ipv4_frame(proto: u8, dst: [u8; 4], dst_port: u16) -> Vec<u8> {
+    let mut f = Vec::new();
+    f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x01]); // dst MAC
+    f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // src MAC
+    f.extend_from_slice(&0x0800u16.to_be_bytes()); // EtherType: IPv4
+    // IPv4 header, IHL = 5 (20 bytes), fragment offset 0.
+    f.push(0x45);
+    f.push(0x00);
+    f.extend_from_slice(&40u16.to_be_bytes()); // total length (unread)
+    f.extend_from_slice(&0u16.to_be_bytes()); // identification
+    f.extend_from_slice(&0u16.to_be_bytes()); // flags + fragment offset
+    f.push(64); // TTL
+    f.push(proto);
+    f.extend_from_slice(&0u16.to_be_bytes()); // header checksum (unread)
+    f.extend_from_slice(&[10, 0, 0, 5]); // src: the box itself
+    f.extend_from_slice(&dst);
+    // L4 header: enough of one for the port to be readable.
+    f.extend_from_slice(&40000u16.to_be_bytes()); // src port
+    f.extend_from_slice(&dst_port.to_be_bytes());
+    f.extend_from_slice(&[0u8; 12]); // seq/ack (unread)
+    f
+}
+
+/// NET-074: an own-address box created with no `egress` section reaches
+/// nothing outside itself, once the deny-all default is in force. The phase
+/// is passed explicitly — this build ships the default as announced
+/// (NET-076), so the in-force posture is proven by name, not by whatever
+/// the shipped constant happens to be — and the launcher's gate policy under
+/// it is the deny-all section, whose compiled rules drop every external
+/// destination in every transport, while the resolver Minimal owns for the
+/// box still answers, at its address *and* its port (NET-079). The
+/// session-start line names the phase, the opt-out, and the posture this
+/// build actually leaves in force, so a diagnostics bundle's log tail can
+/// say why the box reaches what it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn own_ip_default_deny_all() {
+    use minimald_rpc::{CreateSession, CreateSessionRequest};
+    use sessions::core::egress::{EgressRules, FrameVerdict};
+
+    // The address of the resolver Minimal owns for a box: the switch
+    // gateway, as the relay hands it to the gate.
+    let resolver = [100, 64, 0, 1];
+    // Something the box did not declare: an address out in the world.
+    let external = [93, 184, 216, 34];
+    // The box's lease — the source address `ipv4_frame` writes, so the
+    // verdicts below turn on the egress dimension alone. The lease check
+    // itself (NET-084) is proven in `sessions::core::egress`.
+    let lease = [10, 0, 0, 5];
+
+    // The launcher's resolution for an own-address box that declared
+    // nothing, once the default is in force: the deny-all section, egress
+    // only touched, ingress kept.
+    let declared = sessions::SessionPolicy::default();
+    let effective = super::effective_session_policy(
+        &declared,
+        sessions::NetworkMode::OwnIp,
+        sessions::EgressDefaultPhase::InForce,
+        false,
+    );
+    assert_eq!(
+        effective.egress,
+        Some(sessions::EgressPolicy::deny_all()),
+        "the gate's egress for an absent section is the deny-all section",
+    );
+    assert_eq!(effective.ingress, None);
+
+    // What that section enforces: every frame to an external address drops,
+    // in every transport — the carve-out excepted, keyed to both the
+    // resolver's address and DNS's port, so no other address at :53 and no
+    // other port on the resolver slips through.
+    let rules = EgressRules::from_policy(effective.egress.as_ref(), resolver, lease);
+    let verdict_on = |proto: u8, dst: [u8; 4], port: u16| {
+        sessions::core::egress::verdict(
+            &sessions::core::egress::summarize(&ipv4_frame(proto, dst, port)),
+            &rules,
+        )
+    };
+    for (proto, name) in [(6u8, "tcp"), (17, "udp"), (1, "icmp")] {
+        assert!(
+            matches!(verdict_on(proto, external, 443), FrameVerdict::Drop(_)),
+            "a deny-all box must not reach an external address over {name}",
+        );
+    }
+    assert!(
+        matches!(verdict_on(17, external, 53), FrameVerdict::Drop(_)),
+        "the carve-out is keyed to the resolver's address: DNS's port alone \
+         admits nothing",
+    );
+    assert!(
+        matches!(verdict_on(17, resolver, 54), FrameVerdict::Drop(_)),
+        "the carve-out is keyed to DNS's port: the resolver's address alone \
+         admits nothing",
+    );
+    assert!(
+        matches!(verdict_on(17, resolver, 53), FrameVerdict::Admit),
+        "a deny-all box must still resolve (NET-079)",
+    );
+
+    // The same posture, observed where a diagnostics bundle reads it: the
+    // one line every session start logs, naming all three facts as this
+    // build ships them — the rollout phase it is in, the opt-out the daemon
+    // was started with, and the egress they leave this bare box with. The
+    // values follow the shipped constant, so a phase flip keeps this
+    // assertion honest about whatever the flip leaves in force.
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    client
+        .call::<CreateSession>(&CreateSessionRequest {
+            config: minimald_rpc::SessionConfig {
+                name: Some("own-ip-bare".to_string()),
+                project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
+                network: sessions::NetworkMode::OwnIp,
+                policy: sessions::SessionPolicy::default(),
+                hooks_enabled: true,
+                attrs: Default::default(),
+            },
+            must_match_version: None,
+        })
+        .await
+        .unwrap();
+    let logged = capture.contents();
+    let start_line = logged
+        .lines()
+        .find(|line| line.contains("session starts") && line.contains("own-ip-bare"))
+        .unwrap_or_else(|| panic!("the session start must be logged, got: {logged}"));
+    for fact in [
+        format!("egress_default_phase={:?}", sessions::EGRESS_DEFAULT_PHASE),
+        "deny_all_opt_out=false".to_string(),
+        format!(
+            "effective_egress={:?}",
+            sessions::effective_egress(
+                None,
+                sessions::NetworkMode::OwnIp,
+                sessions::EGRESS_DEFAULT_PHASE,
+                false
+            )
+        ),
+    ] {
+        assert!(
+            start_line.contains(&fact),
+            "the start line must name {fact}, got: {start_line}",
+        );
+    }
+}

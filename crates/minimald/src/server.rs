@@ -107,6 +107,17 @@ pub struct Config {
     /// disjoint, save for the same wrap-around the paragraph above names.
     #[serde(default)]
     pub switch_subnet_octet: Option<u8>,
+
+    /// The daemon's opt-out of the deny-all egress default (NET-077). While
+    /// the default is in force (see [`sessions::EGRESS_DEFAULT_PHASE`]), an
+    /// own-address box created with no `egress` section reaches nothing
+    /// outside itself (NET-074) and shows `deny all` in `min session policy`
+    /// (NET-075). A deployment that cannot carry that in this release opts
+    /// out, and its boxes keep the shipped allow-all default of 03-spec
+    /// R2.1. Set by `minimald listen --egress-deny-all-opt-out`; a box that
+    /// declares its own egress section is unaffected either way.
+    #[serde(default)]
+    pub deny_all_opt_out: bool,
 }
 
 impl Config {
@@ -347,6 +358,10 @@ impl ServerState {
                 minimal_cache_dir,
                 Arc::clone(&daemon_ctx),
                 net_switch,
+                // Threaded into every session actor so the launcher and the
+                // task path resolve the same effective egress the daemon
+                // was started with (NET-074/NET-077).
+                config.deny_all_opt_out,
             )
             .await?,
             config,
@@ -489,6 +504,14 @@ impl ServerStateHandle {
     /// Why hostname routing is unavailable, or `None` if the proxy is up.
     pub(crate) async fn proxy_unavailable(&self) -> Option<String> {
         self.0.lock().await.proxy_unavailable.clone()
+    }
+
+    /// Whether this daemon opted out of the deny-all egress default
+    /// (NET-077): the fact [`crate::rpc::serve_get_effective_session_policy`]
+    /// resolves a session's effective egress against, so the answer a client
+    /// gets reflects the daemon that is actually serving it.
+    pub(crate) async fn deny_all_opt_out(&self) -> bool {
+        self.0.lock().await.config.deny_all_opt_out
     }
 
     /// Clears the hostname-routing unavailability note: the proxy's startup
@@ -1906,6 +1929,9 @@ pub(crate) fn test_config(dir: &std::path::Path) -> Config {
         hostname_proxy_port: None,
         zone_answerer_port: None,
         switch_subnet_octet: None,
+        // The default every unit-test daemon runs: the rollout phase this
+        // build ships, not opted out.
+        deny_all_opt_out: false,
     }
 }
 

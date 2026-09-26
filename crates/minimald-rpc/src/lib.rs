@@ -18,7 +18,8 @@ pub mod taskenv;
 pub mod trace;
 
 pub use sessions::{
-    DynamicIngress, EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
+    DynamicIngress, EffectiveEgress, EffectiveSessionPolicy, EgressPolicy, IngressPolicy, IpProto,
+    NetworkMode, PortMapping, SessionPolicy,
 };
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
@@ -470,6 +471,21 @@ pub struct CreateSessionResponse {
     /// daemon's ports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone_answerer_port: Option<u16>,
+    /// Whether the serving daemon opted out of the deny-all egress default
+    /// (NET-077). The rollout's one fact the client cannot know from its
+    /// own build: the phase is a build-time constant both sides share
+    /// ([`sessions::EGRESS_DEFAULT_PHASE`]), but the opt-out is set on the
+    /// daemon alone. Carried here — on the reply the activation path
+    /// already holds — so `min session activate` can keep its coming-change
+    /// notice (NET-076) off a deployment that has already chosen to keep
+    /// the shipped default: the notice's remedy names the very flag an
+    /// opted-out daemon runs, and would tell it to do what it has done.
+    ///
+    /// `None` from a daemon that predates the field — and a daemon that
+    /// predates it cannot have the opt-out flag either, so a client reading
+    /// `None` prints the notice exactly as this reply's older readers did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_all_opt_out: Option<bool>,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -774,10 +790,11 @@ impl OneshotSshRpc for AbortSession {
 // ---------------------------------------------------------------------------
 // Networking policy types (Unit 2: egress, ingress, dynamic port mapping).
 //
-// `PortMapping`, `EgressPolicy`, `IngressPolicy`, and `SessionPolicy` are
-// defined in `sessions` and re-exported above, so the only live per-session
-// store (`sessions::Record`) can carry the policy configured at launch without
-// a `sessions` → `minimald-rpc` dependency cycle. The RPC method types below
+// `PortMapping`, `EgressPolicy`, `IngressPolicy`, `SessionPolicy`, and the
+// effective halves (`EffectiveEgress`, `EffectiveSessionPolicy`) are defined
+// in `sessions` and re-exported above, so the only live per-session store
+// (`sessions::Record`) can carry the policy configured at launch without a
+// `sessions` → `minimald-rpc` dependency cycle. The RPC method types below
 // stay here, where the wire contract lives.
 // ---------------------------------------------------------------------------
 
@@ -796,6 +813,34 @@ impl OneshotSshRpc for GetSessionPolicy {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionPolicy");
     type Request<'a> = GetSessionPolicyRequest;
     type Response = Errorable<SessionPolicy>;
+}
+
+/// An RPC to read the *effective* networking policy for a session: the same
+/// record [`GetSessionPolicy`] serves, with its egress half resolved to what
+/// the gate enforces (NET-075) — the answer `min session policy` renders.
+///
+/// A separate response rather than a field on [`SessionPolicy`], so the
+/// strict declaration a client reads back stays exactly what the box was
+/// launched with: the deny-all default (NET-074) reaches the client as
+/// `deny_all` in this response without rewriting the record. The daemon
+/// answers it, not the client, because the inputs are the daemon's own
+/// facts — the rollout phase its build ships and its opt-out flag
+/// (NET-077) — which no client can know.
+pub struct GetEffectiveSessionPolicy;
+
+/// Request for the [`GetEffectiveSessionPolicy`] RPC: the same lookup as
+/// [`GetSessionPolicyRequest`], over the same record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GetEffectiveSessionPolicyRequest {
+    Name(String),
+    Id(SessionId),
+}
+
+impl OneshotSshRpc for GetEffectiveSessionPolicy {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetEffectiveSessionPolicy");
+    type Request<'a> = GetEffectiveSessionPolicyRequest;
+    type Response = Errorable<EffectiveSessionPolicy>;
 }
 
 /// An RPC to list the lifecycle hooks composed into a session, and where
@@ -1430,14 +1475,52 @@ mod tests {
             hostname_routing_unavailable: None,
             hostname_proxy_port: None,
             zone_answerer_port: None,
+            deny_all_opt_out: None,
         };
         assert_eq!(round_trip(&resp), resp);
+    }
+
+    /// The opt-out a daemon reports on its create reply (NET-077) survives
+    /// the wire both ways, and is *absent* — not `false` — when the daemon
+    /// has not set it, so a daemon that keeps the default and a daemon that
+    /// predates the field stay distinguishable to the client deciding
+    /// whether the coming change applies to it (NET-076's notice).
+    #[test]
+    fn create_session_response_carries_the_deny_all_opt_out() {
+        let opted_out = CreateSessionResponse {
+            deny_all_opt_out: Some(true),
+            id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            daemon_version: Some("0.6.0".into()),
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
+        };
+        let json = serde_json_lenient::to_string(&opted_out).expect("serializes");
+        assert!(
+            json.contains(r#""deny_all_opt_out":true"#),
+            "an opted-out daemon must say so on the wire, got: {json}",
+        );
+        assert_eq!(
+            serde_json_lenient::from_str::<CreateSessionResponse>(&json)
+                .expect("decodes back")
+                .deny_all_opt_out,
+            Some(true),
+        );
+
+        let opted_in = CreateSessionResponse {
+            deny_all_opt_out: Some(false),
+            ..opted_out
+        };
+        assert_eq!(round_trip(&opted_in), opted_in);
     }
 
     /// A daemon that predates `hostname_routing_unavailable` must still decode,
     /// with the field absent. Absent has to mean "said nothing", not "reported
     /// a fault": an older daemon is not evidence that routing is down, and a
     /// client that read it that way would warn on every session it lists.
+    /// `deny_all_opt_out` rides the same reply and reads the same way — absent
+    /// from a daemon that predates it, which is a daemon that cannot have
+    /// opted out (NET-077), so the client prints the notice it always did.
     #[test]
     fn responses_predating_hostname_routing_field_decode_as_absent() {
         let list: ListSessionsResponse =
@@ -1456,6 +1539,7 @@ mod tests {
                 assert!(c.hostname_routing_unavailable.is_none());
                 assert!(c.hostname_proxy_port.is_none());
                 assert!(c.zone_answerer_port.is_none());
+                assert!(c.deny_all_opt_out.is_none());
             }
             Errorable::Err { error } => panic!("expected Ok, got {error}"),
         }
