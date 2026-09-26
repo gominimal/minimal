@@ -281,8 +281,13 @@ pub enum EgressDefaultPhase {
     InForce,
 }
 
-/// The phase this build ships: the deny-all default is in force.
-pub const EGRESS_DEFAULT_PHASE: EgressDefaultPhase = EgressDefaultPhase::InForce;
+/// The phase this build ships: the coming default is announced (NET-076),
+/// so an absent `egress` section still allows all and `activate` prints the
+/// change it will bring. The release that turns the default in force is a
+/// plan fact, and no plan has named one yet; when one does, this constant is
+/// the whole cutover — every reader of it (the session gate, the
+/// session-start line, `min session policy`, the activate notice) follows.
+pub const EGRESS_DEFAULT_PHASE: EgressDefaultPhase = EgressDefaultPhase::Announced;
 
 /// The egress a box's traffic is actually held to: its declared section when
 /// it has one, otherwise the default [`effective_egress`] resolves for an

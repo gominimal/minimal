@@ -925,12 +925,15 @@ async fn policy_shows_effective_egress() {
 }
 
 /// `min session policy` shows the default in force for a bare own-address
-/// box (NET-075): the deny-all egress the daemon's gate now enforces
-/// (NET-074), reached the way the command reaches it, rendered the way the
-/// command renders it. A declared section still reads as its own rules, and
-/// the default is scoped to own-address boxes — a bare host-address box
-/// keeps the shipped allow-all, because the deny-all is a gate on the
-/// session's own address, not on its host's namespace.
+/// box (NET-075): the deny-all egress the daemon's gate enforces once the
+/// default is in force (NET-074), rendered the way the command renders it —
+/// with the phase passed explicitly, because this build ships the default as
+/// announced (NET-076), so the deny-all rendering is proven against the
+/// in-force resolution the rollout ends at, while the wire reply is asserted
+/// against the phase this build ships. A declared section still reads as its
+/// own rules, and the default is scoped to own-address boxes — a bare
+/// host-address box keeps the shipped allow-all, because the deny-all is a
+/// gate on the session's own address, not on its host's namespace.
 #[tokio::test]
 async fn policy_shows_deny_all_default() {
     let (daemon, args) = setup().await;
@@ -954,18 +957,43 @@ async fn policy_shows_deny_all_default() {
             panic!("GetEffectiveSessionPolicy failed: {error}")
         }
     };
+    // Over the wire, the daemon answers the resolution the phase this build
+    // ships leaves in force — announced, so a bare box still allows all
+    // (NET-076), and the command's data path carries that answer.
     assert_eq!(
         policy.egress,
-        sessions::EffectiveEgress::DenyAll,
-        "a bare own-address box must resolve to deny-all in force"
+        sessions::effective_egress(
+            None,
+            sessions::NetworkMode::OwnIp,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        ),
+        "the daemon must answer the shipped phase's resolution for a bare box"
     );
 
+    // The default's own posture, with the phase passed explicitly: once in
+    // force, a bare own-address box resolves to deny-all, and the command's
+    // renderer prints it as that — and nothing else.
+    let in_force = sessions::EffectiveSessionPolicy {
+        egress: sessions::effective_egress(
+            None,
+            sessions::NetworkMode::OwnIp,
+            sessions::EgressDefaultPhase::InForce,
+            false,
+        ),
+        ingress: None,
+    };
+    assert_eq!(
+        in_force.egress,
+        sessions::EffectiveEgress::DenyAll,
+        "the in-force default for a bare own-address box is deny-all"
+    );
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp).unwrap();
+    format_policy(&mut out, &in_force, sessions::NetworkMode::OwnIp).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  deny all\n"),
-        "a bare own-address box must print deny-all:\n{text}"
+        "a bare own-address box must print deny-all once in force:\n{text}"
     );
     assert!(
         !text.contains("allow all"),
@@ -1021,25 +1049,92 @@ async fn policy_shows_deny_all_default() {
 
 /// While the deny-all egress default is announced but not yet in force,
 /// `min session activate` prints the coming change (NET-076) — what turns
-/// for a bare own-address box, and how to keep the shipped default. The
-/// notice is phase-gated: once the default is in force it is no longer a
-/// coming change, and nothing prints.
-#[test]
-fn deny_all_announcement_printed() {
-    let notice = deny_all_default_notice(sessions::EgressDefaultPhase::Announced)
-        .expect("the announced phase must carry the coming-change notice");
+/// for a bare own-address box, and how to keep the shipped default. Driven
+/// through the compiled binary so the assertion is on what the user actually
+/// sees; the phase this build ships is announced, so the notice is the
+/// shipped path, and its scoping is exercised with it: a bare own-address
+/// activate prints, a host-address one (a box the change does not reach)
+/// does not. The other phase is gated by construction — once the default is
+/// in force the change is no longer coming, and the notice is `None`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn deny_all_announcement_printed() {
+    let (_daemon, args) = setup().await;
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+
+    // The shipped path: activating a bare own-address box succeeds and
+    // prints the notice — the change, its scope, and the way to keep the
+    // default.
+    let own_ip = run_min(
+        &args,
+        &[
+            "session",
+            "activate",
+            project.path().to_str().unwrap(),
+            "--name",
+            "notice-own-ip",
+            "--network",
+            "own_ip",
+            "--sync",
+            "tarball",
+            "--no-prompt",
+        ],
+    )
+    .await;
     assert!(
-        notice.contains("denies all external reach"),
-        "the notice must name the change:\n{notice}"
+        own_ip.status.success(),
+        "activating a bare own-address box must succeed, but the binary \
+         exited {}:\n{}",
+        own_ip.status,
+        String::from_utf8_lossy(&own_ip.stderr),
+    );
+    let own_ip_stderr = String::from_utf8_lossy(&own_ip.stderr).into_owned();
+    assert!(
+        own_ip_stderr.contains("Heads-up: the next release denies all external reach"),
+        "activating a bare own-address box must print the coming change:\n{own_ip_stderr}"
     );
     assert!(
-        notice.contains("own-address"),
-        "the notice must scope the change to own-address sessions:\n{notice}"
+        own_ip_stderr.contains("own-address"),
+        "the notice must scope the change to own-address sessions:\n{own_ip_stderr}"
     );
     assert!(
-        notice.contains("--egress-deny-all-opt-out"),
-        "the notice must say how to keep the shipped default:\n{notice}"
+        own_ip_stderr.contains("--egress-deny-all-opt-out"),
+        "the notice must say how to keep the shipped default:\n{own_ip_stderr}"
     );
+
+    // Scoped to the boxes the change would reach: a host-address box
+    // shares its host's namespace and owns no address to deny from, so
+    // its activate announces nothing.
+    let host_net_stderr = run_min_stderr(
+        &args,
+        &[
+            "session",
+            "activate",
+            project.path().to_str().unwrap(),
+            "--name",
+            "notice-host-net",
+            "--network",
+            "host_ip",
+            "--sync",
+            "tarball",
+            "--no-prompt",
+        ],
+    )
+    .await;
+    assert!(
+        !host_net_stderr.contains("Heads-up"),
+        "a host-address box the change does not reach must not be announced \
+         at:\n{host_net_stderr}"
+    );
+
+    // The other phase, gated by construction: once the default is in
+    // force the change is no longer coming, and nothing prints.
     assert!(
         deny_all_default_notice(sessions::EgressDefaultPhase::InForce).is_none(),
         "the notice must not print once the default is in force"
