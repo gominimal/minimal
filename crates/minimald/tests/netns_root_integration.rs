@@ -15,6 +15,10 @@
 //! * `network_none_attach_works` — a none box launched the way the session
 //!   host launches it, session leader and pty included, keeps its terminal
 //!   and still accepts an injected process.
+//! * `injected_process_lacks_cap_net_raw` — a process injected into a box
+//!   execs with the box's credentials: the box uid and gid, `no_new_privs`,
+//!   and the same empty capability sets the box's own processes exec with,
+//!   so joining a running box cannot open a raw socket either.
 //!
 //! The own-IP proofs drive the **production** switch-attach wiring rather than a
 //! hand-rolled `ip netns` sequence: each task's namespace is created by the same
@@ -30,7 +34,12 @@
 //! default `cargo test` run (and this sandbox) never attempts privileged netns
 //! operations; the three netns/gvproxy tests are additionally `#[ignore]`,
 //! while the two none-box proofs are not, so the surveyed nextest lines can
-//! name them. The own-IP proofs read the gvproxy binary from `GVPROXY_BIN`,
+//! name them. The injected-process capability proof is the exception: it needs
+//! no sudo, no gvproxy and no network namespace, only the unprivileged user
+//! namespace every sandbox starts by unsharing, so it is gated on the host
+//! allowing that instead — and skips, with the reason, on a host (stock Ubuntu
+//! 24.04) that would deny it, rather than fail the lane that cannot run it.
+//! The own-IP proofs read the gvproxy binary from `GVPROXY_BIN`,
 //! and the none-box proofs compile their socket probe with `gcc` — a gated
 //! host that lacks either fails the proof rather than skipping it into a
 //! false green. Auto-discovered by the native lane's `minimald-root-integration`
@@ -42,12 +51,24 @@
 //! userns + sudo), gcc to build the socket probes, and a pinned gvproxy
 //! (scripts/fetch-gvproxy.sh):
 //! `MINIMALD_NETNS_TEST=1 GVPROXY_BIN=... cargo test -p minimald --test netns_root_integration -- --include-ignored`
+//!
+//! A failing run of that CI job reports an exit code and nothing else unless
+//! the failing proof names itself: nextest captures what a test prints and
+//! indents it four spaces in the step log, which hides `::error` workflow
+//! commands from the Actions annotation parser, and the step log itself is
+//! admin-only besides. So the first line of every proof past its gates is
+//! `announce_to_the_runner`, which says the proof started and, on the panic
+//! that fails it, posts proof, site and reason through the one stream that is
+//! neither captured nor indented — reaching the parser as an annotation on
+//! the check run that every reader of the pull request can see.
 #![cfg(target_os = "linux")]
 
 use sandbox2::NetPlan;
 use sandbox2::Network as _;
-use sandbox2::config::{Config, SandboxMapped};
+use sandbox2::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
 
+use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -65,6 +86,80 @@ fn gated() -> bool {
     }
     eprintln!("skipping netns proof: MINIMALD_NETNS_TEST not set");
     false
+}
+
+/// One line straight into the log stream nextest prints to. What a proof prints
+/// itself never reaches the Actions annotation parser: nextest captures each
+/// test's stdout and stderr and indents them four spaces in the step log, and
+/// the parser only reads a command that starts a line. Nextest forks this proof
+/// from its per-binary fork server, so `/proc/<ppid>/fd/1` is that server's own
+/// stdout — the stream nextest prints to unindented, and the one the parser does
+/// read. Best effort in every direction: away from the CI runner, or where the
+/// path will not open, nothing is written and every proof behaves exactly as it
+/// did without this.
+fn tell_the_runner(line: &str) {
+    if std::env::var("GITHUB_ACTIONS").ok().as_deref() != Some("true") {
+        return;
+    }
+    // SAFETY: getppid() reads the calling process's parent pid; it has no side
+    // effects and cannot fail.
+    let ppid = unsafe { libc::getppid() };
+    if let Ok(mut log) = std::fs::File::create(format!("/proc/{ppid}/fd/1")) {
+        let _written = writeln!(log, "{line}");
+    }
+}
+
+/// Announces `proof` on the CI runner, so a failing run of the lane names the
+/// proof that failed. Two lines of insurance: a start line — a run that dies
+/// without a panic (a hang, a proof the slow-timeout kills) still names the
+/// last proof that began, to whoever reads the step log — and a panic hook,
+/// installed once, that posts the proof's name, panic site and reason as an
+/// `::error` workflow command the runner turns into an annotation on the check
+/// run. The step log holds the full detail but is admin-only; the annotation is
+/// the part every reader of the pull request can see. The hook chains the one
+/// before it, so nextest still reports the failure exactly as it did.
+fn announce_to_the_runner(proof: &str) {
+    // Nextest runs each test in a process of its own, so a process-wide name
+    // names this proof on whichever thread the panic comes from — the test
+    // thread or a runtime worker the proof spawned onto.
+    static RUNNING_PROOF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    let _named = RUNNING_PROOF.set(proof.to_owned());
+    HOOK.call_once(|| {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let proof = RUNNING_PROOF
+                .get()
+                .map(String::as_str)
+                .unwrap_or("an unnamed proof");
+            let payload = info.payload();
+            let reason = if let Some(reason) = payload.downcast_ref::<&str>() {
+                (*reason).to_string()
+            } else if let Some(reason) = payload.downcast_ref::<String>() {
+                reason.clone()
+            } else {
+                "a panic carrying no message".to_string()
+            };
+            let reason: String = reason
+                .replace(['\r', '\n'], " ")
+                .chars()
+                .take(512)
+                .collect();
+            if let Some(location) = info.location() {
+                tell_the_runner(&format!(
+                    "::error file={},line={},title={proof}::netns proof failed: {reason}",
+                    location.file(),
+                    location.line(),
+                ));
+            } else {
+                tell_the_runner(&format!(
+                    "::error title={proof}::netns proof failed: {reason}"
+                ));
+            }
+            previous_hook(info);
+        }));
+    });
+    tell_the_runner(&format!("minimald netns proof started: {proof}"));
 }
 
 fn gvproxy_bin() -> PathBuf {
@@ -91,6 +186,7 @@ fn sudo(args: &[&str]) -> Output {
 /// usable inside an injected process and reports the same two lines.
 const SOCKET_PROBE_C: &str = r#"
 #include <sys/socket.h>
+#include <netinet/in.h>
 #include <errno.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -111,6 +207,33 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "hold") == 0) {
         report();
         while (1) sleep(60);
+    }
+
+    /* The identity and capability sets the process exec'd with, then the one
+     * capability-dependent operation: a raw socket, which NET-083 is about,
+     * and a stream socket, which needs no capability and therefore still
+     * works. One `key: value` line per fact, parsed by the caller. */
+    if (argc > 1 && strcmp(argv[1], "caps") == 0) {
+        FILE *status = fopen("/proc/self/status", "r");
+        if (!status) { perror("fopen /proc/self/status"); return 30; }
+        char line[256];
+        while (fgets(line, sizeof line, status)) {
+            if (strncmp(line, "Uid:", 4) == 0 || strncmp(line, "Gid:", 4) == 0 ||
+                strncmp(line, "Cap", 3) == 0 || strncmp(line, "NoNewPrivs:", 11) == 0) {
+                fputs(line, stdout);
+            }
+        }
+        fclose(status);
+
+        int fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+        printf("raw_socket_errno: %d\n", fd >= 0 ? 0 : errno);
+        if (fd >= 0) close(fd);
+
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        printf("stream_socket_errno: %d\n", fd >= 0 ? 0 : errno);
+        if (fd >= 0) close(fd);
+        fflush(stdout);
+        return 0;
     }
 
     if (argc > 1 && strcmp(argv[1], "attach") == 0) {
@@ -152,11 +275,12 @@ int main(int argc, char **argv) {
 
 /// Compile the socket-family probe statically and return its path.
 ///
-/// Panics when no C compiler is on `PATH` instead of skipping: this proof is
-/// only reached behind `MINIMALD_NETNS_TEST`, so a host that sets the gate is
-/// a host that promised to run it, and a skip here would be a vacuous green on
-/// a security proof — the same shape the CI job's own fail-fast netns check
-/// exists to prevent.
+/// Panics when no C compiler is on `PATH` instead of skipping: every proof
+/// that reaches this is on a host that promised to run it (the netns proofs by
+/// setting `MINIMALD_NETNS_TEST`, the capability proof by allowing the
+/// unprivileged user namespace its gate checks), and a skip here would be a
+/// vacuous green on a security proof — the same shape the CI job's own
+/// fail-fast netns check exists to prevent.
 fn compile_socket_probe(base: &Path) -> PathBuf {
     let src = base.join("socket_probe.c");
     let bin = base.join("socket_probe");
@@ -254,8 +378,10 @@ async fn network_none_blocks_all_outside_sockets() {
     if !gated() {
         return;
     }
+    announce_to_the_runner("network_none_blocks_all_outside_sockets");
 
-    let rootfs_tmp = tempfile::tempdir_in("/tmp").expect("rootfs temp dir under /tmp");
+    let rootfs_tmp =
+        tempfile::tempdir_in(proof_base_dir()).expect("rootfs temp dir under the box base");
     let probe = compile_socket_probe(rootfs_tmp.path());
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
@@ -273,10 +399,9 @@ async fn network_none_blocks_all_outside_sockets() {
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
         .with_plan(no_net);
-    // Build the sandbox in /tmp rather than the default (/home is a read-only
-    // ext4 bind with locked nosuid, which breaks the unprivileged remounts
-    // hakoniwa does inside the user namespace).
-    let tmp = tempfile::tempdir_in("/tmp").expect("sandbox temp dir under /tmp");
+    // The sandbox goes where every proof builds its box; `proof_base_dir`
+    // says what that has to satisfy and why.
+    let tmp = tempfile::tempdir_in(proof_base_dir()).expect("sandbox temp dir under the box base");
     let mut sandbox = config
         .build(tmp.path().join("sandbox"), ())
         .await
@@ -334,14 +459,16 @@ async fn network_none_attach_works() {
     if !gated() {
         return;
     }
+    announce_to_the_runner("network_none_attach_works");
     use minimald::nsenter::{Injection, session_leader_pid};
     use minimald::session_host::{Pty, WinSize};
-    use std::io::BufRead as _;
+    use std::io::{BufRead as _, Read as _};
 
     /// What the session host would set: the shell that is actually running.
     const PROBE_SHELL: &str = "/usr/bin/probe";
 
-    let rootfs_tmp = tempfile::tempdir_in("/tmp").expect("rootfs temp dir under /tmp");
+    let rootfs_tmp =
+        tempfile::tempdir_in(proof_base_dir()).expect("rootfs temp dir under the box base");
     let probe = compile_socket_probe(rootfs_tmp.path());
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
@@ -350,7 +477,7 @@ async fn network_none_attach_works() {
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
         .with_plan(NetPlan::none());
-    let tmp = tempfile::tempdir_in("/tmp").expect("sandbox temp dir under /tmp");
+    let tmp = tempfile::tempdir_in(proof_base_dir()).expect("sandbox temp dir under the box base");
     let mut sandbox = config
         .build(tmp.path().join("sandbox"), ())
         .await
@@ -399,10 +526,18 @@ async fn network_none_attach_works() {
         pty.dup_slave_fd()
             .expect("duplicating the launch-path pty slave"),
     ));
+    // Both report streams are the proof's own pipes, not its inherited ones:
+    // the hold program is the supervisor's child, so it can outlive the
+    // supervisor when its parent-death signal does not land, and a process
+    // holding the test's streams past the proof's exit is what the lane's
+    // leak window fails with no message of the proof's own.
     hold.stdout(hakoniwa::Stdio::MakePipe);
+    hold.stderr(hakoniwa::Stdio::MakePipe);
     let mut child = hold.spawn().expect("spawning hold process in none box");
 
     let hold_stdout = child.stdout.take().expect("hold process stdout pipe");
+    let mut hold_stderr = child.stderr.take().expect("hold process stderr pipe");
+    let mut guard = LiveBox::new(child);
     let hold_report = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {
@@ -423,23 +558,20 @@ async fn network_none_attach_works() {
         // hakoniwa's mount setup, before any seccomp or exec) reads
         // differently here from a launch that started the program without
         // its cwd or `SHELL`, and the difference is the first thing to check.
-        let status = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || child.wait()),
-        )
-        .await
-        .expect("waiting for the silent hold process timed out")
-        .expect("spawn_blocking join")
-        .expect("waiting for the silent hold process");
+        let end = guard.stop();
+        let mut stderr = Vec::new();
+        let _drained = hold_stderr.read_to_end(&mut stderr);
         panic!(
             "the none-box launch lost the command's cwd or SHELL across the \
              seccomp closure swap: expected {expected_report:?}, got \
-             {hold_report:?}; the hold process exited with {status:?}"
+             {hold_report:?}; the hold process exited with {end:?}\nstderr: {}",
+            String::from_utf8_lossy(&stderr)
         );
     }
 
     let leader =
-        session_leader_pid(child.id()).expect("resolving the none box's session leader pid");
+        session_leader_pid(guard.child_id()).expect("resolving the none box's session leader pid");
+    guard.holds(leader);
 
     // The launch-path half of NET-039: hakoniwa runs `setsid()` and
     // `TIOCSCTTY` in the box's own process, driven by the container's runctl
@@ -484,15 +616,10 @@ async fn network_none_attach_works() {
     .expect("injected attach probe timed out")
     .expect("spawn_blocking join");
 
-    let _ = child.kill();
-    let _ = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::task::spawn_blocking(move || child.wait()),
-    )
-    .await
-    .expect("waiting for hold process timed out")
-    .expect("spawn_blocking join")
-    .expect("waiting for hold process");
+    // Stop the box the way the capability proof does — the supervisor first,
+    // then the program it holds — so the proof returns having left no process
+    // of the box's behind.
+    let _stopped = guard.stop();
 
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
@@ -510,6 +637,475 @@ async fn network_none_attach_works() {
     );
 }
 
+/// What a box's base directory has to leave room for below itself: the
+/// `sandbox` level the proofs nest under it, the directory the layer's
+/// `Config::build` makes inside that (`<name>-<timestamp>-<attempt>-<pid>`,
+/// with `none-sockets` the longest name the proofs pass), and the box's
+/// environment socket under it.
+///
+/// The socket is what the room is for: its path goes into the kernel's
+/// 108-byte `sockaddr_un::sun_path`, and the bind is refused with `EINVAL` —
+/// "path must be shorter than SUN_LEN" — when it does not fit. That is what
+/// the CI lane failed on for four rounds, with every box the proofs build
+/// sitting under the checkout.
+const BELOW_BASE: &str = "/sandbox/none-sockets-1790441721-0-1048576/run/minenv_sock";
+
+/// The longest path an `AF_UNIX` socket may take: `sockaddr_un::sun_path`
+/// holds 108 bytes including the terminating NUL.
+const SUN_PATH_MAX: usize = 107;
+
+/// Where the proofs that build a box build it: the first directory on this
+/// host that can host one.
+///
+/// A base directory has to satisfy two constraints no single choice satisfies
+/// on every host these proofs run on:
+///
+/// * **Short.** The box's environment socket lives at
+///   `<base>/run/minenv_sock`, and a checkout is long enough to push that past
+///   what an `AF_UNIX` path may be on both this host and the CI runners — so
+///   the cargo target directory is the last candidate, not the default.
+///
+/// * **On a filesystem hakoniwa can bind from.** Hakoniwa bind-mounts every
+///   subdirectory of the rootfs read-only (`RDONLY|NOSUID|BIND|REC`) and then
+///   re-issues those flags with `MS_REMOUNT`, and a remount inside a user
+///   namespace may not *clear* a flag the underlying mount holds — so a
+///   `nodev` tmpfs, which is what an ordinary `/tmp` is, refuses it with
+///   `EPERM`, and a `noexec` filesystem could not run the probe inside the box
+///   either. The layer's own binds survive this because it asks for the
+///   source mount's flags in every bind; hakoniwa's rootfs binds do not, so
+///   the filesystem itself has to be clean.
+///
+/// So each proof asks the candidates — the host's tmp first, then the
+/// conventional scratch and runtime directories, the cargo target directory's
+/// tmp last — whether one takes a tempdir, carries no `nodev` or `noexec`, and
+/// leaves the socket's path room, and builds under the first one that does.
+/// On the CI runners that is `/tmp` (one filesystem, nothing locked); on a
+/// host whose `/tmp` is a `nodev` tmpfs over a read-only `/` it is `/run` or
+/// `/state`. A host that has nowhere is told what every candidate was refused
+/// for, because a box there cannot be built at all.
+///
+/// Every proof builds its rootfs source and its sandbox under the one base it
+/// gets from here, so the two keep sharing a filesystem — the layer assembles
+/// the rootfs as a hardlink farm over the source.
+fn proof_base_dir() -> PathBuf {
+    let mut refusals = Vec::new();
+    let chosen =
+        proof_base_dir_candidates()
+            .into_iter()
+            .find(|candidate| match hosts_a_box(candidate) {
+                Ok(()) => true,
+                Err(reason) => {
+                    refusals.push(format!("{}: {}", candidate.display(), reason));
+                    false
+                }
+            });
+    let no_candidate = format!(
+        "no directory on this host can host a box: {}",
+        refusals.join("; ")
+    );
+    let chosen = chosen.expect(&no_candidate);
+    // Say where the box went, and why everywhere else was refused: nextest
+    // shows a test's stderr only when the test fails, which is exactly when
+    // this is the context a failure needs.
+    if refusals.is_empty() {
+        eprintln!("box base: {}", chosen.display());
+    } else {
+        eprintln!(
+            "box base: {} (refused: {})",
+            chosen.display(),
+            refusals.join("; ")
+        );
+    }
+    chosen
+}
+
+/// The directories to try, in preference order: the host's tmp first — the
+/// conventional place, and the right one on the CI runners — then the
+/// conventional scratch and runtime directories a sandboxed host provisions,
+/// then the cargo target directory's tmp.
+fn proof_base_dir_candidates() -> Vec<PathBuf> {
+    vec![
+        std::env::temp_dir(),
+        PathBuf::from("/var/tmp"),
+        PathBuf::from("/run"),
+        PathBuf::from("/state"),
+        // The target directory this build uses; cargo points test targets at
+        // its own tmp through CARGO_TARGET_DIR, and a checkout that lets
+        // cargo default has one at its root.
+        std::env::var_os("CARGO_TARGET_DIR")
+            .map(|dir| PathBuf::from(dir).join("tmp"))
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp")),
+    ]
+}
+
+/// Whether a box can be built under `candidate`.
+fn hosts_a_box(candidate: &Path) -> Result<(), String> {
+    use nix::sys::statfs::statfs;
+    use nix::sys::statvfs::FsFlags;
+
+    // A tempdir of the proof's own proves the directory is writable and gives
+    // the path the proof's own tempdirs there will have.
+    let probe = tempfile::tempdir_in(candidate)
+        .map_err(|e| format!("cannot create a temp dir here: {e}"))?;
+    let flags = statfs(probe.path())
+        .map_err(|e| format!("statfs failed: {e}"))?
+        .flags();
+    if flags.contains(FsFlags::ST_NODEV) {
+        return Err(
+            "the filesystem is mounted nodev, so the read-only remounts \
+             hakoniwa does on every rootfs subdirectory inside the user \
+             namespace are refused with EPERM"
+                .to_string(),
+        );
+    }
+    if flags.contains(FsFlags::ST_NOEXEC) {
+        return Err(
+            "the filesystem is mounted noexec, so the box could not run the \
+             probe"
+                .to_string(),
+        );
+    }
+    let socket_len = probe.path().as_os_str().len() + BELOW_BASE.len();
+    if socket_len > SUN_PATH_MAX {
+        return Err(format!(
+            "the box's socket path under it would be {socket_len} bytes, \
+             past the {SUN_PATH_MAX} an AF_UNIX path may be"
+        ));
+    }
+    Ok(())
+}
+
+/// The credential state a process must exec with, read from the probe's
+/// report: the box uid and gid in every id field, `no_new_privs` set, every
+/// capability set exec clears empty, and the bounding set — the one set an
+/// exec does not clear — holding none of the capabilities no box may hold.
+fn assert_box_credentials(report: &BTreeMap<String, String>, what: &str) {
+    // The box uid and gid in every id field the status file reports (real,
+    // effective, saved, fs): a box process is never root inside its own user
+    // namespace, which is what makes exec clear the capability sets at all.
+    for (key, expected) in [("Uid", BOX_UID), ("Gid", BOX_GID)] {
+        let value = reported(report, key, what);
+        let fields: Vec<&str> = value.split_ascii_whitespace().collect();
+        assert_eq!(
+            fields.len(),
+            4,
+            "{what}: {key} must carry the real, effective, saved and fs ids: {value}"
+        );
+        for field in &fields {
+            let not_a_number = format!("{what}: {key} field {field} is not a number");
+            let id: u32 = field.parse().expect(&not_a_number);
+            assert_eq!(
+                id, expected,
+                "{what}: the process must exec as the box uid/gid {expected} in every \
+                 {key} field: {value}"
+            );
+        }
+    }
+
+    assert_eq!(
+        reported(report, "NoNewPrivs", what),
+        "1",
+        "{what}: the no_new_privs bit must be set, so no file capability or \
+         setuid bit can restore a privilege"
+    );
+
+    // The sets exec clears: empty by construction, whatever the credentials
+    // the joining process arrived with.
+    for set in ["CapPrm", "CapEff", "CapInh", "CapAmb"] {
+        let mask = capability_mask(report, set, what);
+        assert_eq!(
+            mask, 0,
+            "{what}: {set} must be empty — the process execs as the \
+             unprivileged box uid with no_new_privs set, so exec clears it"
+        );
+    }
+
+    // The bounding set, the one set exec does not clear: it must hold none of
+    // the capabilities no box may hold. A capability left in it is one a file
+    // capability in the box could hand back.
+    let mask = capability_mask(report, "CapBnd", what);
+    for cap in BOX_FORBIDDEN_CAPABILITIES {
+        assert_eq!(
+            mask & (1 << cap.number),
+            0,
+            "{what}: CapBnd must not hold {} (bit {}): the bounding set \
+             survives exec, so a capability left in it is one a file \
+             capability in the box could restore",
+            cap.name,
+            cap.number
+        );
+    }
+}
+
+/// The probe's report: one entry per `key: value` line it printed.
+fn parse_report(stdout: &str) -> BTreeMap<String, String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            line.split_once(':')
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// The probe's report line for `key`, or a panic naming what never arrived: a
+/// report that does not show up is the failure to show, not a mystery, so the
+/// panic carries the report that did arrive, whatever shape it is in.
+fn reported<'a>(report: &'a BTreeMap<String, String>, key: &str, what: &str) -> &'a str {
+    let never_arrived = format!("{what}: the probe did not report {key}: {report:?}");
+    report.get(key).expect(&never_arrived)
+}
+
+/// The errno the probe reported for `key`, e.g. `raw_socket_errno`.
+fn reported_errno(report: &BTreeMap<String, String>, key: &str, what: &str) -> i32 {
+    let not_a_number = format!("{what}: {key} is not a number");
+    reported(report, key, what).parse().expect(&not_a_number)
+}
+
+/// One capability-set mask from the probe's report, e.g. `CapBnd:
+/// 000001ffffffffff`.
+fn capability_mask(report: &BTreeMap<String, String>, set: &str, what: &str) -> u64 {
+    let value = reported(report, set, what);
+    let no_mask = format!("{what}: {set} must carry one hex mask: {value}");
+    let mask = value.split_ascii_whitespace().next().expect(&no_mask);
+    let not_a_mask = format!("{what}: {set} is not a hex mask: {mask}");
+    u64::from_str_radix(mask, 16).expect(&not_a_mask)
+}
+
+/// A box a proof holds up for an injection, stopped on every exit path.
+///
+/// hakoniwa's supervisor is the proof's own child and the program it holds
+/// dies from the supervisor's `PDEATHSIG`, so a proof that fails between
+/// spawning the box and its own cleanup — a launch that never reports, an
+/// injection that does not answer — leaves a live box behind in the proof's
+/// process group, and the runner reports the process it found still running
+/// instead of the assertion that actually failed. `LiveBox` stops the box on
+/// drop as well as on request, so every exit path ends with the box gone:
+/// SIGKILL reaches the supervisor, `wait` reaps it, and the program — not the
+/// proof's child, so nothing else reaps it — is given a moment to take its
+/// `PDEATHSIG` before the proof returns.
+struct LiveBox {
+    child: hakoniwa::Child,
+    /// The program the injection targets, once the box has reported; only
+    /// then can stopping the box wait for the program to be gone.
+    leader: Option<i32>,
+}
+
+impl LiveBox {
+    fn new(child: hakoniwa::Child) -> Self {
+        Self {
+            child,
+            leader: None,
+        }
+    }
+
+    /// Records the pid the injection is aimed at, so `stop` can tell the
+    /// program is gone rather than merely the supervisor that ran it. Held as
+    /// the `i32` `libc::kill` takes: a Linux pid always fits one.
+    fn holds(&mut self, leader: u32) {
+        self.leader = Some(i32::try_from(leader).expect("the program pid fits an i32"));
+    }
+
+    /// The supervisor's pid, which the session leader is looked up from.
+    fn child_id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Stops the box and waits out what it held. Safe to call twice: hakoniwa
+    /// ignores `kill` on an already-reaped child and `wait` returns the status
+    /// it collected, so the drop after an explicit stop is a no-op.
+    fn stop(&mut self) -> hakoniwa::Result<hakoniwa::ExitStatus> {
+        let _signalled = self.child.kill();
+        let status = self.child.wait()?;
+        if let Some(leader) = self.leader {
+            let program = format!("/proc/{leader}");
+            // The program is the supervisor's child, not this proof's, so it
+            // dies from the supervisor's PDEATHSIG and nothing here reaps it.
+            // Signal it directly as well: a host where that death signal did
+            // not survive the launch must not be able to leave the proof a
+            // live process, which is the one failure the lane reports with no
+            // message of the proof's own.
+            // SAFETY: `kill` is an async-signal-safe syscall taking a pid this
+            // proof created and a valid signal; it reports ESRCH when the
+            // program is already gone, which is the state being asked for, so
+            // the return value carries nothing to act on.
+            let _already_gone = unsafe { libc::kill(leader, libc::SIGKILL) };
+            // The signal has usually landed before the loop is reached; the
+            // loop exists so a scheduling hiccup cannot turn a passing proof
+            // into a live process left behind.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while Path::new(&program).exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if Path::new(&program).exists() {
+                eprintln!("warning: program {leader} outlived the box that ran it");
+            }
+        }
+        Ok(status)
+    }
+}
+
+impl Drop for LiveBox {
+    fn drop(&mut self) {
+        // Best effort: a stop that fails is reported by whatever failure made
+        // the proof drop the box mid-flight.
+        let _stopped = self.stop();
+    }
+}
+
+/// NET-083, the injected-process half: a process a client attaches into a
+/// running box — the `nsenter` shim, joined to the box's namespaces — execs
+/// with the box's credentials, so joining a box is not a way around the
+/// posture every box process already execs with.
+///
+/// The box is an *open* one (a host plan, no socket-family filter), so the
+/// only thing that can refuse the injected process a raw socket is the missing
+/// capability: the refusal this proof pins is the one NET-083 is about. The
+/// hold process keeps the box alive for the injection and reports first,
+/// which is also how the proof tells a launch that never reached the program
+/// (exit 125 in hakoniwa's mount setup, no report) from one that did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn injected_process_lacks_cap_net_raw() {
+    if let Some(reason) = sandbox2::user_namespaces_restriction() {
+        eprintln!(
+            "skipping injected_process_lacks_cap_net_raw: this host denies the \
+             unprivileged user namespace every sandbox starts by unsharing: \
+             {reason}"
+        );
+        return;
+    }
+    announce_to_the_runner("injected_process_lacks_cap_net_raw");
+    use minimald::nsenter::{Injection, session_leader_pid};
+    use std::io::{BufRead as _, Read as _};
+
+    let proofs = proof_base_dir();
+    let no_base_dir = format!("base temp dir under {}", proofs.display());
+    let base = tempfile::tempdir_in(&proofs).expect(&no_base_dir);
+    let probe = compile_socket_probe(base.path());
+    let source = base.path().join("rootfs-src");
+    probe_rootfs(&source, &probe);
+
+    let config = Config::new("caps-inject")
+        .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+        .with_dns(false)
+        .with_plan(NetPlan::host());
+    let no_sandbox_dir = format!("sandbox temp dir under {}", proofs.display());
+    let sandbox_base = tempfile::tempdir_in(&proofs).expect(&no_sandbox_dir);
+    let mut sandbox = config
+        .build(sandbox_base.path().join("sandbox"), ())
+        .await
+        .expect("building the open-box sandbox");
+    let plan = sandbox.built_in_plan();
+    let container = sandbox
+        .new_container(&plan)
+        .expect("building the open-box container");
+
+    let mut hold = sandbox
+        .command(
+            &container,
+            "/usr/bin/probe",
+            ["hold"],
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .expect("building hold command");
+    hold.stdout(hakoniwa::Stdio::MakePipe);
+    hold.stderr(hakoniwa::Stdio::MakePipe);
+    let mut child = hold.spawn().expect("spawning hold process in open box");
+
+    // The hold report is what proves the launch reached the program the
+    // injection is aimed at; a host that cannot build the box exits 125 in
+    // hakoniwa's mount setup, before any report.
+    let hold_stdout = child.stdout.take().expect("hold process stdout pipe");
+    // The box's launch path — hakoniwa's setup, the program it execs — says
+    // on stderr what went wrong when it goes wrong, so the proof takes the
+    // stream to say it in its own failure instead of leaving it in the log's
+    // margin.
+    let mut hold_stderr = child.stderr.take().expect("hold process stderr pipe");
+    let mut guard = LiveBox::new(child);
+    let hold_report = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            std::io::BufReader::new(hold_stdout)
+                .lines()
+                .take(2)
+                .collect::<Result<Vec<String>, _>>()
+                .expect("reading the hold process report")
+        }),
+    )
+    .await
+    .expect("hold process report timed out")
+    .expect("spawn_blocking join");
+    if !hold_report
+        .first()
+        .is_some_and(|line| line.starts_with("cwd="))
+    {
+        // Stop the box before saying why, so the failure names how the launch
+        // ended and what the box printed, not only the absence of a report.
+        let end = guard.stop();
+        let mut stderr = Vec::new();
+        let _drained = hold_stderr.read_to_end(&mut stderr);
+        panic!(
+            "the hold process did not report: {hold_report:?}\nstatus: {end:?}\nstderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+
+    let leader =
+        session_leader_pid(guard.child_id()).expect("resolving the open box's program pid");
+    guard.holds(leader);
+
+    let injection = Injection::new(leader, "/usr/bin/probe", ["caps"])
+        .with_shim(shim())
+        .with_cwd(sandbox.command_cwd().expect("resolving sandbox cwd"))
+        .with_env(sandbox.command_env());
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            injection
+                .command()
+                .expect("building injection command")
+                .output()
+                .expect("running injected capability probe")
+        }),
+    )
+    .await
+    .expect("injected capability probe timed out")
+    .expect("spawn_blocking join");
+
+    // Stop the box the proof no longer needs: SIGKILL to the supervisor —
+    // which the program dies from — then the reap. The wait after the signal
+    // cannot hang, the supervisor being the proof's own child, and it hands
+    // the program the moment it needs to be gone before the proof returns;
+    // the rest of the proof asserts over output already collected.
+    let _stopped = guard.stop();
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "capability probe injected into an open box failed: status={:?}\nstderr={stderr}",
+        output.status.code(),
+    );
+    let report = parse_report(&String::from_utf8_lossy(&output.stdout));
+    assert_box_credentials(&report, "the injected process");
+
+    // The capability-dependent operation itself. An open box's network is the
+    // host's and carries no family filter, so a raw socket refused with
+    // anything but EPERM is a capability that survived the join.
+    let raw = reported_errno(&report, "raw_socket_errno", "the injected process");
+    assert_eq!(
+        raw,
+        libc::EPERM,
+        "the injected process's raw socket attempt must be refused for lack \
+         of the capability, not by a filter or a missing network"
+    );
+    let stream = reported_errno(&report, "stream_socket_errno", "the injected process");
+    assert_eq!(
+        stream, 0,
+        "the injected process must still be able to open an ordinary socket: \
+         the box's posture denies capabilities, not networking"
+    );
+}
+
 /// A no-network task cannot reach the internet.
 ///
 /// Drives the egress attempt through `unshare --net`, which calls the same
@@ -523,6 +1119,7 @@ async fn netns_nonet_refuses_egress() {
     if !gated() {
         return;
     }
+    announce_to_the_runner("netns_nonet_refuses_egress");
 
     // The production decision under test: `NoNet` plans an isolated network
     // namespace, `HostNet` a shared one.
@@ -563,6 +1160,7 @@ async fn netns_ownip_ptask_to_ptask() {
     if !gated() {
         return;
     }
+    announce_to_the_runner("netns_ownip_ptask_to_ptask");
     use sessions::{IngressPolicy, IpProto, PortMapping};
 
     let state = tempfile::tempdir().expect("switch state dir");
@@ -656,6 +1254,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     if !gated() {
         return;
     }
+    announce_to_the_runner("netns_ingress_static_port_mapping_exposes_then_unexposes");
     use minimald::net::policy::{ControlChannel, apply_ingress, remove_ingress};
     use sessions::{IngressPolicy, IpProto, PortMapping};
 
