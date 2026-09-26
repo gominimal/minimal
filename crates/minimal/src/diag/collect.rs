@@ -666,7 +666,58 @@ pub async fn provider_files(
         &json,
         Redaction::None,
     )
+    .await?;
+
+    // The data volume's apparent vs allocated size. A sparse `data-vol.raw`
+    // reports its full 256 GiB to `len()`, while `st_blocks * 512` is what it
+    // actually occupies — the number that says whether a machine holding tens
+    // of GB is healthy or silently full.
+    let volume_dir = dir.to_path_buf();
+    let volume = tokio::task::spawn_blocking(move || volume_info(&volume_dir))
+        .await
+        .context("volume info worker")?;
+    let json = serde_json_lenient::to_vec_pretty(&volume).context("serializing volume info")?;
+    w.add_bytes(
+        &format!("providers/{name}/volume.json"),
+        &json,
+        Redaction::None,
+    )
     .await
+}
+
+/// The data volume image's apparent and allocated sizes. `apparent_bytes` is
+/// `Metadata::len()` — the full sparse size — while `allocated_bytes` is
+/// `st_blocks * 512`, what the image actually occupies on disk.
+#[derive(Serialize)]
+struct VolumeInfo {
+    path: String,
+    exists: bool,
+    apparent_bytes: Option<u64>,
+    allocated_bytes: Option<u64>,
+    /// A non-`NotFound` stat failure (permission, I/O). "Absent" and
+    /// "unreadable" are different diagnoses and must not collapse into the
+    /// same `exists: false`, mirroring `guest::volume_fallback`.
+    error: Option<String>,
+}
+
+/// Reads the data volume image's sizes, best-effort: an absent image is
+/// `exists: false` with `None` sizes, while a non-`NotFound` stat failure is
+/// preserved in `error` rather than reported as a missing image.
+fn volume_info(dir: &Path) -> VolumeInfo {
+    use std::os::unix::fs::MetadataExt as _;
+    let image = dir.join("data-vol.raw");
+    let (meta, error) = match std::fs::metadata(&image) {
+        Ok(m) => (Some(m), None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    VolumeInfo {
+        path: image.display().to_string(),
+        exists: meta.is_some(),
+        apparent_bytes: meta.as_ref().map(std::fs::Metadata::len),
+        allocated_bytes: meta.as_ref().map(|m| m.blocks() * 512),
+        error,
+    }
 }
 
 #[derive(Serialize)]
@@ -1107,6 +1158,52 @@ mod tests {
                 alpha.join("ssh.sock").display()
             )),
             "the named VM's status must give its socket: {alpha_status}"
+        );
+    }
+
+    /// A sparse data volume must report both its apparent and allocated sizes:
+    /// `len()` alone makes a 256 GiB sparse image look full when it occupies
+    /// almost nothing.
+    #[tokio::test]
+    async fn volume_json_records_apparent_and_allocated_sizes() {
+        let state = tempfile::TempDir::new().unwrap();
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+
+        let provider = state.path().join("providers/local-minvmd0");
+        std::fs::create_dir_all(&provider).unwrap();
+        // A sparse file: 1 MiB apparent, one 4 KiB block allocated. Write
+        // without truncation so the apparent size stays 1 MiB.
+        let image = provider.join("data-vol.raw");
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&image)
+            .unwrap();
+        f.set_len(1024 * 1024).unwrap();
+        f.write_all(&[0u8; 4096]).unwrap();
+
+        provider_files(&mut w, "local-minvmd0", &provider)
+            .await
+            .unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        let files = unpack(&out, "r").await;
+        let volume: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["providers/local-minvmd0/volume.json"]).unwrap();
+        assert_eq!(volume["exists"], true);
+        assert_eq!(volume["apparent_bytes"], 1024 * 1024);
+        assert!(
+            volume["allocated_bytes"].as_u64().unwrap() < 1024 * 1024,
+            "a sparse image's allocated size must be far below its apparent size: {volume}"
+        );
+        assert!(
+            volume["allocated_bytes"].as_u64().unwrap() >= 4096,
+            "the written block must be counted: {volume}"
         );
     }
 }
