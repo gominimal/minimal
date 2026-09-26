@@ -759,7 +759,7 @@ fn log_refusal(host: Option<&str>, reason: &str, status: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::net::SocketAddrV4;
     use std::sync::{Mutex, RwLock};
 
@@ -1858,6 +1858,13 @@ mod tests {
             // The target's published ports: bit i set publishes external
             // port 1024+i forwarding to internal port 8000+i.
             published in 0u8..=15,
+            // Whether an own-address target declares an ingress section at
+            // all. `sessions::validate_policy` accepts an `OwnIp` record with
+            // none, whose posture is deny-all — so the property ranges over
+            // the absent declaration too, and every own-address path that
+            // fills the registry must carry it as the empty set it is, never
+            // as "no gate" (the value that means a host-address box).
+            declares_ingress in prop::bool::ANY,
             // Whether the request comes from a box — whose egress rules the
             // request is put to — or from a host-side peer, whose egress is
             // ungated here exactly as its direct connections are.
@@ -1877,22 +1884,28 @@ mod tests {
                     proto: IpProto::Tcp,
                 })
                 .collect();
-            // The target's declaration. A host-address box cannot carry one;
-            // an own-address box carries exactly its mappings (an empty one
-            // is the deny-all default).
+            // The target's declaration. A host-address box cannot carry one
+            // (launch validation rejects it); an own-address box carries
+            // exactly its mappings, or no section at all.
             let target_policy = SessionPolicy {
                 egress: None,
-                ingress: (mode != TargetMode::HostAddress).then(|| IngressPolicy {
-                    port_mappings: mappings.clone(),
-                    dynamic_allowed_range: None,
-                    dynamic_ingress: None,
+                ingress: (mode != TargetMode::HostAddress && declares_ingress).then(|| {
+                    IngressPolicy {
+                        port_mappings: mappings.clone(),
+                        dynamic_allowed_range: None,
+                        dynamic_ingress: None,
+                    }
                 }),
             };
             // The registry, as the session actor and the attach path fill it
             // for each mode. Loopback stands in for the target's lease.
             let target_lease = Ipv4Addr::LOCALHOST;
+            // The applied external→internal map the attach path reports: the
+            // declaration's own mappings, so a box with no ingress section
+            // reports an empty map, exactly as the attach path derives it.
             let applied: BTreeMap<u16, u16> = mappings
                 .iter()
+                .filter(|_| declares_ingress)
                 .map(|m| (m.external_port, m.internal_port))
                 .collect();
             let target = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
@@ -2001,6 +2014,100 @@ mod tests {
                     gate.admits_direct_tcp(internal),
                     "the proxy forwarded to port {internal}, which the target's gate refuses"
                 );
+            }
+        }
+    }
+
+    /// The own-address/absent-ingress case the NET-071 property ranges over
+    /// and must never lose again: a box that declares no ingress — a
+    /// configuration `sessions::validate_policy` accepts on `own_ip` — is
+    /// deny-all on *every* host form, because `None` on a route is the
+    /// *host-address* box's ungated route, and an own-address box with no
+    /// declaration is not one. Both registry paths that build its route are
+    /// checked: the applied external→internal map the attach path reports
+    /// (empty when nothing is declared) and the session's own registration a
+    /// rename or re-finalize re-registers through
+    /// [`crate::net::switch::declared_request_ports`], which read the absent
+    /// declaration as `None` — the host-address value — and so had a native
+    /// host's proxy dial `127.0.0.1:<any port>` for a request the VM host's
+    /// refused (NET-069, NET-071).
+    #[test]
+    fn own_ip_target_with_no_ingress_is_deny_all_on_every_host_form() {
+        // The target's declaration: none, which launch accepts on `own_ip`.
+        let policy = SessionPolicy {
+            egress: None,
+            ingress: None,
+        };
+        // The direct half: the relay's own gate for that declaration refuses
+        // every new inbound connection — the own-IP default-block posture.
+        let gate = SessionGate::for_session("web".to_string(), &policy, SwitchSubnet::default());
+        assert!(
+            !gate.admits_direct_tcp(18080),
+            "a box that declares no ingress admits no direct connection"
+        );
+
+        let target = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let client = SessionId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        for (on_switch, form) in [(true, "a VM host"), (false, "a native host")] {
+            let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, on_switch);
+            // A caller whose egress admits the target, so the ingress half is
+            // the one that refuses: the refusal names the rule, not a verdict
+            // another half got in first.
+            reg.register_caller(
+                client,
+                "client",
+                crate::net::switch::compiled_egress(
+                    Some(&egress_allowing_the_target()),
+                    SwitchSubnet::default(),
+                ),
+            );
+            reg.report_own_address(client, "client", CALLER_LEASE, BTreeMap::new());
+            let caller = reg
+                .caller_at(CALLER_LEASE)
+                .expect("the reported lease names the registered caller");
+
+            // The attach path's report — an applied map with no mappings —
+            // and then the session actor's own registration, as a rename
+            // makes it: both must leave the route deny-all.
+            reg.report_own_address(target, "web", Ipv4Addr::LOCALHOST, BTreeMap::new());
+            reg.register_own_ip(target, "web", declared_request_ports(Some(&policy)));
+            let route = reg
+                .resolve("web.min.internal")
+                .expect("an own-address box's name routes");
+
+            assert_eq!(
+                route.declared_ports(),
+                Some(&BTreeSet::new()),
+                "{form}: a box with no ingress declaration is deny-all, not ungated"
+            );
+            assert_eq!(
+                route.upstream(18080),
+                None,
+                "{form}: no port routes to a box that publishes none"
+            );
+
+            // The proxy's verdict is the same refusal for a host-side peer and
+            // for a box whose egress admits the target: the ingress half
+            // alone refuses it, with the rule a direct connection's drop
+            // carries.
+            for caller in [None, Some(caller)] {
+                match proxied_request_verdict(caller.as_ref(), &route, 18080) {
+                    ProxiedRequest::Forward(upstream) => panic!(
+                        "{form}: the proxy forwarded to {upstream}, a port the \
+                         target's own gate refuses"
+                    ),
+                    ProxiedRequest::Refused(refusal) => {
+                        assert_eq!(
+                            refusal.rule, NO_INGRESS_MAPPING_RULE,
+                            "{form}: the refusal must name the ingress rule"
+                        );
+                        assert_eq!(
+                            refusal.direction,
+                            Direction::Ingress,
+                            "{form}: the refusal must be the ingress half's"
+                        );
+                    }
+                }
             }
         }
     }

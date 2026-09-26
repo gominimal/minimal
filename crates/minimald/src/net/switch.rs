@@ -765,25 +765,31 @@ pub fn declared_ingress_ports(
         .unwrap_or_default()
 }
 
-/// The external ports a request to a target may name (NET-069): the ports its
-/// ingress declaration *publishes* — the port a URL carries and the proxy
-/// sees, which [`Route::upstream`](crate::net::dns::Route::upstream) then
-/// translates to the internal port behind it. `None` when the target declares
-/// no ingress policy at all: that is what a host-address box is (launch
-/// validation rejects an ingress declaration on every network mode but
-/// `own_ip`), and a direct connection to it is ungated, so the proxy gates
-/// nothing either — the same verdict on both surfaces (NET-071).
+/// The external ports a request to an **own-address** target may name
+/// (NET-069): the ports its ingress declaration *publishes* — the port a URL
+/// carries and the proxy sees, which [`Route::upstream`](crate::net::dns::Route::upstream)
+/// then translates to the internal port behind it. An own-address box that
+/// declares no ingress publishes nothing: absent ingress is the deny-all
+/// posture `sessions::validate_policy` accepts on `own_ip`, the same posture
+/// [`declared_ingress_ports`] gives a direct connection to it, so the set is
+/// empty and never `None`. `None` on a route means a *host-address* box
+/// (launch validation rejects an ingress declaration on every mode but
+/// `own_ip`), a different verdict whose direct connections no surface gates —
+/// collapsing the two is what would let a proxied request dial an undeclared
+/// port on a native host's published-loopback route while a VM host refuses
+/// it (NET-071).
 #[must_use]
-pub fn declared_request_ports(policy: Option<&sessions::SessionPolicy>) -> Option<BTreeSet<u16>> {
-    Some(
-        policy?
-            .ingress
-            .as_ref()?
-            .port_mappings
-            .iter()
-            .map(|m| m.external_port)
-            .collect(),
-    )
+pub fn declared_request_ports(policy: Option<&sessions::SessionPolicy>) -> BTreeSet<u16> {
+    policy
+        .and_then(|policy| policy.ingress.as_ref())
+        .map(|ingress| {
+            ingress
+                .port_mappings
+                .iter()
+                .map(|m| m.external_port)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The compiled egress rules a session's own outbound frames are decided by

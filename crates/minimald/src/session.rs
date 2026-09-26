@@ -650,7 +650,10 @@ impl Session {
     /// yet, so this registers nothing and the route appears when the box
     /// attaches (NET-001); on a rename or re-finalize the reported lease is
     /// already on file and the name re-registers against it, carrying the
-    /// ports the session's ingress declaration publishes (NET-069). A NoNet
+    /// ports the session's ingress declaration publishes (NET-069) — an empty
+    /// set, and so a deny-all gate, when the box declares no ingress: that is
+    /// the posture its own relay gate gives a direct connection, and the
+    /// proxy's must match on every host form (NET-071). A NoNet
     /// PTask exposes no services, so it is not registered — and neither is a
     /// `Draft` session, which has nothing to route to until its composition
     /// finalizes.

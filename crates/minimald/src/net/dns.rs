@@ -155,15 +155,16 @@ pub struct Route {
     target: Target,
     session: String,
     /// The ports a request to this name may name (NET-069, NET-071): the
-    /// external ports the target's ingress declaration publishes. `None` when
-    /// the target declares no ingress at all — a host-address box, whose
-    /// direct connections no surface gates — so a proxied request to it gates
-    /// nothing either; `Some(…)` when it does, from the declaration of record
+    /// external ports the target's ingress declaration publishes. `None` only
+    /// for a host-address box, whose direct connections no surface gates, so a
+    /// proxied request to it gates nothing either; `Some(…)` for every
+    /// own-address target, from the declaration of record
     /// ([`super::switch::declared_request_ports`] at registration, or the
-    /// applied external→internal map the attach path reports). Carried on the
-    /// route, not read from the policy at request time, so the target's
-    /// declaration decides it on both halves of the proxy's verdict and the
-    /// relay's port gate stays the one derivation
+    /// applied external→internal map the attach path reports) — empty when the
+    /// box declares no ingress, which is the own-IP deny-all posture, never an
+    /// open gate. Carried on the route, not read from the policy at request
+    /// time, so the target's declaration decides it on both halves of the
+    /// proxy's verdict and the relay's port gate stays the one derivation
     /// ([`super::switch::declared_ingress_ports`]).
     declared: Option<BTreeSet<u16>>,
 }
@@ -233,9 +234,10 @@ impl Route {
     /// not publish has no upstream — the proxy refuses the request rather
     /// than dialing a port the target's ingress gate would drop, whose silent
     /// SYN drop is a connect hang instead of a refusal (NET-001, NET-014,
-    /// NET-069). A route that declares no ports gates nothing — a host-address
-    /// box has no ingress declaration and its direct connections are ungated,
-    /// so its proxied requests are too (NET-071).
+    /// NET-069). A route with no gate at all (`None`, a host-address box)
+    /// forwards any port: its direct connections are ungated, so its proxied
+    /// requests are too — while an own-address route with an empty set is a
+    /// deny-all gate, the posture of a box that declared no ingress (NET-071).
     #[must_use]
     pub fn upstream(&self, port: u16) -> Option<SocketAddr> {
         if let Some(declared) = self.declared_ports()
@@ -515,7 +517,9 @@ impl HostnameRegistry {
     /// session id, and nothing is registered when there is none — a box with
     /// no lease has no address to route to. `declared` is the session's own
     /// ingress declaration as the ports a request may name
-    /// ([`super::switch::declared_request_ports`]), the half of the route that
+    /// ([`super::switch::declared_request_ports`]) — a plain set, because an
+    /// own-address box is always gated and a declaration of none is the
+    /// deny-all posture, not an open gate; this is the half of the route that
     /// keeps the proxy's refusals identical to the direct connection's on a
     /// native host's published-loopback routes (NET-069, NET-071). The
     /// session actor calls this at spawn, finalize, and rename; the attach path
@@ -525,7 +529,7 @@ impl HostnameRegistry {
         &mut self,
         session_id: SessionId,
         session_name: &str,
-        declared: Option<BTreeSet<u16>>,
+        declared: BTreeSet<u16>,
     ) -> Option<Hostname> {
         let own = self.own.get(&session_id)?;
         let route = self.own_route(session_name, own, declared);
@@ -599,7 +603,7 @@ impl HostnameRegistry {
             ports: ports.clone(),
         };
         self.by_lease.insert(lease, session_id);
-        let route = self.own_route(session_name, &own, Some(declared_keys(&ports)));
+        let route = self.own_route(session_name, &own, declared_keys(&ports));
         self.own.insert(session_id, own);
         self.register(session_id, session_name, route)
     }
@@ -622,18 +626,14 @@ impl HostnameRegistry {
     /// host (the daemon is on the switch, NET-001), or the published-loopback
     /// model on a native host (the daemon is off the switch, and the client
     /// selects the published external port). `declared` is the ports-a-request
-    /// -may-name set; on a lease route the applied map carries it already, so
-    /// the translation and the gate stay one declaration.
-    fn own_route(
-        &self,
-        session_name: &str,
-        own: &OwnAddress,
-        declared: Option<BTreeSet<u16>>,
-    ) -> Route {
+    /// -may-name set, always a gate for an own-address box — empty when the
+    /// box declares no ingress; on a lease route the applied map carries it
+    /// already, so the translation and the gate stay one declaration.
+    fn own_route(&self, session_name: &str, own: &OwnAddress, declared: BTreeSet<u16>) -> Route {
         if self.on_switch {
             Route::lease(session_name, own.lease, own.ports.clone())
         } else {
-            Route::loopback(session_name, declared)
+            Route::loopback(session_name, Some(declared))
         }
     }
 
@@ -841,8 +841,12 @@ mod tests {
     fn own_ip_name_registers_once_the_lease_is_reported() {
         let mut reg = HostnameRegistry::new("dev", false);
 
-        // No lease yet: the name registers nothing.
-        assert!(reg.register_own_ip(SessionId::nil(), "web", None).is_none());
+        // No lease yet: the name registers nothing — whatever the box's
+        // declaration is.
+        assert!(
+            reg.register_own_ip(SessionId::nil(), "web", declared_ports())
+                .is_none()
+        );
         assert_eq!(reg.resolve("web.min.internal"), None);
 
         // The attach path reports the lease with the box's ingress declaration.
@@ -865,7 +869,7 @@ mod tests {
         // the session's declared ports as the session actor does.
         reg.deregister("web");
         assert!(
-            reg.register_own_ip(SessionId::nil(), "web", Some(declared_ports()))
+            reg.register_own_ip(SessionId::nil(), "web", declared_ports())
                 .is_some()
         );
         let route = reg
@@ -889,7 +893,10 @@ mod tests {
             reg.deregister("web").map(|h| h.as_str().to_string()),
             Some("web.min.internal".to_string())
         );
-        assert!(reg.register_own_ip(SessionId::nil(), "web", None).is_none());
+        assert!(
+            reg.register_own_ip(SessionId::nil(), "web", declared_ports())
+                .is_none()
+        );
         assert_eq!(reg.resolve("web.min.internal"), None);
     }
 
