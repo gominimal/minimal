@@ -57,6 +57,10 @@ pub use ::switch::{
     DEFAULT_MTU, DEFAULT_SUBNET, InvalidPrefix, MacAddr, SwitchSubnet, VSOCK_GVPROXY_SHUTTLE_PORT,
     VSOCK_HOST_CID, render_gvproxy_config,
 };
+// The default address plan itself (NET-102) is imported un-re-exported: the
+// plan is a definition the allocation below draws from, not part of the
+// `minimald::net::*` vocabulary callers consume.
+use ::switch::AddressPlan;
 
 /// How the per-host gvproxy switch is reached, selected by deployment model.
 ///
@@ -157,6 +161,16 @@ impl IpAllocator {
         }
     }
 
+    /// Creates an allocator over the switch crate's default address plan
+    /// (NET-102): the block an un-enrolled host self-allocates box addresses
+    /// from, because no control plane has handed it one. The plan's switch
+    /// subnet is where the leases come from; its reserved local range is where
+    /// their published addresses will.
+    #[must_use]
+    pub fn for_default_plan() -> Self {
+        Self::new(AddressPlan::default().switch_subnet())
+    }
+
     /// The subnet this allocator draws from.
     #[must_use]
     pub fn subnet(&self) -> SwitchSubnet {
@@ -194,6 +208,15 @@ impl IpAllocator {
     }
 }
 
+impl Default for IpAllocator {
+    /// The plan an un-enrolled host self-allocates from (NET-102): an
+    /// allocator with no subnet named draws from the switch crate's default
+    /// plan rather than an implicit constant of its own.
+    fn default() -> Self {
+        Self::for_default_plan()
+    }
+}
+
 ///
 /// The switch is reference-counted against the set of attached `OwnIp` PTasks:
 /// it is spawned lazily on the first attach and torn down after the last
@@ -227,10 +250,12 @@ pub struct SwitchClient {
 
 impl SwitchClient {
     /// Builds a switch supervisor. Does not spawn anything; the first
-    /// [`attach`](Self::attach) starts gvproxy.
+    /// [`attach`](Self::attach) starts gvproxy. The allocator draws from the
+    /// switch crate's default address plan (NET-102) — the block an un-enrolled
+    /// host self-allocates from.
     #[must_use]
     pub fn new(binary: impl Into<PathBuf>, state_dir: impl Into<PathBuf>) -> Self {
-        Self::with_subnet(binary, state_dir, SwitchSubnet::default())
+        Self::with_subnet(binary, state_dir, AddressPlan::default().switch_subnet())
     }
 
     /// Builds a switch supervisor over a non-default subnet.
@@ -552,6 +577,46 @@ mod tests {
         assert_eq!(second.ip, Ipv4Addr::new(100, 64, 0, 3));
         assert_ne!(first.ip, second.ip);
         assert_eq!(a.leases().len(), 2);
+    }
+
+    #[test]
+    fn allocator_uses_default_plan() {
+        // NET-102: an un-enrolled host self-allocates box addresses from the
+        // switch crate's default plan, so an allocator with no subnet named
+        // draws from that plan rather than a constant of minimald's own.
+        let plan = AddressPlan::default();
+        let mut a = IpAllocator::for_default_plan();
+        assert_eq!(a.subnet(), plan.switch_subnet());
+        // The first lease is the plan's first allocatable box address...
+        let lease = a.allocate().unwrap();
+        assert_eq!(lease.ip, Ipv4Addr::from(plan.switch_subnet().first_ptask()));
+        assert_eq!(lease.ip, Ipv4Addr::new(100, 64, 0, 2));
+        // ...and the default allocator is the same one.
+        assert_eq!(
+            IpAllocator::default().allocate().unwrap().ip,
+            Ipv4Addr::new(100, 64, 0, 2)
+        );
+        // The plan's reserved local range — where those boxes' published
+        // addresses come from on the host's loopback — is the same block the
+        // zone's published names answer at (NET-127). One definition now: the
+        // answerer re-exports the switch crate's constant, so this asserts the
+        // plan is built from the range it serves rather than bridging two
+        // constants that could drift.
+        assert_eq!(
+            plan.reserved_local_range(),
+            crate::net::dns::RESERVED_LOCAL_RANGE
+        );
+        // Every loopback slice the plan pairs with one of its switches stays
+        // inside that range, so a published box answers on the host's
+        // loopback, at an address no other switch on the host holds.
+        let (range_net, range_prefix) = plan.reserved_local_range();
+        let range_first = u32::from(range_net);
+        let range_len = 1u32 << (32 - range_prefix);
+        for index in 0..plan.switch_capacity() {
+            let slice = plan.switch_slice(index).unwrap().loopback();
+            assert!(u32::from(slice.first()) >= range_first);
+            assert!(u32::from(slice.last()) < range_first + range_len);
+        }
     }
 
     #[test]

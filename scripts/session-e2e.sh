@@ -82,6 +82,9 @@
 #   skip_scaffold                    the daemon-scaffolded blueprint upload lane
 #   sandbox                          interactive attach: in-sandbox `min add`
 #   restart                          daemon stop → autospawn, hooks survive
+#   fresh_install_own_ip_ingress_publishes_loopback
+#                                    a real install.sh run ships the switch;
+#                                    own-IP ingress answers at 127.0.0.1:8080
 #   min_internal_names_through_proxy NET-001..004 through the shipped proxy
 #   hostnames_recover_and_two_daemons_route NET-020..027 warning, recovery,
 #                                   two daemons on one machine routing
@@ -808,6 +811,427 @@ if [ -n "${MINVMD_GVPROXY_BIN:-}" ]; then
 else
   echo "own-IP session proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
 fi
+}
+
+# ---------------------------------------------------------------------------
+# Fresh-install loopback publish proof (NET-040/NET-041/NET-102): from a REAL
+# scripts/install.sh run into a fresh HOME — a local mock bucket built out of
+# THIS checkout's own binaries, reached through the same stub-curl trick
+# install_test.sh uses, so the installer itself runs unmodified — the
+# installed pair must serve an own-IP box whose `--ingress 8080:8080` mapping
+# answers ON THE HOST at 127.0.0.1:8080 with the box's own server's response.
+# That is the own-address pipeline in the exact shape a user gets it: the
+# installer ships gvproxy-min into ~/.local/bin (and names the path it
+# verified), the daemon finds it there through switch::installed_gvproxy_bin,
+# and the switch publishes the box's port on the host loopback — with one
+# record in the daemon's log per exposed mapping (host, port, session).
+#
+# Gating, decided by where the proof's pieces actually run:
+#   * Native Linux only. A VM lane's daemon runs in the guest while the pair
+#     this proof installs lives host-side (macOS is always VM-backed), so
+#     there is no fresh-install story to drive there — those lanes'
+#     own-address boxes are the proxy proof's own-address half.
+#   * The box needs a TUN device: its session program opens /dev/net/tun for
+#     its in-namespace tap, and a host that is itself a sandbox (the
+#     agent-runtime boxes this harness runs on) has none and cannot mknod one,
+#     so the box cannot come up no matter what this proof ships. Gate on the
+#     device and skip when it is absent — the same prerequisite the
+#     own-ip tap root integration harness asserts on the native netns lane,
+#     which has it and runs this case for real.
+#   * The switch binary to ship: $MINVMD_GVPROXY_BIN, the justfile's
+#     .scratch/gvproxy, or the pinned fetch. Unlike own_ip this never SKIPS
+#     for want of one: a lane that cannot ship a switch cannot prove what
+#     this case exists for, so the fetch failing is a failure.
+#   * The system-package half (the daemon serving the same mapping from
+#     /usr/bin/gvproxy-min, the nfpm/AUR dest) runs only on a lane that can
+#     stage that path — writable /usr/bin, never over an existing binary;
+#     the probe ORDER that finds it is pinned by the switch crate's resolver
+#     tests either way.
+#   * The host half of the mapping is 127.0.0.1:8080; a host that already
+#     has a listener there (the agent-runtime boxes this harness itself runs
+#     on do) publishes on the fallback 18082 instead — the box always serves
+#     its INTERNAL 8080, so the mapping exercised is always <host-port>:8080
+#     and a clean host runs it exactly as the proof sentence says.
+#
+# Ordered after `restart`: it stops whatever daemon is up and swaps the
+# driving pair to the installed one, so nothing that still shares the
+# `lifecycle` session may follow it. The whole body runs in a subshell — HOME,
+# PATH, MINIMAL_BIN and RUST_LOG all change for the installed pair and must
+# revert before the next proof runs — and a failure exits the subshell, with
+# the wrapper calling fail so the run still dumps its diagnostics.
+proof_fresh_install_own_ip_ingress_publishes_loopback() {
+local fi_arch fi_gvproxy fi_root fi_home fi_bucket fi_stubbin fi_seed fi_out
+local fi_h_minimald fi_h_minimal fi_h_gvmin fi_sid fi_sid2 fi_log fi_rec
+local fi_ready fi_answered fi_status fi_bucket_host fi_hport fi_portpat
+local fi_lane_minimald fi_restore_profile
+if [ -n "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
+  echo "fresh-install loopback publish SKIPPED (VM-backed lane: the pair this proof installs lives host-side)"
+  return 0
+fi
+case "$(uname -m)" in
+  x86_64)        fi_arch=amd64 ;;
+  aarch64|arm64) fi_arch=arm64 ;;
+  *)
+    echo "fresh-install loopback publish SKIPPED (no release arch for $(uname -m))"
+    return 0
+    ;;
+esac
+
+# The box opens /dev/net/tun for its in-namespace tap; without the device its
+# session program cannot spawn, and a host that is itself a sandbox cannot
+# mknod one either. Skip rather than fail: the failure would say nothing about
+# this branch, and the native CI lane — where the tap root integration harness
+# already builds a tap — runs the case for real.
+if [ ! -c /dev/net/tun ]; then
+  echo "fresh-install loopback publish SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  return 0
+fi
+
+# The proof's mapping is 8080:8080 — the box serves its INTERNAL 8080, the
+# switch publishes the host half on the loopback. A host may already have a
+# listener on the host port (the agent-runtime boxes this harness itself runs
+# on do), so claim it BEFORE anything is installed, and when it is taken
+# publish on the fallback port instead: the whole pipeline — install, switch
+# discovery, expose, host answer, log record — is exercised either way, and a
+# clean host runs the mapping exactly as the proof sentence says it.
+fi_hport=8080
+if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$fi_hport/" 2>/dev/null; then
+  if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:18082/" 2>/dev/null; then
+    echo "::error::both 127.0.0.1:8080 and the fallback 18082 already answer on this host; the loopback publish proof needs one of them free"
+    fail
+  fi
+  fi_hport=18082
+  echo "127.0.0.1:8080 is already answering on this host — publishing the mapping on the fallback port $fi_hport instead (the box still serves its internal 8080)"
+fi
+fi_portpat="\"port\":$fi_hport"
+
+# The daemon THIS lane was driving, resolved before the proof swaps PATH and
+# HOME over to the installed pair. On a host that restricts unprivileged user
+# namespaces (stock Ubuntu 24.04+) the harness's start-up block attached the
+# minimald AppArmor profile to this binary, and attaching it to anything else
+# REPLACES the recorded set — so the re-attach inside the proof must name this
+# one too, or the proofs that follow would lose the profile and with it every
+# sandbox they fork.
+fi_lane_minimald="$(command -v minimald 2>/dev/null || true)"
+
+# The switch binary the fresh install will ship. `just e2e` and a dev who ran
+# `just gvproxy` already have one; otherwise fetch the pinned release — the
+# installer's own pinned artifact, verified against vendor/gvproxy/gvproxy.lock.
+if [ -n "${MINVMD_GVPROXY_BIN:-}" ] && [ -x "$MINVMD_GVPROXY_BIN" ]; then
+  fi_gvproxy="$MINVMD_GVPROXY_BIN"
+elif [ -x "$ROOT/.scratch/gvproxy" ]; then
+  fi_gvproxy="$ROOT/.scratch/gvproxy"
+else
+  mkdir -p "$WORK/fresh-install"
+  if ! "$ROOT/scripts/fetch-gvproxy.sh" "$WORK/fresh-install/gvproxy" \
+      >"$WORK/fresh-install/fetch-gvproxy.out" 2>&1; then
+    echo "::error::could not fetch the pinned gvproxy the fresh install must ship"
+    cat "$WORK/fresh-install/fetch-gvproxy.out" 2>/dev/null || true
+    fail
+  fi
+  fi_gvproxy="$WORK/fresh-install/gvproxy"
+fi
+
+echo "::group::fresh install publishes an own-IP ingress on the host loopback"
+# Everything the proof builds lives under $WORK/fresh-install, so the state
+# dir's teardown covers all of it — no extra bookkeeping.
+fi_root="$WORK/fresh-install"
+fi_home="$fi_root/home"
+fi_bucket="$fi_root/bucket"
+fi_stubbin="$fi_root/stubbin"
+fi_seed="$fi_root/seed"
+fi_out="$fi_root/install.out"
+fi_bucket_host="https://mock.invalid/minimal-fresh"
+mkdir -p "$fi_home" "$fi_bucket/versions/v1" "$fi_stubbin" "$fi_seed"
+hook_seed_preamble > "$fi_seed/minimal.toml"
+# The `.git` marker the headless upload gate wants.
+mkdir "$fi_seed/.git"
+
+# The mock bucket: the real artifacts this lane drives — its own `min` and
+# `minimald`, plus the gvproxy the installer must ship — behind the pinned
+# host the stub curl below maps to this dir. A `curl | sh` install without
+# the network; the real transport is CI's real-bucket installer run.
+cp "$(command -v min)"      "$fi_bucket/versions/v1/minimal-linux-$fi_arch"
+cp "$(command -v minimald)" "$fi_bucket/versions/v1/minimald-linux-$fi_arch"
+cp "$fi_gvproxy"            "$fi_bucket/versions/v1/gvproxy-min-linux-$fi_arch"
+printf 'v1\n' >"$fi_bucket/stable"
+fi_sha() { sha256sum "$1" | awk '{print $1}'; }
+fi_h_minimald="$(fi_sha "$fi_bucket/versions/v1/minimald-linux-$fi_arch")"
+fi_h_minimal="$(fi_sha "$fi_bucket/versions/v1/minimal-linux-$fi_arch")"
+fi_h_gvmin="$(fi_sha "$fi_bucket/versions/v1/gvproxy-min-linux-$fi_arch")"
+{
+  printf '# format: 1\n'
+  printf '# component   os      arch    version   sha256   kind   dest   src\n'
+  printf '\n'
+  printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+    minimald linux "$fi_arch" v1 "$fi_h_minimald" file bin/minimald "versions/v1/minimald-linux-$fi_arch"
+  printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+    minimal linux "$fi_arch" v1 "$fi_h_minimal" file bin/min "versions/v1/minimal-linux-$fi_arch"
+  printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+    gvproxy-min linux "$fi_arch" v1 "$fi_h_gvmin" file bin/gvproxy-min "versions/v1/gvproxy-min-linux-$fi_arch"
+} >"$fi_bucket/versions/v1/components"
+
+cat >"$fi_stubbin/curl" <<STUB
+#!/bin/sh
+# Fake curl: maps the pinned bucket host to the local dir this proof built —
+# the same trick install_test.sh uses, so the real installer runs unmodified;
+# its own HTTPS/TLS flags are accepted and ignored.
+out= url=
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    https://*|http://*) url="\$1"; shift ;;
+    *) shift ;;
+  esac
+done
+[ -n "\$url" ] || { echo "stub curl: no url" >&2; exit 2; }
+rel="\${url#$fi_bucket_host/}"
+src="$fi_bucket/\$rel"
+[ -f "\$src" ] || { echo "stub curl: 404 \$url" >&2; exit 22; }
+if [ -n "\$out" ]; then cp "\$src" "\$out"; else cat "\$src"; fi
+STUB
+chmod +x "$fi_stubbin/curl"
+# Force the wget path off so the downloader selection is deterministic.
+cat >"$fi_stubbin/wget" <<'STUB'
+#!/bin/sh
+echo "stub wget should not be used here" >&2
+exit 1
+STUB
+chmod +x "$fi_stubbin/wget"
+
+if (
+  # The install itself, into the fresh home: the same command a user runs,
+  # over the stub transport. MINIMAL_BIN pins the prefix the installer and
+  # the daemon's binary probe both resolve (~/.local/bin under the fresh
+  # HOME is the default anyway; explicit so a stray env cannot redirect it).
+  HOME="$fi_home" MINIMAL_BIN="$fi_home/.local/bin" \
+  PATH="$fi_stubbin:$PATH" \
+  MINIMAL_OVERRIDE_INSTALLER_BUCKET="$fi_bucket_host" \
+    sh "$ROOT/scripts/install.sh" >"$fi_out" 2>&1 || {
+      echo "::error::the fresh install failed"
+      echo "--- install output ---"; cat "$fi_out" 2>/dev/null || true
+      exit 1
+    }
+  # NET-041's installer half: the install NAMES the switch binary it verified.
+  grep -qE 'switch-binary +verified +[^ ]*/bin/gvproxy-min$' "$fi_out" || {
+    echo "::error::the install output does not name the switch binary it verified"
+    echo "--- install output (tail) ---"; tail -25 "$fi_out" 2>/dev/null || true
+    exit 1
+  }
+  [ -x "$fi_home/.local/bin/gvproxy-min" ] || {
+    echo "::error::the fresh install did not ship an executable gvproxy-min"
+    exit 1
+  }
+
+  # A host that restricts unprivileged user namespaces confines the permission
+  # to the executable paths the minimald profile names, and this proof's pair
+  # sits under a fresh mktemp home that none of the stock tunables can cover
+  # (`@{HOME}/.local/bin/minimald` matches a real home, not a nested one) — so
+  # the INSTALLED daemon comes up unconfined and every sandbox it forks dies
+  # writing /proc/self/uid_map with EPERM, far from the cause: the first thing
+  # this proof would see is the socat probe below failing with nothing in its
+  # stderr that names it. Attach it exactly as the installer's own advisory
+  # tells a user to, before the pair is driven. `--path` replaces the recorded
+  # set, so the lane's binary is named alongside it (see fi_lane_minimald); the
+  # EXIT trap below puts the set back on the way out.
+  fi_restore_profile=0
+  if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
+    fi_attach_args=()
+    for fi_p in "$fi_home/.local/bin/minimald" "$fi_lane_minimald"; do
+      [ -n "$fi_p" ] && [ -e "$fi_p" ] && fi_attach_args+=(--path "$fi_p")
+    done
+    if ! sudo -n "$ROOT/scripts/install-apparmor-profile.sh" "${fi_attach_args[@]}"; then
+      echo "::error::this host restricts unprivileged user namespaces and the minimald AppArmor profile could not be attached to the installed pair, so its session sandbox cannot start (see docs/reference/linux-host-setup.md)"
+      exit 1
+    fi
+    fi_restore_profile=1
+    echo "restricted host: minimald AppArmor profile attached to the installed pair ($fi_home/.local/bin/minimald)"
+  fi
+  # One EXIT trap for the whole subshell, so every path out of it — the early
+  # exits above included — undoes both things the proof staged on the host: the
+  # package-path switch (the /usr/bin/gvproxy-min half below) and the profile
+  # attachment set it widened above. Neither way this function is reached is
+  # visible to shellcheck — `trap` calls it out of a subshell shellcheck
+  # cannot follow (SC2317, on older shellchecks) and the subshell's own
+  # fall-through calls it too (SC2329, on newer ones) — so the directive below
+  # silences both, and it covers the whole definition, body included.
+  # shellcheck disable=SC2317,SC2329
+  fi_cleanup() {
+    rm -f /usr/bin/gvproxy-min 2>/dev/null || true
+    if [ "${fi_restore_profile:-0}" = 1 ] && [ -n "$fi_lane_minimald" ]; then
+      sudo -n "$ROOT/scripts/install-apparmor-profile.sh" \
+        --path "$fi_lane_minimald" >/dev/null 2>&1 || echo "::warning::could not restore the minimald AppArmor profile's attachment set (sudo -n failed); it still names the installed pair's path, which this proof deletes with its work dir" >&2
+    fi
+  }
+  trap fi_cleanup EXIT
+
+  # Drive the INSTALLED pair: its dir goes first on PATH (the CLI autospawns
+  # its daemon by bare name, so the pair must resolve from one dir) and HOME
+  # becomes the fresh install's, which is exactly how the daemon finds the
+  # switch the installer shipped (switch::installed_gvproxy_bin probes
+  # \$MINIMAL_BIN, then ~/.local/bin). The expose record this proof reads
+  # from the daemon log is INFO while the harness quiets the CLI to `warn`
+  # for output parsing, so the activate that autospawns the daemon alone
+  # carries the noisier filter — as a command-local assignment, never a
+  # subshell export, so nothing leaks past this proof.
+  export HOME="$fi_home" MINIMAL_BIN="$fi_home/.local/bin"
+  export PATH="$fi_home/.local/bin:$PATH"
+  mnl stop --force >/dev/null 2>&1 || true
+  fi_sid="$(cd "$fi_seed" && RUST_LOG=info mnl session activate . --no-prompt \
+    --name e2e-fresh-ingress --network own_ip --ingress "$fi_hport":8080 \
+    2>"$fi_root/activate.err")" || {
+    echo "::error::the installed pair failed to activate an own-IP session with an ingress mapping"
+    echo "--- activate stderr ---"; cat "$fi_root/activate.err" 2>/dev/null || true
+    exit 1
+  }
+  fi_sid="$(printf '%s\n' "$fi_sid" | tail -n1 | tr -d '\r')"
+
+  # socat carries the in-box responder (a launcher baseline package, at
+  # /usr/bin in every box), serving one 200 whose body is the marker; the
+  # detach form is the documented one for a listener that must outlive the
+  # exec that starts it.
+  mnl session exec "$fi_sid" 'test -x /usr/bin/socat' >/dev/null 2>"$fi_root/socat-probe.err" || {
+    echo "::error::probing the box for /usr/bin/socat failed (it is a launcher baseline package, so an empty stderr below means the file is not there — anything else is a spawn failure the probe surfaced for free)"
+    echo "--- probe stderr ---"; cat "$fi_root/socat-probe.err" 2>/dev/null || true
+    exit 1
+  }
+  mnl session exec "$fi_sid" \
+    "body=fi-fresh-install-own-ip; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
+    >/dev/null 2>"$fi_root/responder.err" || {
+    echo "::error::could not write the in-box responder's response"
+    cat "$fi_root/responder.err" 2>/dev/null || true
+    exit 1
+  }
+  mnl session exec "$fi_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:8080,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
+    >/dev/null 2>"$fi_root/responder.err" || {
+    echo "::error::could not start the in-box responder"
+    cat "$fi_root/responder.err" 2>/dev/null || true
+    exit 1
+  }
+  fi_ready=""
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$fi_sid" \
+      "curl -sS --max-time 5 -o /home/ready.body -w '%{http_code}' http://127.0.0.1:8080/" \
+      2>/dev/null || true)" = "200" ]; then
+      fi_ready=1; break
+    fi
+    sleep 0.25
+  done
+  [ -n "$fi_ready" ] || {
+    echo "::error::the in-box responder never answered a direct curl — the publish is not in the picture yet"
+    exit 1
+  }
+
+  # NET-040: the mapping answers ON THE HOST loopback, with the box's own
+  # server's response.
+  fi_answered=""
+  fi_status=""
+  for _ in $(seq 1 40); do
+    fi_status="$(curl -sS --max-time 5 -o "$fi_root/host.body" -w '%{http_code}' \
+      "http://127.0.0.1:$fi_hport/" 2>/dev/null || true)"
+    if [ "$fi_status" = "200" ] && grep -q "fi-fresh-install-own-ip" "$fi_root/host.body" 2>/dev/null; then
+      fi_answered=1; break
+    fi
+    sleep 0.25
+  done
+  [ -n "$fi_answered" ] || {
+    echo "::error::the host loopback never answered at 127.0.0.1:$fi_hport (last status: '${fi_status:-none}')"
+    echo "--- host body ---"; cat "$fi_root/host.body" 2>/dev/null || true
+    exit 1
+  }
+  echo "127.0.0.1:$fi_hport answered the box's own server (200: $(cat "$fi_root/host.body"))"
+
+  # NET-040 observability: one daemon-log record per exposed mapping, with
+  # the host address, the port and the session.
+  fi_log="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null | sort | tail -n1)"
+  fi_rec=""
+  for _ in $(seq 1 10); do
+    fi_rec="$(grep -h -- 'exposed ingress port on the host loopback' "$fi_log" 2>/dev/null \
+      | grep -F '"session":"e2e-fresh-ingress"' | tail -n1)"
+    [ -n "$fi_rec" ] && break
+    sleep 0.25
+  done
+  if [ -z "$fi_rec" ]; then
+    echo "::error::no expose record in the daemon log names the session"
+    echo "--- daemon log (tail) ---"; tail -20 "$fi_log" 2>/dev/null || true
+    exit 1
+  fi
+  case "$fi_rec" in
+    *'"host":"127.0.0.1"'*"$fi_portpat"*) ;;
+    *)
+      echo "::error::the expose record does not carry host 127.0.0.1 and the published port $fi_hport"
+      echo "--- record ---"; printf '%s\n' "$fi_rec"
+      exit 1
+      ;;
+  esac
+  echo "daemon log: $fi_rec"
+
+  mnl session destroy --force "$fi_sid" >/dev/null 2>&1 || true
+  mnl stop --force >/dev/null 2>&1 || true
+  # The switch goes down with the daemon; wait out the host port it held so
+  # the package-path half below re-publishes on the same one.
+  for _ in $(seq 1 20); do
+    curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$fi_hport/" 2>/dev/null || break
+    sleep 0.25
+  done
+
+  # The system-package half: the daemon must serve the same mapping when the
+  # only switch binary it can find is /usr/bin/gvproxy-min (the nfpm/AUR
+  # dest), not the one the installer placed in ~/.local/bin. Gated on what
+  # this lane permits — never over an existing binary — and the subshell's
+  # EXIT trap (set above) removes the staged one on every path out of the proof.
+  if [ -w /usr/bin ] && [ ! -e /usr/bin/gvproxy-min ]; then
+    cp "$fi_home/.local/bin/gvproxy-min" /usr/bin/gvproxy-min
+    rm -f "$fi_home/.local/bin/gvproxy-min"
+    fi_sid2="$(cd "$fi_seed" && RUST_LOG=info mnl session activate . --no-prompt \
+      --name e2e-fresh-ingress-pkg --network own_ip --ingress "$fi_hport":8080 \
+      2>"$fi_root/activate-pkg.err")" || {
+      echo "::error::the daemon did not serve an own-IP box from the package-path switch binary"
+      echo "--- activate stderr ---"; cat "$fi_root/activate-pkg.err" 2>/dev/null || true
+      exit 1
+    }
+    fi_sid2="$(printf '%s\n' "$fi_sid2" | tail -n1 | tr -d '\r')"
+    mnl session exec "$fi_sid2" \
+      "body=fi-fresh-install-pkgpath; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
+      >/dev/null 2>&1
+    mnl session exec "$fi_sid2" \
+      "nohup /usr/bin/socat TCP-LISTEN:8080,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>&1
+    fi_answered=""
+    for _ in $(seq 1 40); do
+      if curl -sS --max-time 5 -o "$fi_root/host-pkg.body" \
+          "http://127.0.0.1:$fi_hport/" 2>/dev/null \
+          && grep -q "fi-fresh-install-pkgpath" "$fi_root/host-pkg.body" 2>/dev/null; then
+        fi_answered=1; break
+      fi
+      sleep 0.25
+    done
+    [ -n "$fi_answered" ] || {
+      echo "::error::the package-path switch never published the mapping at 127.0.0.1:$fi_hport"
+      echo "--- activate stderr ---"; cat "$fi_root/activate-pkg.err" 2>/dev/null || true
+      exit 1
+    }
+    echo "package-path half OK: /usr/bin/gvproxy-min served the same mapping ($(cat "$fi_root/host-pkg.body"))"
+    mnl session destroy --force "$fi_sid2" >/dev/null 2>&1 || true
+  else
+    if [ -e /usr/bin/gvproxy-min ]; then
+      echo "package-path half SKIPPED (a gvproxy-min is already installed at /usr/bin/gvproxy-min, which this proof never touches)"
+    else
+      echo "package-path half SKIPPED (/usr/bin is not writable on this lane) — the /usr/bin/gvproxy-min probe order is pinned by the switch crate's resolver tests"
+    fi
+  fi
+
+  # Leave the lane as it was: the installed daemon stopped, so the next proof
+  # auto-respawns the checkout's own pair from the restored PATH.
+  mnl stop --force >/dev/null 2>&1 || true
+); then
+  :
+else
+  fail
+fi
+echo "fresh-install loopback publish OK (installed pair, shipped switch, host-loopback answer, logged expose)"
+echo "::endgroup::"
 }
 
 # ---------------------------------------------------------------------------
@@ -3370,12 +3794,14 @@ case "${1:-}" in
     proof_skip_scaffold
     proof_sandbox
     proof_restart
+    proof_fresh_install_own_ip_ingress_publishes_loopback
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
     proof_retired_surfaces_gone
     ;;
   lifecycle | session_exec | session_outbound_request | own_ip | task_run | hooks \
-    | skip_scaffold | sandbox | restart | hostnames_recover_and_two_daemons_route \
+    | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
+    | hostnames_recover_and_two_daemons_route \
     | min_internal_names_through_proxy | retired_surfaces_gone)
     "proof_$1"
     ;;
@@ -3383,7 +3809,8 @@ case "${1:-}" in
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
     echo "  cases: lifecycle session_exec session_outbound_request own_ip task_run hooks"
-    echo "         skip_scaffold sandbox restart hostnames_recover_and_two_daemons_route"
+    echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
+    echo "         hostnames_recover_and_two_daemons_route"
     echo "         min_internal_names_through_proxy retired_surfaces_gone"
     exit 2
     ;;
