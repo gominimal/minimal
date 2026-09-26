@@ -913,14 +913,14 @@ mod tests {
 
         // The stub named — alone or beside foreign servers — is a host the
         // command works on: no blocker, the command is named.
+        assert!(stub_bypass_blocker(Some(domain), Some("nameserver 127.0.0.53\n")).is_none());
         assert!(
-            stub_bypass_blocker(Some(domain), Some("nameserver 127.0.0.53\n")).is_none()
+            stub_bypass_blocker(
+                Some(domain),
+                Some("nameserver 192.168.1.1\nnameserver 127.0.0.53\n")
+            )
+            .is_none()
         );
-        assert!(stub_bypass_blocker(
-            Some(domain),
-            Some("nameserver 192.168.1.1\nnameserver 127.0.0.53\n")
-        )
-        .is_none());
 
         // No resolved to configure — `resolvectl domain` did not run — no
         // routing-domain command to withhold, however foreign the file: the
