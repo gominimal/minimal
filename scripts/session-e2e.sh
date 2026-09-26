@@ -86,6 +86,8 @@
 #                                    a real install.sh run ships the switch;
 #                                    own-IP ingress answers at 127.0.0.1:8080
 #   min_internal_names_through_proxy NET-001..004 through the shipped proxy
+#   hostnames_recover_and_two_daemons_route NET-020..027 warning, recovery,
+#                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
 #                                    and a direct-tcpip forward relays for real
 #
@@ -126,6 +128,12 @@ PROXY_SEED_DIR="" # seeded by the min.internal proxy proof; removed on teardown
 PROXY_OWN_SEED_DIR="" # its own-address box's seed; removed on teardown
 PROXY_HOST_DIR="" # the host-loopback dir that proof serves; removed on teardown
 PROXY_HOST_SRV_PID="" # the host-loopback server it starts; killed on teardown
+RECOVER_SEED_DIR="" # the hostnames-recovery proof's seed; removed on teardown
+SECOND_SEED_DIR="" # its second-daemon box's seed; removed on teardown
+RECOVER_STATE2_DIR="" # the second daemon's state base; `mnl2 stop` on teardown
+RECOVER_HOLDER_PID="" # the port holder the recovery proof starts; killed
+RECOVER_SWITCH_SOCK="" # the minvmd switch socket beat C moves; restored
+RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
@@ -354,6 +362,23 @@ teardown() {
   if [ -n "$PROXY_HOST_SRV_PID" ]; then
     kill "$PROXY_HOST_SRV_PID" 2>/dev/null || true
   fi
+  # The hostnames-recovery proof's extras: the port holder it starts, the
+  # second daemon it brings up (its sessions were destroyed in the proof,
+  # but the daemon itself outlives them), and the switch socket beat C may
+  # have moved — restoring it matters on a mid-beat failure, because a VM
+  # lane with the socket gone never recovers its datapath and every later
+  # case (and the soak's next run) would boot into a broken switch.
+  if [ -n "$RECOVER_HOLDER_PID" ]; then
+    kill "$RECOVER_HOLDER_PID" 2>/dev/null || true
+  fi
+  if [ -n "$RECOVER_STATE2_DIR" ]; then
+    min --minimal-dir "$RECOVER_STATE2_DIR" stop --force >/dev/null 2>&1 || true
+  fi
+  if [ -n "$RECOVER_SWITCH_HOLD" ] && [ -n "$RECOVER_SWITCH_SOCK" ]; then
+    mv "$RECOVER_SWITCH_HOLD" "$RECOVER_SWITCH_SOCK" 2>/dev/null || true
+  fi
+  [ -n "$RECOVER_SEED_DIR" ] && rm -rf "$RECOVER_SEED_DIR"
+  [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
   # The forward holds the laptop-side listener; INT is the documented stop,
   # KILL the backstop so a hung relay cannot outlive the run.
@@ -2213,6 +2238,615 @@ fi
 }
 
 # ---------------------------------------------------------------------------
+# Session hostnames that recover, and two daemons sharing one machine, end
+# to end (NET-020..NET-027). Four surfaces, driven the way a person drives
+# them — activate, `min ls`, and a request from inside a box:
+#
+#   A. A held port at activate and on the list (NET-020). A python3 holder
+#      occupies 127.0.0.1:<pin> before the daemon starts, the daemon comes
+#      up pinned to that port (--hostname-proxy-port), and both activate
+#      and `min ls` must say what failed, whose fault it is, and what
+#      clears it — the daemon's bind report, remedy included.
+#   B. Recovery without a restart (NET-021, NET-022). Free the port; the
+#      daemon's own retry loop binds it, `min ls` stops warning and starts
+#      printing the listening line on the SAME daemon process — asserted
+#      by pid continuity, because a restart would clear the warning too.
+#      The daemon log carries the pair the retry leaves: the unavailable
+#      warns with their next-retry schedule, then the recovered/serving
+#      infos that say the listener is back.
+#   C. The lost datapath (NET-023, VM lanes only). The switch socket
+#      disappears from under minvmd; within one monitor period minvmd
+#      must warn that guest attach and egress are down.
+#   D. Two daemons, one machine (NET-024..NET-027). A second daemon under
+#      its own state dir comes up on its own port — its default is busy,
+#      so it selects (NET-025) — `min ls` discovers both ports (NET-026),
+#      and each box's name routes through its OWN daemon while the other
+#      daemon refuses it (NET-027).
+#
+# Lane gating, decided by where the shipped surfaces actually live:
+# beats A, B and D need a host-native daemon the run can pin
+# (--hostname-proxy-port) and a host whose boxes can exec; on a VM lane
+# the guest's pid-1 hardcodes no proxy port (crates/minimald/src/main.rs)
+# and a second daemon there would be another minvmd, so the VM branch
+# proves only beat C. A native lane has no switch, so it prints beat C's
+# skip the same honest way. Nothing is skipped silently: every skip says
+# what it did not assert.
+proof_hostnames_recover_and_two_daemons_route() {
+  echo "::group::hostnames recover, and two daemons share a machine (NET-020..NET-027)"
+
+  # Beat D's in-box responders (the proxy proof's socat form, below). Their
+  # ports are fixed, never OS-assigned: a daemon that finds its port taken
+  # relocates by asking the OS for a free one (crates/minimald/src/server.rs
+  # binds port 0), and the OS only ever hands out ephemeral-range ports — so
+  # neither daemon can land on these, and a responder can never collide with
+  # a proxy listener. The band sits beside the proxy proof's 18080-18082,
+  # which runs only after this proof has torn its boxes down. Both boxes
+  # answer with one marker: the URL's port names the box, so a 200 carrying
+  # it proves the request reached a box of this run through the daemon it
+  # named.
+  RECOVER_BOX_PORT=18080                 # box A's (e2e-recover) responder
+  SECOND_BOX_PORT=18081                  # box B's (e2e-second) responder
+  RECOVER_BOX_MARKER="RECOVER_ROUTED_OK" # what the in-box responders answer
+
+  # The daemon log readers. The log dir is per state base, so the two
+  # daemons of beat D read from different dirs — the helper takes the base;
+  # the first daemon's is this run's $XDG_STATE_HOME/minimal, the second's
+  # is $RECOVER_STATE2_DIR.
+  recover_daemon_log() {
+    find "${1:-$XDG_STATE_HOME/minimal}/logs" -name 'minimald.log.*' -type f 2>/dev/null \
+      | sort | tail -n1
+  }
+  recover_daemon2_log() { recover_daemon_log "$RECOVER_STATE2_DIR"; }
+  recover_minvmd_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f 2>/dev/null \
+      | sort | tail -n1
+  }
+
+  # Whether 127.0.0.1:$1 is free to bind — the probe that picks the pin,
+  # then confirms the holder took it. Deliberately a bind probe, not a
+  # connect one: a held-but-never-listening socket is exactly the situation
+  # beat A stages.
+  recover_port_free() {
+    python3 -c 'import socket,sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+s.close()' "$1"
+  }
+
+  # One request through ONE daemon's proxy, reported: runner ($1 — `mnl` or
+  # `mnl2`), box ($2), proxy address ($3), URL ($4), label ($5). Sets
+  # RECOVER_STATUS / RECOVER_BODY for `recover_route_want`, and prints each
+  # request with its status so the transcript reads as the run's narrative.
+  recover_route() {
+    local runner="$1" box="$2" proxy_addr="$3" url="$4"
+    RECOVER_ROUTE_LABEL="$5"
+    RECOVER_STATUS="$("$runner" session exec "$box" \
+      "curl -sS --max-time 20 -x http://$proxy_addr -o /home/proxy.body -w '%{http_code}' '$url'" \
+      2>"$WORK/recover-curl.err" | tail -n1 | tr -d '\r\n')"
+    if [ ! -s "$WORK/recover-curl.err" ] && [ -z "$RECOVER_STATUS" ]; then
+      echo "::error::$RECOVER_ROUTE_LABEL: curl produced no status (exec output empty)"
+      fail
+    fi
+    RECOVER_BODY="$("$runner" session exec "$box" 'cat /home/proxy.body' 2>/dev/null || true)"
+    echo "$RECOVER_ROUTE_LABEL: GET $url via $proxy_addr -> HTTP ${RECOVER_STATUS:-<none>} ${RECOVER_BODY:0:48}"
+  }
+  # Asserts the last `recover_route`: $1 = the HTTP status, $2 = a substring
+  # the body must carry ("" to skip).
+  recover_route_want() {
+    if [ "${RECOVER_STATUS:-}" != "$1" ]; then
+      echo "::error::$RECOVER_ROUTE_LABEL: expected HTTP $1, got '${RECOVER_STATUS:-<none>}'"
+      echo "--- curl stderr ---"; cat "$WORK/recover-curl.err" 2>/dev/null || true
+      fail
+    fi
+    if [ -n "$2" ] && [[ "${RECOVER_BODY:-}" != *"$2"* ]]; then
+      echo "::error::$RECOVER_ROUTE_LABEL: the answer does not carry '$2' (got: '${RECOVER_BODY:-<empty>}')"
+      fail
+    fi
+  }
+
+  # The in-box responder of beat D — the proxy proof's socat form verbatim:
+  # socat is a launcher baseline package every box ships at /usr/bin, and
+  # the response is written by the SESSION's shell so the Content-Length
+  # can never drift from the body it frames.
+  # $1 = runner, $2 = session id, $3 = the port the responder listens on.
+  recover_start_responder() {
+    local runner="$1" sid="$2" port="$3" ready
+    "$runner" session exec "$sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
+      || { echo "::error::the session has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; fail; }
+    "$runner" session exec "$sid" \
+      "body=$RECOVER_BOX_MARKER; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
+      >/dev/null 2>"$WORK/recover-responder.err" \
+      || { echo "::error::could not write the in-box responder's response"; cat "$WORK/recover-responder.err" 2>/dev/null || true; fail; }
+    "$runner" session exec "$sid" \
+      "nohup /usr/bin/socat TCP-LISTEN:$port,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>"$WORK/recover-responder.err" \
+      || { echo "::error::could not start the in-box responder"; cat "$WORK/recover-responder.err" 2>/dev/null || true; fail; }
+    ready=""
+    for _ in $(seq 1 40); do
+      if [ "$("$runner" session exec "$sid" \
+        "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$port/" \
+        2>/dev/null || true)" = "200" ]; then
+        ready=1; break
+      fi
+      sleep 0.25
+    done
+    if [ -z "$ready" ]; then
+      echo "::error::the in-box responder never answered a direct curl on 127.0.0.1:$port"
+      echo "--- responder stderr ---"; cat "$WORK/recover-responder.err" 2>/dev/null || true
+      fail
+    fi
+  }
+
+  # Tear-down of the two-daemon half, shared by its normal end and its
+  # degradation path. The second daemon must never leak: it would keep
+  # holding whatever port it selected, and the next run's pick (or the soak's
+  # next rep) would inherit the confusion this case exists to explain.
+  recover_two_daemon_cleanup() {
+    mnl session destroy --force "$recover_sid" >/dev/null 2>&1 || true
+    if [ -n "${second_sid:-}" ]; then
+      mnl2 session destroy --force "$second_sid" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$RECOVER_STATE2_DIR" ]; then
+      mnl2 stop >/dev/null 2>&1 || true
+    fi
+    RECOVER_STATE2_DIR=""
+    if [ -n "$SAVED_RUST_LOG" ]; then
+      export RUST_LOG="$SAVED_RUST_LOG"
+    else
+      unset RUST_LOG
+    fi
+  }
+
+  # Skips degrade by observed fact and only ever on a developer host: CI
+  # sets CI=true on every lane, and E2E_VM marks the VM-backed targets —
+  # a tripped gate there is a lane-level fault, not a degraded proof.
+  recover_gate_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
+
+  # The pids whose cmdline carries $1, straight off /proc — pgrep -f's
+  # answer without the procps dependency (musl guest images and slim CI
+  # images both lack it). Beat B reads the pinned daemon's pid from here
+  # twice, to prove the recovery happened without a restart.
+  recover_pids_for() {
+    local proc entry pat="$1"
+    for proc in /proc/[0-9]*; do
+      [ -r "$proc/cmdline" ] || continue
+      # 2>/dev/null BEFORE the file redirect: a pid can vanish between the
+      # glob and the open, and the shell reports the failed redirect to the
+      # stderr in effect at that point — discard it first, or every scan
+      # prints noise for pids that died mid-scan.
+      entry="$(tr '\0' ' ' 2>/dev/null <"$proc/cmdline" || true)"
+      case "$entry" in
+        *"$pat"*) printf '%s\n' "${proc#/proc/}" ;;
+      esac
+    done
+  }
+
+  # ---- the VM branch: only beat C exists there ----------------------------
+  if [ "$min_daemon" = minvmd ]; then
+    mnl ls >/dev/null 2>&1 || true # a standalone run: make sure the VM is up
+    RECOVER_SWITCH_SOCK="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-switch.sock"
+    for _ in $(seq 1 120); do
+      [ -S "$RECOVER_SWITCH_SOCK" ] && break
+      sleep 1
+    done
+    if [ ! -S "$RECOVER_SWITCH_SOCK" ]; then
+      if [ -n "${MINVMD_GVPROXY_BIN:-}" ]; then
+        echo "::error::the minvmd switch socket never appeared at $RECOVER_SWITCH_SOCK — there is no datapath to lose, so NET-023 cannot be proven"
+        fail
+      fi
+      echo "beat C (lost switch datapath) SKIPPED: this minvmd runs switchless (no MINVMD_GVPROXY_BIN), so there is no datapath to lose"
+      echo "  (asserted here: nothing — NET-023 needs a switch; the switch lanes carry the assertion)"
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "beat C: the switch socket is $RECOVER_SWITCH_SOCK"
+
+    # The monitor polls every 30 s (crates/minvmd/src/net.rs
+    # DEFAULT_DATAPATH_CHECK_INTERVAL), so the warn lands within a minute
+    # of the socket going away. Move the socket aside — the daemon's connect
+    # then fails with ENOENT, the same fact a crashed gvproxy presents.
+    recover_vmd_log="$(recover_minvmd_log)"
+    recover_vmd_lines=0
+    if [ -n "$recover_vmd_log" ]; then
+      recover_vmd_lines="$(wc -l <"$recover_vmd_log" | tr -d ' ')"
+    fi
+    recover_t0="$(now_ms)"
+    mv "$RECOVER_SWITCH_SOCK" "$WORK/gvproxy-switch.sock.hold"
+    RECOVER_SWITCH_HOLD="$WORK/gvproxy-switch.sock.hold"
+    echo "switch socket moved aside at t=0; minvmd's monitor should warn within its 30 s period"
+
+    recover_lost_record=""
+    for _ in $(seq 1 60); do
+      recover_vmd_log="$(recover_minvmd_log)"
+      if [ -n "$recover_vmd_log" ]; then
+        recover_lost_record="$(tail -n "+$((recover_vmd_lines + 1))" "$recover_vmd_log" 2>/dev/null \
+          | grep -F -- 'switch datapath lost' | tail -n1 || true)"
+        [ -n "$recover_lost_record" ] && break
+      fi
+      sleep 1
+    done
+    if [ -z "$recover_lost_record" ]; then
+      echo "::error::minvmd did not warn 'switch datapath lost' within a minute of the socket disappearing (NET-023)"
+      echo "--- minvmd log (tail) ---"
+      tail -20 "${recover_vmd_log:-<no minvmd log>}" 2>/dev/null || true
+      fail
+    fi
+    echo "minvmd warned $(( "$(now_ms)" - recover_t0 )) ms after the socket disappeared"
+    echo "minvmd log: $recover_lost_record"
+
+    # Put the datapath back before anything else runs on this VM — a lane
+    # that continues switchless would fail everywhere else, and teardown
+    # restores it too if something below fails mid-beat.
+    mv "$RECOVER_SWITCH_HOLD" "$RECOVER_SWITCH_SOCK"
+    RECOVER_SWITCH_HOLD=""
+    for _ in $(seq 1 40); do
+      [ -S "$RECOVER_SWITCH_SOCK" ] && break
+      sleep 0.25
+    done
+    if [ ! -S "$RECOVER_SWITCH_SOCK" ]; then
+      echo "::error::the switch socket did not come back after the restore — the VM's datapath is still down for whatever runs next"
+      fail
+    fi
+    echo "switch socket restored"
+
+    # Beats A, B, D need a host-native daemon this run can pin; the guest
+    # daemon's pid-1 hardcodes no --hostname-proxy-port, and a second
+    # daemon here would be another minvmd — neither story is stageable on
+    # a VM lane, and the minvmd net.rs unit tests pin the warn's emission.
+    echo "beats A/B/D SKIPPED on this lane: the daemon is the guest's pid-1 (no pin-able --hostname-proxy-port)"
+    echo "  (asserted here: NET-023, beat C above; the pid-1 posture is crates/minimald/src/main.rs)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # ---- the native branch: beats A, B, D -----------------------------------
+  #
+  # The daemon's filter comes from RUST_LOG at spawn, and this lane runs it
+  # at `warn` — which drops the INFO records beat B asserts (recovered,
+  # serving). Stop whatever daemon a previous proof left and spawn this
+  # case's own, pinned, with minimald::server at info. `run --detach`
+  # returns only once the daemon is listening, so there is no autospawn
+  # race behind it.
+  mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
+  SAVED_RUST_LOG="${RUST_LOG:-}"
+  export RUST_LOG="warn,minimald::server=info"
+
+  # Pick the port the story holds: 7654 first — the documented default, the
+  # one every HTTP(S)_PROXY recipe assumes — falling back to spares on a
+  # dev host where a daemon outside this run already owns it. Either way
+  # the invariant beat D needs holds: 7654 is busy when the second daemon
+  # starts, so it always ends up relocating to a selected port.
+  RECOVER_PIN=""
+  for recover_cand in 7654 18754 18755; do
+    if recover_port_free "$recover_cand"; then RECOVER_PIN="$recover_cand"; break; fi
+  done
+  if [ -z "$RECOVER_PIN" ]; then
+    echo "::error::no free candidate port among 7654/18754/18755 to stage the held-port story on"
+    fail
+  fi
+  echo "beat A: pinning the daemon to 127.0.0.1:$RECOVER_PIN and holding it"
+
+  python3 -c 'import socket,sys,time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(1)
+while True:
+    time.sleep(3600)' "$RECOVER_PIN" \
+    >/dev/null 2>"$WORK/recover-holder.err" &
+  RECOVER_HOLDER_PID=$!
+  holder_bound=""
+  for _ in $(seq 1 40); do
+    if ! recover_port_free "$RECOVER_PIN"; then holder_bound=1; break; fi
+    sleep 0.25
+  done
+  if [ -z "$holder_bound" ]; then
+    echo "::error::the port holder never took 127.0.0.1:$RECOVER_PIN — the story cannot be staged"
+    echo "--- holder stderr ---"; cat "$WORK/recover-holder.err" 2>/dev/null || true
+    fail
+  fi
+  echo "port holder: python3 holding 127.0.0.1:$RECOVER_PIN (pid $RECOVER_HOLDER_PID)"
+
+  minimald run --detach --instance-num 0 --hostname-proxy-port "$RECOVER_PIN" \
+    >"$WORK/recover-spawn.out" 2>"$WORK/recover-spawn.err" \
+    || { echo "::error::could not spawn the daemon pinned to 127.0.0.1:$RECOVER_PIN"
+         echo "--- spawn stderr ---"; cat "$WORK/recover-spawn.err" 2>/dev/null || true
+         fail; }
+
+  # ---- beat A: the reason and the remedy, at activate and on the list -----
+  RECOVER_SEED_DIR="$(hook_mktemp /tmp/mnlrc.XXXXXX)"
+  hook_seed_preamble > "$RECOVER_SEED_DIR/minimal.toml"
+  mkdir "$RECOVER_SEED_DIR/.git"
+  recover_sid="$(cd "$RECOVER_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-recover 2>"$WORK/recover-activate.err")" \
+    || { echo "::error::'min session activate' against the pinned daemon failed"
+         echo "--- stderr ---"; cat "$WORK/recover-activate.err" 2>/dev/null || true
+         fail; }
+  recover_sid="$(printf '%s\n' "$recover_sid" | tail -n1 | tr -d '\r')"
+
+  recover_activate_err="$(cat "$WORK/recover-activate.err" 2>/dev/null || true)"
+  case "$recover_activate_err" in
+    *"session hostnames will not route"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
+    *)
+      echo "::error::activate against the held port did not warn with the reason and the remedy (NET-020)"
+      echo "--- activate stderr ---"; cat "$WORK/recover-activate.err" 2>/dev/null || true
+      fail
+      ;;
+  esac
+  if ! grep -F -q -- 'min session activate' "$WORK/recover-activate.err" \
+     || ! grep -F -q -- 'again to check' "$WORK/recover-activate.err"; then
+    echo "::error::the activate warning's recovery sentence does not name the command it rode on (NET-020)"
+    echo "--- activate stderr ---"; cat "$WORK/recover-activate.err" 2>/dev/null || true
+    fail
+  fi
+  echo "activate warned:"; sed 's/^/  /' "$WORK/recover-activate.err"
+
+  recover_ls_out="$(mnl ls 2>&1)"
+  case "$recover_ls_out" in
+    *"session hostnames will not route"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
+    *)
+      echo "::error::min ls against the held port did not warn with the reason and the remedy (NET-020)"
+      echo "--- min ls output ---"; printf '%s\n' "$recover_ls_out"
+      fail
+      ;;
+  esac
+  if ! printf '%s\n' "$recover_ls_out" | grep -F -q -- 'again to check' \
+     || ! printf '%s\n' "$recover_ls_out" | grep -F -q -- 'min ls'; then
+    echo "::error::the ls warning's recovery sentence does not name the command it rode on (NET-020)"
+    echo "--- min ls output ---"; printf '%s\n' "$recover_ls_out"
+    fail
+  fi
+  printf '%s\n' "$recover_ls_out" | grep -F -- 'session hostnames will not route' | sed 's/^/  /'
+
+  # The daemon log's own record: the warn the retry left, with its status
+  # and next-retry schedule (the file log is JSON lines).
+  recover_bind_record=""
+  for _ in $(seq 1 20); do
+    recover_bind_record="$(grep -F -- "could not bind 127.0.0.1:$RECOVER_PIN" \
+      "$(recover_daemon_log)" 2>/dev/null | tail -n1 || true)"
+    [ -n "$recover_bind_record" ] && break
+    sleep 0.25
+  done
+  if [ -z "$recover_bind_record" ]; then
+    echo "::error::no bind-failure record for 127.0.0.1:$RECOVER_PIN in the daemon log (the diagnostics bundle tails this log — it must carry the story)"
+    echo "--- daemon log (tail) ---"; tail -20 "$(recover_daemon_log)" 2>/dev/null || true
+    fail
+  fi
+  # Two separate substring checks, never one ordered glob: the file log is
+  # JSON with its fields rendered alphabetically, so "next_retry" sorts
+  # BEFORE "status" and a single `*status*next_retry*` pattern could never
+  # match a real record.
+  case "$recover_bind_record" in
+    *'"status":"unavailable"'*) ;;
+    *)
+      echo "::error::the bind-failure record does not carry its unavailable status"
+      echo "--- record ---"; printf '%s\n' "$recover_bind_record"
+      fail
+      ;;
+  esac
+  case "$recover_bind_record" in
+    *'"next_retry"'*) ;;
+    *)
+      echo "::error::the bind-failure record does not carry its next-retry schedule"
+      echo "--- record ---"; printf '%s\n' "$recover_bind_record"
+      fail
+      ;;
+  esac
+  echo "daemon log: $recover_bind_record"
+
+  # ---- beat B: free the port; recovery, no restart ------------------------
+  recover_pid_before="$(recover_pids_for "hostname-proxy-port $RECOVER_PIN" | head -n1)"
+  if [ -z "$recover_pid_before" ]; then
+    echo "::error::cannot find the daemon pinned to --hostname-proxy-port $RECOVER_PIN — the no-restart proof has no pid to compare"
+    fail
+  fi
+  echo "beat B: freeing 127.0.0.1:$RECOVER_PIN (killing the holder, pid $RECOVER_HOLDER_PID)"
+  kill "$RECOVER_HOLDER_PID" 2>/dev/null || true
+  RECOVER_HOLDER_PID=""
+
+  # The retry loop's next attempt is at most one backoff cap (30 s) away,
+  # so 90 one-second ls polls is generous. Cleared means BOTH halves: the
+  # warning gone AND the listening line on the pinned port.
+  recover_cleared=""
+  for recover_try in $(seq 1 90); do
+    recover_ls_after="$(mnl ls 2>&1)"
+    recover_port_now="$(printf '%s\n' "$recover_ls_after" | grep -F -- 'HOSTNAME PROXY' \
+      | grep -oE '127\.0\.0\.1:[0-9]+' | head -n1 | cut -d: -f2 || true)"
+    if [ "$recover_port_now" = "$RECOVER_PIN" ]; then
+      case "$recover_ls_after" in
+        *"session hostnames will not route"*) ;; # serving but still warning: keep polling
+        *) recover_cleared=1; break ;;
+      esac
+    fi
+    sleep 1
+  done
+  if [ -z "$recover_cleared" ]; then
+    echo "::error::min ls did not clear the warning and report the pinned listener back after the port was freed (NET-021, NET-022)"
+    echo "--- last min ls output ---"; printf '%s\n' "${recover_ls_after:-<none>}"
+    fail
+  fi
+  echo "min ls cleared the warning after ${recover_try} one-second poll(s); it now reads:"
+  printf '%s\n' "$recover_ls_after" | grep -E -- 'HOSTNAME PROXY|ZONE ANSWERER' | sed 's/^/  /'
+
+  recover_pid_after="$(recover_pids_for "hostname-proxy-port $RECOVER_PIN" | head -n1)"
+  if [ "$recover_pid_after" != "$recover_pid_before" ]; then
+    echo "::error::the daemon's pid changed across the recovery ($recover_pid_before -> ${recover_pid_after:-<none>}) — a restart clears the warning too, so this proves nothing (NET-022 is about the daemon recovering on its own)"
+    fail
+  fi
+  echo "daemon pid unchanged across the recovery ($recover_pid_before): no restart"
+
+  recover_recover_record=""
+  for _ in $(seq 1 30); do
+    recover_recover_record="$(grep -F -- 'host-side proxy is serving after retrying' \
+      "$(recover_daemon_log)" 2>/dev/null | tail -n1 || true)"
+    [ -n "$recover_recover_record" ] && break
+    sleep 1
+  done
+  if [ -z "$recover_recover_record" ]; then
+    echo "::error::no 'serving after retrying' record in the daemon log — the retry's recovery is the diagnostics story NET-021 owes"
+    echo "--- daemon log (tail) ---"; tail -20 "$(recover_daemon_log)" 2>/dev/null || true
+    fail
+  fi
+  case "$recover_recover_record" in
+    *'"status":"recovered"'*) ;;
+    *)
+      echo "::error::the recovered record does not carry its recovered status"
+      echo "--- record ---"; printf '%s\n' "$recover_recover_record"
+      fail
+      ;;
+  esac
+  case "$recover_recover_record" in
+    *"\"addr\":\"127.0.0.1:$RECOVER_PIN\""*) ;;
+    *)
+      echo "::error::the recovered record does not name the recovered address"
+      echo "--- record ---"; printf '%s\n' "$recover_recover_record"
+      fail
+      ;;
+  esac
+  echo "daemon log: $recover_recover_record"
+
+  recover_serving_record="$(grep -F -- 'hostname proxy is serving on its configured port' \
+    "$(recover_daemon_log)" 2>/dev/null | tail -n1 || true)"
+  case "$recover_serving_record" in
+    *"\"port\":$RECOVER_PIN"*) ;;
+    "" | *)
+      echo "::error::no serving record for the pinned port in the daemon log"
+      echo "--- record ---"; printf '%s\n' "${recover_serving_record:-<none>}"
+      fail
+      ;;
+  esac
+  echo "daemon log: $recover_serving_record"
+
+  # ---- beat D: a second daemon on the same machine ------------------------
+  echo "beat D: a second daemon under its own state dir"
+  RECOVER_STATE2_DIR="$WORK/state2"
+  mkdir -p "$RECOVER_STATE2_DIR"
+  mnl2() { min --minimal-dir "$RECOVER_STATE2_DIR" "$@"; }
+
+  # Boot it through the CLI's own autospawn, then read the port `min ls`
+  # discovers (NET-026): the default is busy (the first daemon holds 7654,
+  # or the dev daemon that made us pick a spare pin does), so this daemon
+  # selects a free one (NET-025) and reports it.
+  recover_ls2=""
+  for _ in $(seq 1 60); do
+    if recover_ls2="$(mnl2 ls 2>&1)"; then break; fi
+    sleep 0.5
+  done
+  recover_port2=""
+  if [ -n "$recover_ls2" ]; then
+    recover_port2="$(printf '%s\n' "$recover_ls2" | grep -F -- 'HOSTNAME PROXY' \
+      | grep -oE '127\.0\.0\.1:[0-9]+' | head -n1 | cut -d: -f2 || true)"
+  fi
+  for _ in $(seq 1 60); do
+    [ -n "$recover_port2" ] && break
+    recover_ls2="$(mnl2 ls 2>&1)"
+    recover_port2="$(printf '%s\n' "$recover_ls2" | grep -F -- 'HOSTNAME PROXY' \
+      | grep -oE '127\.0\.0\.1:[0-9]+' | head -n1 | cut -d: -f2 || true)"
+    sleep 0.5
+  done
+  if [ -z "$recover_port2" ]; then
+    echo "::error::the second daemon never reported a HOSTNAME PROXY port (NET-026)"
+    echo "--- min ls output ---"; printf '%s\n' "${recover_ls2:-<none>}"
+    fail
+  fi
+  if [ "$recover_port2" = "$RECOVER_PIN" ]; then
+    echo "::error::both daemons report the same proxy port 127.0.0.1:$recover_port2 — the second one should have relocated off its busy default (NET-025)"
+    fail
+  fi
+  echo "two daemons: one on 127.0.0.1:$RECOVER_PIN, two on 127.0.0.1:$recover_port2 (both from min ls discovery)"
+
+  # The in-box half of NET-027 needs a box whose sandbox can exec. Same
+  # gate as the proxy proof's: fail on CI or a VM lane, degrade honestly
+  # for a developer host whose sandbox denies the nested namespaces.
+  if ! mnl session exec "$recover_sid" 'true' >"$WORK/recover-execgate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$recover_sid" 'true' >"$WORK/recover-execgate.err" 2>&1; }; then
+    if recover_gate_can_skip; then
+      echo "::warning::two-daemon routing half SKIPPED — this host cannot run a session sandbox"
+      echo "  (exec: $(head -n1 "$WORK/recover-execgate.err" 2>/dev/null || true))"
+      echo "  asserted here: both daemons came up on distinct discovered ports (the lines above)."
+      echo "  the per-daemon routing matrix needs boxes that can exec; on CI or a VM lane this gate fails instead"
+      recover_two_daemon_cleanup
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::this lane cannot run a session sandbox, so no in-box request can be sent"
+    echo "  (exec: $(head -n1 "$WORK/recover-execgate.err" 2>/dev/null || true))"
+    fail
+  fi
+
+  SECOND_SEED_DIR="$(hook_mktemp /tmp/mnlr2.XXXXXX)"
+  hook_seed_preamble > "$SECOND_SEED_DIR/minimal.toml"
+  mkdir "$SECOND_SEED_DIR/.git"
+  second_sid="$(cd "$SECOND_SEED_DIR" && mnl2 session activate . --no-prompt \
+    --name e2e-second 2>"$WORK/recover-second-activate.err")" \
+    || { echo "::error::'min session activate' on the second daemon failed"
+         echo "--- stderr ---"; cat "$WORK/recover-second-activate.err" 2>/dev/null || true
+         fail; }
+  second_sid="$(printf '%s\n' "$second_sid" | tail -n1 | tr -d '\r')"
+  echo "second box: $second_sid on daemon 2"
+
+  recover_start_responder mnl "$recover_sid" "$RECOVER_BOX_PORT"
+  recover_start_responder mnl2 "$second_sid" "$SECOND_BOX_PORT"
+
+  # The routing matrix: each name routes through its OWN daemon — and
+  # through the port `min ls` discovered for it — while the OTHER daemon
+  # refuses it, because a registry is per daemon (NET-027).
+  recover_route mnl "$recover_sid" "127.0.0.1:$RECOVER_PIN" \
+    "http://e2e-recover.min.internal:$RECOVER_BOX_PORT/" \
+    "NET-027: box A's name routes through daemon 1 on the port min discovered"
+  recover_route_want 200 "$RECOVER_BOX_MARKER"
+  recover_route mnl2 "$second_sid" "127.0.0.1:$recover_port2" \
+    "http://e2e-second.min.internal:$SECOND_BOX_PORT/" \
+    "NET-027: box B's name routes through daemon 2 on the port min discovered"
+  recover_route_want 200 "$RECOVER_BOX_MARKER"
+  recover_route mnl "$recover_sid" "127.0.0.1:$recover_port2" \
+    "http://e2e-recover.min.internal:$RECOVER_BOX_PORT/" \
+    "NET-027: daemon 2 does not know box A's name — it refuses"
+  recover_route_want 502 ""
+  recover_route mnl2 "$second_sid" "127.0.0.1:$RECOVER_PIN" \
+    "http://e2e-second.min.internal:$SECOND_BOX_PORT/" \
+    "NET-027: daemon 1 does not know box B's name — it refuses"
+  recover_route_want 502 ""
+
+  # Daemon 2's log tells its half of the story: the relocation warn (its
+  # default was busy) and the serving record naming the selected port.
+  recover_reloc_record=""
+  for _ in $(seq 1 20); do
+    recover_reloc_record="$(grep -F -- 'the default hostname-proxy port is busy' \
+      "$(recover_daemon2_log)" 2>/dev/null | tail -n1 || true)"
+    [ -n "$recover_reloc_record" ] && break
+    sleep 0.5
+  done
+  if [ -z "$recover_reloc_record" ]; then
+    echo "::error::no relocation record in daemon 2's log — its default port was busy, so NET-025's warn is owed"
+    echo "--- daemon 2 log (tail) ---"; tail -20 "$(recover_daemon2_log)" 2>/dev/null || true
+    fail
+  fi
+  echo "daemon 2 log: $recover_reloc_record"
+
+  recover_serving2_record="$(grep -F -- 'hostname proxy is serving on its selected port' \
+    "$(recover_daemon2_log)" 2>/dev/null | tail -n1 || true)"
+  case "$recover_serving2_record" in
+    *"\"port\":$recover_port2"*) ;;
+    "" | *)
+      echo "::error::daemon 2's serving record does not name the selected port $recover_port2"
+      echo "--- record ---"; printf '%s\n' "${recover_serving2_record:-<none>}"
+      fail
+      ;;
+  esac
+  echo "daemon 2 log: $recover_serving2_record"
+
+  recover_two_daemon_cleanup
+
+  echo "beat C (lost switch datapath) SKIPPED on this native lane: there is no minvmd switch here —"
+  echo "  that record is the VM lanes' assertion (its emission is pinned by the minvmd net.rs unit tests)"
+  echo "hostnames recover and two daemons route OK (reason+remedy at activate and ls, cleared without a restart, second daemon selected and both routed)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # `min.internal` names through the shipped hostname proxy, end to end
 # (NET-001..NET-004). The proxy minimald already serves — the :7654 egress
 # proxy, the one a client reaches as an HTTP(S)_PROXY — is the only thing
@@ -3157,11 +3791,13 @@ case "${1:-}" in
     proof_sandbox
     proof_restart
     proof_fresh_install_own_ip_ingress_publishes_loopback
+    proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
     proof_retired_surfaces_gone
     ;;
   lifecycle | session_exec | session_outbound_request | own_ip | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
+    | hostnames_recover_and_two_daemons_route \
     | min_internal_names_through_proxy | retired_surfaces_gone)
     "proof_$1"
     ;;
@@ -3169,9 +3805,9 @@ case "${1:-}" in
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
     echo "  cases: lifecycle session_exec session_outbound_request own_ip task_run hooks"
-    echo "         skip_scaffold sandbox restart min_internal_names_through_proxy"
-    echo "         fresh_install_own_ip_ingress_publishes_loopback"
-    echo "         retired_surfaces_gone"
+    echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
+    echo "         hostnames_recover_and_two_daemons_route"
+    echo "         min_internal_names_through_proxy retired_surfaces_gone"
     exit 2
     ;;
 esac
