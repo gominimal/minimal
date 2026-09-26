@@ -1706,3 +1706,85 @@ async fn net_forward_closes_with_session() {
         .expect("the forward must exit cleanly");
     echo.abort();
 }
+
+// --- task run stdin pipe (gominimal/inbox#746) ---
+
+/// `min task run` must exit once the task exits, even when its stdin is a
+/// pipe whose writer stays open. The old bridge pumped stdin through
+/// `tokio::io::stdin()`, a blocking `read(0)` parked on tokio's blocking
+/// pool that `pump.abort()` cannot interrupt — so a held-open pipe kept the
+/// runtime alive forever after the task's exit status arrived. Driven
+/// through the compiled binary with the write end deliberately held open,
+/// so the assertion is on the process actually terminating.
+///
+/// Linux-only for the same reason as [`run_min`]: the spawned binary resolves
+/// the native `local-minimald` provider socket, which the harness daemon
+/// serves on a UDS; macOS resolves `local-minvmd` instead.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn task_run_exits_with_held_open_stdin_pipe() {
+    let (_daemon, args) = setup().await;
+    let minimal_dir = args
+        .minimal_dir
+        .as_ref()
+        .expect("setup points at a tempdir");
+
+    // A VCS root so the headless upload gate passes, and a declared echo
+    // task that exits on its own without reading stdin.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "[tasks.e2e-echo]\necho = \"TASK_RUN_STDIN_OK\"\n",
+    )
+    .unwrap();
+
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["-C".as_ref(), project.path().as_os_str()])
+        .args(["task", "run", "e2e-echo"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the min binary should be invocable");
+
+    // Hold the write end open for the whole run: this is the pipe whose
+    // writer "stays open" in the report. Dropping it would EOF the child's
+    // stdin and mask the hang.
+    let _held_stdin = child.stdin.take().expect("stdin is piped");
+
+    let status = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait())
+        .await
+        .expect("min task run must exit even though its stdin pipe stays open")
+        .expect("waiting for min task run");
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(
+        &mut child.stdout.take().expect("stdout is piped"),
+        &mut stdout,
+    )
+    .await
+    .unwrap();
+    tokio::io::AsyncReadExt::read_to_end(
+        &mut child.stderr.take().expect("stderr is piped"),
+        &mut stderr,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        status.success(),
+        "task run must exit 0: stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stdout).contains("TASK_RUN_STDIN_OK"),
+        "task output must stream back: stdout={}",
+        String::from_utf8_lossy(&stdout)
+    );
+}
