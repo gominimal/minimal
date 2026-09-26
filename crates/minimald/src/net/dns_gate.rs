@@ -31,8 +31,11 @@
 //! * **Refusing denied ranges** (NET-067) — an answer the intersection
 //!   refuses never enters the table, and each refusal says so through the
 //!   session's rate limiter with the name and the answer, once per name per
-//!   rule per minute — the same budget and the same log the frame drops
-//!   share.
+//!   rule per minute. The limiter and the warn log are the ones the frame
+//!   drops share; the *bucket* deliberately is not — a refusal keys its
+//!   rate limit by name as well as rule, so a drop's line never silences
+//!   a refused name's, nor one name's burst silence another's
+//!   ([`PolicyWarnLimiter::warn_dns_refusal`]).
 //! * **NODATA for the record types v1 does not carry** (NET-136) — AAAA,
 //!   HTTPS (65) and SVCB (64) queries toward this box's resolver are
 //!   answered empty by the relay itself and never written on to the switch,
@@ -260,8 +263,11 @@ pub(crate) struct DnsGate {
     /// The box's switch IP, the `session_id` of every log line and the
     /// limiter's key.
     label: String,
-    /// The session's rate limiter, shared with the frame-drop warnings so
-    /// every refusal line costs from the same per-box budget.
+    /// The session's rate limiter, the same instance the frame-drop
+    /// warnings emit through: one limiter and one warn log per session
+    /// gate, but not one bucket — the drops key their rate limit by rule
+    /// alone, this gate's refusals by rule and name
+    /// ([`PolicyWarnLimiter::warn_dns_refusal`]).
     limiter: Arc<PolicyWarnLimiter>,
 }
 
