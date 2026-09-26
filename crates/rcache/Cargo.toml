@@ -26,7 +26,5 @@ mfile = { workspace = true }
 lcache = { workspace = true }
 ot = { workspace = true }
 
-[lints.rust]
-# `cfg(kani)` gates the proof harnesses in index_file.rs; declare it so
-# stable rustc's unexpected_cfgs lint accepts the attribute.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+[lints]
+workspace = true
