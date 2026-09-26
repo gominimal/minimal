@@ -286,11 +286,11 @@ impl MacAddr {
 
 /// Renders the gvproxy `-config` YAML for the given subnet and static leases.
 ///
-/// gvproxy v0.8.9 has no `-subnet` CLI flag: the subnet, gateway, NAT alias, and
-/// DHCP static leases are all expressed through a `-config` YAML file (see the
-/// 2026-06-21 spike). gvproxy reads this file only at spawn time; an `OwnIp`
-/// PTask configures its switch address statically rather than via DHCP, so
-/// `dhcpStaticLeases` is a startup-time seed, not a live source.
+/// gvproxy v0.8.9 has no `-subnet` CLI flag: the subnet, gateway, NAT alias, DNS
+/// zone, and DHCP static leases are all expressed through a `-config` YAML file
+/// (see the 2026-06-21 spike). gvproxy reads this file only at spawn time; an
+/// `OwnIp` PTask configures its switch address statically rather than via DHCP,
+/// so `dhcpStaticLeases` is a startup-time seed, not a live source.
 #[must_use]
 pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[(Ipv4Addr, MacAddr)]) -> String {
     let mut s = String::with_capacity(256 + leases.len() * 48);
@@ -303,6 +303,15 @@ pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[(Ipv4Addr, MacAddr)
     s.push_str(&format!("    \"{}\": \"127.0.0.1\"\n", subnet.host_alias()));
     s.push_str("  gatewayVirtualIPs:\n");
     s.push_str(&format!("    - \"{}\"\n", subnet.host_alias()));
+    // NET-003: the switch answers `host.min.internal` itself, with the host
+    // alias — the address its `nat` table maps to the host's loopback. Rendered
+    // from first boot, ahead of any dynamic `min.internal.` registration; the
+    // dynamic `/services/dns/add` merge keeps this record behind new ones.
+    s.push_str("  dns:\n");
+    s.push_str("    - name: \"min.internal.\"\n");
+    s.push_str("      records:\n");
+    s.push_str("        - name: \"host\"\n");
+    s.push_str(&format!("          ip: \"{}\"\n", subnet.host_alias()));
     s.push_str("  dhcpStaticLeases:\n");
     if leases.is_empty() {
         // gvproxy accepts an empty map; keep the key present for clarity.
@@ -375,6 +384,22 @@ mod tests {
         let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
         assert!(yaml.contains("dhcpStaticLeases:\n    {}\n"));
         assert!(yaml.contains("subnet: \"100.64.0.0/16\""));
+    }
+
+    #[test]
+    fn gvproxy_config_carries_host_min_internal() {
+        let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
+        // The static zone record NET-003 renders from first boot: `host`
+        // answered inside the `min.internal.` zone at the NAT'd host-alias
+        // address, so a box resolving the name gets the host's loopback.
+        let zone = concat!(
+            "  dns:\n",
+            "    - name: \"min.internal.\"\n",
+            "      records:\n",
+            "        - name: \"host\"\n",
+            "          ip: \"100.64.255.254\"\n",
+        );
+        assert!(yaml.contains(zone), "config was:\n{yaml}");
     }
 
     // Resolver tests mutate process-global env (MINIMAL_BIN), so serialise

@@ -313,6 +313,23 @@ impl From<common::HardlinkError> for Error {
     }
 }
 
+impl From<rcache::Error<common::fetchers::AnyRespError>> for Error {
+    fn from(value: rcache::Error<common::fetchers::AnyRespError>) -> Self {
+        // The two arms are NOT interchangeable, though they look it:
+        // `rcache::Error`'s `Display` is `write!(f, "{:?}", self)` — it
+        // Debug-formats itself — so the fallback arm renders a `Config` as
+        // `Config("MINIMAL_INDEX_SOURCE: unknown index source \"banana\" ...")`,
+        // variant name and escaped quotes included. Destructuring `Config` and
+        // formatting the inner `msg` is what yields the clean, user-facing
+        // message; collapsing this to one arm reintroduces the panic-era output
+        // it replaced.
+        match value {
+            rcache::Error::Config(msg) => Self::Other(anyhow::anyhow!("{msg}")),
+            other => Self::Other(anyhow::anyhow!("{other}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -47,6 +47,13 @@ async fn run() -> ExitCode {
     let cli = minimal::Cli::parse();
     minimal::theme::install();
 
+    // Publish `--vm` before any path resolution, so the socket, the state dir,
+    // and any autospawn all name the same VM (NET-052).
+    if let Err(e) = cli.global_args.publish_vm_name() {
+        eprintln!("error: {e:#}");
+        return ExitCode::FAILURE;
+    }
+
     let registry = tracing_subscriber::registry().with(filter);
     // `min dash` owns the terminal (alternate screen); a log line landing on
     // stdout/stderr would corrupt the frame. Log to <state>/dash.log

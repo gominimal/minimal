@@ -68,7 +68,7 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
         ctx.download_if_available(
             g,
             if args.filter_names.is_empty() {
-                g.from_origin(&ctx.repo_origin()).collect()
+                g.from_origin(&ctx.repo_origin()?).collect()
             } else {
                 g.top_levels
                     .iter()

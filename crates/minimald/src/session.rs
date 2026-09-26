@@ -384,6 +384,11 @@ enum SessionMessage {
     /// Hand back an `Arc` clone of this session's hook-scripts-upload lock,
     /// see [`Session::hook_scripts_upload_lock`].
     GetHookScriptsUploadLock(oneshot::Sender<Arc<Mutex<()>>>),
+    /// Register a live direct-tcpip forward relay as belonging to this
+    /// session, so teardown takes it down too: a session that goes away
+    /// aborts its forwards rather than leaving relays pointing into a box
+    /// that no longer exists.
+    TrackForward(tokio::task::AbortHandle),
     /// Kick off a background package build as a session side-op. Replies with
     /// the receiver end of the build's event stream.
     StartBuild {
@@ -480,6 +485,12 @@ pub struct Session {
     /// What brought the currently held host up, which decides whether an
     /// interactive attach may respawn it. See [`HostOrigin`].
     host_origin: HostOrigin,
+
+    /// The live direct-tcpip forwards opened for this session: one abort
+    /// handle per relay the connection layer spawned. Pruned as relays
+    /// finish; every live one is aborted by [`Session::stop_running`], so a
+    /// session that goes away takes its forwards down with it (NET-105).
+    forwards: Vec<tokio::task::AbortHandle>,
 }
 
 /// Why a session host was launched.
@@ -543,6 +554,9 @@ impl Session {
             // conservative default — it is the one value that never licenses
             // a respawn.
             host_origin: HostOrigin::Interactive,
+            // Forwards are registered as their channels open; a session
+            // starts with none.
+            forwards: Vec::new(),
             #[cfg(target_os = "linux")]
             hostnames,
         }
@@ -630,10 +644,12 @@ impl Session {
         Ok(SessionHandle(sender))
     }
 
-    /// Register this session's PTask hostname (R3.1/R3.6). Both HostNet and
-    /// OwnIp resolve to loopback: a HostNet PTask's listeners are on host
-    /// loopback; an OwnIp PTask is reached through a gvproxy-published
-    /// loopback port (#542, the published-loopback model). A NoNet PTask
+    /// Register this session's PTask hostname (R3.1/R3.6). A HostNet PTask's
+    /// listeners are on host loopback. An OwnIp PTask routes once the attach
+    /// path has reported its lease — at spawn that report has not happened
+    /// yet, so this registers nothing and the route appears when the box
+    /// attaches (NET-001); on a rename or re-finalize the reported lease is
+    /// already on file and the name re-registers against it. A NoNet PTask
     /// exposes no services, so it is not registered — and neither is a
     /// `Draft` session, which has nothing to route to until its composition
     /// finalizes.
@@ -670,23 +686,31 @@ impl Session {
             )
     }
 
-    /// Withdraw this session's PTask hostname (R3.5).
+    /// Withdraw this session's PTask hostname (R3.5), and — when the session
+    /// is ending for good — drop its lease fact, so the registry does not
+    /// outlive the box it pointed at.
     ///
     /// Gated on [`Self::owns_hostname_route`] rather than relying on the
     /// registry's no-op behavior: the registry is keyed by name alone, so an
     /// ungated deregister from a session that never registered (`Draft`, or
     /// a non-routable mode) could withdraw an *unrelated* session's route
-    /// that happens to share the same derived name.
+    /// that happens to share the same derived name. A rename withdraws with
+    /// the lease kept: the re-register that follows it routes at the same box
+    /// (NET-001).
     #[cfg(target_os = "linux")]
-    async fn deregister_hostname(&self) {
+    async fn deregister_hostname(&self, for_good: bool) {
         let record = self.record.record().await.unwrap();
+        let mut reg = self
+            .hostnames
+            .write()
+            .expect("hostname registry lock poisoned");
+        if for_good {
+            reg.forget_own_address(record.id);
+        }
         if !self.owns_hostname_route(&record) {
             return;
         }
-        self.hostnames
-            .write()
-            .expect("hostname registry lock poisoned")
-            .deregister(&registry_name(&record));
+        reg.deregister(&registry_name(&record));
     }
 
     /// The async task which handles interactions with the session.
@@ -857,7 +881,7 @@ impl Session {
             SessionMessage::Stop(r) => {
                 self.stop_running(true).await;
                 #[cfg(target_os = "linux")]
-                self.deregister_hostname().await;
+                self.deregister_hostname(true).await;
                 let _ = r.send(());
                 return ControlFlow::Break(Teardown::ManagerInitiated);
             }
@@ -879,9 +903,10 @@ impl Session {
                 // Withdraw the hostname before the fallible record delete, so
                 // a delete failure leaves a stale on-disk record (repairable
                 // on restart) but never a stale routing entry pointing at a
-                // destroyed session (R3.5).
+                // destroyed session (R3.5). The session is ending for good, so
+                // its lease fact goes with it.
                 #[cfg(target_os = "linux")]
-                self.deregister_hostname().await;
+                self.deregister_hostname(true).await;
                 let _ = r.send(self.record.clone().delete().await);
                 return ControlFlow::Break(Teardown::ManagerInitiated);
             }
@@ -890,6 +915,12 @@ impl Session {
             }
             SessionMessage::GetHookScriptsUploadLock(r) => {
                 let _ = r.send(Arc::clone(&self.hook_scripts_upload_lock));
+            }
+            SessionMessage::TrackForward(forward) => {
+                // Prune the ones that have finished on their own, so the
+                // list holds the live forwards and nothing else.
+                self.forwards.retain(|h| !h.is_finished());
+                self.forwards.push(forward);
             }
             SessionMessage::StartBuild {
                 rebuild,
@@ -1434,6 +1465,14 @@ impl Session {
     /// the daemon-shutdown message (and a terminal reset) rather than a bare
     /// disconnect when the session dies because the daemon is going away.
     async fn stop_running(&mut self, for_shutdown: bool) {
+        // The session's forwards relay into its box: a session that is going
+        // away takes them with it, rather than leaving live relays pointed at
+        // a box that is being torn down. Both teardown paths — `Stop` and
+        // `Destroy` — come through here.
+        for forward in std::mem::take(&mut self.forwards) {
+            forward.abort();
+        }
+
         let inner = match &mut self.inner {
             SessionInner::Active { host, sops, .. } => Some((host.take(), std::mem::take(sops))),
             SessionInner::Draft { .. } => None,
@@ -1455,16 +1494,18 @@ impl Session {
 
     /// Renames the session: persists the new name through the record handle
     /// (a name collision surfaces as the store's `AlreadyExists`), relinks
-    /// the PTask hostname so `<new>.local.min.internal` routes and the old name stops (R3.6).
+    /// the PTask hostname so `<new>.min.internal` routes and the old name
+    /// stops (R3.6).
     async fn rename(&mut self, new_name: String) -> Result<(), std::io::Error> {
         let record = self.record.record().await?;
 
         // Withdraw the route under the pre-rename name before the record
         // mutates; re-register under the new name afterwards. Both calls
         // gate on this session actually owning a route, so a Draft/NoNet
-        // rename never touches the registry.
+        // rename never touches the registry. The lease fact stays: the
+        // re-register routes at the same box (NET-001).
         #[cfg(target_os = "linux")]
-        self.deregister_hostname().await;
+        self.deregister_hostname(false).await;
         let mut new_record = record.clone();
         new_record.name = Some(new_name);
         let written = self.record.write(new_record.clone()).await;
@@ -2138,15 +2179,19 @@ impl Session {
         phase: LaunchPhase,
     ) -> Result<session_host::SandboxLauncher, AttachError> {
         // R2.1: reject a policy that is incompatible with the network mode
-        // (e.g. egress on a non-`OwnIp` PTask) before launching the host.
+        // (e.g. ingress forwards on a non-`OwnIp` PTask) before launching the
+        // host.
         record
             .validate_policy()
             .map_err(AttachError::InvalidPolicy)?;
         let network_mode = record.network;
-        // Only an `OwnIp` PTask attaches to the switch, so ingress forwards are
-        // only carried for that mode; `validate_policy` has already rejected
-        // ingress configured on any other mode.
-        let ingress = record.policy.ingress.clone();
+        // Only an `OwnIp` PTask attaches to the switch, so the policy's relay
+        // halves — egress verdict and ingress forwards — are only consumed in
+        // that mode. `validate_policy` rejects egress rules only on `NoNet`: a
+        // host-address box may carry them (NET-120), and such a box never
+        // reaches the relay. Only the ingress half is own-address-only, and
+        // `validate_policy` has already rejected it on any other mode.
+        let policy = record.policy.clone();
         Ok(session_host::SandboxLauncher {
             ctx: match phase {
                 LaunchPhase::Attached => self.context(true).await,
@@ -2163,7 +2208,14 @@ impl Session {
             attach_env,
             network_mode,
             net_switch: Arc::clone(&self.net_switch),
-            ingress,
+            policy,
+            // The attach reports the lease through this, so the box's
+            // `<name>.min.internal` proxy route exists exactly while the box
+            // does (NET-001).
+            own_address: Some(crate::net::provider::OwnAddressReporter::new(
+                Arc::clone(&self.hostnames),
+                record.id,
+            )),
             composition: self.composition(),
             // A weak handle so in-sandbox `min build` can drive session
             // side-ops without keeping the actor alive past teardown.
@@ -2174,6 +2226,12 @@ impl Session {
     /// Under test, swap in a mock launcher that runs a plain host process wired
     /// to the pty, exercising the session-host runtime without building a real
     /// sandbox (which needs packages unavailable in the unit-test tempdir).
+    ///
+    /// Kept separate from the production launcher: the two return *different*
+    /// launcher types (`SandboxLauncher` vs `MockLauncher`), each with its own
+    /// `SessionProcess`/`SessionGuard` associated types, and `SessionLauncher`
+    /// is not object-safe — merging them would force a boxed/dyn launcher
+    /// through the production spawn path.
     #[cfg(test)]
     async fn session_launcher(
         &mut self,
@@ -2187,7 +2245,7 @@ impl Session {
         record
             .validate_policy()
             .map_err(AttachError::InvalidPolicy)?;
-        Ok(session_host::MockLauncher)
+        Ok(session_host::MockLauncher::default())
     }
 
     /// Return this session's workspace-rooted [`mctx::Context`].
@@ -2223,7 +2281,7 @@ impl Session {
         if record.status != SessionStatus::Active {
             return Err(format!(
                 "session isn't attachable yet (status is {:?}, need Active — \
-                 finish the upload + FinalizeSession sequence first)",
+             finish the upload + FinalizeSession sequence first)",
                 record.status,
             ));
         }
@@ -2273,38 +2331,38 @@ impl Session {
         }
     }
 
-    /// The default `minimal.toml` [`Self::scaffold_mfile_if_missing`] writes:
-    /// `op::InitProject` detects the workspace's stack against the default
-    /// package repo, whose branch head it resolves over the network.
-    #[cfg(not(any(test, feature = "test-support")))]
+    /// The default `minimal.toml` [`Self::scaffold_mfile_if_missing`] writes.
+    ///
+    /// Production: `op::InitProject` detects the workspace's stack against the
+    /// default package repo, whose branch head it resolves over the network.
+    ///
+    /// Under `test`/`test-support`: stand in for that network round-trip. Tests
+    /// run offline, and what they need from the scaffold is that it lands before
+    /// the composition — not what stack detection would have picked. The two
+    /// packages are what `op::InitProject` falls back to when nothing matches.
     fn default_mfile_plan(
         &self,
         wsp: &DaemonAbsPath,
     ) -> Result<(std::path::PathBuf, String), String> {
-        let config = self.workspace_config(wsp)?;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            Ok((
+                wsp.as_utf8_path()
+                    .join(mfile::MFILE_NAME)
+                    .into_std_path_buf(),
+                "[session]\npackages = [\"base\", \"vim\"]\n".to_string(),
+            ))
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let config = self.workspace_config(wsp)?;
 
-        use op::ProjectOp as _;
-        let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
-        let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
+            use op::ProjectOp as _;
+            let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
+            let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
 
-        Ok((plan.toml_path, plan.content))
-    }
-
-    /// Under test, stand in for `op::InitProject`'s network round-trip: tests
-    /// run offline, and what they need from the scaffold is that it lands
-    /// before the composition — not what stack detection would have picked.
-    /// Same two packages `op::InitProject` falls back to when nothing matches.
-    #[cfg(any(test, feature = "test-support"))]
-    fn default_mfile_plan(
-        &self,
-        wsp: &DaemonAbsPath,
-    ) -> Result<(std::path::PathBuf, String), String> {
-        Ok((
-            wsp.as_utf8_path()
-                .join(mfile::MFILE_NAME)
-                .into_std_path_buf(),
-            "[session]\npackages = [\"base\", \"vim\"]\n".to_string(),
-        ))
+            Ok((plan.toml_path, plan.content))
+        }
     }
 
     /// Do the actual context construction: run [`mctx::Context::new`] against
@@ -2733,6 +2791,19 @@ impl SessionHandle {
                 "session actor terminated before the host could be launched",
             ))),
         }
+    }
+
+    /// Registers a forward relay with the session it forwards for, so the
+    /// session aborts it at teardown.
+    ///
+    /// Best-effort by design: a send error means the session actor is
+    /// already gone, in which case the relay is about to learn the same
+    /// thing its client does — there is no session to outlive. The
+    /// connection layer ignores the outcome.
+    pub async fn track_forward(&self, forward: tokio::task::AbortHandle) {
+        // Ignore send errors - a session that is gone has nothing left to
+        // track, and the forward ends with it.
+        let _ = self.0.send(SessionMessage::TrackForward(forward)).await;
     }
 
     pub async fn attach(

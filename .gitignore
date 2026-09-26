@@ -18,3 +18,7 @@ __pycache__/
 
 # just pkg-nfpm default OUT_DIR (scripts/package-nfpm.sh)
 /dist/
+
+# Pinned gvproxy switch binary fetched by scripts/fetch-gvproxy.sh for the
+# netns proofs; never committed.
+/gvproxy

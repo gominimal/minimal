@@ -20,7 +20,7 @@ pub async fn cmd_pkg_upload_cache(
         ctx.graph_from_package_names(args.packages.clone())?
     } else {
         let mut g = ctx.graph_from_all_packages()?;
-        g.top_levels = g.from_origin(&ctx.repo_origin()).collect();
+        g.top_levels = g.from_origin(&ctx.repo_origin()?).collect();
         g
     };
     let cache = ctx.local_cache();

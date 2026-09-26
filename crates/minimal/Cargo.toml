@@ -17,9 +17,9 @@ name = "min"
 path = "src/main.rs"
 
 [features]
-# Off by default: gates the `mesh` and `ssh-forward` CLI subcommands. WireGuard
-# mesh (UC7 / UC2b-A) and the SSH port-forward fallback are deferred for now; the
-# daemon-side `direct-tcpip` handler is behind minimald's `ssh-forward` feature.
+# Off by default: gates the `mesh` CLI subcommand. WireGuard mesh (UC7 / UC2b-A)
+# is deferred for now; the daemon-side `direct-tcpip` handler needs no feature
+# and is served in every build.
 remote-access = []
 
 [dependencies]

@@ -15,18 +15,18 @@ name: CI shell installer
 # trigger-level `paths:` — a path-skipped required context wedges the PR.
 on:
   pull_request:
-    branches: ["main"]
+    branches: ["main", "release/**"]
   push:
-    branches: ["main"]
+    branches: ["main", "release/**"]
   workflow_dispatch:
   # Reused by nightly-tests.yml to re-run the suite against a fresh runner
   # image even when install.sh is untouched (runner-image shell drift).
   workflow_call:
 
-# Cancel superseded runs on a branch; never cancel a run on main.
+# Cancel superseded runs on a branch; never cancel a run on main or release/*.
 concurrency:
   group: ci-shell-installer-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
 
 permissions:
   contents: read

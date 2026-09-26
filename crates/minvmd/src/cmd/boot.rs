@@ -21,6 +21,15 @@ use anyhow::{Result, bail};
 /// `foreground`: if true, block until the VMM child process exits after the VM
 /// is confirmed up.
 pub fn run(foreground: bool) -> Result<()> {
+    // One line per VM start, naming the VM and its state directory (NET-052):
+    // `boot` supervises the boot it performs, so this process is the one that
+    // owns it.
+    tracing::info!(
+        vm = %crate::state::vm_name(),
+        state_dir = %crate::state::provider_dir().display(),
+        "starting VM"
+    );
+
     #[cfg(minvmd_libkrun)]
     return run_boot(foreground);
 
@@ -114,9 +123,9 @@ fn run_boot(foreground: bool) -> Result<()> {
     // a second appender on the same file would interleave with the
     // supervisor's. Its diagnostics ride the hvc0 console into boot.log.
     cmd.env_remove(crate::DETACHED_ENV);
-    if let Some(dir) = crate::state::state_dir_override() {
-        cmd.args(["--minimal-state-dir", dir.as_str()]);
-    }
+    // Forward the state-dir override and VM name so the VMM child resolves the
+    // same per-VM state dir this process does.
+    crate::state::forward_identity(&mut cmd);
     alive_lock.inherit_into(&mut cmd);
     let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
@@ -210,6 +219,10 @@ fn run_boot(foreground: bool) -> Result<()> {
 
     if foreground {
         let status = child.wait().context("waiting for VMM child")?;
+        // The one-per-stop line (NET-055): a foreground `boot` supervises the
+        // VM like `run` does, so a stop of it — `min stop` included — is
+        // observed here, as the VMM child exiting.
+        crate::cmd::log_stopping_vm(state_dir.dir());
         if !status.success() {
             let code = status.code().unwrap_or(-1);
             bail!("VMM child exited with code {code}");

@@ -233,6 +233,25 @@ pub struct ListenArgs {
     #[clap(hide = true)]
     timekeep_listener_port: Option<u32>,
 
+    /// Port the host-side hostname proxy must listen on, when this deployment
+    /// pins one — the port clients point `HTTP(S)_PROXY` at, whose documented
+    /// default is 7654. Unset (the default) tries that default first and only
+    /// when it is busy asks the OS for a free port, which the daemon reports
+    /// wherever a client needs it: `min ls` prints it, and a second daemon on
+    /// the same machine gets its own port instead of silently losing hostname
+    /// routing. A pinned port that is busy stays a hard failure — the
+    /// operator named it, and moving the listener would hide the loss.
+    #[arg(long)]
+    hostname_proxy_port: Option<u16>,
+
+    /// Port the box-zone answerer must listen on (UDP), when this deployment
+    /// pins one — the port the host's resolver is pointed at to answer
+    /// `*.min.internal`, whose documented default is 7656. Unset (the
+    /// default) gives it the same try-the-default-then-select treatment the
+    /// hostname proxy's flag documents.
+    #[arg(long)]
+    zone_answerer_port: Option<u16>,
+
     /// Daemonize: spawn minimald in a new session (setsid) and return once the
     /// SSH socket accepts connections, or an 8s timeout elapses. Used by the
     /// `min` CLI to auto-start a native daemon on Linux.
@@ -427,16 +446,6 @@ fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
 }
 
 async fn async_main() -> Result<(), MainError> {
-    // With `networking-proxy` on, both the `ring` (workspace rustls) and the
-    // `aws-lc-rs` (google-cloud) providers are compiled in, so rustls cannot
-    // auto-pick one and panics ("no process-level CryptoProvider") the first time
-    // a config is built — e.g. when a session build reaches the remote-cache
-    // HTTPS client, off the proxy's own install path. Install ring explicitly
-    // here (idempotent; the proxy's later install no-ops). Without
-    // networking-proxy only one provider is present and rustls auto-installs it.
-    #[cfg(feature = "networking-proxy")]
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     // Use hardcoded configuration if we are the init process (`argv[0] == "/init"`), which
     // would indicate we are operating in a single-purpose micro-vm.
     //
@@ -459,6 +468,15 @@ async fn async_main() -> Result<(), MainError> {
                 // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
                 // vsock shuttle, so no in-guest gvproxy binary path is needed.
                 gvproxy_bin: None,
+                // Auto-select the hostname proxy's port: a VM daemon shares its
+                // host with whatever native daemon runs there, and the host
+                // gvproxy publishes whichever port this guest ends up on, so
+                // the two route both sets of names at the same time (NET-027)
+                // rather than fighting over one pinned port. `None` still
+                // tries the documented default first — it only relocates when
+                // something else on the machine holds it.
+                hostname_proxy_port: None,
+                zone_answerer_port: None,
             }),
             global_args: GlobalArgs {
                 minimal_state_dir: Some(DaemonAbsPath::try_new("/run/minimal").unwrap().into()),
@@ -758,6 +776,15 @@ async fn async_main() -> Result<(), MainError> {
         // not spawn gvproxy in-guest. The UDS path is DM2.
         in_microvm: cli.listen_args().unwrap().vsock,
         state_volume_mounted,
+        // The port the hostname proxy listens on when the deployment pins
+        // one; `None` tries the documented default and only when it is busy
+        // asks the OS for a free port (NET-024/NET-025).
+        hostname_proxy_port: cli.listen_args().unwrap().hostname_proxy_port,
+        // The answerer's port, given the same treatment.
+        zone_answerer_port: cli.listen_args().unwrap().zone_answerer_port,
+        // The daemon derives its switch /24 from its instance id (NET-027);
+        // no CLI flag pins one yet.
+        switch_subnet_octet: None,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
@@ -846,9 +873,10 @@ async fn async_main() -> Result<(), MainError> {
     if !cli.listen_args().unwrap().vsock {
         // standard path, listening on UDS socket.
         //
-        // The B5 host-side egress proxy (:7654) and B8 mTLS reverse proxy
-        // (:7655) are bound and served by `Server::run` for both DM2 (here) and
-        // DM1 (the vsock path below), so no separate startup bind happens here.
+        // The B5 host-side egress proxy (on its configured port, or one the
+        // OS selected) is bound and served by `Server::run` for both DM2
+        // (here) and DM1 (the vsock path below), so no separate startup bind
+        // happens here.
 
         if let Err(e) = std::fs::remove_file(cli.listen_on())
             && e.kind() != std::io::ErrorKind::NotFound

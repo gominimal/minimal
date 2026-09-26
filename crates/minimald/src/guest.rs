@@ -1042,10 +1042,17 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
         tracing::warn!(error = %e, "installing /etc/resolv.conf for guest egress (DNS may fail)");
     }
 
-    // Relay the tap to the host gvproxy over the vsock shuttle (CID 2).
-    let relay =
-        switch::attach_to_switch_vsock(tap_fd, VSOCK_HOST_CID, VSOCK_GVPROXY_SHUTTLE_PORT, None)
-            .await?;
+    // Relay the tap to the host gvproxy over the vsock shuttle (CID 2). The
+    // daemon relay carries no gate, so it emits no deprecation notice; the
+    // subnet passed is the one the guest is configured on above.
+    let relay = switch::attach_to_switch_vsock(
+        tap_fd,
+        VSOCK_HOST_CID,
+        VSOCK_GVPROXY_SHUTTLE_PORT,
+        None,
+        DEFAULT_SUBNET,
+    )
+    .await?;
     tracing::info!(%cidr, %gateway, "guest root egress up via host gvproxy shuttle");
     Ok(relay)
 }

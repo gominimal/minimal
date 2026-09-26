@@ -38,7 +38,7 @@ pub async fn cmd_rexec(args: RexecArgs, ctx: &mut Context) -> Result<(), Error> 
     let worktree = if args.ephemeral {
         Worktree::Ephemeral
     } else {
-        Worktree::Dir(Cow::Borrowed(ctx.repo_dir()))
+        Worktree::Dir(Cow::Borrowed(ctx.repo_dir()?))
     };
 
     let env = client

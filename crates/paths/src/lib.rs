@@ -202,6 +202,81 @@ pub fn provider_instance_dir(
     sub_path!(state_dir, "providers").sub_path_unchecked(&provider_instance_name(kind, instance))
 }
 
+/// The VM name that means "the default VM": the single unnamed instance whose
+/// on-disk layout predates named VMs. Every path of that VM must stay
+/// unchanged (NET-053), so it resolves to the provider-instance dir itself
+/// rather than a per-name subdirectory.
+pub const DEFAULT_VM_NAME: &str = "default";
+
+/// The longest VM name [`validate_vm_name`] accepts. The cap keeps a named
+/// VM's socket paths inside the platform's unix-socket budget at the default
+/// state dir: the 104-byte macOS `sun_path` leaves about this much for the
+/// name under `.../providers/local-minvmd0/<name>/gvproxy-switch.sock`.
+const MAX_VM_NAME_BYTES: usize = 24;
+
+/// The VM name reserved for the in-guest diagnostic bundle's directory inside
+/// a provider dir (`providers/<provider>/guest/`, see the `min` diag
+/// collector): a VM named `guest` would collide with it and be invisible to
+/// every diagnostic listing.
+const RESERVED_VM_NAME: &str = "guest";
+
+/// Whether one byte of a VM name is inside the allowed character set.
+fn vm_name_byte_allowed(b: u8) -> bool {
+    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'
+}
+
+/// Validate a VM name (`--vm <NAME>`): it names a directory under the provider
+/// dir, so the rule is an allowlist, not a sanitiser — ASCII lowercase
+/// letters, digits and `-`, at most [`MAX_VM_NAME_BYTES`] bytes, starting
+/// with a letter or digit, and never the reserved [`RESERVED_VM_NAME`]. A name
+/// that fits can only select a subdirectory *under* the provider dir: it can
+/// never escape it, and it can never shadow one of the provider dir's own
+/// files (`ssh.sock`, the payload `guest/` dir).
+///
+/// # Errors
+///
+/// [`Error::InvalidVmName`] when `vm` breaks any rule above; the error's
+/// message states the whole rule.
+pub fn validate_vm_name(vm: &str) -> Result<(), Error> {
+    let bytes = vm.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > MAX_VM_NAME_BYTES
+        || bytes[0] == b'-'
+        || vm == RESERVED_VM_NAME
+        || !bytes.iter().all(|b| vm_name_byte_allowed(*b))
+    {
+        return Err(Error::InvalidVmName(vm.to_owned()));
+    }
+    Ok(())
+}
+
+/// The per-name provider-instance dir (NET-052, NET-054): the directory
+/// holding one named VM's own state files, socket, and locks.
+///
+/// A named VM — any `vm` other than [`DEFAULT_VM_NAME`] — nests under a
+/// per-name subdirectory:
+/// `<state_dir>/providers/local-<kind><instance>/<vm>/`. The default VM
+/// resolves to the provider-instance dir itself, exactly as
+/// [`provider_instance_dir`] does, so its paths are unchanged (NET-053).
+///
+/// # Errors
+///
+/// [`Error::InvalidVmName`] when `vm` breaks the naming rule (see
+/// [`validate_vm_name`]).
+pub fn provider_instance_dir_named(
+    state_dir: &DaemonAbsPath,
+    kind: ProviderKind,
+    instance: u32,
+    vm: &str,
+) -> Result<DaemonAbsPath, Error> {
+    let base = provider_instance_dir(state_dir, kind, instance);
+    if vm == DEFAULT_VM_NAME {
+        return Ok(base);
+    }
+    validate_vm_name(vm)?;
+    Ok(base.sub_path_unchecked(vm))
+}
+
 /// Migrate legacy `providers/local-<N>` instance dirs — the pre-split naming,
 /// from before the native minimald and minvmd backends had distinct identities
 /// — to the kind-tagged scheme (`local-minimald<N>` / `local-minvmd<N>`), so
@@ -458,6 +533,13 @@ pub enum Error {
     /// re-validate.
     #[error("path contains a `..` traversal component: {0}")]
     ContainsParentDir(Utf8PathBuf),
+    /// A VM name broke the naming rule, so it cannot name a per-VM
+    /// subdirectory. The message states the whole rule so the rejection
+    /// points at what a valid name is.
+    #[error(
+        "invalid VM name `{0}`: names are at most 24 bytes of ASCII lowercase letters, digits and `-`, start with a letter or digit, and `guest` is reserved"
+    )]
+    InvalidVmName(String),
 }
 
 #[doc(hidden)]
@@ -1872,6 +1954,80 @@ mod tests {
             provider_instance_dir(&state, ProviderKind::Minvmd, 0).as_str(),
             "/state/minimal/providers/local-minvmd0",
         );
+    }
+
+    /// A named VM's provider dir nests under a per-name subdirectory
+    /// (NET-054); the default VM's is the provider dir itself, unchanged
+    /// (NET-053); and a name outside the allowlist is rejected rather than
+    /// resolved somewhere outside the provider dir — one from every class
+    /// the allowlist exists to catch.
+    #[test]
+    fn provider_instance_dir_accepts_a_name() {
+        let state = DaemonAbsPath::try_new("/state/minimal").unwrap();
+
+        // A named VM: its own directory under the provider dir.
+        assert_eq!(
+            provider_instance_dir_named(&state, ProviderKind::Minvmd, 0, "alpha")
+                .unwrap()
+                .as_str(),
+            "/state/minimal/providers/local-minvmd0/alpha",
+        );
+        // The default VM: byte-for-byte the pre-named-VMs layout.
+        assert_eq!(
+            provider_instance_dir_named(&state, ProviderKind::Minvmd, 0, DEFAULT_VM_NAME)
+                .unwrap()
+                .as_str(),
+            provider_instance_dir(&state, ProviderKind::Minvmd, 0).as_str(),
+        );
+        assert_eq!(
+            provider_instance_dir_named(&state, ProviderKind::Minimald, 2, DEFAULT_VM_NAME)
+                .unwrap()
+                .as_str(),
+            provider_instance_dir(&state, ProviderKind::Minimald, 2).as_str(),
+        );
+
+        // The length cap is inclusive: 24 bytes still resolves.
+        let capped = "a".repeat(24);
+        assert!(
+            provider_instance_dir_named(&state, ProviderKind::Minvmd, 0, &capped).is_ok(),
+            "a 24-byte name is at the cap, not over it"
+        );
+
+        // Rejected names, one from every class: not a single path component
+        // (empty, `.`, `..`, embedded `/`), outside the character set
+        // (whitespace, uppercase, the `.` in `ssh.sock`), a leading `-`,
+        // over the cap, and the reserved `guest` (which would shadow the
+        // in-guest diag bundle's directory).
+        let bad_names: Vec<String> = [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "../sibling",
+            "a b",
+            "Alpha",
+            "-alpha",
+            "ssh.sock",
+            "guest",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(std::iter::once("a".repeat(25)))
+        .collect();
+        for bad in &bad_names {
+            let err = provider_instance_dir_named(&state, ProviderKind::Minvmd, 0, bad)
+                .expect_err("an invalid VM name must be rejected");
+            assert_eq!(err, Error::InvalidVmName(bad.clone()));
+        }
+
+        // And the rejection points at the rule a valid name has to fit.
+        let rule = Error::InvalidVmName(String::new()).to_string();
+        for expected in ["24 bytes", "lowercase", "letter or digit", "`guest`"] {
+            assert!(
+                rule.contains(expected),
+                "the rejection must state the rule, missing {expected:?}: {rule}"
+            );
+        }
     }
 
     /// A tempdir turned into a `DaemonAbsPath` state root.

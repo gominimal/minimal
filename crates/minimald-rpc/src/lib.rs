@@ -17,7 +17,9 @@ pub mod exec;
 pub mod taskenv;
 pub mod trace;
 
-pub use sessions::{EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy};
+pub use sessions::{
+    DynamicIngress, EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
+};
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
 
@@ -245,18 +247,23 @@ pub struct ListSessionsResponse {
     /// daemon log, and the user is at a terminal watching curl fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_routing_unavailable: Option<String>,
-    /// Why the mTLS reverse proxy (`:7655`) is not serving, when it is not.
-    ///
-    /// Separate from [`Self::hostname_routing_unavailable`] because they are
-    /// different services with different consumers: losing `:7654` costs every
-    /// session its hostname, losing `:7655` costs whatever terminates TLS
-    /// against it. Reporting them through one field would tell a user their
-    /// hostnames are broken when they are not.
-    ///
-    /// Always `None` from a daemon built without the `networking-proxy`
-    /// feature, which is the default — there is no proxy to be unavailable.
+    /// The port the host-side hostname proxy is serving on, so a client can
+    /// tell a user where `<name>.min.internal` resolves from. The daemon
+    /// listens on the port it was configured with, the documented default
+    /// when it was not given one and that one was free, or on an
+    /// OS-selected free port when the default was busy — which is why the
+    /// port has to travel instead of staying a constant. `None` from a
+    /// daemon that predates the field, or while the proxy has not come up
+    /// yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mtls_proxy_unavailable: Option<String>,
+    pub hostname_proxy_port: Option<u16>,
+    /// The UDP port the box-zone answerer is serving on, beside
+    /// [`Self::hostname_proxy_port`] — where the host's resolver is pointed
+    /// to answer `*.min.internal`. Carries the same configured / default /
+    /// selected story that field does. `None` from a daemon that predates
+    /// the field, or while the answerer has not come up yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_answerer_port: Option<u16>,
 }
 
 impl OneshotSshRpc for ListSessions {
@@ -446,15 +453,23 @@ pub struct CreateSessionResponse {
     /// looking healthy either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_routing_unavailable: Option<String>,
-    /// Why the mTLS reverse proxy is not serving, when it is not — see
-    /// [`ListSessionsResponse::mtls_proxy_unavailable`].
+    /// The port the host-side hostname proxy is serving on — see
+    /// [`ListSessionsResponse::hostname_proxy_port`].
     ///
-    /// Here for the same reason as the field above it: both proxies are
-    /// daemon-wide rather than session-scoped, so the thing that decides
-    /// whether activation should mention them is whether the person
-    /// activating is about to depend on one, and that is not ours to know.
+    /// Carried on the activation reply as well as the list for the same
+    /// reason as `hostname_routing_unavailable`: activation is where the
+    /// user is about to rely on the names this port routes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mtls_proxy_unavailable: Option<String>,
+    pub hostname_proxy_port: Option<u16>,
+    /// The UDP port the box-zone answerer is serving on — see
+    /// [`ListSessionsResponse::zone_answerer_port`].
+    ///
+    /// Carried on the activation reply as well as the list for the same
+    /// reason as `hostname_proxy_port`: activation is where the user is
+    /// about to point `HTTP(S)_PROXY` — and the host resolver — at this
+    /// daemon's ports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_answerer_port: Option<u16>,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -847,43 +862,6 @@ impl OneshotSshRpc for DynamicPortMap {
 }
 
 // ---------------------------------------------------------------------------
-// mTLS client certificate issuance (R4.4 / `minimal login`).
-// ---------------------------------------------------------------------------
-
-/// An RPC that signs and returns a fresh client certificate for use with the
-/// HTTPS reverse proxy's mTLS authentication (R4.4). The caller supplies a
-/// subject common name; the daemon generates a key pair, signs the certificate
-/// with its internal CA, and returns PEM-encoded certificate and private key.
-/// The CA certificate PEM is also returned so the client can add it to
-/// its trust store.
-pub struct IssueClientCert;
-
-/// Request for the [`IssueClientCert`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IssueClientCertRequest {
-    /// Subject common name for the client certificate (e.g. the OS username).
-    pub subject_cn: String,
-}
-
-/// Response for the [`IssueClientCert`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct IssueClientCertResponse {
-    /// PEM-encoded client certificate signed by the daemon's CA.
-    pub cert_pem: String,
-    /// PEM-encoded PKCS#8 private key matching the certificate.
-    pub key_pem: String,
-    /// PEM-encoded CA certificate, so the client can trust the HTTPS proxy's
-    /// server certificate.
-    pub ca_cert_pem: String,
-}
-
-impl OneshotSshRpc for IssueClientCert {
-    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "IssueClientCert");
-    type Request<'a> = IssueClientCertRequest;
-    type Response = Errorable<IssueClientCertResponse>;
-}
-
-// ---------------------------------------------------------------------------
 // WireGuard mesh status (Unit 4: R4.6).
 //
 // These types are the wire contract for `minimal mesh status` and carry no
@@ -1266,6 +1244,7 @@ mod tests {
         let ingress = IngressPolicy {
             port_mappings: vec![mapping],
             dynamic_allowed_range: Some((10000, 20000)),
+            dynamic_ingress: Some(sessions::DynamicIngress::Ask),
         };
         let json = serde_json_lenient::to_string(&ingress).unwrap();
         let rt: IngressPolicy = serde_json_lenient::from_str(&json).unwrap();
@@ -1288,6 +1267,7 @@ mod tests {
             json.contains("\"dynamic_allowed_range\":null"),
             "got: {json}"
         );
+        assert!(json.contains("\"dynamic_ingress\":null"), "got: {json}");
     }
 
     fn round_trip<T>(value: &T) -> T
@@ -1448,7 +1428,8 @@ mod tests {
             id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: None,
-            mtls_proxy_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
         };
         assert_eq!(round_trip(&resp), resp);
     }
@@ -1463,7 +1444,8 @@ mod tests {
             serde_json_lenient::from_str(r#"{"sessions":[],"daemon_version":"0.5.0"}"#)
                 .expect("a pre-field ListSessions reply must still decode");
         assert!(list.hostname_routing_unavailable.is_none());
-        assert!(list.mtls_proxy_unavailable.is_none());
+        assert!(list.hostname_proxy_port.is_none());
+        assert!(list.zone_answerer_port.is_none());
 
         let create: Errorable<CreateSessionResponse> = serde_json_lenient::from_str(
             r#"{"id":"00000000-0000-0000-0000-000000000001","daemon_version":"0.5.0"}"#,
@@ -1472,7 +1454,8 @@ mod tests {
         match create {
             Errorable::Ok(c) => {
                 assert!(c.hostname_routing_unavailable.is_none());
-                assert!(c.mtls_proxy_unavailable.is_none());
+                assert!(c.hostname_proxy_port.is_none());
+                assert!(c.zone_answerer_port.is_none());
             }
             Errorable::Err { error } => panic!("expected Ok, got {error}"),
         }
@@ -1486,7 +1469,8 @@ mod tests {
         let resp = ListSessionsResponse {
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: None,
-            mtls_proxy_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
             resource_pool: None,
             sessions: vec![],
         };
@@ -1496,13 +1480,17 @@ mod tests {
             "healthy reply should omit the field, got {json}"
         );
         assert!(
-            !json.contains("mtls_proxy_unavailable"),
-            "healthy reply should omit the mTLS field too, got {json}"
+            !json.contains("hostname_proxy_port"),
+            "a reply that has not discovered its port should omit the field, got {json}"
+        );
+        assert!(
+            !json.contains("zone_answerer_port"),
+            "a reply that has not discovered its answerer port should omit the field, got {json}"
         );
 
         let down = ListSessionsResponse {
             hostname_routing_unavailable: Some("port 7654 is held".into()),
-            ..resp
+            ..resp.clone()
         };
         let json = serde_json_lenient::to_string(&down).expect("serializes");
         let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
@@ -1510,6 +1498,14 @@ mod tests {
             back.hostname_routing_unavailable.as_deref(),
             Some("port 7654 is held")
         );
+
+        let discovered = ListSessionsResponse {
+            hostname_proxy_port: Some(41234),
+            ..resp.clone()
+        };
+        let json = serde_json_lenient::to_string(&discovered).expect("serializes");
+        let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
+        assert_eq!(back.hostname_proxy_port, Some(41234));
     }
 
     /// The reply a daemon that predates `daemon_version` sends must still

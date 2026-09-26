@@ -70,7 +70,39 @@ pub enum Resolver {
 pub struct NetPlan {
     isolate_netns: bool,
     tap: Option<TapSpec>,
+    /// The plan promises no reach outside the sandbox at all, so socket
+    /// families the network namespace does not confine (`AF_VSOCK`) are
+    /// refused too. Set only by [`NetPlan::none`]: an isolated plan without a
+    /// tap may still be an own-address box whose tap the daemon moves in
+    /// after the process exists.
+    seal_sockets: bool,
     resolver: Resolver,
+    hosts: Vec<HostEntry>,
+}
+
+/// A static `name → address` line the container build writes into the
+/// sandbox's `/etc/hosts`, so a name the box's resolver does not know still
+/// answers (NSS consults `/etc/hosts` before DNS).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEntry {
+    /// The name to answer, as written — `/etc/hosts` needs no zone suffix.
+    pub name: String,
+    /// The address the name answers with.
+    pub address: Ipv4Addr,
+}
+
+impl std::fmt::Display for NetPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.seal_sockets {
+            write!(f, "none")
+        } else if !self.isolate_netns {
+            write!(f, "host_ip")
+        } else if self.tap.is_some() {
+            write!(f, "own_ip")
+        } else {
+            write!(f, "isolated")
+        }
+    }
 }
 
 impl NetPlan {
@@ -80,7 +112,9 @@ impl NetPlan {
         Self {
             isolate_netns: false,
             tap: None,
+            seal_sockets: false,
             resolver: Resolver::None,
+            hosts: Vec::new(),
         }
     }
 
@@ -91,7 +125,25 @@ impl NetPlan {
         Self {
             isolate_netns: true,
             tap: None,
+            seal_sockets: false,
             resolver: Resolver::None,
+            hosts: Vec::new(),
+        }
+    }
+
+    /// A none box: an unshared network namespace that will never get a tap,
+    /// with every socket family the namespace does not confine refused as
+    /// well (`AF_VSOCK` reaches the host regardless of the namespace). Unlike
+    /// [`NetPlan::isolated`], which an own-address box also starts from when
+    /// its tap is moved in after spawn, this plan is the promise of no reach.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            isolate_netns: true,
+            tap: None,
+            seal_sockets: true,
+            resolver: Resolver::None,
+            hosts: Vec::new(),
         }
     }
 
@@ -101,7 +153,9 @@ impl NetPlan {
         Self {
             isolate_netns: true,
             tap: Some(tap),
+            seal_sockets: false,
             resolver: Resolver::None,
+            hosts: Vec::new(),
         }
     }
 
@@ -112,10 +166,30 @@ impl NetPlan {
         self
     }
 
+    /// Adds a static `/etc/hosts` entry for the sandbox.
+    #[must_use]
+    pub fn with_hosts_entry(mut self, name: impl Into<String>, address: Ipv4Addr) -> Self {
+        self.hosts.push(HostEntry {
+            name: name.into(),
+            address,
+        });
+        self
+    }
+
     /// Whether the sandbox runs in its own unshared network namespace.
     #[must_use]
     pub fn isolates_netns(&self) -> bool {
         self.isolate_netns
+    }
+
+    /// Whether this plan promises no network reach outside the sandbox and
+    /// therefore refuses the socket families the network namespace does not
+    /// confine. Only [`NetPlan::none`] does: the shape of the plan cannot say,
+    /// because an own-address box whose tap is moved in after spawn is also
+    /// isolated with no tap at build time.
+    #[must_use]
+    pub fn blocks_outside_sockets(&self) -> bool {
+        self.seal_sockets
     }
 
     /// The tap to build inside that namespace, if any.
@@ -128,6 +202,12 @@ impl NetPlan {
     #[must_use]
     pub fn resolver(&self) -> &Resolver {
         &self.resolver
+    }
+
+    /// The static `/etc/hosts` entries to write.
+    #[must_use]
+    pub fn hosts(&self) -> &[HostEntry] {
+        &self.hosts
     }
 }
 
@@ -260,6 +340,12 @@ pub trait NetGuard: Send {
     fn teardown(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
+/// The static name the host answers by, for boxes that share its network
+/// namespace (NET-003). The host's own resolver has no `min.internal.` zone, so
+/// a native host-address box resolves the host by name through this
+/// `/etc/hosts` entry at the host's loopback.
+pub const HOST_MIN_INTERNAL: &str = "host.min.internal";
+
 /// Shares the host/VM network namespace (the default), and the host's
 /// resolver with it. No isolation, no wiring.
 #[derive(Debug, Default, Clone, Copy)]
@@ -267,9 +353,9 @@ pub struct HostNet;
 
 impl Network for HostNet {
     fn plan(&self) -> PlanFuture<'_> {
-        Box::pin(std::future::ready(Ok(
-            NetPlan::host().with_resolver(Resolver::Host)
-        )))
+        Box::pin(std::future::ready(Ok(NetPlan::host()
+            .with_resolver(Resolver::Host)
+            .with_hosts_entry(HOST_MIN_INTERNAL, Ipv4Addr::LOCALHOST))))
     }
 }
 
@@ -280,7 +366,7 @@ pub struct NoNet;
 
 impl Network for NoNet {
     fn plan(&self) -> PlanFuture<'_> {
-        Box::pin(std::future::ready(Ok(NetPlan::isolated())))
+        Box::pin(std::future::ready(Ok(NetPlan::none())))
     }
 }
 
