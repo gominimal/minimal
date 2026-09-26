@@ -72,8 +72,11 @@ impl NetGuard for OwnIpGuard {
 ///
 /// The relay is gated by the session's whole policy: the egress leg enforces
 /// its declared egress rules (NET-062/063/064), the ingress leg its declared
-/// inbound ports. The gate also carries the session's DNS dimension — its
-/// `egress.allow_dns_hosts` and `egress.deny_subnets` ride the same
+/// inbound ports. The lease the box was allocated goes into the relay either
+/// way: the egress leg rejects any frame whose source is not it (NET-084), so
+/// a task's ungated relay is bound by its lease too. The gate also carries
+/// the session's DNS dimension — its `egress.allow_dns_hosts` and
+/// `egress.deny_subnets` ride the same
 /// [`SessionGate`](crate::net::switch::SessionGate) into the relay, where
 /// the DNS gate pins the addresses those names resolve to for their
 /// admission window (NET-066), refuses the ones that land in denied ranges
@@ -99,21 +102,29 @@ pub(crate) async fn complete_own_ip_attach(
     // own host alias.
     let subnet = switch.lock().await.subnet();
     let gate = policy.map(|policy| {
-        crate::net::switch::SessionGate::for_session(lease_ip.to_string(), policy, subnet)
+        crate::net::switch::SessionGate::for_session(lease_ip.to_string(), lease_ip, policy, subnet)
     });
     let relay = match (&control, gate) {
         (ControlChannel::Unix(sock), Some(gate)) => {
-            crate::net::switch::attach_to_switch(tap_fd, sock, Some(gate), subnet).await?
+            crate::net::switch::attach_to_switch(tap_fd, sock, Some(gate), lease_ip, subnet).await?
         }
         (ControlChannel::Vsock { cid, port }, Some(gate)) => {
-            crate::net::switch::attach_to_switch_vsock(tap_fd, *cid, *port, Some(gate), subnet)
-                .await?
+            crate::net::switch::attach_to_switch_vsock(
+                tap_fd,
+                *cid,
+                *port,
+                Some(gate),
+                lease_ip,
+                subnet,
+            )
+            .await?
         }
         (ControlChannel::Unix(sock), None) => {
-            crate::net::switch::attach_to_switch(tap_fd, sock, None, subnet).await?
+            crate::net::switch::attach_to_switch(tap_fd, sock, None, lease_ip, subnet).await?
         }
         (ControlChannel::Vsock { cid, port }, None) => {
-            crate::net::switch::attach_to_switch_vsock(tap_fd, *cid, *port, None, subnet).await?
+            crate::net::switch::attach_to_switch_vsock(tap_fd, *cid, *port, None, lease_ip, subnet)
+                .await?
         }
     };
     finish_own_ip_attach(

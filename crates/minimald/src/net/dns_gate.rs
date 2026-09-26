@@ -799,6 +799,7 @@ mod tests {
             sessions::core::egress::EgressRules::from_policy(
                 policy.egress.as_ref(),
                 RESOLVER.octets(),
+                LEASE.octets(),
             ),
             InfrastructureDenySet::new(RESOLVER.octets(), [100, 64, 0, 254]),
             Arc::new(PolicyWarnLimiter::new()),
@@ -938,7 +939,7 @@ mod tests {
         // dropped, the sentinel standing in for everything decided before
         // it.
         let other = egress_tcp_frame(LEASE, Ipv4Addr::new(198, 51, 100, 7), 443);
-        let sentinel = arp_frame();
+        let sentinel = arp_frame(LEASE);
         harness.box_end.write_all(&other).unwrap();
         harness.box_end.write_all(&sentinel).unwrap();
         let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
@@ -956,7 +957,7 @@ mod tests {
         assert!(
             gate.admits_destination(
                 [140, 82, 121, 3],
-                t0 + ADMISSION_WINDOW - Duration::from_nanos(1)
+                t0 + ADMISSION_WINDOW.saturating_sub(Duration::from_nanos(1))
             ),
             "the admission holds through the window"
         );
@@ -1045,7 +1046,7 @@ mod tests {
         // the pin established holds, so a fresh connection — from another
         // source port — is refused until the box re-resolves the name.
         let fresh = egress_tcp_segment(LEASE, 40001, PINNED, 443, SYN);
-        let sentinel = arp_frame();
+        let sentinel = arp_frame(LEASE);
         harness.box_end.write_all(&fresh).unwrap();
         harness.box_end.write_all(&sentinel).unwrap();
         let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
@@ -1130,7 +1131,7 @@ mod tests {
             gate.admits_flow(pinned, Some(pkt), ridden),
             "a flow past the window is retained while it is ridden"
         );
-        let idle_at = ridden + FLOW_IDLE_CAP - Duration::from_secs(1);
+        let idle_at = ridden + FLOW_IDLE_CAP.saturating_sub(Duration::from_secs(1));
         assert!(
             gate.admits_flow(pinned, Some(pkt), idle_at),
             "the flow holds up to the cap while it is ridden"
@@ -1224,7 +1225,7 @@ mod tests {
         // ridden it is dropped — the release happens at the lookup of the
         // frame itself, on a table of one flow.
         tokio::time::sleep(Duration::from_millis(4200)).await;
-        let sentinel = arp_frame();
+        let sentinel = arp_frame(LEASE);
         harness.box_end.write_all(&datagram).unwrap();
         harness.box_end.write_all(&sentinel).unwrap();
         let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
@@ -1349,7 +1350,7 @@ mod tests {
         // the flow for the cap's length. The segment that would have ridden
         // it next is dropped, released by idleness alone.
         tokio::time::sleep(Duration::from_millis(4200)).await;
-        let sentinel = arp_frame();
+        let sentinel = arp_frame(LEASE);
         harness.box_end.write_all(&data).unwrap();
         harness.box_end.write_all(&sentinel).unwrap();
         let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
@@ -1481,7 +1482,7 @@ mod tests {
         // The denied answer is refused: the connection never reaches the
         // switch (the sentinel stands in for it).
         let denied = egress_tcp_frame(LEASE, Ipv4Addr::new(10, 9, 9, 9), 443);
-        let sentinel = arp_frame();
+        let sentinel = arp_frame(LEASE);
         harness.box_end.write_all(&denied).unwrap();
         harness.box_end.write_all(&sentinel).unwrap();
         let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
@@ -1668,7 +1669,7 @@ mod tests {
 
             // And the query never reached the switch: the sentinel written
             // after it is the next thing the switch sees.
-            let sentinel = arp_frame();
+            let sentinel = arp_frame(LEASE);
             harness.box_end.write_all(&sentinel).unwrap();
             let next =
                 tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
@@ -1692,7 +1693,7 @@ mod tests {
                 &dns_response("github.com.", &[Ipv4Addr::new(140, 82, 121, 3)]),
             );
             harness.switch.write_all(&wire_frame(&bogus)).await.unwrap();
-            let passer = arp_frame();
+            let passer = arp_frame(LEASE);
             harness
                 .switch
                 .write_all(&wire_frame(&passer))
@@ -1836,7 +1837,7 @@ mod tests {
             .expect("the reply passes through");
 
         let connect = egress_tcp_frame(LEASE, Ipv4Addr::new(203, 0, 113, 20), 443);
-        let sentinel = arp_frame();
+        let sentinel = arp_frame(LEASE);
         harness.box_end.write_all(&connect).unwrap();
         harness.box_end.write_all(&sentinel).unwrap();
         let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))

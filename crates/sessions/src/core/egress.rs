@@ -1,4 +1,4 @@
-//! The frame-level egress verdict (NET-062, NET-063, NET-064).
+//! The frame-level egress verdict (NET-062, NET-063, NET-064, NET-084).
 //!
 //! One pure decision — admit or drop — over an owned frame summary and an
 //! owned rule set, deliberately separate from the relay loop that applies
@@ -9,9 +9,16 @@
 //!
 //! What the verdict encodes:
 //!
+//! * **The source must be the box's lease** — a frame whose source address
+//!   (an IPv4 frame's IPv4 source, an ARP frame's sender protocol address)
+//!   is not the lease the relay was attached with is rejected before any
+//!   family or rule is consulted (NET-084). No box may speak from an
+//!   address but its own.
 //! * **ARP is admitted** — address resolution on the shared L2 switch is a
 //!   declared path for every box; the gateway's MAC must be learnable for
-//!   any egress at all to work.
+//!   any egress at all to work. An ARP frame from the lease, that is: its
+//!   sender address is a source like any other, and a foreign one is
+//!   rejected by the lease check above.
 //! * **IPv6 is dropped** — v1 declares no IPv6 admission path anywhere
 //!   (guest IPv6 disabled, NET-082; AAAA answered NODATA, NET-136), so an
 //!   IPv6 frame is dropped as a family rather than matched against rules.
@@ -68,10 +75,14 @@ pub enum FrameFamily {
     /// tags (0x8100) included, since a VLAN-tagged IPv4 frame is not an
     /// IPv4 frame to this header reader.
     UndeclaredFamily(u16),
-    /// Too short to carry the header the family decision or the rule match
-    /// reads: below 14 bytes there is not even an `EtherType`, and an
-    /// IPv4-ethertype frame below 34 bytes has no readable IPv4 header.
-    /// Never admitted — an unreadable frame cannot be a declared one.
+    /// Too short to carry the header the family decision, the rule match or
+    /// the lease check reads: below 14 bytes there is not even an
+    /// `EtherType`, an IPv4-ethertype frame below 34 bytes has no readable
+    /// IPv4 header, and an ARP frame too short to carry four bytes of
+    /// sender protocol address at the `hlen` its header declares has no
+    /// readable source. Never admitted — an unreadable frame
+    /// cannot be a declared one, and an unattributable one cannot be the
+    /// lease's (NET-084).
     Truncated,
 }
 
@@ -82,6 +93,13 @@ pub enum FrameFamily {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameSummary {
     family: FrameFamily,
+    /// The source address the frame carries: an IPv4 frame's header
+    /// source, or an ARP frame's sender protocol address — read whatever
+    /// protocol type the frame claims for it — the address the lease check
+    /// (NET-084) compares against the box's lease. `None` when the frame
+    /// carries no readable one: IPv6, an undeclared family, or a frame too
+    /// short to read.
+    src: Option<[u8; 4]>,
     /// The IPv4 destination address, when the frame carries one.
     dst: Option<[u8; 4]>,
     /// The IPv4 protocol number, when the frame carries one.
@@ -98,6 +116,15 @@ impl FrameSummary {
     #[must_use]
     pub fn family(&self) -> FrameFamily {
         self.family
+    }
+
+    /// The source address the frame carries — an IPv4 frame's header
+    /// source, or an ARP frame's sender protocol address, whatever
+    /// protocol the frame claims for it (the address the lease check
+    /// reads). `None` when the frame carries no readable one.
+    #[must_use]
+    pub fn source(&self) -> Option<[u8; 4]> {
+        self.src
     }
 
     /// The IPv4 destination address, when the frame carries one.
@@ -127,6 +154,7 @@ impl FrameSummary {
 pub fn summarize(frame: &[u8]) -> FrameSummary {
     let none = |family| FrameSummary {
         family,
+        src: None,
         dst: None,
         proto: None,
         dst_port: 0,
@@ -136,12 +164,41 @@ pub fn summarize(frame: &[u8]) -> FrameSummary {
     }
     let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
     let family = match ethertype {
-        ETHERTYPE_ARP => return none(FrameFamily::Arp),
+        ETHERTYPE_ARP => {
+            // ARP: the sender protocol address is the frame's source — the
+            // address the lease check (NET-084) compares. It sits `hlen`
+            // bytes of sender hardware into the ARP payload, behind 8 bytes
+            // of fixed header, and the check reads four bytes of it, so the
+            // offset is bounds-checked before it is used. The protocol type
+            // the frame claims for the address is not consulted: an ARP
+            // claiming a protocol other than IPv4 must be no way to
+            // announce an address unchecked, so the slot is the source
+            // whatever the frame claims to speak. A frame too short to
+            // carry four bytes of sender address at its own `hlen` has no
+            // readable source: it cannot be attributed to the lease, so it
+            // is truncated rather than admitted.
+            if frame.len() < ETH_HDR + 8 {
+                return none(FrameFamily::Truncated);
+            }
+            let hlen = frame[ETH_HDR + 4] as usize;
+            let spa = ETH_HDR + 8 + hlen;
+            if frame.len() < spa + 4 {
+                return none(FrameFamily::Truncated);
+            }
+            return FrameSummary {
+                family: FrameFamily::Arp,
+                src: Some([frame[spa], frame[spa + 1], frame[spa + 2], frame[spa + 3]]),
+                dst: None,
+                proto: None,
+                dst_port: 0,
+            };
+        }
         ETHERTYPE_IPV6 => return none(FrameFamily::Ipv6),
         ETHERTYPE_IPV4 => FrameFamily::Ipv4,
         _ => return none(FrameFamily::UndeclaredFamily(ethertype)),
     };
-    // IPv4: the fixed 20-byte header carries the destination and protocol.
+    // IPv4: the fixed 20-byte header carries the source, destination and
+    // protocol.
     let ip = &frame[ETH_HDR..];
     if ip.len() < 20 {
         return none(FrameFamily::Truncated);
@@ -158,6 +215,7 @@ pub fn summarize(frame: &[u8]) -> FrameSummary {
     };
     FrameSummary {
         family,
+        src: Some([ip[12], ip[13], ip[14], ip[15]]),
         dst: Some([ip[16], ip[17], ip[18], ip[19]]),
         proto: Some(ip[9]),
         dst_port,
@@ -219,8 +277,9 @@ impl Ipv4Cidr {
 }
 
 /// A box's compiled egress rules: the three declaration dimensions of an
-/// [`EgressPolicy`], owned and matchable, plus the address of the resolver
-/// the carve-out admits.
+/// [`EgressPolicy`], owned and matchable, plus the addresses the verdict is
+/// keyed to — the resolver the carve-out admits, and the box's lease, the
+/// one source its frames may carry.
 ///
 /// Each dimension is `None` to allow all and `Some(list)` to allow exactly
 /// the listed entries — so a deny-all declaration is `Some(vec![])` on
@@ -239,6 +298,10 @@ pub struct EgressRules {
     /// gateway), which the carve-out admits at [`DNS_PORT`] under any
     /// declaration.
     resolver: [u8; 4],
+    /// The box's lease on the switch — the one source address its frames
+    /// may carry, which the verdict rejects any other of (NET-084). Known
+    /// when the box is attached, the same moment the policy is compiled.
+    lease: [u8; 4],
 }
 
 impl EgressRules {
@@ -250,12 +313,14 @@ impl EgressRules {
         allow_subnets: Option<Vec<Ipv4Cidr>>,
         deny_subnets: Option<Vec<Ipv4Cidr>>,
         resolver: [u8; 4],
+        lease: [u8; 4],
     ) -> Self {
         Self {
             allow_protocols,
             allow_subnets,
             deny_subnets,
             resolver,
+            lease,
         }
     }
 
@@ -264,11 +329,13 @@ impl EgressRules {
     /// NET-074 changes it once the deny-all default is in force), and a
     /// declared dimension keeps only the entries the launch-time validation
     /// already checked parse. `resolver` is the switch gateway's address,
-    /// the resolver this box's carve-out is keyed to.
+    /// the resolver this box's carve-out is keyed to, and `lease` the box's
+    /// own address on the switch — the source its frames must carry
+    /// (NET-084).
     #[must_use]
-    pub fn from_policy(policy: Option<&EgressPolicy>, resolver: [u8; 4]) -> Self {
+    pub fn from_policy(policy: Option<&EgressPolicy>, resolver: [u8; 4], lease: [u8; 4]) -> Self {
         let Some(policy) = policy else {
-            return Self::new(None, None, None, resolver);
+            return Self::new(None, None, None, resolver, lease);
         };
         let allow_protocols: Option<Vec<u8>> = policy
             .allow_protocols
@@ -286,6 +353,7 @@ impl EgressRules {
             subnets(&policy.allow_subnets),
             subnets(&policy.deny_subnets),
             resolver,
+            lease,
         )
     }
 
@@ -310,6 +378,12 @@ impl EgressRules {
     #[must_use]
     pub fn deny_subnets(&self) -> Option<&[Ipv4Cidr]> {
         self.deny_subnets.as_deref()
+    }
+
+    /// The box's lease — the one source address its frames may carry.
+    #[must_use]
+    pub fn lease(&self) -> [u8; 4] {
+        self.lease
     }
 }
 
@@ -340,6 +414,15 @@ pub enum FrameVerdict {
 /// without re-deriving any of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
+    /// The frame's source is not the lease the relay was attached with — a
+    /// spoofed or foreign source, rejected before any family or rule is
+    /// consulted (NET-084).
+    ForeignSource {
+        /// The source address the frame carried.
+        src: [u8; 4],
+        /// The lease the frame's source had to be.
+        lease: [u8; 4],
+    },
     /// IPv6: dropped as a family, no v1 admission path (NET-082, NET-136).
     Ipv6,
     /// An `EtherType` no admission path is declared for, carried raw.
@@ -373,6 +456,7 @@ impl DropReason {
     #[must_use]
     pub fn rule(&self) -> &'static str {
         match self {
+            Self::ForeignSource { .. } => "egress-foreign-source",
             Self::Ipv6 => "egress-ipv6",
             Self::UndeclaredFamily(_) => "egress-undeclared-ethertype",
             Self::Truncated => "egress-truncated-ipv4",
@@ -386,7 +470,8 @@ impl DropReason {
     #[must_use]
     pub fn destination(&self) -> Option<[u8; 4]> {
         match self {
-            Self::Ipv6
+            Self::ForeignSource { .. }
+            | Self::Ipv6
             | Self::UndeclaredFamily(_)
             | Self::Truncated
             | Self::UndeclaredProtocol { .. } => None,
@@ -401,21 +486,44 @@ impl DropReason {
             Self::UndeclaredProtocol { proto }
             | Self::DeniedSubnet { proto, .. }
             | Self::UndeclaredSubnet { proto, .. } => Some(*proto),
-            Self::Ipv6 | Self::UndeclaredFamily(_) | Self::Truncated => None,
+            Self::ForeignSource { .. }
+            | Self::Ipv6
+            | Self::UndeclaredFamily(_)
+            | Self::Truncated => None,
         }
     }
 }
 
+/// NET-084: whether a frame's source is foreign — an address other than the
+/// `lease` the relay was attached with. `Some(reason)` when the frame must
+/// be rejected; `None` when it carries the lease, or no readable source at
+/// all — an IPv6 or undeclared-family frame, or a truncated one, none of
+/// which `verdict` admits either way. An IPv4 frame's source is its header
+/// source address; an ARP frame's is its sender protocol address, read
+/// whatever protocol type the frame claims for it — so a foreign address
+/// cannot be announced by address resolution either, least of all by an
+/// ARP dressed up as another protocol.
+#[must_use]
+pub fn foreign_source(summary: &FrameSummary, lease: [u8; 4]) -> Option<DropReason> {
+    let src = summary.src?;
+    (src != lease).then_some(DropReason::ForeignSource { src, lease })
+}
+
 /// The admit-or-drop decision for one frame summary against one box's rules
-/// — the pure function NET-062, NET-063, and NET-064 all reduce to, and
-/// the one the Kani harness exhausts.
+/// — the pure function NET-062, NET-063, NET-064, and NET-084 all reduce
+/// to, and the one the Kani harness exhausts.
 ///
-/// Order of the IPv4 checks is part of the contract: the resolver
-/// carve-out comes first, so a box that denies the resolver's own subnet
-/// still resolves (NET-079); `deny_subnets` then carves out of what the
-/// allows admit; and a drop never depends on the rule lists being sorted.
+/// Order of the checks is part of the contract: the lease check comes
+/// first, so a frame from a foreign source is rejected whatever family or
+/// destination it carries (NET-084); the resolver carve-out then comes
+/// before the rules, so a box that denies the resolver's own subnet still
+/// resolves (NET-079); `deny_subnets` then carves out of what the allows
+/// admit; and a drop never depends on the rule lists being sorted.
 #[must_use]
 pub fn verdict(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
+    if let Some(reason) = foreign_source(summary, rules.lease) {
+        return FrameVerdict::Drop(reason);
+    }
     match summary.family {
         FrameFamily::Arp => FrameVerdict::Admit,
         FrameFamily::Ipv6 => FrameVerdict::Drop(DropReason::Ipv6),
@@ -651,6 +759,10 @@ mod tests {
     /// keyed to (the default switch subnet's gateway).
     const RESOLVER: [u8; 4] = [100, 64, 0, 1];
 
+    /// The lease every rule set below is compiled with — the one source
+    /// address the frames below may carry (NET-084).
+    const LEASE: [u8; 4] = [100, 64, 0, 9];
+
     /// IPv4 protocol number for TCP, for the frames below.
     const IPPROTO_TCP: u8 = 6;
 
@@ -661,6 +773,7 @@ mod tests {
             Some(Vec::new()),
             Some(Vec::new()),
             RESOLVER,
+            LEASE,
         )
     }
 
@@ -674,14 +787,30 @@ mod tests {
         frame
     }
 
+    /// An ARP payload for `spa`: a full Ethernet/IPv4 ARP request, whose
+    /// sender protocol address is the source the lease check reads.
+    fn arp_payload(spa: [u8; 4]) -> Vec<u8> {
+        let mut arp = Vec::with_capacity(28);
+        arp.extend_from_slice(&1u16.to_be_bytes()); // htype: Ethernet
+        arp.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes()); // ptype: IPv4
+        arp.push(6); // hlen
+        arp.push(4); // plen
+        arp.extend_from_slice(&1u16.to_be_bytes()); // oper: request
+        arp.extend_from_slice(&[0x52, 0x54, 0x00, 0x40, 0x00, 0x09]); // sender MAC
+        arp.extend_from_slice(&spa); // sender protocol address
+        arp.extend_from_slice(&[0; 6]); // target MAC (unread)
+        arp.extend_from_slice(&RESOLVER); // target protocol address
+        arp
+    }
+
     /// An IPv4 packet payload: a header for `proto` carrying `frag_offset`
     ///'s low 13 bits, followed by `l4`.
-    fn ip_payload(proto: u8, dst: [u8; 4], frag_offset: u16, l4: &[u8]) -> Vec<u8> {
+    fn ip_payload(proto: u8, src: [u8; 4], dst: [u8; 4], frag_offset: u16, l4: &[u8]) -> Vec<u8> {
         let mut ip = vec![0u8; 20 + l4.len()];
         ip[0] = 0x45; // version 4, IHL 5 (20 bytes)
         ip[6..8].copy_from_slice(&frag_offset.to_be_bytes());
         ip[9] = proto;
-        ip[12..16].copy_from_slice(&[192, 168, 1, 2]); // src, unread by the verdict
+        ip[12..16].copy_from_slice(&src);
         ip[16..20].copy_from_slice(&dst);
         ip[20..].copy_from_slice(l4);
         ip
@@ -696,9 +825,14 @@ mod tests {
         out
     }
 
-    /// An IPv4 frame for `proto` to `dst`:`port`.
+    /// An IPv4 frame for `proto` from the lease to `dst`:`port`.
     fn ipv4_frame(proto: u8, dst: [u8; 4], port: u16) -> Vec<u8> {
-        eth_frame(ETHERTYPE_IPV4, &ip_payload(proto, dst, 0, &l4(port)))
+        ipv4_frame_from(LEASE, proto, dst, port)
+    }
+
+    /// An IPv4 frame for `proto` from `src` to `dst`:`port`.
+    fn ipv4_frame_from(src: [u8; 4], proto: u8, dst: [u8; 4], port: u16) -> Vec<u8> {
+        eth_frame(ETHERTYPE_IPV4, &ip_payload(proto, src, dst, 0, &l4(port)))
     }
 
     fn admits(frame: &[u8], rules: &EgressRules) -> bool {
@@ -709,8 +843,8 @@ mod tests {
     /// without rules behave identically under allow-all and deny-all.
     #[test]
     fn families_decided_without_rules() {
-        let allow_all = EgressRules::from_policy(None, RESOLVER);
-        let arp = eth_frame(ETHERTYPE_ARP, &[0u8; 28]);
+        let allow_all = EgressRules::from_policy(None, RESOLVER, LEASE);
+        let arp = eth_frame(ETHERTYPE_ARP, &arp_payload(LEASE));
         assert!(
             admits(&arp, &allow_all) && admits(&arp, &deny_all()),
             "ARP is a declared path for every box"
@@ -738,6 +872,150 @@ mod tests {
             FrameFamily::Truncated,
             "a frame shorter than an Ethernet header is truncated"
         );
+    }
+
+    /// NET-084: a frame whose source is not the box's lease is rejected —
+    /// an IPv4 frame carrying another address in its header, or an ARP frame
+    /// whose sender protocol address is another box's — whatever family,
+    /// destination or declaration it carries; the same frame from the lease
+    /// is admitted; and an ARP frame too short to carry its sender address
+    /// has no readable source and is truncated rather than admitted.
+    #[test]
+    fn foreign_source_is_rejected_whatever_it_carries() {
+        // Under a declaration that allows everything, the destination is
+        // not what drops this frame: the source is.
+        let allow_all = EgressRules::from_policy(None, RESOLVER, LEASE);
+        let spoofed = ipv4_frame_from([203, 0, 113, 7], IPPROTO_TCP, [10, 1, 2, 3], 443);
+        assert_eq!(
+            verdict(&summarize(&spoofed), &allow_all),
+            FrameVerdict::Drop(DropReason::ForeignSource {
+                src: [203, 0, 113, 7],
+                lease: LEASE,
+            })
+        );
+        // The same frame from the lease is the declared thing it looks like.
+        assert!(admits(
+            &ipv4_frame(IPPROTO_TCP, [10, 1, 2, 3], 443),
+            &allow_all
+        ));
+
+        // The resolver carve-out does not rescue a foreign source either:
+        // deny-all admits DNS to the resolver, from the lease only.
+        let dns = ipv4_frame_from([203, 0, 113, 7], IPPROTO_UDP, RESOLVER, DNS_PORT);
+        assert_eq!(
+            verdict(&summarize(&dns), &deny_all()),
+            FrameVerdict::Drop(DropReason::ForeignSource {
+                src: [203, 0, 113, 7],
+                lease: LEASE,
+            })
+        );
+        assert!(admits(
+            &ipv4_frame(IPPROTO_UDP, RESOLVER, DNS_PORT),
+            &deny_all()
+        ));
+
+        // ARP is a declared path — from the lease. A frame announcing
+        // another box's address as its sender is a foreign source too.
+        let arp = eth_frame(ETHERTYPE_ARP, &arp_payload(LEASE));
+        assert!(admits(&arp, &deny_all()), "the lease's own ARP resolves");
+        assert_eq!(summarize(&arp).source(), Some(LEASE));
+        let arp_spoof = eth_frame(ETHERTYPE_ARP, &arp_payload([203, 0, 113, 7]));
+        assert_eq!(
+            verdict(&summarize(&arp_spoof), &deny_all()),
+            FrameVerdict::Drop(DropReason::ForeignSource {
+                src: [203, 0, 113, 7],
+                lease: LEASE,
+            })
+        );
+
+        // An ARP frame too short to carry its sender protocol address has
+        // no readable source: it cannot be attributed to the lease, so it
+        // is truncated — never admitted. (The sender address sits 14 bytes
+        // into the ARP payload, behind the 8-byte fixed header and the
+        // 6-byte sender hardware address; 14 payload bytes stop short of
+        // it.)
+        let short_arp = eth_frame(ETHERTYPE_ARP, &arp_payload(LEASE)[..14]);
+        assert_eq!(summarize(&short_arp).family, FrameFamily::Truncated);
+        assert!(!admits(&short_arp, &allow_all));
+    }
+
+    /// The sender protocol address slot is an ARP frame's source whatever
+    /// protocol the frame claims for it (NET-084): an ARP announcing a
+    /// foreign address under a protocol type other than IPv4 — or under an
+    /// unexpected `hlen` or `plen` — is a foreign source like any other,
+    /// rejected and named the same way; an ARP whose slot carries the lease
+    /// is the declared family whatever it claims; and one too short to
+    /// carry four bytes of sender address at its own `hlen` is truncated,
+    /// never admitted.
+    #[test]
+    fn arp_source_is_read_whatever_protocol_the_frame_claims() {
+        /// An ARP payload claiming `ptype`, `hlen` and `plen`, whose sender
+        /// protocol address is `spa` — sitting `hlen` bytes of sender
+        /// hardware into the payload, and the `hlen` hardware bytes are
+        /// emitted so the address really is where the header says.
+        fn arp_claiming(ptype: u16, hlen: u8, plen: u8, spa: &[u8]) -> Vec<u8> {
+            let mut arp = Vec::new();
+            arp.extend_from_slice(&1u16.to_be_bytes()); // htype: Ethernet
+            arp.extend_from_slice(&ptype.to_be_bytes()); // ptype: as claimed
+            arp.push(hlen);
+            arp.push(plen);
+            arp.extend_from_slice(&1u16.to_be_bytes()); // oper: request
+            let mac = [0x52u8, 0x54, 0x00, 0x40, 0x00, 0x09];
+            arp.extend(mac.iter().cycle().take(usize::from(hlen))); // sender hardware address
+            arp.extend_from_slice(spa); // sender protocol address
+            arp
+        }
+
+        let allow_all = EgressRules::from_policy(None, RESOLVER, LEASE);
+        let foreign = [203, 0, 113, 7];
+
+        // An ARP claiming a protocol type other than IPv4, carrying a
+        // foreign address in its sender protocol address slot, is a
+        // foreign source like any other: the slot is the source whatever
+        // the frame claims to speak.
+        let odd = eth_frame(ETHERTYPE_ARP, &arp_claiming(0x1234, 6, 4, &foreign));
+        assert_eq!(summarize(&odd).family, FrameFamily::Arp);
+        assert_eq!(summarize(&odd).source(), Some(foreign));
+        assert_eq!(
+            verdict(&summarize(&odd), &allow_all),
+            FrameVerdict::Drop(DropReason::ForeignSource {
+                src: foreign,
+                lease: LEASE,
+            })
+        );
+
+        // An unexpected `hlen` moves the slot, and the read follows it.
+        let shifted = eth_frame(ETHERTYPE_ARP, &arp_claiming(0x1234, 8, 4, &foreign));
+        assert_eq!(summarize(&shifted).source(), Some(foreign));
+
+        // A `plen` other than four hides nothing either: the four bytes the
+        // lease check reads are the first four of the slot the frame
+        // declares.
+        let wide = eth_frame(
+            ETHERTYPE_ARP,
+            &arp_claiming(
+                0x1234,
+                6,
+                6,
+                &[foreign[0], foreign[1], foreign[2], foreign[3], 9, 9],
+            ),
+        );
+        assert_eq!(summarize(&wide).source(), Some(foreign));
+
+        // An ARP whose slot carries the lease is the declared family
+        // whatever protocol it claims: it announces the box's own address,
+        // which is what its ordinary ARP announces anyway.
+        let own = eth_frame(ETHERTYPE_ARP, &arp_claiming(0x1234, 6, 4, &LEASE));
+        assert!(
+            admits(&own, &deny_all()),
+            "the lease's own ARP resolves under a foreign protocol type too"
+        );
+
+        // Too short to carry four bytes of sender address at its own
+        // `hlen`: no readable source, so truncated rather than admitted.
+        let long_hlen = eth_frame(ETHERTYPE_ARP, &arp_claiming(0x0800, 200, 4, &[]));
+        assert_eq!(summarize(&long_hlen).family, FrameFamily::Truncated);
+        assert!(!admits(&long_hlen, &allow_all));
     }
 
     /// NET-079's carve-out: a deny-all box still reaches the resolver
@@ -772,6 +1050,7 @@ mod tests {
                 prefix: 16,
             }]),
             RESOLVER,
+            LEASE,
         );
         assert!(
             admits(&ipv4_frame(IPPROTO_UDP, RESOLVER, DNS_PORT), &denied_subnet),
@@ -791,6 +1070,7 @@ mod tests {
             }]),
             None,
             RESOLVER,
+            LEASE,
         );
         assert!(
             admits(&ipv4_frame(IPPROTO_TCP, [10, 1, 2, 3], 80), &rules),
@@ -818,6 +1098,7 @@ mod tests {
             }]),
             None,
             RESOLVER,
+            LEASE,
         );
         let denied = ipv4_frame(IPPROTO_TCP, [203, 0, 113, 7], 443);
         assert_eq!(
@@ -840,6 +1121,7 @@ mod tests {
                 prefix: 24,
             }]),
             RESOLVER,
+            LEASE,
         );
         assert!(
             admits(&ipv4_frame(IPPROTO_TCP, [10, 7, 7, 7], 80), &subtractive),
@@ -860,7 +1142,7 @@ mod tests {
     /// deny-all default comes into force.
     #[test]
     fn absent_policy_allows_all() {
-        let rules = EgressRules::from_policy(None, RESOLVER);
+        let rules = EgressRules::from_policy(None, RESOLVER, LEASE);
         assert!(admits(
             &ipv4_frame(IPPROTO_UDP, [203, 0, 113, 7], 9999),
             &rules
@@ -870,7 +1152,9 @@ mod tests {
 
     /// `from_policy` compiles each declared dimension and keeps the absent
     /// ones allow-all; `allow_dns_hosts` is not a frame-level rule (it is
-    /// the proxy's, NET-066) and compiles to nothing here.
+    /// the proxy's, NET-066) and compiles to nothing here. The lease is
+    /// carried beside the rules: the box's own address on the switch, the
+    /// source the verdict checks every frame against (NET-084).
     #[test]
     fn from_policy_compiles_the_declared_dimensions() {
         let policy = EgressPolicy {
@@ -879,7 +1163,7 @@ mod tests {
             allow_dns_hosts: Some(vec!["github.com".to_string()]),
             deny_subnets: None,
         };
-        let rules = EgressRules::from_policy(Some(&policy), RESOLVER);
+        let rules = EgressRules::from_policy(Some(&policy), RESOLVER, LEASE);
         assert_eq!(
             rules,
             EgressRules::new(
@@ -890,9 +1174,11 @@ mod tests {
                 }]),
                 None,
                 RESOLVER,
+                LEASE,
             )
         );
         assert_eq!(rules.resolver(), RESOLVER);
+        assert_eq!(rules.lease(), LEASE);
     }
 
     /// `Ipv4Cidr::parse` accepts exactly the spelling the launch-time
@@ -960,6 +1246,7 @@ mod tests {
         assert_eq!(summarize(&first).destination_port(), DNS_PORT);
         assert_eq!(summarize(&first).protocol(), Some(IPPROTO_UDP));
         assert_eq!(summarize(&first).destination(), Some(RESOLVER));
+        assert_eq!(summarize(&first).source(), Some(LEASE));
 
         // A later fragment: the offset bits are set, so there is no L4
         // header to read — and the missing port keeps the carve-out closed.
@@ -975,7 +1262,7 @@ mod tests {
         // An L4 header shorter than its ports cannot be read either.
         let short_l4 = eth_frame(
             ETHERTYPE_IPV4,
-            &ip_payload(IPPROTO_UDP, RESOLVER, 0, &[0u8; 2]),
+            &ip_payload(IPPROTO_UDP, LEASE, RESOLVER, 0, &[0u8; 2]),
         );
         assert_eq!(summarize(&short_l4).destination_port(), 0);
 
@@ -1114,7 +1401,7 @@ mod tests {
             allow_dns_hosts: None,
             deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
         };
-        let rules = EgressRules::from_policy(Some(&policy), RESOLVER);
+        let rules = EgressRules::from_policy(Some(&policy), RESOLVER, LEASE);
         let allow = rules.allow_subnets().expect("allow_subnets compiled");
         assert_eq!(allow.len(), 1);
         assert!(allow[0].contains([10, 200, 0, 1]));
@@ -1123,7 +1410,7 @@ mod tests {
         assert_eq!(deny.len(), 1);
         assert!(deny[0].contains([192, 168, 0, 1]));
 
-        let open = EgressRules::from_policy(None, RESOLVER);
+        let open = EgressRules::from_policy(None, RESOLVER, LEASE);
         assert!(open.allow_subnets().is_none() && open.deny_subnets().is_none());
     }
 }
@@ -1131,10 +1418,11 @@ mod tests {
 /// The frame-level admit-or-drop harness NET-016, NET-062, NET-064,
 /// NET-069, NET-070, NET-081's failure case and NET-084 share (spec NET,
 /// Tiers): exhaustive over every value the decision reads — the fragment
-/// offset, the protocol, the destination and the L4 destination port of an
-/// IPv4 frame — under rule lists of zero or two rules per dimension, at an
-/// unwind bound of 6 (the `[u8; 4]` address comparisons lower to a 4-trip
-/// `memcmp` loop; see the harness).
+/// offset, the source, the protocol, the destination and the L4 destination
+/// port of an IPv4 frame, plus the lease the source must be — under rule
+/// lists of zero or two rules per dimension, at an unwind bound of 6 (the
+/// `[u8; 4]` address comparisons lower to a 4-trip `memcmp` loop; see the
+/// harness).
 ///
 /// The module also carries the rebinding intersection's harness (NET-067,
 /// [`kani_rebinding_intersection_admits_no_denied_address`]), which shares
@@ -1198,9 +1486,10 @@ mod kani_proofs {
     /// A frame is admitted exactly when it is declared: stated as an iff so
     /// neither arm can silently become unreachable (the rcache harness
     /// pattern). The declared half is restated over the same summary and
-    /// rules — the resolver carve-out first (NET-079), then the three
-    /// declared dimensions conjunctively — so a verdict that checks in a
-    /// different order, or that reads `None` as deny-all, fails here.
+    /// rules — the lease first (NET-084: the source is the lease), then the
+    /// resolver carve-out (NET-079), then the three declared dimensions
+    /// conjunctively — so a verdict that checks in a different order, or
+    /// that reads `None` as deny-all, fails here.
     ///
     /// The unwind bound is 6, with one loop to spare over the longest
     /// this proof unwinds: comparing `[u8; 4]` addresses lowers to
@@ -1209,7 +1498,8 @@ mod kani_proofs {
     /// writes (the rule scans in `verdict` and below, over lists of at
     /// most two rules) has exited by its third check. The bound has to
     /// clear every trip the compiler generates, not only the ones the
-    /// source shows.
+    /// source shows; the lease check's source comparison is one more of
+    /// those `memcmp`s, not a longer one.
     #[kani::proof]
     #[kani::unwind(6)]
     fn kani_frame_verdict_admits_nothing_undeclared() {
@@ -1217,8 +1507,11 @@ mod kani_proofs {
         // region, 20 bytes of IPv4 header plus 20 of L4 — the shape the
         // relay hands the verdict for every IPv4 packet it forwards.
         //
-        // Symbolic: the fragment offset, the protocol, the destination and
-        // the L4 destination port — every value the decision reads.
+        // Symbolic: the fragment offset, the source, the protocol, the
+        // destination and the L4 destination port — every value the
+        // decision reads — and the lease, beside the rules, that the source
+        // is checked against (NET-084's property is over every frame and
+        // every lease).
         //
         // Pinned to constants: the EtherType (IPv4, the one family the
         // rules decide; the families decided without rules each have their
@@ -1233,6 +1526,7 @@ mod kani_proofs {
         // pay for bit by bit.
         let frag: u16 = kani::any();
         let proto: u8 = kani::any();
+        let src: [u8; 4] = kani::any();
         let dst: [u8; 4] = kani::any();
         let port: u16 = kani::any();
         let mut frame = [0u8; ETH_HDR + 40];
@@ -1245,6 +1539,10 @@ mod kani_proofs {
         frame[ip + 6] = frag_bytes[0]; // flags + fragment offset
         frame[ip + 7] = frag_bytes[1];
         frame[ip + 9] = proto;
+        frame[ip + 12] = src[0]; // the IPv4 source address
+        frame[ip + 13] = src[1];
+        frame[ip + 14] = src[2];
+        frame[ip + 15] = src[3];
         frame[ip + 16] = dst[0];
         frame[ip + 17] = dst[1];
         frame[ip + 18] = dst[2];
@@ -1257,12 +1555,14 @@ mod kani_proofs {
         assert!(matches!(summary.family(), FrameFamily::Ipv4));
 
         let resolver: [u8; 4] = kani::any();
-        let rules = EgressRules::new(two_protocols(), two_cidrs(), two_cidrs(), resolver);
+        let lease: [u8; 4] = kani::any();
+        let rules = EgressRules::new(two_protocols(), two_cidrs(), two_cidrs(), resolver, lease);
 
         let admitted = matches!(verdict(&summary, &rules), FrameVerdict::Admit);
 
-        let declared = match (summary.destination(), summary.protocol()) {
-            (Some(dst), Some(proto)) => {
+        let declared = match (summary.source(), summary.destination(), summary.protocol()) {
+            (Some(src), Some(dst), Some(proto)) => {
+                let lease = src == rules.lease();
                 let resolver = proto == IPPROTO_UDP
                     && dst == rules.resolver()
                     && summary.destination_port() == DNS_PORT;
@@ -1278,7 +1578,7 @@ mod kani_proofs {
                     .allow_subnets
                     .as_ref()
                     .is_none_or(|list| list.iter().any(|cidr| cidr.contains(dst)));
-                resolver || (protocols && !denied && allowed)
+                lease && (resolver || (protocols && !denied && allowed))
             }
             // No readable IPv4 header is never a declared frame.
             _ => false,

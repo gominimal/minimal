@@ -24,3 +24,6 @@ common.workspace = true
 graph.workspace = true
 orchestrator.workspace = true
 remote-proto.workspace = true
+
+[lints]
+workspace = true

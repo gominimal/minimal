@@ -34,3 +34,6 @@ arbitrary = { workspace = true, optional = true }
 [features]
 # Exposes `Graph::fuzz_roundtrip` for crates/graph/fuzz. Not for production use.
 fuzzing = ["dep:arbitrary"]
+
+[lints]
+workspace = true
