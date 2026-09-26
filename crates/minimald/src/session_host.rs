@@ -1205,6 +1205,15 @@ pub struct HostHandle {
     sender: mpsc::Sender<Message>,
 }
 
+/// Why [`HostHandle::attach`] could not deliver the attach message.
+pub enum HostAttachError {
+    /// The host's mailbox is full and did not drain before the deadline.
+    /// The host is still alive; the caller should retry or report busy.
+    Timeout,
+    /// The host's runtime loop has ended. The caller should mint a new host.
+    Closed(Channel<Msg>, WinSize),
+}
+
 /// The mailbox of a [`HostHandle::wedged`] host, opaque so [`Message`] stays
 /// private to this module.
 ///
@@ -1270,7 +1279,7 @@ impl HostHandle {
         sz: WinSize,
         connection: ConnectionEnv,
         keys: SessionKeys,
-    ) -> Result<(), (Channel<Msg>, WinSize)> {
+    ) -> Result<(), HostAttachError> {
         match self
             .sender
             .send_timeout(
@@ -1280,11 +1289,12 @@ impl HostHandle {
             .await
         {
             Ok(()) => Ok(()),
-            // A wedged loop that never drains its mailbox (the send times out)
-            // and a loop that has gone (the channel is closed) both hand the
-            // channel back; the caller re-mints a host from it either way.
-            Err(SendTimeoutError::Timeout(Message::Attach(c, sz, _, _)))
-            | Err(SendTimeoutError::Closed(Message::Attach(c, sz, _, _))) => Err((c, sz)),
+            Err(SendTimeoutError::Timeout(Message::Attach(_, _, _, _))) => {
+                Err(HostAttachError::Timeout)
+            }
+            Err(SendTimeoutError::Closed(Message::Attach(c, sz, _, _))) => {
+                Err(HostAttachError::Closed(c, sz))
+            }
             Err(e) => unreachable!("{:?}", e),
         }
     }
