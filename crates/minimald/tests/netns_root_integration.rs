@@ -378,7 +378,7 @@ async fn network_none_attach_works() {
     }
     use minimald::nsenter::{Injection, session_leader_pid};
     use minimald::session_host::{Pty, WinSize};
-    use std::io::BufRead as _;
+    use std::io::{BufRead as _, Read as _};
 
     /// What the session host would set: the shell that is actually running.
     const PROBE_SHELL: &str = "/usr/bin/probe";
@@ -443,10 +443,18 @@ async fn network_none_attach_works() {
         pty.dup_slave_fd()
             .expect("duplicating the launch-path pty slave"),
     ));
+    // Both report streams are the proof's own pipes, not its inherited ones:
+    // the hold program is the supervisor's child, so it can outlive the
+    // supervisor when its parent-death signal does not land, and a process
+    // holding the test's streams past the proof's exit is what the lane's
+    // leak window fails with no message of the proof's own.
     hold.stdout(hakoniwa::Stdio::MakePipe);
+    hold.stderr(hakoniwa::Stdio::MakePipe);
     let mut child = hold.spawn().expect("spawning hold process in none box");
 
     let hold_stdout = child.stdout.take().expect("hold process stdout pipe");
+    let mut hold_stderr = child.stderr.take().expect("hold process stderr pipe");
+    let mut guard = LiveBox::new(child);
     let hold_report = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {
@@ -467,23 +475,20 @@ async fn network_none_attach_works() {
         // hakoniwa's mount setup, before any seccomp or exec) reads
         // differently here from a launch that started the program without
         // its cwd or `SHELL`, and the difference is the first thing to check.
-        let status = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || child.wait()),
-        )
-        .await
-        .expect("waiting for the silent hold process timed out")
-        .expect("spawn_blocking join")
-        .expect("waiting for the silent hold process");
+        let end = guard.stop();
+        let mut stderr = Vec::new();
+        let _drained = hold_stderr.read_to_end(&mut stderr);
         panic!(
             "the none-box launch lost the command's cwd or SHELL across the \
              seccomp closure swap: expected {expected_report:?}, got \
-             {hold_report:?}; the hold process exited with {status:?}"
+             {hold_report:?}; the hold process exited with {end:?}\nstderr: {}",
+            String::from_utf8_lossy(&stderr)
         );
     }
 
     let leader =
-        session_leader_pid(child.id()).expect("resolving the none box's session leader pid");
+        session_leader_pid(guard.child_id()).expect("resolving the none box's session leader pid");
+    guard.holds(leader);
 
     // The launch-path half of NET-039: hakoniwa runs `setsid()` and
     // `TIOCSCTTY` in the box's own process, driven by the container's runctl
@@ -528,15 +533,10 @@ async fn network_none_attach_works() {
     .expect("injected attach probe timed out")
     .expect("spawn_blocking join");
 
-    let _ = child.kill();
-    let _ = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::task::spawn_blocking(move || child.wait()),
-    )
-    .await
-    .expect("waiting for hold process timed out")
-    .expect("spawn_blocking join")
-    .expect("waiting for hold process");
+    // Stop the box the way the capability proof does — the supervisor first,
+    // then the program it holds — so the proof returns having left no process
+    // of the box's behind.
+    let _stopped = guard.stop();
 
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
@@ -691,7 +691,7 @@ struct LiveBox {
     child: hakoniwa::Child,
     /// The program the injection targets, once the box has reported; only
     /// then can stopping the box wait for the program to be gone.
-    leader: Option<u32>,
+    leader: Option<i32>,
 }
 
 impl LiveBox {
@@ -703,9 +703,10 @@ impl LiveBox {
     }
 
     /// Records the pid the injection is aimed at, so `stop` can tell the
-    /// program is gone rather than merely the supervisor that ran it.
+    /// program is gone rather than merely the supervisor that ran it. Held as
+    /// the `i32` `libc::kill` takes: a Linux pid always fits one.
     fn holds(&mut self, leader: u32) {
-        self.leader = Some(leader);
+        self.leader = Some(i32::try_from(leader).expect("the program pid fits an i32"));
     }
 
     /// The supervisor's pid, which the session leader is looked up from.
@@ -721,10 +722,20 @@ impl LiveBox {
         let status = self.child.wait()?;
         if let Some(leader) = self.leader {
             let program = format!("/proc/{leader}");
-            // The program dies from the supervisor's PDEATHSIG the moment the
-            // SIGKILL lands, so the loop body almost never runs; it exists so
-            // a scheduling hiccup cannot turn a passing proof into a live
-            // process left behind.
+            // The program is the supervisor's child, not this proof's, so it
+            // dies from the supervisor's PDEATHSIG and nothing here reaps it.
+            // Signal it directly as well: a host where that death signal did
+            // not survive the launch must not be able to leave the proof a
+            // live process, which is the one failure the lane reports with no
+            // message of the proof's own.
+            // SAFETY: `kill` is an async-signal-safe syscall taking a pid this
+            // proof created and a valid signal; it reports ESRCH when the
+            // program is already gone, which is the state being asked for, so
+            // the return value carries nothing to act on.
+            let _already_gone = unsafe { libc::kill(leader, libc::SIGKILL) };
+            // The signal has usually landed before the loop is reached; the
+            // loop exists so a scheduling hiccup cannot turn a passing proof
+            // into a live process left behind.
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while Path::new(&program).exists() && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
