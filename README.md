@@ -186,8 +186,9 @@ name, using a git helper that `min` installs.
 
 The project's `minimal.toml` describes what every contributor's session
 needs; a **loadout** carries what *you* want on top: your editor, shell
-config, and dotfiles. Minimal is not a multiplexer: run tmux or zellij inside
-the box, from your loadout.
+config, and dotfiles, so the environment stays identical for everyone while
+you keep the muscle memory you have earned. Minimal is not a multiplexer:
+run tmux or zellij inside the box, from your loadout.
 Loadouts live under `~/.config/minimal/loadouts/`, either as `<name>.toml` or
 — to keep one under version control, alongside the files it ships — as
 `<name>/loadout.toml`; the
