@@ -45,6 +45,16 @@ fn run_vmm() -> Result<()> {
     use crate::krun::Context;
     use crate::vm::VmConfig;
 
+    // The VMM child inherits the parent's default 256-fd soft limit, but a
+    // burst of `min session exec` opens one vsock connection per exec and
+    // libkrun holds each closed connection ~5 s before freeing it, so a burst
+    // exhausts the limit and every exec fails for those 5 s. Widen the limit
+    // before any fd-heavy work; best-effort, since a VM that boots with the
+    // default limit beats one that does not boot.
+    if let Err(e) = raise_nofile_limit(DEFAULT_VMM_NOFILE_LIMIT) {
+        tracing::warn!(error = %e, "cannot raise RLIMIT_NOFILE; the VM keeps its inherited limit");
+    }
+
     let kernel = resolve_kernel_path().context("resolving kernel path")?;
     let rootfs = resolve_rootfs_path().context("resolving rootfs path")?;
     let initramfs = resolve_initramfs_path().context("resolving initramfs path")?;
@@ -134,6 +144,63 @@ fn run_vmm() -> Result<()> {
     // error so the parent can observe the child's non-zero exit.
     let err = ctx.start_enter();
     bail!("krun_start_enter returned unexpectedly: {err}");
+}
+
+/// Soft and hard `RLIMIT_NOFILE` the VMM child installs for itself. The child
+/// inherits the parent's default 256-fd soft limit, but a burst of
+/// `min session exec` opens one vsock connection per exec and libkrun holds
+/// each closed connection ~5 s before freeing it, so a burst exhausts the
+/// limit and every exec fails for those 5 s. 64 Ki covers the fd-hungry cases
+/// while staying well under the `fs.nr_open` ceiling.
+#[cfg(minvmd_libkrun)]
+const DEFAULT_VMM_NOFILE_LIMIT: u64 = 65536;
+
+/// Raises `RLIMIT_NOFILE`, soft and hard, to `limit`; returns the soft limit in
+/// force afterwards, which can be below `limit` (see the fallback).
+#[cfg(minvmd_libkrun)]
+fn raise_nofile_limit(limit: u64) -> std::io::Result<u64> {
+    let current = get_nofile_limit()?;
+    let target = limit as libc::rlim_t;
+    if current.rlim_cur >= target {
+        return Ok(current.rlim_cur);
+    }
+
+    // The kernel rejects a hard limit above `fs.nr_open` outright rather than
+    // clamping, so an overshooting request fails wholesale. Fall back to the
+    // hard limit we already have — no privilege needed — instead of leaving the
+    // 256-fd default in place.
+    if set_nofile_limit(target, target).is_err() {
+        set_nofile_limit(current.rlim_max, current.rlim_max)?;
+    }
+
+    Ok(get_nofile_limit()?.rlim_cur)
+}
+
+#[cfg(minvmd_libkrun)]
+fn get_nofile_limit() -> std::io::Result<libc::rlimit> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a live `rlimit`, which is exactly what the kernel
+    // writes through the pointer.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) };
+    (rc == 0)
+        .then_some(limit)
+        .ok_or_else(std::io::Error::last_os_error)
+}
+
+#[cfg(minvmd_libkrun)]
+fn set_nofile_limit(soft: libc::rlim_t, hard: libc::rlim_t) -> std::io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: hard,
+    };
+    // SAFETY: `limit` is a live `rlimit` the kernel only reads from.
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) };
+    (rc == 0)
+        .then_some(())
+        .ok_or_else(std::io::Error::last_os_error)
 }
 
 /// Register the host→guest timekeep bridge and start the sender thread.
