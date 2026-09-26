@@ -1079,8 +1079,11 @@ if (
   # for output parsing, so the activate that autospawns the daemon alone
   # carries the noisier filter — as a command-local assignment, never a
   # subshell export, so nothing leaks past this proof.
-  export HOME="$fi_home" MINIMAL_BIN="$fi_home/.local/bin"
-  export PATH="$fi_home/.local/bin:$PATH"
+  # The swap is deliberately subshell-local (SC2030): the lane's own env
+  # must not pick it up, so the change dying with this proof's subshell is
+  # the point — see the comment above.
+  # shellcheck disable=SC2030
+  export HOME="$fi_home" MINIMAL_BIN="$fi_home/.local/bin" PATH="$fi_home/.local/bin:$PATH"
   mnl stop --force >/dev/null 2>&1 || true
   fi_sid="$(cd "$fi_seed" && RUST_LOG=info mnl session activate . --no-prompt \
     --name e2e-fresh-ingress --network own_ip --ingress "$fi_hport":8080 \
@@ -1411,6 +1414,10 @@ STUB
 
   if (
     # ---- the fresh install --------------------------------------------------
+    # The $PATH read below (SC2031) is meant to see the lane's PATH: the
+    # loopback-publish proof's subshell swap never reaches this proof, so
+    # nothing is lost.
+    # shellcheck disable=SC2031
     HOME="$np_home" MINIMAL_BIN="$np_home/.local/bin" \
       PATH="$np_stubbin:$PATH" \
       MINIMAL_OVERRIDE_INSTALLER_BUCKET="$np_bucket_host" \
@@ -1495,8 +1502,11 @@ STUB
     trap np_cleanup EXIT
 
     # ---- drive the INSTALLED pair -------------------------------------------
-    export HOME="$np_home" MINIMAL_BIN="$np_home/.local/bin"
-    export PATH="$np_home/.local/bin:$PATH"
+    # As in the loopback-publish proof, the swap is deliberately subshell-local
+    # (SC2030/SC2031): the lane's env must stay as it was, and the $PATH read
+    # is the lane's PATH — no earlier proof's swap reaches here.
+    # shellcheck disable=SC2030,SC2031
+    export HOME="$np_home" MINIMAL_BIN="$np_home/.local/bin" PATH="$np_home/.local/bin:$PATH"
     mnl stop --force >/dev/null 2>&1 || true
 
     # The daemon the case drives autospawns on the FIRST daemon-touching
@@ -1785,6 +1795,7 @@ STUB
     # destroy below. The marker the typed command prints is the proof the
     # attach reached the box.
     local np_attach_out
+    # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
     np_attach_out="$(E2E_PTY_COMMANDS='echo POSTURE_NONE_ATTACH_OK
 exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
       min ${E2E_MINIMAL_ARGS:-} session attach "$np_none_sid" \
