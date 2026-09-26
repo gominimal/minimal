@@ -1099,6 +1099,39 @@ remove_renamed_gvproxy() {
         fi
     done <"$prev_record"
 }
+
+# --- Switch binary verification ---------------------------------------
+
+# NET-041: an own-IP session is served by a switch binary (gvproxy-min) the
+# daemon spawns from the exact paths this installer writes to
+# (switch::installed_gvproxy_bin). Check the binary this run shipped is
+# present and executable — and say which path was checked — BEFORE the
+# rename cleanup that follows can delete anything: an activate that
+# cannot find its switch fails far away from the installer that left it
+# broken, and a mid-rename host still holding only `bin/gvproxy` must not
+# have that file removed before the failure is known. Records hold a row for
+# every applicable component — skipped and current ones included — so the
+# scan below sees the row even when nothing was downloaded this run.
+verify_switch_binary() {
+    _tab="$(printf '\t')"
+    # `$records` holds only this platform's applicable rows, and at most one
+    # gvproxy-min row, so the last assignment is also the only one.
+    _dest="$(awk -F"$_tab" '$1 == "gvproxy-min" { d = $2 } END { print d }' "$records")"
+    # A pre-rename manifest still ships the component under its old name; that
+    # path is then the switch binary the host actually has.
+    [ -n "$_dest" ] ||
+        _dest="$(awk -F"$_tab" '$1 == "gvproxy" { d = $2 } END { print d }' "$records")"
+    if [ -z "$_dest" ]; then
+        # No row at all: this channel ships no switch binary, so there is
+        # nothing to break. Not an error — data-only channels exist.
+        row switch-binary skipped "this channel ships no switch binary"
+        return 0
+    fi
+    [ -x "$_dest" ] ||
+        die "switch binary $_dest is not present or not executable; own-IP sessions need it"
+    row switch-binary verified "$_dest"
+}
+verify_switch_binary
 remove_renamed_gvproxy
 
 # Persist the resolved (component, dest, installed-hash) rows for this
