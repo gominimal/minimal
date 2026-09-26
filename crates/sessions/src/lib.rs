@@ -825,6 +825,10 @@ mod tests {
         // The address of the resolver Minimal owns for a box: the switch
         // gateway, whose value only shapes the carve-out's key.
         let resolver = [100, 64, 0, 1];
+        // The box's lease, whose value only shapes the source check
+        // (NET-084), proven in `core::egress`; what is asserted here is the
+        // egress dimensions the deny-all arm materializes to.
+        let lease = [100, 64, 0, 9];
         let declared = EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".into()]),
             ..EgressPolicy::default()
@@ -889,8 +893,8 @@ mod tests {
         // `verdict` holds every external destination against, the resolver
         // carve-out excepted.
         assert_eq!(
-            EgressRules::from_policy(Some(&EgressPolicy::deny_all()), resolver),
-            EgressRules::new(Some(Vec::new()), Some(Vec::new()), None, resolver),
+            EgressRules::from_policy(Some(&EgressPolicy::deny_all()), resolver, lease),
+            EgressRules::new(Some(Vec::new()), Some(Vec::new()), None, resolver, lease),
             "the deny-all section must compile to rules that admit nothing",
         );
     }

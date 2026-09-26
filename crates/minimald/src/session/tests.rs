@@ -2546,6 +2546,10 @@ async fn own_ip_default_deny_all() {
     let resolver = [100, 64, 0, 1];
     // Something the box did not declare: an address out in the world.
     let external = [93, 184, 216, 34];
+    // The box's lease — the source address `ipv4_frame` writes, so the
+    // verdicts below turn on the egress dimension alone. The lease check
+    // itself (NET-084) is proven in `sessions::core::egress`.
+    let lease = [10, 0, 0, 5];
 
     // The launcher's resolution for an own-address box that declared
     // nothing, once the default is in force: the deny-all section, egress
@@ -2568,7 +2572,7 @@ async fn own_ip_default_deny_all() {
     // in every transport — the carve-out excepted, keyed to both the
     // resolver's address and DNS's port, so no other address at :53 and no
     // other port on the resolver slips through.
-    let rules = EgressRules::from_policy(effective.egress.as_ref(), resolver);
+    let rules = EgressRules::from_policy(effective.egress.as_ref(), resolver, lease);
     let verdict_on = |proto: u8, dst: [u8; 4], port: u16| {
         sessions::core::egress::verdict(
             &sessions::core::egress::summarize(&ipv4_frame(proto, dst, port)),
