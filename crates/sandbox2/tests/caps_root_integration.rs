@@ -83,19 +83,14 @@ fn compile_cap_probe(base: &Path) -> PathBuf {
         .args(["-static", "-o"])
         .arg(&bin)
         .arg(&src)
-        .status();
-    let status = match status {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            panic!(
-                "gcc not found: this proof's host gate passed, so this host \
-                 promised to run it; install a C compiler (build-essential on \
-                 Ubuntu) rather than letting a security proof pass without \
-                 asserting anything (spawn error: {e})"
-            );
-        }
-        Err(e) => panic!("spawning gcc to compile the capability probe: {e}"),
-    };
+        .status()
+        .expect(
+            "spawning gcc to compile the capability probe — a gcc that is not \
+             on PATH means this proof's host gate passed but the host cannot \
+             keep that promise: install a C compiler (build-essential on \
+             Ubuntu) rather than letting a security proof pass without \
+             asserting anything",
+        );
     assert!(
         status.success(),
         "gcc failed to compile the capability probe: {status:?}"
@@ -145,8 +140,9 @@ fn base_dir() -> PathBuf {
 /// `Sandbox::new_container` every consumer uses — so what the report shows is
 /// what any box a session or a task runs in holds, not a hand-built container.
 async fn box_report(plan: NetPlan) -> BTreeMap<String, String> {
-    let base = tempfile::tempdir_in(base_dir())
-        .unwrap_or_else(|e| panic!("base temp dir under {}: {e}", base_dir().display()));
+    let base_dir = base_dir();
+    let no_base_dir = format!("base temp dir under {}", base_dir.display());
+    let base = tempfile::tempdir_in(&base_dir).expect(&no_base_dir);
     let probe = compile_cap_probe(base.path());
     let source = base.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
@@ -155,8 +151,8 @@ async fn box_report(plan: NetPlan) -> BTreeMap<String, String> {
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
         .with_plan(plan);
-    let sandbox_base = tempfile::tempdir_in(base_dir())
-        .unwrap_or_else(|e| panic!("sandbox temp dir under {}: {e}", base_dir().display()));
+    let no_sandbox_dir = format!("sandbox temp dir under {}", base_dir.display());
+    let sandbox_base = tempfile::tempdir_in(&base_dir).expect(&no_sandbox_dir);
     let mut sandbox = config
         .build(sandbox_base.path().join("sandbox"), ())
         .await
@@ -275,9 +271,8 @@ fn assert_box_credentials(report: &BTreeMap<String, String>, what: &str) {
             "{what}: {key} must carry the real, effective, saved and fs ids: {value}"
         );
         for field in &fields {
-            let id: u32 = field
-                .parse()
-                .unwrap_or_else(|e| panic!("{what}: {key} field {field} is not a number: {e}"));
+            let not_a_number = format!("{what}: {key} field {field} is not a number");
+            let id: u32 = field.parse().expect(&not_a_number);
             assert_eq!(
                 id, expected,
                 "{what}: the box must exec as the box uid/gid {expected} in every {key} field: {value}"
@@ -334,26 +329,22 @@ fn parse_report(stdout: &str) -> BTreeMap<String, String> {
 /// The probe's report line for `key`, or a panic naming what never arrived: a
 /// report that does not show up is the failure to show, not a mystery.
 fn reported<'a>(report: &'a BTreeMap<String, String>, key: &str, what: &str) -> &'a str {
-    report
-        .get(key)
-        .unwrap_or_else(|| panic!("{what}: the probe did not report {key}"))
+    let never_arrived = format!("{what}: the probe did not report {key}");
+    report.get(key).expect(&never_arrived)
 }
 
 /// The errno the probe reported for `key`, e.g. `raw_socket_errno`.
 fn reported_errno(report: &BTreeMap<String, String>, key: &str, what: &str) -> i32 {
-    reported(report, key, what)
-        .parse()
-        .unwrap_or_else(|e| panic!("{what}: {key} is not a number: {e}"))
+    let not_a_number = format!("{what}: {key} is not a number");
+    reported(report, key, what).parse().expect(&not_a_number)
 }
 
 /// One capability-set mask from the probe's report, e.g. `CapBnd:
 /// 000001ffffffffff`.
 fn capability_mask(report: &BTreeMap<String, String>, set: &str, what: &str) -> u64 {
     let value = reported(report, set, what);
-    let mask = value
-        .split_ascii_whitespace()
-        .next()
-        .unwrap_or_else(|| panic!("{what}: {set} must carry one hex mask: {value}"));
-    u64::from_str_radix(mask, 16)
-        .unwrap_or_else(|e| panic!("{what}: {set} is not a hex mask ({mask}): {e}"))
+    let no_mask = format!("{what}: {set} must carry one hex mask: {value}");
+    let mask = value.split_ascii_whitespace().next().expect(&no_mask);
+    let not_a_mask = format!("{what}: {set} is not a hex mask: {mask}");
+    u64::from_str_radix(mask, 16).expect(&not_a_mask)
 }

@@ -294,7 +294,8 @@ async fn network_none_blocks_all_outside_sockets() {
         return;
     }
 
-    let rootfs_tmp = tempfile::tempdir_in("/tmp").expect("rootfs temp dir under /tmp");
+    let rootfs_tmp =
+        tempfile::tempdir_in(proof_base_dir()).expect("rootfs temp dir under the target tmp");
     let probe = compile_socket_probe(rootfs_tmp.path());
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
@@ -312,10 +313,12 @@ async fn network_none_blocks_all_outside_sockets() {
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
         .with_plan(no_net);
-    // Build the sandbox in /tmp rather than the default (/home is a read-only
-    // ext4 bind with locked nosuid, which breaks the unprivileged remounts
-    // hakoniwa does inside the user namespace).
-    let tmp = tempfile::tempdir_in("/tmp").expect("sandbox temp dir under /tmp");
+    // Build the sandbox under the target directory rather than the default
+    // (`/home` here can be a read-only ext4 bind with locked nosuid, and
+    // `/tmp` a `nosuid,nodev` tmpfs; both break the unprivileged remounts
+    // hakoniwa does inside the user namespace — see `proof_base_dir`).
+    let tmp =
+        tempfile::tempdir_in(proof_base_dir()).expect("sandbox temp dir under the target tmp");
     let mut sandbox = config
         .build(tmp.path().join("sandbox"), ())
         .await
@@ -380,7 +383,8 @@ async fn network_none_attach_works() {
     /// What the session host would set: the shell that is actually running.
     const PROBE_SHELL: &str = "/usr/bin/probe";
 
-    let rootfs_tmp = tempfile::tempdir_in("/tmp").expect("rootfs temp dir under /tmp");
+    let rootfs_tmp =
+        tempfile::tempdir_in(proof_base_dir()).expect("rootfs temp dir under the target tmp");
     let probe = compile_socket_probe(rootfs_tmp.path());
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
@@ -389,7 +393,8 @@ async fn network_none_attach_works() {
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
         .with_plan(NetPlan::none());
-    let tmp = tempfile::tempdir_in("/tmp").expect("sandbox temp dir under /tmp");
+    let tmp =
+        tempfile::tempdir_in(proof_base_dir()).expect("sandbox temp dir under the target tmp");
     let mut sandbox = config
         .build(tmp.path().join("sandbox"), ())
         .await
@@ -549,19 +554,20 @@ async fn network_none_attach_works() {
     );
 }
 
-/// Where the injected-process capability proof builds its box: the cargo
-/// target directory, never `/tmp`.
+/// Where the proofs that build a box build it: the cargo target directory,
+/// never `/tmp`.
 ///
-/// The other proofs here build under `/tmp`, which is fine on the CI lane's
-/// runners — but a host whose `/tmp` is a `nosuid,nodev` tmpfs cannot host a
-/// box at all: a bind remount inside a user namespace may only repeat flags
-/// the underlying mount already has, and hakoniwa's read-only remount asks
-/// for `MS_RDONLY|MS_NOSUID` without `nodev`, so a bind whose source carries
-/// a locked `nodev` is refused. This proof is gated on the user namespace
-/// alone, so it must run on such hosts too; the target directory sits on the
+/// `/tmp` works on the CI lane's runners, but a host whose `/tmp` is a
+/// `nosuid,nodev` tmpfs cannot host a box at all: a bind remount inside a user
+/// namespace may only repeat flags the underlying mount already has, and
+/// hakoniwa's read-only remount asks for `MS_RDONLY|MS_NOSUID` without
+/// `nodev`, so a bind whose source carries a locked `nodev` is refused. The
+/// capability proof is gated on the user namespace alone, so it has to run on
+/// such hosts; the none-box proofs go through the same place so a host that
+/// can run one can run all of them. The target directory sits on the
 /// checkout's own filesystem, which carries no such lock, and is ignored by
 /// git like everything under `target/`.
-fn caps_base_dir() -> PathBuf {
+fn proof_base_dir() -> PathBuf {
     // The target directory this build uses; cargo points test targets at its
     // own tmp through CARGO_TARGET_DIR, and a checkout that lets cargo
     // default has one at its root.
@@ -589,9 +595,8 @@ fn assert_box_credentials(report: &BTreeMap<String, String>, what: &str) {
             "{what}: {key} must carry the real, effective, saved and fs ids: {value}"
         );
         for field in &fields {
-            let id: u32 = field
-                .parse()
-                .unwrap_or_else(|e| panic!("{what}: {key} field {field} is not a number: {e}"));
+            let not_a_number = format!("{what}: {key} field {field} is not a number");
+            let id: u32 = field.parse().expect(&not_a_number);
             assert_eq!(
                 id, expected,
                 "{what}: the process must exec as the box uid/gid {expected} in every \
@@ -649,28 +654,24 @@ fn parse_report(stdout: &str) -> BTreeMap<String, String> {
 /// The probe's report line for `key`, or a panic naming what never arrived: a
 /// report that does not show up is the failure to show, not a mystery.
 fn reported<'a>(report: &'a BTreeMap<String, String>, key: &str, what: &str) -> &'a str {
-    report
-        .get(key)
-        .unwrap_or_else(|| panic!("{what}: the probe did not report {key}"))
+    let never_arrived = format!("{what}: the probe did not report {key}");
+    report.get(key).expect(&never_arrived)
 }
 
 /// The errno the probe reported for `key`, e.g. `raw_socket_errno`.
 fn reported_errno(report: &BTreeMap<String, String>, key: &str, what: &str) -> i32 {
-    reported(report, key, what)
-        .parse()
-        .unwrap_or_else(|e| panic!("{what}: {key} is not a number: {e}"))
+    let not_a_number = format!("{what}: {key} is not a number");
+    reported(report, key, what).parse().expect(&not_a_number)
 }
 
 /// One capability-set mask from the probe's report, e.g. `CapBnd:
 /// 000001ffffffffff`.
 fn capability_mask(report: &BTreeMap<String, String>, set: &str, what: &str) -> u64 {
     let value = reported(report, set, what);
-    let mask = value
-        .split_ascii_whitespace()
-        .next()
-        .unwrap_or_else(|| panic!("{what}: {set} must carry one hex mask: {value}"));
-    u64::from_str_radix(mask, 16)
-        .unwrap_or_else(|e| panic!("{what}: {set} is not a hex mask ({mask}): {e}"))
+    let no_mask = format!("{what}: {set} must carry one hex mask: {value}");
+    let mask = value.split_ascii_whitespace().next().expect(&no_mask);
+    let not_a_mask = format!("{what}: {set} is not a hex mask: {mask}");
+    u64::from_str_radix(mask, 16).expect(&not_a_mask)
 }
 
 /// NET-083, the injected-process half: a process a client attaches into a
@@ -697,8 +698,9 @@ async fn injected_process_lacks_cap_net_raw() {
     use minimald::nsenter::{Injection, session_leader_pid};
     use std::io::BufRead as _;
 
-    let base = tempfile::tempdir_in(caps_base_dir())
-        .unwrap_or_else(|e| panic!("base temp dir under {}: {e}", caps_base_dir().display()));
+    let proofs = proof_base_dir();
+    let no_base_dir = format!("base temp dir under {}", proofs.display());
+    let base = tempfile::tempdir_in(&proofs).expect(&no_base_dir);
     let probe = compile_socket_probe(base.path());
     let source = base.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
@@ -707,8 +709,8 @@ async fn injected_process_lacks_cap_net_raw() {
         .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
         .with_dns(false)
         .with_plan(NetPlan::host());
-    let sandbox_base = tempfile::tempdir_in(caps_base_dir())
-        .unwrap_or_else(|e| panic!("sandbox temp dir under {}: {e}", caps_base_dir().display()));
+    let no_sandbox_dir = format!("sandbox temp dir under {}", proofs.display());
+    let sandbox_base = tempfile::tempdir_in(&proofs).expect(&no_sandbox_dir);
     let mut sandbox = config
         .build(sandbox_base.path().join("sandbox"), ())
         .await
@@ -773,7 +775,9 @@ async fn injected_process_lacks_cap_net_raw() {
     .expect("injected capability probe timed out")
     .expect("spawn_blocking join");
 
-    let _ = child.kill();
+    // Best effort: the hold process may already be gone, and the wait below
+    // says how the launch actually ended.
+    let _killed = child.kill();
     let _ = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::task::spawn_blocking(move || child.wait()),
