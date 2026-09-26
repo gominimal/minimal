@@ -21,7 +21,7 @@
 //! NET-064) to every frame before it reaches the switch, and the ingress leg
 //! keeps the default-block posture of finding #2.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -695,29 +695,13 @@ impl SessionGate {
         policy: &sessions::SessionPolicy,
         subnet: SwitchSubnet,
     ) -> Self {
-        let ports = |proto: sessions::IpProto| -> HashSet<u16> {
-            policy
-                .ingress
-                .as_ref()
-                .map(|i| {
-                    i.port_mappings
-                        .iter()
-                        .filter(|m| m.proto == proto)
-                        .map(|m| m.internal_port)
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
         Self {
-            allowed: ports(sessions::IpProto::Tcp),
-            udp_allowed: ports(sessions::IpProto::Udp),
+            allowed: declared_ingress_ports(Some(policy), sessions::IpProto::Tcp),
+            udp_allowed: declared_ingress_ports(Some(policy), sessions::IpProto::Udp),
             conntrack: Arc::new(UdpConntrack::default()),
             label,
             limiter: Arc::new(PolicyWarnLimiter::new()),
-            egress: egress::EgressRules::from_policy(
-                policy.egress.as_ref(),
-                subnet.dns_server().octets(),
-            ),
+            egress: compiled_egress(Some(policy), subnet),
         }
     }
 
@@ -732,6 +716,209 @@ impl SessionGate {
             return Some((sessions::IpProto::Udp, dst_port, src));
         }
         None
+    }
+
+    /// Whether the target's own gate admits a direct inbound TCP connection to
+    /// `port` — the port on the box the connection terminates on, which is the
+    /// mapping's *internal* port for a proxied request translated through its
+    /// declaration. The relay's half of the verdict
+    /// [`proxied_request_verdict`] composes (its port predicate, the one
+    /// `blocked_syn` applies to a new connection), exposed so the hostname
+    /// proxy's refusals can be held to it: the proxy may forward a request
+    /// only to a port this admits, and refuses every request whose port the
+    /// same declaration does not publish (NET-069, NET-071).
+    #[must_use]
+    pub fn admits_direct_tcp(&self, port: u16) -> bool {
+        self.allowed.contains(&port)
+    }
+}
+
+/// The rule name an ingress refusal carries on both surfaces that decide
+/// ingress (NET-069, NET-071): the relay logs this name when it drops a
+/// direct connection to a port the target did not declare, and the hostname
+/// proxy logs the *same* name when it refuses a proxied request to that port
+/// before dialing — so the daemon log's tail (the diagnostics bundle's)
+/// shows one rule for one violation, whichever route it took. R2.7's
+/// `rule_matched` field.
+pub const NO_INGRESS_MAPPING_RULE: &str = "no ingress mapping";
+
+/// The internal ports a target's ingress declaration admits on `proto` — the
+/// one derivation both ingress surfaces read: the relay's inbound gate
+/// ([`SessionGate::allowed`]/[`SessionGate::udp_allowed`]) and, through the
+/// registry's routes, the hostname proxy's own port gate. An absent ingress
+/// policy admits nothing (the own-IP default-block posture).
+#[must_use]
+pub fn declared_ingress_ports(
+    policy: Option<&sessions::SessionPolicy>,
+    proto: sessions::IpProto,
+) -> HashSet<u16> {
+    policy
+        .and_then(|policy| policy.ingress.as_ref())
+        .map(|ingress| {
+            ingress
+                .port_mappings
+                .iter()
+                .filter(|m| m.proto == proto)
+                .map(|m| m.internal_port)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The external ports a request to a target may name (NET-069): the ports its
+/// ingress declaration *publishes* — the port a URL carries and the proxy
+/// sees, which [`Route::upstream`](crate::net::dns::Route::upstream) then
+/// translates to the internal port behind it. `None` when the target declares
+/// no ingress policy at all: that is what a host-address box is (launch
+/// validation rejects an ingress declaration on every network mode but
+/// `own_ip`), and a direct connection to it is ungated, so the proxy gates
+/// nothing either — the same verdict on both surfaces (NET-071).
+#[must_use]
+pub fn declared_request_ports(policy: Option<&sessions::SessionPolicy>) -> Option<BTreeSet<u16>> {
+    Some(
+        policy?
+            .ingress
+            .as_ref()?
+            .port_mappings
+            .iter()
+            .map(|m| m.external_port)
+            .collect(),
+    )
+}
+
+/// The compiled egress rules a session's own outbound frames are decided by
+/// on the relay ([`SessionGate::egress`]), keyed to `subnet`'s resolver — the
+/// same compilation for the hostname proxy's caller check (NET-070), so a
+/// session's egress declaration cannot mean one thing on the switch and
+/// another through the proxy (NET-071).
+#[must_use]
+pub fn compiled_egress(
+    policy: Option<&sessions::SessionPolicy>,
+    subnet: SwitchSubnet,
+) -> egress::EgressRules {
+    egress::EgressRules::from_policy(
+        policy.and_then(|policy| policy.egress.as_ref()),
+        subnet.dns_server().octets(),
+    )
+}
+
+/// The egress verdict a direct TCP connection from a box whose own frames are
+/// decided by `rules` to `dst:port` would carry — the same pure
+/// `sessions::core::egress` verdict the relay applies to every frame the box
+/// sends, asked about a synthesized TCP frame, so the hostname proxy decides
+/// a request with the relay's own function and never grows a second
+/// implementation of the rules that could drift (NET-070, NET-071).
+///
+/// The frame is synthesized because the verdict's input *is* a frame: the
+/// decision stays a pure function of an owned frame summary, exactly as the
+/// NET-062..064 tier requires, and reusing it verbatim is what keeps exactly
+/// one admit-or-drop function in the tree. The rules are address- and
+/// protocol-shaped — never port-shaped, the resolver carve-out aside, which a
+/// TCP frame cannot match — so the port names the connection without
+/// changing the verdict.
+#[must_use]
+pub fn direct_connection_verdict(
+    rules: &egress::EgressRules,
+    dst: Ipv4Addr,
+    dst_port: u16,
+) -> FrameVerdict {
+    egress::verdict(&tcp_frame_summary(dst, dst_port), rules)
+}
+
+/// Sizes of the Ethernet header and the minimum IPv4 header `summarize`
+/// extracts; the synthesized frame is exactly the bytes [`egress::summarize`]
+/// reads and nothing else.
+const SYNTH_ETH_HDR: usize = 14;
+const SYNTH_IPV4_HDR: usize = 20;
+const SYNTH_L4_HDR: usize = 4;
+
+/// The frame summary the egress verdict reads for a TCP connection to
+/// `dst:port` — an Ethernet header carrying the minimum IPv4 header and a
+/// 4-byte L4 header, with EtherType, IHL, protocol, destination address and
+/// destination port set at the offsets `summarize` extracts them from.
+#[must_use]
+fn tcp_frame_summary(dst: Ipv4Addr, dst_port: u16) -> FrameSummary {
+    let mut frame = [0u8; SYNTH_ETH_HDR + SYNTH_IPV4_HDR + SYNTH_L4_HDR];
+    frame[12..14].copy_from_slice(&[0x08, 0x00]); // EtherType: IPv4.
+    let ip = &mut frame[SYNTH_ETH_HDR..];
+    ip[0] = 0x45; // IPv4, IHL 5 (the 20-byte header below).
+    ip[9] = IPPROTO_TCP;
+    ip[16..20].copy_from_slice(&dst.octets());
+    ip[SYNTH_IPV4_HDR..SYNTH_IPV4_HDR + 2].copy_from_slice(&dst_port.to_be_bytes());
+    egress::summarize(&frame)
+}
+
+/// The decision for one proxied request, put to the same verdict a direct
+/// connection between the same two boxes would meet (NET-069, NET-070,
+/// NET-071): the caller's compiled egress rules for the target first, then
+/// the target's declared ingress ports for the request's port. Decided by one
+/// function ([`proxied_request_verdict`]) through the relay's own helpers —
+/// [`direct_connection_verdict`], [`Route::upstream`](crate::net::dns::Route::upstream)
+/// and [`NO_INGRESS_MAPPING_RULE`] — so a hostname-routing surface gives no
+/// reach a direct connection would not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxiedRequest {
+    /// Both declarations admit: forward to this upstream.
+    Forward(SocketAddr),
+    /// Refused before the proxy dialed anything, in the relay's drop-line
+    /// vocabulary, so a proxied refusal and a direct one log as the same
+    /// violation of the same rule (NET-069).
+    Refused(Refusal),
+}
+
+/// Why a proxied request was refused: which declaration was violated, under
+/// which rule, and the other side's address — the facts a proxied refusal's
+/// warn line carries beside the proxy's own (host, session, port).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// The relay's rule name for this refusal (R2.7's `rule_matched`): an
+    /// `egress::DropReason` rule for an egress refusal,
+    /// [`NO_INGRESS_MAPPING_RULE`] for an ingress one.
+    pub rule: &'static str,
+    /// Which declaration refused it: the caller's egress or the target's
+    /// ingress.
+    pub direction: Direction,
+    /// The other side of the refused connection: the target for an egress
+    /// refusal, the caller for an ingress one. `None` when the proxy cannot
+    /// name it (a host-side caller, which is no box at all).
+    pub other: Option<SocketAddr>,
+}
+
+/// Decides one proxied request (NET-069, NET-070, NET-071). `caller` is the
+/// live session the request's peer address names — `None` when it names no
+/// live box, which is what a host-side client (the developer's browser, the
+/// daemon's own lanes) is: no box's egress declaration to honour, so only the
+/// target's ingress half decides. `route` is the target the request resolved
+/// to and `port` the port its authority carried.
+///
+/// The caller's declaration comes first, in the order a direct connection
+/// meets the two: its frame clears the caller's own egress gate before the
+/// target's ingress gate ever sees it (NET-070). The target's declaration is
+/// the port gate [`Route::upstream`](crate::net::dns::Route::upstream) already
+/// applies — a port its ingress does not publish routes nowhere.
+#[must_use]
+pub fn proxied_request_verdict(
+    caller: Option<&crate::net::dns::Caller>,
+    route: &crate::net::dns::Route,
+    port: u16,
+) -> ProxiedRequest {
+    let target = route.address();
+    if let Some(caller) = caller
+        && let FrameVerdict::Drop(reason) = direct_connection_verdict(caller.egress(), target, port)
+    {
+        return ProxiedRequest::Refused(Refusal {
+            rule: reason.rule(),
+            direction: Direction::Egress,
+            other: Some(SocketAddr::V4(SocketAddrV4::new(target, port))),
+        });
+    }
+    match route.upstream(port) {
+        Some(upstream) => ProxiedRequest::Forward(upstream),
+        None => ProxiedRequest::Refused(Refusal {
+            rule: NO_INGRESS_MAPPING_RULE,
+            direction: Direction::Ingress,
+            other: caller.map(|caller| SocketAddr::V4(SocketAddrV4::new(caller.lease(), port))),
+        }),
     }
 }
 
@@ -927,7 +1114,7 @@ where
                 Some(SocketAddr::V4(src)),
                 Proto::from_ipproto(proto),
                 Some(dst_port),
-                "no ingress mapping",
+                NO_INGRESS_MAPPING_RULE,
             );
             continue;
         }
