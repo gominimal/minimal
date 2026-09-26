@@ -16,7 +16,7 @@
 //! refactored out of it: a few duplicated lines of glue keep
 //! `cmd_activate`'s diff at zero.
 
-use std::io::IsTerminal as _;
+use std::io::{IsTerminal as _, Read as _};
 
 use anyhow::{Context as _, bail};
 use tokio::io::AsyncWriteExt as _;
@@ -445,14 +445,14 @@ fn arm_task_run_interrupt(
 ///
 /// stdin is pumped into the channel only when it is NOT a terminal: a piped
 /// stdin EOFs and half-closes the channel like the git helper's does, but a
-/// terminal stdin never EOFs — and tokio's stdin is an uncancellable
-/// blocking read that would hold the runtime open after the task exits — so
-/// a terminal caller half-closes immediately and a stdin-reading task sees
-/// EOF instead of hanging. The upshot: tasks run non-interactively; stdin
-/// content reaches the task only when piped. That is not just the tokio
-/// constraint — the daemon's exec channel has no PTY (only the shell path
-/// does), so interactive tasks are structurally unsupported here anyway;
-/// interactive work belongs in `min session attach`.
+/// terminal stdin never EOFs — and a blocking stdin read cannot be
+/// cancelled once the task exits — so a terminal caller half-closes
+/// immediately and a stdin-reading task sees EOF instead of hanging. The
+/// upshot: tasks run non-interactively; stdin content reaches the task only
+/// when piped. That is not just the cancellation constraint — the daemon's
+/// exec channel has no PTY (only the shell path does), so interactive tasks
+/// are structurally unsupported here anyway; interactive work belongs in
+/// `min session attach`.
 async fn bridge_exec(
     mut channel: russh::Channel<russh::client::Msg>,
 ) -> Result<Option<u32>, anyhow::Error> {
@@ -461,12 +461,35 @@ async fn bridge_exec(
         None
     } else {
         let mut to_channel = channel.make_writer();
+        // Read stdin on a detached thread, not `tokio::io::stdin()`: the
+        // latter parks a blocking `read(0)` on tokio's blocking pool, which
+        // `pump.abort()` cannot interrupt — so a piped stdin whose writer
+        // stays open would hold the runtime open forever after the task
+        // exits. A detached thread is abandoned on exit instead of awaited.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 8192];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
         // Both results are deliberately dropped: the remote side may close
         // the channel before consuming all our input, and that surfaces
         // through the channel loop below, not here.
         Some(tokio::spawn(async move {
-            let mut stdin = tokio::io::stdin();
-            let _ = tokio::io::copy(&mut stdin, &mut to_channel).await;
+            while let Some(chunk) = rx.recv().await {
+                if to_channel.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
             let _ = to_channel.shutdown().await;
         }))
     };
