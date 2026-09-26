@@ -1904,6 +1904,24 @@ async fn handle_git_upload(
             }
         };
 
+        let dotgit_dir = paths.working.as_utf8_path().join(".git");
+        if let Ok(false) = tokio::fs::try_exists(&dotgit_dir).await {
+            // A fresh session can reach upload-pack before any receive-pack
+            // request, so the workspace may not be a Git repository yet.
+            // Initialize it the same way handle_git_receive does, otherwise
+            // clone, fetch, and ls-remote fail on a non-repo directory.
+            let res = tokio::process::Command::new("git")
+                .arg("init")
+                .current_dir(paths.working.as_utf8_path())
+                .output()
+                .await;
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "git init failed");
+                channel.close().await.unwrap();
+                return;
+            }
+        }
+
         let exec_task = ExecTask {
             conn,
             serv,
