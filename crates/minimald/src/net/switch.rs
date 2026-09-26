@@ -486,19 +486,9 @@ where
         // shared switch. A dropped frame is simply not written on — nothing is
         // sent back toward the box either, a drop is not a reset — and the drop
         // says so once per box per rule per minute (R2.7).
-        //
-        // One drop is rescued: a reply to a flow the ingress leg admitted to a
-        // port the box declared. The deny-all default (NET-074) withdraws the
-        // box's own reach, not its declared exposures — a published port must
-        // still answer (NET-001) — so the window [`InboundConntrack`] holds is
-        // consulted before the drop stands. Nothing the box initiates matches
-        // it: a new connection's source port is its own, and the window is
-        // keyed to the remote's port on the box's declared one.
         if let Some(gate) = &gate {
             let summary = egress::summarize(&buf[..n]);
-            if let FrameVerdict::Drop(reason) = egress::verdict(&summary, &gate.egress)
-                && !gate.allows_reply(&buf[..n])
-            {
+            if let FrameVerdict::Drop(reason) = egress::verdict(&summary, &gate.egress) {
                 gate.limiter.warn(
                     &gate.label,
                     Direction::Egress,
@@ -651,11 +641,7 @@ impl LegacyHostNotice {
 ///   in `sessions::core::egress` against the box's compiled
 ///   [`EgressRules`]: what the box did not declare is dropped, without
 ///   answering, and says so once per rule per minute (NET-062, NET-063,
-///   NET-064). One frame class is exempt: a reply to a flow the ingress leg
-///   admitted to a port the box declared (see [`InboundConntrack`]), because a
-///   published port that cannot answer is not published (NET-001) — the
-///   deny-all default (NET-074) withdraws the box's *own* reach, never the
-///   exposures it declared.
+///   NET-064).
 /// - **Ingress** (`switch → tap`, UC6 / finding #2) — session↔session (and
 ///   daemon→session) traffic is subject to the *target* PTask's ingress
 ///   policy:
@@ -685,10 +671,6 @@ pub struct SessionGate {
     /// the PTask's own UDP egress (DNS, QUIC, …) is allowed back in — and an
     /// undeclared datagram cannot open a window.
     conntrack: Arc<UdpConntrack>,
-    /// Inbound-flow tracker, shared between the relay legs so the box's reply
-    /// to a flow the ingress gate admitted to a declared port may leave — and
-    /// nothing the box initiates on its own opens a window.
-    inbound_flows: Arc<InboundConntrack>,
     /// The target PTask's switch IP, carried as the R2.7 log's `session_id`.
     label: String,
     /// Rate-limited emitter for dropped-frame warnings (R2.7), keyed by box and
@@ -705,10 +687,8 @@ impl SessionGate {
     /// the relay is attached to — whose gateway is the resolver the egress
     /// carve-out is keyed to (NET-079). A session with no declared ingress
     /// denies every new inbound connection/datagram while still receiving
-    /// replies to its own egress; an absent egress section allows all at this
-    /// layer, but the launcher hands the gate the *effective* policy, so a
-    /// bare own-address box arrives with the deny-all section already
-    /// materialized once NET-074's default is in force.
+    /// replies to its own egress; one with no declared egress allows all (the
+    /// shipped default, until NET-074's deny-all default is in force).
     #[must_use]
     pub fn for_session(
         label: String,
@@ -732,7 +712,6 @@ impl SessionGate {
             allowed: ports(sessions::IpProto::Tcp),
             udp_allowed: ports(sessions::IpProto::Udp),
             conntrack: Arc::new(UdpConntrack::default()),
-            inbound_flows: Arc::new(InboundConntrack::default()),
             label,
             limiter: Arc::new(PolicyWarnLimiter::new()),
             egress: egress::EgressRules::from_policy(
@@ -753,32 +732,6 @@ impl SessionGate {
             return Some((sessions::IpProto::Udp, dst_port, src));
         }
         None
-    }
-
-    /// Records one inbound frame the gate admitted, so the box's reply to that
-    /// flow may leave. Only a frame addressed to a port the box *declared*
-    /// opens a window: an undeclared port must not become a declared one by
-    /// being talked at (the ingress gate passes ACK-set segments to undeclared
-    /// ports as return traffic, and those open nothing).
-    fn record_inbound(&self, frame: &[u8]) {
-        let Some(pkt) = parse_ipv4_l4(frame) else {
-            return;
-        };
-        let declared = match pkt.proto {
-            IPPROTO_TCP => self.allowed.contains(&pkt.dst.port()),
-            IPPROTO_UDP => self.udp_allowed.contains(&pkt.dst.port()),
-            _ => false,
-        };
-        if declared {
-            self.inbound_flows.record_ingress(&pkt);
-        }
-    }
-
-    /// Whether an outbound frame is a reply to an inbound flow the gate
-    /// admitted to a declared port — the one frame class a deny-all egress
-    /// still lets leave beyond the resolver carve-out.
-    fn allows_reply(&self, frame: &[u8]) -> bool {
-        parse_ipv4_l4(frame).is_some_and(|pkt| self.inbound_flows.allows_reply(&pkt))
     }
 }
 
@@ -859,17 +812,13 @@ fn blocked_syn(frame: &[u8], allowed: &HashSet<u16>) -> Option<(u16, SocketAddrV
     Some((pkt.dst.port(), pkt.src))
 }
 
-/// TTL for a tracked flow window. An outbound UDP datagram opens one in which
-/// its reply is allowed back in, and an inbound packet the gate admitted to a
-/// declared port opens one in which the box's reply to that flow is allowed
-/// out. Long enough for real request/reply (DNS, QUIC handshakes) and for TCP
-/// retransmissions to be recovered by the peer's next segment — every admitted
-/// packet on a flow re-arms its window — without keeping stale state around.
-const FLOW_TTL: Duration = Duration::from_secs(120);
-/// Sweep expired flows once a tracker's table crosses this many entries,
-/// bounding memory under a burst of distinct destinations without a background
-/// timer.
-const FLOW_SWEEP_AT: usize = 4096;
+/// TTL for a tracked outbound UDP flow: an egress datagram opens a window in which
+/// the matching reply is allowed back in. Long enough for real request/reply (DNS,
+/// QUIC handshakes) without keeping stale state around.
+const UDP_FLOW_TTL: Duration = Duration::from_secs(120);
+/// Sweep expired flows once the table crosses this many entries, bounding memory
+/// under a burst of distinct destinations without a background timer.
+const UDP_FLOW_SWEEP_AT: usize = 4096;
 
 /// Per-PTask UDP flow tracker shared between the egress and ingress relay legs.
 ///
@@ -892,8 +841,8 @@ impl UdpConntrack {
         let now = Instant::now();
         let mut flows = self.flows.lock().expect("UdpConntrack mutex poisoned");
         flows.insert(key, now);
-        if flows.len() > FLOW_SWEEP_AT {
-            flows.retain(|_, seen| now.duration_since(*seen) < FLOW_TTL);
+        if flows.len() > UDP_FLOW_SWEEP_AT {
+            flows.retain(|_, seen| now.duration_since(*seen) < UDP_FLOW_TTL);
         }
     }
 
@@ -904,50 +853,7 @@ impl UdpConntrack {
         let flows = self.flows.lock().expect("UdpConntrack mutex poisoned");
         flows
             .get(&key)
-            .is_some_and(|seen| Instant::now().duration_since(*seen) < FLOW_TTL)
-    }
-}
-
-/// Per-PTask inbound-flow tracker shared between the ingress and egress relay
-/// legs — the mirror of [`UdpConntrack`].
-///
-/// The egress verdict is pure (see `sessions::core::egress`), so it cannot
-/// know whether a frame answers a conversation someone else started; but a
-/// published port that cannot answer is not published (NET-001), and the
-/// deny-all default (NET-074) must not break one. This records each admitted
-/// inbound packet's flow key `(remote_ip, remote_port, local_port)` — only for
-/// a local port the box declared, decided by [`SessionGate::record_inbound`]
-/// — so the egress leg can admit the box's reply to that flow, and nothing
-/// else: the box cannot initiate anything, and a port it did not declare stays
-/// unreachable in both directions. The PTask's own address is fixed (its
-/// lease), so the reverse tuple alone identifies a flow.
-#[derive(Debug, Default)]
-struct InboundConntrack {
-    flows: Mutex<HashMap<(Ipv4Addr, u16, u16), Instant>>,
-}
-
-impl InboundConntrack {
-    /// Records an admitted inbound packet (`pkt.src` = remote, `pkt.dst` =
-    /// local lease) so the box's reply to that flow may leave.
-    fn record_ingress(&self, pkt: &L4Packet) {
-        let key = (*pkt.src.ip(), pkt.src.port(), pkt.dst.port());
-        let now = Instant::now();
-        let mut flows = self.flows.lock().expect("InboundConntrack mutex poisoned");
-        flows.insert(key, now);
-        if flows.len() > FLOW_SWEEP_AT {
-            flows.retain(|_, seen| now.duration_since(*seen) < FLOW_TTL);
-        }
-    }
-
-    /// Whether an outbound frame (`pkt.src` = local lease, `pkt.dst` = remote)
-    /// matches a live inbound flow — i.e. is a reply to a conversation the
-    /// ingress gate admitted to a declared port.
-    fn allows_reply(&self, pkt: &L4Packet) -> bool {
-        let key = (*pkt.dst.ip(), pkt.dst.port(), pkt.src.port());
-        let flows = self.flows.lock().expect("InboundConntrack mutex poisoned");
-        flows
-            .get(&key)
-            .is_some_and(|seen| Instant::now().duration_since(*seen) < FLOW_TTL)
+            .is_some_and(|seen| Instant::now().duration_since(*seen) < UDP_FLOW_TTL)
     }
 }
 
@@ -1024,14 +930,6 @@ where
                 "no ingress mapping",
             );
             continue;
-        }
-        // Track the flows the gate just admitted to a port the box declared,
-        // so the box's replies to them may leave even under a deny-all egress
-        // (the window the egress leg consults before it drops). Recorded
-        // before the frame is written on: once the box can be observed
-        // answering, the window for that answer is already open.
-        if let Some(gate) = &gate {
-            gate.record_inbound(&frame[..n]);
         }
         loop {
             let mut guard = tap.writable().await?;
@@ -1367,20 +1265,6 @@ mod tests {
     /// the egress direction of [`tcp_frame`], whose destination is the box
     /// itself. The segment is a new connection (SYN).
     fn egress_tcp_frame(src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16) -> Vec<u8> {
-        egress_tcp_segment(40000, SYN, src, dst, dst_port)
-    }
-
-    /// An Ethernet II + IPv4 + TCP segment the box sends from `src_port` to
-    /// `dst`:`dst_port` with `flags` — the box's own half of a conversation
-    /// [`tcp_frame`] started, so it can be a reply to an admitted inbound
-    /// flow (a SYN-ACK, an established segment) as well as a new connection.
-    fn egress_tcp_segment(
-        src_port: u16,
-        flags: u8,
-        src: Ipv4Addr,
-        dst: Ipv4Addr,
-        dst_port: u16,
-    ) -> Vec<u8> {
         let mut f = Vec::new();
         f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x01]); // dst MAC
         f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // src MAC
@@ -1395,12 +1279,12 @@ mod tests {
         f.extend_from_slice(&0u16.to_be_bytes()); // header checksum (unread)
         f.extend_from_slice(&src.octets());
         f.extend_from_slice(&dst.octets());
-        f.extend_from_slice(&src_port.to_be_bytes());
+        f.extend_from_slice(&40000u16.to_be_bytes()); // src port
         f.extend_from_slice(&dst_port.to_be_bytes());
         f.extend_from_slice(&0u32.to_be_bytes()); // seq
         f.extend_from_slice(&0u32.to_be_bytes()); // ack
         f.push(0x50); // data offset 5, reserved
-        f.push(flags);
+        f.push(SYN);
         f.extend_from_slice(&0u16.to_be_bytes()); // window
         f.extend_from_slice(&0u16.to_be_bytes()); // checksum
         f.extend_from_slice(&0u16.to_be_bytes()); // urgent pointer
@@ -1778,112 +1662,6 @@ mod tests {
         assert!(
             notice.emit(),
             "a policy warning must not suppress the deprecation notice"
-        );
-    }
-
-    /// NET-074 × NET-001: under the deny-all default the box reaches nothing
-    /// it did not declare, but a flow the ingress gate admitted to a port it
-    /// declared is still answered — a published port that cannot answer is not
-    /// published. The reply window is keyed to the admitted flow's reverse
-    /// tuple, so nothing the box initiates matches it: a new connection to the
-    /// very peer it is already answering is dropped, and an undeclared port
-    /// stays undeclared no matter who talks at it.
-    #[tokio::test]
-    async fn deny_all_still_answers_a_declared_port() {
-        let capture = crate::test_harness::captured_log();
-        let policy = sessions::SessionPolicy {
-            // The effective egress a bare own-address box now gets once the
-            // deny-all default is in force: the materialized section.
-            egress: Some(sessions::EgressPolicy::deny_all()),
-            // One declared exposure: a published TCP port (NET-001).
-            ingress: Some(sessions::IngressPolicy {
-                port_mappings: vec![sessions::PortMapping {
-                    external_port: 18080,
-                    internal_port: 80,
-                    proto: sessions::IpProto::Tcp,
-                }],
-                dynamic_allowed_range: None,
-                dynamic_ingress: None,
-            }),
-        };
-        let mut harness = spawn_test_relay(&policy);
-
-        // A peer connects to the box's declared port: PEER:40000 -> LEASE:80.
-        let syn = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 80);
-        let mut framed = Vec::with_capacity(2 + syn.len());
-        framed.extend_from_slice(&(syn.len() as u16).to_le_bytes());
-        framed.extend_from_slice(&syn);
-        harness.switch.write_all(&framed).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // The ingress gate admits it (declared port) and the relay delivers it
-        // to the box — reading it back confirms the delivery, and the flow
-        // window for its reply opens before the write, so it is open now.
-        set_nonblocking(harness.box_end.as_raw_fd()).unwrap();
-        let mut delivered = vec![0u8; max_frame() + 1];
-        let n = harness
-            .box_end
-            .read(&mut delivered)
-            .expect("the admitted SYN is delivered to the box");
-        assert_eq!(&delivered[..n], &syn[..], "the SYN arrives verbatim");
-
-        // The box answers: LEASE:80 -> PEER:40000. The deny-all verdict drops
-        // every destination, and the reply window is the one thing that lets
-        // this frame leave — so the published port still serves (NET-001).
-        let syn_ack = egress_tcp_segment(80, SYN | ACK, LEASE, PEER, 40000);
-        harness.box_end.write_all(&syn_ack).unwrap();
-        let answered =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-                .await
-                .expect("the box's reply to an admitted flow is forwarded")
-                .expect("the switch side stays open");
-        assert_eq!(answered, syn_ack, "the reply is forwarded verbatim");
-        assert!(
-            !capture.contents().contains("remote_addr=100.64.0.5:40000"),
-            "answering an admitted flow is not a violation: {}",
-            capture.contents()
-        );
-
-        // Nothing else the box sends matches the window: a NEW connection (its
-        // own source port, the peer's other port) is still denied, named.
-        let sentinel = arp_frame();
-        harness
-            .box_end
-            .write_all(&egress_tcp_frame(LEASE, PEER, 443))
-            .unwrap();
-        harness.box_end.write_all(&sentinel).unwrap();
-        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-            .await
-            .expect("the relay forwards the sentinel")
-            .expect("the switch side stays open");
-        assert_eq!(next, sentinel, "a new connection is still denied");
-        let logged = capture.contents();
-        assert!(
-            logged.contains("remote_addr=100.64.0.5:443"),
-            "the new connection's drop is named: {logged}"
-        );
-
-        // A reply keyed to a port nobody declared opens no window: the ingress
-        // gate passes an ACK-set segment to an undeclared port (return
-        // traffic), and talking at an undeclared port must not declare it.
-        let stray = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, ACK, PEER, 9999);
-        let mut framed = Vec::with_capacity(2 + stray.len());
-        framed.extend_from_slice(&(stray.len() as u16).to_le_bytes());
-        framed.extend_from_slice(&stray);
-        harness.switch.write_all(&framed).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        harness
-            .box_end
-            .write_all(&egress_tcp_segment(9999, ACK, LEASE, PEER, 40000))
-            .unwrap();
-        harness.box_end.write_all(&sentinel).unwrap();
-        let last = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-            .await
-            .expect("the relay forwards the sentinel")
-            .expect("the switch side stays open");
-        assert_eq!(
-            last, sentinel,
-            "an undeclared port answers nothing, whatever talks at it"
         );
     }
 }
