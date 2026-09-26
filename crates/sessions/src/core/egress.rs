@@ -70,8 +70,9 @@ pub enum FrameFamily {
     /// Too short to carry the header the family decision, the rule match or
     /// the lease check reads: below 14 bytes there is not even an
     /// `EtherType`, an IPv4-ethertype frame below 34 bytes has no readable
-    /// IPv4 header, and an ARP frame too short to carry its sender protocol
-    /// address has no readable source. Never admitted — an unreadable frame
+    /// IPv4 header, and an ARP frame too short to carry four bytes of
+    /// sender protocol address at the `hlen` its header declares has no
+    /// readable source. Never admitted — an unreadable frame
     /// cannot be a declared one, and an unattributable one cannot be the
     /// lease's (NET-084).
     Truncated,
@@ -84,12 +85,12 @@ pub enum FrameFamily {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameSummary {
     family: FrameFamily,
-    /// The IPv4 source address the frame carries: an IPv4 frame's header
-    /// source, or an ARP frame's sender protocol address — the address the
-    /// lease check (NET-084) compares against the box's lease. `None` when
-    /// the frame carries no readable IPv4 source: IPv6, an undeclared
-    /// family, a frame too short to read, or an ARP whose sender address is
-    /// not an IPv4 one.
+    /// The source address the frame carries: an IPv4 frame's header
+    /// source, or an ARP frame's sender protocol address — read whatever
+    /// protocol type the frame claims for it — the address the lease check
+    /// (NET-084) compares against the box's lease. `None` when the frame
+    /// carries no readable one: IPv6, an undeclared family, or a frame too
+    /// short to read.
     src: Option<[u8; 4]>,
     /// The IPv4 destination address, when the frame carries one.
     dst: Option<[u8; 4]>,
@@ -109,9 +110,10 @@ impl FrameSummary {
         self.family
     }
 
-    /// The IPv4 source address the frame carries — an IPv4 frame's header
-    /// source, or an ARP frame's sender protocol address (the address the
-    /// lease check reads). `None` when the frame carries no readable one.
+    /// The source address the frame carries — an IPv4 frame's header
+    /// source, or an ARP frame's sender protocol address, whatever
+    /// protocol the frame claims for it (the address the lease check
+    /// reads). `None` when the frame carries no readable one.
     #[must_use]
     pub fn source(&self) -> Option<[u8; 4]> {
         self.src
@@ -158,28 +160,26 @@ pub fn summarize(frame: &[u8]) -> FrameSummary {
             // ARP: the sender protocol address is the frame's source — the
             // address the lease check (NET-084) compares. It sits `hlen`
             // bytes of sender hardware into the ARP payload, behind 8 bytes
-            // of fixed header, and is `plen` bytes long, so both lengths are
-            // read before any offset is used. A frame too short to carry
-            // them has no readable source: it cannot be attributed to the
-            // lease, so it is truncated rather than admitted.
+            // of fixed header, and the check reads four bytes of it, so the
+            // offset is bounds-checked before it is used. The protocol type
+            // the frame claims for the address is not consulted: an ARP
+            // claiming a protocol other than IPv4 must be no way to
+            // announce an address unchecked, so the slot is the source
+            // whatever the frame claims to speak. A frame too short to
+            // carry four bytes of sender address at its own `hlen` has no
+            // readable source: it cannot be attributed to the lease, so it
+            // is truncated rather than admitted.
             if frame.len() < ETH_HDR + 8 {
                 return none(FrameFamily::Truncated);
             }
-            let ptype = u16::from_be_bytes([frame[ETH_HDR + 2], frame[ETH_HDR + 3]]);
             let hlen = frame[ETH_HDR + 4] as usize;
-            let plen = frame[ETH_HDR + 5] as usize;
             let spa = ETH_HDR + 8 + hlen;
-            if frame.len() < spa + plen {
+            if frame.len() < spa + 4 {
                 return none(FrameFamily::Truncated);
             }
-            // Only an Ethernet/IPv4 ARP carries an IPv4 sender address the
-            // lease check can compare; any other ARP keeps the family's
-            // admission, with no source to read.
-            let src = (ptype == ETHERTYPE_IPV4 && hlen == 6 && plen == 4)
-                .then(|| [frame[spa], frame[spa + 1], frame[spa + 2], frame[spa + 3]]);
             return FrameSummary {
                 family: FrameFamily::Arp,
-                src,
+                src: Some([frame[spa], frame[spa + 1], frame[spa + 2], frame[spa + 3]]),
                 dst: None,
                 proto: None,
                 dst_port: 0,
@@ -466,8 +466,10 @@ impl DropReason {
 /// be rejected; `None` when it carries the lease, or no readable source at
 /// all — an IPv6 or undeclared-family frame, or a truncated one, none of
 /// which `verdict` admits either way. An IPv4 frame's source is its header
-/// source address; an ARP frame's is its sender protocol address, so a
-/// foreign address cannot be announced by address resolution either.
+/// source address; an ARP frame's is its sender protocol address, read
+/// whatever protocol type the frame claims for it — so a foreign address
+/// cannot be announced by address resolution either, least of all by an
+/// ARP dressed up as another protocol.
 #[must_use]
 pub fn foreign_source(summary: &FrameSummary, lease: [u8; 4]) -> Option<DropReason> {
     let src = summary.src?;
@@ -714,12 +716,92 @@ mod tests {
 
         // An ARP frame too short to carry its sender protocol address has
         // no readable source: it cannot be attributed to the lease, so it
-        // is truncated — never admitted. (The sender address sits 18 bytes
-        // into the ARP payload, behind the fixed header and the sender
-        // hardware address; 14 payload bytes stop short of it.)
+        // is truncated — never admitted. (The sender address sits 14 bytes
+        // into the ARP payload, behind the 8-byte fixed header and the
+        // 6-byte sender hardware address; 14 payload bytes stop short of
+        // it.)
         let short_arp = eth_frame(ETHERTYPE_ARP, &arp_payload(LEASE)[..14]);
         assert_eq!(summarize(&short_arp).family, FrameFamily::Truncated);
         assert!(!admits(&short_arp, &allow_all));
+    }
+
+    /// The sender protocol address slot is an ARP frame's source whatever
+    /// protocol the frame claims for it (NET-084): an ARP announcing a
+    /// foreign address under a protocol type other than IPv4 — or under an
+    /// unexpected `hlen` or `plen` — is a foreign source like any other,
+    /// rejected and named the same way; an ARP whose slot carries the lease
+    /// is the declared family whatever it claims; and one too short to
+    /// carry four bytes of sender address at its own `hlen` is truncated,
+    /// never admitted.
+    #[test]
+    fn arp_source_is_read_whatever_protocol_the_frame_claims() {
+        /// An ARP payload claiming `ptype`, `hlen` and `plen`, whose sender
+        /// protocol address is `spa` — sitting `hlen` bytes of sender
+        /// hardware into the payload, and the `hlen` hardware bytes are
+        /// emitted so the address really is where the header says.
+        fn arp_claiming(ptype: u16, hlen: u8, plen: u8, spa: &[u8]) -> Vec<u8> {
+            let mut arp = Vec::new();
+            arp.extend_from_slice(&1u16.to_be_bytes()); // htype: Ethernet
+            arp.extend_from_slice(&ptype.to_be_bytes()); // ptype: as claimed
+            arp.push(hlen);
+            arp.push(plen);
+            arp.extend_from_slice(&1u16.to_be_bytes()); // oper: request
+            let mac = [0x52u8, 0x54, 0x00, 0x40, 0x00, 0x09];
+            arp.extend(mac.iter().cycle().take(usize::from(hlen))); // sender hardware address
+            arp.extend_from_slice(spa); // sender protocol address
+            arp
+        }
+
+        let allow_all = EgressRules::from_policy(None, RESOLVER, LEASE);
+        let foreign = [203, 0, 113, 7];
+
+        // An ARP claiming a protocol type other than IPv4, carrying a
+        // foreign address in its sender protocol address slot, is a
+        // foreign source like any other: the slot is the source whatever
+        // the frame claims to speak.
+        let odd = eth_frame(ETHERTYPE_ARP, &arp_claiming(0x1234, 6, 4, &foreign));
+        assert_eq!(summarize(&odd).family, FrameFamily::Arp);
+        assert_eq!(summarize(&odd).source(), Some(foreign));
+        assert_eq!(
+            verdict(&summarize(&odd), &allow_all),
+            FrameVerdict::Drop(DropReason::ForeignSource {
+                src: foreign,
+                lease: LEASE,
+            })
+        );
+
+        // An unexpected `hlen` moves the slot, and the read follows it.
+        let shifted = eth_frame(ETHERTYPE_ARP, &arp_claiming(0x1234, 8, 4, &foreign));
+        assert_eq!(summarize(&shifted).source(), Some(foreign));
+
+        // A `plen` other than four hides nothing either: the four bytes the
+        // lease check reads are the first four of the slot the frame
+        // declares.
+        let wide = eth_frame(
+            ETHERTYPE_ARP,
+            &arp_claiming(
+                0x1234,
+                6,
+                6,
+                &[foreign[0], foreign[1], foreign[2], foreign[3], 9, 9],
+            ),
+        );
+        assert_eq!(summarize(&wide).source(), Some(foreign));
+
+        // An ARP whose slot carries the lease is the declared family
+        // whatever protocol it claims: it announces the box's own address,
+        // which is what its ordinary ARP announces anyway.
+        let own = eth_frame(ETHERTYPE_ARP, &arp_claiming(0x1234, 6, 4, &LEASE));
+        assert!(
+            admits(&own, &deny_all()),
+            "the lease's own ARP resolves under a foreign protocol type too"
+        );
+
+        // Too short to carry four bytes of sender address at its own
+        // `hlen`: no readable source, so truncated rather than admitted.
+        let long_hlen = eth_frame(ETHERTYPE_ARP, &arp_claiming(0x0800, 200, 4, &[]));
+        assert_eq!(summarize(&long_hlen).family, FrameFamily::Truncated);
+        assert!(!admits(&long_hlen, &allow_all));
     }
 
     /// NET-079's carve-out: a deny-all box still reaches the resolver

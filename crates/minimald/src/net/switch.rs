@@ -505,8 +505,9 @@ where
         // attached with never reaches the shared switch — a box's relay or
         // the daemon's own, whose lease is its own address. The source an
         // IPv4 frame carries is its IPv4 source address; an ARP frame's is
-        // its sender protocol address, so a foreign address cannot be
-        // announced by address resolution either. A rejected frame is simply
+        // its sender protocol address, read whatever protocol type the
+        // frame claims for it, so a foreign address cannot be announced by
+        // address resolution either. A rejected frame is simply
         // not written on — a drop is not a reset — and opens no conntrack
         // window (the record below only sees frames past this check); the
         // rejection says so once per lease per minute, naming the session,
@@ -1375,12 +1376,20 @@ mod tests {
     /// whose sender protocol address is the source the lease check (NET-084)
     /// reads.
     fn arp_frame(spa: Ipv4Addr) -> Vec<u8> {
+        arp_frame_of_ptype(spa, 0x0800)
+    }
+
+    /// An ARP frame from `spa` claiming `ptype` as its protocol type —
+    /// everything else matches [`arp_frame`]. The lease check reads the
+    /// sender protocol address slot whatever the frame claims it speaks, so
+    /// a foreign protocol type is no way to announce an address unchecked.
+    fn arp_frame_of_ptype(spa: Ipv4Addr, ptype: u16) -> Vec<u8> {
         let mut f = Vec::new();
         f.extend_from_slice(&[0xff; 6]); // dst MAC: broadcast
         f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // src MAC
         f.extend_from_slice(&0x0806u16.to_be_bytes()); // EtherType: ARP
         f.extend_from_slice(&1u16.to_be_bytes()); // htype: Ethernet
-        f.extend_from_slice(&0x0800u16.to_be_bytes()); // ptype: IPv4
+        f.extend_from_slice(&ptype.to_be_bytes()); // ptype: as claimed
         f.push(6); // hlen
         f.push(4); // plen
         f.extend_from_slice(&1u16.to_be_bytes()); // oper: request
@@ -1810,7 +1819,8 @@ mod tests {
 
     /// NET-084: a frame whose source is not the relay's lease never reaches
     /// the switch — an IPv4 frame sent from another box's address, or an ARP
-    /// frame announcing one as its sender protocol address — and the
+    /// frame announcing one as its sender protocol address, whatever
+    /// protocol type the ARP claims — and the
     /// rejection says so, once per lease per minute, naming the session, the
     /// lease and the source the frame carried. Frames from the lease itself
     /// are untouched, and a rejected frame opens no conntrack window (its
@@ -1848,6 +1858,25 @@ mod tests {
         assert_eq!(
             next, sentinel,
             "the foreign ARP sender never reached the switch"
+        );
+
+        // An ARP claiming a protocol type other than IPv4 is no way around
+        // the check either: the sender protocol address slot is the source
+        // whatever the frame claims to speak, so announcing the peer's
+        // address under another protocol is rejected the same way.
+        harness
+            .box_end
+            .write_all(&arp_frame_of_ptype(PEER, 0x1234))
+            .unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "the foreign ARP sender under another protocol type never \
+             reached the switch"
         );
 
         // The rejection line names the session, the lease and the source,
@@ -1922,8 +1951,8 @@ mod tests {
 
     /// NET-084 at the daemon's own relay: the guest's root egress relay
     /// carries no gate but still rejects a frame whose source is not the
-    /// address the daemon attached with — its own — and forwards its own
-    /// frames untouched.
+    /// address the daemon attached with — its own — whatever the frame
+    /// dresses its source up as, and forwards its own frames untouched.
     #[tokio::test]
     async fn daemon_relay_rejects_foreign_source_too() {
         // The daemon's address on the default switch subnet — the lease its
@@ -1932,8 +1961,10 @@ mod tests {
         let mut harness = spawn_daemon_relay(DAEMON_IP);
 
         let spoofed = egress_tcp_frame(PEER, Ipv4Addr::new(203, 0, 113, 7), 443);
+        let odd_arp = arp_frame_of_ptype(PEER, 0x1234);
         let own = egress_tcp_frame(DAEMON_IP, Ipv4Addr::new(10, 1, 2, 3), 80);
         harness.box_end.write_all(&spoofed).unwrap();
+        harness.box_end.write_all(&odd_arp).unwrap();
         harness.box_end.write_all(&own).unwrap();
         let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
             .await
@@ -1941,8 +1972,9 @@ mod tests {
             .expect("the switch side stays open");
         assert_eq!(
             first, own,
-            "the ungated daemon relay still rejects a foreign source, \
-             and forwards its own frames"
+            "the ungated daemon relay still rejects a foreign source — \
+             an IPv4 header source and an ARP sender address alike, \
+             whatever protocol the ARP claims — and forwards its own frames"
         );
     }
 }
