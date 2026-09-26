@@ -51,6 +51,16 @@
 //! userns + sudo), gcc to build the socket probes, and a pinned gvproxy
 //! (scripts/fetch-gvproxy.sh):
 //! `MINIMALD_NETNS_TEST=1 GVPROXY_BIN=... cargo test -p minimald --test netns_root_integration -- --include-ignored`
+//!
+//! A failing run of that CI job reports an exit code and nothing else unless
+//! the failing proof names itself: nextest captures what a test prints and
+//! indents it four spaces in the step log, which hides `::error` workflow
+//! commands from the Actions annotation parser, and the step log itself is
+//! admin-only besides. So the first line of every proof past its gates is
+//! `announce_to_the_runner`, which says the proof started and, on the panic
+//! that fails it, posts proof, site and reason through the one stream that is
+//! neither captured nor indented — reaching the parser as an annotation on
+//! the check run that every reader of the pull request can see.
 #![cfg(target_os = "linux")]
 
 use sandbox2::NetPlan;
@@ -58,6 +68,7 @@ use sandbox2::Network as _;
 use sandbox2::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -75,6 +86,80 @@ fn gated() -> bool {
     }
     eprintln!("skipping netns proof: MINIMALD_NETNS_TEST not set");
     false
+}
+
+/// One line straight into the log stream nextest prints to. What a proof prints
+/// itself never reaches the Actions annotation parser: nextest captures each
+/// test's stdout and stderr and indents them four spaces in the step log, and
+/// the parser only reads a command that starts a line. Nextest forks this proof
+/// from its per-binary fork server, so `/proc/<ppid>/fd/1` is that server's own
+/// stdout — the stream nextest prints to unindented, and the one the parser does
+/// read. Best effort in every direction: away from the CI runner, or where the
+/// path will not open, nothing is written and every proof behaves exactly as it
+/// did without this.
+fn tell_the_runner(line: &str) {
+    if std::env::var("GITHUB_ACTIONS").ok().as_deref() != Some("true") {
+        return;
+    }
+    // SAFETY: getppid() reads the calling process's parent pid; it has no side
+    // effects and cannot fail.
+    let ppid = unsafe { libc::getppid() };
+    if let Ok(mut log) = std::fs::File::create(format!("/proc/{ppid}/fd/1")) {
+        let _written = writeln!(log, "{line}");
+    }
+}
+
+/// Announces `proof` on the CI runner, so a failing run of the lane names the
+/// proof that failed. Two lines of insurance: a start line — a run that dies
+/// without a panic (a hang, a proof the slow-timeout kills) still names the
+/// last proof that began, to whoever reads the step log — and a panic hook,
+/// installed once, that posts the proof's name, panic site and reason as an
+/// `::error` workflow command the runner turns into an annotation on the check
+/// run. The step log holds the full detail but is admin-only; the annotation is
+/// the part every reader of the pull request can see. The hook chains the one
+/// before it, so nextest still reports the failure exactly as it did.
+fn announce_to_the_runner(proof: &str) {
+    // Nextest runs each test in a process of its own, so a process-wide name
+    // names this proof on whichever thread the panic comes from — the test
+    // thread or a runtime worker the proof spawned onto.
+    static RUNNING_PROOF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    let _named = RUNNING_PROOF.set(proof.to_owned());
+    HOOK.call_once(|| {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let proof = RUNNING_PROOF
+                .get()
+                .map(String::as_str)
+                .unwrap_or("an unnamed proof");
+            let payload = info.payload();
+            let reason = if let Some(reason) = payload.downcast_ref::<&str>() {
+                (*reason).to_string()
+            } else if let Some(reason) = payload.downcast_ref::<String>() {
+                reason.clone()
+            } else {
+                "a panic carrying no message".to_string()
+            };
+            let reason: String = reason
+                .replace(['\r', '\n'], " ")
+                .chars()
+                .take(512)
+                .collect();
+            if let Some(location) = info.location() {
+                tell_the_runner(&format!(
+                    "::error file={},line={},title={proof}::netns proof failed: {reason}",
+                    location.file(),
+                    location.line(),
+                ));
+            } else {
+                tell_the_runner(&format!(
+                    "::error title={proof}::netns proof failed: {reason}"
+                ));
+            }
+            previous_hook(info);
+        }));
+    });
+    tell_the_runner(&format!("minimald netns proof started: {proof}"));
 }
 
 fn gvproxy_bin() -> PathBuf {
@@ -293,6 +378,7 @@ async fn network_none_blocks_all_outside_sockets() {
     if !gated() {
         return;
     }
+    announce_to_the_runner("network_none_blocks_all_outside_sockets");
 
     let rootfs_tmp =
         tempfile::tempdir_in(proof_base_dir()).expect("rootfs temp dir under the target tmp");
@@ -376,6 +462,7 @@ async fn network_none_attach_works() {
     if !gated() {
         return;
     }
+    announce_to_the_runner("network_none_attach_works");
     use minimald::nsenter::{Injection, session_leader_pid};
     use minimald::session_host::{Pty, WinSize};
     use std::io::{BufRead as _, Read as _};
@@ -777,6 +864,7 @@ async fn injected_process_lacks_cap_net_raw() {
         );
         return;
     }
+    announce_to_the_runner("injected_process_lacks_cap_net_raw");
     use minimald::nsenter::{Injection, session_leader_pid};
     use std::io::{BufRead as _, Read as _};
 
@@ -921,6 +1009,7 @@ async fn netns_nonet_refuses_egress() {
     if !gated() {
         return;
     }
+    announce_to_the_runner("netns_nonet_refuses_egress");
 
     // The production decision under test: `NoNet` plans an isolated network
     // namespace, `HostNet` a shared one.
@@ -961,6 +1050,7 @@ async fn netns_ownip_ptask_to_ptask() {
     if !gated() {
         return;
     }
+    announce_to_the_runner("netns_ownip_ptask_to_ptask");
     use sessions::{IngressPolicy, IpProto, PortMapping};
 
     let state = tempfile::tempdir().expect("switch state dir");
@@ -1054,6 +1144,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     if !gated() {
         return;
     }
+    announce_to_the_runner("netns_ingress_static_port_mapping_exposes_then_unexposes");
     use minimald::net::policy::{ControlChannel, apply_ingress, remove_ingress};
     use sessions::{IngressPolicy, IpProto, PortMapping};
 
