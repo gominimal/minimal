@@ -3099,8 +3099,11 @@ fi
 #     doctrine); a CI native lane that cannot run the command is a red lane.
 #   * A dev host that already routes the zone to THIS daemon's answerer sees
 #     the advisory correctly quiet (NET-122's only quiet state, once the
-#     interim is out of the picture); the resolution check below still runs
-#     there, and passing it is the assertion that the quiet was right.
+#     interim is out of the picture and nothing blocks the command — a host
+#     whose lookups bypass resolved's stub is told the blocker even on a
+#     hook that routes, so it lands in the branch above); the resolution
+#     check below still runs there, and passing it is the assertion that
+#     the quiet was right.
 # ---------------------------------------------------------------------------
 proof_native_resolution_without_proxy_env() {
   echo "::group::native min.internal resolution with no proxy settings (NET-009, NET-122, NET-123)"
@@ -3245,10 +3248,11 @@ proof_native_resolution_without_proxy_env() {
     native_proved="advised-bypass"
   else
     # No advisory. NET-122's only quiet state is a hook that already routes
-    # this answerer's port (the create carried the port — warmed above — and
-    # no Linux lane reports the interim), so this is a dev host that
-    # configured the zone against this daemon before. CI's fresh runners
-    # never see it, which is why it is an error there.
+    # this answerer's port with nothing blocking the command (the create
+    # carried the port — warmed above — and no Linux lane reports the
+    # interim), so this is a dev host that configured the zone against this
+    # daemon before. CI's fresh runners never see it, which is why it is an
+    # error there.
     if [ -n "${CI:-}" ] || [ -n "$E2E_VM" ]; then
       echo "::error::no advisory on the activate's stderr, and this lane's resolver is not configured for the zone (NET-122)"
       echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
