@@ -722,8 +722,8 @@ pub(crate) fn command(port: u16) -> String {
 /// `None` — nothing to say — when the hook already routes the zone to this
 /// answerer, the daemon did not publish at the interim, *and* nothing
 /// blocks the command. Otherwise the advisory says what is missing and
-/// names the exact command. The interim
-/// re-surfaces the advisory even when the hook routes (NET-123: "re-surface
+/// names the exact command. The interim re-surfaces the advisory even when
+/// the hook routes (NET-123: "re-surface
 /// the advisory of NET-122"): a session on the interim is a fact the user
 /// has no other way to see. The interim fact says what there is to do
 /// about it — nothing: the interim ends when a host-side step installs the
