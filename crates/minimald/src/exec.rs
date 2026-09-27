@@ -2133,6 +2133,14 @@ mod tests {
     /// default: the announcement may change nothing yet. Under InForce the
     /// same bare box's task carries the deny-all gate.
     ///
+    /// What the announcement defers is the *default* for a box that declared
+    /// nothing. A box that declared an `egress` section is enforced on its
+    /// session's own PTask in every phase, so a task in such a session
+    /// carries that declaration's gate even now, under the phase this build
+    /// ships — the same inbound posture the in-force case below already
+    /// accepts: a task PTask holds no ingress of its own, so its gate
+    /// default-blocks unsolicited inbound.
+    ///
     /// The phase is passed by name, not read from the shipped constant, so
     /// the in-force posture stays proven while the default is only
     /// announced. `own_ip_default_deny_all` proves what the deny-all section
@@ -2198,6 +2206,46 @@ mod tests {
         assert!(
             format!("{in_force:?}").contains("has_policy: true"),
             "the in-force default gates a bare box's task: {in_force:?}"
+        );
+
+        // A box that *declared* an egress section is the other case where
+        // the task path attaches a gate, and the announcement does not defer
+        // it: the declaration is enforced on the session's own PTask in every
+        // phase, so a task in that session resolves the same section its
+        // session's gate did — the declaration verbatim, not the deny-all
+        // section and not nothing — even under the phase this build ships.
+        let section = sessions::EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..sessions::EgressPolicy::default()
+        };
+        let mut declared_record = record_with(sessions::NetworkMode::OwnIp);
+        declared_record.policy.egress = Some(section.clone());
+        for phase in [
+            sessions::EgressDefaultPhase::Announced,
+            sessions::EgressDefaultPhase::InForce,
+        ] {
+            assert_eq!(
+                crate::session::effective_egress_section(
+                    &declared_record.policy,
+                    declared_record.network,
+                    phase,
+                    false,
+                ),
+                Some(section.clone()),
+                "a declared egress section reaches the task's gate verbatim \
+                 while the default is {phase:?}",
+            );
+        }
+        let declared = super::task_network(
+            &declared_record,
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
+        assert!(
+            format!("{declared:?}").contains("has_policy: true"),
+            "a declared egress section gates the task under the shipped \
+             phase too: {declared:?}"
         );
     }
 
