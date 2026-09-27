@@ -720,8 +720,9 @@ pub(crate) fn command(port: u16) -> String {
 /// (NET-122, NET-123's interim arm). Pure.
 ///
 /// `None` — nothing to say — when the hook already routes the zone to this
-/// answerer *and* the daemon did not publish at the interim. Otherwise the
-/// advisory says what is missing and names the exact command. The interim
+/// answerer, the daemon did not publish at the interim, *and* nothing
+/// blocks the command. Otherwise the advisory says what is missing and
+/// names the exact command. The interim
 /// re-surfaces the advisory even when the hook routes (NET-123: "re-surface
 /// the advisory of NET-122"): a session on the interim is a fact the user
 /// has no other way to see. The interim fact says what there is to do
@@ -737,14 +738,24 @@ pub(crate) fn command(port: u16) -> String {
 /// case the advisory says that instead of naming a command: NET-122's
 /// "exact command" is only ever one that works, and printing a dead one
 /// would take a privilege prompt in exchange for configuration no host
-/// process would ever consult.
+/// process would ever consult. That holds on a hook that routes too: the
+/// bypass leaves the configured hook as dead as an unconfigured one, so
+/// the blocker is still said (and is then the whole of the note, no fact
+/// being missing — a hook that routes is not a fact the note can lean on).
 pub(crate) fn advisory_at(
     hook: &Hook,
     port: u16,
     interim: bool,
     blocker: Option<&str>,
 ) -> Option<String> {
-    if hook.routes(port) && !interim {
+    // A hook routing this answerer's port is configured, but only on a
+    // host whose lookups reach the resolver it points at. A blocker says
+    // they do not, so it outranks the quiet arm: staying silent there
+    // would tell the user their resolver is set up while no host process's
+    // lookup consults it, and `*.{ZONE}` would not resolve — NET-122's
+    // WHILE clause is about the resolver that works, not the one whose
+    // configuration is on paper.
+    if hook.routes(port) && !interim && blocker.is_none() {
         return None;
     }
     let mut facts = Vec::new();
@@ -774,13 +785,19 @@ pub(crate) fn advisory_at(
         ));
     }
     let facts = facts.join("; ");
-    if let Some(blocker) = blocker {
-        return Some(format!("note: {facts}; {blocker}."));
+    match blocker {
+        // The note is built from the parts that are there. A blocker can be
+        // the whole of it — the hook routes, so no fact is missing — and a
+        // missing fact must not print as a dangling `; ` after the colon.
+        Some(blocker) if facts.is_empty() => Some(format!("note: {blocker}.")),
+        Some(blocker) => Some(format!("note: {facts}; {blocker}.")),
+        None => {
+            let command = command(port);
+            Some(format!(
+                "note: {facts}. Configure the host's resolver for the zone with:\n  {command}"
+            ))
+        }
     }
-    let command = command(port);
-    Some(format!(
-        "note: {facts}. Configure the host's resolver for the zone with:\n  {command}"
-    ))
 }
 
 /// The advisory to print at this session's start, given what the daemon
@@ -1026,17 +1043,28 @@ mod tests {
     }
 
     // The full path on this host: whatever `detect` finds, the advisory
-    // either stays quiet because the hook already routes the port, or
-    // names this platform's exact command. Either arm is a pass; only the
-    // mismatch — advised without a command, or quiet while unconfigured —
-    // fails.
+    // either stays quiet because the hook already routes the port and
+    // nothing blocks the command, or says what the host needs — this
+    // platform's exact command, or the blocker that makes it dead. Either
+    // arm is a pass; only the mismatch — advised without anything to say,
+    // or quiet while the host cannot resolve the zone — fails.
     #[tokio::test]
     async fn session_advisory_agrees_with_the_hook_it_detected() {
         let port = 15353;
-        let (hook, _) = session_detection().await;
+        let (hook, blocker) = session_detection().await;
         let advisory = session_advisory(Some(port), false).await;
-        if hook.routes(port) {
+        if hook.routes(port) && blocker.is_none() {
             assert!(advisory.is_none(), "configured host must not be advised");
+        } else if let Some(blocker) = blocker {
+            let advisory = advisory.expect("a host the command cannot reach must be told why");
+            assert!(
+                advisory.contains(&blocker),
+                "the advisory says why no command is named: {advisory}"
+            );
+            assert!(
+                !advisory.contains("sudo"),
+                "a command that does nothing is not named: {advisory}"
+            );
         } else {
             let advisory = advisory.expect("an unconfigured host must be advised");
             for marker in command_markers(port) {
@@ -1248,6 +1276,20 @@ mod tests {
         assert!(
             !advisory.contains('?'),
             "an advisory never asks a question — it says what is wrong: {advisory}"
+        );
+
+        // The same host whose hook already routes this answerer's port —
+        // `minzone0` configured earlier, `/etc/resolv.conf` since rewritten
+        // to bypass the stub — is advised too, and by the blocker alone:
+        // nothing is missing there, so the note carries no dangling `; `
+        // where a fact would sit and no dead command either.
+        let routed = Hook::configured("test", Some(15353), "the routing domain routes the zone");
+        let advisory = advisory_at(&routed, 15353, false, Some(&blocker))
+            .expect("a bypassing host is advised even when its hook routes");
+        assert_eq!(
+            advisory,
+            format!("note: {blocker}."),
+            "the note is the blocker alone, with no empty facts to separate: {advisory}"
         );
 
         // The stub named — alone or beside foreign servers — is a host the
