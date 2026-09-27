@@ -82,10 +82,21 @@
 #   skip_scaffold                    the daemon-scaffolded blueprint upload lane
 #   sandbox                          interactive attach: in-sandbox `min add`
 #   restart                          daemon stop → autospawn, hooks survive
+#   fresh_install_own_ip_ingress_publishes_loopback
+#                                    a real install.sh run ships the switch;
+#                                    own-IP ingress answers at 127.0.0.1:8080
+#   network_posture_from_stock_install
+#                                    from a real install.sh run: --network and
+#                                    --ingress in help+reference+hints, a none
+#                                    box that attaches and reaches nothing,
+#                                    the stock posture's reach, own-IP again
+#   min_internal_names_through_proxy NET-001..004 through the shipped proxy
+#   proxy_refuses_like_direct        the proxy refuses exactly as the switch
+#                                    does: paired direct/proxied attempts,
+#                                    h2 closed, h2c stripped (NET-069..071, 135)
 #   native_resolution_without_proxy_env
 #                                    NET-009/122/123: the advisory, the probe,
 #                                    and host-OS resolution with no proxies
-#   min_internal_names_through_proxy NET-001..004 through the shipped proxy
 #   hostnames_recover_and_two_daemons_route NET-020..027 warning, recovery,
 #                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
@@ -130,6 +141,9 @@ PROXY_SEED_DIR="" # seeded by the min.internal proxy proof; removed on teardown
 PROXY_OWN_SEED_DIR="" # its own-address box's seed; removed on teardown
 PROXY_HOST_DIR="" # the host-loopback dir that proof serves; removed on teardown
 PROXY_HOST_SRV_PID="" # the host-loopback server it starts; killed on teardown
+PAR_SEED_DIR="" # seeded by the proxy-parity proof below; removed on teardown
+PAR_OWN_SEED_DIR="" # its own-address target box's seed; removed on teardown
+PAR_CALLER_SEED_DIR="" # its denied-caller box's seed; removed on teardown
 RECOVER_SEED_DIR="" # the hostnames-recovery proof's seed; removed on teardown
 SECOND_SEED_DIR="" # its second-daemon box's seed; removed on teardown
 RECOVER_STATE2_DIR="" # the second daemon's state base; `mnl2 stop` on teardown
@@ -375,6 +389,9 @@ teardown() {
   if [ -n "$PROXY_HOST_SRV_PID" ]; then
     kill "$PROXY_HOST_SRV_PID" 2>/dev/null || true
   fi
+  [ -n "$PAR_SEED_DIR" ] && rm -rf "$PAR_SEED_DIR"
+  [ -n "$PAR_OWN_SEED_DIR" ] && rm -rf "$PAR_OWN_SEED_DIR"
+  [ -n "$PAR_CALLER_SEED_DIR" ] && rm -rf "$PAR_CALLER_SEED_DIR"
   # The hostnames-recovery proof's extras: the port holder it starts, the
   # second daemon it brings up (its sessions were destroyed in the proof,
   # but the daemon itself outlives them), and the switch socket beat C may
@@ -824,6 +841,1215 @@ if [ -n "${MINVMD_GVPROXY_BIN:-}" ]; then
 else
   echo "own-IP session proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
 fi
+}
+
+# ---------------------------------------------------------------------------
+# Fresh-install loopback publish proof (NET-040/NET-041/NET-102): from a REAL
+# scripts/install.sh run into a fresh HOME — a local mock bucket built out of
+# THIS checkout's own binaries, reached through the same stub-curl trick
+# install_test.sh uses, so the installer itself runs unmodified — the
+# installed pair must serve an own-IP box whose `--ingress 8080:8080` mapping
+# answers ON THE HOST at 127.0.0.1:8080 with the box's own server's response.
+# That is the own-address pipeline in the exact shape a user gets it: the
+# installer ships gvproxy-min into ~/.local/bin (and names the path it
+# verified), the daemon finds it there through switch::installed_gvproxy_bin,
+# and the switch publishes the box's port on the host loopback — with one
+# record in the daemon's log per exposed mapping (host, port, session).
+#
+# Gating, decided by where the proof's pieces actually run:
+#   * Native Linux only. A VM lane's daemon runs in the guest while the pair
+#     this proof installs lives host-side (macOS is always VM-backed), so
+#     there is no fresh-install story to drive there — those lanes'
+#     own-address boxes are the proxy proof's own-address half.
+#   * The box needs a TUN device: its session program opens /dev/net/tun for
+#     its in-namespace tap, and a host that is itself a sandbox (the
+#     agent-runtime boxes this harness runs on) has none and cannot mknod one,
+#     so the box cannot come up no matter what this proof ships. Gate on the
+#     device and skip when it is absent — the same prerequisite the
+#     own-ip tap root integration harness asserts on the native netns lane,
+#     which has it and runs this case for real.
+#   * The switch binary to ship: $MINVMD_GVPROXY_BIN, the justfile's
+#     .scratch/gvproxy, or the pinned fetch. Unlike own_ip this never SKIPS
+#     for want of one: a lane that cannot ship a switch cannot prove what
+#     this case exists for, so the fetch failing is a failure.
+#   * The system-package half (the daemon serving the same mapping from
+#     /usr/bin/gvproxy-min, the nfpm/AUR dest) runs only on a lane that can
+#     stage that path — writable /usr/bin, never over an existing binary;
+#     the probe ORDER that finds it is pinned by the switch crate's resolver
+#     tests either way.
+#   * The host half of the mapping is 127.0.0.1:8080; a host that already
+#     has a listener there (the agent-runtime boxes this harness itself runs
+#     on do) publishes on the fallback 18082 instead — the box always serves
+#     its INTERNAL 8080, so the mapping exercised is always <host-port>:8080
+#     and a clean host runs it exactly as the proof sentence says.
+#
+# Ordered after `restart`: it stops whatever daemon is up and swaps the
+# driving pair to the installed one, so nothing that still shares the
+# `lifecycle` session may follow it. The whole body runs in a subshell — HOME,
+# PATH, MINIMAL_BIN and RUST_LOG all change for the installed pair and must
+# revert before the next proof runs — and a failure exits the subshell, with
+# the wrapper calling fail so the run still dumps its diagnostics.
+proof_fresh_install_own_ip_ingress_publishes_loopback() {
+local fi_arch fi_gvproxy fi_root fi_home fi_bucket fi_stubbin fi_seed fi_out
+local fi_h_minimald fi_h_minimal fi_h_gvmin fi_sid fi_sid2 fi_log fi_rec
+local fi_ready fi_answered fi_status fi_bucket_host fi_hport fi_portpat
+local fi_lane_minimald fi_restore_profile
+if [ -n "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
+  echo "fresh-install loopback publish SKIPPED (VM-backed lane: the pair this proof installs lives host-side)"
+  return 0
+fi
+case "$(uname -m)" in
+  x86_64)        fi_arch=amd64 ;;
+  aarch64|arm64) fi_arch=arm64 ;;
+  *)
+    echo "fresh-install loopback publish SKIPPED (no release arch for $(uname -m))"
+    return 0
+    ;;
+esac
+
+# The box opens /dev/net/tun for its in-namespace tap; without the device its
+# session program cannot spawn, and a host that is itself a sandbox cannot
+# mknod one either. Skip rather than fail: the failure would say nothing about
+# this branch, and the native CI lane — where the tap root integration harness
+# already builds a tap — runs the case for real.
+if [ ! -c /dev/net/tun ]; then
+  echo "fresh-install loopback publish SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  return 0
+fi
+
+# The proof's mapping is 8080:8080 — the box serves its INTERNAL 8080, the
+# switch publishes the host half on the loopback. A host may already have a
+# listener on the host port (the agent-runtime boxes this harness itself runs
+# on do), so claim it BEFORE anything is installed, and when it is taken
+# publish on the fallback port instead: the whole pipeline — install, switch
+# discovery, expose, host answer, log record — is exercised either way, and a
+# clean host runs the mapping exactly as the proof sentence says it.
+fi_hport=8080
+if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$fi_hport/" 2>/dev/null; then
+  if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:18082/" 2>/dev/null; then
+    echo "::error::both 127.0.0.1:8080 and the fallback 18082 already answer on this host; the loopback publish proof needs one of them free"
+    fail
+  fi
+  fi_hport=18082
+  echo "127.0.0.1:8080 is already answering on this host — publishing the mapping on the fallback port $fi_hport instead (the box still serves its internal 8080)"
+fi
+fi_portpat="\"port\":$fi_hport"
+
+# The daemon THIS lane was driving, resolved before the proof swaps PATH and
+# HOME over to the installed pair. On a host that restricts unprivileged user
+# namespaces (stock Ubuntu 24.04+) the harness's start-up block attached the
+# minimald AppArmor profile to this binary, and attaching it to anything else
+# REPLACES the recorded set — so the re-attach inside the proof must name this
+# one too, or the proofs that follow would lose the profile and with it every
+# sandbox they fork.
+fi_lane_minimald="$(command -v minimald 2>/dev/null || true)"
+
+# The switch binary the fresh install will ship. `just e2e` and a dev who ran
+# `just gvproxy` already have one; otherwise fetch the pinned release — the
+# installer's own pinned artifact, verified against vendor/gvproxy/gvproxy.lock.
+if [ -n "${MINVMD_GVPROXY_BIN:-}" ] && [ -x "$MINVMD_GVPROXY_BIN" ]; then
+  fi_gvproxy="$MINVMD_GVPROXY_BIN"
+elif [ -x "$ROOT/.scratch/gvproxy" ]; then
+  fi_gvproxy="$ROOT/.scratch/gvproxy"
+else
+  mkdir -p "$WORK/fresh-install"
+  if ! "$ROOT/scripts/fetch-gvproxy.sh" "$WORK/fresh-install/gvproxy" \
+      >"$WORK/fresh-install/fetch-gvproxy.out" 2>&1; then
+    echo "::error::could not fetch the pinned gvproxy the fresh install must ship"
+    cat "$WORK/fresh-install/fetch-gvproxy.out" 2>/dev/null || true
+    fail
+  fi
+  fi_gvproxy="$WORK/fresh-install/gvproxy"
+fi
+
+echo "::group::fresh install publishes an own-IP ingress on the host loopback"
+# Everything the proof builds lives under $WORK/fresh-install, so the state
+# dir's teardown covers all of it — no extra bookkeeping.
+fi_root="$WORK/fresh-install"
+fi_home="$fi_root/home"
+fi_bucket="$fi_root/bucket"
+fi_stubbin="$fi_root/stubbin"
+fi_seed="$fi_root/seed"
+fi_out="$fi_root/install.out"
+fi_bucket_host="https://mock.invalid/minimal-fresh"
+mkdir -p "$fi_home" "$fi_bucket/versions/v1" "$fi_stubbin" "$fi_seed"
+hook_seed_preamble > "$fi_seed/minimal.toml"
+# The `.git` marker the headless upload gate wants.
+mkdir "$fi_seed/.git"
+
+# The mock bucket: the real artifacts this lane drives — its own `min` and
+# `minimald`, plus the gvproxy the installer must ship — behind the pinned
+# host the stub curl below maps to this dir. A `curl | sh` install without
+# the network; the real transport is CI's real-bucket installer run.
+cp "$(command -v min)"      "$fi_bucket/versions/v1/minimal-linux-$fi_arch"
+cp "$(command -v minimald)" "$fi_bucket/versions/v1/minimald-linux-$fi_arch"
+cp "$fi_gvproxy"            "$fi_bucket/versions/v1/gvproxy-min-linux-$fi_arch"
+printf 'v1\n' >"$fi_bucket/stable"
+fi_sha() { sha256sum "$1" | awk '{print $1}'; }
+fi_h_minimald="$(fi_sha "$fi_bucket/versions/v1/minimald-linux-$fi_arch")"
+fi_h_minimal="$(fi_sha "$fi_bucket/versions/v1/minimal-linux-$fi_arch")"
+fi_h_gvmin="$(fi_sha "$fi_bucket/versions/v1/gvproxy-min-linux-$fi_arch")"
+{
+  printf '# format: 1\n'
+  printf '# component   os      arch    version   sha256   kind   dest   src\n'
+  printf '\n'
+  printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+    minimald linux "$fi_arch" v1 "$fi_h_minimald" file bin/minimald "versions/v1/minimald-linux-$fi_arch"
+  printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+    minimal linux "$fi_arch" v1 "$fi_h_minimal" file bin/min "versions/v1/minimal-linux-$fi_arch"
+  printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+    gvproxy-min linux "$fi_arch" v1 "$fi_h_gvmin" file bin/gvproxy-min "versions/v1/gvproxy-min-linux-$fi_arch"
+} >"$fi_bucket/versions/v1/components"
+
+cat >"$fi_stubbin/curl" <<STUB
+#!/bin/sh
+# Fake curl: maps the pinned bucket host to the local dir this proof built —
+# the same trick install_test.sh uses, so the real installer runs unmodified;
+# its own HTTPS/TLS flags are accepted and ignored.
+out= url=
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    https://*|http://*) url="\$1"; shift ;;
+    *) shift ;;
+  esac
+done
+[ -n "\$url" ] || { echo "stub curl: no url" >&2; exit 2; }
+rel="\${url#$fi_bucket_host/}"
+src="$fi_bucket/\$rel"
+[ -f "\$src" ] || { echo "stub curl: 404 \$url" >&2; exit 22; }
+if [ -n "\$out" ]; then cp "\$src" "\$out"; else cat "\$src"; fi
+STUB
+chmod +x "$fi_stubbin/curl"
+# Force the wget path off so the downloader selection is deterministic.
+cat >"$fi_stubbin/wget" <<'STUB'
+#!/bin/sh
+echo "stub wget should not be used here" >&2
+exit 1
+STUB
+chmod +x "$fi_stubbin/wget"
+
+if (
+  # The install itself, into the fresh home: the same command a user runs,
+  # over the stub transport. MINIMAL_BIN pins the prefix the installer and
+  # the daemon's binary probe both resolve (~/.local/bin under the fresh
+  # HOME is the default anyway; explicit so a stray env cannot redirect it).
+  HOME="$fi_home" MINIMAL_BIN="$fi_home/.local/bin" \
+  PATH="$fi_stubbin:$PATH" \
+  MINIMAL_OVERRIDE_INSTALLER_BUCKET="$fi_bucket_host" \
+    sh "$ROOT/scripts/install.sh" >"$fi_out" 2>&1 || {
+      echo "::error::the fresh install failed"
+      echo "--- install output ---"; cat "$fi_out" 2>/dev/null || true
+      exit 1
+    }
+  # NET-041's installer half: the install NAMES the switch binary it verified.
+  grep -qE 'switch-binary +verified +[^ ]*/bin/gvproxy-min$' "$fi_out" || {
+    echo "::error::the install output does not name the switch binary it verified"
+    echo "--- install output (tail) ---"; tail -25 "$fi_out" 2>/dev/null || true
+    exit 1
+  }
+  [ -x "$fi_home/.local/bin/gvproxy-min" ] || {
+    echo "::error::the fresh install did not ship an executable gvproxy-min"
+    exit 1
+  }
+
+  # A host that restricts unprivileged user namespaces confines the permission
+  # to the executable paths the minimald profile names, and this proof's pair
+  # sits under a fresh mktemp home that none of the stock tunables can cover
+  # (`@{HOME}/.local/bin/minimald` matches a real home, not a nested one) — so
+  # the INSTALLED daemon comes up unconfined and every sandbox it forks dies
+  # writing /proc/self/uid_map with EPERM, far from the cause: the first thing
+  # this proof would see is the socat probe below failing with nothing in its
+  # stderr that names it. Attach it exactly as the installer's own advisory
+  # tells a user to, before the pair is driven. `--path` replaces the recorded
+  # set, so the lane's binary is named alongside it (see fi_lane_minimald); the
+  # EXIT trap below puts the set back on the way out.
+  fi_restore_profile=0
+  if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
+    fi_attach_args=()
+    for fi_p in "$fi_home/.local/bin/minimald" "$fi_lane_minimald"; do
+      [ -n "$fi_p" ] && [ -e "$fi_p" ] && fi_attach_args+=(--path "$fi_p")
+    done
+    if ! sudo -n "$ROOT/scripts/install-apparmor-profile.sh" "${fi_attach_args[@]}"; then
+      echo "::error::this host restricts unprivileged user namespaces and the minimald AppArmor profile could not be attached to the installed pair, so its session sandbox cannot start (see docs/reference/linux-host-setup.md)"
+      exit 1
+    fi
+    fi_restore_profile=1
+    echo "restricted host: minimald AppArmor profile attached to the installed pair ($fi_home/.local/bin/minimald)"
+  fi
+  # One EXIT trap for the whole subshell, so every path out of it — the early
+  # exits above included — undoes both things the proof staged on the host: the
+  # package-path switch (the /usr/bin/gvproxy-min half below) and the profile
+  # attachment set it widened above. Neither way this function is reached is
+  # visible to shellcheck — `trap` calls it out of a subshell shellcheck
+  # cannot follow (SC2317, on older shellchecks) and the subshell's own
+  # fall-through calls it too (SC2329, on newer ones) — so the directive below
+  # silences both, and it covers the whole definition, body included.
+  # shellcheck disable=SC2317,SC2329
+  fi_cleanup() {
+    rm -f /usr/bin/gvproxy-min 2>/dev/null || true
+    if [ "${fi_restore_profile:-0}" = 1 ] && [ -n "$fi_lane_minimald" ]; then
+      sudo -n "$ROOT/scripts/install-apparmor-profile.sh" \
+        --path "$fi_lane_minimald" >/dev/null 2>&1 || echo "::warning::could not restore the minimald AppArmor profile's attachment set (sudo -n failed); it still names the installed pair's path, which this proof deletes with its work dir" >&2
+    fi
+  }
+  trap fi_cleanup EXIT
+
+  # Drive the INSTALLED pair: its dir goes first on PATH (the CLI autospawns
+  # its daemon by bare name, so the pair must resolve from one dir) and HOME
+  # becomes the fresh install's, which is exactly how the daemon finds the
+  # switch the installer shipped (switch::installed_gvproxy_bin probes
+  # \$MINIMAL_BIN, then ~/.local/bin). The expose record this proof reads
+  # from the daemon log is INFO while the harness quiets the CLI to `warn`
+  # for output parsing, so the activate that autospawns the daemon alone
+  # carries the noisier filter — as a command-local assignment, never a
+  # subshell export, so nothing leaks past this proof.
+  # The swap is deliberately subshell-local (SC2030): the lane's own env
+  # must not pick it up, so the change dying with this proof's subshell is
+  # the point — see the comment above.
+  # shellcheck disable=SC2030
+  export HOME="$fi_home" MINIMAL_BIN="$fi_home/.local/bin" PATH="$fi_home/.local/bin:$PATH"
+  mnl stop --force >/dev/null 2>&1 || true
+  fi_sid="$(cd "$fi_seed" && RUST_LOG=info mnl session activate . --no-prompt \
+    --name e2e-fresh-ingress --network own_ip --ingress "$fi_hport":8080 \
+    2>"$fi_root/activate.err")" || {
+    echo "::error::the installed pair failed to activate an own-IP session with an ingress mapping"
+    echo "--- activate stderr ---"; cat "$fi_root/activate.err" 2>/dev/null || true
+    exit 1
+  }
+  fi_sid="$(printf '%s\n' "$fi_sid" | tail -n1 | tr -d '\r')"
+
+  # socat carries the in-box responder (a launcher baseline package, at
+  # /usr/bin in every box), serving one 200 whose body is the marker; the
+  # detach form is the documented one for a listener that must outlive the
+  # exec that starts it.
+  mnl session exec "$fi_sid" 'test -x /usr/bin/socat' >/dev/null 2>"$fi_root/socat-probe.err" || {
+    echo "::error::probing the box for /usr/bin/socat failed (it is a launcher baseline package, so an empty stderr below means the file is not there — anything else is a spawn failure the probe surfaced for free)"
+    echo "--- probe stderr ---"; cat "$fi_root/socat-probe.err" 2>/dev/null || true
+    exit 1
+  }
+  mnl session exec "$fi_sid" \
+    "body=fi-fresh-install-own-ip; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
+    >/dev/null 2>"$fi_root/responder.err" || {
+    echo "::error::could not write the in-box responder's response"
+    cat "$fi_root/responder.err" 2>/dev/null || true
+    exit 1
+  }
+  mnl session exec "$fi_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:8080,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
+    >/dev/null 2>"$fi_root/responder.err" || {
+    echo "::error::could not start the in-box responder"
+    cat "$fi_root/responder.err" 2>/dev/null || true
+    exit 1
+  }
+  fi_ready=""
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$fi_sid" \
+      "curl -sS --max-time 5 -o /home/ready.body -w '%{http_code}' http://127.0.0.1:8080/" \
+      2>/dev/null || true)" = "200" ]; then
+      fi_ready=1; break
+    fi
+    sleep 0.25
+  done
+  [ -n "$fi_ready" ] || {
+    echo "::error::the in-box responder never answered a direct curl — the publish is not in the picture yet"
+    exit 1
+  }
+
+  # NET-040: the mapping answers ON THE HOST loopback, with the box's own
+  # server's response.
+  fi_answered=""
+  fi_status=""
+  for _ in $(seq 1 40); do
+    fi_status="$(curl -sS --max-time 5 -o "$fi_root/host.body" -w '%{http_code}' \
+      "http://127.0.0.1:$fi_hport/" 2>/dev/null || true)"
+    if [ "$fi_status" = "200" ] && grep -q "fi-fresh-install-own-ip" "$fi_root/host.body" 2>/dev/null; then
+      fi_answered=1; break
+    fi
+    sleep 0.25
+  done
+  [ -n "$fi_answered" ] || {
+    echo "::error::the host loopback never answered at 127.0.0.1:$fi_hport (last status: '${fi_status:-none}')"
+    echo "--- host body ---"; cat "$fi_root/host.body" 2>/dev/null || true
+    exit 1
+  }
+  echo "127.0.0.1:$fi_hport answered the box's own server (200: $(cat "$fi_root/host.body"))"
+
+  # NET-040 observability: one daemon-log record per exposed mapping, with
+  # the host address, the port and the session.
+  fi_log="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null | sort | tail -n1)"
+  fi_rec=""
+  for _ in $(seq 1 10); do
+    fi_rec="$(grep -h -- 'exposed ingress port on the host loopback' "$fi_log" 2>/dev/null \
+      | grep -F '"session":"e2e-fresh-ingress"' | tail -n1)"
+    [ -n "$fi_rec" ] && break
+    sleep 0.25
+  done
+  if [ -z "$fi_rec" ]; then
+    echo "::error::no expose record in the daemon log names the session"
+    echo "--- daemon log (tail) ---"; tail -20 "$fi_log" 2>/dev/null || true
+    exit 1
+  fi
+  case "$fi_rec" in
+    *'"host":"127.0.0.1"'*"$fi_portpat"*) ;;
+    *)
+      echo "::error::the expose record does not carry host 127.0.0.1 and the published port $fi_hport"
+      echo "--- record ---"; printf '%s\n' "$fi_rec"
+      exit 1
+      ;;
+  esac
+  echo "daemon log: $fi_rec"
+
+  mnl session destroy --force "$fi_sid" >/dev/null 2>&1 || true
+  mnl stop --force >/dev/null 2>&1 || true
+  # The switch goes down with the daemon; wait out the host port it held so
+  # the package-path half below re-publishes on the same one.
+  for _ in $(seq 1 20); do
+    curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$fi_hport/" 2>/dev/null || break
+    sleep 0.25
+  done
+
+  # The system-package half: the daemon must serve the same mapping when the
+  # only switch binary it can find is /usr/bin/gvproxy-min (the nfpm/AUR
+  # dest), not the one the installer placed in ~/.local/bin. Gated on what
+  # this lane permits — never over an existing binary — and the subshell's
+  # EXIT trap (set above) removes the staged one on every path out of the proof.
+  if [ -w /usr/bin ] && [ ! -e /usr/bin/gvproxy-min ]; then
+    cp "$fi_home/.local/bin/gvproxy-min" /usr/bin/gvproxy-min
+    rm -f "$fi_home/.local/bin/gvproxy-min"
+    fi_sid2="$(cd "$fi_seed" && RUST_LOG=info mnl session activate . --no-prompt \
+      --name e2e-fresh-ingress-pkg --network own_ip --ingress "$fi_hport":8080 \
+      2>"$fi_root/activate-pkg.err")" || {
+      echo "::error::the daemon did not serve an own-IP box from the package-path switch binary"
+      echo "--- activate stderr ---"; cat "$fi_root/activate-pkg.err" 2>/dev/null || true
+      exit 1
+    }
+    fi_sid2="$(printf '%s\n' "$fi_sid2" | tail -n1 | tr -d '\r')"
+    mnl session exec "$fi_sid2" \
+      "body=fi-fresh-install-pkgpath; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
+      >/dev/null 2>&1
+    mnl session exec "$fi_sid2" \
+      "nohup /usr/bin/socat TCP-LISTEN:8080,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>&1
+    fi_answered=""
+    for _ in $(seq 1 40); do
+      if curl -sS --max-time 5 -o "$fi_root/host-pkg.body" \
+          "http://127.0.0.1:$fi_hport/" 2>/dev/null \
+          && grep -q "fi-fresh-install-pkgpath" "$fi_root/host-pkg.body" 2>/dev/null; then
+        fi_answered=1; break
+      fi
+      sleep 0.25
+    done
+    [ -n "$fi_answered" ] || {
+      echo "::error::the package-path switch never published the mapping at 127.0.0.1:$fi_hport"
+      echo "--- activate stderr ---"; cat "$fi_root/activate-pkg.err" 2>/dev/null || true
+      exit 1
+    }
+    echo "package-path half OK: /usr/bin/gvproxy-min served the same mapping ($(cat "$fi_root/host-pkg.body"))"
+    mnl session destroy --force "$fi_sid2" >/dev/null 2>&1 || true
+  else
+    if [ -e /usr/bin/gvproxy-min ]; then
+      echo "package-path half SKIPPED (a gvproxy-min is already installed at /usr/bin/gvproxy-min, which this proof never touches)"
+    else
+      echo "package-path half SKIPPED (/usr/bin is not writable on this lane) — the /usr/bin/gvproxy-min probe order is pinned by the switch crate's resolver tests"
+    fi
+  fi
+
+  # Leave the lane as it was: the installed daemon stopped, so the next proof
+  # auto-respawns the checkout's own pair from the restored PATH.
+  mnl stop --force >/dev/null 2>&1 || true
+); then
+  :
+else
+  fail
+fi
+echo "fresh-install loopback publish OK (installed pair, shipped switch, host-loopback answer, logged expose)"
+echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# The network postures of a stock install, end to end (the S2 integration
+# case). From a REAL scripts/install.sh run into a fresh HOME — the same
+# mock-bucket install the loopback-publish proof above uses, minus its
+# system-package half — the INSTALLED pair must let a user choose a box's
+# network posture from the command line and get exactly what the choice
+# says:
+#
+#   * the chooser is findable: `min session activate --help` carries
+#     `--network` with its none|host_ip|own_ip values and `--ingress`
+#     (NET-035), the CLI reference documents both (NET-036), and the old
+#     hyphenated spellings still parse, each printing a one-line hint
+#     naming the current one (NET-037) — `no-net` is driven for real (a
+#     box activated through it), `host-net` and `own-ip` at the parser,
+#     through an invocation whose only failure is the bogus project path
+#     it is given, so acceptance is visible: the hint prints and no clap
+#     error does. The current spellings print no hint.
+#   * a `--network none` box accepts attach — a REAL pty attach, and the
+#     exec probes below which ride the same session channel — and reaches
+#     nothing outside itself (NET-038, NET-039): its namespace holds no
+#     interface besides `lo` and no default route, and the host's own
+#     listener — answering on the host before the probe starts — is
+#     refused from inside the box, fast, and a public host is
+#     unreachable too. The stock posture (host_ip, the default) completes
+#     an outbound request (NET-107).
+#   * from the fresh install, `--network own_ip --ingress 8080:8080`
+#     answers ON THE HOST at 127.0.0.1:8080 with the box's own server's
+#     response (NET-040) — and that box completes an outbound request
+#     through the switch the installer shipped (NET-107's switch half).
+#
+# Lane gating, decided by where the proof's pieces actually run:
+#   * Native Linux only: the install pair lives host-side on a VM lane
+#     (the loopback-publish proof's reason). An arch without a release
+#     binary for this channel is skipped the same way.
+#   * The own-IP half additionally needs a tap (/dev/net/tun), and a host
+#     without one cannot come up as an own-IP box no matter what the
+#     install ships. The gate holds ONLY that half — help, hints, the
+#     none box and the stock posture's reach need no tap — so a tap-less
+#     host still proves every other clause and says what it left unrun.
+#     The bucket ships the switch only when that half will run; without
+#     it the manifest carries no switch row and the install log is
+#     asserted to record the skip instead.
+#   * When the own-IP half will run, the switch binary the fresh install
+#     must ship is $MINVMD_GVPROXY_BIN, the justfile's .scratch/gvproxy,
+#     or the pinned fetch — never a skip: a lane that cannot ship a
+#     switch cannot prove what this case exists for.
+#   * A host whose boxes cannot exec degrades by observed fact (the
+#     proxy case's gate): the install, the help, the reference and the
+#     hints run without a box; on CI or a VM lane a tripped exec gate
+#     fails.
+#
+# Ordered after the loopback-publish proof for the same reason it is
+# ordered after `restart`: the case swaps the driving pair to the
+# installed one, so nothing that still shares the lane's session may
+# follow before the swap is undone.
+proof_network_posture_from_stock_install() {
+  local np_arch np_gvproxy np_want_switch
+  if [ -n "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
+    echo "network posture SKIPPED (VM-backed lane: the pair this proof installs lives host-side)"
+    return 0
+  fi
+  case "$(uname -m)" in
+    x86_64) np_arch=amd64 ;;
+    aarch64|arm64) np_arch=arm64 ;;
+    *)
+      echo "network posture SKIPPED (no release arch for $(uname -m))"
+      return 0
+      ;;
+  esac
+  if [ -c /dev/net/tun ]; then
+    np_want_switch=1
+  else
+    np_want_switch=0
+    echo "own-IP half SKIPPED (no /dev/net/tun: an own-IP box cannot open its in-namespace tap; the help, hint, none-box and stock-posture halves still run)"
+  fi
+
+  echo "::group::network posture from a stock install (help, hints, none box, own-ip, reach)"
+
+  # Everything the case builds lives under $WORK/posture, so the state
+  # dir's teardown covers all of it — no extra bookkeeping.
+  local np_root="$WORK/posture"
+  local np_home="$np_root/home"
+  local np_bucket="$np_root/bucket" np_stubbin="$np_root/stubbin"
+  local np_out="$np_root/install.log" np_bucket_host
+  np_bucket_host="https://mock.invalid/minimal-posture"
+  POSTURE_HELP="$np_root/activate-help.txt"
+  POSTURE_HOST_MARKER="posture-host-listener-ok"
+  POSTURE_OWNIP_MARKER="posture-ownip-box-ok"
+  mkdir -p "$np_home" "$np_bucket/versions/v1" "$np_stubbin"
+
+  # The switch the fresh install will ship — only when the own-IP half
+  # will run (see the tap gate above).
+  if [ "$np_want_switch" -eq 1 ]; then
+    if [ -n "${MINVMD_GVPROXY_BIN:-}" ] && [ -x "$MINVMD_GVPROXY_BIN" ]; then
+      np_gvproxy="$MINVMD_GVPROXY_BIN"
+    elif [ -x "$ROOT/.scratch/gvproxy" ]; then
+      np_gvproxy="$ROOT/.scratch/gvproxy"
+    else
+      if ! "$ROOT/scripts/fetch-gvproxy.sh" "$np_root/gvproxy" \
+        >"$np_root/fetch-gvproxy.out" 2>&1; then
+        echo "::error::could not fetch the pinned gvproxy the fresh install must ship"
+        cat "$np_root/fetch-gvproxy.out" 2>/dev/null || true
+        fail
+      fi
+      np_gvproxy="$np_root/gvproxy"
+    fi
+    cp "$np_gvproxy" "$np_bucket/versions/v1/gvproxy-min-linux-$np_arch"
+  fi
+  cp "$(command -v min)" "$np_bucket/versions/v1/minimal-linux-$np_arch"
+  cp "$(command -v minimald)" "$np_bucket/versions/v1/minimald-linux-$np_arch"
+  printf 'v1\n' >"$np_bucket/stable"
+  np_sha() { sha256sum "$1" | awk '{print $1}'; }
+  local np_h_minimald np_h_minimal
+  np_h_minimald="$(np_sha "$np_bucket/versions/v1/minimald-linux-$np_arch")"
+  np_h_minimal="$(np_sha "$np_bucket/versions/v1/minimal-linux-$np_arch")"
+  {
+    printf '# format: 1\n'
+    printf '# component   os      arch    version   sha256   kind   dest                 src\n'
+    printf '\n'
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      minimald linux "$np_arch" v1 "$np_h_minimald" file bin/minimald \
+      "versions/v1/minimald-linux-$np_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      minimal linux "$np_arch" v1 "$np_h_minimal" file bin/min \
+      "versions/v1/minimal-linux-$np_arch"
+    if [ "$np_want_switch" -eq 1 ]; then
+      local np_h_gvmin
+      np_h_gvmin="$(np_sha "$np_bucket/versions/v1/gvproxy-min-linux-$np_arch")"
+      printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+        gvproxy-min linux "$np_arch" v1 "$np_h_gvmin" file bin/gvproxy-min \
+        "versions/v1/gvproxy-min-linux-$np_arch"
+    fi
+  } >"$np_bucket/versions/v1/components"
+
+  # The installer's curl, mapped to the mock bucket (the loopback-publish
+  # proof's stub: a fake curl, so the real installer runs unmodified and
+  # its HTTPS flags are accepted and ignored).
+  cat >"$np_stubbin/curl" <<STUB
+#!/bin/sh
+# Fake curl: maps the mock bucket host to the local dir this proof built —
+# the same trick install_test.sh uses, so the real installer runs unmodified;
+# its own HTTPS/TLS flags are accepted and ignored.
+out= url=
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    https://*|http://*) url="\$1"; shift ;;
+    *) shift ;;
+  esac
+done
+[ -n "\$url" ] || { echo "stub curl: no url" >&2; exit 2; }
+rel="\${url#$np_bucket_host/}"
+src="$np_bucket/\$rel"
+[ -f "\$src" ] || { echo "stub curl: 404 \$url" >&2; exit 22; }
+if [ -n "\$out" ]; then cp "\$src" "\$out"; else cat "\$src"; fi
+STUB
+  chmod +x "$np_stubbin/curl"
+  # Force the wget path off so the downloader selection is deterministic.
+  cat >"$np_stubbin/wget" <<'STUB'
+#!/bin/sh
+echo "stub wget should not be used here" >&2
+exit 1
+STUB
+  chmod +x "$np_stubbin/wget"
+
+  # The lane daemon this run was driving, resolved before HOME and PATH
+  # swap to the installed pair (the AppArmor restore below needs it).
+  local np_lane_minimald
+  np_lane_minimald="$(command -v minimald 2>/dev/null || true)"
+
+  if (
+    # ---- the fresh install --------------------------------------------------
+    # The $PATH read below (SC2031) is meant to see the lane's PATH: the
+    # loopback-publish proof's subshell swap never reaches this proof, so
+    # nothing is lost.
+    # shellcheck disable=SC2031
+    HOME="$np_home" MINIMAL_BIN="$np_home/.local/bin" \
+      PATH="$np_stubbin:$PATH" \
+      MINIMAL_OVERRIDE_INSTALLER_BUCKET="$np_bucket_host" \
+      sh "$ROOT/scripts/install.sh" >"$np_out" 2>&1 || {
+      echo "::error::the fresh install failed"
+      echo "--- install output ---"
+      cat "$np_out" 2>/dev/null || true
+      exit 1
+    }
+    echo "step: sh scripts/install.sh (fresh HOME, mock bucket) → exit 0"
+    if [ "$np_want_switch" -eq 1 ]; then
+      grep -qE 'switch-binary +verified +[^ ]*/bin/gvproxy-min' "$np_out" || {
+        echo "::error::the install output does not name the switch binary it verified"
+        echo "--- install output (tail) ---"
+        tail -25 "$np_out" 2>/dev/null || true
+        exit 1
+      }
+    else
+      grep -qE 'switch-binary +skipped' "$np_out" || {
+        echo "::error::the install output does not record the switch-binary skip the manifest without the switch row made"
+        echo "--- install output (tail) ---"
+        tail -25 "$np_out" 2>/dev/null || true
+        exit 1
+      }
+    fi
+    [ -x "$np_home/.local/bin/min" ] && [ -x "$np_home/.local/bin/minimald" ] || {
+      echo "::error::the fresh install did not ship an executable min/minimald pair"
+      tail -25 "$np_out" 2>/dev/null || true
+      exit 1
+    }
+    if [ "$np_want_switch" -eq 1 ] && [ ! -x "$np_home/.local/bin/gvproxy-min" ]; then
+      echo "::error::the fresh install did not ship an executable gvproxy-min"
+      exit 1
+    fi
+    echo "install log: $(grep -E 'switch-binary +(verified|skipped)' "$np_out" | tail -n1)"
+
+    # ---- AppArmor, restricted hosts (the loopback-publish proof's block) ----
+    local np_restore_profile=0
+    if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
+      local np_attach_args=()
+      local np_p
+      for np_p in "$np_home/.local/bin/minimald" "$np_lane_minimald"; do
+        if [ -n "$np_p" ] && [ -e "$np_p" ]; then
+          np_attach_args+=(--path "$np_p")
+        fi
+      done
+      if ! sudo -n "$ROOT/scripts/install-apparmor-profile.sh" "${np_attach_args[@]}"; then
+        echo "::error::this host restricts unprivileged user namespaces and the minimald AppArmor profile could not be attached to the installed pair, so its session sandbox cannot start (see docs/reference/linux-host-setup.md)"
+        exit 1
+      fi
+      np_restore_profile=1
+      echo "restricted host: minimald AppArmor profile attached to the installed pair ($np_home/.local/bin/minimald)"
+    fi
+
+    # One EXIT trap for the whole subshell: every path out of it — the
+    # early exits above included — undoes what the proof staged on the
+    # host, and a nonzero exit carries the case's diagnostics: the install
+    # log, the help capture and the installed daemon's log tail (rc 3 is
+    # the exec-gate skip, not a failure).
+    # shellcheck disable=SC2317,SC2329
+    np_cleanup() {
+      local np_rc=$?
+      if [ "$np_rc" -ne 0 ] && [ "$np_rc" -ne 3 ]; then
+        echo "--- install log (tail) ---"
+        tail -30 "$np_out" 2>/dev/null || true
+        echo "--- min session activate --help (captured) ---"
+        cat "$POSTURE_HELP" 2>/dev/null || true
+        echo "--- installed daemon log (tail) ---"
+        find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null \
+          | sort | tail -n1 | xargs -r tail -30 2>/dev/null || true
+      fi
+      if [ -n "${POSTURE_HOST_PID:-}" ]; then
+        kill "$POSTURE_HOST_PID" 2>/dev/null || true
+      fi
+      if [ "${np_restore_profile:-0}" = 1 ] && [ -n "$np_lane_minimald" ]; then
+        sudo -n "$ROOT/scripts/install-apparmor-profile.sh" \
+          --path "$np_lane_minimald" >/dev/null 2>&1 \
+          || echo "::warning::could not restore the minimald AppArmor profile's attachment set (sudo -n failed)" >&2
+      fi
+      trap - EXIT
+    }
+    trap np_cleanup EXIT
+
+    # ---- drive the INSTALLED pair -------------------------------------------
+    # As in the loopback-publish proof, the swap is deliberately subshell-local
+    # (SC2030/SC2031): the lane's env must stay as it was, and the $PATH read
+    # is the lane's PATH — no earlier proof's swap reaches here.
+    # shellcheck disable=SC2030,SC2031
+    export HOME="$np_home" MINIMAL_BIN="$np_home/.local/bin" PATH="$np_home/.local/bin:$PATH"
+    mnl stop --force >/dev/null 2>&1 || true
+
+    # The daemon the case drives autospawns on the FIRST daemon-touching
+    # call, so that call alone carries the noisier filter: the daemon keeps
+    # INFO records (the expose record the own-IP half prints below) while
+    # the CLI's own stdout stays quiet for the session-id extraction.
+    # Command-local, never exported.
+    RUST_LOG=info mnl ls >/dev/null 2>"$np_root/autospawn.err" || {
+      echo "::error::the installed pair's daemon did not come up"
+      echo "--- stderr ---"
+      cat "$np_root/autospawn.err" 2>/dev/null || true
+      exit 1
+    }
+    echo "step: RUST_LOG=info min ls (autospawns the installed daemon) → exit 0"
+
+    # ---- NET-035: the chooser is in `--help` --------------------------------
+    mnl session activate --help >"$POSTURE_HELP" 2>"$np_root/help.err"
+    local np_help_rc=$?
+    echo "step: min session activate --help → exit $np_help_rc (captured at $POSTURE_HELP)"
+    if [ "$np_help_rc" -ne 0 ]; then
+      echo "::error::'min session activate --help' failed"
+      echo "--- stderr ---"
+      cat "$np_root/help.err" 2>/dev/null || true
+      exit 1
+    fi
+    if ! grep -q -- '--network' "$POSTURE_HELP" \
+      || ! grep -q -- 'none|host_ip|own_ip' "$POSTURE_HELP" \
+      || ! grep -q -- '--ingress' "$POSTURE_HELP" \
+      || ! grep -q -- 'EXT:INT' "$POSTURE_HELP" \
+      || ! grep -q -- 'no-net' "$POSTURE_HELP"; then
+      echo "::error::'min session activate --help' does not carry the network posture flags (NET-035): --network with its none|host_ip|own_ip values, --ingress, and the legacy spellings named"
+      exit 1
+    fi
+    echo "help carries --network <none|host_ip|own_ip>, --ingress <EXT:INT[/PROTO]>, and the legacy spellings"
+
+    # ---- NET-036: the reference documents the chooser -----------------------
+    if ! grep -q -- '--network <none' "$ROOT/docs/reference/cli-min.md" \
+      || ! grep -q -- '--ingress <EXT:INT' "$ROOT/docs/reference/cli-min.md" \
+      || ! grep -Eq 'no-net.*host-net.*own-ip' "$ROOT/docs/reference/cli-min.md"; then
+      echo "::error::the CLI reference (docs/reference/cli-min.md) does not document --network and --ingress with the legacy spellings (NET-036)"
+      grep -n -- '--network' "$ROOT/docs/reference/cli-min.md" | head -5 || true
+      exit 1
+    fi
+    echo "step: reference check (docs/reference/cli-min.md carries --network, --ingress, legacy spellings) → exit 0"
+
+    # ---- NET-037: the legacy spellings parse, each with a rename hint -------
+    # `no-net` is driven for real: a box activated THROUGH the legacy
+    # spelling is the acceptance the requirement names, and its stderr must
+    # carry the hint. `host-net` and `own-ip` are driven at the parser,
+    # through an invocation whose only failure is the bogus project path it
+    # is given: the hint prints while the arguments parse, before any path
+    # is resolved, and a refusal to accept the spelling would be a clap
+    # error instead.
+    local np_hint_seed="$np_root/seeds/hint" np_hint_err="$np_root/hint.err"
+    local np_hint_sid np_hint_rc
+    mkdir -p "$np_hint_seed"
+    hook_seed_preamble >"$np_hint_seed/minimal.toml"
+    mkdir "$np_hint_seed/.git"
+    np_hint_sid="$(cd "$np_hint_seed" && mnl session activate . --no-prompt \
+      --name e2e-posture-hint --network no-net 2>"$np_hint_err")"
+    np_hint_rc=$?
+    echo "step: min session activate --network no-net (a real activation through the legacy spelling) → exit $np_hint_rc"
+    if [ "$np_hint_rc" -ne 0 ]; then
+      echo "::error::the legacy spelling --network no-net did not activate a session (NET-037)"
+      echo "--- stderr ---"
+      cat "$np_hint_err" 2>/dev/null || true
+      exit 1
+    fi
+    np_hint_sid="$(printf '%s\n' "$np_hint_sid" | tail -n1 | tr -d '\r')"
+    case "$(cat "$np_hint_err")" in
+      *"note: --network no-net"*"--network none"*) ;;
+      *)
+        echo "::error::the legacy spelling --network no-net did not print the rename hint naming the current spelling (NET-037)"
+        echo "--- stderr ---"
+        cat "$np_hint_err" 2>/dev/null || true
+        exit 1
+        ;;
+    esac
+    echo "hint: $(head -n1 "$np_hint_err")"
+    mnl ls --raw 2>/dev/null | grep -Fqx "$np_hint_sid" || {
+      echo "::error::the session activated through --network no-net is not listed"
+      exit 1
+    }
+    echo "step: min ls --raw lists the legacy-spelling session → exit 0"
+    mnl session destroy --force "$np_hint_sid" >/dev/null 2>&1 || true
+    echo "step: min session destroy --force (the hint probe's throwaway) → exit 0"
+
+    local np_legacy np_probe_err np_probe_rc
+    for np_legacy in host-net own-ip; do
+      # The path below must NOT exist: the activation's only failure is the
+      # path resolution, after the arguments (the hint) have parsed.
+      np_probe_err="$np_root/legacy-$np_legacy.err"
+      mnl session activate "$np_root/seeds/no-such-dir-$np_legacy" \
+        --network "$np_legacy" >/dev/null 2>"$np_probe_err"
+      np_probe_rc=$?
+      echo "step: min session activate <absent-dir> --network $np_legacy → exit $np_probe_rc (parser-level probe)"
+      case "$(cat "$np_probe_err")" in
+        *"note: --network $np_legacy"*) ;;
+        *)
+          echo "::error::the legacy spelling --network $np_legacy did not print the rename hint (NET-037)"
+          echo "--- stderr ---"
+          cat "$np_probe_err" 2>/dev/null || true
+          exit 1
+          ;;
+      esac
+      case "$(cat "$np_probe_err")" in
+        *"invalid value"*)
+          echo "::error::the legacy spelling --network $np_legacy was refused by the parser (NET-037)"
+          echo "--- stderr ---"
+          cat "$np_probe_err" 2>/dev/null || true
+          exit 1
+          ;;
+      esac
+      echo "  hint: $(head -n1 "$np_probe_err")"
+    done
+
+    # ---- the stock posture reaches the network (NET-107) ---------------------
+    # A default host-address box, activated explicitly with the current
+    # spelling. Its exec doubles as the case's capability gate: a host that
+    # cannot run a box's sandbox can run nothing below, and the gate
+    # degrades by observed fact — the proxy case's rule.
+    local np_hostip_seed="$np_root/seeds/hostip" np_hostip_err="$np_root/hostip.err"
+    local np_host_sid
+    mkdir -p "$np_hostip_seed"
+    hook_seed_preamble >"$np_hostip_seed/minimal.toml"
+    mkdir "$np_hostip_seed/.git"
+    np_host_sid="$(cd "$np_hostip_seed" && mnl session activate . --no-prompt \
+      --name e2e-posture-hostip --network host_ip 2>"$np_hostip_err")" || {
+      echo "::error::the stock posture (--network host_ip) did not activate"
+      echo "--- stderr ---"
+      cat "$np_hostip_err" 2>/dev/null || true
+      exit 1
+    }
+    np_host_sid="$(printf '%s\n' "$np_host_sid" | tail -n1 | tr -d '\r')"
+    echo "step: min session activate --network host_ip (the stock posture) → exit 0, session $np_host_sid"
+    if grep -q -- 'note: --network' "$np_hostip_err"; then
+      echo "::error::the current spelling --network host_ip printed a legacy hint"
+      echo "--- stderr ---"
+      cat "$np_hostip_err" 2>/dev/null || true
+      exit 1
+    fi
+    echo "policy of the stock posture box:"
+    mnl session policy "$np_host_sid" 2>"$np_root/hostip-policy.err" | sed 's/^/  /' || {
+      echo "::error::'min session policy' failed for the stock posture box"
+      cat "$np_root/hostip-policy.err" 2>/dev/null || true
+      exit 1
+    }
+    if ! mnl session exec "$np_host_sid" 'true' >"$np_root/execgate.err" 2>&1 \
+      && ! { sleep 1; mnl session exec "$np_host_sid" 'true' >"$np_root/execgate.err" 2>&1; }; then
+      if [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; then
+        echo "::warning::the box halves SKIPPED — this host cannot run a session sandbox"
+        echo "  (exec: $(head -n1 "$np_root/execgate.err" 2>/dev/null || true))"
+        echo "  asserted above: the install, the help capture, the reference and the three legacy hints."
+        echo "  the postures' in-box behavior needs a host whose boxes can run; on CI or a VM lane this gate fails instead"
+        mnl session destroy --force "$np_host_sid" >/dev/null 2>&1 || true
+        mnl stop --force >/dev/null 2>&1 || true
+        exit 3
+      fi
+      echo "::error::this lane cannot run a session sandbox, so no box can be driven: the posture behavior cannot be asserted"
+      echo "  (exec: $(head -n1 "$np_root/execgate.err" 2>/dev/null || true))"
+      exit 1
+    fi
+    posture_outbound "$np_host_sid" "the stock posture (host_ip)"
+    mnl session destroy --force "$np_host_sid" >/dev/null 2>&1 || true
+    echo "step: min session destroy --force (the stock posture's box) → exit 0"
+
+    # ---- the none box: accepts attach, reaches nothing (NET-038, NET-039) ---
+    local np_none_seed="$np_root/seeds/none" np_none_err="$np_root/none.err"
+    local np_none_sid
+    mkdir -p "$np_none_seed"
+    hook_seed_preamble >"$np_none_seed/minimal.toml"
+    mkdir "$np_none_seed/.git"
+    np_none_sid="$(cd "$np_none_seed" && mnl session activate . --no-prompt \
+      --name e2e-posture-none --network none 2>"$np_none_err")" || {
+      echo "::error::the none posture did not activate"
+      echo "--- stderr ---"
+      cat "$np_none_err" 2>/dev/null || true
+      exit 1
+    }
+    np_none_sid="$(printf '%s\n' "$np_none_sid" | tail -n1 | tr -d '\r')"
+    echo "step: min session activate --network none → exit 0, session $np_none_sid"
+    if grep -q -- 'note: --network' "$np_none_err"; then
+      echo "::error::the current spelling --network none printed a legacy hint"
+      echo "--- stderr ---"
+      cat "$np_none_err" 2>/dev/null || true
+      exit 1
+    fi
+    echo "policy of the none box:"
+    mnl session policy "$np_none_sid" 2>/dev/null | sed 's/^/  /' || true
+
+    # The namespace's shape: one interface (lo), no default route.
+    posture_probe "$np_none_sid" 'echo ---DEV---; cat /proc/net/dev; echo ---ROUTE---; cat /proc/net/route'
+    if [ "$POSTURE_EXEC_RC" -ne 0 ]; then
+      echo "::error::the none box's namespace probe failed"
+      echo "--- stderr ---"
+      cat "$WORK/posture-probe.err" 2>/dev/null || true
+      exit 1
+    fi
+    local np_dev np_route np_iface_count
+    np_dev="$(printf '%s\n' "$POSTURE_EXEC_OUT" | np_section DEV)"
+    np_route="$(printf '%s\n' "$POSTURE_EXEC_OUT" | np_section ROUTE)"
+    np_iface_count="$(printf '%s\n' "$np_dev" | grep -c ':')"
+    if [ "$np_iface_count" -ne 1 ] \
+      || ! printf '%s\n' "$np_dev" | grep -q '^[[:space:]]*lo:'; then
+      echo "::error::the none box's namespace does not hold exactly the loopback interface (NET-038)"
+      echo "--- probed facts ---"
+      printf '%s\n' "$POSTURE_EXEC_OUT"
+      exit 1
+    fi
+    if printf '%s\n' "$np_route" | awk 'NR > 1 && $2 == "00000000" { found = 1 } END { exit !found }'; then
+      echo "::error::the none box's namespace has a default route (NET-038)"
+      echo "--- probed facts ---"
+      printf '%s\n' "$POSTURE_EXEC_OUT"
+      exit 1
+    fi
+    echo "the none box's namespace: one interface (lo), no default route"
+
+    # The host-side listener the reach probes measure against: a plain
+    # python3 http.server bound to the host's loopback (the proxy case's
+    # pattern). The none box's 127.0.0.1 is its OWN loopback — the same
+    # literal address, a different namespace — so "the host answers, the
+    # box cannot reach it" is the isolation fact, not an outage.
+    POSTURE_HOST_DIR="$np_root/host-listener"
+    mkdir -p "$POSTURE_HOST_DIR"
+    printf '%s\n' "$POSTURE_HOST_MARKER" >"$POSTURE_HOST_DIR/marker"
+    local np_hport="" np_cand
+    for np_cand in 18085 18086 18087 18088; do
+      if np_port_free "$np_cand"; then
+        np_hport="$np_cand"
+        break
+      fi
+    done
+    if [ -z "$np_hport" ]; then
+      echo "::error::no free candidate port among 18085-18088 for the host-side listener"
+      exit 1
+    fi
+    (cd "$POSTURE_HOST_DIR" && exec python3 -m http.server "$np_hport" --bind 127.0.0.1) \
+      >/dev/null 2>"$np_root/host-listener.err" &
+    POSTURE_HOST_PID=$!
+    local np_up=""
+    for _ in $(seq 1 40); do
+      if [ "$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+        "http://127.0.0.1:$np_hport/marker" 2>/dev/null || true)" = "200" ]; then
+        np_up=1
+        break
+      fi
+      sleep 0.25
+    done
+    if [ -z "$np_up" ]; then
+      echo "::error::the host-side listener never answered on 127.0.0.1:$np_hport"
+      echo "--- listener stderr ---"
+      cat "$np_root/host-listener.err" 2>/dev/null || true
+      exit 1
+    fi
+    echo "step: python3 -m http.server $np_hport --bind 127.0.0.1 (host-side) → exit 0, answers 200"
+
+    # The box cannot reach it: refused, fast — never a timeout.
+    local np_t0 np_t1
+    np_t0=$(now_ms)
+    posture_probe "$np_none_sid" "curl -sS --max-time 5 -o /dev/null http://127.0.0.1:$np_hport/"
+    np_t1=$(now_ms)
+    if [ "$POSTURE_EXEC_RC" -eq 0 ]; then
+      echo "::error::the none box reached the host's listener at 127.0.0.1:$np_hport — its namespace is not empty (NET-038)"
+      exit 1
+    fi
+    if [ $((np_t1 - np_t0)) -ge 4000 ]; then
+      echo "::error::the none box's refused connection took $((np_t1 - np_t0))ms — a refusal must be fast, not a timeout (NET-038)"
+      echo "--- curl stderr ---"
+      cat "$WORK/posture-probe.err" 2>/dev/null || true
+      exit 1
+    fi
+    echo "the none box cannot reach the host's listener (exit $POSTURE_EXEC_RC in $((np_t1 - np_t0))ms: $(head -n1 "$WORK/posture-probe.err" 2>/dev/null || true))"
+
+    # ...and a public host is unreachable too.
+    np_t0=$(now_ms)
+    posture_probe "$np_none_sid" "curl -sS --max-time 8 -o /dev/null https://example.com"
+    np_t1=$(now_ms)
+    if [ "$POSTURE_EXEC_RC" -eq 0 ]; then
+      echo "::error::the none box completed an outbound request to https://example.com (NET-038)"
+      exit 1
+    fi
+    echo "the none box cannot reach the internet (exit $POSTURE_EXEC_RC in $((np_t1 - np_t0))ms: $(head -n1 "$WORK/posture-probe.err" 2>/dev/null || true))"
+
+    # The attach: a REAL pty attach to the none box (the sandbox case's
+    # driver), answered with the detach lane so the session stays for its
+    # destroy below. The marker the typed command prints is the proof the
+    # attach reached the box.
+    local np_attach_out
+    # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+    np_attach_out="$(E2E_PTY_COMMANDS='echo POSTURE_NONE_ATTACH_OK
+exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+      min ${E2E_MINIMAL_ARGS:-} session attach "$np_none_sid" \
+      2>"$np_root/none-attach.err")" || {
+      echo "::error::the pty attach to the none box failed (NET-039)"
+      echo "--- transcript ---"
+      printf '%s\n' "$np_attach_out"
+      echo "--- stderr ---"
+      cat "$np_root/none-attach.err" 2>/dev/null || true
+      exit 1
+    }
+    echo "step: pty attach to the none box → exit 0"
+    if [[ "$np_attach_out" != *POSTURE_NONE_ATTACH_OK* ]]; then
+      echo "::error::the none box did not answer through the attached terminal (NET-039)"
+      echo "--- transcript ---"
+      printf '%s\n' "$np_attach_out"
+      exit 1
+    fi
+    echo "attach: POSTURE_NONE_ATTACH_OK came back through the attached terminal"
+    mnl session destroy --force "$np_none_sid" >/dev/null 2>&1 || true
+    echo "step: min session destroy --force (the none box) → exit 0"
+
+    # ---- the own-IP posture: publish on the host loopback, reach out --------
+    if [ "$np_want_switch" -eq 1 ]; then
+      local np_hport2=8080
+      if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$np_hport2/" 2>/dev/null; then
+        if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:18082/" 2>/dev/null; then
+          echo "::error::both 127.0.0.1:8080 and the fallback 18082 already answer on this host; the own-IP half needs one of them free"
+          exit 1
+        fi
+        np_hport2=18082
+        echo "127.0.0.1:8080 is already answering on this host — publishing the mapping on the fallback port $np_hport2 instead (the box still serves its internal 8080)"
+      fi
+      local np_ownip_seed="$np_root/seeds/ownip" np_own_err="$np_root/ownip-activate.err"
+      local np_own_sid
+      mkdir -p "$np_ownip_seed"
+      hook_seed_preamble >"$np_ownip_seed/minimal.toml"
+      mkdir "$np_ownip_seed/.git"
+      np_own_sid="$(cd "$np_ownip_seed" && mnl session activate . --no-prompt \
+        --name e2e-posture-ownip --network own_ip --ingress "$np_hport2":8080 \
+        2>"$np_own_err")" || {
+        echo "::error::the installed pair failed to activate an own-IP session with an ingress mapping"
+        echo "--- stderr ---"
+        cat "$np_own_err" 2>/dev/null || true
+        exit 1
+      }
+      np_own_sid="$(printf '%s\n' "$np_own_sid" | tail -n1 | tr -d '\r')"
+      echo "step: min session activate --network own_ip --ingress $np_hport2:8080 → exit 0, session $np_own_sid"
+      if grep -q -- 'note: --network' "$np_own_err"; then
+        echo "::error::the current spelling --network own_ip printed a legacy hint"
+        echo "--- stderr ---"
+        cat "$np_own_err" 2>/dev/null || true
+        exit 1
+      fi
+      # socat carries the in-box responder (a launcher baseline package, at
+      # /usr/bin in every box), serving one 200 whose body is the marker;
+      # the loopback-publish proof's detach form, verbatim.
+      posture_probe_quiet "$np_own_sid" 'test -x /usr/bin/socat' || {
+        echo "::error::probing the box for /usr/bin/socat failed (it is a launcher baseline package — an empty stderr below means the file is not there)"
+        echo "--- probe stderr ---"
+        cat "$WORK/posture-probe.err" 2>/dev/null || true
+        exit 1
+      }
+      posture_probe "$np_own_sid" \
+        "body=$POSTURE_OWNIP_MARKER; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200"
+      if [ "$POSTURE_EXEC_RC" -ne 0 ]; then
+        echo "::error::could not write the in-box responder's response"
+        echo "--- stderr ---"
+        cat "$WORK/posture-probe.err" 2>/dev/null || true
+        exit 1
+      fi
+      posture_probe "$np_own_sid" \
+        "nohup /usr/bin/socat TCP-LISTEN:8080,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &"
+      if [ "$POSTURE_EXEC_RC" -ne 0 ]; then
+        echo "::error::could not start the in-box responder"
+        echo "--- stderr ---"
+        cat "$WORK/posture-probe.err" 2>/dev/null || true
+        exit 1
+      fi
+      local np_ready=""
+      for _ in $(seq 1 40); do
+        if [ "$(mnl session exec "$np_own_sid" \
+          "curl -sS --max-time 5 -o /home/ready.body -w '%{http_code}' http://127.0.0.1:8080/" \
+          2>/dev/null || true)" = "200" ]; then
+          np_ready=1
+          break
+        fi
+        sleep 0.25
+      done
+      if [ -z "$np_ready" ]; then
+        echo "::error::the in-box responder never answered a direct curl — the publish is not in the picture yet"
+        exit 1
+      fi
+      echo "the box answers its own ingress mapping at 127.0.0.1:8080"
+      local np_status
+      np_status="$(curl -sS --max-time 5 -o "$np_root/host-answer.body" -w '%{http_code}' \
+        "http://127.0.0.1:$np_hport2/" 2>"$np_root/host-answer.err" || true)"
+      if [ "$np_status" != "200" ] \
+        || ! grep -Fq "$POSTURE_OWNIP_MARKER" "$np_root/host-answer.body" 2>/dev/null; then
+        echo "::error::the fresh install's own-IP ingress did not answer on the host loopback at 127.0.0.1:$np_hport2 (NET-040)"
+        echo "  status: $np_status, body: $(cat "$np_root/host-answer.body" 2>/dev/null || true)"
+        echo "--- curl stderr ---"
+        cat "$np_root/host-answer.err" 2>/dev/null || true
+        exit 1
+      fi
+      echo "step: host curl http://127.0.0.1:$np_hport2/ → 200, body carries the box's marker (NET-040)"
+
+      # Observability, not an assertion: the loopback-publish proof owns
+      # the expose record's assert. Find the record and print it.
+      local np_daemon_log np_expose=""
+      np_daemon_log="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null | sort | tail -n1)"
+      for _ in $(seq 1 10); do
+        np_expose="$(grep -h -- 'exposed ingress port on the host loopback' "$np_daemon_log" 2>/dev/null \
+          | grep -F '"session":"e2e-posture-ownip"' | tail -n1)"
+        if [ -n "$np_expose" ]; then
+          break
+        fi
+        sleep 0.25
+      done
+      if [ -n "$np_expose" ]; then
+        echo "daemon log: $np_expose"
+      else
+        echo "daemon log: (no expose record found — the host answer above is the assertion)"
+      fi
+      echo "policy of the own-IP box:"
+      mnl session policy "$np_own_sid" 2>/dev/null | sed 's/^/  /' || true
+      posture_outbound "$np_own_sid" "the own-IP posture (switch lane)"
+      mnl session destroy --force "$np_own_sid" >/dev/null 2>&1 || true
+      mnl stop --force >/dev/null 2>&1 || true
+      for _ in $(seq 1 20); do
+        curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$np_hport2/" 2>/dev/null || break
+        sleep 0.25
+      done
+    else
+      echo "own-IP half SKIPPED (no /dev/net/tun: the fresh install ships no switch and the half is gated on the tap — see the skip note at the top)"
+    fi
+
+    # Leave the lane as it was: the installed daemon stopped, so the next
+    # proof auto-respawns the checkout's own pair from the restored PATH.
+    mnl stop --force >/dev/null 2>&1 || true
+  ); then
+    :
+  else
+    local np_rc=$?
+    if [ "$np_rc" -eq 3 ]; then
+      echo "network posture from a stock install SKIPPED (this host cannot run a session sandbox; the install, help, reference and hint halves above still ran)"
+      echo "::endgroup::"
+      return 0
+    fi
+    fail
+  fi
+  echo "network posture from a stock install OK (chooser in help+reference+hints, none box isolated, own-ip answered on the host, live postures reached the network)"
+  echo "::endgroup::"
+}
+
+# The posture case's own helpers. posture_probe drives one `min session
+# exec` and prints the command, its exit status and the captured output
+# (the case's observability contract), leaving them in POSTURE_EXEC_RC and
+# POSTURE_EXEC_OUT; posture_probe_quiet is the ready-loop variant (status
+# only); posture_outbound is the tolerant outbound probe (the
+# session_outbound_request proof's shape); np_section and np_port_free are
+# the section splitter and the bind-probe the reach probes need.
+posture_probe() {
+  local np_sid="$1" np_cmd="$2"
+  POSTURE_EXEC_OUT="$(mnl session exec "$np_sid" "$np_cmd" 2>"$WORK/posture-probe.err")"
+  POSTURE_EXEC_RC=$?
+  echo "exec: $np_cmd"
+  echo "  exit: $POSTURE_EXEC_RC"
+  if [ -n "$POSTURE_EXEC_OUT" ]; then
+    printf '%s\n' "$POSTURE_EXEC_OUT" | sed 's/^/  | /'
+  fi
+}
+posture_probe_quiet() {
+  POSTURE_EXEC_OUT="$(mnl session exec "$1" "$2" 2>"$WORK/posture-probe.err")"
+  POSTURE_EXEC_RC=$?
+  [ "$POSTURE_EXEC_RC" -eq 0 ]
+}
+posture_outbound() {
+  local np_sid="$1" np_label="$2"
+  local np_h np_t np_status np_out np_ok=0 np_failed=""
+  for np_h in example.com example.org; do
+    np_status=0
+    np_out=""
+    for np_t in 1 2 3; do
+      # The request runs INSIDE the box (NET-107: from inside the session).
+      np_out="$(mnl session exec "$np_sid" \
+        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 30 https://$np_h" \
+        2>"$WORK/posture-outbound.err")"
+      np_status=$?
+      echo "exec: curl -sS https://$np_h (from inside $np_label, attempt $np_t) → exit $np_status (got '${np_out:-<none>}')"
+      if [ "$np_status" -eq 0 ] && [ "$np_out" = "HTTP:200" ]; then
+        break
+      fi
+      if [ "$np_t" -lt 3 ]; then
+        echo "  retrying in $((np_t * 3))s"
+        sleep "$((np_t * 3))"
+      fi
+    done
+    if [ "$np_status" -eq 0 ] && [ "$np_out" = "HTTP:200" ]; then
+      np_ok=$((np_ok + 1))
+    else
+      np_failed="$np_failed https://$np_h"
+      # Warned, not failed: the other host answering proves the box's
+      # egress, which makes this that endpoint's problem. Surfaced, so a
+      # partial fault is visible.
+      echo "::warning::outbound from $np_label to https://$np_h failed all 3 attempts (exec status $np_status, got '${np_out:-<none>}'); not fatal while the other host still proves the box reaches the network."
+      cat "$WORK/posture-outbound.err" 2>/dev/null || true
+    fi
+  done
+  if [ "$np_ok" -eq 0 ]; then
+    echo "::error::$np_label completed an outbound request against no host (${np_failed}) — the box has no working egress (NET-107)"
+    exit 1
+  fi
+}
+np_section() {
+  awk -v want="---$1---" '
+    $0 == want   { grab = 1; next }
+    /^---.*---$/ { grab = 0 }
+    grab         { print }
+  '
+}
+np_port_free() {
+  python3 -c 'import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+s.close()' "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -3394,6 +4620,504 @@ proof_min_internal_names_through_proxy() {
 }
 
 # ---------------------------------------------------------------------------
+# The hostname proxy honours the switch's rules, end to end (NET-069, NET-070,
+# NET-071, NET-135). The rule is parity, and parity is proved by PAIRS: the
+# same target attempted directly and through the proxy, the two attempts
+# printed side by side with the refusal each got. A readable-log lane also
+# prints the daemon record a refusal left, so the transcript shows the proxy's
+# answer beside the direct leg's; on a VM lane the records are the guest
+# daemon's, and the `min bug` bundle a failing run writes (see `fail`) carries
+# them — the statuses pair the refusals meanwhile.
+#
+# The pairing covers three shapes:
+#   * an undeclared port — refused by the OS on the direct leg (host-address
+#     box: nothing listens), refused by the proxy with that same refusal as
+#     its reason (502), and on a VM lane refused by the target's ingress
+#     declaration on BOTH legs (dropped SYN direct, 403 proxied);
+#   * a caller whose egress rules deny the target — the caller's own gate
+#     drops its direct SYN, and the proxy refuses its request before dialing
+#     (403), against the same request routing from an ungated box;
+#   * the protocol discipline (NET-135) — the HTTP/2 prior-knowledge preface
+#     is closed without a status where a direct connection is served, and an
+#     h2c upgrade offer is stripped where a direct connection passes it
+#     through, both read from the upstream's own echo.
+proof_proxy_refuses_like_direct() {
+  echo "::group::the hostname proxy honours the switch's rules (NET-069/070/071, NET-135)"
+
+  # The daemon's file log, newest first, and the net-module records it gained
+  # since line $1 — the window ONE paired attempt produces. Same shape as the
+  # min.internal proof's helpers above, whose filtering note applies here too
+  # (the daemon logs plenty besides a request; only the net modules are this
+  # case's business). Callers poll for a pattern.
+  par_daemon_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null \
+      | sort | tail -n1
+  }
+  par_log_lines() {
+    local f
+    f="$(par_daemon_log)"
+    if [ -n "$f" ]; then wc -l < "$f"; else printf '0\n'; fi
+  }
+  par_log_since() {
+    local f
+    f="$(par_daemon_log)"
+    [ -n "$f" ] || return 0
+    tail -n "+$(($1 + 1))" "$f" | grep -E -- '"target": *"minimald::net::' || true
+  }
+  # The window that has gained a record matching $2 within ~5s (the file
+  # writer is asynchronous), else the last window — so the failing assert
+  # below prints what actually landed.
+  par_log_wait() {
+    local before="$1" want="$2" i w=""
+    for i in $(seq 1 20); do
+      w="$(par_log_since "$before")"
+      case "$w" in *"$want"*) break ;; esac
+      sleep 0.25
+    done
+    printf '%s\n' "$w"
+  }
+
+  # One DIRECT attempt from a box: curl's exit code and its stderr ARE the
+  # refusal a direct connection gets — an OS-refused connection is curl 7, a
+  # SYN a target's gate silently dropped is a connect timeout, curl 28.
+  par_direct() { # $1 box, $2 url, $3 max-time
+    mnl session exec "$1" "curl -sS --max-time $3 -o /dev/null '$2'" \
+      2>"$WORK/par-direct.err"
+    PAR_RC=$?
+  }
+  # One proxied attempt from a box: the status line and the body, via the
+  # proxy at $3 — host loopback from a host-address box, the daemon's own
+  # switch address from a box with a lease.
+  par_proxied() { # $1 box, $2 url, $3 proxy address, $4 max-time
+    local out
+    out="$(mnl session exec "$1" \
+      "curl -sS --max-time $4 -x http://$3 -o /home/par.body -w '%{http_code}' '$2'" \
+      2>"$WORK/par-proxied.err")" || true
+    PAR_STATUS="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r\n')"
+    PAR_BODY="$(mnl session exec "$1" 'cat /home/par.body' 2>/dev/null || true)"
+  }
+  # The paired print — the two lines this case owes the transcript per pair.
+  par_pair() { # $1 label, $2 the direct attempt's line, $3 the proxied one
+    printf 'pair %s\n' "$1"
+    printf '  direct:  %s\n' "$2"
+    printf '  proxied: %s\n' "$3"
+  }
+
+  # The names and ports. Ports are fixed on purpose (the execs that start and
+  # probe the responders must agree) and high enough to need no privilege;
+  # 18080-18084 and 19090/19091 belong to the proofs around this one.
+  PAR_NAME="e2e-par"                # the origin box, host-address, every lane
+  PAR_OWN_NAME="e2e-par-own"        # the target box, own-address, VM lanes
+  PAR_CALLER_NAME="e2e-par-caller"  # the denied caller, own-address, VM lanes
+  PAR_ECHO_PORT=18085               # the in-box echo responder (served + routed)
+  PAR_DEAD_PORT=18086               # nothing listens: the OS refusal, both legs
+  PAR_OWN_PORT=18087                # the target's published port (ext == int)
+  PAR_OWN_CLOSED_PORT=18088         # never published: dropped direct, 403 proxied
+  PAR_OWN_MARKER="PAR_OWN_ROUTED_OK"
+
+  # The request origin: a host-address box, sharing its host's loopback —
+  # which is how it reaches the proxy at 127.0.0.1:7654, on every lane.
+  PAR_SEED_DIR="$(hook_mktemp /tmp/mnlpd.XXXXXX)"
+  hook_seed_preamble > "$PAR_SEED_DIR/minimal.toml"
+  mkdir "$PAR_SEED_DIR/.git"
+  par_sid="$(cd "$PAR_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$PAR_NAME" 2>"$WORK/par-activate.err")" || {
+    echo "::error::'min session activate' for the parity proof's origin box failed"
+    echo "--- stderr ---"; cat "$WORK/par-activate.err" 2>/dev/null || true
+    fail
+  }
+  par_sid="$(printf '%s\n' "$par_sid" | tail -n1 | tr -d '\r')"
+
+  # ---- capability gates: what THIS host can run ---------------------------
+  # The same two gates the min.internal proof runs, for the same reasons; a
+  # skip is honest only on a developer host (no CI, no VM lane).
+  par_gate_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
+
+  # 1. The session's sandbox program. A host that is itself a sandbox denies
+  #    the nested mount namespaces a box's rootfs needs: no probe inside a
+  #    box can run, and nothing this case asserts can be asserted.
+  if ! mnl session exec "$par_sid" 'true' >"$WORK/par-execgate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$par_sid" 'true' >"$WORK/par-execgate.err" 2>&1; }; then
+    if par_gate_can_skip; then
+      echo "::warning::proxy parity proof SKIPPED — this host cannot run a session sandbox"
+      echo "  (exec: $(head -n1 "$WORK/par-execgate.err" 2>/dev/null || true))"
+      mnl session destroy --force "$par_sid" >/dev/null 2>&1 || true
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::this lane cannot run a session sandbox, so no probe inside a box can run: nothing this case asserts can be asserted"
+    echo "  (exec: $(head -n1 "$WORK/par-execgate.err" 2>/dev/null || true))"
+    echo "  on a VM lane the boxes live in the guest, so this is a lane-level fault"
+    fail
+  fi
+
+  # 2. The hostname proxy's listen address (:7654, EGRESS_PROXY_PORT). A host
+  #    that already runs a minimald has it taken, and every probe through the
+  #    proxy would reach a daemon that knows nothing about this run's boxes.
+  par_bind_taken=0
+  for par_bind_try in 1 2 3 4 5; do
+    par_ls_out="$(mnl ls 2>&1)"
+    case "$par_ls_out" in
+      *"session hostnames will not route"*) par_bind_taken=1 ;;
+      *) par_bind_taken=0; break ;;
+    esac
+    [ "$par_bind_try" = 5 ] || sleep 3
+  done
+  if [ "$par_bind_taken" -eq 1 ]; then
+    if par_gate_can_skip; then
+      echo "::warning::proxy parity proof SKIPPED — another daemon owns 127.0.0.1:7654 on this host"
+      echo "  every probe through the proxy would reach a daemon that knows nothing about this run's boxes"
+      mnl session destroy --force "$par_sid" >/dev/null 2>&1 || true
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::another daemon owns 127.0.0.1:7654, so this run's daemon cannot route session hostnames: every probe through the proxy would reach a daemon that knows nothing about this run's boxes"
+    echo "--- min ls ---"; printf '%s\n' "${par_ls_out:-}"
+    fail
+  fi
+
+  # socat carries the responders below and base64 carries the echo script in;
+  # both are launcher-baseline packages (crates/minimald/src/session_host.rs
+  # BASELINE_PACKAGES), at /usr/bin — packages install with --prefix=/usr and
+  # the generic rootfs has no /bin, so the absolute paths are the daemon's own
+  # convention for in-box argv.
+  mnl session exec "$par_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
+    || { echo "::error::the session has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; fail; }
+  mnl session exec "$par_sid" 'test -x /usr/bin/base64' >/dev/null 2>&1 \
+    || { echo "::error::the session has no base64 at /usr/bin/base64 (a coreutils package — every box ships it)"; fail; }
+
+  # The echo responder the protocol pairs need: it answers every head with a
+  # 200 whose body is the head it received, lines joined with '|'. The body is
+  # the assertion: what the UPSTREAM received is what the echo carries, so the
+  # strip's effect — and the direct leg's pass-through — is read from the box
+  # that would have had to honour the upgrade. Delivered through base64
+  # (python3 encodes it host-side; python3 is an e2e prerequisite on every
+  # lane), because a shell-quoted delivery would fight the script's own
+  # quoting.
+  par_echo_script="$(cat <<'PAR_EO'
+head=
+while IFS= read -r line; do
+  line=${line%$'\r'}
+  [ -n "$line" ] || break
+  head="$head|$line"
+done
+printf 'HTTP/1.1 200 OK\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' "${#head}" "$head"
+PAR_EO
+)"
+  par_echo_b64="$(printf '%s' "$par_echo_script" | python3 -c \
+    'import base64,sys; sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode())')"
+  mnl session exec "$par_sid" "printf %s '$par_echo_b64' | /usr/bin/base64 -d > /home/par-echo.sh" \
+    >/dev/null 2>"$WORK/par-echo.err" \
+    || { echo "::error::could not write the echo responder's script"; cat "$WORK/par-echo.err" 2>/dev/null || true; fail; }
+  # `nohup ... &` is the documented detach form (docs/reference/cli-min.md,
+  # `session exec`): the responder has to outlive the exec that starts it.
+  mnl session exec "$par_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$PAR_ECHO_PORT,reuseaddr,fork SYSTEM:'/usr/bin/bash /home/par-echo.sh' >/dev/null 2>&1 &" \
+    >/dev/null 2>"$WORK/par-echo.err" \
+    || { echo "::error::could not start the echo responder"; cat "$WORK/par-echo.err" 2>/dev/null || true; fail; }
+  par_ready=""
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$par_sid" \
+      "curl -sS --max-time 5 -o /home/par-ready.body -w '%{http_code}' http://127.0.0.1:$PAR_ECHO_PORT/" \
+      2>/dev/null || true)" = "200" ]; then
+      par_ready=1; break
+    fi
+    sleep 0.25
+  done
+  [ -n "$par_ready" ] || {
+    echo "::error::the echo responder never answered a direct curl — the proxy is not in the picture yet"
+    echo "--- socat exec stderr ---"; cat "$WORK/par-echo.err" 2>/dev/null || true
+    fail
+  }
+
+  # ---- the baseline: a published port routes ------------------------------
+  # Every refusal below is the proxy's decision, not a broken route; this is
+  # the clean 200 that says the routing machinery is live when they are read.
+  # The echo body carries the request the upstream received.
+  par_proxied "$par_sid" "http://$PAR_NAME.min.internal:$PAR_ECHO_PORT/" "127.0.0.1:7654" 20
+  echo "routed baseline: GET http://$PAR_NAME.min.internal:$PAR_ECHO_PORT/ via the proxy -> HTTP ${PAR_STATUS:-<none>}"
+  [ "${PAR_STATUS:-}" = 200 ] || {
+    echo "::error::the routed baseline did not return 200 (got '${PAR_STATUS:-<none>}')"
+    echo "--- curl stderr ---"; cat "$WORK/par-proxied.err" 2>/dev/null || true
+    fail
+  }
+  case "$PAR_BODY" in *"$PAR_NAME.min.internal"*) ;; *)
+    echo "::error::the routed baseline's answer does not echo the request that reached the upstream"
+    echo "--- body ---"; printf '%s\n' "$PAR_BODY" | head -5
+    fail ;;
+  esac
+
+  # ---- pair 1 (NET-069, NET-071): an undeclared port, host-address box ----
+  # The box declares no ingress at all, so the switch has no gate to sit
+  # between: the OS refuses the DIRECT connection (nothing listens), and the
+  # proxy must hand the request to exactly that refusal — a 502 whose reason
+  # is the upstream's refusal — instead of swallowing it or dialing wide.
+  par_before="$(par_log_lines)"
+  par_direct "$par_sid" "http://127.0.0.1:$PAR_DEAD_PORT/" 5
+  par_direct_rc="$PAR_RC"
+  par_direct_line="GET http://127.0.0.1:$PAR_DEAD_PORT/ -> curl exit $PAR_RC: $(head -n1 "$WORK/par-direct.err" 2>/dev/null || true)"
+  par_proxied "$par_sid" "http://$PAR_NAME.min.internal:$PAR_DEAD_PORT/" "127.0.0.1:7654" 20
+  par_pair "an undeclared port, host-address box" \
+    "$par_direct_line" \
+    "GET http://$PAR_NAME.min.internal:$PAR_DEAD_PORT/ via the proxy -> HTTP ${PAR_STATUS:-<none>} ($(head -n1 "$WORK/par-proxied.err" 2>/dev/null || true))"
+  [ "$par_direct_rc" -eq 7 ] || {
+    echo "::error::the direct attempt to the undeclared port did not end in a refused connection (curl exit $par_direct_rc, expected 7)"
+    echo "--- curl stderr ---"; cat "$WORK/par-direct.err" 2>/dev/null || true
+    fail
+  }
+  [ "${PAR_STATUS:-}" = 502 ] || {
+    echo "::error::the proxied attempt to the undeclared port did not get the proxy's 502 (got '${PAR_STATUS:-<none>}')"
+    echo "--- curl stderr ---"; cat "$WORK/par-proxied.err" 2>/dev/null || true
+    fail
+  }
+  if hook_log_readable; then
+    par_pair_log="$(par_log_wait "$par_before" 'the upstream box refused the connection')"
+    printf '%s\n' "$par_pair_log" | sed 's/^/  daemon log: /'
+    case "$par_pair_log" in *"the upstream box refused the connection"*) ;; *)
+      echo "::error::the proxy did not log the upstream refusal beside the direct attempt's refusal"
+      echo "--- daemon log (tail) ---"; tail -20 "$(par_daemon_log)" 2>/dev/null || true
+      fail ;;
+    esac
+    case "$par_pair_log" in *'"host":"'"$PAR_NAME.min.internal"'"'*) ;; *)
+      echo "::error::the refusal record does not name the host the request asked for"
+      echo "--- record ---"; printf '%s\n' "$par_pair_log"
+      fail ;;
+    esac
+  else
+    echo "  (the refusal record is the guest daemon's on this lane — a failing run's diagnostics bundle carries it)"
+  fi
+
+  # ---- pair 2 (NET-135): the HTTP/2 prior-knowledge preface ---------------
+  # The same bytes to both: to the echo upstream directly (an HTTP/1.1 server
+  # serves them as a request head, which is what the direct half shows) and
+  # to the proxy, which routes HTTP/1.1 requests and CONNECT tunnels only —
+  # it closes instead of answering, because there is no protocol switch
+  # behind it to offer and tunneling one would bypass the routing core's
+  # refusals entirely.
+  par_before="$(par_log_lines)"
+  par_h2_direct="$(mnl session exec "$par_sid" \
+    "printf 'PRI * HTTP/2.0\r\n\r\n' | /usr/bin/socat -t 3 - TCP:127.0.0.1:$PAR_ECHO_PORT" \
+    2>"$WORK/par-h2-direct.err" || true)"
+  par_h2_proxied="$(mnl session exec "$par_sid" \
+    "printf 'PRI * HTTP/2.0\r\n\r\n' | /usr/bin/socat -t 3 - TCP:127.0.0.1:7654" \
+    2>"$WORK/par-h2-proxy.err" || true)"
+  par_pair "the HTTP/2 prior-knowledge preface" \
+    "the preface to the echo upstream -> $(printf '%s' "$par_h2_direct" | head -n1)" \
+    "the preface to the proxy -> $(if [ -n "$par_h2_proxied" ]; then printf '%s' "$par_h2_proxied" | head -n1; else printf '<no bytes: the connection closed without a status>'; fi)"
+  case "$par_h2_direct" in *"200 OK"*) ;; *)
+    echo "::error::the echo upstream did not serve the preface as an HTTP/1.1 head — the pair's direct half is broken, not the proxy's close"
+    echo "--- socat stderr ---"; cat "$WORK/par-h2-direct.err" 2>/dev/null || true
+    fail ;;
+  esac
+  case "$par_h2_proxied" in
+    *"HTTP/"*)
+      echo "::error::the proxy answered the HTTP/2 prior-knowledge preface instead of closing it (got: '$(printf '%s' "$par_h2_proxied" | head -n1)')"
+      echo "--- socat stderr ---"; cat "$WORK/par-h2-proxy.err" 2>/dev/null || true
+      fail ;;
+  esac
+  echo "  the proxy closed the preface connection: $(printf '%s' "$par_h2_proxied" | wc -c | tr -d ' ') bytes came back"
+  if hook_log_readable; then
+    par_pair_log="$(par_log_wait "$par_before" 'closed an HTTP/2 prior-knowledge connection')"
+    printf '%s\n' "$par_pair_log" | sed 's/^/  daemon log: /'
+    case "$par_pair_log" in *"closed an HTTP/2 prior-knowledge connection"*) ;; *)
+      echo "::error::the proxy did not log closing the HTTP/2 prior-knowledge connection"
+      echo "--- daemon log (tail) ---"; tail -20 "$(par_daemon_log)" 2>/dev/null || true
+      fail ;;
+    esac
+  fi
+
+  # ---- pair 3 (NET-135): an h2c upgrade offer -----------------------------
+  # The SAME head to both legs, differing only in where it is dialed: the
+  # request line is absolute-form (what a request through a proxy carries)
+  # and carries `Upgrade: h2c` with its paired `HTTP2-Settings`. Direct, the
+  # echo upstream receives the offer verbatim; through the proxy, the offer
+  # must be GONE — the request routed as the HTTP/1.1 request it is, so the
+  # upstream cannot answer a protocol switch the proxy cannot splice.
+  par_h2c_head() { # $1 the authority the head names, $2 the dial target
+    printf "printf 'GET http://%s/ HTTP/1.1\\r\\nHost: %s\\r\\nUpgrade: h2c\\r\\nHTTP2-Settings: AAMAAABkAAQAAP__\\r\\nConnection: Upgrade, HTTP2-Settings\\r\\n\\r\\n' | /usr/bin/socat -t 3 - TCP:%s" \
+      "$1" "$1" "$2"
+  }
+  par_h2c_direct="$(mnl session exec "$par_sid" \
+    "$(par_h2c_head "$PAR_NAME.min.internal:$PAR_ECHO_PORT" "127.0.0.1:$PAR_ECHO_PORT")" \
+    2>"$WORK/par-h2c-direct.err" || true)"
+  par_h2c_proxied="$(mnl session exec "$par_sid" \
+    "$(par_h2c_head "$PAR_NAME.min.internal:$PAR_ECHO_PORT" "127.0.0.1:7654")" \
+    2>"$WORK/par-h2c-proxy.err" || true)"
+  par_pair "an h2c upgrade offer" \
+    "the same head, direct to the echo upstream -> $(printf '%s' "$par_h2c_direct" | head -n1)" \
+    "the same head, via the proxy -> $(printf '%s' "$par_h2c_proxied" | head -n1)"
+  echo "  what the direct upstream received: $(printf '%s' "$par_h2c_direct" | tr -d '\r' | tr '\n' ' ' | cut -c1-160)"
+  echo "  what the proxied upstream received: $(printf '%s' "$par_h2c_proxied" | tr -d '\r' | tr '\n' ' ' | cut -c1-160)"
+  case "$par_h2c_direct" in *"Upgrade: h2c"*) ;; *)
+    echo "::error::the echo upstream did not echo the upgrade offer verbatim — the pair's direct half is broken, not the proxy's strip"
+    echo "--- socat stderr ---"; cat "$WORK/par-h2c-direct.err" 2>/dev/null || true
+    fail ;;
+  esac
+  case "$par_h2c_proxied" in *"200 OK"*) ;; *)
+    echo "::error::the h2c request did not route as plain HTTP/1.1 (got: '$(printf '%s' "$par_h2c_proxied" | head -n1)')"
+    echo "--- socat stderr ---"; cat "$WORK/par-h2c-proxy.err" 2>/dev/null || true
+    fail ;;
+  esac
+  case "$par_h2c_proxied" in
+    *h2c*|*"HTTP2-Settings"*)
+      echo "::error::the h2c upgrade offer reached the upstream through the proxy — the echo of what it received carries it"
+      fail ;;
+  esac
+
+  # ---- the switch halves (NET-069/NET-070 across boxes) -------------------
+  # Gated on E2E_VM, and the gate is the address fabric these pairs route
+  # over, not the switch binary: the pairs go BETWEEN boxes — an own-address
+  # target's lease, and a caller whose lease the egress verdict reads. On a
+  # VM lane both boxes stand on the switch and the daemon serves the proxy
+  # from inside it (a denied caller reaches it at the daemon's own switch
+  # address). On a native host the daemon is off the switch — a lease is
+  # deliberately not host-answerable (NET-127/128) — so a direct attempt from
+  # the host's namespace cannot route to a box's lease, and the pair would
+  # not be honest to run there.
+  if [ -n "$E2E_VM" ]; then
+    PAR_OWN_SEED_DIR="$(hook_mktemp /tmp/mnlpx.XXXXXX)"
+    hook_seed_preamble > "$PAR_OWN_SEED_DIR/minimal.toml"
+    mkdir "$PAR_OWN_SEED_DIR/.git"
+    PAR_OWN_SID="$(cd "$PAR_OWN_SEED_DIR" && mnl session activate . --no-prompt \
+      --name "$PAR_OWN_NAME" --network own_ip \
+      --ingress "$PAR_OWN_PORT:$PAR_OWN_PORT" 2>"$WORK/par-own.err")" || {
+      echo "::error::'min session activate --network own_ip --ingress ...' for the parity proof's target box failed"
+      echo "--- stderr ---"; cat "$WORK/par-own.err" 2>/dev/null || true
+      fail
+    }
+    PAR_OWN_SID="$(printf '%s\n' "$PAR_OWN_SID" | tail -n1 | tr -d '\r')"
+
+    # The target's published-port responder: one fixed 200 whose body is the
+    # marker, on the INTERNAL port the ingress declaration publishes (the
+    # proxy dials the lease at the mapped internal port, and the box's
+    # ingress gate admits exactly those) — the min.internal proof's pattern.
+    mnl session exec "$PAR_OWN_SID" \
+      "body=$PAR_OWN_MARKER; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/par-own200" \
+      >/dev/null 2>"$WORK/par-own-resp.err" \
+      || { echo "::error::could not write the target box's response"; cat "$WORK/par-own-resp.err" 2>/dev/null || true; fail; }
+    mnl session exec "$PAR_OWN_SID" \
+      "nohup /usr/bin/socat TCP-LISTEN:$PAR_OWN_PORT,reuseaddr,fork SYSTEM:\"cat /home/par-own200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>"$WORK/par-own-resp.err" \
+      || { echo "::error::could not start the target box's responder"; cat "$WORK/par-own-resp.err" 2>/dev/null || true; fail; }
+    par_own_ready=""
+    for _ in $(seq 1 40); do
+      if [ "$(mnl session exec "$PAR_OWN_SID" \
+        "curl -sS --max-time 5 -o /home/par-ready.body -w '%{http_code}' http://127.0.0.1:$PAR_OWN_PORT/" \
+        2>/dev/null || true)" = "200" ]; then
+        par_own_ready=1; break
+      fi
+      sleep 0.25
+    done
+    [ -n "$par_own_ready" ] || {
+      echo "::error::the target box's responder never answered a direct curl"
+      echo "--- socat exec stderr ---"; cat "$WORK/par-own-resp.err" 2>/dev/null || true
+      fail
+    }
+
+    # The published port routes (the baseline the refusals below pair with).
+    par_proxied "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "127.0.0.1:7654" 20
+    echo "target baseline: GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/ via the proxy -> HTTP ${PAR_STATUS:-<none>}"
+    [ "${PAR_STATUS:-}" = 200 ] || {
+      echo "::error::the target's published port did not route (got '${PAR_STATUS:-<none>}')"
+      echo "--- curl stderr ---"; cat "$WORK/par-proxied.err" 2>/dev/null || true
+      fail
+    }
+    case "$PAR_BODY" in *"$PAR_OWN_MARKER"*) ;; *)
+      echo "::error::the routed answer is not the target box's marker response"
+      echo "--- body ---"; printf '%s\n' "$PAR_BODY" | head -3
+      fail ;;
+    esac
+
+    # ---- pair 4: an undeclared port, own-address target --------------------
+    # Both legs are refused by the ONE declaration: the proxy refuses the
+    # request before dialing (403, where the host, the session and the port
+    # are all in hand), and the target's ingress gate drops the direct SYN —
+    # a drop is not a reset, so the direct leg is a connect timeout, which is
+    # itself the assertion that the gate sat between.
+    par_direct "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/" 5
+    par_direct_rc="$PAR_RC"
+    par_direct_line="GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/ -> curl exit $PAR_RC: $(head -n1 "$WORK/par-direct.err" 2>/dev/null || true)"
+    par_proxied "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/" "127.0.0.1:7654" 20
+    par_pair "an undeclared port, own-address box" \
+      "$par_direct_line" \
+      "GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/ via the proxy -> HTTP ${PAR_STATUS:-<none>} ($(head -n1 "$WORK/par-proxied.err" 2>/dev/null || true))"
+    [ "$par_direct_rc" -eq 28 ] || {
+      echo "::error::the direct attempt to the target's unpublished port did not end in a connect timeout (curl exit $par_direct_rc, expected 28) — the target's ingress gate did not drop it, or something answered"
+      echo "--- curl stderr ---"; cat "$WORK/par-direct.err" 2>/dev/null || true
+      fail
+    }
+    [ "${PAR_STATUS:-}" = 403 ] || {
+      echo "::error::the proxied attempt to the target's unpublished port did not get the proxy's 403 (got '${PAR_STATUS:-<none>}')"
+      echo "--- curl stderr ---"; cat "$WORK/par-proxied.err" 2>/dev/null || true
+      fail
+    }
+
+    # ---- pair 5 (NET-070): a caller whose egress rules deny the target -----
+    # The caller is an own-address box whose ONE allowed destination is the
+    # daemon's own address on the switch — where the in-guest proxy listens.
+    # The switch's resolver and ARP keep their built-in carve-outs, so the
+    # box still resolves names; every other destination, the target's lease
+    # chief among them, is denied by the caller's own compiled rules. The
+    # literal is the default switch subnet's daemon address (the subnet every
+    # lane this script runs on uses; the alias literal the min.internal proof
+    # prints carries the same posture).
+    PAR_CALLER_SEED_DIR="$(hook_mktemp /tmp/mnlpy.XXXXXX)"
+    hook_seed_preamble > "$PAR_CALLER_SEED_DIR/minimal.toml"
+    mkdir "$PAR_CALLER_SEED_DIR/.git"
+    PAR_CALLER_SID="$(cd "$PAR_CALLER_SEED_DIR" && mnl session activate . --no-prompt \
+      --name "$PAR_CALLER_NAME" --network own_ip \
+      --allow-subnets 100.64.255.253/32 2>"$WORK/par-caller.err")" || {
+      echo "::error::'min session activate --network own_ip --allow-subnets ...' for the parity proof's denied caller failed"
+      echo "--- stderr ---"; cat "$WORK/par-caller.err" 2>/dev/null || true
+      fail
+    }
+    PAR_CALLER_SID="$(printf '%s\n' "$PAR_CALLER_SID" | tail -n1 | tr -d '\r')"
+
+    # The control: the SAME request from the ungated origin box routes. The
+    # denial below is the caller's rules, not the target's port map — this
+    # names the published port, which the pair above proved routes.
+    par_proxied "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "127.0.0.1:7654" 20
+    echo "caller control: the same proxied request from an ungated box -> HTTP ${PAR_STATUS:-<none>}"
+    [ "${PAR_STATUS:-}" = 200 ] || {
+      echo "::error::the control request from the ungated origin box did not route (got '${PAR_STATUS:-<none>}') — the refusals below would not be the caller's"
+      echo "--- curl stderr ---"; cat "$WORK/par-proxied.err" 2>/dev/null || true
+      fail
+    }
+
+    par_direct "$PAR_CALLER_SID" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" 5
+    par_direct_rc="$PAR_RC"
+    par_direct_line="GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/ -> curl exit $PAR_RC: $(head -n1 "$WORK/par-direct.err" 2>/dev/null || true)"
+    par_proxied "$PAR_CALLER_SID" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "100.64.255.253:7654" 20
+    par_pair "a caller whose egress rules deny the target" \
+      "$par_direct_line" \
+      "GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/ via the proxy at the daemon's switch address -> HTTP ${PAR_STATUS:-<none>} ($(head -n1 "$WORK/par-proxied.err" 2>/dev/null || true))"
+    [ "$par_direct_rc" -eq 28 ] || {
+      echo "::error::the denied caller's direct attempt did not end in a connect timeout (curl exit $par_direct_rc, expected 28) — the caller's egress gate did not drop it"
+      echo "--- curl stderr ---"; cat "$WORK/par-direct.err" 2>/dev/null || true
+      fail
+    }
+    [ "${PAR_STATUS:-}" = 403 ] || {
+      echo "::error::the denied caller's proxied attempt did not get the proxy's 403 (got '${PAR_STATUS:-<none>}')"
+      echo "--- curl stderr ---"; cat "$WORK/par-proxied.err" 2>/dev/null || true
+      fail
+    }
+    echo "  (both pairs' refusals are one rule each — no ingress mapping for pair 4, egress-undeclared-subnet for pair 5 —"
+    echo "   decided by the same compiled policy on both legs; the records are the guest daemon's on this lane and ride"
+    echo "   the diagnostics bundle a failing run writes)"
+
+    mnl session destroy --force "$PAR_CALLER_SID" >/dev/null 2>&1 || true
+    mnl session destroy --force "$PAR_OWN_SID" >/dev/null 2>&1 || true
+  else
+    echo "switch halves SKIPPED (no E2E_VM: the between-box pairs need the guest fabric — a direct attempt"
+    echo "  to a box's lease, and the proxy at the daemon's own switch address — which a host-side daemon has none of)"
+  fi
+
+  mnl session destroy --force "$par_sid" >/dev/null 2>&1 || true
+  echo "the hostname proxy honours the switch's rules OK (each pair printed with both refusals; the readable lanes' records beside them)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # The retired surfaces are gone, end to end (NET-109, NET-110). The mTLS/OIDC
 # HTTPS reverse proxy, its daemon-issued client certificates and the
 # `min ssh-forward` verb came out of the tree, `min login` stopped minting,
@@ -3753,24 +5477,29 @@ case "${1:-}" in
     proof_skip_scaffold
     proof_sandbox
     proof_restart
+    proof_fresh_install_own_ip_ingress_publishes_loopback
+    proof_network_posture_from_stock_install
     proof_native_resolution_without_proxy_env
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
+    proof_proxy_refuses_like_direct
     proof_retired_surfaces_gone
     ;;
   lifecycle | session_exec | session_outbound_request | own_ip | task_run | hooks \
-    | skip_scaffold | sandbox | restart | native_resolution_without_proxy_env \
+    | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
+    | network_posture_from_stock_install | native_resolution_without_proxy_env \
     | hostnames_recover_and_two_daemons_route \
-    | min_internal_names_through_proxy | retired_surfaces_gone)
+    | min_internal_names_through_proxy | proxy_refuses_like_direct | retired_surfaces_gone)
     "proof_$1"
     ;;
   *)
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
     echo "  cases: lifecycle session_exec session_outbound_request own_ip task_run hooks"
-    echo "         skip_scaffold sandbox restart native_resolution_without_proxy_env"
+    echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
+    echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
     echo "         hostnames_recover_and_two_daemons_route"
-    echo "         min_internal_names_through_proxy retired_surfaces_gone"
+    echo "         min_internal_names_through_proxy proxy_refuses_like_direct retired_surfaces_gone"
     exit 2
     ;;
 esac

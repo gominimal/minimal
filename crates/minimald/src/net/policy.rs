@@ -121,6 +121,28 @@ pub struct ExposedMapping {
     protocol: String,
 }
 
+impl ExposedMapping {
+    /// The `host:port` the forward is bound on — the address the switch is
+    /// actually holding, spelled exactly as its expose request named it. A
+    /// caller reporting a publish (the per-mapping info line in
+    /// `finish_own_ip_attach`) reads this instead of re-deriving the address
+    /// from the request, so the report cannot claim a host a forward is not
+    /// published on.
+    #[must_use]
+    pub fn local(&self) -> &str {
+        &self.local
+    }
+
+    /// [`Self::local`] split into the host address and port to report. `None`
+    /// when `local` is not a `host:port` pair with a numeric port — a shape
+    /// [`expose_request`], its only builder, never produces.
+    #[must_use]
+    pub fn host_port(&self) -> Option<(&str, u16)> {
+        let (host, port) = self.local.rsplit_once(':')?;
+        Some((host, port.parse().ok()?))
+    }
+}
+
 /// Exposes every static port mapping in `ingress` on the switch's `control_sock`
 /// forwarding to `ptask_ip`, returning a handle per exposed forward for teardown
 /// (R2.3, R2.4-static). The dynamic range, if any, is not applied here — dynamic
