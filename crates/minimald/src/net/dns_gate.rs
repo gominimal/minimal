@@ -162,16 +162,21 @@ pub(crate) const ADMISSION_WINDOW: Duration = Duration::from_secs(5 * 60);
 /// Design §5.3's cap on a name's admitted addresses: at most this many per
 /// name per family, fail closed. A reply whose A records run past the cap
 /// has its tail refused, so a hostile or pathological answer cannot grow
-/// the box's grant one address at a time; the cap is what keeps the table
-/// proportionate to the box's declared names rather than to what its
-/// resolver chose to say. Only IPv4 addresses are ever admitted here (AAAA
-/// is answered NODATA, NET-136), so the family half of the cap is the IPv4
-/// half alone.
+/// the box's grant one address at a time. The cap counts what a name
+/// *holds*: an admission whose window has passed is released before the
+/// cap is spent, so a name whose resolved address set rotates keeps its
+/// grant, and the table stays proportionate to the box's declared names
+/// rather than to what its resolver chose to say. Only IPv4 addresses are
+/// ever admitted here (AAAA is answered NODATA, NET-136), so the family
+/// half of the cap is the IPv4 half alone.
 const MAX_ADDRESSES_PER_NAME: usize = 32;
 
 /// Sweep expired admissions once the table crosses this many entries — the
 /// per-box backstop behind the per-name cap, bounding memory without a
-/// background timer (the conntrack's pattern).
+/// background timer (the conntrack's pattern). It is the *table's* bound:
+/// `admit` already releases a name's expired entries when it counts that
+/// name's cap, so what reaches this threshold is the entries of names
+/// that stopped resolving.
 const ADMISSION_SWEEP_AT: usize = 4096;
 
 /// TCP FIN: the box's half-close, the end of its outbound use of a flow.
@@ -478,12 +483,15 @@ impl DnsGate {
     /// tail carries every admission this way).
     ///
     /// §5.3's cap is enforced here: a name holds at most
-    /// [`MAX_ADDRESSES_PER_NAME`] addresses at once, counted over the whole
-    /// table, so answers past the cap are refused (fail closed) and the
-    /// table stays proportionate to the box's declared names rather than to
-    /// what its resolver chose to say. An address a *different* allowed name
-    /// already admitted keeps its first owner: it is one address either way,
-    /// and re-owning it would let a second name's burst evict the first's.
+    /// [`MAX_ADDRESSES_PER_NAME`] addresses at once, counted over the *live*
+    /// admissions it owns — the ones whose window has passed are released
+    /// below, before the cap is spent — so answers past the cap are refused
+    /// (fail closed), a name whose resolved address set rotates keeps its
+    /// grant, and the table stays proportionate to the box's declared names
+    /// rather than to what its resolver chose to say. An address a *different*
+    /// allowed name already admitted keeps its first owner: it is one address
+    /// either way, and re-owning it would let a second name's burst evict the
+    /// first's.
     fn admit(&self, name: &str, addresses: &[[u8; 4]], now: Instant) {
         if addresses.is_empty() {
             return;
@@ -493,9 +501,18 @@ impl DnsGate {
             .admitted
             .lock()
             .expect("DNS admission table mutex poisoned");
-        // How many addresses this name already holds — §5.3's per-name cap,
-        // counted where it is spent. One scan per observed reply, on a table
-        // the cap itself keeps small.
+        // Release this name's expired admissions before its cap is spent: an
+        // expired window admits nothing — `admits_destination` has already
+        // stopped answering for it — so it must not hold the cap's room
+        // either. Without this, a name whose resolved address set rotates
+        // fills its cap with addresses it can no longer reach and every
+        // later disjoint answer is refused as over-cap, on a table a
+        // one-name box never crosses [`ADMISSION_SWEEP_AT`] on and so never
+        // sweeps. The sweep stays the *table's* bound; this is the *name's*.
+        admitted.retain(|_, admission| &*admission.name != name || now < admission.expires);
+        // How many addresses this name still holds — §5.3's per-name cap,
+        // counted where it is spent. One walk per observed reply, on a
+        // table the cap keeps proportionate to the box's declared names.
         let mut held = admitted
             .values()
             .filter(|admission| &*admission.name == name)
@@ -873,6 +890,64 @@ mod tests {
             assert!(
                 gate.admits_destination(*address, later),
                 "the cap bounds each name, not the box"
+            );
+        }
+    }
+
+    /// The cap is released when the window is: a name that once filled its
+    /// [`MAX_ADDRESSES_PER_NAME`] and then resolves to a disjoint set after
+    /// the window passes has every new address admitted, because `held`
+    /// counts only what the name still holds and the expired entries are
+    /// released before it is counted — not left to spend the cap until the
+    /// [`ADMISSION_SWEEP_AT`] sweep, which a box with one or two names never
+    /// crosses. This is the cap's "at once": a name whose resolved address
+    /// set rotates — a CDN, a host that moves providers — keeps its grant,
+    /// instead of becoming reachable only while its first ever-resolved
+    /// addresses happen to be re-answered.
+    #[test]
+    fn expired_admissions_release_the_per_name_cap() {
+        let gate = test_gate();
+        let now = Instant::now();
+
+        // A name resolves to a full cap's worth of addresses.
+        let first: Vec<[u8; 4]> = (0u8..MAX_ADDRESSES_PER_NAME as u8)
+            .map(|host| [140, 82, 121, host])
+            .collect();
+        gate.admit("github.com", &first, now);
+        for address in &first {
+            assert!(
+                gate.admits_destination(*address, now),
+                "a name's first full answer is admitted"
+            );
+        }
+
+        // The window passes: nothing the first answer admitted is still
+        // reachable.
+        let later = now + ADMISSION_WINDOW + Duration::from_secs(1);
+        for address in &first {
+            assert!(
+                !gate.admits_destination(*address, later),
+                "the first answer's window has passed"
+            );
+        }
+
+        // The same name resolves to a disjoint set of the same size. Every
+        // one of them is admitted — the dead set spent no cap — while the
+        // addresses it replaced stay refused.
+        let second: Vec<[u8; 4]> = (0u8..MAX_ADDRESSES_PER_NAME as u8)
+            .map(|host| [192, 30, 252, host])
+            .collect();
+        gate.admit("github.com", &second, later);
+        for address in &second {
+            assert!(
+                gate.admits_destination(*address, later),
+                "an expired admission spends no cap, so the rotated set is admitted"
+            );
+        }
+        for address in &first {
+            assert!(
+                !gate.admits_destination(*address, later),
+                "the expired set stays refused"
             );
         }
     }
