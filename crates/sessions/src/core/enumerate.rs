@@ -11,6 +11,13 @@ use crate::core::source::{Provenanced, Source};
 /// Directory names excluded by default when walking a plain-directory
 /// patch source. These are common VCS and dependency directories that
 /// are almost never intended to be patched into a session.
+///
+/// This is a fixed allowlist of well-known names, not a `.gitignore`
+/// walk. A `.gitignore`-driven exclusion would be a moving target:
+/// it varies per directory, can be negated (`!keep/`), and would
+/// silently change what a loadout copies depending on which ignore
+/// files happen to exist on the host. Keeping the list explicit makes
+/// the copy set predictable and reviewable.
 const DEFAULT_EXCLUDED_DIRS: &[&str] = &[".git", ".hg", ".svn", "CVS", ".jj", "node_modules"];
 
 /// Maximum total size in bytes for files enumerated from a single
