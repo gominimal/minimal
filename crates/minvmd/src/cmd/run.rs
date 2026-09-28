@@ -41,6 +41,19 @@ pub fn run(detach: bool, timeout_secs: Option<u64>) -> Result<()> {
     }
     let timeout_secs = timeout_secs.unwrap_or(DEFAULT_DETACH_TIMEOUT_SECS);
 
+    // One line per VM start, naming the VM and its state directory
+    // (NET-052). Only the process that will actually supervise the VM logs
+    // it: a `--detach` caller re-execs `minvmd run` (without `--detach`) for
+    // the real start, so the line is written once, by the process that owns
+    // the boot.
+    if !detach {
+        tracing::info!(
+            vm = %crate::state::vm_name(),
+            state_dir = %crate::state::provider_dir().display(),
+            "starting VM"
+        );
+    }
+
     #[cfg(minvmd_libkrun)]
     return run_supervisor(detach, timeout_secs);
 
@@ -121,9 +134,9 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("run");
-    if let Some(dir) = crate::state::state_dir_override() {
-        cmd.args(["--minimal-state-dir", dir.as_str()]);
-    }
+    // Forward the state-dir override and VM name so the re-exec'd supervisor
+    // resolves the same per-VM state dir this process did.
+    crate::state::forward_identity(&mut cmd);
     // Mark the child as detached so it routes tracing to the daily-rotated
     // log file (`<state>/logs/minvmd.log`) instead of stdout.
     cmd.env(crate::DETACHED_ENV, "1");
@@ -209,6 +222,13 @@ fn run_foreground() -> Result<()> {
     use crate::image::{resolve_kernel_path, resolve_rootfs_path};
     use crate::lifecycle::{Action, Lifecycle, next_state};
     use crate::state::{StartingGuard, State, StateDir};
+
+    // One span per supervised VM, like minimald's per-connection `conn` span:
+    // every record the supervisor emits carries `vm`, so a detached
+    // supervisor's lines in the shared log (`<state>/logs/minvmd.log`, common
+    // to every VM on the host) stay attributable once a second VM runs —
+    // grep instead of manual fields on each line.
+    let _vm_scope = tracing::info_span!("supervisor", vm = %crate::state::vm_name()).entered();
 
     // Fail-fast: resolve paths before touching lifecycle state.
     // (UDS path lengths were already checked in `run_supervisor`.)
@@ -378,9 +398,9 @@ fn run_foreground() -> Result<()> {
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("__krun-vmm");
-    if let Some(dir) = crate::state::state_dir_override() {
-        cmd.args(["--minimal-state-dir", dir.as_str()]);
-    }
+    // Forward the state-dir override and VM name so the VMM child resolves the
+    // same per-VM state dir this supervisor does.
+    crate::state::forward_identity(&mut cmd);
     alive_lock.inherit_into(&mut cmd);
     let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
@@ -511,7 +531,13 @@ fn run_foreground() -> Result<()> {
 
     // ── Phase 3: Supervise until VMM child exits ─────────────────────────────
     let status = child.wait().context("waiting for VMM child")?;
-    tracing::info!(success = status.success(), "VMM child exited");
+    // The one-per-stop line (NET-055): the supervisor observes every stop of
+    // its VM — `min stop`, `minvmd stop`, a guest poweroff, a crash — as the
+    // VMM child exiting, and it is the line's only witness: the `minvmd stop`
+    // CLI logs none of its own, because whenever it stops something this
+    // supervisor is alive and watching (it holds the alive lock `stop`
+    // requires). A crash still says so, as the error below.
+    crate::cmd::log_stopping_vm(state_dir.dir());
 
     // ── Phase 4: Running → Stopped (under lock) ─────────────────────────────
     {

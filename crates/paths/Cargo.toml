@@ -18,3 +18,20 @@ tempfile.workspace = true
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+# Kept in sync with [workspace.lints.clippy] by hand: this crate cannot inherit
+# the workspace table because it also sets `pedantic` above.
+unchecked_time_subtraction = "warn"
+let_underscore_future = "warn"
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+unnecessary_safety_doc = "warn"
+float_cmp = "warn"
+float_cmp_const = "warn"
+lossy_float_literal = "warn"
+invalid_upcast_comparisons = "warn"
+rc_mutex = "warn"
+debug_assert_with_mut_call = "warn"
+iter_not_returning_iterator = "warn"
+expl_impl_clone_on_copy = "warn"
+infallible_try_from = "warn"
+dbg_macro = "warn"

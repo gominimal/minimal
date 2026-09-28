@@ -1043,13 +1043,16 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     }
 
     // Relay the tap to the host gvproxy over the vsock shuttle (CID 2). The
-    // daemon relay carries no gate, so it emits no deprecation notice; the
+    // daemon relay carries no gate, so it emits no deprecation notice; its
+    // lease is the daemon's own address (NET-084: a frame out of this tap
+    // whose source is anything else is rejected at the relay), and the
     // subnet passed is the one the guest is configured on above.
     let relay = switch::attach_to_switch_vsock(
         tap_fd,
         VSOCK_HOST_CID,
         VSOCK_GVPROXY_SHUTTLE_PORT,
         None,
+        ip,
         DEFAULT_SUBNET,
     )
     .await?;

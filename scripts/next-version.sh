@@ -9,14 +9,16 @@
 # 0.5.4 range's detach-chord change had one). Both consumers read that one
 # walk rather than each growing its own parser:
 #
-#   * the bump level: `feat:` -> minor; `fix:`/`perf:` (and a range with
-#     nothing release-worthy) -> patch. Commitlint enforces the format, so the
-#     range determines the level. Breaking changes (`!` or a
-#     `BREAKING CHANGE:`/`BREAKING-CHANGE:` footer) are DETECTED and rendered
-#     first in the notes but do NOT move the number while the project is
-#     0.x/alpha: no major increment is cut until the team decides on GA, so
-#     this lint never demands 1.0.0. ALLOW_MAJOR below is the one-line switch
-#     for that day (an explicit item on the GA checklist).
+#   * the bump level: `feat:` -> minor; a breaking change under ANY type
+#     (`!` or a `BREAKING CHANGE:`/`BREAKING-CHANGE:` footer) -> minor;
+#     `fix:`/`perf:` (and a range with nothing release-worthy) -> patch.
+#     Commitlint enforces the format, so the range determines the level.
+#     Breaking changes are DETECTED and rendered first in the notes, and while
+#     the project is 0.x/alpha they are a MINOR rather than a major: no major
+#     increment is cut until the team decides on GA, so this lint never
+#     demands 1.0.0, but a breaking change is never allowed to ship as a mere
+#     patch either. ALLOW_MAJOR below is the one-line switch for that day (an
+#     explicit item on the GA checklist).
 #   * the notes: markdown grouped as breaking changes / features / fixes /
 #     other changes, each entry keeping its scope, PR reference, and short sha.
 #     Breaking entries carry their footer text.
@@ -67,8 +69,8 @@
 
 set -euo pipefail
 
-# The GA switch. 0: a breaking change is detected and reported but bumps
-# nothing beyond what its type does (0.x/alpha rule). 1: breaking -> major.
+# The GA switch. 0: a breaking change is detected and reported but bumps only
+# a minor under any type (0.x/alpha rule). 1: breaking -> major.
 ALLOW_MAJOR="${NEXT_VERSION_ALLOW_MAJOR:-0}"
 
 # die <message> — print it with the script prefix on stderr and exit 1.
@@ -202,7 +204,7 @@ newest_version="${newest_tag#v}"
 level="patch"
 n_commits=0 n_feat=0 n_fix=0 n_breaking=0
 breaking_entries=() feat_entries=() fix_entries=() other_entries=()
-feat_drivers=()
+feat_drivers=() breaking_drivers=()
 
 # entry <sha> <scope> <desc> — one markdown bullet.
 entry() {
@@ -245,12 +247,20 @@ while IFS=$'\x1f' read -r -d $'\x1e' sha subject body; do
     footer="$(breaking_footer "$body")"
     if [ -n "$bang" ] || [ -n "$footer" ]; then
         n_breaking=$((n_breaking + 1))
+        breaking_drivers+=("$short $subject")
         e="$(entry "$short" "$scope" "$desc")"
         if [ -n "$footer" ]; then
             e="$e"$'\n\n'"$(printf '%s\n' "$footer" | sed 's/^/  /')"
         fi
         breaking_entries+=("$e")
-        [ "$ALLOW_MAJOR" = 1 ] && level=major
+        # A breaking change is a breaking change whatever its type: while
+        # 0.x/alpha it is a MINOR, not a patch, so a `fix!:` cannot ship as a
+        # patch. (The GA switch turns the same commit into the major instead.)
+        if [ "$ALLOW_MAJOR" = 1 ]; then
+            level=major
+        elif [ "$level" != major ]; then
+            level=minor
+        fi
     fi
 
     case "$type" in
@@ -341,9 +351,21 @@ case "$MODE" in
         declared_core="${package_version%%-*}"
         declared_core="${declared_core%%+*}"
         if [ "$(semver_cmp "$declared_core" "$next")" = lt ]; then
-            reason="$n_fix fix/perf commit(s)"
-            [ "$level" = minor ] && reason="$n_feat feat commit(s): $(printf '%s; ' "${feat_drivers[@]}" | sed 's/; $//')"
-            [ "$level" = major ] && reason="$n_breaking breaking change(s)"
+            # Name what drives the level, since that is the only thing a
+            # contributor with a stale package.version reads. Minor is driven
+            # by a feat and/or a breaking change under any type.
+            case "$level" in
+                major) reason="$n_breaking breaking change(s)" ;;
+                minor)
+                    if [ "$n_feat" -gt 0 ]; then
+                        reason="$n_feat feat commit(s): $(printf '%s; ' "${feat_drivers[@]}" | sed 's/; $//')"
+                        [ "$n_breaking" -gt 0 ] && reason="$reason; $n_breaking breaking change(s)"
+                    else
+                        reason="$n_breaking breaking change(s): $(printf '%s; ' "${breaking_drivers[@]}" | sed 's/; $//')"
+                    fi
+                    ;;
+                *) reason="$n_fix fix/perf commit(s)" ;;
+            esac
             die "package.version $package_version is behind the commits since $base_tag, which require a $level bump to at least $next ($reason) — bump $CARGO_TOML"
         fi
         printf 'next-version: package.version %s satisfies the %d commit(s) since %s (%s bump, at least %s) and is greater than the newest tag %s\n' \

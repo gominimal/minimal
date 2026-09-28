@@ -14,6 +14,7 @@
 # Usage:
 #   curl --proto '=https' --tlsv1.2 -fsSL <URL>/install.sh | sh
 #   curl … | sh -s -- unstable          # pick a non-default target
+#   curl … | sh -s -- --version 0.6.0   # install a staged version, no pointer
 #   curl … | sh -s -- --force-stop      # stop live sessions without asking
 #   curl … | sh -s -- --uninstall       # remove what a prior run installed
 #
@@ -196,6 +197,10 @@ dry_run=0
 # flag or environment because `curl … | sh` makes argv awkward. Deliberately NOT
 # named --force: that flag already means "remove modified files" in uninstall.
 force_stop=0
+# `--version VER` installs versions/VER/ directly instead of resolving a target
+# pointer: how a staged release that no channel points at yet gets tested.
+version_arg=
+version_set=0
 if [ -n "${MINIMAL_INSTALL_FORCE_STOP:-}" ]; then
     force_stop=1
 fi
@@ -212,14 +217,26 @@ if [ "${1-}" = "--uninstall" ]; then
         shift
     done
 else
-    # Install mode's only option. Filter it out of "$@" wherever it appears (by
+    # Install mode's options. Filter them out of "$@" wherever they appear (by
     # rotating the kept arguments to the end) so the sole positional — the
     # target — is still $1 for target resolution, whichever side of the
-    # flag it was on.
+    # flags it was on.
     argn=$#
     while [ "$argn" -gt 0 ]; do
         case "$1" in
             --force-stop) force_stop=1 ;;
+            --version)
+                case "${2-}" in
+                    ''|-*) die "--version needs a value (e.g. --version 0.6.0)" ;;
+                esac
+                version_arg="$2"; version_set=1
+                shift
+                argn=$((argn - 1)) ;;
+            --version=*)
+                version_arg="${1#--version=}"; version_set=1
+                case "$version_arg" in
+                    ''|-*) die "--version needs a value (e.g. --version 0.6.0)" ;;
+                esac ;;
             *)            set -- "$@" "$1" ;;
         esac
         shift
@@ -646,10 +663,23 @@ fi
 # `/`, so a value is always a single path segment; `.` and `..` are rejected
 # outright because curl normalizes `$BUCKET/..` back past the bucket prefix
 # (RFC 3986 dot-segment removal) before the request is sent.
-target="${MINIMAL_INSTALL_TARGET_OVERRIDE:-${1-stable}}"
-case "$target" in
-    ''|.|..|*[!A-Za-z0-9._-]*) die "invalid target '$target' (allowed: A-Za-z0-9._-, not '.'/'..')" ;;
-esac
+#
+# `--version` replaces the target: the version is named directly, so there is
+# no pointer to fetch. It takes the same charset and dot-segment guard as a
+# fetched version (below), and cannot be combined with a target.
+if [ "$version_set" -eq 1 ]; then
+    if [ -n "${MINIMAL_INSTALL_TARGET_OVERRIDE:-}" ] || [ $# -gt 0 ]; then
+        die "pass a target or --version, not both"
+    fi
+    case "$version_arg" in
+        ''|.|..|*[!A-Za-z0-9._-]*) die "invalid version '$version_arg' (allowed: A-Za-z0-9._-, not '.'/'..')" ;;
+    esac
+else
+    target="${MINIMAL_INSTALL_TARGET_OVERRIDE:-${1-stable}}"
+    case "$target" in
+        ''|.|..|*[!A-Za-z0-9._-]*) die "invalid target '$target' (allowed: A-Za-z0-9._-, not '.'/'..')" ;;
+    esac
+fi
 
 # A trap-cleaned temp dir for the pointer and manifest. The BSD/GNU mktemp
 # template split is bridged the portable way.
@@ -659,21 +689,29 @@ trap 'rm -rf "$tmpdir"' EXIT
 # Resolve the target to a version via the pointer file. Command
 # substitution strips the trailing newline; the charset check catches any
 # internal whitespace or smuggled path segment.
-fetch "$BUCKET/$target" "$tmpdir/pointer" \
-    || die "could not fetch target pointer '$target' from $BUCKET/$target"
-VERSION="$(cat "$tmpdir/pointer")"
-# Same guard as the target: reject `.`/`..` so a compromised pointer cannot make
-# `versions/$VERSION/components` normalize outside the versioned prefix.
-case "$VERSION" in
-    ''|.|..|*[!A-Za-z0-9._-]*) die "target '$target' resolved to a malformed version" ;;
-esac
+if [ "$version_set" -eq 1 ]; then
+    VERSION="$version_arg"
+else
+    fetch "$BUCKET/$target" "$tmpdir/pointer" \
+        || die "could not fetch target pointer '$target' from $BUCKET/$target"
+    VERSION="$(cat "$tmpdir/pointer")"
+    # Same guard as the target: reject `.`/`..` so a compromised pointer cannot
+    # make `versions/$VERSION/components` normalize outside the versioned prefix.
+    case "$VERSION" in
+        ''|.|..|*[!A-Za-z0-9._-]*) die "target '$target' resolved to a malformed version" ;;
+    esac
+fi
 # The mark waits for a resolved version: a run that cannot even reach the
 # bucket should print an error, not a logo.
 if [ "$first_run" -eq 1 ]; then
     wordmark
 fi
 say ""
-say "$mark target '$target' $arrow $b$VERSION$rst"
+if [ "$version_set" -eq 1 ]; then
+    say "$mark version $b$VERSION$rst"
+else
+    say "$mark target '$target' $arrow $b$VERSION$rst"
+fi
 say ""
 
 # Fetch that version's immutable components manifest.
@@ -1061,6 +1099,39 @@ remove_renamed_gvproxy() {
         fi
     done <"$prev_record"
 }
+
+# --- Switch binary verification ---------------------------------------
+
+# NET-041: an own-IP session is served by a switch binary (gvproxy-min) the
+# daemon spawns from the exact paths this installer writes to
+# (switch::installed_gvproxy_bin). Check the binary this run shipped is
+# present and executable — and say which path was checked — BEFORE the
+# rename cleanup that follows can delete anything: an activate that
+# cannot find its switch fails far away from the installer that left it
+# broken, and a mid-rename host still holding only `bin/gvproxy` must not
+# have that file removed before the failure is known. Records hold a row for
+# every applicable component — skipped and current ones included — so the
+# scan below sees the row even when nothing was downloaded this run.
+verify_switch_binary() {
+    _tab="$(printf '\t')"
+    # `$records` holds only this platform's applicable rows, and at most one
+    # gvproxy-min row, so the last assignment is also the only one.
+    _dest="$(awk -F"$_tab" '$1 == "gvproxy-min" { d = $2 } END { print d }' "$records")"
+    # A pre-rename manifest still ships the component under its old name; that
+    # path is then the switch binary the host actually has.
+    [ -n "$_dest" ] ||
+        _dest="$(awk -F"$_tab" '$1 == "gvproxy" { d = $2 } END { print d }' "$records")"
+    if [ -z "$_dest" ]; then
+        # No row at all: this channel ships no switch binary, so there is
+        # nothing to break. Not an error — data-only channels exist.
+        row switch-binary skipped "this channel ships no switch binary"
+        return 0
+    fi
+    [ -x "$_dest" ] ||
+        die "switch binary $_dest is not present or not executable; own-IP sessions need it"
+    row switch-binary verified "$_dest"
+}
+verify_switch_binary
 remove_renamed_gvproxy
 
 # Persist the resolved (component, dest, installed-hash) rows for this

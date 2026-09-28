@@ -378,7 +378,8 @@ fn zone_soa() -> Record {
 /// # Errors
 ///
 /// Returns a [`BindFailure`] when the address cannot be bound; the OS error is
-/// carried inside the failure's reason.
+/// carried inside the failure's reason, and its kind beside it
+/// ([`BindFailure::kind`]).
 pub async fn bind_answerer(addr: SocketAddr) -> Result<UdpSocket, BindFailure> {
     match UdpSocket::bind(addr).await {
         Ok(socket) => {
@@ -396,6 +397,7 @@ pub async fn bind_answerer(addr: SocketAddr) -> Result<UdpSocket, BindFailure> {
                 "free the listen address; `lsof -nP -iUDP:{}` names the holder",
                 addr.port()
             ),
+            kind: error.kind(),
         }),
     }
 }

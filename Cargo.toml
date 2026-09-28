@@ -51,12 +51,51 @@ package.rust-version = "1.95"
 # is handed it as MINIMAL_RELEASE_VERSION (asserted equal by build.rs and
 # scripts/assert-release-version.sh), and a no-.git build (source tarball)
 # reports it verbatim. See crates/version/src/scheme.rs.
-# Bump it when the commits since the last tag require it: `feat:` -> minor,
-# anything else -> patch; while the project is 0.x no breaking change bumps the
-# major (scripts/next-version.sh). `scripts/next-version.sh --check` (the
+# Bump it when the commits since the last tag require it: `feat:` -> minor, a
+# breaking change under any type -> minor, anything else -> patch; while the
+# project is 0.x a breaking change is a minor, never a major
+# (scripts/next-version.sh). `scripts/next-version.sh --check` (the
 # workspace `package_version` test, `just check-version`) fails the PR that
 # leaves it stale or not strictly greater than the newest v* tag.
 package.version = "0.6.0"
+
+# Workspace lint policy. A crate opts in with `[lints] workspace = true`.
+#
+# Only lints already clean across the workspace live here: CI's clippy job runs
+# `-D warnings`, which promotes a `warn` lint into a hard error, so a single
+# remaining hit would fail every PR. These 15 have zero hits today and act as
+# tripwires against new ones. The stricter lints that still have legacy sites
+# (unwrap_used, indexing_slicing, let_underscore_must_use, ...) are enforced on
+# changed lines by `just clippy-strict` instead — see scripts/clippy-strict.sh —
+# and should be promoted here as their counts reach zero. Test code is exempt
+# from the panic family in clippy.toml.
+[workspace.lints.rust]
+# The kani proof harnesses (sessions, rcache) are gated on `cfg(kani)`, a
+# custom cfg. Declaring it once here keeps rustc's unexpected_cfgs lint quiet
+# on the normal (non-kani) builds without every crate repeating the check-cfg.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[workspace.lints.clippy]
+# Panic / silent-failure tripwires.
+unchecked_time_subtraction = "warn"
+let_underscore_future = "warn"
+# Holding a lock across .await.
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+# Safety documentation hygiene.
+unnecessary_safety_doc = "warn"
+# Numeric correctness.
+float_cmp = "warn"
+float_cmp_const = "warn"
+lossy_float_literal = "warn"
+invalid_upcast_comparisons = "warn"
+# Easily-avoided footguns.
+rc_mutex = "warn"
+debug_assert_with_mut_call = "warn"
+iter_not_returning_iterator = "warn"
+expl_impl_clone_on_copy = "warn"
+infallible_try_from = "warn"
+dbg_macro = "warn"
 
 [profile.release]
 strip = true
@@ -148,10 +187,7 @@ rand = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
 rayon = "1.12"
 ratatui = "0.30"
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 regex = "1" # keep in sync with nickel-lang-core
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
 reqwest = { version = "0.13.4", features = ["stream"], default-features = false } # keep in sync with google-cloud-gax
 rustc-hash = "2.1.3"
 serde = { version = "1.0", features = ["derive", "rc"] } # Keep within the same minor version as nickel-lang-core

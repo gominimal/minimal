@@ -120,6 +120,26 @@ impl EgressPolicy {
     pub fn first_invalid_deny_subnet(&self) -> Option<&str> {
         first_invalid_cidr(self.deny_subnets.as_ref())
     }
+
+    /// The deny-all section: `Some(vec![])` on every `allow_*` dimension —
+    /// the one [`crate::core::egress::EgressRules::from_policy`] shape that
+    /// admits nothing — with nothing denied, because there is nothing left
+    /// to subtract from. The materialized form of
+    /// [`EffectiveEgress::DenyAll`], built as a real section so the gate
+    /// compiles the default through the same path a declared one takes.
+    ///
+    /// The resolver carve-out (NET-079) is not in the section: it lives in
+    /// the verdict, which admits the resolver Minimal owns for a box at
+    /// DNS's port whatever the rules say.
+    #[must_use]
+    pub fn deny_all() -> Self {
+        Self {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(Vec::new()),
+            allow_protocols: Some(Vec::new()),
+            deny_subnets: None,
+        }
+    }
 }
 
 /// The first entry of an optional CIDR list that is not a syntactically valid
@@ -132,9 +152,42 @@ fn first_invalid_cidr(entries: Option<&Vec<String>>) -> Option<&str> {
         .find(|cidr| !is_valid_cidr(cidr))
 }
 
+/// How dynamic ingress requests from inside a box are decided.
+///
+/// A request to publish a port from inside the box (e.g. `min net expose`)
+/// is either allowed automatically, denied, or routed to a prompt for the
+/// attached human. The default for an absent declaration is deny-all.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicIngress {
+    /// Dynamic ingress requests are published without prompting.
+    Allow,
+    /// Dynamic ingress requests are refused (the default when no setting is
+    /// declared).
+    #[default]
+    Deny,
+    /// Dynamic ingress requests prompt the attached human. If nobody is
+    /// attached, the request is refused.
+    Ask,
+}
+
+impl fmt::Display for DynamicIngress {
+    /// Renders the lowercase mode name, matching the `snake_case` serde
+    /// representation so the TUI and any structured log fields agree with the
+    /// wire format.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Ask => "ask",
+        })
+    }
+}
+
 /// Effective ingress policy for an `OwnIp` `PTask`.
 ///
-/// Default (empty `port_mappings`, no `dynamic_allowed_range`) is deny-all-external.
+/// Default (empty `port_mappings`, no `dynamic_allowed_range`, no
+/// `dynamic_ingress`) is deny-all-external.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct IngressPolicy {
     /// Static port mappings applied at `PTask` launch.
@@ -146,14 +199,25 @@ pub struct IngressPolicy {
     /// but **not yet enforced**: dynamic port-mapping is split to #553. Until
     /// then a set range is recorded configuration only, with no runtime effect.
     pub dynamic_allowed_range: Option<(u16, u16)>,
+    /// How dynamic port-mapping requests from inside the box are decided.
+    /// `None` means the default deny-all applies.
+    ///
+    /// Stored on the [`Record`] and returned verbatim by `GetSessionPolicy`,
+    /// but **not yet enforced**: the runtime evaluation is split to #553.
+    pub dynamic_ingress: Option<DynamicIngress>,
 }
 
 impl IngressPolicy {
     /// Whether this ingress policy configures any forwarding at all (a static
-    /// mapping or a dynamic range). An empty policy is the deny-all default.
+    /// mapping, a dynamic range, or a non-default dynamic-ingress setting). An
+    /// empty policy is the deny-all default.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.port_mappings.is_empty() && self.dynamic_allowed_range.is_none()
+        self.port_mappings.is_empty()
+            && self.dynamic_allowed_range.is_none()
+            && self
+                .dynamic_ingress
+                .is_none_or(|d| d == DynamicIngress::Deny)
     }
 }
 
@@ -182,6 +246,125 @@ impl SessionPolicy {
     #[must_use]
     pub fn new(egress: Option<EgressPolicy>, ingress: Option<IngressPolicy>) -> Self {
         Self { egress, ingress }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The deny-all egress default's rollout (NET-074..NET-077).
+//
+// An absent `egress` section used to mean allow-all on every dimension
+// (03-spec R2.1). The deny-all default replaces that for an own-address box:
+// once in force it reaches nothing outside itself, an opt-out keeps the
+// shipped default, and the release before it only announces the change.
+// ---------------------------------------------------------------------------
+
+/// Which release the deny-all egress default is in (NET-074..NET-077): a
+/// build-time fact, not configuration, because it is decided by which build
+/// is running. Every path that needs it — the session gate, the session-start
+/// log line, `min session policy`, the activate announcement — reads
+/// [`EGRESS_DEFAULT_PHASE`] rather than a flag nobody could set differently
+/// within one build.
+///
+/// Deliberately not `#[non_exhaustive]`: a future phase (a default retired
+/// after its soak, say) must break the exhaustive matches over this enum,
+/// forcing each one to say what the new phase means for it, rather than
+/// falling into a wildcard arm that silently keeps the old answer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EgressDefaultPhase {
+    /// The coming default is announced at activate (NET-076); an absent
+    /// `egress` section still allows all.
+    Announced,
+    /// The default binds: an own-address box created with no `egress`
+    /// section reaches nothing outside itself (NET-074) and shows
+    /// `deny all` in `min session policy` (NET-075), the opt-out excepted
+    /// (NET-077).
+    InForce,
+}
+
+/// The phase this build ships: the coming default is announced (NET-076),
+/// so an absent `egress` section still allows all and `activate` prints the
+/// change it will bring. The release that turns the default in force is a
+/// plan fact, and no plan has named one yet; when one does, this constant is
+/// the whole cutover — every reader of it (the session gate, the
+/// session-start line, `min session policy`, the activate notice) follows.
+pub const EGRESS_DEFAULT_PHASE: EgressDefaultPhase = EgressDefaultPhase::Announced;
+
+/// The egress a box's traffic is actually held to: its declared section when
+/// it has one, otherwise the default [`effective_egress`] resolves for an
+/// absent one. This is what the gate enforces and what `min session policy`
+/// shows; the declaration itself stays untouched on the record, so the
+/// strict [`SessionPolicy`] a client reads back is exactly what the box was
+/// launched with.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveEgress {
+    /// An absent `egress` section under the in-force default (NET-074):
+    /// nothing outside the box is reachable, the resolver Minimal owns for
+    /// it excepted (NET-079).
+    DenyAll,
+    /// The shipped default (03-spec R2.1): every dimension allows all. What
+    /// an absent section keeps before the default is in force, behind the
+    /// daemon's opt-out (NET-077), and on any box without an address of its
+    /// own.
+    #[default]
+    AllowAll,
+    /// The box declared its own egress section; carried verbatim.
+    Declared(EgressPolicy),
+}
+
+/// A session's policy with its egress half resolved to what the gate
+/// enforces: the answer `GetEffectiveSessionPolicy` serves and
+/// `min session policy` renders (NET-075) — the shape that can carry
+/// [`EffectiveEgress::DenyAll`] without rewriting the strict
+/// [`SessionPolicy`] declaration. The ingress half is carried verbatim:
+/// ingress has no rollout default.
+///
+/// The egress here is not an `Option`: an absent section has already been
+/// resolved into [`EffectiveEgress::DenyAll`] or [`EffectiveEgress::AllowAll`],
+/// so a reader cannot mistake "no declaration" for "no rules".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+// Same reason as the attribute on `SessionPolicy`: the response rides an
+// `#[serde(untagged)]` `Errorable`, and the daemon's `{"error": "..."}` reply
+// must fall through to the `Err` arm rather than decode as a valid policy —
+// a silent false negative on a security-introspection command.
+#[serde(deny_unknown_fields)]
+pub struct EffectiveSessionPolicy {
+    /// The effective egress: the declaration, or the default the rollout
+    /// phase and the daemon's opt-out leave in force.
+    pub egress: EffectiveEgress,
+    /// Ingress policy; `None` when no explicit ingress config is present.
+    pub ingress: Option<IngressPolicy>,
+}
+
+/// Resolves the effective egress of a box (NET-074/NET-077): a declared
+/// section is carried verbatim whatever the phase — a box that says what it
+/// wants gets what it said — and an absent `egress` section is the default's
+/// to decide. Deny-all once [`EgressDefaultPhase::InForce`], on an
+/// own-address box ([`NetworkMode::OwnIp`]) whose daemon has not opted out;
+/// the shipped allow-all of 03-spec R2.1 in every other case: before the
+/// default is in force, behind the opt-out, or for a box that shares its
+/// host's namespace (or has no network at all) and so owns no address of its
+/// own to deny from.
+///
+/// `opt_out` is the daemon's deny-all opt-out flag (NET-077); the caller
+/// threads it in from the daemon's configuration, because it is the daemon —
+/// not the client asking about a session — that knows whether it set the
+/// flag.
+#[must_use]
+pub fn effective_egress(
+    declared: Option<&EgressPolicy>,
+    network: NetworkMode,
+    phase: EgressDefaultPhase,
+    opt_out: bool,
+) -> EffectiveEgress {
+    match declared {
+        Some(section) => EffectiveEgress::Declared(section.clone()),
+        None => match (phase, network) {
+            (EgressDefaultPhase::InForce, NetworkMode::OwnIp) if !opt_out => {
+                EffectiveEgress::DenyAll
+            }
+            _ => EffectiveEgress::AllowAll,
+        },
     }
 }
 
@@ -452,7 +635,8 @@ impl Record {
     /// `deny_subnets` entry is not, [`PolicyError::InvalidDynamicRange`] when
     /// the ingress `dynamic_allowed_range` lower bound exceeds its upper bound,
     /// or [`PolicyError::PrivilegedDynamicRange`] when that lower bound is a
-    /// privileged host port (< 1024).
+    /// privileged host port (< 1024). Does not validate `dynamic_ingress`, which
+    /// is accepted on an `OwnIp` `PTask` and serialized verbatim.
     pub fn validate_policy(&self) -> Result<(), PolicyError> {
         // gvproxy's static forwarder only exposes TCP and UDP, so an ingress
         // mapping with any other transport is a configuration error wherever it
@@ -630,6 +814,91 @@ mod tests {
         assert!(record.validate_policy().is_ok());
     }
 
+    /// NET-074/NET-075/NET-076/NET-077: what an absent `egress` section
+    /// resolves to, by rollout phase, opt-out, and network mode — and that
+    /// the deny-all arm is not a label but the section whose compiled rules
+    /// admit nothing.
+    #[test]
+    fn effective_egress_by_phase_and_opt_out() {
+        use crate::core::egress::EgressRules;
+
+        // The address of the resolver Minimal owns for a box: the switch
+        // gateway, whose value only shapes the carve-out's key.
+        let resolver = [100, 64, 0, 1];
+        // The box's lease, whose value only shapes the source check
+        // (NET-084), proven in `core::egress`; what is asserted here is the
+        // egress dimensions the deny-all arm materializes to.
+        let lease = [100, 64, 0, 9];
+        let declared = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".into()]),
+            ..EgressPolicy::default()
+        };
+
+        // A declared section is carried verbatim in every phase, opted out
+        // or not, on every mode: the default only fills an absent section.
+        for phase in [EgressDefaultPhase::Announced, EgressDefaultPhase::InForce] {
+            for opt_out in [false, true] {
+                for network in [NetworkMode::OwnIp, NetworkMode::HostNet, NetworkMode::NoNet] {
+                    assert_eq!(
+                        effective_egress(Some(&declared), network, phase, opt_out),
+                        EffectiveEgress::Declared(declared.clone()),
+                        "a declared egress section must survive phase {phase:?}, \
+                         opt_out {opt_out}, mode {network:?} untouched",
+                    );
+                }
+            }
+        }
+
+        // The one case the default rewrites: an own-address box with no
+        // `egress` section, once the default is in force, unless the daemon
+        // opted out (NET-077) — and still allow-all while the default is
+        // only announced (NET-076's other half).
+        assert_eq!(
+            effective_egress(None, NetworkMode::OwnIp, EgressDefaultPhase::InForce, false),
+            EffectiveEgress::DenyAll,
+            "in force without the opt-out, an own-address box with no egress \
+             section denies all (NET-074)",
+        );
+        assert_eq!(
+            effective_egress(None, NetworkMode::OwnIp, EgressDefaultPhase::InForce, true),
+            EffectiveEgress::AllowAll,
+            "the opt-out keeps the shipped allow-all default (NET-077)",
+        );
+        assert_eq!(
+            effective_egress(
+                None,
+                NetworkMode::OwnIp,
+                EgressDefaultPhase::Announced,
+                false
+            ),
+            EffectiveEgress::AllowAll,
+            "while the default is only announced, an absent section still \
+             allows all (NET-076)",
+        );
+
+        // The default scopes to own-address boxes: a box that shares its
+        // host's namespace owns no address of its own to deny from, and a
+        // none box has no network to deny on.
+        for network in [NetworkMode::HostNet, NetworkMode::NoNet] {
+            assert_eq!(
+                effective_egress(None, network, EgressDefaultPhase::InForce, false),
+                EffectiveEgress::AllowAll,
+                "an absent section on a {network:?} box keeps the shipped default",
+            );
+        }
+
+        // The deny-all arm materializes to the section that compiles to
+        // rules admitting nothing: `Some(vec![])` on every allow dimension,
+        // nothing denied — the shape `EgressRules::from_policy` builds and
+        // `verdict` holds every external destination against, the resolver
+        // carve-out excepted.
+        assert_eq!(
+            EgressRules::from_policy(Some(&EgressPolicy::deny_all()), resolver, lease),
+            EgressRules::new(Some(Vec::new()), Some(Vec::new()), None, resolver, lease),
+            "the deny-all section must compile to rules that admit nothing",
+        );
+    }
+
     #[test]
     fn egress_on_none_box_is_validation_error() {
         // NET-065: a none box has no network, so there is nothing to enforce
@@ -675,6 +944,7 @@ mod tests {
                 proto: IpProto::Tcp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         let record = record_with(
             NetworkMode::HostNet,
@@ -700,6 +970,7 @@ mod tests {
                 proto: IpProto::Icmp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         assert_eq!(
             record_with(
@@ -725,6 +996,7 @@ mod tests {
                 proto: IpProto::Tcp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         assert_eq!(
             record_with(
@@ -747,6 +1019,7 @@ mod tests {
                 proto: IpProto::Icmp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
         assert_eq!(
@@ -769,6 +1042,7 @@ mod tests {
                 proto: IpProto::Tcp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
         assert_eq!(
@@ -788,6 +1062,7 @@ mod tests {
                 proto: IpProto::Tcp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
         assert!(record.validate_policy().is_ok());
@@ -863,6 +1138,7 @@ mod tests {
                 proto: IpProto::Tcp,
             }],
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         };
         let record = record_with(
             NetworkMode::HostNet,
@@ -885,6 +1161,7 @@ mod tests {
         let ingress = IngressPolicy {
             port_mappings: vec![],
             dynamic_allowed_range: Some((8443, 8000)),
+            dynamic_ingress: None,
         };
         let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
         assert_eq!(
@@ -905,6 +1182,7 @@ mod tests {
             let ingress = IngressPolicy {
                 port_mappings: vec![],
                 dynamic_allowed_range: Some(range),
+                dynamic_ingress: None,
             };
             let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
             assert_eq!(
@@ -922,6 +1200,7 @@ mod tests {
             let ingress = IngressPolicy {
                 port_mappings: vec![],
                 dynamic_allowed_range: Some(range),
+                dynamic_ingress: None,
             };
             let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
             assert!(record.validate_policy().is_ok());
@@ -940,6 +1219,87 @@ mod tests {
             SessionPolicy::new(None, Some(IngressPolicy::default())),
         );
         assert!(record.validate_policy().is_ok());
+    }
+
+    #[test]
+    fn dynamic_ingress_setting_parses() {
+        // NET-043: a box spec declaring `dynamic_ingress` allow, deny or ask
+        // parses, and an unknown value is refused.
+        for (json, expected) in [
+            ("\"allow\"", DynamicIngress::Allow),
+            ("\"deny\"", DynamicIngress::Deny),
+            ("\"ask\"", DynamicIngress::Ask),
+        ] {
+            let parsed: DynamicIngress =
+                serde_json_lenient::from_str(json).expect("{json} must parse to {expected:?}");
+            assert_eq!(parsed, expected);
+        }
+
+        let err = serde_json_lenient::from_str::<DynamicIngress>("\"unknown\"").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown variant")
+                && msg.contains("allow")
+                && msg.contains("deny")
+                && msg.contains("ask"),
+            "unknown dynamic_ingress must name allowed variants: {msg}"
+        );
+
+        // A full ingress policy round-trips the setting.
+        let ingress = IngressPolicy {
+            port_mappings: vec![],
+            dynamic_allowed_range: Some((8000, 8443)),
+            dynamic_ingress: Some(DynamicIngress::Ask),
+        };
+        let json = serde_json_lenient::to_string(&ingress).unwrap();
+        let rt: IngressPolicy = serde_json_lenient::from_str(&json).unwrap();
+        assert_eq!(rt, ingress, "IngressPolicy must round-trip dynamic_ingress");
+
+        // An ingress policy with only the new field is valid on an OwnIp PTask.
+        let record = record_with(
+            NetworkMode::OwnIp,
+            SessionPolicy::new(None, Some(ingress.clone())),
+        );
+        assert!(
+            record.validate_policy().is_ok(),
+            "dynamic_ingress does not change validation"
+        );
+
+        // An explicit `deny` is the default and is treated like `None` for
+        // the "ingress only on own-address" rule: it is accepted on a
+        // host-address box and on a none box too (NET-065).
+        let deny_ingress = IngressPolicy {
+            port_mappings: vec![],
+            dynamic_allowed_range: None,
+            dynamic_ingress: Some(DynamicIngress::Deny),
+        };
+        for network in [NetworkMode::HostNet, NetworkMode::NoNet] {
+            let record = record_with(
+                network,
+                SessionPolicy::new(None, Some(deny_ingress.clone())),
+            );
+            assert!(
+                record.validate_policy().is_ok(),
+                "dynamic_ingress = deny must be accepted on {network:?}"
+            );
+        }
+
+        // A non-deny `dynamic_ingress` alone is still an ingress policy on a
+        // non-own-address box and is refused there.
+        for network in [NetworkMode::HostNet, NetworkMode::NoNet] {
+            for mode in [DynamicIngress::Allow, DynamicIngress::Ask] {
+                let ingest = IngressPolicy {
+                    dynamic_ingress: Some(mode),
+                    ..IngressPolicy::default()
+                };
+                let record = record_with(network, SessionPolicy::new(None, Some(ingest)));
+                assert_eq!(
+                    record.validate_policy(),
+                    Err(PolicyError::IngressRequiresOwnIp { mode: network }),
+                    "dynamic_ingress = {mode} must be rejected on {network:?}"
+                );
+            }
+        }
     }
 
     /// On-disk records that predate the `status` field must

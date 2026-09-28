@@ -128,6 +128,60 @@ pub(crate) struct SessionConfig {
     /// route on spawn, relinks on rename, and withdraws on stop/destroy.
     #[cfg(target_os = "linux")]
     pub hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// Whether the daemon opted out of the deny-all egress default
+    /// (NET-077): the launcher and the task path read it to resolve this
+    /// session's effective egress (NET-074), and the start line below logs
+    /// it so a diagnostics bundle can name the posture without the daemon's
+    /// flags.
+    pub deny_all_opt_out: bool,
+}
+
+/// The egress *section* the gate compiles for a session: the materialized
+/// form of [`sessions::effective_egress`]'s answer — `None` for the shipped
+/// allow-all, the deny-all section for an absent declaration under the
+/// in-force default (NET-074), and a declaration verbatim. `phase` is the
+/// rollout phase to resolve under — the launcher and the task path pass
+/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
+/// tests pass [`sessions::EgressDefaultPhase::InForce`] so the posture the
+/// rollout ends at stays proven while the default is only announced
+/// (NET-076). `opt_out` is the daemon's deny-all opt-out (NET-077), threaded
+/// from the server config.
+///
+/// Shared by the session launcher (the box's own gate) and the task path
+/// ([`crate::exec::task_network`]), so a task runs under the same egress
+/// its session does.
+pub(crate) fn effective_egress_section(
+    policy: &sessions::SessionPolicy,
+    network: sessions::NetworkMode,
+    phase: sessions::EgressDefaultPhase,
+    opt_out: bool,
+) -> Option<sessions::EgressPolicy> {
+    match sessions::effective_egress(policy.egress.as_ref(), network, phase, opt_out) {
+        sessions::EffectiveEgress::DenyAll => Some(sessions::EgressPolicy::deny_all()),
+        sessions::EffectiveEgress::AllowAll => None,
+        sessions::EffectiveEgress::Declared(section) => Some(section),
+    }
+}
+
+/// The policy the gate enforces for a session: its declared ingress, and its
+/// egress resolved to the section [`effective_egress_section`] names — the
+/// deny-all section for an own-address box with no `egress` section once the
+/// default is in force (NET-074), the shipped allow-all for everything an
+/// opt-out (NET-077) or an earlier phase leaves in place, and a declaration
+/// verbatim. `phase` resolves under, exactly as [`effective_egress_section`]
+/// documents. The declaration on the record is left untouched: the strict
+/// `SessionPolicy` a client reads back stays exactly what the box was
+/// launched with.
+pub(crate) fn effective_session_policy(
+    policy: &sessions::SessionPolicy,
+    network: sessions::NetworkMode,
+    phase: sessions::EgressDefaultPhase,
+    opt_out: bool,
+) -> sessions::SessionPolicy {
+    sessions::SessionPolicy {
+        egress: effective_egress_section(policy, network, phase, opt_out),
+        ingress: policy.ingress.clone(),
+    }
 }
 
 /// Lifecycle-dependent state of a session actor: the multi-step create flow
@@ -374,6 +428,10 @@ enum SessionMessage {
     /// The daemon's shared gvproxy switch, reached through the session because
     /// that is the handle the task path holds.
     GetNetSwitch(oneshot::Sender<Arc<Mutex<crate::net::SwitchClient>>>),
+    /// Whether this daemon opted out of the deny-all egress default
+    /// (NET-077), read by the task path so a task resolves its session's
+    /// effective egress (NET-074) the same way the launcher does.
+    GetDenyAllOptOut(oneshot::Sender<bool>),
     /// Hand back the session's composition, if it has one. Sourced from
     /// the persisted snapshot: `Session::run` loads it at spawn, so this
     /// answers for an actor brought up from disk after a restart.
@@ -384,6 +442,11 @@ enum SessionMessage {
     /// Hand back an `Arc` clone of this session's hook-scripts-upload lock,
     /// see [`Session::hook_scripts_upload_lock`].
     GetHookScriptsUploadLock(oneshot::Sender<Arc<Mutex<()>>>),
+    /// Register a live direct-tcpip forward relay as belonging to this
+    /// session, so teardown takes it down too: a session that goes away
+    /// aborts its forwards rather than leaving relays pointing into a box
+    /// that no longer exists.
+    TrackForward(tokio::task::AbortHandle),
     /// Kick off a background package build as a session side-op. Replies with
     /// the receiver end of the build's event stream.
     StartBuild {
@@ -480,6 +543,18 @@ pub struct Session {
     /// What brought the currently held host up, which decides whether an
     /// interactive attach may respawn it. See [`HostOrigin`].
     host_origin: HostOrigin,
+
+    /// Whether this daemon opted out of the deny-all egress default
+    /// (NET-077), threaded from the server config: the launcher resolves
+    /// this session's effective egress (NET-074) against it, and the task
+    /// path reads it through the handle for the same resolution.
+    deny_all_opt_out: bool,
+
+    /// The live direct-tcpip forwards opened for this session: one abort
+    /// handle per relay the connection layer spawned. Pruned as relays
+    /// finish; every live one is aborted by [`Session::stop_running`], so a
+    /// session that goes away takes its forwards down with it (NET-105).
+    forwards: Vec<tokio::task::AbortHandle>,
 }
 
 /// Why a session host was launched.
@@ -522,6 +597,7 @@ impl Session {
             record,
             net_switch,
             manager,
+            deny_all_opt_out,
             #[cfg(target_os = "linux")]
             hostnames,
         } = seed;
@@ -532,6 +608,7 @@ impl Session {
             minimal_cache_dir,
             daemon_ctx,
             net_switch,
+            deny_all_opt_out,
             tracker: OpTracker::new_root(),
             inner,
             workspace_baseline: WorkspaceBaseline::Unarmed,
@@ -543,6 +620,9 @@ impl Session {
             // conservative default — it is the one value that never licenses
             // a respawn.
             host_origin: HostOrigin::Interactive,
+            // Forwards are registered as their channels open; a session
+            // starts with none.
+            forwards: Vec::new(),
             #[cfg(target_os = "linux")]
             hostnames,
         }
@@ -614,6 +694,30 @@ impl Session {
         };
 
         let (sender, receiver) = mpsc::channel(8);
+        // One line per session start (NET-074/NET-076/NET-077): the rollout
+        // phase this build ships, the daemon's opt-out state, and the
+        // effective egress they leave this box with. The declaration
+        // travels on the record; these three are the facts a reader of a
+        // diagnostics bundle's daemon-log tail needs to explain why a box
+        // can — or cannot — reach anything, without the daemon's flags or
+        // its source at hand.
+        {
+            let record = obj.record();
+            tracing::info!(
+                session = %record.id,
+                name = ?record.name,
+                network = ?record.network,
+                egress_default_phase = ?sessions::EGRESS_DEFAULT_PHASE,
+                deny_all_opt_out = conf.deny_all_opt_out,
+                effective_egress = ?sessions::effective_egress(
+                    record.policy.egress.as_ref(),
+                    record.network,
+                    sessions::EGRESS_DEFAULT_PHASE,
+                    conf.deny_all_opt_out,
+                ),
+                "session starts"
+            );
+        }
         // A weak self-handle so the actor can hand its own mailbox to the
         // runtime objects it spawns without a caller threading it in.
         let weak_self = WeakSessionHandle(sender.downgrade());
@@ -624,7 +728,7 @@ impl Session {
         // (R3.1/R3.6). A `Draft` session has nothing to route to yet, so
         // `register_hostname` no-ops until its loadout finalizes.
         #[cfg(target_os = "linux")]
-        actor.register_hostname(obj.record());
+        actor.register_hostname(obj.record()).await;
 
         tokio::spawn(actor.mainloop());
         Ok(SessionHandle(sender))
@@ -635,23 +739,46 @@ impl Session {
     /// path has reported its lease — at spawn that report has not happened
     /// yet, so this registers nothing and the route appears when the box
     /// attaches (NET-001); on a rename or re-finalize the reported lease is
-    /// already on file and the name re-registers against it. A NoNet PTask
-    /// exposes no services, so it is not registered — and neither is a
+    /// already on file and the name re-registers against it, carrying the
+    /// ports the session's ingress declaration publishes (NET-069) — an empty
+    /// set, and so a deny-all gate, when the box declares no ingress: that is
+    /// the posture its own relay gate gives a direct connection, and the
+    /// proxy's must match on every host form (NET-071). A NoNet
+    /// PTask exposes no services, so it is not registered — and neither is a
     /// `Draft` session, which has nothing to route to until its composition
     /// finalizes.
+    ///
+    /// An `OwnIp` PTask is also recorded as the *caller* a proxied request
+    /// from it is checked against (NET-070): its egress declaration, over the
+    /// switch its own relay is attached to, is kept until the box's lease
+    /// joins onto it, and the rules built there are the ones its own outbound
+    /// frames are decided by on the switch
+    /// ([`crate::net::switch::compiled_egress`] over the switch's subnet, so
+    /// the resolver carve-out matches too, and with the box's lease, so the
+    /// verdict's source check does too — NET-084), so a request from the box
+    /// through the hostname proxy meets its own declaration — exactly what a
+    /// direct connection from it meets (NET-071).
     #[cfg(target_os = "linux")]
-    fn register_hostname(&self, record: &Record) {
+    async fn register_hostname(&self, record: &Record) {
         if !self.owns_hostname_route(record) {
             return;
         }
         let name = registry_name(record);
+        // Scoped: the switch lock is dropped before the registry is taken, so
+        // no path holds both.
+        let subnet = self.net_switch.lock().await.subnet();
         let mut reg = self
             .hostnames
             .write()
             .expect("hostname registry lock poisoned");
         match record.network {
             sessions::NetworkMode::OwnIp => {
-                reg.register_own_ip(record.id, &name);
+                reg.register_caller(record.id, &name, &record.policy, subnet);
+                reg.register_own_ip(
+                    record.id,
+                    &name,
+                    crate::net::switch::declared_request_ports(Some(&record.policy)),
+                );
             }
             sessions::NetworkMode::HostNet => {
                 reg.register_host_net(record.id, &name);
@@ -902,6 +1029,12 @@ impl Session {
             SessionMessage::GetHookScriptsUploadLock(r) => {
                 let _ = r.send(Arc::clone(&self.hook_scripts_upload_lock));
             }
+            SessionMessage::TrackForward(forward) => {
+                // Prune the ones that have finished on their own, so the
+                // list holds the live forwards and nothing else.
+                self.forwards.retain(|h| !h.is_finished());
+                self.forwards.push(forward);
+            }
             SessionMessage::StartBuild {
                 rebuild,
                 pkgs,
@@ -923,6 +1056,13 @@ impl Session {
             }
             SessionMessage::GetNetSwitch(r) => {
                 let _ = r.send(Arc::clone(&self.net_switch));
+            }
+            SessionMessage::GetDenyAllOptOut(r) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = r.send(self.deny_all_opt_out);
             }
             #[cfg(test)]
             SessionMessage::PeekComposition(r) => {
@@ -1332,7 +1472,7 @@ impl Session {
                 record.status = SessionStatus::Active;
                 self.record.write(record.clone()).await?;
                 #[cfg(target_os = "linux")]
-                self.register_hostname(&record);
+                self.register_hostname(&record).await;
                 Ok(ran)
             }
             SessionStatus::Pending => Err(std::io::Error::new(
@@ -1445,6 +1585,14 @@ impl Session {
     /// the daemon-shutdown message (and a terminal reset) rather than a bare
     /// disconnect when the session dies because the daemon is going away.
     async fn stop_running(&mut self, for_shutdown: bool) {
+        // The session's forwards relay into its box: a session that is going
+        // away takes them with it, rather than leaving live relays pointed at
+        // a box that is being torn down. Both teardown paths — `Stop` and
+        // `Destroy` — come through here.
+        for forward in std::mem::take(&mut self.forwards) {
+            forward.abort();
+        }
+
         let inner = match &mut self.inner {
             SessionInner::Active { host, sops, .. } => Some((host.take(), std::mem::take(sops))),
             SessionInner::Draft { .. } => None,
@@ -1489,7 +1637,8 @@ impl Session {
         self.register_hostname(match &written {
             Ok(_) => &new_record,
             Err(_) => &record,
-        });
+        })
+        .await;
 
         written
     }
@@ -2151,15 +2300,30 @@ impl Session {
         phase: LaunchPhase,
     ) -> Result<session_host::SandboxLauncher, AttachError> {
         // R2.1: reject a policy that is incompatible with the network mode
-        // (e.g. egress on a non-`OwnIp` PTask) before launching the host.
+        // (e.g. ingress forwards on a non-`OwnIp` PTask) before launching the
+        // host.
         record
             .validate_policy()
             .map_err(AttachError::InvalidPolicy)?;
         let network_mode = record.network;
-        // Only an `OwnIp` PTask attaches to the switch, so ingress forwards are
-        // only carried for that mode; `validate_policy` has already rejected
-        // ingress configured on any other mode.
-        let ingress = record.policy.ingress.clone();
+        // Only an `OwnIp` PTask attaches to the switch, so the policy's relay
+        // halves — egress verdict and ingress forwards — are only consumed in
+        // that mode. `validate_policy` rejects egress rules only on `NoNet`: a
+        // host-address box may carry them (NET-120), and such a box never
+        // reaches the relay. Only the ingress half is own-address-only, and
+        // `validate_policy` has already rejected it on any other mode.
+        //
+        // NET-074: the gate enforces the *effective* egress — an absent
+        // section on an own-address box is the deny-all section once the
+        // default is in force, this daemon's opt-out excepted (NET-077) —
+        // while the record keeps the declaration untouched for the strict
+        // `GetSessionPolicy` reply.
+        let policy = effective_session_policy(
+            &record.policy,
+            record.network,
+            sessions::EGRESS_DEFAULT_PHASE,
+            self.deny_all_opt_out,
+        );
         Ok(session_host::SandboxLauncher {
             ctx: match phase {
                 LaunchPhase::Attached => self.context(true).await,
@@ -2176,7 +2340,7 @@ impl Session {
             attach_env,
             network_mode,
             net_switch: Arc::clone(&self.net_switch),
-            ingress,
+            policy,
             // The attach reports the lease through this, so the box's
             // `<name>.min.internal` proxy route exists exactly while the box
             // does (NET-001).
@@ -2194,6 +2358,12 @@ impl Session {
     /// Under test, swap in a mock launcher that runs a plain host process wired
     /// to the pty, exercising the session-host runtime without building a real
     /// sandbox (which needs packages unavailable in the unit-test tempdir).
+    ///
+    /// Kept separate from the production launcher: the two return *different*
+    /// launcher types (`SandboxLauncher` vs `MockLauncher`), each with its own
+    /// `SessionProcess`/`SessionGuard` associated types, and `SessionLauncher`
+    /// is not object-safe — merging them would force a boxed/dyn launcher
+    /// through the production spawn path.
     #[cfg(test)]
     async fn session_launcher(
         &mut self,
@@ -2207,7 +2377,7 @@ impl Session {
         record
             .validate_policy()
             .map_err(AttachError::InvalidPolicy)?;
-        Ok(session_host::MockLauncher)
+        Ok(session_host::MockLauncher::default())
     }
 
     /// Return this session's workspace-rooted [`mctx::Context`].
@@ -2243,7 +2413,7 @@ impl Session {
         if record.status != SessionStatus::Active {
             return Err(format!(
                 "session isn't attachable yet (status is {:?}, need Active — \
-                 finish the upload + FinalizeSession sequence first)",
+             finish the upload + FinalizeSession sequence first)",
                 record.status,
             ));
         }
@@ -2293,38 +2463,38 @@ impl Session {
         }
     }
 
-    /// The default `minimal.toml` [`Self::scaffold_mfile_if_missing`] writes:
-    /// `op::InitProject` detects the workspace's stack against the default
-    /// package repo, whose branch head it resolves over the network.
-    #[cfg(not(any(test, feature = "test-support")))]
+    /// The default `minimal.toml` [`Self::scaffold_mfile_if_missing`] writes.
+    ///
+    /// Production: `op::InitProject` detects the workspace's stack against the
+    /// default package repo, whose branch head it resolves over the network.
+    ///
+    /// Under `test`/`test-support`: stand in for that network round-trip. Tests
+    /// run offline, and what they need from the scaffold is that it lands before
+    /// the composition — not what stack detection would have picked. The two
+    /// packages are what `op::InitProject` falls back to when nothing matches.
     fn default_mfile_plan(
         &self,
         wsp: &DaemonAbsPath,
     ) -> Result<(std::path::PathBuf, String), String> {
-        let config = self.workspace_config(wsp)?;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            Ok((
+                wsp.as_utf8_path()
+                    .join(mfile::MFILE_NAME)
+                    .into_std_path_buf(),
+                "[session]\npackages = [\"base\", \"vim\"]\n".to_string(),
+            ))
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let config = self.workspace_config(wsp)?;
 
-        use op::ProjectOp as _;
-        let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
-        let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
+            use op::ProjectOp as _;
+            let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
+            let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
 
-        Ok((plan.toml_path, plan.content))
-    }
-
-    /// Under test, stand in for `op::InitProject`'s network round-trip: tests
-    /// run offline, and what they need from the scaffold is that it lands
-    /// before the composition — not what stack detection would have picked.
-    /// Same two packages `op::InitProject` falls back to when nothing matches.
-    #[cfg(any(test, feature = "test-support"))]
-    fn default_mfile_plan(
-        &self,
-        wsp: &DaemonAbsPath,
-    ) -> Result<(std::path::PathBuf, String), String> {
-        Ok((
-            wsp.as_utf8_path()
-                .join(mfile::MFILE_NAME)
-                .into_std_path_buf(),
-            "[session]\npackages = [\"base\", \"vim\"]\n".to_string(),
-        ))
+            Ok((plan.toml_path, plan.content))
+        }
     }
 
     /// Do the actual context construction: run [`mctx::Context::new`] against
@@ -2583,6 +2753,26 @@ impl SessionHandle {
         })
     }
 
+    /// Whether this daemon opted out of the deny-all egress default
+    /// (NET-077), for the task path's effective-egress resolution. A dead
+    /// actor maps to `NotConnected`.
+    pub(crate) async fn deny_all_opt_out(&self) -> Result<bool, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the actor may already be gone; the recv below reports that"
+        )]
+        let _ = self.0.send(SessionMessage::GetDenyAllOptOut(send)).await;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "a closed oneshot carries no cause beyond the actor being gone"
+        )]
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })
+    }
+
     /// Configure the session's loadout from the client's wire contribution:
     /// `Ok(None)` means the composition finalized and the session is now
     /// `Active`; `Ok(Some(response))` means the client must gate the returned
@@ -2753,6 +2943,19 @@ impl SessionHandle {
                 "session actor terminated before the host could be launched",
             ))),
         }
+    }
+
+    /// Registers a forward relay with the session it forwards for, so the
+    /// session aborts it at teardown.
+    ///
+    /// Best-effort by design: a send error means the session actor is
+    /// already gone, in which case the relay is about to learn the same
+    /// thing its client does — there is no session to outlive. The
+    /// connection layer ignores the outcome.
+    pub async fn track_forward(&self, forward: tokio::task::AbortHandle) {
+        // Ignore send errors - a session that is gone has nothing left to
+        // track, and the forward ends with it.
+        let _ = self.0.send(SessionMessage::TrackForward(forward)).await;
     }
 
     pub async fn attach(
