@@ -40,7 +40,7 @@ on:
 env:
     # Single source of truth for the gate's approver allowlist.
     # Comma-separated, no spaces (the polling step splits on `,`).
-    APPROVERS: bryan-minimal,evanspearman,jessie-minimal,jtnkminimal,Max-minimal,mitodrummer,msample,norrietaylor,twitchyliquid64
+    APPROVERS: bryan-minimal,evanspearman,jessie-minimal,jtnkminimal,Max-minimal,mitodrummer,msample,norrietaylor
 
 jobs:
     gate:
