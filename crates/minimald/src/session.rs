@@ -128,6 +128,60 @@ pub(crate) struct SessionConfig {
     /// route on spawn, relinks on rename, and withdraws on stop/destroy.
     #[cfg(target_os = "linux")]
     pub hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// Whether the daemon opted out of the deny-all egress default
+    /// (NET-077): the launcher and the task path read it to resolve this
+    /// session's effective egress (NET-074), and the start line below logs
+    /// it so a diagnostics bundle can name the posture without the daemon's
+    /// flags.
+    pub deny_all_opt_out: bool,
+}
+
+/// The egress *section* the gate compiles for a session: the materialized
+/// form of [`sessions::effective_egress`]'s answer — `None` for the shipped
+/// allow-all, the deny-all section for an absent declaration under the
+/// in-force default (NET-074), and a declaration verbatim. `phase` is the
+/// rollout phase to resolve under — the launcher and the task path pass
+/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
+/// tests pass [`sessions::EgressDefaultPhase::InForce`] so the posture the
+/// rollout ends at stays proven while the default is only announced
+/// (NET-076). `opt_out` is the daemon's deny-all opt-out (NET-077), threaded
+/// from the server config.
+///
+/// Shared by the session launcher (the box's own gate) and the task path
+/// ([`crate::exec::task_network`]), so a task runs under the same egress
+/// its session does.
+pub(crate) fn effective_egress_section(
+    policy: &sessions::SessionPolicy,
+    network: sessions::NetworkMode,
+    phase: sessions::EgressDefaultPhase,
+    opt_out: bool,
+) -> Option<sessions::EgressPolicy> {
+    match sessions::effective_egress(policy.egress.as_ref(), network, phase, opt_out) {
+        sessions::EffectiveEgress::DenyAll => Some(sessions::EgressPolicy::deny_all()),
+        sessions::EffectiveEgress::AllowAll => None,
+        sessions::EffectiveEgress::Declared(section) => Some(section),
+    }
+}
+
+/// The policy the gate enforces for a session: its declared ingress, and its
+/// egress resolved to the section [`effective_egress_section`] names — the
+/// deny-all section for an own-address box with no `egress` section once the
+/// default is in force (NET-074), the shipped allow-all for everything an
+/// opt-out (NET-077) or an earlier phase leaves in place, and a declaration
+/// verbatim. `phase` resolves under, exactly as [`effective_egress_section`]
+/// documents. The declaration on the record is left untouched: the strict
+/// `SessionPolicy` a client reads back stays exactly what the box was
+/// launched with.
+pub(crate) fn effective_session_policy(
+    policy: &sessions::SessionPolicy,
+    network: sessions::NetworkMode,
+    phase: sessions::EgressDefaultPhase,
+    opt_out: bool,
+) -> sessions::SessionPolicy {
+    sessions::SessionPolicy {
+        egress: effective_egress_section(policy, network, phase, opt_out),
+        ingress: policy.ingress.clone(),
+    }
 }
 
 /// Lifecycle-dependent state of a session actor: the multi-step create flow
@@ -374,6 +428,10 @@ enum SessionMessage {
     /// The daemon's shared gvproxy switch, reached through the session because
     /// that is the handle the task path holds.
     GetNetSwitch(oneshot::Sender<Arc<Mutex<crate::net::SwitchClient>>>),
+    /// Whether this daemon opted out of the deny-all egress default
+    /// (NET-077), read by the task path so a task resolves its session's
+    /// effective egress (NET-074) the same way the launcher does.
+    GetDenyAllOptOut(oneshot::Sender<bool>),
     /// Hand back the session's composition, if it has one. Sourced from
     /// the persisted snapshot: `Session::run` loads it at spawn, so this
     /// answers for an actor brought up from disk after a restart.
@@ -486,6 +544,12 @@ pub struct Session {
     /// interactive attach may respawn it. See [`HostOrigin`].
     host_origin: HostOrigin,
 
+    /// Whether this daemon opted out of the deny-all egress default
+    /// (NET-077), threaded from the server config: the launcher resolves
+    /// this session's effective egress (NET-074) against it, and the task
+    /// path reads it through the handle for the same resolution.
+    deny_all_opt_out: bool,
+
     /// The live direct-tcpip forwards opened for this session: one abort
     /// handle per relay the connection layer spawned. Pruned as relays
     /// finish; every live one is aborted by [`Session::stop_running`], so a
@@ -533,6 +597,7 @@ impl Session {
             record,
             net_switch,
             manager,
+            deny_all_opt_out,
             #[cfg(target_os = "linux")]
             hostnames,
         } = seed;
@@ -543,6 +608,7 @@ impl Session {
             minimal_cache_dir,
             daemon_ctx,
             net_switch,
+            deny_all_opt_out,
             tracker: OpTracker::new_root(),
             inner,
             workspace_baseline: WorkspaceBaseline::Unarmed,
@@ -628,6 +694,30 @@ impl Session {
         };
 
         let (sender, receiver) = mpsc::channel(8);
+        // One line per session start (NET-074/NET-076/NET-077): the rollout
+        // phase this build ships, the daemon's opt-out state, and the
+        // effective egress they leave this box with. The declaration
+        // travels on the record; these three are the facts a reader of a
+        // diagnostics bundle's daemon-log tail needs to explain why a box
+        // can — or cannot — reach anything, without the daemon's flags or
+        // its source at hand.
+        {
+            let record = obj.record();
+            tracing::info!(
+                session = %record.id,
+                name = ?record.name,
+                network = ?record.network,
+                egress_default_phase = ?sessions::EGRESS_DEFAULT_PHASE,
+                deny_all_opt_out = conf.deny_all_opt_out,
+                effective_egress = ?sessions::effective_egress(
+                    record.policy.egress.as_ref(),
+                    record.network,
+                    sessions::EGRESS_DEFAULT_PHASE,
+                    conf.deny_all_opt_out,
+                ),
+                "session starts"
+            );
+        }
         // A weak self-handle so the actor can hand its own mailbox to the
         // runtime objects it spawns without a caller threading it in.
         let weak_self = WeakSessionHandle(sender.downgrade());
@@ -966,6 +1056,13 @@ impl Session {
             }
             SessionMessage::GetNetSwitch(r) => {
                 let _ = r.send(Arc::clone(&self.net_switch));
+            }
+            SessionMessage::GetDenyAllOptOut(r) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = r.send(self.deny_all_opt_out);
             }
             #[cfg(test)]
             SessionMessage::PeekComposition(r) => {
@@ -2215,7 +2312,18 @@ impl Session {
         // host-address box may carry them (NET-120), and such a box never
         // reaches the relay. Only the ingress half is own-address-only, and
         // `validate_policy` has already rejected it on any other mode.
-        let policy = record.policy.clone();
+        //
+        // NET-074: the gate enforces the *effective* egress — an absent
+        // section on an own-address box is the deny-all section once the
+        // default is in force, this daemon's opt-out excepted (NET-077) —
+        // while the record keeps the declaration untouched for the strict
+        // `GetSessionPolicy` reply.
+        let policy = effective_session_policy(
+            &record.policy,
+            record.network,
+            sessions::EGRESS_DEFAULT_PHASE,
+            self.deny_all_opt_out,
+        );
         Ok(session_host::SandboxLauncher {
             ctx: match phase {
                 LaunchPhase::Attached => self.context(true).await,
@@ -2640,6 +2748,26 @@ impl SessionHandle {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::GetNetSwitch(send)).await;
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })
+    }
+
+    /// Whether this daemon opted out of the deny-all egress default
+    /// (NET-077), for the task path's effective-egress resolution. A dead
+    /// actor maps to `NotConnected`.
+    pub(crate) async fn deny_all_opt_out(&self) -> Result<bool, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the actor may already be gone; the recv below reports that"
+        )]
+        let _ = self.0.send(SessionMessage::GetDenyAllOptOut(send)).await;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "a closed oneshot carries no cause beyond the actor being gone"
+        )]
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })
