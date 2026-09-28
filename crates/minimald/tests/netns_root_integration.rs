@@ -20,6 +20,17 @@
 //!   and the same empty capability sets the box's own processes exec with,
 //!   so joining a running box cannot open a raw socket either.
 //!
+//! The sandbox-layer half of NET-083 is another crate's test binary,
+//! `crates/sandbox2/tests/caps_root_integration.rs`
+//! (`boxes_lack_cap_net_raw`), pinning the same credentials for the box's own
+//! processes. Test binaries in separate crates cannot call each other's
+//! helpers, so the plumbing this file and that one share — the base-directory
+//! choice with the `BELOW_BASE` room it leaves, the runner channel, the report
+//! parser, `assert_box_credentials` — is duplicated on purpose rather than
+//! shared through a cross-crate include: a change to any of it has to be made
+//! in both files, with each file's `BELOW_BASE` sized to its own longest box
+//! name.
+//!
 //! The own-IP proofs drive the **production** switch-attach wiring rather than a
 //! hand-rolled `ip netns` sequence: each task's namespace is created by the same
 //! `CLONE_NEWNET` `unshare` that `sandbox2::new_container` performs for own-IP

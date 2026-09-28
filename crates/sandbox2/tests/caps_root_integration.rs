@@ -19,6 +19,17 @@
 //! gate passes but that has no `gcc` fails the proof rather than skipping it
 //! into a false green.
 //!
+//! The injected-process half of NET-083 is another crate's test binary,
+//! `crates/minimald/tests/netns_root_integration.rs`
+//! (`injected_process_lacks_cap_net_raw`), pinning the same credentials for a
+//! process joined into a running box. Test binaries in separate crates cannot
+//! call each other's helpers, so the plumbing this file and that one share —
+//! the base-directory choice with the `BELOW_BASE` room it leaves, the runner
+//! channel, the report parser, `assert_box_credentials` — is duplicated on
+//! purpose rather than shared through a cross-crate include: a change to any of
+//! it has to be made in both files, with each file's `BELOW_BASE` sized to its
+//! own longest box name.
+//!
 //! To run locally you need a host that allows unprivileged user namespaces and
 //! a C compiler:
 //! `cargo nextest run -p sandbox2 boxes_lack_cap_net_raw`
