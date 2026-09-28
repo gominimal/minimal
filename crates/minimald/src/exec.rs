@@ -1967,7 +1967,11 @@ async fn handle_git_upload(
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "git init failed");
-                    channel.close().await.unwrap();
+                    let msg = format!("minimald: git init failed: {e}\n");
+                    let _ = channel.extended_data(1, msg.as_bytes()).await;
+                    let _ = channel.exit_status(1).await;
+                    let _ = channel.eof().await;
+                    let _ = channel.close().await;
                     return;
                 }
             }
