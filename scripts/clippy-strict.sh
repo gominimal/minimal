@@ -27,7 +27,7 @@
 # A build or tooling failure still exits non-zero under it — only hits are
 # demoted.
 #
-# BASE defaults to the merge-base with the main branch; only diagnostics whose
+# BASE defaults to the merge-base with `origin/main`; only diagnostics whose
 # primary span falls on a line added or changed since BASE are reported. Edits
 # that are not committed yet count, as do untracked files. Any further arguments
 # are passed to `cargo clippy` as the crate scope, overriding the derived one
@@ -66,7 +66,24 @@ if [ "$#" -gt 0 ]; then
     shift
 fi
 if [ -z "$base" ]; then
-    base="$(git merge-base main HEAD 2>/dev/null || git merge-base origin/main HEAD)"
+    # `origin/main`, not the local `main`. A branch that merges `origin/main`
+    # leaves the local ref where it was — agent sandboxes and worktrees never
+    # check main out at all — and the merge-base against a ref that stale
+    # predates the main commits the branch merged in, so every line of those
+    # commits reads as a line this branch changed. The gate then reports
+    # diagnostics on other people's code, under a heading saying they are
+    # yours. That is what it looked like: on the branch adding this comment,
+    # a local `main` ten commits behind turned a change touching no Rust at
+    # all into 14 changed Rust files across `minimald`, `sessions` and
+    # `switch`.
+    #
+    # The remote ref is the safe one by construction: `origin/main` cannot be
+    # behind anything the branch merged, because merging it required fetching
+    # it first, and a fetch only moves it forward. Stale means the base is
+    # merely older than the newest main, never older than this branch's own
+    # first commit. The local ref is kept as a fallback for a clone with no
+    # remote.
+    base="$(git merge-base origin/main HEAD 2>/dev/null || git merge-base main HEAD)"
 fi
 
 explicit_scope=("$@")
