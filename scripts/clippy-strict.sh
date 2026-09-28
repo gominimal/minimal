@@ -24,8 +24,11 @@
 # rather than a stop: the round's directive bounds what the change may touch, and
 # a gate that fails inside the innermost loop argues for editing past it. `just
 # ci` runs without it, which is where "before opening a PR" owns the decision.
-# A build or tooling failure still exits non-zero under it — only hits are
-# demoted.
+# Under it the script never exits non-zero: a build or tooling failure is
+# printed with its exit code and demoted too, because `just fix` is an autofix
+# loop that must be safe to run any number of times and must never stop on the
+# gate. Without it every failure is fatal, so `just ci` still cannot pass on a
+# gate that did not run.
 #
 # BASE defaults to the merge-base with `origin/main`; only diagnostics whose
 # primary span falls on a line added or changed since BASE are reported. Edits
@@ -33,6 +36,17 @@
 # are passed to `cargo clippy` as the crate scope, overriding the derived one
 # (the justfile pins it on macOS, where the Linux-only crates do not build).
 set -euo pipefail
+
+# A failure to run the gate at all. Enforcing, it is fatal with its own exit
+# code; report-only, it is said and demoted, so `just fix` never stops here.
+report_only_exit() {
+    if [ -n "${CLIPPY_STRICT_REPORT_ONLY:-}" ]; then
+        echo "clippy-strict: did not run to completion (exit $1); nothing enforced" \
+            "here, \`just ci\` is the gate" >&2
+        exit 0
+    fi
+    exit "$1"
+}
 
 lints=(
     clippy::string_slice
@@ -176,13 +190,13 @@ cargo clippy "${cargo_scope[@]}" --all-targets --locked --message-format=json --
 if [ "$status" -ne 0 ]; then
     echo "clippy-strict: cargo clippy failed (exit ${status})" >&2
     cat "$err_file" >&2
-    exit "$status"
+    report_only_exit "$status"
 fi
 
 # HITS_EXIT, and only HITS_EXIT, is the filter saying it found something. Any
 # other non-zero is the filter itself failing — no python3 on PATH, a crash in
-# it — and report-only must not demote that: a gate that exits 0 because it
-# could not run is worse than no gate.
+# it — and is said as such rather than read as clean: enforcing, it is fatal;
+# report-only, it is printed and demoted like everything else.
 HITS_EXIT=2
 hits_status=0
 python3 - "$HITS_EXIT" "$out_file" "$diff_file" "$untracked_file" "${lints[@]}" <<'PY' || hits_status=$?
@@ -295,5 +309,10 @@ if [ "$hits_status" -eq "$HITS_EXIT" ] && [ -n "${CLIPPY_STRICT_REPORT_ONLY:-}" 
         "\`just ci\` is the gate; in a revise or conflict round the directive" \
         "bounds the change, so these belong in \`notes\`." >&2
     exit 0
+fi
+if [ "$hits_status" -ne 0 ] && [ "$hits_status" -ne "$HITS_EXIT" ]; then
+    echo "clippy-strict: the diagnostic filter failed (exit ${hits_status});" \
+        "nothing was checked" >&2
+    report_only_exit "$hits_status"
 fi
 exit "$hits_status"
