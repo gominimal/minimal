@@ -78,7 +78,15 @@ After this ships, every box declares its size or takes the host's default, the h
   tier:     T0
   verify:   cargo nextest run -p minimald oom_applies_on_oom_and_records_event
 
-- **BRES-011** IF an OOM kill ends a box THEN THE SYSTEM SHALL record `exited.reason = "oom"` and return 137 from `min run` and `min box wait`.
+- **BRES-017** WHERE a box's `on_oom` is `kill_process`, IF the kernel kills a process in the box for memory THEN THE SYSTEM SHALL leave the box running when that process is not the box's entrypoint, and end the box to `exited` with `reason = "oom"` and `exit_code` 137 when it is.
+  tier:     T0
+  verify:   cargo nextest run -p minimald kill_process_oom_of_entrypoint_ends_box_oom_137
+
+- **BRES-018** WHERE a box's `on_oom` is `end_box`, IF the kernel kills a process in the box for memory THEN THE SYSTEM SHALL kill every process in the box, end the box to `exited` with `reason = "oom"` and `exit_code` 137, and then, for a box whose spec sets `lifetime = "until_stopped"`, apply its `[execution] restart` policy.
+  tier:     T0
+  verify:   cargo nextest run -p minimald end_box_oom_ends_box_then_service_follows_restart
+
+- **BRES-011** IF an OOM kill ends a box under BRES-017 or BRES-018 THEN THE SYSTEM SHALL record `exited.reason = "oom"` and return 137 from `min run` and `min box wait`.
   tier:     T0
   verify:   cargo nextest run -p minimald oom_ending_box_exits_137
 
@@ -121,6 +129,8 @@ After this ships, every box declares its size or takes the host's default, the h
 **The escape claim covers in-box root.** BRES-008 is written for every process in the box's namespaces including one running as root inside, and is testable as such. Limiting it to ordinary processes was rejected as a weaker claim than the mechanism provides.
 
 **The boxes subtree is tested on both enforced host kinds.** The subtree (BRES-007) exists on any `enforced` host: a native `local0` with a delegated memory controller, and the guest of a VM host. The native case is a root integration test in `minimald`; the VM case exists only with the VM host daemon in the loop, so its test names the VM lane (NET-107) rather than taking `tier: none`, which would have left the VM path unverified.
+
+**When an OOM kill ends a box is stated, not inferred.** The owner decided on 2026-09-28 to carry the architecture's two rules (Box Resources › `[execution] on_oom`) as BRES-017 and BRES-018: under `kill_process` an OOM kill of the entrypoint ends the box as `exited` with reason `oom` and code 137, and under `end_box` the box ends and a service then follows its `restart` policy. BRES-011's 137 return keys on them. The alternative, leaving BRES-010's "apply `on_oom`" as the only rule, was rejected: a session whose shell is OOM-killed could stay `running` with no entrypoint, BOX-038's end on the entrypoint's return would not fire because the entrypoint did not return, and `min box wait` would never return.
 
 **Generality:** every requirement is written for any host a daemon runs on and exercised on `local0` and `local-minvmd0`; a remote host inherits them unchanged, and the architecture has every host report the same fields. What varies by host is only whether it can enforce, and that is reported rather than assumed (BRES-012), so a host with no memory controller fits as `advisory`.
 

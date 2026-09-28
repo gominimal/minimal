@@ -43,7 +43,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   <!-- was BOX-007, without its `self` sub-bullet, which stays in BOX -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_address_accepts_id_name_and_qualified
-  - IF an unqualified name matches more than one running box across hosts THEN THE SYSTEM SHALL fail with exit 2 listing the candidates.
+  - IF an unqualified name matches running boxes on more than one host THEN THE SYSTEM SHALL report BOX-005's refusal with exit 2, listing each candidate with its host.
     tier:   T0
     verify: cargo nextest run -p minimal ambiguous_name_across_hosts_exit2_lists_candidates
 
@@ -71,7 +71,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   <!-- split from BOX-025: which verbs resume; the resume itself stays in BOX -->
   tier:     T0
   verify:   cargo nextest run -p minimal shell_attach_and_resume_verbs_resume_stopped_session
-  - IF `min shell`, `min attach` or `min box resume` would resume a box whose spec sets `pty_enabled` and whose name a running box on the same host holds THEN THE SYSTEM SHALL report BOX-025's refusal with exit 2, naming the running box, in the order BOX-025 states. Its hint says to rename the running box with `min box rename`, or to resume this box by its `box_id` after renaming it, and notes that another box may also hold a volume this box declares `rw`, which BVOL-013 then refuses with exit 5.
+  - IF `min shell`, `min attach` or `min box resume` would resume a box whose spec sets `pty_enabled` and whose name a running box on the same host holds THEN THE SYSTEM SHALL report BOX-025's refusal with exit 2, naming the running box, in the order BOX-025 states. Its hint says to rename the running box with `min box rename`, or to resume this box by its `box_id` after renaming it, and notes that another box may also hold a volume this box declares, which BVOL-013 then refuses with exit 5.
     tier:   T0
     verify: cargo nextest run -p minimal resume_name_conflict_exit2_names_holder
 
@@ -218,6 +218,10 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
     tier:   T0
     verify: cargo nextest run -p minimal shell_ambiguous_entries_exit2_lists
 
+- **BCLI-065** WHERE `--new` is given to `min shell` and a running box on the target host holds the entry's name THE SYSTEM SHALL name the new box `<entry>-<n>` for the smallest `n` from 1 whose name no running box on that host holds, record that name in the box's record, and show it in `min box list`.
+  tier:     T0
+  verify:   cargo nextest run -p minimal shell_new_takes_first_free_suffixed_name_shown_in_list
+
 - **BCLI-032** WHEN `min attach <box>` targets a box whose spec sets `pty_enabled` THE SYSTEM SHALL re-attach its PTY.
   <!-- was BOX-093 -->
   tier:     T0
@@ -255,12 +259,16 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   <!-- the presentation half of BOX-099, formerly BCLI-036; the exec operation returned to BOX as BOX-149 -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_exec_runs_command_and_exits_with_its_code
-  - WHERE `-t` is given to `min box exec` THE SYSTEM SHALL request a PTY exec as BOX-149 defines and print its exec id.
+  - WHERE `-t` is given to `min box exec` THE SYSTEM SHALL request a PTY exec as BOX-149 defines, print its exec id to stderr, and write nothing but the exec's output to stdout.
     tier:   T0
-    verify: cargo nextest run -p minimal box_exec_tty_prints_exec_id
-  - WHERE `--detach` is given to `min box exec` THE SYSTEM SHALL start a detached exec as BOX-149 defines, print its exec id, and return.
+    verify: cargo nextest run -p minimal box_exec_tty_prints_exec_id_to_stderr
+  - WHERE `--detach` is given to `min box exec` THE SYSTEM SHALL start a detached exec as BOX-149 defines, print only its exec id to stdout, and return.
     tier:   T0
     verify: cargo nextest run -p minimal box_exec_detach_prints_id_and_returns
+
+- **BCLI-067** WHEN `min box show <box>` runs THE SYSTEM SHALL list the box's live execs, each with its exec id, argv and whether it holds a PTY or is detached.
+  tier:     T0
+  verify:   cargo nextest run -p minimal box_show_lists_live_execs
 
 - **BCLI-054** WHEN `min attach <box> --exec <id>` runs THE SYSTEM SHALL re-attach that exec's PTY as BOX-149 defines.
   <!-- the presentation half of BOX-099, formerly a sub-bullet of BCLI-036 -->
@@ -282,7 +290,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal box_wait_exec_returns_exec_code
 
-- **BCLI-058** WHEN `min box rename <box> <name>` runs THE SYSTEM SHALL rename the box as BOX-010 defines.
+- **BCLI-058** WHEN `min box rename <box> <name>` runs THE SYSTEM SHALL rename the box as BOX-010 defines, reporting BOX-010's refusal with exit 2 naming the holder.
   tier:     T0
   verify:   cargo nextest run -p minimal box_rename_renames_as_box_010
 
@@ -294,7 +302,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal box_rm_reaps_as_box_019_force_forces
 
-- **BCLI-061** WHEN `min box prune` runs with `--stopped`, `--older-than <d>` or `--parent <box>` THE SYSTEM SHALL prune by the matching `stopped`, `older-than <d>` or `parent <box>` selector as BOX-021 defines.
+- **BCLI-061** WHEN `min box prune` runs THE SYSTEM SHALL prune as BOX-021 defines, narrowed by the `older-than <d>` or `parent <box>` selector for `--older-than <d>` or `--parent <box>`, and accept the architecture's `--stopped` as selecting every box BOX-021 may reap.
   tier:     T0
   verify:   cargo nextest run -p minimal box_prune_flags_map_to_box_021_selectors
 
@@ -302,18 +310,17 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal box_cp_reads_stopped_box_as_box_017
 
-- **BCLI-041** THE SYSTEM SHALL accept `min session exec` as a hidden alias of `min box exec` for one release.
-  <!-- was BOX-106 -->
-  tier:     T0
-  verify:   cargo nextest run -p minimal session_exec_alias_hidden_one_release
-
-- **BCLI-042** THE SYSTEM SHALL accept, as hidden aliases for one release that print one stderr hint naming the replacement and leave `-o json` output unchanged, `session activate` as `session start` (a path mapping to the entry, `--name` to the box name, and `--network` and `--ingress` to BCLI-024's overrides), `session destroy` as `box rm --force`, `session exec` as `box exec`, `session rename` as `box rename`, `session policy` as `box show --network`, `session hooks` as `box show`, `session run <box> <task>` as `box exec <box> -- min run <task>`, `task run --keep` as `task run` with `--keep` ignored, and bare `stop` as `host stop` on the local host.
+- **BCLI-042** THE SYSTEM SHALL accept, as hidden aliases for one release that print one stderr hint naming the replacement and leave `-o json` output unchanged, `session activate` as `session start` (a path mapping to the entry, `--name` to the box name, and `--network` and `--ingress` to BCLI-024's overrides), `session destroy` as `box rm --force`, `session exec` as `box exec`, `session rename` as `box rename`, `session policy` as `box show --network`, `session hooks` as `box show`, `task run --keep` as `task run` with `--keep` ignored, and bare `stop` as `host stop` on the local host.
   <!-- was BOX-107; the mapping follows epic S12. `session destroy` maps to the forced reap (BOX-019) so a live box is still stopped and removed and BEP-043's revoke-on-destroy fires; a bare `session rm` of a running box is refused (BCLI-004). -->
   tier:     T0
   verify:   cargo nextest run -p minimal legacy_session_verbs_alias_with_hint
-  - IF an alias from BCLI-041, BCLI-042 or BCLI-046 is invoked after the release that accepted it THEN THE SYSTEM SHALL fail with exit 2 carrying the same hint.
+  - IF an alias from BCLI-042 or BCLI-046 is invoked after the release that accepted it THEN THE SYSTEM SHALL fail with exit 2 carrying the same hint.
     tier:   T0
     verify: cargo nextest run -p minimal aliases_exit2_after_grace_release
+
+- **BCLI-066** IF `min session run` is invoked THEN THE SYSTEM SHALL fail with exit 2 and a hint naming `min run <task>`.
+  tier:     T0
+  verify:   cargo nextest run -p minimal session_run_exit2_hints_min_run
 
 - **BCLI-043** THE SYSTEM SHALL keep `session setup-zed` hidden and unchanged.
   <!-- was BOX-108 -->
@@ -354,11 +361,6 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
     tier:   T0
     verify: cargo nextest run -p minimal host_stop_force_forces_boxes_and_daemon
 
-- **BCLI-050** THE SYSTEM SHALL map bare `min stop`, a BCLI-042 alias, to `min host stop` on the local host for one release, after which BCLI-042 applies.
-  <!-- was BOX-116 -->
-  tier:     T0
-  verify:   cargo nextest run -p minimal bare_stop_aliases_host_stop
-
 - **BCLI-051** THE SYSTEM SHALL show the host of every box in `min ls` and `min box list`.
   <!-- was BOX-117 -->
   tier:     T0
@@ -384,9 +386,15 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 **The grammar is a sibling of the model.** The owner split the grammar out of BOX on 2026-09-25. The model lands first because the networking and egress-proxy specs bind to the box spec and record, not to verbs, and are blocked until it exists; the grammar is scheduled and reviewed separately; and a client other than the CLI binds to the model, so BOX states its behaviour as operations and this spec maps verbs onto them. Every requirement here was moved from BOX with its text, tier and test, and the comment under each names its BOX id. The exec operations (running the command in the box, client loss, stopping an exec, its events and `exec_enabled`) are daemon behaviour and live in BOX as BOX-149 to BOX-153; BCLI-053 to BCLI-057 are only the verbs and flags that drive them.
 
-**Old spellings hint for one release, then fail.** The architecture's command tree is taken verbatim; the additions are `min box rename`, `min host stop`, `min box prune --dry-run` (BCLI-006) and the create-time `--network` and `--ingress` overrides (BCLI-024), which `min box spec <entry>` also accepts so the pre-flight render is what the daemon receives (BCLI-021), each an open question below. `session destroy` maps to `box rm --force` rather than `session rm`, because a live session must still be stopped and removed and BEP-043's revoke-on-destroy must still fire. `session policy` stays reachable as an alias of `box show --network` (BCLI-025), the successor that carries NET-061's effective egress and the draft GWI-003's exposures. Every old spelling (the session verbs, `task run --keep`, bare `min stop`, and the `local-minimald` and `local-minvmd` provider values) stays as a hidden alias for one release, printing one hint naming its replacement, and fails with exit 2 and the same hint the release after (BCLI-041, BCLI-042, BCLI-046, BCLI-050). Bare `min stop` maps to `min host stop` because what it stops today is the daemon, not a box.
+**Old spellings hint for one release, then fail.** The architecture's command tree is taken verbatim; the additions are `min box rename`, `min host stop`, `min box prune --dry-run` (BCLI-006) and the create-time `--network` and `--ingress` overrides (BCLI-024), which `min box spec <entry>` also accepts so the pre-flight render is what the daemon receives (BCLI-021), each an open question below. `session destroy` maps to `box rm --force` rather than `session rm`, because a live session must still be stopped and removed and BEP-043's revoke-on-destroy must still fire. `session policy` stays reachable as an alias of `box show --network` (BCLI-025), the successor that carries NET-061's effective egress and the draft GWI-003's exposures. Every old spelling (the session verbs except `session run`, `task run --keep`, bare `min stop`, and the `local-minimald` and `local-minvmd` provider values) stays as a hidden alias for one release, printing one hint naming its replacement, and fails with exit 2 and the same hint the release after (BCLI-042, BCLI-046). Bare `min stop` maps to `min host stop` because what it stops today is the daemon, not a box. The former BCLI-041 (`session exec`) and BCLI-050 (bare `min stop`) restated rows of BCLI-042's table and were deleted; their numbers stay unused.
 
-**Resume restarts processes; enrolled identity composes with it.** BCLI-007 and BCLI-009 drive BOX-025 and BOX-030's restart of a stopped or exited box's processes, and the refusal is only for restarting the processes of a non-PTY box, whose restart is a new `min run`. Under enrollment, re-establishing identity for any box, non-PTY included, is Gatehouse §6.3.3's (which names `min box resume <box>` among its paths); it composes with this, as BOX's Design reasoning states. A resume refused because a running box holds the name exits 2 by this spec's choice, as a usage-shaped refusal like the ambiguous-name error, rather than the policy exit 5. A resume refused because another box holds a volume the box declares `rw` exits 5 (BVOL-013); the name check runs before the spec and volume checks, so a resume that meets both refusals exits 2.
+**`min session run` is refused, not aliased.** The owner decided on 2026-09-28 to drop the `session run <box> <task>` row from BCLI-042 and have `min session run` fail with exit 2 and a hint naming `min run <task>` (BCLI-066). The rejected alternative, aliasing it to `box exec <box> -- min run <task>`, needs `min` inside the box and the nested `local-box` provider, and nesting is a non-goal (gominimal/inbox#568): on a stock box it exits 127, so the one-release alias would not have worked for this verb.
+
+**`min shell --new` takes the first free suffixed name.** BOX-004 keeps names unique among a host's running boxes, and a box name defaults to its entry's. The owner decided on 2026-09-28 that a second instance takes `<entry>-1`, `<entry>-2`, …, the first not held by a running box on that host, recorded on the record and shown by `min box list` (BCLI-065), as the architecture's `dev-1` addressing example implies. The alternatives were refusing `--new` while the entry's name is held, which makes the flag unusable, and a daemon-invented name no requirement documents.
+
+**The exec id never enters the exec's stdout.** The owner decided on 2026-09-28 that `min box exec -t` prints the exec id to stderr, so stdout carries only the exec's output, while `--detach`, which has no other output, prints only the id on stdout; `min box show <box>` lists the live execs (BCLI-053, BCLI-067). The rejected alternative printed the id on stdout under `-t`, where it lands in the attached PTY stream and any transcript wrapping it, against the architecture's payload-only stdout (design principle 4).
+
+**Resume restarts processes; enrolled identity composes with it.** BCLI-007 and BCLI-009 drive BOX-025 and BOX-030's restart of a stopped or exited box's processes, and the refusal is only for restarting the processes of a non-PTY box, whose restart is a new `min run`. Under enrollment, re-establishing identity for any box, non-PTY included, is Gatehouse §6.3.3's (which names `min box resume <box>` among its paths); it composes with this, as BOX's Design reasoning states. A resume refused because a running box holds the name exits 2 by this spec's choice, as a usage-shaped refusal like the ambiguous-name error, rather than the policy exit 5. A resume refused because another box holds a volume the box declares exits 5 (BVOL-013); the name check runs before the spec and volume checks, so a resume that meets both refusals exits 2.
 
 **`min host stop` stops the boxes first.** The owner decided on 2026-09-25 that BCLI-049 stops each running box as BOX-013 defines and then the daemon, and that `--force` forces both, so a host shuts down in one step and every stopped record resumes later. The alternative, refusing while any box runs, was rejected by the owner. A record left `running` by a daemon that did not get to stop it becomes `stopped` on restart (BOX-154).
 
@@ -412,4 +420,4 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 - [NEEDS CLARIFICATION (MEDIUM): BCLI-007 gives `min box resume` a process-restart meaning beyond the architecture's gloss ("re-establish identity for a stopped/host-resumed box"); the architecture needs one line saying the verb also restarts a PTY box's processes (raised on gominimal/arch#98 (comment)).]
 - [NEEDS CLARIFICATION (MEDIUM): NET-035 binds `--help` to `min session activate`, and NET-061 and the draft GWI-003 cite `min session policy`; both are BCLI-042 aliases for one release, and NET-035, NET-061 and GWI-003 should re-cite `min session start` and `min box show --network` (BCLI-025) before the aliases are removed.]
 - [NEEDS CLARIFICATION (LOW): the architecture's `min box prune` has no `--dry-run` (BCLI-006), and no create verb carries `--network` or `--ingress` overrides (BCLI-024), nor does its expansion order have the command-line override layer those flags feed (BOX-064), nor does `min box spec <entry>` accept them so its render stays exactly what a Box Host receives (BCLI-021); each is this spec's addition pending one architecture line (raised on gominimal/arch#98 (comment)).]
-- [NEEDS CLARIFICATION (MEDIUM): the architecture's command tree lacks `min box rename`, the replacement BCLI-042 names for `session rename`, and `min host stop` (BCLI-049, BCLI-050); both are written to this spec's additions pending one architecture line each (gominimal/arch#98).]
+- [NEEDS CLARIFICATION (MEDIUM): the architecture's command tree lacks `min box rename`, the replacement BCLI-042 names for `session rename`, and `min host stop` (BCLI-049, and BCLI-042's bare `stop` row); both are written to this spec's additions pending one architecture line each (gominimal/arch#98).]

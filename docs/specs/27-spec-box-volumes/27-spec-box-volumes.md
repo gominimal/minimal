@@ -27,7 +27,7 @@ This spec is the first backing: a volume lives on the host that runs the box, in
 
 ## Requirements
 
-- **BVOL-001** WHERE an entry declares `volumes = ["<name>", …]` THE SYSTEM SHALL mount each named volume at `/volumes/<name>` in every box created from that entry.
+- **BVOL-001** WHERE an entry declares `volumes = ["<name>", …]` THE SYSTEM SHALL mount each named volume read-write at `/volumes/<name>` in every box created from that entry, taking each `volumes` item as a bare volume name only.
   tier:     T0
   verify:   cargo nextest run -p minimald declared_volume_is_mounted
 
@@ -39,13 +39,9 @@ This spec is the first backing: a volume lives on the host that runs the box, in
   tier:     T0
   verify:   cargo nextest run -p minimald create_or_resume_reattaches_volume_by_project_and_name_keeps_contents
 
-- **BVOL-004** IF a box declares `rw` access to a volume that another box holds for writing THEN THE SYSTEM SHALL refuse the box with exit 5, naming the holding box.
+- **BVOL-004** IF a box declares a volume that another box holds for writing THEN THE SYSTEM SHALL refuse the box with exit 5, naming the holding box.
   tier:     T0
   verify:   cargo nextest run -p minimald second_writer_refused_exit5_names_holder
-
-- **BVOL-005** WHILE a box holds a volume for writing THE SYSTEM SHALL mount the volume in any number of other boxes that declare it `ro`.
-  tier:     T0
-  verify:   cargo nextest run -p minimald readers_unlimited_while_writer_holds
 
 - **BVOL-006** THE SYSTEM SHALL provide `min volume list`, `show`, `rm` and `prune [--unused-for <d>]`, rendering each volume's project, size, last use and the boxes that used it.
   tier:     T0
@@ -63,11 +59,11 @@ This spec is the first backing: a volume lives on the host that runs the box, in
   tier:     T0
   verify:   cargo nextest run -p minimald volume_never_mounted_across_projects
 
-- **BVOL-010** THE SYSTEM SHALL hold each volume a box declares `rw` for writing while the box is `pending`, `materializing`, `running` or `stopped`, and release that hold when the box reaches `exited` or is reaped.
+- **BVOL-010** THE SYSTEM SHALL hold each volume a box declares for writing while the box is `pending`, `materializing`, `running` or `stopped`, and release that hold when the box reaches `exited` or is reaped.
   tier:     T0
   verify:   cargo nextest run -p minimald write_hold_kept_while_stopped_released_on_exit
 
-- **BVOL-013** IF an `exited` box whose spec sets `pty_enabled` is resumed while another box holds for writing a volume the resumed box declares `rw` THEN THE SYSTEM SHALL refuse the resume with exit 5, naming the holding box, and leave the record `exited`, evaluated last in the resume refusal order BOX-025 states.
+- **BVOL-013** IF an `exited` box whose spec sets `pty_enabled` is resumed while another box holds for writing a volume the resumed box declares THEN THE SYSTEM SHALL refuse the resume with exit 5, naming the holding box, and leave the record `exited`, evaluated last in the resume refusal order BOX-025 states.
   tier:     T0
   verify:   cargo nextest run -p minimald resume_from_exited_refused_exit5_when_volume_held
 
@@ -75,13 +71,14 @@ This spec is the first backing: a volume lives on the host that runs the box, in
   tier:     T0
   verify:   cargo nextest run -p minimald volume_prune_skips_held_prunes_exited_writers
 
-- **BVOL-011** THE SYSTEM SHALL accept each `volumes` item as a bare name, meaning `mode = "rw"`, or as `{ name = "<name>", mode = "rw" | "ro" }`, holding an `rw` volume for writing and mounting an `ro` volume read-only.
-  tier:     T0
-  verify:   cargo nextest run -p minimald volume_mode_bare_is_rw_and_ro_mounts_read_only
+- **BVOL-014** THE SYSTEM SHALL deduplicate an expanded spec's `volumes` list by name, keeping each name's first occurrence in BOX-064's layer order, so each name appears once.
+  tier:     T1
+  verify:   cargo nextest run -p mfile expanded_volumes_deduplicated_first_occurrence_order
+  property: For every set of layers whose `volumes` lists share names, the expanded `volumes` list holds each name exactly once, in the order of its first occurrence across the layers, and expanding twice yields identical bytes.
 
 ## Non-goals
 
-- Object-storage backing and point-in-time readers: the architecture's Box Volume (Glossary › Box Volume); a second backing behind this interface.
+- Object-storage backing and read-only readers of a point-in-time value: the architecture's Box Volume (Glossary › Box Volume); a second backing behind this interface, which adds the reader form.
 - Sharing a volume across hosts: a local volume exists only on the host that created it; cross-host reuse arrives with the object-storage backing.
 
 ## Design reasoning
@@ -92,7 +89,9 @@ This spec is the first backing: a volume lives on the host that runs the box, in
 
 **A write hold ends when the box exits, not when it stops.** The owner decided on 2026-09-25 that a box keeps its write hold while `stopped` and releases it on reaching `exited` (BVOL-010), so a task re-run at once takes the volume its previous run just wrote, and a stopped session still resumes with its volume. The exited record and the volume's files stay readable; only the hold drops. `min volume prune` skips only a volume that is still held, so a volume whose writers have all exited can be pruned (BVOL-012). Two alternatives were rejected by the owner. Keeping the hold until the box is reaped, for every box, made each repeat run of a task fail with exit 5 until the previous run was pruned. Releasing on exit only for `until_complete` boxes had the same effect keyed on the lifetime, since a session is `until_complete` too. The accepted consequence is that a session whose shell exited, which is `exited` and still resumable as a PTY box (BOX-030), may find its volume held by another box on resume, and is then refused by the single-writer rule with exit 5 (BVOL-013). Because an exited box holds nothing, `min volume prune` may also remove an exited resumable box's volume; the resume then starts with a fresh, empty volume (BVOL-002), or, if another box has meanwhile recreated a volume of that name for the project, with that volume and its contents (BVOL-003).
 
-**A bare volume name means read-write.** The owner decided on 2026-09-25 that `volumes = ["cache"]` holds the volume for writing, matching the architecture's `volumes = ["dev"]` example, which implies a writer; `{ name, mode = "ro" }` is the reader form (BVOL-011). The alternative, a bare name meaning read-only, was rejected by the owner because it diverges from that example.
+**A volume entry is a bare name, always read-write, with one holder.** The owner decided on 2026-09-25 that `volumes = ["cache"]` holds the volume for writing, matching the architecture's `volumes = ["dev"]` example, which implies a writer, and on 2026-09-28 dropped the `{ name, mode = "ro" }` reader form, so every entry is a bare name, mounted read-write, and held by one box at a time (BVOL-001, BVOL-004, BVOL-010). The rejected alternative was a live read-only view: mounting the directory a writer is changing into reader boxes. The architecture's Box Volume gives a reader "a specific point-in-time value" and is "backed solely by an Object Store"; a live view would hand readers a torn, half-written state and would change what a reader observes when object storage arrives, which this spec promises it will not. Read-only readers therefore arrive with the object-storage backing.
+
+**Layer union cannot duplicate a volume.** `volumes` is a list, which BOX-048 and BOX-064 union across layers, so `[defaults] volumes = ["cache"]` and an entry's `volumes = ["cache"]` would otherwise expand to two items. The owner decided on 2026-09-28 that the expanded list is deduplicated by name keeping first-occurrence order (BVOL-014), so the expanded spec stays byte-identical (BOX-065) and each name is mounted and held once. With no access mode there is nothing to conflict. The alternative, refusing a duplicate with exit 3, was rejected because a union across layers producing the same name is the ordinary case, not a mistake.
 
 **Generality:** a second backing fits because the requirements name the interface (the `volumes` key, the single-writer rule, the `min volume` verbs, survival past `min box rm`), not the directory.
 
@@ -110,6 +109,6 @@ This spec is the first backing: a volume lives on the host that runs the box, in
 
 - [NEEDS CLARIFICATION (HIGH): the state directory path on each host kind and who owns the volume directories (the daemon's user, the box's user, or root); the epic's own note on S19 asks for this before sizing.]
 - [NEEDS CLARIFICATION (MEDIUM): neither the architecture's `box.toml` nor its Glossary gives the path at which a volume is mounted inside a box; BVOL-001 fixes `/volumes/<name>` as this spec's decision pending an architecture line.]
-- [NEEDS CLARIFICATION (MEDIUM): the architecture's `box.toml` writes `volumes` with no access mode; BVOL-011 adds one pending an architecture line.]
+- [NEEDS CLARIFICATION (MEDIUM): the architecture's Glossary says a Box Volume is "backed solely by an Object Store"; this spec's local-directory backing needs that line amended to admit a host-local, writer-only backing ahead of object storage.]
 - [NEEDS CLARIFICATION (MEDIUM): what identifies a project for BVOL-009, its root directory's path or a stable id; a path changes when the project directory moves, which would orphan its volumes.]
 - [NEEDS CLARIFICATION (LOW): whether `min box rm` of the last box that wrote a volume should warn that the volume remains (BVOL-008).]
