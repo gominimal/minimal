@@ -451,11 +451,18 @@ impl Binding {
     /// Hands `kind` to the host, giving up if the binding is shed first.
     ///
     /// The host's stdin queue fills when the shell stops reading its input,
-    /// and a binding parked here would never see the shed.
-    async fn send_to_host(&self, kind: StdinMsgKind) -> Result<(), ()> {
+    /// and a binding parked here would never see the shed. Takes the fields
+    /// it needs rather than `&self`, because [`Self::run`] has moved the
+    /// channel out of `self` by the time it sends.
+    async fn send_to_host(
+        stdin_tx: &mpsc::Sender<StdinMsg>,
+        generation: u64,
+        shed: &CancellationToken,
+        kind: StdinMsgKind,
+    ) -> Result<(), ()> {
         tokio::select! {
-            _ = self.stdin_tx.send(StdinMsg::new(self.generation, kind)) => Ok(()),
-            () = self.shed.cancelled() => Err(()),
+            _ = stdin_tx.send(StdinMsg::new(generation, kind)) => Ok(()),
+            () = shed.cancelled() => Err(()),
         }
     }
 
@@ -485,7 +492,7 @@ impl Binding {
                     Some(msg) => {
                         match msg {
                             russh::ChannelMsg::Data{ data } => {
-                                if self.send_to_host(StdinMsgKind::Bytes(data)).await.is_err() {
+                                if Self::send_to_host(&self.stdin_tx, self.generation, &self.shed, StdinMsgKind::Bytes(data)).await.is_err() {
                                     break MainloopExitReason::Shed;
                                 }
                             }
@@ -504,7 +511,7 @@ impl Binding {
                                     term: term.to_string(),
                                     modes: terminal_modes.to_vec(),
                                 });
-                                if self.send_to_host(update).await.is_err() {
+                                if Self::send_to_host(&self.stdin_tx, self.generation, &self.shed, update).await.is_err() {
                                     break MainloopExitReason::Shed;
                                 }
                             },
@@ -517,7 +524,7 @@ impl Binding {
                                 let change = StdinMsgKind::WindowChange {
                                     col_width, row_height, pix_width, pix_height,
                                 };
-                                if self.send_to_host(change).await.is_err() {
+                                if Self::send_to_host(&self.stdin_tx, self.generation, &self.shed, change).await.is_err() {
                                     break MainloopExitReason::Shed;
                                 }
                             },
