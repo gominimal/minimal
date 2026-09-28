@@ -162,15 +162,19 @@ if [ "$status" -ne 0 ]; then
     exit "$status"
 fi
 
-# A non-zero exit from here is hits, and nothing else: the cargo failure above
-# already left. So report-only can demote this without hiding a broken build.
+# HITS_EXIT, and only HITS_EXIT, is the filter saying it found something. Any
+# other non-zero is the filter itself failing — no python3 on PATH, a crash in
+# it — and report-only must not demote that: a gate that exits 0 because it
+# could not run is worse than no gate.
+HITS_EXIT=2
 hits_status=0
-python3 - "$out_file" "$diff_file" "$untracked_file" "${lints[@]}" <<'PY' || hits_status=$?
+python3 - "$HITS_EXIT" "$out_file" "$diff_file" "$untracked_file" "${lints[@]}" <<'PY' || hits_status=$?
 import json
 import sys
 
-out_path, diff_path, untracked_path = sys.argv[1], sys.argv[2], sys.argv[3]
-strict = set(sys.argv[4:])
+hits_exit = int(sys.argv[1])
+out_path, diff_path, untracked_path = sys.argv[2], sys.argv[3], sys.argv[4]
+strict = set(sys.argv[5:])
 
 # path -> [(start, end)] of lines added or changed in the new revision.
 changed = {}
@@ -262,12 +266,14 @@ if hits:
         f'with #[expect(<lint>, reason = "...")]. Re-run: just clippy-strict',
         file=sys.stderr,
     )
-    sys.exit(1)
+    # Distinct from the 1 an unhandled exception here would exit with, so the
+    # caller can demote hits without demoting a broken filter.
+    sys.exit(hits_exit)
 
 print("clippy-strict: clean")
 PY
 
-if [ "$hits_status" -ne 0 ] && [ -n "${CLIPPY_STRICT_REPORT_ONLY:-}" ]; then
+if [ "$hits_status" -eq "$HITS_EXIT" ] && [ -n "${CLIPPY_STRICT_REPORT_ONLY:-}" ]; then
     echo "clippy-strict: reported, not enforced here." \
         "\`just ci\` is the gate; in a revise or conflict round the directive" \
         "bounds the change, so these belong in \`notes\`." >&2

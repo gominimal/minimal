@@ -315,7 +315,10 @@ clippy:
 #
 # Strict Clippy on the lines this branch changed, scoped to the crates you touched.
 clippy-strict BASE="":
-    scripts/clippy-strict.sh "{{BASE}}" {{strict-scope}}
+    # Cleared, not inherited: an exported CLIPPY_STRICT_REPORT_ONLY would make
+    # this recipe report and exit 0, and `just ci` depends on it, so one stray
+    # export in a shell profile would turn the gate off without saying so.
+    CLIPPY_STRICT_REPORT_ONLY= scripts/clippy-strict.sh "{{BASE}}" {{strict-scope}}
 
 # A local advisories failure may just mean newer RUSTSEC data than CI's last run.
 # CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).
