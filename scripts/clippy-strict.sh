@@ -19,6 +19,14 @@
 #
 # Usage: scripts/clippy-strict.sh [BASE] [CARGO_SCOPE...]
 #
+# CLIPPY_STRICT_REPORT_ONLY=1 prints the diagnostics and exits 0. `just fix` sets
+# it, because that recipe is the mid-edit loop and a hit there is information
+# rather than a stop: the round's directive bounds what the change may touch, and
+# a gate that fails inside the innermost loop argues for editing past it. `just
+# ci` runs without it, which is where "before opening a PR" owns the decision.
+# A build or tooling failure still exits non-zero under it — only hits are
+# demoted.
+#
 # BASE defaults to the merge-base with the main branch; only diagnostics whose
 # primary span falls on a line added or changed since BASE are reported. Edits
 # that are not committed yet count, as do untracked files. Any further arguments
@@ -154,7 +162,10 @@ if [ "$status" -ne 0 ]; then
     exit "$status"
 fi
 
-python3 - "$out_file" "$diff_file" "$untracked_file" "${lints[@]}" <<'PY'
+# A non-zero exit from here is hits, and nothing else: the cargo failure above
+# already left. So report-only can demote this without hiding a broken build.
+hits_status=0
+python3 - "$out_file" "$diff_file" "$untracked_file" "${lints[@]}" <<'PY' || hits_status=$?
 import json
 import sys
 
@@ -255,3 +266,11 @@ if hits:
 
 print("clippy-strict: clean")
 PY
+
+if [ "$hits_status" -ne 0 ] && [ -n "${CLIPPY_STRICT_REPORT_ONLY:-}" ]; then
+    echo "clippy-strict: reported, not enforced here." \
+        "\`just ci\` is the gate; in a revise or conflict round the directive" \
+        "bounds the change, so these belong in \`notes\`." >&2
+    exit 0
+fi
+exit "$hits_status"

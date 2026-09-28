@@ -206,7 +206,9 @@ for your OS, and then `clippy-strict`, which applies a stricter lint set to
 the lines your branch changed. Run `just clippy-strict` alone to see just
 those. That gate is local only: no CI lane runs it, so its hits never turn
 a PR red, and in a revise or conflict round the directive bounds the
-change, so report its hits in `notes` rather than fix them. Platform notes
+change, so report its hits in `notes` rather than fix them. `just fix`
+reports it without failing for that reason; `just ci` is where it stops
+you, because that is the round that owns the judgement. Platform notes
 for agents:
 
 - **macOS**: the workspace does not build natively (see
@@ -217,6 +219,6 @@ for agents:
 - **VM/daemon-path changes**: also run `just e2e` (the session proof)
   and/or `just test-vm` (the VM integration harnesses).
 - **Tight iteration loops**: `just fix` (fmt → `clippy --fix` → fmt, then the
-  strict clippy gate, with `--allow-dirty` so it runs mid-edit) then
-  `just test`. Both carry this host's scope; neither needs a hand-written
-  `cargo` line.
+  strict clippy gate reported but not enforced, with `--allow-dirty` so it
+  runs mid-edit) then `just test`. Both carry this host's scope; neither
+  needs a hand-written `cargo` line.
