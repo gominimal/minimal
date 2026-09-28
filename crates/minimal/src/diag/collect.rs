@@ -1180,6 +1180,7 @@ mod tests {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&image)
             .unwrap();
         f.set_len(1024 * 1024).unwrap();
