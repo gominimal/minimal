@@ -1932,6 +1932,7 @@ async fn handle_git_upload(
             Ok(paths) => paths,
             Err(e) => {
                 tracing::warn!(error = %e, "git-upload-pack aborted: session is gone");
+                let _ = channel.close().await;
                 return;
             }
         };
