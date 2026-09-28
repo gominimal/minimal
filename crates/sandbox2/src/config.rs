@@ -12,11 +12,15 @@ use std::path::{Path, PathBuf};
 /// user namespace and the kernel therefore clears its effective and permitted
 /// capability sets at exec. The same uid is the one
 /// `common::synth_user_group_config` writes the box's `/etc/passwd` entry for,
-/// so the name the box reports and the uid it holds agree.
+/// so the name the box reports and the uid it holds agree. `common` cannot
+/// depend on this crate, so no type can hold that agreement;
+/// `the_synth_passwd_entry_names_the_box_uid_and_gid` does, reading the entries
+/// the function writes and failing when they name another uid.
 pub const BOX_UID: u32 = 1000;
 
 /// The gid every box execs as inside its user namespace, mapped onto the
-/// daemon's own gid the same way [`BOX_UID`] is mapped onto its uid.
+/// daemon's own gid the same way [`BOX_UID`] is mapped onto its uid. The
+/// synthesized `group` entry is held to it by the same test.
 pub const BOX_GID: u32 = 1000;
 
 /// A capability no box may hold: its kernel number (these are ABI, assigned
@@ -784,5 +788,74 @@ mod tests {
 
         let build = Config::new("test").with_home(Some("/elsewhere"));
         assert_eq!(build.sandbox_home(), "/state/home");
+    }
+
+    /// One file of a synthesized `etc`, read back from disk: what these tests
+    /// check is what `common::synth_user_group_config` wrote, not what it was
+    /// asked to write.
+    fn synth_file(dir: &tempfile::TempDir, file: &str) -> String {
+        std::fs::read_to_string(dir.path().join("etc").join(file))
+            .unwrap_or_else(|e| panic!("reading the synthesized {file}: {e}"))
+    }
+
+    /// The `name` entry of a synthesized passwd or group `content`, so a test
+    /// can read the entry the box's reported identity comes from.
+    fn synth_entry<'a>(content: &'a str, name: &str, file: &str) -> &'a str {
+        let not_there = format!("no {name} entry in the synthesized {file}: {content}");
+        content
+            .lines()
+            .find(|line| line.split(':').next() == Some(name))
+            .unwrap_or_else(|| panic!("{not_there}"))
+    }
+
+    /// The numeric field at `index` of a colon-separated passwd or group
+    /// `entry`, named by `what` in the panics a malformed entry raises.
+    fn synth_number(entry: &str, index: usize, what: &str) -> u32 {
+        let missing = format!("{what} is missing from the entry: {entry}");
+        let field = entry
+            .split(':')
+            .nth(index)
+            .unwrap_or_else(|| panic!("{missing}"));
+        let not_a_number = format!("{what} is not a number in the entry: {entry}");
+        field.parse().unwrap_or_else(|_| panic!("{not_a_number}"))
+    }
+
+    /// The agreement `BOX_UID`'s documentation promises: the uid every box
+    /// execs as and the uid `common::synth_user_group_config` writes the box's
+    /// `/etc/passwd` entry for are the same, and likewise the gids — so the
+    /// name a box reports and the id it holds agree.
+    ///
+    /// `common` cannot depend on this crate, so no type holds the two
+    /// constants together; this test does, by reading the files the function
+    /// writes. A change to either side fails here, rather than leaving a box
+    /// reporting a name that maps to a uid it does not hold.
+    #[test]
+    fn the_synth_passwd_entry_names_the_box_uid_and_gid() {
+        let synth = tempfile::tempdir().expect("a temp dir for the synthesized config");
+        common::synth_user_group_config(synth.path(), "dev", "/home")
+            .expect("synthesizing the box's user and group configuration");
+
+        let passwd = synth_file(&synth, "passwd");
+        let group = synth_file(&synth, "group");
+
+        let user = synth_entry(&passwd, "dev", "passwd");
+        assert_eq!(
+            synth_number(user, 2, "the passwd entry's uid"),
+            BOX_UID,
+            "the synthesized passwd entry must name the uid every box execs as, \
+             or the box reports a name that maps to a uid it does not hold"
+        );
+        assert_eq!(
+            synth_number(user, 3, "the passwd entry's gid"),
+            BOX_GID,
+            "the synthesized passwd entry must name the gid every box execs as"
+        );
+
+        let own_group = synth_entry(&group, "dev", "group");
+        assert_eq!(
+            synth_number(own_group, 2, "the group entry's gid"),
+            BOX_GID,
+            "the synthesized group entry must name the gid every box execs as"
+        );
     }
 }
