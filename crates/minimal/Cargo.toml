@@ -57,6 +57,12 @@ russh.workspace = true
 serde.workspace = true
 serde_json_lenient.workspace = true
 sessions.workspace = true
+# The reserved local range the resolver advisory's bind probe reads. Owned by
+# the zero-dependency `switch` crate — the same constant the daemon's DNS zone
+# re-exports and publishes per-box addresses from — so the CLI's probe and the
+# daemon's publish agree by construction instead of drifting between two
+# copies of the /24. Not the daemon crate: the CLI keeps depending on none.
+switch.workspace = true
 # Staging for the `min bug` volume fallback: `debugfs -c` rdumps the guest's
 # /logs into a temp dir before the readable files are tail-capped into the
 # bundle.

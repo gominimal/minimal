@@ -57,10 +57,12 @@ pub(crate) const ZONE_LINK: &str = "minzone0";
 pub(crate) const ZONE_LINK_ADDR: Ipv4Addr = Ipv4Addr::new(100, 127, 255, 254);
 
 /// The reserved local range the daemon publishes per-box addresses from and
-/// whose presence at session start NET-123's bind probe verifies. Mirrors
-/// `minimald::net::dns::RESERVED_LOCAL_RANGE` — the probe here and the
-/// publish there must agree on the range, so the constants move together.
-pub(crate) const RESERVED_LOCAL_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 64, 0, 0), 24);
+/// whose presence at session start NET-123's bind probe verifies: the one
+/// definition of the range, owned by the `switch` crate and re-exported by
+/// the daemon's DNS zone (`minimald::net::dns::RESERVED_LOCAL_RANGE`), so the
+/// probe here and the publish there are the same constant and cannot drift
+/// on where published addresses live.
+pub(crate) use switch::RESERVED_LOCAL_RANGE;
 
 /// The resolver file the advisory's command writes on macOS. `nameserver`
 /// plus `port` is the format the loopback-alias spike verified against
