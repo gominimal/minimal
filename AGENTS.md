@@ -204,7 +204,10 @@ PR"): it runs the same gates the PR lanes run (fmt, clippy, cargo-deny,
 the test suite, doctests; plus `just test-ignored` on Linux), dispatched
 for your OS, and then `clippy-strict`, which applies a stricter lint set to
 the lines your branch changed. Run `just clippy-strict` alone to see just
-those. Platform notes for agents:
+those. That gate is local only: no CI lane runs it, so its hits never turn
+a PR red, and in a revise or conflict round the directive bounds the
+change, so report its hits in `notes` rather than fix them. Platform notes
+for agents:
 
 - **macOS**: the workspace does not build natively (see
   [Platform matrix](#platform-matrix)); `just ci` runs the darwin-capable
