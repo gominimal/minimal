@@ -2340,8 +2340,9 @@ impl SessionLauncher for SandboxLauncher {
             let (master, slave) = pty.into_fds();
             command.stderr(hakoniwa::Stdio::from(slave));
 
-            let process = command
-                .spawn()
+            // On the fork thread, never this one: the container dies with
+            // the thread that forked it (see `sandbox2::forker`).
+            let process = sandbox2::forker::on_fork_thread(move || command.spawn())
                 .map_err(|e| io::Error::other(format!("exec failed: {e}")))?;
             // `command`/`container` no longer borrow `env`, so it can be moved
             // into the host to keep its backing files alive.
