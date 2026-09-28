@@ -589,21 +589,55 @@ fn declared_by(packages: &BTreeMap<String, String>, declared: &str, task: &str) 
     }
 }
 
+/// One declared patch entry that shares an expanded host path with
+/// possibly other entries. A directory mapping and a file mapping can
+/// expand to the same path — `Config::validate` processes directories
+/// first, so a missing read-write directory is created there and a
+/// later file mapping at the same path then fails as "directory mapped
+/// as a file". Carrying `is_file`/`read_only` alongside the declaration
+/// lets [`attribute_fs_mapping_error`] pick the entry that actually
+/// caused a given failure instead of an arbitrary one sharing its path.
+struct DeclaredMapping<'a> {
+    declared: &'a String,
+    is_file: bool,
+    read_only: bool,
+}
+
 /// Attributes a sandbox fs-mapping failure to the declaration behind the
 /// expanded path it names, so "create mapped file /.claude.json: EROFS" on
 /// its own sends nobody anywhere useful (#1204). A read-only mapping is never
 /// created, so a missing source surfaces as `"fs mapping"` and gets a distinct
 /// message; creation failures keep the existing wording.
+///
+/// When several declarations expand to the same path, the match is narrowed
+/// by mirroring the check in `Config::validate` that produced `op`, falling
+/// back to the first declaration when nothing narrows it (the common case:
+/// exactly one declaration at that path).
 fn attribute_fs_mapping_error(
     e: &sandbox2::Error,
-    declarations: &BTreeMap<String, &String>,
+    declarations: &BTreeMap<String, Vec<DeclaredMapping<'_>>>,
     fs_mapping_packages: &BTreeMap<String, String>,
     task: &str,
 ) -> Option<Error> {
-    let sandbox2::Error::IO(op, path, _) = e else {
+    let sandbox2::Error::IO(op, path, io_err) = e else {
         return None;
     };
-    let declared = path.to_str().and_then(|p| declarations.get(p))?;
+    let candidates = path.to_str().and_then(|p| declarations.get(p))?;
+    let declared = match *op {
+        // A read-only mapping is never created, so a missing source is
+        // always the read-only side of a collision.
+        "fs mapping" => candidates.iter().find(|c| c.read_only),
+        "create mapped file" => candidates.iter().find(|c| c.is_file && !c.read_only),
+        "create mapped dir" => candidates.iter().find(|c| !c.is_file && !c.read_only),
+        // "directory mapped as a file": the failing side is whichever
+        // declaration named this path as a file.
+        "stat fs mapping" if io_err.kind() == std::io::ErrorKind::AlreadyExists => {
+            candidates.iter().find(|c| c.is_file)
+        }
+        _ => None,
+    }
+    .or_else(|| candidates.first())?
+    .declared;
     let by = declared_by(fs_mapping_packages, declared, task);
     let msg = match *op {
         "fs mapping" => {
@@ -725,23 +759,37 @@ impl<'a> Env<'a> {
                 declared_by(&fs_mapping_packages, &e.declared, args.name)
             ))
         })?;
-        // Expanded path → the declaration behind it. sandbox2 only ever sees
-        // the expanded form, so its fs-mapping failures name a path nobody
-        // wrote down; this puts the `~/`-rooted declaration back into the
-        // message. Built from the merged patch set so the task's own `patch`
-        // table is covered alongside package-declared mappings.
-        let declarations: BTreeMap<String, &String> = patch
+        // Expanded path → the declaration(s) behind it. sandbox2 only ever
+        // sees the expanded form, so its fs-mapping failures name a path
+        // nobody wrote down; this puts the `~/`-rooted declaration back
+        // into the message. A path can carry more than one declaration (a
+        // dir mapping and a file mapping can expand to the same path), so
+        // every declaration at a path is kept, for
+        // [`attribute_fs_mapping_error`] to pick among. Built from the
+        // merged patch set so the task's own `patch` table is covered
+        // alongside package-declared mappings.
+        let declarations: BTreeMap<String, Vec<DeclaredMapping<'_>>> = patch
             .dir
-            .keys()
-            .chain(patch.file.keys())
-            .filter_map(|declared| {
+            .iter()
+            .map(|(declared, setting)| (declared, false, setting))
+            .chain(
+                patch
+                    .file
+                    .iter()
+                    .map(|(declared, setting)| (declared, true, setting)),
+            )
+            .filter_map(|(declared, is_file, setting)| {
                 Some((
                     EnvPatches::expand_home(declared, home.as_deref()).ok()?,
-                    declared,
+                    DeclaredMapping {
+                        declared,
+                        is_file,
+                        read_only: matches!(setting, mfile::PatchSetting::ReadOnly),
+                    },
                 ))
             })
-            .fold(BTreeMap::new(), |mut declarations, (expanded, declared)| {
-                declarations.entry(expanded).or_insert(declared);
+            .fold(BTreeMap::new(), |mut declarations, (expanded, mapping)| {
+                declarations.entry(expanded).or_default().push(mapping);
                 declarations
             });
 
@@ -1043,7 +1091,14 @@ mod tests {
     #[test]
     fn attribute_fs_mapping_error_names_the_declaration() {
         let declared = "~/.aws".to_string();
-        let declarations = BTreeMap::from_iter([("/home/dev/.aws".to_string(), &declared)]);
+        let declarations = BTreeMap::from_iter([(
+            "/home/dev/.aws".to_string(),
+            vec![DeclaredMapping {
+                declared: &declared,
+                is_file: false,
+                read_only: true,
+            }],
+        )]);
         let packages = BTreeMap::new();
 
         let missing = sandbox2::Error::IO(
@@ -1078,6 +1133,51 @@ mod tests {
         assert!(
             msg.contains("mapped in by task `deploy`, which declares it as `~/.aws`"),
             "creation failure keeps the existing wording, got: {msg}"
+        );
+    }
+
+    /// A directory mapping and a file mapping that expand to the same path
+    /// collide when the directory is created first: `Config::validate`
+    /// reports "directory mapped as a file" against the *file* mapping. The
+    /// message must name the file declaration, not the directory one, even
+    /// though both share the same host path.
+    #[test]
+    fn attribute_fs_mapping_error_disambiguates_dir_file_collision() {
+        let dir_declared = "~/shared".to_string();
+        let file_declared = "/home/dev/shared".to_string();
+        let declarations = BTreeMap::from_iter([(
+            "/home/dev/shared".to_string(),
+            vec![
+                DeclaredMapping {
+                    declared: &dir_declared,
+                    is_file: false,
+                    read_only: false,
+                },
+                DeclaredMapping {
+                    declared: &file_declared,
+                    is_file: true,
+                    read_only: true,
+                },
+            ],
+        )]);
+        let packages = BTreeMap::new();
+
+        let collision = sandbox2::Error::IO(
+            "stat fs mapping",
+            PathBuf::from("/home/dev/shared"),
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "directory mapped as a file",
+            ),
+        );
+        let msg = format!(
+            "{}",
+            attribute_fs_mapping_error(&collision, &declarations, &packages, "deploy")
+                .expect("a dir/file collision must be attributed")
+        );
+        assert!(
+            msg.contains(&format!("declares it as `{file_declared}`")),
+            "collision must name the file mapping, not the directory one, got: {msg}"
         );
     }
 
