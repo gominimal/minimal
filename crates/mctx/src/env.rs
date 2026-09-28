@@ -740,7 +740,10 @@ impl<'a> Env<'a> {
                     declared,
                 ))
             })
-            .collect();
+            .fold(BTreeMap::new(), |mut declarations, (expanded, declared)| {
+                declarations.entry(expanded).or_insert(declared);
+                declarations
+            });
 
         let mut config = sandbox2::config::Config::new(args.name)
             .with_wd(args.cwd.clone(), false, fs_mappings)
