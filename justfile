@@ -271,24 +271,21 @@ fmt:
 # clean-worktree check — the usual case here is running mid-edit with
 # staged/unstaged work.
 #
-# Autofix pass: fmt, clippy --fix, fmt again, then the strict clippy gate, reported (runnable mid-edit).
+# The strict clippy gate is not part of this loop. It ran here once, and
+# three agent rounds on the NET walk then rewrote lines their task never
+# named to clear it, two in conflict rounds whose only directive was the
+# merge (#1737, #1730, #1727): everything else this recipe prints is
+# something to fix, so a strict hit printed beside it reads the same way,
+# whatever a doc says. There is no autofix for that set either — `clippy
+# --fix` cannot be scoped to changed lines and would sweep legacy sites — so
+# the gate lives in `just clippy-strict` and `just ci`, which is the round
+# that owns the judgement.
+#
+# Autofix pass: fmt, clippy --fix, fmt again (runnable mid-edit).
 fix:
     cargo fmt --all
     cargo clippy {{scope}} --all-targets --fix --allow-dirty -- -D warnings
     cargo fmt --all
-    # No autofix for the strict set. `clippy --fix` rewrites every hit in the
-    # selected crates and cannot be scoped to changed lines, so autofixing it
-    # would sweep legacy sites in every crate it touches. Most of the set has no
-    # machine-applicable suggestion anyway (6% of current hits, none of the four
-    # largest lints), so these are judgement calls, not rewrites.
-    #
-    # Reported, not enforced: this is the innermost loop, and it used to fail
-    # here. Three agent rounds on the NET walk then rewrote lines their task
-    # never named to clear it, two in conflict rounds whose only directive was
-    # the merge (#1737, #1730, #1727) — a failing command in the loop outranks
-    # any doc sentence saying to leave the hit alone. `just ci` enforces it,
-    # which is where "before opening a PR" owns the judgement.
-    CLIPPY_STRICT_REPORT_ONLY=1 scripts/clippy-strict.sh "" {{strict-scope}}
 
 # CI: ci.yml `fmt`.
 #
@@ -310,15 +307,13 @@ clippy:
 # reports on the lines your change introduced, and promote each lint into
 # [workspace.lints.clippy] as its count reaches zero.
 #
-# This recipe and `just ci` enforce; `just fix` only reports. A hit on a line the
-# round's directive did not name is a note, not a licence to edit it.
+# This recipe and `just ci` are the only callers; `just fix` does not run it. A
+# hit on a line the round's directive did not name is a note, not a licence to
+# edit it.
 #
 # Strict Clippy on the lines this branch changed, scoped to the crates you touched.
 clippy-strict BASE="":
-    # Cleared, not inherited: an exported CLIPPY_STRICT_REPORT_ONLY would make
-    # this recipe report and exit 0, and `just ci` depends on it, so one stray
-    # export in a shell profile would turn the gate off without saying so.
-    CLIPPY_STRICT_REPORT_ONLY= scripts/clippy-strict.sh "{{BASE}}" {{strict-scope}}
+    scripts/clippy-strict.sh "{{BASE}}" {{strict-scope}}
 
 # A local advisories failure may just mean newer RUSTSEC data than CI's last run.
 # CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).
