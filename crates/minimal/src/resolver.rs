@@ -189,10 +189,14 @@ pub(crate) fn resolver_file_hook(contents: Option<&str>) -> Hook {
                  would ask on 53, where the answerer does not listen",
             ),
         },
-        Some(other) => Hook::configured(
+        // The foreign server is not echoed: the detail is printed in the
+        // advisory and recorded verbatim in the `min bug` bundle, and a
+        // host's DNS server address is not the bundle's to carry.
+        Some(_) => Hook::configured(
             RESOLVER_FILE,
             None,
-            format!("resolver file nameserver is {other}, expected 127.0.0.1"),
+            "resolver file names a nameserver other than 127.0.0.1, so the \
+             zone is not routed to the answerer",
         ),
         None => Hook::configured(
             RESOLVER_FILE,

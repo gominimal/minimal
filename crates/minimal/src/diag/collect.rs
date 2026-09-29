@@ -47,8 +47,9 @@ pub async fn system(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
     // NET-122/NET-123: the host's naming surface — the resolver hook state
     // (the macOS resolver file or the Linux routing-domain link), the
     // reserved range's loopback aliases as a bind probe found them, and
-    // whether the host is on the 127.0.0.1 interim. Ports and interface
-    // names are all it holds, so nothing needs redacting.
+    // whether the host is on the 127.0.0.1 interim. Ports, interface names
+    // and loopback addresses are all it holds — the hook's detail never
+    // echoes a foreign nameserver — so nothing needs redacting.
     let naming = crate::resolver::naming_surface().await;
     let json = serde_json_lenient::to_vec_pretty(&naming)
         .context("serializing the host naming surface")?;
