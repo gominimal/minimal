@@ -415,25 +415,28 @@ impl Container {
             command.env(k.as_ref(), v.as_ref());
         }
 
-        // If this container was built with a socket-family filter, install it
-        // in the child immediately before exec.  This is the same moment hakoniwa
-        // would load a libseccomp-based filter, but we use `prctl` + `seccomp`
-        // through libc only.
-        if let Some(filter) = self.socket_family_filter {
-            install_filter_in_command(&self.container, &mut command, filter)?;
-        }
+        // Every box execs with the same credentials: as the unprivileged box
+        // uid inside its user namespace, with no_new_privs set and the
+        // capabilities no box may hold dropped from its bounding set — the one
+        // capability set an exec does not clear. The closure below runs at the
+        // only moment that is possible, while the process still holds
+        // CAP_SETPCAP in its user namespace. A none box additionally installs
+        // its socket-family filter at the same moment hakoniwa would load a
+        // libseccomp filter.
+        install_box_credentials(&self.container, &mut command, self.socket_family_filter)?;
 
         Ok(command)
     }
 }
 
-/// Install a seccomp-BPF filter into a hakoniwa command as a program-closure.
+/// Install the box's credentials — and, for a none box, its seccomp-BPF
+/// filter — into a hakoniwa command as a program-closure.
 ///
 /// The closure runs after namespaces and credentials are configured but before
-/// the supervised program execs, which is the correct moment for seccomp.  It
-/// captures the `&'static` filter the `Container` holds, loads it, and then
-/// execs the original program, since `command_from_closure` otherwise replaces
-/// the program entirely.
+/// the supervised program execs, which is the correct moment for both.  It
+/// takes the box's credentials, loads the `&'static` filter the `Container`
+/// holds if there is one, and then execs the original program, since
+/// `command_from_closure` otherwise replaces the program entirely.
 ///
 /// `command_from_closure` starts a fresh `Command`, so the working directory
 /// and environment already set on `command` are carried over to it: hakoniwa
@@ -442,42 +445,181 @@ impl Container {
 /// returned command afterwards (`SHELL`, `PS1`, stdio) lands on the closure
 /// command and reaches the program the same way.
 #[cfg(target_os = "linux")]
-fn install_filter_in_command(
+fn install_box_credentials(
     container: &hakoniwa::Container,
     command: &mut hakoniwa::Command,
-    filter: &'static SocketFamilyFilter,
+    socket_family_filter: Option<&'static SocketFamilyFilter>,
 ) -> Result<(), Error> {
     let program = command.get_program().to_string();
     let args = command.get_args();
     let current_dir = command.get_current_dir().map(Path::to_path_buf);
     let envs = command.get_envs();
     // SAFETY: `command_from_closure` is unsafe because the closure runs in a
-    // forked child.  `filter` is `&'static`: it is the process-wide
-    // `socket_family_filter_for_none_box()` `OnceLock` value, owned for the
-    // process's whole life, so it outlives every command spawned from the
-    // container.  The closure is not
+    // forked child.  `socket_family_filter` is `&'static`: it is the
+    // process-wide `socket_family_filter_for_none_box()` `OnceLock` value,
+    // owned for the process's whole life, so it outlives every command spawned
+    // from the container.  The closure is not
     // async-signal-safe: it allocates after the fork (the argv `CString`s, a
     // failure message), in kind with hakoniwa's own closure path, which
     // `format!`s its panic report at the same point.  The child is
     // single-threaded, so no allocator lock can be held across the fork.  The
     // closure never returns: it execs, or `_exit`s.
     let mut closure = unsafe {
-        container.command_from_closure(move || {
-            if let Err(e) = install_socket_family_filter(filter) {
-                exit_child("installing the socket-family filter", &e);
-            }
-            // `command_from_closure` replaces the program with this closure;
-            // exec into the real program so the spawn runs what the caller
-            // asked for, now with the seccomp filter installed.
-            let e = execv_in_child(&program, &args);
-            exit_child(&format!("exec {program}"), &e)
-        })
+        container
+            .command_from_closure(move || exec_box_program(&program, &args, socket_family_filter))
     };
     if let Some(dir) = current_dir {
         closure.current_dir(dir);
     }
     closure.envs(envs);
     *command = closure;
+    Ok(())
+}
+
+/// The body of the launch closure in [`install_box_credentials`]: take the
+/// box's credentials, install the box's socket-family filter if it has one,
+/// then exec the program the caller asked for.  Never returns; a failure is
+/// reported on the child's stderr and exits it with the shell's "cannot run"
+/// status.
+///
+/// Split out of the closure so each unsafe operation sits in its own block
+/// rather than inheriting the one around `command_from_closure`.
+#[cfg(target_os = "linux")]
+fn exec_box_program(
+    program: &str,
+    args: &[String],
+    socket_family_filter: Option<&'static SocketFamilyFilter>,
+) -> ! {
+    // SAFETY: `assume_box_credentials` is async-signal-safe; this is the
+    // pre-exec moment it is for, with the namespace built and CAP_SETPCAP in
+    // it still held.
+    if let Err(e) = unsafe { assume_box_credentials() } {
+        exit_child("taking the box credentials", &e);
+    }
+    if let Some(filter) = socket_family_filter {
+        // SAFETY: `install_socket_family_filter` is async-signal-safe, and
+        // `filter` is `&'static`, so it stays valid for the call.
+        if let Err(e) = unsafe { install_socket_family_filter(filter) } {
+            exit_child("installing the socket-family filter", &e);
+        }
+    }
+    // `command_from_closure` replaces the program with this closure; exec
+    // into the real program so the spawn runs what the caller asked for, now
+    // with the box's credentials (and, for a none box, its seccomp filter)
+    // in place.
+    let e = execv_in_child(program, args);
+    exit_child(&format!("exec {program}"), &e)
+}
+
+/// Takes the credentials every box process execs with: sets `no_new_privs`,
+/// drops each capability no box may hold
+/// ([`config::BOX_FORBIDDEN_CAPABILITIES`]) from the bounding set, clears the
+/// remaining capability sets, and switches to the box uid and gid
+/// ([`config::BOX_UID`], [`config::BOX_GID`]).
+///
+/// The bounding set is the one capability set an exec does not clear, so a
+/// capability dropped from it can never be granted back — not by the process
+/// once it holds no capabilities, and not by a file capability or a setuid
+/// bit, which `no_new_privs` makes the kernel ignore at exec. The other sets
+/// are cleared here too, so the program that execs next holds no capability at
+/// all whatever the daemon's own credential state was.
+///
+/// The caller must still hold `CAP_SETPCAP` in the user namespace it is about
+/// to exec in — the drops need it — and `CAP_SETUID`/`CAP_SETGID` unless the
+/// box ids are already its own. Both hold for the two call sites: the launch
+/// path runs this in its pre-exec closure, where the process has just created
+/// the box's user namespace and therefore holds every capability in it, and
+/// `nsenter` runs it after joining a box's user namespace, which grants the
+/// joiner the same.
+///
+/// # Safety
+///
+/// Only async-signal-safe syscalls (`prctl`, `capset`, `setgid`, `setuid`) are
+/// used, so this is safe to call from a pre-exec closure; it is `unsafe`
+/// because it takes over the calling process's credentials.
+#[cfg(target_os = "linux")]
+pub unsafe fn assume_box_credentials() -> std::io::Result<()> {
+    // no_new_privs, first: nothing that follows, and no file the box execs
+    // later, can grant a privilege the process does not already hold.
+    // SAFETY: prctl with valid arguments; async-signal-safe.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // The bounding set, dropped while CAP_SETPCAP is still held: it survives
+    // exec, so it is the only set that has to be dropped rather than cleared.
+    for cap in config::BOX_FORBIDDEN_CAPABILITIES {
+        // SAFETY: prctl with valid arguments; async-signal-safe.
+        if unsafe {
+            libc::prctl(
+                libc::PR_CAPBSET_DROP,
+                libc::c_ulong::from(cap.number),
+                0,
+                0,
+                0,
+            )
+        } == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    // Every other set, cleared by hand: exec recomputes them empty for a
+    // process that is not root in its user namespace and carries no file
+    // capabilities, but doing it here makes that hold by construction instead
+    // of resting on the uid and the no_new_privs bit staying as they are.
+    clear_capability_sets()?;
+
+    // The box uid and gid, last: both resolve through the namespace's map onto
+    // the daemon's own ids, so this asserts the identity the box's rootfs and
+    // its plan describe, and fails the launch rather than exec a box that is
+    // someone else.
+    // SAFETY: setgid with a valid id; async-signal-safe.
+    if unsafe { libc::setgid(config::BOX_GID) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: setuid with a valid id; async-signal-safe.
+    if unsafe { libc::setuid(config::BOX_UID) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+/// Clears this process's inheritable, permitted and effective capability sets
+/// with one `capset(2)`, and its ambient set with `PR_CAP_AMBIENT_CLEAR_ALL`.
+/// Dropping capabilities needs no privilege, so this works for a process that
+/// holds none.
+///
+/// The kernel's `capset` payload is plain `u32` words: an 8-byte header
+/// (`version`, `pid`) followed by two 12-byte structs of (`effective`,
+/// `permitted`, `inheritable`), the second covering capabilities 32..63. They
+/// are spelled here as arrays rather than `repr(C)` structs so the layout is
+/// fixed by construction.
+#[cfg(target_os = "linux")]
+fn clear_capability_sets() -> std::io::Result<()> {
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    let header = [LINUX_CAPABILITY_VERSION_3, 0];
+    let data = [0; 6];
+    // SAFETY: capset reads the header and the zeroed data words, both of which
+    // outlive the call; it is async-signal-safe.
+    if unsafe { libc::syscall(libc::SYS_capset, header.as_ptr(), data.as_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: prctl with valid arguments; async-signal-safe, and clearing the
+    // ambient set needs no privilege either.
+    if unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    } == -1
+    {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -513,7 +655,7 @@ fn execv_in_child(program: &str, args: &[String]) -> std::io::Error {
 /// exit machinery.
 #[cfg(target_os = "linux")]
 fn exit_child(what: &str, err: &std::io::Error) -> ! {
-    let msg = format!("minimal: none box: {what} failed: {err}\n");
+    let msg = format!("minimal: sandbox: {what} failed: {err}\n");
     // SAFETY: `write` and `_exit` are async-signal-safe; `msg` outlives the
     // write, and `_exit` does not return.
     unsafe {
@@ -605,15 +747,34 @@ impl<C: Channel> Sandbox<C> {
         container
             .rootfs(self.rootfs())
             .unwrap()
-            // By default hakoniwa sets UID and GID to the current ones
-            // We explicitly set it to 1000 here to match the user/group
-            // we create for the sandbox
-            .uidmap(1000)
-            .gidmap(1000)
+            // The box's uid and gid inside its user namespace, mapped onto the
+            // daemon's own. Every box execs as this unprivileged uid with
+            // no_new_privs set, so the kernel clears its capability sets at
+            // exec; see `assume_box_credentials` for what the launch applies
+            // on top of the map, and `config::BOX_UID` for why this uid.
+            .uidmap(config::BOX_UID)
+            .gidmap(config::BOX_GID)
             .devfsmount("/dev")
             .tmpfsmount("/tmp")
             .unshare(hakoniwa::Namespace::Cgroup)
             .runctl(hakoniwa::Runctl::IgnoreCgroupSetupFailed);
+
+        // Every box's launch posture (NET-083), applied by the pre-exec
+        // closure on every command spawned from this container: exec as the
+        // unprivileged box uid with no_new_privs set — so the kernel clears
+        // every capability set at exec and ignores any file capability or
+        // setuid bit — with the capabilities no box may hold dropped from the
+        // bounding set, the one set an exec does not clear, so they cannot
+        // come back. Logged once per launch, so a diagnostics bundle's daemon
+        // log tail carries the posture the box was launched with.
+        tracing::info!(
+            uid = config::BOX_UID,
+            gid = config::BOX_GID,
+            no_new_privs = true,
+            cleared_sets = "inheritable,permitted,effective,ambient",
+            bounding_set_dropped = %config::forbidden_capability_names(),
+            "sandbox launch: box execs as the box uid with no capability a box may not hold"
+        );
 
         // Network isolation (R1.4/R1.7). An isolating plan gets a fresh network
         // namespace with only a down `lo`; wiring it is the provider's job,
