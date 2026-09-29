@@ -110,19 +110,20 @@ impl Maintenance {
                         // disk as well as inside the guest. Answering early
                         // would have `mip cache clean` return while the space
                         // it reported is still not back, which is the one
-                        // question the caller is asking.
-                        if report.is_ok() {
-                            trim_state_volume_if_mounted(&self.state).await;
-                        }
+                        // question the caller is asking. The trim runs even
+                        // when the clean failed, so a failed sweep does not
+                        // strand the extents earlier work already freed.
+                        trim_state_volume_if_mounted(&self.state).await;
                         responder.handle(std::future::ready(report)).await;
                         next_tick = Instant::now() + CLEAN_INTERVAL;
                     }
                 },
                 () = tokio::time::sleep_until(next_tick) => {
                     // Nobody is waiting on this one; `clean` logged the outcome.
-                    if clean(&self.state, UNUSED_FOR, None).await.is_ok() {
-                        trim_state_volume_if_mounted(&self.state).await;
-                    }
+                    // The trim runs regardless of the clean's outcome, so a
+                    // failed sweep does not strand earlier-freed extents.
+                    let _report = clean(&self.state, UNUSED_FOR, None).await;
+                    trim_state_volume_if_mounted(&self.state).await;
                     next_tick = Instant::now() + CLEAN_INTERVAL;
                 }
             }
