@@ -19,7 +19,17 @@
 #
 # Usage: scripts/clippy-strict.sh [BASE] [CARGO_SCOPE...]
 #
-# BASE defaults to the merge-base with the main branch; only diagnostics whose
+# Callers: `just clippy-strict` and, through it, `just ci`. Not `just fix`: that
+# is the mid-edit loop, and everything it prints is something to fix, so a hit
+# printed there reads as work whatever a doc says — the round's directive bounds
+# what a change may touch, and a hit outside it belongs in the round's notes.
+#
+# Exit codes: 0 clean, 2 hits on changed lines, anything else a failure to run
+# (cargo's own status, 127 with no python3, 1 for a crash in the filter). A gate
+# that exits 0 because it could not run is worse than no gate, so none of those
+# is ever read as clean.
+#
+# BASE defaults to the merge-base with `origin/main`; only diagnostics whose
 # primary span falls on a line added or changed since BASE are reported. Edits
 # that are not committed yet count, as do untracked files. Any further arguments
 # are passed to `cargo clippy` as the crate scope, overriding the derived one
@@ -58,7 +68,24 @@ if [ "$#" -gt 0 ]; then
     shift
 fi
 if [ -z "$base" ]; then
-    base="$(git merge-base main HEAD 2>/dev/null || git merge-base origin/main HEAD)"
+    # `origin/main`, not the local `main`. A branch that merges `origin/main`
+    # leaves the local ref where it was — agent sandboxes and worktrees never
+    # check main out at all — and the merge-base against a ref that stale
+    # predates the main commits the branch merged in, so every line of those
+    # commits reads as a line this branch changed. The gate then reports
+    # diagnostics on other people's code, under a heading saying they are
+    # yours. That is what it looked like: on the branch adding this comment,
+    # a local `main` ten commits behind turned a change touching no Rust at
+    # all into 14 changed Rust files across `minimald`, `sessions` and
+    # `switch`.
+    #
+    # The remote ref is the safe one by construction: `origin/main` cannot be
+    # behind anything the branch merged, because merging it required fetching
+    # it first, and a fetch only moves it forward. Stale means the base is
+    # merely older than the newest main, never older than this branch's own
+    # first commit. The local ref is kept as a fallback for a clone with no
+    # remote.
+    base="$(git merge-base origin/main HEAD 2>/dev/null || git merge-base main HEAD)"
 fi
 
 explicit_scope=("$@")
@@ -154,12 +181,18 @@ if [ "$status" -ne 0 ]; then
     exit "$status"
 fi
 
-python3 - "$out_file" "$diff_file" "$untracked_file" "${lints[@]}" <<'PY'
+# HITS_EXIT, and only HITS_EXIT, is the filter saying it found something. Any
+# other non-zero is the filter itself failing — no python3 on PATH, a crash in
+# it — and is said as such rather than read as clean.
+HITS_EXIT=2
+hits_status=0
+python3 - "$HITS_EXIT" "$out_file" "$diff_file" "$untracked_file" "${lints[@]}" <<'PY' || hits_status=$?
 import json
 import sys
 
-out_path, diff_path, untracked_path = sys.argv[1], sys.argv[2], sys.argv[3]
-strict = set(sys.argv[4:])
+hits_exit = int(sys.argv[1])
+out_path, diff_path, untracked_path = sys.argv[2], sys.argv[3], sys.argv[4]
+strict = set(sys.argv[5:])
 
 # path -> [(start, end)] of lines added or changed in the new revision.
 changed = {}
@@ -251,7 +284,15 @@ if hits:
         f'with #[expect(<lint>, reason = "...")]. Re-run: just clippy-strict',
         file=sys.stderr,
     )
-    sys.exit(1)
+    # Distinct from the 1 an unhandled exception here would exit with, so the
+    # caller can demote hits without demoting a broken filter.
+    sys.exit(hits_exit)
 
 print("clippy-strict: clean")
 PY
+
+if [ "$hits_status" -ne 0 ] && [ "$hits_status" -ne "$HITS_EXIT" ]; then
+    echo "clippy-strict: the diagnostic filter failed (exit ${hits_status});" \
+        "nothing was checked" >&2
+fi
+exit "$hits_status"

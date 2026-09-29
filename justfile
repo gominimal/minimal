@@ -271,18 +271,21 @@ fmt:
 # clean-worktree check — the usual case here is running mid-edit with
 # staged/unstaged work.
 #
-# Autofix pass: fmt, clippy --fix, fmt again, then the strict clippy gate (runnable mid-edit).
+# The strict clippy gate is not part of this loop. It ran here once, and
+# three agent rounds on the NET walk then rewrote lines their task never
+# named to clear it, two in conflict rounds whose only directive was the
+# merge (#1737, #1730, #1727): everything else this recipe prints is
+# something to fix, so a strict hit printed beside it reads the same way,
+# whatever a doc says. There is no autofix for that set either — `clippy
+# --fix` cannot be scoped to changed lines and would sweep legacy sites — so
+# the gate lives in `just clippy-strict` and `just ci`, which is the round
+# that owns the judgement.
+#
+# Autofix pass: fmt, clippy --fix, fmt again (runnable mid-edit).
 fix:
     cargo fmt --all
     cargo clippy {{scope}} --all-targets --fix --allow-dirty -- -D warnings
     cargo fmt --all
-    # No autofix for the strict set, and a hit fails this recipe. `clippy --fix`
-    # rewrites every hit in the selected crates and cannot be scoped to changed
-    # lines, so autofixing it would sweep legacy sites in every crate it
-    # touches. Most of the set has no machine-applicable suggestion anyway (6%
-    # of current hits, none of the four largest lints), so these are judgement
-    # calls, not rewrites.
-    scripts/clippy-strict.sh "" {{strict-scope}}
 
 # CI: ci.yml `fmt`.
 #
@@ -301,8 +304,12 @@ clippy:
 # The lints below are the ones the tree is not yet clean for: CI's clippy job
 # runs `-D warnings`, so they live here rather than in Cargo.toml and only the
 # lines you changed are reported. Run it once your change is ready, fix what it
-# reports in the files you touched, and promote each lint into
+# reports on the lines your change introduced, and promote each lint into
 # [workspace.lints.clippy] as its count reaches zero.
+#
+# This recipe and `just ci` are the only callers; `just fix` does not run it. A
+# hit on a line the round's directive did not name is a note, not a licence to
+# edit it.
 #
 # Strict Clippy on the lines this branch changed, scoped to the crates you touched.
 clippy-strict BASE="":
