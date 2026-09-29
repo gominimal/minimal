@@ -204,7 +204,11 @@ PR"): it runs the same gates the PR lanes run (fmt, clippy, cargo-deny,
 the test suite, doctests; plus `just test-ignored` on Linux), dispatched
 for your OS, and then `clippy-strict`, which applies a stricter lint set to
 the lines your branch changed. Run `just clippy-strict` alone to see just
-those. Platform notes for agents:
+those. That gate is local only: no CI lane runs it, so its hits never turn
+a PR red, and in a revise or conflict round the directive bounds the
+change, so report its hits in `notes` rather than fix them. `just fix`
+does not run it, so nothing in the edit loop asks you to. Platform notes
+for agents:
 
 - **macOS**: the workspace does not build natively (see
   [Platform matrix](#platform-matrix)); `just ci` runs the darwin-capable
@@ -213,7 +217,7 @@ those. Platform notes for agents:
   is unverified until `just test-cross` has run.
 - **VM/daemon-path changes**: also run `just e2e` (the session proof)
   and/or `just test-vm` (the VM integration harnesses).
-- **Tight iteration loops**: `just fix` (fmt → `clippy --fix` → fmt, then the
-  strict clippy gate, with `--allow-dirty` so it runs mid-edit) then
-  `just test`. Both carry this host's scope; neither needs a hand-written
-  `cargo` line.
+- **Tight iteration loops**: `just fix` (fmt → `clippy --fix` → fmt, with
+  `--allow-dirty` so it runs mid-edit) then `just test`. Both carry this
+  host's scope; neither needs a hand-written `cargo` line. Everything that
+  loop prints is something to fix; the strict gate is not in it.

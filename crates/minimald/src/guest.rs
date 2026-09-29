@@ -524,10 +524,11 @@ pub fn mount_state_volume(device: &str, mountpoint: &str) -> std::io::Result<()>
 
 /// Quiesce the state volume before VMM teardown (spec R2.1): `syncfs(2)` the
 /// mount to flush all pending writes and the ext4 journal to the block device,
-/// then best-effort lazy-detach the mount so a clean stop leaves the journal
-/// closed. A syncfs error propagates; an unmount failure is logged and
-/// swallowed — the data is already synced, so the worst case is a journal
-/// replay on the next boot.
+/// then best-effort trim the freed extents back to the host, then best-effort
+/// lazy-detach the mount so a clean stop leaves the journal closed. A syncfs
+/// error propagates; a trim or unmount failure is logged and swallowed — the
+/// data is already synced, so the worst case is a journal replay on the next
+/// boot.
 pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -538,6 +539,19 @@ pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     drop(dir);
+
+    // Best-effort trim before teardown: a clean stop is the one moment the
+    // guest can return every freed extent to the host, and unlike the
+    // maintenance sweep it must not be skipped when nothing else ran. The
+    // error is logged and swallowed — the data is already synced, so a failed
+    // trim only strands extents for the next boot's sweep to reclaim.
+    if let Err(error) = trim_state_volume(mountpoint) {
+        tracing::warn!(
+            mountpoint,
+            %error,
+            "trimming state volume before teardown (best-effort; already synced)"
+        );
+    }
 
     let c_mountpoint = CString::new(mountpoint)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in mountpoint"))?;
