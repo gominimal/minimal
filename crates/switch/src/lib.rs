@@ -11,6 +11,8 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
+pub mod loopback;
+
 /// MTU advertised to the switch and the tap devices. gvproxy's own default.
 pub const DEFAULT_MTU: u16 = 1500;
 

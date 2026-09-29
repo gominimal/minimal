@@ -17,9 +17,11 @@
 //! hang).
 
 use serde::Serialize;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+#[cfg(any(test, not(target_os = "macos")))]
+use std::net::Ipv4Addr;
 #[cfg(any(test, not(target_os = "macos")))]
 use std::time::Duration;
+use switch::loopback::RangeProbe;
 
 /// The zone the daemon's answerer holds. Mirrors
 /// `minimald::net::dns::HOSTNAME_SUFFIX`; the CLI does not depend on the
@@ -727,13 +729,13 @@ pub(crate) fn command(port: u16) -> String {
 /// names the exact command. The interim re-surfaces the advisory even when
 /// the hook routes (NET-123: "re-surface
 /// the advisory of NET-122"): a session on the interim is a fact the user
-/// has no other way to see. The interim fact says what there is to do
-/// about it — nothing: the interim ends when a host-side step installs the
-/// range, never by configuring the resolver, which is all the command the
-/// advisory names ever does. Without that severance a user on the interim
-/// who ran the advised command would be re-advised at every later session
-/// start, the command being the one step the advisory never claims ends
-/// it. String assembly only.
+/// has no other way to see. The interim fact names the step that ends it:
+/// installing the range on the host — by design §7.1 the job of the same
+/// advisory command on macOS, once that command reserves the range (a
+/// root-held boot step, not yet part of the command it renders here). The
+/// command the advisory names is therefore said to configure the resolver,
+/// and the range fact stands beside it rather than under it, so a user who
+/// ran the command is not told it ended the interim. String assembly only.
 ///
 /// `blocker` names why the command would do nothing on this host — a host
 /// whose lookups never reach the resolver the command configures — in which
@@ -762,22 +764,17 @@ pub(crate) fn advisory_at(
     }
     let mut facts = Vec::new();
     if interim {
+        // The interim ends when the range is installed on the host — the
+        // root-held boot step design §7.1 folds into the macOS advisory
+        // command. The command rendered here does not carry that step yet,
+        // so the fact names the range as what is missing and stops there:
+        // it neither claims the command below ends the interim nor claims
+        // nothing ever will.
         facts.push(format!(
             "this session publishes at the shared 127.0.0.1 interim: the \
-             reserved local range {} is not installed on this host",
+             reserved local range {} is not installed on this host's loopback",
             range_text()
         ));
-        // What there is to do about the interim: nothing. The command the
-        // advisory names configures the resolver, never the range — a
-        // host-side step installs that — so this fact says both, or a
-        // user on the interim would take the command as the step that
-        // ends the interim and be re-advised at every session start,
-        // command run and range still absent.
-        facts.push(
-            "nothing is needed for the interim — it ends when a host-side \
-             step installs the range, never by configuring the resolver"
-                .to_string(),
-        );
     }
     if !hook.routes(port) {
         facts.push(format!(
@@ -834,12 +831,9 @@ fn range_text() -> String {
     format!("{network}/{prefix}")
 }
 
-/// The result of bind-probing the reserved local range: one
-/// `TcpListener::bind((address, 0))` per usable host address, where
-/// `EADDRNOTAVAIL` is what an absent loopback alias looks like. The CLI-side
-/// twin of the daemon's NET-123 probe (`minimald::net::loopback`), restated
-/// because the CLI does not depend on the daemon crate; a partial alias set
-/// reads as absent, the same way.
+/// The bind probe's result as the bundle records it: the same probe the
+/// daemon runs at session start (`switch::loopback`, one definition next to
+/// the range it probes), with its refusal spelled out for a JSON reader.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct BindProbe {
     /// How many addresses in the range accepted a bind.
@@ -851,54 +845,16 @@ pub(crate) struct BindProbe {
     pub first_refusal: Option<(String, String)>,
 }
 
-impl BindProbe {
-    /// The probe that never ran, for a worker that died: reads as absent.
-    pub(crate) fn failed_to_run() -> Self {
+impl From<&RangeProbe> for BindProbe {
+    fn from(probe: &RangeProbe) -> Self {
         BindProbe {
-            bound: 0,
-            probed: 0,
-            first_refusal: None,
+            bound: probe.bound,
+            probed: probe.probed,
+            first_refusal: probe
+                .first_failure
+                .map(|(address, kind)| (address.to_string(), kind.to_string())),
         }
     }
-
-    /// The whole range accepted binds: the loopback aliases are installed.
-    pub(crate) fn present(&self) -> bool {
-        self.bound == self.probed && self.probed > 0
-    }
-
-    /// The host is on the 127.0.0.1 interim (NET-123): the reserved range
-    /// is absent, so the daemon publishes session names at the shared
-    /// host loopback address.
-    pub(crate) fn interim(&self) -> bool {
-        !self.present()
-    }
-}
-
-/// Bind-probe the reserved local range from this host: the same 254 usable
-/// host addresses the daemon's probe covers. About 2.5ms for a /24;
-/// blocking, so callers run it on a blocking thread.
-pub(crate) fn probe_range() -> BindProbe {
-    let (network, prefix) = RESERVED_LOCAL_RANGE;
-    let mut probe = BindProbe {
-        bound: 0,
-        probed: 0,
-        first_refusal: None,
-    };
-    // Host parts 1 through 254: the network and broadcast addresses are not
-    // aliases a session would publish from.
-    for host in 1..(1u32 << (32 - u32::from(prefix))) - 1 {
-        let address = Ipv4Addr::from(u32::from(network) + host);
-        probe.probed += 1;
-        match TcpListener::bind(SocketAddrV4::new(address, 0)) {
-            Ok(_) => probe.bound += 1,
-            Err(e) => {
-                probe
-                    .first_refusal
-                    .get_or_insert((address.to_string(), e.kind().to_string()));
-            }
-        }
-    }
-    probe
 }
 
 /// The host's naming surface for the diagnostic bundle: the resolver hook
@@ -924,7 +880,9 @@ pub(crate) struct NamingSurface {
 /// Reads everything [`NamingSurface`] holds, for `min bug` to record.
 pub(crate) async fn naming_surface() -> NamingSurface {
     let (hook, _) = session_detection().await;
-    let probe = tokio::task::spawn_blocking(probe_range)
+    // The daemon's session-start probe, run here on the CLI's own host:
+    // blocking, so on a blocking thread.
+    let probe = tokio::task::spawn_blocking(switch::loopback::probe)
         .await
         .unwrap_or_else(|join| {
             tracing::warn!(
@@ -932,7 +890,7 @@ pub(crate) async fn naming_surface() -> NamingSurface {
                 "the naming-surface bind probe did not run; treating the \
                  reserved local range as absent"
             );
-            BindProbe::failed_to_run()
+            RangeProbe::failed_to_run()
         });
     NamingSurface {
         zone: ZONE,
@@ -940,7 +898,7 @@ pub(crate) async fn naming_surface() -> NamingSurface {
         loopback_aliases_present: probe.present(),
         interim_loopback: probe.interim(),
         resolver_hook: hook,
-        bind_probe: probe,
+        bind_probe: BindProbe::from(&probe),
     }
 }
 
@@ -1022,19 +980,17 @@ mod tests {
             "the interim advisory must name the interim: {interim}"
         );
         assert!(interim.contains(&range_text()));
-        // The interim fact must say what there is to do about it — nothing,
-        // until a host-side step installs the range — and never leave the
-        // command to be read as the step that ends the interim: the command
-        // configures the resolver, and a user who ran it expecting the
-        // interim to end would be re-advised at every session start.
+        // The interim fact names what is missing — the range on the host's
+        // loopback — and does not claim the command below ends it: the
+        // command rendered today configures the resolver only, and the
+        // range step is not yet part of it (design §7.1 makes it so).
         assert!(
-            interim.contains("nothing is needed for the interim"),
-            "the interim advisory must say nothing is needed: {interim}"
+            interim.contains("is not installed on this host's loopback"),
+            "the interim advisory must name the missing range: {interim}"
         );
         assert!(
-            interim.contains("host-side step installs the range"),
-            "the interim advisory must name what ends it, a host-side \
-             step: {interim}"
+            !interim.contains("nothing is needed"),
+            "the interim advisory must not claim nothing ends it: {interim}"
         );
         for marker in command_markers(port) {
             assert!(
@@ -1453,25 +1409,32 @@ mod tests {
         );
     }
 
+    /// The bundle's record of the probe carries the same counts and the
+    /// refusal spelled out, so the record and the daemon's verdict cannot
+    /// disagree about one host.
     #[test]
-    fn probe_range_reports_every_address_in_the_range() {
-        let probe = probe_range();
-        let (_, prefix) = RESERVED_LOCAL_RANGE;
-        let usable = ((1u32 << (32 - u32::from(prefix))) - 2) as usize;
-        assert_eq!(probe.probed, usable, "every usable host address probed");
-        assert!(probe.bound <= probe.probed);
+    fn the_bundle_record_mirrors_the_probe() {
+        let refused = RangeProbe {
+            bound: 3,
+            probed: 254,
+            first_failure: Some((
+                Ipv4Addr::new(127, 64, 0, 4),
+                std::io::ErrorKind::AddrNotAvailable,
+            )),
+        };
+        let record = BindProbe::from(&refused);
+        assert_eq!(record.bound, 3);
+        assert_eq!(record.probed, 254);
         assert_eq!(
-            probe.present(),
-            probe.bound == probe.probed,
-            "present means the whole range bound: {:?}",
-            probe
+            record.first_refusal,
+            Some((
+                "127.64.0.4".to_string(),
+                "address not available".to_string()
+            ))
         );
-        assert_eq!(probe.interim(), !probe.present());
         assert_eq!(
-            probe.first_refusal.is_none(),
-            probe.present(),
-            "a present range records no refusal: {:?}",
-            probe
+            BindProbe::from(&RangeProbe::failed_to_run()).first_refusal,
+            None
         );
     }
 

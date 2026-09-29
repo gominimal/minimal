@@ -477,10 +477,9 @@ pub struct CreateSessionResponse {
     ///
     /// A client that reads `true` surfaces the naming advisory again
     /// (NET-122): a session on the interim is a fact nothing else shows.
-    /// The advisory it re-surfaces names the command that configures the
-    /// host's resolver hook, which is not a step that ends the interim —
-    /// the range is installed by a host-side step the command is not, so
-    /// the interim needs nothing of the user until that step exists.
+    /// The interim ends when the range is installed on the host — on macOS
+    /// the root-held boot step design §7.1 folds into the same advisory
+    /// command, not yet part of the command the client renders.
     /// `false` from a daemon that predates
     /// the field is the safe read — nothing downstream is gated on it; the
     /// advisory a client prints from its own host-resolver detection is not,
