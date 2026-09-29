@@ -22,3 +22,6 @@ hakoniwa.workspace = true
 libc.workspace = true
 nix.workspace = true
 
+
+[lints]
+workspace = true

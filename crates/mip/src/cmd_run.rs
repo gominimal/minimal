@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use common::Target;
 use graph::Graph;
 use mctx::{Config, Context, Error};
-use tracing::trace;
+use tracing::{trace, warn};
 
 /// Specifies which task to run.
 #[derive(Debug, Clone)]
@@ -243,6 +243,43 @@ pub async fn run_task(
     mut graph: Graph,
     ctx: &mut Context,
 ) -> Result<(), Error> {
+    // Preflight (advisory): every build sandbox starts by unsharing an
+    // unprivileged user namespace, forked from this process with no exec in
+    // between — so this process's own privileges and AppArmor label are what
+    // the kernel will check. On a restricted host (stock Ubuntu 24.04+ with
+    // an unconfined mip) that denial otherwise surfaces only when the first
+    // spawn dies writing /proc/self/uid_map, with nothing useful in the log.
+    // Warn once at the start of the first task run instead, with the fix.
+    if let Some(restriction) = sandbox2::user_namespaces_restriction() {
+        let fix = match restriction {
+            sandbox2::UsernsRestriction::ApparmorUnconfined => {
+                let bin = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.to_str().map(str::to_owned))
+                    .unwrap_or_else(|| "<path to this mip binary>".to_string());
+                format!(
+                    "attach the minimald AppArmor profile to mip (one-time, needs root): \
+                     sudo scripts/install-apparmor-profile.sh --path {bin} \
+                     (from a checkout; or use the sysctl workaround)"
+                )
+            }
+            sandbox2::UsernsRestriction::Disabled => {
+                "re-enable user namespaces, e.g. sudo sysctl -w user.max_user_namespaces=15000"
+                    .to_string()
+            }
+            // `UsernsRestriction` is #[non_exhaustive]; future variants get
+            // the docs pointer until a matching remediation lands here.
+            _ => "see the linux-host-setup doc".to_string(),
+        };
+        warn!(
+            reason = %restriction,
+            fix,
+            docs = "https://docs.minimal.dev/reference/linux-host-setup",
+            "builds will fail to start: this host refuses the unprivileged user \
+             namespace every build sandbox needs"
+        );
+    }
+
     let mut env = ctx
         .make_env(
             task_name,

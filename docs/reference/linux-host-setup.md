@@ -5,8 +5,8 @@ description: "Preparing a Linux host to run minimald: the unprivileged user name
 
 # Linux host setup
 
-`minimald` runs every session and task inside its own sandbox
-composed of an unprivileged user namespace and other Linux
+`minimald` and `mip` run every session and task inside their own
+sandbox composed of an unprivileged user namespace and other Linux
 namespaces, similar to how containers are sandboxed on
 Kubernetes. Root/sudo access is not needed to create these sandboxes;
 however, some Linux distributions require enabling unprivileged user
@@ -28,10 +28,10 @@ DIAG hakoniwa container/process exited non-zero code=125 exit_code=None
 ```
 
 `min session attach` shows this as a session that closes
-immediately. The `minimald` daemon also checks this at startup: on a
-host that will refuse the namespace it logs a `sessions will fail to
-start` warning naming the restriction and this fix, so check the
-daemon log first. Confirm the host is the cause using stock tools,
+immediately. The `minimald` daemon and `mip` both check this at
+startup: on a host that will refuse the namespace they log a warning
+naming the restriction and this fix, so check the daemon log or the
+`mip` output first. Confirm the host is the cause using stock tools,
 no Minimal involved:
 
 ```console
@@ -86,6 +86,22 @@ To remove the AppArmor profile:
 ```console
 $ sudo scripts/install-apparmor-profile.sh --uninstall   # from a checkout
 ```
+
+### Attaching the profile to `mip`
+
+`mip` builds every task in the same kind of sandbox, so a standalone
+`mip` on Ubuntu 24.04+ needs the same allowance. The profile above
+grants `userns` to whichever binary it is attached to, so attach it to
+`mip` the same way — pass the binary's path with `--path`:
+
+```console
+$ sudo scripts/install-apparmor-profile.sh --path "$PWD/target/debug/minimald" --path "$PWD/target/debug/mip"
+```
+
+The installer's `--path` accepts any binary path, so this works for a
+source build, a custom install prefix, or a binary installed elsewhere
+on the host. The sysctl in Option 1 also covers `mip` if you prefer a
+host-wide change.
 
 ## User namespaces disabled entirely
 

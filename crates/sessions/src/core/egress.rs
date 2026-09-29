@@ -1,4 +1,4 @@
-//! The frame-level egress verdict (NET-062, NET-063, NET-064).
+//! The frame-level egress verdict (NET-062, NET-063, NET-064, NET-084).
 //!
 //! One pure decision — admit or drop — over an owned frame summary and an
 //! owned rule set, deliberately separate from the relay loop that applies
@@ -9,9 +9,16 @@
 //!
 //! What the verdict encodes:
 //!
+//! * **The source must be the box's lease** — a frame whose source address
+//!   (an IPv4 frame's IPv4 source, an ARP frame's sender protocol address)
+//!   is not the lease the relay was attached with is rejected before any
+//!   family or rule is consulted (NET-084). No box may speak from an
+//!   address but its own.
 //! * **ARP is admitted** — address resolution on the shared L2 switch is a
 //!   declared path for every box; the gateway's MAC must be learnable for
-//!   any egress at all to work.
+//!   any egress at all to work. An ARP frame from the lease, that is: its
+//!   sender address is a source like any other, and a foreign one is
+//!   rejected by the lease check above.
 //! * **IPv6 is dropped** — v1 declares no IPv6 admission path anywhere
 //!   (guest IPv6 disabled, NET-082; AAAA answered NODATA, NET-136), so an
 //!   IPv6 frame is dropped as a family rather than matched against rules.
@@ -29,6 +36,14 @@
 //! The rules are compiled once per box at attach
 //! ([`EgressRules::from_policy`]); the per-frame work is [`summarize`] plus
 //! [`verdict`], both allocation-free.
+//!
+//! Beside the frame verdict sits its name-level counterpart, the DNS
+//! rebinding intersection (NET-066, NET-067): the pure decision of which
+//! addresses a name *resolved to* may ever be admitted for a box, once the
+//! box's denies and the infrastructure deny set are subtracted. The relay
+//! (not this module) holds the admission window; what lives here is the
+//! arithmetic the window stores the results of, kept pure and free of
+//! resolver I/O so the NET-067 harness can exhaust it.
 
 use crate::{EgressPolicy, IpProto};
 
@@ -60,10 +75,14 @@ pub enum FrameFamily {
     /// tags (0x8100) included, since a VLAN-tagged IPv4 frame is not an
     /// IPv4 frame to this header reader.
     UndeclaredFamily(u16),
-    /// Too short to carry the header the family decision or the rule match
-    /// reads: below 14 bytes there is not even an `EtherType`, and an
-    /// IPv4-ethertype frame below 34 bytes has no readable IPv4 header.
-    /// Never admitted — an unreadable frame cannot be a declared one.
+    /// Too short to carry the header the family decision, the rule match or
+    /// the lease check reads: below 14 bytes there is not even an
+    /// `EtherType`, an IPv4-ethertype frame below 34 bytes has no readable
+    /// IPv4 header, and an ARP frame too short to carry four bytes of
+    /// sender protocol address at the `hlen` its header declares has no
+    /// readable source. Never admitted — an unreadable frame
+    /// cannot be a declared one, and an unattributable one cannot be the
+    /// lease's (NET-084).
     Truncated,
 }
 
@@ -74,6 +93,13 @@ pub enum FrameFamily {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameSummary {
     family: FrameFamily,
+    /// The source address the frame carries: an IPv4 frame's header
+    /// source, or an ARP frame's sender protocol address — read whatever
+    /// protocol type the frame claims for it — the address the lease check
+    /// (NET-084) compares against the box's lease. `None` when the frame
+    /// carries no readable one: IPv6, an undeclared family, or a frame too
+    /// short to read.
+    src: Option<[u8; 4]>,
     /// The IPv4 destination address, when the frame carries one.
     dst: Option<[u8; 4]>,
     /// The IPv4 protocol number, when the frame carries one.
@@ -90,6 +116,15 @@ impl FrameSummary {
     #[must_use]
     pub fn family(&self) -> FrameFamily {
         self.family
+    }
+
+    /// The source address the frame carries — an IPv4 frame's header
+    /// source, or an ARP frame's sender protocol address, whatever
+    /// protocol the frame claims for it (the address the lease check
+    /// reads). `None` when the frame carries no readable one.
+    #[must_use]
+    pub fn source(&self) -> Option<[u8; 4]> {
+        self.src
     }
 
     /// The IPv4 destination address, when the frame carries one.
@@ -119,6 +154,7 @@ impl FrameSummary {
 pub fn summarize(frame: &[u8]) -> FrameSummary {
     let none = |family| FrameSummary {
         family,
+        src: None,
         dst: None,
         proto: None,
         dst_port: 0,
@@ -128,12 +164,41 @@ pub fn summarize(frame: &[u8]) -> FrameSummary {
     }
     let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
     let family = match ethertype {
-        ETHERTYPE_ARP => return none(FrameFamily::Arp),
+        ETHERTYPE_ARP => {
+            // ARP: the sender protocol address is the frame's source — the
+            // address the lease check (NET-084) compares. It sits `hlen`
+            // bytes of sender hardware into the ARP payload, behind 8 bytes
+            // of fixed header, and the check reads four bytes of it, so the
+            // offset is bounds-checked before it is used. The protocol type
+            // the frame claims for the address is not consulted: an ARP
+            // claiming a protocol other than IPv4 must be no way to
+            // announce an address unchecked, so the slot is the source
+            // whatever the frame claims to speak. A frame too short to
+            // carry four bytes of sender address at its own `hlen` has no
+            // readable source: it cannot be attributed to the lease, so it
+            // is truncated rather than admitted.
+            if frame.len() < ETH_HDR + 8 {
+                return none(FrameFamily::Truncated);
+            }
+            let hlen = frame[ETH_HDR + 4] as usize;
+            let spa = ETH_HDR + 8 + hlen;
+            if frame.len() < spa + 4 {
+                return none(FrameFamily::Truncated);
+            }
+            return FrameSummary {
+                family: FrameFamily::Arp,
+                src: Some([frame[spa], frame[spa + 1], frame[spa + 2], frame[spa + 3]]),
+                dst: None,
+                proto: None,
+                dst_port: 0,
+            };
+        }
         ETHERTYPE_IPV6 => return none(FrameFamily::Ipv6),
         ETHERTYPE_IPV4 => FrameFamily::Ipv4,
         _ => return none(FrameFamily::UndeclaredFamily(ethertype)),
     };
-    // IPv4: the fixed 20-byte header carries the destination and protocol.
+    // IPv4: the fixed 20-byte header carries the source, destination and
+    // protocol.
     let ip = &frame[ETH_HDR..];
     if ip.len() < 20 {
         return none(FrameFamily::Truncated);
@@ -150,6 +215,7 @@ pub fn summarize(frame: &[u8]) -> FrameSummary {
     };
     FrameSummary {
         family,
+        src: Some([ip[12], ip[13], ip[14], ip[15]]),
         dst: Some([ip[16], ip[17], ip[18], ip[19]]),
         proto: Some(ip[9]),
         dst_port,
@@ -200,11 +266,20 @@ impl Ipv4Cidr {
         };
         (u32::from_be_bytes(ip) & mask) == (u32::from_be_bytes(self.addr) & mask)
     }
+
+    /// The single-address `/32` of one address: the shape the infrastructure
+    /// deny set holds a gateway's own addresses in, so they are named
+    /// individually rather than only through the plane that contains them.
+    #[must_use]
+    pub fn exact(addr: [u8; 4]) -> Self {
+        Self { addr, prefix: 32 }
+    }
 }
 
 /// A box's compiled egress rules: the three declaration dimensions of an
-/// [`EgressPolicy`], owned and matchable, plus the address of the resolver
-/// the carve-out admits.
+/// [`EgressPolicy`], owned and matchable, plus the addresses the verdict is
+/// keyed to — the resolver the carve-out admits, and the box's lease, the
+/// one source its frames may carry.
 ///
 /// Each dimension is `None` to allow all and `Some(list)` to allow exactly
 /// the listed entries — so a deny-all declaration is `Some(vec![])` on
@@ -223,6 +298,10 @@ pub struct EgressRules {
     /// gateway), which the carve-out admits at [`DNS_PORT`] under any
     /// declaration.
     resolver: [u8; 4],
+    /// The box's lease on the switch — the one source address its frames
+    /// may carry, which the verdict rejects any other of (NET-084). Known
+    /// when the box is attached, the same moment the policy is compiled.
+    lease: [u8; 4],
 }
 
 impl EgressRules {
@@ -234,12 +313,14 @@ impl EgressRules {
         allow_subnets: Option<Vec<Ipv4Cidr>>,
         deny_subnets: Option<Vec<Ipv4Cidr>>,
         resolver: [u8; 4],
+        lease: [u8; 4],
     ) -> Self {
         Self {
             allow_protocols,
             allow_subnets,
             deny_subnets,
             resolver,
+            lease,
         }
     }
 
@@ -248,11 +329,13 @@ impl EgressRules {
     /// NET-074 changes it once the deny-all default is in force), and a
     /// declared dimension keeps only the entries the launch-time validation
     /// already checked parse. `resolver` is the switch gateway's address,
-    /// the resolver this box's carve-out is keyed to.
+    /// the resolver this box's carve-out is keyed to, and `lease` the box's
+    /// own address on the switch — the source its frames must carry
+    /// (NET-084).
     #[must_use]
-    pub fn from_policy(policy: Option<&EgressPolicy>, resolver: [u8; 4]) -> Self {
+    pub fn from_policy(policy: Option<&EgressPolicy>, resolver: [u8; 4], lease: [u8; 4]) -> Self {
         let Some(policy) = policy else {
-            return Self::new(None, None, None, resolver);
+            return Self::new(None, None, None, resolver, lease);
         };
         let allow_protocols: Option<Vec<u8>> = policy
             .allow_protocols
@@ -270,6 +353,7 @@ impl EgressRules {
             subnets(&policy.allow_subnets),
             subnets(&policy.deny_subnets),
             resolver,
+            lease,
         )
     }
 
@@ -277,6 +361,29 @@ impl EgressRules {
     #[must_use]
     pub fn resolver(&self) -> [u8; 4] {
         self.resolver
+    }
+
+    /// The compiled `allow_subnets`, `None` when the dimension allows all —
+    /// the one dimension the rebinding intersection also reads, as the
+    /// RFC 1918 exemption's signal (NET-067): private space is admitted for
+    /// a name only where the box's own address declaration covers it.
+    #[must_use]
+    pub fn allow_subnets(&self) -> Option<&[Ipv4Cidr]> {
+        self.allow_subnets.as_deref()
+    }
+
+    /// The compiled `deny_subnets`, `None` when nothing is denied — the
+    /// deny half the rebinding intersection subtracts from every resolved
+    /// answer before anything is admitted (NET-067).
+    #[must_use]
+    pub fn deny_subnets(&self) -> Option<&[Ipv4Cidr]> {
+        self.deny_subnets.as_deref()
+    }
+
+    /// The box's lease — the one source address its frames may carry.
+    #[must_use]
+    pub fn lease(&self) -> [u8; 4] {
+        self.lease
     }
 }
 
@@ -307,6 +414,15 @@ pub enum FrameVerdict {
 /// without re-deriving any of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
+    /// The frame's source is not the lease the relay was attached with — a
+    /// spoofed or foreign source, rejected before any family or rule is
+    /// consulted (NET-084).
+    ForeignSource {
+        /// The source address the frame carried.
+        src: [u8; 4],
+        /// The lease the frame's source had to be.
+        lease: [u8; 4],
+    },
     /// IPv6: dropped as a family, no v1 admission path (NET-082, NET-136).
     Ipv6,
     /// An `EtherType` no admission path is declared for, carried raw.
@@ -340,6 +456,7 @@ impl DropReason {
     #[must_use]
     pub fn rule(&self) -> &'static str {
         match self {
+            Self::ForeignSource { .. } => "egress-foreign-source",
             Self::Ipv6 => "egress-ipv6",
             Self::UndeclaredFamily(_) => "egress-undeclared-ethertype",
             Self::Truncated => "egress-truncated-ipv4",
@@ -353,7 +470,8 @@ impl DropReason {
     #[must_use]
     pub fn destination(&self) -> Option<[u8; 4]> {
         match self {
-            Self::Ipv6
+            Self::ForeignSource { .. }
+            | Self::Ipv6
             | Self::UndeclaredFamily(_)
             | Self::Truncated
             | Self::UndeclaredProtocol { .. } => None,
@@ -368,21 +486,44 @@ impl DropReason {
             Self::UndeclaredProtocol { proto }
             | Self::DeniedSubnet { proto, .. }
             | Self::UndeclaredSubnet { proto, .. } => Some(*proto),
-            Self::Ipv6 | Self::UndeclaredFamily(_) | Self::Truncated => None,
+            Self::ForeignSource { .. }
+            | Self::Ipv6
+            | Self::UndeclaredFamily(_)
+            | Self::Truncated => None,
         }
     }
 }
 
+/// NET-084: whether a frame's source is foreign — an address other than the
+/// `lease` the relay was attached with. `Some(reason)` when the frame must
+/// be rejected; `None` when it carries the lease, or no readable source at
+/// all — an IPv6 or undeclared-family frame, or a truncated one, none of
+/// which `verdict` admits either way. An IPv4 frame's source is its header
+/// source address; an ARP frame's is its sender protocol address, read
+/// whatever protocol type the frame claims for it — so a foreign address
+/// cannot be announced by address resolution either, least of all by an
+/// ARP dressed up as another protocol.
+#[must_use]
+pub fn foreign_source(summary: &FrameSummary, lease: [u8; 4]) -> Option<DropReason> {
+    let src = summary.src?;
+    (src != lease).then_some(DropReason::ForeignSource { src, lease })
+}
+
 /// The admit-or-drop decision for one frame summary against one box's rules
-/// — the pure function NET-062, NET-063, and NET-064 all reduce to, and
-/// the one the Kani harness exhausts.
+/// — the pure function NET-062, NET-063, NET-064, and NET-084 all reduce
+/// to, and the one the Kani harness exhausts.
 ///
-/// Order of the IPv4 checks is part of the contract: the resolver
-/// carve-out comes first, so a box that denies the resolver's own subnet
-/// still resolves (NET-079); `deny_subnets` then carves out of what the
-/// allows admit; and a drop never depends on the rule lists being sorted.
+/// Order of the checks is part of the contract: the lease check comes
+/// first, so a frame from a foreign source is rejected whatever family or
+/// destination it carries (NET-084); the resolver carve-out then comes
+/// before the rules, so a box that denies the resolver's own subnet still
+/// resolves (NET-079); `deny_subnets` then carves out of what the allows
+/// admit; and a drop never depends on the rule lists being sorted.
 #[must_use]
 pub fn verdict(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
+    if let Some(reason) = foreign_source(summary, rules.lease) {
+        return FrameVerdict::Drop(reason);
+    }
     match summary.family {
         FrameFamily::Arp => FrameVerdict::Admit,
         FrameFamily::Ipv6 => FrameVerdict::Drop(DropReason::Ipv6),
@@ -429,6 +570,187 @@ fn verdict_ipv4(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
     FrameVerdict::Admit
 }
 
+/// The infrastructure deny set of the DNS rebinding intersection (design
+/// §5.3, NET-067): the ranges an allowed name's answer may never be admitted
+/// into, whatever the box's own rules say — the fabric's own space and the
+/// ranges that stand for the host, not destinations.
+///
+/// Two classes, because one of them is conditional:
+///
+/// * **Fixed** — link-local and the metadata services living in it, loopback
+///   space, the whole `100.64.0.0/10` plane the switch fabric draws its
+///   subnets from (so no answer can ever name a box, the gateway, or the
+///   daemon itself), and the gateway's own two addresses: the answerer's (the
+///   resolver the box's carve-out is keyed to, NET-079) and the helper's (the
+///   deprecated host-alias literal, NET-004), each held as a `/32` so both
+///   are named individually rather than only through the plane containing
+///   them. Refused under every declaration.
+/// * **RFC 1918** — private space, refused *unless the box's
+///   `egress.allow_subnets` covers the answer*: a developer who wants a name
+///   to reach the LAN says so by allowing the range, so a name rule cannot
+///   become a way around leaving it undeclared.
+///
+/// Owned outright — no borrow of the policy survives the attach — which is
+/// what keeps [`rebinding_admits`] a pure function over owned addresses and
+/// CIDRs, separate from resolver I/O, as the NET-067 harness requires.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InfrastructureDenySet {
+    /// Ranges refused under every declaration.
+    fixed: Vec<Ipv4Cidr>,
+    /// RFC 1918 space, refused unless `allow_subnets` covers the answer.
+    rfc1918: Vec<Ipv4Cidr>,
+}
+
+impl InfrastructureDenySet {
+    /// The set for one box's attach: the always-refused ranges, plus the
+    /// gateway's `resolver` (where the box's own queries are answered) and
+    /// `host_alias` (the helper's address) as `/32`s.
+    ///
+    /// Both gateway addresses lie inside the plane today; they are named
+    /// individually so the set still refuses them if the plane is ever
+    /// renumbered out from under them.
+    ///
+    /// # Panics
+    ///
+    /// Never: every range is a constant that parses.
+    #[must_use]
+    pub fn new(resolver: [u8; 4], host_alias: [u8; 4]) -> Self {
+        // Every constant parses; the parses exist so the set's contents are
+        // spelled as ranges, not as byte arrays.
+        let cidr = |s: &'static str| Ipv4Cidr::parse(s).expect("a constant CIDR parses");
+        Self {
+            fixed: vec![
+                // Link-local, and the metadata services living in it.
+                cidr("169.254.0.0/16"),
+                // Loopback space.
+                cidr("127.0.0.0/8"),
+                // The plane the switch fabric draws subnets from.
+                cidr("100.64.0.0/10"),
+                Ipv4Cidr::exact(resolver),
+                Ipv4Cidr::exact(host_alias),
+            ],
+            rfc1918: vec![
+                cidr("10.0.0.0/8"),
+                cidr("172.16.0.0/12"),
+                cidr("192.168.0.0/16"),
+            ],
+        }
+    }
+}
+
+/// Why the rebinding intersection refused one resolved address, carrying the
+/// rule its rate-limited warning is keyed to (mirroring [`DropReason::rule`],
+/// the frame verdict's naming discipline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebindingRefusal {
+    /// The answer lies in the box's `deny_subnets`: a declared deny is
+    /// subtractive from every admission path, a name rule included.
+    DeniedSubnet,
+    /// The answer lies in the infrastructure deny set: a fixed range, or
+    /// RFC 1918 the box's `allow_subnets` does not cover.
+    Infrastructure,
+}
+
+impl RebindingRefusal {
+    /// The rule that refused the answer: the rate-limit key and the warning's
+    /// `rule_matched` field (NET-067).
+    #[must_use]
+    pub fn rule(&self) -> &'static str {
+        match self {
+            Self::DeniedSubnet => "dns-rebinding-denied-subnet",
+            Self::Infrastructure => "dns-rebinding-infrastructure",
+        }
+    }
+}
+
+/// The DNS rebinding intersection's decision for one resolved address
+/// (NET-066, NET-067): admitted — `Ok(())` — exactly when nothing refuses
+/// it, where RFC 1918 is the one infrastructure class an `allow_subnets`
+/// entry exempts.
+///
+/// Pure over owned addresses and CIDRs, and deliberately separate from any
+/// resolver: the daemon hands this function the addresses a resolver already
+/// returned and learns which of them may ever be admitted, which is what
+/// lets the Kani harness exhaust the decision without a socket in sight.
+///
+/// The order of the checks is part of the contract: the box's own denies
+/// first — a declared deny outranks every allowance — then the fixed
+/// infrastructure ranges, then RFC 1918 under its `allow_subnets` exemption.
+/// An undeclared `allow_subnets` (`None`, allow-all) counts as covering the
+/// answer: the box's address dimension is open, so the name path opens with
+/// it rather than refusing answers the box can already reach.
+///
+/// # Errors
+///
+/// [`RebindingRefusal`] — never an I/O or parse failure; the answer is
+/// refused exactly when a deny or the infrastructure set names it.
+pub fn rebinding_admits(
+    answer: [u8; 4],
+    allow: Option<&[Ipv4Cidr]>,
+    deny: Option<&[Ipv4Cidr]>,
+    infrastructure: &InfrastructureDenySet,
+) -> Result<(), RebindingRefusal> {
+    if let Some(denied) = deny
+        && denied.iter().any(|cidr| cidr.contains(answer))
+    {
+        return Err(RebindingRefusal::DeniedSubnet);
+    }
+    if infrastructure
+        .fixed
+        .iter()
+        .any(|cidr| cidr.contains(answer))
+    {
+        return Err(RebindingRefusal::Infrastructure);
+    }
+    if infrastructure
+        .rfc1918
+        .iter()
+        .any(|cidr| cidr.contains(answer))
+        && !allow.is_none_or(|list| list.iter().any(|cidr| cidr.contains(answer)))
+    {
+        return Err(RebindingRefusal::Infrastructure);
+    }
+    Ok(())
+}
+
+/// [`rebinding_intersection`]'s split of one name's resolved addresses:
+/// which may be admitted, and which are refused with the reason to log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RebindingSplit {
+    /// The addresses that may be admitted for the admission window, in the
+    /// order the answer carried them.
+    pub admitted: Vec<[u8; 4]>,
+    /// The refused addresses, each with the rule that refused it, in the
+    /// order the answer carried them.
+    pub refused: Vec<([u8; 4], RebindingRefusal)>,
+}
+
+/// Splits one name's resolved addresses by [`rebinding_admits`]: the
+/// addresses that may be admitted for the admission window, and the
+/// refusals to log — each refused address with its reason, in the order the
+/// answer carried them. This is the set-shaped wrapper the daemon calls
+/// once per DNS reply; the decision itself stays per-address, which is the
+/// shape the harness proves.
+#[must_use]
+pub fn rebinding_intersection(
+    answers: &[[u8; 4]],
+    allow: Option<&[Ipv4Cidr]>,
+    deny: Option<&[Ipv4Cidr]>,
+    infrastructure: &InfrastructureDenySet,
+) -> RebindingSplit {
+    let mut split = RebindingSplit {
+        admitted: Vec::with_capacity(answers.len()),
+        refused: Vec::with_capacity(answers.len()),
+    };
+    for answer in answers {
+        match rebinding_admits(*answer, allow, deny, infrastructure) {
+            Ok(()) => split.admitted.push(*answer),
+            Err(reason) => split.refused.push((*answer, reason)),
+        }
+    }
+    split
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +758,10 @@ mod tests {
     /// The switch gateway's address, the resolver every rule set below is
     /// keyed to (the default switch subnet's gateway).
     const RESOLVER: [u8; 4] = [100, 64, 0, 1];
+
+    /// The lease every rule set below is compiled with — the one source
+    /// address the frames below may carry (NET-084).
+    const LEASE: [u8; 4] = [100, 64, 0, 9];
 
     /// IPv4 protocol number for TCP, for the frames below.
     const IPPROTO_TCP: u8 = 6;
@@ -447,6 +773,7 @@ mod tests {
             Some(Vec::new()),
             Some(Vec::new()),
             RESOLVER,
+            LEASE,
         )
     }
 
@@ -460,14 +787,30 @@ mod tests {
         frame
     }
 
+    /// An ARP payload for `spa`: a full Ethernet/IPv4 ARP request, whose
+    /// sender protocol address is the source the lease check reads.
+    fn arp_payload(spa: [u8; 4]) -> Vec<u8> {
+        let mut arp = Vec::with_capacity(28);
+        arp.extend_from_slice(&1u16.to_be_bytes()); // htype: Ethernet
+        arp.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes()); // ptype: IPv4
+        arp.push(6); // hlen
+        arp.push(4); // plen
+        arp.extend_from_slice(&1u16.to_be_bytes()); // oper: request
+        arp.extend_from_slice(&[0x52, 0x54, 0x00, 0x40, 0x00, 0x09]); // sender MAC
+        arp.extend_from_slice(&spa); // sender protocol address
+        arp.extend_from_slice(&[0; 6]); // target MAC (unread)
+        arp.extend_from_slice(&RESOLVER); // target protocol address
+        arp
+    }
+
     /// An IPv4 packet payload: a header for `proto` carrying `frag_offset`
     ///'s low 13 bits, followed by `l4`.
-    fn ip_payload(proto: u8, dst: [u8; 4], frag_offset: u16, l4: &[u8]) -> Vec<u8> {
+    fn ip_payload(proto: u8, src: [u8; 4], dst: [u8; 4], frag_offset: u16, l4: &[u8]) -> Vec<u8> {
         let mut ip = vec![0u8; 20 + l4.len()];
         ip[0] = 0x45; // version 4, IHL 5 (20 bytes)
         ip[6..8].copy_from_slice(&frag_offset.to_be_bytes());
         ip[9] = proto;
-        ip[12..16].copy_from_slice(&[192, 168, 1, 2]); // src, unread by the verdict
+        ip[12..16].copy_from_slice(&src);
         ip[16..20].copy_from_slice(&dst);
         ip[20..].copy_from_slice(l4);
         ip
@@ -482,9 +825,14 @@ mod tests {
         out
     }
 
-    /// An IPv4 frame for `proto` to `dst`:`port`.
+    /// An IPv4 frame for `proto` from the lease to `dst`:`port`.
     fn ipv4_frame(proto: u8, dst: [u8; 4], port: u16) -> Vec<u8> {
-        eth_frame(ETHERTYPE_IPV4, &ip_payload(proto, dst, 0, &l4(port)))
+        ipv4_frame_from(LEASE, proto, dst, port)
+    }
+
+    /// An IPv4 frame for `proto` from `src` to `dst`:`port`.
+    fn ipv4_frame_from(src: [u8; 4], proto: u8, dst: [u8; 4], port: u16) -> Vec<u8> {
+        eth_frame(ETHERTYPE_IPV4, &ip_payload(proto, src, dst, 0, &l4(port)))
     }
 
     fn admits(frame: &[u8], rules: &EgressRules) -> bool {
@@ -495,8 +843,8 @@ mod tests {
     /// without rules behave identically under allow-all and deny-all.
     #[test]
     fn families_decided_without_rules() {
-        let allow_all = EgressRules::from_policy(None, RESOLVER);
-        let arp = eth_frame(ETHERTYPE_ARP, &[0u8; 28]);
+        let allow_all = EgressRules::from_policy(None, RESOLVER, LEASE);
+        let arp = eth_frame(ETHERTYPE_ARP, &arp_payload(LEASE));
         assert!(
             admits(&arp, &allow_all) && admits(&arp, &deny_all()),
             "ARP is a declared path for every box"
@@ -524,6 +872,150 @@ mod tests {
             FrameFamily::Truncated,
             "a frame shorter than an Ethernet header is truncated"
         );
+    }
+
+    /// NET-084: a frame whose source is not the box's lease is rejected —
+    /// an IPv4 frame carrying another address in its header, or an ARP frame
+    /// whose sender protocol address is another box's — whatever family,
+    /// destination or declaration it carries; the same frame from the lease
+    /// is admitted; and an ARP frame too short to carry its sender address
+    /// has no readable source and is truncated rather than admitted.
+    #[test]
+    fn foreign_source_is_rejected_whatever_it_carries() {
+        // Under a declaration that allows everything, the destination is
+        // not what drops this frame: the source is.
+        let allow_all = EgressRules::from_policy(None, RESOLVER, LEASE);
+        let spoofed = ipv4_frame_from([203, 0, 113, 7], IPPROTO_TCP, [10, 1, 2, 3], 443);
+        assert_eq!(
+            verdict(&summarize(&spoofed), &allow_all),
+            FrameVerdict::Drop(DropReason::ForeignSource {
+                src: [203, 0, 113, 7],
+                lease: LEASE,
+            })
+        );
+        // The same frame from the lease is the declared thing it looks like.
+        assert!(admits(
+            &ipv4_frame(IPPROTO_TCP, [10, 1, 2, 3], 443),
+            &allow_all
+        ));
+
+        // The resolver carve-out does not rescue a foreign source either:
+        // deny-all admits DNS to the resolver, from the lease only.
+        let dns = ipv4_frame_from([203, 0, 113, 7], IPPROTO_UDP, RESOLVER, DNS_PORT);
+        assert_eq!(
+            verdict(&summarize(&dns), &deny_all()),
+            FrameVerdict::Drop(DropReason::ForeignSource {
+                src: [203, 0, 113, 7],
+                lease: LEASE,
+            })
+        );
+        assert!(admits(
+            &ipv4_frame(IPPROTO_UDP, RESOLVER, DNS_PORT),
+            &deny_all()
+        ));
+
+        // ARP is a declared path — from the lease. A frame announcing
+        // another box's address as its sender is a foreign source too.
+        let arp = eth_frame(ETHERTYPE_ARP, &arp_payload(LEASE));
+        assert!(admits(&arp, &deny_all()), "the lease's own ARP resolves");
+        assert_eq!(summarize(&arp).source(), Some(LEASE));
+        let arp_spoof = eth_frame(ETHERTYPE_ARP, &arp_payload([203, 0, 113, 7]));
+        assert_eq!(
+            verdict(&summarize(&arp_spoof), &deny_all()),
+            FrameVerdict::Drop(DropReason::ForeignSource {
+                src: [203, 0, 113, 7],
+                lease: LEASE,
+            })
+        );
+
+        // An ARP frame too short to carry its sender protocol address has
+        // no readable source: it cannot be attributed to the lease, so it
+        // is truncated — never admitted. (The sender address sits 14 bytes
+        // into the ARP payload, behind the 8-byte fixed header and the
+        // 6-byte sender hardware address; 14 payload bytes stop short of
+        // it.)
+        let short_arp = eth_frame(ETHERTYPE_ARP, &arp_payload(LEASE)[..14]);
+        assert_eq!(summarize(&short_arp).family, FrameFamily::Truncated);
+        assert!(!admits(&short_arp, &allow_all));
+    }
+
+    /// The sender protocol address slot is an ARP frame's source whatever
+    /// protocol the frame claims for it (NET-084): an ARP announcing a
+    /// foreign address under a protocol type other than IPv4 — or under an
+    /// unexpected `hlen` or `plen` — is a foreign source like any other,
+    /// rejected and named the same way; an ARP whose slot carries the lease
+    /// is the declared family whatever it claims; and one too short to
+    /// carry four bytes of sender address at its own `hlen` is truncated,
+    /// never admitted.
+    #[test]
+    fn arp_source_is_read_whatever_protocol_the_frame_claims() {
+        /// An ARP payload claiming `ptype`, `hlen` and `plen`, whose sender
+        /// protocol address is `spa` — sitting `hlen` bytes of sender
+        /// hardware into the payload, and the `hlen` hardware bytes are
+        /// emitted so the address really is where the header says.
+        fn arp_claiming(ptype: u16, hlen: u8, plen: u8, spa: &[u8]) -> Vec<u8> {
+            let mut arp = Vec::new();
+            arp.extend_from_slice(&1u16.to_be_bytes()); // htype: Ethernet
+            arp.extend_from_slice(&ptype.to_be_bytes()); // ptype: as claimed
+            arp.push(hlen);
+            arp.push(plen);
+            arp.extend_from_slice(&1u16.to_be_bytes()); // oper: request
+            let mac = [0x52u8, 0x54, 0x00, 0x40, 0x00, 0x09];
+            arp.extend(mac.iter().cycle().take(usize::from(hlen))); // sender hardware address
+            arp.extend_from_slice(spa); // sender protocol address
+            arp
+        }
+
+        let allow_all = EgressRules::from_policy(None, RESOLVER, LEASE);
+        let foreign = [203, 0, 113, 7];
+
+        // An ARP claiming a protocol type other than IPv4, carrying a
+        // foreign address in its sender protocol address slot, is a
+        // foreign source like any other: the slot is the source whatever
+        // the frame claims to speak.
+        let odd = eth_frame(ETHERTYPE_ARP, &arp_claiming(0x1234, 6, 4, &foreign));
+        assert_eq!(summarize(&odd).family, FrameFamily::Arp);
+        assert_eq!(summarize(&odd).source(), Some(foreign));
+        assert_eq!(
+            verdict(&summarize(&odd), &allow_all),
+            FrameVerdict::Drop(DropReason::ForeignSource {
+                src: foreign,
+                lease: LEASE,
+            })
+        );
+
+        // An unexpected `hlen` moves the slot, and the read follows it.
+        let shifted = eth_frame(ETHERTYPE_ARP, &arp_claiming(0x1234, 8, 4, &foreign));
+        assert_eq!(summarize(&shifted).source(), Some(foreign));
+
+        // A `plen` other than four hides nothing either: the four bytes the
+        // lease check reads are the first four of the slot the frame
+        // declares.
+        let wide = eth_frame(
+            ETHERTYPE_ARP,
+            &arp_claiming(
+                0x1234,
+                6,
+                6,
+                &[foreign[0], foreign[1], foreign[2], foreign[3], 9, 9],
+            ),
+        );
+        assert_eq!(summarize(&wide).source(), Some(foreign));
+
+        // An ARP whose slot carries the lease is the declared family
+        // whatever protocol it claims: it announces the box's own address,
+        // which is what its ordinary ARP announces anyway.
+        let own = eth_frame(ETHERTYPE_ARP, &arp_claiming(0x1234, 6, 4, &LEASE));
+        assert!(
+            admits(&own, &deny_all()),
+            "the lease's own ARP resolves under a foreign protocol type too"
+        );
+
+        // Too short to carry four bytes of sender address at its own
+        // `hlen`: no readable source, so truncated rather than admitted.
+        let long_hlen = eth_frame(ETHERTYPE_ARP, &arp_claiming(0x0800, 200, 4, &[]));
+        assert_eq!(summarize(&long_hlen).family, FrameFamily::Truncated);
+        assert!(!admits(&long_hlen, &allow_all));
     }
 
     /// NET-079's carve-out: a deny-all box still reaches the resolver
@@ -558,6 +1050,7 @@ mod tests {
                 prefix: 16,
             }]),
             RESOLVER,
+            LEASE,
         );
         assert!(
             admits(&ipv4_frame(IPPROTO_UDP, RESOLVER, DNS_PORT), &denied_subnet),
@@ -577,6 +1070,7 @@ mod tests {
             }]),
             None,
             RESOLVER,
+            LEASE,
         );
         assert!(
             admits(&ipv4_frame(IPPROTO_TCP, [10, 1, 2, 3], 80), &rules),
@@ -604,6 +1098,7 @@ mod tests {
             }]),
             None,
             RESOLVER,
+            LEASE,
         );
         let denied = ipv4_frame(IPPROTO_TCP, [203, 0, 113, 7], 443);
         assert_eq!(
@@ -626,6 +1121,7 @@ mod tests {
                 prefix: 24,
             }]),
             RESOLVER,
+            LEASE,
         );
         assert!(
             admits(&ipv4_frame(IPPROTO_TCP, [10, 7, 7, 7], 80), &subtractive),
@@ -646,7 +1142,7 @@ mod tests {
     /// deny-all default comes into force.
     #[test]
     fn absent_policy_allows_all() {
-        let rules = EgressRules::from_policy(None, RESOLVER);
+        let rules = EgressRules::from_policy(None, RESOLVER, LEASE);
         assert!(admits(
             &ipv4_frame(IPPROTO_UDP, [203, 0, 113, 7], 9999),
             &rules
@@ -656,7 +1152,9 @@ mod tests {
 
     /// `from_policy` compiles each declared dimension and keeps the absent
     /// ones allow-all; `allow_dns_hosts` is not a frame-level rule (it is
-    /// the proxy's, NET-066) and compiles to nothing here.
+    /// the proxy's, NET-066) and compiles to nothing here. The lease is
+    /// carried beside the rules: the box's own address on the switch, the
+    /// source the verdict checks every frame against (NET-084).
     #[test]
     fn from_policy_compiles_the_declared_dimensions() {
         let policy = EgressPolicy {
@@ -665,7 +1163,7 @@ mod tests {
             allow_dns_hosts: Some(vec!["github.com".to_string()]),
             deny_subnets: None,
         };
-        let rules = EgressRules::from_policy(Some(&policy), RESOLVER);
+        let rules = EgressRules::from_policy(Some(&policy), RESOLVER, LEASE);
         assert_eq!(
             rules,
             EgressRules::new(
@@ -676,9 +1174,11 @@ mod tests {
                 }]),
                 None,
                 RESOLVER,
+                LEASE,
             )
         );
         assert_eq!(rules.resolver(), RESOLVER);
+        assert_eq!(rules.lease(), LEASE);
     }
 
     /// `Ipv4Cidr::parse` accepts exactly the spelling the launch-time
@@ -746,6 +1246,7 @@ mod tests {
         assert_eq!(summarize(&first).destination_port(), DNS_PORT);
         assert_eq!(summarize(&first).protocol(), Some(IPPROTO_UDP));
         assert_eq!(summarize(&first).destination(), Some(RESOLVER));
+        assert_eq!(summarize(&first).source(), Some(LEASE));
 
         // A later fragment: the offset bits are set, so there is no L4
         // header to read — and the missing port keeps the carve-out closed.
@@ -761,7 +1262,7 @@ mod tests {
         // An L4 header shorter than its ports cannot be read either.
         let short_l4 = eth_frame(
             ETHERTYPE_IPV4,
-            &ip_payload(IPPROTO_UDP, RESOLVER, 0, &[0u8; 2]),
+            &ip_payload(IPPROTO_UDP, LEASE, RESOLVER, 0, &[0u8; 2]),
         );
         assert_eq!(summarize(&short_l4).destination_port(), 0);
 
@@ -769,15 +1270,164 @@ mod tests {
         let short_ip = eth_frame(ETHERTYPE_IPV4, &[0u8; 10]);
         assert_eq!(summarize(&short_ip).family, FrameFamily::Truncated);
     }
+
+    /// The default switch's host alias, the helper's address the
+    /// infrastructure deny set holds beside the resolver.
+    const HOST_ALIAS: [u8; 4] = [100, 64, 255, 254];
+
+    /// Compiles a CIDR list, the way [`EgressRules::from_policy`] does, for
+    /// the intersection tests below.
+    fn cidrs(entries: &[&str]) -> Vec<Ipv4Cidr> {
+        entries
+            .iter()
+            .map(|cidr| Ipv4Cidr::parse(cidr).expect("a declared CIDR parses"))
+            .collect()
+    }
+
+    /// NET-066/NET-067: the intersection admits exactly the resolved
+    /// addresses that no deny and no infrastructure range refuses — a
+    /// declared deny first, the fixed ranges under every declaration, and
+    /// RFC 1918 only where the box's own `allow_subnets` covers the answer.
+    #[test]
+    fn rebinding_intersection_admits_only_clean_answers() {
+        let infrastructure = InfrastructureDenySet::new(RESOLVER, HOST_ALIAS);
+        let admit = |answer: [u8; 4], allow: Option<&[Ipv4Cidr]>, deny: Option<&[Ipv4Cidr]>| {
+            rebinding_admits(answer, allow, deny, &infrastructure)
+        };
+
+        // A public answer is admitted with no declarations at all (NET-066).
+        admit([140, 82, 121, 3], None, None).unwrap();
+
+        // The box's own denies are subtracted from every name (NET-067).
+        let deny = cidrs(&["203.0.113.0/24"]);
+        assert_eq!(
+            admit([203, 0, 113, 7], None, Some(deny.as_slice())),
+            Err(RebindingRefusal::DeniedSubnet)
+        );
+
+        // The fixed infrastructure ranges are refused under every
+        // declaration — link-local and the metadata services in it, loopback,
+        // the plane, and the gateway's own two addresses.
+        for refused in [
+            [169, 254, 169, 254], // metadata, in link-local
+            [127, 0, 0, 1],       // loopback
+            [100, 64, 0, 9],      // the plane (a box's lease)
+            RESOLVER,             // the answerer's own address
+            HOST_ALIAS,           // the helper's own address
+        ] {
+            assert_eq!(
+                admit(refused, None, None),
+                Err(RebindingRefusal::Infrastructure),
+                "{refused:?} is infrastructure, refused under every declaration"
+            );
+            // And an explicit allow does not exempt them: the exemption is
+            // RFC 1918's alone.
+            let allow_all = cidrs(&["0.0.0.0/0"]);
+            assert_eq!(
+                admit(refused, Some(allow_all.as_slice()), None),
+                Err(RebindingRefusal::Infrastructure),
+                "{refused:?} stays refused even where allow_subnets covers it"
+            );
+        }
+
+        // RFC 1918 is admitted only where `allow_subnets` covers the answer:
+        // an open dimension covers it (the address dimension is open, so the
+        // name path opens with it), an allow-all entry covers it, an empty
+        // one does not, and a different private range does not.
+        let private = [10, 1, 2, 3];
+        admit(private, None, None).unwrap();
+        let allow_all = cidrs(&["0.0.0.0/0"]);
+        admit(private, Some(allow_all.as_slice()), None).unwrap();
+        let allow_lan = cidrs(&["10.0.0.0/8"]);
+        admit(private, Some(allow_lan.as_slice()), None).unwrap();
+        let allow_none = cidrs(&[]);
+        assert_eq!(
+            admit(private, Some(allow_none.as_slice()), None),
+            Err(RebindingRefusal::Infrastructure),
+            "a deny-all address declaration refuses private answers"
+        );
+        let allow_other_private = cidrs(&["192.168.0.0/16"]);
+        assert_eq!(
+            admit(private, Some(allow_other_private.as_slice()), None),
+            Err(RebindingRefusal::Infrastructure),
+            "a different private range is not a covering"
+        );
+    }
+
+    /// [`rebinding_intersection`] — the set-shaped wrapper the relay calls per
+    /// reply: it splits the answer set exactly (nothing dropped, nothing
+    /// duplicated, order preserved), each refusal carrying its reason.
+    #[test]
+    fn rebinding_intersection_splits_the_answer_set() {
+        let infrastructure = InfrastructureDenySet::new(RESOLVER, HOST_ALIAS);
+        let answers = [
+            [140, 82, 121, 3], // admitted: public
+            [203, 0, 113, 7],  // refused: the box's deny
+            [10, 1, 2, 3],     // refused: RFC 1918, uncovered
+            [169, 254, 1, 1],  // refused: fixed infrastructure
+            [140, 82, 121, 4], // admitted: public
+        ];
+        let allow = cidrs(&[]);
+        let deny = cidrs(&["203.0.113.0/24"]);
+        let split = rebinding_intersection(
+            &answers,
+            Some(allow.as_slice()),
+            Some(deny.as_slice()),
+            &infrastructure,
+        );
+        assert_eq!(
+            split.admitted,
+            [[140, 82, 121, 3], [140, 82, 121, 4]],
+            "the admitted addresses, in the order the answer carried them"
+        );
+        assert_eq!(
+            split.refused,
+            [
+                ([203, 0, 113, 7], RebindingRefusal::DeniedSubnet),
+                ([10, 1, 2, 3], RebindingRefusal::Infrastructure),
+                ([169, 254, 1, 1], RebindingRefusal::Infrastructure),
+            ]
+        );
+    }
+
+    /// The subnet accessors the rebinding intersection reads: they surface
+    /// the compiled dimensions of the policy, and stay `None` where the
+    /// policy left the dimension open.
+    #[test]
+    fn subnet_accessors_expose_the_compiled_dimensions() {
+        let policy = EgressPolicy {
+            allow_protocols: None,
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            allow_dns_hosts: None,
+            deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
+        };
+        let rules = EgressRules::from_policy(Some(&policy), RESOLVER, LEASE);
+        let allow = rules.allow_subnets().expect("allow_subnets compiled");
+        assert_eq!(allow.len(), 1);
+        assert!(allow[0].contains([10, 200, 0, 1]));
+        assert!(!allow[0].contains([192, 168, 0, 1]));
+        let deny = rules.deny_subnets().expect("deny_subnets compiled");
+        assert_eq!(deny.len(), 1);
+        assert!(deny[0].contains([192, 168, 0, 1]));
+
+        let open = EgressRules::from_policy(None, RESOLVER, LEASE);
+        assert!(open.allow_subnets().is_none() && open.deny_subnets().is_none());
+    }
 }
 
 /// The frame-level admit-or-drop harness NET-016, NET-062, NET-064,
 /// NET-069, NET-070, NET-081's failure case and NET-084 share (spec NET,
 /// Tiers): exhaustive over every value the decision reads — the fragment
-/// offset, the protocol, the destination and the L4 destination port of an
-/// IPv4 frame — under rule lists of zero or two rules per dimension, at an
-/// unwind bound of 6 (the `[u8; 4]` address comparisons lower to a 4-trip
-/// `memcmp` loop; see the harness).
+/// offset, the source, the protocol, the destination and the L4 destination
+/// port of an IPv4 frame, plus the lease the source must be — under rule
+/// lists of zero or two rules per dimension, at an unwind bound of 6 (the
+/// `[u8; 4]` address comparisons lower to a 4-trip `memcmp` loop; see the
+/// harness).
+///
+/// The module also carries the rebinding intersection's harness (NET-067,
+/// [`kani_rebinding_intersection_admits_no_denied_address`]), which shares
+/// [`two_cidrs`] and its pinning rationale and runs at the tighter bound 4
+/// its own doc explains.
 ///
 /// The scope is deliberate. This module's first form was exhaustive over a
 /// fully symbolic 40-byte header and rule lists of symbolic *length*, and
@@ -794,7 +1444,8 @@ mod tests {
 mod kani_proofs {
     use super::{
         DNS_PORT, ETH_HDR, ETHERTYPE_IPV4, EgressRules, FrameFamily, FrameVerdict, IPPROTO_UDP,
-        Ipv4Cidr, summarize, verdict,
+        InfrastructureDenySet, Ipv4Cidr, rebinding_admits, rebinding_intersection, summarize,
+        verdict,
     };
 
     /// One dimension's rules under every declaration the compile can
@@ -835,9 +1486,10 @@ mod kani_proofs {
     /// A frame is admitted exactly when it is declared: stated as an iff so
     /// neither arm can silently become unreachable (the rcache harness
     /// pattern). The declared half is restated over the same summary and
-    /// rules — the resolver carve-out first (NET-079), then the three
-    /// declared dimensions conjunctively — so a verdict that checks in a
-    /// different order, or that reads `None` as deny-all, fails here.
+    /// rules — the lease first (NET-084: the source is the lease), then the
+    /// resolver carve-out (NET-079), then the three declared dimensions
+    /// conjunctively — so a verdict that checks in a different order, or
+    /// that reads `None` as deny-all, fails here.
     ///
     /// The unwind bound is 6, with one loop to spare over the longest
     /// this proof unwinds: comparing `[u8; 4]` addresses lowers to
@@ -846,7 +1498,8 @@ mod kani_proofs {
     /// writes (the rule scans in `verdict` and below, over lists of at
     /// most two rules) has exited by its third check. The bound has to
     /// clear every trip the compiler generates, not only the ones the
-    /// source shows.
+    /// source shows; the lease check's source comparison is one more of
+    /// those `memcmp`s, not a longer one.
     #[kani::proof]
     #[kani::unwind(6)]
     fn kani_frame_verdict_admits_nothing_undeclared() {
@@ -854,8 +1507,11 @@ mod kani_proofs {
         // region, 20 bytes of IPv4 header plus 20 of L4 — the shape the
         // relay hands the verdict for every IPv4 packet it forwards.
         //
-        // Symbolic: the fragment offset, the protocol, the destination and
-        // the L4 destination port — every value the decision reads.
+        // Symbolic: the fragment offset, the source, the protocol, the
+        // destination and the L4 destination port — every value the
+        // decision reads — and the lease, beside the rules, that the source
+        // is checked against (NET-084's property is over every frame and
+        // every lease).
         //
         // Pinned to constants: the EtherType (IPv4, the one family the
         // rules decide; the families decided without rules each have their
@@ -870,6 +1526,7 @@ mod kani_proofs {
         // pay for bit by bit.
         let frag: u16 = kani::any();
         let proto: u8 = kani::any();
+        let src: [u8; 4] = kani::any();
         let dst: [u8; 4] = kani::any();
         let port: u16 = kani::any();
         let mut frame = [0u8; ETH_HDR + 40];
@@ -882,6 +1539,10 @@ mod kani_proofs {
         frame[ip + 6] = frag_bytes[0]; // flags + fragment offset
         frame[ip + 7] = frag_bytes[1];
         frame[ip + 9] = proto;
+        frame[ip + 12] = src[0]; // the IPv4 source address
+        frame[ip + 13] = src[1];
+        frame[ip + 14] = src[2];
+        frame[ip + 15] = src[3];
         frame[ip + 16] = dst[0];
         frame[ip + 17] = dst[1];
         frame[ip + 18] = dst[2];
@@ -894,12 +1555,14 @@ mod kani_proofs {
         assert!(matches!(summary.family(), FrameFamily::Ipv4));
 
         let resolver: [u8; 4] = kani::any();
-        let rules = EgressRules::new(two_protocols(), two_cidrs(), two_cidrs(), resolver);
+        let lease: [u8; 4] = kani::any();
+        let rules = EgressRules::new(two_protocols(), two_cidrs(), two_cidrs(), resolver, lease);
 
         let admitted = matches!(verdict(&summary, &rules), FrameVerdict::Admit);
 
-        let declared = match (summary.destination(), summary.protocol()) {
-            (Some(dst), Some(proto)) => {
+        let declared = match (summary.source(), summary.destination(), summary.protocol()) {
+            (Some(src), Some(dst), Some(proto)) => {
+                let lease = src == rules.lease();
                 let resolver = proto == IPPROTO_UDP
                     && dst == rules.resolver()
                     && summary.destination_port() == DNS_PORT;
@@ -915,11 +1578,101 @@ mod kani_proofs {
                     .allow_subnets
                     .as_ref()
                     .is_none_or(|list| list.iter().any(|cidr| cidr.contains(dst)));
-                resolver || (protocols && !denied && allowed)
+                lease && (resolver || (protocols && !denied && allowed))
             }
             // No readable IPv4 header is never a declared frame.
             _ => false,
         };
         assert_eq!(admitted, declared);
+    }
+
+    /// NET-067's property, the rebinding half: **for every resolved answer
+    /// set and every allow, deny, and infrastructure-deny CIDR set, the
+    /// admitted set contains no denied address** — proved in two parts that
+    /// share one set of rule lists:
+    ///
+    /// * the per-address decision, restated as an iff over one fully
+    ///   symbolic answer so neither arm can silently become unreachable (the
+    ///   rcache harness pattern) — this is the exhaustive half, over every
+    ///   IPv4 answer there is;
+    /// * the set-shaped wrapper, over an answer set of two symbolic
+    ///   addresses, asserting the split loses nothing (the counts match the
+    ///   oracle) and that every address the wrapper admitted passes the
+    ///   oracle — so no cross-answer coupling (admit one because another is
+    ///   clean) and no loss can hide.
+    ///
+    /// Every CIDR set rides [`two_cidrs`]: `None`, empty, or two symbolic
+    /// rules — **two** per set, one tighter than the tier text's "at most
+    /// 4", for the same reason [`two_protocols`] pins two: two rules is
+    /// what catches a scan that reads only one element or stops one short
+    /// of the end, and a third adds no failure shape while it multiplies
+    /// CBMC's search. Both halves of the infrastructure set ride it too,
+    /// so a set-shaped hole that only opens at three or more rules is
+    /// outside this proof's bound — stated here rather than left to be
+    /// read off the tier text.
+    ///
+    /// The unwind bound is 4. No loop this proof unwinds runs past its third
+    /// check: the set scans walk lists of at most two CIDRs, the answer-set
+    /// loop walks two answers, and — unlike the frame-verdict harness, whose
+    /// `[u8; 4]` comparisons lower to a 4-trip `memcmp` — every comparison
+    /// here is [`Ipv4Cidr::contains`]'s u32 mask arithmetic, so there is no
+    /// address-equality loop to buy extra trips for. (The wrapper's `Vec`s
+    /// are pre-sized to the answer count, so no growth copy enters the proof
+    /// either.)
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn kani_rebinding_intersection_admits_no_denied_address() {
+        let allow = two_cidrs();
+        let deny = two_cidrs();
+        let infrastructure = InfrastructureDenySet {
+            fixed: two_cidrs().unwrap_or_default(),
+            rfc1918: two_cidrs().unwrap_or_default(),
+        };
+        // The oracle's one question, restated over CIDR math alone: may this
+        // answer be admitted — not denied by the box, not in a fixed
+        // infrastructure range, and not in RFC 1918 that `allow_subnets`
+        // does not cover?
+        let admissible = |answer: [u8; 4]| {
+            let denied = deny
+                .as_deref()
+                .is_some_and(|list| list.iter().any(|cidr| cidr.contains(answer)));
+            let fixed = infrastructure
+                .fixed
+                .iter()
+                .any(|cidr| cidr.contains(answer));
+            let rfc1918 = infrastructure
+                .rfc1918
+                .iter()
+                .any(|cidr| cidr.contains(answer));
+            let covers = allow
+                .as_deref()
+                .is_none_or(|list| list.iter().any(|cidr| cidr.contains(answer)));
+            !denied && !fixed && (!rfc1918 || covers)
+        };
+
+        // Part one: the per-address decision, iff the oracle, over every
+        // IPv4 answer.
+        let answer: [u8; 4] = kani::any();
+        let admitted =
+            rebinding_admits(answer, allow.as_deref(), deny.as_deref(), &infrastructure).is_ok();
+        assert_eq!(admitted, admissible(answer));
+
+        // Part two: the wrapper over a two-answer set — the split is exact,
+        // and everything it admitted passes the oracle.
+        let answers = [kani::any::<[u8; 4]>(), kani::any::<[u8; 4]>()];
+        let split =
+            rebinding_intersection(&answers, allow.as_deref(), deny.as_deref(), &infrastructure);
+        let expected: usize = answers.iter().filter(|a| admissible(**a)).count();
+        assert_eq!(split.admitted.len(), expected);
+        assert_eq!(split.refused.len(), answers.len() - expected);
+        for address in &split.admitted {
+            assert!(
+                admissible(*address),
+                "the admitted set holds an address the oracle denies"
+            );
+        }
+        for (address, _) in &split.refused {
+            assert!(!admissible(*address), "an admissible answer was refused");
+        }
     }
 }

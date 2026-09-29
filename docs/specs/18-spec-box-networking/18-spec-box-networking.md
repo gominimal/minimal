@@ -1,6 +1,6 @@
 ---
 id: NET
-title: Box networking on the local host: preview by name and bounded egress
+title: "Box networking on the local host: preview by name and bounded egress"
 owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md
