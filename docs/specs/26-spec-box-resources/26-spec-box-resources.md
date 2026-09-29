@@ -114,7 +114,8 @@ After this ships, every box declares its size or takes the host's default, the h
 
 - The guest VM's own size on `local-minvmd`: gominimal/inbox#698 S1.
 - Swap in the guest: gominimal/inbox#698 S2; swap as host policy is the architecture's (Box Resources › Swap).
-- The daemon's own memory reservation and the cgroup2 mount in the guest: gominimal/inbox#698 S3a-1.
+- The daemon's own memory reservation and the cgroup2 mount in the guest: gominimal/inbox#698 S3a-1. The leaf's limit, its read-only surface and exec-join are this spec's (BRES-007 to BRES-009); #698 reuses them.
+- Memory-pressure sampling and warnings, the attached-shell OOM banner and the `min ls` headroom line: gominimal/inbox#698 S4 to S6.
 - The provider's `ram` quota and the quota's other dimensions (exit 5): Box Provider API §5, gominimal/arch#45.
 - Cedar decisions on `[machine]`: none; the architecture leaves `[machine]` out of the Gatehouse Box Spec projection (Policy layers and precedence), so resources are bounded without Cedar.
 - The nested-box reservation cap (exit 5): nesting lands with gominimal/inbox#568.
@@ -134,6 +135,8 @@ After this ships, every box declares its size or takes the host's default, the h
 
 **Generality:** every requirement is written for any host a daemon runs on and exercised on `local0` and `local-minvmd0`; a remote host inherits them unchanged, and the architecture has every host report the same fields. What varies by host is only whether it can enforce, and that is reported rather than assumed (BRES-012), so a host with no memory controller fits as `advisory`.
 
+**Split with the guest-memory epic (gominimal/inbox#698), decided 2026-09-29.** This spec owns admission, the memory limit and who may touch it: BRES-004 to BRES-009 apply on every host that can enforce, and the guest daemon on `local-minvmd` applies `memory.max` through BRES-007 rather than through #698 S3b, whose clamp of an undeclared default to guest RAM minus the daemon reserve is replaced by BRES-004's fit check and BRES-005's refusal with figures (a default that does not fit is a host mis-sized for its own default, reported, never silently shrunk). #698 S3a-2 reuses BRES-009 and its read-only leaf reuses BRES-008. #698 keeps what is guest-specific and what this spec does not say: the host-derived guest size (S1), swap (S2), the cgroup2 mount and the daemon's own reservation (S3a-1), the pressure sampler and its warnings (S4), the attached-shell banner (S5) and the headroom line in `min ls` (S6). Rejected: folding S1, S2, S4 to S6 into this spec, which would tie a per-box contract to one provider's boot and reporting paths.
+
 ## Security considerations
 
 - **Invariant:** WHILE a host's memory enforcement is `enforced` THE SYSTEM SHALL keep every process in a box's namespaces, including in-box root, from raising that box's memory limit.
@@ -145,5 +148,3 @@ After this ships, every box declares its size or takes the host's default, the h
 - [NEEDS CLARIFICATION (HIGH): `cpus` and `disk` are fit-only here (BRES-004), checked one box at a time against allocatable, pending architecture open gap 18; gominimal/arch#96 question 2 notes that Box Provider API §5 instead makes them reservations summed in `allocated`, which would add a reservation-sum check for both.]
 - [NEEDS CLARIFICATION (HIGH): where the exit 8 refusal lives, the daemon's `min/v1/error` surface or the provider API's `RESOURCE_EXHAUSTED` mapping (gominimal/arch#96 question 1). BRES-005 is written to the daemon's error surface.]
 - [NEEDS CLARIFICATION (MEDIUM): gominimal/arch#96 questions 4 and 6 touch this spec: how a scripted caller learns that an `advisory` host waived a written `ram` (BRES-012, BRES-013), and whether `allocated` sums implied reservations or only written `ram_reserved` (BRES-004).]
-- [NEEDS CLARIFICATION (HIGH): which side applies `memory.max`. gominimal/inbox#698 S3b has the guest daemon apply `[machine] ram` as its session leaf's bound and clamps a non-declared default to guest RAM minus the daemon reserve, while BRES-004 admits without clamping and BRES-007 sets `memory.max` in the boxes subtree. One of the two needs to cede the write and the clamp rule before either lands.]
-- [NEEDS CLARIFICATION (HIGH): gominimal/inbox#698 S3a-2 has every exec process and every daemon-run lifecycle hook join the session leaf, which is BRES-009, and S3a-1 bind-mounts the leaf read-only, which overlaps BRES-008. Question for the owner: does BRES keep BRES-008 and BRES-009 with #698 reusing them, or do they become non-goals pointing at #698 S3a-1 and S3a-2?]
