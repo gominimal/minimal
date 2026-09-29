@@ -57,7 +57,7 @@ package.rust-version = "1.95"
 # (scripts/next-version.sh). `scripts/next-version.sh --check` (the
 # workspace `package_version` test, `just check-version`) fails the PR that
 # leaves it stale or not strictly greater than the newest v* tag.
-package.version = "0.6.0"
+package.version = "0.7.0"
 
 # Workspace lint policy. A crate opts in with `[lints] workspace = true`.
 #

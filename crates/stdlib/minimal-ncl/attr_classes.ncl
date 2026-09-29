@@ -160,5 +160,11 @@ in
         name = "redistributable",
         desc = "Whether built artifacts of this package may be redistributed through a shared binary cache. Absent means true. Set false when the upstream license or terms forbid redistribution: build infrastructure then neither uploads, indexes, nor seals the artifacts, and consumers build the package locally from the upstream source.",
         validate = Bool,
+    },
+
+    bootstrap_rung = {
+        name = "bootstrap ladder rung",
+        desc = "Marks this package as a pinned rung of a bootstrap ladder; the value names the ladder (e.g. \"hex0\", \"ghc\", \"jvm\"). A rung's version is its identity: it is fixed by what the previous rung can compile and by the ladder's byte-identity seals, so automated tooling must never propose a version bump for it (pkgmgr freezes it). The top of a ladder, the version users install, is not a rung.",
+        validate = String,
     }
 }
