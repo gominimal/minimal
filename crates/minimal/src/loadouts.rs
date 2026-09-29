@@ -748,6 +748,7 @@ mod tests {
             config_dir: Some(PathBuf::from("/definitely/does/not/exist")),
             provider: None,
             no_input: false,
+            vm: None,
         };
         let out = resolve_active_loadouts(LoadoutSelection::None, &cfg, &global)
             .expect("None → Ok(empty), no I/O");
@@ -771,6 +772,7 @@ mod tests {
             config_dir: Some(tmp.path().to_path_buf()),
             provider: None,
             no_input: false,
+            vm: None,
         };
         let selection = LoadoutSelection::Cli(vec!["missing".to_string()]);
         let err = resolve_active_loadouts(selection, &cfg, &global)
@@ -804,6 +806,7 @@ mod tests {
             config_dir: Some(tmp.path().to_path_buf()),
             provider: None,
             no_input: false,
+            vm: None,
         };
         let selection = LoadoutSelection::Cli(vec!["broken".to_string()]);
         let err = resolve_active_loadouts(selection, &cfg, &global)
@@ -844,6 +847,7 @@ mod tests {
             config_dir: Some(tmp.path().to_path_buf()),
             provider: None,
             no_input: false,
+            vm: None,
         };
         // The dot forms carry no separator, so they need their own
         // refusal: under the directory layout `..` would resolve
@@ -1052,6 +1056,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             config_dir: Some(tmp.path().to_path_buf()),
             provider: None,
             no_input: false,
+            vm: None,
         };
         let out = resolve_active_loadouts(LoadoutSelection::Defaults, &cfg, &global)
             .expect("built-in fallback resolves");
@@ -1081,6 +1086,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             config_dir: Some(tmp.path().to_path_buf()),
             provider: None,
             no_input: false,
+            vm: None,
         };
         let out = resolve_active_loadouts(LoadoutSelection::Defaults, &cfg, &global)
             .expect("user default resolves");
@@ -1115,6 +1121,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             config_dir: Some(tmp.path().to_path_buf()),
             provider: None,
             no_input: false,
+            vm: None,
         };
         let out = resolve_active_loadouts(
             LoadoutSelection::Cli(vec!["dev".to_string()]),
@@ -1151,6 +1158,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             config_dir: Some(tmp.path().to_path_buf()),
             provider: None,
             no_input: false,
+            vm: None,
         };
         let err = resolve_active_loadouts(
             LoadoutSelection::Cli(vec!["dev".to_string()]),
@@ -1183,6 +1191,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             config_dir: Some(tmp.path().to_path_buf()),
             provider: None,
             no_input: false,
+            vm: None,
         };
         let out = resolve_active_loadouts(LoadoutSelection::Defaults, &cfg, &global)
             .expect("user default resolves");
@@ -1209,6 +1218,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             config_dir: Some(tmp.path().to_path_buf()),
             provider: None,
             no_input: false,
+            vm: None,
         };
         assert!(
             resolve_active_loadouts(LoadoutSelection::Defaults, &cfg, &global).is_err(),
@@ -1240,6 +1250,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             config_dir: Some(tmp.path().to_path_buf()),
             provider: None,
             no_input: false,
+            vm: None,
         };
 
         let none = resolve_active_loadouts(LoadoutSelection::None, &cfg, &global).unwrap();
@@ -1277,6 +1288,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             config_dir: Some(PathBuf::from("rel-cfg")),
             provider: None,
             no_input: false,
+            vm: None,
         };
         let out = resolve_active_loadouts(LoadoutSelection::None, &cfg, &global)
             .expect("a relative --config-dir must still resolve");
@@ -1317,6 +1329,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             config_dir: Some(tmp.path().to_path_buf()),
             provider: None,
             no_input: false,
+            vm: None,
         };
         assert!(cmd_loadout_list(args, &global).is_err());
     }
@@ -1345,6 +1358,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             config_dir: Some(tmp.path().to_path_buf()),
             provider: None,
             no_input: false,
+            vm: None,
         };
         assert!(cmd_loadout_list(args, &global).is_err());
     }
@@ -1382,6 +1396,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             config_dir: Some(tmp.path().to_path_buf()),
             provider: None,
             no_input: false,
+            vm: None,
         };
         assert!(cmd_loadout_list(args, &global).is_ok());
     }

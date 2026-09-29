@@ -1,5 +1,6 @@
 use super::Error;
 use crate::{CheckCtx, CheckResult, CheckVerdict};
+use anyhow::anyhow;
 use decode::Stack;
 use nickel_lang_core::eval::cache::CacheImpl;
 use nickel_lang_core::identifier::LocIdent;
@@ -23,13 +24,16 @@ pub(crate) async fn check_stack(
     use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
 
     let entry_file = stacks_dir.join(&stack).join("stack.ncl");
+    let entry_file_str = entry_file.to_str().ok_or_else(|| {
+        Error::Other(anyhow!(
+            "stack file path is not valid UTF-8: {}",
+            entry_file.display()
+        ))
+    })?;
 
     let program_res: Result<Program<CacheImpl>, _> = ProgramBuilder::new()
         .add_source(
-            std::io::Cursor::new(format!(
-                "import \"{}\"",
-                entry_file.as_os_str().to_str().unwrap()
-            )),
+            std::io::Cursor::new(format!("import \"{entry_file_str}\"")),
             "toplevel",
         )
         .add_import_paths([ctx.stdlib_dir.clone()].iter())

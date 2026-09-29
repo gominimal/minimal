@@ -1,0 +1,12 @@
+# zizmor configuration for the nightly `hygiene` job
+# (`zizmor .github/workflows/`, see .github/workflows/nightly-tests.yml).
+rules:
+  # zizmor 1.30.0 added `self-repository`, which asks for GitHub's new
+  # `uses: $/...` syntax (github.blog changelog, 2026-07-30) in place of
+  # `uses: ./...`. actionlint 1.7.12 (the latest release, also run by
+  # `hygiene`) rejects `$/...` as an invalid action/workflow reference, so
+  # we can't adopt it yet without breaking the lint.
+  # Revisit once an actionlint release accepts `$/` (rhysd/actionlint#711);
+  # then drop this rule and apply `zizmor --fix=unsafe-only`.
+  self-repository:
+    disable: true

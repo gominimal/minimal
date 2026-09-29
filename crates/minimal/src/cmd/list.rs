@@ -65,6 +65,10 @@ pub(crate) fn bare_activate_args() -> ActivateArgs {
         sync: None,
         network: CliNetworkMode::HostNet,
         ingress: Vec::new(),
+        allow_subnets: Vec::new(),
+        allow_dns_hosts: Vec::new(),
+        allow_protocols: Vec::new(),
+        deny_subnets: Vec::new(),
         loadout: Vec::new(),
         no_loadouts: false,
         no_hooks: false,
@@ -304,32 +308,45 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // fault this severe — `--raw` most of all, since a script parsing bare ids
     // is exactly what will go on using hostnames that no longer resolve — and
     // stdout stays clean for the parser either way.
-    warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref());
-    warn_if_mtls_proxy_down(resp.mtls_proxy_unavailable.as_deref());
+    warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref(), "min ls");
     format_ls(&mut std::io::stdout(), &args, &resp)?;
     Ok(())
 }
 
-/// Tells the user that `<name>.local.min.internal` will not resolve, and why.
+/// The warning `min ls` and `min session activate` print when the daemon
+/// reports hostname routing down: the daemon's reason and remedy for the
+/// failed bind or publish, plus what recovery looks like from here — the
+/// daemon retries with backoff and clears the warning on its own once the
+/// listener recovers (NET-020, NET-022). `command` names the command the
+/// warning rides on: re-running it shows the warning while the listener is
+/// still down and nothing once it has recovered, so the recovery sentence
+/// tells the user to re-run the command they are already in, not some other
+/// one. Pure, so tests can assert the wording without capturing stderr.
+#[must_use]
+pub fn hostname_routing_warning(reason: &str, command: &str) -> String {
+    format!(
+        "warning: session hostnames will not route: {reason}. The daemon retries \
+         with backoff and clears this warning on its own once the listener \
+         recovers; run `{command}` again to check."
+    )
+}
+
+/// Tells the user that `<name>.local.min.internal` will not resolve, and why,
+/// and what clears it.
 ///
 /// The daemon keeps serving without its host-side proxy, so nothing else the
 /// user sees is different: sessions activate, exec works, the list prints. The
 /// only other trace is a `warn!` in the daemon log, which is not where someone
-/// watching curl fail is looking (gominimal/inbox#560).
-pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>) {
+/// watching curl fail is looking (gominimal/inbox#560). The daemon's report
+/// carries the reason and the remedy for the cause (a held port, a failed
+/// publish); the recovery is the daemon's job now — it retries with backoff
+/// and the warning goes away by itself, so the remedy says to check again
+/// rather than to restart anything. `command` names the command this runs
+/// from, so the recovery sentence fits it — `min ls` on the list, `min
+/// session activate` at activation.
+pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>, command: &str) {
     if let Some(reason) = reason {
-        eprintln!("warning: session hostnames will not route: {reason}");
-    }
-}
-
-/// Tells the user the mTLS reverse proxy is not serving, and why.
-///
-/// Kept separate from [`warn_if_hostname_routing_down`] so the two faults read
-/// as what they are: hostnames failing to resolve and TLS termination being
-/// absent are different problems with different fixes.
-pub(crate) fn warn_if_mtls_proxy_down(reason: Option<&str>) {
-    if let Some(reason) = reason {
-        eprintln!("warning: the mTLS reverse proxy is not serving: {reason}");
+        eprintln!("{}", hostname_routing_warning(reason, command));
     }
 }
 
@@ -368,6 +385,33 @@ pub fn format_ls(
             session_label,
         )?;
         writeln!(out)?;
+    }
+
+    // NET-026: say where this daemon's names route from — the TCP proxy an
+    // `HTTP(S)_PROXY` export points at, and beside it the UDP answerer the
+    // host's resolver would be pointed at for the same zone. Both ports
+    // travel on the reply because a daemon that auto-selected is on
+    // OS-chosen ones, and the addresses are what the exports need —
+    // especially on a machine running two daemons. Absent while the daemon
+    // is still bringing a listener up, or from a daemon too old to carry the
+    // field: nothing to print for it then. `--raw` and `--json` stay
+    // machine-readable-only, so a port line never lands in a pipeline.
+    if !args.raw {
+        if let Some(port) = resp.hostname_proxy_port {
+            writeln!(
+                out,
+                "HOSTNAME PROXY:  listening on 127.0.0.1:{port} · <name>.min.internal routes through it"
+            )?;
+        }
+        if let Some(answerer) = resp.zone_answerer_port {
+            writeln!(
+                out,
+                "ZONE ANSWERER:   listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal"
+            )?;
+        }
+        if resp.hostname_proxy_port.is_some() || resp.zone_answerer_port.is_some() {
+            writeln!(out)?;
+        }
     }
 
     if resp.sessions.is_empty() {

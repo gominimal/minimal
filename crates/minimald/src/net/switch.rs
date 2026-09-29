@@ -14,9 +14,16 @@
 //!    2-byte little-endian length prefix (the HyperKit protocol).
 //!
 //! Implements R1.5 (per-PTask switch attachment) and R1.7 (the DM2 native-Linux
-//! attachment path).
+//! attachment path). A gated relay — every own-IP session's — also carries its
+//! session's network policy at this bridge, because gvproxy itself enforces
+//! nothing per client (v0.8.9 has no per-client ACL API): the egress leg
+//! applies the pure frame verdict (`sessions::core::egress`, NET-062/NET-063/
+//! NET-064) to every frame before it reaches the switch, and the ingress leg
+//! keeps the default-block posture of finding #2. Every relay — gated or not,
+//! the daemon's own included — also carries the lease it was attached with,
+//! and rejects any frame whose source is not it (NET-084).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -29,8 +36,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
-use super::policy::{Direction, PolicyWarnLimiter};
+use super::dns_gate::DnsGate;
+use super::policy::{Direction, PolicyWarnLimiter, Proto};
 use super::{DEFAULT_MTU, PtaskLease, SwitchSubnet};
+use sessions::core::egress::{self, DropReason, FrameSummary, FrameVerdict};
 
 /// `ioctl` request number for `TUNSETIFF` (set the tap/tun interface a fd backs).
 ///
@@ -270,8 +279,9 @@ pub async fn move_tap_into_netns(
 
 /// Sets `O_NONBLOCK` on `fd` so the tap device can be epoll-driven via
 /// [`AsyncFd`]. `std::fs::File` has no `set_nonblocking`, so this goes through
-/// `fcntl` directly.
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+/// `fcntl` directly. `pub(crate)`: the DNS gate's tests also put their
+/// box-end stand-in in polling mode.
+pub(crate) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     // SAFETY: F_GETFL/F_SETFL on a valid, open fd reads/writes its status
     // flags; neither has any effect beyond that and cannot break memory safety.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -304,6 +314,19 @@ impl Drop for SwitchRelay {
 /// Attaches `tap_fd` to the gvproxy switch listening on `api_sock` (DM2, native
 /// Linux) and starts relaying frames between them.
 ///
+/// `gate` is the session's compiled network policy (see [`SessionGate`]):
+/// `None` attaches ungated, which is the daemon's own relay — not a box, not a
+/// session — and the netns proof's harness PTasks opt into via their declared
+/// policies. `lease` is the relay's lease on the switch — the one source
+/// address frames it forwards may carry (NET-084): a frame whose IPv4 source,
+/// or ARP sender address, is anything else is rejected before it reaches the
+/// switch, whatever the gate says. A session relay passes the box's lease; the
+/// daemon's own relay passes its own address. `subnet` is the switch's subnet —
+/// the subnet gvproxy was configured with — from which a gated relay derives
+/// the resolver address its egress carve-out is keyed to (NET-079) and the
+/// deprecated host-alias literal it notices (NET-004); the daemon relay ignores
+/// it.
+///
 /// Spawns two background tasks — tap→switch and switch→tap — and returns a
 /// [`SwitchRelay`] handle whose lifetime keeps the attachment alive.
 ///
@@ -315,12 +338,14 @@ impl Drop for SwitchRelay {
 pub async fn attach_to_switch(
     tap_fd: OwnedFd,
     api_sock: &Path,
-    gate: Option<IngressGate>,
+    gate: Option<SessionGate>,
+    lease: Ipv4Addr,
+    subnet: SwitchSubnet,
 ) -> io::Result<SwitchRelay> {
     let mut sock = UnixStream::connect(api_sock).await?;
     sock.write_all(CONNECT_REQUEST).await?;
     let (sock_rx, sock_tx) = sock.into_split();
-    spawn_relay(tap_fd, sock_rx, sock_tx, gate)
+    spawn_relay(tap_fd, sock_rx, sock_tx, gate, lease, subnet)
 }
 
 /// Attaches `tap_fd` to the **host** gvproxy switch over AF_VSOCK (DM1/3/4) and
@@ -342,7 +367,9 @@ pub async fn attach_to_switch_vsock(
     tap_fd: OwnedFd,
     cid: u32,
     port: u32,
-    gate: Option<IngressGate>,
+    gate: Option<SessionGate>,
+    lease: Ipv4Addr,
+    subnet: SwitchSubnet,
 ) -> io::Result<SwitchRelay> {
     // Bound the connect + `/connect` upgrade: a wedged or absent host gvproxy
     // must fail the attach fast, not stall OwnIp bring-up forever.
@@ -366,20 +393,28 @@ pub async fn attach_to_switch_vsock(
         )
     })??;
     let (sock_rx, sock_tx) = tokio::io::split(sock);
-    spawn_relay(tap_fd, sock_rx, sock_tx, gate)
+    spawn_relay(tap_fd, sock_rx, sock_tx, gate, lease, subnet)
 }
 
 /// Wires `tap_fd` into the bidirectional frame relay against an already-connected,
 /// `/connect`-upgraded switch stream split into `sock_rx`/`sock_tx`.
 ///
-/// Shared by the DM2 UDS path ([`attach_to_switch`]) and the DM1/3/4 vsock path
-/// ([`attach_to_switch_vsock`]); the relay loops are transport-agnostic
-/// (`AsyncRead`/`AsyncWrite`), so only the connect step differs.
+/// `subnet` is the switch this relay is attached to — the subnet the switch was
+/// configured with — and a gated relay derives NET-004's deprecated host-alias
+/// literal from it, so the notice always watches the address this switch (and
+/// no other) NATs to the host's loopback. `lease` is the relay's lease on that
+/// switch, the one source its frames may carry (NET-084), checked on the egress
+/// leg whatever the gate. Shared by the DM2 UDS path ([`attach_to_switch`]) and
+/// the DM1/3/4 vsock path ([`attach_to_switch_vsock`]); the relay loops are
+/// transport-agnostic (`AsyncRead`/`AsyncWrite`), so only the connect step
+/// differs.
 fn spawn_relay<R, W>(
     tap_fd: OwnedFd,
     sock_rx: R,
     sock_tx: W,
-    gate: Option<IngressGate>,
+    gate: Option<SessionGate>,
+    lease: Ipv4Addr,
+    subnet: SwitchSubnet,
 ) -> io::Result<SwitchRelay>
 where
     R: AsyncReadExt + Unpin + Send + 'static,
@@ -395,13 +430,27 @@ where
     set_nonblocking(tap_file.as_raw_fd())?;
     let tap = Arc::new(AsyncFd::new(tap_file)?);
 
-    // Share the UDP flow tracker with the egress leg so a reply to the PTask's own
-    // UDP egress is recognized as solicited by the inbound gate (finding #2, UDP).
-    let egress_conntrack = gate.as_ref().map(|g| Arc::clone(&g.conntrack));
+    // One gate serves both legs: the egress leg applies its verdict, the
+    // ingress leg its default-block posture, both sharing the conntrack (a
+    // reply to the PTask's own UDP egress is solicited, finding #2) and the one
+    // rate limiter, whose keys keep every rule's line independent.
+    let gate = gate.map(Arc::new);
+    // NET-004: a session relay tells its box — rate-limited — that frames to the
+    // literal host-alias address are deprecated. The daemon's own relay (`gate`
+    // is `None`) is not a box and gets no notice.
+    let legacy_notice = gate
+        .as_deref()
+        .map(|gate| LegacyHostNotice::for_gate(gate, subnet));
+    // NET-084: every relay rejects a frame whose source is not its lease — a
+    // session relay's lease is the box's, the daemon relay's its own address —
+    // and says so through the notice below.
+    let reject = ForeignSourceReject::for_relay(gate.as_deref(), lease);
     let tap_to_switch = tokio::spawn(relay_tap_to_switch(
         Arc::clone(&tap),
         sock_tx,
-        egress_conntrack,
+        gate.clone(),
+        legacy_notice,
+        reject,
     ));
     let switch_to_tap = tokio::spawn(relay_switch_to_tap(sock_rx, tap, gate));
     Ok(SwitchRelay {
@@ -410,14 +459,27 @@ where
     })
 }
 
-/// tap → switch: read a raw Ethernet frame, record any outbound UDP flow (so its
-/// reply is allowed back in — finding #2, UDP), prepend its 2-byte LE length, and
-/// write the framed packet to the control socket. `conntrack` is `None` for the
-/// daemon relay, which has no ingress gate.
+/// tap → switch: read a raw Ethernet frame, reject it if its source is not the
+/// lease the relay was attached with (NET-084 — the daemon's own relay
+/// included), apply the session's egress verdict to what remains (NET-062 —
+/// dropped frames never reach the switch and are not answered, save the one
+/// drop a DNS pin lifts, NET-066), answer the box's own AAAA/HTTPS/SVCB
+/// lookups (NET-136), record the outbound UDP flow of every datagram this leg
+/// actually forwards (so its reply is allowed back in — finding #2, UDP; only
+/// a declared, forwarded datagram opens a window), notice frames to the
+/// deprecated literal host address (NET-004), prepend its 2-byte LE length,
+/// and write the framed packet to the control socket. `gate` is `None` for the
+/// daemon relay, which is not a box and forwards its own frames unchecked.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every `buf[..n]` is bounded by `n`, the count this loop's own read of `buf` returned"
+)]
 async fn relay_tap_to_switch<W>(
     tap: Arc<AsyncFd<std::fs::File>>,
     mut sock: W,
-    conntrack: Option<Arc<UdpConntrack>>,
+    gate: Option<Arc<SessionGate>>,
+    notice: Option<LegacyHostNotice>,
+    reject: ForeignSourceReject,
 ) -> io::Result<()>
 where
     W: AsyncWriteExt + Unpin,
@@ -447,12 +509,100 @@ where
             );
             continue;
         }
-        // Track outbound UDP so the inbound gate recognizes its reply as solicited.
-        if let Some(ct) = &conntrack
-            && let Some(pkt) = parse_ipv4_l4(&buf[..n])
-            && pkt.proto == IPPROTO_UDP
+        // NET-084: a frame whose source is not the lease this relay was
+        // attached with never reaches the shared switch — a box's relay or
+        // the daemon's own, whose lease is its own address. The source an
+        // IPv4 frame carries is its IPv4 source address; an ARP frame's is
+        // its sender protocol address, read whatever protocol type the
+        // frame claims for it, so a foreign address cannot be announced by
+        // address resolution either. A rejected frame is simply
+        // not written on — a drop is not a reset — and opens no conntrack
+        // window (the record below only sees frames past this check); the
+        // rejection says so once per lease per minute, naming the session,
+        // the lease and the source the frame carried.
+        let summary = egress::summarize(&buf[..n]);
+        if let Some(reason) = egress::foreign_source(&summary, reject.lease.octets()) {
+            reject.emit(&reason);
+            continue;
+        }
+        // Egress enforcement (NET-062, NET-063, NET-064): every frame is
+        // decided against the box's declared policy before it reaches the
+        // shared switch. A dropped frame is simply not written on — nothing is
+        // sent back toward the box either, a drop is not a reset — and the drop
+        // says so once per box per rule per minute (R2.7).
+        if let Some(gate) = &gate
+            && let FrameVerdict::Drop(reason) = egress::verdict(&summary, &gate.egress)
         {
-            ct.record_egress(&pkt);
+            // NET-066, with design §5.3's conntrack-aware retention: an
+            // address the box resolved from a name its policy allowed is
+            // admitted for the DNS gate's window, and a flow that pin
+            // established keeps its destination past the window until the
+            // flow ends — together those are the one drop a pin lifts.
+            // The resolution-time intersection (NET-067, on the ingress
+            // leg) already subtracted the box's denies and the
+            // infrastructure deny set from those addresses, so a pin
+            // cannot smuggle a refused range past this drop. Denied
+            // ranges and the protocol rules keep governing pinned
+            // addresses too.
+            let pinned = matches!(reason, DropReason::UndeclaredSubnet { .. })
+                && reason.destination().is_some_and(|dst| {
+                    // The flow's identity is the frame's own ports, so
+                    // this parse is spent on the pin's path alone: a
+                    // frame with no L4 header to read has no flow to
+                    // retain and only the window can admit it.
+                    let pkt = parse_ipv4_l4(&buf[..n]);
+                    gate.dns.admits_flow(dst, pkt.as_ref(), Instant::now())
+                });
+            if !pinned {
+                gate.limiter.warn(
+                    &gate.label,
+                    Direction::Egress,
+                    drop_remote(&summary),
+                    drop_transport(&reason),
+                    None,
+                    reason.rule(),
+                );
+                continue;
+            }
+        }
+        // The frame's UDP addressing, parsed once for both of this leg's UDP
+        // consumers below: the DNS gate's NODATA interception and the conntrack
+        // window. A frame that is not IPv4+UDP — most of a box's traffic —
+        // reaches neither, and costs no second parse here.
+        if let Some(gate) = &gate {
+            let udp = parse_ipv4_l4(&buf[..n]).filter(|pkt| pkt.proto == IPPROTO_UDP);
+            // NET-136: the box's AAAA, HTTPS and SVCB lookups toward this
+            // switch's resolver are answered NODATA by the relay itself and
+            // never reach the switch. The box gets its empty answer — its own
+            // query id, so its resolver stack matches the reply — and nothing
+            // upstream can answer an empty-records lookup differently.
+            if let Some(pkt) = &udp
+                && let Some(payload) = udp_payload(&buf[..n], pkt)
+                && let Some(reply) = gate.dns.intercept_query(&pkt.dst, payload)
+            {
+                let frame = udp_reply_frame(&buf[..n], pkt, &reply);
+                write_tap_frame(&tap, &frame).await?;
+                continue;
+            }
+            // Track outbound UDP so the inbound gate recognizes its reply as
+            // solicited — after the interception, so a datagram this leg
+            // answered itself opens no window: it never reached the resolver,
+            // so nothing replies to it, and a window keyed to it would be dead
+            // state whose only effect is to let an unsolicited inbound
+            // datagram pass as solicited for the TTL. A frame the verdict did
+            // not admit never gets here either: an undeclared datagram must
+            // not punch a hole in the inbound gate.
+            if let Some(pkt) = &udp {
+                gate.conntrack.record_egress(pkt);
+            }
+        }
+        // NET-004: the literal host address still routes — the switch's `nat`
+        // table maps it to the host's loopback — but the relay says, once per
+        // interval, that `host.min.internal` is the name to use instead.
+        if let Some(notice) = &notice
+            && is_legacy_host_literal(&buf[..n], notice.alias)
+        {
+            notice.emit();
         }
         // One combined write keeps the length prefix and frame atomic even if
         // the socket closes between writes.
@@ -463,32 +613,213 @@ where
     }
 }
 
+/// The R2.7 `remote_addr` of a dropped egress frame: the destination the box
+/// tried to reach, when the frame carries one to read, with its L4 destination
+/// port when that was readable too (`0` otherwise — a later fragment or a
+/// truncated L4 header). `None` — rendered `none` in the warning — for the
+/// drops with no IPv4 destination to name, as for IPv6, an undeclared family,
+/// or a truncated frame.
+fn drop_remote(summary: &FrameSummary) -> Option<SocketAddr> {
+    let dst = summary.destination()?;
+    Some(SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::from(dst),
+        summary.destination_port(),
+    )))
+}
+
+/// The R2.7 `proto` of a dropped egress frame, from why the verdict dropped it:
+/// `ipv6` for the family drop, `none` for a frame with no L4 header to name,
+/// and the frame's IPv4 protocol number otherwise — `tcp`/`udp`/`icmp` by
+/// name, anything else by number.
+fn drop_transport(reason: &DropReason) -> Proto {
+    match reason {
+        // Unreachable on this relay, whose NET-084 check runs before the
+        // verdict and rejects a foreign source first; a foreign-source drop
+        // is not about a transport to name.
+        DropReason::ForeignSource { .. } => Proto::None,
+        DropReason::Ipv6 => Proto::Ipv6,
+        DropReason::UndeclaredFamily(_) | DropReason::Truncated => Proto::None,
+        DropReason::UndeclaredProtocol { proto }
+        | DropReason::DeniedSubnet { proto, .. }
+        | DropReason::UndeclaredSubnet { proto, .. } => Proto::from_ipv4_number(*proto),
+    }
+}
+
 /// Ethernet II header length: destination MAC (6) + source MAC (6) + EtherType (2).
 const ETH_HDR: usize = 14;
 /// EtherType for IPv4. Frames carrying anything else (ARP `0x0806`, IPv6
 /// `0x86DD`, VLAN-tagged `0x8100`) are outside the gate's scope and pass through.
 const ETHERTYPE_IPV4: u16 = 0x0800;
-/// IPv4 protocol number for TCP.
-const IPPROTO_TCP: u8 = 6;
-/// IPv4 protocol number for UDP.
-const IPPROTO_UDP: u8 = 17;
+/// IPv4 protocol number for TCP. `pub(crate)`: the DNS gate's tests build
+/// their own flow identities with it.
+pub(crate) const IPPROTO_TCP: u8 = 6;
+/// IPv4 protocol number for UDP. `pub(crate)`: the DNS gate's tests build
+/// their own UDP frames with it.
+pub(crate) const IPPROTO_UDP: u8 = 17;
 
-/// A per-PTask inbound ingress filter for the `switch → tap` relay leg.
+/// The zone record name a box can resolve the host by (NET-003) — the name the
+/// deprecation notice tells a box to use instead of the literal.
+const HOST_MIN_INTERNAL: &str = "host.min.internal";
+
+/// The limiter key the deprecation notice logs under: its own rule, so a
+/// policy warning on the same relay never consumes the notice's interval and
+/// vice versa (NET-062 keys the rate limit by box and rule).
+const LEGACY_HOST_RULE: &str = "legacy-host-literal";
+
+/// True when an Ethernet II frame is an IPv4 packet addressed to `alias` —
+/// NET-004's deprecated literal host address, the address the switch's `nat`
+/// table maps to the host's loopback. Any protocol counts: the notice is about
+/// the destination address, not the transport.
+fn is_legacy_host_literal(frame: &[u8], alias: Ipv4Addr) -> bool {
+    // EtherType at 12..14; the IPv4 destination address at 14+16..14+20.
+    frame.len() >= ETH_HDR + 20
+        && frame[12..14] == ETHERTYPE_IPV4.to_be_bytes()
+        && frame[30..34] == alias.octets()
+}
+
+/// Emits NET-004's deprecation notice on the egress relay leg: when a session
+/// box sends frames to the literal host-alias address, the relay says so —
+/// rate-limited, naming the box and [`HOST_MIN_INTERNAL`] — instead of letting
+/// the connection pass silently on an address the code should not keep using.
+struct LegacyHostNotice {
+    /// The box's switch IP — the relay gate's `session_id` label, the same
+    /// identity the policy warnings name.
+    label: String,
+    /// The literal address the notice watches for.
+    alias: Ipv4Addr,
+    /// The session gate's limiter, shared so one relay keeps one clock: its
+    /// keys keep the notice's line independent of any policy warning's (the
+    /// notice logs under its own rule key).
+    limiter: Arc<PolicyWarnLimiter>,
+}
+
+impl LegacyHostNotice {
+    /// Builds the notice from the relay's session gate, which carries the
+    /// box's session label, and the subnet of the switch the relay is attached
+    /// to, whose host alias is the deprecated literal — never a hardcoded
+    /// default, so a custom-subnet switch's literal is watched too. The gate's
+    /// limiter is shared, not the whole gate: the notice is egress-side.
+    fn for_gate(gate: &SessionGate, subnet: SwitchSubnet) -> Self {
+        Self {
+            label: gate.label.clone(),
+            alias: subnet.host_alias(),
+            limiter: Arc::clone(&gate.limiter),
+        }
+    }
+
+    /// Logs the notice if the rate limiter allows. Returns whether it fired.
+    fn emit(&self) -> bool {
+        if !self
+            .limiter
+            .should_warn_at(&self.label, LEGACY_HOST_RULE, Instant::now())
+        {
+            return false;
+        }
+        tracing::info!(
+            session = %self.label,
+            deprecated = %self.alias,
+            replacement = HOST_MIN_INTERNAL,
+            "connection to the deprecated literal host address; \
+             use host.min.internal instead"
+        );
+        true
+    }
+}
+
+/// NET-084's rejection notice on the egress relay leg: when a relay's tap
+/// emits a frame whose source is not the lease the relay was attached with,
+/// the relay rejects it — the frame never reaches the switch — and says so,
+/// once per lease per minute, naming the session, the lease, and the source
+/// the rejected frame carried.
+struct ForeignSourceReject {
+    /// The lease the relay was attached with: the one source address its
+    /// frames may carry, and what the rejection line names as the lease.
+    lease: Ipv4Addr,
+    /// The relay's identity in the log — the gate's label (the box's lease,
+    /// for a session relay) or the lease itself for the daemon's own relay,
+    /// which is not a session.
+    label: String,
+    /// The limiter shared with the relay's other warns: the gate's when there
+    /// is one, so every rule's line on one relay keeps its own interval; a
+    /// fresh one for the daemon's own relay, which has no gate to share.
+    limiter: Arc<PolicyWarnLimiter>,
+}
+
+impl ForeignSourceReject {
+    /// Builds the notice for a relay attached with `lease`, taking its log
+    /// identity and limiter from the gate when it carries one.
+    fn for_relay(gate: Option<&SessionGate>, lease: Ipv4Addr) -> Self {
+        Self {
+            label: gate.map_or_else(|| lease.to_string(), |gate| gate.label.clone()),
+            lease,
+            limiter: gate.map_or_else(
+                || Arc::new(PolicyWarnLimiter::new()),
+                |gate| Arc::clone(&gate.limiter),
+            ),
+        }
+    }
+
+    /// Logs the rejection if the rate limiter allows. Returns whether it
+    /// fired. The reason carries the source the rejected frame carried —
+    /// `foreign_source` yields only [`DropReason::ForeignSource`], and that
+    /// reason always names it.
+    fn emit(&self, reason: &egress::DropReason) -> bool {
+        let DropReason::ForeignSource { src, .. } = reason else {
+            return false;
+        };
+        let source = Ipv4Addr::from(*src);
+        if !self
+            .limiter
+            .should_warn_at(&self.label, reason.rule(), Instant::now())
+        {
+            return false;
+        }
+        tracing::warn!(
+            // A `&str` field renders quoted, the way `PolicyWarnLimiter`'s
+            // `session_id` does; `Display` would drop the quotes.
+            session_id = self.label.as_str(),
+            lease = %self.lease,
+            source = %source,
+            rule_matched = reason.rule(),
+            "rejected egress frame whose source is not the lease"
+        );
+        true
+    }
+}
+
+/// A PTask's compiled network policy, applied at the relay bridge — gvproxy
+/// v0.8.9 enforces nothing per client, so both directions of the session's
+/// traffic are decided here:
 ///
-/// Realizes UC6 / finding #2: session↔session (and daemon→session) traffic on the
-/// shared gvproxy switch is subject to the *target* PTask's ingress policy, which
-/// gvproxy itself cannot enforce (v0.8.9 has no per-client ACL API):
+/// - **Egress** (`tap → switch`) — every frame is decided by the pure verdict
+///   in `sessions::core::egress` against the box's compiled
+///   [`EgressRules`]: what the box did not declare is dropped, without
+///   answering, and says so once per rule per minute (NET-062, NET-063,
+///   NET-064) — and every frame whose source is not the box's lease is
+///   rejected before the rules are consulted at all (NET-084). One drop has
+///   one exception: an address the box resolved from a name its
+///   `allow_dns_hosts` declared, held in the DNS gate's admission table for
+///   its window (NET-066) — and the box's AAAA, HTTPS and SVCB lookups
+///   toward the switch's resolver are answered NODATA here, never written
+///   on (NET-136).
+/// - **Ingress** (`switch → tap`, UC6 / finding #2) — session↔session (and
+///   daemon→session) traffic is subject to the *target* PTask's ingress
+///   policy:
+///   - **TCP** — a stateless SYN gate: a new inbound connection (a bare SYN)
+///     to a port the target did not declare is dropped; established/return
+///     traffic and declared ports pass (an ACK-set segment is never a new
+///     connection).
+///   - **UDP** — a conntracked gate: UDP has no connection-establishment
+///     signal, so the egress leg records each *admitted* outbound datagram's
+///     flow and the ingress leg allows a matching reply while dropping
+///     unsolicited datagrams to undeclared ports (see [`UdpConntrack`]).
 ///
-/// - **TCP** — a stateless SYN gate: a new inbound connection (a bare SYN) to a
-///   port the target did not declare is dropped; established/return traffic and
-///   declared ports pass (an ACK-set segment is never a new connection).
-/// - **UDP** — a conntracked gate: UDP has no connection-establishment signal, so
-///   the egress leg records each outbound datagram's flow and the ingress leg
-///   allows a matching reply while dropping unsolicited datagrams to undeclared
-///   ports (see [`UdpConntrack`]).
-///
-/// ICMP and non-IPv4 traffic pass (out of scope).
-pub struct IngressGate {
+/// ICMP passes inbound (out of scope for the ingress half); non-IPv4 traffic
+/// passes inbound, since its only sources are the switch's own ARP and the
+/// relays minimald runs. A DNS reply from this switch's own resolver is also
+/// observed on the ingress leg — the one traffic class that can grow what
+/// the box may reach (NET-066/NET-067, [`DnsGate`]).
+pub struct SessionGate {
     /// TCP destination ports the target accepts new inbound connections on — the
     /// *internal* ports of its TCP `port_mappings` (what the sandbox listens on,
     /// and what both a peer session and the host-publish forwarder dial). An empty
@@ -498,40 +829,91 @@ pub struct IngressGate {
     /// internal ports of its UDP `port_mappings`). Inbound UDP to any other port
     /// passes only if it matches a live outbound flow in `conntrack`.
     udp_allowed: HashSet<u16>,
-    /// Outbound-UDP flow tracker, shared with the egress relay leg so a reply to
-    /// the PTask's own UDP egress (DNS, QUIC, …) is allowed back in.
+    /// Outbound-UDP flow tracker, shared between the relay legs so a reply to
+    /// the PTask's own UDP egress (DNS, QUIC, …) is allowed back in — and an
+    /// undeclared datagram, or one the relay answered itself (NET-136), cannot
+    /// open a window.
     conntrack: Arc<UdpConntrack>,
     /// The target PTask's switch IP, carried as the R2.7 log's `session_id`.
     label: String,
-    /// Rate-limited emitter for dropped-frame warnings (R2.7).
-    limiter: PolicyWarnLimiter,
+    /// Rate-limited emitter for dropped-frame warnings (R2.7), keyed by box and
+    /// rule, shared by both legs and the NET-004 notice.
+    limiter: Arc<PolicyWarnLimiter>,
+    /// The box's compiled egress rules — its declared dimensions, the
+    /// resolver the carve-out is keyed to, and its lease (NET-084) — decided
+    /// by `sessions::core::egress`.
+    egress: egress::EgressRules,
+    /// The DNS gate (NET-066, NET-067, NET-136): the per-box table of the
+    /// addresses its allowed names resolved to, each holding for its
+    /// admission window — the one thing that can lift an
+    /// undeclared-destination drop on the egress leg — plus the
+    /// AAAA/HTTPS/SVCB interception the egress leg answers NODATA with.
+    /// Built at attach and shared by both legs through this gate.
+    dns: DnsGate,
 }
 
-impl IngressGate {
-    /// Builds a gate from a PTask's ingress policy: the declared internal ports
-    /// per transport (TCP and UDP separately), plus a fresh UDP flow tracker. A
-    /// session with no ingress denies every new inbound connection/datagram while
-    /// still receiving replies to its own egress.
+impl SessionGate {
+    /// Builds a gate from a session's whole policy: the declared internal ports
+    /// per transport (TCP and UDP separately) drive the inbound half, the
+    /// compiled egress rules the outbound half, and `subnet` names the switch
+    /// the relay is attached to — whose gateway is the resolver the egress
+    /// carve-out is keyed to (NET-079). `lease` is the box's address on that
+    /// switch, compiled into its egress rules as the one source its frames may
+    /// carry (NET-084). A session with no declared ingress denies every new
+    /// inbound connection/datagram while still receiving replies to its own
+    /// egress; one with no declared egress allows all (the shipped default,
+    /// until NET-074's deny-all default is in force).
     #[must_use]
-    pub fn for_session(label: String, ingress: Option<&sessions::IngressPolicy>) -> Self {
-        let ports = |proto: sessions::IpProto| -> HashSet<u16> {
-            ingress
-                .map(|i| {
-                    i.port_mappings
-                        .iter()
-                        .filter(|m| m.proto == proto)
-                        .map(|m| m.internal_port)
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
+    pub fn for_session(
+        label: String,
+        lease: Ipv4Addr,
+        policy: &sessions::SessionPolicy,
+        subnet: SwitchSubnet,
+    ) -> Self {
+        // The one egress compilation this box's frames are decided by, shared
+        // with the DNS gate below — so a name's admission and a frame's
+        // verdict can never disagree about what the box declared.
+        let rules = compiled_egress(Some(policy), subnet, lease);
+        let infrastructure = egress::InfrastructureDenySet::new(
+            subnet.dns_server().octets(),
+            subnet.host_alias().octets(),
+        );
+        let limiter = Arc::new(PolicyWarnLimiter::new());
+        // One DNS gate per box, sharing the limiter and the resolver address
+        // the egress rules already resolved from `subnet` (NET-079's
+        // carve-out, the address this gate watches replies from).
+        let dns = DnsGate::new(
+            &label,
+            policy.egress.as_ref(),
+            rules.clone(),
+            infrastructure,
+            Arc::clone(&limiter),
+        );
         Self {
-            allowed: ports(sessions::IpProto::Tcp),
-            udp_allowed: ports(sessions::IpProto::Udp),
+            allowed: declared_ingress_ports(Some(policy), sessions::IpProto::Tcp),
+            udp_allowed: declared_ingress_ports(Some(policy), sessions::IpProto::Udp),
             conntrack: Arc::new(UdpConntrack::default()),
             label,
-            limiter: PolicyWarnLimiter::new(),
+            limiter,
+            egress: rules,
+            dns,
         }
+    }
+
+    /// Shrinks the DNS gate's admission window — a test hook for the
+    /// relay-level proof that an established flow outlives the window,
+    /// which cannot be written against a five-minute one.
+    #[cfg(test)]
+    pub(crate) fn shrink_admission_window(&mut self, window: Duration) {
+        self.dns.shrink_window(window);
+    }
+
+    /// Shrinks the DNS gate's flow idle cap — the window hook's twin, for
+    /// the relay-level proofs that an established flow is *released* by
+    /// idleness, which cannot be written against a day-long one.
+    #[cfg(test)]
+    pub(crate) fn shrink_flow_idle_cap(&mut self, cap: Duration) {
+        self.dns.shrink_flow_idle_cap(cap);
     }
 
     /// The inbound-gate decision for one Ethernet frame: `Some((proto, dst_port,
@@ -546,19 +928,258 @@ impl IngressGate {
         }
         None
     }
+
+    /// Whether the target's own gate admits a direct inbound TCP connection to
+    /// `port` — the port on the box the connection terminates on, which is the
+    /// mapping's *internal* port for a proxied request translated through its
+    /// declaration. The relay's half of the verdict
+    /// [`proxied_request_verdict`] composes (its port predicate, the one
+    /// `blocked_syn` applies to a new connection), exposed so the hostname
+    /// proxy's refusals can be held to it: the proxy may forward a request
+    /// only to a port this admits, and refuses every request whose port the
+    /// same declaration does not publish (NET-069, NET-071).
+    #[must_use]
+    pub fn admits_direct_tcp(&self, port: u16) -> bool {
+        self.allowed.contains(&port)
+    }
+}
+
+/// The rule name an ingress refusal carries on both surfaces that decide
+/// ingress (NET-069, NET-071): the relay logs this name when it drops a
+/// direct connection to a port the target did not declare, and the hostname
+/// proxy logs the *same* name when it refuses a proxied request to that port
+/// before dialing — so the daemon log's tail (the diagnostics bundle's)
+/// shows one rule for one violation, whichever route it took. R2.7's
+/// `rule_matched` field.
+pub const NO_INGRESS_MAPPING_RULE: &str = "no ingress mapping";
+
+/// The internal ports a target's ingress declaration admits on `proto` — the
+/// one derivation both ingress surfaces read: the relay's inbound gate
+/// ([`SessionGate::allowed`]/[`SessionGate::udp_allowed`]) and, through the
+/// registry's routes, the hostname proxy's own port gate. An absent ingress
+/// policy admits nothing (the own-IP default-block posture).
+#[must_use]
+pub fn declared_ingress_ports(
+    policy: Option<&sessions::SessionPolicy>,
+    proto: sessions::IpProto,
+) -> HashSet<u16> {
+    policy
+        .and_then(|policy| policy.ingress.as_ref())
+        .map(|ingress| {
+            ingress
+                .port_mappings
+                .iter()
+                .filter(|m| m.proto == proto)
+                .map(|m| m.internal_port)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The external ports a request to an **own-address** target may name
+/// (NET-069): the ports its ingress declaration *publishes* — the port a URL
+/// carries and the proxy sees, which [`Route::upstream`](crate::net::dns::Route::upstream)
+/// then translates to the internal port behind it. An own-address box that
+/// declares no ingress publishes nothing: absent ingress is the deny-all
+/// posture `sessions::validate_policy` accepts on `own_ip`, the same posture
+/// [`declared_ingress_ports`] gives a direct connection to it, so the set is
+/// empty and never `None`. `None` on a route means a *host-address* box
+/// (launch validation rejects an ingress declaration on every mode but
+/// `own_ip`), a different verdict whose direct connections no surface gates —
+/// collapsing the two is what would let a proxied request dial an undeclared
+/// port on a native host's published-loopback route while a VM host refuses
+/// it (NET-071).
+#[must_use]
+pub fn declared_request_ports(policy: Option<&sessions::SessionPolicy>) -> BTreeSet<u16> {
+    policy
+        .and_then(|policy| policy.ingress.as_ref())
+        .map(|ingress| {
+            ingress
+                .port_mappings
+                .iter()
+                .map(|m| m.external_port)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The compiled egress rules a session's own outbound frames are decided by
+/// on the relay ([`SessionGate::egress`]), keyed to `subnet`'s resolver — the
+/// same compilation for the hostname proxy's caller check (NET-070), so a
+/// session's egress declaration cannot mean one thing on the switch and
+/// another through the proxy (NET-071). `lease` is the box's address on that
+/// switch, compiled into the rules as the one source its frames may carry
+/// (NET-084).
+#[must_use]
+pub fn compiled_egress(
+    policy: Option<&sessions::SessionPolicy>,
+    subnet: SwitchSubnet,
+    lease: Ipv4Addr,
+) -> egress::EgressRules {
+    egress::EgressRules::from_policy(
+        policy.and_then(|policy| policy.egress.as_ref()),
+        subnet.dns_server().octets(),
+        lease.octets(),
+    )
+}
+
+/// The egress verdict a direct TCP connection from a box whose own frames are
+/// decided by `rules` to `dst:port` would carry — the same pure
+/// `sessions::core::egress` verdict the relay applies to every frame the box
+/// sends, asked about a synthesized TCP frame, so the hostname proxy decides
+/// a request with the relay's own function and never grows a second
+/// implementation of the rules that could drift (NET-070, NET-071).
+///
+/// The frame is synthesized because the verdict's input *is* a frame: the
+/// decision stays a pure function of an owned frame summary, exactly as the
+/// NET-062..064 tier requires, and reusing it verbatim is what keeps exactly
+/// one admit-or-drop function in the tree. The rules are address- and
+/// protocol-shaped — never port-shaped, the resolver carve-out aside, which a
+/// TCP frame cannot match — so the port names the connection without
+/// changing the verdict.
+///
+/// The synthesized frame carries the rules' own lease as its source (NET-084):
+/// it stands for a frame the box itself put on the wire, so the verdict's
+/// lease check reads it as the box's own and the declared dimensions decide —
+/// the same frame-source relationship the relay's frames have to the same
+/// rules. Synthesizing it with any other source would have the lease check
+/// refuse every request, and never consult the caller's declaration at all.
+#[must_use]
+pub fn direct_connection_verdict(
+    rules: &egress::EgressRules,
+    dst: Ipv4Addr,
+    dst_port: u16,
+) -> FrameVerdict {
+    egress::verdict(
+        &tcp_frame_summary(Ipv4Addr::from(rules.lease()), dst, dst_port),
+        rules,
+    )
+}
+
+/// Sizes of the Ethernet header and the minimum IPv4 header `summarize`
+/// extracts; the synthesized frame is exactly the bytes [`egress::summarize`]
+/// reads and nothing else.
+const SYNTH_ETH_HDR: usize = 14;
+const SYNTH_IPV4_HDR: usize = 20;
+const SYNTH_L4_HDR: usize = 4;
+
+/// The frame summary the egress verdict reads for a TCP connection from
+/// `src` to `dst:port` — an Ethernet header carrying the minimum IPv4 header
+/// and a 4-byte L4 header, with EtherType, IHL, protocol, source address,
+/// destination address and destination port set at the offsets `summarize`
+/// extracts them from. `src` is the box's lease the rules carry (NET-084).
+///
+/// [`egress::summarize`] reads a frame, so a frame is what stands for the
+/// connection — but only the fields it extracts are written, and every index
+/// below is a constant offset inside a fixed-size array sized for exactly
+/// those fields, so none of them can be out of bounds.
+#[must_use]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "constant offsets into a fixed-size array sized for exactly these fields"
+)]
+fn tcp_frame_summary(src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16) -> FrameSummary {
+    let mut frame = [0u8; SYNTH_ETH_HDR + SYNTH_IPV4_HDR + SYNTH_L4_HDR];
+    frame[12..14].copy_from_slice(&[0x08, 0x00]); // EtherType: IPv4.
+    let ip = &mut frame[SYNTH_ETH_HDR..];
+    ip[0] = 0x45; // IPv4, IHL 5 (the 20-byte header below).
+    ip[9] = IPPROTO_TCP;
+    ip[12..16].copy_from_slice(&src.octets());
+    ip[16..20].copy_from_slice(&dst.octets());
+    // The L4 destination port, at the offset `summarize` reads it from
+    // (`ip[ihl + 2..ihl + 4]`) — the two bytes *after* the 20-byte IPv4
+    // header, not the source-port slot inside it.
+    ip[SYNTH_IPV4_HDR + 2..SYNTH_IPV4_HDR + 4].copy_from_slice(&dst_port.to_be_bytes());
+    egress::summarize(&frame)
+}
+
+/// The decision for one proxied request, put to the same verdict a direct
+/// connection between the same two boxes would meet (NET-069, NET-070,
+/// NET-071): the caller's compiled egress rules for the target first, then
+/// the target's declared ingress ports for the request's port. Decided by one
+/// function ([`proxied_request_verdict`]) through the relay's own helpers —
+/// [`direct_connection_verdict`], [`Route::upstream`](crate::net::dns::Route::upstream)
+/// and [`NO_INGRESS_MAPPING_RULE`] — so a hostname-routing surface gives no
+/// reach a direct connection would not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxiedRequest {
+    /// Both declarations admit: forward to this upstream.
+    Forward(SocketAddr),
+    /// Refused before the proxy dialed anything, in the relay's drop-line
+    /// vocabulary, so a proxied refusal and a direct one log as the same
+    /// violation of the same rule (NET-069).
+    Refused(Refusal),
+}
+
+/// Why a proxied request was refused: which declaration was violated, under
+/// which rule, and the other side's address — the facts a proxied refusal's
+/// warn line carries beside the proxy's own (host, session, port).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// The relay's rule name for this refusal (R2.7's `rule_matched`): an
+    /// `egress::DropReason` rule for an egress refusal,
+    /// [`NO_INGRESS_MAPPING_RULE`] for an ingress one.
+    pub rule: &'static str,
+    /// Which declaration refused it: the caller's egress or the target's
+    /// ingress.
+    pub direction: Direction,
+    /// The other side of the refused connection: the target for an egress
+    /// refusal, the caller for an ingress one. `None` when the proxy cannot
+    /// name it (a host-side caller, which is no box at all).
+    pub other: Option<SocketAddr>,
+}
+
+/// Decides one proxied request (NET-069, NET-070, NET-071). `caller` is the
+/// live session the request's peer address names — `None` when it names no
+/// live box, which is what a host-side client (the developer's browser, the
+/// daemon's own lanes) is: no box's egress declaration to honour, so only the
+/// target's ingress half decides. `route` is the target the request resolved
+/// to and `port` the port its authority carried.
+///
+/// The caller's declaration comes first, in the order a direct connection
+/// meets the two: its frame clears the caller's own egress gate before the
+/// target's ingress gate ever sees it (NET-070). The target's declaration is
+/// the port gate [`Route::upstream`](crate::net::dns::Route::upstream) already
+/// applies — a port its ingress does not publish routes nowhere.
+#[must_use]
+pub fn proxied_request_verdict(
+    caller: Option<&crate::net::dns::Caller>,
+    route: &crate::net::dns::Route,
+    port: u16,
+) -> ProxiedRequest {
+    let target = route.address();
+    if let Some(caller) = caller
+        && let FrameVerdict::Drop(reason) = direct_connection_verdict(caller.egress(), target, port)
+    {
+        return ProxiedRequest::Refused(Refusal {
+            rule: reason.rule(),
+            direction: Direction::Egress,
+            other: Some(SocketAddr::V4(SocketAddrV4::new(target, port))),
+        });
+    }
+    match route.upstream(port) {
+        Some(upstream) => ProxiedRequest::Forward(upstream),
+        None => ProxiedRequest::Refused(Refusal {
+            rule: NO_INGRESS_MAPPING_RULE,
+            direction: Direction::Ingress,
+            other: caller.map(|caller| SocketAddr::V4(SocketAddrV4::new(caller.lease(), port))),
+        }),
+    }
 }
 
 /// The L4 addressing of a TCP/UDP-over-IPv4 frame, as extracted by
 /// [`parse_ipv4_l4`]. `tcp_flags` is meaningful only when `proto == IPPROTO_TCP`.
-struct L4Packet {
+/// `pub(crate)`: the DNS gate's tests read the addressing of the replies the
+/// relay synthesizes.
+pub(crate) struct L4Packet {
     /// Source `ip:port`.
-    src: SocketAddrV4,
+    pub(crate) src: SocketAddrV4,
     /// Destination `ip:port`.
-    dst: SocketAddrV4,
+    pub(crate) dst: SocketAddrV4,
     /// IPv4 protocol number (`IPPROTO_TCP` or `IPPROTO_UDP`).
-    proto: u8,
+    pub(crate) proto: u8,
     /// TCP flags byte; `0` for UDP.
-    tcp_flags: u8,
+    pub(crate) tcp_flags: u8,
 }
 
 /// Parses an Ethernet II + IPv4 + TCP/UDP frame into its L4 addressing, or `None`
@@ -648,7 +1269,10 @@ struct UdpConntrack {
 
 impl UdpConntrack {
     /// Records an outbound UDP datagram (`pkt.src` = local lease, `pkt.dst` =
-    /// remote) so its reply may return.
+    /// remote) so its reply may return. The caller passes only a datagram it is
+    /// forwarding: one the relay answered itself never reaches the remote, so
+    /// no reply is coming and a window keyed to it would admit unsolicited
+    /// inbound traffic for the TTL.
     fn record_egress(&self, pkt: &L4Packet) {
         let key = (*pkt.dst.ip(), pkt.dst.port(), pkt.src.port());
         let now = Instant::now();
@@ -690,13 +1314,152 @@ fn blocked_udp(
     Some((dst_port, pkt.src))
 }
 
+/// The UDP datagram one Ethernet frame carries — its L4 addressing plus the
+/// datagram's payload — or `None` for anything that is not an
+/// IPv4+UDP frame, or whose claimed lengths do not bound its own payload.
+///
+/// [`parse_ipv4_l4`] decides the addressing and [`udp_payload`] the length
+/// arithmetic, because the DNS gate reads the datagram's payload and a
+/// hostile frame yields `None` — never an out-of-bounds slice, and never a
+/// slice padded out to the Ethernet frame's end: the datagram is `total`
+/// bytes, whatever the frame around it claims to be.
+pub(crate) fn udp_datagram(frame: &[u8]) -> Option<(L4Packet, &[u8])> {
+    let pkt = parse_ipv4_l4(frame).filter(|pkt| pkt.proto == IPPROTO_UDP)?;
+    let payload = udp_payload(frame, &pkt)?;
+    Some((pkt, payload))
+}
+
+/// The payload of the UDP datagram one frame carries, for a caller already
+/// holding that frame's own [`parse_ipv4_l4`] result — the egress leg, whose
+/// conntrack window and DNS-gate interception share one parse instead of a
+/// parse each. The length contract is [`udp_datagram`]'s: a claimed length
+/// that does not bound a payload yields `None`, so a mismatched `pkt` can
+/// only cost a parse, never panic.
+fn udp_payload<'a>(frame: &'a [u8], pkt: &L4Packet) -> Option<&'a [u8]> {
+    if pkt.proto != IPPROTO_UDP {
+        return None;
+    }
+    let ip = frame.get(ETH_HDR..)?;
+    let ihl = ((ip.first()? & 0x0f) as usize) * 4;
+    // The IPv4 total length bounds the datagram; a total shorter than its
+    // own headers (including the `0` an offload'd frame carries) is not a
+    // datagram this relay reads.
+    let total = u16::from_be_bytes([*ip.get(2)?, *ip.get(3)?]) as usize;
+    if total < ihl + 8 {
+        return None;
+    }
+    let udp = ip.get(ihl..)?;
+    // A UDP length shorter than its own header is malformed; a longer one is
+    // trimmed to the IP total, which is the datagram's real bound.
+    let udp_len = u16::from_be_bytes([*udp.get(4)?, *udp.get(5)?]) as usize;
+    if udp_len < 8 {
+        return None;
+    }
+    let end = total.min(ip.len());
+    let payload_end = (ihl + udp_len).min(end);
+    udp.get(8..payload_end - ihl)
+}
+
+/// Whether an Ethernet frame's IPv4 protocol byte says UDP — a pre-check, not
+/// a parse: the EtherType and the one protocol byte, nothing else, so the
+/// relay's inbound hot path — mostly a peer's TCP frames, which the DNS gate
+/// can never observe — spends three comparisons per frame instead of the full
+/// [`udp_datagram`] parse. A frame that says UDP here is still parsed and
+/// length-checked before the gate reads a word of it. Both reads are
+/// bounds-checked with `get`, the way [`udp_payload`] reads its headers, so a
+/// frame shorter than either field is "not UDP" rather than a panic.
+fn is_ipv4_udp(frame: &[u8]) -> bool {
+    frame
+        .get(12..14)
+        .is_some_and(|ether| *ether == ETHERTYPE_IPV4.to_be_bytes())
+        && frame
+            .get(ETH_HDR + 9)
+            .is_some_and(|proto| *proto == IPPROTO_UDP)
+}
+
+/// The IPv4 header checksum of `header` (a whole header, the checksum field
+/// zeroed): the ones' complement of the ones' complement sum of its 16-bit
+/// words. The box's kernel verifies it on every received frame, so the
+/// replies the relay synthesizes must carry an honest one.
+fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut words = header.chunks_exact(2);
+    let mut sum: u32 = words
+        .by_ref()
+        .map(|word| {
+            u32::from(u16::from_be_bytes(
+                // `chunks_exact(2)` yields two-byte words by definition, so
+                // this conversion cannot fail.
+                word.try_into().expect("chunks_exact(2) yields two bytes"),
+            ))
+        })
+        .sum();
+    // An odd header's final byte is the high half of a padded last word.
+    if let Some(tail) = words.remainder().first() {
+        sum += u32::from(*tail) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Builds the Ethernet + IPv4 + UDP frame the relay writes back toward the
+/// box, answering the DNS `request` frame whose L4 addressing was `pkt` with
+/// `payload` from the resolver the box asked — the request's destination —
+/// back to the request's own source, port for port.
+///
+/// For the NODATA answers of NET-136: the box's resolver stack sees its
+/// question answered by the resolver it asked. The IPv4 header checksum is
+/// computed; the UDP checksum is left zero, a legal "no checksum" for IPv4,
+/// so the reply needs no pseudo-header arithmetic of its own.
+fn udp_reply_frame(request: &[u8], pkt: &L4Packet, payload: &[u8]) -> Vec<u8> {
+    let total = 20 + 8 + payload.len();
+    let mut frame = Vec::with_capacity(ETH_HDR + total);
+    // Ethernet: the reply's destination is the request's source and vice
+    // versa, the way any answer looks to the box. A request that parsed far
+    // enough to yield `pkt` carries the whole header, so both MACs are here.
+    let (requested_dst, rest) = request
+        .split_first_chunk::<6>()
+        .expect("a parsed datagram carries an Ethernet header");
+    let (requested_src, _) = rest
+        .split_first_chunk::<6>()
+        .expect("an Ethernet header carries a source MAC too");
+    frame.extend_from_slice(requested_src);
+    frame.extend_from_slice(requested_dst);
+    frame.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+    // IPv4, IHL 5: the resolver the box asked is the source, the box the
+    // destination; the checksum covers the header the box's kernel verifies.
+    let mut header = [0u8; 20];
+    header[0] = 0x45;
+    header[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    header[8] = 64;
+    header[9] = IPPROTO_UDP;
+    header[12..16].copy_from_slice(&pkt.dst.ip().octets());
+    header[16..20].copy_from_slice(&pkt.src.ip().octets());
+    let checksum = ipv4_checksum(&header);
+    header[10..12].copy_from_slice(&checksum.to_be_bytes());
+    frame.extend_from_slice(&header);
+    // UDP: the resolver's :53 back to the query's source port, no checksum.
+    let udp_len = 8 + payload.len();
+    frame.extend_from_slice(&pkt.dst.port().to_be_bytes());
+    frame.extend_from_slice(&pkt.src.port().to_be_bytes());
+    frame.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    frame.extend_from_slice(&0u16.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
 /// switch → tap: read a 2-byte LE length, then that many bytes of Ethernet
 /// frame, apply the inbound ingress gate (finding #2), and write the frame to the
 /// tap device.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every `frame[..n]` is bounded by the explicit `n > frame.len()` rejection above"
+)]
 async fn relay_switch_to_tap<R>(
     mut sock: R,
     tap: Arc<AsyncFd<std::fs::File>>,
-    gate: Option<IngressGate>,
+    gate: Option<Arc<SessionGate>>,
 ) -> io::Result<()>
 where
     R: AsyncReadExt + Unpin,
@@ -737,35 +1500,73 @@ where
             gate.limiter.warn(
                 &gate.label,
                 Direction::Ingress,
-                SocketAddr::V4(src),
-                proto,
-                &format!("no ingress mapping for {proto} dst port {dst_port}"),
+                Some(SocketAddr::V4(src)),
+                Proto::from_ipproto(proto),
+                Some(dst_port),
+                NO_INGRESS_MAPPING_RULE,
             );
             continue;
         }
-        loop {
-            let mut guard = tap.writable().await?;
-            // One non-blocking write per try_io call: write_all could issue
-            // several syscalls and, on a partial write then EAGAIN, restart the
-            // whole frame from byte 0 — re-emitting the already-written prefix.
-            // A tap write is frame-atomic, so a single write delivers the whole
-            // frame; a short count would mean a malformed write we surface.
-            match guard.try_io(|inner| inner.get_ref().write(&frame[..n])) {
-                Ok(result) => {
-                    let written = result?;
-                    if written != n {
-                        tracing::warn!(written, n, "short tap write; frame may be truncated");
-                    }
-                    break;
+        // NET-066/NET-067: a DNS reply from this switch's own resolver is
+        // the one thing that can add to what the box may reach. The egress
+        // leg drops every destination the box did not declare; observing
+        // the reply admits the addresses the box's allowed names resolved
+        // to — each intersected with the box's denies and the
+        // infrastructure deny set at resolution time, so a refused answer
+        // (logged once per rule per minute, with its name and the answer)
+        // is never admitted at all. The reply itself always passes on to
+        // the box below: resolution is honest, only the connection to a
+        // refused address is not admitted.
+        //
+        // Before it parses anything, the gate reads the two header bytes
+        // that decide whether the frame can be one of its own at all: only
+        // an IPv4+UDP frame can carry a resolver reply, and most inbound
+        // traffic — a peer's TCP — is not one, so the full [`udp_datagram`]
+        // parse is spent on UDP frames alone.
+        if let Some(gate) = &gate
+            && is_ipv4_udp(&frame[..n])
+            && let Some((pkt, payload)) = udp_datagram(&frame[..n])
+        {
+            gate.dns.observe_response(&pkt.src, payload, Instant::now());
+        }
+        write_tap_frame(&tap, &frame[..n]).await?;
+    }
+}
+
+/// Writes one Ethernet frame to the tap: readiness-guarded, one
+/// non-blocking write per try. Used by both the ingress leg (frames from
+/// the switch) and the DNS gate's NODATA answers on the egress leg.
+///
+/// One non-blocking write per try_io call: write_all could issue several
+/// syscalls and, on a partial write then EAGAIN, restart the whole frame
+/// from byte 0 — re-emitting the already-written prefix. A tap write is
+/// frame-atomic, so a single write delivers the whole frame; a short count
+/// would mean a malformed write we surface.
+async fn write_tap_frame(tap: &Arc<AsyncFd<std::fs::File>>, frame: &[u8]) -> io::Result<()> {
+    loop {
+        let mut guard = tap.writable().await?;
+        match guard.try_io(|inner| inner.get_ref().write(frame)) {
+            Ok(result) => {
+                let written = result?;
+                if written != frame.len() {
+                    tracing::warn!(
+                        written,
+                        n = frame.len(),
+                        "short tap write; frame may be truncated"
+                    );
                 }
-                Err(_would_block) => continue,
+                return Ok(());
             }
+            Err(_would_block) => continue,
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    // `pub(crate)`: `net::dns_gate`'s tests drive the same relay harness —
+    // its sessions stand in front of the same relay legs this module proves —
+    // so the harness items below are shared rather than copied.
     use super::*;
 
     /// Builds an Ethernet II + IPv4 + TCP frame for the ingress-gate tests.
@@ -799,8 +1600,11 @@ mod tests {
         f
     }
 
-    const SYN: u8 = 0x02;
-    const ACK: u8 = 0x10;
+    /// TCP SYN. `pub(crate)`: the DNS gate's retention proof builds segments
+    /// that open, ride and close a flow.
+    pub(crate) const SYN: u8 = 0x02;
+    /// TCP ACK, likewise shared with the DNS gate's proofs.
+    pub(crate) const ACK: u8 = 0x10;
     const SRC: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 5);
 
     #[test]
@@ -865,30 +1669,75 @@ mod tests {
 
     #[test]
     fn for_session_collects_tcp_internal_ports_only() {
-        let ingress = sessions::IngressPolicy {
-            port_mappings: vec![
-                sessions::PortMapping {
-                    external_port: 18080,
-                    internal_port: 80,
-                    proto: sessions::IpProto::Tcp,
-                },
-                sessions::PortMapping {
-                    external_port: 19999,
-                    internal_port: 53,
-                    proto: sessions::IpProto::Udp,
-                },
-            ],
-            dynamic_allowed_range: None,
+        let policy = sessions::SessionPolicy {
+            ingress: Some(sessions::IngressPolicy {
+                port_mappings: vec![
+                    sessions::PortMapping {
+                        external_port: 18080,
+                        internal_port: 80,
+                        proto: sessions::IpProto::Tcp,
+                    },
+                    sessions::PortMapping {
+                        external_port: 19999,
+                        internal_port: 53,
+                        proto: sessions::IpProto::Udp,
+                    },
+                ],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+            egress: None,
         };
-        let gate = IngressGate::for_session("100.64.0.9".into(), Some(&ingress));
+        let gate = SessionGate::for_session(
+            "100.64.0.9".into(),
+            Ipv4Addr::new(100, 64, 0, 9),
+            &policy,
+            SwitchSubnet::default(),
+        );
         assert!(gate.allowed.contains(&80)); // TCP internal port
         assert!(!gate.allowed.contains(&53)); // the UDP mapping is not a TCP port
         assert!(!gate.allowed.contains(&18080)); // external port is not the listener
         assert!(gate.udp_allowed.contains(&53)); // UDP internal port
         assert!(!gate.udp_allowed.contains(&80)); // the TCP mapping is not a UDP port
         // A no-ingress own-IP session denies every new inbound connection/datagram.
-        let empty = IngressGate::for_session("x".into(), None);
+        let empty = SessionGate::for_session(
+            "x".into(),
+            Ipv4Addr::new(100, 64, 0, 9),
+            &sessions::SessionPolicy::default(),
+            SwitchSubnet::default(),
+        );
         assert!(empty.allowed.is_empty() && empty.udp_allowed.is_empty());
+    }
+
+    /// The synthesized frame the proxy's verdict reads names the connection's
+    /// destination port: `tcp_frame_summary` writes it at the offset
+    /// `egress::summarize` extracts it from (`ip[ihl + 2..ihl + 4]`, the two
+    /// bytes after the IPv4 header), not the L4 source-port slot inside it, so
+    /// the summary a proxied request is put to and the one a direct
+    /// connection's frame carries are the same at the port level (NET-070,
+    /// NET-071) and a port-shaped rule the egress verdict ever grows sees the
+    /// port the request named. Its source is the lease the rules carry, so the
+    /// verdict's lease check (NET-084) reads the frame as the box's own.
+    #[test]
+    fn tcp_frame_summary_names_the_destination_port() {
+        let lease = Ipv4Addr::new(100, 64, 0, 9);
+        let dst = Ipv4Addr::new(100, 64, 0, 5);
+        for port in [1u16, 53, 1024, 8080, u16::MAX] {
+            assert_eq!(
+                tcp_frame_summary(lease, dst, port).destination_port(),
+                port,
+                "the summary must carry destination port {port}"
+            );
+        }
+        // The rest of the summary is the frame's own: the source and address
+        // the verdict decides by — the lease it was compiled with and the
+        // destination it was asked about — and no port to read when there is
+        // none.
+        let summary = tcp_frame_summary(lease, dst, 8080);
+        assert_eq!(summary.source(), Some(lease.octets()));
+        assert_eq!(summary.destination(), Some(dst.octets()));
+        assert_eq!(summary.protocol(), Some(IPPROTO_TCP));
+        assert_eq!(tcp_frame_summary(lease, dst, 0).destination_port(), 0);
     }
 
     /// Builds an Ethernet II + IPv4 + UDP frame for the conntrack tests.
@@ -914,7 +1763,9 @@ mod tests {
         f
     }
 
-    const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+    /// The box's own switch IP, the lease every egress frame below carries —
+    /// shared with the DNS gate's tests.
+    pub(crate) const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
     const PEER: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 5);
 
     #[test]
@@ -953,17 +1804,54 @@ mod tests {
         assert!(blocked_udp(&spoof, &HashSet::new(), &ct).is_some());
     }
 
+    /// The DNS gate's inbound pre-check reads the EtherType and the IPv4
+    /// protocol byte and nothing else, so the relay's hot path spends three
+    /// comparisons on a peer's TCP frames rather than a full parse — and it
+    /// only ever *narrows*: every frame it rejects is one `udp_datagram` could
+    /// not have read anyway, and every frame it admits is still parsed and
+    /// length-checked before the gate reads a word of it.
+    #[test]
+    fn udp_precheck_narrows_without_losing_datagrams() {
+        // A UDP frame passes the pre-check and parses as a datagram.
+        let udp = udp_frame(PEER, 33333, LEASE, 53);
+        assert!(is_ipv4_udp(&udp));
+        assert!(udp_datagram(&udp).is_some());
+
+        // A peer's TCP, ARP, and IPv6: the traffic that dominates the
+        // inbound leg, none of it a datagram the gate could observe.
+        for frame in [
+            &tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, SRC, 9999)[..],
+            &arp_frame(LEASE)[..],
+            &ipv6_frame()[..],
+        ] {
+            assert!(!is_ipv4_udp(frame), "rejected: {frame:02x?}");
+            assert!(udp_datagram(frame).is_none());
+        }
+
+        // A frame too short to carry the bytes the pre-check reads: the same
+        // `None` the parse would give, never a misclassification.
+        for cut in [0, 14, 20, 23] {
+            assert!(!is_ipv4_udp(&udp[..cut]), "len {cut}");
+            assert!(udp_datagram(&udp[..cut]).is_none(), "len {cut}");
+        }
+    }
+
     #[test]
     fn inbound_drop_tags_the_transport() {
-        let ingress = sessions::IngressPolicy {
-            port_mappings: vec![sessions::PortMapping {
-                external_port: 18080,
-                internal_port: 80,
-                proto: sessions::IpProto::Tcp,
-            }],
-            dynamic_allowed_range: None,
+        let policy = sessions::SessionPolicy {
+            ingress: Some(sessions::IngressPolicy {
+                port_mappings: vec![sessions::PortMapping {
+                    external_port: 18080,
+                    internal_port: 80,
+                    proto: sessions::IpProto::Tcp,
+                }],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+            egress: None,
         };
-        let gate = IngressGate::for_session(LEASE.to_string(), Some(&ingress));
+        let gate =
+            SessionGate::for_session(LEASE.to_string(), LEASE, &policy, SwitchSubnet::default());
         // New TCP connection to an undeclared port -> dropped, tagged Tcp.
         let tcp = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9999);
         assert_eq!(
@@ -979,6 +1867,410 @@ mod tests {
         // Declared TCP port passes.
         let ok = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 80);
         assert!(gate.inbound_drop(&ok).is_none());
+    }
+
+    /// The egress-relay harness: drives a real [`spawn_relay`] end-to-end
+    /// without a tap device or a gvproxy. A `SOCK_DGRAM` unix socketpair
+    /// stands in for the tap (reads stay frame-atomic the way a tap's are,
+    /// so the test writes whole frames as the box would), and a tokio
+    /// duplex stands in for gvproxy's upgraded control socket — reading
+    /// there observes exactly what the relay put on the wire, framed the
+    /// way it frames.
+    pub(crate) struct RelayHarness {
+        /// The "box" end of the socketpair: frames written here are the
+        /// box's egress; frames the relay writes back would be its answers.
+        pub(crate) box_end: std::fs::File,
+        /// The gvproxy side of the duplex: the relay's framed output.
+        pub(crate) switch: tokio::io::DuplexStream,
+        /// Keeps the relay's legs alive for the harness's lifetime.
+        _relay: SwitchRelay,
+    }
+
+    /// Spawns a gated relay for a box at [`LEASE`] on the default switch
+    /// subnet (whose gateway is the resolver the carve-out is keyed to),
+    /// under `policy`.
+    pub(crate) fn spawn_test_relay(policy: &sessions::SessionPolicy) -> RelayHarness {
+        spawn_test_relay_with(policy, |_| {})
+    }
+
+    /// [`spawn_test_relay`] with the session gate handed to `configure`
+    /// before the relay takes it: the DNS-gate proofs are the callers, for
+    /// the things a policy cannot say — the admission window and the flow
+    /// idle cap, shrunk short enough that their expiry is observable inside
+    /// a test.
+    pub(crate) fn spawn_test_relay_with(
+        policy: &sessions::SessionPolicy,
+        configure: impl FnOnce(&mut SessionGate),
+    ) -> RelayHarness {
+        spawn_relay_for(LEASE, Some(policy), configure)
+    }
+
+    /// Spawns the daemon's own relay shape: no gate, the daemon's address as
+    /// its lease — what the guest's root egress attach runs (`guest.rs`).
+    fn spawn_daemon_relay(lease: Ipv4Addr) -> RelayHarness {
+        spawn_relay_for(lease, None, |_| {})
+    }
+
+    /// The relay both harnesses share: a box's gated relay under `policy`, or
+    /// the daemon's own ungated one (`policy` is `None`), attached with
+    /// `lease` on the default switch subnet. The gate, when there is one, is
+    /// handed to `configure` before the relay takes it — the DNS-gate proofs
+    /// are the callers, for the things a policy cannot say.
+    fn spawn_relay_for(
+        lease: Ipv4Addr,
+        policy: Option<&sessions::SessionPolicy>,
+        configure: impl FnOnce(&mut SessionGate),
+    ) -> RelayHarness {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `socketpair` with a valid domain/type either returns -1
+        // (checked) or fills `fds` with two fresh descriptors.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair: {}", io::Error::last_os_error());
+        // SAFETY: each fd in `fds` is a fresh, valid, owned descriptor just
+        // returned by socketpair.
+        let tap_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let box_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+
+        let (switch, relay_side) = tokio::io::duplex(64 * 1024);
+        let (sock_rx, sock_tx) = tokio::io::split(relay_side);
+        let mut gate = policy.map(|policy| {
+            SessionGate::for_session(lease.to_string(), lease, policy, SwitchSubnet::default())
+        });
+        if let Some(gate) = gate.as_mut() {
+            configure(gate);
+        }
+        let relay = spawn_relay(
+            tap_fd,
+            sock_rx,
+            sock_tx,
+            gate,
+            lease,
+            SwitchSubnet::default(),
+        )
+        .expect("the harness relay spawns");
+        RelayHarness {
+            box_end,
+            switch,
+            _relay: relay,
+        }
+    }
+
+    /// Reads one 2-byte-LE-framed frame off the relay's switch side.
+    pub(crate) async fn read_framed(switch: &mut tokio::io::DuplexStream) -> io::Result<Vec<u8>> {
+        let mut len_buf = [0u8; 2];
+        switch.read_exact(&mut len_buf).await?;
+        let n = u16::from_le_bytes(len_buf) as usize;
+        let mut frame = vec![0u8; n];
+        switch.read_exact(&mut frame).await?;
+        Ok(frame)
+    }
+
+    /// An ARP frame from `spa`: address resolution, a declared path for every
+    /// box from its own source — the sentinel that says "everything before me
+    /// has been decided". The payload is a full Ethernet/IPv4 ARP request,
+    /// whose sender protocol address is the source the lease check (NET-084)
+    /// reads.
+    pub(crate) fn arp_frame(spa: Ipv4Addr) -> Vec<u8> {
+        arp_frame_of_ptype(spa, 0x0800)
+    }
+
+    /// An ARP frame from `spa` claiming `ptype` as its protocol type —
+    /// everything else matches [`arp_frame`]. The lease check reads the
+    /// sender protocol address slot whatever the frame claims it speaks, so
+    /// a foreign protocol type is no way to announce an address unchecked.
+    fn arp_frame_of_ptype(spa: Ipv4Addr, ptype: u16) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&[0xff; 6]); // dst MAC: broadcast
+        f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // src MAC
+        f.extend_from_slice(&0x0806u16.to_be_bytes()); // EtherType: ARP
+        f.extend_from_slice(&1u16.to_be_bytes()); // htype: Ethernet
+        f.extend_from_slice(&ptype.to_be_bytes()); // ptype: as claimed
+        f.push(6); // hlen
+        f.push(4); // plen
+        f.extend_from_slice(&1u16.to_be_bytes()); // oper: request
+        f.extend_from_slice(&[0x52, 0x54, 0x00, 0x40, 0x00, 0x09]); // sender MAC
+        f.extend_from_slice(&spa.octets()); // sender protocol address
+        f.extend_from_slice(&[0; 6]); // target MAC (unread in a request)
+        f.extend_from_slice(&Ipv4Addr::new(100, 64, 0, 1).octets()); // target protocol address
+        f
+    }
+
+    /// An IPv6 frame: dropped as a family (NET-082), payload unread.
+    fn ipv6_frame() -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&[0x33, 0x33, 0x00, 0x00, 0x00, 0x01]); // dst MAC
+        f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // src MAC
+        f.extend_from_slice(&0x86DDu16.to_be_bytes()); // EtherType: IPv6
+        f.extend_from_slice(&[0u8; 40]); // payload is outside the verdict's scope
+        f
+    }
+
+    /// An Ethernet II + IPv4 + TCP frame the box sends to `dst`:`dst_port`
+    /// from a fixed ephemeral source port — a new connection (SYN).
+    pub(crate) fn egress_tcp_frame(src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16) -> Vec<u8> {
+        egress_tcp_segment(src, 40000, dst, dst_port, SYN)
+    }
+
+    /// An Ethernet II + IPv4 + TCP segment the box sends to
+    /// `dst`:`dst_port` from `src_port` with `flags` — [`egress_tcp_frame`]
+    /// with the source port and the flags the DNS gate's retention proof
+    /// varies: a flow opens on a SYN, rides on an ACK and ends on a FIN or
+    /// RST, and the flow a second SYN belongs to is told apart by its source
+    /// port.
+    pub(crate) fn egress_tcp_segment(
+        src: Ipv4Addr,
+        src_port: u16,
+        dst: Ipv4Addr,
+        dst_port: u16,
+        flags: u8,
+    ) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x01]); // dst MAC
+        f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // src MAC
+        f.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+        f.push(0x45); // IPv4, IHL 5 (20 bytes), fragment offset 0
+        f.push(0x00);
+        f.extend_from_slice(&40u16.to_be_bytes()); // total length (unread)
+        f.extend_from_slice(&0u16.to_be_bytes()); // identification
+        f.extend_from_slice(&0u16.to_be_bytes()); // flags + fragment offset
+        f.push(64); // TTL
+        f.push(IPPROTO_TCP);
+        f.extend_from_slice(&0u16.to_be_bytes()); // header checksum (unread)
+        f.extend_from_slice(&src.octets());
+        f.extend_from_slice(&dst.octets());
+        f.extend_from_slice(&src_port.to_be_bytes());
+        f.extend_from_slice(&dst_port.to_be_bytes());
+        f.extend_from_slice(&0u32.to_be_bytes()); // seq
+        f.extend_from_slice(&0u32.to_be_bytes()); // ack
+        f.push(0x50); // data offset 5, reserved
+        f.push(flags);
+        f.extend_from_slice(&0u16.to_be_bytes()); // window
+        f.extend_from_slice(&0u16.to_be_bytes()); // checksum
+        f.extend_from_slice(&0u16.to_be_bytes()); // urgent pointer
+        f
+    }
+
+    /// An egress declaration that allows no destination: `allow_subnets`
+    /// declared empty, every other dimension open. The address is the only
+    /// thing undeclared, which is the drop the egress proofs probe — the
+    /// strictest all-dimension deny-all would fire the protocol rule first.
+    fn undeclared_destination_egress() -> sessions::SessionPolicy {
+        sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: None,
+                deny_subnets: None,
+            }),
+            ingress: None,
+        }
+    }
+
+    /// NET-062: a frame to an undeclared destination is dropped at the relay —
+    /// it never reaches the switch — and nothing is written back toward the
+    /// box either: a drop is not a reset. The relay keeps forwarding after.
+    #[tokio::test]
+    async fn disallowed_egress_dropped_not_reset() {
+        let mut harness = spawn_test_relay(&undeclared_destination_egress());
+
+        // The box sends to an address it did not declare, then ARP (a declared
+        // path for every box) as the sentinel: whatever has been put on the
+        // wire by the time the sentinel arrives is everything the relay
+        // forwarded — frames are decided in order, on one leg.
+        let denied = egress_tcp_frame(LEASE, Ipv4Addr::new(203, 0, 113, 7), 443);
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&denied).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            first, sentinel,
+            "the undeclared frame never reached the switch"
+        );
+
+        // A reset would be a frame written back toward the box; a drop writes
+        // nothing. Give the misbehavior a moment, then assert the box's end is
+        // still silent.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        set_nonblocking(harness.box_end.as_raw_fd()).unwrap();
+        let mut probe = [0u8; 1];
+        let read = harness.box_end.read(&mut probe);
+        assert!(
+            matches!(read, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock),
+            "a drop must not be answered: got {read:?}"
+        );
+
+        // And the relay still forwards afterwards — the drop broke nothing.
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay survives a dropped frame")
+            .expect("the switch side stays open");
+        assert_eq!(next, sentinel);
+    }
+
+    /// NET-062's warning: every drop is logged once per box per rule per
+    /// minute — a flood of identical drops says one line, a different rule is
+    /// still heard — and the line carries the box, the direction, the
+    /// destination and the protocol (R2.7).
+    #[tokio::test]
+    async fn egress_drop_logged_rate_limited() {
+        let capture = crate::test_harness::captured_log();
+        let mut harness = spawn_test_relay(&undeclared_destination_egress());
+
+        // Three identical drops, then the sentinel.
+        let denied = egress_tcp_frame(LEASE, Ipv4Addr::new(203, 0, 113, 7), 443);
+        let sentinel = arp_frame(LEASE);
+        for _ in 0..3 {
+            harness.box_end.write_all(&denied).unwrap();
+        }
+        harness.box_end.write_all(&sentinel).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(first, sentinel);
+
+        // `session_id`/`rule_matched` are string fields (rendered quoted);
+        // the rest render through `Display`.
+        let logged = capture.contents();
+        assert_eq!(
+            logged
+                .matches("rule_matched=\"egress-undeclared-subnet\"")
+                .count(),
+            1,
+            "three identical drops say one line: {logged}"
+        );
+        for expected in [
+            "network policy violation",
+            "session_id=\"100.64.0.9\"",
+            "direction=egress",
+            "remote_addr=203.0.113.7:443",
+            "proto=tcp",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
+
+        // A drop under a different rule is not silenced by the first rule's
+        // line: IPv6 says its own — no destination to name, no L4 protocol.
+        harness.box_end.write_all(&ipv6_frame()).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(next, sentinel);
+
+        let logged = capture.contents();
+        assert_eq!(
+            logged.matches("network policy violation").count(),
+            2,
+            "per-rule keys keep a second rule audible: {logged}"
+        );
+        for expected in [
+            "rule_matched=\"egress-ipv6\"",
+            "remote_addr=none",
+            "proto=ipv6",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
+    }
+
+    /// NET-063: a connection the policy declares completes — the frame
+    /// reaches the switch exactly as the box sent it, and nothing is logged
+    /// against it.
+    #[tokio::test]
+    async fn allowed_egress_succeeds() {
+        let capture = crate::test_harness::captured_log();
+        let policy = sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy {
+                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                allow_dns_hosts: None,
+                deny_subnets: None,
+            }),
+            ingress: None,
+        };
+        let mut harness = spawn_test_relay(&policy);
+
+        let allowed = egress_tcp_frame(LEASE, Ipv4Addr::new(10, 1, 2, 3), 80);
+        harness.box_end.write_all(&allowed).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the declared frame is forwarded")
+            .expect("the switch side stays open");
+        assert_eq!(first, allowed, "an allowed frame is forwarded verbatim");
+        assert!(
+            !capture.contents().contains("network policy violation"),
+            "an allowed connection is not a violation"
+        );
+    }
+
+    /// NET-064: with only TCP allowed, a UDP datagram is dropped — even to a
+    /// declared subnet — and being dropped it opens no conntrack window, so
+    /// its would-be reply is refused inbound too. TCP to the same declared
+    /// subnet still completes.
+    #[tokio::test]
+    async fn udp_dropped_when_only_tcp_allowed() {
+        let policy = sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy {
+                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                allow_dns_hosts: None,
+                deny_subnets: None,
+            }),
+            ingress: None,
+        };
+        let mut harness = spawn_test_relay(&policy);
+        let peer = Ipv4Addr::new(10, 1, 2, 3);
+
+        // UDP to the *declared* subnet: still dropped, because only TCP is
+        // allowed. (UDP DNS to the gateway would still flow — the carve-out
+        // is `sessions::core::egress`'s own proof.)
+        let udp = udp_frame(LEASE, 40000, peer, 53);
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&udp).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(first, sentinel, "the UDP datagram never reached the switch");
+
+        // The dropped datagram opened no UDP conntrack window: its "reply"
+        // from the peer is unsolicited inbound UDP to an undeclared port, and
+        // must not reach the box either.
+        let reply = udp_frame(peer, 53, LEASE, 40000);
+        let mut framed = Vec::with_capacity(2 + reply.len());
+        framed.extend_from_slice(&(reply.len() as u16).to_le_bytes());
+        framed.extend_from_slice(&reply);
+        harness.switch.write_all(&framed).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        set_nonblocking(harness.box_end.as_raw_fd()).unwrap();
+        let mut probe = [0u8; 1];
+        let read = harness.box_end.read(&mut probe);
+        assert!(
+            matches!(read, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock),
+            "a dropped datagram must not open a reply window: got {read:?}"
+        );
+
+        // TCP to the same declared subnet still completes.
+        let allowed = egress_tcp_frame(LEASE, peer, 80);
+        harness.box_end.write_all(&allowed).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the declared TCP frame")
+            .expect("the switch side stays open");
+        assert_eq!(next, allowed, "TCP to the declared subnet completes");
     }
 
     #[test]
@@ -1036,6 +2328,263 @@ mod tests {
             joined
                 .iter()
                 .any(|c| c.contains(&format!("address {}", lease.mac)))
+        );
+    }
+
+    /// NET-004: a frame a session box sends to the old literal host address is
+    /// noticed — one rate-limited line naming the box and the name to use
+    /// instead — while frames to any other destination, or to the literal from
+    /// a relay without a gate, notice nothing.
+    #[test]
+    fn legacy_host_literal_routes_with_deprecation() {
+        // The literal is the attached switch's host alias — the address its
+        // nat table routes to the host's loopback. Routing is the existing nat
+        // table's job; what is new is the notice.
+        let alias = SwitchSubnet::default().host_alias();
+        assert_eq!(alias, Ipv4Addr::new(100, 64, 255, 254));
+
+        let gate = SessionGate::for_session(
+            "100.64.0.9".into(),
+            Ipv4Addr::new(100, 64, 0, 9),
+            &sessions::SessionPolicy::default(),
+            SwitchSubnet::default(),
+        );
+        let notice = LegacyHostNotice::for_gate(&gate, SwitchSubnet::default());
+        assert_eq!(notice.alias, alias, "the notice watches the switch's alias");
+
+        // The alias comes from the switch the relay is attached to, never a
+        // hardcoded default: a custom-subnet switch's literal is the one
+        // noticed, and the default alias is not.
+        let custom = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap();
+        let custom_notice = LegacyHostNotice::for_gate(
+            &SessionGate::for_session(
+                "10.0.0.9".into(),
+                Ipv4Addr::new(10, 0, 0, 9),
+                &sessions::SessionPolicy::default(),
+                custom,
+            ),
+            custom,
+        );
+        assert_eq!(custom_notice.alias, custom.host_alias());
+        assert_ne!(custom_notice.alias, alias);
+        assert!(is_legacy_host_literal(
+            &udp_frame(SRC, 40000, custom.host_alias(), 53),
+            custom_notice.alias
+        ));
+        assert!(!is_legacy_host_literal(
+            &udp_frame(SRC, 40000, alias, 53),
+            custom_notice.alias
+        ));
+
+        // A frame to the literal is noticed; one to the gateway is not; a
+        // truncated frame and a non-IPv4 ethertype are not.
+        assert!(is_legacy_host_literal(
+            &udp_frame(SRC, 40000, alias, 53),
+            alias
+        ));
+        assert!(!is_legacy_host_literal(
+            &udp_frame(SRC, 40000, Ipv4Addr::new(100, 64, 0, 1), 53),
+            alias
+        ));
+        assert!(!is_legacy_host_literal(
+            &udp_frame(SRC, 40000, alias, 53)[..14],
+            alias
+        ));
+        assert!(!is_legacy_host_literal(
+            &tcp_frame(0x0806, IPPROTO_TCP, SYN, SRC, 53),
+            alias
+        ));
+
+        // Rate-limited through the limiter: the first connection to the literal
+        // notices, a second one inside the interval does not.
+        assert!(
+            notice.emit(),
+            "the first frames to the literal emit a notice"
+        );
+        assert!(
+            !notice.emit(),
+            "the notice is rate-limited within the interval"
+        );
+
+        // The notice shares the gate's limiter but logs under its own rule key,
+        // so a policy warning on the same relay does not consume the
+        // deprecation notice's interval.
+        let gate = SessionGate::for_session(
+            "100.64.0.10".into(),
+            Ipv4Addr::new(100, 64, 0, 10),
+            &sessions::SessionPolicy::default(),
+            SwitchSubnet::default(),
+        );
+        assert!(gate.limiter.should_warn_at(
+            "100.64.0.10",
+            "egress-undeclared-subnet",
+            Instant::now()
+        ));
+        let notice = LegacyHostNotice::for_gate(&gate, SwitchSubnet::default());
+        assert!(
+            notice.emit(),
+            "a policy warning must not suppress the deprecation notice"
+        );
+    }
+
+    /// NET-084: a frame whose source is not the relay's lease never reaches
+    /// the switch — an IPv4 frame sent from another box's address, or an ARP
+    /// frame announcing one as its sender protocol address, whatever
+    /// protocol type the ARP claims — and the
+    /// rejection says so, once per lease per minute, naming the session, the
+    /// lease and the source the frame carried. Frames from the lease itself
+    /// are untouched, and a rejected frame opens no conntrack window (its
+    /// "reply" is unsolicited inbound and is refused too).
+    #[tokio::test]
+    async fn relay_rejects_non_lease_source() {
+        let capture = crate::test_harness::captured_log();
+        // No egress declared: allow-all, so the only rule that can drop a
+        // frame below is the source check — the destination is not what
+        // fires.
+        let mut harness = spawn_test_relay(&sessions::SessionPolicy::default());
+
+        // An IPv4 frame sent from another box's address, then the sentinel.
+        let spoofed = egress_tcp_frame(PEER, Ipv4Addr::new(203, 0, 113, 7), 443);
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&spoofed).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            first, sentinel,
+            "the frame from a foreign source never reached the switch"
+        );
+
+        // An ARP frame announcing the foreign address as its sender is
+        // rejected the same way: the sender protocol address is a source.
+        harness.box_end.write_all(&arp_frame(PEER)).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "the foreign ARP sender never reached the switch"
+        );
+
+        // An ARP claiming a protocol type other than IPv4 is no way around
+        // the check either: the sender protocol address slot is the source
+        // whatever the frame claims to speak, so announcing the peer's
+        // address under another protocol is rejected the same way.
+        harness
+            .box_end
+            .write_all(&arp_frame_of_ptype(PEER, 0x1234))
+            .unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "the foreign ARP sender under another protocol type never \
+             reached the switch"
+        );
+
+        // The rejection line names the session, the lease and the source,
+        // and is rate-limited: a flood of spoofed frames says one line.
+        for _ in 0..3 {
+            harness.box_end.write_all(&spoofed).unwrap();
+        }
+        harness.box_end.write_all(&sentinel).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        let logged = capture.contents();
+        assert_eq!(
+            logged
+                .matches("rule_matched=\"egress-foreign-source\"")
+                .count(),
+            1,
+            "a flood of foreign-source rejections says one line: {logged}"
+        );
+        for expected in [
+            "session_id=\"100.64.0.9\"",
+            "lease=100.64.0.9",
+            "source=100.64.0.5",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
+
+        // A rejected frame opened no conntrack window: the spoofed datagram
+        // below is refused at the source check before the record runs, so
+        // its "reply" is unsolicited inbound UDP to an undeclared port and
+        // must not reach the box either.
+        let own = egress_tcp_frame(LEASE, Ipv4Addr::new(10, 1, 2, 3), 80);
+        harness.box_end.write_all(&own).unwrap();
+        let own_frame =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                .await
+                .expect("the relay forwards the lease's own frame")
+                .expect("the switch side stays open");
+        assert_eq!(own_frame, own, "the lease's own frames are untouched");
+
+        let spoofed_udp = udp_frame(PEER, 40000, Ipv4Addr::new(1, 1, 1, 1), 53);
+        harness.box_end.write_all(&spoofed_udp).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let after = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            after, sentinel,
+            "the spoofed datagram never reached the switch"
+        );
+
+        // ...and its would-be reply is refused inbound too.
+        let reply = udp_frame(Ipv4Addr::new(1, 1, 1, 1), 53, LEASE, 40000);
+        let mut framed = Vec::with_capacity(2 + reply.len());
+        framed.extend_from_slice(&(reply.len() as u16).to_le_bytes());
+        framed.extend_from_slice(&reply);
+        harness.switch.write_all(&framed).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        set_nonblocking(harness.box_end.as_raw_fd()).unwrap();
+        let mut probe = [0u8; 1];
+        let read = harness.box_end.read(&mut probe);
+        assert!(
+            matches!(read, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock),
+            "a rejected frame must not open a reply window: got {read:?}"
+        );
+    }
+
+    /// NET-084 at the daemon's own relay: the guest's root egress relay
+    /// carries no gate but still rejects a frame whose source is not the
+    /// address the daemon attached with — its own — whatever the frame
+    /// dresses its source up as, and forwards its own frames untouched.
+    #[tokio::test]
+    async fn daemon_relay_rejects_foreign_source_too() {
+        // The daemon's address on the default switch subnet — the lease its
+        // own relay attaches with (`guest.rs`).
+        const DAEMON_IP: Ipv4Addr = Ipv4Addr::new(100, 64, 255, 253);
+        let mut harness = spawn_daemon_relay(DAEMON_IP);
+
+        let spoofed = egress_tcp_frame(PEER, Ipv4Addr::new(203, 0, 113, 7), 443);
+        let odd_arp = arp_frame_of_ptype(PEER, 0x1234);
+        let own = egress_tcp_frame(DAEMON_IP, Ipv4Addr::new(10, 1, 2, 3), 80);
+        harness.box_end.write_all(&spoofed).unwrap();
+        harness.box_end.write_all(&odd_arp).unwrap();
+        harness.box_end.write_all(&own).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the daemon's own frame")
+            .expect("the switch side stays open");
+        assert_eq!(
+            first, own,
+            "the ungated daemon relay still rejects a foreign source — \
+             an IPv4 header source and an ARP sender address alike, \
+             whatever protocol the ARP claims — and forwards its own frames"
         );
     }
 }

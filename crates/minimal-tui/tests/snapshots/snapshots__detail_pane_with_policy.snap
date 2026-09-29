@@ -1,5 +1,6 @@
 ---
 source: crates/minimal-tui/tests/snapshots.rs
+assertion_line: 230
 expression: render(&mut model)
 ---
 "┌──────────────────────────────┐┌ api-staging · 00000000 ──────────────────────────────────────────┐"
@@ -12,11 +13,11 @@ expression: render(&mut model)
 "│                              ││   subnets  10.0.0.0/8                                            │"
 "│                              ││   dns hosts  allow all                                           │"
 "│                              ││   protocols  allow all                                           │"
+"│                              ││   deny subnets  192.168.0.0/16                                   │"
 "│                              ││ ingress                                                          │"
 "│                              ││   tcp  :8080 → :80                                               │"
 "│                              ││ ─ Preview (live screen snapshot) ─────────────────────────────── │"
 "│                              ││ loading preview…                                                 │"
-"│                              ││                                                                  │"
 "│                              ││                                                                  │"
 "│                              ││                                                                  │"
 "│                              ││                                                                  │"

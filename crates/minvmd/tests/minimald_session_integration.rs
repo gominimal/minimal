@@ -177,7 +177,11 @@ async fn minimald_exec_over_bridge() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut result = Err("not attempted".to_string());
     for attempt in 1..=6 {
-        let task = minimald_rpc::exec::ExecRequest::TaskRun("echo_ok".to_string()).encode();
+        let task = minimald_rpc::exec::ExecRequest::TaskRun {
+            task: "echo_ok".to_string(),
+            owns_box: false,
+        }
+        .encode();
         result = run_session_exec(&guest.sock_path, Some(&mfile), &task).await;
         if result.is_ok() {
             break;

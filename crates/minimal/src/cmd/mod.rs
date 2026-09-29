@@ -19,11 +19,13 @@ use crate::*;
 
 mod admin;
 mod list;
+mod net;
 mod project;
 mod session;
 
 pub use admin::*;
 pub use list::*;
+pub use net::*;
 pub use project::*;
 pub use session::*;
 
@@ -72,6 +74,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
         },
         Some(Command::Run(args)) => task::cmd_run(&args),
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Forward(args),
+        })) => cmd_net_forward(&cli.global_args, args).await,
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         #[cfg(feature = "remote-access")]
@@ -81,9 +86,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             MeshCommand::Leave => cmd_mesh_leave(&cli.global_args),
         },
         Some(Command::Proxy(args)) => cmd_proxy(&cli.global_args, args).await,
-        #[cfg(feature = "remote-access")]
-        Some(Command::SshForward(args)) => cmd_ssh_forward(&cli.global_args, args).await,
-        Some(Command::Login(args)) => cmd_login(&cli.global_args, args).await,
+        Some(Command::Login(args)) => {
+            cmd_login(&cli.global_args, args, &mut std::io::stdout().lock()).await
+        }
         Some(Command::Version) => cmd_version(&cli.global_args).await,
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
         Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
@@ -252,7 +257,7 @@ impl From<SessionLookup> for minimald_rpc::GetSessionHooksRequest {
 /// Resolve a session by UUID or name, returning its record.
 ///
 /// Used by commands that need the full record before proceeding (destroy,
-/// rename, attach, ssh-forward). If the string parses as a UUID, the session
+/// rename). If the string parses as a UUID, the session
 /// is looked up by ID; otherwise by name. Bails if no session matches.
 pub(crate) async fn resolve_session(
     client: &mut client::Client,
@@ -266,8 +271,8 @@ pub(crate) async fn resolve_session(
 /// the same lookup, with the build it reports asserted before the record is
 /// used for anything.
 ///
-/// The lookup is the first RPC `min session attach`, `min session exec`,
-/// `min session setup-zed`, and `min ssh-forward` make, so the gate rides on
+/// The lookup is the first RPC `min session attach`, `min session exec`, and
+/// `min session setup-zed` make, so the gate rides on
 /// its reply rather than on a `GetVersion` sent ahead of it — an activation
 /// must not pay a round trip for a check the calls it already makes can carry
 /// (#1251). Ordered so the skew is reported ahead of a "no session found":

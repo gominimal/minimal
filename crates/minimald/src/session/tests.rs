@@ -2242,3 +2242,408 @@ async fn materializing_patches_carries_their_modes_into_the_home() {
         );
     }
 }
+
+// ---- a box outlives its client (NET-015) -----------------------------
+//
+// A box runs from activation until destroy whether or not a client is
+// attached. Three observations, one per clause: a running box with no
+// client anywhere keeps running; a client lost *abruptly* mid-attach
+// changes nothing about the entrypoint; and no idle interval ever stops
+// a box — stop is always something a client asked for.
+
+/// A whole `Server::run` daemon on a real UDS in `dir`, spawned for the
+/// caller, alongside the socket path clients dial. The in-memory
+/// [`TestServer::connect`] harness discards the connection task's outcome,
+/// so the connection-level lines the accept loop logs — the client-loss
+/// record — never reach a capture wired to it; a test that asserts on
+/// them drives the real loop, the way `server`'s own tests do.
+async fn spawn_run_server(
+    dir: &tempfile::TempDir,
+) -> (
+    tokio::task::JoinHandle<Result<(), std::io::Error>>,
+    std::path::PathBuf,
+) {
+    let sock = dir.path().join("minimald.sock");
+    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+    let run = tokio::spawn(crate::server::Server::run(
+        crate::server::test_config(dir.path()),
+        listener,
+        None,
+    ));
+    (run, sock)
+}
+
+/// NET-015: a box keeps running whether or not a client is attached.
+///
+/// The box here is a headless one — `ensure_host` launches its
+/// entrypoint with nobody attached, the closed-laptop state — and the
+/// only client connection that ever existed is dropped outright. The
+/// shell keeps running (`is_alive` on the handle minted before the
+/// drop), and a brand-new client can attach and drive it. Nothing about
+/// the entrypoint depended on its creator's connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_survives_without_client() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+
+    // Launch the entrypoint with no client attached.
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a headless host");
+    assert!(host.is_alive());
+
+    // The only client connection ever is gone, abruptly.
+    drop(client);
+
+    // The box neither noticed nor stopped.
+    assert!(host.is_alive(), "the headless shell must keep running");
+
+    // A later attach lands on it and drives the same shell.
+    let mut fresh = server.connect().await;
+    let mut shell = fresh.open_shell(session_id).await;
+    await_echo(&mut shell).await;
+    assert!(
+        host.is_alive(),
+        "the later attach must land on the pre-drop host, not a relaunched one",
+    );
+
+    assert_eq!(
+        record_status(&mut fresh, session_id).await,
+        Some(sessions::SessionStatus::Active),
+        "a box that outlived its client is still an Active record",
+    );
+}
+
+/// NET-015, lost-client clause: the attached client of a PTY box dies
+/// abruptly and the box's entrypoint keeps running, accepting a later
+/// attach — which finds the *same* shell, its pre-loss terminal state
+/// flushed on connect. A relaunched entrypoint would have an empty
+/// screen; seeing `got:hello` is the proof the old one never stopped.
+///
+/// Driven through a real `Server::run` accept loop so the connection's
+/// own close is logged the way the daemon logs it: the client-loss info
+/// line a diagnostic bundle's log tail reads the hang-up from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abrupt_client_loss_keeps_task() {
+    use crate::test_harness::connect_uds;
+
+    let capture = crate::test_harness::captured_log();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (run, sock) = spawn_run_server(&dir).await;
+
+    let mut client = connect_uds(&sock).await;
+    let session_id = create_session(&mut client).await;
+
+    // Attach and drive the shell, so the terminal state holds
+    // `got:hello` when the client is lost.
+    let mut shell = client.open_shell(session_id).await;
+    await_echo(&mut shell).await;
+
+    // The client dies without a farewell: the channel and the connection
+    // both go with it.
+    drop(shell);
+    drop(client);
+
+    // The daemon logs the loss as what it is, not as an incident.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let logged = capture.contents();
+        if logged.contains("connection closed by peer") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon must log the abrupt client loss, got: {logged}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // A brand-new client attaches and finds the entrypoint still running:
+    // the pre-loss terminal state is flushed to it...
+    let mut fresh = connect_uds(&sock).await;
+    let mut shell = fresh.open_shell(session_id).await;
+    let flushed = recv_until(&mut shell, "got:hello").await;
+    assert!(
+        flushed.contains("got:hello"),
+        "the later attach must see the same shell's earlier output, got: {flushed:?}"
+    );
+
+    // ...and the shell answers as itself.
+    shell.data_bytes(b"ping\n".to_vec()).await.unwrap();
+    let echoed = recv_until(&mut shell, "got:ping").await;
+    assert!(
+        echoed.contains("got:ping"),
+        "the shell the lost client left running must still answer, got: {echoed:?}"
+    );
+
+    assert_eq!(
+        record_status(&mut fresh, session_id).await,
+        Some(sessions::SessionStatus::Active),
+    );
+
+    use minimald_rpc::{Shutdown, ShutdownRequest};
+    let _ = fresh
+        .call::<Shutdown>(&ShutdownRequest { force: false })
+        .await;
+    drop(fresh);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), run).await;
+}
+
+/// NET-015, stop-policy clause: a box stops only when its client asks,
+/// when its entrypoint exits, when the run it was created for ends, or
+/// when the host tears it down by force — never because it sat idle.
+///
+/// The box is detached by its client's own chord (the only kind of
+/// departure that leaves a session outliving its binding), then left
+/// with no client anywhere for an idle window. Any idle stop faster
+/// than the window would have fired; the daemon defines none at all, and
+/// the window's close finds the entrypoint still answering. The stop
+/// paths' log lines are asserted absent, not just the outcome — a silent
+/// kill would otherwise pass as a healthy idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_has_no_idle_stop() {
+    let server = TestServer::new().await;
+    let capture = crate::test_harness::captured_log();
+
+    let mut client = server.connect().await;
+    let session_id = create_configured_session(&mut client, "idle-stop-test", "/uwu").await;
+
+    // Attach, drive, then detach by the client's own chord.
+    let mut shell = client.open_shell(session_id).await;
+    await_echo(&mut shell).await;
+    shell.data_bytes(vec![0x1d]).await.unwrap();
+    shell.data_bytes(vec![b'd']).await.unwrap();
+    let detach_out = collect_to_close(&mut shell).await;
+    assert!(
+        detach_out.contains("Detaching from session."),
+        "expected a detach notice before the channel closed, got: {detach_out:?}"
+    );
+
+    // The departure is logged, naming the session — the detach line the
+    // diagnostic bundle reads.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let logged = capture.contents();
+        let detach_line = logged
+            .lines()
+            .find(|line| {
+                line.contains("binding leaving mainloop") && line.contains("idle-stop-test")
+            })
+            .map(str::to_string);
+        if let Some(line) = detach_line {
+            assert!(
+                line.contains("Detach"),
+                "the binding's exit must be logged as a detach, got: {line}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon must log the binding's detach, naming the session, got: {logged}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Idle: no client attached to anything. Five seconds — every daemon
+    // timer that could plausibly reap an idle box would have fired, and
+    // none is defined in the first place.
+    drop(client);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // The box is exactly where the client left it.
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    assert!(
+        handle.get_attrs().await.is_some(),
+        "an idle box's entrypoint must still be running"
+    );
+    assert_eq!(
+        record_status(&mut server.connect().await, session_id).await,
+        Some(sessions::SessionStatus::Active),
+    );
+
+    // And none of the stop paths' lines is in the log for this session.
+    // Scoped to lines naming it (by name, or by id for the reap line, which
+    // carries no name): under libtest the buffer is shared with neighbours.
+    let session_str = session_id.to_string();
+    let logged: String = capture
+        .contents()
+        .lines()
+        .filter(|line| line.contains("idle-stop-test") || line.contains(&session_str))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    for stop_line in [
+        "session host killed on request",
+        "session process exited; reaped by the host loop",
+        "run box ended",
+        "reaped unfinalized session after its connection closed",
+    ] {
+        assert!(
+            !logged.contains(stop_line),
+            "an idle box must not be stopped, but the log carries {stop_line:?}:\n{logged}"
+        );
+    }
+}
+
+/// An Ethernet II frame carrying an IPv4 packet to `dst` under `proto`, with
+/// `dst_port` where the L4 header has one — the shape
+/// [`sessions::core::egress::summarize`] extracts a verdict's inputs from.
+/// Everything the verdict reads is filled in; the unread fields are zeroes.
+fn ipv4_frame(proto: u8, dst: [u8; 4], dst_port: u16) -> Vec<u8> {
+    let mut f = Vec::new();
+    f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x01]); // dst MAC
+    f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // src MAC
+    f.extend_from_slice(&0x0800u16.to_be_bytes()); // EtherType: IPv4
+    // IPv4 header, IHL = 5 (20 bytes), fragment offset 0.
+    f.push(0x45);
+    f.push(0x00);
+    f.extend_from_slice(&40u16.to_be_bytes()); // total length (unread)
+    f.extend_from_slice(&0u16.to_be_bytes()); // identification
+    f.extend_from_slice(&0u16.to_be_bytes()); // flags + fragment offset
+    f.push(64); // TTL
+    f.push(proto);
+    f.extend_from_slice(&0u16.to_be_bytes()); // header checksum (unread)
+    f.extend_from_slice(&[10, 0, 0, 5]); // src: the box itself
+    f.extend_from_slice(&dst);
+    // L4 header: enough of one for the port to be readable.
+    f.extend_from_slice(&40000u16.to_be_bytes()); // src port
+    f.extend_from_slice(&dst_port.to_be_bytes());
+    f.extend_from_slice(&[0u8; 12]); // seq/ack (unread)
+    f
+}
+
+/// NET-074: an own-address box created with no `egress` section reaches
+/// nothing outside itself, once the deny-all default is in force. The phase
+/// is passed explicitly — this build ships the default as announced
+/// (NET-076), so the in-force posture is proven by name, not by whatever
+/// the shipped constant happens to be — and the launcher's gate policy under
+/// it is the deny-all section, whose compiled rules drop every external
+/// destination in every transport, while the resolver Minimal owns for the
+/// box still answers, at its address *and* its port (NET-079). The
+/// session-start line names the phase, the opt-out, and the posture this
+/// build actually leaves in force, so a diagnostics bundle's log tail can
+/// say why the box reaches what it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn own_ip_default_deny_all() {
+    use minimald_rpc::{CreateSession, CreateSessionRequest};
+    use sessions::core::egress::{EgressRules, FrameVerdict};
+
+    // The address of the resolver Minimal owns for a box: the switch
+    // gateway, as the relay hands it to the gate.
+    let resolver = [100, 64, 0, 1];
+    // Something the box did not declare: an address out in the world.
+    let external = [93, 184, 216, 34];
+    // The box's lease — the source address `ipv4_frame` writes, so the
+    // verdicts below turn on the egress dimension alone. The lease check
+    // itself (NET-084) is proven in `sessions::core::egress`.
+    let lease = [10, 0, 0, 5];
+
+    // The launcher's resolution for an own-address box that declared
+    // nothing, once the default is in force: the deny-all section, egress
+    // only touched, ingress kept.
+    let declared = sessions::SessionPolicy::default();
+    let effective = super::effective_session_policy(
+        &declared,
+        sessions::NetworkMode::OwnIp,
+        sessions::EgressDefaultPhase::InForce,
+        false,
+    );
+    assert_eq!(
+        effective.egress,
+        Some(sessions::EgressPolicy::deny_all()),
+        "the gate's egress for an absent section is the deny-all section",
+    );
+    assert_eq!(effective.ingress, None);
+
+    // What that section enforces: every frame to an external address drops,
+    // in every transport — the carve-out excepted, keyed to both the
+    // resolver's address and DNS's port, so no other address at :53 and no
+    // other port on the resolver slips through.
+    let rules = EgressRules::from_policy(effective.egress.as_ref(), resolver, lease);
+    let verdict_on = |proto: u8, dst: [u8; 4], port: u16| {
+        sessions::core::egress::verdict(
+            &sessions::core::egress::summarize(&ipv4_frame(proto, dst, port)),
+            &rules,
+        )
+    };
+    for (proto, name) in [(6u8, "tcp"), (17, "udp"), (1, "icmp")] {
+        assert!(
+            matches!(verdict_on(proto, external, 443), FrameVerdict::Drop(_)),
+            "a deny-all box must not reach an external address over {name}",
+        );
+    }
+    assert!(
+        matches!(verdict_on(17, external, 53), FrameVerdict::Drop(_)),
+        "the carve-out is keyed to the resolver's address: DNS's port alone \
+         admits nothing",
+    );
+    assert!(
+        matches!(verdict_on(17, resolver, 54), FrameVerdict::Drop(_)),
+        "the carve-out is keyed to DNS's port: the resolver's address alone \
+         admits nothing",
+    );
+    assert!(
+        matches!(verdict_on(17, resolver, 53), FrameVerdict::Admit),
+        "a deny-all box must still resolve (NET-079)",
+    );
+
+    // The same posture, observed where a diagnostics bundle reads it: the
+    // one line every session start logs, naming all three facts as this
+    // build ships them — the rollout phase it is in, the opt-out the daemon
+    // was started with, and the egress they leave this bare box with. The
+    // values follow the shipped constant, so a phase flip keeps this
+    // assertion honest about whatever the flip leaves in force.
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    client
+        .call::<CreateSession>(&CreateSessionRequest {
+            config: minimald_rpc::SessionConfig {
+                name: Some("own-ip-bare".to_string()),
+                project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
+                network: sessions::NetworkMode::OwnIp,
+                policy: sessions::SessionPolicy::default(),
+                hooks_enabled: true,
+                attrs: Default::default(),
+            },
+            must_match_version: None,
+        })
+        .await
+        .unwrap();
+    let logged = capture.contents();
+    let start_line = logged
+        .lines()
+        .find(|line| line.contains("session starts") && line.contains("own-ip-bare"))
+        .unwrap_or_else(|| panic!("the session start must be logged, got: {logged}"));
+    for fact in [
+        format!("egress_default_phase={:?}", sessions::EGRESS_DEFAULT_PHASE),
+        "deny_all_opt_out=false".to_string(),
+        format!(
+            "effective_egress={:?}",
+            sessions::effective_egress(
+                None,
+                sessions::NetworkMode::OwnIp,
+                sessions::EGRESS_DEFAULT_PHASE,
+                false
+            )
+        ),
+    ] {
+        assert!(
+            start_line.contains(&fact),
+            "the start line must name {fact}, got: {start_line}",
+        );
+    }
+}

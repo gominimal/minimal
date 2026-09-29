@@ -59,11 +59,29 @@ pub(crate) async fn activate_session(
         let mapping = parse_ingress_mapping(spec)?;
         port_mappings.push(mapping);
     }
+    let mut allow_protocols = Vec::with_capacity(args.allow_protocols.len());
+    for spec in &args.allow_protocols {
+        allow_protocols.push(parse_egress_proto(spec)?);
+    }
+    // Any egress flag makes the declaration; a field with no values stays
+    // `None` — its allow-all/none-denied default — so `--deny-subnets` alone
+    // records an allow-all policy that denies one range.
+    let has_egress = !args.allow_subnets.is_empty()
+        || !allow_protocols.is_empty()
+        || !args.allow_dns_hosts.is_empty()
+        || !args.deny_subnets.is_empty();
+    let egress = has_egress.then_some(sessions::EgressPolicy {
+        allow_subnets: (!args.allow_subnets.is_empty()).then(|| args.allow_subnets.clone()),
+        allow_dns_hosts: (!args.allow_dns_hosts.is_empty()).then(|| args.allow_dns_hosts.clone()),
+        allow_protocols: (!allow_protocols.is_empty()).then_some(allow_protocols),
+        deny_subnets: (!args.deny_subnets.is_empty()).then(|| args.deny_subnets.clone()),
+    });
     let policy = sessions::SessionPolicy {
-        egress: None,
+        egress,
         ingress: (!port_mappings.is_empty()).then_some(sessions::IngressPolicy {
             port_mappings,
             dynamic_allowed_range: None,
+            dynamic_ingress: None,
         }),
     };
 
@@ -258,9 +276,29 @@ pub(crate) async fn activate_session(
     // loadout, and the finalize that #1251 died at, and with the session left
     // unfinalized for the daemon to reap when this connection drops.
     ensure_version_reported(created.daemon_version.as_deref())?;
-    warn_if_hostname_routing_down(created.hostname_routing_unavailable.as_deref());
-    warn_if_mtls_proxy_down(created.mtls_proxy_unavailable.as_deref());
+    warn_if_hostname_routing_down(
+        created.hostname_routing_unavailable.as_deref(),
+        "min session activate",
+    );
     let id = created.id;
+
+    // The coming-change notice (NET-076), printed while the deny-all egress
+    // default is announced but not yet in force. Scoped to the box it would
+    // change — an own-address session that declared no egress — on a daemon
+    // that has not opted out of the change (NET-077): the opt-out is the
+    // one rollout fact this side cannot know, so it is read off the create
+    // reply above, and a daemon that has already set the flag has already
+    // taken the remedy the notice names. Silent once the phase turns (see
+    // [`deny_all_default_notice`]). Printed after the session exists and
+    // before the work on it, so the warning is not lost above a failed
+    // activate's output.
+    if config.network == minimald_rpc::NetworkMode::OwnIp
+        && config.policy.egress.is_none()
+        && created.deny_all_opt_out != Some(true)
+        && let Some(notice) = deny_all_default_notice(sessions::EGRESS_DEFAULT_PHASE)
+    {
+        eprintln!("{notice}");
+    }
 
     // From here the session exists on the daemon in an unfinalized state.
     // Arm a Ctrl-C guard so an interrupt during the (blocking) gating
@@ -659,7 +697,15 @@ pub async fn cmd_session_run(
     session_via_ssh(
         &sock,
         r.id,
-        Some(minimald_rpc::exec::ExecRequest::TaskRun(args.task).encode()),
+        // No owns-box flag (NET-131): the task runs in a session someone
+        // else keeps, so its end stays with whoever holds it.
+        Some(
+            minimald_rpc::exec::ExecRequest::TaskRun {
+                task: args.task,
+                owns_box: false,
+            }
+            .encode(),
+        ),
         None,
     )
     .await
@@ -736,6 +782,10 @@ pub(crate) async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), a
             sync: None,
             network: CliNetworkMode::HostNet,
             ingress: Vec::new(),
+            allow_subnets: Vec::new(),
+            allow_dns_hosts: Vec::new(),
+            allow_protocols: Vec::new(),
+            deny_subnets: Vec::new(),
             loadout: Vec::new(),
             no_loadouts: false,
             no_hooks: false,
@@ -846,7 +896,7 @@ pub(crate) fn exit_code_of(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(1)
 }
 
-/// Print the effective networking policy for a session as JSON.
+/// Print the effective networking rules for a session.
 pub async fn cmd_session_policy(
     global: &GlobalArgs,
     args: PolicyArgs,
@@ -855,25 +905,164 @@ pub async fn cmd_session_policy(
 
     let mut client = connect_daemon(global).await?;
 
-    use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
-    let lookup: GetSessionPolicyRequest = SessionLookup::parse(&args.session).into();
+    // The effective reply carries only the rules, but the ingress block is
+    // suppressed for host-address sessions (see [`format_policy`]), so the
+    // command also resolves the record the policy rides on for its network
+    // mode.
+    let record = resolve_session(&mut client, &args.session).await?;
+
+    // The daemon resolves the effective egress (NET-074/NET-077), because
+    // the rollout phase and its opt-out are the daemon's own facts; built
+    // here rather than through a `SessionLookup` conversion so the request
+    // types stay the rpc crate's, where the wire contract lives.
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
+    let lookup = match SessionLookup::parse(&args.session) {
+        SessionLookup::Id(id) => GetEffectiveSessionPolicyRequest::Id(id),
+        SessionLookup::Name(n) => GetEffectiveSessionPolicyRequest::Name(n),
+    };
 
     let resp = client
-        .oneshot_rpc::<GetSessionPolicy>(lookup)
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(lookup)
         .await
-        .context("GetSessionPolicy RPC failed")?;
+        .context("GetEffectiveSessionPolicy RPC failed")?;
 
     match resp {
         minimald_rpc::Errorable::Ok(policy) => {
-            let json =
-                serde_json_lenient::to_string(&policy).context("Failed to serialize policy")?;
-            println!("{json}");
+            let mut out = std::io::stdout();
+            format_policy(&mut out, &policy, record.network)?;
+            out.flush().context("Failed to write policy")?;
             Ok(())
         }
         minimald_rpc::Errorable::Err { error } => {
             bail!("{error}")
         }
     }
+}
+
+/// The coming-change notice `min session activate` prints while the
+/// deny-all egress default is announced but not yet in force (NET-076):
+/// what changes for an own-address box that declares no egress, and how a
+/// deployment keeps the shipped default while it moves. `None` in every
+/// other phase — once the default is in force the change is no longer
+/// coming, and a box that reaches nothing needs no note about it.
+///
+/// The opt-out half of the scope is the caller's to check: the daemon, not
+/// the client, knows whether it set `--egress-deny-all-opt-out` (NET-077),
+/// so [`activate_session`] reads it off the create reply and stays silent
+/// for a deployment the change is not coming for.
+pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'static str> {
+    match phase {
+        sessions::EgressDefaultPhase::Announced => Some(
+            "Heads-up: the next release denies all external reach for an own-address \
+             session that declares no egress. Declare what the session needs with the \
+             activate egress flags, or start the daemon with \
+             --egress-deny-all-opt-out to keep this default.",
+        ),
+        sessions::EgressDefaultPhase::InForce => None,
+    }
+}
+
+/// Render a session's effective policy as its rules: the egress the gate
+/// enforces (NET-074/NET-075) — a declared section's dimensions each
+/// resolved to its list or its default (`allow all`; `deny subnets` reads
+/// `(none)` when nothing is denied), or, for a box that declared no egress
+/// at all, the default its daemon resolved to (`deny all` once the deny-all
+/// default is in force; `allow all` behind the opt-out or before it) — and
+/// the ingress mappings spelled out.
+/// `network` is the session's network mode, and the modes without a surface
+/// to describe are held to the TUI's detail pane: a none box has no network
+/// at all, so it prints the pane's one-line note in place of both blocks
+/// (`allow all` egress would claim a reach a box with no network does not
+/// have), and a host-address session shares its host's namespace, so it has
+/// no per-session ingress policy to show and the block is omitted entirely.
+/// Shared by `min session policy`'s printer and the integration
+/// tests that pin the rendering (NET-061, NET-075).
+pub fn format_policy(
+    out: &mut impl std::io::Write,
+    effective: &sessions::EffectiveSessionPolicy,
+    network: sessions::NetworkMode,
+) -> Result<(), anyhow::Error> {
+    // A none box has no network, so it can carry no egress or ingress
+    // declaration at all — nothing the blocks print would describe anything
+    // real (the same case the TUI's detail pane replaces with this note).
+    if network == sessions::NetworkMode::NoNet {
+        writeln!(out, "No network policy (NoNet)")?;
+        return Ok(());
+    }
+    writeln!(out, "egress")?;
+    match &effective.egress {
+        sessions::EffectiveEgress::DenyAll => writeln!(out, "  deny all")?,
+        sessions::EffectiveEgress::AllowAll => writeln!(out, "  allow all")?,
+        sessions::EffectiveEgress::Declared(egress) => {
+            write_rules(out, "subnets", egress.allow_subnets.as_ref(), "allow all")?;
+            write_rules(
+                out,
+                "dns hosts",
+                egress.allow_dns_hosts.as_ref(),
+                "allow all",
+            )?;
+            match &egress.allow_protocols {
+                None => writeln!(out, "  protocols  allow all")?,
+                Some(protos) => writeln!(
+                    out,
+                    "  protocols  {}",
+                    protos
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )?,
+            }
+            write_rules(out, "deny subnets", egress.deny_subnets.as_ref(), "(none)")?;
+        }
+    }
+    // Ingress is an own-address surface: the switch's static forwarder is the
+    // only per-session ingress minimald applies, and a host-address box
+    // shares its host's namespace, so there is no per-session ingress policy
+    // to show for it — "deny all" there would claim a deny-rule exists.
+    if network != sessions::NetworkMode::HostNet {
+        writeln!(out, "ingress")?;
+        match &effective.ingress {
+            None => writeln!(out, "  deny all")?,
+            Some(ingress) => {
+                if ingress.port_mappings.is_empty()
+                    && ingress.dynamic_allowed_range.is_none()
+                    && ingress.dynamic_ingress.is_none()
+                {
+                    writeln!(out, "  deny all")?;
+                }
+                for mapping in &ingress.port_mappings {
+                    writeln!(
+                        out,
+                        "  {}  :{} → :{}",
+                        mapping.proto, mapping.external_port, mapping.internal_port
+                    )?;
+                }
+                if let Some((lo, hi)) = ingress.dynamic_allowed_range {
+                    writeln!(out, "  dynamic ports  {lo}–{hi}")?;
+                }
+                if let Some(mode) = ingress.dynamic_ingress {
+                    writeln!(out, "  dynamic ingress  {mode}")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One egress rule row: the CIDR or hostname list, or the default the policy
+/// resolves to when the dimension is unset.
+fn write_rules(
+    out: &mut impl std::io::Write,
+    label: &str,
+    rules: Option<&Vec<String>>,
+    default: &str,
+) -> Result<(), anyhow::Error> {
+    match rules {
+        None => writeln!(out, "  {label}  {default}")?,
+        Some(rules) => writeln!(out, "  {label}  {}", rules.join(", "))?,
+    }
+    Ok(())
 }
 
 /// Register a session as an SSH remote in Zed's `settings.json`.
@@ -1516,5 +1705,118 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
         minimald_rpc::Errorable::Err { error } => {
             bail!("RenameSession failed: {error}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sessions::{
+        DynamicIngress, EffectiveEgress, EffectiveSessionPolicy, IngressPolicy, IpProto,
+        NetworkMode, PortMapping,
+    };
+
+    #[test]
+    fn format_policy_dynamic_ingress_allow_prints_row_not_deny_all() {
+        let policy = EffectiveSessionPolicy {
+            egress: EffectiveEgress::AllowAll,
+            ingress: Some(IngressPolicy {
+                port_mappings: vec![],
+                dynamic_allowed_range: None,
+                dynamic_ingress: Some(DynamicIngress::Allow),
+            }),
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  dynamic ingress  allow"),
+            "dynamic ingress row must be printed: {rendered}"
+        );
+        assert!(
+            !rendered.contains("  deny all"),
+            "a policy with an explicit dynamic ingress setting must not print 'deny all': {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_policy_dynamic_ingress_prints_beside_static_mapping() {
+        let policy = EffectiveSessionPolicy {
+            egress: EffectiveEgress::AllowAll,
+            ingress: Some(IngressPolicy {
+                port_mappings: vec![PortMapping {
+                    external_port: 8080,
+                    internal_port: 80,
+                    proto: IpProto::Tcp,
+                }],
+                dynamic_allowed_range: None,
+                dynamic_ingress: Some(DynamicIngress::Ask),
+            }),
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  tcp  :8080 → :80"),
+            "static mapping must still render: {rendered}"
+        );
+        assert!(
+            rendered.contains("  dynamic ingress  ask"),
+            "dynamic ingress row must render alongside mapping: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_policy_egress_rows_default_when_unset() {
+        // A declared-but-empty section: the strict shape the daemon handed
+        // down before NET-074, which still arrives as `Declared` when the
+        // session or the box opted out of the default — and so keeps
+        // printing the per-dimension defaults, not `deny all`.
+        let policy = EffectiveSessionPolicy {
+            egress: EffectiveEgress::Declared(sessions::EgressPolicy::default()),
+            ingress: None,
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("egress\n"), "{rendered}");
+        assert!(rendered.contains("  allow all\n"), "{rendered}");
+        assert!(rendered.contains("ingress\n"), "{rendered}");
+        assert!(rendered.contains("  deny all\n"), "{rendered}");
+    }
+
+    #[test]
+    fn format_policy_prints_the_effective_default_for_a_bare_own_ip_box() {
+        // NET-075: once the deny-all default is in force, a box that
+        // declared no egress prints the posture the gate enforces, not the
+        // absent section.
+        let deny_all = EffectiveSessionPolicy {
+            egress: EffectiveEgress::DenyAll,
+            ingress: None,
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &deny_all, NetworkMode::OwnIp).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("egress\n  deny all\n"),
+            "a bare own-address box must show deny-all: {rendered}"
+        );
+        assert!(
+            !rendered.contains("allow all"),
+            "deny-all must not also print the allow-all default row: {rendered}"
+        );
+        // The opt-out keeps the shipped default, so that box still reads
+        // allow-all (NET-077).
+        let allow_all = EffectiveSessionPolicy {
+            egress: EffectiveEgress::AllowAll,
+            ingress: None,
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &allow_all, NetworkMode::OwnIp).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("egress\n  allow all\n"),
+            "an opted-out bare box must show allow-all: {rendered}"
+        );
     }
 }

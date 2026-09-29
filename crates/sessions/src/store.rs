@@ -1102,13 +1102,15 @@ mod tests {
             // An OwnIp session carrying a non-default policy, so the round-trip
             // tests prove a configured policy — the live source for the
             // GetSessionPolicy RPC — survives a disk round-trip, not just the
-            // all-`None` default.
+            // all-`None` default. Every egress field is set, deny_subnets
+            // included, so a field dropped on write shows up as a diff.
             network: crate::NetworkMode::OwnIp,
             policy: crate::SessionPolicy::new(
                 Some(crate::EgressPolicy {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                     allow_dns_hosts: None,
                     allow_protocols: None,
+                    deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
                 }),
                 None,
             ),

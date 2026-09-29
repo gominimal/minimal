@@ -15,6 +15,7 @@ mod maintenance;
 pub mod net;
 pub mod nsenter;
 pub mod rpc;
+mod sandbox_progress;
 pub mod server;
 mod session;
 mod session_delta;

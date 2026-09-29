@@ -54,6 +54,8 @@ pub enum Command {
     /// Task subcommands: run declared project tasks in ephemeral sessions
     #[command(visible_alias = "tasks")]
     Task(TaskArgs),
+    /// Network subcommands: bring a box's services to the laptop
+    Net(NetArgs),
     /// Muscle-memory catch for the in-box `min run <task>`: always errors,
     /// naming the canonical `min task run <task>` (host) and
     /// `min session attach --command 'min task run <task>'` (in-box) forms.
@@ -75,41 +77,11 @@ pub enum Command {
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
     #[command(hide = true)]
     Proxy(ProxyArgs),
-    /// Forward a local TCP port to a remote address inside a PTask via SSH
-    /// (R4.8, R4.9).
+    /// Print that there is nothing to mint
     ///
-    /// Sets up an SSH `LocalForward` (`-L`) tunnel through the minimald SSH
-    /// server so traffic sent to `<local-port>` on the host is relayed to
-    /// `<remote-host>:<remote-port>` from inside the named PTask's network
-    /// namespace. Useful when WireGuard (`networking-wg` feature) is
-    /// unavailable (e.g., on corporate networks that block UDP).
-    ///
-    /// Examples:
-    ///
-    ///   # Forward host port 18080 to the webserver inside the "dev" session:
-    ///   min ssh-forward dev 18080:127.0.0.1:80
-    ///
-    ///   # Then access it from the host:
-    ///   curl http://localhost:18080/
-    #[cfg(feature = "remote-access")]
-    #[command(name = "ssh-forward", visible_alias = "forward")]
-    SshForward(SshForwardArgs),
-    /// Obtain an mTLS client certificate for the HTTPS reverse proxy
-    ///
-    /// Connects to minimald, generates a fresh client certificate signed by
-    /// the daemon's internal CA, and saves the certificate and
-    /// private key to `~/.config/minimal/client.pem` /
-    /// `~/.config/minimal/client.key`. Also saves the CA certificate to
-    /// `~/.config/minimal/ca.pem` so tools like `curl` can trust the HTTPS
-    /// proxy.
-    ///
-    /// Example:
-    ///
-    ///   min login
-    ///   curl --cacert ~/.config/minimal/ca.pem \
-    ///        --cert ~/.config/minimal/client.pem \
-    ///        --key  ~/.config/minimal/client.key \
-    ///        https://localhost:7655/
+    /// The HTTPS reverse proxy this verb once served is retired, so it
+    /// issues nothing and writes nothing to disk. The verb stays as the
+    /// future home of the sign-in that replaces it.
     #[command(verbatim_doc_comment)]
     #[command(hide = true)]
     Login(LoginArgs),
@@ -447,6 +419,16 @@ pub struct GlobalArgs {
     /// stdin/stdout is not a terminal.
     #[arg(long, global = true, default_value_t = false)]
     pub no_input: bool,
+    /// Talk to this named minvmd VM instead of the default one.
+    ///
+    /// A named VM keeps its own state directory, socket, and in-VM daemon
+    /// under a per-name subdirectory of the provider dir, so several VMs can
+    /// run side by side on one host. Refused on the native `local-minimald`
+    /// backend, which hosts no VMs — named VMs need
+    /// `--provider local-minvmd` — and no effect on the default VM's paths
+    /// when the name is `default` or omitted.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub vm: Option<String>,
 }
 
 impl GlobalArgs {
@@ -454,6 +436,24 @@ impl GlobalArgs {
     /// `--provider local-minvmd`.
     pub fn use_minvmd(&self) -> bool {
         matches!(self.provider, Some(Provider::LocalMinvmd))
+    }
+
+    /// Publish `--vm` as this process's VM name so every provider dir the
+    /// command resolves — socket, state dir, autospawn — names the same VM
+    /// (NET-052). Called once at dispatch, before any path resolution; the
+    /// default VM is untouched when the flag is absent (NET-053).
+    ///
+    /// # Errors
+    ///
+    /// [`anyhow::Error`] when the name breaks the naming rule
+    /// ([`paths::validate_vm_name`]).
+    pub fn publish_vm_name(&self) -> anyhow::Result<()> {
+        match &self.vm {
+            Some(vm) => {
+                crate::client::set_vm_name(vm).map_err(|err| anyhow::anyhow!("--vm: {err}"))
+            }
+            None => Ok(()),
+        }
     }
 }
 
@@ -473,26 +473,45 @@ pub struct ActivateArgs {
     /// are otherwise skipped without a prompt.
     #[arg(long, value_enum)]
     pub sync: Option<SyncMode>,
-    /// Network mode: no-net, host-net (default), or own-ip.
+    /// Network mode for the session: `none` gives the session no network
+    /// (every socket it opens to a destination outside itself fails),
+    /// `host_ip` shares the host's network namespace (the default), and
+    /// `own_ip` gives the session an IP of its own on the host's switch, so
+    /// `--ingress` can publish ports.
     ///
-    /// Hidden from `--help` while `own-ip` is not usable on an installed host:
-    /// the daemon resolves a switch binary that no install ships yet
-    /// (gominimal/minimal#980), so advertising the flag offers a mode that
-    /// cannot work outside a dev checkout. Still accepted, and `host-net`
-    /// remains the default, so nothing that passes it today breaks. Unhide,
-    /// and restore the row in docs/reference/cli-min.md, once own-ip works
-    /// from an install.
-    #[arg(long, value_enum, default_value_t = CliNetworkMode::HostNet)]
-    #[clap(hide = true)]
+    /// The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still
+    /// accepted, but each prints a one-line hint naming the current spelling.
+    #[arg(
+        long,
+        value_name = "none|host_ip|own_ip",
+        value_parser = parse_network_mode,
+        default_value = "host_ip"
+    )]
     pub network: CliNetworkMode,
     /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
-    /// tcp). Repeatable. Requires `--network own-ip`.
-    ///
-    /// Hidden for the same reason as `--network`: it is only meaningful with
-    /// `--network own-ip`.
+    /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
-    #[clap(hide = true)]
     pub ingress: Vec<String>,
+    /// Allowed destination subnets in CIDR form (`egress.allow_subnets`),
+    /// e.g. `10.0.0.0/8`. Repeatable; unset means allow-all subnets. Valid on
+    /// an own-address (`--network own_ip`) or host-address
+    /// (`--network host_ip`) box; a none box rejects the whole egress
+    /// declaration.
+    #[arg(long = "allow-subnets", value_name = "CIDR")]
+    pub allow_subnets: Vec<String>,
+    /// Allowed destination DNS hostnames (`egress.allow_dns_hosts`), e.g.
+    /// `github.com`. Repeatable; unset means allow-all hosts.
+    #[arg(long = "allow-dns-hosts", value_name = "HOST")]
+    pub allow_dns_hosts: Vec<String>,
+    /// Allowed outbound transport protocols (`egress.allow_protocols`):
+    /// tcp, udp, or icmp. Repeatable; unset means allow all protocols.
+    #[arg(long = "allow-protocols", value_name = "PROTO")]
+    pub allow_protocols: Vec<String>,
+    /// Denied destination subnets in CIDR form (`egress.deny_subnets`),
+    /// subtracted from the allowed set. Repeatable; unset means nothing is
+    /// denied.
+    #[arg(long = "deny-subnets", value_name = "CIDR")]
+    pub deny_subnets: Vec<String>,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
     /// Repeatable. If any `--loadout` is specified, defaults from
     /// `[loadouts].default_loadouts` in the client config are ignored.
@@ -546,13 +565,55 @@ pub enum SyncMode {
     None,
 }
 
-/// CLI surface for [`sessions::NetworkMode`]. A local `ValueEnum` keeps the
-/// `sessions` crate free of a clap dependency.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+/// CLI surface for [`sessions::NetworkMode`]. Parsed by hand in
+/// [`parse_network_mode`] rather than derived from a `ValueEnum`: the hand
+/// parser is what accepts the legacy hyphenated spellings with a rename hint,
+/// which a derived enum cannot, and it keeps the `sessions` crate free of a
+/// clap dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliNetworkMode {
     NoNet,
     HostNet,
     OwnIp,
+}
+
+/// Parses the `--network <none|host_ip|own_ip>` value (NET-037). The
+/// hyphenated spellings `no-net`, `host-net`, and `own-ip` predate the
+/// rename to the underscore forms and still parse to the same modes, each
+/// printing a one-line hint naming the current spelling, so scripts and
+/// muscle memory keep working through the rename window. Anything else is
+/// a clap error.
+pub(crate) fn parse_network_mode(raw: &str) -> Result<CliNetworkMode, String> {
+    let mode = match raw {
+        "none" | "no-net" => CliNetworkMode::NoNet,
+        "host_ip" | "host-net" => CliNetworkMode::HostNet,
+        "own_ip" | "own-ip" => CliNetworkMode::OwnIp,
+        _ => {
+            return Err("expected one of none, host_ip, own_ip (the hyphenated \
+                 no-net, host-net, own-ip are accepted as legacy spellings)"
+                .to_owned());
+        }
+    };
+    if let Some(hint) = legacy_network_hint(raw) {
+        eprintln!("{hint}");
+    }
+    Ok(mode)
+}
+
+/// The rename hint for a legacy `--network` spelling: one line naming the
+/// spelling typed and the current one. `None` for a current spelling, so
+/// only the old forms are announced.
+pub(crate) fn legacy_network_hint(raw: &str) -> Option<String> {
+    let current = match raw {
+        "no-net" => "none",
+        "host-net" => "host_ip",
+        "own-ip" => "own_ip",
+        _ => return None,
+    };
+    Some(format!(
+        "note: --network {raw} still works for one release; \
+         the current spelling is --network {current}"
+    ))
 }
 
 impl From<CliNetworkMode> for sessions::NetworkMode {
@@ -599,6 +660,36 @@ pub(crate) fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyh
     }
 }
 
+/// Parse an `--allow-protocols <PROTO>` spec into an [`sessions::IpProto`].
+/// Egress rules name any transport the policy type carries, so unlike the
+/// ingress parser (whose vocabulary is gvproxy's static forwarder's), icmp is
+/// accepted here.
+pub(crate) fn parse_egress_proto(proto: &str) -> Result<sessions::IpProto, anyhow::Error> {
+    match proto.to_ascii_lowercase().as_str() {
+        "tcp" => Ok(sessions::IpProto::Tcp),
+        "udp" => Ok(sessions::IpProto::Udp),
+        "icmp" => Ok(sessions::IpProto::Icmp),
+        other => Err(anyhow::anyhow!(
+            "egress: unsupported protocol '{other}' (use tcp, udp, or icmp)"
+        )),
+    }
+}
+
+/// Parse a `net forward <LOCAL>:<PORT>` spec into its laptop-side listener
+/// port and its box-side target port.
+pub(crate) fn parse_forward_spec(spec: &str) -> Result<(u16, u16), anyhow::Error> {
+    let (local, port) = spec
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("forward '{spec}': expected LOCAL:PORT"))?;
+    let local_port = local
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("forward '{spec}': invalid local port '{local}'"))?;
+    let box_port = port
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("forward '{spec}': invalid box port '{port}'"))?;
+    Ok((local_port, box_port))
+}
+
 #[derive(Debug, Args)]
 pub struct AttachArgs {
     /// Session identifier (UUID or session name). When omitted, `min session attach`
@@ -632,6 +723,36 @@ pub struct DestroyArgs {
     /// Skip the destroy confirmation
     #[arg(long, short)]
     pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct NetArgs {
+    #[command(subcommand)]
+    pub command: NetCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NetCommand {
+    /// Forward a box port to the laptop over the session
+    ///
+    /// Binds `localhost:<LOCAL>` and relays every accepted connection over
+    /// the session's SSH channel to `127.0.0.1:<PORT>` inside the box, so a
+    /// service running in the session answers on the laptop with nothing
+    /// installed or configured on the remote side. Stays in the foreground
+    /// and closes with the session.
+    Forward(NetForwardArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct NetForwardArgs {
+    /// Session identifier (UUID or session name)
+    #[arg(add = completion::session_completer())]
+    pub session: String,
+    /// Ports to relay, as `<LOCAL>:<PORT>` — the laptop-side listener and
+    /// the box-side port it forwards to (`8080:3000` answers on
+    /// `localhost:8080` from port 3000 in the box)
+    #[arg(value_name = "LOCAL:PORT")]
+    pub spec: String,
 }
 
 #[derive(Debug, Args)]
@@ -706,29 +827,9 @@ pub struct ProxyArgs {
     pub socket: Option<String>,
 }
 
-/// Arguments for `min ssh-forward`.
-#[cfg(feature = "remote-access")]
-#[derive(Debug, Args)]
-pub struct SshForwardArgs {
-    /// Session identifier (UUID or session name)
-    #[arg(add = completion::session_completer())]
-    pub session: String,
-    /// Port-forward specification: `<local-port>:<remote-host>:<remote-port>`
-    ///
-    /// Example: `18080:127.0.0.1:80` to forward local port 18080 to port 80
-    /// on the loopback address as seen from inside the session.
-    #[arg(value_name = "LOCAL:REMOTE_HOST:REMOTE_PORT")]
-    pub forward: String,
-}
-
 /// Arguments for `min login`.
 #[derive(Debug, Args)]
-pub struct LoginArgs {
-    /// Override the directory where client cert files are written
-    /// (default: `~/.config/minimal/`).
-    #[arg(long)]
-    pub cert_dir: Option<PathBuf>,
-}
+pub struct LoginArgs {}
 
 /// Arguments for the hidden `min complete-session-str`.
 #[derive(Debug, Args)]

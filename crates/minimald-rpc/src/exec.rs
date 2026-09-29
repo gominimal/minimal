@@ -32,7 +32,9 @@
 //! ```text
 //! min://shell <command>          run <command> with the session's shell
 //! min://argv ["a","b"]           exec this argv in the session, no shell
-//! min://task/run <task>          daemon-serviced: run a declared task
+//! min://task/run [--owns-box] <task>
+//!                                daemon-serviced: run a declared task;
+//!                                --owns-box ends the box with the run (NET-131)
 //! min://package/build [args]     daemon-serviced: build packages
 //! min://check [args]             daemon-serviced: lint the session's config
 //! <anything else>                a shell command for the session
@@ -64,7 +66,21 @@ pub enum ExecRequest {
     /// handing the daemon a program-less request.
     Argv(Vec<String>),
     /// Run a task the session's project declares.
-    TaskRun(String),
+    ///
+    /// `owns_box` is the run's claim on the session it was created for
+    /// (NET-131): when it is set, the daemon ends the session once this
+    /// task's exit status is on the wire, whether or not the client that
+    /// started the run is still there. `min task run` sets it — its session
+    /// exists for the run and nothing else; `min session run` leaves it
+    /// unset — its box is an attachable session someone else keeps. A
+    /// payload without the marker parses as `owns_box: false`, which is
+    /// also what a client from before the flag sends.
+    TaskRun {
+        /// The task name, as the client typed it; the daemon trims it.
+        task: String,
+        /// The run owns its box: the daemon ends the session with the run.
+        owns_box: bool,
+    },
     /// Build packages against the session.
     PackageBuild(String),
     /// Lint the session's `minimal.toml`, packages, profiles and stacks.
@@ -77,6 +93,12 @@ const SHELL: &str = "shell";
 const ARGV: &str = "argv";
 /// Tag for [`ExecRequest::TaskRun`].
 const TASK_RUN: &str = "task/run";
+/// Payload marker for [`ExecRequest::TaskRun`] saying the run owns its box
+/// (NET-131): the daemon ends the session once the task's exit status is on
+/// the wire. The trailing space is part of the marker — it is read only when
+/// a task name follows it, so a task actually named `--owns-box` still
+/// round-trips through the unflagged spelling.
+const TASK_RUN_OWNS_BOX: &str = "--owns-box ";
 /// Tag for [`ExecRequest::PackageBuild`].
 const PACKAGE_BUILD: &str = "package/build";
 /// Tag for [`ExecRequest::Check`].
@@ -100,7 +122,10 @@ impl ExecRequest {
                     .expect("a Vec<String> always serializes to JSON");
                 format!("{EXEC_SCHEME}{ARGV} {json}")
             }
-            Self::TaskRun(task) => format!("{EXEC_SCHEME}{TASK_RUN} {task}"),
+            Self::TaskRun { task, owns_box } => {
+                let marker = if *owns_box { TASK_RUN_OWNS_BOX } else { "" };
+                format!("{EXEC_SCHEME}{TASK_RUN} {marker}{task}")
+            }
             Self::PackageBuild(args) => format!("{EXEC_SCHEME}{PACKAGE_BUILD} {args}"),
             Self::Check(args) => format!("{EXEC_SCHEME}{CHECK} {args}"),
         }
@@ -141,7 +166,19 @@ impl ExecRequest {
                 }
                 Ok(Self::Argv(words))
             }
-            TASK_RUN => Ok(Self::TaskRun(payload.to_string())),
+            TASK_RUN => {
+                // The owns-box marker rides in front of the task name when
+                // the run owns its box (NET-131); without it the payload is
+                // the task name itself, which is also every payload a client
+                // from before the flag sends.
+                let (owns_box, task) = payload
+                    .strip_prefix(TASK_RUN_OWNS_BOX)
+                    .map_or((false, payload), |task| (true, task));
+                Ok(Self::TaskRun {
+                    task: task.to_string(),
+                    owns_box,
+                })
+            }
             PACKAGE_BUILD => Ok(Self::PackageBuild(payload.to_string())),
             CHECK => Ok(Self::Check(payload.to_string())),
             unknown => Err(ExecParseError::UnknownTag(unknown.to_string())),
@@ -191,7 +228,10 @@ mod tests {
         for req in [
             ExecRequest::Shell("echo EXEC_OK $PWD".to_string()),
             ExecRequest::Argv(vec!["sh".into(), "-c".into(), "echo A B C".into()]),
-            ExecRequest::TaskRun("build".to_string()),
+            ExecRequest::TaskRun {
+                task: "build".to_string(),
+                owns_box: false,
+            },
             ExecRequest::PackageBuild("--verbose pkg".to_string()),
             ExecRequest::Check(String::new()),
         ] {
@@ -251,6 +291,44 @@ mod tests {
         assert_eq!(
             ExecRequest::parse("min://check"),
             Ok(ExecRequest::Check(String::new()))
+        );
+    }
+
+    /// The owns-box flag (NET-131) rides the task-run request: it round-trips
+    /// with the task name, the unflagged spelling stays byte-for-byte the
+    /// legacy form every client from before the flag sends, and a task
+    /// actually named like the marker is not read as the flag.
+    #[test]
+    fn a_task_run_round_trips_its_owns_box_flag() {
+        let owned = ExecRequest::TaskRun {
+            task: "build".to_string(),
+            owns_box: true,
+        };
+        assert_eq!(owned.encode(), "min://task/run --owns-box build");
+        assert_eq!(
+            ExecRequest::parse(&owned.encode()),
+            Ok(owned),
+            "the flag and the task name survive the round trip"
+        );
+
+        // The unflagged spelling is the legacy form.
+        let plain = ExecRequest::TaskRun {
+            task: "build".to_string(),
+            owns_box: false,
+        };
+        assert_eq!(plain.encode(), "min://task/run build");
+        assert_eq!(ExecRequest::parse("min://task/run build"), Ok(plain));
+
+        // The marker is read only when a task name follows it, so a task
+        // named like the marker, sent the unflagged way, stays a task name.
+        let marked = ExecRequest::TaskRun {
+            task: "--owns-box".to_string(),
+            owns_box: false,
+        };
+        assert_eq!(
+            ExecRequest::parse(&marked.encode()),
+            Ok(marked),
+            "a task named like the marker must not be read as the flag"
         );
     }
 

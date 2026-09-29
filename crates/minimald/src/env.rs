@@ -34,7 +34,6 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use futures::StreamExt as _;
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives};
 use mctx::{AddDepMode, Context, Error};
 use mfile::{EnvPatches, EnvVarValue};
@@ -357,6 +356,12 @@ impl EnvArgs {
 /// thus the sandbox's backing files).
 pub struct Env {
     sandbox: Sandbox<BridgeChannel>,
+    /// The working directory commands in this session start in, resolved from
+    /// the sandbox config once at build time. Fixed for the sandbox's lifetime,
+    /// so resolving it here keeps the [`command_environment`] accessor total.
+    ///
+    /// [`command_environment`]: Self::command_environment
+    command_cwd: String,
     /// The command-channel actor task. `Some` until [`Drop`] aborts it.
     actor: Option<JoinHandle<()>>,
     /// Variables the channel actor has added since launch; see
@@ -531,6 +536,7 @@ impl Env {
         }
         install_min_helpers(&sandbox.rootfs()).map_err(std::io::Error::other)?;
         sandbox.keep_dir(false);
+        let command_cwd = sandbox.command_cwd().map_err(sandbox_err_to_io)?;
 
         let runtime_env = RuntimeEnv::default();
         let channel = SessionChannel {
@@ -553,6 +559,7 @@ impl Env {
 
         Ok(Self {
             sandbox,
+            command_cwd,
             actor: Some(actor),
             runtime_env,
             _temp_dirs: Vec::new(),
@@ -612,7 +619,7 @@ impl Env {
         let mut vars = self.sandbox.command_env();
         vars.extend(self.runtime_env.snapshot());
         crate::session_host::SessionEnvironment {
-            cwd: self.sandbox.command_cwd(),
+            cwd: self.command_cwd.clone(),
             vars,
         }
     }
@@ -929,11 +936,19 @@ impl SessionChannel {
             }
         }
         // Stream build progress back to the client while the graph builds: a
-        // first-time `min add` fetches and extracts its packages right here,
-        // and previously drew nothing while the bytes downloaded. Rendered
-        // through the same `BuildRenderer` as `min build`, so both read
-        // identically; a fully-cached add emits no events and stays quiet.
-        let (log_tx, mut log_rx) = futures::channel::mpsc::unbounded();
+        // first-time `min add` fetches and extracts its packages right here.
+        // `msg:` lines (`fetching go`, `building go`) name what started. The
+        // byte meter those fetches already track is painted as `bar:` lines
+        // on the next row; the in-sandbox helper redraws each one in place. A
+        // fully-cached add emits neither and stays quiet.
+        //
+        // Built before the two futures: `build` needs `&mut self.ctx` and
+        // `render` must not borrow it as well.
+        let progress = crate::sandbox_progress::SandboxProgress::new(
+            self.ctx.op_tracker(),
+            Some(install_scope(&new_graph, pkgs)),
+        );
+        let (log_tx, log_rx) = futures::channel::mpsc::unbounded();
         let build = async {
             // Reduce the `!Send` error (`mctx::Error` holds nickel `Rc`s) to a
             // string in the same poll it appears, so `join!` never buffers it
@@ -944,14 +959,13 @@ impl SessionChannel {
                 Err(e) => Some(e.to_string()),
             }
         };
-        let render = async {
-            let mut renderer = orchestrator::BuildRenderer::new(false);
-            while let Some(event) = log_rx.next().await {
+        let mut renderer = orchestrator::BuildRenderer::new(false);
+        let render =
+            crate::sandbox_progress::relay(stream, progress, log_rx, |event, progress, stream| {
                 if let Some(line) = renderer.render(event) {
-                    let _ = writeln!(stream, "msg:{}", line.text);
+                    progress.message(stream, &line.text);
                 }
-            }
-        };
+            });
         let (build_err, ()) = tokio::join!(build, render);
         if let Some(e) = build_err {
             let _ = writeln!(stream, "error: {e}");
@@ -1219,7 +1233,13 @@ impl SessionChannel {
             // would hold it across the second await in a spawned future.
             let record = session.record().await.map_err(gone)?;
             let switch = session.net_switch().await.map_err(gone)?;
-            let network = crate::exec::task_network(&record, &switch);
+            let opt_out = session.deny_all_opt_out().await.map_err(gone)?;
+            let network = crate::exec::task_network(
+                &record,
+                &switch,
+                sessions::EGRESS_DEFAULT_PHASE,
+                opt_out,
+            );
             let mut env = ctx
                 .make_env_with_network(
                     task_name,
@@ -1294,16 +1314,21 @@ impl SessionChannel {
         use crate::session_sop::{BuildOutcome, BuildUpdate};
         let mut renderer = orchestrator::BuildRenderer::new(flag_verbose);
         let mut outcome = None;
-        while let Some(update) = events.recv().await {
+        // The same meter as `min add`. Unscoped: this build runs on the
+        // session's own side-op, so every package row on the tree is its.
+        let progress = crate::sandbox_progress::SandboxProgress::new(self.ctx.op_tracker(), None);
+        let updates = futures::stream::poll_fn(|cx| events.poll_recv(cx));
+        crate::sandbox_progress::relay(stream, progress, updates, |update, progress, stream| {
             match update {
                 BuildUpdate::Event(event) => {
                     if let Some(line) = renderer.render(event) {
-                        let _ = writeln!(stream, "msg:{}", line.text);
+                        progress.message(stream, &line.text);
                     }
                 }
                 BuildUpdate::Finished(o) => outcome = Some(o),
             }
-        }
+        })
+        .await;
 
         // Report the propagated outcome; only success claims completion.
         match outcome {
@@ -1476,6 +1501,18 @@ impl SessionChannel {
             })
             .collect()
     }
+}
+
+/// Names of `pkgs` and of everything building or running them needs: the
+/// packages an install's progress meter reports on.
+fn install_scope(graph: &Graph, pkgs: &[(&str, BuildSpecRef)]) -> HashSet<String> {
+    let top_levels: Vec<BuildSpecRef> = pkgs.iter().map(|(_n, bsr)| *bsr).collect();
+    let deps = Transitives::for_toplevels(graph, top_levels.clone(), true);
+    top_levels
+        .iter()
+        .chain(deps.keys())
+        .filter_map(|bsr| graph.get(bsr).map(|b| b.name.clone()))
+        .collect()
 }
 
 /// A parsed `min materialize` invocation: what to materialize, plus where in
