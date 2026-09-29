@@ -2222,6 +2222,8 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   fi
   grep -Fq '[vars]' "$WORK/env-ungranted.err" \
     || { echo "::error::ungranted var error does not carry the [vars] allow snippet"; cat "$WORK/env-ungranted.err" 2>/dev/null || true; fail; }
+  grep -Fq 'allow =' "$WORK/env-ungranted.err" \
+    || { echo "::error::ungranted var error does not carry the allow = entry"; cat "$WORK/env-ungranted.err" 2>/dev/null || true; fail; }
   grep -q 'E2E_INHERIT_MARKER' "$WORK/env-ungranted.err" \
     || { echo "::error::ungranted var error does not name the var"; cat "$WORK/env-ungranted.err" 2>/dev/null || true; fail; }
   unset E2E_INHERIT_MARKER # leave the invoking shell as this proof found it
