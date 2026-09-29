@@ -1788,11 +1788,12 @@ async fn handle_git_receive(
             // the first push to populate. Create an empty git
             // repo, and make sure its configured to checkout
             // the ref it recieves.
-            let res = tokio::process::Command::new("git")
-                .arg("init")
-                .current_dir(paths.working.as_utf8_path())
-                .output()
-                .await;
+            let mut init = tokio::process::Command::new("git");
+            init.arg("init").current_dir(paths.working.as_utf8_path());
+            for name in git_repo_location_env() {
+                init.env_remove(name);
+            }
+            let res = init.output().await;
             if let Err(e) = res {
                 tracing::warn!(error = %e, "git init failed");
                 channel.close().await.unwrap();
@@ -1939,42 +1940,19 @@ async fn handle_git_upload(
 
         let dotgit_dir = paths.working.as_utf8_path().join(".git");
         if let Ok(false) = tokio::fs::try_exists(&dotgit_dir).await {
-            // A fresh session can reach upload-pack before any receive-pack
-            // request, so the workspace may not be a Git repository yet.
-            // Initialize it the same way handle_git_receive does, otherwise
-            // clone, fetch, and ls-remote fail on a non-repo directory.
-            let mut init = tokio::process::Command::new("git");
-            init.arg("init").current_dir(paths.working.as_utf8_path());
-            for name in git_repo_location_env() {
-                init.env_remove(name);
-            }
-            let res = init.output().await;
-            match res {
-                Ok(out) if out.status.success() => {}
-                Ok(out) => {
-                    // `git init` ran but failed: report the cause to the
-                    // client instead of running upload-pack against a
-                    // non-repository directory.
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    tracing::warn!(status = %out.status, "git init failed: {stderr}");
-                    let _ = channel.extended_data(1, stderr.as_bytes()).await;
-                    let _ = channel
-                        .exit_status(out.status.code().unwrap_or(1).max(0) as u32)
-                        .await;
-                    let _ = channel.eof().await;
-                    let _ = channel.close().await;
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "git init failed");
-                    let msg = format!("minimald: git init failed: {e}\n");
-                    let _ = channel.extended_data(1, msg.as_bytes()).await;
-                    let _ = channel.exit_status(1).await;
-                    let _ = channel.eof().await;
-                    let _ = channel.close().await;
-                    return;
-                }
-            }
+            // A read-only request (ls-remote, fetch, clone) must not create
+            // a repository in the session workspace: `git init` would write
+            // a `.git` directory as the daemon user on an operation the
+            // client believes is read-only, and would turn an
+            // uploaded/generated workspace into a repo with an unborn
+            // branch. Reject instead of initializing.
+            let msg = "minimald: session has no repository yet\n";
+            tracing::warn!("git-upload-pack rejected: session has no repository");
+            let _ = channel.extended_data(1, msg.as_bytes()).await;
+            let _ = channel.exit_status(1).await;
+            let _ = channel.eof().await;
+            let _ = channel.close().await;
+            return;
         }
 
         let exec_task = ExecTask {
