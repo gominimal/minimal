@@ -21,3 +21,6 @@ serde.workspace = true
 toml.workspace = true
 shlex.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true
