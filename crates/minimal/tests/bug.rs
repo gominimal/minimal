@@ -744,6 +744,10 @@ async fn bug_with_stale_socket_reports_the_connect_stage_and_falls_back() {
     .unwrap();
     assert_eq!(volume["exists"], true);
     assert_eq!(volume["bytes"], 4096);
+    assert!(
+        volume["allocated_bytes"].is_u64(),
+        "the allocated size must be recorded: {volume}"
+    );
     assert!(volume["mtime_unix"].is_u64(), "the stall-dating signal");
     assert!(find(&files, "daemon-diag.tar.zst").is_none());
 }

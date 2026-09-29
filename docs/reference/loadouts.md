@@ -460,7 +460,7 @@ from two flags:
 
 | Flag | Description |
 |------|-------------|
-| `--loadout <NAME>` | Apply `<config>/minimal/loadouts/<NAME>.toml`. Repeatable. If given, the config file's `default_loadouts` are ignored |
+| `--loadout <NAME>` | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml` or `<config>/minimal/loadouts/<NAME>/loadout.toml`. Repeatable. If given, the config file's `default_loadouts` are ignored |
 | `--no-loadouts` | Apply no loadouts at all. Conflicts with `--loadout` |
 
 Resolution order:

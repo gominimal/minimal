@@ -98,31 +98,86 @@ enum DetachPoll {
     Keep,
     /// The supervisor child exited with no daemon up: a real startup failure.
     Failed(std::process::ExitStatus),
+    /// The supervisor child exited but a leaked `__krun-vmm` still holds the
+    /// alive lock. The pid is the orphaned VMM process.
+    LeakedVmm(u32),
 }
 
 /// Classify one readiness poll. `ready` is the readiness predicate (UDS
 /// connectable, alive lock held, lifecycle `Running`); `child_status` is the
 /// supervisor child's exit status once it has exited; `daemon_alive` is whether
-/// some minvmd holds the alive lock.
+/// some minvmd holds the alive lock; `vmm_pid` is the VMM pid the supervisor
+/// recorded in state before it exited (if any); `vmm_owned_by_live_supervisor`
+/// is whether that VMM's parent is still a live supervisor (i.e. the VMM
+/// belongs to a competing supervisor, not to the exited child).
 ///
 /// A child that exits while a daemon still holds the alive lock lost the
 /// autospawn race: `try_acquire_alive_lock` handed the lock to a peer that is
 /// still coming up and will reach `Running` shortly. That is success in the
 /// making, not a startup failure — keep waiting to the deadline. Only a child
 /// exit with no live daemon is a genuine failure.
+///
+/// When the child exited and the lock is still held, the holder could also be
+/// an orphaned `__krun-vmm` that inherited the lock from a dead supervisor. If
+/// the recorded VMM pid is still alive and is *not* owned by a live supervisor,
+/// the VMM is leaked — fail fast rather than waiting for the full spawn
+/// timeout. A live VMM owned by a live supervisor is a competing supervisor's
+/// VMM, not a leak.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn classify_detach_poll(
     ready: bool,
     child_status: Option<std::process::ExitStatus>,
     daemon_alive: bool,
+    vmm_pid: Option<u32>,
+    vmm_owned_by_live_supervisor: bool,
 ) -> DetachPoll {
     if ready {
         return DetachPoll::Ready;
     }
     match child_status {
         Some(status) if !daemon_alive => DetachPoll::Failed(status),
+        Some(_status) if daemon_alive => {
+            // The supervisor exited but the alive lock is still held. If the
+            // supervisor recorded a VMM pid and that pid is still running, the
+            // VMM is orphaned — fail fast instead of waiting for the timeout.
+            // A VMM whose parent is still a live supervisor belongs to a
+            // competing supervisor that won the autospawn race, so it is not
+            // a leak.
+            if let Some(pid) = vmm_pid {
+                // SAFETY: kill(pid, 0) probes for process existence without
+                // delivering a signal.
+                if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+                    && !vmm_owned_by_live_supervisor
+                {
+                    return DetachPoll::LeakedVmm(pid);
+                }
+            }
+            DetachPoll::Keep
+        }
         _ => DetachPoll::Keep,
     }
+}
+
+/// Whether `pid`'s parent is a live process other than init (pid 1).
+///
+/// A `__krun-vmm` child is reparented to init the moment its supervisor dies,
+/// so a live parent other than init means the VMM is still owned by a live
+/// supervisor — a competing supervisor's VMM, not a leak.
+#[cfg(minvmd_libkrun)]
+fn vmm_owned_by_live_supervisor(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // `comm` is the parenthesised process name and can itself contain spaces
+    // and ')' — split on the last ')' so the fields after it are stable. The
+    // first field after comm is `state`; the second is `ppid`.
+    let after_comm = stat.rsplit_once(')').map(|(_, rest)| rest).unwrap_or("");
+    let mut fields = after_comm.split_whitespace();
+    let _state = fields.next();
+    let Some(ppid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
+        return false;
+    };
+    ppid != 1 && unsafe { libc::kill(ppid as libc::pid_t, 0) } == 0
 }
 
 /// Spawn `minvmd run` as a detached background supervisor, then poll until
@@ -184,16 +239,21 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     loop {
         let child_status = child.try_wait().context("polling supervisor child")?;
         let daemon_alive = state_dir.daemon_alive().context("probing alive lock")?;
+        let state = state_dir.read_state().context("reading state")?;
         let ready = daemon_alive
             && std::os::unix::net::UnixStream::connect(&uds_path).is_ok()
-            && state_dir.read_state().context("reading state")?.lifecycle
-                == crate::lifecycle::Lifecycle::Running;
-        match classify_detach_poll(ready, child_status, daemon_alive) {
+            && state.lifecycle == crate::lifecycle::Lifecycle::Running;
+        let vmm_owned = state.vmm_pid.is_some_and(vmm_owned_by_live_supervisor);
+        match classify_detach_poll(ready, child_status, daemon_alive, state.vmm_pid, vmm_owned) {
             DetachPoll::Ready => return Ok(()),
             DetachPoll::Failed(status) => bail!(
                 "the detached supervisor exited during startup ({status}); \
                  see {} for its error output",
                 log_path.display()
+            ),
+            DetachPoll::LeakedVmm(pid) => bail!(
+                "the supervisor exited but a leaked __krun-vmm (pid {pid}) still holds the \
+                 alive lock; run `just reap` to kill stranded processes, then retry"
             ),
             DetachPoll::Keep => {}
         }
@@ -605,7 +665,7 @@ mod tests {
         // The child exited, but the readiness predicate already holds: the VM
         // is serving, so this is success regardless of the exit.
         assert!(matches!(
-            super::classify_detach_poll(true, Some(exited(1)), true),
+            super::classify_detach_poll(true, Some(exited(1)), true, None, false),
             super::DetachPoll::Ready
         ));
     }
@@ -614,9 +674,11 @@ mod tests {
     fn detach_poll_lost_race_keeps_waiting() {
         // The supervisor exited because a peer already holds the alive lock —
         // the winner is still coming up. Keep waiting rather than reporting a
-        // startup failure that isn't one.
+        // startup failure that isn't one. The recorded VMM pid is not alive
+        // (None, or a pid that doesn't exist), so this is a genuine race, not
+        // a leak.
         assert!(matches!(
-            super::classify_detach_poll(false, Some(exited(1)), true),
+            super::classify_detach_poll(false, Some(exited(1)), true, None, false),
             super::DetachPoll::Keep
         ));
     }
@@ -626,8 +688,48 @@ mod tests {
         // Child exited and nothing holds the alive lock: a genuine startup
         // failure, still surfaced as an error.
         assert!(matches!(
-            super::classify_detach_poll(false, Some(exited(1)), false),
+            super::classify_detach_poll(false, Some(exited(1)), false, None, false),
             super::DetachPoll::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn detach_poll_leaked_vmm_detected() {
+        // The supervisor exited but the alive lock is still held AND the
+        // recorded VMM pid is still alive: the VMM is orphaned. Fail fast
+        // with the leaked pid.
+        let my_pid = std::process::id();
+        assert!(matches!(
+            super::classify_detach_poll(false, Some(exited(1)), true, Some(my_pid), false),
+            super::DetachPoll::LeakedVmm(pid) if pid == my_pid
+        ));
+    }
+
+    #[test]
+    fn detach_poll_competing_supervisor_vmm_is_not_a_leak() {
+        // The supervisor exited but the alive lock is still held AND the
+        // recorded VMM pid is still alive. However, that VMM's parent is a
+        // live supervisor (a competing supervisor that won the autospawn
+        // race), so this is not a leak — keep waiting for the winner to serve.
+        let my_pid = std::process::id();
+        assert!(matches!(
+            super::classify_detach_poll(false, Some(exited(1)), true, Some(my_pid), true),
+            super::DetachPoll::Keep
+        ));
+    }
+
+    #[test]
+    fn detach_poll_dead_vmm_pid_is_not_a_leak() {
+        // The supervisor exited, daemon is alive, but the recorded VMM pid
+        // is no longer running (e.g. a stale state file). This is not a
+        // leaked VMM — keep waiting (autospawn race).
+        // Use a pid that almost certainly doesn't exist. `u32::MAX` would
+        // wrap to -1 as `pid_t`, which `kill(-1, 0)` treats as "all
+        // processes" and would wrongly report alive; `i32::MAX` stays
+        // positive and is above any real `pid_max`.
+        assert!(matches!(
+            super::classify_detach_poll(false, Some(exited(1)), true, Some(i32::MAX as u32), false),
+            super::DetachPoll::Keep
         ));
     }
 }
