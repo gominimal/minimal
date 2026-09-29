@@ -45,6 +45,7 @@ camino.workspace = true
 chrono.workspace = true
 diagnostics.workspace = true
 dirs.workspace = true
+hex.workspace = true
 nix.workspace = true
 mctx.workspace = true
 mfile.workspace = true
@@ -53,9 +54,12 @@ minimal-tui.workspace = true
 minimald-rpc.workspace = true
 op.workspace = true
 paths.workspace = true
+# `min diag upload` hands a bundle to the diag portal: two requests, HTTPS.
+reqwest.workspace = true
 russh.workspace = true
 serde.workspace = true
 serde_json_lenient.workspace = true
+sha2.workspace = true
 sessions.workspace = true
 # Staging for the `min bug` volume fallback: `debugfs -c` rdumps the guest's
 # /logs into a temp dir before the readable files are tail-capped into the
@@ -69,6 +73,9 @@ toml.workspace = true
 toml_edit.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Parsing the diag portal's endpoint to check its scheme before the
+# upload puts a bearer token on the wire.
+url.workspace = true
 version.workspace = true
 
 # default-features = false drops minvmd's `libkrun` feature: the CLI only uses
