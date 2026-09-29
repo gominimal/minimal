@@ -342,7 +342,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal local_provider_names_and_aliases
 
-- **BCLI-047** WHEN `min host list` runs THE SYSTEM SHALL render each local host with its name and state, beside the resource figures BRES-014 adds.
+- **BCLI-047** WHEN `min host list` runs THE SYSTEM SHALL render each local host with its name and state, beside the resource figures the resources spec (gominimal/inbox#698; BRES) adds.
   <!-- was BOX-113 -->
   tier:     T0
   verify:   cargo nextest run -p minimal host_list_name_and_state
@@ -374,7 +374,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 ## Non-goals
 
 - The box model: the record, its states and retention, the expanded spec, the projection, stop, reap, resume, rename, events and the un-enrolled path: `docs/specs/25-spec-box-local-first` (BOX). This spec renders and drives them and adds no behaviour to them.
-- Resource verbs and figures (`min host list|show` capacity, allocatable, allocated, default box size and enforcement; the 137 return on an OOM end): `docs/specs/26-spec-box-resources` (BRES), which carries them as BRES-011 and BRES-014.
+- Resource verbs and figures (`min host list|show` capacity, allocatable, allocated, default box size and enforcement; the 137 return on an OOM end): the resources spec (gominimal/inbox#698; BRES), written from that epic.
 - Volume verbs (`min volume list|show|rm|prune`): `docs/specs/27-spec-box-volumes` (BVOL), which carries them as BVOL-006, BVOL-007 and BVOL-012. BRES and BVOL keep their own verbs because they are small and move with the behaviour they render.
 - The dash (epic story S14): an amendment to `docs/specs/07-spec-min-dash-tui`.
 - The local providers serving the Box Provider API (epic story S16): they wait on gominimal/arch#45, and `min host` and `min provider` read the daemon directly until then.
