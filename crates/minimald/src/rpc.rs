@@ -1,12 +1,10 @@
 use futures::StreamExt as _;
-#[cfg(feature = "networking-proxy")]
-use minimald_rpc::IssueClientCertResponse;
 use minimald_rpc::{
     AbortSession, AbortSessionResponse, CleanCacheRequest, CleanCacheUpdate, CreateSession,
     DestroySession, DestroySessionResponse, Errorable, FinalizeSession, FinalizeSessionResponse,
-    GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
-    GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen, GetVersion,
-    GetVersionResponse, IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry,
+    GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetMeshStatus, GetSessionPolicy,
+    GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse,
+    GetSessionScreen, GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry,
     ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
     RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
     Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
@@ -128,7 +126,8 @@ async fn serve_list_sessions(
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
-                mtls_proxy_unavailable: s.mtls_unavailable().await,
+                hostname_proxy_port: s.hostname_proxy_port().await,
+                zone_answerer_port: s.zone_answerer_port().await,
                 resource_pool,
                 // `git` is left `None`: the daemon cannot probe it — on
                 // macOS it runs in the minvmd guest, where the host's
@@ -208,6 +207,38 @@ async fn serve_get_session_record(
 /// anonymous session, and an absent field reads like a logging bug.
 const ANONYMOUS_SESSION: &str = "<anonymous>";
 
+/// The egress rule counts a session config parses to, one per egress field.
+/// Logged beside the record the daemon stores at session start, they are the
+/// diagnostic for what a session actually activated with: a count of `0`
+/// means the field — or the whole `egress` section — carries no rules.
+#[derive(Debug, Clone, Copy)]
+struct EgressRuleCounts {
+    allow_subnets: usize,
+    allow_protocols: usize,
+    allow_dns_hosts: usize,
+    deny_subnets: usize,
+}
+
+impl EgressRuleCounts {
+    fn of(policy: &minimald_rpc::SessionPolicy) -> Self {
+        let egress = policy.egress.as_ref();
+        Self {
+            allow_subnets: egress
+                .and_then(|e| e.allow_subnets.as_ref())
+                .map_or(0, Vec::len),
+            allow_protocols: egress
+                .and_then(|e| e.allow_protocols.as_ref())
+                .map_or(0, Vec::len),
+            allow_dns_hosts: egress
+                .and_then(|e| e.allow_dns_hosts.as_ref())
+                .map_or(0, Vec::len),
+            deny_subnets: egress
+                .and_then(|e| e.deny_subnets.as_ref())
+                .map_or(0, Vec::len),
+        }
+    }
+}
+
 /// `CreateSession`: allocates the session's record and brings its actor
 /// up, replying with the assigned id. The loadout is composed separately,
 /// by the `ConfigureLoadout` that follows.
@@ -236,6 +267,10 @@ async fn serve_create_session(
             // manager: the success record below needs it, and the reply
             // carries only the assigned id.
             let session_name = req.config.name.clone();
+            // Read the egress rule counts off the config for the same reason:
+            // the manager consumes it, and the stored record's egress is what
+            // the counts below report beside the "session created" line.
+            let egress_counts = EgressRuleCounts::of(&req.config.policy);
 
             Ok(match mngr.create_session(req.config, ssh_username).await {
                 Ok(id) => {
@@ -247,13 +282,24 @@ async fn serve_create_session(
                     tracing::info!(
                         session_id = %id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
+                        egress_allow_subnets = egress_counts.allow_subnets,
+                        egress_allow_protocols = egress_counts.allow_protocols,
+                        egress_allow_dns_hosts = egress_counts.allow_dns_hosts,
+                        egress_deny_subnets = egress_counts.deny_subnets,
                         "session created"
                     );
                     Errorable::Ok(minimald_rpc::CreateSessionResponse {
                         id,
                         daemon_version: Some(OWN_VERSION.to_string()),
                         hostname_routing_unavailable: s.proxy_unavailable().await,
-                        mtls_proxy_unavailable: s.mtls_unavailable().await,
+                        hostname_proxy_port: s.hostname_proxy_port().await,
+                        zone_answerer_port: s.zone_answerer_port().await,
+                        // The rollout's one fact the client cannot know from
+                        // its own build (NET-077), carried on the reply the
+                        // activation path already holds so the coming-change
+                        // notice (NET-076) can stay off a deployment that has
+                        // already chosen to keep the shipped default.
+                        deny_all_opt_out: Some(s.deny_all_opt_out().await),
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
@@ -586,6 +632,68 @@ async fn serve_get_session_policy(
         .await
 }
 
+/// The `GetEffectiveSessionPolicy` reply for one record's policy and network
+/// mode: the egress half resolved to what the gate enforces, the ingress half
+/// verbatim. `phase` is the rollout phase to resolve under — the handler
+/// serves [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships,
+/// while the tests pass [`sessions::EgressDefaultPhase::InForce`] so the
+/// deny-all posture the rollout ends at stays proven while the default is
+/// only announced (NET-076).
+pub(crate) fn effective_policy_reply(
+    policy: &sessions::SessionPolicy,
+    network: sessions::NetworkMode,
+    phase: sessions::EgressDefaultPhase,
+    opt_out: bool,
+) -> minimald_rpc::EffectiveSessionPolicy {
+    minimald_rpc::EffectiveSessionPolicy {
+        egress: sessions::effective_egress(policy.egress.as_ref(), network, phase, opt_out),
+        ingress: policy.ingress.clone(),
+    }
+}
+
+/// `GetEffectiveSessionPolicy`: the same record
+/// [`serve_get_session_policy`] serves, with the egress half resolved to what
+/// the gate enforces — the answer `min session policy` renders (NET-075).
+///
+/// Resolved here rather than in the client because the inputs are this
+/// daemon's own facts: the rollout phase its build ships
+/// ([`sessions::EGRESS_DEFAULT_PHASE`]) and its opt-out flag (NET-077). An
+/// own-address box with no `egress` section answers `deny_all` once the
+/// default is in force (NET-074) and `allow_all` behind the opt-out or while
+/// the default is only announced; a declared section answers verbatim; the
+/// strict declaration the record holds is never rewritten to say any of
+/// this.
+async fn serve_get_effective_session_policy(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    GetEffectiveSessionPolicy
+        .handle_channel(c, async |req| {
+            let opt_out = s.deny_all_opt_out().await;
+            let mngr = s.sessions_manager().await;
+            let predicate = match req {
+                GetEffectiveSessionPolicyRequest::Id(id) => SessionKeyPredicate::Id(id),
+                GetEffectiveSessionPolicyRequest::Name(name) => SessionKeyPredicate::Name(name),
+            };
+            let record = mngr
+                .get_record(predicate)
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            match record {
+                None => Ok(Errorable::Err {
+                    error: "no session found".to_string(),
+                }),
+                Some(record) => Ok(Errorable::Ok(effective_policy_reply(
+                    &record.policy,
+                    record.network,
+                    sessions::EGRESS_DEFAULT_PHASE,
+                    opt_out,
+                ))),
+            }
+        })
+        .await
+}
+
 /// `GetSessionHooks`: the lifecycle hooks composed into a session, each
 /// with the loadout or project that declared it.
 ///
@@ -682,48 +790,6 @@ async fn serve_get_session_screen(
                 None => Errorable::Err {
                     error: "session is not active".to_string(),
                 },
-            })
-        })
-        .await
-}
-
-/// Signs a fresh client certificate for the `minimal login` flow and returns
-/// the cert PEM, key PEM, and CA cert PEM so the client can authenticate to
-/// the HTTPS reverse proxy. Only compiled when the `networking-proxy` feature
-/// is enabled.
-#[cfg(feature = "networking-proxy")]
-async fn serve_issue_client_cert(
-    s: ServerStateHandle,
-    c: RuChannel<Msg>,
-) -> Result<(), ConnectionError> {
-    IssueClientCert
-        .handle_channel(c, async |req: IssueClientCertRequest| {
-            let ca = s.cert_authority().await;
-            match ca.sign_client_cert(&req.subject_cn) {
-                Ok((cert_pem, key_pem)) => Ok(Errorable::Ok(IssueClientCertResponse {
-                    cert_pem,
-                    key_pem,
-                    ca_cert_pem: ca.ca_cert_pem.clone(),
-                })),
-                Err(e) => Ok(Errorable::Err {
-                    error: e.to_string(),
-                }),
-            }
-        })
-        .await
-}
-
-/// Replies to an `IssueClientCert` request with a readable error when the
-/// `networking-proxy` feature is compiled out, so the client sees "feature not
-/// enabled" instead of an opaque EOF/channel-close on the response stream.
-#[cfg(not(feature = "networking-proxy"))]
-async fn serve_issue_client_cert_unavailable(c: RuChannel<Msg>) -> Result<(), ConnectionError> {
-    IssueClientCert
-        .handle_channel(c, async |_req: IssueClientCertRequest| {
-            Ok(Errorable::Err {
-                error: "minimald was built without the networking-proxy feature; \
-                        client certificate issuance is unavailable"
-                    .to_string(),
             })
         })
         .await
@@ -1579,6 +1645,7 @@ pub async fn handle_ssh_rpc(
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
+        | GetEffectiveSessionPolicy::NAME
         | minimald_rpc::GetSessionHooks::NAME
         | SessionDelta::NAME
         | GetSessionScreen::NAME
@@ -1587,8 +1654,7 @@ pub async fn handle_ssh_rpc(
         | STREAM_WORKSPACE_PATCHES
         | STREAM_WORKSPACE_HOOK_SCRIPTS
         | minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
-        | minimald_rpc::CLEAN_CACHE_SUBSYSTEM
-        | IssueClientCert::NAME => {
+        | minimald_rpc::CLEAN_CACHE_SUBSYSTEM => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
                 None => {
@@ -1663,6 +1729,9 @@ pub async fn handle_ssh_rpc(
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
+        GetEffectiveSessionPolicy::NAME => {
+            serve!(serve_get_effective_session_policy(s, channel))
+        }
         minimald_rpc::GetSessionHooks::NAME => serve!(serve_get_session_hooks(s, channel)),
         SessionDelta::NAME => serve!(serve_session_delta(s, channel)),
         GetSessionScreen::NAME => serve!(serve_get_session_screen(s, channel)),
@@ -1676,19 +1745,6 @@ pub async fn handle_ssh_rpc(
             serve!(crate::diag::serve_stream_diag_bundle(s, config, channel))
         }
         minimald_rpc::CLEAN_CACHE_SUBSYSTEM => serve!(serve_clean_cache(s, channel)),
-        IssueClientCert::NAME => {
-            #[cfg(feature = "networking-proxy")]
-            serve!(serve_issue_client_cert(s, channel));
-            #[cfg(not(feature = "networking-proxy"))]
-            {
-                tracing::warn!(
-                    "IssueClientCert RPC called but the networking-proxy \
-                     feature is not enabled; replying with an error"
-                );
-                drop(s);
-                serve!(serve_issue_client_cert_unavailable(channel));
-            }
-        }
         _ => unreachable!(),
     };
 
@@ -1698,9 +1754,10 @@ pub async fn handle_ssh_rpc(
 #[cfg(test)]
 mod tests {
     use minimald_rpc::{
-        CreateSession, CreateSessionRequest, DestroySessionRequest, EgressPolicy, GetSessionPolicy,
-        GetSessionPolicyRequest, RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest,
-        ShutdownResponse,
+        CreateSession, CreateSessionRequest, DestroySessionRequest, EffectiveEgress,
+        EffectiveSessionPolicy, EgressPolicy, GetEffectiveSessionPolicy,
+        GetEffectiveSessionPolicyRequest, GetSessionPolicy, GetSessionPolicyRequest,
+        RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest, ShutdownResponse,
     };
     use paths::HostAbsPath;
     use sessions::{NetworkMode, SessionId};
@@ -2643,9 +2700,9 @@ mod tests {
         assert_eq!(created.daemon_version.as_deref(), Some(OWN_VERSION));
     }
 
-    /// The two read RPCs the attach / exec / setup-zed / ssh-forward paths
-    /// gate on must report the daemon's build, or those paths have nothing to
-    /// assert against and would have to spend a `GetVersion` to find out.
+    /// The two read RPCs the attach / exec / setup-zed paths gate on must
+    /// report the daemon's build, or those paths have nothing to assert
+    /// against and would have to spend a `GetVersion` to find out.
     #[tokio::test]
     async fn the_read_rpcs_report_the_daemon_build() {
         let server = TestServer::new().await;
@@ -2687,6 +2744,7 @@ mod tests {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             allow_dns_hosts: None,
             allow_protocols: None,
+            deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
         };
         let created_id = client
             .call::<CreateSession>(&CreateSessionRequest {
@@ -2712,6 +2770,246 @@ mod tests {
         // The configured ingress was `None`, and the read reflects that rather
         // than the old hardcoded `Some(IngressPolicy::default())`.
         assert_eq!(policy.ingress, None);
+    }
+
+    /// Creates an own-address session carrying `policy` and returns the
+    /// whole create reply — the box shape the deny-all default is about
+    /// (NET-074): an own-address box, whatever its egress declaration.
+    /// Tests that only need the box take [`own_ip_session`].
+    async fn own_ip_create_reply(
+        client: &mut TestClient,
+        name: &str,
+        policy: SessionPolicy,
+    ) -> minimald_rpc::CreateSessionResponse {
+        client
+            .call::<CreateSession>(&CreateSessionRequest {
+                config: minimald_rpc::SessionConfig {
+                    name: Some(name.to_string()),
+                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                    network: NetworkMode::OwnIp,
+                    policy,
+                    hooks_enabled: true,
+                    attrs: Default::default(),
+                },
+                must_match_version: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Creates an own-address session carrying `policy` and returns its id —
+    /// [`own_ip_create_reply`] for a caller that needs only the box.
+    async fn own_ip_session(
+        client: &mut TestClient,
+        name: &str,
+        policy: SessionPolicy,
+    ) -> SessionId {
+        own_ip_create_reply(client, name, policy).await.id
+    }
+
+    /// NET-074/NET-075: `GetEffectiveSessionPolicy` answers, over the real
+    /// SSH wire, what the gate enforces. This build ships the deny-all
+    /// default as announced (NET-076), so the wire half asserts the reply
+    /// the shipped phase resolves, while the in-force posture the rollout
+    /// ends at is proven by passing the phase explicitly to the same
+    /// resolver the handler serves. In force, an own-address box with no
+    /// `egress` section answers `deny_all` — reported as the posture, not as
+    /// a materialized section — and that reply survives the wire codec it
+    /// travels as, while the strict `GetSessionPolicy` reply still carries
+    /// the absent section as `None`: the default reaches the client without
+    /// rewriting the record. A box that declared its own egress answers it
+    /// verbatim, survived the JSON round trip, with its ingress beside it.
+    #[tokio::test]
+    async fn effective_policy_response_round_trips() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let egress = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            allow_dns_hosts: None,
+            allow_protocols: None,
+            deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
+        };
+        let declared_id = own_ip_session(
+            &mut client,
+            "declared-egress",
+            SessionPolicy::new(Some(egress.clone()), None),
+        )
+        .await;
+        let bare_id = own_ip_session(&mut client, "bare-egress", SessionPolicy::default()).await;
+
+        // The default's own case, with the phase passed explicitly
+        // (NET-074): an own-address box that declared nothing is deny-all
+        // once the default is in force.
+        assert_eq!(
+            super::effective_policy_reply(
+                &SessionPolicy::default(),
+                NetworkMode::OwnIp,
+                sessions::EgressDefaultPhase::InForce,
+                false,
+            ),
+            EffectiveSessionPolicy {
+                egress: EffectiveEgress::DenyAll,
+                ingress: None,
+            },
+            "an own-address box with no egress section must answer deny-all in force",
+        );
+
+        // The response carries that posture across the wire codec it
+        // travels as — the strict shape untouched beside it: the effective
+        // reply spells the default, `deny_all`, and decodes back to the
+        // same value.
+        let deny_all = EffectiveSessionPolicy {
+            egress: EffectiveEgress::DenyAll,
+            ingress: None,
+        };
+        let wire = serde_json_lenient::to_string(&minimald_rpc::Errorable::Ok(deny_all.clone()))
+            .expect("the deny-all reply must serialize");
+        assert!(
+            wire.contains(r#""egress":"deny_all""#),
+            "the wire must carry the deny-all posture, got: {wire}",
+        );
+        assert_eq!(
+            serde_json_lenient::from_str::<minimald_rpc::Errorable<EffectiveSessionPolicy>>(&wire)
+                .expect("the deny-all reply must decode back"),
+            minimald_rpc::Errorable::Ok(deny_all),
+        );
+
+        // Over the real wire, the reply follows the phase this build ships:
+        // whatever [`sessions::EGRESS_DEFAULT_PHASE`] resolves for a bare
+        // own-address box is what the daemon answers.
+        let bare = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(bare_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            bare,
+            super::effective_policy_reply(
+                &SessionPolicy::default(),
+                NetworkMode::OwnIp,
+                sessions::EGRESS_DEFAULT_PHASE,
+                false,
+            ),
+            "the wire must answer the shipped phase's resolution for a bare box",
+        );
+
+        // The strict reply is unchanged: the declaration the box was
+        // launched with, absent section still absent.
+        let strict = client
+            .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(bare_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            strict,
+            SessionPolicy::default(),
+            "the strict policy reply must keep the declaration as launched",
+        );
+
+        // A declared section round-trips verbatim, ingress beside it.
+        let declared = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(declared_id))
+            .await
+            .unwrap();
+        assert_eq!(declared.egress, EffectiveEgress::Declared(egress));
+        assert_eq!(declared.ingress, None);
+    }
+
+    /// NET-077: a daemon started with the deny-all opt-out keeps the shipped
+    /// allow-all default — an own-address box with no `egress` section
+    /// answers `allow_all` where the same box on an opted-in daemon answers
+    /// `deny_all` once the default is in force (that half passes the phase
+    /// explicitly, since this build ships the default as announced) — and
+    /// its gate resolves no section, so nothing is enforced. A box that
+    /// declared its own egress keeps it either way.
+    #[tokio::test]
+    async fn deny_all_opt_out_keeps_prior_default() {
+        let server = TestServer::new_opted_out_in(tempfile::tempdir().unwrap()).await;
+        let mut client = server.connect().await;
+
+        let egress = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..EgressPolicy::default()
+        };
+        let declared_id = own_ip_session(
+            &mut client,
+            "opt-out-declared",
+            SessionPolicy::new(Some(egress.clone()), None),
+        )
+        .await;
+        let bare_id = own_ip_session(&mut client, "opt-out-bare", SessionPolicy::default()).await;
+
+        let bare = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(bare_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            bare,
+            EffectiveSessionPolicy {
+                egress: EffectiveEgress::AllowAll,
+                ingress: None,
+            },
+            "behind the opt-out, an absent egress section keeps the shipped allow-all",
+        );
+
+        // The report and the gate agree, even in force: the same resolution
+        // the launcher applies materializes no section to enforce. The phase
+        // is passed explicitly so the opt-out is proven against the posture
+        // it exists to defer, not only against the announced build.
+        assert_eq!(
+            crate::session::effective_egress_section(
+                &sessions::SessionPolicy::default(),
+                NetworkMode::OwnIp,
+                sessions::EgressDefaultPhase::InForce,
+                true,
+            ),
+            None,
+            "behind the opt-out, the gate compiles no egress section at all",
+        );
+
+        // The opt-out never rewrites a declaration: what the box said is
+        // what it gets, whichever daemon it runs on.
+        let declared = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(declared_id))
+            .await
+            .unwrap();
+        assert_eq!(declared.egress, EffectiveEgress::Declared(egress));
+    }
+
+    /// NET-076/NET-077: the create reply carries the daemon's opt-out —
+    /// the rollout's one fact the client cannot know from its own build,
+    /// since the phase is a build-time constant both sides share and the
+    /// flag is set on the daemon alone. `min session activate` reads it to
+    /// keep its coming-change notice off a deployment that has already
+    /// chosen to keep the shipped default; the create reply is the RPC the
+    /// activation path already holds, so the answer costs no extra round
+    /// trip. An opted-out daemon says `true`, a daemon without the flag
+    /// says `false` — never `None`, which is reserved for a daemon that
+    /// predates the field and so cannot have opted out.
+    #[tokio::test]
+    async fn create_reply_reports_the_deny_all_opt_out() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        assert_eq!(
+            own_ip_create_reply(
+                &mut client,
+                "opt-out-reply-default",
+                SessionPolicy::default()
+            )
+            .await
+            .deny_all_opt_out,
+            Some(false),
+            "a daemon without the flag must say it did not opt out",
+        );
+
+        let server = TestServer::new_opted_out_in(tempfile::tempdir().unwrap()).await;
+        let mut client = server.connect().await;
+        assert_eq!(
+            own_ip_create_reply(&mut client, "opt-out-reply-set", SessionPolicy::default())
+                .await
+                .deny_all_opt_out,
+            Some(true),
+            "an opted-out daemon must say so, so the notice can stay off",
+        );
     }
 
     #[tokio::test]
@@ -2788,19 +3086,22 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        // R2.1: an egress policy on a non-`OwnIp` PTask is rejected at
-        // declaration time, so the invalid session is never stored.
+        // NET-065: an egress policy on a none (`NoNet`) box is rejected at
+        // declaration time, so the invalid session is never stored. Egress on
+        // a host-address box is accepted (NET-120), so `NoNet` is the only
+        // mode that still refuses it.
         let egress = EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             allow_dns_hosts: None,
             allow_protocols: None,
+            deny_subnets: None,
         };
         let resp = client
             .call::<CreateSession>(&CreateSessionRequest {
                 config: minimald_rpc::SessionConfig {
                     name: Some("bad-policy".to_string()),
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: NetworkMode::HostNet,
+                    network: NetworkMode::NoNet,
                     policy: SessionPolicy::new(Some(egress), None),
                     hooks_enabled: true,
                     attrs: Default::default(),
@@ -2811,7 +3112,8 @@ mod tests {
         assert_eq!(
             resp,
             Errorable::Err {
-                error: "egress policy is only valid for an own-IP PTask, not HostNet".to_string()
+                error: "egress policy is only valid for an own-IP or host-address PTask, not NoNet"
+                    .to_string()
             }
         );
 

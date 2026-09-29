@@ -1,0 +1,14 @@
+# Clippy configuration for the workspace.
+#
+# The `*-in-tests` keys below exempt test code for five lints: the panic sources
+# (`unwrap`, `expect`, `panic`), plus `indexing_slicing` and `dbg_macro`. In test
+# code a panicking unwrap or a literal index is the idiomatic way to fail a
+# test, and a leftover `dbg!` is a deliberate probe. None of the five is in
+# `[workspace.lints]`, because the tree is not clean for them yet; they run only
+# on changed lines, via `just clippy-strict`. See scripts/clippy-strict.sh.
+
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true

@@ -361,7 +361,7 @@ impl Manager {
                     }
                 }
                 // There's not a checkout of this ref, lets create it.
-                let checkout_dir = tempdir_in(self.git_checkouts_dir()).unwrap().keep();
+                let checkout_dir = tempdir_in(self.git_checkouts_dir())?.keep();
                 let relative_dir = checkout_dir.strip_prefix(self.git_checkouts_dir()).unwrap();
                 let repo = self.repos.get_mut(id).unwrap();
                 // Offline: skip the fetch and try the worktree checkout against
@@ -375,12 +375,10 @@ impl Manager {
                 let checkout = new_worktree_or_cleanup(repo, &checkout_dir, at.clone())?;
                 let git_hash = checkout.rev.clone();
 
-                self.state
-                    .repos
-                    .get_mut(id)
-                    .unwrap()
-                    .checkouts
-                    .insert(relative_dir.to_str().unwrap().to_string(), checkout);
+                self.state.repos.get_mut(id).unwrap().checkouts.insert(
+                    relative_dir.to_str().ok_or(Error::InvalidPath)?.to_string(),
+                    checkout,
+                );
 
                 Ok((checkout_dir, git_hash))
             }
@@ -402,7 +400,7 @@ impl Manager {
                 let (id, dir) = create_unique_id_and_dir(&self.git_bares_dir(), prefix)?;
                 let mut repo = Repo::new(remote, dir.clone())?;
                 // Make checkout
-                let checkout_dir = tempdir_in(self.git_checkouts_dir()).unwrap().keep();
+                let checkout_dir = tempdir_in(self.git_checkouts_dir())?.keep();
                 let relative_dir = checkout_dir.strip_prefix(self.git_checkouts_dir()).unwrap();
                 // Nothing about this remote is recorded until the checkout
                 // succeeds, so a refused ref must also take the bare clone with
@@ -425,7 +423,11 @@ impl Manager {
                     id.clone(),
                     RepoState {
                         remote: remote.to_string(),
-                        checkouts: [(relative_dir.to_str().unwrap().to_string(), checkout)].into(),
+                        checkouts: [(
+                            relative_dir.to_str().ok_or(Error::InvalidPath)?.to_string(),
+                            checkout,
+                        )]
+                        .into(),
                     },
                 );
                 self.repos.insert(id, repo);

@@ -30,3 +30,6 @@ ignored = [
     "prost-build",
     "tonic-prost-build",
 ]
+
+[lints]
+workspace = true

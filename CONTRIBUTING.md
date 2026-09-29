@@ -36,7 +36,8 @@ just ci
 which runs the same gates the PR lanes run (fmt, clippy, cargo-deny, the
 test suite, doctests — plus, on Linux, the locally-runnable `#[ignore]`
 tests via `just test-ignored`, which no CI lane covers), dispatched for your
-OS. On macOS, `just test-cross` additionally covers the Linux-only crates
+OS. It ends with `just clippy-strict`, which applies a stricter lint set to
+the lines your branch changed. Run that on its own to see just those. On macOS, `just test-cross` additionally covers the Linux-only crates
 (minimald et al.) via `cross`. If your change touches the VM/daemon path,
 also run `just e2e` (the session proof) and/or `just test-vm` (the VM
 integration harnesses).

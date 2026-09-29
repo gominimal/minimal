@@ -164,7 +164,7 @@ fn watch_binding<P: SessionProcess, G: SessionGuard>(
     host: &mut Host<P, G>,
 ) -> mpsc::Receiver<BindingMsg> {
     let (tx, rx) = mpsc::channel(16);
-    host.remote = Some((tx, tokio::spawn(async {})));
+    host.remote = Some((tx, tokio::spawn(async {}), CancellationToken::new()));
     rx
 }
 
@@ -189,7 +189,7 @@ fn teardown_from(rx: &mut mpsc::Receiver<BindingMsg>) -> Option<(TeardownCause, 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
     let (mut host, _handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -240,12 +240,13 @@ async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
 /// host loop. The host forwards each pty read into the binding's mailbox;
 /// once that mailbox fills, an unbounded send parked the loop for good, so
 /// the host could no longer pump the pty, drain its own mailbox, or observe
-/// the shell exiting — one dark client froze the whole session. The bounded
-/// send sheds the stalled binding instead and keeps serving.
+/// the shell exiting — one dark client froze the whole session. The host now
+/// stops reading the pty while the mailbox is full, keeps serving, and sheds
+/// the binding once the stall bound passes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stalled_binding_does_not_wedge_the_host_loop() {
     let (mut host, handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -272,13 +273,15 @@ async fn a_stalled_binding_does_not_wedge_the_host_loop() {
         tx.try_send(BindingMsg::Stdin(Vec::new()))
             .expect("pre-fill stays within the mailbox capacity");
     }
-    host.remote = Some((tx, tokio::spawn(async {})));
+    host.remote = Some((tx, tokio::spawn(async {}), CancellationToken::new()));
+    // Short, so the shed this test goes on to rely on comes quickly.
+    host.output_stall_timeout = Duration::from_millis(200);
 
     let stdin = host.remote_tx.clone();
     let task = tokio::spawn(host.mainloop());
 
-    // Make the shell echo so the host reads pty output and tries to forward
-    // it to the full binding.
+    // Make the shell echo so the host has output for the full binding, and
+    // reads it once the stalled binding has been shed.
     stdin
         .send(stdin_bytes(b"ping\n".to_vec()))
         .await
@@ -332,6 +335,259 @@ async fn a_stalled_binding_does_not_wedge_the_host_loop() {
         .expect("mainloop should return the reaped exit status");
 }
 
+/// Stands in for the daemon's connection handler: accepts any client and
+/// hands each session channel it opens to the test.
+struct ChannelCatcher(mpsc::UnboundedSender<Channel<Msg>>);
+
+impl russh::server::Handler for ChannelCatcher {
+    type Error = russh::Error;
+
+    async fn auth_none(&mut self, _: &str) -> Result<russh::server::Auth, Self::Error> {
+        Ok(russh::server::Auth::Accept)
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        channel: Channel<Msg>,
+        reply: russh::server::ChannelOpenHandle,
+        _: &mut russh::server::Session,
+    ) -> Result<(), Self::Error> {
+        let _ = self.0.send(channel);
+        reply.accept().await;
+        Ok(())
+    }
+}
+
+struct TrustingClient;
+
+impl russh::client::Handler for TrustingClient {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _: &russh::keys::PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+}
+
+/// A host whose shell is attached through a real ssh channel and kept busy
+/// printing, plus the client end of that channel.
+struct FloodedAttach {
+    handle: HostHandle,
+    task: JoinHandle<Result<i32, std::io::Error>>,
+    channel: russh::Channel<russh::client::Msg>,
+    feeder: JoinHandle<()>,
+    // Held so the ssh connection stays up.
+    _client: russh::client::Handle<TrustingClient>,
+}
+
+impl FloodedAttach {
+    /// Builds the host with `output_stall_timeout`, attaches it over an
+    /// in-process ssh connection, and feeds the shell long lines for as long
+    /// as the host takes them. Every line comes back twice, as the tty's echo
+    /// and the shell's `got:` line.
+    ///
+    /// The client's receive window and channel buffer are tiny. A client
+    /// that stops reading then stops the server within a few tens of KiB,
+    /// where the defaults would let megabytes through first.
+    async fn start(output_stall_timeout: Duration) -> Self {
+        let (mut host, handle) = Host::build(
+            MockLauncher::default(),
+            HostParams {
+                name: "test-session".to_string(),
+                username: "user".to_string(),
+                paths: test_paths(),
+                sz: DEFAULT_SIZE,
+                channel: None,
+                control: None,
+                delta: None,
+                archives_dir: std::env::temp_dir(),
+                session_id: sessions::SessionId::nil(),
+                composition: None,
+                connection_env: ConnectionEnv::new(),
+            },
+        )
+        .await
+        .expect("failed to build host");
+        host.output_stall_timeout = output_stall_timeout;
+        let stdin = host.remote_tx.clone();
+        let task = tokio::spawn(host.mainloop());
+
+        let (server_side, client_side) = tokio::net::UnixStream::pair().unwrap();
+        let key = russh::keys::PrivateKey::random(
+            &mut russh::keys::key::safe_rng(),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let server_config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            ..Default::default()
+        });
+        let client_config = Arc::new(russh::client::Config {
+            window_size: 16 * 1024,
+            channel_buffer_size: 1,
+            ..Default::default()
+        });
+        let (caught_tx, mut caught) = mpsc::unbounded_channel();
+        // The server reads the client's ssh id before it returns, so the two
+        // halves have to be driven together.
+        let (server, client) = tokio::join!(
+            russh::server::run_stream(server_config, server_side, ChannelCatcher(caught_tx)),
+            russh::client::connect_stream(client_config, client_side, TrustingClient),
+        );
+        tokio::spawn(server.expect("ssh server handshake"));
+        let mut client = client.expect("ssh client handshake");
+        let auth = client.authenticate_none("test").await.unwrap();
+        assert!(auth.success(), "the test server accepts anyone");
+        let channel = client.channel_open_session().await.unwrap();
+        let server_channel = caught.recv().await.expect("the server caught the channel");
+
+        assert!(
+            handle
+                .attach(
+                    server_channel,
+                    DEFAULT_SIZE,
+                    ConnectionEnv::new(),
+                    SessionKeys::default(),
+                )
+                .await
+                .is_ok(),
+            "the host must take the attach",
+        );
+
+        // Stamped with the generation the attach installs. Lines that reach
+        // the host before it has processed the attach are dropped as stale,
+        // and so is everything after a shed; neither matters here.
+        let line = format!("{}\n", "x".repeat(2000));
+        let feeder = tokio::spawn(async move {
+            while stdin
+                .send(StdinMsg::new(
+                    1,
+                    StdinMsgKind::Bytes(bytes::Bytes::from(line.clone())),
+                ))
+                .await
+                .is_ok()
+            {}
+        });
+
+        Self {
+            handle,
+            task,
+            channel,
+            feeder,
+            _client: client,
+        }
+    }
+
+    async fn stop(self) {
+        self.feeder.abort();
+        let _ = self.handle.kill(false).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), self.task).await;
+    }
+}
+
+/// A shed must close the client's channel. The client of a shed binding
+/// has stopped reading, but it is still connected, and when it reads again
+/// it has to find the attach over: EOF, the shed exit status, and a close,
+/// so `min` exits and the user can re-attach. Aborting the binding task, as
+/// the shed once did, dropped the channel halves, and russh sends no close
+/// for those. The client then stayed connected forever with nothing behind
+/// it: no output, keystrokes swallowed, no detach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shedding_a_stalled_binding_closes_the_client_channel() {
+    let mut attach = FloodedAttach::start(Duration::from_millis(200)).await;
+
+    // Read nothing for long enough that the output backs up to the host and
+    // the stall bound passes.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let (mut eof, mut exit_status, mut closed) = (false, None, false);
+    let drained = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(msg) = attach.channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Eof => eof = true,
+                russh::ChannelMsg::ExitStatus { exit_status: s } => exit_status = Some(s),
+                russh::ChannelMsg::Close => {
+                    closed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        drained.is_ok() && closed,
+        "the shed binding left the client's channel open (eof: {eof}, exit status: {exit_status:?})",
+    );
+    assert!(eof, "the channel must see EOF before it closes");
+    assert_eq!(
+        exit_status,
+        Some(SHED_EXIT_STATUS),
+        "a shed reports the status that has the client restore the terminal",
+    );
+
+    // Only the attach was dropped; the session carries on.
+    assert!(
+        !attach.task.is_finished(),
+        "a shed must not end the session"
+    );
+    tokio::time::timeout(Duration::from_secs(5), attach.handle.get_attrs())
+        .await
+        .expect("the host keeps answering after a shed")
+        .expect("the host is still running");
+
+    attach.stop().await;
+}
+
+/// A terminal that falls behind is slowed down, not dropped. The shed used
+/// to fire whenever one forward waited longer than the 2 s probe deadline,
+/// which any terminal draining under about 800 KB/s hit while a session
+/// printed a few megabytes. Now the host stops reading the pty while the
+/// binding catches up, answering probes all the while, and the attach
+/// carries on once the client reads again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_reader_is_held_back_not_shed() {
+    let mut attach = FloodedAttach::start(OUTPUT_STALL_TIMEOUT).await;
+
+    // Stall well past the probe deadline, probing the host throughout.
+    let stall = tokio::time::Instant::now() + 2 * crate::session::HOST_PROBE_TIMEOUT;
+    while tokio::time::Instant::now() < stall {
+        tokio::time::timeout(
+            crate::session::HOST_PROBE_TIMEOUT,
+            attach.handle.get_attrs(),
+        )
+        .await
+        .expect("a backed-up binding must not stop the host answering probes")
+        .expect("the host is still running");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Reading again, the output keeps coming: far more of it than the
+    // stalled pipeline could hold, so the shell was only held up.
+    let mut received = 0usize;
+    let flowing = tokio::time::timeout(Duration::from_secs(30), async {
+        while received < 1024 * 1024 {
+            match attach.channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => received += data.len(),
+                Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close) | None => {
+                    panic!("a slow reader was shed after {received} bytes");
+                }
+                Some(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        flowing.is_ok(),
+        "output stopped after {received} bytes once the client read again",
+    );
+
+    attach.stop().await;
+}
+
 /// Reads forwarded stdout off the binding channel until `needle` shows up.
 /// The host feeds its parser from the same read it forwards, and in that
 /// order, so seeing the bytes here proves the screen has already absorbed
@@ -363,7 +619,7 @@ async fn await_forwarded(rx: &mut mpsc::Receiver<BindingMsg>, needle: &[u8]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
     let (mut host, _handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -423,7 +679,7 @@ async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
     let (host, _handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -471,7 +727,7 @@ async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_kill_tells_the_binding_nothing() {
     let (mut host, handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -861,7 +1117,7 @@ async fn get_attrs_tracks_title_and_io_times() {
     // through a clone of the host's own remote sender, then drive its
     // runtime loop on a background task.
     let (host, handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -936,7 +1192,7 @@ async fn get_attrs_tracks_title_and_io_times() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kill_tears_down_host_and_reaps_process() {
     let (host, handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -1026,51 +1282,6 @@ impl sandbox2::NetGuard for RecordingNetGuard {
     }
 }
 
-/// Like [`MockLauncher`], but attaches a [`RecordingNetGuard`] so a test can
-/// observe network teardown. The shared `torn_down` flag lets the test assert
-/// when the network is released relative to detach vs. exit.
-struct MockLauncherWithNet {
-    torn_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl SessionLauncher for MockLauncherWithNet {
-    type Process = MockProcess;
-    type Guard = ();
-
-    async fn launch(
-        self,
-        _name: String,
-        _username: String,
-        _paths: SessionPaths,
-        sz: WinSize,
-    ) -> std::io::Result<Launched<MockProcess, ()>> {
-        let pty = Pty::open(sz)?;
-        let script = format!(
-            r#"while read line; do [ "$line" = {MOCK_EXIT_LINE} ] && exit 0; printf 'got:%s\n' "$line"; done"#
-        );
-        let mut command = std::process::Command::new("/bin/sh");
-        command.arg("-c").arg(&script);
-        command.stdin(std::process::Stdio::from(pty.dup_slave_fd()?));
-        command.stdout(std::process::Stdio::from(pty.dup_slave_fd()?));
-        let tty_path = pty.slave_path().to_path_buf();
-        let (master, slave) = pty.into_fds();
-        command.stderr(std::process::Stdio::from(slave));
-        let process = command.spawn()?;
-        Ok(Launched {
-            master,
-            process: MockProcess {
-                child: process,
-                exit: None,
-            },
-            guard: (),
-            tty_path,
-            net_guard: Some(Box::new(RecordingNetGuard {
-                torn_down: self.torn_down,
-            })),
-        })
-    }
-}
-
 fn test_paths() -> SessionPaths {
     SessionPaths {
         working: DaemonAbsPath::root(),
@@ -1088,9 +1299,9 @@ fn test_paths() -> SessionPaths {
 async fn exit_releases_the_network() {
     let torn_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (host, _handle) = Host::build(
-        MockLauncherWithNet {
+        MockLauncher::with_net_guard(Box::new(RecordingNetGuard {
             torn_down: torn_down.clone(),
-        },
+        })),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -1141,9 +1352,9 @@ async fn exit_releases_the_network() {
 async fn detach_keystroke_holds_the_session_and_network() {
     let torn_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (host, handle) = Host::build(
-        MockLauncherWithNet {
+        MockLauncher::with_net_guard(Box::new(RecordingNetGuard {
             torn_down: torn_down.clone(),
-        },
+        })),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -1243,7 +1454,7 @@ fn queue_stdin_appends_after_unwritten_remainder() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_binding_generation_input_is_discarded() {
     let (host, _handle) = Host::build(
-        MockLauncher,
+        MockLauncher::default(),
         HostParams {
             name: "test-session".to_string(),
             username: "user".to_string(),
@@ -1290,4 +1501,117 @@ async fn stale_binding_generation_input_is_discarded() {
         .expect("mainloop should terminate after the shell exits")
         .expect("host task should not panic during teardown")
         .expect("mainloop should return the reaped exit status");
+}
+
+/// A composition with nothing in it. [`Host::hook_plan`] needs a composition
+/// to exist before it will plan a hook run, but no hook script is run by the
+/// plan itself, so an empty one is enough to test the wiring.
+fn bare_composition() -> Arc<sessions::core::compose::Composition> {
+    use sessions::wire::request::{COMPOSITION_SNAPSHOT_VERSION, WireComposition};
+    Arc::new(
+        sessions::core::compose::Composition::try_from(WireComposition {
+            version: COMPOSITION_SNAPSHOT_VERSION,
+            vars: Vec::new(),
+            patches: Vec::new(),
+            packages: Vec::new(),
+            lifecycle_hooks: Vec::new(),
+            orientation: Default::default(),
+        })
+        .expect("an empty composition snapshot converts back"),
+    )
+}
+
+/// A launcher that reports the given none-box seal and runs a stand-in shell
+/// with exactly one child, so [`Host::session_leader_pid`] resolves the way it
+/// does behind a real session.
+struct SealingMockLauncher {
+    seal_injection: bool,
+}
+
+impl SessionLauncher for SealingMockLauncher {
+    type Process = MockProcess;
+    type Guard = ();
+
+    async fn launch(
+        self,
+        _name: String,
+        _username: String,
+        _paths: SessionPaths,
+        sz: WinSize,
+    ) -> io::Result<Launched<MockProcess, ()>> {
+        let pty = Pty::open(sz)?;
+        // The `&` forces a fork, so the shell stays alive holding exactly one
+        // child for `session_leader_pid` to resolve.
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 30 & wait");
+        command.stdin(std::process::Stdio::from(pty.dup_slave_fd()?));
+        command.stdout(std::process::Stdio::from(pty.dup_slave_fd()?));
+        let tty_path = pty.slave_path().to_path_buf();
+        let (master, slave) = pty.into_fds();
+        command.stderr(std::process::Stdio::from(slave));
+
+        let process = command.spawn()?;
+
+        Ok(Launched {
+            master,
+            process: MockProcess::new(MockBackend { child: process }),
+            guard: (),
+            net_guard: None,
+            tty_path,
+            seal_injection: self.seal_injection,
+        })
+    }
+}
+
+/// The seal a lifecycle hook is injected with follows the session's own.
+/// `hook_plan` is the one place the daemon decides what a hook runs in, so it
+/// is where the none-box socket-family seal has to arrive: a hook joins the
+/// session's namespaces rather than being forked from the filtered shell, so
+/// without the flag it would land unfiltered and could open sockets —
+/// `AF_VSOCK` to the host included — from inside a sealed box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_injections_carry_the_session_s_none_box_seal() {
+    for (sealing, expected) in [(true, true), (false, false)] {
+        let (mut host, _handle) = Host::build(
+            SealingMockLauncher {
+                seal_injection: sealing,
+            },
+            HostParams {
+                name: "test-session".to_string(),
+                username: "user".to_string(),
+                paths: test_paths(),
+                sz: DEFAULT_SIZE,
+                channel: None,
+                control: None,
+                delta: None,
+                archives_dir: std::env::temp_dir(),
+                session_id: sessions::SessionId::nil(),
+                composition: Some(bare_composition()),
+                connection_env: ConnectionEnv::new(),
+            },
+        )
+        .await
+        .expect("failed to build host");
+
+        // The stand-in shell forks its child a moment after `spawn` returns,
+        // so the leader may not exist on the first ask. A real session runs
+        // its hooks long after launch; give the stand-in the same courtesy,
+        // bounded so a session that can never plan says so rather than hang.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let plan = loop {
+            if let Some(plan) = host.hook_plan(crate::hooks::HookEvent::Attach) {
+                break plan;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a live session with a composition never planned a hook run",
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let _ = host.process.kill();
+        assert_eq!(
+            plan.commands.seal_none_box, expected,
+            "the hook injection must carry the session's none-box seal",
+        );
+    }
 }

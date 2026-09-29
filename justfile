@@ -15,8 +15,6 @@ krun-prefix  := env('HOME') / ".krun"
 # Prefix for the STATIC libkrun the dev stack links (Linux). Built from the
 # vendored pin, not fetched; `just clean` removes it.
 krun-static  := scratch / "libkrun-static" / musl-target
-# Guest networking features baked into the initramfs (networking-wg deferred).
-features     := "networking-proxy"
 kernel       := scratch / "vmlinuz"
 rootfs       := scratch / "rootfs.img"
 initramfs    := scratch / "initramfs.cpio"
@@ -36,6 +34,10 @@ native-dir   := scratch / "native-state"
 # Linux-only): scope to the darwin-capable crates there; `just test-cross`
 # covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
 scope      := if os() == "macos" { "-p minvmd -p sessions" } else { "--workspace" }
+# The strict gate's scope on macOS: the same pair `clippy` and `test` already
+# use, because the Linux-only crates do not build there. The script reports any
+# changed crate this leaves out, so the scope is never silently narrower.
+strict-scope := if os() == "macos" { "-p minvmd -p sessions" } else { "" }
 # Crates carrying a `fuzz/` workspace. `rcache` is Linux-only: it pulls in
 # `lcache`, which uses the Linux-only `common::renameat2`.
 fuzz-crates := if os() == "macos" { "args common diagnostics graph mfile paths" } else { "args common diagnostics graph mfile paths rcache" }
@@ -101,9 +103,9 @@ gvproxy:
     @mkdir -p {{scratch}}
     @[ -x {{gvproxy}} ] || scripts/fetch-gvproxy.sh {{gvproxy}}
 
-# Cross-compile minimald → initramfs /init with the networking features.
+# Cross-compile minimald → initramfs /init.
 initramfs:
-    FEATURES={{features}} scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
+    scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
 
 # Compiles the guest minimald here, then hands the binary to
 # scripts/build-initramfs.sh via MINIMALD_BIN (its prebuilt mode), so the script
@@ -119,8 +121,7 @@ initramfs:
 #
 # Build minimald → initramfs /init using the cross toolchain on PATH (no container).
 initramfs-nodocker:
-    cargo zigbuild -p minimald --profile initramfs \
-      --target {{musl-target}} --features {{features}}
+    cargo zigbuild -p minimald --profile initramfs --target {{musl-target}}
     MINIMALD_BIN="{{justfile_directory()}}/target/{{musl-target}}/initramfs/minimald" \
       scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
 
@@ -147,10 +148,10 @@ minvmd-build: libkrun-static
 minimal-cli:
     cargo build -p minimal --locked
 
-# Build a host-native (glibc) minimald with the networking features (for `just up`).
+# Build a host-native (glibc) minimald (for `just up`).
 [linux]
 minimald-build:
-    cargo build -p minimald --features {{features}} --locked
+    cargo build -p minimald --locked
 
 # THE single build entrypoint for a shippable build: the four release binaries
 # for a target triple, built exactly the way release.yml's build jobs build
@@ -270,7 +271,17 @@ fmt:
 # clean-worktree check — the usual case here is running mid-edit with
 # staged/unstaged work.
 #
-# Autofix pass: fmt, clippy --fix, fmt again (safe to run mid-edit).
+# The strict clippy gate is not part of this loop. It ran here once, and
+# three agent rounds on the NET walk then rewrote lines their task never
+# named to clear it, two in conflict rounds whose only directive was the
+# merge (#1737, #1730, #1727): everything else this recipe prints is
+# something to fix, so a strict hit printed beside it reads the same way,
+# whatever a doc says. There is no autofix for that set either — `clippy
+# --fix` cannot be scoped to changed lines and would sweep legacy sites — so
+# the gate lives in `just clippy-strict` and `just ci`, which is the round
+# that owns the judgement.
+#
+# Autofix pass: fmt, clippy --fix, fmt again (runnable mid-edit).
 fix:
     cargo fmt --all
     cargo clippy {{scope}} --all-targets --fix --allow-dirty -- -D warnings
@@ -287,6 +298,22 @@ fmt-check:
 # Clippy over all targets at this host's scope, warnings denied.
 clippy:
     cargo clippy {{scope}} --all-targets --locked -- -D warnings
+
+# CI: none — this is a local gate (scripts/clippy-strict.sh).
+#
+# The lints below are the ones the tree is not yet clean for: CI's clippy job
+# runs `-D warnings`, so they live here rather than in Cargo.toml and only the
+# lines you changed are reported. Run it once your change is ready, fix what it
+# reports on the lines your change introduced, and promote each lint into
+# [workspace.lints.clippy] as its count reaches zero.
+#
+# This recipe and `just ci` are the only callers; `just fix` does not run it. A
+# hit on a line the round's directive did not name is a note, not a licence to
+# edit it.
+#
+# Strict Clippy on the lines this branch changed, scoped to the crates you touched.
+clippy-strict BASE="":
+    scripts/clippy-strict.sh "{{BASE}}" {{strict-scope}}
 
 # A local advisories failure may just mean newer RUSTSEC data than CI's last run.
 # CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).
@@ -400,16 +427,18 @@ test-cross: (_need "cross" "cargo install cross --locked")
 #
 # The local PR gate set, cheapest first.
 [linux]
-ci: fmt-check check-version clippy deny test doctest test-ignored
+ci: fmt-check check-version clippy clippy-strict deny test doctest test-ignored
     @echo "ci: local PR gates green"
 
 # The local PR gate set, cheapest first (`just test-cross` covers the Linux-only crates).
 [macos]
-ci: fmt-check check-version clippy deny test doctest
+ci: fmt-check check-version clippy clippy-strict deny test doctest
     @echo "ci: local PR gates green"
 
 # Run the curl|sh installer's tests under every POSIX sh. CI: ci-shell-installer.yml.
-test-installer:
+# `case` runs one named scenario group (see the dispatch at the bottom of
+# scripts/install_test.sh); empty runs them all.
+test-installer case="":
     #!/usr/bin/env bash
     set -euo pipefail
     if command -v shellcheck >/dev/null 2>&1; then
@@ -420,8 +449,8 @@ test-installer:
     fi
     for sh in sh dash; do
         command -v "$sh" >/dev/null 2>&1 || { echo "== $sh not found, skipping =="; continue; }
-        echo "== running install_test.sh under $sh =="
-        SH="$sh" "$sh" scripts/install_test.sh
+        echo "== running install_test.sh under $sh${case:+ (case: $case)} =="
+        SH="$sh" "$sh" scripts/install_test.sh {{case}}
     done
 
 # The reviewed harness the frozen ci-shell-installer.yml can't widen to; CI runs
@@ -430,6 +459,62 @@ test-installer:
 # Shellcheck EVERY script under scripts/ (not just the installer's two files).
 lint-shell:
     bash scripts/lint-shell.sh
+
+# Not a CI gate. Default lints the markdown this branch touches (changed
+# against main, staged, unstaged, and untracked) so the common loop stays
+# short; pass files for specific ones, or --all for the whole tree. The
+# existing tree carries thousands of alerts: drive files you touch to zero,
+# leave untouched files' alerts alone. `vale sync` fetches the pinned packages
+# into styles/ (gitignored) and runs again whenever `.vale.ini` changes, so a
+# bumped pin moves the lint; --no-global keeps a personal ~/.vale.ini from
+# leaking its styles into the repo's run.
+#
+# Vale prose-lint this branch's markdown (`just lint-prose [files|--all]`).
+lint-prose *args: (_need "vale" "brew install vale (or a release binary: github.com/errata-ai/vale/releases)")
+    #!/usr/bin/env sh
+    set -eu
+    args={{quote(args)}}
+    # Re-sync when a package directory is missing, or when `.vale.ini` changed
+    # since the last sync. Vale keeps no version stamp of its own next to the
+    # synced styles, so an existence check alone would freeze a warm checkout
+    # at its first sync and ignore a later pin bump.
+    stamp="$(cksum .vale.ini)"
+    if [ ! -d styles/ai-tells ] || [ ! -d styles/ste ] \
+        || [ "$(cat styles/.sync-stamp 2>/dev/null || true)" != "$stamp" ]; then
+        vale sync
+        printf '%s\n' "$stamp" > styles/.sync-stamp
+    fi
+    # `quote()` joins the arguments into a single shell word, so the splits
+    # below are what separate them again; `set -f` keeps a path's glob
+    # characters literal. Repo paths carry no whitespace, so an argument
+    # holding a space is not supported.
+    set -f
+    if [ "$args" = "--all" ]; then
+        files="$(git ls-files '*.md')"
+    elif [ -n "$args" ]; then
+        files="$args"
+    else
+        base=main
+        git rev-parse -q --verify "$base" >/dev/null || base=origin/main
+        git rev-parse -q --verify "$base" >/dev/null || {
+            echo "lint-prose: no 'main' or 'origin/main' ref to diff against" >&2
+            exit 1
+        }
+        files="$(
+            { git diff --name-only "$base...HEAD" -- '*.md'
+              git diff --name-only --cached -- '*.md'
+              git diff --name-only -- '*.md'
+              git ls-files --others --exclude-standard -- '*.md'
+            } | sort -u
+        )"
+    fi
+    keep=""
+    for f in $files; do
+        if [ -f "$f" ]; then keep="$keep $f"; fi
+    done
+    [ -n "$keep" ] || { echo "lint-prose: no markdown to lint" >&2; exit 0; }
+    # `--` stops vale from parsing a leading-dash path as an option.
+    exec vale --no-global -- $keep
 
 # scripts/record-smoked.sh writes the smoke-provenance marker and
 # scripts/verify-smoked.sh reads it back, over a stubbed `gcloud` backed by a

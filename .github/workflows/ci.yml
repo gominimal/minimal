@@ -9,19 +9,20 @@ name: CI
 # aggregator treats as pass. Do NOT add trigger-level `paths:` here.
 on:
     push:
-        branches: ["main"]
+        branches: ["main", "release/**"]
     pull_request:
-        branches: ["main"]
+        branches: ["main", "release/**"]
     workflow_dispatch:
 
 env:
     CARGO_TERM_COLOR: always
 
 # Cancel an in-progress run when a newer commit is pushed to the same ref.
-# main is excluded so a push to main never gets cancelled mid-flight.
+# main and release/* are excluded so a push there never gets cancelled
+# mid-flight: release.yml's verify-ci needs every commit's results.
 concurrency:
     group: ci-${{ github.ref }}
-    cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
 
 permissions:
     contents: read

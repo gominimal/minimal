@@ -16,6 +16,7 @@
 //! Covers R1.4 (gvproxy child lifecycle), R1.6 (per-host IP allocation with no
 //! reuse), and R1.8 (structured tracing for every switch lifecycle event).
 
+pub mod answerer;
 pub mod dns;
 pub mod policy;
 pub mod proxy;
@@ -26,6 +27,12 @@ pub mod switch;
 // would compile them out.
 pub(crate) mod gvproxy_network;
 pub(crate) mod provider;
+
+// The DNS gate the relay legs share: pins the addresses a box's allowed
+// names resolved to for their admission window (NET-066), refuses denied
+// ranges at resolution time (NET-067), and answers AAAA/HTTPS/SVCB empty
+// (NET-136). Relay-internal, so no more public than this.
+pub(crate) mod dns_gate;
 
 // WireGuard mesh peer (Unit 4). Compiled only under `networking-wg` so the
 // default build carries no WireGuard code (R4.7).
@@ -50,6 +57,10 @@ pub use ::switch::{
     DEFAULT_MTU, DEFAULT_SUBNET, InvalidPrefix, MacAddr, SwitchSubnet, VSOCK_GVPROXY_SHUTTLE_PORT,
     VSOCK_HOST_CID, render_gvproxy_config,
 };
+// The default address plan itself (NET-102) is imported un-re-exported: the
+// plan is a definition the allocation below draws from, not part of the
+// `minimald::net::*` vocabulary callers consume.
+use ::switch::AddressPlan;
 
 /// How the per-host gvproxy switch is reached, selected by deployment model.
 ///
@@ -150,6 +161,16 @@ impl IpAllocator {
         }
     }
 
+    /// Creates an allocator over the switch crate's default address plan
+    /// (NET-102): the block an un-enrolled host self-allocates box addresses
+    /// from, because no control plane has handed it one. The plan's switch
+    /// subnet is where the leases come from; its reserved local range is where
+    /// their published addresses will.
+    #[must_use]
+    pub fn for_default_plan() -> Self {
+        Self::new(AddressPlan::default().switch_subnet())
+    }
+
     /// The subnet this allocator draws from.
     #[must_use]
     pub fn subnet(&self) -> SwitchSubnet {
@@ -187,6 +208,15 @@ impl IpAllocator {
     }
 }
 
+impl Default for IpAllocator {
+    /// The plan an un-enrolled host self-allocates from (NET-102): an
+    /// allocator with no subnet named draws from the switch crate's default
+    /// plan rather than an implicit constant of its own.
+    fn default() -> Self {
+        Self::for_default_plan()
+    }
+}
+
 ///
 /// The switch is reference-counted against the set of attached `OwnIp` PTasks:
 /// it is spawned lazily on the first attach and torn down after the last
@@ -211,14 +241,21 @@ pub struct SwitchClient {
     /// How PTask taps reach the switch: local spawn (DM2) or a
     /// vsock shuttle to the host gvproxy (DM1/3/4).
     transport: SwitchTransport,
+    /// Which daemon instance this switch belongs to, as a hostname label:
+    /// the daemon's own id, which the `OwnIp` attach path registers its
+    /// DNS names under so two daemons on one host mint distinct ones
+    /// (NET-027). Defaults to the single-daemon id `local`.
+    host_id: String,
 }
 
 impl SwitchClient {
     /// Builds a switch supervisor. Does not spawn anything; the first
-    /// [`attach`](Self::attach) starts gvproxy.
+    /// [`attach`](Self::attach) starts gvproxy. The allocator draws from the
+    /// switch crate's default address plan (NET-102) — the block an un-enrolled
+    /// host self-allocates from.
     #[must_use]
     pub fn new(binary: impl Into<PathBuf>, state_dir: impl Into<PathBuf>) -> Self {
-        Self::with_subnet(binary, state_dir, SwitchSubnet::default())
+        Self::with_subnet(binary, state_dir, AddressPlan::default().switch_subnet())
     }
 
     /// Builds a switch supervisor over a non-default subnet.
@@ -237,7 +274,24 @@ impl SwitchClient {
             child: None,
             exit_tx,
             transport: SwitchTransport::default(),
+            host_id: crate::net::dns::DEFAULT_HOST_ID.to_owned(),
         }
+    }
+
+    /// Names this daemon instance's DNS registrations under a host id other
+    /// than the single-daemon default. The daemon passes its own instance
+    /// id, so a second daemon on the same host registers under its own
+    /// label instead of overwriting the first's records.
+    #[must_use]
+    pub fn with_host_id(mut self, host_id: impl Into<String>) -> Self {
+        self.host_id = host_id.into();
+        self
+    }
+
+    /// The host id this daemon's `OwnIp` DNS names register under.
+    #[must_use]
+    pub fn host_id(&self) -> &str {
+        &self.host_id
     }
 
     /// Sets how PTask taps reach the switch. The DM2 default is
@@ -526,6 +580,46 @@ mod tests {
     }
 
     #[test]
+    fn allocator_uses_default_plan() {
+        // NET-102: an un-enrolled host self-allocates box addresses from the
+        // switch crate's default plan, so an allocator with no subnet named
+        // draws from that plan rather than a constant of minimald's own.
+        let plan = AddressPlan::default();
+        let mut a = IpAllocator::for_default_plan();
+        assert_eq!(a.subnet(), plan.switch_subnet());
+        // The first lease is the plan's first allocatable box address...
+        let lease = a.allocate().unwrap();
+        assert_eq!(lease.ip, Ipv4Addr::from(plan.switch_subnet().first_ptask()));
+        assert_eq!(lease.ip, Ipv4Addr::new(100, 64, 0, 2));
+        // ...and the default allocator is the same one.
+        assert_eq!(
+            IpAllocator::default().allocate().unwrap().ip,
+            Ipv4Addr::new(100, 64, 0, 2)
+        );
+        // The plan's reserved local range — where those boxes' published
+        // addresses come from on the host's loopback — is the same block the
+        // zone's published names answer at (NET-127). One definition now: the
+        // answerer re-exports the switch crate's constant, so this asserts the
+        // plan is built from the range it serves rather than bridging two
+        // constants that could drift.
+        assert_eq!(
+            plan.reserved_local_range(),
+            crate::net::dns::RESERVED_LOCAL_RANGE
+        );
+        // Every loopback slice the plan pairs with one of its switches stays
+        // inside that range, so a published box answers on the host's
+        // loopback, at an address no other switch on the host holds.
+        let (range_net, range_prefix) = plan.reserved_local_range();
+        let range_first = u32::from(range_net);
+        let range_len = 1u32 << (32 - range_prefix);
+        for index in 0..plan.switch_capacity() {
+            let slice = plan.switch_slice(index).unwrap().loopback();
+            assert!(u32::from(slice.first()) >= range_first);
+            assert!(u32::from(slice.last()) < range_first + range_len);
+        }
+    }
+
+    #[test]
     fn allocate_never_reuses_after_logical_release() {
         // The allocator has no `free`: addresses only ever advance, so even a
         // long-lived process never hands the same address to two PTasks.
@@ -595,6 +689,10 @@ mod tests {
         assert!(cfg.contains(&format!("\"{}\": \"{}\"", lease.ip, lease.mac)));
         // Host alias is NAT'd to loopback and never allocated.
         assert!(cfg.contains("\"100.64.255.254\": \"127.0.0.1\""));
+        // NET-003: the static zone entry the bundle's switch-configuration copy
+        // shows — `host` answered in `min.internal.` at the NAT'd alias.
+        assert!(cfg.contains("    - name: \"min.internal.\"\n"));
+        assert!(cfg.contains("        - name: \"host\"\n          ip: \"100.64.255.254\"\n"));
     }
 
     #[test]

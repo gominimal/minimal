@@ -139,21 +139,56 @@ impl Exec for TaskExec {
     }
 }
 
-/// The network a task gets: the provider for its session's mode (017-005).
-/// Shared by the two ways a task starts — over an exec channel here, and from
-/// inside the session (`env::SessionChannel::run_task`).
+/// The network a task gets: the provider for its session's mode (017-005),
+/// carrying the session's *effective* egress (NET-074) — a task in an
+/// own-address session runs under whatever the session's own gate enforces:
+/// the deny-all default once it is in force, the shipped allow-all while it
+/// is only announced — and none of its ingress. Shared by the two ways a
+/// task starts — over an exec channel here, and from inside the session
+/// (`env::SessionChannel::run_task`).
 ///
 /// The mode, not the identity: an own-IP task is a second PTask beside the
 /// session's, on the same switch at the same time, so it registers under its
 /// own name and carries none of the session's ingress — forwards a task
-/// applied would come down again at its teardown.
+/// applied would come down again at its teardown. It carries no registry
+/// handle either: a task owns no proxy route of its own, so no lease is ever
+/// reported for it. `phase` is the rollout phase to resolve the egress under
+/// — both callers pass [`sessions::EGRESS_DEFAULT_PHASE`], the phase this
+/// build ships, while the tests pass the phase by name so the posture the
+/// rollout ends at stays proven while the default is only announced
+/// (NET-076) — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
+/// read through the session handle so a task resolves its egress exactly as
+/// the launcher did.
+///
+/// A gate is attached only where that egress has rules to enforce: the
+/// deny-all section the in-force default resolves an absent declaration to,
+/// or the box's own declaration. An absent section — the allow-all the
+/// announced phase and the opt-out both leave in place — passes `None`, as
+/// every task did before the deny-all default: a gate with no ingress
+/// declaration blocks a task's *inbound* too (`allowed`/`udp_allowed` empty),
+/// so attaching one where nothing needs gating would change behaviour an
+/// announcement is not allowed to.
 pub(crate) fn task_network(
     record: &sessions::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
+    phase: sessions::EgressDefaultPhase,
+    deny_all_opt_out: bool,
 ) -> std::sync::Arc<dyn sandbox2::Network> {
     let id = record.id.to_string();
     let session = record.name.as_deref().unwrap_or(&id);
-    crate::net::provider::network_for(record.network, switch, &format!("{session}-task"), None)
+    let egress = crate::session::effective_egress_section(
+        &record.policy,
+        record.network,
+        phase,
+        deny_all_opt_out,
+    );
+    crate::net::provider::network_for(
+        record.network,
+        switch,
+        &format!("{session}-task"),
+        egress.map(|section| sessions::SessionPolicy::new(Some(section), None)),
+        None,
+    )
 }
 
 /// The slice of `hakoniwa::Child` the attach-failure arm needs, so the arm can
@@ -258,7 +293,12 @@ async fn task_producer(
             task.vars
                 .insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
         }
-        let network = task_network(&session.record().await?, &session.net_switch().await?);
+        let network = task_network(
+            &session.record().await?,
+            &session.net_switch().await?,
+            sessions::EGRESS_DEFAULT_PHASE,
+            session.deny_all_opt_out().await?,
+        );
         // A task's `~/` resolves against the session's home, the same
         // directory the interactive session sees at `/home`. The daemon's own
         // ambient home is `/` inside the guest, and expanding against that
@@ -747,7 +787,11 @@ struct ExecTask<S: Exec> {
 }
 
 impl<S: Exec> ExecTask<S> {
-    pub async fn run(self, channel: Channel<Msg>) {
+    /// Drives the exec to completion over the channel and reports the
+    /// SSH-encoded exit code it ended with. The status is on the wire and
+    /// the channel is closed once this returns — the point at which a box
+    /// created for the run can end (NET-131).
+    pub async fn run(self, channel: Channel<Msg>) -> u32 {
         let (mut rs, ws) = channel.split();
         // SSH_EXTENDED_DATA_STDERR (RFC 4254 §5.2) — selects the stderr
         // stream on the same channel as a separate extended-data type.
@@ -765,6 +809,7 @@ impl<S: Exec> ExecTask<S> {
         let _ = ws.eof().await;
         let _ = ws.exit_status(exit_status).await; // otherwise considered -1
         let _ = ws.close().await; // needed to release the remote
+        exit_status
     }
 }
 
@@ -1317,7 +1362,7 @@ pub(crate) async fn handle_exec(
                 .instrument(span),
             );
         }
-        ExecRequest::TaskRun(task) => {
+        ExecRequest::TaskRun { task, owns_box } => {
             let task = task.trim().to_string();
             if task.is_empty() {
                 tracing::warn!(%session_id, "execution request rejected: task/run names no task");
@@ -1332,6 +1377,9 @@ pub(crate) async fn handle_exec(
             let drop_env = minimald_rpc::taskenv::drops_from_channel_env(&config.env_vars);
             session.channel_success(id)?;
             spawn(async move {
+                // `ExecTask::run` consumes the server handle; the box's end
+                // needs one after the bridge returns.
+                let end_serv = serv.clone();
                 let exec_task = ExecTask {
                     conn,
                     serv,
@@ -1339,12 +1387,19 @@ pub(crate) async fn handle_exec(
                     channel_id: id,
                     exec: TaskExec {
                         args: None,
-                        task,
+                        // The name stays behind for the run-box-end log line.
+                        task: task.clone(),
                         env: task_env,
                         drop_env,
                     },
                 };
-                exec_task.run(channel).await;
+                let exit_status = exec_task.run(channel).await;
+                // The exit status is on the wire and the channel closed: the
+                // run is over whether or not its client is still here, so a
+                // box created for it ends now (NET-131).
+                if owns_box {
+                    end_run_box(&end_serv, session_id, &task, exit_status).await;
+                }
             });
         }
         ExecRequest::PackageBuild(args) => {
@@ -1455,6 +1510,52 @@ async fn run_in_session(
         },
     };
     exec_task.run(channel).await;
+}
+
+/// Ends the box a task run owns, from the daemon's side of the exec's exit
+/// (NET-131). The destroy used to be the client's, issued after a normal
+/// run; left there, a client killed mid-run would strand its session — the
+/// abandoned-launch reap covers only un-finalized sessions and there is no
+/// idle stop to catch one. The teardown is the `DestroySession` RPC's own
+/// path, so the box ends exactly as a client-issued destroy ends it.
+///
+/// The one info line this emits on success is what a diagnostic bundle's
+/// daemon-log tail reads the end of a run box from: it names the session,
+/// the run and the exit code.
+async fn end_run_box(
+    serv: &ServerStateHandle,
+    session_id: SessionId,
+    task: &str,
+    exit_status: u32,
+) {
+    let mngr = serv.sessions_manager().await;
+    // The name for the log line, resolved before the delete for the same
+    // reason `serve_destroy_session` resolves it there: once the record is
+    // gone there is nothing left to resolve it against.
+    let session_name = mngr
+        .get_record(SessionKeyPredicate::Id(session_id))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|record| record.name);
+    match mngr.delete_session(session_id).await {
+        Ok(()) => tracing::info!(
+            session_id = %session_id,
+            session_name = session_name.as_deref().unwrap_or("<anonymous>"),
+            task = %task,
+            exit = exit_status,
+            "run box ended",
+        ),
+        // Most plausibly the interrupt path's own destroy won the race; the
+        // error names what actually blocked the teardown.
+        Err(e) => tracing::warn!(
+            session_id = %session_id,
+            task = %task,
+            exit = exit_status,
+            error = %e,
+            "ending the run's box failed",
+        ),
+    }
 }
 
 /// Streams a `min package build [--verbose] [--rebuild] [pkgs...]` exec over the SSH
@@ -1961,17 +2062,27 @@ mod tests {
                 }),
         ));
 
-        let host = super::task_network(&record_with(sessions::NetworkMode::HostNet), &switch);
+        let host = super::task_network(
+            &record_with(sessions::NetworkMode::HostNet),
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
         assert!(!host.plan().await.unwrap().isolates_netns());
 
-        let no_net = super::task_network(&record_with(sessions::NetworkMode::NoNet), &switch);
+        let no_net = super::task_network(
+            &record_with(sessions::NetworkMode::NoNet),
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
         let plan = no_net.plan().await.unwrap();
         assert!(plan.isolates_netns() && plan.tap().is_none());
 
         let mut record = record_with(sessions::NetworkMode::OwnIp);
         record.name = Some("web".to_string());
         record.policy.ingress = Some(sessions::IngressPolicy::default());
-        let own_ip = super::task_network(&record, &switch);
+        let own_ip = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
         let plan = own_ip.plan().await.unwrap();
         assert!(
             plan.isolates_netns(),
@@ -1981,18 +2092,161 @@ mod tests {
             plan.resolver(),
             sandbox2::Resolver::Nameservers(_)
         ));
-        // Its own identity on the switch, and none of the session's ingress:
-        // the session's PTask is attached at the same time.
+        // Its own identity on the switch, and the session's *effective*
+        // egress (NET-074) — resolved under the phase this build ships, so
+        // the same rules the session's own gate enforces, whatever the
+        // rollout leaves in force — but none of its ingress, because the
+        // session's PTask is attached at the same time. The gate exists only
+        // where that egress has rules, so the answer follows the shipped
+        // phase rather than a literal a cutover would invalidate.
+        let gated = crate::session::effective_egress_section(
+            &record.policy,
+            record.network,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        )
+        .is_some();
         let described = format!("{own_ip:?}");
         assert!(
-            described.contains("\"web-task\"") && described.contains("has_ingress: false"),
+            described.contains("\"web-task\"")
+                && described.contains(&format!("has_policy: {gated}")),
             "got {described}"
         );
         own_ip.abandon().await;
 
         // No name: the session id, rather than an empty hostname.
-        let unnamed = super::task_network(&record_with(sessions::NetworkMode::OwnIp), &switch);
+        let unnamed = super::task_network(
+            &record_with(sessions::NetworkMode::OwnIp),
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
         assert!(format!("{unnamed:?}").contains(&sessions::SessionId::nil().to_string()));
+    }
+
+    /// NET-074/NET-076/NET-077 for the task path: a task runs under the same
+    /// egress default its session does, and nothing else changes with it. A
+    /// gate is attached only where the effective egress has rules to enforce,
+    /// because a gate with no ingress declaration blocks a task's *inbound*
+    /// too — so under Announced, with no opt-out, a bare own-address task
+    /// attaches ungated exactly as every task did before the deny-all
+    /// default: the announcement may change nothing yet. Under InForce the
+    /// same bare box's task carries the deny-all gate.
+    ///
+    /// What the announcement defers is the *default* for a box that declared
+    /// nothing. A box that declared an `egress` section is enforced on its
+    /// session's own PTask in every phase, so a task in such a session
+    /// carries that declaration's gate even now, under the phase this build
+    /// ships — the same inbound posture the in-force case below already
+    /// accepts: a task PTask holds no ingress of its own, so its gate
+    /// default-blocks unsolicited inbound.
+    ///
+    /// The phase is passed by name, not read from the shipped constant, so
+    /// the in-force posture stays proven while the default is only
+    /// announced. `own_ip_default_deny_all` proves what the deny-all section
+    /// itself enforces.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_task_gate_follows_the_egress_default() {
+        use std::sync::Arc;
+
+        let switch = Arc::new(tokio::sync::Mutex::new(
+            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                }),
+        ));
+        // A bare own-address box: no egress declaration, so its egress is
+        // whatever the default resolves for an absent one.
+        let record = record_with(sessions::NetworkMode::OwnIp);
+
+        // Announced, no opt-out: an absent section still allows all, so the
+        // task gets no gate at all — its inbound stays as open as it was
+        // before the default was announced.
+        assert_eq!(
+            crate::session::effective_egress_section(
+                &record.policy,
+                record.network,
+                sessions::EgressDefaultPhase::Announced,
+                false,
+            ),
+            None,
+            "an announced default resolves an absent section to allow-all"
+        );
+        let announced = super::task_network(
+            &record,
+            &switch,
+            sessions::EgressDefaultPhase::Announced,
+            false,
+        );
+        assert!(
+            format!("{announced:?}").contains("has_policy: false"),
+            "an announced default gates nothing: {announced:?}"
+        );
+
+        // In force, no opt-out: the same absent section is the deny-all one,
+        // and the task carries the gate built from it.
+        assert_eq!(
+            crate::session::effective_egress_section(
+                &record.policy,
+                record.network,
+                sessions::EgressDefaultPhase::InForce,
+                false,
+            ),
+            Some(sessions::EgressPolicy::deny_all()),
+            "the in-force default resolves an absent section to deny-all"
+        );
+        let in_force = super::task_network(
+            &record,
+            &switch,
+            sessions::EgressDefaultPhase::InForce,
+            false,
+        );
+        assert!(
+            format!("{in_force:?}").contains("has_policy: true"),
+            "the in-force default gates a bare box's task: {in_force:?}"
+        );
+
+        // A box that *declared* an egress section is the other case where
+        // the task path attaches a gate, and the announcement does not defer
+        // it: the declaration is enforced on the session's own PTask in every
+        // phase, so a task in that session resolves the same section its
+        // session's gate did — the declaration verbatim, not the deny-all
+        // section and not nothing — even under the phase this build ships.
+        let section = sessions::EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..sessions::EgressPolicy::default()
+        };
+        let mut declared_record = record_with(sessions::NetworkMode::OwnIp);
+        declared_record.policy.egress = Some(section.clone());
+        for phase in [
+            sessions::EgressDefaultPhase::Announced,
+            sessions::EgressDefaultPhase::InForce,
+        ] {
+            assert_eq!(
+                crate::session::effective_egress_section(
+                    &declared_record.policy,
+                    declared_record.network,
+                    phase,
+                    false,
+                ),
+                Some(section.clone()),
+                "a declared egress section reaches the task's gate verbatim \
+                 while the default is {phase:?}",
+            );
+        }
+        let declared = super::task_network(
+            &declared_record,
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
+        assert!(
+            format!("{declared:?}").contains("has_policy: true"),
+            "a declared egress section gates the task under the shipped \
+             phase too: {declared:?}"
+        );
     }
 
     /// 017-005. An own-IP task whose attach is refused stops with the
@@ -2208,6 +2462,71 @@ mod tests {
         // maps to exit status 1.
         assert_eq!(exit, 1);
         assert!(ctrl.was_killed());
+    }
+
+    /// NET-015: a lost client on a non-PTY exec ends the command that exec
+    /// spawned — and only it. The lost client is the SSH write side failing
+    /// (the channel's peer is gone): the bridge kills the child it was
+    /// driving, reports the kill as exit 1, and stops the sequence without
+    /// ever pulling the next process, so nothing beyond the exec's own
+    /// command was touched. The box the exec ran against is the session
+    /// plane's concern (`session::tests` proves it survives the same loss).
+    #[tokio::test]
+    async fn lost_exec_client_kills_only_its_own_process() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (iter, mut endpoints) = build_mock_seq(2);
+        let second = endpoints.pop().unwrap();
+        let MockEndpoints {
+            stdin_reader: _stdin_reader,
+            stdout_writer: mut first_stdout,
+            stderr_writer: first_stderr,
+            ctrl: first_ctrl,
+        } = endpoints.pop().unwrap();
+        // Nothing on stderr; its EOF is the ordinary case.
+        drop(first_stderr);
+
+        // The client hung up: writes to its stdout side fail at once.
+        let (lost_client, mut bridge_stdout) = duplex(64);
+        drop(lost_client);
+        // bridge_stderr exists only because the signature requires it; the
+        // bridge never touches it in this test.
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64);
+        // The client's stdin went with it: EOF.
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                iter,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+            )
+            .await
+        });
+
+        // The child prints; forwarding it to the dead channel is the write
+        // that models the lost client.
+        first_stdout.write_all(b"output").await.unwrap();
+        drop(first_stdout);
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must end the exec promptly, not hang the bridge")
+            .unwrap();
+        // A killed mock waits back Ok(None), which the bridge maps to 1.
+        assert_eq!(exit, 1);
+        assert!(
+            first_ctrl.was_killed(),
+            "the exec's own command must be killed when its client is lost"
+        );
+        assert!(
+            !second.ctrl.was_killed(),
+            "nothing beyond the exec's own command was spawned, let alone killed"
+        );
     }
 
     /// A grandchild that inherited the child's stdout keeps the pipe
@@ -2505,6 +2824,67 @@ mod tests {
             );
         }
 
+        /// Brings a session to `Active` with a task-only `minimal.toml` in
+        /// its workspace: the create → populate → configure → finalize
+        /// sequence a task run's client drives, shared by every test here
+        /// that execs a task.
+        ///
+        /// The mfile holds only `tasks.echo_ok`, whose entire output lives
+        /// in its declaration — no `[upstream]`, package graph, or sandbox:
+        /// the echo short-circuit never builds a graph, so nothing here
+        /// reaches the (network-bound) package machinery. A task-only mfile
+        /// gates nothing, so the loadout composes in one shot, and this
+        /// composition has no patches, so `FinalizeSession` takes the
+        /// empty-composition shortcut past the marker check and promotes
+        /// the record to `Active` in one call.
+        async fn active_session_with_echo_task(
+            server: &TestServer,
+            client: &mut TestClient,
+            name: &str,
+        ) -> SessionId {
+            use minimald_rpc::{
+                ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
+                FinalizeSessionRequest,
+            };
+
+            let session_id = client
+                .call::<CreateSession>(&create_session_req(name, "/tmp"))
+                .await
+                .unwrap()
+                .id;
+
+            // Drop a task-only `minimal.toml` into the session workspace,
+            // standing in for the e2e test's SFTP upload.
+            server
+                .seed_workspace_mfile(
+                    session_id,
+                    "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n",
+                )
+                .await;
+
+            crate::test_harness::unwrap_ready(
+                client
+                    .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                        session_id,
+                        contribution: Default::default(),
+                    })
+                    .await
+                    .unwrap(),
+            );
+
+            match client
+                .call::<FinalizeSession>(&FinalizeSessionRequest { session_id })
+                .await
+            {
+                minimald_rpc::Errorable::Ok(_) => {}
+                minimald_rpc::Errorable::Err { error } => {
+                    panic!("FinalizeSession failed: {error}");
+                }
+            }
+
+            session_id
+        }
+
         /// End-to-end happy path for `min run <task>`: an `echo` task is
         /// serviced straight from the workspace `minimal.toml` — no
         /// package graph, upstream, or sandbox — and its text (plus a
@@ -2518,63 +2898,20 @@ mod tests {
         /// to resolve a task against) surfaces without needing a VM.
         #[tokio::test]
         async fn exec_runs_echo_task() {
-            use minimald_rpc::{
-                ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
-                FinalizeSessionRequest,
-            };
-
             let server = TestServer::new().await;
             let mut client = server.connect().await;
-            let session_id = client
-                .call::<CreateSession>(&create_session_req("exec-test", "/tmp"))
-                .await
-                .unwrap()
-                .id;
+            let session_id = active_session_with_echo_task(&server, &mut client, "exec-test").await;
             let session_str = session_id.to_string();
-
-            // Drop a task-only `minimal.toml` into the session workspace,
-            // standing in for the e2e test's SFTP upload. No `[upstream]`:
-            // the echo short-circuit never builds a graph, so nothing here
-            // reaches the (network-bound) package machinery.
-            server
-                .seed_workspace_mfile(
-                    session_id,
-                    "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n",
-                )
-                .await;
-
-            // A task-only mfile gates nothing, so the loadout composes in
-            // one shot rather than erroring or pending.
-            crate::test_harness::unwrap_ready(
-                client
-                    .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
-                        session_id,
-                        contribution: Default::default(),
-                    })
-                    .await
-                    .unwrap(),
-            );
-
-            // ConfigureLoadout leaves the record `Materializing`; exec
-            // (and its `context()` gate) requires `Active`. This
-            // composition has no patches, so FinalizeSession takes the
-            // empty-composition shortcut past the marker check and
-            // promotes the record to `Active` in one call.
-            match client
-                .call::<FinalizeSession>(&FinalizeSessionRequest { session_id })
-                .await
-            {
-                minimald_rpc::Errorable::Ok(_) => {}
-                minimald_rpc::Errorable::Err { error } => {
-                    panic!("FinalizeSession failed: {error}");
-                }
-            }
 
             let out = client
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    &ExecRequest::TaskRun("echo_ok".to_string()).encode(),
+                    &ExecRequest::TaskRun {
+                        task: "echo_ok".to_string(),
+                        owns_box: false,
+                    }
+                    .encode(),
                     &[],
                 )
                 .await
@@ -2586,6 +2923,117 @@ mod tests {
                 out.stderr.is_empty(),
                 "echo task should produce no stderr: {:?}",
                 out.stderr,
+            );
+        }
+
+        /// NET-131: a box created for a run ends when the run's command
+        /// exits, whether or not the client that started it is still here.
+        /// The request carries the owns-box flag; the daemon destroys the
+        /// session after the exit status is on the wire — the destroy the
+        /// client used to issue after a normal run, moved here so a client
+        /// killed mid-run strands nothing.
+        ///
+        /// The destroy runs after the channel closes, so this client's exec
+        /// can return before the box is gone: the end is polled for, not
+        /// raced on. The info line the run's end emits is asserted too — it
+        /// is what a diagnostic bundle's daemon-log tail reads the end of a
+        /// run box from.
+        #[tokio::test]
+        async fn run_box_ends_when_its_run_ends() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+
+            let capture = crate::test_harness::captured_log();
+
+            let session_id =
+                active_session_with_echo_task(&server, &mut client, "run-box-ends").await;
+            let session_str = session_id.to_string();
+
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &ExecRequest::TaskRun {
+                        task: "echo_ok".to_string(),
+                        owns_box: true,
+                    }
+                    .encode(),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert_eq!(out.exit_status, Some(0));
+            assert_eq!(out.stdout, b"MINIMALD_SESSION_OK\n");
+
+            // The box ends after the channel closes; poll until the listing
+            // is empty rather than racing the destroy.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let listed = client.call::<minimald_rpc::ListSessions>(&()).await;
+                if listed.sessions.is_empty() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the run's box must end once its task exits, but {} session(s) are still \
+                     listed: {:?}",
+                    listed.sessions.len(),
+                    listed.sessions,
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
+            // The one info line the run's end emits, naming the session, the
+            // exec and the exit code.
+            let logged = capture.contents();
+            assert!(
+                logged.contains("run box ended"),
+                "expected the run-box-end info line, got: {logged}"
+            );
+            assert!(logged.contains(&session_str), "names the session: {logged}");
+            assert!(logged.contains("echo_ok"), "names the exec: {logged}");
+            assert!(logged.contains("exit=0"), "names the exit code: {logged}");
+        }
+
+        /// A task run that does not own its box leaves the session standing:
+        /// the daemon ends only what the run owns, and the unflagged
+        /// spelling — what `min session run` sends, and what every client
+        /// from before the flag sent — keeps the box for whoever holds it.
+        /// After the exec has returned, and the moment a stray destroy would
+        /// have needed, the session is still listed.
+        #[tokio::test]
+        async fn run_box_survives_when_run_keeps_it() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id =
+                active_session_with_echo_task(&server, &mut client, "run-box-kept").await;
+            let session_str = session_id.to_string();
+
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &ExecRequest::TaskRun {
+                        task: "echo_ok".to_string(),
+                        owns_box: false,
+                    }
+                    .encode(),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert_eq!(out.exit_status, Some(0));
+            assert_eq!(out.stdout, b"MINIMALD_SESSION_OK\n");
+
+            // The exec is over; the box is not. Give the moment a stray
+            // destroy would have needed before asserting.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let listed = client.call::<minimald_rpc::ListSessions>(&()).await;
+            assert_eq!(
+                listed.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+                vec![session_id],
+                "a run that keeps its box must not end it; got {:?}",
+                listed.sessions,
             );
         }
 
@@ -2606,7 +3054,11 @@ mod tests {
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    &ExecRequest::TaskRun("some_task".to_string()).encode(),
+                    &ExecRequest::TaskRun {
+                        task: "some_task".to_string(),
+                        owns_box: false,
+                    }
+                    .encode(),
                     &[],
                 )
                 .await;
@@ -2621,7 +3073,11 @@ mod tests {
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    &ExecRequest::TaskRun(String::new()).encode(),
+                    &ExecRequest::TaskRun {
+                        task: String::new(),
+                        owns_box: false,
+                    }
+                    .encode(),
                     &[],
                 )
                 .await;

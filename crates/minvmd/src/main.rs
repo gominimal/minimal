@@ -18,6 +18,15 @@ struct Cli {
     /// Runtime files live under `<dir>/providers/local-minvmd0/`.
     #[arg(long, global = true)]
     minimal_state_dir: Option<paths::CwdRelative<paths::Daemon>>,
+
+    /// Name the VM to act on (default: `default`).
+    ///
+    /// A named VM keeps its own state directory, socket, and daemon under
+    /// `<dir>/providers/local-minvmd0/<NAME>/`; the default VM's paths are
+    /// unchanged. Names are at most 24 bytes of ASCII lowercase letters,
+    /// digits and `-`, starting with a letter or digit; `guest` is reserved.
+    #[arg(long = "vm", global = true, value_name = "NAME")]
+    vm: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -82,10 +91,11 @@ enum ConfigAction {
 }
 
 fn main() -> Result<()> {
-    // Parse and apply the state-dir override BEFORE installing tracing: the
-    // detached log dir derives from the state dir. Nothing in between may
-    // call `tracing::*` (it would be silently dropped); clap prints its own
-    // parse errors to stderr, which is fine.
+    // Parse and apply the state-dir override and the VM name BEFORE installing
+    // tracing: the detached log dir derives from the state dir, and every path
+    // the process resolves derives from both. Nothing in between may call
+    // `tracing::*` (it would be silently dropped); clap prints its own parse
+    // errors to stderr, which is fine.
     let cli = Cli::parse();
 
     if let Some(dir) = &cli.minimal_state_dir {
@@ -93,6 +103,10 @@ fn main() -> Result<()> {
             .resolve()
             .map_err(|e| anyhow::anyhow!("resolving --minimal-state-dir: {e}"))?;
         minvmd::state::set_state_dir_override(dir);
+    }
+
+    if let Some(vm) = &cli.vm {
+        minvmd::state::set_vm_name(vm).map_err(|e| anyhow::anyhow!("--vm: {e}"))?;
     }
 
     let _log_guard = init_tracing()?;
@@ -118,7 +132,16 @@ fn main() -> Result<()> {
             ConfigAction::Show { json } => minvmd::cmd::config::run_show(json),
             ConfigAction::Set { vcpus, ram_mib } => minvmd::cmd::config::run_set(vcpus, ram_mib),
         },
-        Command::Stop => minvmd::cmd::stop::run(),
+        Command::Stop => {
+            // No stop line here (NET-055): the one-per-stop line belongs to
+            // the witness that observes the VM die — the `run` supervisor, or
+            // a foreground `boot` (see `log_stopping_vm`). `stop` only
+            // signals once a supervisor's alive lock says one is watching
+            // that very child, so a line here too would log one stop twice —
+            // and a no-op stop (already stopped, stale state) would log a
+            // stop that never happened.
+            minvmd::cmd::stop::run()
+        }
         Command::KrunVmm => minvmd::cmd::vmm_child::run(),
     }
 }
@@ -134,8 +157,12 @@ fn init_tracing() -> Result<Option<tracing_appender::non_blocking::WorkerGuard>>
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     if std::env::var_os(minvmd::DETACHED_ENV).is_none() {
+        // Colours only on a terminal: piped output — CI logs, `boot.log`
+        // captures, the e2e harnesses, `grep vm=` — must stay plain text, or
+        // the VM name and state dir a line carries are not searchable.
+        use std::io::IsTerminal as _;
         tracing_subscriber::registry()
-            .with(fmt::layer())
+            .with(fmt::layer().with_ansi(std::io::stdout().is_terminal()))
             .with(filter)
             .init();
         return Ok(None);
