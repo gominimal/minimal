@@ -644,6 +644,12 @@ mod tests {
             no_guest: true,
             guest_timeout_secs: 60,
             log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+            upload: false,
+            portal: PortalArgs {
+                context: None,
+                token: None,
+                endpoint: DEFAULT_ENDPOINT.to_string(),
+            },
         };
 
         cmd_bug(&global, args).await.unwrap();
@@ -697,6 +703,12 @@ mod tests {
             no_guest: true,
             guest_timeout_secs: 60,
             log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+            upload: false,
+            portal: PortalArgs {
+                context: None,
+                token: None,
+                endpoint: DEFAULT_ENDPOINT.to_string(),
+            },
         };
 
         cmd_bug(&global, args).await.unwrap();
@@ -741,6 +753,12 @@ mod tests {
             no_guest: true,
             guest_timeout_secs: 60,
             log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+            upload: false,
+            portal: PortalArgs {
+                context: None,
+                token: None,
+                endpoint: DEFAULT_ENDPOINT.to_string(),
+            },
         };
 
         cmd_bug(&global, args).await.unwrap();
@@ -780,6 +798,12 @@ mod tests {
             no_guest: true,
             guest_timeout_secs: 60,
             log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+            upload: false,
+            portal: PortalArgs {
+                context: None,
+                token: None,
+                endpoint: DEFAULT_ENDPOINT.to_string(),
+            },
         };
 
         cmd_bug(&global, args).await.unwrap();
@@ -831,6 +855,12 @@ mod tests {
             no_guest: true,
             guest_timeout_secs: 60,
             log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+            upload: false,
+            portal: PortalArgs {
+                context: None,
+                token: None,
+                endpoint: DEFAULT_ENDPOINT.to_string(),
+            },
         };
 
         cmd_bug(&global, args).await.unwrap();
@@ -865,6 +895,12 @@ mod tests {
             no_guest: true,
             guest_timeout_secs: 60,
             log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+            upload: false,
+            portal: PortalArgs {
+                context: None,
+                token: None,
+                endpoint: DEFAULT_ENDPOINT.to_string(),
+            },
         };
 
         cmd_bug(&global, args).await.unwrap();
@@ -901,6 +937,12 @@ mod tests {
             no_guest: true,
             guest_timeout_secs: 60,
             log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+            upload: false,
+            portal: PortalArgs {
+                context: None,
+                token: None,
+                endpoint: DEFAULT_ENDPOINT.to_string(),
+            },
         };
 
         cmd_bug(&global, args).await.unwrap();
@@ -944,6 +986,12 @@ mod tests {
             no_guest: true,
             guest_timeout_secs: 60,
             log_tail_bytes: 1024,
+            upload: false,
+            portal: PortalArgs {
+                context: None,
+                token: None,
+                endpoint: DEFAULT_ENDPOINT.to_string(),
+            },
         };
 
         cmd_bug(&global, args).await.unwrap();
@@ -1004,6 +1052,12 @@ mod tests {
             no_guest: true,
             guest_timeout_secs: 60,
             log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+            upload: false,
+            portal: PortalArgs {
+                context: None,
+                token: None,
+                endpoint: DEFAULT_ENDPOINT.to_string(),
+            },
         };
 
         cmd_bug(&global, args).await.unwrap();
@@ -1041,6 +1095,12 @@ mod tests {
             no_guest: true,
             guest_timeout_secs: 60,
             log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+            upload: false,
+            portal: PortalArgs {
+                context: None,
+                token: None,
+                endpoint: DEFAULT_ENDPOINT.to_string(),
+            },
         };
 
         cmd_bug(&global, args).await.unwrap();
@@ -1075,6 +1135,12 @@ mod tests {
             no_guest: true,
             guest_timeout_secs: 60,
             log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+            upload: false,
+            portal: PortalArgs {
+                context: None,
+                token: None,
+                endpoint: DEFAULT_ENDPOINT.to_string(),
+            },
         };
 
         cmd_bug(&global, args).await.unwrap();
@@ -1110,6 +1176,12 @@ mod tests {
             no_guest: true,
             guest_timeout_secs: 60,
             log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+            upload: false,
+            portal: PortalArgs {
+                context: None,
+                token: None,
+                endpoint: DEFAULT_ENDPOINT.to_string(),
+            },
         };
 
         cmd_bug(&global, args).await.unwrap();
@@ -1157,6 +1229,12 @@ mod tests {
             no_guest: true,
             guest_timeout_secs: 60,
             log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+            upload: false,
+            portal: PortalArgs {
+                context: None,
+                token: None,
+                endpoint: DEFAULT_ENDPOINT.to_string(),
+            },
         };
 
         cmd_bug(&global, args).await.unwrap();
