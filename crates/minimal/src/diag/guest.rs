@@ -312,6 +312,7 @@ struct VolumeMeta {
     path: String,
     exists: bool,
     bytes: Option<u64>,
+    allocated_bytes: Option<u64>,
     mtime_unix: Option<u64>,
 }
 
@@ -346,6 +347,9 @@ pub async fn volume_fallback(
         path: image.display().to_string(),
         exists: meta.is_some(),
         bytes: meta.as_ref().map(std::fs::Metadata::len),
+        allocated_bytes: meta
+            .as_ref()
+            .map(|m| std::os::unix::fs::MetadataExt::blocks(m) * 512),
         mtime_unix: meta
             .as_ref()
             .and_then(|m| m.modified().ok())
