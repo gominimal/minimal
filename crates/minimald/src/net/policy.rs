@@ -121,6 +121,28 @@ pub struct ExposedMapping {
     protocol: String,
 }
 
+impl ExposedMapping {
+    /// The `host:port` the forward is bound on — the address the switch is
+    /// actually holding, spelled exactly as its expose request named it. A
+    /// caller reporting a publish (the per-mapping info line in
+    /// `finish_own_ip_attach`) reads this instead of re-deriving the address
+    /// from the request, so the report cannot claim a host a forward is not
+    /// published on.
+    #[must_use]
+    pub fn local(&self) -> &str {
+        &self.local
+    }
+
+    /// [`Self::local`] split into the host address and port to report. `None`
+    /// when `local` is not a `host:port` pair with a numeric port — a shape
+    /// [`expose_request`], its only builder, never produces.
+    #[must_use]
+    pub fn host_port(&self) -> Option<(&str, u16)> {
+        let (host, port) = self.local.rsplit_once(':')?;
+        Some((host, port.parse().ok()?))
+    }
+}
+
 /// Exposes every static port mapping in `ingress` on the switch's `control_sock`
 /// forwarding to `ptask_ip`, returning a handle per exposed forward for teardown
 /// (R2.3, R2.4-static). The dynamic range, if any, is not applied here — dynamic
@@ -527,7 +549,10 @@ impl fmt::Display for Proto {
 /// single drop, and a box hitting several rules in the same minute is still
 /// heard once per rule. The relay's egress enforcement
 /// ([`switch`](super::switch)) and its ingress counterpart share one limiter
-/// per session gate, each under its own rule key.
+/// per session gate, each under its own rule key — with the one exception
+/// that a DNS refusal adds the refused name to its key
+/// ([`warn_dns_refusal`](Self::warn_dns_refusal)), because its requirement
+/// is the name and the answer per refusal.
 #[derive(Debug, Default)]
 pub struct PolicyWarnLimiter {
     last: Mutex<HashMap<String, HashMap<String, Instant>>>,
@@ -592,6 +617,40 @@ impl PolicyWarnLimiter {
                 dst_port,
                 rule_matched,
                 "network policy violation"
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Emits a rate-limited `tracing::warn!` for a DNS answer the rebinding
+    /// intersection refused (NET-067): an address a name the box's policy
+    /// allowed resolved into the box's `deny_subnets` or the infrastructure
+    /// deny set, and so is never admitted — the name and the answer, the two
+    /// things the spec requires the refusal to carry.
+    ///
+    /// Rate-limited per **box, name and rule**, not per box and rule like
+    /// [`warn`](Self::warn): the requirement is the name and the answer per
+    /// refusal, so a second refused name inside the interval is its own line
+    /// rather than silenced by the first's, while a burst of the *same*
+    /// name's refusals stays one line per rule. The limiter's key is built
+    /// from both, and the `rule_matched` field it logs is the rule alone.
+    pub fn warn_dns_refusal(
+        &self,
+        session_id: &str,
+        name: &str,
+        answer: Ipv4Addr,
+        rule_matched: &str,
+    ) -> bool {
+        let key = format!("{rule_matched}:{name}");
+        if self.should_warn_at(session_id, &key, Instant::now()) {
+            tracing::warn!(
+                session_id,
+                name,
+                %answer,
+                rule_matched,
+                "an allowed name resolved into a refused range"
             );
             true
         } else {

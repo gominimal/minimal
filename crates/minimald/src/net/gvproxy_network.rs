@@ -74,7 +74,13 @@ impl NetGuard for OwnIpGuard {
 /// its declared egress rules (NET-062/063/064), the ingress leg its declared
 /// inbound ports. The lease the box was allocated goes into the relay either
 /// way: the egress leg rejects any frame whose source is not it (NET-084), so
-/// a task's ungated relay is bound by its lease too.
+/// a task's ungated relay is bound by its lease too. The gate also carries
+/// the session's DNS dimension — its `egress.allow_dns_hosts` and
+/// `egress.deny_subnets` ride the same
+/// [`SessionGate`](crate::net::switch::SessionGate) into the relay, where
+/// the DNS gate pins the addresses those names resolve to for their
+/// admission window (NET-066), refuses the ones that land in denied ranges
+/// (NET-067), and answers AAAA/HTTPS/SVCB lookups NODATA (NET-136).
 ///
 /// The lease was already allocated and gvproxy already ensured-running by the
 /// provider's plan, so this only does the post-spawn relay + ingress. A failure
@@ -151,6 +157,11 @@ async fn finish_own_ip_attach(
             match crate::net::policy::apply_ingress(&control, lease_ip, ingress).await {
                 Ok(exposed) => exposed,
                 Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        session = session_name,
+                        "exposing ingress port mappings on the host loopback"
+                    );
                     drop(relay);
                     return Err(e);
                 }
@@ -158,6 +169,34 @@ async fn finish_own_ip_attach(
         }
         _ => Vec::new(),
     };
+
+    // One info line per exposed mapping (NET-040): the host address it is
+    // reachable at, the port, and the session it belongs to — so the daemon
+    // log tail (and the `min bug` bundle carrying it) shows each forwarder
+    // expose call and its result when a publish goes wrong. Reported from
+    // `exposed` — the forwards the switch actually accepted, 1:1 with the
+    // request since a failed apply rolls back and errors above — and from
+    // each forward's own `local` bind, never from the request: the record
+    // stays true to what the forwarder holds if the address `expose_request`
+    // binds ever moves off the loopback.
+    for mapping in &exposed {
+        match mapping.host_port() {
+            Some((host, port)) => tracing::info!(
+                host,
+                port,
+                session = session_name,
+                "exposed ingress port on the host loopback"
+            ),
+            // `expose_request` cannot build a `local` that splits into no
+            // host and port; if one ever appears, name what the forwarder
+            // holds rather than invent a port for it.
+            None => tracing::info!(
+                local = %mapping.local(),
+                session = session_name,
+                "exposed ingress port on the host loopback"
+            ),
+        }
+    }
 
     // Register this PTask's two-label name — with the deprecated three-label
     // forms beside it (NET-002) — pointing at its current lease, so peer

@@ -197,6 +197,12 @@ pub struct Manager {
     /// `HostNet` PTasks register on launch and withdraw on teardown.
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+
+    /// Whether this daemon opted out of the deny-all egress default
+    /// (NET-077), threaded from the server config into every session actor
+    /// so each one resolves its own effective egress (NET-074) the same way
+    /// the RPC path does.
+    deny_all_opt_out: bool,
 }
 
 impl Manager {
@@ -207,6 +213,7 @@ impl Manager {
         minimal_cache_dir: DaemonAbsPath,
         daemon_ctx: Arc<mctx::DaemonContext>,
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
+        deny_all_opt_out: bool,
     ) -> Result<ManagerHandle, std::io::Error> {
         let store = Store::init(minimal_state_dir.clone()).await?;
 
@@ -274,6 +281,7 @@ impl Manager {
             net_switch,
             #[cfg(target_os = "linux")]
             hostnames,
+            deny_all_opt_out,
         };
 
         tokio::spawn(mngr.mainloop());
@@ -311,6 +319,12 @@ impl Manager {
 /// (NET-129) is another task's and is not wired yet — until it lands,
 /// nothing calls [`LoopbackAllocator::allocate`], and the manager holds no
 /// allocator of its own.
+///
+/// The carve-out itself is not restated here: the constructor reads its
+/// slice from the switch crate's default address plan, the same one that
+/// pairs each slice with the switch a daemon of that octet runs, so there
+/// is one definition of the `/27`s and this type owns only the cursor
+/// inside the slice it is handed.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct LoopbackAllocator {
@@ -324,21 +338,15 @@ pub struct LoopbackAllocator {
     next: u32,
 }
 
-/// How many addresses one daemon's slice of the reserved local range holds:
-/// a /27 gives each daemon 32 published boxes' worth of room, and the octet
-/// indexes eight daemons' worth of distinct slices before the wrap-around the
-/// doc on [`LoopbackAllocator::for_slice_octet`] names.
+/// How many slices the reserved local range holds — exactly as many switches
+/// as the switch crate's default address plan serves on one host, since it
+/// carves the range one slice per switch
+/// ([`switch::AddressPlan::switch_capacity`]; a /24 into `/27`s, eight). A
+/// slice octet mod this many indexes every slice there is. `pub(crate)` for
+/// the daemon-start tests, which assert two daemons' slices against exactly
+/// this wrap-around.
 #[cfg(target_os = "linux")]
-const LOOPBACK_SLICE_PREFIX: u8 = 27;
-
-/// How many slices the reserved local range holds: it is one /24 (256
-/// addresses, see [`crate::net::dns::RESERVED_LOCAL_RANGE`]) carved into
-/// /27s — eight slices — so a slice octet mod this many indexes every
-/// slice there is. `pub(crate)` for the daemon-start tests, which assert
-/// two daemons' slices against exactly this wrap-around.
-#[cfg(target_os = "linux")]
-pub(crate) const LOOPBACK_SLICES: u32 =
-    1 << (LOOPBACK_SLICE_PREFIX - crate::net::dns::RESERVED_LOCAL_RANGE.1);
+pub(crate) const LOOPBACK_SLICES: u32 = ::switch::DEFAULT_ADDRESS_PLAN.switch_capacity() as u32;
 
 #[cfg(target_os = "linux")]
 impl LoopbackAllocator {
@@ -356,16 +364,23 @@ impl LoopbackAllocator {
     /// prints the slice's range, so the wrap is visible rather than
     /// hidden (two daemons' logs carry the same `loopback_slice`), and
     /// NET-010's host-global allocation is what arbitrates when it binds.
+    ///
+    /// The slice it lands on is the switch crate's own carve-out, read from
+    /// the plan rather than recomputed here — the same slice the plan pairs
+    /// with the switch a daemon of this octet runs, so a daemon's published
+    /// addresses can never fall outside the pairing the plan guarantees.
     #[must_use]
     pub fn for_slice_octet(octet: u8) -> Self {
-        let (range_base, _) = crate::net::dns::RESERVED_LOCAL_RANGE;
-        let slice_size = 1u32 << (32 - u32::from(LOOPBACK_SLICE_PREFIX));
+        let plan = ::switch::DEFAULT_ADDRESS_PLAN;
         let index = u32::from(octet) % LOOPBACK_SLICES;
-        let first = u32::from(range_base) + index * slice_size;
+        let slice = plan
+            .switch_slice(index as usize)
+            .expect("a wrapped octet always indexes a slice the plan serves")
+            .loopback();
         Self {
-            first,
-            last: first + slice_size - 1,
-            next: first,
+            first: u32::from(slice.first()),
+            last: u32::from(slice.last()),
+            next: u32::from(slice.first()),
         }
     }
 
@@ -512,6 +527,7 @@ impl Manager {
             record,
             net_switch: Arc::clone(&self.net_switch),
             manager: self.weak_self.clone(),
+            deny_all_opt_out: self.deny_all_opt_out,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
         }
@@ -1309,9 +1325,17 @@ pub(crate) mod tests {
             .build()
             .unwrap();
         let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
-        Manager::init(daemon_abs(&state), daemon_abs(&cache), daemon_ctx, switch)
-            .await
-            .unwrap()
+        // `false`: these tests run the default the build ships, not the
+        // opt-out.
+        Manager::init(
+            daemon_abs(&state),
+            daemon_abs(&cache),
+            daemon_ctx,
+            switch,
+            false,
+        )
+        .await
+        .unwrap()
     }
 
     /// A [`DaemonAbsPath`] for a test directory.

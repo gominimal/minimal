@@ -620,6 +620,23 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
             Ok(())
         });
 
+        // The injected process takes the box's credentials — no_new_privs, the
+        // capabilities no box may hold dropped from the bounding set, every
+        // capability set cleared, and the box uid and gid — the same state the
+        // box's own processes exec with, so a process that joins a running box
+        // cannot be the hole that state was for. Joining the user namespace
+        // above granted this process a full capability set in it, which is
+        // what the drops run on; without them, a file capability or a setuid
+        // bit on a program in the box could hand the injected process a
+        // capability no box process may hold.
+        cmd.pre_exec(|| {
+            // SAFETY: `assume_box_credentials` only makes async-signal-safe
+            // syscalls and owns no state; this is the pre-exec moment it is
+            // for, in the box's user namespace with the capabilities joining
+            // it granted.
+            sandbox2::assume_box_credentials()
+        });
+
         if let Some(filter) = none_box_filter {
             cmd.pre_exec(move || {
                 // Re-install the none-box socket-family filter.  The filter
