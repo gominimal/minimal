@@ -2178,9 +2178,13 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # env_vars inherit crosses the VM boundary: the client reads the value out
   # of the invoking shell and the task's `printenv` sees it inside the
   # session. The var is project-origin, so it must be allow-listed first.
+  # The export lives in THIS shell — the invoking shell the client resolves
+  # against — not in the run's subshell, where it would reach `min` just the
+  # same but read as an accident (SC2030).
   mkdir -p "$XDG_CONFIG_HOME/minimal"
   printf '[vars]\nallow = ["E2E_INHERIT_MARKER"]\n' > "$XDG_CONFIG_HOME/minimal/user_policy.toml"
-  env_out="$(cd "$TASK_SEED_DIR" && export E2E_INHERIT_MARKER=hello-from-the-host && mnl task run e2e-envprint 2>"$WORK/env-inherit.err")"
+  export E2E_INHERIT_MARKER=hello-from-the-host
+  env_out="$(cd "$TASK_SEED_DIR" && mnl task run e2e-envprint 2>"$WORK/env-inherit.err")"
   rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "::error::'min task run e2e-envprint' with inherited var exited $rc (expected 0)"
@@ -2209,7 +2213,8 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # Without the allow entry the var is refused at the policy gate, and the
   # error carries the `[vars] allow` snippet to paste.
   rm -f "$XDG_CONFIG_HOME/minimal/user_policy.toml"
-  (cd "$TASK_SEED_DIR" && export E2E_INHERIT_MARKER=hello-from-the-host && mnl task run e2e-envprint >/dev/null 2>"$WORK/env-ungranted.err")
+  export E2E_INHERIT_MARKER=hello-from-the-host
+  (cd "$TASK_SEED_DIR" && mnl task run e2e-envprint >/dev/null 2>"$WORK/env-ungranted.err")
   rc=$?
   if [ "$rc" -ne 1 ]; then
     echo "::error::'min task run e2e-envprint' with ungranted var exited $rc (expected 1)"
@@ -2219,6 +2224,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     || { echo "::error::ungranted var error does not carry the [vars] allow snippet"; cat "$WORK/env-ungranted.err" 2>/dev/null || true; fail; }
   grep -q 'E2E_INHERIT_MARKER' "$WORK/env-ungranted.err" \
     || { echo "::error::ungranted var error does not name the var"; cat "$WORK/env-ungranted.err" 2>/dev/null || true; fail; }
+  unset E2E_INHERIT_MARKER # leave the invoking shell as this proof found it
   echo "env_vars inherit: ungranted var refused at the policy gate OK"
 
   echo "task run proof OK"
