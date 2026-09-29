@@ -179,6 +179,15 @@ pub enum PatchError {
          or raise the cap"
     )]
     SizeCapExceeded { root: Utf8PathBuf, limit_bytes: u64 },
+    /// The size of a file in a plain-directory patch source could not
+    /// be read, so the total-size cap cannot be enforced. The file is
+    /// not emitted.
+    #[error("failed to read size of {path}: {source}")]
+    SizeMetadataFailure {
+        path: Utf8PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 // =====================================================================

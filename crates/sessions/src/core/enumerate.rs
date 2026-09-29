@@ -82,6 +82,12 @@ pub(crate) struct ExpandedProvenancedPatch {
     /// [`expand_patch_sources`]: crate::core::compose::expand_patch_sources
     /// [`ProvenancedPatch`]: crate::core::source::ProvenancedPatch
     pub(crate) follow_symlinks: bool,
+    /// Whether the source was a plain directory (no glob metacharacters
+    /// naming an existing directory) that expansion rewrote to
+    /// `dir/**/*`. The default-directory excludes and the total-size
+    /// cap apply only to these sources; explicit globs and literal
+    /// files are copied verbatim.
+    pub(crate) plain_directory: bool,
 }
 
 /// Walk each pre-expanded patch's `FileSet` and produce one
@@ -126,12 +132,10 @@ pub(crate) fn enumerate_patch_files(
         };
         let walk_root_path = walk_root.as_utf8_path().to_path_buf();
         let dest_root = pp.dest.as_sandbox_path().as_utf8_path();
+        let plain_directory = pp.plain_directory;
         let mut total_bytes: u64 = 0;
-        for entry_result in walkdir::WalkDir::new(walk_root_path.as_std_path())
-            .follow_links(follow_symlinks)
-            .into_iter()
-            .filter_entry(|e| !is_default_excluded_dir(e))
-        {
+        let walker = walk_entries(&walk_root_path, follow_symlinks, plain_directory);
+        for entry_result in walker {
             let entry = match entry_result {
                 Ok(entry) => entry,
                 Err(source) => {
@@ -178,9 +182,14 @@ pub(crate) fn enumerate_patch_files(
             if !pp.source.is_match(&link_path) {
                 continue;
             }
-            if let Some(err) = accumulate_size(&mut total_bytes, &link_path, &walk_root_path) {
-                accumulated_errors.push(err);
-                break;
+            if plain_directory {
+                match accumulate_size(&mut total_bytes, &link_path, &walk_root_path) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        accumulated_errors.push(err);
+                        break;
+                    }
+                }
             }
             let walker_path = HostAbsPath::new_unchecked(link_path.clone());
             let Some((link_path, target_path)) = resolve_symlink_target(
@@ -207,6 +216,24 @@ pub(crate) fn enumerate_patch_files(
     Err(ComposeError::PatchWalk {
         sources: accumulated_errors,
     })
+}
+
+/// Build the walkdir iterator for a patch source. Plain-directory
+/// sources apply the default-directory excludes; explicit globs and
+/// literal files walk everything.
+fn walk_entries(
+    walk_root_path: &Utf8PathBuf,
+    follow_symlinks: bool,
+    plain_directory: bool,
+) -> Box<dyn Iterator<Item = walkdir::Result<walkdir::DirEntry>>> {
+    let walker = walkdir::WalkDir::new(walk_root_path.as_std_path())
+        .follow_links(follow_symlinks)
+        .into_iter();
+    if plain_directory {
+        Box::new(walker.filter_entry(|e| !is_default_excluded_dir(e)))
+    } else {
+        Box::new(walker)
+    }
 }
 
 /// Classification of a walkdir entry for [`enumerate_patch_files`].
@@ -258,17 +285,29 @@ fn is_default_excluded_dir(entry: &walkdir::DirEntry) -> bool {
 }
 
 /// Add `path`'s file size to `total` and return a
-/// [`PatchError::SizeCapExceeded`] if the cap is breached.
-fn accumulate_size(total: &mut u64, path: &Utf8PathBuf, root: &Utf8PathBuf) -> Option<PatchError> {
-    let meta = path.as_std_path().metadata().ok()?;
+/// [`PatchError::SizeCapExceeded`] if the cap is breached. A metadata
+/// read failure is a hard error: the file's size is unknown, so the
+/// cap cannot be enforced and the file must not be emitted.
+fn accumulate_size(
+    total: &mut u64,
+    path: &Utf8PathBuf,
+    root: &Utf8PathBuf,
+) -> Result<(), PatchError> {
+    let meta = path
+        .as_std_path()
+        .metadata()
+        .map_err(|source| PatchError::SizeMetadataFailure {
+            path: path.clone(),
+            source,
+        })?;
     *total = total.saturating_add(meta.len());
     if *total > MAX_PLAIN_DIR_TOTAL_BYTES {
-        Some(PatchError::SizeCapExceeded {
+        Err(PatchError::SizeCapExceeded {
             root: root.clone(),
             limit_bytes: MAX_PLAIN_DIR_TOTAL_BYTES,
         })
     } else {
-        None
+        Ok(())
     }
 }
 
@@ -452,6 +491,7 @@ mod tests {
                 name: "symsrc".to_string(),
             },
             follow_symlinks,
+            plain_directory: false,
         };
 
         let dropped = enumerate_patch_files(vec![make_item(false)]).unwrap();
@@ -524,6 +564,7 @@ mod tests {
                     name: "follow".to_string(),
                 },
                 follow_symlinks: true,
+                plain_directory: false,
             },
             ExpandedProvenancedPatch {
                 source: FileSet::try_new(format!("{}/*.conf", nofollow_dir.as_str())).unwrap(),
@@ -532,6 +573,7 @@ mod tests {
                     name: "nofollow".to_string(),
                 },
                 follow_symlinks: false,
+                plain_directory: false,
             },
         ];
 
@@ -595,6 +637,7 @@ mod tests {
                 name: "excludes".to_string(),
             },
             follow_symlinks: false,
+            plain_directory: true,
         };
 
         let files = enumerate_patch_files(vec![item]).unwrap();
@@ -626,6 +669,7 @@ mod tests {
                 name: "symdir".to_string(),
             },
             follow_symlinks: false,
+            plain_directory: false,
         };
 
         let files = enumerate_patch_files(vec![item]).unwrap();
@@ -650,7 +694,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let small = Utf8PathBuf::from_path_buf(tmp.path().join("small.bin")).unwrap();
         std::fs::write(small.as_std_path(), vec![0u8; 2]).unwrap();
-        let err = accumulate_size(&mut total, &small, &root).expect("should exceed cap");
+        let err = accumulate_size(&mut total, &small, &root).unwrap_err();
         assert!(matches!(err, PatchError::SizeCapExceeded { .. }));
     }
 }

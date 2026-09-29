@@ -324,9 +324,10 @@ Details worth knowing:
 - The name is **reserved** here: a loadout that also declares a
   `LOADOUT_ROOT` variable still patches from its own directory. The variable
   reaches the session normally -- only patch sources ignore it.
-- `$LOADOUT_ROOT` alone names a directory, and a patch source matches files,
-  so it patches in nothing. Write `$LOADOUT_ROOT/**/*` to take the whole
-  tree.
+- `$LOADOUT_ROOT` alone names a directory, which is a plain-directory
+  source: it copies the whole tree (equivalent to `$LOADOUT_ROOT/**/*`),
+  with the default VCS/dependency directory excludes and the 100 MiB size
+  cap applied. Write an explicit glob to narrow the copy.
 - The directory is optional. A loadout that never references it does not
   need one, and -- like any other source -- a path that isn't there is
   skipped with a warning rather than failing the activation.
