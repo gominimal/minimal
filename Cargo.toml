@@ -57,7 +57,7 @@ package.rust-version = "1.95"
 # (scripts/next-version.sh). `scripts/next-version.sh --check` (the
 # workspace `package_version` test, `just check-version`) fails the PR that
 # leaves it stale or not strictly greater than the newest v* tag.
-package.version = "0.6.0"
+package.version = "0.7.0"
 
 # Workspace lint policy. A crate opts in with `[lints] workspace = true`.
 #
@@ -173,11 +173,11 @@ lzma-rs = "0.3"
 # releases catch up. Current rev is master @ 2026-08-03.
 nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "21decd294fe404d67d1545d11563016af6ea4090", default-features = false, features = ["format"] }
 
-opentelemetry-semantic-conventions = "0.32"
+opentelemetry-semantic-conventions = "0.33"
 # `socket` + `time`: the guest's vsock timekeep listener binds an AF_VSOCK
 # datagram socket and steps CLOCK_REALTIME from the host's updates.
 nix = { version = "0.31", features = ["fs", "sched", "socket", "time", "user"] }
-nutype = { version = "0.7", features = ["serde"] }
+nutype = { version = "0.8", features = ["serde"] }
 object = { version = "0.40", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.10"
 path-absolutize = "4.0"
