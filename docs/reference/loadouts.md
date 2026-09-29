@@ -243,6 +243,13 @@ so list entries only make sense with per-entry dests or glob entries):
   with `~/`.
 - Glob patterns must have a literal directory prefix to walk from:
   `~/dotfiles/**/*.lua` is fine, a bare `**/*.pem` is rejected.
+- A plain directory path (no glob metacharacters) is shorthand for
+  `dir/**/*`: `source = "~/dotfiles"` copies the whole tree. Common
+  VCS and dependency directories (`.git`, `.hg`, `.svn`, `CVS`, `.jj`,
+  `node_modules`) are excluded by default, and the total size of a
+  plain-directory source is capped at 100 MiB — a larger tree fails the
+  activation rather than being copied silently. Use an explicit glob to
+  narrow the copy.
 - `..` components are rejected wherever they appear.
 - A source path that does not exist on the host is dropped with a warning
   at activation rather than failing it, so opportunistically patching a
@@ -317,9 +324,10 @@ Details worth knowing:
 - The name is **reserved** here: a loadout that also declares a
   `LOADOUT_ROOT` variable still patches from its own directory. The variable
   reaches the session normally -- only patch sources ignore it.
-- `$LOADOUT_ROOT` alone names a directory, and a patch source matches files,
-  so it patches in nothing. Write `$LOADOUT_ROOT/**/*` to take the whole
-  tree.
+- `$LOADOUT_ROOT` alone names a directory, which is a plain-directory
+  source: it copies the whole tree (equivalent to `$LOADOUT_ROOT/**/*`),
+  with the default VCS/dependency directory excludes and the 100 MiB size
+  cap applied. Write an explicit glob to narrow the copy.
 - The directory is optional. A loadout that never references it does not
   need one, and -- like any other source -- a path that isn't there is
   skipped with a warning rather than failing the activation.
