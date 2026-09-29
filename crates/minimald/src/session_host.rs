@@ -19,6 +19,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::error::{SendError, SendTimeoutError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::RequestedPty;
@@ -360,6 +361,50 @@ struct Binding {
     /// Daemon-side directory the save-then-delete lane archives into
     /// (`<minimal_state_dir>/archives`). Created on demand at save time.
     archives_dir: std::path::PathBuf,
+    /// Cancelled by the host when it sheds this binding (see
+    /// [`Host::shed_binding`]). A separate signal rather than a
+    /// [`BindingMsg`], because a binding is shed exactly when its mailbox is
+    /// full; and raced against every await that can park on a stalled
+    /// client, so the binding still reaches its exit path and closes the
+    /// channel.
+    shed: CancellationToken,
+}
+
+/// What the host keeps of an attached binding: its mailbox, its task, and
+/// the token that sheds it.
+type BindingSlot = (mpsc::Sender<BindingMsg>, JoinHandle<()>, CancellationToken);
+
+/// The line a shed binding leaves on the terminal before its channel closes.
+const SHED_NOTICE: &[u8] =
+    b"\r\nDisconnecting - the terminal stopped keeping up with session output; \
+      re-attach with `min session attach`\r\n";
+
+/// The exit status a shed binding reports. It is ssh's own "connection
+/// failed" status on purpose: the client restores the terminal itself only
+/// on this status (see `client_must_unwind` in the `min` CLI), and after a
+/// shed it has to, because the output stream was cut mid-flight and no
+/// unwind codes followed it.
+const SHED_EXIT_STATUS: u32 = 255;
+
+/// Hands a departing binding its teardown message and waits for it to
+/// finish, so its farewell lands before whatever comes next.
+///
+/// The wait is bounded because this runs inside the host loop. A binding
+/// whose client stopped draining can neither take the message nor finish,
+/// and past [`HOST_PROBE_TIMEOUT`](crate::session::HOST_PROBE_TIMEOUT) it is
+/// shed instead, which still closes its channel.
+async fn retire_binding((tx, mut task, shed): BindingSlot, msg: BindingMsg) {
+    let orderly = async {
+        let _ = tx.send(msg).await;
+        let _ = (&mut task).await;
+    };
+    if tokio::time::timeout(crate::session::HOST_PROBE_TIMEOUT, orderly)
+        .await
+        .is_err()
+    {
+        tracing::warn!("departing binding did not finish its teardown in time; shedding it");
+        shed.cancel();
+    }
 }
 
 impl Binding {
@@ -373,8 +418,9 @@ impl Binding {
         delta: Option<Arc<DeltaSource>>,
         name: String,
         archives_dir: std::path::PathBuf,
-    ) -> (mpsc::Sender<BindingMsg>, JoinHandle<()>) {
+    ) -> BindingSlot {
         let (tx, rx) = mpsc::channel(4);
+        let shed = CancellationToken::new();
 
         let binding = Self {
             channel,
@@ -385,6 +431,7 @@ impl Binding {
             delta,
             name,
             archives_dir,
+            shed: shed.clone(),
         };
 
         // The channel id ties every line this binding logs back to the
@@ -398,7 +445,25 @@ impl Binding {
             channel = %binding.channel.id(),
             session = %binding.name,
         );
-        (tx, tokio::spawn(binding.run().instrument(span)))
+        (tx, tokio::spawn(binding.run().instrument(span)), shed)
+    }
+
+    /// Hands `kind` to the host, giving up if the binding is shed first.
+    ///
+    /// The host's stdin queue fills when the shell stops reading its input,
+    /// and a binding parked here would never see the shed. Takes the fields
+    /// it needs rather than `&self`, because [`Self::run`] has moved the
+    /// channel out of `self` by the time it sends.
+    async fn send_to_host(
+        stdin_tx: &mpsc::Sender<StdinMsg>,
+        generation: u64,
+        shed: &CancellationToken,
+        kind: StdinMsgKind,
+    ) -> Result<(), ()> {
+        tokio::select! {
+            _ = stdin_tx.send(StdinMsg::new(generation, kind)) => Ok(()),
+            () = shed.cancelled() => Err(()),
+        }
     }
 
     async fn run(mut self) {
@@ -413,6 +478,7 @@ impl Binding {
             Superceded,
             ProcessExited,
             Shutdown,
+            Shed,
         }
 
         // Reading from the remote stops once it sends EOF;
@@ -426,10 +492,9 @@ impl Binding {
                     Some(msg) => {
                         match msg {
                             russh::ChannelMsg::Data{ data } => {
-                                let _ = self
-                                    .stdin_tx
-                                    .send(StdinMsg::new(self.generation, StdinMsgKind::Bytes(data)))
-                                    .await;
+                                if Self::send_to_host(&self.stdin_tx, self.generation, &self.shed, StdinMsgKind::Bytes(data)).await.is_err() {
+                                    break MainloopExitReason::Shed;
+                                }
                             }
                             russh::ChannelMsg::RequestPty {
                                 want_reply: _,
@@ -440,18 +505,15 @@ impl Binding {
                                 pix_height,
                                 terminal_modes,
                             } => {
-                                let _ = self
-                                    .stdin_tx
-                                    .send(StdinMsg::new(
-                                        self.generation,
-                                        StdinMsgKind::TerminalUpdate(RequestedPty {
-                                            char_sizes: (col_width, row_height),
-                                            pixel_sizes: (pix_width, pix_height),
-                                            term: term.to_string(),
-                                            modes: terminal_modes.to_vec(),
-                                        }),
-                                    ))
-                                    .await;
+                                let update = StdinMsgKind::TerminalUpdate(RequestedPty {
+                                    char_sizes: (col_width, row_height),
+                                    pixel_sizes: (pix_width, pix_height),
+                                    term: term.to_string(),
+                                    modes: terminal_modes.to_vec(),
+                                });
+                                if Self::send_to_host(&self.stdin_tx, self.generation, &self.shed, update).await.is_err() {
+                                    break MainloopExitReason::Shed;
+                                }
                             },
                             russh::ChannelMsg::WindowChange{
                                 col_width,
@@ -459,15 +521,12 @@ impl Binding {
                                 pix_width,
                                 pix_height,
                             } => {
-                                let _ = self
-                                    .stdin_tx
-                                    .send(StdinMsg::new(
-                                        self.generation,
-                                        StdinMsgKind::WindowChange {
-                                            col_width, row_height, pix_width, pix_height,
-                                        },
-                                    ))
-                                    .await;
+                                let change = StdinMsgKind::WindowChange {
+                                    col_width, row_height, pix_width, pix_height,
+                                };
+                                if Self::send_to_host(&self.stdin_tx, self.generation, &self.shed, change).await.is_err() {
+                                    break MainloopExitReason::Shed;
+                                }
                             },
                             // Flow-control window updates fire on every
                             // burst of bytes forwarded through the
@@ -482,6 +541,7 @@ impl Binding {
                         };
                     }
                 },
+                () = self.shed.cancelled() => break MainloopExitReason::Shed,
                 // Session stdout => remote (ssh channel).
                 // A closed channel means the host is gone;
                 // tear the attachment down.
@@ -489,7 +549,12 @@ impl Binding {
                     let Some(msg) = msg else { break MainloopExitReason::HostGone; };
                     match msg {
                         BindingMsg::Stdin(b) => {
-                            let _ = w.write_all(&b).await;
+                            // Raced against the shed: this is where a client
+                            // that stopped draining parks the binding.
+                            tokio::select! {
+                                _ = w.write_all(&b) => {},
+                                () = self.shed.cancelled() => break MainloopExitReason::Shed,
+                            }
                         },
                         BindingMsg::TeardownDueToProcessExit { cause, unwind_codes } => {
                             // Before the notices below and before the
@@ -586,6 +651,9 @@ impl Binding {
             // suspended, not left: `on_detach` waits for the next real
             // departure.
             MainloopExitReason::Shutdown => false,
+            // Not on a shed either. Nobody chose to leave, and the terminal
+            // a hook would write to is the one that stopped reading.
+            MainloopExitReason::Shed => false,
         };
 
         // Asked of the session actor rather than run here: a detach hook is
@@ -597,8 +665,20 @@ impl Binding {
             control.detached().await;
         }
 
+        let shed = exit_reason == MainloopExitReason::Shed;
+        if shed {
+            // Bounded: the client stopped draining, so this write can park
+            // exactly as the one that got the binding shed. The notice is
+            // lost then, but the close below still goes out.
+            let _ =
+                tokio::time::timeout(crate::session::HOST_PROBE_TIMEOUT, w.write_all(SHED_NOTICE))
+                    .await;
+        }
+
         let _ = ws.eof().await;
-        let _ = ws.exit_status(0).await;
+        let _ = ws
+            .exit_status(if shed { SHED_EXIT_STATUS } else { 0 })
+            .await;
         let _ = ws.close().await; // needed to release the remote
     }
 
@@ -1199,10 +1279,32 @@ impl WeakHostHandle {
 /// [`HOST_PROBE_TIMEOUT`](crate::session::HOST_PROBE_TIMEOUT).
 pub(crate) const HOST_MAILBOX_CAPACITY: usize = 8;
 
+/// How long an attached binding may take no session output at all before
+/// the host sheds it.
+///
+/// Until then a binding that falls behind gets backpressure: the host stops
+/// reading the pty while the binding's mailbox is full, so the shell waits on
+/// the terminal, and the loop keeps serving its own mailbox. The bound is far
+/// longer than [`HOST_PROBE_TIMEOUT`](crate::session::HOST_PROBE_TIMEOUT)
+/// because it catches something else. The probe deadline asks whether the
+/// host is alive. This one asks whether the client has stopped reading
+/// altogether. A slow terminal drains a mailbox slot in milliseconds, so it
+/// never gets near this bound.
+pub(crate) const OUTPUT_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The handle to the session host - the running process.
 #[derive(Debug, Clone)]
 pub struct HostHandle {
     sender: mpsc::Sender<Message>,
+}
+
+/// Why [`HostHandle::attach`] could not deliver the attach message.
+pub enum HostAttachError {
+    /// The host's mailbox is full and did not drain before the deadline.
+    /// The host is still alive; the caller should retry or report busy.
+    Timeout,
+    /// The host's runtime loop has ended. The caller should mint a new host.
+    Closed(Channel<Msg>, WinSize),
 }
 
 /// The mailbox of a [`HostHandle::wedged`] host, opaque so [`Message`] stays
@@ -1270,7 +1372,7 @@ impl HostHandle {
         sz: WinSize,
         connection: ConnectionEnv,
         keys: SessionKeys,
-    ) -> Result<(), (Channel<Msg>, WinSize)> {
+    ) -> Result<(), HostAttachError> {
         match self
             .sender
             .send_timeout(
@@ -1280,11 +1382,12 @@ impl HostHandle {
             .await
         {
             Ok(()) => Ok(()),
-            // A wedged loop that never drains its mailbox (the send times out)
-            // and a loop that has gone (the channel is closed) both hand the
-            // channel back; the caller re-mints a host from it either way.
-            Err(SendTimeoutError::Timeout(Message::Attach(c, sz, _, _)))
-            | Err(SendTimeoutError::Closed(Message::Attach(c, sz, _, _))) => Err((c, sz)),
+            Err(SendTimeoutError::Timeout(Message::Attach(_, _, _, _))) => {
+                Err(HostAttachError::Timeout)
+            }
+            Err(SendTimeoutError::Closed(Message::Attach(c, sz, _, _))) => {
+                Err(HostAttachError::Closed(c, sz))
+            }
             Err(e) => unreachable!("{:?}", e),
         }
     }
@@ -1432,7 +1535,14 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
 
     /// The async task and its channel that wires the session
     /// to the ssh channel, if currently attached.
-    remote: Option<(mpsc::Sender<BindingMsg>, JoinHandle<()>)>,
+    remote: Option<BindingSlot>,
+
+    /// See [`OUTPUT_STALL_TIMEOUT`]; a field only so a test can shorten it.
+    output_stall_timeout: std::time::Duration,
+    /// When the attached binding, whose mailbox is full, gets shed. Armed when
+    /// the host first finds the mailbox full, and cleared as soon as a slot
+    /// frees up.
+    output_stall_deadline: Option<tokio::time::Instant>,
 
     /// The last-set pty terminal size.
     sz: WinSize,
@@ -2340,8 +2450,9 @@ impl SessionLauncher for SandboxLauncher {
             let (master, slave) = pty.into_fds();
             command.stderr(hakoniwa::Stdio::from(slave));
 
-            let process = command
-                .spawn()
+            // On the fork thread, never this one: the container dies with
+            // the thread that forked it (see `sandbox2::forker`).
+            let process = sandbox2::forker::on_fork_thread(move || command.spawn())
                 .map_err(|e| io::Error::other(format!("exec failed: {e}")))?;
             // `command`/`container` no longer borrow `env`, so it can be moved
             // into the host to keep its backing files alive.
@@ -2770,6 +2881,8 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         let mut host = Host {
             receiver,
             remote: None,
+            output_stall_timeout: OUTPUT_STALL_TIMEOUT,
+            output_stall_deadline: None,
             sz,
             parser,
             process,
@@ -2992,7 +3105,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         // input modes the process left behind have to travel with the message.
         let unwind_codes = self.unwind_codes();
         match self.remote.as_mut() {
-            Some((tx, _hnd)) => match tx.try_send(BindingMsg::TeardownDueToProcessExit {
+            Some((tx, ..)) => match tx.try_send(BindingMsg::TeardownDueToProcessExit {
                 cause,
                 unwind_codes,
             }) {
@@ -3035,6 +3148,22 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         // each iteration and never fire while other events keep waking the
         // loop).
         let chord_flush_deadline = self.chord_flush_deadline;
+        // Output backpressure. While the attached binding's mailbox is full,
+        // the pty is not read: the shell waits on the terminal instead of
+        // this loop parking in a send, so the loop keeps answering its
+        // mailbox. A binding that frees no slot within the stall bound is
+        // shed. Snapshotted like the chord deadline, so the timer survives
+        // the select being rebuilt on every call.
+        let stalled_binding = self
+            .remote
+            .as_ref()
+            .filter(|(tx, ..)| tx.capacity() == 0)
+            .map(|(tx, ..)| tx.clone());
+        self.output_stall_deadline = stalled_binding.as_ref().map(|_| {
+            self.output_stall_deadline
+                .unwrap_or_else(|| tokio::time::Instant::now() + self.output_stall_timeout)
+        });
+        let output_stall_deadline = self.output_stall_deadline;
         tokio::select! {
             // Read actor messages.
             Some(msg) = self.receiver.recv() => {
@@ -3051,13 +3180,15 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                             "session host killed on request",
                         );
                         if for_shutdown
-                            && let Some((old_tx, old_join_hnd)) = self.remote.take() {
+                            && let Some(binding) = self.remote.take() {
                                 // If there was a binding we just swapped out, tell it to
                                 // shut down and wait for it to finish.
-                                let _ = old_tx
-                                    .send(BindingMsg::TeardownDueToDaemonShutdown(self.unwind_codes()))
-                                    .await;
-                                let _ = old_join_hnd.await;
+                                let unwind_codes = self.unwind_codes();
+                                retire_binding(
+                                    binding,
+                                    BindingMsg::TeardownDueToDaemonShutdown(unwind_codes),
+                                )
+                                .await;
                             }
 
                         if let Err(e) = self.process.kill() {
@@ -3114,8 +3245,9 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     }
                 }
             },
-            // Read from master - stdout of session process => ssh channel (if any)
-            r = self.master.readable() => {
+            // Read from master - stdout of session process => ssh channel (if any).
+            // Not while the binding's mailbox is full; see `stalled_binding`.
+            r = self.master.readable(), if stalled_binding.is_none() => {
                 let mut guard = match r {
                     Ok(g) => g,
                     Err(e) => {
@@ -3131,50 +3263,15 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         let b = &self.stdout_buf[..n];
                         self.attrs.stdout_last = Some(SystemTime::now());
                         self.parser.process(b);
-                        if let Some((tx, _hnd)) = self.remote.as_mut() {
-                            // Bounded, not an unbounded await: once the binding
-                            // stops draining (a client whose transport went
-                            // dark), its mailbox fills and an unbounded send
-                            // parks this whole loop for good — the host then
-                            // never returns to pump the pty or drain its own
-                            // mailbox, so one dark client freezes the session.
-                            // A binding that cannot take a write within the
-                            // probe deadline is shed like a closed channel; a
-                            // re-attach re-mints a fresh binding on the same shell.
-                            match tx
-                                .send_timeout(
-                                    BindingMsg::Stdin(b.to_vec()),
-                                    crate::session::HOST_PROBE_TIMEOUT,
-                                )
-                                .await
-                            {
-                                Ok(()) => {},
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "shedding stalled binding on stdout=>remote send: {e}"
-                                    );
-                                    // Take the binding and abort its task before
-                                    // discarding it: dropping the `JoinHandle`
-                                    // only detaches the task, which can still be
-                                    // parked in `w.write_all(...)` on a transport
-                                    // that is not draining. Aborting converges the
-                                    // shed with the closed-channel outcome, where
-                                    // the binding task has already exited and
-                                    // released the channel (EOF/close).
-                                    //
-                                    // Bump the generation before removing the
-                                    // binding: stdin the shed binding already
-                                    // queued into the shared stdin channel still
-                                    // carries the old generation, so the stdin arm
-                                    // drops it instead of handing a dead channel's
-                                    // keystrokes to the shell (or to a later
-                                    // re-attach's fresh chord).
-                                    self.binding_generation += 1;
-                                    if let Some((_tx, binding_task)) = self.remote.take() {
-                                        binding_task.abort();
-                                    }
-                                }
-                            };
+                        // Never an awaited send: this arm runs only while the
+                        // mailbox has a free slot, and nothing else fills it
+                        // in between. What can fail is a binding whose task
+                        // has already ended.
+                        if let Some((tx, ..)) = self.remote.as_ref()
+                            && let Err(e) = tx.try_send(BindingMsg::Stdin(b.to_vec()))
+                        {
+                            tracing::warn!("shedding binding on stdout=>remote send: {e}");
+                            self.shed_binding();
                         }
                     }
                     // Every errno except `WouldBlock` (which `try_io` routes to
@@ -3189,6 +3286,36 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     Err(_would_block) => {},
                 }
             },
+            // A slot freed up in the stalled binding's mailbox. The permit is
+            // dropped at once; the point is to wake the loop so the pty read
+            // arm re-arms.
+            reserved = async {
+                match stalled_binding.as_ref() {
+                    Some(tx) => tx.reserve().await.map(drop),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if reserved.is_err() {
+                    tracing::warn!("shedding binding whose task has ended");
+                    self.shed_binding();
+                }
+            }
+            // The stalled binding took no output within the stall bound: its
+            // client has stopped reading.
+            _ = async {
+                match output_stall_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    session = %self.session_name,
+                    stall = ?self.output_stall_timeout,
+                    "shedding binding that took no session output within the stall bound",
+                );
+                self.shed_binding();
+            }
             // Read from remote (ssh channel) - these keystrokes need writing to the pty.
             //
             // To ensure we never block service of reads from the master side of the pty ('stdout'),
@@ -3226,35 +3353,37 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                                     // Ring the terminal bell on the channel back
                                     // to the user (never the PTY, so the app
                                     // never sees it) when the client opted in.
+                                    // `try_send`: a bell is worth dropping,
+                                    // and an awaited send would park this loop
+                                    // behind a stalled binding.
                                     if self.chord_matcher.keys().bell_on_leader
-                                        && let Some((tx, _)) = self.remote.as_ref()
+                                        && let Some((tx, ..)) = self.remote.as_ref()
                                     {
-                                        let _ = tx.send(BindingMsg::Stdin(vec![0x07])).await;
+                                        let _ = tx.try_send(BindingMsg::Stdin(vec![0x07]));
                                     }
                                 }
                                 FeedOutcome::Action(KeyAction::Detach) => {
-                                    // worker-iterate:declined — a review suggested
-                                    // bounding this send (and the bell/detach/
-                                    // daemon-shutdown/supercede sibling sends) with
-                                    // `send_timeout` like the stdout-forward path.
-                                    // Not applied: these are teardown/detach paths
-                                    // where the host is already unwinding, and a
-                                    // bounded send that times out would drop the
-                                    // teardown message and change the documented
-                                    // teardown semantics (the supercede path
-                                    // deliberately awaits the incumbent binding's
-                                    // join handle so its unwind codes finish first).
-                                    // A broader pattern fix belongs in a follow-up,
-                                    // not this targeted stdout-forward fix.
+                                    // Bounded, because the detach chord is also
+                                    // how a user gets out of an attach whose
+                                    // output has stalled, and then the mailbox
+                                    // is full. A binding that cannot take the
+                                    // detach in time is shed, which closes its
+                                    // channel all the same.
                                     let uc = self.unwind_codes();
-                                    if let Some((tx, _hnd)) = self.remote.as_mut() {
-                                        match tx.send(BindingMsg::TeardownDueToDetach(uc)).await {
-                                            Ok(()) => {},
+                                    if let Some((tx, ..)) = self.remote.as_ref() {
+                                        match tx
+                                            .send_timeout(
+                                                BindingMsg::TeardownDueToDetach(uc),
+                                                crate::session::HOST_PROBE_TIMEOUT,
+                                            )
+                                            .await
+                                        {
+                                            Ok(()) => self.remote = None,
                                             Err(e) => {
-                                                tracing::warn!("failed sending detach signal to remote: {e}");
+                                                tracing::warn!("shedding binding that could not take the detach: {e}");
+                                                self.shed_binding();
                                             }
                                         };
-                                        self.remote = None;
                                     }
                                 }
                                 FeedOutcome::Action(KeyAction::ForwardLeader) => {
@@ -3407,13 +3536,15 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         )
         .await;
 
-        if let Some((old_tx, old_join_hnd)) = self.remote.replace(new_binding) {
+        if let Some(old_binding) = self.remote.replace(new_binding) {
             // If there was a binding we just swapped out, tell it to
             // shut down and wait for it to finish.
-            let _ = old_tx
-                .send(BindingMsg::TeardownDueToSuperceded(self.unwind_codes()))
-                .await;
-            let _ = old_join_hnd.await;
+            let unwind_codes = self.unwind_codes();
+            retire_binding(
+                old_binding,
+                BindingMsg::TeardownDueToSuperceded(unwind_codes),
+            )
+            .await;
         }
 
         self.set_size(sz);
@@ -3431,6 +3562,27 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     /// [`HookPlan`] snapshots around).
     async fn publish_connection_env(&mut self) {
         write_connection_env(self.home_dir.clone(), self.connection_env.clone()).await;
+    }
+
+    /// Drops the attached binding without waiting for it, for when it has
+    /// stopped taking what the host hands it.
+    ///
+    /// Cancels the binding's shed token rather than aborting its task: an
+    /// aborted task drops its channel halves, and russh sends no close for a
+    /// dropped channel, so the client would stay connected with nothing
+    /// behind it. A shed binding instead leaves through its own exit path,
+    /// which sends EOF, an exit status and a close.
+    ///
+    /// Bumps the generation first. Stdin that the shed binding already queued
+    /// into the shared stdin channel still carries the old generation, so the
+    /// stdin arm drops it instead of handing a dead channel's keystrokes to
+    /// the shell (or to a later re-attach's fresh chord).
+    fn shed_binding(&mut self) {
+        self.binding_generation += 1;
+        self.output_stall_deadline = None;
+        if let Some((_tx, _task, shed)) = self.remote.take() {
+            shed.cancel();
+        }
     }
 
     fn set_size(&mut self, sz: WinSize) {
