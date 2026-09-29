@@ -26,6 +26,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 pub mod error;
+pub mod forker;
 #[cfg(target_os = "linux")]
 use crate::config::Invocation;
 use crate::config::WdSetup;
@@ -1084,31 +1085,14 @@ impl<C: Channel> Sandbox<C> {
     /// Runs the invocations in the sandbox, killing the container if `cancel`
     /// fires.
     ///
-    /// # Thread-affinity footgun (hakoniwa `PR_SET_PDEATHSIG`)
+    /// # Container lifetime (hakoniwa `PR_SET_PDEATHSIG`)
     ///
-    /// This forks the sandbox container **in-process, on the calling thread**
-    /// (via [`new_container`](Self::new_container) → hakoniwa's `Command::spawn`,
-    /// a bare `fork()`). The forked container arms `PR_SET_PDEATHSIG(SIGKILL)`
-    /// ("die with parent") — and on Linux that signal is delivered when the
-    /// **parent *thread*** terminates, not the parent *process*. Nothing ever
-    /// clears it, so the container stays bound to the exact thread that forked it
-    /// for its whole life.
-    ///
-    /// Consequences for callers:
-    ///
-    /// * The forking thread MUST outlive the container. This future is fine on a
-    ///   normal multi-thread runtime worker (they're stable), but the container
-    ///   dies with a spurious SIGKILL — surfacing as `InvocationFailed` — if that
-    ///   thread is retired while the container runs.
-    /// * NEVER drive this under [`tokio::task::block_in_place`]: it churns/retires
-    ///   worker threads, which SIGKILLs containers forked on them — including
-    ///   those of *unrelated* concurrent builds.
-    /// * NEVER run this on a [`tokio::task::spawn_blocking`] pool thread: those
-    ///   are reaped after an idle keep-alive, again killing the container.
-    ///
-    /// By contrast, purely-synchronous work that forks no container (e.g. staging
-    /// the rootfs in `Sandbox::new`) carries none of this and could be offloaded
-    /// to the blocking pool if it ever became hot enough to matter.
+    /// The forked container arms `PR_SET_PDEATHSIG(SIGKILL)`, which Linux
+    /// delivers when the forking *thread* exits, so every container is forked
+    /// on the process-wide fork thread ([`forker::on_fork_thread`]) rather than
+    /// on the caller's. That thread is never retired, so this future may be
+    /// driven from any runtime thread, worker or blocking-pool; see the
+    /// [`forker`] module docs for the failure the fork thread rules out.
     #[cfg(target_os = "linux")]
     pub async fn run_with_cancel<W1, W2>(
         &mut self,
@@ -1136,8 +1120,7 @@ impl<C: Channel> Sandbox<C> {
             cmd.stdout(hakoniwa::Stdio::MakePipe);
             tracing::debug!("Executing: {} {}", &exec.executable, exec.args.join(" "));
 
-            let mut child = cmd
-                .spawn()
+            let mut child = forker::on_fork_thread(move || cmd.spawn())
                 .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
             // Step 3: wire this invocation's netns. Torn down explicitly once
