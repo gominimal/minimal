@@ -156,7 +156,7 @@ jobs:
         # commit; carry it across runs so the e2e isn't dominated by pulls.
         # The e2e script resets XDG_STATE_HOME/XDG_RUNTIME_DIR but leaves
         # XDG_CACHE_HOME alone for exactly this reason.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6 # zizmor: ignore[cache-poisoning] test-only e2e lane, nothing published; the entry is package pulls keyed by the pinned upstream commit
         with:
           path: ~/.cache/minimal
           key: native-e2e-minimal-cache-${{ hashFiles('.minimal/minimal.toml') }}
