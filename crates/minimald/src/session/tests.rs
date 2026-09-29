@@ -62,7 +62,7 @@ async fn a_probe_of_a_wedged_host_ends_instead_of_stranding_its_task() {
 }
 
 /// The bounded stop path gives up on a host whose loop accepted the kill
-/// but never winds down, aborting the loop task instead of awaiting it
+/// but never winds down, detaching the loop task instead of awaiting it
 /// forever.
 ///
 /// This is the shape `HostHandle::kill`'s `send_timeout` alone cannot
@@ -70,10 +70,13 @@ async fn a_probe_of_a_wedged_host_ends_instead_of_stranding_its_task() {
 /// `Ok`) and the `!killed` short-circuit does not fire, yet the runtime
 /// loop is parked mid-`step()` and never processes the queued kill. The
 /// *join* bound — not the kill's own deadline — is what has to return the
-/// caller and abort the loop. `kill_to_a_wedged_host_gives_up_instead_of_parking`
-/// covers the saturated-mailbox sibling, where the kill itself times out.
+/// caller. The task is detached rather than aborted so the `NetGuard`
+/// teardown at the end of `mainloop` can still run once the loop drains.
+/// `kill_to_a_wedged_host_gives_up_instead_of_parking` covers the
+/// saturated-mailbox sibling, where the kill itself times out and the
+/// task is aborted.
 #[tokio::test(start_paused = true)]
-async fn stopping_a_wedged_host_aborts_its_loop_instead_of_parking() {
+async fn stopping_a_wedged_host_detaches_its_loop_instead_of_parking() {
     // Mailbox held but not saturated: the kill enqueues within its
     // deadline, so the join bound is the branch under test.
     let (host, _mailbox) = HostHandle::wedged();
@@ -92,12 +95,12 @@ async fn stopping_a_wedged_host_aborts_its_loop_instead_of_parking() {
     .await
     .expect("the bounded stop path must return, not park on a wedged loop");
 
-    // The loop task is torn down, not left running behind a detached
-    // handle: awaiting it yields a cancelled join.
-    let outcome = task.await;
+    // The loop task is detached, not aborted: awaiting it would park
+    // forever (it is `pending()`), but the handle is still valid — the
+    // task was not cancelled.
     assert!(
-        outcome.is_err_and(|e| e.is_cancelled()),
-        "a loop that never wound down within the deadline must be aborted",
+        !task.is_finished(),
+        "a loop whose kill landed must be detached, not aborted"
     );
 }
 

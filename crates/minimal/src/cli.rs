@@ -70,7 +70,13 @@ pub enum Command {
     /// Secret-shaped values (env vars, tokens) are redacted and session/
     /// project file contents are never included — only name/size listings.
     /// Works even when no daemon is running; never starts one.
+    ///
+    /// The same command as `min diag collect`, kept under its own name
+    /// because it is what everyone already types and what every bug report
+    /// asks for.
     Bug(diag::BugArgs),
+    /// Collect diagnostic bundles and send them for diagnosis
+    Diag(diag::DiagArgs),
     /// WireGuard mesh: join, leave, and inspect remote-access state
     #[cfg(feature = "remote-access")]
     Mesh(MeshArgs),
