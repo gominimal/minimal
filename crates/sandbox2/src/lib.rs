@@ -1118,17 +1118,37 @@ fn install_box_credentials(
 /// the daemon can say, after the spawn, what nothing else can carry: which
 /// cover the box took over its classifier tree, or the errno that killed the
 /// closure before the program ran (the `127` the spawn then reports, whose
-/// stderr reaches only the box's own stdio, never a daemon log). Last
-/// writer wins, so a closure that covered and then failed reports the
-/// failure — the line worth reading is the one that says the box never
-/// reached its program.
+/// stderr reaches only the box's own stdio, never a daemon log). Each write
+/// replaces the line wholesale, so a closure that covered and then failed
+/// leaves the failure — the line worth reading is the one that says the box
+/// never reached its program — and the daemon holds the file until the box's
+/// fate is known, so a failure that lands after a cover line is still the
+/// line it logs.
+///
+/// The line appears whole or not at all: `fs::write` creates the report
+/// empty before it fills it, and a reader that caught that window would log
+/// an empty line and take the file away before the real one landed. A temp
+/// file beside the report, renamed over it, leaves no such window —
+/// `rename(2)` is atomic, and the temp sits in the same directory, the one
+/// read-write `/run` both sides share.
 ///
 /// Best-effort by design: a box that cannot say what it did still runs, and
 /// the daemon says so when the report never appears.
 #[cfg(target_os = "linux")]
 fn write_closure_report(report: Option<&Path>, line: &str) {
     let Some(report) = report else { return };
-    let _ = std::fs::write(report, format!("{line}\n"));
+    let name = report
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("closure-report");
+    let temp = report.with_file_name(format!("{name}.tmp{}", std::process::id()));
+    let written =
+        std::fs::write(&temp, format!("{line}\n")).and_then(|()| std::fs::rename(&temp, report));
+    // A rename that failed leaves the line nowhere — the state the daemon's
+    // watch already names — so the temp never lingers either.
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
 }
 
 /// Marks the cover the box took in its own environment
@@ -1613,11 +1633,20 @@ impl<C: Channel> Sandbox<C> {
             )?;
 
             // What the host's mount table says about cgroup2, for the launch
-            // log: the box's confinement holds without `nsdelegate` — the
-            // cover leaves no cgroup path to write a migration to at all on
-            // the fallback, and on the design's own cover the namespace root
-            // is the leaf itself — but the absence of it is what a
-            // diagnostics bundle would look for first.
+            // log. The line's own claim is the hiding: none of these mounts
+            // is the box's to see — the tree bound for the join is the only
+            // cgroup2 the box is ever given, and it is covered over once the
+            // join has run — and which of them carries `nsdelegate` is what a
+            // diagnostics bundle would look for first (the confinement holds
+            // without it; its absence is the first thing to rule out).
+            //
+            // The cover branch is not this line's to name: the line is
+            // written before the box's pre-exec closure runs, and which
+            // cover the closure took — the design's cgroup2 view of the
+            // box's own namespace root, or the recorded tmpfs where the
+            // kernel refuses that mount — is the closure's own report into
+            // `/run`, which the daemon's watch logs and warns about when no
+            // report comes.
             let mountinfo = classifier::own_mountinfo().unwrap_or_default();
             let host_mounts = classifier::host_cgroup2_mounts(&mountinfo);
             let named = if host_mounts.is_empty() {
@@ -1638,10 +1667,7 @@ impl<C: Channel> Sandbox<C> {
             tracing::info!(
                 leaf = %leaf.dir().display(),
                 join_procs = %Path::new(mountpoint).join(leaf.relative_dir()).join("cgroup.procs").display(),
-                cover = "design: read-only cgroup2 of the box's namespace root; fallback: empty \
-                         read-only tmpfs where the kernel refuses that mount, recorded and \
-                         warned after the spawn",
-                host_cgroup_mount = %named,
+                host_cgroup_mount = %format!("hidden from the box: {named}"),
                 "sandbox launch: box joins its classifier leaf before its \
                  cgroup namespace is unshared onto it"
             );
