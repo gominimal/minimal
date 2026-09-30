@@ -1069,23 +1069,31 @@ proof_own_ip_egress_declared_and_enforced() {
   }
   deny_all_sid="$(printf '%s\n' "$deny_all_sid" | tail -n1 | tr -d '\r')"
 
-  deny_all_start_ms="$(now_ms)"
-  mnl session exec "$deny_all_sid" \
-    "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.com" \
-    >"$WORK/egress-deny-all.out" 2>"$WORK/egress-deny-all-curl.err"
-  deny_all_rc=$?
-  deny_all_elapsed_ms=$(( $(now_ms) - deny_all_start_ms ))
-  deny_all_status="$(cat "$WORK/egress-deny-all.out" 2>/dev/null)"
-  echo "deny-all GET https://example.com -> rc=$deny_all_rc status=${deny_all_status:-<none>} elapsed=${deny_all_elapsed_ms}ms"
-  if [ "$deny_all_rc" -eq 0 ] || [ "$deny_all_status" = "HTTP:200" ]; then
-    echo "::error::a deny-all box reached an external destination"
-    fail
-  fi
-  if [ "$deny_all_elapsed_ms" -lt 6000 ]; then
-    echo "::warning::the deny-all box's connection failed fast instead of dropping silently; this can be endpoint weather (e.g. a fast DNS failure) and is recorded as a warning"
-    cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
+  # A deny-all box cannot prove general reachability by construction, but the
+  # assertion that it reaches "nothing" only means something if the lane can
+  # already reach the public internet. Otherwise a slow DNS/connect failure
+  # (>= 6 s) reads exactly like a silent drop and reports fake enforcement.
+  if ! egress_reachability_probe "$deny_all_sid" "deny-all"; then
+    echo "deny-all WARNING: the lane could not prove external reachability; the deny-all enforcement assertion is skipped as a weather warning"
   else
-    echo "NET-074/075 OK: a box with no effective reach gets nothing (explicit deny-all stand-in)"
+    deny_all_start_ms="$(now_ms)"
+    mnl session exec "$deny_all_sid" \
+      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.com" \
+      >"$WORK/egress-deny-all.out" 2>"$WORK/egress-deny-all-curl.err"
+    deny_all_rc=$?
+    deny_all_elapsed_ms=$(( $(now_ms) - deny_all_start_ms ))
+    deny_all_status="$(cat "$WORK/egress-deny-all.out" 2>/dev/null)"
+    echo "deny-all GET https://example.com -> rc=$deny_all_rc status=${deny_all_status:-<none>} elapsed=${deny_all_elapsed_ms}ms"
+    if [ "$deny_all_rc" -eq 0 ] || [ "$deny_all_status" = "HTTP:200" ]; then
+      echo "::error::a deny-all box reached an external destination"
+      fail
+    fi
+    if [ "$deny_all_elapsed_ms" -lt 6000 ]; then
+      echo "::warning::NET-074/075: the deny-all box's connection failed fast instead of dropping silently; this can be endpoint weather (e.g. a fast DNS failure) and is recorded as a warning"
+      cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
+    else
+      echo "NET-074/075 OK: a box with no effective reach gets nothing (explicit deny-all stand-in)"
+    fi
   fi
 
   mnl session destroy --force "$declare_sid" >/dev/null 2>&1 || true
