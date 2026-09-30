@@ -95,7 +95,7 @@ pub const NET068_TOOLCHAIN_EGRESS_HOSTS: &[&str] = &[
     "production.cloudflare.docker.com",
 ];
 
-/// Effective ingress policy for a session.
+/// Effective egress policy for a session.
 ///
 /// Each `allow_*` field is `None` to mean allow-all for that dimension, and
 /// `deny_subnets` is `None` to mean nothing is denied. Absent `egress` config
