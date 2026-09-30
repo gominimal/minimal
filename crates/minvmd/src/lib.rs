@@ -10,6 +10,7 @@
 //! cfg; the portable surface (errors, state, image resolution) compiles
 //! everywhere.
 
+pub mod box_registry;
 pub mod cmd;
 pub mod config;
 pub mod error;
