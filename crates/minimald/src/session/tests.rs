@@ -2716,7 +2716,7 @@ async fn finalize_own_ip_session(client: &mut TestClient, name: &str) -> Session
 
 /// The A answer a live box's name carries, and the session that owns it —
 /// `None` when the name is absent (NXDOMAIN, NET-125).
-fn zone_answer_for(server: &TestServer, name: &str) -> Option<(String, std::net::Ipv4Addr)> {
+async fn zone_answer_for(server: &TestServer, name: &str) -> Option<(String, std::net::Ipv4Addr)> {
     let registry = server.state.sessions_manager().await.hostnames();
     match registry
         .read()
@@ -2747,7 +2747,9 @@ async fn name_registered_at_finalize() {
 
     // No attach has happened — the name is held at the box's own address.
     let (owner, address) =
-        zone_answer_for(&server, "web.min.internal").expect("the name is held at finalize");
+        zone_answer_for(&server, "web.min.internal")
+            .await
+            .expect("the name is held at finalize");
     assert_eq!(owner, "web", "the session owns its box name");
     assert!(
         address.octets()[0] == 127 && address.octets()[1] == 64,
@@ -2799,9 +2801,13 @@ async fn each_box_gets_own_loopback_address() {
     let _beta = finalize_own_ip_session(&mut client, "beta").await;
 
     let (_, alpha_address) =
-        zone_answer_for(&server, "alpha.min.internal").expect("alpha's name is held");
+        zone_answer_for(&server, "alpha.min.internal")
+            .await
+            .expect("alpha's name is held");
     let (_, beta_address) =
-        zone_answer_for(&server, "beta.min.internal").expect("beta's name is held");
+        zone_answer_for(&server, "beta.min.internal")
+            .await
+            .expect("beta's name is held");
     assert_ne!(
         alpha_address, beta_address,
         "two live boxes on one daemon must never share a loopback address"
@@ -2851,7 +2857,9 @@ async fn name_answers_without_attached_client() {
 
     // No attach: the zone answers A, not NODATA and not NXDOMAIN.
     let (_, address) =
-        zone_answer_for(&server, "web.min.internal").expect("the name answers with no client");
+        zone_answer_for(&server, "web.min.internal")
+            .await
+            .expect("the name answers with no client");
 
     // And the routing half says the same address at the box's own port.
     let registry = server.state.sessions_manager().await.hostnames();
@@ -2882,7 +2890,9 @@ async fn destroyed_box_name_is_nxdomain() {
     let mut client = server.connect().await;
     let id = finalize_own_ip_session(&mut client, "web").await;
     let (_, address) =
-        zone_answer_for(&server, "web.min.internal").expect("the name answers while the box lives");
+        zone_answer_for(&server, "web.min.internal")
+            .await
+            .expect("the name answers while the box lives");
 
     use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
     match client
@@ -2895,7 +2905,7 @@ async fn destroyed_box_name_is_nxdomain() {
 
     // The name is gone: a later lookup is told NXDOMAIN, not a stale address.
     assert_eq!(
-        zone_answer_for(&server, "web.min.internal"),
+        zone_answer_for(&server, "web.min.internal").await,
         None,
         "a destroyed box's name must answer NXDOMAIN"
     );

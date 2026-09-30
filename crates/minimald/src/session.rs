@@ -810,7 +810,7 @@ impl Session {
                 let declared = crate::net::switch::declared_request_ports(Some(&record.policy));
                 let published = reg
                     .published_own_address(record.id)
-                    .or_else(|| self.lease_loopback_address(&record, &name));
+                    .or_else(|| self.lease_loopback_address(record, &name));
                 if let Some(address) = published {
                     // One warn line per port another box at the same address
                     // also publishes (NET-129): intrinsic to the shared-address
@@ -873,7 +873,7 @@ impl Session {
     /// [`Self::lease_loopback_address`] that named the lease — with the one
     /// info line per release naming the box and the address.
     #[cfg(target_os = "linux")]
-    fn release_loopback_address(&self, record: &Record, name: &str, address: Ipv4Addr) {
+    fn release_loopback_address(&self, record: &Record, name: &str, address: std::net::Ipv4Addr) {
         let mut allocator = self
             .loopback
             .lock()
