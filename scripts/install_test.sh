@@ -1530,12 +1530,17 @@ case_host_classifier_tree_installed() {
     # A recording chown stub: delegation is the point of the install, and on
     # the stand-in filesystem the caller owns the files anyway, so the case
     # reads what the script chowned rather than inferring it from their owner.
+    # It records and exits 0 without exec'ing the real chown: on the host this
+    # script installs on that chown runs as root, which CI's unprivileged
+    # lanes cannot stage, and where it lives is host-specific (/usr/bin on
+    # Linux, /usr/sbin on macOS), so exec'ing it would break the macOS lane
+    # while asserting nothing the case needs — the recorded argv is the whole
+    # delegation decision.
     hcbin="$root/hcbin"; mkdir -p "$hcbin"
     chown_calls="$root/chown.calls"; : >"$chown_calls"
     cat >"$hcbin/chown" <<'STUB'
 #!/bin/sh
 printf '%s\n' "$*" >>"$CHOWN_CALLS"
-exec /usr/bin/chown "$@"
 STUB
     chmod +x "$hcbin/chown"
 

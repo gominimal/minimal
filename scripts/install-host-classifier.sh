@@ -56,7 +56,10 @@ while [ $# -gt 0 ]; do
             ;;
         --uninstall) mode=uninstall; shift ;;
         --check)     mode=check; shift ;;
-        -h|--help)   sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        # The header above this line is the usage. Two explicit strips, not
+        # 's/^# \?//': \? is a GNU sed extension BSD sed does not know, and this
+        # script's own tests run on macOS's /bin/sh too.
+        -h|--help)   sed -n '2,20p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
         *)           die "unknown argument: $1 (see --help)" ;;
     esac
 done
@@ -219,9 +222,13 @@ fi
 verify_mount
 resolve_owner
 
-install -d "$tree_root" ||
+# mkdir, not install -d: on a cgroup2 mount mkdir is the operation itself (the
+# hierarchy decides its own permissions, there is no mode to set), and it is
+# the one form every host this script runs on guarantees — BSD install -d is a
+# different tool with its own default mode.
+mkdir -p "$tree_root" ||
     die "cannot create $tree_root (is cgroup2 mounted there, and this account allowed to?)"
-install -d "$tree_root/$DAEMON_LEAF" "$tree_root/$BOXES_DIR"
+mkdir -p "$tree_root/$DAEMON_LEAF" "$tree_root/$BOXES_DIR"
 
 # Delegate the two leaves and nothing above them: the daemon must be able to
 # create a leaf per box and to move processes in and out — `daemon/` is
