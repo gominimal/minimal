@@ -438,45 +438,72 @@ impl Container {
 }
 
 /// The classifier tree each host-address box's egress verdict is decided on
-/// (NET-079, design §4.1): one root-owned cgroup per daemon, holding a leaf
-/// for the daemon itself and one leaf per box.
+/// (NET-079, design §4.1): one cgroup tree per daemon, holding a leaf for the
+/// daemon itself and one leaf per box.
 ///
 /// ```text
-/// <TREE_ROOT>/            root-owned; no process ever lives here and no
-///                         controller is ever enabled on it (the
-///                         no-internal-process rule — a controller on a
-///                         process-bearing cgroup makes every child below it
-///                         `domain invalid`, spike finding F)
+/// <TREE_ROOT>/            delegated to the daemon's account — the directory
+///                         plus its cgroup.procs, cgroup.threads and
+///                         cgroup.subtree_control, the whole v2 delegation
+///                         contract. The kernel reads a write to a
+///                         cgroup.procs as a migration that needs write on
+///                         the *common ancestor* of source and destination,
+///                         so the contract is what makes the daemon's own
+///                         entry (and each box's) possible at all — and the
+///                         mount root above the tree, whose `cgroup.procs`
+///                         the contract does not cover, is the one file a
+///                         process outside the tree cannot write to get in.
+///                         No process ever lives here and no controller is
+///                         ever enabled on it (the no-internal-process rule —
+///                         a controller on a process-bearing cgroup makes
+///                         every child below it `domain invalid`, spike
+///                         finding F)
 ///   daemon/               the daemon and its own helpers; entered at startup
-///   boxes/                delegated to the daemon's uid, so it can create a
-///                         leaf per box and move its boxes into it
-///     <box-id>/           one leaf per box, created before the spawn,
-///                         removed after the box is reaped
+///   boxes/                every box leaf lives under here, and the daemon
+///                         never places itself under it (NET-078's two
+///                         identities)
+///     <box-id>/           one leaf per box, named by its session id, created
+///                         before the spawn and removed after the box is
+///                         reaped; an empty one a daemon death left behind is
+///                         swept at the next daemon start
 /// ```
 ///
 /// Natively the tree is installed by the privileged step
-/// (`scripts/install-host-classifier.sh`), which also delegates `daemon/` and
-/// `boxes/` to the daemon's uid; in a microVM the guest daemon is pid 1 and
-/// roots its own tree under the cgroup2 mount the guest boot path makes with
-/// namespace delegation.
+/// (`scripts/install-host-classifier.sh`), which delegates it to the daemon's
+/// account and leaves the cgroup2 mount root above it root-owned. Delegation
+/// does not move the daemon itself: a process cannot migrate itself into the
+/// tree from `user.slice`, where the daemon's first hop's common ancestor is
+/// the root-owned mount root, so natively the daemon must be *placed* — the
+/// installer's `--pid` step for a running daemon, or a systemd unit with
+/// `Delegate=yes` for one it starts — and a daemon that is not inside the
+/// tree does not place its boxes either (NET-079's exception: unenforced,
+/// never refused, and never a box that dies joining a leaf it cannot join).
+/// In a microVM the guest daemon is pid 1 and roots its own tree under the
+/// cgroup2 mount the guest boot path makes with namespace delegation.
 ///
 /// **Why a box stays in its leaf.** The box's leaf is the root of its cgroup
 /// namespace (architecture, *Box Resources*): the box's first process joins
-/// the leaf in its pre-exec closure, *then* unshares the cgroup namespace, so
-/// the namespace is rooted where the box already stands. Any cgroup view the
-/// box could mount after that starts at the namespace root — the leaf itself —
-/// so a sibling leaf is below neither and invisible, and with cgroup2 mounted
-/// `nsdelegate` the root's own `cgroup.procs` is not writable from inside the
-/// namespace (it is a delegation boundary, and the process running as the
-/// delegated uid inside it holds no capability over it). The tree the sandbox
-/// binds at the conventional mountpoint for the join is *covered* once the
-/// join has run — an empty read-only tmpfs — so the host's cgroup mount stays
-/// out of the box's mount namespace (the design's own wording of this
-/// obligation) and the box is left with no cgroup path to resolve at all:
-/// none to read a limit from, and none to write a migration to. The
-/// root-owned tree above `boxes/` is the barrier behind that: a box runs as
-/// the daemon's uid via its user-namespace map, which is delegated `boxes/`
-/// and nothing above it.
+/// the leaf in its pre-exec closure, *then* unshares the cgroup namespace —
+/// `unshare(CLONE_NEWCGROUP)` roots the new namespace at the cgroup the
+/// caller stands in, so the namespace is rooted where the box already stands.
+/// Any cgroup view the box could mount after that starts at the namespace
+/// root — the leaf itself — so a sibling leaf is neither visible nor
+/// reachable, and with cgroup2 mounted `nsdelegate` the root's own
+/// `cgroup.procs` is not writable from inside the namespace (it is a
+/// delegation boundary, and the process running as the delegated account
+/// inside it holds no capability over it). The tree the sandbox binds at the
+/// conventional mountpoint for the join is *covered* once the join has run —
+/// an empty read-only tmpfs — so the host's cgroup mount stays out of the
+/// box's mount namespace (the design's own wording of this obligation) and
+/// the box is left with no cgroup path to resolve at all: none to read a
+/// limit from, and none to write a migration to. The barrier against a box is
+/// therefore its cgroup-namespace root plus `nsdelegate` plus that cover —
+/// not the slice's uid, which the box shares with the daemon. Of those
+/// layers, the cover is the one the stand-in-tree tests can assert (a path
+/// under an empty tmpfs does not resolve); the namespace root needs the
+/// kernel's own bookkeeping to see, which is what the delegated-tree test
+/// asserts: the host-side `cgroup.procs` holds the box's pid while the box
+/// reads `0::/`.
 pub mod classifier {
     use std::path::{Path, PathBuf};
 
@@ -556,22 +583,17 @@ pub mod classifier {
     /// Creates the box's leaf under `root`, before the box's first process
     /// exists. Requires the tree the privileged step installs (or the guest
     /// daemon builds): `<root>/boxes` must already exist and be delegated to
-    /// the daemon's uid, and its absence is the `NotFound` that tells the
+    /// the daemon's account, and its absence is the `NotFound` that tells the
     /// daemon this host has no per-box classifier at all — the box then runs
     /// unenforced, never refused (NET-079's exception).
     ///
-    /// A leaf that already exists is reused rather than reported: it is what
-    /// a daemon death leaves behind (a box's leaf is removed when its launch
-    /// is abandoned and when its process is reaped, but nothing removes one
-    /// when the daemon is killed first), and an empty directory is not a
-    /// reason to fail a launch.
+    /// A leaf that already exists is surfaced, not reused: the leaf is named
+    /// by its session's id, so on a fresh launch an existing one is a
+    /// collision — another session holds it — and [`sweep_box_leaves`] has
+    /// already taken the empty directories a daemon death leaves behind.
     pub fn create_box_leaf(root: &Path, box_id: &str) -> std::io::Result<PathBuf> {
         let leaf = box_leaf(root, box_id);
-        match std::fs::create_dir(&leaf) {
-            Ok(()) => Ok(leaf),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(leaf),
-            Err(e) => Err(e),
-        }
+        std::fs::create_dir(&leaf).map(|()| leaf)
     }
 
     /// Moves `pid` into the cgroup whose `cgroup.procs` is `procs` — the one
@@ -583,13 +605,14 @@ pub mod classifier {
     /// than replacing the last. A process inherits its cgroup at fork, so a
     /// box is placed by moving the processes that were forked before the leaf
     /// existed, and everything they fork later lands in it without help.
+    ///
+    /// The `cgroup.procs` is never created here: a missing one means the leaf
+    /// is not a cgroup at all, and that is the `NotFound` the caller should
+    /// see, not a stray file a later write would fill.
     pub fn place_pid(procs: &Path, pid: u32) -> std::io::Result<()> {
         use std::io::Write as _;
 
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(procs)?;
+        let mut file = std::fs::OpenOptions::new().append(true).open(procs)?;
         file.write_all(format!("{pid}\n").as_bytes())
     }
 
@@ -606,6 +629,218 @@ pub mod classifier {
         }
     }
 
+    /// Removes the empty box leaves a daemon death leaves behind: a box's
+    /// leaf is removed when its launch is abandoned and when its process is
+    /// reaped, but nothing removes one when the daemon is killed first, and a
+    /// leaf named by its session's id must never be mistaken for a leftover
+    /// one the next launch of that id could take. Each is removed with the
+    /// same `rmdir` [`remove_box_leaf`] uses, and the kernel's refusal while
+    /// a cgroup holds a process is the sweep's own test of emptiness: a leaf
+    /// that goes was nobody's, and a leaf that stays belongs to a session the
+    /// daemon no longer knows — which is the collision its next launch
+    /// reports rather than a directory it reuses. A missing `boxes/` is not
+    /// an error; it is the host with no tree at all.
+    ///
+    /// Returns the leaves it removed, so the caller can say what it swept.
+    pub fn sweep_box_leaves(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let mut swept = Vec::new();
+        let entries = match std::fs::read_dir(root.join(BOXES_DIR)) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(swept),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            // `rmdir` refuses — `EBUSY` over a real tree, `ENOTEMPTY` over a
+            // stand-in holding a `cgroup.procs` — whatever still has a
+            // session in it, and that refusal is kept, not an error: the
+            // sweep owes a leaf its removal only when the leaf is empty.
+            if std::fs::remove_dir(&path).is_ok() {
+                swept.push(path);
+            }
+        }
+        Ok(swept)
+    }
+
+    /// Whether this daemon can place a box process in a leaf under `root` —
+    /// the daemon-side half of the placement, proved by doing it: a
+    /// throwaway child of this process migrates into a throwaway leaf and
+    /// back out, and the probe succeeding is the only evidence that the join
+    /// the box's own pre-exec closure makes can succeed.
+    ///
+    /// The kernel gates that migration on write permission to the
+    /// `cgroup.procs` of the *common ancestor* of source and destination, so
+    /// the probe is exactly the question that matters: a daemon outside the
+    /// delegated tree — one systemd starts in `user.slice`, whose first hop's
+    /// common ancestor is the root-owned cgroup2 mount root — fails with the
+    /// same `EACCES` the box's join would die on, and its daemon then knows
+    /// to place no box at all rather than to spawn one that dies taking a
+    /// leaf it cannot take (NET-079's exception, decided at the launch
+    /// rather than in the box). A daemon inside the tree — placed by the
+    /// installer's `--pid` step or a `Delegate=yes` unit, or entered by its
+    /// own pid-1 hand in the guest — needs no help, and every launch pays
+    /// one throwaway migration for the proof.
+    #[cfg(target_os = "linux")]
+    pub fn probe_child_placement(root: &Path) -> std::io::Result<()> {
+        // A throwaway leaf under the cohort, named by this daemon's pid so
+        // two daemons probing one tree never share one, and removed first so
+        // a probe that died before its own cleanup cannot wedge the next.
+        let leaf = box_leaf(root, &format!("placement-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir(&leaf);
+        std::fs::create_dir(&leaf)?;
+        let placed = place_child_in(&leaf.join("cgroup.procs"));
+        // The throwaway leaf is owed its removal. The child is gone by now,
+        // so over a real tree the kernel allows it; a refusal here is left
+        // alone — the probe has its answer, and a stuck probe leaf says so
+        // at the next probe, which removes it first.
+        let _ = std::fs::remove_dir(&leaf);
+        placed
+    }
+
+    /// Forks a child that writes its own pid to `procs`, and reports the
+    /// child's migration: `Ok(())` when the write placed it, the write's own
+    /// errno otherwise. Never called but by [`probe_child_placement`].
+    #[cfg(target_os = "linux")]
+    fn place_child_in(procs: &Path) -> std::io::Result<()> {
+        let path = match std::ffi::CString::new(procs.as_os_str().as_encoded_bytes()) {
+            Ok(path) => path,
+            Err(_) => return Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        };
+        // SAFETY: `fork(2)` runs in this (possibly multithreaded) process,
+        // and the child runs only async-signal-safe calls between the fork
+        // and its `_exit` — open, write, close, getpid — so no allocator or
+        // lock can be held across the fork by the child itself, in kind
+        // with the pre-exec closure this probe models.
+        let pid = unsafe { libc::fork() };
+        if pid == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if pid == 0 {
+            // The child's report is its exit status: 0 for a placement made,
+            // the migration's own errno for one refused. `Error::last_os_error`
+            // is `Error::Os(RawOsError)` around this thread's errno — no
+            // allocation, so it belongs to the async-signal-safe set the
+            // child may run.
+            let errno = match unsafe { place_self_in(path.as_ptr()) } {
+                Some(()) => 0,
+                None => std::io::Error::last_os_error().raw_os_error().unwrap_or(1),
+            };
+            // SAFETY: `_exit(2)` never returns, so the child ends here.
+            unsafe { libc::_exit(errno as libc::c_int) };
+        }
+        let mut status = 0;
+        // SAFETY: `waitpid(2)` waits on the child this function forked.
+        if unsafe { libc::waitpid(pid, &mut status, 0) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::WIFEXITED(status) {
+            let errno = libc::WEXITSTATUS(status);
+            if errno == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(errno))
+            }
+        } else {
+            Err(std::io::Error::other(
+                "the placement probe's child did not exit on its own",
+            ))
+        }
+    }
+
+    /// The child half of the placement probe: this process writes its own
+    /// pid to `path` with the raw syscalls, the same migration the box's
+    /// pre-exec closure makes. `Ok(())` is a placement made; an `Err` carries
+    /// the failing syscall's errno for the exit status. No `O_CREAT`: a
+    /// missing `cgroup.procs` is a missing leaf and is reported, not made.
+    #[cfg(target_os = "linux")]
+    unsafe fn place_self_in(path: *const libc::c_char) -> Option<()> {
+        // SAFETY: `open(2)` reads its arguments; the flags are the append
+        // the migration primitive uses, and `O_CLOEXEC` keeps the descriptor
+        // from crossing the exec this child never reaches anyway.
+        let fd = unsafe { libc::open(path, libc::O_WRONLY | libc::O_APPEND | libc::O_CLOEXEC) };
+        if fd == -1 {
+            return None;
+        }
+        // The pid is formatted by hand into a stack buffer: `format!` would
+        // allocate, and this is the pre-exec environment.
+        let mut digits = [0u8; 12];
+        let mut len = 0;
+        let mut pid = unsafe { libc::getpid() };
+        if pid == 0 {
+            digits[len] = b'0';
+            len += 1;
+        }
+        while pid > 0 && len < digits.len() {
+            digits[len] = b'0' + (pid % 10) as u8;
+            pid /= 10;
+            len += 1;
+        }
+        digits[..len].reverse();
+        digits[len] = b'\n';
+        len += 1;
+        // SAFETY: `write(2)` reads `digits`, which outlives the call, and the
+        // length is the pid and its newline.
+        if unsafe { libc::write(fd, digits.as_ptr().cast(), len) } == -1 {
+            // SAFETY: `close(2)` consumes the descriptor just opened, even
+            // on the failing path.
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        // SAFETY: `close(2)` consumes the descriptor just opened.
+        unsafe { libc::close(fd) };
+        Some(())
+    }
+
+    /// This process's cgroup as the kernel names it: the `0::` line of
+    /// `/proc/self/cgroup`, without its prefix — the v2 spelling, which a
+    /// v1 host does not carry. This is where the *daemon* stands, and what a
+    /// placement advisory can name: a daemon outside the delegated tree
+    /// reads the cgroup its supervisor put it in, and a daemon inside it
+    /// reads the leaf it entered.
+    #[must_use]
+    pub fn own_cgroup_path() -> Option<String> {
+        std::fs::read_to_string("/proc/self/cgroup")
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .map(str::to_string)
+    }
+
+    /// The account this daemon runs as: the daemon knows its own uid, and
+    /// the *name* is what a person types after the installer's `--user`, so
+    /// it is looked up rather than guessed. A uid with no account — a
+    /// container running a bare uid — is the `None` the hint below names
+    /// its fallback for.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn own_account() -> Option<String> {
+        nix::unistd::User::from_uid(nix::unistd::getuid())
+            .ok()
+            .flatten()
+            .map(|user| user.name)
+    }
+
+    /// The command a person runs on this host to give this daemon a
+    /// classifier tree: the installer takes the account the daemon runs as,
+    /// and the hint spells the whole command so the advisory that carries it
+    /// never has to name a placeholder for the one thing the daemon knows.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn install_hint() -> String {
+        match own_account() {
+            Some(account) => {
+                format!("sudo scripts/install-host-classifier.sh --user {account}")
+            }
+            None => "sudo scripts/install-host-classifier.sh --user \
+                 <the account this daemon runs as>"
+                .to_string(),
+        }
+    }
+
     /// Moves this process into `root`'s [`DAEMON_LEAF`], as the daemon does at
     /// startup: its own traffic then leaves from a leaf of its own (NET-080),
     /// never classed with a box's, and the daemon sits in a *sibling* of every
@@ -613,9 +848,15 @@ pub mod classifier {
     /// benefit could make the box leaves `domain invalid` (spike finding F).
     ///
     /// Creates the tree first where this process has the privilege to (the
-    /// guest's pid 1); natively the tree is the privileged step's to install,
-    /// so a missing one surfaces as the error it is and the daemon keeps
-    /// running, and its boxes, unenforced.
+    /// guest's pid 1). Natively the tree is the privileged step's to install,
+    /// and entering it is a migration: the daemon's first hop out of
+    /// `user.slice` has the root-owned cgroup2 mount root as its common
+    /// ancestor, so a daemon that starts outside the delegated tree cannot
+    /// make it itself — the installer's `--pid` step or a `Delegate=yes`
+    /// unit places it. A daemon left outside keeps running, with its boxes
+    /// unenforced: [`probe_child_placement`] is what tells an installed tree
+    /// it can place a box in from one it cannot, and nothing boxes into a
+    /// leaf before that.
     ///
     /// Also asks the kernel for the `memory` controller on the cohort —
     /// best-effort, and safe: `boxes/` holds no process, so enabling a
@@ -3321,12 +3562,35 @@ mod tests {
     /// would sit there without the cover, and whether the paths that would
     /// let it migrate anywhere open for writing at all.
     #[cfg(target_os = "linux")]
+    /// The files the kernel makes when a cgroup is created, modelled over a
+    /// stand-in tree: `cgroup.procs` and `cgroup.threads` — the two migration
+    /// files, empty because a fresh cgroup holds no process — and
+    /// `cgroup.subtree_control`, which the kernel puts in every cgroup. A real
+    /// tree is never asked to have these made for it: the kernel makes them
+    /// at `mkdir` time, and their absence over a stand-in is the one gap in
+    /// the model.
+    #[cfg(target_os = "linux")]
+    const CGROUP_KERNEL_FILES: [&str; 3] =
+        ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"];
+
+    /// Stands in for the kernel over a stand-in tree: writes
+    /// [`CGROUP_KERNEL_FILES`] into `dir`, empty, as the kernel leaves them
+    /// when it makes a cgroup.
+    #[cfg(target_os = "linux")]
+    fn model_cgroup_files(dir: &Path) {
+        for name in CGROUP_KERNEL_FILES {
+            std::fs::write(dir.join(name), "")
+                .unwrap_or_else(|e| panic!("modeling {name} in {}: {e}", dir.display()));
+        }
+    }
+
     const CGROUP_PROBE_C: &str = r#"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/statfs.h>
+#include <time.h>
 #include <unistd.h>
 
 int main(int argc, char **argv) {
@@ -3380,6 +3644,22 @@ int main(int argc, char **argv) {
             close(fd);
         } else {
             printf("open %s: errno %d\n", argv[i], errno);
+        }
+    }
+
+    /* argv[i] of the form "HOLD:<path>": the box then stays alive until that
+       path appears, so the test can read the host's side of the tree — the
+       leaf's cgroup.procs, which the kernel empties the moment the box's
+       last process exits — while the box is still in it. 30s of waiting, so
+       a lost release file is a held box the test notices, not one it hangs
+       on. */
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "HOLD:", 5) == 0) {
+            const char *release = argv[i] + 5;
+            for (int tries = 0; tries < 600 && access(release, F_OK) != 0; tries++) {
+                struct timespec ts = {0, 50 * 1000 * 1000};
+                nanosleep(&ts, 0);
+            }
         }
     }
     return 0;
@@ -3608,6 +3888,57 @@ int main(int argc, char **argv) {
             .collect()
     }
 
+    /// The daemon-side probe: a throwaway child of this process migrates
+    /// into a throwaway leaf of the tree and back out, and the daemon's
+    /// placement decision rests on what it reports — the same migration the
+    /// box's own join makes, performed by a child that is gone before the
+    /// box is spawned.
+    ///
+    /// Over a stand-in tree the probe can only be caught failing, and that
+    /// failure is the one the design owes: nothing behind the stand-in makes
+    /// the kernel's files when the probe makes its leaf, so the child
+    /// reports the missing `cgroup.procs` rather than a placement — the probe
+    /// never makes what it is looking for, which is what keeps it honest on
+    /// a host whose tree is not a tree. The success half runs where the tree
+    /// is real: it is the gate of `host_address_box_placed_in_leaf`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_reports_a_leaf_it_cannot_place_a_child_in() {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        std::fs::create_dir_all(tree.path().join(classifier::BOXES_DIR))
+            .expect("creating the cohort directory");
+
+        let missing = classifier::probe_child_placement(tree.path())
+            .expect_err("over a stand-in tree nothing made the probe leaf's cgroup.procs");
+        assert_eq!(
+            missing.kind(),
+            std::io::ErrorKind::NotFound,
+            "the probe's child opens the leaf's cgroup.procs without creating \
+             it: a missing one is a missing leaf, reported rather than made"
+        );
+
+        // The leaf the probe made is not left behind by the failure either:
+        // the probe owes the throwaway its removal whatever the answer was.
+        assert!(
+            !classifier::box_leaf(
+                tree.path(),
+                &format!("placement-probe-{}", std::process::id())
+            )
+            .exists(),
+            "the throwaway leaf the probe made is gone, failure or not"
+        );
+
+        // A host with no cohort directory at all says the same thing one step
+        // earlier: the probe never made its leaf.
+        let bare = classifier::probe_child_placement(tree.path().join("no-such-tree").as_path())
+            .expect_err("the probe cannot make a leaf under a tree that is absent");
+        assert_eq!(
+            bare.kind(),
+            std::io::ErrorKind::NotFound,
+            "a missing cohort is a missing tree, not a probe that passes"
+        );
+    }
+
     /// NET-079. A box placed in its own classifier leaf can neither see nor
     /// join another box's leaf: the leaf is the root of its cgroup namespace.
     ///
@@ -3671,6 +4002,11 @@ int main(int argc, char **argv) {
             "the leaf exists before the box's first process does"
         );
 
+        // The kernel makes a cgroup's files when it makes the cgroup; over a
+        // stand-in tree nothing does, so the model stands in for the kernel
+        // before any placement writes into them.
+        model_cgroup_files(&leaf);
+
         // A process is moved by writing its pid to the leaf's cgroup.procs —
         // the one migration primitive the whole placement rests on, the same
         // one the box's own first process and an injected process both use.
@@ -3689,16 +4025,67 @@ int main(int argc, char **argv) {
         // rather than exactly once. On a real tree the kernel holds the
         // membership itself, so nothing but the directory is ever left to
         // remove; over a stand-in tree the procs file the placements went
-        // into stands in for them, so it is dropped to represent their
-        // departure.
-        std::fs::remove_file(leaf.join("cgroup.procs"))
-            .expect("the box's processes are gone before its leaf is removed");
+        // into stands in for them, so the model is dropped to represent
+        // their departure.
+        for name in CGROUP_KERNEL_FILES {
+            std::fs::remove_file(leaf.join(name))
+                .unwrap_or_else(|e| panic!("dropping the modelled {name}: {e}"));
+        }
         classifier::remove_box_leaf(&leaf).expect("removing the box's leaf");
         assert!(
             !leaf.exists(),
             "a box's leaf does not outlive the box it decided"
         );
         classifier::remove_box_leaf(&leaf).expect("removing an already-removed leaf succeeds");
+
+        // A leaf that already exists is a collision, not a reuse: the leaf is
+        // named by the session that holds it, so a fresh launch finding one
+        // is told — and the sweep below has already taken what a daemon
+        // death left behind.
+        classifier::create_box_leaf(tree.path(), "held by another session")
+            .expect("creating the leaf a second session will collide with");
+        let collision = classifier::create_box_leaf(tree.path(), "held by another session")
+            .expect_err("a leaf another session holds is not taken over");
+        assert_eq!(
+            collision.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "the leaf is named by its session's id, so an existing one on a \
+             fresh launch is a collision, never a directory to reuse"
+        );
+        classifier::remove_box_leaf(&classifier::box_leaf(
+            tree.path(),
+            "held by another session",
+        ))
+        .expect("dropping the collision leaf now that it has done its work");
+
+        // The sweep at daemon start takes the empty leaves a daemon death
+        // leaves behind — and only those: a leaf that still holds a session
+        // is refused by its `rmdir`, over a real tree because the kernel
+        // will not remove a cgroup holding a process, and over this stand-in
+        // because the modelled procs file stands in for them.
+        let held = classifier::create_box_leaf(tree.path(), "a live session")
+            .expect("creating the leaf a live session holds");
+        model_cgroup_files(&held);
+        let empty = classifier::create_box_leaf(tree.path(), "an abandoned launch")
+            .expect("creating the leaf a daemon death left behind");
+        assert_eq!(
+            classifier::sweep_box_leaves(tree.path()).expect("sweeping the cohort at daemon start"),
+            vec![empty.clone()],
+            "the sweep removes the empty leaves and refuses the occupied ones"
+        );
+        assert!(
+            held.is_dir(),
+            "a leaf that still holds a session outlives the sweep: its \
+             session's next launch reports the collision instead of reusing \
+             the directory"
+        );
+        assert_eq!(
+            classifier::sweep_box_leaves(tree.path().join("no-such-tree").as_path())
+                .expect("a host with no tree sweeps nothing"),
+            Vec::<PathBuf>::new(),
+            "a missing cohort directory is a host with no tree at all, not a \
+             sweep failure"
+        );
 
         // A host without the tree says so in the error, not in a refusal: the
         // daemon reads this as "no per-box classifier on this host" and runs
@@ -3728,6 +4115,12 @@ int main(int argc, char **argv) {
         );
         let _sibling = classifier::create_box_leaf(box_tree.path(), "the-other-box")
             .expect("creating the sibling's leaf, for the box to fail to reach");
+        // The kernel made both leaves' files when it made the leaves; over a
+        // stand-in tree nothing did, and the box's own join — the write its
+        // pre-exec closure makes through the tree the sandbox bound — is
+        // into the modelled procs file.
+        model_cgroup_files(leaf.dir());
+        model_cgroup_files(&classifier::box_leaf(box_tree.path(), "the-other-box"));
 
         let mountpoint = classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT.to_string();
         let controllers = format!("{mountpoint}/cgroup.controllers");
@@ -3773,14 +4166,21 @@ int main(int argc, char **argv) {
              unshared its cgroup namespace onto it"
         );
 
-        // The box stands at the root of its own cgroup namespace — `0::/` —
-        // which on a tree-bearing host is its own leaf, never the daemon's
-        // and never a leaf with a sibling in it.
+        // The box stands at the root of its own cgroup namespace — `0::/`.
+        // Over this stand-in tree that reading is what any process reports
+        // after `unshare(CLONE_NEWCGROUP)` and proves the namespace was
+        // taken, not where it is rooted: the root is the test runner's own
+        // cgroup here. The kernel-held half — the host-side leaf's
+        // `cgroup.procs` naming the box while the box reads `0::/` — is what
+        // `host_address_box_placed_in_leaf` asserts on a delegated tree, the
+        // only place the namespace root is pinned to the leaf by the kernel
+        // itself.
         assert_eq!(
             placed.get("self_cgroup").map(String::as_str),
             Some("0::/"),
-            "the box's cgroup namespace is rooted where the box stands: the \
-             leaf it joined, which is what keeps every other leaf outside it"
+            "the box reads the root of its own cgroup namespace; that this \
+             stand-in tree is not the kernel's own is why the membership, not \
+             the reading, is what `host_address_box_placed_in_leaf` proves"
         );
 
         // The cover, mounted over the tree the box just joined through: the
@@ -3851,5 +4251,163 @@ int main(int argc, char **argv) {
             "a box with no classifier leaf gets no classifier tree at all: the \
              placement is an opt-in per box, not a change to every sandbox"
         );
+    }
+
+    /// NET-079 against the kernel's own bookkeeping: on a host whose
+    /// classifier tree is real and delegated to this account, and where this
+    /// process is inside it, the box's placement is a migration the kernel
+    /// performed — the host-side `cgroup.procs` of the leaf names the box's
+    /// process while the box reads `0::/` — which no stand-in tree can prove,
+    /// because a stand-in has no kernel to hold the membership.
+    ///
+    /// Gated, with the reason printed, on the two halves the kernel needs:
+    /// the tree installed and writable by this account, and a child of this
+    /// process actually migrating into a leaf of it — the same probe the
+    /// daemon's placement decision runs. Any host that never prepared the
+    /// tree is told so, and a host that did not place its *daemon* in it is
+    /// told that too, so the skip is the deployment's own state, not a
+    /// silent pass.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_address_box_placed_in_leaf() {
+        const SKIP: &str = "skipping host_address_box_placed_in_leaf";
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "{SKIP}: this host denies the unprivileged user namespace \
+                       every sandbox starts by unsharing: {reason}"
+            );
+            return;
+        }
+        let root = Path::new(classifier::TREE_ROOT);
+        let boxes = root.join(classifier::BOXES_DIR);
+        if !boxes.is_dir() {
+            eprintln!(
+                "{SKIP}: {} is absent — this host has no classifier tree to \
+                 place a box in (scripts/install-host-classifier.sh installs one)",
+                boxes.display()
+            );
+            return;
+        }
+        if nix::unistd::access(&boxes, nix::unistd::AccessFlags::W_OK).is_err() {
+            eprintln!(
+                "{SKIP}: {} is not writable by this account — the tree is \
+                 installed but not delegated to the account this process runs as",
+                boxes.display()
+            );
+            return;
+        }
+        if let Err(e) = classifier::probe_child_placement(root) {
+            eprintln!(
+                "{SKIP}: this process cannot place a child in the tree ({e}; it \
+                 runs in {}) — the installer's --pid step or a Delegate=yes unit \
+                 has to place the daemon first",
+                classifier::own_cgroup_path()
+                    .as_deref()
+                    .unwrap_or("no v2 cgroup of its own")
+            );
+            return;
+        }
+
+        // Two leaves of the real cohort, this test's own: the box's, and a
+        // sibling's the box must not reach.
+        let box_id = format!("host-address-{}", std::process::id());
+        let sibling_id = format!("sibling-of-{box_id}");
+        let leaf = classifier::create_box_leaf(root, &box_id)
+            .expect("creating the box's leaf in the real tree");
+        let sibling = classifier::create_box_leaf(root, &sibling_id)
+            .expect("creating the sibling's leaf in the real tree");
+        let mountpoint = classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT.to_string();
+        let controllers = format!("{mountpoint}/cgroup.controllers");
+        let root_procs = format!("{mountpoint}/cgroup.procs");
+        let sibling_procs = classifier::box_leaf(Path::new(&mountpoint), &sibling_id)
+            .join("cgroup.procs")
+            .to_string_lossy()
+            .into_owned();
+
+        // The probe holds the box in its leaf for a while — the kernel drops
+        // the membership the moment the box's last process exits, so the
+        // host's side of the tree has to be read while the box is still in
+        // it, and the box's build takes its own time to get there.
+        let probe_args = vec![
+            mountpoint.clone(),
+            controllers.clone(),
+            root_procs.clone(),
+            sibling_procs.clone(),
+            "HOLD:15000".to_string(),
+        ];
+        let held_name = box_id.clone();
+        let held_leaf = Some(config::ClassifierLeaf::new(leaf.clone()));
+        let report =
+            tokio::spawn(async move { box_probe_report(&held_name, held_leaf, &probe_args).await });
+
+        // The kernel's own half of the placement: the leaf's `cgroup.procs`
+        // on the host side, holding the box's own first process. The box
+        // names its pid as it reads it — inside its own PID namespace, which
+        // is not the pid the host side holds — so the member is not matched
+        // against the report but asserted to be the leaf's one and only.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        let members = loop {
+            let members = std::fs::read_to_string(leaf.join("cgroup.procs")).unwrap_or_default();
+            if !members.is_empty() {
+                break members;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the box never joined its leaf: the kernel holds nothing in {}",
+                leaf.join("cgroup.procs").display()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        eprintln!(
+            "the kernel holds {} in the box's leaf while the box is alive in it",
+            members.trim()
+        );
+        assert_eq!(
+            members.lines().count(),
+            1,
+            "the leaf the box joined holds the box's own first process and \
+             nobody else: {members:?}"
+        );
+        assert_ne!(
+            members.trim(),
+            std::process::id().to_string(),
+            "the member is the box's process, not this test's"
+        );
+
+        let placed = report.await.expect("the probe's box");
+        assert_eq!(
+            placed.get("self_cgroup").map(String::as_str),
+            Some("0::/"),
+            "the box reads the root of its own cgroup namespace — and the \
+             kernel holds that process in the leaf, so the root is the leaf"
+        );
+        // The barrier holds on the real tree as on the stand-in: the cover
+        // leaves the box no cgroup path at all, so the migration out of its
+        // leaf — to the tree root's own `cgroup.procs` or a sibling leaf's —
+        // has no file to open, let alone permission to write.
+        let wrote_root = placed
+            .get(&format!("open {root_procs}"))
+            .cloned()
+            .unwrap_or_else(|| "no report".to_string());
+        assert_ne!(
+            wrote_root, "errno 0",
+            "the box must not be able to open its own tree root's cgroup.procs \
+             for writing — writing a pid there is leaving the leaf. It reports \
+             {wrote_root:?}"
+        );
+        let opened_sibling = placed
+            .get(&format!("open {sibling_procs}"))
+            .cloned()
+            .unwrap_or_else(|| "no report".to_string());
+        assert_ne!(
+            opened_sibling, "errno 0",
+            "the box must not be able to open a sibling leaf's cgroup.procs on \
+             the real tree either. It reports {opened_sibling:?}"
+        );
+
+        // The box is out, so its leaf is empty and removable — and this test
+        // owes the real tree both of the leaves it made in it.
+        classifier::remove_box_leaf(&leaf).expect("removing the box's leaf");
+        classifier::remove_box_leaf(&sibling).expect("removing the sibling's leaf");
     }
 }
