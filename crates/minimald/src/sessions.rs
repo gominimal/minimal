@@ -418,6 +418,17 @@ impl Manager {
                 // other ask either way. Holds only `Arc`s, so a daemon that
                 // shuts down mid-walk leaves it to land on a closed book —
                 // grants then withhold, the shutdown-time answer anyway.
+                //
+                // The blocking work below — the book's std-Mutex'd flock and
+                // the registry's std RwLock, not the awaited walk — is a
+                // deliberate choice, not an oversight: it is the same class
+                // of ask a session actor's own `lease_loopback_address`
+                // makes on the same runtime, and both are bounded by the
+                // walk's own per-round and whole-probe caps, so neither
+                // parks a worker for an unbounded length. `spawn_blocking`
+                // would move the ask but not shorten it, and would add a
+                // thread whose whole job is to wait on a lock the actor
+                // path already waits on inline.
                 let book = Arc::clone(&loopback);
                 let registry = Arc::clone(&hostnames);
                 tokio::spawn(async move {
