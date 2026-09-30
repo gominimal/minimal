@@ -54,7 +54,7 @@
 //! the re-scope; an egress-proxy reachability check
 //! ([`super::proxy::bind_listener`]) replaces it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -71,10 +71,6 @@ pub const HOSTNAME_SUFFIX: &str = "min.internal";
 /// for this `minimald` instance. The host-id is configurable; this is the value
 /// used when none is configured.
 pub const DEFAULT_HOST_ID: &str = "local";
-
-/// The loopback address a `HostNet` PTask's name routes to (R3.6), and the
-/// published-loopback forwarder an `OwnIp` PTask keeps on a native host.
-const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// The reserved local range published box addresses come from on the host:
 /// `127.64.0.0/24` (design §7.1), as network address and prefix. Loopback
@@ -178,10 +174,13 @@ pub struct Route {
 /// The upstream a [`Route`] forwards to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Target {
-    /// Host loopback: a `HostNet` box's listeners (R3.6) — and, on a native
-    /// host, an `OwnIp` box's published-loopback forwarder, where the requested
-    /// port is the published external one.
-    Loopback,
+    /// Host loopback at `address`: a `HostNet` box's listeners, which sit on
+    /// its node's published address (R3.6, NET-129) — and, on a native host,
+    /// an `OwnIp` box's published-loopback forwarder, where the requested
+    /// port is the published external one and `address` is the host loopback
+    /// address the box's own ports are published at (NET-010) — its own, or
+    /// the node's when the reserved local range is absent (NET-123's interim).
+    Loopback { address: Ipv4Addr },
     /// An `OwnIp` box at its lease on the switch (a VM host): the daemon is on
     /// the switch, so a request reaches the box itself instead of the guest
     /// loopback. `ports` is the box's ingress declaration as an
@@ -196,11 +195,15 @@ enum Target {
 }
 
 impl Route {
-    /// A route to host loopback, owned by `session`, gating the ports a
-    /// request may name on `declared` (see [`Route::declared`]).
-    pub(crate) fn loopback(session: impl Into<String>, declared: Option<BTreeSet<u16>>) -> Self {
+    /// A route to host loopback at `address`, owned by `session`, gating the
+    /// ports a request may name on `declared` (see [`Route::declared`]).
+    pub(crate) fn loopback(
+        session: impl Into<String>,
+        address: Ipv4Addr,
+        declared: Option<BTreeSet<u16>>,
+    ) -> Self {
         Self {
-            target: Target::Loopback,
+            target: Target::Loopback { address },
             session: session.into(),
             declared,
         }
@@ -252,7 +255,7 @@ impl Route {
             return None;
         }
         match &self.target {
-            Target::Loopback => Some(SocketAddr::new(LOOPBACK, port)),
+            Target::Loopback { address } => Some(SocketAddr::new(IpAddr::V4(*address), port)),
             Target::Lease { lease, ports } => {
                 let internal = ports.get(&port).copied()?;
                 Some(SocketAddr::new(IpAddr::V4(*lease), internal))
@@ -266,16 +269,17 @@ impl Route {
         &self.session
     }
 
-    /// The IPv4 address the name routes at: host loopback, or the box's lease
-    /// on the switch. Every route's address is IPv4 — the switch fabric is,
-    /// and so is the host loopback a host-address box's listeners sit on —
-    /// which is what lets the caller's egress verdict, an IPv4 frame
-    /// decision, be asked about it directly (NET-070). Also the address the
-    /// R3.5 tracing events carry.
+    /// The IPv4 address the name routes at: the host loopback address its
+    /// published ports bind on, or the box's lease on the switch. Every
+    /// route's address is IPv4 — the switch fabric is, and so is the host
+    /// loopback a host-address box's listeners sit on — which is what lets
+    /// the caller's egress verdict, an IPv4 frame decision, be asked about
+    /// it directly (NET-070). Also the address the R3.5 tracing events
+    /// carry.
     #[must_use]
     pub fn address(&self) -> Ipv4Addr {
         match &self.target {
-            Target::Loopback => Ipv4Addr::LOCALHOST,
+            Target::Loopback { address } => *address,
             Target::Lease { lease, .. } => *lease,
         }
     }
@@ -319,6 +323,35 @@ struct OwnAddress {
     lease: Ipv4Addr,
     /// The box's ingress declaration as an external→internal port map.
     ports: BTreeMap<u16, u16>,
+}
+
+/// The publish state of an own-address box, by stable session id (NET-010):
+/// the host loopback address it leased from the reserved local range, and the
+/// ports its ingress declaration publishes on it — the inputs of the
+/// same-address collision check ([`HostnameRegistry::publish_own_address`],
+/// NET-129). Held by id, never by name, so the box keeps its address across a
+/// rename and the attach path can read it back without the session's current
+/// name.
+#[derive(Debug, Clone)]
+struct OwnPublished {
+    /// The host loopback address the box's ports are published at.
+    address: Ipv4Addr,
+    /// The external ports the box's declaration publishes on it.
+    ports: BTreeSet<u16>,
+}
+
+/// A same-address port collision a publish found (NET-129): a port two boxes
+/// would both answer at on one shared address. Intrinsic to the mode — the
+/// boxes were told to publish at the same place — so it is *reported*, at
+/// session start and in the daemon log, and neither port is translated: the
+/// declarations of record stand, and the collision is what the operator reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedPortCollision {
+    /// The port both boxes publish at.
+    pub port: u16,
+    /// The session whose box held the port first — the collision's other
+    /// half, named for the report.
+    pub other: String,
 }
 
 /// Who a proxied request came from (NET-070): the live session the request's
@@ -436,6 +469,22 @@ pub struct HostnameRegistry {
     /// box's route then targets its lease; on a native host it keeps the
     /// published-loopback model.
     on_switch: bool,
+    /// The host loopback address this node's `HostNet` boxes answer at
+    /// (R3.6, NET-129): the address the daemon leased from its slice of the
+    /// reserved local range when it started, which its boxes' listeners are
+    /// forwarded to. Default `127.0.0.1` — a native host's node address is the
+    /// host loopback itself.
+    node: Ipv4Addr,
+    /// Published own-address state, by stable session id (NET-010): the
+    /// address and ports an `OwnIp` box's declaration publishes at, from
+    /// finalize until destroy.
+    own_published: HashMap<SessionId, OwnPublished>,
+    /// Sessions whose box has stopped (NET-128): its name stays *held* —
+    /// answered, not absent, so a stopped box is never mistaken for one that
+    /// never existed — but a name it shares with the node answers NODATA, so
+    /// the node's own listener at that port keeps answering and the stopped
+    /// box is not silently impersonated by it.
+    stopped: HashSet<SessionId>,
     /// box name → the route a host-side proxy forwards its requests on.
     by_host: HashMap<Hostname, Route>,
     /// session name → its live registration, for withdrawal on exit.
@@ -482,12 +531,26 @@ impl HostnameRegistry {
         Self {
             host_ids: host_ids_for(&host_id.into()),
             on_switch,
+            node: Ipv4Addr::LOCALHOST,
+            own_published: HashMap::new(),
+            stopped: HashSet::new(),
             by_host: HashMap::new(),
             by_session: HashMap::new(),
             own: HashMap::new(),
             callers: HashMap::new(),
             by_lease: HashMap::new(),
         }
+    }
+
+    /// Sets the node's host loopback address — the address the daemon leased
+    /// from its slice for itself (NET-129) — and returns the registry, for
+    /// the sessions manager to build its registry with at init, after it has
+    /// leased. `HostNet` boxes answer at it; an own-address box that asked for
+    /// the shared node address publishes on it too.
+    #[must_use]
+    pub fn with_node_address(mut self, node: Ipv4Addr) -> Self {
+        self.node = node;
+        self
     }
 
     /// Registers `session_name`'s box name routing it along `route`, and
@@ -517,40 +580,46 @@ impl HostnameRegistry {
         hostname
     }
 
-    /// Registers a `HostNet` PTask, routing its box name to host loopback
-    /// (R3.6). The route gates no port: a host-address box has no ingress
-    /// declaration — launch validation rejects one on every network mode but
-    /// `own_ip` — and a direct connection to it is ungated, so the proxy
-    /// gates nothing either (NET-071).
+    /// Registers a `HostNet` PTask, routing its box name to this node's host
+    /// loopback address (R3.6, NET-129) — the address the daemon leased for
+    /// itself, which its boxes' forwarded listeners sit on. The route gates no
+    /// port: a host-address box has no ingress declaration — launch validation
+    /// rejects one on every network mode but `own_ip` — and a direct
+    /// connection to it is ungated, so the proxy gates nothing either
+    /// (NET-071).
     pub fn register_host_net(&mut self, session_id: SessionId, session_name: &str) -> Hostname {
         self.register(
             session_id,
             session_name,
-            Route::loopback(session_name, None),
+            Route::loopback(session_name, self.node, None),
         )
     }
 
-    /// Registers an `OwnIp` PTask **once its lease exists** (R3.1, NET-001):
-    /// the route reads the lease the attach path reported for this stable
-    /// session id, and nothing is registered when there is none — a box with
-    /// no lease has no address to route to. `declared` is the session's own
+    /// Registers an `OwnIp` PTask's box name at the address its declaration
+    /// publishes on (NET-010, NET-011): the box's own host loopback address
+    /// where it has one — leased from the reserved local range at finalize
+    /// ([`Self::publish_own_address`]) — or the node's shared address until it
+    /// does. On a VM host the route targets the box's switch lease as soon as
+    /// the attach path has reported one ([`Self::report_own_address`], R3.1,
+    /// NET-001); before that, and on a native host always, it targets the
+    /// published address, so **the name is held from finalize to destroy**
+    /// whether or not a client is attached. `declared` is the session's own
     /// ingress declaration as the ports a request may name
     /// ([`super::switch::declared_request_ports`]) — a plain set, because an
     /// own-address box is always gated and a declaration of none is the
     /// deny-all posture, not an open gate; this is the half of the route that
     /// keeps the proxy's refusals identical to the direct connection's on a
     /// native host's published-loopback routes (NET-069, NET-071). The
-    /// session actor calls this at spawn, finalize, and rename; the attach path
-    /// reports the lease with [`Self::report_own_address`] as soon as the box
-    /// attaches.
+    /// session actor calls this at spawn, finalize, and rename; the attach
+    /// path reports the lease with [`Self::report_own_address`] as soon as
+    /// the box attaches.
     pub fn register_own_ip(
         &mut self,
         session_id: SessionId,
         session_name: &str,
         declared: BTreeSet<u16>,
     ) -> Option<Hostname> {
-        let own = self.own.get(&session_id)?;
-        let route = self.own_route(session_name, own, declared);
+        let route = self.own_route(session_id, session_name, declared);
         Some(self.register(session_id, session_name, route))
     }
 
@@ -631,7 +700,7 @@ impl HostnameRegistry {
             ports: ports.clone(),
         };
         self.by_lease.insert(lease, session_id);
-        let route = self.own_route(session_name, &own, declared_keys(&ports));
+        let route = self.own_route(session_id, session_name, declared_keys(&ports));
         self.own.insert(session_id, own);
         self.register(session_id, session_name, route)
     }
@@ -648,21 +717,146 @@ impl HostnameRegistry {
             self.by_lease.remove(&own.lease);
         }
         self.callers.remove(&session_id);
+        self.stopped.remove(&session_id);
+    }
+
+    /// Publishes an `OwnIp` box's ingress declaration at `address` (NET-010):
+    /// the host loopback address the session leased for the box from the
+    /// daemon's slice of the reserved local range, with the external ports its
+    /// declaration names — the box's own port numbers, never translated.
+    /// Recorded by stable id from finalize until destroy, so the name answers
+    /// with no client attached (NET-011) and the box keeps its address across a
+    /// rename or a re-attach.
+    ///
+    /// Two boxes publishing at one address — the shared-address mode — collide
+    /// on every port both name (NET-129). The collision is intrinsic to the
+    /// mode: the boxes were told to publish at the same place, so it is
+    /// **reported**, never fixed by translating a port. One warn line here for
+    /// the daemon log per collision, and the list returned for the
+    /// session-start report.
+    pub fn publish_own_address(
+        &mut self,
+        session_id: SessionId,
+        session_name: &str,
+        address: Ipv4Addr,
+        ports: BTreeSet<u16>,
+    ) -> Vec<SharedPortCollision> {
+        let collisions: Vec<_> = self
+            .own_published
+            .iter()
+            .filter(|(other, own)| **other != session_id && own.address == address)
+            .flat_map(|(other, own)| {
+                let other_name = self
+                    .by_session
+                    .values()
+                    .find(|registration| registration.id == *other)
+                    .map(|registration| registration.hostname.to_string())
+                    .unwrap_or_else(|| other.to_string());
+                own.ports
+                    .intersection(&ports)
+                    .map(move |port| SharedPortCollision {
+                        port: *port,
+                        other: other_name,
+                    })
+            })
+            .collect();
+        for collision in &collisions {
+            tracing::warn!(
+                session_id = %session_id,
+                session_name,
+                address = %address,
+                port = collision.port,
+                other = %collision.other,
+                action = "shared-address-port-collision",
+                "two boxes publish one port at a shared loopback address"
+            );
+        }
+        self.own_published.insert(session_id, OwnPublished { address, ports });
+        collisions
+    }
+
+    /// The address a session's box publishes at, if it has one — for the
+    /// session actor to keep across a rename or re-register without leasing a
+    /// second address for the same box (NET-010).
+    #[must_use]
+    pub fn published_own_address(&self, session_id: SessionId) -> Option<Ipv4Addr> {
+        self.own_published.get(&session_id).map(|own| own.address)
+    }
+
+    /// Withdraws a destroyed box's publish and returns the address it held,
+    /// for the session actor to release into the allocator (NET-010) — the
+    /// lease's other half, at the same place the release is logged. A box
+    /// whose publish is gone stops answering at the address: its name is
+    /// withdrawn by [`Self::deregister`] in the same deregister.
+    pub fn unpublish_own_address(&mut self, session_id: SessionId) -> Option<Ipv4Addr> {
+        self.stopped.remove(&session_id);
+        self.own_published
+            .remove(&session_id)
+            .map(|own| own.address)
+    }
+
+    /// Marks a box's host as running: its name answers at its address — the
+    /// state every box is in from finalize, so a caller that never saw a stop
+    /// changes nothing (NET-011).
+    pub fn mark_running(&mut self, session_id: SessionId) {
+        if self.stopped.remove(&session_id) {
+            tracing::info!(
+                session_id = %session_id,
+                action = "name-answers",
+                "a stopped box's name answers again"
+            );
+        }
+    }
+
+    /// Marks a box's host as stopped (NET-128). The name stays **held** — a
+    /// stopped box is never mistaken for one that never existed, so the zone
+    /// never says NXDOMAIN for it — but a name it shares with the node answers
+    /// NODATA while it is stopped, so the node's own listener at that port is
+    /// not silently impersonated by a dead box's declaration. A box at its own
+    /// address keeps answering A: that address answers for it alone, and a
+    /// client connecting there is told where the box would be.
+    pub fn mark_stopped(&mut self, session_id: SessionId) {
+        if self.stopped.insert(session_id) {
+            tracing::info!(
+                session_id = %session_id,
+                action = "name-nodata-at-node-address",
+                "a stopped box's shared-address name answers NODATA"
+            );
+        }
     }
 
     /// The route an `OwnIp` box's name follows: straight to the lease on a VM
-    /// host (the daemon is on the switch, NET-001), or the published-loopback
-    /// model on a native host (the daemon is off the switch, and the client
-    /// selects the published external port). `declared` is the ports-a-request
-    /// -may-name set, always a gate for an own-address box — empty when the
-    /// box declares no ingress; on a lease route the applied map carries it
-    /// already, so the translation and the gate stay one declaration.
-    fn own_route(&self, session_name: &str, own: &OwnAddress, declared: BTreeSet<u16>) -> Route {
-        if self.on_switch {
-            Route::lease(session_name, own.lease, own.ports.clone())
-        } else {
-            Route::loopback(session_name, Some(declared))
+    /// host once the box holds one (the daemon is on the switch, NET-001) —
+    /// and, before that, at the address the box's declaration publishes on, so
+    /// the name is held from finalize (NET-011). On a native host the route
+    /// always targets the published address (NET-010): the box's own leased
+    /// address where the reserved local range gave it one, the node's shared
+    /// address where it did not (NET-123's interim), and the host loopback
+    /// where nothing published yet — the pre-instance published-loopback
+    /// model, which is what the answerer's fixtures and the proxy's
+    /// translation still exercise. `declared` is the ports-a-request-may-name
+    /// set, always a gate for an own-address box — empty when the box declares
+    /// no ingress; on a lease route the applied map carries it already, so the
+    /// translation and the gate stay one declaration.
+    fn own_route(&self, session_id: SessionId, session_name: &str, declared: BTreeSet<u16>) -> Route {
+        if self.on_switch
+            && let Some(own) = self.own.get(&session_id)
+        {
+            return Route::lease(session_name, own.lease, own.ports.clone());
         }
+        Route::loopback(session_name, self.published_or_node(session_id), Some(declared))
+    }
+
+    /// The host loopback address an `OwnIp` box's declaration publishes on
+    /// (NET-010): its own leased address where finalize published one, else
+    /// the node's shared address (NET-123's interim). What the attach path
+    /// binds the box's forwards at — read, not re-derived, so the forwards and
+    /// the name answer at the one address the registry holds for the box.
+    pub(crate) fn published_or_node(&self, session_id: SessionId) -> Ipv4Addr {
+        self.own_published
+            .get(&session_id)
+            .map(|own| own.address)
+            .unwrap_or(self.node)
     }
 
     /// Withdraws `session_name`'s box name, returning it if one was registered.
@@ -736,6 +930,36 @@ impl HostnameRegistry {
             .map(|name| format!("{name}.{HOSTNAME_SUFFIX}"))
     }
 
+    /// The A answer a live route's name carries in the box zone, with the
+    /// per-box state applied. The address is the one the box's declaration
+    /// publishes at (NET-010) — its own leased address where the reserved
+    /// local range gave it one, the node's shared address where it did not —
+    /// gate-checked the same way a route's own address is (NET-127).
+    ///
+    /// A box that is **stopped on a shared address** answers `None` (NET-128):
+    /// its name stays held, so the zone never says NXDOMAIN for a box that
+    /// exists, but the node's own listener at that port must not answer for a
+    /// dead box. A box on its own address keeps answering A — the address
+    /// answers for it alone, and the lookup says where the box would be.
+    fn zone_answer(&self, route: &Route, node: &[Ipv4Addr]) -> Option<Ipv4Addr> {
+        let Some(id) = self
+            .by_session
+            .get(route.session())
+            .map(|registration| registration.id)
+        else {
+            return route.zone_address(node);
+        };
+        let address = self
+            .own_published
+            .get(&id)
+            .map(|own| is_host_answerable(own.address, node).then_some(own.address))
+            .unwrap_or_else(|| route.zone_address(node));
+        if self.stopped.contains(&id) && address.is_some_and(|a| a == self.node) {
+            return None;
+        }
+        address
+    }
+
     /// What the box zone holds for a full zone name (`<name>.min.internal`,
     /// or its deprecated three-label form): the held/absent distinction
     /// [`ZoneEntry`] documents, which is the difference between NODATA and
@@ -751,7 +975,7 @@ impl HostnameRegistry {
         let host = host.to_ascii_lowercase();
         let entry = |route: &Route| ZoneEntry::Held {
             owner: route.session().to_string(),
-            address: route.zone_address(node),
+            address: self.zone_answer(route, node),
         };
         match self.by_host.get(&Hostname(host.clone())) {
             Some(route) => entry(route),
@@ -764,8 +988,10 @@ impl HostnameRegistry {
 
     /// Every live name in the zone as a [`ZoneRow`] — the zone table the
     /// daemon's state dump carries, one row per live name in name order. The
-    /// address column is the A answer a host-OS lookup gets (NET-127) or
-    /// `None` when the name is held at an address the host may not be told.
+    /// address column is the box's state as a lookup sees it (NET-010,
+    /// NET-128): the A answer a host-OS lookup gets — the box's own address
+    /// where it has one — or `None` when the name is held at an address the
+    /// host may not be told, or at a shared address by a box that is stopped.
     ///
     /// `node` is the set of addresses this daemon's host publishes at (see
     /// [`is_host_answerable`]).
@@ -777,7 +1003,7 @@ impl HostnameRegistry {
             .map(|(name, route)| ZoneRow {
                 name: name.as_str().to_string(),
                 owner: route.session().to_string(),
-                address: route.zone_address(node),
+                address: self.zone_answer(route, node),
             })
             .collect();
         rows.sort_unstable_by(|a, b| a.name.cmp(&b.name));
@@ -856,45 +1082,81 @@ mod tests {
         assert_eq!(reg.resolve("myservice.min.internal"), None);
     }
 
-    /// An `OwnIp` name registers only once its lease exists (NET-001): before
-    /// the attach path reports it there is nothing to route to, and after the
-    /// report the route follows the deployment. On a native host (off the
-    /// switch) that is the published-loopback model — the requested port is
-    /// the published external one (R3.1) — and the session's re-registration
+    /// An `OwnIp` box's name is **held from finalize**, before any client
+    /// attaches (NET-011, NET-013): it registers at the address the box's
+    /// declaration publishes on — the node's shared address until finalize's
+    /// publish leases the box one of its own (NET-010), the box's own address
+    /// from then on. The attach path's report carries the lease the box
+    /// attached with (NET-001); on a native host (off the switch) the route
+    /// keeps the published-loopback model — the requested port is the
+    /// published external one (R3.1) — and the session's re-registration
     /// carries the same declared ports the attach path's map applied
-    /// (NET-069). The lease is kept by the stable session id, so a rename
-    /// re-registers without a fresh report, and only the session's end drops
-    /// it.
+    /// (NET-069). The lease and the publish are both kept by the stable
+    /// session id, so a rename re-registers without a fresh report or a fresh
+    /// address, and only the session's end drops them.
     #[test]
-    fn own_ip_name_registers_once_the_lease_is_reported() {
+    fn own_ip_name_is_held_from_finalize_at_the_published_address() {
         let mut reg = HostnameRegistry::new("dev", false);
 
-        // No lease yet: the name registers nothing — whatever the box's
-        // declaration is.
-        assert!(
-            reg.register_own_ip(SessionId::nil(), "web", declared_ports())
-                .is_none()
+        // Finalize, with no client attached and no address leased yet: the
+        // name is held at the node's shared address — the interim for a host
+        // whose daemon has not leased the box one of its own (NET-123).
+        let hostname = reg
+            .register_own_ip(SessionId::nil(), "web", declared_ports())
+            .expect("the name is held at finalize");
+        assert_eq!(hostname.as_str(), "web.min.internal");
+        let route = reg.resolve("web.min.internal").expect("the name routes");
+        assert_eq!(
+            route.upstream(18080),
+            Some(SocketAddr::new(loopback_addr(), 18080))
         );
-        assert_eq!(reg.resolve("web.min.internal"), None);
+        assert_eq!(
+            route.upstream(9000),
+            None,
+            "a port outside the declaration routes nowhere, attached or not"
+        );
 
-        // The attach path reports the lease with the box's ingress declaration.
+        // Finalize's publish leases the box its own address (NET-010), and the
+        // re-registration that follows it moves the name there — still with no
+        // client attached.
+        let own = Ipv4Addr::new(127, 64, 0, 9);
+        assert!(
+            reg.publish_own_address(SessionId::nil(), "web", own, declared_ports())
+                .is_empty(),
+            "a box on its own address collides with nothing"
+        );
+        reg.register_own_ip(SessionId::nil(), "web", declared_ports())
+            .expect("re-registered at the box's own address");
+        let route = reg
+            .resolve("web.min.internal")
+            .expect("the name routes at its own address");
+        assert_eq!(
+            route.upstream(18080),
+            Some(SocketAddr::new(IpAddr::V4(own), 18080)),
+            "the name answers at the box's own address at its own port number"
+        );
+        assert_eq!(route.session(), "web");
+
+        // The attach path reports the lease with the box's ingress
+        // declaration. On a native host the route keeps the published address:
+        // the published external port is carried in the URL, and the
+        // forwarder sits on the box's own address at that same published
+        // port.
         let hostname =
             reg.report_own_address(SessionId::nil(), "web", Ipv4Addr::LOCALHOST, leased_ports());
         assert_eq!(hostname.as_str(), "web.min.internal");
-
-        // The published external port is carried in the URL; on a native host
-        // the forwarder is on loopback at that same published port.
         let route = reg
             .resolve("web.min.internal")
             .expect("routes after the report");
         assert_eq!(
             route.upstream(18080),
-            Some(SocketAddr::new(loopback_addr(), 18080))
+            Some(SocketAddr::new(IpAddr::V4(own), 18080))
         );
         assert_eq!(route.session(), "web");
 
-        // A rename withdraws and re-registers against the same lease, passing
-        // the session's declared ports as the session actor does.
+        // A rename withdraws and re-registers against the same lease and the
+        // same published address, passing the session's declared ports as the
+        // session actor does.
         reg.deregister("web");
         assert!(
             reg.register_own_ip(SessionId::nil(), "web", declared_ports())
@@ -905,25 +1167,21 @@ mod tests {
             .expect("routes after the re-registration");
         assert_eq!(
             route.upstream(18080),
-            Some(SocketAddr::new(loopback_addr(), 18080)),
-            "the re-registration carries the same declared ports"
-        );
-        assert_eq!(
-            route.upstream(9000),
-            None,
-            "a port outside the declaration still routes nowhere"
+            Some(SocketAddr::new(IpAddr::V4(own), 18080)),
+            "the re-registration carries the same declared ports and address"
         );
 
-        // At session end the fact is dropped: the name is withdrawn and
-        // nothing routes anymore.
+        // At session end the publish and the lease fact are dropped with the
+        // name: nothing of the destroyed box's routes or addresses survives.
+        assert_eq!(
+            reg.unpublish_own_address(SessionId::nil()),
+            Some(own),
+            "the destroy path gets the address back to release into the allocator"
+        );
         reg.forget_own_address(SessionId::nil());
         assert_eq!(
             reg.deregister("web").map(|h| h.as_str().to_string()),
             Some("web.min.internal".to_string())
-        );
-        assert!(
-            reg.register_own_ip(SessionId::nil(), "web", declared_ports())
-                .is_none()
         );
         assert_eq!(reg.resolve("web.min.internal"), None);
     }
@@ -969,12 +1227,244 @@ mod tests {
         );
     }
 
+    /// A session id from a literal UUID, distinct per test: the registry holds
+    /// publish and lease state by id, so two boxes in one registry must have
+    /// two ids — sharing [`SessionId::nil`] would fake a collision and a
+    /// shared publish.
+    fn id(last: &str) -> SessionId {
+        SessionId::parse_str(&format!(
+            "00000000-0000-0000-0000-00000000000{last}"
+        ))
+        .expect("a literal uuid")
+    }
+
+    /// NET-129: a host-address box answers its name with its **node's**
+    /// published host-loopback address — `127.0.0.1` on a native node, one
+    /// allocated address per VM node — at the box's own port numbers, which a
+    /// `HostNet` route never gates and never translates.
+    #[test]
+    fn host_ip_box_answers_node_loopback_address() {
+        // A native node: the node address is the host loopback itself, and a
+        // host-address box's name answers there.
+        let mut native = HostnameRegistry::new("dev", false);
+        native.register_host_net(id("1"), "web");
+        assert_eq!(
+            native.zone_entry("web.min.internal", &[]),
+            ZoneEntry::Held {
+                owner: "web".to_string(),
+                address: Some(Ipv4Addr::LOCALHOST),
+            }
+        );
+        let route = native
+            .resolve("web.min.internal:8080")
+            .expect("a host-address box's name routes");
+        assert_eq!(
+            route.upstream(8080),
+            Some(SocketAddr::new(loopback_addr(), 8080)),
+            "the box's own port number, at the node's address, ungated"
+        );
+
+        // A VM node: the node holds one allocated address of its own, and its
+        // host-address boxes answer at it.
+        let node = Ipv4Addr::new(127, 64, 0, 200);
+        let mut vm = HostnameRegistry::new("dev", true).with_node_address(node);
+        vm.register_host_net(id("2"), "web");
+        assert_eq!(
+            vm.zone_entry("web.min.internal", &[]),
+            ZoneEntry::Held {
+                owner: "web".to_string(),
+                address: Some(node),
+            },
+            "a host-address box answers with its node's published address"
+        );
+        let route = vm
+            .resolve("web.min.internal:8080")
+            .expect("a host-address box's name routes");
+        assert_eq!(
+            route.upstream(8080),
+            Some(SocketAddr::new(IpAddr::V4(node), 8080)),
+            "the box's own port number at the node's allocated address"
+        );
+        assert_eq!(
+            route.upstream(9090),
+            Some(SocketAddr::new(IpAddr::V4(node), 9090)),
+            "a host-address route gates no port, so no port is translated"
+        );
+    }
+
+    /// NET-128: a box stopped on a **shared address** answers NODATA — held, so
+    /// the zone never says NXDOMAIN for a box that exists — because the
+    /// node's own listener at that port must not answer for a dead box. A box
+    /// on an address of its own keeps answering A while it is stopped: the
+    /// address answers for it alone, and a lookup says where the box would be.
+    #[test]
+    fn stopped_shared_address_box_is_nodata() {
+        let node = Ipv4Addr::new(127, 64, 0, 200);
+        let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
+        let shared = id("1");
+        let own = id("2");
+        let port = BTreeSet::from([8080u16]);
+
+        // One box publishing on the node's shared address, one on an address
+        // of its own — both registered from finalize, as the session actor
+        // does.
+        reg.publish_own_address(shared, "shared", node, port.clone());
+        reg.register_own_ip(shared, "shared", port.clone());
+        let own_address = Ipv4Addr::new(127, 64, 0, 9);
+        reg.publish_own_address(own, "own", own_address, port.clone());
+        reg.register_own_ip(own, "own", port);
+
+        // Both answer while they run.
+        let ZoneEntry::Held {
+            address: shared_address,
+            ..
+        } = reg.zone_entry("shared.min.internal", &[])
+        else {
+            panic!("a registered box's name is held");
+        };
+        assert_eq!(shared_address, Some(node));
+        let ZoneEntry::Held {
+            address: own_address,
+            ..
+        } = reg.zone_entry("own.min.internal", &[])
+        else {
+            panic!("a registered box's name is held");
+        };
+        assert_eq!(own_address, Some(Ipv4Addr::new(127, 64, 0, 9)));
+
+        // The hosts exit: both names stay held — never absent, so neither is
+        // negatively cached — but the shared one answers NODATA while the
+        // node's own listener at the port must not speak for the dead box.
+        reg.mark_stopped(shared);
+        reg.mark_stopped(own);
+        assert_eq!(
+            reg.zone_entry("shared.min.internal", &[]),
+            ZoneEntry::Held {
+                owner: "shared".to_string(),
+                address: None,
+            },
+            "a stopped shared-address box answers NODATA, not the node's address"
+        );
+        assert_eq!(
+            reg.zone_entry("own.min.internal", &[]),
+            ZoneEntry::Held {
+                owner: "own".to_string(),
+                address: Some(Ipv4Addr::new(127, 64, 0, 9)),
+            },
+            "a stopped box on its own address keeps answering A"
+        );
+
+        // The same view in the zone table the state dump carries: name order
+        // puts `own` first, so `shared` is the row that pops first.
+        let mut rows = reg.zone_table(&[]);
+        assert_eq!(rows.len(), 2, "both names stay in the zone: {rows:?}");
+        assert_eq!(
+            rows.pop().expect("the shared box's row").address,
+            None,
+            "the zone table reports the shared-address box as held without an A answer"
+        );
+        assert_eq!(
+            rows.pop().expect("the own box's row").address,
+            Some(Ipv4Addr::new(127, 64, 0, 9))
+        );
+
+        // Running again answers again — the stop is a state, not an end.
+        reg.mark_running(shared);
+        assert_eq!(
+            reg.zone_entry("shared.min.internal", &[]),
+            ZoneEntry::Held {
+                owner: "shared".to_string(),
+                address: Some(node),
+            }
+        );
+    }
+
+    /// NET-129: two boxes publishing at one shared address that name the same
+    /// port are **reported** — each collision once, naming both boxes and the
+    /// port — and neither port is translated: the declarations of record
+    /// stand, at the port numbers the boxes asked for. The collision is
+    /// intrinsic to the mode — the boxes were told to publish at the same
+    /// place — so nothing remaps around it.
+    #[test]
+    fn shared_address_port_collision_reported_not_translated() {
+        let node = Ipv4Addr::new(127, 64, 0, 200);
+        let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
+        let first = id("1");
+        let second = id("2");
+
+        // Finalize publishes and registers the first box: 8080 and 9090 on the
+        // node's shared address.
+        let first_ports = BTreeSet::from([8080u16, 9090]);
+        assert!(
+            reg.publish_own_address(first, "first", node, first_ports.clone())
+                .is_empty(),
+            "the first box at a port collides with nothing"
+        );
+        reg.register_own_ip(first, "first", first_ports.clone());
+        assert!(
+            reg.publish_own_address(first, "first", node, first_ports.clone())
+                .is_empty(),
+            "a box does not collide with its own re-published declaration"
+        );
+
+        // A second box at the same address naming 8080 too: the collision is
+        // reported against the first box's name, once, with the port — and
+        // its own port is not translated, so its declaration still names 8080.
+        let second_ports = BTreeSet::from([8080u16]);
+        assert_eq!(
+            reg.publish_own_address(second, "second", node, second_ports.clone()),
+            vec![SharedPortCollision {
+                port: 8080,
+                other: "first.min.internal".to_string(),
+            }],
+            "one collision, naming the box that held the port and the port itself"
+        );
+        reg.register_own_ip(second, "second", second_ports.clone());
+
+        // Neither port is translated: each box's route forwards at the port
+        // its own declaration names, on the shared address.
+        let first_route = reg
+            .resolve("first.min.internal")
+            .expect("the first box's name routes");
+        assert_eq!(
+            first_route.upstream(8080),
+            Some(SocketAddr::new(IpAddr::V4(node), 8080))
+        );
+        assert_eq!(
+            first_route.upstream(9090),
+            Some(SocketAddr::new(IpAddr::V4(node), 9090)),
+            "the first box keeps the port the collision did not touch"
+        );
+        let second_route = reg
+            .resolve("second.min.internal")
+            .expect("the second box's name routes");
+        assert_eq!(
+            second_route.upstream(8080),
+            Some(SocketAddr::new(IpAddr::V4(node), 8080)),
+            "the second box's port is published at the number it asked for"
+        );
+        assert_eq!(
+            second_route.upstream(9090),
+            None,
+            "and it does not inherit the other box's port either"
+        );
+
+        // A third box at an address of its own names the same port with no
+        // collision at all (NET-010): different address, no shared port.
+        let third = id("3");
+        let own_address = Ipv4Addr::new(127, 64, 0, 9);
+        assert!(
+            reg.publish_own_address(third, "third", own_address, second_ports)
+                .is_empty(),
+            "the same port on a different address is not a collision"
+        );
+    }
+
     /// The deprecated three-label form resolves to the same entry as the
     /// two-label one (NET-002). Matching keys on the `<host-id>` label, so a
     /// dotted session name is not stripped at the wrong label.
     #[test]
-    fn legacy_three_label_resolves_to_the_same_entry() {
-        let mut reg = HostnameRegistry::new("local", false);
+    fn legacy_three_label_resolves_to_the_same_entry() {        let mut reg = HostnameRegistry::new("local", false);
         reg.register_host_net(SessionId::nil(), "web");
 
         let legacy = reg

@@ -134,6 +134,13 @@ pub(crate) struct SessionConfig {
     /// route on spawn, relinks on rename, and withdraws on stop/destroy.
     #[cfg(target_os = "linux")]
     pub hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// The daemon's loopback allocator over its slice of the reserved local
+    /// range: the pool this session's own-address box's declaration publishes
+    /// on. The actor leases one address at finalize (NET-010/NET-011) and
+    /// releases it back at destroy — through the registry the publish and the
+    /// withdrawal bookend.
+    #[cfg(target_os = "linux")]
+    pub loopback: Arc<std::sync::Mutex<crate::sessions::LoopbackAllocator>>,
     /// Whether the daemon opted out of the deny-all egress default
     /// (NET-077): the launcher and the task path read it to resolve this
     /// session's effective egress (NET-074), and the start line below logs
@@ -501,6 +508,14 @@ pub struct Session {
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
 
+    /// The daemon's loopback allocator over its slice of the reserved local
+    /// range ([`SessionConfig::loopback`]): where the box's own host loopback
+    /// address comes from at finalize and where it goes back at destroy. The
+    /// lock is only ever held for a synchronous lease or release — a leaf
+    /// lock, never held across an `.await`.
+    #[cfg(target_os = "linux")]
+    loopback: Arc<std::sync::Mutex<crate::sessions::LoopbackAllocator>>,
+
     /// The daemon-scoped gvproxy switch, injected into each `SandboxLauncher`
     /// this session mints so an `OwnIp` PTask attaches to the one per-host
     /// switch (R1.5). Read only by the production `session_launcher`
@@ -606,6 +621,8 @@ impl Session {
             deny_all_opt_out,
             #[cfg(target_os = "linux")]
             hostnames,
+            #[cfg(target_os = "linux")]
+            loopback,
         } = seed;
         Self {
             receiver,
@@ -631,6 +648,8 @@ impl Session {
             forwards: Vec::new(),
             #[cfg(target_os = "linux")]
             hostnames,
+            #[cfg(target_os = "linux")]
+            loopback,
         }
     }
 
@@ -780,16 +799,94 @@ impl Session {
         match record.network {
             sessions::NetworkMode::OwnIp => {
                 reg.register_caller(record.id, &name, &record.policy, subnet);
-                reg.register_own_ip(
-                    record.id,
-                    &name,
-                    crate::net::switch::declared_request_ports(Some(&record.policy)),
-                );
+                // NET-010/NET-011: finalize publishes the box's declaration at
+                // a host loopback address of its own — leased from this
+                // daemon's slice the first time, kept by the stable session id
+                // across a rename or a restart of the actor — so the name
+                // answers from here to destroy, whether or not a client ever
+                // attaches (NET-013). The allocator is a leaf lock, taken
+                // briefly here with the registry held and never the other way
+                // round, so the two orders cannot cycle.
+                let declared =
+                    crate::net::switch::declared_request_ports(Some(&record.policy));
+                let published = reg
+                    .published_own_address(record.id)
+                    .or_else(|| self.lease_loopback_address(&record, &name));
+                if let Some(address) = published {
+                    // One warn line per port another box at the same address
+                    // also publishes (NET-129): intrinsic to the shared-address
+                    // mode, reported — the session-start report — and never
+                    // translated.
+                    reg.publish_own_address(record.id, &name, address, declared.clone());
+                }
+                reg.register_own_ip(record.id, &name, declared);
             }
             sessions::NetworkMode::HostNet => {
                 reg.register_host_net(record.id, &name);
             }
             _ => {}
+        }
+    }
+
+    /// Leases the next host loopback address out of this daemon's slice of the
+    /// reserved local range for `record`'s box (NET-010), with the one info
+    /// line the observability contract asks for per lease, naming the box and
+    /// the address (the diagnostics bundle's log tail carries these beside
+    /// each release).
+    ///
+    /// `None` — with the warn line that says why — when the slice is spent:
+    /// the box then publishes on the node's shared address, the mode
+    /// [`HostnameRegistry`](crate::net::dns::HostnameRegistry) already
+    /// answers for, where NET-128 keeps a stopped box from impersonating the
+    /// node and NET-129 keeps the collision reported rather than translated.
+    #[cfg(target_os = "linux")]
+    fn lease_loopback_address(&self, record: &Record, name: &str) -> Option<Ipv4Addr> {
+        let mut allocator = self
+            .loopback
+            .lock()
+            .expect("loopback allocator lock poisoned");
+        match allocator.lease() {
+            Some(address) => {
+                tracing::info!(
+                    session_id = %record.id,
+                    session_name = name,
+                    ip = %address,
+                    action = "loopback-lease",
+                    "leased a host loopback address for the box's published ports"
+                );
+                Some(address)
+            }
+            None => {
+                tracing::warn!(
+                    session_id = %record.id,
+                    session_name = name,
+                    action = "loopback-slice-spent",
+                    "this daemon's slice of the reserved local range is spent; \
+                     the box's ports publish on the node's shared address"
+                );
+                None
+            }
+        }
+    }
+
+    /// Releases a destroyed box's host loopback address back into this
+    /// daemon's slice (NET-010) — the publish's other half, at the same
+    /// [`Self::lease_loopback_address`] that named the lease — with the one
+    /// info line per release naming the box and the address.
+    #[cfg(target_os = "linux")]
+    fn release_loopback_address(&self, record: &Record, name: &str, address: Ipv4Addr) {
+        let mut allocator = self
+            .loopback
+            .lock()
+            .expect("loopback allocator lock poisoned");
+        if allocator.release(address) {
+            tracing::info!(
+                session_id = %record.id,
+                session_name = name,
+                ip = %address,
+                action = "loopback-release",
+                "released a destroyed box's host loopback address back into the slice"
+            );
         }
     }
 
@@ -806,16 +903,18 @@ impl Session {
     }
 
     /// Withdraw this session's PTask hostname (R3.5), and — when the session
-    /// is ending for good — drop its lease fact, so the registry does not
-    /// outlive the box it pointed at.
+    /// is ending for good — drop its publish and its lease fact, so neither
+    /// the registry nor the daemon's slice outlives the box they pointed at:
+    /// the address returns to the slice (NET-010) and every later lookup of
+    /// the name answers NXDOMAIN (NET-012).
     ///
     /// Gated on [`Self::owns_hostname_route`] rather than relying on the
     /// registry's no-op behavior: the registry is keyed by name alone, so an
     /// ungated deregister from a session that never registered (`Draft`, or
     /// a non-routable mode) could withdraw an *unrelated* session's route
     /// that happens to share the same derived name. A rename withdraws with
-    /// the lease kept: the re-register that follows it routes at the same box
-    /// (NET-001).
+    /// the lease and the publish kept: the re-register that follows it routes
+    /// at the same box, on the same address (NET-001).
     #[cfg(target_os = "linux")]
     async fn deregister_hostname(&self, for_good: bool) {
         let record = self.record.record().await.unwrap();
@@ -824,6 +923,14 @@ impl Session {
             .write()
             .expect("hostname registry lock poisoned");
         if for_good {
+            // NET-010: the destroyed box's publish is withdrawn first, and the
+            // address it held returns to the daemon's slice — the lease the
+            // finalize made, released here so the next box may publish on it.
+            // NET-012: the name goes with the publish, so every later lookup
+            // answers NXDOMAIN rather than a stale address.
+            if let Some(address) = reg.unpublish_own_address(record.id) {
+                self.release_loopback_address(&record, &registry_name(&record), address);
+            }
             reg.forget_own_address(record.id);
         }
         if !self.owns_hostname_route(&record) {
@@ -1973,6 +2080,15 @@ impl Session {
                 // they write to and the process whose namespaces they join.
                 composition: self.composition(),
                 connection_env,
+                // The host owns the box's name-lifecycle half (NET-128): its
+                // `mainloop` marks the name running on the way in and stopped
+                // on the way out, so a shared-address name answers NODATA while
+                // no host is alive to answer it.
+                #[cfg(target_os = "linux")]
+                name_marker: Some(session_host::NameMarker::new(
+                    Arc::clone(&self.hostnames),
+                    record.id,
+                )),
             },
         ));
 

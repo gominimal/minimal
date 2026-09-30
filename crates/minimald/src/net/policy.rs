@@ -98,16 +98,29 @@ fn protocol_str(proto: IpProto) -> &'static str {
 }
 
 /// Builds the [`ExposeRequest`] that forwards `mapping`'s host-side
-/// `external_port` to `ptask_ip:internal_port` on the switch.
+/// `external_port` — published at `published`, the host loopback address the
+/// box's declaration is published on (NET-010) — to `ptask_ip:internal_port`
+/// on the switch.
 ///
-/// The `local` host is `127.0.0.1` so the forward binds host loopback only: a
-/// process *on the host* reaches the port (R2.3), while the spec's "no external
-/// exposure by default" keeps it off the LAN. The `remote` targets the PTask's
-/// allocated switch address.
+/// The `local` host is a loopback address so the forward binds host loopback
+/// only: a process *on the host* reaches the port (R2.3), while the spec's "no
+/// external exposure by default" keeps it off the LAN. It is the box's **own**
+/// address, not `127.0.0.1`, wherever the reserved local range gave it one, so
+/// two boxes naming the same port both publish — on their own addresses, at
+/// their own port numbers (NET-010). A box that shares an address with another
+/// and names a port it names too collides there; the collision is intrinsic to
+/// the mode, so it is *reported* by the registry's publish — never translated
+/// away here: neither port number is remapped (NET-129).
+///
+/// The `remote` targets the PTask's allocated switch address.
 #[must_use]
-pub fn expose_request(mapping: &PortMapping, ptask_ip: Ipv4Addr) -> ExposeRequest {
+pub fn expose_request(
+    mapping: &PortMapping,
+    published: Ipv4Addr,
+    ptask_ip: Ipv4Addr,
+) -> ExposeRequest {
     ExposeRequest {
-        local: format!("127.0.0.1:{}", mapping.external_port),
+        local: format!("{published}:{}", mapping.external_port),
         remote: format!("{ptask_ip}:{}", mapping.internal_port),
         protocol: protocol_str(mapping.proto).to_string(),
     }
@@ -144,7 +157,8 @@ impl ExposedMapping {
 }
 
 /// Exposes every static port mapping in `ingress` on the switch's `control_sock`
-/// forwarding to `ptask_ip`, returning a handle per exposed forward for teardown
+/// at `published` — the box's own host loopback address (NET-010) — forwarding
+/// to `ptask_ip`, returning a handle per exposed forward for teardown
 /// (R2.3, R2.4-static). The dynamic range, if any, is not applied here — dynamic
 /// port-mapping is split to #553.
 ///
@@ -157,12 +171,13 @@ impl ExposedMapping {
 /// Returns the I/O error from the first failing `expose` call (after rollback).
 pub async fn apply_ingress(
     control: &ControlChannel,
+    published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
 ) -> io::Result<Vec<ExposedMapping>> {
     let mut exposed: Vec<ExposedMapping> = Vec::with_capacity(ingress.port_mappings.len());
     for mapping in &ingress.port_mappings {
-        let req = expose_request(mapping, ptask_ip);
+        let req = expose_request(mapping, published, ptask_ip);
         match post_json(control, "/services/forwarder/expose", &req).await {
             Ok(()) => exposed.push(ExposedMapping {
                 local: req.local,
@@ -681,14 +696,16 @@ mod tests {
     #[test]
     fn expose_request_maps_host_port_to_ptask_ip() {
         // R2.3/R2.4-static: external_port forwards to the PTask's switch IP on
-        // internal_port; the local host is loopback so only the host can connect.
+        // internal_port; the local host is the box's own loopback address
+        // (NET-010) so only the host can connect.
         let mapping = PortMapping {
             external_port: 18080,
             internal_port: 80,
             proto: IpProto::Tcp,
         };
-        let req = expose_request(&mapping, Ipv4Addr::new(100, 64, 0, 2));
-        assert_eq!(req.local, "127.0.0.1:18080");
+        let published = Ipv4Addr::new(127, 64, 0, 9);
+        let req = expose_request(&mapping, published, Ipv4Addr::new(100, 64, 0, 2));
+        assert_eq!(req.local, "127.64.0.9:18080");
         assert_eq!(req.remote, "100.64.0.2:80");
         assert_eq!(req.protocol, "tcp");
     }
@@ -700,7 +717,13 @@ mod tests {
             internal_port: 53,
             proto: IpProto::Udp,
         };
-        let req = expose_request(&mapping, Ipv4Addr::new(100, 64, 0, 7));
+        // A box with no address of its own publishes on the node's shared
+        // one, still at its own port numbers (NET-123's interim, NET-129).
+        let req = expose_request(
+            &mapping,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(100, 64, 0, 7),
+        );
         let json = serde_json_lenient::to_string(&req).unwrap();
         assert!(json.contains("\"local\":\"127.0.0.1:5353\""), "got: {json}");
         assert!(json.contains("\"remote\":\"100.64.0.7:53\""), "got: {json}");

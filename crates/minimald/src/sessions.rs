@@ -198,6 +198,18 @@ pub struct Manager {
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
 
+    /// The daemon's allocator over its own slice of the reserved local range
+    /// (NET-010): the address pool a session's own-address box's declaration
+    /// publishes on, leased at finalize and released at destroy by the session
+    /// actor — which holds this through its `SessionConfig`, so the lease and
+    /// the release spend the one pool the manager built. Beside the registry,
+    /// because the two are one publish's two halves: the allocator owns the
+    /// *address*, the registry the *name* answering it. Like the registry's,
+    /// the lock is only ever held for a synchronous lease or release, never
+    /// across an `.await`.
+    #[cfg(target_os = "linux")]
+    loopback: Arc<std::sync::Mutex<LoopbackAllocator>>,
+
     /// Whether this daemon opted out of the deny-all egress default
     /// (NET-077), threaded from the server config into every session actor
     /// so each one resolves its own effective egress (NET-074) the same way
@@ -243,24 +255,55 @@ impl Manager {
         // daemons on one host mint distinct names and route both sets at the
         // same time (NET-027) instead of the second daemon's registrations
         // overwriting the first's under the shared `local` label.
+        // This daemon's slice of the reserved local range is a pure function of
+        // its own slice octet — the octet the daemon-start line in
+        // `crate::server` logs (NET-027) — so the allocator that spends it and
+        // the registry that answers the names it publishes are built over one
+        // slice, here beside each other: no daemon asks another for an address,
+        // because no daemon can reach another's slice (NET-010's per-daemon
+        // half; the host-global half is the disjointness of the slices).
+        //
+        // A VM daemon leases one address for its *node* out of that slice
+        // before any box does (NET-129: "one allocated address per VM node") —
+        // the address its host-address boxes answer at. A native node's
+        // address is the host loopback itself, which it already owns.
         #[cfg(target_os = "linux")]
-        let hostnames = {
+        let (hostnames, loopback) = {
             let switch = net_switch.lock().await;
             let on_switch = matches!(
                 switch.transport(),
                 crate::net::SwitchTransport::HostShuttle { .. }
             );
-            Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
+            // The slice octet: the third octet of this daemon's own gvproxy's
+            // /24 where it owns one (a native host — the pairing the plan
+            // guarantees), else the octet its instance id derives, since its
+            // switch is the host's default /16, the same one every VM on the
+            // host taps, and cannot name a slice of its own. The derivation is
+            // the same function `crate::server` keys its start line to,
+            // mirrored here; see [`slice_octet_for_daemon_id`].
+            let slice_octet = if on_switch {
+                slice_octet_for_daemon_id(switch.host_id())
+            } else {
+                switch.subnet().network().octets()[2]
+            };
+            let mut allocator = LoopbackAllocator::for_slice_octet(slice_octet);
+            let node = if on_switch {
+                allocator
+                    .lease()
+                    .expect("a daemon's own fresh slice always holds its node address")
+            } else {
+                Ipv4Addr::LOCALHOST
+            };
+            let registry = crate::net::dns::HostnameRegistry::new(
                 switch.host_id().to_owned(),
                 on_switch,
-            )))
+            )
+            .with_node_address(node);
+            (
+                Arc::new(RwLock::new(registry)),
+                Arc::new(std::sync::Mutex::new(allocator)),
+            )
         };
-        // This daemon's slice of the reserved local range is a pure function
-        // of its own slice octet — see [`LoopbackAllocator`], and the
-        // daemon-start line in `crate::server` that logs it (NET-027). It is
-        // not held here: the publish path that spends these addresses
-        // (NET-010/NET-129) is what will own the allocator, and it is another
-        // task's.
         let handle = ManagerHandle {
             sender,
             #[cfg(target_os = "linux")]
@@ -281,6 +324,8 @@ impl Manager {
             net_switch,
             #[cfg(target_os = "linux")]
             hostnames,
+            #[cfg(target_os = "linux")]
+            loopback,
             deny_all_opt_out,
         };
 
@@ -315,27 +360,25 @@ impl Manager {
 /// on one.
 ///
 /// The full arbitration is NET-010's host-global allocation; this is the
-/// per-daemon half of it. The publish path that **spends** these addresses
-/// (NET-129) is another task's and is not wired yet — until it lands,
-/// nothing calls [`LoopbackAllocator::allocate`], and the manager holds no
-/// allocator of its own.
+/// per-daemon half of it, and the publish path that **spends** these addresses
+/// is the session actor's finalize: it leases from the allocator the manager
+/// holds here (beside the hostname registry), one address per published box,
+/// and releases back at destroy.
 ///
 /// The carve-out itself is not restated here: the constructor reads its
 /// slice from the switch crate's default address plan, the same one that
 /// pairs each slice with the switch a daemon of that octet runs, so there
-/// is one definition of the `/27`s and this type owns only the cursor
-/// inside the slice it is handed.
+/// is one definition of the `/27`s — and the lease bookkeeping inside the
+/// slice is the `sessions` crate's pure allocator, the one the
+/// injectivity proof covers ([`sessions::core::loopback`],
+/// `kani_loopback_alloc_injective`), so the addresses a daemon hands out
+/// are the ones the proof speaks for.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct LoopbackAllocator {
-    /// The slice's first address, as a `u32` so hand-out is `next += 1`.
-    first: u32,
-    /// The slice's last address, inclusive.
-    last: u32,
-    /// The next address to hand out. Only ever advances — a published box
-    /// holds its address for its whole life, so reuse would collide with a
-    /// name that is still routed.
-    next: u32,
+    /// The pure allocator over this daemon's slice — the lease set the proof
+    /// is about, spent here.
+    inner: sessions::core::loopback::LoopbackAllocator,
 }
 
 /// How many slices the reserved local range holds — exactly as many switches
@@ -369,6 +412,9 @@ impl LoopbackAllocator {
     /// the plan rather than recomputed here — the same slice the plan pairs
     /// with the switch a daemon of this octet runs, so a daemon's published
     /// addresses can never fall outside the pairing the plan guarantees.
+    /// The pure allocator is built over the same carve, minted at the same
+    /// index; the two are one definition, and
+    /// `loopback_slice_carve_matches_the_switch_plan` keeps them that way.
     #[must_use]
     pub fn for_slice_octet(octet: u8) -> Self {
         let plan = ::switch::DEFAULT_ADDRESS_PLAN;
@@ -377,37 +423,73 @@ impl LoopbackAllocator {
             .switch_slice(index as usize)
             .expect("a wrapped octet always indexes a slice the plan serves")
             .loopback();
+        let carved = sessions::core::loopback::LoopbackSlice::for_index(index)
+            .expect("a wrapped octet always indexes a slice of the carve");
+        assert_eq!(
+            (slice.first(), slice.last()),
+            carved.range(),
+            "the plan's slice and the carve's slice are one definition"
+        );
         Self {
-            first: u32::from(slice.first()),
-            last: u32::from(slice.last()),
-            next: u32::from(slice.first()),
+            inner: sessions::core::loopback::LoopbackAllocator::new(carved),
         }
     }
 
     /// The next address to publish a box at, or `None` once this daemon's
-    /// slice is spent. Never reuses: a withdrawn name's address stays
-    /// retired until the daemon restarts.
+    /// slice is spent. Two live boxes never hold one address — the property
+    /// the pure allocator carries — and an address released at destroy is
+    /// free for the next box to publish on.
     ///
-    /// No caller yet, on purpose: the publish path that spends these
-    /// addresses (NET-129, arbitrated host-globally by NET-010) is another
-    /// task's, and it — not the daemon's start line — is what will call
-    /// this. Until it lands the slice is derived and announced, never drawn
-    /// from.
-    #[allow(dead_code)] // The publish path (NET-129/NET-010) is another task's.
-    pub fn allocate(&mut self) -> Option<Ipv4Addr> {
-        if self.next > self.last {
-            return None;
-        }
-        let addr = Ipv4Addr::from(self.next);
-        self.next += 1;
-        Some(addr)
+    /// The publish path that spends these addresses is the session actor's
+    /// finalize (NET-010, NET-011); the daemon's start line names the slice
+    /// it draws from.
+    pub fn lease(&mut self) -> Option<Ipv4Addr> {
+        self.inner.lease()
+    }
+
+    /// Returns a published box's address to the slice at destroy, so the
+    /// next box may publish on it. `false` — and no change — for an address
+    /// this slice never handed out or one that is not currently leased: a
+    /// double release must not free another box's address.
+    pub fn release(&mut self, address: Ipv4Addr) -> bool {
+        self.inner.release(address)
     }
 
     /// The slice this daemon draws from, first and last address inclusive.
     #[must_use]
     pub fn range(&self) -> (Ipv4Addr, Ipv4Addr) {
-        (Ipv4Addr::from(self.first), Ipv4Addr::from(self.last))
+        self.inner.slice().range()
     }
+}
+
+/// The slice octet a daemon instance id derives: FNV-1a over the id's bytes,
+/// folded into `1..=254`.
+///
+/// A mirror of `crate::server::octet_for_daemon_id`, byte for byte — the
+/// function the daemon's start line names its slice with. The manager needs
+/// the same octet to build the allocator that *spends* the slice, and the two
+/// must land on one slice: a daemon whose allocator drew from a different
+/// slice than the one its start line announces would hand out addresses its
+/// log disclaims. The twin lives in `crate::server`, which derives it for the
+/// start line from the *config's* pinned octet when one is set; the manager
+/// derives it here from the switch a native daemon owns (its /24's third
+/// octet — always the octet its start line used, pinned or derived) or, on a
+/// VM host where the switch is the host's shared /16, from the instance id
+/// alone. If either derivation is ever re-keyed, the other must follow: the
+/// test below pins the concrete octets, so a re-key of this copy fails it,
+/// and `crate::server`'s own tests walk its copy over the same id space.
+#[cfg(target_os = "linux")]
+fn slice_octet_for_daemon_id(id: &str) -> u8 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in id.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    // 1..=254, never 0 (the /16's own gateway sits at its network + 1) and
+    // never 255 (the /16's own host alias and daemon address sit in its last
+    // /24) — the same fold, and the same reason, as the twin in
+    // `crate::server`.
+    (hash % 254 + 1) as u8
 }
 
 /// Delete on-disk records whose status is unresumable after a
@@ -530,6 +612,8 @@ impl Manager {
             deny_all_opt_out: self.deny_all_opt_out,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
+            #[cfg(target_os = "linux")]
+            loopback: Arc::clone(&self.loopback),
         }
     }
 
@@ -2426,10 +2510,11 @@ pub(crate) mod tests {
             );
         }
 
-        // Hand-out never reuses and never leaves the slice.
+        // Hand-out is injective and never leaves the slice (NET-010) — the
+        // pure allocator's property, spent here over this daemon's slice.
         let mut allocator = daemon_a;
         let mut handed = std::collections::BTreeSet::new();
-        while let Some(addr) = allocator.allocate() {
+        while let Some(addr) = allocator.lease() {
             assert!(handed.insert(addr), "an address is handed out once");
             assert!(addr >= first_a && addr <= last_a, "inside the slice");
         }
@@ -2439,9 +2524,75 @@ pub(crate) mod tests {
             "a /27 slice holds 32 published addresses' worth of room"
         );
         assert_eq!(
-            allocator.allocate(),
+            allocator.lease(),
             None,
             "a spent slice yields no more addresses"
+        );
+
+        // A destroyed box's address returns to the slice, and the next box may
+        // publish on it — but only once: a second release of the same address,
+        // or a release of an address this slice never held, frees nothing.
+        assert!(
+            allocator.release(first_a),
+            "a released address returns to the slice"
+        );
+        assert_eq!(allocator.lease(), Some(first_a));
+        assert!(
+            !allocator.release(first_a),
+            "a released address is no longer leased, so releasing it again frees nothing"
+        );
+        assert!(
+            !allocator.release(Ipv4Addr::LOCALHOST),
+            "an address outside the slice is not this daemon's to free"
+        );
+    }
+
+    /// The carve the pure allocator proves and the switch plan's pairing are
+    /// one definition: every slice the plan serves a switch is exactly the
+    /// slice the sessions allocator mints at the same index, so the addresses
+    /// a daemon leases are the ones the injectivity proof covers, and the
+    /// slice its gvproxy publishes from is the one its log names.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn loopback_slice_carve_matches_the_switch_plan() {
+        for index in 0..::switch::DEFAULT_ADDRESS_PLAN.switch_capacity() {
+            let plan_slice = ::switch::DEFAULT_ADDRESS_PLAN
+                .switch_slice(index)
+                .expect("the plan serves exactly its own capacity")
+                .loopback();
+            let carved = sessions::core::loopback::LoopbackSlice::for_index(index as u32)
+                .expect("the carve mints one slice per index the plan serves");
+            assert_eq!(
+                (plan_slice.first(), plan_slice.last()),
+                carved.range(),
+                "slice {index} must be one definition in both crates"
+            );
+        }
+    }
+
+    /// The mirrored id derivation is the twin in `crate::server`'s: the same
+    /// octets for the same ids, always in `1..=254` — never 0 or 255, the two
+    /// octets reserved inside the /16 (see [`slice_octet_for_daemon_id`]).
+    /// A VM daemon's slice follows it, where a native daemon's follows its own
+    /// gvproxy's /24 instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn slice_octet_for_daemon_id_stays_within_the_reserved_octets() {
+        for id in ["", "a", "local", "k7f2m", "0", "1", "63", "min-internal"] {
+            let octet = slice_octet_for_daemon_id(id);
+            assert!(
+                (1..=254).contains(&octet),
+                "id {id:?} must derive an octet inside 1..=254, got {octet}"
+            );
+        }
+        // The twin's fold, pinned: a re-key of either copy moves these.
+        assert_eq!(slice_octet_for_daemon_id("a"), 221);
+        assert_eq!(slice_octet_for_daemon_id("b"), 184);
+        assert_eq!(slice_octet_for_daemon_id(""), 132);
+        assert_ne!(
+            slice_octet_for_daemon_id("a"),
+            slice_octet_for_daemon_id("b"),
+            "two ids must not land on one octet by construction of the fold"
         );
     }
 }

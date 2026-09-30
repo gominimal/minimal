@@ -2650,3 +2650,272 @@ async fn own_ip_default_deny_all() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Per-box loopback addresses and the name's finalize-to-destroy lifecycle
+// (NET-010 to NET-013)
+// ---------------------------------------------------------------------------
+
+/// An own-address session's config: a box that declares one published port —
+/// the ingress a publish is made of (NET-010) — under the session `name`.
+fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
+    minimald_rpc::CreateSessionRequest {
+        config: minimald_rpc::SessionConfig {
+            name: Some(name.to_string()),
+            project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
+            network: sessions::NetworkMode::OwnIp,
+            policy: sessions::SessionPolicy {
+                egress: None,
+                ingress: Some(sessions::IngressPolicy {
+                    port_mappings: vec![sessions::PortMapping {
+                        external_port: 18080,
+                        internal_port: 80,
+                        proto: sessions::IpProto::Tcp,
+                    }],
+                    ..Default::default()
+                }),
+            },
+            hooks_enabled: true,
+            attrs: Default::default(),
+        },
+        must_match_version: None,
+    }
+}
+
+/// Drives Create → ConfigureLoadout → FinalizeSession for an own-address box
+/// and returns its id. No attach ever happens along the way: the box is
+/// finalised and its name registered while no client has connected — the
+/// condition NET-013 answers under.
+async fn finalize_own_ip_session(client: &mut TestClient, name: &str) -> SessionId {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    let id = client
+        .call::<CreateSession>(&own_ip_session_req(name))
+        .await
+        .unwrap()
+        .id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .await
+    {
+        Errorable::Ok(_) => id,
+        Errorable::Err { error } => panic!("FinalizeSession failed for {name}: {error}"),
+    }
+}
+
+/// The A answer a live box's name carries, and the session that owns it —
+/// `None` when the name is absent (NXDOMAIN, NET-125).
+fn zone_answer_for(
+    server: &TestServer,
+    name: &str,
+) -> Option<(String, std::net::Ipv4Addr)> {
+    let registry = server.state.sessions_manager().await.hostnames();
+    match registry
+        .read()
+        .expect("registry lock")
+        .zone_entry(name, &[])
+    {
+        crate::net::dns::ZoneEntry::Held { owner, address } => {
+            Some((owner, address.expect("a live box's name answers with an A record")))
+        }
+        crate::net::dns::ZoneEntry::Absent => None,
+    }
+}
+
+/// NET-011: a session's finalisation is what registers its box's
+/// `<name>.min.internal` — the reply to `FinalizeSession` comes back with the
+/// name already held, at the box's own leased loopback address, and the lease
+/// is the one the registry published: the two surfaces that must agree (the
+/// route a proxy follows and the address a resolver answers) name one address.
+/// The registration is in the daemon log, naming the box and the address —
+/// the line a diagnostics bundle's log tail carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn name_registered_at_finalize() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_own_ip_session(&mut client, "web").await;
+
+    // No attach has happened — the name is held at the box's own address.
+    let (owner, address) =
+        zone_answer_for(&server, "web.min.internal").expect("the name is held at finalize");
+    assert_eq!(owner, "web", "the session owns its box name");
+    assert!(
+        address.octets()[0] == 127 && address.octets()[1] == 64,
+        "the box's own address comes from the reserved local range, got {address}"
+    );
+
+    // The registry's publish and the zone's answer are one address — the two
+    // halves of the same publish (NET-010) cannot disagree.
+    let registry = server.state.sessions_manager().await.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(id),
+        Some(address),
+        "the address the name answers at is the one the finalize published"
+    );
+
+    // The registration is said out loud, naming the box and the address.
+    let logged = capture.contents();
+    let lease_line = logged
+        .lines()
+        .find(|line| line.contains("loopback-lease") && line.contains("session_name=web"))
+        .unwrap_or_else(|| panic!("the lease must be logged, got: {logged}"));
+    assert!(
+        lease_line.contains(&format!("ip={address}")),
+        "the lease line names the address it leased, got: {lease_line}"
+    );
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains("registered PTask hostname") && line.contains("web")),
+        "the R3.5 registration is logged with the box's name, got: {logged}"
+    );
+}
+
+/// NET-010, runtime half: two own-address boxes that declare the *same* port
+/// each get a host loopback address of their own out of the daemon's slice of
+/// the reserved local range, so both publish — at their own addresses, at
+/// their own port numbers, never translated — where one loopback address
+/// would have made the second box's port a collision. NET-129's sub-requirement
+/// (report, don't translate) covers the boxes that *do* share an address; this
+/// is the case the shared-address mode exists to avoid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_box_gets_own_loopback_address() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let _alpha = finalize_own_ip_session(&mut client, "alpha").await;
+    let _beta = finalize_own_ip_session(&mut client, "beta").await;
+
+    let (_, alpha_address) =
+        zone_answer_for(&server, "alpha.min.internal").expect("alpha's name is held");
+    let (_, beta_address) =
+        zone_answer_for(&server, "beta.min.internal").expect("beta's name is held");
+    assert_ne!(
+        alpha_address, beta_address,
+        "two live boxes on one daemon must never share a loopback address"
+    );
+    for (name, address) in [("alpha", alpha_address), ("beta", beta_address)] {
+        assert!(
+            address.octets()[0] == 127 && address.octets()[1] == 64,
+            "{name}'s address comes from the reserved local range, got {address}"
+        );
+    }
+
+    // The same declared port is published at both addresses at the port
+    // number each box asked for — no translation, no remap around the pair.
+    let registry = server.state.sessions_manager().await.hostnames();
+    let routes = registry.read().expect("registry lock");
+    for (name, address) in [("alpha", alpha_address), ("beta", beta_address)] {
+        let route = routes
+            .resolve(&format!("{name}.min.internal"))
+            .unwrap_or_else(|| panic!("{name}'s name routes"));
+        assert_eq!(
+            route.upstream(18080),
+            Some(std::net::SocketAddr::new(
+                std::net::IpAddr::V4(address),
+                18080
+            )),
+            "{name}'s own port number is published at its own address, not translated"
+        );
+        assert_eq!(
+            route.upstream(9000),
+            None,
+            "a port outside {name}'s declaration routes nowhere"
+        );
+    }
+}
+
+/// NET-013: a box's name answers whether or not a client is attached. The
+/// finalize above attached nothing; the answer here is a full A record at the
+/// box's own address — held, in-zone, at the port the box declared — and the
+/// route a request follows reaches the same address at the same port, so a
+/// client that resolves the name and one that connects through the hostname
+/// proxy are told one and the same place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn name_answers_without_attached_client() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let _id = finalize_own_ip_session(&mut client, "web").await;
+
+    // No attach: the zone answers A, not NODATA and not NXDOMAIN.
+    let (_, address) =
+        zone_answer_for(&server, "web.min.internal").expect("the name answers with no client");
+
+    // And the routing half says the same address at the box's own port.
+    let registry = server.state.sessions_manager().await.hostnames();
+    let route = registry
+        .read()
+        .expect("registry lock")
+        .resolve("web.min.internal:18080")
+        .expect("the name routes with no client attached");
+    assert_eq!(
+        route.upstream(18080),
+        Some(std::net::SocketAddr::new(std::net::IpAddr::V4(address), 18080)),
+        "a request for the box's declared port is forwarded to the box's own address"
+    );
+}
+
+/// NET-012: destroying the box is what ends the name. Every later lookup
+/// answers NXDOMAIN — held while the box existed (NET-013), absent the moment
+/// it is destroyed — and the address it held returns to the daemon's slice with
+/// the release line the observability contract asks for, so the next box may
+/// publish on it (NET-010).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destroyed_box_name_is_nxdomain() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_own_ip_session(&mut client, "web").await;
+    let (_, address) =
+        zone_answer_for(&server, "web.min.internal").expect("the name answers while the box lives");
+
+    use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
+    match client
+        .call::<DestroySession>(&DestroySessionRequest { id })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("DestroySession failed: {error}"),
+    }
+
+    // The name is gone: a later lookup is told NXDOMAIN, not a stale address.
+    assert_eq!(
+        zone_answer_for(&server, "web.min.internal"),
+        None,
+        "a destroyed box's name must answer NXDOMAIN"
+    );
+    let registry = server.state.sessions_manager().await.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .resolve("web.min.internal"),
+        None,
+        "and nothing routes to a destroyed box"
+    );
+
+    // The release is said out loud, naming the box and the address it held.
+    let logged = capture.contents();
+    let release_line = logged
+        .lines()
+        .find(|line| line.contains("loopback-release") && line.contains("session_name=web"))
+        .unwrap_or_else(|| panic!("the release must be logged, got: {logged}"));
+    assert!(
+        release_line.contains(&format!("ip={address}")),
+        "the release line names the address it returned to the slice, got: {release_line}"
+    );
+}
