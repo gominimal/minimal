@@ -1422,7 +1422,7 @@ mod tests {
             bound: 3,
             probed: 254,
             first_failure: Some((
-                Ipv4Addr::new(127, 64, 0, 4),
+                Ipv4Addr::new(127, 0, 64, 4),
                 std::io::ErrorKind::AddrNotAvailable,
             )),
         };
@@ -1432,7 +1432,7 @@ mod tests {
         assert_eq!(
             record.first_refusal,
             Some((
-                "127.64.0.4".to_string(),
+                "127.0.64.4".to_string(),
                 "address not available".to_string()
             ))
         );
@@ -1458,7 +1458,7 @@ mod tests {
         };
         let json = serde_json_lenient::to_string_pretty(&surface).unwrap();
         assert!(json.contains("\"zone\": \"min.internal\""), "{json}");
-        assert!(json.contains("127.64.0.0/24"), "{json}");
+        assert!(json.contains("127.0.64.0/24"), "{json}");
         assert!(json.contains("\"interim_loopback\": false"), "{json}");
         assert!(json.contains("\"port\": 15353"), "{json}");
     }
