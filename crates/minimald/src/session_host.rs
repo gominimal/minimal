@@ -1115,6 +1115,12 @@ pub(crate) struct Launched<P, G> {
     /// with [`NetworkMode::NoNet`], since the filter is inherited only by
     /// children of the filtered process.
     seal_injection: bool,
+    /// The box's classifier leaf (NET-079): the cgroup its egress verdict is
+    /// decided on, and the one every process of the session — injected ones
+    /// included — is placed in. `None` on a host that places no box: the tree
+    /// the privileged step installs is absent, so the session runs unenforced
+    /// rather than refused on that ground.
+    leaf: Option<sandbox2::config::ClassifierLeaf>,
 }
 
 /// Actor messages to a [`Host`].
@@ -1628,6 +1634,13 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     #[cfg_attr(test, allow(dead_code))]
     seal_injection: bool,
 
+    /// The box's classifier leaf (NET-079): handed to every process injected
+    /// into this session so it joins the leaf — in the shim, before it joins
+    /// the box's namespaces, from the daemon's own cgroup namespace where the
+    /// leaf is reachable. `None` on a host that places no box.
+    #[cfg_attr(test, allow(dead_code))]
+    leaf: Option<sandbox2::config::ClassifierLeaf>,
+
     // The session's display name, handed to each binding so the shell-exit
     // prompt's save-then-delete lane can name its archive.
     session_name: String,
@@ -1812,6 +1825,10 @@ async fn run_hook_plan(plan: HookPlan) {
 #[cfg(not(test))]
 pub(crate) struct SandboxBackend {
     child: hakoniwa::Child,
+    /// The box's classifier leaf (NET-079), removed when this backend — and
+    /// so the session's last process — is dropped: a leaf does not outlive the
+    /// box it decided.
+    leaf: Option<sandbox2::config::ClassifierLeaf>,
 }
 
 #[cfg(not(test))]
@@ -1878,6 +1895,45 @@ impl ProcessBackend for SandboxBackend {
                 exit_code = ?reason.exit_code,
                 reason = %reason.reason,
                 "hakoniwa container/process exited"
+            );
+        }
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for SandboxBackend {
+    /// Tears the box down and removes its leaf (NET-079): a leaf does not
+    /// outlive the box it decided, and a [`hakoniwa::Child`] does not
+    /// terminate when dropped — without the kill, dropping a host that never
+    /// reaped its process would both orphan the sandbox and leave a leaf in
+    /// the tree with a process still in it.
+    ///
+    /// In the ordinary paths both are no-ops: `mainloop` reaps the process
+    /// before it returns (even on a kill — the loop's `wait()` at the
+    /// bottom), and `hakoniwa` caches the status so `wait` after a reap
+    /// returns it instead of blocking. The kill+wait here is for the paths
+    /// that skip all of that — an aborted loop future, most notably — where
+    /// SIGKILL is the bounded way out.
+    fn drop(&mut self) {
+        let Some(leaf) = self.leaf.take() else {
+            return;
+        };
+        // `kill` and `wait` are independent: a process that already exited
+        // fails the kill with `ESRCH` but still needs reaping.
+        if let Err(e) = self.child.kill() {
+            tracing::warn!(error = %e, "killing session process at teardown");
+        }
+        if let Err(e) = self.child.wait() {
+            tracing::warn!(error = %e, "reaping session process at teardown");
+        }
+        // The leaf goes last, once nothing is in it: a cgroup that still
+        // holds a process refuses its removal, so a leaked one is a warn and
+        // an empty directory, reused by the next session with the same name.
+        if let Err(e) = sandbox2::classifier::remove_box_leaf(leaf.dir()) {
+            tracing::warn!(
+                leaf = %leaf.dir().display(),
+                error = %e,
+                "removing the session's classifier leaf"
             );
         }
     }
@@ -2216,6 +2272,125 @@ impl Drop for SpawnedProcessGuard {
     }
 }
 
+/// The box's classifier leaf during its launch, removed if the launch is
+/// abandoned before the leaf is handed off (NET-079).
+///
+/// The leaf is created before the spawn — the sandbox layer needs it to keep
+/// the host's cgroup mounts out of the box — so every way out of
+/// [`SandboxLauncher::launch`] between that and the handoff into
+/// [`Launched`] has to account for a leaf with no box in it: an `Err` return
+/// for a build that failed, and — the one no `return` covers — the future's
+/// own `Drop`, which is what a teardown transition bounding its launch with
+/// a timeout (`session::HOOK_LAUNCH_TIMEOUT`) takes. This guard owns the
+/// leaf until `release` hands it to the [`SandboxBackend`] that keeps it for
+/// the session's lifetime.
+///
+/// Declared *before* the [`SpawnedProcessGuard`] it shares the launch with,
+/// so an abandoned launch drops in the opposite order: the process is reaped
+/// first and the leaf removed after, because a cgroup that still holds a
+/// process refuses its removal.
+#[cfg(not(test))]
+struct BoxLeafGuard {
+    leaf: Option<sandbox2::config::ClassifierLeaf>,
+}
+
+#[cfg(not(test))]
+impl BoxLeafGuard {
+    fn new(leaf: sandbox2::config::ClassifierLeaf) -> Self {
+        Self { leaf: Some(leaf) }
+    }
+
+    /// The leaf this guard owns, for the placement between the spawn and the
+    /// handoff.
+    fn get(&self) -> Option<&sandbox2::config::ClassifierLeaf> {
+        self.leaf.as_ref()
+    }
+
+    /// Hand the leaf off, disarming the guard.
+    fn release(mut self) -> sandbox2::config::ClassifierLeaf {
+        self.leaf
+            .take()
+            .expect("the leaf is taken only here, and this consumes the guard")
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for BoxLeafGuard {
+    fn drop(&mut self) {
+        let Some(leaf) = self.leaf.take() else {
+            return;
+        };
+        if let Err(e) = sandbox2::classifier::remove_box_leaf(leaf.dir()) {
+            tracing::warn!(
+                leaf = %leaf.dir().display(),
+                error = %e,
+                "removing the classifier leaf of an abandoned launch"
+            );
+        }
+    }
+}
+
+/// Creates the classifier leaf this session's box is placed in (NET-079),
+/// under the tree the privileged step installs on a native host
+/// (`scripts/install-host-classifier.sh`) and the guest daemon mounts for
+/// itself.
+///
+/// `None` means this host places no box: the tree is absent, or refuses the
+/// leaf. The session still launches, and its box runs unenforced — NET-079's
+/// exception, that a host which cannot decide per box never refuses the box
+/// or its connections on that ground.
+#[cfg(not(test))]
+fn create_session_leaf(session_name: &str) -> Option<sandbox2::config::ClassifierLeaf> {
+    match sandbox2::classifier::create_box_leaf(
+        std::path::Path::new(sandbox2::classifier::TREE_ROOT),
+        session_name,
+    ) {
+        Ok(leaf) => Some(sandbox2::config::ClassifierLeaf::new(leaf)),
+        // `NotFound` is the ordinary shape of "no tree on this host": the
+        // privileged step has not run. Info, not warn — it is a deployment
+        // state, not a fault, and the next step on this host is to run the
+        // installer, not to debug one launch.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                session = session_name,
+                "the classifier tree is not installed on this host; \
+                 the session's box runs unenforced",
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                session = session_name,
+                error = %e,
+                "creating the session's classifier leaf; the box runs unenforced",
+            );
+            None
+        }
+    }
+}
+
+/// Moves the box's processes into its classifier leaf, now that they exist.
+///
+/// Two of them do, because both were forked before the placement could run:
+/// hakoniwa forks the container supervisor inside `spawn()`, and that
+/// supervisor forks the program it execs before `spawn()` returns. Both are
+/// written in; everything either one forks later takes the leaf from its
+/// parent, and the processes the shim injects join it in
+/// [`crate::nsenter`] before they join the namespaces — so the box is in its
+/// leaf from its first process to its last.
+#[cfg(not(test))]
+fn place_box_processes(
+    leaf: &sandbox2::config::ClassifierLeaf,
+    supervisor: u32,
+) -> std::io::Result<()> {
+    let program = crate::nsenter::session_leader_pid(supervisor)
+        .map_err(|e| std::io::Error::other(format!("resolving the session program's pid: {e}")))?;
+    for pid in [supervisor, program] {
+        sandbox2::classifier::place_pid(&leaf.procs(), pid)?;
+    }
+    Ok(())
+}
+
 #[cfg(not(test))]
 impl SessionLauncher for SandboxLauncher {
     type Process = SandboxProcess;
@@ -2271,6 +2446,15 @@ impl SessionLauncher for SandboxLauncher {
         ))
         .await
         .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;
+
+        // NET-079: the classifier leaf this box's egress verdict is decided
+        // on, created before its first process exists. The guard owns it until
+        // the handoff into `Launched`, so a launch abandoned anywhere in
+        // between — a failed build, a cancelled future — leaves no leaf
+        // behind, and it drops after the process guard below so the box's
+        // processes are gone before their leaf is removed.
+        let leaf = create_session_leaf(&session_name);
+        let mut leaf_guard = leaf.clone().map(BoxLeafGuard::new);
 
         // Package + env-var union of the launcher baseline and every
         // contribution the composer collected. Packages: baseline set
@@ -2375,9 +2559,7 @@ impl SessionLauncher for SandboxLauncher {
             // into the host as the guard that keeps those files alive.
             // Boxed: inlined, this reaches the cache fetchers' client stack and
             // the launch future's layout overruns rustc's query depth (128).
-            let mut env = Box::pin(crate::env::Env::build(
-                ctx,
-                graph,
+            let mut env_args =
                 crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache, session)
                     .with_packages(packages)
                     .with_resolved_env_vars(env_vars)
@@ -2388,9 +2570,15 @@ impl SessionLauncher for SandboxLauncher {
                     // keeps the legacy un-gated wiring for now.
                     .without_package_attr_wiring()
                     .with_network(plan.clone())
-                    .with_username(username),
-            ))
-            .await?;
+                    .with_username(username);
+            // NET-079: the leaf created before this build, so the sandbox
+            // keeps the host's cgroup mounts out of the box and names the leaf
+            // it entered on its launch log line. The guard keeps the leaf for
+            // the launch's duration; this copy travels into the config.
+            if let Some(leaf) = leaf_guard.as_ref().and_then(BoxLeafGuard::get).cloned() {
+                env_args = env_args.with_classifier_leaf(leaf);
+            }
+            let mut env = Box::pin(crate::env::Env::build(ctx, graph, env_args)).await?;
 
             let mut container = env
                 .container(&plan)
@@ -2472,6 +2660,31 @@ impl SessionLauncher for SandboxLauncher {
         // handoff at the bottom; an `Err` return or a drop reaps it.
         let mut process = SpawnedProcessGuard::new(process);
 
+        // NET-079: the box's processes are moved into its leaf right after the
+        // spawn, from the daemon's own namespaces where the leaf is
+        // reachable — the same place the shim later writes an injected
+        // process. Never fatal: a box the host could not place runs in the
+        // daemon's leaf, which confines it just as tightly (it is the cgroup
+        // namespace every box gets as its root), at the cost of being
+        // classified as the daemon rather than itself.
+        if let Some(leaf) = leaf_guard.as_ref().and_then(BoxLeafGuard::get) {
+            let supervisor = process.get_mut().id();
+            match place_box_processes(leaf, supervisor) {
+                Ok(()) => tracing::info!(
+                    session = %session_label,
+                    leaf = %leaf.dir().display(),
+                    supervisor,
+                    "placed the session's processes in their classifier leaf",
+                ),
+                Err(e) => tracing::warn!(
+                    session = %session_label,
+                    leaf = %leaf.dir().display(),
+                    error = %e,
+                    "placing the session's processes in their classifier leaf",
+                ),
+            }
+        }
+
         // Step 3 (post-spawn): hand the process to the provider, which wires its
         // namespace onto the switch; a tap the sandbox layer built travels here
         // inside `Spawned`.
@@ -2493,11 +2706,18 @@ impl SessionLauncher for SandboxLauncher {
             master,
             process: SandboxProcess::new(SandboxBackend {
                 child: process.release(),
+                // The backend owns the leaf from here: it is what the session
+                // is placed in, and its removal at session end is the last
+                // thing the box owes.
+                leaf: leaf_guard.take().map(BoxLeafGuard::release),
             }),
             guard: env,
             net_guard,
             tty_path,
             seal_injection: network_mode == NetworkMode::NoNet,
+            // The copy the host keeps, so every process injected into the
+            // session can join the same leaf.
+            leaf,
         })
     }
 }
@@ -2628,6 +2848,8 @@ impl SessionLauncher for MockLauncher {
             net_guard: self.net_guard,
             tty_path,
             seal_injection: false,
+            // The mock has no sandbox, so no classifier placed it anywhere.
+            leaf: None,
         })
     }
 }
@@ -2706,6 +2928,13 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         let injection = crate::nsenter::Injection::new(self.session_leader_pid()?, program, args)
             .with_cwd(environment.cwd)
             .with_env(vars);
+        // NET-079: the box's leaf, so the injected process joins it in the
+        // shim before it joins the namespaces — the only place the join can
+        // happen from (see [`Injection::with_classifier_leaf`]).
+        let injection = match self.leaf.clone() {
+            Some(leaf) => injection.with_classifier_leaf(leaf),
+            None => injection,
+        };
         let injection = if self.seal_injection {
             injection.seal_none_box()
         } else {
@@ -2859,6 +3088,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             net_guard,
             tty_path,
             seal_injection,
+            leaf,
         } = launcher.launch(name, username, paths, sz).await?;
 
         let (sender, receiver) = mpsc::channel(HOST_MAILBOX_CAPACITY);
@@ -2909,6 +3139,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             connection_env,
             home_dir,
             seal_injection,
+            leaf,
             chord_matcher: ChordMatcher::new(SessionKeys::default()),
             chord_flush_deadline: None,
             guard,

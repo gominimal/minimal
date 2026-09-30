@@ -1559,6 +1559,8 @@ impl SessionLauncher for SealingMockLauncher {
             net_guard: None,
             tty_path,
             seal_injection: self.seal_injection,
+            // This mock has no sandbox, so no classifier placed it anywhere.
+            leaf: None,
         })
     }
 }
@@ -1614,4 +1616,79 @@ async fn hook_injections_carry_the_session_s_none_box_seal() {
             "the hook injection must carry the session's none-box seal",
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// NET-079: the daemon in a classifier leaf of its own, and every box's
+// leaf placed in a cohort it is a sibling of.
+// ---------------------------------------------------------------------
+
+/// The daemon enters a classifier leaf of its own at start: `<root>/daemon`,
+/// a **sibling** of every box leaf — never the tree root, where enabling a
+/// controller would make the box leaves unusable and where the daemon's own
+/// fetches could not be told apart from a box's, and never inside `boxes/`,
+/// the cohort that holds boxes and nothing else.
+///
+/// The placement is this process's pid written to its leaf's `cgroup.procs`,
+/// the one migration primitive the whole classifier rests on. Asserted over
+/// a stand-in tree because the host running this test may have no cgroup2 of
+/// its own: on a real tree the kernel holds the membership, and the write
+/// that performs the migration is the same either way. The tree is created
+/// by the entry itself, which is what the guest's pid 1 does on its own
+/// rootfs — natively the installer owns the tree, and its absence is the
+/// `NotFound` that leaves the daemon — and its boxes — unenforced.
+#[test]
+fn daemon_enters_its_own_leaf() {
+    let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+    let root = tree.path();
+
+    sandbox2::classifier::enter_daemon_leaf(root)
+        .expect("the daemon enters its own leaf, building the tree as it does");
+
+    let daemon = sandbox2::classifier::daemon_leaf(root);
+    let procs = daemon.join("cgroup.procs");
+    assert_eq!(
+        std::fs::read_to_string(&procs).expect("reading the daemon leaf's procs file"),
+        format!("{}\n", std::process::id()),
+        "the daemon is placed by writing its own pid to its leaf's cgroup.procs"
+    );
+    assert_eq!(
+        daemon,
+        root.join(sandbox2::classifier::DAEMON_LEAF),
+        "the daemon's leaf is one component under the tree root"
+    );
+    let cohort = root.join(sandbox2::classifier::BOXES_DIR);
+    assert!(
+        cohort.is_dir(),
+        "the cohort directory exists for the boxes to come"
+    );
+
+    // The two identities: a box's leaf lives in the cohort, a sibling of the
+    // daemon's, so no box is ever placed in the daemon's leaf and the daemon
+    // never in a box's.
+    let a_box = sandbox2::classifier::create_box_leaf(root, "a session")
+        .expect("creating a box's leaf in the same tree");
+    assert_eq!(
+        a_box.parent(),
+        Some(root.join(sandbox2::classifier::BOXES_DIR).as_path()),
+        "a box's leaf lives in the cohort, not beside it: {}",
+        a_box.display()
+    );
+    assert_ne!(
+        a_box.parent(),
+        daemon.parent(),
+        "a box's leaf and the daemon's are siblings, never the same directory"
+    );
+
+    // Entering again is harmless: a daemon that restarts into the leaf it
+    // already holds stays one member, and on a real tree the kernel keeps
+    // the membership set — the second write is a no-op there.
+    sandbox2::classifier::enter_daemon_leaf(root).expect("re-entering the daemon's leaf");
+    let members = std::fs::read_to_string(&procs).expect("re-reading the daemon leaf's procs");
+    assert!(
+        members
+            .lines()
+            .any(|member| member == std::process::id().to_string()),
+        "the daemon is still a member of its own leaf: {members:?}"
+    );
 }

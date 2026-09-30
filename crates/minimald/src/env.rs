@@ -40,7 +40,7 @@ use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use ot::OpTracker;
 use paths::{DaemonAbsPath, DaemonRelPath, SandboxAbsPath};
-use sandbox2::config::{Config, SandboxMapped};
+use sandbox2::config::{ClassifierLeaf, Config, SandboxMapped};
 use sandbox2::{Container, Sandbox};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -246,6 +246,13 @@ pub struct EnvArgs {
     ///
     /// [`SetupForPackages`]: graph::SetupForPackages
     include_package_attr_wiring: bool,
+
+    /// The box's classifier leaf (NET-079): the cgroup its egress verdict is
+    /// decided on, and the one every process of the box is placed in.
+    /// `None` on a host that places no box — the tree the privileged step
+    /// installs is absent — whose environments launch exactly as they did
+    /// before the classifier existed, never refused on that ground.
+    classifier_leaf: Option<ClassifierLeaf>,
 }
 
 impl EnvArgs {
@@ -272,6 +279,7 @@ impl EnvArgs {
             network: sandbox2::NetPlan::host(),
             session,
             include_package_attr_wiring: true,
+            classifier_leaf: None,
         }
     }
 
@@ -344,6 +352,16 @@ impl EnvArgs {
     #[must_use]
     pub fn with_network(mut self, plan: sandbox2::NetPlan) -> Self {
         self.network = plan;
+        self
+    }
+
+    /// Places this environment's box in `leaf`, its own classifier leaf
+    /// (NET-079) — the cgroup its egress verdict is decided on and the one
+    /// every process of the box is placed in. The leaf must already exist:
+    /// the launcher creates it before the spawn.
+    #[must_use]
+    pub fn with_classifier_leaf(mut self, leaf: ClassifierLeaf) -> Self {
+        self.classifier_leaf = Some(leaf);
         self
     }
 }
@@ -521,6 +539,15 @@ impl Env {
             .with_hostname(args.name.clone())
             .with_daemon_id(ctx.daemon_id().unwrap()) // Always set under minimald
             .with_username(args.username.unwrap_or_else(|| "user".to_string()));
+        // NET-079: the leaf the launcher created before this build, so the
+        // sandbox keeps the host's cgroup mounts out of a leaf-bearing box and
+        // names the leaf it entered on its launch log line. `None` on a host
+        // that places no box: the config above is the whole story, exactly as
+        // it was before the classifier existed.
+        let config = match args.classifier_leaf {
+            Some(leaf) => config.with_classifier_leaf(leaf),
+            None => config,
+        };
 
         // Wire up the channel actor and build the sandbox around the bridge.
         let (tx, rx) = mpsc::channel(8);

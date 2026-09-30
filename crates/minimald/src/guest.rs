@@ -217,6 +217,50 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
         }
     }
 
+    // NET-079: cgroup2, mounted with `nsdelegate` so the cgroup namespace
+    // every box is unshared into is a delegation boundary — the property the
+    // whole per-box classifier rests on. A box's namespace root is the
+    // daemon's own (childless) leaf, so its own leaf is a *sibling* of that
+    // root and no cgroup outside the root can be written; the daemon builds
+    // the tree itself once this mount is up (it enters its leaf at start,
+    // which creates it — pid 1 needs no privileged step). The same path is
+    // what the installer provisions natively.
+    // Best-effort: a guest without cgroup2 (a kernel without CONFIG_CGROUPS,
+    // say) must not fail boot over classification — its boxes run unenforced.
+    let cgroup2 = format!("{NEWROOT}/sys/fs/cgroup");
+    if let Err(e) = std::fs::create_dir_all(&cgroup2) {
+        tracing::warn!(error = %e, "creating the cgroup2 mountpoint; boxes will run unenforced");
+    }
+    let cgroup2_target = CString::new(cgroup2.as_str()).expect("no NUL in the cgroup2 mountpoint");
+    // SAFETY: mount(2) with valid C strings; `data` carries the `nsdelegate`
+    // option and is read for the duration of the call.
+    let mounted = unsafe {
+        libc::mount(
+            c"cgroup2".as_ptr(),
+            cgroup2_target.as_ptr(),
+            c"cgroup2".as_ptr(),
+            0,
+            c"nsdelegate".as_ptr().cast(),
+        )
+    };
+    // `EBUSY` (already mounted) is success for an idempotent mount — same
+    // tolerance as `raw_mount`, which cannot carry the `data` option.
+    let failure = if mounted == 0 {
+        None
+    } else {
+        let e = std::io::Error::last_os_error();
+        (e.raw_os_error() != Some(libc::EBUSY)).then_some(e)
+    };
+    match failure {
+        None => tracing::info!(
+            mountpoint = %cgroup2,
+            "mounted cgroup2 with nsdelegate for the per-box classifier tree"
+        ),
+        Some(e) => {
+            tracing::warn!(error = %e, "mounting cgroup2 with nsdelegate; boxes will run unenforced")
+        }
+    }
+
     // Transition into the new root the `switch_root(8)` way — mount-move it over
     // `/` then `chroot(".")` — rather than a bare `chroot(NEWROOT)`.
     //
