@@ -3449,7 +3449,7 @@ proof_native_resolution_without_proxy_env() {
       fi
       echo "resolved $NATIVE_NAME.min.internal with no proxy settings: $native_resolved"
       case "$native_resolved" in
-        *127.0.0.1*|*127.64.0.*) ;;
+        *127.0.0.1*|*127.0.64.*) ;;
         *)
           echo "::error::the name resolved outside the box zone's loopback (got: '$native_resolved')"
           fail
