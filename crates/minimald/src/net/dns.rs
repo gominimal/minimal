@@ -286,6 +286,20 @@ impl Route {
         }
     }
 
+    /// Moves this route from `from` to `to` — the registry's half of a node
+    /// address that was granted after the routes citing it were registered
+    /// ([`HostnameRegistry::set_node_address`]). Only a host-loopback route
+    /// answering exactly the old address moves: a box's lease is not a
+    /// host-loopback fact and never carries the node's address, and a box's
+    /// own granted address is not the node's either.
+    pub(crate) fn repoint(&mut self, from: Ipv4Addr, to: Ipv4Addr) {
+        if let Target::Loopback { address } = &mut self.target
+            && *address == from
+        {
+            *address = to;
+        }
+    }
+
     /// The A answer this route's name carries in the box zone when the lookup
     /// originates on the host OS (NET-127): the route's address when it is one
     /// the host may be told, `None` when it is not. A box's switch lease, which
@@ -553,6 +567,39 @@ impl HostnameRegistry {
     pub fn with_node_address(mut self, node: Ipv4Addr) -> Self {
         self.node = node;
         self
+    }
+
+    /// Sets the node's host loopback address once the answerer granted it —
+    /// the half of [`Self::with_node_address`] a daemon whose range verdict
+    /// landed *after* its registry was built needs (a microVM daemon: its
+    /// probe is a walk through the host's forwarder, and the daemon does not
+    /// hold its accept loop for it, so the registry opens on the interim and
+    /// the walk hands the node its address when it answers).
+    ///
+    /// Every route the **old** address answers is re-pointed at the new one,
+    /// not just the field: a host-address box registered while the node was
+    /// still on the interim would otherwise keep answering the interim for
+    /// its lifetime, and so would an own-address box that published on the
+    /// shared address for want of a verdict. Those are exactly the routes
+    /// whose address is the node's — a box's own granted address is never the
+    /// node's, because the record cannot grant one address to two namespaces
+    /// — so that is the rule. Nothing else about a route moves: the ports a
+    /// request may name are the box's own declaration, not a fact about where
+    /// it publishes.
+    pub fn set_node_address(&mut self, node: Ipv4Addr) {
+        let was = std::mem::replace(&mut self.node, node);
+        if was == node {
+            return;
+        }
+        tracing::info!(
+            from = %was,
+            to = %node,
+            action = "node-loopback-address",
+            "the node's own loopback address was granted; the names it answers move with it"
+        );
+        for route in self.by_host.values_mut() {
+            route.repoint(was, node);
+        }
     }
 
     /// Registers `session_name`'s box name routing it along `route`, and
@@ -1233,11 +1280,16 @@ pub struct LoopbackLeaseBook {
     /// volume with no descriptor the book holds open.
     lock: std::sync::Mutex<Option<fd_lock::RwLock<std::fs::File>>>,
     /// Whether the reserved local range is bindable on this host: the
-    /// daemon-start bind probe's verdict (NET-123), read once at start.
-    /// While it is absent every grant answers
-    /// [`LoopbackGrant::RangeAbsent`] — the addresses this book would grant
-    /// are not publishable, so none is spent.
-    present: bool,
+    /// daemon-start bind probe's verdict (NET-123), applied once at start —
+    /// or, on a host whose publish surface the probe can only reach through
+    /// the forwarder, once that walk lands, by
+    /// [`LoopbackLeaseBook::set_range_present`]. While it is absent every
+    /// grant answers [`LoopbackGrant::RangeAbsent`] — the addresses this book
+    /// would grant are not publishable, so none is spent — which is also the
+    /// verdict the book opens on while a deferred probe is still walking, so
+    /// a box that asks before the walk lands is published on the interim and
+    /// never handed an address nothing has vouched for.
+    present: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(target_os = "linux")]
@@ -1283,7 +1335,7 @@ impl LoopbackLeaseBook {
             record,
             staging,
             lock: std::sync::Mutex::new(Some(lock)),
-            present,
+            present: std::sync::atomic::AtomicBool::new(present),
         })
     }
 
@@ -1302,6 +1354,34 @@ impl LoopbackLeaseBook {
         drop(self.lock.lock().ok().and_then(|mut held| held.take()));
     }
 
+    /// Whether the reserved local range is bindable on this host — the verdict
+    /// every grant is gated on, as it stands right now.
+    ///
+    /// An interior read rather than a field because the verdict is not always
+    /// known when the book opens: a daemon inside a microVM can only measure
+    /// its publish surface through the host's forwarder, and that walk takes
+    /// long enough that the daemon must not hold its accept loop for it (see
+    /// [`crate::sessions::Manager::init`]), so the book opens on the interim
+    /// verdict and the walk applies its own when it lands.
+    fn range_present(&self) -> bool {
+        self.present.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Applies the bind probe's verdict over the reserved local range, when
+    /// the book opened before the probe that produced it could answer.
+    ///
+    /// The one transition this exists for is the deferred forwarder-conducted
+    /// walk of a microVM daemon ([`crate::net::policy::probe_publish_surface`]):
+    /// the book opens holding the interim verdict — absent, so nothing is
+    /// granted at an address nothing has vouched for — and the walk, once it
+    /// has an answer, applies it here. Only the verdict moves: no grant is
+    /// made or taken back by this call, and a book that already holds the
+    /// verdict it is asked for changes nothing.
+    pub fn set_range_present(&self, present: bool) {
+        self.present
+            .store(present, std::sync::atomic::Ordering::Release);
+    }
+
     /// Grants `namespace` an address from the host's pool, or answers with
     /// the one it already holds.
     ///
@@ -1317,7 +1397,7 @@ impl LoopbackLeaseBook {
     /// namespace — a rename racing a finalize — are both answered with the
     /// one address, the second by the line the first wrote.
     pub fn grant(&self, namespace: LeaseNamespace) -> LoopbackGrant {
-        if !self.present {
+        if !self.range_present() {
             return LoopbackGrant::RangeAbsent;
         }
         let Ok(mut held) = self.lock.lock() else {
@@ -1933,6 +2013,60 @@ mod tests {
             route.upstream(9090),
             Some(SocketAddr::new(IpAddr::V4(node), 9090)),
             "a host-address route gates no port, so no port is translated"
+        );
+    }
+
+    /// NET-129's other half: a node address that lands **after** the registry
+    /// was built — the shape of a microVM daemon, whose range verdict comes
+    /// back from a walk the daemon does not hold its accept loop for, so the
+    /// registry opens on the interim — takes the names that answered the
+    /// interim with it. A host-address box and an own-address box that
+    /// published on the shared address both answer the granted address, in the
+    /// zone and at the proxy's route, while a box at its own lease keeps it:
+    /// its address was never the node's to move.
+    #[test]
+    fn a_late_node_address_re_points_the_names_the_interim_answered() {
+        let node = Ipv4Addr::new(127, 0, 64, 200);
+        let mut reg = HostnameRegistry::new("dev", true);
+        // The interim the registry opens on: the host loopback.
+        reg.register_host_net(id("1"), "shared");
+        reg.register_own_ip(id("2"), "interim", declared_ports());
+        // And one box whose address was never the node's.
+        let lease = Ipv4Addr::new(100, 64, 0, 7);
+        reg.report_own_address(id("3"), "leased", lease, leased_ports());
+
+        reg.set_node_address(node);
+
+        for name in ["shared", "interim"] {
+            assert_eq!(
+                reg.zone_entry(&format!("{name}.min.internal"), &[]),
+                ZoneEntry::Held {
+                    owner: name.to_string(),
+                    address: Some(node),
+                },
+                "{name} answers the node's granted address, not the interim it opened on"
+            );
+        }
+        assert_eq!(
+            reg.resolve("shared.min.internal:8080")
+                .expect("a host-address box's name routes")
+                .upstream(8080),
+            Some(SocketAddr::new(IpAddr::V4(node), 8080)),
+            "the proxy forwards a host-address box at the granted address too"
+        );
+        assert_eq!(
+            reg.resolve("interim.min.internal:18080")
+                .expect("an own-address box's name routes")
+                .upstream(18080),
+            Some(SocketAddr::new(IpAddr::V4(node), 18080)),
+            "an own-address box on the shared address keeps its own gate, at the node's address"
+        );
+        assert_eq!(
+            reg.resolve("leased.min.internal:18080")
+                .expect("a leased box's name routes")
+                .upstream(18080),
+            Some(SocketAddr::new(IpAddr::V4(lease), 8080)),
+            "a box at its own lease keeps it: its address was never the node's"
         );
     }
 
@@ -2665,6 +2799,41 @@ mod tests {
         );
         // The record stays empty: an absent range spends nothing.
         assert_eq!(book.read().unwrap(), Vec::new());
+    }
+
+    /// The verdict a book opens on while the probe that produces it is still
+    /// walking — a microVM daemon's shape, the one daemon whose publish surface
+    /// it cannot bind on itself and whose walk it must not hold its accept loop
+    /// for. Grants are withheld — the interim, never a guess at an address —
+    /// until the verdict lands and is applied, and then the same ask grants; a
+    /// verdict the book already holds, applied again, spends nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_book_opens_interim_until_the_range_verdict_lands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let namespace = LeaseNamespace::Node;
+        let book = LoopbackLeaseBook::open(&state_root, false).unwrap();
+        assert_eq!(book.grant(namespace), LoopbackGrant::RangeAbsent);
+
+        // The walk lands, present: the book un-withholds, and the node's ask —
+        // the one the walk itself makes — is answered from the same record any
+        // later ask reads.
+        book.set_range_present(true);
+        let granted = match book.grant(namespace) {
+            LoopbackGrant::Granted(address) => address,
+            other => panic!("the landed verdict lets the same ask grant: {other:?}"),
+        };
+        assert_eq!(granted, sessions::core::loopback::POOL_FIRST);
+
+        // And applying the verdict a second time changes nothing: the walk
+        // lands once, and a book that already holds it is not re-opened.
+        book.set_range_present(true);
+        assert_eq!(
+            book.grant(namespace),
+            LoopbackGrant::Granted(granted),
+            "the namespace still holds the address the first landed verdict granted"
+        );
     }
 
     /// A record that cannot be trusted withholds grants rather than guessing:

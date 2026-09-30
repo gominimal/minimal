@@ -309,41 +309,58 @@ impl Manager {
             // session-start stand-in `rpc.rs`'s tests install: the stand-in
             // is process-global, and a daemon built in one test must not see
             // another test's absent verdict.
-            let probe = match transport {
-                crate::net::SwitchTransport::HostShuttle { cid, port } => {
-                    let via = "forwarder";
-                    let probe = crate::net::policy::probe_publish_surface(
-                        &crate::net::policy::ControlChannel::Vsock { cid, port },
-                    )
-                    .await;
-                    tracing::info!(
-                        via,
-                        "the daemon-start range probe walked the forwarder's loopback",
-                    );
-                    probe
-                }
-                _ => tokio::task::spawn_blocking(crate::net::loopback::probe)
-                    .await
-                    .unwrap_or_else(|join_error| {
-                        tracing::warn!(
-                            error = %join_error,
-                            "the daemon-start loopback probe was lost; reading the range absent",
-                        );
-                        crate::net::loopback::RangeProbe::failed_to_run()
-                    }),
+            //
+            // The two arms are not equally cheap, and only the cheap one is
+            // waited on. The local bind probe answers in microseconds, so it
+            // is read here, on the way to the book. The forwarder-conducted
+            // walk is two request/response rounds per address of the range on
+            // one control channel, and a channel that does not answer takes
+            // seconds to say so — long enough that awaiting it here would put
+            // it on `Manager::init`'s critical path, which is the one path
+            // `Server::run` waits on before it starts *accepting*: a guest
+            // daemon that held its own SSH accept for the host's loopback
+            // verdict would make every `minvmd stop` race the probe instead
+            // of reaching the daemon behind it. So that arm is spawned here
+            // and its verdict applied when it lands — the book opens on the
+            // interim verdict (grants withheld, nothing published at an
+            // address nothing has vouched for) and the walk, once it has an
+            // answer, both un-withholds and hands the node its address; the
+            // registry re-points the names that answered the interim. A box
+            // published in that window keeps the interim address it got — the
+            // same publish a range-absent host gives it — until a rename or a
+            // re-finalize asks again.
+            let (probe, shuttle) = match transport {
+                crate::net::SwitchTransport::HostShuttle { cid, port } => (None, Some((cid, port))),
+                _ => (
+                    Some(
+                        tokio::task::spawn_blocking(crate::net::loopback::probe)
+                            .await
+                            .unwrap_or_else(|join_error| {
+                                tracing::warn!(
+                                    error = %join_error,
+                                    "the daemon-start loopback probe was lost; \
+                                     reading the range absent",
+                                );
+                                crate::net::loopback::RangeProbe::failed_to_run()
+                            }),
+                    ),
+                    None,
+                ),
             };
-            tracing::info!(
-                surface = probe.surface(),
-                interim = probe.interim(),
-                first_failure = ?probe.first_failure,
-                "daemon-start loopback probe picked the publish surface",
-            );
+            if let Some(probe) = probe.as_ref() {
+                tracing::info!(
+                    surface = probe.surface(),
+                    interim = probe.interim(),
+                    first_failure = ?probe.first_failure,
+                    "daemon-start loopback probe picked the publish surface",
+                );
+            }
+            let present = probe.as_ref().is_some_and(|probe| probe.present());
             // The answerer's record for this host, under the state root every
             // daemon instance on it shares. Unreadable records withhold
             // grants (never guess an address another namespace may hold);
             // absent ranges grant nothing, the interim's business.
-            let book =
-                crate::net::dns::LoopbackLeaseBook::open(&minimal_state_dir, probe.present())?;
+            let book = crate::net::dns::LoopbackLeaseBook::open(&minimal_state_dir, present)?;
             let swept = book.release_dead_boxes(&live_session_ids(&store).await?, daemon_start);
             if !swept.is_empty() {
                 tracing::info!(
@@ -368,25 +385,67 @@ impl Manager {
             for address in book.unrecorded_publishes() {
                 crate::net::dns::warn_publish_collision(address);
             }
-            let node = if on_switch {
-                match book.grant(crate::net::dns::LeaseNamespace::Node) {
-                    crate::net::dns::LoopbackGrant::Granted(address) => address,
-                    other => {
-                        tracing::warn!(
-                            grant = ?other,
-                            "the node's own loopback address was not granted; \
-                             publishing host-address boxes on the 127.0.0.1 interim",
-                        );
-                        Ipv4Addr::LOCALHOST
-                    }
-                }
-            } else {
-                Ipv4Addr::LOCALHOST
-            };
+            // The node's own address (NET-129): a native node's is the host
+            // loopback it already owns, and a VM node's is a grant the range
+            // verdict gates — so on a VM node it is the spawned walk's to
+            // make, not this block's, and the registry opens on the interim
+            // address a withheld grant falls back to (`new`'s own default,
+            // named here because it is the interim, not an omission).
             let registry =
                 crate::net::dns::HostnameRegistry::new(switch.host_id().to_owned(), on_switch)
-                    .with_node_address(node);
-            (Arc::new(RwLock::new(registry)), Arc::new(book))
+                    .with_node_address(Ipv4Addr::LOCALHOST);
+            let hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>> =
+                Arc::new(RwLock::new(registry));
+            let loopback = Arc::new(book);
+            if let Some((cid, port)) = shuttle {
+                // Spawned after the sweep above, so the node's grant cannot
+                // race the daemon-start liveness pass that frees dead boxes'
+                // lines; the book's own flock serializes it against every
+                // other ask either way. Holds only `Arc`s, so a daemon that
+                // shuts down mid-walk leaves it to land on a closed book —
+                // grants then withhold, the shutdown-time answer anyway.
+                let book = Arc::clone(&loopback);
+                let registry = Arc::clone(&hostnames);
+                tokio::spawn(async move {
+                    let probe = crate::net::policy::probe_publish_surface(
+                        &crate::net::policy::ControlChannel::Vsock { cid, port },
+                    )
+                    .await;
+                    tracing::info!(
+                        via = "forwarder",
+                        surface = probe.surface(),
+                        interim = probe.interim(),
+                        first_failure = ?probe.first_failure,
+                        "the daemon-start range probe walked the forwarder's loopback \
+                         and picked the publish surface",
+                    );
+                    book.set_range_present(probe.present());
+                    if !probe.present() {
+                        tracing::warn!(
+                            first_failure = ?probe.first_failure,
+                            "the reserved local range is absent on the publish surface; \
+                             publishing boxes on the 127.0.0.1 interim",
+                        );
+                        return;
+                    }
+                    let node = match book.grant(crate::net::dns::LeaseNamespace::Node) {
+                        crate::net::dns::LoopbackGrant::Granted(address) => address,
+                        other => {
+                            tracing::warn!(
+                                grant = ?other,
+                                "the node's own loopback address was not granted; \
+                                 publishing host-address boxes on the 127.0.0.1 interim",
+                            );
+                            return;
+                        }
+                    };
+                    registry
+                        .write()
+                        .expect("hostname registry lock poisoned")
+                        .set_node_address(node);
+                });
+            }
+            (hostnames, loopback)
         };
         let handle = ManagerHandle {
             sender,

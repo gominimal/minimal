@@ -242,14 +242,17 @@ pub async fn remove_ingress(control: &ControlChannel, exposed: &[ExposedMapping]
 pub(crate) async fn probe_publish_surface(
     control: &ControlChannel,
 ) -> ::switch::loopback::RangeProbe {
-    probe_publish_surface_within(control, RANGE_PROBE_BUDGET).await
+    probe_publish_surface_within(control, RANGE_PROBE_BUDGET, RANGE_PROBE_REQUEST_BUDGET).await
 }
 
-/// [`probe_publish_surface`] with the walk's overall budget injected, so the
-/// overrun arm is testable at a budget a test can afford.
+/// [`probe_publish_surface`] with the walk's two budgets injected, so the
+/// overrun arm and the stalled-round arm are testable at numbers a test can
+/// afford: `budget` bounds the whole walk, `request` one request/response
+/// round of it.
 async fn probe_publish_surface_within(
     control: &ControlChannel,
     budget: Duration,
+    request: Duration,
 ) -> ::switch::loopback::RangeProbe {
     let mut probe = ::switch::loopback::RangeProbe::failed_to_run();
     let hosts: Vec<Ipv4Addr> = ::switch::loopback::range_hosts().collect();
@@ -261,15 +264,20 @@ async fn probe_publish_surface_within(
                 remote: format!("{}:1", Ipv4Addr::LOCALHOST),
                 protocol: "tcp".to_string(),
             };
-            match post_json(control, "/services/forwarder/expose", &expose).await {
+            match post_json_within(control, "/services/forwarder/expose", &expose, request).await {
                 Ok(()) => {
                     probe.bound += 1;
                     let unexpose = UnexposeRequest {
                         local: expose.local,
                         protocol: expose.protocol,
                     };
-                    if let Err(error) =
-                        post_json(control, "/services/forwarder/unexpose", &unexpose).await
+                    if let Err(error) = post_json_within(
+                        control,
+                        "/services/forwarder/unexpose",
+                        &unexpose,
+                        request,
+                    )
+                    .await
                     {
                         // Best-effort, like teardown's: a probe round left
                         // bound holds one obscure port at one address, while
@@ -402,6 +410,20 @@ pub(crate) async fn post_json<T: Serialize>(
     path: &str,
     body: &T,
 ) -> io::Result<()> {
+    post_json_within(control, path, body, GVPROXY_CONTROL_TIMEOUT).await
+}
+
+/// [`post_json`] with the exchange's bound injected: the publish verbs run at
+/// [`GVPROXY_CONTROL_TIMEOUT`], while the range probe's walk runs at its own
+/// tighter [`RANGE_PROBE_REQUEST_BUDGET`] — one round per address of the range
+/// is not a launch-path request to a live box, and a channel that cannot answer
+/// one round in that bound is not a fact about the host's loopback either way.
+pub(crate) async fn post_json_within<T: Serialize>(
+    control: &ControlChannel,
+    path: &str,
+    body: &T,
+    timeout: Duration,
+) -> io::Result<()> {
     let body = serde_json_lenient::to_vec(body).map_err(io::Error::other)?;
     let mut request = Vec::with_capacity(128 + body.len());
     // HTTP/1.1 keep-alive (no `Connection: close`): gvproxy must respond *without*
@@ -422,7 +444,7 @@ pub(crate) async fn post_json<T: Serialize>(
     // stalls must not hang the launch or teardown path indefinitely. The control
     // socket is local (DM2) or the host gvproxy over vsock (DM1/3/4); both speak
     // the same HTTP/1.0 request/response on a fresh connection.
-    let response = tokio::time::timeout(GVPROXY_CONTROL_TIMEOUT, async {
+    let response = tokio::time::timeout(timeout, async {
         match control {
             ControlChannel::Unix(sock) => {
                 exchange(UnixStream::connect(sock).await?, &request).await
@@ -437,7 +459,7 @@ pub(crate) async fn post_json<T: Serialize>(
     .map_err(|_| {
         io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("gvproxy {path} control request timed out after {GVPROXY_CONTROL_TIMEOUT:?}"),
+            format!("gvproxy {path} control request timed out after {timeout:?}"),
         )
     })??;
 
@@ -587,6 +609,17 @@ const RANGE_PROBE_PORT: u16 = 21064;
 /// the addresses it never reached are the ones it cannot vouch for, so the
 /// range reads absent, the interim.
 const RANGE_PROBE_BUDGET: Duration = Duration::from_secs(20);
+
+/// Upper bound on **one** request/response round of the forwarder-conducted
+/// range walk — tighter than the [`GVPROXY_CONTROL_TIMEOUT`] the publish verbs
+/// run under, because the probe is a walk, two rounds per address of the range
+/// on one channel, and a round that does not answer inside this bound is a
+/// channel with no fact to give about the host's loopback: the walk stops there
+/// and the range reads absent, the interim. A forwarder that answers at all
+/// answers in milliseconds — a bind and its release — so the bound costs a live
+/// host nothing, while a stalled one is read for what it is a second rather
+/// than after the publish verbs' five.
+const RANGE_PROBE_REQUEST_BUDGET: Duration = Duration::from_secs(1);
 
 /// Minimum gap between emitted policy-violation warnings: one minute, matching
 /// R2.2's "first drop per PTask per rule per minute" rate-limit window, so a
@@ -996,7 +1029,8 @@ mod tests {
         use tokio::sync::mpsc;
 
         use super::super::{
-            ControlChannel, RANGE_PROBE_PORT, UnexposeRequest, post_json, probe_publish_surface,
+            ControlChannel, GVPROXY_CONTROL_TIMEOUT, RANGE_PROBE_BUDGET, RANGE_PROBE_PORT,
+            RANGE_PROBE_REQUEST_BUDGET, UnexposeRequest, post_json, probe_publish_surface,
             probe_publish_surface_within,
         };
 
@@ -1246,9 +1280,12 @@ mod tests {
             // past it, so the walk cannot get past its first round.
             let (forwarder, _asked) =
                 spawn_forwarder_answering(sock.clone(), Duration::from_millis(50), |_| 200);
-            let probe =
-                probe_publish_surface_within(&ControlChannel::Unix(sock), Duration::from_millis(1))
-                    .await;
+            let probe = probe_publish_surface_within(
+                &ControlChannel::Unix(sock),
+                Duration::from_millis(1),
+                RANGE_PROBE_REQUEST_BUDGET,
+            )
+            .await;
             forwarder.abort();
 
             assert_eq!(
@@ -1266,6 +1303,58 @@ mod tests {
                 probe.first_failure,
                 Some((Ipv4Addr::new(127, 0, 64, 1), io::ErrorKind::TimedOut)),
                 "the address whose round the budget expired inside is the record's"
+            );
+        }
+
+        /// A forwarder that parks its answer stalls one *round* of the walk,
+        /// and the walk reads that round at its own bound — not at the publish
+        /// verbs' [`GVPROXY_CONTROL_TIMEOUT`] — stopping at the first address
+        /// with the channel's own `TimedOut`, which is not a fact about the
+        /// host's loopback and so never a bind refusal the range is read from.
+        /// The budget stays the walk's whole one, so what is exercised here is
+        /// the round bound alone.
+        #[tokio::test]
+        async fn a_stalled_round_costs_the_walk_only_its_own_bound() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            // Parks far past the round's bound and far inside the publish
+            // verbs' one, so only the round bound can cut the walk short.
+            let (forwarder, _asked) =
+                spawn_forwarder_answering(sock.clone(), Duration::from_millis(60), |_| 200);
+            let probe = probe_publish_surface_within(
+                &ControlChannel::Unix(sock),
+                RANGE_PROBE_BUDGET,
+                Duration::from_millis(1),
+            )
+            .await;
+            forwarder.abort();
+
+            assert_eq!(probe.probed, 1, "{}", probe.summary());
+            assert_eq!(probe.bound, 0);
+            assert!(!probe.present());
+            assert!(probe.interim());
+            assert_eq!(
+                probe.first_failure,
+                Some((Ipv4Addr::new(127, 0, 64, 1), io::ErrorKind::TimedOut)),
+                "the stalled round is the channel's own timeout, never a bind refusal"
+            );
+        }
+
+        /// The round bound the stalled round above is read at: at most a
+        /// second, and always tighter than the publish verbs'
+        /// [`GVPROXY_CONTROL_TIMEOUT`]. The walk is two rounds per address of
+        /// the range on one channel, so a channel that cannot answer one round
+        /// in a second is one the walk stops asking — while the launch and
+        /// teardown verbs keep their own, roomier bound.
+        #[test]
+        fn the_walks_round_bound_is_tighter_than_the_publish_verbs() {
+            assert!(
+                RANGE_PROBE_REQUEST_BUDGET <= Duration::from_secs(1),
+                "the walk's round bound is {RANGE_PROBE_REQUEST_BUDGET:?}"
+            );
+            assert!(
+                RANGE_PROBE_REQUEST_BUDGET < GVPROXY_CONTROL_TIMEOUT,
+                "the walk never inherits the publish verbs' bound"
             );
         }
 
