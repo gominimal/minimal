@@ -3367,16 +3367,16 @@ mod tests {
         assert_eq!(
             slice_a,
             (
-                Ipv4Addr::new(127, 64, 0, 160),
-                Ipv4Addr::new(127, 64, 0, 191)
+                Ipv4Addr::new(127, 0, 64, 160),
+                Ipv4Addr::new(127, 0, 64, 191)
             ),
             "a daemon on 100.64.37.0/24 must draw from that /24's slice"
         );
         assert_eq!(
             slice_b,
             (
-                Ipv4Addr::new(127, 64, 0, 128),
-                Ipv4Addr::new(127, 64, 0, 159)
+                Ipv4Addr::new(127, 0, 64, 128),
+                Ipv4Addr::new(127, 0, 64, 159)
             ),
             "a daemon on 100.64.52.0/24 must draw from that /24's slice"
         );
@@ -3620,7 +3620,7 @@ mod tests {
         // switch, but it is still its own: the slice it draws from is keyed
         // on the octet, not the subnet (NET-027's address half).
         assert!(
-            line.contains("loopback_slice=127.64.0.160-127.64.0.191"),
+            line.contains("loopback_slice=127.0.64.160-127.0.64.191"),
             "a microVM daemon pinned to octet 37 draws from that octet's \
              slice, not its switch's, got: {line}"
         );

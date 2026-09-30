@@ -73,7 +73,7 @@ pub const HOSTNAME_SUFFIX: &str = "min.internal";
 pub const DEFAULT_HOST_ID: &str = "local";
 
 /// The reserved local range published box addresses come from on the host:
-/// `127.64.0.0/24` (design §7.1), as network address and prefix. Loopback
+/// `127.0.64.0/24` (design §7.1), as network address and prefix. Loopback
 /// space, so it never leaves the machine, with one address per published box
 /// (NET-010's host-global allocation). Kept as a pair rather than a CIDR type
 /// — the only question asked of it is membership, which

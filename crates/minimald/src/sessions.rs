@@ -337,7 +337,7 @@ impl Manager {
 /// this daemon's published boxes come from.
 ///
 /// The range is host-global — every daemon on the machine draws from the
-/// same `127.64.0.0/24` — so the slice a daemon draws from must be a
+/// same `127.0.64.0/24` — so the slice a daemon draws from must be a
 /// function of **its own** identity (the same per-daemon identity that
 /// names its zone, NET-027), never a constant two daemons would both start
 /// at. That identity is the daemon's *slice octet*: the octet a deployment

@@ -2797,7 +2797,7 @@ mod tests {
             bound: 0,
             probed: 254,
             first_failure: Some((
-                std::net::Ipv4Addr::new(127, 64, 0, 1),
+                std::net::Ipv4Addr::new(127, 0, 64, 1),
                 std::io::ErrorKind::AddrNotAvailable,
             )),
         }
@@ -2886,7 +2886,7 @@ mod tests {
 
         let line = probe_line(&log.contents(), &created.id);
         assert!(
-            line.contains("127.64.0.0/24 254/254 bound"),
+            line.contains("127.0.64.0/24 254/254 bound"),
             "the probe covers the whole reserved range, and the line says so: {line}"
         );
         assert!(
