@@ -421,9 +421,9 @@ impl Injection {
     /// the shim's own — and it happens *before* `setns`, the only place it
     /// can: the box's cgroup namespace is rooted at its own leaf, and from
     /// inside it that root is not writable — with `nsdelegate` mounted the
-    /// root's `cgroup.procs` is a delegation boundary, and the read-only
-    /// cgroup2 view the box holds dies on the write even where the host
-    /// mounts cgroup2 plain. Writing the shim's pid from the daemon's
+    /// root's `cgroup.procs` is a delegation boundary, and the empty tmpfs
+    /// the box mounts over the tree it joined through leaves no path to
+    /// write a migration to at all. Writing the shim's pid from the daemon's
     /// namespaces puts it, and the program it forks, in the leaf.
     pub fn with_classifier_leaf(mut self, leaf: sandbox2::config::ClassifierLeaf) -> Self {
         self.leaf = Some(leaf);
@@ -590,8 +590,8 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // the one write that has to happen *before* `setns`: the box's cgroup
     // namespace is rooted at its own leaf, and from inside it that root is
     // not writable — with `nsdelegate` mounted the root's `cgroup.procs` is
-    // a delegation boundary, and the read-only cgroup2 view the box holds
-    // dies on the write even where the host mounts cgroup2 plain. Writing
+    // a delegation boundary, and the empty tmpfs the box mounts over the
+    // tree it joined through leaves no path to write a migration to. Writing
     // our pid here, from the daemon's own namespaces, moves this shim into
     // the leaf, and the program forked below inherits it with everything
     // else.

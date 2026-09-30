@@ -1663,16 +1663,16 @@ fn daemon_enters_its_own_leaf() {
         "the cohort directory exists for the boxes to come"
     );
 
-    // The cohort asks the kernel for the memory controller: a box leaf's
-    // own read-only cgroup2 view can only show `memory.max` — the limit a
-    // cgroup-aware runtime looks for, at the one mountpoint it looks — when
-    // the cgroup above the leaf carries the controller, and `boxes/` holds
-    // no process, so enabling it breaks no internal-process rule.
+    // The cohort asks the kernel for the memory controller: a box leaf only
+    // carries a `memory.max` — the limit a host-side reader or a future
+    // box-held view would name — when the cgroup above the leaf carries the
+    // controller, and `boxes/` holds no process, so enabling it breaks no
+    // internal-process rule.
     assert_eq!(
         std::fs::read_to_string(cohort.join("cgroup.subtree_control"))
             .expect("the daemon enables the memory controller on the cohort"),
         "+memory\n",
-        "a box's own view must be able to show the limit a runtime looks for"
+        "the leaf must carry the limit a reader would look for in it"
     );
 
     // The two identities: a box's leaf lives in the cohort, a sibling of the
