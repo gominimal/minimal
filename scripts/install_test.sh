@@ -60,6 +60,21 @@ record_has() {
     awk -v c="$1" -v p="$2" '$1==c && $2==p {hit=1} END{exit !hit}' "$3"
 }
 
+# record_has_comp <component> <record> — true when the install record lists the
+# named component at any path (used to assert every VM-stack part is recorded).
+record_has_comp() {
+    awk -v c="$1" '$1==c {hit=1} END{exit !hit}' "$2"
+}
+
+# manifest_has <component> <os> <arch> [manifest] — true when the release
+# component table holds a row for that component/os/arch. The default manifest
+# is the one the installer just fetched.
+manifest_has() {
+    _mh="${4:-$mock/versions/v1/components}"
+    awk -v c="$1" -v o="$2" -v a="$3" \
+        '!/^#/ && NF && $1==c && $2==o && $3==a {hit=1} END{exit !hit}' "$_mh"
+}
+
 # The harness computes expected hashes with whatever SHA-256 tool the host has.
 # macOS ships `shasum`, not `sha256sum`, so pick portably (same order the
 # installer under test uses) — otherwise the macOS lane fails in the harness
@@ -141,13 +156,30 @@ MOCKEOF
 # artifacts are runnable sh scripts that answer `completions install <shell>`,
 # because the installer installs completions by executing the installed bin/min
 # (R9.3); the other artifacts stay opaque bodies.
-printf 'linux-amd64-minimald-body\n'  >"$mock/versions/v1/minimald-linux-amd64"
+# Linux amd64 release artifacts, including the VM stack (NET-048).
+printf 'linux-amd64-minimald-body\n'     >"$mock/versions/v1/minimald-linux-amd64"
 write_min_stub "$mock/versions/v1/minimal-linux-amd64"  linux-amd64
-write_min_stub "$mock/versions/v1/minimal-darwin-arm64" darwin-arm64
-printf 'darwin-arm64-rootfs-body\n'   >"$mock/versions/v1/rootfs-arm64.img"
+printf 'linux-amd64-minvmd-body\n'       >"$mock/versions/v1/minvmd-linux-amd64"
+printf 'linux-amd64-initramfs-body\n'   >"$mock/versions/v1/initramfs-amd64.cpio"
+printf 'linux-amd64-rootfs-body\n'      >"$mock/versions/v1/rootfs-amd64.img"
+printf 'linux-amd64-vmlinuz-body\n'     >"$mock/versions/v1/vmlinuz-amd64"
 # The switch binary the daemon spawns for own-IP sessions (NET-041); shipped
-printf 'mock-gvproxy-switch-body\n'  >"$mock/versions/v1/gvproxy-min-linux-amd64"
+printf 'mock-gvproxy-switch-body\n'      >"$mock/versions/v1/gvproxy-min-linux-amd64"
 # as bin/gvproxy-min so the installer has a row to verify.
+
+# Linux arm64 release artifacts, including the VM stack (NET-050).
+printf 'linux-arm64-minimald-body\n'    >"$mock/versions/v1/minimald-linux-arm64"
+write_min_stub "$mock/versions/v1/minimal-linux-arm64" linux-arm64
+printf 'linux-arm64-minvmd-body\n'      >"$mock/versions/v1/minvmd-linux-arm64"
+printf 'linux-arm64-initramfs-body\n'    >"$mock/versions/v1/initramfs-arm64.cpio"
+printf 'linux-arm64-rootfs-body\n'       >"$mock/versions/v1/rootfs-arm64.img"
+printf 'linux-arm64-vmlinuz-body\n'      >"$mock/versions/v1/vmlinuz-arm64"
+printf 'mock-gvproxy-switch-arm64-body\n' >"$mock/versions/v1/gvproxy-min-linux-arm64"
+
+# macOS arm64 guest payload (kept distinct from the linux arm64 rootfs so each
+# architecture is exercised with its own artifact and hash).
+write_min_stub "$mock/versions/v1/minimal-darwin-arm64" darwin-arm64
+printf 'darwin-arm64-rootfs-body\n'      >"$mock/versions/v1/rootfs-darwin-arm64.img"
 
 # AppArmor components: noarch text (the loader is a runnable stub here), shipped
 # to Linux hosts under the data prefix (see stage-release.sh).
@@ -155,14 +187,29 @@ printf 'mock-apparmor-profile-body\n'  >"$mock/versions/v1/minimald.apparmor"
 printf 'mock-apparmor-tunable-body\n'  >"$mock/versions/v1/minimald.apparmor-tunable"
 printf '#!/bin/sh\n# mock apparmor loader\n' >"$mock/versions/v1/install-apparmor-profile.sh"
 
+# Hashes for every artifact referenced by the component table below.
 h_minimald="$(hash_file "$mock/versions/v1/minimald-linux-amd64")"
 h_minimal="$(hash_file "$mock/versions/v1/minimal-linux-amd64")"
+h_minvmd="$(hash_file "$mock/versions/v1/minvmd-linux-amd64")"
+h_initramfs="$(hash_file "$mock/versions/v1/initramfs-amd64.cpio")"
+h_rootfs="$(hash_file "$mock/versions/v1/rootfs-amd64.img")"
+h_vmlinuz="$(hash_file "$mock/versions/v1/vmlinuz-amd64")"
+h_gvmin="$(hash_file "$mock/versions/v1/gvproxy-min-linux-amd64")"
+
+h_minimald_arm="$(hash_file "$mock/versions/v1/minimald-linux-arm64")"
+h_minimal_arm="$(hash_file "$mock/versions/v1/minimal-linux-arm64")"
+h_minvmd_arm="$(hash_file "$mock/versions/v1/minvmd-linux-arm64")"
+h_initramfs_arm="$(hash_file "$mock/versions/v1/initramfs-arm64.cpio")"
+h_rootfs_arm="$(hash_file "$mock/versions/v1/rootfs-arm64.img")"
+h_vmlinuz_arm="$(hash_file "$mock/versions/v1/vmlinuz-arm64")"
+h_gvmin_arm="$(hash_file "$mock/versions/v1/gvproxy-min-linux-arm64")"
+
 h_dmin="$(hash_file "$mock/versions/v1/minimal-darwin-arm64")"
-h_rootfs="$(hash_file "$mock/versions/v1/rootfs-arm64.img")"
+h_drootfs="$(hash_file "$mock/versions/v1/rootfs-darwin-arm64.img")"
+
 h_aaprof="$(hash_file "$mock/versions/v1/minimald.apparmor")"
 h_aatun="$(hash_file "$mock/versions/v1/minimald.apparmor-tunable")"
 h_aaload="$(hash_file "$mock/versions/v1/install-apparmor-profile.sh")"
-h_gvmin="$(hash_file "$mock/versions/v1/gvproxy-min-linux-amd64")"
 
 printf 'v1\n' >"$mock/stable"
 
@@ -172,6 +219,7 @@ write_manifest() {
         printf '# format: %s\n' "$fmt"
         printf '# component   os      arch    version   sha256   kind   dest   src\n'
         printf '\n'
+        # Linux amd64: full CLI, daemon, switch, and VM host stack (NET-048).
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimald linux amd64 v1 "$h_minimald" file bin/minimald versions/v1/minimald-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
@@ -179,19 +227,52 @@ write_manifest() {
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             gvproxy-min linux amd64 v1 "$h_gvmin" file bin/gvproxy-min versions/v1/gvproxy-min-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            minvmd linux amd64 v1 "$h_minvmd" file bin/minvmd versions/v1/minvmd-linux-amd64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            initramfs linux amd64 v1 "$h_initramfs" file data/initramfs.cpio versions/v1/initramfs-amd64.cpio
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-amd64.img
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            vmlinuz linux amd64 v1 "$h_vmlinuz" file data/vmlinuz versions/v1/vmlinuz-amd64
+        # Linux arm64: the same VM host stack must ship for arm64 (NET-050).
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            minimald linux arm64 v1 "$h_minimald_arm" file bin/minimald versions/v1/minimald-linux-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            minimal linux arm64 v1 "$h_minimal_arm" file bin/min versions/v1/minimal-linux-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            gvproxy-min linux arm64 v1 "$h_gvmin_arm" file bin/gvproxy-min versions/v1/gvproxy-min-linux-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            minvmd linux arm64 v1 "$h_minvmd_arm" file bin/minvmd versions/v1/minvmd-linux-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            initramfs linux arm64 v1 "$h_initramfs_arm" file data/initramfs.cpio versions/v1/initramfs-arm64.cpio
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            rootfs linux arm64 v1 "$h_rootfs_arm" file data/rootfs.img versions/v1/rootfs-arm64.img
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            vmlinuz linux arm64 v1 "$h_vmlinuz_arm" file data/vmlinuz versions/v1/vmlinuz-arm64
+        # macOS arm64: VM host stack is macOS-native, guest payload is arm64.
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimal darwin arm64 v1 "$h_dmin" file bin/min versions/v1/minimal-darwin-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            rootfs darwin arm64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
+            rootfs darwin arm64 v1 "$h_drootfs" file data/rootfs.img versions/v1/rootfs-darwin-arm64.img
+        # AppArmor support files ship to every Linux arch.
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             apparmor-profile linux amd64 v1 "$h_aaprof" file data/apparmor/minimald versions/v1/minimald.apparmor
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            apparmor-profile linux arm64 v1 "$h_aaprof" file data/apparmor/minimald versions/v1/minimald.apparmor
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             apparmor-tunable linux amd64 v1 "$h_aatun" file data/apparmor/tunables/minimald versions/v1/minimald.apparmor-tunable
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            apparmor-tunable linux arm64 v1 "$h_aatun" file data/apparmor/tunables/minimald versions/v1/minimald.apparmor-tunable
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             apparmor-installer linux amd64 v1 "$h_aaload" file data/apparmor/install-apparmor-profile.sh versions/v1/install-apparmor-profile.sh
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            apparmor-installer linux arm64 v1 "$h_aaload" file data/apparmor/install-apparmor-profile.sh versions/v1/install-apparmor-profile.sh
         # Symlink rows (R5.6): sha256 is the `-` placeholder, src is the link
         # target relative to dest's directory.
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             git-remote-min linux amd64 v1 - symlink bin/git-remote-min min
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            git-remote-min linux arm64 v1 - symlink bin/git-remote-min min
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             git-remote-min darwin arm64 v1 - symlink bin/git-remote-min min
     } >"$mock/versions/v1/components"
@@ -589,7 +670,7 @@ case_prefix_resolution() {
         printf '# format: 1\n'
         printf '# c o a v s k d s\n'
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
+            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-amd64.img
     } >"$mock/versions/v1/components"
     H5="$root/h5"; mkdir -p "$H5"
     run datadest "$H5"
@@ -607,7 +688,7 @@ case_prefix_resolution() {
         printf '# format: 1\n'
         printf '# c o a v s k d s\n'
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            libkrun linux amd64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-arm64.img
+            libkrun linux amd64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-amd64.img
     } >"$mock/versions/v1/components"
     H6="$root/h6"; mkdir -p "$H6"
     run libdest "$H6"
@@ -1078,7 +1159,7 @@ case_darwin_dequarantine() {
         printf '# format: 1\n'
         printf '# c o a v s k d s\n'
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            libkrun darwin arm64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-arm64.img
+            libkrun darwin arm64 v1 "$h_drootfs" file lib/libkrun.1.dylib versions/v1/rootfs-darwin-arm64.img
     } >"$mock/versions/v1/components"
     : >"$root/xattr.calls"
     HDL="$root/hdl"; mkdir -p "$HDL"
@@ -1270,7 +1351,7 @@ case_uninstall() {
         printf '# format: 1\n'
         printf '# c o a v s k d s\n'
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
+            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-amd64.img
     } >"$mock/versions/v1/components"
     HUD="$root/hud"; mkdir -p "$HUD"
     run u_datadump_install "$HUD"
@@ -1385,7 +1466,7 @@ case_installer_switch_binary_executable() {
         printf '# format: 1\n'
         printf '# c o a v s k d s\n'
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
+            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-amd64.img
     } >"$mock/versions/v1/components"
     HY="$root/hy"; mkdir -p "$HY"
     run sw_noship "$HY"
@@ -1565,6 +1646,61 @@ STUB
     fi
 }
 
+# --- NET-048 / NET-050: Linux amd64 and arm64 releases ship the VM stack -----
+# The proof is the release components table itself: every Linux architecture
+# carries minvmd, the guest kernel, initramfs, rootfs image, and the switch.
+# Each architecture installs under the uname stub into its own home, then we
+# assert the files land on disk and are recorded.
+case_linux_vm_stack() {
+    _arch="$1"
+    case "$_arch" in
+        amd64) _uname_m=x86_64 ;;
+        arm64) _uname_m=arm64 ;;
+        *) bad "case_linux_vm_stack: unknown arch '$_arch'"; return ;;
+    esac
+
+    H_VM="$root/h_vm_$_arch"; mkdir -p "$H_VM"
+
+    # Manifest proof: the release component table must list every VM-stack
+    # part for linux/$_arch. If a row is missing the failure names the
+    # component and architecture.
+    for _comp in minvmd initramfs rootfs vmlinuz gvproxy-min; do
+        want_ok "manifest ships $_comp for linux/$_arch" \
+            manifest_has "$_comp" linux "$_arch"
+    done
+
+    PLAT_M="$_uname_m"
+    reset_dl
+    run "vm_${_arch}_install" "$H_VM"
+    PLAT_M=x86_64
+    check 0 "$rc" "$_arch install with VM stack exits 0"
+
+    # The installer must have placed every VM-stack component for this arch.
+    want_ok "$_arch minvmd installed and executable" test -x "$H_VM/bin/minvmd"
+    want_ok "$_arch initramfs installed to data" test -f "$H_VM/xdg-data/minimal/initramfs.cpio"
+    want_ok "$_arch rootfs installed to data" test -f "$H_VM/xdg-data/minimal/rootfs.img"
+    want_ok "$_arch vmlinuz installed to data" test -f "$H_VM/xdg-data/minimal/vmlinuz"
+    want_ok "$_arch switch binary installed and executable" test -x "$H_VM/bin/gvproxy-min"
+
+    # Each one appears in the install record so --uninstall can remove it.
+    _rec="$H_VM/xdg-state/minimal/installed"
+    for _comp in minvmd initramfs rootfs vmlinuz gvproxy-min; do
+        want_ok "$_arch install record lists $_comp" \
+            record_has_comp "$_comp" "$_rec"
+    done
+
+    # Observability: the installer output names every component it found.
+    for _comp in minvmd initramfs rootfs vmlinuz; do
+        want_ok "$_arch installer printed $_comp status" \
+            grep -qE "^  $_comp +(installed|current)" "$OUT"
+    done
+    want_ok "$_arch installer verified the switch binary" \
+        grep -qE "^  switch-binary +(verified|current)" "$OUT"
+}
+
+case_linux_amd64_manifest_ships_vm_stack() { case_linux_vm_stack amd64; }
+case_linux_arm64_manifest_ships_vm_stack() { case_linux_vm_stack arm64; }
+
 # --- Case dispatch -----------------------------------------------------------
 # Every scenario group above is one named case. No argument runs them all, in
 # the order the linear script used to have; one argument runs exactly that
@@ -1587,6 +1723,8 @@ case_for() {
         gvproxy_rename_migration)           case_gvproxy_rename_migration ;;
         installer_switch_binary_executable) case_installer_switch_binary_executable ;;
         host_classifier_tree_installed)  case_host_classifier_tree_installed ;;
+        linux_amd64_manifest_ships_vm_stack) case_linux_amd64_manifest_ships_vm_stack ;;
+        linux_arm64_manifest_ships_vm_stack) case_linux_arm64_manifest_ships_vm_stack ;;
         *)
             echo "install_test: unknown case '$1' (known cases listed in the dispatch)" >&2
             exit 2
@@ -1599,7 +1737,8 @@ case "${1:-}" in
             target_validation prefix_resolution install_record daemon_stop \
             shell_integration darwin_dequarantine uninstall \
             gvproxy_rename_migration installer_switch_binary_executable \
-            host_classifier_tree_installed; do
+            host_classifier_tree_installed \
+            linux_amd64_manifest_ships_vm_stack linux_arm64_manifest_ships_vm_stack; do
             case_for "$_c"
         done
         ;;
