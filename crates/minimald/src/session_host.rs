@@ -1117,8 +1117,9 @@ pub(crate) struct Launched<P, G> {
     /// The box's classifier leaf (NET-079): the cgroup its egress verdict is
     /// decided on, and the one every process of the session — injected ones
     /// included — is placed in. `None` on a host that places no box: the tree
-    /// the privileged step installs is absent, so the session runs unenforced
-    /// rather than refused on that ground.
+    /// is absent, and while a native session then runs unenforced rather than
+    /// refused on that ground, a guest's host-address launch is refused
+    /// instead (design §7.1).
     leaf: Option<sandbox2::config::ClassifierLeaf>,
 }
 
