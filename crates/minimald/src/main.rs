@@ -648,9 +648,10 @@ async fn async_main() -> Result<(), MainError> {
                 tree = sandbox2::classifier::TREE_ROOT,
                 daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
                 install = %sandbox2::classifier::install_hint(),
-                "this daemon is not inside the classifier tree, so no box it \
-                 launches will be placed: enter the tree with the installer's \
-                 --pid step, or start the daemon from a Delegate=yes unit"
+                "entering the daemon's own classifier leaf failed, so every \
+                 box launch now decides its placement by whether it can \
+                 migrate into the tree: enter it with the installer's --pid \
+                 step, or start the daemon from a Delegate=yes unit"
             );
         }
     }
