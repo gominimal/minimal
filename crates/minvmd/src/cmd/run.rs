@@ -46,33 +46,36 @@ pub fn run(detach: bool, timeout_secs: Option<u64>) -> Result<()> {
     // that will actually supervise the VM logs it: a `--detach` caller re-execs
     // `minvmd run` (without `--detach`) for the real start, so the line is
     // written once, by the process that owns the boot.
+    //
+    // When resolution fails the supervisor below fails on the same missing
+    // images, so no VM boots — do not emit the resolved-images line with empty
+    // paths (it would name nothing while claiming a start). The start record
+    // still exists, at WARN, carrying the reason instead.
     if !detach {
-        let (kernel, rootfs, initramfs) = crate::image::resolve_boot_images()
-            .map_err(|e| tracing::warn!(error = %e, "could not resolve boot images for start log"))
-            .ok()
-            .map(|(k, r, i)| {
-                (
-                    k.display().to_string(),
-                    r.display().to_string(),
-                    i.display().to_string(),
-                )
-            })
-            .unwrap_or_default();
         let switch = crate::image::resolve_gvproxy_path();
         let switch_str = if switch.exists() {
             switch.display().to_string()
         } else {
             "not found".to_string()
         };
-        tracing::info!(
-            vm = %crate::state::vm_name(),
-            state_dir = %crate::state::provider_dir().display(),
-            %kernel,
-            %rootfs,
-            %initramfs,
-            switch = %switch_str,
-            "starting VM"
-        );
+        match crate::image::resolve_boot_images() {
+            Ok((kernel, rootfs, initramfs)) => tracing::info!(
+                vm = %crate::state::vm_name(),
+                state_dir = %crate::state::provider_dir().display(),
+                kernel = %kernel.display(),
+                rootfs = %rootfs.display(),
+                initramfs = %initramfs.display(),
+                switch = %switch_str,
+                "starting VM"
+            ),
+            Err(e) => tracing::warn!(
+                vm = %crate::state::vm_name(),
+                state_dir = %crate::state::provider_dir().display(),
+                switch = %switch_str,
+                error = %e,
+                "starting VM with unresolved boot images"
+            ),
+        }
     }
 
     #[cfg(minvmd_libkrun)]
