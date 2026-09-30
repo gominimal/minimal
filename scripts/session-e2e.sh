@@ -330,6 +330,37 @@ else
       break
     fi
   done
+  # Nothing prebuilt — but this checkout can build the pair itself, and every
+  # case below is runnable standalone from a bare checkout, so do the same
+  # build `just e2e-native` does first (`cargo build -p minimald --bin
+  # minimald -p minimal --bin min --locked`): the CLI plus the one daemon it
+  # autospawns by name, `min_daemon` computed above per OS/backend. Dormant on
+  # real lanes — they export target/debug on PATH or pass MINIMAL_E2E_MIN, so
+  # one of the branches above already won — so this only pays where the gates
+  # below would otherwise have nothing to check. A sandboxed bare checkout
+  # (the agent runtime boxes are themselves session boxes: `min` on PATH is
+  # the in-sandbox helper, and target/ is empty) is exactly that: the pair
+  # builds, and the case then runs — or skips on its own prerequisites —
+  # instead of the run dying at the CLI gate with a build instruction the
+  # caller cannot read mid-verify.
+  if [ -z "$min_cli_dir" ] && command -v cargo >/dev/null 2>&1; then
+    echo "no usable 'min' on PATH and no build under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
+    if (cd "$ROOT" && cargo build --locked -p minimal --bin min \
+        -p "$min_daemon" --bin "$min_daemon") >"$WORK/cli-build.log" 2>&1; then
+      for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
+        if [ -x "$d/min" ]; then
+          min_cli_dir="$d"
+          break
+        fi
+      done
+      if [ -n "$min_cli_dir" ]; then
+        echo "built the pair: $min_cli_dir/min and $min_cli_dir/$min_daemon"
+      fi
+    else
+      echo "::warning::building the CLI pair failed — the gates below name what is missing. Build log tail follows:" >&2
+      tail -20 "$WORK/cli-build.log" 2>/dev/null || true
+    fi
+  fi
   if [ -n "$min_cli_dir" ]; then
     PATH="$min_cli_dir:$PATH"
     export PATH
