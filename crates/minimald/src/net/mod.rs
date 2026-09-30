@@ -18,6 +18,7 @@
 
 pub mod answerer;
 pub mod dns;
+pub mod loopback;
 pub mod policy;
 pub mod proxy;
 pub mod switch;

@@ -3989,6 +3989,7 @@ dependencies = [
  "serde_json_lenient",
  "sessions",
  "sha2 0.11.0",
+ "switch",
  "tempfile",
  "tokio",
  "tokio-stream",
