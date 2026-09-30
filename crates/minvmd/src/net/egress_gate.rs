@@ -96,8 +96,9 @@ const CONNECT_REQUEST: &[u8] = b"POST /connect HTTP/1.0\r\nHost: localhost\r\n\r
 const CONNECT_PATH: &[u8] = b"/connect";
 
 /// How much of a control connection's already-forwarded bytes the splice keeps
-/// in hand: the most of [`CONNECT_PATH`] a read boundary can split, so a path
-/// straddling two reads is still seen whole.
+/// in hand: one fewer than [`CONNECT_PATH`], which is the most of it that can
+/// be behind the read its last byte lands in — the read itself holds the rest
+/// — so a path split over any number of reads is still seen whole.
 const CONNECT_WATCH_TAIL: usize = CONNECT_PATH.len() - 1;
 
 /// How much of a control connection's guest → switch stream one read of the
@@ -512,12 +513,15 @@ async fn relay_control(
 /// hijacks on it, so those bytes are the one reach a control exchange could
 /// buy, and the leg ends in [`ControlEnd::Upgrade`] the moment they appear.
 ///
-/// The watch is exact across read boundaries: each read is searched together
-/// with a tail of what was already forwarded, so a path split between two
-/// writes is caught when its last byte arrives — before any byte of that same
-/// read is written on, which is why gvproxy can never hold the request it would
-/// hijack on. A path that arrives whole is caught before it is forwarded at
-/// all. No byte is ever held back, so a control exchange is delayed by nothing.
+/// The watch is exact across read boundaries, however many a path is split
+/// over: each read is searched together with a rolling tail of the stream
+/// already forwarded — its last [`CONNECT_WATCH_TAIL`] bytes, carried read to
+/// read rather than taken from the last one — so a byte-at-a-time path and a
+/// two-write path are caught the same way, at the read its last byte lands in
+/// and before any byte of that read is written on, which is why gvproxy can
+/// never hold the request it would hijack on. A path that arrives whole is
+/// caught before it is forwarded at all. No byte is ever held back, so a
+/// control exchange is delayed by nothing.
 #[expect(
     clippy::indexing_slicing,
     reason = "every slice is bounded by the `n` a read reported or the tail it left"
@@ -550,11 +554,14 @@ async fn splice_control(
             tracing::warn!(%error, "egress gate control leg ended on an error");
             return ControlEnd::GuestClosed;
         }
-        // Keep only what a later read could complete a path within — of the
-        // bytes this read actually filled, not the buffer's whole length.
-        let keep = n.min(CONNECT_WATCH_TAIL);
+        // Roll the tail forward: it is the last few bytes of the *stream*,
+        // carried read to read — not the tail of this one read — because a
+        // path can land in as many reads as the guest can make it. Keeping
+        // only this read's bytes would see a byte-at-a-time path as separate
+        // fragments and forward every one of them.
+        let keep = window.len().min(CONNECT_WATCH_TAIL);
         tail.clear();
-        tail.extend_from_slice(&chunk[n - keep..n]);
+        tail.extend_from_slice(&window[window.len() - keep..]);
     }
 }
 
@@ -1262,8 +1269,8 @@ mod tests {
     };
     use super::{
         CONNECT_PATH, CONNECT_REQUEST, DROP_WARN_MAX_TRACKED_PAIRS, DROP_WARN_MIN_INTERVAL,
-        DropLimiter, GateDrop, GuestSpeak, HANDSHAKE_TIMEOUT, MAX_HEAD, WarnDecision, gate_verdict,
-        max_frame, serve_connection,
+        DropLimiter, GateDrop, GuestSpeak, HANDSHAKE_TIMEOUT, MAX_HEAD, WarnDecision,
+        find_subslice, gate_verdict, max_frame, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry};
 
@@ -1626,6 +1633,81 @@ mod tests {
             !logged.contains("egress-unknown-source"),
             "no frame behind the refused upgrade was parsed or dropped, got: {logged}"
         );
+    }
+
+    /// The watch is a rolling tail of the stream, not of one read: a path
+    /// split over three writes — the guest choosing where every byte of it
+    /// lands — is refused the same as a two-write one. This is the split a
+    /// tail taken from the last read alone would wave through: no window ever
+    /// holds the path whole, so every byte of the upgrade would be spliced on
+    /// and gvproxy would have the request it hijacks on.
+    #[tokio::test]
+    async fn an_upgrade_split_across_three_writes_is_refused() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        // Live as control traffic first, so the relay really is the splice.
+        let request =
+            b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+                .to_vec();
+        let answer: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mut h = gate_over_control(registry, request).await;
+        h.switch
+            .write_all(answer)
+            .await
+            .expect("answering the control request");
+
+        // The upgrade as three fragments, none holding the path: "POST /",
+        // "connec", "t HTTP/1.0…". A sleep between writes makes each one a
+        // read of its own, so no read and no single read's tail ever sees
+        // more than a fragment.
+        for fragment in [
+            &CONNECT_REQUEST[..6],
+            &CONNECT_REQUEST[6..12],
+            &CONNECT_REQUEST[12..],
+        ] {
+            h.guest
+                .write_all(fragment)
+                .await
+                .expect("writing an upgrade fragment");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        wait_for_log(&h, "tried to upgrade into the frame stream").await;
+        // What was relayed before the last fragment completed the path never
+        // held it whole, so gvproxy had nothing to hijack on — and then the
+        // gate closed its side rather than leaving it hanging.
+        let mut seen = [0u8; CONNECT_REQUEST.len()];
+        let got = match tokio::time::timeout(DEADLINE, h.switch.read(&mut seen)).await {
+            Ok(read) => read.expect("reading the switch end"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        };
+        assert!(
+            find_subslice(&seen[..got], CONNECT_PATH).is_none(),
+            "the switch held the upgrade's path whole: {:?}",
+            String::from_utf8_lossy(&seen[..got]),
+        );
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, h.switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("{n} more byte(s) of the upgrade reached the switch"),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+        // And the guest's side comes down with it, after the answer it was
+        // owed for the request it did make.
+        let mut answered = vec![0u8; answer.len()];
+        read_within(&mut h.guest, &mut answered).await;
+        assert_eq!(
+            answered, answer,
+            "the refused guest got the answer it was owed"
+        );
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, h.guest.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("the gate left {n} byte(s) past the answer for a refused guest"),
+            Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
+            Err(_) => panic!("the gate left the refused connection hanging"),
+        }
     }
 
     /// The first head picks the relay, and the choice is deliberately wide: any
