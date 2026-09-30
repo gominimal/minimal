@@ -1085,6 +1085,8 @@ mod tests {
                 mk_mount_state_volume: None,
                 rlimit_nofile: None,
                 timekeep_listener_port: None,
+                // The CLI's own defaults: no pinned ports, and the shipped
+                // egress default stays in force.
                 hostname_proxy_port: None,
                 zone_answerer_port: None,
                 detach: false,
