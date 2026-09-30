@@ -1010,26 +1010,43 @@ impl Session {
     /// that happens to share the same derived name. A rename withdraws with
     /// the grant and the publish kept: the re-register that follows it routes
     /// at the same box, on the same address (NET-001).
+    ///
+    /// The registry's lock is never held across the answerer's record — the
+    /// same rule the grant path's [`Self::lease_loopback_address`] ask
+    /// follows: the release is a synchronous read-modify-write of the record
+    /// under its lock file, and this daemon's registry is what every DNS
+    /// answer it serves reads, so no answer waits behind a destroyed box's
+    /// release. The registry's rows go first, under the write lock alone,
+    /// and the release runs after it is dropped — which is also the safe
+    /// half of that order: while the record still names the grant, no other
+    /// box can be handed the address, so there is no moment where the
+    /// registry answers an address the pool already holds free.
     #[cfg(target_os = "linux")]
     async fn deregister_hostname(&self, for_good: bool) {
         let record = self.record.record().await.unwrap();
-        let mut reg = self
-            .hostnames
-            .write()
-            .expect("hostname registry lock poisoned");
         if for_good {
             // NET-010: the destroyed box's publish is withdrawn first, and the
             // grant it held returns to the host's pool — the grant the
             // finalize made, released here so the next box may publish on it.
             // NET-012: the name goes with the publish, so every later lookup
             // answers NXDOMAIN rather than a stale address.
-            reg.unpublish_own_address(record.id);
+            {
+                let mut reg = self
+                    .hostnames
+                    .write()
+                    .expect("hostname registry lock poisoned");
+                reg.unpublish_own_address(record.id);
+                reg.forget_own_address(record.id);
+            }
             self.release_loopback_address(&record, &registry_name(&record));
-            reg.forget_own_address(record.id);
         }
         if !self.owns_hostname_route(&record) {
             return;
         }
+        let mut reg = self
+            .hostnames
+            .write()
+            .expect("hostname registry lock poisoned");
         reg.deregister(&registry_name(&record));
     }
 
