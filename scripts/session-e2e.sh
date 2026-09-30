@@ -1044,30 +1044,37 @@ proof_own_ip_egress_declared_and_enforced() {
   # "the box's own resolution" and the host's never agree; the macOS lane is
   # where they do — both ride the same upstream — so the pinned address was
   # held, the "disallowed" connection was an allowed one, and the proof read
-  # a completed connection as a failure to enforce. 1.1.1.1 is a public
-  # anycast service endpoint, live on 443 and stable by design, that the one
-  # name this box pins (example.com) can never resolve to — and being a
-  # literal, no resolver has to agree with anything for the probe to run.
-  egress_disallowed_dst="1.1.1.1"
-  egress_disallowed_live=0
-  for egress_dst_try in 1 2 3; do
-    egress_dst_out="$(mnl session exec "$announce_sid" \
-      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 20 https://$egress_disallowed_dst/" \
-      2>"$WORK/egress-dst-live.err")"
-    egress_dst_rc=$?
-    if egress_curl_answered "$egress_dst_rc" "${egress_dst_out:-}"; then
-      egress_disallowed_live=1
-      echo "control GET https://$egress_disallowed_dst/ from the bare box -> ${egress_dst_out:-<none>} (attempt ${egress_dst_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
+  # a completed connection as a failure to enforce. The candidates are public
+  # anycast service endpoints, live on 443 and stable by design, that the one
+  # name this box pins (example.com) can never resolve to — and being
+  # literals, no resolver has to agree with anything for the probe to run.
+  # Two of them, because a lane whose network blocks one still deserves the
+  # proof: the first the bare box reaches is the one the declared box must be
+  # refused.
+  egress_disallowed_dst=""
+  for egress_dst_candidate in 1.1.1.1 9.9.9.9; do
+    for egress_dst_try in 1 2 3; do
+      egress_dst_out="$(mnl session exec "$announce_sid" \
+        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 20 https://$egress_dst_candidate/" \
+        2>"$WORK/egress-dst-live.err")"
+      egress_dst_rc=$?
+      if egress_curl_answered "$egress_dst_rc" "${egress_dst_out:-}"; then
+        egress_disallowed_dst="$egress_dst_candidate"
+        echo "control GET https://$egress_dst_candidate/ from the bare box -> ${egress_dst_out:-<none>} (attempt ${egress_dst_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
+        break
+      fi
+      echo "control GET https://$egress_dst_candidate/ from the bare box failed on attempt ${egress_dst_try}/3 (rc ${egress_dst_rc}, got '${egress_dst_out:-<none>}')"
+      cat "$WORK/egress-dst-live.err" 2>/dev/null || true
+      if [ "$egress_dst_try" -lt 3 ]; then
+        sleep 3
+      fi
+    done
+    if [ -n "$egress_disallowed_dst" ]; then
       break
     fi
-    echo "control GET https://$egress_disallowed_dst/ from the bare box failed on attempt ${egress_dst_try}/3 (rc ${egress_dst_rc}, got '${egress_dst_out:-<none>}')"
-    cat "$WORK/egress-dst-live.err" 2>/dev/null || true
-    if [ "$egress_dst_try" -lt 3 ]; then
-      sleep 3
-    fi
   done
-  if [ "$egress_disallowed_live" -ne 1 ]; then
-    echo "::warning::the bare box could not complete https://$egress_disallowed_dst/ on this run, so the disallowed-connection drop below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
+  if [ -z "$egress_disallowed_dst" ]; then
+    echo "::warning::the bare box could not reach a disallowed candidate destination on this run, so the disallowed-connection drop below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
   fi
   mnl session destroy --force "$announce_sid" >/dev/null 2>&1 || true
 
@@ -1145,8 +1152,8 @@ proof_own_ip_egress_declared_and_enforced() {
     # (this box's network and its allowed path), so a non-completion here is
     # neither a dead route nor a dead box, and a fast refusal is the box's own
     # doing rather than weather.
-    if [ "$egress_disallowed_live" -ne 1 ]; then
-      echo "::warning::NET-062: the disallowed-address drop is skipped as a weather warning (the bare box could not complete https://$egress_disallowed_dst/ above, so a drop here would prove nothing about the rules)"
+    if [ -z "$egress_disallowed_dst" ]; then
+      echo "::warning::NET-062: the disallowed-address drop is skipped as a weather warning (the bare box reached no candidate destination above, so a drop here would prove nothing about the rules)"
     else
       deny_start_ms="$(now_ms)"
       mnl session exec "$declare_sid" \
