@@ -5690,6 +5690,15 @@ STUB
   chmod +x "$fk_stubbin/wget"
 
   if (
+    # XDG_DATA_HOME outranks HOME in both the installer's data-prefix
+    # resolution (scripts/install.sh) and the daemon's image resolver
+    # (crates/minvmd/src/image.rs), and the harness does not hermeticize it —
+    # a host or CI that exports it would land the guest images in a different
+    # prefix from the $fk_home/.local/share/minimal this proof asserts, for the
+    # install check below and the start-line values alike. A genuinely fresh
+    # install has it unset, so drop it (this subshell only, like the PATH
+    # below) and let the HOME-based path be the one actually exercised.
+    unset XDG_DATA_HOME
     # Fresh install into the throwaway home, no path overrides. The PATH change
     # is intentionally scoped to this subshell (SC2031).
     # shellcheck disable=SC2031
