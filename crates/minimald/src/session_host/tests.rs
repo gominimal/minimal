@@ -1563,6 +1563,7 @@ impl SessionLauncher for SealingMockLauncher {
             seal_injection: self.seal_injection,
             // This mock has no sandbox, so no classifier placed it anywhere.
             leaf: None,
+            host_ip_enforcement: None,
         })
     }
 }
@@ -1803,6 +1804,129 @@ fn only_the_guest_refuses_an_unplaceable_host_address_box() {
     }
 }
 
+/// A leaf a fresh launch finds, and what it may be (NET-079): a leftover
+/// from a daemon death the start sweep could not have seen — the daemon died
+/// between creating the leaf and spawning the box into it — or another
+/// session's, which the same session id cannot be. The kernel's own
+/// emptiness test tells them apart, and it is the `rmdir` of
+/// [`sandbox2::classifier::remove_box_leaf`]: a cgroup holding a process
+/// cannot be removed, so a leftover that goes was nobody's and one that
+/// stays belongs to a session the daemon no longer knows. Driven over a
+/// stand-in tree, where the modelled kernel files stand in for the members:
+/// the reclaims are the same code paths, and only the emptiness test is the
+/// kernel's.
+#[test]
+fn a_leftover_leaf_is_reclaimed_but_a_held_one_refuses_the_launch() {
+    let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+    std::fs::create_dir_all(tree.path().join(sandbox2::classifier::BOXES_DIR))
+        .expect("the cohort directory");
+    let id = sessions::SessionId::nil();
+    let named = sandbox2::classifier::box_leaf(tree.path(), &id.to_string());
+
+    // The fresh launch: nothing to find, so nothing to reclaim.
+    let (leaf, reclaimed) = super::create_or_reclaim_box_leaf(tree.path(), &id)
+        .expect("the fresh launch creates its leaf");
+    assert!(!reclaimed, "a fresh launch reclaims nothing");
+    assert_eq!(
+        leaf, named,
+        "the leaf is named by the session that holds it"
+    );
+
+    // The leftover: empty, as a launch that never reached its spawn leaves
+    // it. The emptiness test lets it go, and the launch creates the leaf
+    // again for this box rather than reusing the directory as-is.
+    let (leaf, reclaimed) = super::create_or_reclaim_box_leaf(tree.path(), &id)
+        .expect("an empty leftover is reclaimed");
+    assert!(
+        reclaimed,
+        "an empty leftover is reclaimed: the launch tried its rmdir, the \
+         kernel's own test that a cgroup holds no process, and it went"
+    );
+    assert_eq!(
+        leaf, named,
+        "the reclaimed leaf is this session's, recreated"
+    );
+
+    // A leaf that still holds a session: over a real tree the kernel refuses
+    // the rmdir while the cgroup holds a process; over this stand-in the
+    // modelled procs file stands in for the members, and the refusal is the
+    // same `rmdir`'s. The launch is refused rather than placing this box in
+    // another session's cgroup, and the refusal names the test that refused.
+    model_cgroup_files(&leaf);
+    let held = super::create_or_reclaim_box_leaf(tree.path(), &id)
+        .expect_err("a leaf another session holds is not taken over");
+    assert_eq!(
+        held.kind(),
+        std::io::ErrorKind::AlreadyExists,
+        "the held leaf surfaces as the collision it is, not as a leftover"
+    );
+    for named in [
+        "its rmdir",
+        "another session holds this one's classifier leaf",
+    ] {
+        assert!(
+            held.to_string().contains(named),
+            "the refusal says what would have had to be true for the leaf to \
+             have been reclaimable: {held}"
+        );
+    }
+    assert!(
+        leaf.is_dir(),
+        "the held leaf outlives the launch that would have taken it over"
+    );
+}
+
+/// What the launch's leaf decision means for the box's egress verdict — the
+/// declared-and-enforced attribute a session carries from its launch
+/// (design §7.2): a host-address box with a leaf is enforced, a
+/// host-address box without one runs with the host's address and no verdict
+/// of its own, and a none box or an own-IP box has no host address to decide
+/// on at all. Pure over its inputs, so each mapping is pinned where it is
+/// written — beside the refusal predicate, the two halves of what a launch
+/// says about the box it is about to run.
+#[test]
+fn host_ip_enforcement_says_what_the_launch_decided() {
+    use sessions::NetworkMode;
+
+    let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+    std::fs::create_dir_all(tree.path().join(sandbox2::classifier::BOXES_DIR))
+        .expect("the cohort directory");
+    let leaf = sandbox2::config::ClassifierLeaf::new(
+        sandbox2::classifier::create_box_leaf(tree.path(), "a placed box")
+            .expect("the leaf the launch places its box in"),
+    );
+    let decided = |mode, leaf: Option<sandbox2::config::ClassifierLeaf>| {
+        super::host_ip_enforcement(mode, leaf.as_ref())
+    };
+
+    assert_eq!(
+        decided(NetworkMode::HostNet, Some(leaf.clone())),
+        Some(super::HostIpEnforcement::Enforced),
+        "a host-address box with a leaf has its egress verdict decided on it"
+    );
+    assert_eq!(
+        decided(NetworkMode::HostNet, None),
+        Some(super::HostIpEnforcement::Unenforced),
+        "a host-address box with no leaf runs with the host's address and no \
+         verdict of its own — the state the session-start notice names"
+    );
+    for (mode, why) in [
+        (NetworkMode::NoNet, "a none box has no traffic to decide"),
+        (
+            NetworkMode::OwnIp,
+            "an own-IP box's verdict is its own, on the address it holds",
+        ),
+    ] {
+        for leaf in [Some(leaf.clone()), None] {
+            assert_eq!(
+                decided(mode, leaf),
+                None,
+                "{why}: there is no host address to decide on, leaf or no leaf"
+            );
+        }
+    }
+}
+
 /// A [`SandboxLauncher`] for the launch-path test: the fakerepo context the
 /// channel tests use, a switch client pointed at a binary that is not there,
 /// and no composition — everything a launch needs to reach its own
@@ -1849,6 +1973,28 @@ fn sandbox_launcher(network_mode: sessions::NetworkMode) -> (SandboxLauncher, te
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guest_launch_refuses_only_the_unplaced_host_address_box() {
     use sessions::NetworkMode;
+
+    // The one host state this proof cannot run on: a tree this daemon can
+    // place a child in. The refusal it asserts is the guest's answer to a
+    // leaf decision that came back `None`, and on a delegated host the launch
+    // gets a leaf instead, so the guest's host-address launch proceeds past
+    // the gate and the proof's assertions would be measuring a different
+    // launch's answer. The placement probe is the same one the launch runs,
+    // so the skip is the deployment's own state, printed rather than passed
+    // off as a pass.
+    if sandbox2::classifier::probe_child_placement(std::path::Path::new(
+        sandbox2::classifier::TREE_ROOT,
+    ))
+    .is_ok()
+    {
+        eprintln!(
+            "skipping guest_launch_refuses_only_the_unplaced_host_address_box: this \
+             daemon can place a child in its classifier tree, so a guest \
+             host-address launch gets a leaf here and is not refused; the refusal \
+             is proved on a host with no placeable tree"
+        );
+        return;
+    }
 
     const REFUSAL: &str = "this guest has no classifier tree to place a host-address box in";
     for (guest, mode, refused, why) in [

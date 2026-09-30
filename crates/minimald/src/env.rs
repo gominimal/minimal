@@ -606,6 +606,24 @@ impl Env {
         self.sandbox.new_container(plan).map_err(sandbox_err_to_io)
     }
 
+    /// The host-side twin of the report file a leaf-bearing box's pre-exec
+    /// closure writes into its `/run`: the same file, through the sandbox's
+    /// read-write `/run` bind, named by the leaf. For the launch to read
+    /// after the spawn — which cover the box took over its classifier tree,
+    /// or the errno that killed the closure before the program ran — so it
+    /// is forwarded from the sandbox, which owns the directory the box's
+    /// `/run` is bound from and cannot have its path precomputed by a caller
+    /// (the base directory is named by [`Env::build`], per launch).
+    ///
+    /// [`Env::build`]: crate::env::Env::build
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn closure_report_path(
+        &self,
+        leaf: &sandbox2::config::ClassifierLeaf,
+    ) -> std::path::PathBuf {
+        self.sandbox.closure_report_path(leaf)
+    }
+
     /// The assembled session rootfs on the daemon's filesystem.
     ///
     /// Exposed so the launcher can answer "is this shell installed in

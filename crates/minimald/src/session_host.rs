@@ -1129,6 +1129,11 @@ pub(crate) struct Launched<P, G> {
     /// refused on that ground, a guest's host-address launch is refused
     /// instead (design §7.1).
     leaf: Option<sandbox2::config::ClassifierLeaf>,
+    /// What the launch decided about this box's egress verdict: enforced on
+    /// a leaf of its own, or unenforced on a host that could not decide per
+    /// box. Carried to the host's attributes so a session can say which it
+    /// runs under — the launch's own decision, not a re-derivation.
+    host_ip_enforcement: Option<HostIpEnforcement>,
 }
 
 /// Actor messages to a [`Host`].
@@ -1536,6 +1541,48 @@ pub struct HostAttrs {
     pub(crate) stdout_last: Option<SystemTime>,
     /// When the last byte was sent to the process from a binding.
     pub(crate) stdin_last: Option<SystemTime>,
+
+    /// What the launch decided about this session's box and the host's
+    /// address (NET-079, design §7.2's "declared and enforced" attribute):
+    /// `Enforced` when the box's egress verdict is decided on a classifier
+    /// leaf of its own, `Unenforced` when the host could not decide per box
+    /// and the box runs with the host's address and no verdict of its own —
+    /// the state a session-start notice says to the person in the terminal.
+    ///
+    /// A launch-time attribute, set once by the launch and never updated:
+    /// `None` for a none box or an own-IP box, whose verdicts are decided on
+    /// address leases rather than the host's cgroup tree.
+    pub(crate) host_ip_enforcement: Option<HostIpEnforcement>,
+}
+
+/// What a host-address box's launch decided about its egress verdict
+/// (NET-079): whether the box is classified in a cgroup leaf of its own, or
+/// runs with the host's address and no verdict of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostIpEnforcement {
+    /// The box was placed in a classifier leaf; its verdict is decided there.
+    Enforced,
+    /// The host could not decide per box; the box runs unenforced.
+    Unenforced,
+}
+
+/// What the launch's leaf decision means for the box's egress verdict:
+/// a host-address box with a leaf is enforced, a host-address box without
+/// one runs with the host's address and no verdict of its own, and any other
+/// network mode has no host address to decide on at all.
+///
+/// Pure over its inputs, so the mapping is pinned where it is written.
+fn host_ip_enforcement(
+    network_mode: NetworkMode,
+    leaf: Option<&sandbox2::config::ClassifierLeaf>,
+) -> Option<HostIpEnforcement> {
+    match network_mode {
+        NetworkMode::HostNet => match leaf {
+            Some(_) => Some(HostIpEnforcement::Enforced),
+            None => Some(HostIpEnforcement::Unenforced),
+        },
+        _ => None,
+    }
 }
 
 /// The state of the session process.
@@ -2392,20 +2439,51 @@ async fn create_session_leaf(
         Err(join) => Err(io::Error::other(join)),
     };
     if let Err(e) = placement {
+        // Which step is missing decides what a person is told to do next: a
+        // tree that is not there is the installer's to install, and a tree
+        // that is there but refuses this daemon means the daemon is not
+        // inside the delegated slice — the state the installer's `--pid`
+        // step exists for, effective on the very next launch because the
+        // probe is per-launch.
+        let (what, hint) = match e.kind() {
+            std::io::ErrorKind::NotFound => (
+                "the classifier tree is not installed on this host — the \
+                 placement probe cannot even make its throwaway leaf in it",
+                "the installer has to install the tree",
+            ),
+            std::io::ErrorKind::PermissionDenied => (
+                "this daemon cannot place a process in the classifier tree",
+                "it is not inside the delegated slice, so the installer's \
+                 --pid step or a Delegate=yes unit has to place it",
+            ),
+            _ => (
+                "the placement probe of the classifier tree failed",
+                "the probe's error is where to start",
+            ),
+        };
         tracing::info!(
             session = session_name,
             error = %e,
             daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
             install = %sandbox2::classifier::install_hint(),
-            "this daemon cannot place a process in the classifier tree — it is \
-             not inside the delegated slice, so the installer's --pid step or a \
-             Delegate=yes unit has to place it; the session's box runs \
-             unenforced",
+            hint,
+            "{what}; {hint} — the session's box runs unenforced",
         );
         return Ok(None);
     }
-    match sandbox2::classifier::create_box_leaf(root, &session_id.to_string()) {
-        Ok(leaf) => Ok(Some(sandbox2::config::ClassifierLeaf::new(leaf))),
+    match create_or_reclaim_box_leaf(root, session_id) {
+        Ok((leaf, reclaimed)) => {
+            if reclaimed {
+                tracing::info!(
+                    session = session_name,
+                    leaf = %leaf.display(),
+                    "reclaimed this session's empty classifier leaf — a leftover a \
+                     daemon death left behind; the kernel's rmdir emptiness test \
+                     let it go, and the launch created it again for this box",
+                );
+            }
+            Ok(Some(sandbox2::config::ClassifierLeaf::new(leaf)))
+        }
         // `NotFound` is the ordinary shape of "no tree on this host": the
         // privileged step has not run. Info, not warn — it is a deployment
         // state, not a fault, and the next step on this host is to run the
@@ -2413,22 +2491,16 @@ async fn create_session_leaf(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!(
                 session = session_name,
+                install = %sandbox2::classifier::install_hint(),
                 "the classifier tree is not installed on this host; \
                  the session's box runs unenforced",
             );
             Ok(None)
         }
-        // A leaf named by this session's id already exists, and the sweep at
-        // daemon start has already taken what a daemon death left behind, so
-        // a fresh launch finding one is not reusing a leftover: another
-        // session holds it, and this launch is refused rather than deciding
-        // two sessions' verdicts together.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(io::Error::other(format!(
-            "another session holds this one's classifier leaf ({session_id}): \
-                 its leaf was created before this launch and still exists, so \
-                 the launch is refused rather than placing this box in another \
-                 session's cgroup"
-        ))),
+        // A leaf named by this session's id that survives the reclaim is
+        // another session's, and the refusal below says so: two sessions in
+        // one leaf would decide both their verdicts together.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
         Err(e) => {
             tracing::warn!(
                 session = session_name,
@@ -2436,6 +2508,153 @@ async fn create_session_leaf(
                 "creating the session's classifier leaf; the box runs unenforced",
             );
             Ok(None)
+        }
+    }
+}
+
+/// Creates the session's classifier leaf, reclaiming a leftover empty one.
+///
+/// The sweep at daemon start takes the empty leaves a daemon death leaves
+/// behind, but it cannot take one made after it ran: a daemon that died
+/// between creating the leaf and spawning the box into it leaves a leaf a
+/// fresh launch of the same session id then finds. Whether that leaf is a
+/// leftover or another session's is not for this code to guess — the
+/// kernel's own emptiness test tells them apart, and it is the same
+/// primitive [`sandbox2::classifier::remove_box_leaf`] runs: an `rmdir`,
+/// which the kernel refuses while the cgroup holds a process. A leftover
+/// goes and the leaf is created again for this launch; a leaf that stays
+/// belongs to a live session, and the refusal names the `rmdir` that
+/// refused, so what a person reads is what would have had to be true for
+/// the leaf to have been reclaimable.
+///
+/// Returns the leaf and whether it is a reclaimed leftover, so the launch
+/// can say so. Split out of [`create_session_leaf`] so the two halves can
+/// be driven over a stand-in tree: the real tree's emptiness test is the
+/// kernel's, but the reclaims over a plain directory are the same code
+/// paths.
+fn create_or_reclaim_box_leaf(
+    root: &std::path::Path,
+    session_id: &sessions::SessionId,
+) -> io::Result<(std::path::PathBuf, bool)> {
+    let id = session_id.to_string();
+    match sandbox2::classifier::create_box_leaf(root, &id) {
+        Ok(leaf) => Ok((leaf, false)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let leftover = sandbox2::classifier::box_leaf(root, &id);
+            sandbox2::classifier::remove_box_leaf(&leftover)
+                .and_then(|()| sandbox2::classifier::create_box_leaf(root, &id))
+                .map(|leaf| (leaf, true))
+                .map_err(|refused| {
+                    io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "another session holds this one's classifier leaf \
+                             ({session_id}): the leaf this launch found still exists \
+                             and its rmdir — the kernel's own test that a cgroup \
+                             holds no process — refused ({refused}), so the launch \
+                             is refused rather than placing this box in another \
+                             session's cgroup"
+                        ),
+                    )
+                })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Reads the one line the box's pre-exec closure reported into the
+/// sandbox's `/run`, and says what it means: which cover the box took over
+/// the classifier tree the launch bound for its join, or the errno that
+/// killed the closure before the program ran — the `127` the spawn then
+/// reports, whose stderr is the session's own terminal and reaches no
+/// daemon log without this file.
+///
+/// Polled rather than awaited: the closure writes the line before the
+/// program execs, but the spawn returns before the write is guaranteed to
+/// have landed, and a report that never appears is itself a finding — a box
+/// that could not say what it did still ran, so the daemon says that and
+/// stops waiting. Runs off the launch's critical path (it is `tokio::spawn`
+///ed), so a session is never held up by what its box did in its first
+/// milliseconds.
+async fn report_box_closure(report: std::path::PathBuf, session: String) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match tokio::fs::read_to_string(&report).await {
+            Ok(line) => {
+                // The report is the box's to write once; the daemon owes the
+                // tree one line per launch, not a file per session.
+                let _ = tokio::fs::remove_file(&report).await;
+                let line = line.trim();
+                if line == "cover cgroup2" {
+                    tracing::info!(
+                        session = %session,
+                        cover = "cgroup2",
+                        "the box covered its bound classifier tree with the design's \
+                         own cover: a read-only cgroup2 mount of its namespace root, \
+                         so its own limit is readable where a runtime looks and no \
+                         other cgroup is reachable",
+                    );
+                } else if let Some(errno) = line.strip_prefix("cover tmpfs-fallback errno ") {
+                    tracing::warn!(
+                        session = %session,
+                        cover = "tmpfs-fallback",
+                        mount_errno = errno,
+                        "the box's classifier cover fell back to an empty read-only \
+                         tmpfs: the kernel refused the design's cgroup2 mount of the \
+                         box's namespace root in its user namespace, so the box has \
+                         no cgroup path to write a migration to, but none to read a \
+                         limit from either — a recorded fallback, never the design's \
+                         cover",
+                    );
+                } else if line == "cover tmpfs-fallback forced" {
+                    tracing::warn!(
+                        session = %session,
+                        cover = "tmpfs-fallback",
+                        "the box's classifier cover was forced onto its recorded \
+                         fallback — a launch in a test posture, never a production one",
+                    );
+                } else if let Some(failed) = line.strip_prefix("failed ") {
+                    let (step, errno) = failed
+                        .rsplit_once(" errno ")
+                        .unwrap_or((failed, "unreported"));
+                    tracing::error!(
+                        session = %session,
+                        step = %step,
+                        errno = %errno,
+                        "the box's pre-exec closure died before its program ran: the \
+                         spawn reports this as exit 127, and this line is the only \
+                         place a daemon log ever sees which step and which errno",
+                    );
+                } else {
+                    tracing::warn!(
+                        session = %session,
+                        report = %line,
+                        "the box's pre-exec closure reported a line this daemon does \
+                         not read",
+                    );
+                }
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if std::time::Instant::now() > deadline {
+                    tracing::debug!(
+                        session = %session,
+                        report = %report.display(),
+                        "the box's pre-exec closure wrote no report; nothing further \
+                         is owed",
+                    );
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session = %session,
+                    error = %e,
+                    "reading the box's closure report",
+                );
+                return;
+            }
         }
     }
 }
@@ -2704,6 +2923,40 @@ impl SessionLauncher for SandboxLauncher {
             container.set_session_leader();
 
             let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
+
+            // NET-079: a host-address box this native launch could not place
+            // gets a session-start notice in the terminal itself, not only a
+            // daemon log line — the person about to type in this session is
+            // the one whose egress is not being decided, and the state is
+            // the deployment's, not the session's, so the notice says what
+            // would change it. Never in the guest: a guest's unplaced
+            // host-address box never gets this far, its launch being refused
+            // (design §7.1).
+            if matches!(network_mode, NetworkMode::HostNet)
+                && !guest
+                && leaf_guard.as_ref().and_then(BoxLeafGuard::get).is_none()
+            {
+                let notice = format!(
+                    "this host places no classifier leaf for this session: its box \
+                     runs with the host's address and no egress verdict of its own \
+                     — {}",
+                    sandbox2::classifier::install_hint()
+                );
+                tracing::info!(session = %session_label, "{notice}");
+                // The same write the shell fallback notice uses, for the same
+                // reasons: onto the pty's slave, best-effort, CRLF — see the
+                // comment there.
+                let written = pty.dup_slave_fd().and_then(|fd| {
+                    use std::io::Write as _;
+                    std::fs::File::from(fd).write_all(format!("minimal: {notice}\r\n").as_bytes())
+                });
+                if let Err(e) = written {
+                    tracing::debug!(
+                        error = %e,
+                        "could not print the placement notice to the terminal"
+                    );
+                }
+            }
             // The shell, and the argv it needs to reach the daemon's
             // per-attach environment hook. Every program path here is
             // absolute (`/usr/bin/<shell>`): packages install with
@@ -2778,6 +3031,19 @@ impl SessionLauncher for SandboxLauncher {
         // handoff at the bottom; an `Err` return or a drop reaps it.
         let mut process = SpawnedProcessGuard::new(process);
 
+        // The box's closure report, read off the launch's critical path: the
+        // cover it took over its bound classifier tree — the design's
+        // read-only cgroup2 mount of its namespace root, or the recorded
+        // tmpfs fallback with the errno that forced it — or the errno that
+        // killed the pre-exec closure before the program ran, which is the
+        // one place a `127` ever reaches a daemon log. Nothing in the session
+        // waits on it; the session is up while this reads.
+        if let Some(leaf) = leaf.as_ref() {
+            let report = env.closure_report_path(leaf);
+            let session = session_label.clone();
+            tokio::spawn(async move { report_box_closure(report, session).await });
+        }
+
         // NET-079: the box's supervisor is moved into its leaf right after the
         // spawn, from the daemon's own namespaces where the leaf is
         // reachable — the same place the shim later writes an injected
@@ -2836,6 +3102,10 @@ impl SessionLauncher for SandboxLauncher {
             net_guard,
             tty_path,
             seal_injection: network_mode == NetworkMode::NoNet,
+            // The launch's own decision about this box's egress verdict, so
+            // the session can say which it runs under without re-deriving
+            // it from things a person never sees.
+            host_ip_enforcement: host_ip_enforcement(network_mode, leaf.as_ref()),
             // The copy the host keeps, so every process injected into the
             // session can join the same leaf.
             leaf,
@@ -2973,6 +3243,7 @@ impl SessionLauncher for MockLauncher {
             seal_injection: false,
             // The mock has no sandbox, so no classifier placed it anywhere.
             leaf: None,
+            host_ip_enforcement: None,
         })
     }
 }
@@ -3212,6 +3483,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             tty_path,
             seal_injection,
             leaf,
+            host_ip_enforcement,
         } = launcher
             .launch(
                 crate::guest::is_microvm_daemon(),
@@ -3250,7 +3522,14 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             process,
             pending_pty_err: None,
             master,
-            attrs: HostAttrs::default(),
+            // The launch decided the box's egress verdict posture before
+            // anything was reserved; the attributes carry that decision so
+            // the session can say which it runs under (design §7.2's
+            // declared-and-enforced attribute).
+            attrs: HostAttrs {
+                host_ip_enforcement,
+                ..HostAttrs::default()
+            },
 
             remote_tx,
             remote_rx,
