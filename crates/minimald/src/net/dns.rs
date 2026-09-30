@@ -67,6 +67,18 @@ use super::SwitchSubnet;
 /// The DNS suffix every PTask box name carries (see the module docs).
 pub const HOSTNAME_SUFFIX: &str = "min.internal";
 
+/// Whether `name` is a box-zone name — the zone apex itself or any name under
+/// it (NET-072). `name` is an already-normalized qname: lowercased, no root
+/// dot, exactly what [`super::dns_gate`]'s gate asks about. Mirrors the
+/// answerer's zone-suffix match so both layers cannot drift.
+#[must_use]
+pub fn is_zone_name(name: &str) -> bool {
+    name == HOSTNAME_SUFFIX
+        || name
+            .strip_suffix(HOSTNAME_SUFFIX)
+            .is_some_and(|stem| stem.ends_with('.'))
+}
+
 /// Default `<host-id>` of the deprecated three-label zone: a stable short name
 /// for this `minimald` instance. The host-id is configurable; this is the value
 /// used when none is configured.

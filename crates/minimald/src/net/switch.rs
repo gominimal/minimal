@@ -28,7 +28,7 @@ use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::io::unix::AsyncFd;
@@ -435,6 +435,13 @@ where
     // reply to the PTask's own UDP egress is solicited, finding #2) and the one
     // rate limiter, whose keys keep every rule's line independent.
     let gate = gate.map(Arc::new);
+    // NET-073: a session relay publishes its gate under its lease, so a
+    // sibling's relay can consult the box's own egress rules at connect time.
+    // The daemon's own relay (`gate` is `None`) is not a box and publishes
+    // nothing.
+    if let Some(gate) = &gate {
+        register_live_gate(lease, gate);
+    }
     // NET-004: a session relay tells its box — rate-limited — that frames to the
     // literal host-alias address are deprecated. The daemon's own relay (`gate`
     // is `None`) is not a box and gets no notice.
@@ -787,6 +794,49 @@ impl ForeignSourceReject {
     }
 }
 
+/// The live gate of every box this daemon relays, keyed by its lease (NET-073).
+///
+/// The connect-time half of the box-zone conjunction asks, for a bare SYN
+/// arriving at a box's relay, who the *source* is and what the source's own
+/// egress rules say — which only the source's own relay knows. Each session
+/// relay publishes its gate here at spawn ([`register_live_gate`]); a target's
+/// relay looks the source up through [`live_gate`]. Membership is the
+/// sibling-box classification itself: only session relays register, so the
+/// switch's own traffic, the daemon's relay (whose gate is `None`), and a
+/// resolver are never found, and a source that is not a box on this daemon's
+/// switch keeps today's target-ingress-only behavior.
+///
+/// Values are [`Weak`]: a gate lives exactly as long as its relay, so a dead
+/// relay's entry answers nothing and needs no deregistration — leases are never
+/// reused. The table still sweeps its dead entries past a threshold, the
+/// [`UdpConntrack`] pattern, so it never grows without bound. Per-process:
+/// boxes behind a *different* daemon are not seen from here, and their
+/// connections decide on the target's ingress alone.
+const LIVE_GATES: Mutex<HashMap<Ipv4Addr, Weak<SessionGate>>> = Mutex::new(HashMap::new());
+/// Sweep dead entries once the table crosses this many leases — the
+/// [`UdpConntrack`] bound, sized for the same burst-of-attach picture.
+const LIVE_GATES_SWEEP_AT: usize = 4096;
+
+/// Publishes a session relay's gate under its lease in [`LIVE_GATES`], sweeping
+/// dead entries first when the table is at its threshold.
+fn register_live_gate(lease: Ipv4Addr, gate: &Arc<SessionGate>) {
+    let mut gates = LIVE_GATES.lock().expect("live gate table poisoned");
+    if gates.len() >= LIVE_GATES_SWEEP_AT {
+        gates.retain(|_, weak| weak.strong_count() > 0);
+    }
+    gates.insert(lease, Arc::downgrade(gate));
+}
+
+/// The live gate of the box `addr` belongs to, while its relay lives — `None`
+/// for every other source, whatever the table once held.
+fn live_gate(addr: Ipv4Addr) -> Option<Arc<SessionGate>> {
+    LIVE_GATES
+        .lock()
+        .expect("live gate table poisoned")
+        .get(&addr)
+        .and_then(Weak::upgrade)
+}
+
 /// A PTask's compiled network policy, applied at the relay bridge — gvproxy
 /// v0.8.9 enforces nothing per client, so both directions of the session's
 /// traffic are decided here:
@@ -927,6 +977,81 @@ impl SessionGate {
             return Some((sessions::IpProto::Udp, dst_port, src));
         }
         None
+    }
+
+    /// NET-073's connect-time half: whether a new inbound TCP connection to
+    /// this box must be dropped because the *source* box's own egress rules
+    /// refuse it. Only the source's relay holds those rules, so this relay
+    /// asks the source's live gate (the [`LIVE_GATES`] table) and applies the
+    /// one decision function the proxy's caller check uses
+    /// ([`direct_connection_verdict`]) — the parity rule that a
+    /// hostname-routing surface buys no reach a direct connection would not
+    /// have. The pin lift is mirrored too, so a box that resolved this box
+    /// by name is judged on its pin, exactly as its own relay judged it.
+    ///
+    /// Returns `true` to drop. `false` leaves the decision where it was:
+    /// [`inbound_drop`] still governs the connection with the target's own
+    /// ingress rules — this check narrows it, never widens it. A connection
+    /// event is a bare SYN; a source that is not a live box on this daemon's
+    /// switch (the resolver, the daemon's own relay, a box behind another
+    /// daemon) finds no gate and keeps today's target-ingress-only behavior.
+    ///
+    /// One debug line per connection names both boxes and each side's verdict;
+    /// a source refusal is also said through the shared limiter once per
+    /// source box and rule per minute (R2.7), under the source's label, the
+    /// line its own egress leg would have emitted had it seen the frame.
+    fn refuse_zone_connect(&self, frame: &[u8], now: Instant) -> bool {
+        let Some(pkt) = parse_ipv4_l4(frame) else {
+            return false;
+        };
+        if pkt.proto != IPPROTO_TCP {
+            return false;
+        }
+        let (syn, ack) = (pkt.tcp_flags & 0x02 != 0, pkt.tcp_flags & 0x10 != 0);
+        if !syn || ack {
+            return false;
+        }
+        let Some(peer) = live_gate(pkt.src.ip()) else {
+            return false;
+        };
+        let (dst, dst_port) = (pkt.dst.ip(), pkt.dst.port());
+        // The source's half of the conjunction: the verdict the source's own
+        // relay would give this connection, with the same pin lift — the one
+        // drop a name-granted address lifts, on the gate that table lives in.
+        let (refusal, source_pass) = match direct_connection_verdict(&peer.egress, *dst, dst_port) {
+            FrameVerdict::Drop(reason) => {
+                let pass = matches!(reason, DropReason::UndeclaredSubnet { .. })
+                    && reason.destination().is_some_and(|destination| {
+                        peer.dns.admits_flow(destination, Some(&pkt), now)
+                    });
+                (Some(reason), pass)
+            }
+            FrameVerdict::Admit => (None, true),
+        };
+        // The target's half, as `inbound_drop` will decide the same frame a
+        // breath later if the source's half passes.
+        let target_pass = self.allowed.contains(&dst_port);
+        tracing::debug!(
+            source = %peer.label,
+            target = %self.label,
+            source_pass,
+            target_pass,
+            port = dst_port,
+            "box-zone connection decided at connect"
+        );
+        if source_pass {
+            return false;
+        }
+        let reason = refusal.expect("refusal known when the source half fails");
+        self.limiter.warn(
+            &peer.label,
+            Direction::Egress,
+            Some(SocketAddr::V4(pkt.dst)),
+            Proto::Tcp,
+            Some(dst_port),
+            reason.rule(),
+        );
+        true
     }
 
     /// Whether the target's own gate admits a direct inbound TCP connection to
@@ -1494,6 +1619,17 @@ where
         // peer session or the daemon tap cannot reach undeclared listeners on the
         // shared switch. Replies to the PTask's own egress pass (TCP: ACK set; UDP:
         // matched by the conntrack).
+        //
+        // NET-073 goes first, on the connection event itself: a bare SYN from
+        // another box is judged by the source box's own egress rules beside
+        // this target's ingress ones — the conjunction the box-zone
+        // resolution rides on. A refused connection never reaches the
+        // ingress gate below; an allowed one is decided by it, unchanged.
+        if let Some(gate) = &gate
+            && gate.refuse_zone_connect(&frame[..n], Instant::now())
+        {
+            continue;
+        }
         if let Some(gate) = &gate
             && let Some((proto, dst_port, src)) = gate.inbound_drop(&frame[..n])
         {

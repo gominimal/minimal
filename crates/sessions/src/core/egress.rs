@@ -1321,10 +1321,9 @@ mod tests {
     #[test]
     fn rebinding_intersection_admits_only_clean_answers() {
         let infrastructure = InfrastructureDenySet::new(RESOLVER, HOST_ALIAS);
-        let admit =
-            |answer: [u8; 4], allow: Option<&[Ipv4Cidr]>, deny: Option<&[Ipv4Cidr]>| {
-                rebinding_admits(answer, false, allow, deny, &infrastructure)
-            };
+        let admit = |answer: [u8; 4], allow: Option<&[Ipv4Cidr]>, deny: Option<&[Ipv4Cidr]>| {
+            rebinding_admits(answer, false, allow, deny, &infrastructure)
+        };
 
         // A public answer is admitted with no declarations at all (NET-066).
         admit([140, 82, 121, 3], None, None).unwrap();
@@ -1392,10 +1391,9 @@ mod tests {
     #[test]
     fn box_zone_answers_carved_out_of_infrastructure_deny() {
         let infrastructure = InfrastructureDenySet::new(RESOLVER, HOST_ALIAS);
-        let admit =
-            |answer: [u8; 4], allow: Option<&[Ipv4Cidr]>, deny: Option<&[Ipv4Cidr]>| {
-                rebinding_admits(answer, true, allow, deny, &infrastructure)
-            };
+        let admit = |answer: [u8; 4], allow: Option<&[Ipv4Cidr]>, deny: Option<&[Ipv4Cidr]>| {
+            rebinding_admits(answer, true, allow, deny, &infrastructure)
+        };
 
         // A sibling's lease — the plane address a zone name must resolve to
         // — is admitted with no declarations at all (NET-072).

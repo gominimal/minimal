@@ -57,6 +57,15 @@
 //! other way would turn every deny-all box into a resolve-anything box,
 //! which is the opposite of what NET-063 established.
 //!
+//! The box zone is the one carve-out (NET-072): a sibling's
+//! `<box>.min.internal` resolves with no entry, because every attached
+//! box's name is registered in that zone by the daemon itself — the grant
+//! is the daemon's, not the box's policy's. A zone answer is admitted past
+//! the rebinding intersection even where the infrastructure deny would
+//! refuse a plane address, and what a box may then *do* with it is the
+//! connect-time conjunction (NET-073): the sibling's ingress rules beside
+//! the resolving box's own egress ones.
+//!
 //! ## The window, and the one place this gate departs from design §5.3
 //!
 //! §5.3 defines the admission window as TTL-bounded — an answer holds for
@@ -327,11 +336,14 @@ impl DnsGate {
     }
 
     /// Whether `name` is one the box's policy allowed — the trigger for
-    /// pinning. An undeclared allowlist allows no name.
+    /// pinning. An undeclared allowlist allows no name, with the box zone as
+    /// the one exception (NET-072): every attached box's name is registered
+    /// there, so a sibling resolves with no entry of the box's own.
     fn allows_name(&self, name: &str) -> bool {
         self.names
             .as_ref()
             .is_some_and(|names| names.contains(name))
+            || super::dns::is_zone_name(name)
     }
 
     /// The egress leg, NET-136: whether the datagram the box sent to `dst`
@@ -462,6 +474,7 @@ impl DnsGate {
             .collect();
         let split = egress::rebinding_intersection(
             &answers,
+            super::dns::is_zone_name(&asked),
             self.rules.allow_subnets(),
             self.rules.deny_subnets(),
             &self.infrastructure,
