@@ -36,16 +36,23 @@
 //! The socket is not the shuttle's alone. gvproxy's switch socket is one
 //! listener carrying two protocols, and the guest daemon uses both over the
 //! bridged vsock port: the shuttle's `/connect` upgrade, and the plain
-//! HTTP/1.1 control verbs (`/services/forwarder/expose`, the `/services/dns`
-//! zone verbs) it drives its publishes and its zone with — request/response,
-//! framed by `Content-Length`, never a frame on the wire. The gate reads the
-//! first request head either way, forwards it verbatim, and then relays by
-//! what that head asked for: frames through the verdict, control bytes spliced
-//! untouched. The one thing a control connection may never be allowed to
-//! become is an upgrade — gvproxy hijacks any request whose path is the
-//! connect path, however late in the connection's life it arrives — so the
-//! splice watches for that path and tears the connection down, which is what
-//! keeps the gate the only way a frame ever reaches the switch.
+//! HTTP/1.1 control verbs (`/services/forwarder/expose`,
+//! `/services/forwarder/unexpose`, `/services/dns/add`) it drives its
+//! publishes and its zone with — request/response, framed by
+//! `Content-Length`, never a frame on the wire. The gate reads the first
+//! request head either way, classifies it by its request line's target
+//! against an allow-list, and refuses anything else **before forwarding** —
+//! because gvproxy hijacks on more than the connect path (`/tunnel` dials
+//! an address inside the virtual network and relays bytes), so a head the
+//! gate has not classified is a reach, not plumbing. What is classified is
+//! relayed by what the head asked for — frames through the verdict, control
+//! bytes untouched — and a control connection carries exactly **one**
+//! request: the head plus exactly its `Content-Length` body bytes, the
+//! daemon's own client's shape, after which the first further guest byte
+//! tears the connection down without being written on. gvproxy hijacks a
+//! hijacking request however late in the connection's life it arrives, so
+//! there being no second request to read is what keeps the gate the only
+//! way a frame ever reaches the switch.
 //!
 //! Fail-closed is the posture. A frame whose source address no published
 //! namespace holds never leaves the VM (NET-081's failure case); a frame a
@@ -86,24 +93,43 @@ const CONNECT_REQUEST: &[u8] = b"POST /connect HTTP/1.0\r\nHost: localhost\r\n\r
 /// switch socket is one listener with two protocols on it — the HTTP
 /// request/response verbs the guest daemon drives, and the upgrade that
 /// hijacks the connection into the shuttle's length-framed L2 stream — and
-/// gvproxy hijacks on this path alone, whatever the method and however late in
-/// the connection's life the request arrives
+/// gvproxy hijacks on this path, whatever the method and however late in the
+/// connection's life the request arrives
 /// (`crates/minimald/src/net/policy.rs` for the verbs,
-/// `crates/minimald/src/net/switch.rs` for the upgrade).
+/// `crates/minimald/src/net/switch.rs` for the upgrade). It is the one
+/// hijacking path the gate relays, and it relays it only as a first request:
+/// on a frame connection the frames behind it go through the verdict, and on
+/// a control connection there is no second request to hide one in.
 ///
-/// The path is the whole of the classification: a head carrying it is a frame
-/// stream, any other head is a control exchange.
+/// The path is the whole of the classification, read off the head's request
+/// line: a first request for it is a frame stream, a first request for a verb
+/// in [`CONTROL_VERBS`] is a control exchange, and any other first request is
+/// refused before forwarding ([`GuestSpeak::of_head`]).
 const CONNECT_PATH: &[u8] = b"/connect";
 
-/// How much of a control connection's already-forwarded bytes the splice keeps
-/// in hand: one fewer than [`CONNECT_PATH`], which is the most of it that can
-/// be behind the read its last byte lands in — the read itself holds the rest
-/// — so a path split over any number of reads is still seen whole.
-const CONNECT_WATCH_TAIL: usize = CONNECT_PATH.len() - 1;
+/// The control verbs the gate relays: the guest daemon's own plumbing — the
+/// publish and unpublish of a declared ingress port, and the zone-add that
+/// gives a box its `*.min.internal` name — and nothing else. gvproxy's switch
+/// socket carries other verbs on the same listener, its forwarder listings
+/// and its lease, CAM and stats reads among them, and one more hijacking
+/// verb beside the connect path: `/tunnel?ip=&port=`, which dials an address
+/// inside the virtual network and relays bytes — host-originated TCP to any
+/// switch address, with no rule consulted and no frame ever through the
+/// gate. None of it is a box's declared traffic, so none of it is forwarded.
+/// The list is the daemon's own verbs verbatim, matched exactly on the
+/// request line's target: the daemon never speaks another, so a head naming
+/// something else is not the daemon, and the guest daemon is the only
+/// speaker the gate owes anything to here.
+const CONTROL_VERBS: [&[u8]; 3] = [
+    b"/services/forwarder/expose",
+    b"/services/forwarder/unexpose",
+    b"/services/dns/add",
+];
 
-/// How much of a control connection's guest → switch stream one read of the
-/// splice takes. Control bodies are a few hundred bytes of JSON; the size only
-/// sets how often the watch runs, never what it admits.
+/// How much of a control connection's body one read of the splice takes.
+/// Control bodies are a few hundred bytes of JSON; the size sets only how
+/// many writes the body is relayed in, never what is admitted — the count the
+/// gate relays is the head's `Content-Length`, exactly.
 const CONTROL_READ: usize = 4 * 1024;
 
 /// Where the upgrade head ends and the frames begin.
@@ -163,51 +189,195 @@ const DROP_WARN_MAX_TRACKED_PAIRS: usize = 1024;
 /// host published.
 const UNKNOWN_SOURCE_RULE: &str = "egress-unknown-source";
 
-/// The rule name for a control connection that tried to upgrade into the frame
-/// stream mid-connection — the one reach a control exchange could otherwise
-/// buy. Emitted at the same cadence as the frame drops: a guest can attempt it
-/// on a fresh connection as cheaply as it can send a frame, and the refusal
-/// must not become the flood the frame drops are rate-limited against.
+/// The rule name for a request head the gate refuses to relay. Two shapes
+/// share it: a request-target outside the gate's allow-list — gvproxy's
+/// switch socket carries other verbs there, the `/tunnel` hijack among them —
+/// and a control head whose body the gate cannot frame, chunked or split
+/// across two disagreeing `Content-Length`s. Neither is the daemon's own
+/// client's shape, so the head is refused before anything of it is written
+/// on, and the refusal is rate-limited like a frame drop: a guest can attempt
+/// it on a fresh connection as cheaply as it can send a frame.
+const UNDECLARED_VERB_RULE: &str = "egress-undeclared-verb";
+
+/// The rule name for a control connection spoken past the one request it was
+/// allowed — the one reach a control exchange could otherwise buy, since
+/// gvproxy hijacks a hijacking request however late in the connection's life
+/// it arrives. The gate reads no second request at all: the first byte past
+/// the body is refused unread and the connection comes down. Emitted at the
+/// same cadence as the frame drops: a guest can attempt it on a fresh
+/// connection as cheaply as it can send a frame, and the refusal must not
+/// become the flood the frame drops are rate-limited against.
 const CONTROL_UPGRADE_RULE: &str = "egress-control-upgrade";
 
 /// What the guest's first request head says it came for: gvproxy's switch
-/// socket speaks two protocols on one listener, and the head is where they
-/// part ways.
+/// socket speaks two protocols on one listener, and the head's request line
+/// is where they part ways — or does not, which is itself an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuestSpeak {
     /// The connect upgrade: a hijacked connection carrying length-framed
     /// Ethernet frames — the traffic NET-081 exists to gate.
     Frames,
-    /// A control request: plain HTTP/1.1 request/response, framed by
-    /// `Content-Length`, never a frame on the wire.
-    Control,
+    /// One control request: plain HTTP/1.1 request/response, framed by
+    /// `Content-Length`, never a frame on the wire. The body is the only
+    /// thing the gate relays past the head, and the only thing a control
+    /// connection may say after the head at all.
+    Control {
+        /// The request's body length in bytes, read from the head's
+        /// `Content-Length`: exactly this many bytes are relayed, and the
+        /// first one after them is refused.
+        body: usize,
+    },
+}
+
+/// A first request head the gate refuses to relay, and what the refusal line
+/// names: `target` is the first line's request-target — or the line's own
+/// start, when the line never reached one — so the log can say what was
+/// refused, even when it is the guest daemon's own verb with a framing the
+/// gate cannot follow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefusedHead {
+    /// The request-target the refusal names, truncated to
+    /// [`MAX_NAMED_TARGET`].
+    target: Vec<u8>,
+}
+
+/// How much of a refused request's first line the refusal line names: the
+/// verbs the gate relays are under thirty bytes, so anything past this is not
+/// one of them, and a rate-limited warning is no place to echo a hostile
+/// head.
+const MAX_NAMED_TARGET: usize = 64;
+
+impl RefusedHead {
+    /// Refuses `what` — a request-target, or the line that never reached one.
+    fn new(what: &[u8]) -> Self {
+        Self {
+            target: what.iter().copied().take(MAX_NAMED_TARGET).collect(),
+        }
+    }
 }
 
 impl GuestSpeak {
-    /// Classifies a first request head. Deliberately wide — any head carrying
-    /// the connect path is the upgrade — because the two misreadings fail in
-    /// opposite directions: an HTTP request the gate takes for frames dies at
-    /// its first length claim, fail-closed, while an upgrade taken for a
-    /// control request would be spliced to the switch ungated.
-    fn of_head(head: &[u8]) -> Self {
-        if find_subslice(head, CONNECT_PATH).is_some() {
-            Self::Frames
-        } else {
-            Self::Control
+    /// Classifies a first request head by its request line's target against
+    /// the gate's allow-list: [`CONNECT_PATH`] is the frame stream, a verb in
+    /// [`CONTROL_VERBS`] is one control request, and anything else — a target
+    /// gvproxy can do more with than the gate has classified, a line the gate
+    /// cannot read a target from, or a control head with no single numeric
+    /// `Content-Length` to relay a body by — is refused **before forwarding**,
+    /// because a head the gate has not classified is a reach, not plumbing.
+    ///
+    /// The target is matched on its path alone: gvproxy hijacks the connect
+    /// path whatever the method and whatever the query, so neither is read —
+    /// but nothing else about the target is forgiven either. An absolute-form
+    /// target, a path with anything before or after the connect path, and a
+    /// first line that is not `METHOD SP target SP version` are all refused:
+    /// the gate never writes on a head it has not classified, so gvproxy
+    /// never holds bytes it can reinterpret.
+    fn of_head(head: &[u8]) -> Result<Self, RefusedHead> {
+        // The request line is the head's first line, CRLF-framed as the head
+        // itself is (the head ends where it does because it carries
+        // [`HEAD_END`]), so reading it by LF loses the framing CR, not the
+        // line.
+        let line = strip_cr(head.split(|&b| b == b'\n').next().unwrap_or(&[]));
+        // `METHOD SP request-target SP HTTP-version`: three tokens. The
+        // split always yields the first, so the method is stepped over
+        // unread — gvproxy ignores it on the connect path, and the daemon's
+        // verbs are the target's to name.
+        let mut words = line.split(|&b| b == b' ');
+        words.next();
+        let Some(target) = words.next() else {
+            return Err(RefusedHead::new(line));
+        };
+        if words.next().is_none() || words.next().is_some() {
+            // No version, or a fourth word: not a request line the gate can
+            // read a target from.
+            return Err(RefusedHead::new(line));
         }
+        // The query is not part of what gvproxy routes by; the path is.
+        let path = target.split(|&b| b == b'?').next().unwrap_or(target);
+        if path == CONNECT_PATH {
+            return Ok(Self::Frames);
+        }
+        if !CONTROL_VERBS.contains(&path) {
+            return Err(RefusedHead::new(target));
+        }
+        // A control request is `Content-Length`-framed and the gate relays
+        // exactly that many body bytes, so the head must frame one body it
+        // can read the end of. The daemon's client always sends one count;
+        // a head that frames its body any other way — chunked, or in two
+        // disagreeing counts — is not a request the gate can relay exactly.
+        match framed_body(head) {
+            Some(body) => Ok(Self::Control { body }),
+            None => Err(RefusedHead::new(target)),
+        }
+    }
+}
+
+/// The body byte count the head frames its request by, or nothing when the
+/// gate cannot frame it: the `Content-Length` the daemon's client sends on
+/// every control request (`post_json`, `crates/minimald/src/net/policy.rs`),
+/// with an absent count reading as no body the way HTTP itself reads it. A
+/// `Transfer-Encoding`, a count that is not one plain decimal number, and two
+/// counts that disagree are each a request whose end the gate cannot pin,
+/// and each is refused rather than guessed at: the count decides where the
+/// request ends and where the bytes the gate must never write on begin.
+fn framed_body(head: &[u8]) -> Option<usize> {
+    let mut found: Option<usize> = None;
+    for line in head.split(|&b| b == b'\n').skip(1) {
+        let line = strip_cr(line);
+        if line.is_empty() {
+            // The head's terminator: the headers are done.
+            break;
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            // Not a header the gate reads; gvproxy's own parse of the head
+            // decides what it means, and the head was already classified by
+            // its target.
+            continue;
+        };
+        let (name, rest) = line.split_at(colon);
+        if name.eq_ignore_ascii_case(b"Transfer-Encoding") {
+            // Chunked framing is the smuggling shape: the gate relays by a
+            // byte count, so a request that will not say one is refused.
+            return None;
+        }
+        if !name.eq_ignore_ascii_case(b"Content-Length") {
+            continue;
+        }
+        let value = rest.strip_prefix(b":")?;
+        let count = std::str::from_utf8(value.trim_ascii())
+            .ok()?
+            .parse::<usize>()
+            .ok()?;
+        if found.replace(count).is_some() {
+            // Two `Content-Length` headers is a smuggling shape, not
+            // plumbing: the gate refuses rather than pick one.
+            return None;
+        }
+    }
+    // No count named is HTTP's own reading of no body, not a malformed head.
+    found.or(Some(0))
+}
+
+/// A head line's bytes without the CR its CRLF framing left on it: the gate
+/// reads the head's lines by LF, which keeps the framing.
+fn strip_cr(line: &[u8]) -> &[u8] {
+    match line.split_last() {
+        Some((&b'\r', rest)) => rest,
+        _ => line,
     }
 }
 
 /// How a control connection's guest → switch leg ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlEnd {
-    /// The guest's side is done — it closed the connection, or errored — so the
-    /// splice has nothing more to carry.
+    /// The guest's side is done — it closed the connection, or errored —
+    /// having said nothing past its one request's body.
     GuestClosed,
-    /// The connect path appeared in the stream. gvproxy hijacks on it, so the
-    /// connection is torn down rather than allowed to become a frame stream no
-    /// verdict had decided.
-    Upgrade,
+    /// The guest spoke past its one request's body. The bytes are refused
+    /// unread — the gate parses no second request, because gvproxy hijacks a
+    /// hijacking request however late in the connection's life it arrives
+    /// and the only safe number of further bytes to relay is none.
+    SpokePastRequest,
 }
 
 /// A running host-side egress gate: the accept loop on the gate socket, plus
@@ -295,14 +465,16 @@ async fn accept_loop(
 }
 
 /// Serves one guest connection end to end: dial the switch this gate fronts,
-/// forward the request head the guest wrote verbatim, then relay by what that
-/// head asked for — frames through the verdict, control bytes untouched — for
-/// as long as the connection lives, until the guest or the switch goes away.
+/// classify the request head the guest wrote, forward the head if — and only
+/// if — the gate relays what it asks for, then relay by what that head asked
+/// for: frames through the verdict, control bytes untouched, for as long as
+/// the connection lives, until the guest or the switch goes away.
 ///
 /// `handshake_timeout` bounds everything up to and including the forwarded
-/// head. It is a parameter only so a test can shrink it; every caller outside
-/// this module's tests reaches a connection through [`accept_loop`], which
-/// passes [`HANDSHAKE_TIMEOUT`].
+/// head, and, on a control connection, the drain of the answer that follows
+/// the request's end. It is a parameter only so a test can shrink it; every
+/// caller outside this module's tests reaches a connection through
+/// [`accept_loop`], which passes [`HANDSHAKE_TIMEOUT`].
 async fn serve_connection(
     mut guest: UnixStream,
     switch_sock: PathBuf,
@@ -340,11 +512,21 @@ async fn serve_connection(
                 return Err(());
             }
         };
+        // The head is classified before a byte of it is written on: a target
+        // the gate has not classified — the `/tunnel` hijack, a listing, a
+        // shape the gate cannot frame — never reaches the switch at all.
+        let speak = match GuestSpeak::of_head(&head) {
+            Ok(speak) => speak,
+            Err(refused) => {
+                refuse_head(&limiter, &refused);
+                return Err(());
+            }
+        };
         if let Err(error) = switch.write_all(&head).await {
             tracing::warn!(%error, "egress gate could not forward the request head");
             return Err(());
         }
-        Ok((switch, carry, GuestSpeak::of_head(&head)))
+        Ok((switch, carry, speak))
     };
     let (switch, carry, speak) = match tokio::time::timeout(handshake_timeout, handshake).await {
         Ok(Ok(triple)) => triple,
@@ -373,16 +555,33 @@ async fn serve_connection(
             )
             .await;
         }
-        GuestSpeak::Control => {
+        GuestSpeak::Control { body } => {
             relay_control(
                 Prefixed::new(carry, guest_rx),
                 switch_tx,
                 switch_rx,
                 guest_tx,
+                body,
                 limiter,
+                handshake_timeout,
             )
             .await;
         }
+    }
+}
+
+/// Refuses a first request head, at the frame drops' cadence: a guest can
+/// attempt an off-list request on a fresh connection as cheaply as it can
+/// send a frame, so the refusal must not become a flood. Nothing of the head
+/// is written on — gvproxy never sees the request — and the connection's
+/// halves come down with the return.
+fn refuse_head(limiter: &DropLimiter, refused: &RefusedHead) {
+    if limiter.should_warn_at(None, UNDECLARED_VERB_RULE, Instant::now()) != WarnDecision::Silent {
+        tracing::warn!(
+            rule_matched = UNDECLARED_VERB_RULE,
+            request_target = %String::from_utf8_lossy(&refused.target),
+            "refused a request head the egress gate does not relay",
+        );
     }
 }
 
@@ -443,18 +642,19 @@ async fn relay_frames(
     ingress.abort();
 }
 
-/// A control connection: gvproxy's HTTP request/response verbs, spliced
-/// verbatim both ways. Nothing on this connection is a frame, so there is
-/// nothing to gate — the head, the body and the response are the guest
-/// daemon's own plumbing, forwarded as they came, and a control exchange the
-/// gate mangled would leave the daemon's publishes failing and its zone never
-/// coming up. One thing is watched for on the guest → switch leg: the connect
-/// path, which would hand the guest the ungated frame stream this gate exists
-/// to prevent ([`ControlEnd::Upgrade`]).
+/// One control request on a connection: the head is already forwarded, the
+/// gate relays its `Content-Length` body — `body` bytes — verbatim, and
+/// nothing past it. The daemon's own client speaks one request per
+/// connection and closes from its side once the answer is read (`post_json`,
+/// `crates/minimald/src/net/policy.rs`), so one request is all the gate ever
+/// relays, and the first guest byte past the body is refused unread rather
+/// than parsed: gvproxy hijacks a hijacking request however late in a
+/// connection's life it arrives, and there being no second request to read
+/// is what leaves nothing for an upgrade to hide in.
 ///
-/// The legs race, because neither can see the other's end. The splice blocks
-/// on the guest, which has no reason to speak while it is idle waiting for
-/// the response, so it has no way to learn the switch hung up this one
+/// The legs race, because neither can see the other's end. The request leg
+/// blocks on the guest, which has no reason to speak while it is idle waiting
+/// for the response, so it has no way to learn the switch hung up this one
 /// connection's end — the per-connection close a keep-alive control channel
 /// makes without the process exit the supervisor catches, the same close
 /// [`relay_frames`] races its legs for — and would otherwise hold the relay
@@ -462,60 +662,49 @@ async fn relay_frames(
 /// spoke. The response leg ending is the only thing on this side that knows,
 /// so whichever leg ends first takes the relay down with it.
 ///
-/// One ending is *not* the connection's end, though: a control exchange is a
-/// request **and** its response, and a guest that has said all it means to
-/// say is still waiting for the answer. So the request leg half-closes the
-/// switch's side when it is done and the response leg is drained before the
-/// relay comes off, bounded by the peers' own lifetimes: a gvproxy that will
-/// neither answer nor die holds one relay until the supervisor tears the
-/// switch — and with it the gate — down.
+/// Whichever way the request leg ends, the exchange's answer is still owed:
+/// the switch's side is half-closed, so gvproxy sees the request's end and
+/// answers the one request it was given — refused or not, the guest made a
+/// request the gate relayed, and dropping its answer in flight would punish
+/// nothing but the guest's own daemon — and the response is drained before
+/// the relay comes off, bounded by `drain_timeout` — the same bound the
+/// handshake reads under — so a switch that will neither answer nor die holds
+/// no gate task and no socket past it.
 async fn relay_control(
     guest: Prefixed<OwnedReadHalf>,
     switch: OwnedWriteHalf,
     switch_rx: OwnedReadHalf,
     guest_tx: OwnedWriteHalf,
+    body: usize,
     limiter: Arc<DropLimiter>,
+    drain_timeout: Duration,
 ) {
     let mut response = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
-    let splice = splice_control(guest, switch);
+    let splice = splice_control(guest, switch, body);
     tokio::pin!(splice);
     tokio::select! {
         (end, mut switch) = &mut splice => match end {
             ControlEnd::GuestClosed => {
-                // Half-close the switch's side, so gvproxy sees the request's
-                // end the moment the guest is done speaking it.
-                if let Err(error) = switch.shutdown().await {
-                    tracing::warn!(
-                        %error,
-                        "egress gate could not close the switch's side of a control connection"
-                    );
-                }
-                match response.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "egress gate control response leg ended on an error");
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "egress gate control response leg ended");
-                    }
-                }
+                finish_control(&mut response, &mut switch, drain_timeout).await;
             }
-            ControlEnd::Upgrade => {
-                // Refused, at the same cadence as the frame drops: a guest can
-                // attempt this on a fresh connection as cheaply as it can send
-                // a frame, and the refusal must not become the flood.
+            ControlEnd::SpokePastRequest => {
+                // Refused, at the frame drops' cadence: a guest can attempt
+                // this on a fresh connection as cheaply as it can send a
+                // frame, and the refusal must not become the flood.
                 if limiter.should_warn_at(None, CONTROL_UPGRADE_RULE, Instant::now())
                     != WarnDecision::Silent
                 {
                     tracing::warn!(
                         rule_matched = CONTROL_UPGRADE_RULE,
-                        "a control connection tried to upgrade into the frame stream; \
-                         the egress gate refused it",
+                        "a control connection was spoken past its one request; \
+                         the egress gate tore it down",
                     );
                 }
-                // Both halves drop with the relay, so gvproxy never sees the
-                // request that would have hijacked it.
-                response.abort();
+                // The answer to the request that *was* relayed is still
+                // drained: half-close the switch's side and let gvproxy
+                // finish, rather than aborting the response leg and dropping
+                // an answer mid-flight.
+                finish_control(&mut response, &mut switch, drain_timeout).await;
             }
         },
         result = &mut response => match result {
@@ -537,38 +726,84 @@ async fn relay_control(
     }
 }
 
-/// Splices a control connection's guest → switch bytes to the switch verbatim,
-/// never parsing them as anything, and watches for the connect path — gvproxy
-/// hijacks on it, so those bytes are the one reach a control exchange could
-/// buy, and the leg ends in [`ControlEnd::Upgrade`] the moment they appear.
-/// The switch half comes back out beside the leg's end, so its caller can
-/// half-close the switch's side once the request is spoken — the half is the
-/// splice's to write on, not its caller's to hold while the splice runs.
+/// Ends a control connection whose request leg finished: half-close the
+/// switch's side, so gvproxy sees the request's end and answers the one
+/// request it was given, then drain the answer to the guest, bounded by
+/// `drain_timeout`. The bound is what releases the gate's task and the socket
+/// halves it holds when a switch will neither answer nor die: the daemon is
+/// unaffected either way, but the gate must not outlive the connection on a
+/// switch that is not going to speak again.
+async fn finish_control(
+    response: &mut JoinHandle<io::Result<()>>,
+    switch: &mut OwnedWriteHalf,
+    drain_timeout: Duration,
+) {
+    if let Err(error) = switch.shutdown().await {
+        tracing::warn!(
+            %error,
+            "egress gate could not close the switch's side of a control connection"
+        );
+    }
+    match tokio::time::timeout(drain_timeout, &mut *response).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(%error, "egress gate control response leg ended on an error");
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "egress gate control response leg ended");
+        }
+        Err(_) => {
+            // The switch took the request and said nothing back for the
+            // whole bound: stop waiting on it, so the relay — and the dial
+            // and both socket halves it holds — comes down now.
+            response.abort();
+            tracing::warn!(
+                drain_timeout = ?drain_timeout,
+                "gvproxy did not answer a control request within the bound; \
+                 the egress gate relay is down for it"
+            );
+        }
+    }
+}
+
+/// Relays a control connection's request to the switch verbatim: exactly
+/// `body` bytes — the head's `Content-Length` — however many reads they
+/// arrive in, and then the leg's end. A guest that closes or errors is done
+/// speaking ([`ControlEnd::GuestClosed`]); a guest that says anything more
+/// has spoken past its one request ([`ControlEnd::SpokePastRequest`]), and
+/// those bytes are refused **unread**: the gate parses no second request,
+/// because gvproxy hijacks a hijacking request however late in the
+/// connection's life it arrives, and the only safe number of further bytes
+/// to relay is none. The switch half comes back out beside the leg's end, so
+/// its caller can half-close the switch's side once the request is spoken —
+/// the half is the splice's to write on, not its caller's to hold while the
+/// splice runs.
 ///
-/// The watch is exact across read boundaries, however many a path is split
-/// over: each read is searched together with a rolling tail of the stream
-/// already forwarded — its last [`CONNECT_WATCH_TAIL`] bytes, carried read to
-/// read rather than taken from the last one — so a byte-at-a-time path and a
-/// two-write path are caught the same way, at the read its last byte lands in
-/// and before any byte of that read is written on, which is why gvproxy can
-/// never hold the request it would hijack on. A path that arrives whole is
-/// caught before it is forwarded at all. No byte is ever held back, so a
-/// control exchange is delayed by nothing.
+/// The body is never parsed, and not only because it is the guest daemon's
+/// own plumbing — a `Content-Length`-framed JSON blob, and a control exchange
+/// the gate mangled would leave the daemon's publishes failing and its zone
+/// never coming up — but because its content is not the gate's to read: the
+/// zone-add carries the session's name, and a session name may legally hold
+/// the bytes of the connect path (`fix/connection-leak`), so relaying by
+/// framing rather than by content is what keeps a legitimate body legitimate.
 #[expect(
     clippy::indexing_slicing,
-    reason = "every slice is bounded by the `n` a read reported or the tail it left"
+    reason = "every slice is bounded by the `want` the loop computed and the `n` a read reported"
 )]
 async fn splice_control(
     mut guest: Prefixed<OwnedReadHalf>,
     mut switch: OwnedWriteHalf,
+    body: usize,
 ) -> (ControlEnd, OwnedWriteHalf) {
+    let mut remaining = body;
     let mut chunk = vec![0u8; CONTROL_READ];
-    let mut window: Vec<u8> = Vec::with_capacity(CONNECT_WATCH_TAIL + CONTROL_READ);
-    let mut tail: Vec<u8> = Vec::with_capacity(CONNECT_WATCH_TAIL);
-    loop {
-        let n = match guest.read(&mut chunk).await {
-            // The guest's side is done; nothing is held back, so there is
-            // nothing left to flush.
+    while remaining > 0 {
+        // One read takes at most what the body still owes, so no read ever
+        // holds a byte of what follows it: that is not the gate's to relay.
+        let want = remaining.min(chunk.len());
+        let n = match guest.read(&mut chunk[..want]).await {
+            // The guest's side is done mid-body; nothing is held back, so
+            // there is nothing left to flush.
             Ok(0) => return (ControlEnd::GuestClosed, switch),
             Ok(n) => n,
             Err(error) => {
@@ -576,24 +811,23 @@ async fn splice_control(
                 return (ControlEnd::GuestClosed, switch);
             }
         };
-        window.clear();
-        window.extend_from_slice(&tail);
-        window.extend_from_slice(&chunk[..n]);
-        if find_subslice(&window, CONNECT_PATH).is_some() {
-            return (ControlEnd::Upgrade, switch);
-        }
         if let Err(error) = switch.write_all(&chunk[..n]).await {
             tracing::warn!(%error, "egress gate control leg ended on an error");
             return (ControlEnd::GuestClosed, switch);
         }
-        // Roll the tail forward: it is the last few bytes of the *stream*,
-        // carried read to read — not the tail of this one read — because a
-        // path can land in as many reads as the guest can make it. Keeping
-        // only this read's bytes would see a byte-at-a-time path as separate
-        // fragments and forward every one of them.
-        let keep = window.len().min(CONNECT_WATCH_TAIL);
-        tail.clear();
-        tail.extend_from_slice(&window[window.len() - keep..]);
+        remaining -= n;
+    }
+    // The body is spoken. One request per connection: the next byte —
+    // whatever it is, and the gate does not read what it would be — ends
+    // the leg as spoken-past, and is never written on.
+    let mut probe = [0u8; 1];
+    match guest.read(&mut probe).await {
+        Ok(0) => (ControlEnd::GuestClosed, switch),
+        Ok(_) => (ControlEnd::SpokePastRequest, switch),
+        Err(error) => {
+            tracing::warn!(%error, "egress gate control leg ended on an error");
+            (ControlEnd::GuestClosed, switch)
+        }
     }
 }
 
@@ -868,8 +1102,8 @@ impl DropLimiter {
 /// control request's body — so the relay must not lose them.
 ///
 /// The head is read for both protocols the switch socket speaks, not only the
-/// upgrade: it is forwarded verbatim either way, and what it asks for is what
-/// picks the relay ([`GuestSpeak`]).
+/// upgrade: what it asks for is what picks the relay ([`GuestSpeak`]) — and
+/// decides whether the gate forwards it at all.
 ///
 /// # Errors
 ///
@@ -1197,10 +1431,10 @@ pub(crate) mod test_support {
 
     /// Polls the captured log until it contains `needle`, failing with the
     /// log's contents once [`DEADLINE`] passes.
-    pub(crate) async fn wait_for_log(harness: &GateHarness, needle: &str) {
+    pub(crate) async fn wait_for_log(log: &CaptureWriter, needle: &str) {
         let deadline = tokio::time::Instant::now() + DEADLINE;
         loop {
-            let logged = harness.log.contents();
+            let logged = log.contents();
             if logged.contains(needle) {
                 return;
             }
@@ -1225,6 +1459,24 @@ pub(crate) mod test_support {
             Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
             // Quiet for the window: nothing else was written on.
             Err(_) => {}
+        }
+    }
+
+    /// Asserts the guest's side of a refused connection is down — that no
+    /// further byte will ever arrive on it — without insisting on which
+    /// signal the teardown left behind. A well-behaved guest, one that sent
+    /// only what its request declared, reads clean EOF; a guest whose bytes
+    /// the gate refused to read finds the socket reset, the OS's report that
+    /// its data was discarded. Both mean the gate closed its side, and
+    /// neither leaves a further byte for the guest to read.
+    pub(crate) async fn expect_teardown(guest: &mut UnixStream) {
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, guest.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("the gate left {n} byte(s) for a refused guest to read"),
+            Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
+            Err(_) => panic!("the gate left the refused connection hanging"),
         }
     }
 
@@ -1295,14 +1547,14 @@ mod tests {
     use tokio::net::{UnixListener, UnixStream};
 
     use super::test_support::{
-        DEADLINE, arp_frame, expect_frame, expect_silence, gate_connected, gate_over,
-        gate_over_control, gate_over_with, ipv4_frame, ipv6_frame, read_within, send_frame,
-        wait_for_log,
+        CaptureWriter, DEADLINE, arp_frame, expect_frame, expect_silence, expect_teardown,
+        gate_connected, gate_over, gate_over_control, gate_over_with, ipv4_frame, ipv6_frame,
+        read_within, send_frame, wait_for_log,
     };
     use super::{
-        CONNECT_PATH, CONNECT_REQUEST, DROP_WARN_MAX_TRACKED_PAIRS, DROP_WARN_MIN_INTERVAL,
-        DropLimiter, GateDrop, GuestSpeak, HANDSHAKE_TIMEOUT, MAX_HEAD, WarnDecision,
-        find_subslice, gate_verdict, max_frame, serve_connection,
+        CONNECT_REQUEST, CONTROL_VERBS, DROP_WARN_MAX_TRACKED_PAIRS, DROP_WARN_MIN_INTERVAL,
+        DropLimiter, EgressGate, GateDrop, GuestSpeak, HANDSHAKE_TIMEOUT, MAX_HEAD,
+        MAX_NAMED_TARGET, WarnDecision, gate_verdict, max_frame, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry};
 
@@ -1366,7 +1618,7 @@ mod tests {
 
         // The drop says so, naming the source address and the rule — the line
         // a diagnostic bundle's daemon log tail carries.
-        wait_for_log(&h, "egress-undeclared-subnet").await;
+        wait_for_log(&h.log, "egress-undeclared-subnet").await;
         let logged = h.log.contents();
         assert!(
             logged.contains("source=100.64.0.9"),
@@ -1443,8 +1695,8 @@ mod tests {
         // The drops are named: the unknown sources under NET-081's own rule —
         // one line per address, so the stranger's two frames share one line —
         // and the IPv6 family under its own, with no source to name.
-        wait_for_log(&h, "egress-unknown-source").await;
-        wait_for_log(&h, "egress-ipv6").await;
+        wait_for_log(&h.log, "egress-unknown-source").await;
+        wait_for_log(&h.log, "egress-ipv6").await;
         let logged = h.log.contents();
         for src in [stranger, withdrawn] {
             assert!(
@@ -1560,100 +1812,148 @@ mod tests {
         );
     }
 
-    /// A control connection must not be allowed to become a frame stream behind
-    /// the gate's back. gvproxy hijacks any request whose path is the connect
-    /// path, however late in the connection's life it arrives, so a guest that
-    /// has spoken a control verb and then writes an upgrade on the same
-    /// connection — with frames from a source no box holds behind it — is one
-    /// hijack from the ungated egress NET-081 exists to prevent. The splice
-    /// watches for the path and refuses the connection instead: nothing reaches
-    /// the switch, both sides come down, and the refusal says so under its own
-    /// rule.
+    /// A control body's bytes are never scanned for the connect path: the
+    /// zone-add request carries the session's name, and a session name may
+    /// legally hold those bytes (`fix/connection-leak`), so a relay that
+    /// grepped the stream for them would tear a perfectly legitimate control
+    /// exchange down. The gate relays the body by its `Content-Length`
+    /// instead — the request is framed before any of it is read — so a body
+    /// carrying the path verbatim is spliced verbatim, answered, and never
+    /// refused.
     #[tokio::test]
-    async fn a_control_connection_cannot_upgrade_mid_stream() {
+    async fn a_body_carrying_the_connect_path_passes_verbatim() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        // The request the guest's own control client writes, with a session
+        // named after a branch — the legitimate body a content watch would
+        // have torn this exchange down over.
+        let body =
+            br#"{"name":"fix/connection-leak","records":[{"name":"web","ip":"100.64.0.9"}]}"#;
+        let mut request = b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\n\
+                           Content-Type: application/json\r\n"
+            .to_vec();
+        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        request.extend_from_slice(body);
+        let mut h = gate_over_control(registry, request).await;
+
+        // The body arrives exactly as written, connect path and all: the
+        // path is what a request *line* says, and this connection's one
+        // request line was already spoken.
+        let mut seen_body = vec![0u8; body.len()];
+        read_within(&mut h.switch, &mut seen_body).await;
+        assert_eq!(
+            seen_body, body,
+            "a body carrying the connect path reaches gvproxy exactly as the guest sent it"
+        );
+
+        // And the exchange completes as though the gate were not there.
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        h.switch
+            .write_all(response)
+            .await
+            .expect("writing gvproxy's response");
+        let mut seen = vec![0u8; response.len()];
+        read_within(&mut h.guest, &mut seen).await;
+        assert_eq!(
+            seen, response,
+            "the control response reaches the guest verbatim"
+        );
+
+        // Nothing was refused and nothing was gated: the body was never read
+        // as anything but the request its head had already framed.
+        let logged = h.log.contents();
+        assert!(
+            !logged.contains("egress-control-upgrade"),
+            "a body carrying the connect path was refused as an upgrade, got: {logged}"
+        );
+        assert!(
+            !logged.contains("dropped"),
+            "a control exchange passes through ungated, got: {logged}"
+        );
+    }
+
+    /// A control connection carries exactly one request, and the first guest
+    /// byte past that request's `Content-Length` body tears the connection
+    /// down without being written on. gvproxy hijacks a hijacking request
+    /// however late in the connection's life it arrives, so a guest that has
+    /// spoken a control verb and then writes a second request on the same
+    /// connection — with frames from a source no box holds pipelined behind
+    /// it — is one hijack from the ungated egress NET-081 exists to prevent.
+    /// Nothing reaches the switch, both sides come down after the answer the
+    /// gate owes the request it did relay, and the refusal says so under its
+    /// own rule.
+    #[tokio::test]
+    async fn a_second_request_after_the_body_is_refused() {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
         // One ordinary control exchange, answered, so the connection is live
-        // as control traffic and the guest is still on it.
+        // as control traffic and the guest is still on it — the state a
+        // smuggled second request arrives in, however long the guest waits.
         let request =
             b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
                 .to_vec();
         let answer: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
         let mut h = gate_over_control(registry, request).await;
+
+        // The second request: a whole control head the gate never reads as
+        // one, because this connection's one request is already spoken. With
+        // a frame from a source no box holds pipelined behind it, for the
+        // ungated egress the hijack would buy.
+        let second =
+            b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\n";
+        h.guest
+            .write_all(second)
+            .await
+            .expect("writing the smuggled second request");
+        let frame = ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80);
+        send_frame(&mut h.guest, &frame).await;
+
+        // Refused unread, and said so at the gate's own cadence — before the
+        // switch end below closes, so the refusal is what ended the relay.
+        wait_for_log(&h.log, "spoken past its one request").await;
+        // Not one byte of the second request — and none of the frame behind
+        // it — reached the switch: its end sees the half-close that ends the
+        // exchange, and nothing before it.
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, h.switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("{n} byte(s) of the smuggled request reached the switch"),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+        // The request that *was* relayed is still owed its answer: answer it
+        // and close the switch end, so the drain of the answer completes.
         h.switch
             .write_all(answer)
             .await
             .expect("answering the control request");
-
-        // The upgrade, split across two writes so the path itself is split
-        // across a read boundary — a guest choosing where its bytes land is
-        // exactly the shape the watch keeps a tail for.
-        let at = CONNECT_REQUEST
-            .windows(CONNECT_PATH.len())
-            .position(|window| window == CONNECT_PATH)
-            .expect("the upgrade head carries the connect path");
-        let (first, rest) = CONNECT_REQUEST.split_at(at + 1);
-        h.guest
-            .write_all(first)
+        h.switch
+            .shutdown()
             .await
-            .expect("writing the split upgrade's start");
-        // Let the gate take the first half before the second arrives, so the
-        // split the watch has to survive is a real one.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        h.guest
-            .write_all(rest)
-            .await
-            .expect("writing the split upgrade's rest");
-        // And frames from a source no box holds pipelined behind the upgrade
-        // the gate is about to refuse.
-        let frame = ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80);
-        send_frame(&mut h.guest, &frame).await;
-
-        // Refused, and said so at the gate's own cadence.
-        wait_for_log(&h, "tried to upgrade into the frame stream").await;
-        // What did reach the switch is only the bytes already relayed before
-        // the path completed — a strict prefix of the upgrade, shorter than
-        // the path itself, so gvproxy can never have held the request it would
-        // hijack on.
-        let mut seen = [0u8; CONNECT_REQUEST.len()];
-        let got = match tokio::time::timeout(DEADLINE, h.switch.read(&mut seen)).await {
-            Ok(read) => read.expect("reading the switch end"),
-            Err(_) => panic!("the gate left the switch side hanging"),
-        };
-        assert!(
-            got < at + CONNECT_PATH.len(),
-            "{got} byte(s) of the upgrade reached the switch, past the path's end"
-        );
-        assert_eq!(
-            &seen[..got],
-            &CONNECT_REQUEST[..got],
-            "what reached the switch is only the head's relayed start"
-        );
-        // And then the gate closed its side: no byte of the rest of the
-        // upgrade — and none of the frames pipelined behind it — arrives.
+            .expect("closing the stand-in switch's end");
+        // Not one byte of the second request — and none of the frame behind
+        // it — reached the switch: its end sees the half-close that ends the
+        // exchange, and nothing before it.
         let mut probe = [0u8; 1];
         match tokio::time::timeout(DEADLINE, h.switch.read(&mut probe)).await {
             Ok(Ok(0)) => {}
-            Ok(Ok(n)) => panic!("{n} more byte(s) of the upgrade reached the switch"),
+            Ok(Ok(n)) => panic!("{n} byte(s) of the smuggled request reached the switch"),
             Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
             Err(_) => panic!("the gate left the switch side hanging"),
         }
         // And the guest's side comes down with it — after the answer to the
         // request it legitimately made, which the gate owes it, and with no
-        // byte of the frame stream it tried to steal behind it.
+        // byte of the stream it tried to steal behind it.
         let mut answered = vec![0u8; answer.len()];
         read_within(&mut h.guest, &mut answered).await;
         assert_eq!(
             answered, answer,
             "the refused guest got the answer it was owed, and only that"
         );
-        let mut probe = [0u8; 1];
-        match tokio::time::timeout(DEADLINE, h.guest.read(&mut probe)).await {
-            Ok(Ok(0)) => {}
-            Ok(Ok(n)) => panic!("the gate left {n} byte(s) past the answer for a refused guest"),
-            Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
-            Err(_) => panic!("the gate left the refused connection hanging"),
-        }
+        // The connection is down with no further byte for the guest — a
+        // smuggler's unread bytes were discarded, so its side reads the
+        // teardown as a reset rather than a clean end.
+        expect_teardown(&mut h.guest).await;
         // The refusal is its own class, not a frame drop: no frame was ever
         // parsed, so no source address was read and no box's rule fired.
         let logged = h.log.contents();
@@ -1663,115 +1963,329 @@ mod tests {
         );
         assert!(
             !logged.contains("egress-unknown-source"),
-            "no frame behind the refused upgrade was parsed or dropped, got: {logged}"
+            "no frame behind the refused request was parsed or dropped, got: {logged}"
         );
     }
 
-    /// The watch is a rolling tail of the stream, not of one read: a path
-    /// split over three writes — the guest choosing where every byte of it
-    /// lands — is refused the same as a two-write one. This is the split a
-    /// tail taken from the last read alone would wave through: no window ever
-    /// holds the path whole, so every byte of the upgrade would be spliced on
-    /// and gvproxy would have the request it hijacks on.
+    /// The same refusal when the smuggled request shares one write with the
+    /// request it trails — head, body, a second request and a frame, all
+    /// pipelined the way a fast guest puts them on the wire. The body is
+    /// relayed by its `Content-Length` alone, so no read ever takes a byte of
+    /// what follows it, whatever write the bytes arrived in: the last body
+    /// byte is the gate's to relay and the one after it is not.
     #[tokio::test]
-    async fn an_upgrade_split_across_three_writes_is_refused() {
+    async fn a_request_pipelined_behind_the_body_is_refused() {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
-        // Live as control traffic first, so the relay really is the splice.
-        let request =
-            b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
-                .to_vec();
-        let answer: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        // A real request with a real body, so the count the gate relays is a
+        // `Content-Length` it read out of the head, not the empty body of a
+        // hand-built one.
+        let body = br#"{"name":"web"}"#;
+        let mut request = b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        request.extend_from_slice(body);
+        // Pipelined behind it in the same write: a whole second request, and
+        // a frame from a source no box holds.
+        request.extend_from_slice(
+            b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\n",
+        );
+        let frame = ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80);
+        request.extend_from_slice(&(frame.len() as u16).to_le_bytes());
+        request.extend_from_slice(&frame);
         let mut h = gate_over_control(registry, request).await;
+
+        // The body arrives — the request it belongs to was relayed, and the
+        // gate owes it an answer — and not one byte more.
+        let mut seen_body = vec![0u8; body.len()];
+        read_within(&mut h.switch, &mut seen_body).await;
+        assert_eq!(
+            seen_body, body,
+            "the one request the head declared arrived whole, and alone"
+        );
+        // The smuggled request was refused unread: the gate relays exactly
+        // what the `Content-Length` declared and no byte past it.
+        wait_for_log(&h.log, "spoken past its one request").await;
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, h.switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("{n} byte(s) of the pipelined request reached the switch"),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+        // The request that *was* relayed is still owed its answer: answer it
+        // and close the switch end, so the drain of the answer completes.
+        let answer: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
         h.switch
             .write_all(answer)
             .await
             .expect("answering the control request");
-
-        // The upgrade as three fragments, none holding the path: "POST /",
-        // "connec", "t HTTP/1.0…". A sleep between writes makes each one a
-        // read of its own, so no read and no single read's tail ever sees
-        // more than a fragment.
-        for fragment in [
-            &CONNECT_REQUEST[..6],
-            &CONNECT_REQUEST[6..12],
-            &CONNECT_REQUEST[12..],
-        ] {
-            h.guest
-                .write_all(fragment)
-                .await
-                .expect("writing an upgrade fragment");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        wait_for_log(&h, "tried to upgrade into the frame stream").await;
-        // What was relayed before the last fragment completed the path never
-        // held it whole, so gvproxy had nothing to hijack on — and then the
-        // gate closed its side rather than leaving it hanging.
-        let mut seen = [0u8; CONNECT_REQUEST.len()];
-        let got = match tokio::time::timeout(DEADLINE, h.switch.read(&mut seen)).await {
-            Ok(read) => read.expect("reading the switch end"),
-            Err(_) => panic!("the gate left the switch side hanging"),
-        };
-        assert!(
-            find_subslice(&seen[..got], CONNECT_PATH).is_none(),
-            "the switch held the upgrade's path whole: {:?}",
-            String::from_utf8_lossy(&seen[..got]),
-        );
-        let mut probe = [0u8; 1];
-        match tokio::time::timeout(DEADLINE, h.switch.read(&mut probe)).await {
-            Ok(Ok(0)) => {}
-            Ok(Ok(n)) => panic!("{n} more byte(s) of the upgrade reached the switch"),
-            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
-            Err(_) => panic!("the gate left the switch side hanging"),
-        }
-        // And the guest's side comes down with it, after the answer it was
-        // owed for the request it did make.
+        h.switch
+            .shutdown()
+            .await
+            .expect("closing the stand-in switch's end");
+        // The guest got the answer it was owed for the request it did make,
+        // then the connection came down — with no byte of the smuggled
+        // request or the frame behind it for anyone to read.
         let mut answered = vec![0u8; answer.len()];
         read_within(&mut h.guest, &mut answered).await;
         assert_eq!(
             answered, answer,
             "the refused guest got the answer it was owed"
         );
+        // And the connection came down — with no byte of the smuggled request
+        // or the frame behind it for anyone to read; the smuggler's own
+        // unread bytes were discarded with the teardown.
+        expect_teardown(&mut h.guest).await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("rule_matched=\"egress-control-upgrade\""),
+            "the refusal names its own class, got: {logged}"
+        );
+        assert!(
+            !logged.contains("egress-unknown-source"),
+            "no frame behind the refused request was parsed or dropped, got: {logged}"
+        );
+    }
+
+    /// The first head picks the relay, and the choice is deliberately narrow:
+    /// the frame stream is exactly the connect path, because gvproxy hijacks
+    /// on the path alone, whatever the method or query; the control relay is
+    /// exactly the three verbs the daemon's own client speaks, each with one
+    /// `Content-Length`-framed body; and everything else — the `/tunnel`
+    /// hijack, the verbs the gate does not relay, a target it has never
+    /// classified, a head too malformed to frame — is refused **before
+    /// forwarding**. The two ways to be wrong fail differently, and only one
+    /// of them widens reach: reading an upgrade as control would splice it to
+    /// the switch ungated, while reading a control request as frames fails
+    /// closed at its first length claim.
+    #[test]
+    fn the_first_head_picks_the_relay() {
+        // The frame stream: the connect path, however it is asked for.
+        assert_eq!(GuestSpeak::of_head(CONNECT_REQUEST), Ok(GuestSpeak::Frames));
+        assert_eq!(
+            GuestSpeak::of_head(b"GET /connect HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            Ok(GuestSpeak::Frames),
+            "gvproxy hijacks on the path alone, not on the method"
+        );
+        assert_eq!(
+            GuestSpeak::of_head(b"POST /connect?guest=1 HTTP/1.1\r\n\r\n"),
+            Ok(GuestSpeak::Frames),
+            "a query on the path is still the path"
+        );
+
+        // The control verbs: one request each, with the body its head
+        // declares. An absent count is HTTP's own no-body, not a refusal —
+        // the frame relay takes over from wherever the body ends.
+        for verb in CONTROL_VERBS {
+            let verb = String::from_utf8_lossy(verb);
+            let head =
+                format!("POST {verb} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{{}}");
+            assert_eq!(
+                GuestSpeak::of_head(head.as_bytes()),
+                Ok(GuestSpeak::Control { body: 2 }),
+                "{verb} is the control relay",
+            );
+        }
+        assert_eq!(
+            GuestSpeak::of_head(b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            Ok(GuestSpeak::Control { body: 0 }),
+            "a control request with no Content-Length has no body to relay"
+        );
+
+        // Everything else is refused, and the refusal names what was asked
+        // for — the bytes a diagnostic reads off the line.
+        let refused = |head: &[u8]| GuestSpeak::of_head(head).unwrap_err().target;
+        // The other hijacking verb gvproxy serves on this socket: it dials an
+        // address inside the virtual network and relays bytes, so it is not
+        // the gate's to splice.
+        assert_eq!(
+            refused(b"TUNNEL /tunnel?ip=100.64.0.9&port=22 HTTP/1.1\r\n\r\n"),
+            b"/tunnel?ip=100.64.0.9&port=22",
+            "the tunnel hijack is refused, not spliced ungated"
+        );
+        // A verb the daemon never speaks — the listing gvproxy serves the
+        // host, not the guest.
+        assert_eq!(
+            refused(b"GET /services/forwarder/all HTTP/1.1\r\n\r\n"),
+            b"/services/forwarder/all",
+            "a verb the daemon does not speak is refused"
+        );
+        // A target one byte past the connect path is not it.
+        assert_eq!(
+            refused(b"POST /connectx HTTP/1.1\r\n\r\n"),
+            b"/connectx",
+            "an exact path is an exact match: /connectx is not /connect"
+        );
+        // The absolute form is not the origin form the gate relays.
+        assert_eq!(
+            refused(b"GET http://localhost/connect HTTP/1.1\r\n\r\n"),
+            b"http://localhost/connect",
+            "an absolute-form target is not the connect path"
+        );
+        // A body the gate cannot frame the end of: chunked, or two counts
+        // disagreeing.
+        assert_eq!(
+            refused(
+                b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+            ),
+            b"/services/dns/add",
+            "a chunked control request is refused: the gate relays by a byte count"
+        );
+        assert_eq!(
+            refused(
+                b"POST /services/dns/add HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 4\r\n\r\n"
+            ),
+            b"/services/dns/add",
+            "a split body count is the smuggling shape, and is refused"
+        );
+        assert_eq!(
+            refused(b"POST /services/dns/add HTTP/1.1\r\nContent-Length: 0x2\r\n\r\n"),
+            b"/services/dns/add",
+            "a body count that is not a plain decimal number is refused"
+        );
+        // And a head too malformed to read a request line from, which names
+        // nothing rather than guess at bytes.
+        assert_eq!(
+            refused(b"\r\nHost: localhost\r\n\r\n"),
+            b"",
+            "a head with no request line is refused, naming nothing"
+        );
+        // The refusal is a warn line, so it does not echo a hostile head back:
+        // a target past the naming bound is named to the bound and no further.
+        let long = vec![b'x'; MAX_HEAD];
+        let mut shouted = b"GET /".to_vec();
+        shouted.extend_from_slice(&long);
+        shouted.extend_from_slice(b" HTTP/1.1\r\n\r\n");
+        let named = GuestSpeak::of_head(&shouted).unwrap_err().target;
+        assert!(
+            named.len() <= MAX_NAMED_TARGET,
+            "a refused head names at most a bounded prefix of its target, got {} bytes",
+            named.len()
+        );
+
+        // What the gate classifies by is the request line's target — not the
+        // bytes anywhere else in the head, and not the body's content: a
+        // control verb whose header block carries the connect path is still
+        // the control request its own line says it is.
+        assert_eq!(
+            GuestSpeak::of_head(
+                b"POST /services/dns/add HTTP/1.1\r\nHost: fix/connection-leak\r\nContent-Length: 0\r\n\r\n"
+            ),
+            Ok(GuestSpeak::Control { body: 0 }),
+            "the connect path in a header does not make a control request an upgrade"
+        );
+    }
+
+    /// A request head the gate has not classified is refused before it is
+    /// forwarded, because gvproxy's switch socket serves more than the
+    /// shuttle's upgrade and the daemon's three verbs: `/tunnel` dials an
+    /// address inside the virtual network and relays bytes to it, and what a
+    /// hijacked request may do is nothing the reach rules get a say in. The
+    /// hijack arriving as a first head — the way the guest's own client
+    /// arrives — is refused unread: gvproxy never holds the request, both
+    /// ends come down, and the refusal names the target under its own rule.
+    #[tokio::test]
+    async fn a_request_outside_the_allow_list_is_refused_before_forwarding() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let head = b"TUNNEL /tunnel?ip=100.64.0.9&port=22 HTTP/1.1\r\n\r\n";
+        let mut h = gate_connected(registry).await;
+        h.guest
+            .write_all(head)
+            .await
+            .expect("writing the tunnel hijack");
+
+        // Refused before forwarding, and said so at the frame drops' cadence:
+        // the refusal names the target — the bytes a diagnostic reads off the
+        // line — under the head's own rule.
+        wait_for_log(&h.log, "egress-undeclared-verb").await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("rule_matched=\"egress-undeclared-verb\""),
+            "the refusal names its own class, got: {logged}"
+        );
+        assert!(
+            logged.contains("request_target=/tunnel?ip=100.64.0.9&port=22"),
+            "the refusal names the target it refused, got: {logged}"
+        );
+        // Nothing of it reached the switch — the head was never written on,
+        // so gvproxy never held a request to hijack — and its end comes down
+        // rather than hanging.
         let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, h.switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("{n} byte(s) of a refused head reached the switch"),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+        // And the guest's side comes down with it, not left hanging.
         match tokio::time::timeout(DEADLINE, h.guest.read(&mut probe)).await {
             Ok(Ok(0)) => {}
-            Ok(Ok(n)) => panic!("the gate left {n} byte(s) past the answer for a refused guest"),
+            Ok(Ok(n)) => panic!("the gate left {n} byte(s) for a refused guest to read"),
             Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
             Err(_) => panic!("the gate left the refused connection hanging"),
         }
     }
 
-    /// The first head picks the relay, and the choice is deliberately wide: any
-    /// head carrying the connect path is a frame stream, because gvproxy hijacks
-    /// on the path alone, whatever the method or query. The two ways to be
-    /// wrong fail differently, and only one of them widens reach — reading an
-    /// upgrade as control would splice it to the switch ungated, while reading
-    /// a control request as frames fails closed at its first length claim.
-    #[test]
-    fn the_first_head_picks_the_relay() {
-        assert_eq!(GuestSpeak::of_head(CONNECT_REQUEST), GuestSpeak::Frames);
+    /// Refused heads are rate-limited the way frame drops are, and across
+    /// connections: a guest that connects fresh for every attempt — exactly as
+    /// cheap as sending a frame — must not buy a warn line each time. The
+    /// window is keyed by the rule alone, because a refused head names no
+    /// source address, so two connections refused in the same interval make
+    /// one line, not two.
+    #[tokio::test]
+    async fn refused_request_heads_share_one_rate_window_across_connections() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let dir = TempDir::new().expect("a tempdir is creatable");
+        let switch_sock = dir.path().join("gvproxy-switch.sock");
+        let gate_sock = dir.path().join("gvproxy-gate.sock");
+        let listener = UnixListener::bind(&switch_sock).expect("binding the stand-in switch");
+
+        let log = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let _gate = EgressGate::spawn(gate_sock.clone(), switch_sock.clone(), registry.table())
+            .expect("spawning the egress gate");
+
+        // Two connections, each refused on its head — the guest's own
+        // client's shape: connect, speak a head the gate does not relay, and
+        // take the teardown.
+        let head = b"GET /services/forwarder/all HTTP/1.1\r\n\r\n";
+        for _ in 0..2 {
+            let mut guest = UnixStream::connect(&gate_sock)
+                .await
+                .expect("connecting the guest end");
+            let (mut switch, _) = listener.accept().await.expect("accepting the gate's dial");
+            guest
+                .write_all(head)
+                .await
+                .expect("writing the refused head");
+            let mut probe = [0u8; 1];
+            match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => panic!("{n} byte(s) of a refused head reached the switch"),
+                Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+                Err(_) => panic!("the gate left the switch side hanging"),
+            }
+            match tokio::time::timeout(DEADLINE, guest.read(&mut probe)).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => panic!("the gate left {n} byte(s) for a refused guest to read"),
+                Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
+                Err(_) => panic!("the gate left the refused connection hanging"),
+            }
+        }
+
+        // One warn line for the pair, not one per connection.
+        wait_for_log(&log, "egress-undeclared-verb").await;
         assert_eq!(
-            GuestSpeak::of_head(b"GET /connect HTTP/1.1\r\nHost: localhost\r\n\r\n"),
-            GuestSpeak::Frames,
-            "gvproxy hijacks on the path alone, not on the method"
-        );
-        assert_eq!(
-            GuestSpeak::of_head(b"POST /connect?guest=1 HTTP/1.1\r\n\r\n"),
-            GuestSpeak::Frames,
-            "a query on the path is still the path"
-        );
-        assert_eq!(
-            GuestSpeak::of_head(
-                b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n\r\n"
-            ),
-            GuestSpeak::Control
-        );
-        assert_eq!(
-            GuestSpeak::of_head(
-                b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"
-            ),
-            GuestSpeak::Control
+            log.contents().matches("egress-undeclared-verb").count(),
+            1,
+            "two refused connections inside one interval make one line, got: {}",
+            log.contents()
         );
     }
 
@@ -1800,7 +2314,7 @@ mod tests {
         // Refused on the head's own bound: the log names the over-long head,
         // so the byte-count check is what refused the connection, not the
         // handshake timeout waiting out a silent peer.
-        wait_for_log(&h, &format!("exceeded {MAX_HEAD} bytes without ending")).await;
+        wait_for_log(&h.log, &format!("exceeded {MAX_HEAD} bytes without ending")).await;
         // The gate must close the guest's side rather than leave it hanging…
         let mut probe = [0u8; 1];
         let refused = tokio::time::timeout(DEADLINE, h.guest.read_exact(&mut probe))
@@ -1842,7 +2356,7 @@ mod tests {
             .expect("writing the oversized claim");
 
         // The refusal says so: the relay ended on the claim's length, and…
-        wait_for_log(&h, &format!("exceeds max {}", max_frame())).await;
+        wait_for_log(&h.log, &format!("exceeds max {}", max_frame())).await;
         // …the gate closes the guest's side rather than leave it hanging.
         let mut probe = [0u8; 1];
         let refused = tokio::time::timeout(DEADLINE, h.guest.read_exact(&mut probe))
@@ -1884,7 +2398,7 @@ mod tests {
 
         // The gate says which leg ended — the line a bundle's daemon log tail
         // carries for a box whose egress went dark with the guest still there.
-        wait_for_log(&h, "the switch closed its side of the connection").await;
+        wait_for_log(&h.log, "the switch closed its side of the connection").await;
         // And the guest's side comes down with the relay, promptly, rather
         // than hanging on until its next frame finds nowhere to write.
         let mut probe = [0u8; 1];
@@ -1924,7 +2438,11 @@ mod tests {
 
         // The gate says which leg ended — the line a bundle's daemon log tail
         // carries for a control connection the host closed under an idle guest.
-        wait_for_log(&h, "the switch closed its side of the control connection").await;
+        wait_for_log(
+            &h.log,
+            "the switch closed its side of the control connection",
+        )
+        .await;
         // And the guest's side comes down with the relay, promptly, rather than
         // hanging on until a guest with nothing more to say speaks again.
         let mut probe = [0u8; 1];
@@ -1933,6 +2451,81 @@ mod tests {
             Ok(Ok(n)) => panic!("the gate left {n} byte(s) for a hung-up-on guest to read"),
             Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
             Err(_) => panic!("a hung-up switch left the control relay up past {DEADLINE:?}"),
+        }
+    }
+
+    /// A switch that takes a control request and then says nothing — neither
+    /// answering nor closing, the shape a wedged gvproxy would wear —
+    /// releases the relay at the drain bound, the same bound the handshake
+    /// reads under. The drain after the guest's request ends is bounded
+    /// because it is the only thing left holding the relay, the gate's dial
+    /// and both socket halves: without the bound they would hang on a switch
+    /// that is never going to speak again, for as long as the gate lives.
+    #[tokio::test]
+    async fn a_switch_that_never_answers_releases_the_control_relay_at_the_drain_bound() {
+        // The bound shrunk from [`HANDSHAKE_TIMEOUT`] — the one every real
+        // connection reads and drains under — so the release is watched in
+        // milliseconds rather than five seconds.
+        let bound = Duration::from_millis(200);
+        assert!(
+            bound < HANDSHAKE_TIMEOUT,
+            "the release must be watched in less time than the real bound allows"
+        );
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let table = registry.table();
+        let dir = TempDir::new().expect("a tempdir is creatable");
+        let switch_sock = dir.path().join("gvproxy-switch.sock");
+        let listener = UnixListener::bind(&switch_sock).expect("binding the stand-in switch");
+
+        let log = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (mut guest, gate_end) = UnixStream::pair().expect("pairing the guest's socket");
+        tokio::spawn(serve_connection(
+            gate_end,
+            switch_sock.clone(),
+            table,
+            Arc::new(DropLimiter::new()),
+            bound,
+        ));
+        // One control request, spoken whole, answered by nothing.
+        let request =
+            b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+        guest
+            .write_all(request)
+            .await
+            .expect("writing the control request");
+        // The gate's dial is accepted and the request arrives at the switch…
+        let (mut switch, _) = listener.accept().await.expect("accepting the gate's dial");
+        let mut seen = vec![0u8; request.len()];
+        read_within(&mut switch, &mut seen).await;
+        assert_eq!(seen, request, "the one request reached the switch");
+        // …and the guest ends its side of it — the daemon's own client does
+        // the same once its answer is read — which is the state whose drain
+        // is the bounded one.
+        guest.shutdown().await.expect("closing the guest's end");
+
+        // The drain gives the switch its bound, then gives up on it with a
+        // line naming the bound it waited out.
+        wait_for_log(&log, "did not answer a control request within the bound").await;
+        let logged = log.contents();
+        assert!(
+            logged.contains(&format!("drain_timeout={bound:?}")),
+            "the release names the bound it waited out, got: {logged}"
+        );
+        // And the guest's side comes down with the relay, promptly, rather
+        // than hanging on until the switch might have spoken.
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, guest.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("the gate left {n} byte(s) for a drained guest to read"),
+            Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
+            Err(_) => panic!("a switch that never answered held the relay past {DEADLINE:?}"),
         }
     }
 
