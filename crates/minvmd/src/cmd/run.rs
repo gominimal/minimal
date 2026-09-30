@@ -41,17 +41,41 @@ pub fn run(detach: bool, timeout_secs: Option<u64>) -> Result<()> {
     }
     let timeout_secs = timeout_secs.unwrap_or(DEFAULT_DETACH_TIMEOUT_SECS);
 
-    // One line per VM start, naming the VM and its state directory
-    // (NET-052). Only the process that will actually supervise the VM logs
-    // it: a `--detach` caller re-execs `minvmd run` (without `--detach`) for
-    // the real start, so the line is written once, by the process that owns
-    // the boot.
+    // One line per VM start, naming the VM, its state directory (NET-052), and
+    // the boot images + switch it resolved (NET-049/NET-051). Only the process
+    // that will actually supervise the VM logs it: a `--detach` caller re-execs
+    // `minvmd run` (without `--detach`) for the real start, so the line is
+    // written once, by the process that owns the boot.
+    //
+    // When resolution fails the supervisor below fails on the same missing
+    // images, so no VM boots — do not emit the resolved-images line with empty
+    // paths (it would name nothing while claiming a start). The start record
+    // still exists, at WARN, carrying the reason instead.
     if !detach {
-        tracing::info!(
-            vm = %crate::state::vm_name(),
-            state_dir = %crate::state::provider_dir().display(),
-            "starting VM"
-        );
+        let switch = crate::image::resolve_gvproxy_path();
+        let switch_str = if switch.exists() {
+            switch.display().to_string()
+        } else {
+            "not found".to_string()
+        };
+        match crate::image::resolve_boot_images() {
+            Ok((kernel, rootfs, initramfs)) => tracing::info!(
+                vm = %crate::state::vm_name(),
+                state_dir = %crate::state::provider_dir().display(),
+                kernel = %kernel.display(),
+                rootfs = %rootfs.display(),
+                initramfs = %initramfs.display(),
+                switch = %switch_str,
+                "starting VM"
+            ),
+            Err(e) => tracing::warn!(
+                vm = %crate::state::vm_name(),
+                state_dir = %crate::state::provider_dir().display(),
+                switch = %switch_str,
+                error = %e,
+                "starting VM with unresolved boot images"
+            ),
+        }
     }
 
     #[cfg(minvmd_libkrun)]
@@ -279,7 +303,7 @@ fn run_foreground() -> Result<()> {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::cmd::MARKER_SOCK_ENV;
-    use crate::image::{resolve_kernel_path, resolve_rootfs_path};
+    use crate::image::resolve_boot_images;
     use crate::lifecycle::{Action, Lifecycle, next_state};
     use crate::state::{StartingGuard, State, StateDir};
 
@@ -292,8 +316,8 @@ fn run_foreground() -> Result<()> {
 
     // Fail-fast: resolve paths before touching lifecycle state.
     // (UDS path lengths were already checked in `run_supervisor`.)
-    let _kernel = resolve_kernel_path().context("resolving kernel path")?;
-    let _rootfs = resolve_rootfs_path().context("resolving rootfs path")?;
+    let (_kernel, _rootfs, _initramfs) =
+        resolve_boot_images().context("resolving boot image paths")?;
 
     let state_dir = StateDir::new(StateDir::default_path()).context("opening state dir")?;
 
