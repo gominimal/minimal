@@ -3,7 +3,8 @@ id: NET
 title: "Box networking on the local host: preview by name and bounded egress"
 owner: norrietaylor
 epic: gominimal/inbox#646
-arch: https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md
+arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/networking/deployment-and-egress-gateway.md
+arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
 updated: 2026-09-23
 ---
 
@@ -975,7 +976,7 @@ NET-072); `egress.deny_subnets` (NET-060, NET-067) has no crate counterpart and
 is introduced here, in the same spelling, from design §5.3's
 `egress_deny_subnets`. The architecture's canonical Box Spec fields are the flat
 `egress_allow_dns`, `egress_allow_subnets` and `egress_deny_subnets`
-([box.toml](https://github.com/gominimal/arch/blob/main/box.toml); design §4.3,
+([box.toml](https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/box.toml); design §4.3,
 §5.3, §7.1), and the box-spec schema work
 ([gominimal/inbox#570](https://github.com/gominimal/inbox/issues/570)) owns the
 reconciliation. Three shipped rules are superseded: 03-spec R2.1's parse-time
@@ -1105,6 +1106,6 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   admitted by address rules alone ([design §5.3][design]); and the per-box
   enforcement the host records under NET-079 covers addresses, never names.]
 
-[design]: https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md
-[arch]: https://github.com/gominimal/arch/blob/main/architecture.md
-[gatehouse]: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
+[design]: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/networking/deployment-and-egress-gateway.md
+[arch]: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/architecture.md
+[gatehouse]: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/authn-authz/gatehouse-spec.md
