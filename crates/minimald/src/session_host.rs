@@ -73,7 +73,6 @@ const DELTA_ROWS_SHOWN: usize = 10;
 /// Var values are logged at `debug` (separate call) rather than
 /// `info` so an accidentally-inherited secret doesn't sit in the
 /// default log stream.
-#[cfg(not(test))]
 fn log_session_contents(
     session_name: &str,
     baseline_packages: &[&str],
@@ -1048,8 +1047,18 @@ pub(crate) trait SessionLauncher {
     /// of the session's environment. Dropped after [`Self::Process`].
     type Guard: SessionGuard;
 
+    /// Launches the session's shell, placing its host-address box in a
+    /// classifier leaf named by `session_id` when this host has one.
+    ///
+    /// `guest` is the daemon's own posture — whether this daemon is a
+    /// microVM's pid 1 — handed in per launch rather than read from
+    /// [`crate::guest`] inside, because the launch decision it scopes (a
+    /// guest refuses a host-address box it cannot place; a native host runs
+    /// it unenforced) is exactly what a launcher test has to be able to pose.
     fn launch(
         self,
+        guest: bool,
+        session_id: sessions::SessionId,
         name: String,
         username: String,
         paths: SessionPaths,
@@ -1086,7 +1095,6 @@ impl SessionGuard for () {
     }
 }
 
-#[cfg(not(test))]
 impl SessionGuard for crate::env::Env {
     fn command_environment(&self) -> SessionEnvironment {
         crate::env::Env::command_environment(self)
@@ -1822,7 +1830,6 @@ async fn run_hook_plan(plan: HookPlan) {
 }
 
 /// The real sandboxed child backend: a [`hakoniwa::Child`].
-#[cfg(not(test))]
 pub(crate) struct SandboxBackend {
     child: hakoniwa::Child,
     /// The box's classifier leaf (NET-079), removed when this backend — and
@@ -1831,7 +1838,6 @@ pub(crate) struct SandboxBackend {
     leaf: Option<sandbox2::config::ClassifierLeaf>,
 }
 
-#[cfg(not(test))]
 impl SandboxBackend {
     /// Reduces `hakoniwa`'s account of an exit to the shared [`ExitReport`].
     fn report(s: hakoniwa::ExitStatus) -> ExitReport {
@@ -1846,7 +1852,6 @@ impl SandboxBackend {
     }
 }
 
-#[cfg(not(test))]
 impl ProcessBackend for SandboxBackend {
     fn container_pid(&self) -> u32 {
         self.child.id()
@@ -1900,7 +1905,6 @@ impl ProcessBackend for SandboxBackend {
     }
 }
 
-#[cfg(not(test))]
 impl Drop for SandboxBackend {
     /// Tears the box down and removes its leaf (NET-079): a leaf does not
     /// outlive the box it decided, and a [`hakoniwa::Child`] does not
@@ -1928,7 +1932,8 @@ impl Drop for SandboxBackend {
         }
         // The leaf goes last, once nothing is in it: a cgroup that still
         // holds a process refuses its removal, so a leaked one is a warn and
-        // an empty directory, reused by the next session with the same name.
+        // an empty directory — named by its session's id, so no later session
+        // can be launched into it, and swept away at the next daemon start.
         if let Err(e) = sandbox2::classifier::remove_box_leaf(leaf.dir()) {
             tracing::warn!(
                 leaf = %leaf.dir().display(),
@@ -1940,7 +1945,6 @@ impl Drop for SandboxBackend {
 }
 
 /// A launched session process backed by a sandboxed [`hakoniwa::Child`].
-#[cfg(not(test))]
 pub(crate) type SandboxProcess = HostProcess<SandboxBackend>;
 
 /// Packages every session sandbox gets unconditionally, regardless of
@@ -1948,7 +1952,6 @@ pub(crate) type SandboxProcess = HostProcess<SandboxBackend>;
 /// `ls`/`cat`/etc, and `socat` for the `min` command bridge (the
 /// helper installed at `/usr/bin/min` speaks to `/run/minenv_sock`
 /// via `socat`).
-#[cfg(not(test))]
 const BASELINE_PACKAGES: &[&str] = &["base", "coreutils", "socat"];
 
 /// Environment folded into a session shell at the launching attach, over and
@@ -1964,8 +1967,8 @@ const BASELINE_PACKAGES: &[&str] = &["base", "coreutils", "socat"];
 /// per-attach fact — see [`ConnectionEnv`] — carried on every attach, not just
 /// the one that mints the host.
 ///
-/// The fields are read only by the real [`SandboxLauncher`] (`cfg(not(test))`);
-/// the mock launcher ignores them, so tolerate them being unread under `test`.
+/// The fields are read only by the real [`SandboxLauncher`]; the mock launcher
+/// ignores them, so tolerate them being unread under `test`.
 #[derive(Debug, Default, Clone)]
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) struct AttachEnv {
@@ -2180,7 +2183,6 @@ fn layer_session_env(
 
 /// The real [`SessionLauncher`]: evaluates a minimal context into a graph,
 /// builds a sandboxed `/bin/bash`, and wires it to a freshly opened PTY.
-#[cfg(not(test))]
 pub(crate) struct SandboxLauncher {
     pub(crate) ctx: mctx::Context,
     /// Env captured from the SSH channel that mints this shell; see
@@ -2224,14 +2226,12 @@ pub(crate) struct SandboxLauncher {
 /// Reaping is synchronous (`kill` + `wait` are not async), so unlike
 /// [`sandbox2::PlannedLaunch`] — which has to give a lease back, and spawns
 /// that release — this needs no runtime to do its work in `Drop`.
-#[cfg(not(test))]
 struct SpawnedProcessGuard {
     /// `None` once the process has been handed off — see
     /// [`Self::release`].
     process: Option<hakoniwa::Child>,
 }
 
-#[cfg(not(test))]
 impl SpawnedProcessGuard {
     fn new(process: hakoniwa::Child) -> Self {
         Self {
@@ -2255,7 +2255,6 @@ impl SpawnedProcessGuard {
     }
 }
 
-#[cfg(not(test))]
 impl Drop for SpawnedProcessGuard {
     fn drop(&mut self) {
         let Some(mut process) = self.process.take() else {
@@ -2290,12 +2289,10 @@ impl Drop for SpawnedProcessGuard {
 /// so an abandoned launch drops in the opposite order: the process is reaped
 /// first and the leaf removed after, because a cgroup that still holds a
 /// process refuses its removal.
-#[cfg(not(test))]
 struct BoxLeafGuard {
     leaf: Option<sandbox2::config::ClassifierLeaf>,
 }
 
-#[cfg(not(test))]
 impl BoxLeafGuard {
     fn new(leaf: sandbox2::config::ClassifierLeaf) -> Self {
         Self { leaf: Some(leaf) }
@@ -2315,7 +2312,6 @@ impl BoxLeafGuard {
     }
 }
 
-#[cfg(not(test))]
 impl Drop for BoxLeafGuard {
     fn drop(&mut self) {
         let Some(leaf) = self.leaf.take() else {
@@ -2331,10 +2327,11 @@ impl Drop for BoxLeafGuard {
     }
 }
 
-/// Creates the classifier leaf this session's box is placed in (NET-079),
-/// under the tree the privileged step installs on a native host
+/// Creates the classifier leaf this session's host-address box is placed in
+/// (NET-079), under the tree the privileged step installs on a native host
 /// (`scripts/install-host-classifier.sh`) and the guest daemon mounts for
-/// itself.
+/// itself, named by the session's id: the leaf belongs to a session, not to
+/// a display name a person can type twice.
 ///
 /// The tree has to be *real* first — on this host's cgroup2, and in the
 /// guest with `nsdelegate` — or the leaf this function would create decides
@@ -2342,29 +2339,73 @@ impl Drop for BoxLeafGuard {
 /// for the guest, where that state refuses a host-address launch instead of
 /// running it unenforced.
 ///
-/// `None` means this host places no box: the tree is absent, or refuses the
-/// leaf. The session still launches, and its box runs unenforced — NET-079's
-/// exception, that a host which cannot decide per box never refuses the box
-/// or its connections on that ground.
-#[cfg(not(test))]
-fn create_session_leaf(session_name: &str) -> Option<sandbox2::config::ClassifierLeaf> {
+/// And the daemon has to be able to *place a process* in a leaf of it: a
+/// real tree the daemon is not inside decides its verdicts on a join the box
+/// dies making, because the kernel gates a `cgroup.procs` write on write
+/// permission to the common ancestor of source and destination — the
+/// root-owned mount root above the tree for a daemon still in `user.slice`.
+/// [`sandbox2::classifier::probe_child_placement`] performs the migration
+/// with a throwaway child first, so the box's own join never runs where it
+/// cannot succeed: an unplaceable session is decided here, at the launch,
+/// not by a box that dies with `127` in a closure whose stderr reaches no
+/// log.
+///
+/// `Ok(None)` means this host places no box: the tree is absent, or the
+/// daemon cannot place a child in it. The session still launches, and its
+/// box runs unenforced — NET-079's exception, that a host which cannot
+/// decide per box never refuses the box or its connections on that ground.
+///
+/// `Err` means the leaf exists but cannot be this session's: another session
+/// holds it, which a fresh launch of the same id cannot tolerate — two
+/// sessions in one leaf would decide both their verdicts together.
+async fn create_session_leaf(
+    guest: bool,
+    session_id: &sessions::SessionId,
+    session_name: &str,
+) -> io::Result<Option<sandbox2::config::ClassifierLeaf>> {
     let root = std::path::Path::new(sandbox2::classifier::TREE_ROOT);
     if !sandbox2::classifier::tree_is_real(
         root,
         sandbox2::classifier::own_mountinfo().as_deref(),
-        crate::guest::is_microvm_daemon(),
+        guest,
     ) {
         tracing::info!(
             session = session_name,
             tree = sandbox2::classifier::TREE_ROOT,
-            install = "sudo scripts/install-host-classifier.sh --user <this daemon's account>",
+            install = %sandbox2::classifier::install_hint(),
             "this host has no classifier tree to place a box in; the session's \
              box runs unenforced",
         );
-        return None;
+        return Ok(None);
     }
-    match sandbox2::classifier::create_box_leaf(root, session_name) {
-        Ok(leaf) => Some(sandbox2::config::ClassifierLeaf::new(leaf)),
+    // The placement the box's own join performs, tried first by a throwaway
+    // child of this daemon: the proof is a migration the kernel accepted, not
+    // the tree's existence. On the blocking pool, because a fork and its reap
+    // do not belong on an executor thread.
+    let placement = match tokio::task::spawn_blocking({
+        let root = root.to_path_buf();
+        move || sandbox2::classifier::probe_child_placement(&root)
+    })
+    .await
+    {
+        Ok(placement) => placement,
+        Err(join) => Err(io::Error::other(join)),
+    };
+    if let Err(e) = placement {
+        tracing::info!(
+            session = session_name,
+            error = %e,
+            daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
+            install = %sandbox2::classifier::install_hint(),
+            "this daemon cannot place a process in the classifier tree — it is \
+             not inside the delegated slice, so the installer's --pid step or a \
+             Delegate=yes unit has to place it; the session's box runs \
+             unenforced",
+        );
+        return Ok(None);
+    }
+    match sandbox2::classifier::create_box_leaf(root, &session_id.to_string()) {
+        Ok(leaf) => Ok(Some(sandbox2::config::ClassifierLeaf::new(leaf))),
         // `NotFound` is the ordinary shape of "no tree on this host": the
         // privileged step has not run. Info, not warn — it is a deployment
         // state, not a fault, and the next step on this host is to run the
@@ -2375,15 +2416,26 @@ fn create_session_leaf(session_name: &str) -> Option<sandbox2::config::Classifie
                 "the classifier tree is not installed on this host; \
                  the session's box runs unenforced",
             );
-            None
+            Ok(None)
         }
+        // A leaf named by this session's id already exists, and the sweep at
+        // daemon start has already taken what a daemon death left behind, so
+        // a fresh launch finding one is not reusing a leftover: another
+        // session holds it, and this launch is refused rather than deciding
+        // two sessions' verdicts together.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(io::Error::other(format!(
+            "another session holds this one's classifier leaf ({session_id}): \
+                 its leaf was created before this launch and still exists, so \
+                 the launch is refused rather than placing this box in another \
+                 session's cgroup"
+        ))),
         Err(e) => {
             tracing::warn!(
                 session = session_name,
                 error = %e,
                 "creating the session's classifier leaf; the box runs unenforced",
             );
-            None
+            Ok(None)
         }
     }
 }
@@ -2412,7 +2464,6 @@ fn refuses_unenforced_host_address_box(guest: bool, network_mode: NetworkMode) -
 /// writes an injected process. Everything the program forks later takes the
 /// leaf from its parent, so the box is in its leaf from its first process to
 /// its last.
-#[cfg(not(test))]
 fn place_box_processes(
     leaf: &sandbox2::config::ClassifierLeaf,
     supervisor: u32,
@@ -2420,7 +2471,6 @@ fn place_box_processes(
     sandbox2::classifier::place_pid(&leaf.procs(), supervisor)
 }
 
-#[cfg(not(test))]
 impl SessionLauncher for SandboxLauncher {
     type Process = SandboxProcess;
     // The session env, kept alive for the session's lifetime (it owns the
@@ -2431,6 +2481,8 @@ impl SessionLauncher for SandboxLauncher {
 
     async fn launch(
         self,
+        guest: bool,
+        session_id: sessions::SessionId,
         name: String,
         username: String,
         paths: SessionPaths,
@@ -2462,6 +2514,51 @@ impl SessionLauncher for SandboxLauncher {
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
 
+        // NET-079: the classifier leaf this host-address box's egress verdict
+        // is decided on, decided *before anything is reserved* and before its
+        // first process exists. Scoped to the host-address box, the one that
+        // speaks with an address it did not lease: a none box has no traffic
+        // to decide and an own-IP box's verdict is its own, on the address
+        // it holds. The decision fails closed for the launch — a tree that
+        // is absent, or a daemon that cannot place a process in it, leaves
+        // the box unenforced rather than refused natively — and never reaches
+        // the box's own pre-exec closure, which is where an unplaceable join
+        // would die taking the leaf it cannot take. The guard owns the leaf
+        // until the handoff into `Launched`, so a launch abandoned anywhere
+        // in between leaves no leaf behind, and it drops after the process
+        // guard below so the box's processes are gone before their leaf is
+        // removed.
+        let leaf = if matches!(network_mode, NetworkMode::HostNet) {
+            create_session_leaf(guest, &session_id, &session_name).await?
+        } else {
+            None
+        };
+        let mut leaf_guard = leaf.clone().map(BoxLeafGuard::new);
+
+        // A host-address box this daemon cannot place is refused in the guest
+        // — the one place a missing tree is a broken image rather than a
+        // deployment state, and the one place there is no installer to run
+        // (design §7.1). Natively the same state runs the box unenforced and
+        // says so in the log instead (NET-079's exception).
+        if leaf.is_none() && refuses_unenforced_host_address_box(guest, network_mode) {
+            tracing::error!(
+                session = %session_name,
+                network_mode = ?network_mode,
+                tree = sandbox2::classifier::TREE_ROOT,
+                "refusing a host-address box this guest cannot place in a \
+                 classifier leaf: its cgroup2 tree is missing or mounted \
+                 without namespace delegation, or the daemon cannot place a \
+                 process in it, so the box's egress verdict could not be \
+                 decided — a broken guest image"
+            );
+            return Err(io::Error::other(
+                "this guest has no classifier tree to place a host-address \
+                 box in: its cgroup2 is not mounted with nsdelegate, so the \
+                 box's verdict could not be decided and the box was refused \
+                 rather than run unenforced (broken guest image)",
+            ));
+        }
+
         // Step 1 (pre-spawn): the provider for this PTask's mode reserves what
         // the sandbox needs — for own-IP, a lease and a running gvproxy — and
         // says what it is. `PlannedLaunch` owns the release from here: an early
@@ -2475,40 +2572,6 @@ impl SessionLauncher for SandboxLauncher {
         ))
         .await
         .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;
-
-        // NET-079: the classifier leaf this box's egress verdict is decided
-        // on, created before its first process exists. The guard owns it until
-        // the handoff into `Launched`, so a launch abandoned anywhere in
-        // between — a failed build, a cancelled future — leaves no leaf
-        // behind, and it drops after the process guard below so the box's
-        // processes are gone before their leaf is removed.
-        let leaf = create_session_leaf(&session_name);
-        let mut leaf_guard = leaf.clone().map(BoxLeafGuard::new);
-
-        // A host-address box this daemon cannot place is refused in the guest
-        // — the one place a missing tree is a broken image rather than a
-        // deployment state, and the one place there is no installer to run
-        // (design §7.1). Natively the same state runs the box unenforced and
-        // says so in the log instead (NET-079's exception).
-        if leaf.is_none()
-            && refuses_unenforced_host_address_box(crate::guest::is_microvm_daemon(), network_mode)
-        {
-            tracing::error!(
-                session = %session_name,
-                network_mode = ?network_mode,
-                tree = sandbox2::classifier::TREE_ROOT,
-                "refusing a host-address box this guest cannot place in a \
-                 classifier leaf: its cgroup2 tree is missing or mounted \
-                 without namespace delegation, so the box's egress verdict \
-                 could not be decided — a broken guest image"
-            );
-            return Err(io::Error::other(
-                "this guest has no classifier tree to place a host-address \
-                 box in: its cgroup2 is not mounted with nsdelegate, so the \
-                 box's verdict could not be decided and the box was refused \
-                 rather than run unenforced (broken guest image)",
-            ));
-        }
 
         // Package + env-var union of the launcher baseline and every
         // contribution the composer collected. Packages: baseline set
@@ -2879,6 +2942,8 @@ impl SessionLauncher for MockLauncher {
 
     async fn launch(
         self,
+        _guest: bool,
+        _session_id: sessions::SessionId,
         _name: String,
         _username: String,
         _paths: SessionPaths,
@@ -3147,7 +3212,16 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             tty_path,
             seal_injection,
             leaf,
-        } = launcher.launch(name, username, paths, sz).await?;
+        } = launcher
+            .launch(
+                crate::guest::is_microvm_daemon(),
+                session_id,
+                name,
+                username,
+                paths,
+                sz,
+            )
+            .await?;
 
         let (sender, receiver) = mpsc::channel(HOST_MAILBOX_CAPACITY);
         let handle = HostHandle { sender };

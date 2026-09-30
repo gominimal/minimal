@@ -1534,6 +1534,8 @@ impl SessionLauncher for SealingMockLauncher {
 
     async fn launch(
         self,
+        _guest: bool,
+        _session_id: sessions::SessionId,
         _name: String,
         _username: String,
         _paths: SessionPaths,
@@ -1623,6 +1625,24 @@ async fn hook_injections_carry_the_session_s_none_box_seal() {
 // leaf placed in a cohort it is a sibling of.
 // ---------------------------------------------------------------------
 
+/// The files the kernel makes when it makes a cgroup — `cgroup.procs`,
+/// `cgroup.threads`, `cgroup.subtree_control` — modelled empty over a
+/// stand-in tree, which has no kernel behind it to make them. Modelling them
+/// is what makes a stand-in the installer's tree: directories delegated to
+/// the daemon's account, with the kernel's own files in them, and nothing
+/// left for the entry to make but the migration.
+const CGROUP_KERNEL_FILES: [&str; 3] = ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"];
+
+/// Stands in for the kernel over a stand-in tree: writes
+/// [`CGROUP_KERNEL_FILES`] into `dir`, empty, as the kernel leaves them when
+/// it makes a cgroup.
+fn model_cgroup_files(dir: &std::path::Path) {
+    for name in CGROUP_KERNEL_FILES {
+        std::fs::write(dir.join(name), "")
+            .unwrap_or_else(|e| panic!("modeling {name} in {}: {e}", dir.display()));
+    }
+}
+
 /// The daemon enters a classifier leaf of its own at start: `<root>/daemon`,
 /// a **sibling** of every box leaf — never the tree root, where enabling a
 /// controller would make the box leaves unusable and where the daemon's own
@@ -1633,17 +1653,27 @@ async fn hook_injections_carry_the_session_s_none_box_seal() {
 /// the one migration primitive the whole classifier rests on. Asserted over
 /// a stand-in tree because the host running this test may have no cgroup2 of
 /// its own: on a real tree the kernel holds the membership, and the write
-/// that performs the migration is the same either way. The tree is created
-/// by the entry itself, which is what the guest's pid 1 does on its own
-/// rootfs — natively the installer owns the tree, and its absence is the
-/// `NotFound` that leaves the daemon — and its boxes — unenforced.
+/// that performs the migration is the same either way. Natively the
+/// installer owns the tree — the slice itself delegated to the daemon's
+/// account, `daemon/` and `boxes/` made, the kernel's files in them — and a
+/// daemon that cannot enter it is left outside, its boxes unenforced; only
+/// the guest's pid 1 builds the tree, on the cgroup2 it mounted itself.
 #[test]
 fn daemon_enters_its_own_leaf() {
     let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
     let root = tree.path();
 
+    // The installer's tree, as a stand-in holds it: both directories made,
+    // and the kernel's files modelled into the daemon's leaf, because
+    // nothing behind the stand-in makes them at `mkdir` time.
+    std::fs::create_dir_all(sandbox2::classifier::daemon_leaf(root))
+        .expect("the installer makes the daemon's leaf");
+    std::fs::create_dir_all(root.join(sandbox2::classifier::BOXES_DIR))
+        .expect("the installer makes the box cohort");
+    model_cgroup_files(&sandbox2::classifier::daemon_leaf(root));
+
     sandbox2::classifier::enter_daemon_leaf(root)
-        .expect("the daemon enters its own leaf, building the tree as it does");
+        .expect("the daemon enters its own leaf in the installer's tree");
 
     let daemon = sandbox2::classifier::daemon_leaf(root);
     let procs = daemon.join("cgroup.procs");
@@ -1703,6 +1733,31 @@ fn daemon_enters_its_own_leaf() {
             .any(|member| member == std::process::id().to_string()),
         "the daemon is still a member of its own leaf: {members:?}"
     );
+
+    // And the one daemon that builds the tree itself — the guest's pid 1, on
+    // the cgroup2 it mounted — makes both directories where there was
+    // nothing, and then reports the stand-in's one gap as what it is: no
+    // kernel made the `cgroup.procs` its entry writes into, so the write
+    // says the leaf is missing, which over a real tree it never is. Nothing
+    // boxes into a tree the entry could not enter.
+    let bare = tempfile::tempdir().expect("a bare stand-in tree, nothing installed in it");
+    let entry = sandbox2::classifier::enter_daemon_leaf(bare.path())
+        .expect_err("over a bare stand-in no kernel made the daemon leaf's cgroup.procs");
+    assert_eq!(
+        entry.kind(),
+        std::io::ErrorKind::NotFound,
+        "the entry's write is a migration into a leaf that must already hold \
+         its kernel-made files: a missing one is a missing leaf"
+    );
+    assert!(
+        bare.path().join(sandbox2::classifier::BOXES_DIR).is_dir(),
+        "the pid-1 entry builds the cohort directory where it has the \
+         privilege to"
+    );
+    assert!(
+        sandbox2::classifier::daemon_leaf(bare.path()).is_dir(),
+        "the pid-1 entry builds its own leaf where it has the privilege to"
+    );
 }
 
 /// Only the guest refuses an unplaceable box, and only a host-address one
@@ -1745,5 +1800,110 @@ fn only_the_guest_refuses_an_unplaceable_host_address_box() {
             "{why}: the box launches, enforced where the tree allowed it and \
              unenforced with a log line where it did not"
         );
+    }
+}
+
+/// A [`SandboxLauncher`] for the launch-path test: the fakerepo context the
+/// channel tests use, a switch client pointed at a binary that is not there,
+/// and no composition — everything a launch needs to reach its own
+/// decisions, and nothing that could fetch or build. The state dir travels
+/// out with the launcher, because the context reads it long after this
+/// returns.
+fn sandbox_launcher(network_mode: sessions::NetworkMode) -> (SandboxLauncher, tempfile::TempDir) {
+    let state = tempfile::tempdir().expect("a state dir for the launcher's context");
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let config = mctx::ConfigBuilder::new()
+        .with_state_dir(state.path().to_path_buf())
+        .with_repo_dir(manifest_dir.join("../mctx/testdata/fakerepo"))
+        .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
+        .with_no_fetch(true)
+        .build()
+        .expect("the fakerepo context builds");
+    let launcher = SandboxLauncher {
+        ctx: mctx::Context::new(config).expect("the fakerepo context loads"),
+        attach_env: AttachEnv::default(),
+        network_mode,
+        net_switch: std::sync::Arc::new(tokio::sync::Mutex::new(crate::net::SwitchClient::new(
+            "/nonexistent/gvproxy",
+            state.path().to_path_buf(),
+        ))),
+        policy: sessions::SessionPolicy::default(),
+        own_address: None,
+        composition: None,
+        session: crate::session::WeakSessionHandle::dangling(),
+    };
+    (launcher, state)
+}
+
+/// The launch-path half of the guest refusal: the predicate says which
+/// launch must be refused, and this drives the launcher itself, with the
+/// guest flag handed in as production hands it in, so the refusal the
+/// predicate names is the one `launch` returns — for the host-address box in
+/// the guest, and for no other launch. A none box, an own-IP box and a
+/// native host-address box go through the same tree-less host and none is
+/// stopped by the classifier: what each returns is whatever its launch
+/// found next, because the baseline packages are not materializable in the
+/// unit-test environment — which is exactly why the refusal's *absence* is
+/// the assertion, and a launched-and-dropped [`Launched`] is what its `Drop`
+/// promises it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_launch_refuses_only_the_unplaced_host_address_box() {
+    use sessions::NetworkMode;
+
+    const REFUSAL: &str = "this guest has no classifier tree to place a host-address box in";
+    for (guest, mode, refused, why) in [
+        (
+            true,
+            NetworkMode::HostNet,
+            true,
+            "a guest's host-address box",
+        ),
+        (true, NetworkMode::NoNet, false, "a guest's none box"),
+        (true, NetworkMode::OwnIp, false, "a guest's own-IP box"),
+        (
+            false,
+            NetworkMode::HostNet,
+            false,
+            "a native host-address box",
+        ),
+    ] {
+        let (launcher, _state) = sandbox_launcher(mode);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            launcher.launch(
+                guest,
+                sessions::SessionId::nil(),
+                "refusal-proof".to_string(),
+                "guest".to_string(),
+                test_paths(),
+                DEFAULT_SIZE,
+            ),
+        )
+        .await
+        .expect("the launch decides within its timeout")
+        .map(|launched| {
+            // Nothing a launch returns outlives this block: the process and
+            // its leaf are what the guard's `Drop` reaps when it goes.
+            drop(launched);
+        });
+        match (outcome, refused) {
+            (Err(e), true) => {
+                eprintln!("{why}: refused with {e}");
+                assert!(
+                    e.to_string().contains(REFUSAL),
+                    "{why} is refused with the named error, not: {e}"
+                );
+            }
+            (Err(e), false) => {
+                eprintln!("{why}: launches past the classifier gate, and stops at {e}");
+                assert!(
+                    !e.to_string().contains(REFUSAL),
+                    "{why} is not a host-address box this guest cannot place, so \
+                     it is not refused on that ground: {e}"
+                );
+            }
+            (Ok(()), false) => eprintln!("{why}: launched"),
+            (Ok(()), true) => panic!("{why} must be refused, and was launched"),
+        }
     }
 }

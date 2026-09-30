@@ -622,17 +622,19 @@ async fn async_main() -> Result<(), MainError> {
     // it, which is what keeps a box out of every other leaf on the tree (see
     // `sandbox2::classifier`).
     //
-    // Natively the tree is the privileged step's to install
-    // (`scripts/install-host-classifier.sh`); in the guest this is pid 1,
-    // which mounts cgroup2 itself (`guest::enter_rootfs`) and so builds the
-    // tree here. Best effort natively — a host without the tree runs the
-    // daemon, and its boxes, unenforced, never refusing them on that ground.
-    // In the guest a tree that could not be built is a broken image, not a
-    // deployment state: the failure is an error and `session_host` refuses a
-    // host-address box on it (design §7.1).
-    if let Err(e) = sandbox2::classifier::enter_daemon_leaf(std::path::Path::new(
-        sandbox2::classifier::TREE_ROOT,
-    )) {
+    // In the guest this is pid 1, which mounts cgroup2 itself
+    // (`guest::enter_rootfs`) and so builds the tree here; a tree it could
+    // not build is a broken image, not a deployment state, and
+    // `session_host` refuses a host-address box on it (design §7.1).
+    // Natively the installer installs the tree and delegates it to this
+    // account, and entering it is a migration whose common ancestor this
+    // daemon can write only from *inside* the tree: the installer's `--pid`
+    // step or a `Delegate=yes` unit places it. A daemon left outside keeps
+    // running and places no box — `create_session_leaf` decides that per
+    // launch, by migrating a throwaway child, so no box is ever spawned into
+    // a join it dies making.
+    let tree_root = std::path::Path::new(sandbox2::classifier::TREE_ROOT);
+    if let Err(e) = sandbox2::classifier::enter_daemon_leaf(tree_root) {
         if guest::is_microvm_daemon() {
             tracing::error!(
                 error = %e,
@@ -644,12 +646,34 @@ async fn async_main() -> Result<(), MainError> {
             tracing::warn!(
                 error = %e,
                 tree = sandbox2::classifier::TREE_ROOT,
-                install = "sudo scripts/install-host-classifier.sh --user <this \
-                          daemon's account>",
-                "entering the daemon's own classifier leaf; its boxes run \
-                 unenforced"
+                daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
+                install = %sandbox2::classifier::install_hint(),
+                "this daemon is not inside the classifier tree, so no box it \
+                 launches will be placed: enter the tree with the installer's \
+                 --pid step, or start the daemon from a Delegate=yes unit"
             );
         }
+    }
+
+    // NET-079: the empty leaves a daemon death left behind are swept here, at
+    // the next start, so a leaf named by a session's id is never mistaken for
+    // a leftover its next launch could take: a fresh launch finding one
+    // reports the collision. A leaf that still holds a session refuses its
+    // own removal and stays, which is the emptiness the sweep tests by.
+    match sandbox2::classifier::sweep_box_leaves(tree_root) {
+        Ok(swept) if swept.is_empty() => {}
+        Ok(swept) => tracing::info!(
+            count = swept.len(),
+            leaves = ?swept
+                .iter()
+                .map(|leaf| leaf.display().to_string())
+                .collect::<Vec<_>>(),
+            "swept the empty classifier leaves a previous daemon left behind"
+        ),
+        Err(e) => tracing::debug!(
+            error = %e,
+            "sweeping the box cohort at start"
+        ),
     }
 
     // R1.5/R1.6: when the microVM config requested a data volume
