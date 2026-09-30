@@ -1977,11 +1977,18 @@ impl Drop for SandboxBackend {
         if let Err(e) = self.child.wait() {
             tracing::warn!(error = %e, "reaping session process at teardown");
         }
-        // The leaf goes last, once nothing is in it: a cgroup that still
-        // holds a process refuses its removal, so a leaked one is a warn and
-        // an empty directory — named by its session's id, so no later session
-        // can be launched into it, and swept away at the next daemon start.
-        if let Err(e) = sandbox2::classifier::remove_box_leaf(leaf.dir()) {
+        // The leaf goes last, once nothing is in it — and outlasting the
+        // box's last moments, because a SIGKILLed box's cgroup can refuse
+        // its `rmdir` (`EBUSY`) for a few milliseconds after the reap while
+        // the kernel empties it. A refusal at the first try would leak the
+        // leaf until a later launch of the same session id reclaimed it or
+        // the daemon restarted, so the removal is retried briefly before it
+        // is warned about; a leaf that still refuses is a warn and an empty
+        // directory — named by its session's id, so no later session can be
+        // launched into it, and swept away at the next daemon start.
+        if let Err(e) = remove_box_leaf_patiently(leaf.dir(), DROP_LEAF_REMOVAL_ATTEMPTS, |_| {
+            std::thread::sleep(DROP_LEAF_REMOVAL_PAUSE)
+        }) {
             tracing::warn!(
                 leaf = %leaf.dir().display(),
                 error = %e,
@@ -1989,6 +1996,43 @@ impl Drop for SandboxBackend {
             );
         }
     }
+}
+
+/// How many times a teardown tries to remove the box's leaf before warning
+/// about a leak. One first try plus four retries.
+const DROP_LEAF_REMOVAL_ATTEMPTS: usize = 5;
+
+/// The pause between those tries: long enough for the kernel to finish
+/// emptying a just-killed cgroup, short enough that a wedged teardown never
+/// parks on it — 4 × 20 ms after the first refusal.
+const DROP_LEAF_REMOVAL_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Removes the box's leaf, retrying while a just-reaped box's cgroup may
+/// still be dying: the `rmdir` of a cgroup the kernel has not finished
+/// emptying comes back `EBUSY` for a few milliseconds after the last
+/// process is reaped, and the removal is owed once — not indefinitely, so
+/// the attempts are counted and the last refusal is returned for the caller
+/// to warn.
+///
+/// `pause` is called with the number of the attempt that just failed —
+/// before the next try — and is the seam the test drives: production sleeps
+/// [`DROP_LEAF_REMOVAL_PAUSE`], a test clears the obstruction between two
+/// attempts and proves the retry is what healed the removal.
+fn remove_box_leaf_patiently(
+    leaf: &std::path::Path,
+    attempts: usize,
+    mut pause: impl FnMut(usize),
+) -> io::Result<()> {
+    for attempt in 1..=attempts.max(1) {
+        match sandbox2::classifier::remove_box_leaf(leaf) {
+            Ok(()) => return Ok(()),
+            // A refusal that is not the last attempt's is what the pause is
+            // for; the last one is returned for the caller to warn.
+            Err(_) if attempt < attempts.max(1) => pause(attempt),
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the loop returns on its last attempt at the latest")
 }
 
 /// A launched session process backed by a sandboxed [`hakoniwa::Child`].
@@ -2569,84 +2613,49 @@ fn create_or_reclaim_box_leaf(
 /// reports, whose stderr is the session's own terminal and reaches no
 /// daemon log without this file.
 ///
-/// Polled rather than awaited: the closure writes the line before the
-/// program execs, but the spawn returns before the write is guaranteed to
-/// have landed, and a report that never appears is itself a finding — a box
-/// that could not say what it did still ran, so the daemon says that and
-/// stops waiting. Runs off the launch's critical path (it is `tokio::spawn`
-///ed), so a session is never held up by what its box did in its first
+/// Polled rather than awaited, and the file is taken away only once the
+/// box's fate is known: a `failed` line is written by the closure's own
+/// exit path, so nothing follows it and the removal is owed then; a `cover`
+/// line is written while the closure is still heading for its exec, and a
+/// closure that covered and then died past that point replaces its line —
+/// the removal before that would have dropped the `failed` line carrying
+/// the `127`'s diagnosis into a file nobody reads, so the watch goes on
+/// until the deadline even after a line was read. A report that never
+/// appears is itself a finding — a box that could not say what it did still
+/// ran — and it is warned, not debugged: a leaf-bearing box whose closure
+/// could not write `/run` is exactly the state this channel exists to
+/// catch. Runs off the launch's critical path (it is `tokio::spawn`ed), so
+/// a session is never held up by what its box did in its first
 /// milliseconds.
-async fn report_box_closure(report: std::path::PathBuf, session: String) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+///
+/// `watch` is how long the launch's own watch waits; [`CLOSURE_REPORT_WATCH`]
+/// is the production one, and a test drives the same code with a shorter
+/// one.
+async fn report_box_closure(
+    report: std::path::PathBuf,
+    session: String,
+    watch: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + watch;
+    // The last line this closure left, so a replacement is logged as the
+    // new finding it is rather than skipped as a repeat.
+    let mut seen: Option<String> = None;
     loop {
         match tokio::fs::read_to_string(&report).await {
             Ok(line) => {
-                // The report is the box's to write once; the daemon owes the
-                // tree one line per launch, not a file per session.
-                let _ = tokio::fs::remove_file(&report).await;
-                let line = line.trim();
-                if line == "cover cgroup2" {
-                    tracing::info!(
-                        session = %session,
-                        cover = "cgroup2",
-                        "the box covered its bound classifier tree with the design's \
-                         own cover: a read-only cgroup2 mount of its namespace root, \
-                         so its own limit is readable where a runtime looks and no \
-                         other cgroup is reachable",
-                    );
-                } else if let Some(errno) = line.strip_prefix("cover tmpfs-fallback errno ") {
-                    tracing::warn!(
-                        session = %session,
-                        cover = "tmpfs-fallback",
-                        mount_errno = errno,
-                        "the box's classifier cover fell back to an empty read-only \
-                         tmpfs: the kernel refused the design's cgroup2 mount of the \
-                         box's namespace root in its user namespace, so the box has \
-                         no cgroup path to write a migration to, but none to read a \
-                         limit from either — a recorded fallback, never the design's \
-                         cover",
-                    );
-                } else if line == "cover tmpfs-fallback forced" {
-                    tracing::warn!(
-                        session = %session,
-                        cover = "tmpfs-fallback",
-                        "the box's classifier cover was forced onto its recorded \
-                         fallback — a launch in a test posture, never a production one",
-                    );
-                } else if let Some(failed) = line.strip_prefix("failed ") {
-                    let (step, errno) = failed
-                        .rsplit_once(" errno ")
-                        .unwrap_or((failed, "unreported"));
-                    tracing::error!(
-                        session = %session,
-                        step = %step,
-                        errno = %errno,
-                        "the box's pre-exec closure died before its program ran: the \
-                         spawn reports this as exit 127, and this line is the only \
-                         place a daemon log ever sees which step and which errno",
-                    );
-                } else {
-                    tracing::warn!(
-                        session = %session,
-                        report = %line,
-                        "the box's pre-exec closure reported a line this daemon does \
-                         not read",
-                    );
+                let line = line.trim().to_string();
+                if seen.as_deref() != Some(line.as_str()) {
+                    seen = Some(line.clone());
+                    if say_closure_line(&line, &session) {
+                        // The box's fate is known: the closure died, and it
+                        // died having said so. The daemon owes the tree one
+                        // line per launch, not a file per session.
+                        let _ = tokio::fs::remove_file(&report).await;
+                        return;
+                    }
                 }
-                return;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if std::time::Instant::now() > deadline {
-                    tracing::debug!(
-                        session = %session,
-                        report = %report.display(),
-                        "the box's pre-exec closure wrote no report; nothing further \
-                         is owed",
-                    );
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 tracing::warn!(
                     session = %session,
@@ -2656,7 +2665,91 @@ async fn report_box_closure(report: std::path::PathBuf, session: String) {
                 return;
             }
         }
+        if std::time::Instant::now() > deadline {
+            if seen.is_none() {
+                tracing::warn!(
+                    session = %session,
+                    report = %report.display(),
+                    "the box's pre-exec closure wrote no report into its /run \
+                     before the watch gave up: a leaf-bearing box that could not \
+                     say what it did over its classifier tree is exactly the \
+                     state this channel exists to catch — no line below names \
+                     its cover or its errno",
+                );
+            }
+            // The box's fate is known by the deadline either way: the closure
+            // writes within its first milliseconds, so the watch's whole
+            // window without a new line is a closure that execed — or one
+            // that never got to write, which the warn above just said. The
+            // removal is owed now, and the box's fate is the only thing that
+            // ever owed it.
+            let _ = tokio::fs::remove_file(&report).await;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+}
+
+/// How long a launch watches its box's closure report: the closure writes
+/// within its first milliseconds, so three seconds without a line it has not
+/// already read is a closure that has nothing more to say.
+const CLOSURE_REPORT_WATCH: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Says what one line of the box's closure report means, and returns whether
+/// the line settles the box's fate: `true` for a `failed` line, which the
+/// closure writes on its way to `_exit(127)` and nothing follows; `false`
+/// for a `cover` line, which it writes while still heading for its exec.
+fn say_closure_line(line: &str, session: &str) -> bool {
+    if line == "cover cgroup2" {
+        tracing::info!(
+            session = %session,
+            cover = "cgroup2",
+            "the box covered its bound classifier tree with the design's \
+             own cover: a read-only cgroup2 mount of its namespace root, \
+             so its own limit is readable where a runtime looks and no \
+             other cgroup is reachable",
+        );
+    } else if let Some(errno) = line.strip_prefix("cover tmpfs-fallback errno ") {
+        tracing::warn!(
+            session = %session,
+            cover = "tmpfs-fallback",
+            mount_errno = errno,
+            "the box's classifier cover fell back to an empty read-only \
+             tmpfs: the kernel refused the design's cgroup2 mount of the \
+             box's namespace root in its user namespace, so the box has \
+             no cgroup path to write a migration to, but none to read a \
+             limit from either — a recorded fallback, never the design's \
+             cover",
+        );
+    } else if line == "cover tmpfs-fallback forced" {
+        tracing::warn!(
+            session = %session,
+            cover = "tmpfs-fallback",
+            "the box's classifier cover was forced onto its recorded \
+             fallback — a launch in a test posture, never a production one",
+        );
+    } else if let Some(failed) = line.strip_prefix("failed ") {
+        let (step, errno) = failed
+            .rsplit_once(" errno ")
+            .unwrap_or((failed, "unreported"));
+        tracing::error!(
+            session = %session,
+            step = %step,
+            errno = %errno,
+            "the box's pre-exec closure died before its program ran: the \
+             spawn reports this as exit 127, and this line is the only \
+             place a daemon log ever sees which step and which errno",
+        );
+        return true;
+    } else {
+        tracing::warn!(
+            session = %session,
+            report = %line,
+            "the box's pre-exec closure reported a line this daemon does \
+             not read",
+        );
+    }
+    false
 }
 
 /// Whether a session that could not be placed in a classifier leaf must be
@@ -2670,6 +2763,26 @@ async fn report_box_closure(report: std::path::PathBuf, session: String) {
 /// exception instead — NET-079's advisory posture, never a refusal.
 fn refuses_unenforced_host_address_box(guest: bool, network_mode: NetworkMode) -> bool {
     guest && matches!(network_mode, NetworkMode::HostNet)
+}
+
+/// Whether this daemon has already printed the unenforced-placement notice
+/// into a session terminal: the notice names the *host's* deployment state,
+/// which stays the same across every session one daemon runs, so one
+/// terminal per daemon start carries it — every launch still records the
+/// state in the daemon log — and the banner does not become the default
+/// path ahead of every prompt on the hosts that have no tree (every dev
+/// machine today). Cleared only by a restart: a new daemon start is a new
+/// first session.
+static UNENFORCED_NOTICE_PRINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Takes the once-per-daemon turn at printing the unenforced-placement
+/// notice: `true` for the launch that gets to print it, `false` for every
+/// launch after the first on this daemon. Split out over the raw `swap` so
+/// the once-only semantics are pinned where they are written, not only
+/// where they are relied on.
+fn first_unenforced_notice(latch: &std::sync::atomic::AtomicBool) -> bool {
+    !latch.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Moves the box's container supervisor into its classifier leaf, now that
@@ -2943,18 +3056,29 @@ impl SessionLauncher for SandboxLauncher {
                     sandbox2::classifier::install_hint()
                 );
                 tracing::info!(session = %session_label, "{notice}");
-                // The same write the shell fallback notice uses, for the same
-                // reasons: onto the pty's slave, best-effort, CRLF — see the
-                // comment there.
-                let written = pty.dup_slave_fd().and_then(|fd| {
-                    use std::io::Write as _;
-                    std::fs::File::from(fd).write_all(format!("minimal: {notice}\r\n").as_bytes())
-                });
-                if let Err(e) = written {
-                    tracing::debug!(
-                        error = %e,
-                        "could not print the placement notice to the terminal"
-                    );
+                // The terminal gets it once per daemon, not once per session:
+                // the notice names the deployment's state, which no session
+                // this daemon runs can change — every launch still records
+                // it in the daemon log — and on every host without the
+                // installer's tree (every dev machine today) a banner ahead
+                // of every prompt is the default path, not the exception.
+                // A daemon restart clears the latch: a new daemon start is a
+                // new first session.
+                if first_unenforced_notice(&UNENFORCED_NOTICE_PRINTED) {
+                    // The same write the shell fallback notice uses, for the
+                    // same reasons: onto the pty's slave, best-effort, CRLF —
+                    // see the comment there.
+                    let written = pty.dup_slave_fd().and_then(|fd| {
+                        use std::io::Write as _;
+                        std::fs::File::from(fd)
+                            .write_all(format!("minimal: {notice}\r\n").as_bytes())
+                    });
+                    if let Err(e) = written {
+                        tracing::debug!(
+                            error = %e,
+                            "could not print the placement notice to the terminal"
+                        );
+                    }
                 }
             }
             // The shell, and the argv it needs to reach the daemon's
@@ -3041,7 +3165,9 @@ impl SessionLauncher for SandboxLauncher {
         if let Some(leaf) = leaf.as_ref() {
             let report = env.closure_report_path(leaf);
             let session = session_label.clone();
-            tokio::spawn(async move { report_box_closure(report, session).await });
+            tokio::spawn(
+                async move { report_box_closure(report, session, CLOSURE_REPORT_WATCH).await },
+            );
         }
 
         // NET-079: the box's supervisor is moved into its leaf right after the

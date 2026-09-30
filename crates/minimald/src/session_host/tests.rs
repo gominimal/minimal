@@ -1927,6 +1927,171 @@ fn host_ip_enforcement_says_what_the_launch_decided() {
     }
 }
 
+/// A torn-down box's leaf goes when the box's cgroup stops refusing it, not
+/// when the teardown's first `rmdir` happens to land: a SIGKILLed box's
+/// cgroup answers `EBUSY` for a few milliseconds after the reap, while the
+/// kernel empties it, and a leaf that leaked on that window would outlive
+/// its box until a later launch of the same session id reclaimed it. Over
+/// this stand-in tree the modelled `cgroup.procs` is the obstruction —
+/// `rmdir` refuses a non-empty directory the way the kernel refuses a
+/// cgroup that still holds a process — and the seam's pause callback clears
+/// it between two attempts, so the proof is the retry itself: the removal
+/// succeeds on the attempt after the obstruction went, and an obstruction
+/// that never goes gives up after the attempts it was given, with the
+/// `rmdir`'s own refusal for the caller to warn.
+#[test]
+fn a_torn_down_boxs_leaf_removal_outlasts_its_last_moments() {
+    let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+    std::fs::create_dir_all(tree.path().join(sandbox2::classifier::BOXES_DIR))
+        .expect("the cohort directory");
+    let leaf = sandbox2::classifier::create_box_leaf(tree.path(), "a torn-down box")
+        .expect("the box's leaf, as its teardown finds it");
+    model_cgroup_files(&leaf);
+
+    let outcome = super::remove_box_leaf_patiently(&leaf, 5, |attempt| {
+        if attempt == 2 {
+            for name in CGROUP_KERNEL_FILES {
+                std::fs::remove_file(leaf.join(name))
+                    .unwrap_or_else(|e| panic!("clearing {name} in {}: {e}", leaf.display()));
+            }
+        }
+    });
+    assert!(
+        outcome.is_ok(),
+        "the leaf went on the attempt after the box's cgroup stopped \
+         refusing its removal: {outcome:?}"
+    );
+    assert!(
+        !leaf.exists(),
+        "a leaf whose refusal was only the box's last moments does not \
+         outlive the box"
+    );
+
+    // A leaf that keeps refusing is warned about, not parked behind: the
+    // attempts are spent, and the refusal the caller warns with is the
+    // kernel's own test that the cgroup still holds a process — here, the
+    // `rmdir`'s ENOTEMPTY over the modelled file.
+    let held = sandbox2::classifier::create_box_leaf(tree.path(), "a box still dying")
+        .expect("the leaf of a box whose teardown could not remove it");
+    model_cgroup_files(&held);
+    let refused =
+        super::remove_box_leaf_patiently(&held, 3, |_| ()).expect_err("the obstruction stays");
+    assert_eq!(
+        refused.raw_os_error(),
+        Some(libc::ENOTEMPTY),
+        "the warn a teardown raises names the rmdir's own refusal, not a \
+         retry's: {refused}"
+    );
+    assert!(
+        held.is_dir(),
+        "a leaf that keeps refusing outlives the teardown that owes it, to \
+         be reclaimed by the same session's next launch"
+    );
+}
+
+/// Which line of a box's closure report settles the box's fate — the one
+/// fact the removal of the report rests on. A `failed` line is written by
+/// the closure's own exit path and nothing follows it, so the fate is known
+/// the moment it is read; a `cover` line is written while the closure is
+/// still heading for its exec, and a line the daemon does not read settles
+/// nothing at all.
+#[test]
+fn a_failed_closure_line_settles_the_boxs_fate_a_cover_line_does_not() {
+    assert!(
+        !super::say_closure_line("cover cgroup2", "a session"),
+        "a cover line leaves the closure still heading for its exec, so the \
+         file has to stay for the failure that can still replace it"
+    );
+    assert!(
+        !super::say_closure_line("cover tmpfs-fallback errno 22", "a session"),
+        "the recorded fallback is as non-terminal as the design's cover"
+    );
+    assert!(
+        super::say_closure_line(
+            "failed covering the bound classifier tree errno 1",
+            "a session"
+        ),
+        "a failed line is the closure's own exit path — nothing follows it, \
+         so the fate is known and the tree is owed its removal"
+    );
+    assert!(
+        !super::say_closure_line("a line this daemon does not read", "a session"),
+        "an unknown line settles nothing: the watch owes the file to the end \
+         of its window"
+    );
+}
+
+/// The closure report is taken away only once the box's fate is known: a
+/// `failed` line is terminal, so the file goes the moment it is read, while
+/// a `cover` line is not — the closure that covered and then died past that
+/// point replaces its line with the diagnosis a bare `127` would otherwise
+/// lose, and taking the file on the first read would drop that line into a
+/// file nobody reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_closure_report_is_removed_only_once_the_boxs_fate_is_known() {
+    let dir = tempfile::tempdir().expect("a temp dir for the closure reports");
+    let failed = dir.path().join("a-failed-closure");
+    std::fs::write(
+        &failed,
+        "failed joining the box's classifier leaf errno 1\n",
+    )
+    .expect("the closure's dying line");
+
+    super::report_box_closure(
+        failed.clone(),
+        "a session".to_string(),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        !failed.exists(),
+        "a failed line settles the fate: the removal is owed the moment it \
+         is read, not ten seconds later"
+    );
+
+    let covered = dir.path().join("a-covered-closure");
+    std::fs::write(&covered, "cover cgroup2\n").expect("the cover the closure took");
+    let watching = tokio::spawn(super::report_box_closure(
+        covered.clone(),
+        "a session".to_string(),
+        Duration::from_millis(300),
+    ));
+    // The watch has read the cover line by now — the file is there from the
+    // first poll — and still holds it: the fate is not known yet.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        covered.exists(),
+        "a cover line does not settle the fate, so the report stays for the \
+         failure that can still replace it"
+    );
+    watching.await.expect("the watch ends on its own");
+    assert!(
+        !covered.exists(),
+        "the watch's window is the fate known by default: the removal is \
+         owed at the end of it, and only then"
+    );
+}
+
+/// The unenforced-placement notice is printed into a terminal once per
+/// daemon, not once per session: it names the host's deployment state, which
+/// no session this daemon runs can change, and on a host with no classifier
+/// tree (every dev machine today) a banner ahead of every prompt would be
+/// the default path rather than the exception. A fresh latch is a fresh
+/// daemon start; the daemon log still records the state per launch.
+#[test]
+fn the_unenforced_notice_prints_once_per_daemon() {
+    let latch = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        super::first_unenforced_notice(&latch),
+        "the daemon's first unenforced launch prints the notice"
+    );
+    assert!(
+        !super::first_unenforced_notice(&latch),
+        "every launch after it leaves the banner out: the state it names has \
+         not changed, and the daemon log still records it per launch"
+    );
+}
+
 /// A [`SandboxLauncher`] for the launch-path test: the fakerepo context the
 /// channel tests use, a switch client pointed at a binary that is not there,
 /// and no composition — everything a launch needs to reach its own
