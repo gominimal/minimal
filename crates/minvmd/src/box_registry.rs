@@ -176,9 +176,16 @@ impl BoxRegistry {
     /// Publishes one namespace: compiles the declaration into a row keyed by
     /// its switch address — the lease the shared verdict checks every
     /// frame's source against (NET-084) — and returns it. Registering an
-    /// address that is already published replaces the row, so a
-    /// re-registration can only ever tighten or restate, never widen behind
-    /// the gate's back.
+    /// address that is already published replaces that row with the newest
+    /// declaration, whatever it holds: the table compares no policy against
+    /// the row it holds — a rule set's absent dimensions are allow-all, so
+    /// there is not even a widest one to rank against — and a re-registration
+    /// can widen a namespace's reach as readily as narrow it. Whether a
+    /// re-declaration may widen is the registering side's contract to enforce
+    /// (T66's client-driven path, which decides whether re-declaring a live
+    /// namespace is even possible); what this table enforces is NET-138's
+    /// boundary — only the host process holding this registry can publish at
+    /// all, so nothing inside the VM can change a row behind the gate's back.
     ///
     /// # Panics
     ///
@@ -300,6 +307,7 @@ impl BoxTable {
 #[cfg(test)]
 mod tests {
     use sessions::IpProto;
+    use sessions::core::egress::FrameVerdict;
     use switch::SwitchSubnet;
 
     use crate::net::egress_gate::test_support::{
@@ -437,12 +445,18 @@ mod tests {
             "a registration after the table was handed out reaches it"
         );
 
-        // Re-registering an address replaces the row, so a namespace can only
-        // ever be restated, not widened behind a row's back.
-        let restated = registry.register(
-            BoxRegistration::new("web", Ipv4Addr::new(100, 64, 0, 9), Ipv4Addr::LOCALHOST)
-                .with_egress_policy(EgressPolicy::deny_all()),
-        );
+        // Re-registering an address replaces the row with the newest
+        // declaration, compared against nothing: this restatement is wider
+        // than the one it replaces — no declared policy, so allow-all where
+        // the first said TCP to a LAN — and the table holds it anyway,
+        // because the reach a row grants is its latest registration's, and
+        // whether a re-declaration may widen is the registering side's
+        // contract (T66's path), not the table's.
+        let restated = registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::LOCALHOST,
+        ));
         let rows = table.rows();
         assert_eq!(rows.len(), 3);
         let restated_row = table
@@ -452,6 +466,27 @@ mod tests {
         assert!(
             restated_row.egress() != web.egress(),
             "the re-registration replaced the row the gate resolves"
+        );
+        // And it widens, visibly: the shared verdict — the decision the gate
+        // applies — drops a frame to an address outside the LAN the first
+        // declaration allowed, and admits the same frame under the row the
+        // re-registration left.
+        let outside = sessions::core::egress::summarize(&ipv4_frame(
+            Ipv4Addr::new(100, 64, 0, 9).octets(),
+            6,
+            [203, 0, 113, 7],
+            443,
+        ));
+        assert!(matches!(
+            sessions::core::egress::verdict(&outside, web.egress()),
+            FrameVerdict::Drop(_)
+        ));
+        assert!(
+            matches!(
+                sessions::core::egress::verdict(&outside, restated_row.egress()),
+                FrameVerdict::Admit
+            ),
+            "the re-registration's reach is what the gate now decides by"
         );
     }
 
