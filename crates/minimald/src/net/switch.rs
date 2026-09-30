@@ -28,7 +28,7 @@ use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::io::unix::AsyncFd;
@@ -812,7 +812,8 @@ impl ForeignSourceReject {
 /// [`UdpConntrack`] pattern, so it never grows without bound. Per-process:
 /// boxes behind a *different* daemon are not seen from here, and their
 /// connections decide on the target's ingress alone.
-const LIVE_GATES: Mutex<HashMap<Ipv4Addr, Weak<SessionGate>>> = Mutex::new(HashMap::new());
+static LIVE_GATES: LazyLock<Mutex<HashMap<Ipv4Addr, Weak<SessionGate>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Sweep dead entries once the table crosses this many leases — the
 /// [`UdpConntrack`] bound, sized for the same burst-of-attach picture.
 const LIVE_GATES_SWEEP_AT: usize = 4096;
@@ -1011,7 +1012,7 @@ impl SessionGate {
         if !syn || ack {
             return false;
         }
-        let Some(peer) = live_gate(pkt.src.ip()) else {
+        let Some(peer) = live_gate(*pkt.src.ip()) else {
             return false;
         };
         let (dst, dst_port) = (pkt.dst.ip(), pkt.dst.port());
