@@ -77,6 +77,10 @@
 #   session_exec                     `min session exec` in the session's namespaces
 #   session_outbound_request         an outbound request from inside the session (NET-107)
 #   own_ip                           `--network own_ip` tap + switch attach
+#   own_ip_egress_declared_and_enforced
+#                                    the four egress fields declared, allowed
+#                                    and disallowed connections, the coming
+#                                    deny-all announcement, and the opt-out
 #   task_run                         `min task run` / `min session run` loop
 #   hooks                            lifecycle hooks, loadouts, patches, shells
 #   skip_scaffold                    the daemon-scaffolded blueprint upload lane
@@ -167,6 +171,7 @@ RECOVER_SWITCH_SOCK="" # the minvmd switch socket beat C moves; restored
 RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
+EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -340,6 +345,37 @@ else
       break
     fi
   done
+  # Nothing prebuilt — but this checkout can build the pair itself, and every
+  # case below is runnable standalone from a bare checkout, so do the same
+  # build `just e2e-native` does first (`cargo build -p minimald --bin
+  # minimald -p minimal --bin min --locked`): the CLI plus the one daemon it
+  # autospawns by name, `min_daemon` computed above per OS/backend. Dormant on
+  # real lanes — they export target/debug on PATH or pass MINIMAL_E2E_MIN, so
+  # one of the branches above already won — so this only pays where the gates
+  # below would otherwise have nothing to check. A sandboxed bare checkout
+  # (the agent runtime boxes are themselves session boxes: `min` on PATH is
+  # the in-sandbox helper, and target/ is empty) is exactly that: the pair
+  # builds, and the case then runs — or skips on its own prerequisites —
+  # instead of the run dying at the CLI gate with a build instruction the
+  # caller cannot read mid-verify.
+  if [ -z "$min_cli_dir" ] && command -v cargo >/dev/null 2>&1; then
+    echo "no usable 'min' on PATH and no build under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
+    if (cd "$ROOT" && cargo build --locked -p minimal --bin min \
+        -p "$min_daemon" --bin "$min_daemon") >"$WORK/cli-build.log" 2>&1; then
+      for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
+        if [ -x "$d/min" ]; then
+          min_cli_dir="$d"
+          break
+        fi
+      done
+      if [ -n "$min_cli_dir" ]; then
+        echo "built the pair: $min_cli_dir/min and $min_cli_dir/$min_daemon"
+      fi
+    else
+      echo "::warning::building the CLI pair failed — the gates below name what is missing. Build log tail follows:" >&2
+      tail -20 "$WORK/cli-build.log" 2>/dev/null || true
+    fi
+  fi
   if [ -n "$min_cli_dir" ]; then
     PATH="$min_cli_dir:$PATH"
     export PATH
@@ -425,6 +461,7 @@ teardown() {
   [ -n "$RECOVER_SEED_DIR" ] && rm -rf "$RECOVER_SEED_DIR"
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
+  [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
   # The forward holds the laptop-side listener; INT is the documented stop,
   # KILL the backstop so a hung relay cannot outlive the run.
   if [ -n "$RETIRED_FWD_PID" ]; then
@@ -856,6 +893,425 @@ if [ -n "${MINVMD_GVPROXY_BIN:-}" ]; then
 else
   echo "own-IP session proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
 fi
+}
+
+# ---------------------------------------------------------------------------
+# Own-IP egress declared and enforced, end to end (NET T20). Gated on
+# MINVMD_GVPROXY_BIN like the own-IP proof above: own-address enforcement lives
+# on the switch, so a target without one has nothing to prove here.
+#
+# This case drives the four egress flags the CLI exposes today
+# (`--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`)
+# through an own-address box, checks that `min session policy` shows the
+# effective rules, proves an allowed connection completes and a disallowed one
+# is dropped silently and logged, and records the deny-all default story around
+# it: while the default is only announced this build still allows a bare
+# own-address box and prints the coming change; an explicit deny-all declaration
+# stands in for the in-force default to show the box reaching nothing; and the
+# announcement names the opt-out flag that keeps the prior default.
+proof_own_ip_egress_declared_and_enforced() {
+  echo "::group::own-IP egress: declared and enforced (NET T20)"
+
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "own-IP egress proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  EGRESS_SEED_DIR="$(hook_mktemp /tmp/mnleg.XXXXXX)"
+  hook_seed_preamble > "$EGRESS_SEED_DIR/minimal.toml"
+  mkdir "$EGRESS_SEED_DIR/.git"
+
+  # The drop warning is a daemon-side record. On a native lane that log lives
+  # on this host; on a VM lane it is inside the guest tmpfs, inaccessible here
+  # (see hook_log_readable). Use the file's existing helper so the assertion
+  # only runs where it can actually read the log, and fails closed when it
+  # cannot.
+  assert_egress_drop_logged() {
+    if ! hook_log_readable; then
+      echo "egress-drop log check skipped (guest-side daemon log on VM lane)"
+      return 0
+    fi
+    if [ -n "$(hook_log_has 'network policy violation')" ]; then
+      echo "daemon log: found the egress-drop warning"
+      return 0
+    fi
+    echo "::error::no daemon log recorded the disallowed connection's drop"
+    fail
+  }
+
+  # Whether one of this proof's curl probes actually reached a server. curl
+  # ALWAYS writes its -w line — and writes `HTTP:000` when nothing answered —
+  # so a completed exchange is a zero exit OR any real status back, whatever
+  # the code and whatever curl then thought of the certificate. Judging by
+  # `HTTP:200` alone (an earlier draft) would read a redirect or a TLS
+  # complaint after a live answer as a drop, and prove enforcement nobody
+  # enforced.
+  egress_curl_answered() {
+    local eca_rc="$1" eca_status="$2"
+    [ "$eca_rc" -eq 0 ] && return 0
+    [ -n "$eca_status" ] && [ "$eca_status" != "HTTP:000" ] && return 0
+    return 1
+  }
+
+  # ---- NET-076: the coming deny-all default is announced -------------------
+  # A bare own-address box still allows everything while the default is only
+  # announced, but the user is told what is coming and how to keep the current
+  # behaviour.
+  announce_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-egress-announce --network own_ip 2>"$WORK/egress-announce.err")" || {
+    echo "::error::'min session activate --network own_ip' (announcement probe) failed"
+    cat "$WORK/egress-announce.err" 2>/dev/null || true
+    fail
+  }
+  announce_sid="$(printf '%s\n' "$announce_sid" | tail -n1 | tr -d '\r')"
+  if ! grep -q "Heads-up: the next release denies all external reach" "$WORK/egress-announce.err"; then
+    echo "::error::activate did not announce the coming deny-all default (NET-076)"
+    cat "$WORK/egress-announce.err" 2>/dev/null || true
+    fail
+  fi
+  if ! grep -q -- "--egress-deny-all-opt-out" "$WORK/egress-announce.err"; then
+    echo "::error::the deny-all announcement did not name the opt-out flag"
+    cat "$WORK/egress-announce.err" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-076 OK: activate announced the coming default and named the opt-out"
+
+  # The remaining probes exercise allowed/disallowed flows against the public
+  # internet, so they follow the same weather-aware policy as
+  # proof_session_outbound_request: at least one host must answer to prove the
+  # box can reach the network, but no CI gate turns red because example.com or
+  # example.org is having a bad minute. A helper returns 0 if >=1 host answers.
+  # The hosts are the caller's: the default pair is the sibling proof's, and a
+  # policy-bound box names only the destination its rules admit — probing a
+  # destination the box's own policy forbids could never answer, so asking one
+  # to prove its reachability that way is vacuous (the declared box below
+  # names example.com, the one host its allow list admits; example.org's
+  # disallowed outcome is asserted in its own right further down).
+  egress_reachability_probe() {
+    local er_sid="$1" er_prefix="$2"
+    shift 2
+    local er_hosts="$*"
+    [ -n "$er_hosts" ] || er_hosts="example.com example.org"
+    local er_ok=0 er_total=0 er_failed=""
+    local er_host er_try er_out er_status
+    for er_host in $er_hosts; do
+      er_total=$((er_total + 1))
+      er_status=0
+      er_out=""
+      for er_try in 1 2 3; do
+        er_out="$(mnl session exec "$er_sid" \
+          "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 30 https://$er_host" \
+          2>"$WORK/${er_prefix}-reach.err")"
+        er_status=$?
+        if [ "$er_status" -eq 0 ] && [ "$er_out" = "HTTP:200" ]; then
+          break
+        fi
+        if [ "$er_try" -lt 3 ]; then
+          echo "reachability probe https://$er_host failed on attempt ${er_try}/3 (status ${er_status}, got '${er_out:-<none>}'); retrying"
+          cat "$WORK/${er_prefix}-reach.err" 2>/dev/null || true
+          sleep "$((er_try * 3))"
+        fi
+      done
+      if [ "$er_status" -eq 0 ] && [ "$er_out" = "HTTP:200" ]; then
+        er_ok=$((er_ok + 1))
+        echo "reachability probe https://$er_host: HTTP 200 (attempt ${er_try}/3)"
+      else
+        er_failed="${er_failed} https://$er_host (status ${er_status}, got '${er_out:-<none>}')"
+        echo "reachability probe https://$er_host failed all 3 attempts; transcript above"
+      fi
+    done
+    if [ "$er_ok" -gt 0 ]; then
+      echo "external-reachability guard OK (${er_ok}/${er_total} hosts answered)"
+      return 0
+    fi
+    echo "::warning::external-reachability guard failed for ${er_prefix} box against all ${er_total} hosts (${er_failed}); the remaining probes that need the public internet are skipped as warnings"
+    return 1
+  }
+
+  if egress_reachability_probe "$announce_sid" "announce" example.com example.org; then
+    echo "allowed-connection OK: a bare box still reaches the network during the announcement"
+  else
+    echo "allowed-connection WARNING: the bare box could not prove external reachability; the announcement text and opt-out were still verified above"
+  fi
+
+  # ---- the destination the declared box must be refused, proven live first --
+  # NET-062's drop is only meaningful against a destination this lane can
+  # actually reach: a connection nobody could have completed reads as a
+  # "silent drop" on a networkless lane, which is enforcement nobody enforced.
+  # So the SAME run first asks a box with NO egress section — the announce box
+  # above, which the announcement phase still leaves unrestricted — to
+  # complete the exact connection the declared box must be refused. Its
+  # completing proves the destination is live and reachable through this
+  # switch fabric, so the declared box's non-completion below can only be its
+  # own rules — and it doubles as the reach the coming deny-all default takes
+  # away (NET-074).
+  #
+  # The destination is a LITERAL public address, and it is chosen so nothing
+  # the declared box admits can ever cover it. Its allow subnets are a
+  # documentation range and its deny subnets another, which leaves the one
+  # other way an address outside `allow_subnets` still connects: a DNS pin,
+  # design §5.3's DNS-pinned admission, which admits an *address* for the
+  # window its name resolved in — and admits it however the application
+  # learned it, `curl --resolve` included, because the pin table is keyed by
+  # address alone (crates/minimald/src/net/dns_gate.rs). An earlier round
+  # probed a host-resolved address of example.com itself on the belief that
+  # "the box's own resolution" and the host's never agree; the macOS lane is
+  # where they do — both ride the same upstream — so the pinned address was
+  # held, the "disallowed" connection was an allowed one, and the proof read
+  # a completed connection as a failure to enforce. The candidates are public
+  # anycast service endpoints, live on 443 and stable by design, that the one
+  # name this box pins (example.com) can never resolve to — and being
+  # literals, no resolver has to agree with anything for the probe to run.
+  # Two of them, because a lane whose network blocks one still deserves the
+  # proof: the first the bare box reaches is the one the declared box must be
+  # refused.
+  egress_disallowed_dst=""
+  for egress_dst_candidate in 1.1.1.1 9.9.9.9; do
+    for egress_dst_try in 1 2 3; do
+      egress_dst_out="$(mnl session exec "$announce_sid" \
+        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 20 https://$egress_dst_candidate/" \
+        2>"$WORK/egress-dst-live.err")"
+      egress_dst_rc=$?
+      if egress_curl_answered "$egress_dst_rc" "${egress_dst_out:-}"; then
+        egress_disallowed_dst="$egress_dst_candidate"
+        echo "control GET https://$egress_dst_candidate/ from the bare box -> ${egress_dst_out:-<none>} (attempt ${egress_dst_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
+        break
+      fi
+      echo "control GET https://$egress_dst_candidate/ from the bare box failed on attempt ${egress_dst_try}/3 (rc ${egress_dst_rc}, got '${egress_dst_out:-<none>}')"
+      cat "$WORK/egress-dst-live.err" 2>/dev/null || true
+      if [ "$egress_dst_try" -lt 3 ]; then
+        sleep 3
+      fi
+    done
+    if [ -n "$egress_disallowed_dst" ]; then
+      break
+    fi
+  done
+  if [ -z "$egress_disallowed_dst" ]; then
+    echo "::warning::the bare box could not reach a disallowed candidate destination on this run, so the disallowed-connection drop below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
+  fi
+  mnl session destroy --force "$announce_sid" >/dev/null 2>&1 || true
+
+  # ---- NET-060/061/062/063: four-field declaration, effective rules, drop --
+  # The allowed list is intentionally narrow: one non-loopback documentation
+  # CIDR, example.com, and TCP+UDP. The CIDR is TEST-NET-3 (RFC 5737): a range
+  # no real destination ever sits inside, so the rule can never admit live
+  # traffic — but it is a genuine allow rule, unlike the loopback entry an
+  # earlier round used: the infrastructure deny set always refuses 127.0.0.0/8
+  # (design §5.3's rebinding defence, CIDR-admitted flows included), so a
+  # `127.0.0.1/32` rule can never admit anything and would present a dead
+  # entry as a working allow rule. The resolver carve-out handles DNS to the
+  # switch gateway, so example.com resolves and is admitted by name.
+  declare_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-egress-declared --network own_ip \
+    --allow-subnets 203.0.113.0/24 \
+    --allow-dns-hosts example.com \
+    --allow-protocols tcp \
+    --allow-protocols udp \
+    --deny-subnets 198.51.100.0/24 \
+    2>"$WORK/egress-declared.err")" || {
+    echo "::error::'min session activate' with the four egress fields failed"
+    cat "$WORK/egress-declared.err" 2>/dev/null || true
+    fail
+  }
+  declare_sid="$(printf '%s\n' "$declare_sid" | tail -n1 | tr -d '\r')"
+  if grep -q "Heads-up: the next release denies all external reach" "$WORK/egress-declared.err"; then
+    echo "::error::a declared box was announced as if it had no egress section"
+    cat "$WORK/egress-declared.err" 2>/dev/null || true
+    fail
+  fi
+  echo "own-IP session with four egress fields: $declare_sid"
+
+  policy_out="$(mnl session policy "$declare_sid" 2>"$WORK/egress-policy.err")" || {
+    echo "::error::'min session policy' failed for the declared box"
+    cat "$WORK/egress-policy.err" 2>/dev/null || true
+    fail
+  }
+  echo "effective policy of the declared box:"
+  printf '%s\n' "$policy_out" | sed 's/^/  /'
+  if ! grep -q "subnets  203.0.113.0/24" <<<"$policy_out" \
+    || ! grep -q "dns hosts  example.com" <<<"$policy_out" \
+    || ! grep -q "protocols  tcp, udp" <<<"$policy_out" \
+    || ! grep -q "deny subnets  198.51.100.0/24" <<<"$policy_out"; then
+    echo "::error::'min session policy' did not show all four declared egress fields"
+    echo "--- raw policy output ---"
+    printf '%s\n' "$policy_out"
+    fail
+  fi
+  echo "NET-061 OK: the four egress fields are visible in the effective policy"
+
+  # The connection probes need the public internet. Their control is the
+  # allowed name's own completion (NET-063): example.com is the one
+  # destination this box's rules admit, so its completing proves both the
+  # lane's network and the allowed path — and, on the SAME run, separates a
+  # policy drop from a dead network, which is what lets the fast-failure
+  # branches below be hard fails instead of weather warnings. The control's
+  # result is kept for the deny-all stand-in further down, whose own
+  # reachability cannot be probed from itself (it reaches nothing by
+  # construction, so a guard run from it could never pass).
+  declared_reach_ok=0
+  if egress_reachability_probe "$declare_sid" "declared" example.com; then
+    declared_reach_ok=1
+    echo "NET-063 OK: https://example.com completed — allowed by name and protocol, and the control that separates a policy drop below from a dead network"
+
+    # ---- NET-062: a packet to an unadmitted address drops silently ---------
+    # The silent drop NET-062 binds is a packet property, not a name one: a
+    # name outside `allow_dns_hosts` is a resolver matter (design §5.3 refuses
+    # non-matching names at resolution), so the drop is proven against a
+    # destination ADDRESS no rule and no pin admits — the literal chosen and
+    # proven live further up, from the bare box, in this same run. Two
+    # controls bracket it: the bare box's completed connection to the very
+    # destination (a live destination on this lane, reached through the same
+    # fabric) and this box's own completed connection to example.com above
+    # (this box's network and its allowed path), so a non-completion here is
+    # neither a dead route nor a dead box, and a fast refusal is the box's own
+    # doing rather than weather.
+    if [ -z "$egress_disallowed_dst" ]; then
+      echo "::warning::NET-062: the disallowed-address drop is skipped as a weather warning (the bare box reached no candidate destination above, so a drop here would prove nothing about the rules)"
+    else
+      deny_start_ms="$(now_ms)"
+      mnl session exec "$declare_sid" \
+        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://$egress_disallowed_dst/" \
+        >"$WORK/egress-deny-ip.out" 2>"$WORK/egress-deny-ip.err"
+      deny_rc=$?
+      deny_elapsed_ms=$(( $(now_ms) - deny_start_ms ))
+      deny_status="$(cat "$WORK/egress-deny-ip.out" 2>/dev/null)"
+      deny_err="$(tr '\n' ' ' < "$WORK/egress-deny-ip.err" 2>/dev/null)"
+      echo "disallowed-address GET https://$egress_disallowed_dst/ -> rc=$deny_rc status=${deny_status:-<none>} elapsed=${deny_elapsed_ms}ms curl: ${deny_err:-<none>}"
+      if egress_curl_answered "$deny_rc" "${deny_status:-}"; then
+        echo "::error::NET-062: a connection to an address no rule admits ($egress_disallowed_dst) completed — the bare box completed this same connection above, so the lane reaches the destination and the egress rules did not enforce"
+        cat "$WORK/egress-deny-ip.err" 2>/dev/null || true
+        fail
+      fi
+      if printf '%s' "$deny_err" | grep -qi 'reset by peer'; then
+        echo "::error::NET-062: the disallowed connection was reset, not dropped silently"
+        cat "$WORK/egress-deny-ip.err" 2>/dev/null || true
+        fail
+      fi
+      if [ "$deny_elapsed_ms" -ge 6000 ]; then
+        echo "NET-062 OK: the disallowed connection to $egress_disallowed_dst dropped silently (no answer and no reset until the 10 s timeout), while the bare box completed the same connection in this run"
+        assert_egress_drop_logged
+        echo "NET-062 (rate-limited warning) OK: the drop is logged"
+      else
+        echo "::error::NET-062: the disallowed connection failed in ${deny_elapsed_ms}ms — a fast refusal, not a silent drop. The controls bracketing this probe (the bare box's completed connection to the same destination, and this box's own to https://example.com) both completed on this run, so the network path is alive and the fast failure is the box's own doing"
+        cat "$WORK/egress-deny-ip.err" 2>/dev/null || true
+        fail
+      fi
+    fi
+
+    # ---- the disallowed NAME, its own assertion ----------------------------
+    # example.org is outside `allow_dns_hosts`, so its connection must not
+    # complete. Whether it is refused FAST at resolution (the design outcome:
+    # the resolver refuses a non-matching name) or TIMES OUT with no reset
+    # (the current relay leaves the name unpinned and drops the SYN) is NOT
+    # asserted either way — reconciling those two is the dns_gate work's, not
+    # this proof's — but the observed outcome is printed, with the curl error
+    # and the elapsed time, so the transcript names which behaviour this
+    # build has.
+    name_deny_start_ms="$(now_ms)"
+    mnl session exec "$declare_sid" \
+      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.org" \
+      >"$WORK/egress-deny-name.out" 2>"$WORK/egress-deny-name.err"
+    name_rc=$?
+    name_elapsed_ms=$(( $(now_ms) - name_deny_start_ms ))
+    name_status="$(cat "$WORK/egress-deny-name.out" 2>/dev/null)"
+    name_err="$(tr '\n' ' ' < "$WORK/egress-deny-name.err" 2>/dev/null)"
+    if egress_curl_answered "$name_rc" "${name_status:-}"; then
+      echo "::error::https://example.org completed — a name outside allow_dns_hosts reached its destination; the egress rules did not enforce"
+      cat "$WORK/egress-deny-name.err" 2>/dev/null || true
+      fail
+    fi
+    name_outcome="fast refusal"
+    if grep -qi 'could not resolve' "$WORK/egress-deny-name.err" 2>/dev/null; then
+      name_outcome="fast resolver refusal"
+    elif [ "$name_elapsed_ms" -ge 6000 ]; then
+      name_outcome="timeout with no reset"
+    fi
+    echo "disallowed-name GET https://example.org -> rc=$name_rc status=${name_status:-<none>} elapsed=${name_elapsed_ms}ms ($name_outcome) curl: ${name_err:-<none>}"
+  else
+    echo "allowed/disallowed-connection WARNING: the declared box could not complete its allowed connection to https://example.com; the connection assertions that need the public internet are skipped as weather warnings"
+  fi
+
+  # ---- NET-074 stand-in: no egress section reaches nothing once the default
+  # is in force. The shipped phase is announced, so we exercise the
+  # enforcement shape with an explicit deny-all declaration (deny 0.0.0.0/0);
+  # the unit and CLI tests already cover the in-force resolution, and the
+  # announcement above covers the transition notice. This is a stand-in for
+  # NET-074's REACH only: NET-075's observable is the word `deny all` in
+  # `min session policy`, which an explicit-rule box cannot show — it shows
+  # its rule — so that rendering stays with the CLI tests that pin it.
+  deny_all_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-egress-deny-all --network own_ip \
+    --deny-subnets 0.0.0.0/0 \
+    2>"$WORK/egress-deny-all.err")" || {
+    echo "::error::'min session activate --deny-subnets 0.0.0.0/0' failed"
+    cat "$WORK/egress-deny-all.err" 2>/dev/null || true
+    fail
+  }
+  deny_all_sid="$(printf '%s\n' "$deny_all_sid" | tail -n1 | tr -d '\r')"
+
+  # "A box with no effective reach reaches nothing" only means something if
+  # the lane can already reach the public internet — otherwise the
+  # non-completion being asserted here is just the dead network. The control
+  # is the declared box's guard from THIS run, not a probe from the deny-all
+  # box itself: that box reaches nothing by construction, so a guard run from
+  # it could never pass and the assertion would always be skipped. Branch on
+  # the control — a hard assertion when it passed, a weather warning when it
+  # did not — and probe the same endpoint the control just proved answers.
+  if [ "$declared_reach_ok" != 1 ]; then
+    echo "::warning::NET-074: the declared box could not prove external reachability in this run, so the deny-all stand-in's reach assertion is skipped as a weather warning"
+  else
+    deny_all_start_ms="$(now_ms)"
+    mnl session exec "$deny_all_sid" \
+      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.com" \
+      >"$WORK/egress-deny-all.out" 2>"$WORK/egress-deny-all-curl.err"
+    deny_all_rc=$?
+    deny_all_elapsed_ms=$(( $(now_ms) - deny_all_start_ms ))
+    deny_all_status="$(cat "$WORK/egress-deny-all.out" 2>/dev/null)"
+    deny_all_err="$(tr '\n' ' ' < "$WORK/egress-deny-all-curl.err" 2>/dev/null)"
+    if egress_curl_answered "$deny_all_rc" "${deny_all_status:-}"; then
+      echo "::error::a deny-all box reached an external destination"
+      cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
+      fail
+    fi
+    # Two outcomes are legitimate for this box, and only two: the resolver
+    # refuses the name outright (example.com is in no allow list, and the
+    # address it resolves to sits inside the 0.0.0.0/0 deny), or the SYN
+    # leaves, matches the deny, and gets no answer until the timeout — the
+    # silent drop NET-062 binds, which is what an enforcing filter looks like
+    # from inside the box. A fast failure that is neither of those means the
+    # connection reached something that answered it, and the control that
+    # gated this branch completed https://example.com from the declared box in
+    # this run, so the destination answers on this lane: the fast failure is
+    # the box's own escaping SYN (or a broken probe), never weather. The
+    # disallowed-IP probe above hard-fails this same shape; accepting it here
+    # would print a policy hole as `NET-074 OK`.
+    deny_all_outcome="fast refusal"
+    if grep -qi 'could not resolve' "$WORK/egress-deny-all-curl.err" 2>/dev/null; then
+      deny_all_outcome="fast resolver refusal"
+    elif [ "$deny_all_elapsed_ms" -ge 6000 ]; then
+      deny_all_outcome="timeout with no reset"
+    fi
+    echo "deny-all GET https://example.com -> rc=$deny_all_rc status=${deny_all_status:-<none>} elapsed=${deny_all_elapsed_ms}ms ($deny_all_outcome) curl: ${deny_all_err:-<none>}"
+    if printf '%s' "$deny_all_err" | grep -qi 'reset by peer'; then
+      echo "::error::NET-074: the deny-all box's connection to https://example.com was reset by the destination — the SYN escaped the 0.0.0.0/0 deny and reached a server this run's control proved answers"
+      cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
+      fail
+    fi
+    if [ "$deny_all_outcome" = "fast refusal" ]; then
+      echo "::error::NET-074: the deny-all box failed in ${deny_all_elapsed_ms}ms — a fast refusal that is neither a resolver refusal nor a silent drop. The control above completed https://example.com from the declared box in this run, so the destination answers on this lane and the fast failure is the box's own escaping connection or a broken probe, not weather"
+      cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
+      fail
+    fi
+    echo "NET-074 OK: a box with no effective external reach gets nothing (explicit deny-all stand-in for the in-force default)"
+  fi
+
+  mnl session destroy --force "$declare_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$deny_all_sid" >/dev/null 2>&1 || true
+  rm -rf "$EGRESS_SEED_DIR"; EGRESS_SEED_DIR=""
+  echo "own-IP egress declared and enforced OK"
+  echo "::endgroup::"
 }
 
 # ---------------------------------------------------------------------------
@@ -5897,6 +6353,7 @@ case "${1:-}" in
     proof_session_exec
     proof_session_outbound_request
     proof_own_ip
+    proof_own_ip_egress_declared_and_enforced
     proof_task_run
     proof_hooks
     proof_skip_scaffold
@@ -5912,7 +6369,7 @@ case "${1:-}" in
     proof_proxy_refuses_like_direct
     proof_retired_surfaces_gone
     ;;
-  lifecycle | session_exec | session_outbound_request | own_ip | task_run | hooks \
+  lifecycle | session_exec | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | network_posture_from_stock_install | native_resolution_without_proxy_env \
     | hostnames_recover_and_two_daemons_route \
@@ -5923,7 +6380,7 @@ case "${1:-}" in
   *)
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
-    echo "  cases: lifecycle session_exec session_outbound_request own_ip task_run hooks"
+    echo "  cases: lifecycle session_exec session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run hooks"
     echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
     echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
