@@ -3049,10 +3049,19 @@ async fn a_restarted_daemon_re_derives_the_box_s_address_from_the_answerer() {
         .await
         .expect("a forced shutdown has nothing left to refuse it");
     let stopped = capture.contents();
+    // Scoped by session name, not by word alone: the capture buffer is
+    // process-wide and under libtest (`just test-cross`, minimald's macOS
+    // coverage) every test in the binary shares it, so an assertion that *no*
+    // line says `loopback-release` would fail on another test's destroy —
+    // `destroyed_box_name_is_nxdomain` releases on purpose. What this check
+    // owns is these two boxes: neither alpha nor beta may be released by a
+    // stop.
     assert!(
-        !stopped
-            .lines()
-            .any(|line| line.contains("loopback-release")),
+        !stopped.lines().any(|line| {
+            line.contains("loopback-release")
+                && (line.contains("session_name=\"alpha\"")
+                    || line.contains("session_name=\"beta\""))
+        }),
         "shutdown stops the boxes without releasing their grants: {stopped}"
     );
     drop(client);
