@@ -138,6 +138,30 @@ impl<C: Channel> Sandbox<C> {
         self.config.command_env()
     }
 
+    /// The host-side twin of the report file a leaf-bearing box's pre-exec
+    /// closure writes into its `/run` — the same file, through the sandbox's
+    /// read-write `/run` bind, named by the leaf ([`classifier::closure_report_name`]).
+    ///
+    /// For the daemon to read after the spawn: which cover the box took over
+    /// its classifier tree (the design's read-only cgroup2 mount of the
+    /// namespace root, or the recorded tmpfs fallback, with the errno that
+    /// forced it), or the errno the closure died on where the box never
+    /// reached its program — the `127` the spawn then reports, whose stderr
+    /// is the box's own stdio and reaches no daemon log without this file.
+    ///
+    /// `leaf` names a leaf this sandbox's box was placed in; the caller that
+    /// created the leaf is the caller that reads the report.
+    #[must_use]
+    pub fn closure_report_path(&self, leaf: &config::ClassifierLeaf) -> PathBuf {
+        let name = leaf
+            .dir()
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(classifier::closure_report_name)
+            .unwrap_or_else(|| classifier::closure_report_name("unnamed-leaf"));
+        self.base_dir.join("run").join(name)
+    }
+
     /// Creates a new sandbox, containing all filesystem state within `base_dir`.
     pub(crate) fn new(base_dir: PathBuf, config: Config, channel: C) -> Result<Self, Error> {
         // Setup the rootfs
@@ -431,6 +455,7 @@ impl Container {
             &mut command,
             self.socket_family_filter,
             sandbox.config.classifier_leaf.clone(),
+            sandbox.config.force_cover_fallback,
         )?;
 
         Ok(command)
@@ -493,14 +518,24 @@ impl Container {
 /// delegation boundary, and the process running as the delegated account
 /// inside it holds no capability over it). The tree the sandbox binds at the
 /// conventional mountpoint for the join is *covered* once the join has run —
-/// an empty read-only tmpfs — so the host's cgroup mount stays out of the
-/// box's mount namespace (the design's own wording of this obligation) and
-/// the box is left with no cgroup path to resolve at all: none to read a
-/// limit from, and none to write a migration to. The barrier against a box is
-/// therefore its cgroup-namespace root plus `nsdelegate` plus that cover —
-/// not the slice's uid, which the box shares with the daemon. Of those
-/// layers, the cover is the one the stand-in-tree tests can assert (a path
-/// under an empty tmpfs does not resolve); the namespace root needs the
+/// with the design's own cover, a read-only cgroup2 mount of the namespace
+/// root, so the host's cgroup mount stays out of the box's mount namespace
+/// while the box keeps exactly the view a cgroup-aware runtime expects to
+/// find: its own limit readable (`memory.max`) at the conventional place, no
+/// cgroup but its own reachable, its own root's `cgroup.procs` not writable.
+/// Where the kernel refuses that mount inside the box's user namespace, the
+/// bind is covered by an empty read-only tmpfs instead — a *recorded
+/// fallback*, never the design's cover: the box still has no cgroup path to
+/// write a migration to, but none to read a limit from either, which is why
+/// the fallback is reported through the sandbox's `/run` for the daemon to
+/// warn, marked in the box's own environment (`MINIMAL_CLASSIFIER_COVER`),
+/// and asserted by the tests branch by branch rather than passed off as the
+/// design. The barrier against a box is therefore its cgroup-namespace root
+/// plus `nsdelegate` plus that cover — not the slice's uid, which the box
+/// shares with the daemon. Of those layers, the cover is the one the
+/// stand-in-tree tests can assert per branch (nothing resolves under the
+/// fallback's tmpfs; under the design's cover the box's own `memory.max`
+/// resolves and a sibling's path does not); the namespace root needs the
 /// kernel's own bookkeeping to see, which is what the delegated-tree test
 /// asserts: the host-side `cgroup.procs` holds the box's pid while the box
 /// reads `0::/`.
@@ -523,11 +558,14 @@ pub mod classifier {
     pub const BOXES_DIR: &str = "boxes";
 
     /// The conventional cgroup2 mountpoint: where the box's classifier tree
-    /// is bound for the join, and where the empty read-only tmpfs that covers
-    /// the bind once the join has run is mounted over it. It is the one place
-    /// a cgroup-aware runtime looks, so it is the one place the cover has to
-    /// hold: with it there, the box has no cgroup path at all — none to read
-    /// a limit from, and none to write a migration to.
+    /// is bound for the join, and where the cover — the design's read-only
+    /// cgroup2 mount of the box's own namespace root, or the recorded empty
+    /// read-only tmpfs fallback — is mounted over that bind once the join
+    /// has run. It is the one place a cgroup-aware runtime looks, so it is
+    /// the one place the cover has to hold: under the design's cover the
+    /// box finds its own limit there and no cgroup but its own; under the
+    /// fallback it finds no cgroup path at all — none to read a limit
+    /// from, and none to write a migration to.
     pub const CONVENTIONAL_CGROUP2_MOUNTPOINT: &str = "/sys/fs/cgroup";
 
     /// The daemon's own leaf under `root`.
@@ -578,6 +616,20 @@ pub mod classifier {
     #[must_use]
     pub fn box_leaf(root: &Path, box_id: &str) -> PathBuf {
         root.join(BOXES_DIR).join(sanitize_box_id(box_id))
+    }
+
+    /// The name of the report file the box's pre-exec closure writes into
+    /// the sandbox's read-write `/run`, named by the leaf the box is placed
+    /// in so two sessions never share one. Spelled identically from both
+    /// sides of the `/run` bind: by the closure, which knows the leaf only
+    /// as the `cgroup.procs` it joined, and by the daemon, which knows the
+    /// leaf directory it created — see [`crate::Sandbox::closure_report_path`]
+    /// for the host-side twin. The report carries what nothing else can:
+    /// which cover the box took over its classifier tree, or the errno the
+    /// closure died on before the program ran.
+    #[must_use]
+    pub fn closure_report_name(box_id: &str) -> String {
+        format!("minimal-closure-{box_id}")
     }
 
     /// Creates the box's leaf under `root`, before the box's first process
@@ -861,8 +913,8 @@ pub mod classifier {
     /// Also asks the kernel for the `memory` controller on the cohort —
     /// best-effort, and safe: `boxes/` holds no process, so enabling a
     /// controller on it breaks no internal-process rule. A leaf without it
-    /// carries no `memory.max` at all, so no host-side reader — a
-    /// diagnostics bundle, or a box-held view a future revision restores —
+    /// carries no `memory.max` at all, so no reader — a diagnostics bundle
+    /// on the host side, or the box itself under the design's own cover —
     /// can name the limit a box's verdict is decided on.
     pub fn enter_daemon_leaf(root: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(root.join(BOXES_DIR))?;
@@ -982,11 +1034,12 @@ pub mod classifier {
 /// The closure runs after namespaces and credentials are configured but before
 /// the supervised program execs, which is the correct moment for all three.
 /// For a box with a classifier leaf it joins the leaf, unshares the cgroup
-/// namespace onto it, and covers the tree the join went through with an
-/// empty read-only tmpfs; it takes the box's credentials, loads the
-/// `&'static` filter the `Container` holds if there is one, and then execs
-/// the original program, since `command_from_closure` otherwise replaces
-/// the program entirely.
+/// namespace onto it, and covers the tree the join went through — with the
+/// design's read-only cgroup2 mount of the namespace root, or the recorded
+/// tmpfs fallback where the kernel refuses that mount; it takes the box's
+/// credentials, loads the `&'static` filter the `Container` holds if there
+/// is one, and then execs the original program, since
+/// `command_from_closure` otherwise replaces the program entirely.
 ///
 /// `command_from_closure` starts a fresh `Command`, so the working directory
 /// and environment already set on `command` are carried over to it: hakoniwa
@@ -1000,6 +1053,7 @@ fn install_box_credentials(
     command: &mut hakoniwa::Command,
     socket_family_filter: Option<&'static SocketFamilyFilter>,
     classifier_leaf: Option<config::ClassifierLeaf>,
+    force_cover_fallback: bool,
 ) -> Result<(), Error> {
     let program = command.get_program().to_string();
     let args = command.get_args();
@@ -1009,12 +1063,25 @@ fn install_box_credentials(
     // tree the sandbox bound at the conventional mountpoint, the only place
     // the leaf is reachable from inside the box. The write happens before the
     // cgroup namespace is unshared, and the cover mounted over the tree
-    // afterwards is empty — so this is also the last spelling of the leaf
-    // that ever opens for anything the box runs.
+    // afterwards leaves no spelling of another leaf at all — so this is also
+    // the last spelling of *this* leaf that ever opens for a migration.
     let classifier_join = classifier_leaf.map(|leaf| {
         Path::new(classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT)
             .join(leaf.relative_dir())
             .join("cgroup.procs")
+    });
+    // The closure's report file, in the sandbox's read-write `/run`, named by
+    // the leaf so two sessions never share one: the closure knows the leaf
+    // only as the `cgroup.procs` it joins, so the name is derived from that
+    // path here, and the daemon derives the same name from the leaf
+    // directory it created — see [`Sandbox::closure_report_path`], the
+    // host-side twin.
+    let closure_report = classifier_join.as_deref().and_then(|procs| {
+        procs
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .map(|box_id| Path::new("/run").join(classifier::closure_report_name(box_id)))
     });
     // SAFETY: `command_from_closure` is unsafe because the closure runs in a
     // forked child.  `socket_family_filter` is `&'static`: it is the
@@ -1033,6 +1100,8 @@ fn install_box_credentials(
                 &args,
                 socket_family_filter,
                 classifier_join.as_deref(),
+                force_cover_fallback,
+                closure_report.as_deref(),
             )
         })
     };
@@ -1044,11 +1113,54 @@ fn install_box_credentials(
     Ok(())
 }
 
+/// Writes the one line the box's pre-exec closure reports into the sandbox's
+/// read-write `/run` — the one directory the box and the daemon share — so
+/// the daemon can say, after the spawn, what nothing else can carry: which
+/// cover the box took over its classifier tree, or the errno that killed the
+/// closure before the program ran (the `127` the spawn then reports, whose
+/// stderr reaches only the box's own stdio, never a daemon log). Last
+/// writer wins, so a closure that covered and then failed reports the
+/// failure — the line worth reading is the one that says the box never
+/// reached its program.
+///
+/// Best-effort by design: a box that cannot say what it did still runs, and
+/// the daemon says so when the report never appears.
+#[cfg(target_os = "linux")]
+fn write_closure_report(report: Option<&Path>, line: &str) {
+    let Some(report) = report else { return };
+    let _ = std::fs::write(report, format!("{line}\n"));
+}
+
+/// Marks the cover the box took in its own environment
+/// (`MINIMAL_CLASSIFIER_COVER`: the design's `cgroup2`, or the recorded
+/// `tmpfs-fallback`) — the box-visible half of the fallback being recorded
+/// at all: a process inside the box can learn which it runs under, which is
+/// the question a cgroup-aware runtime in the box would ask first.
+///
+/// `setenv(3)` mutates this forked child's own `environ`, which the `execv(3)`
+/// below hands to the program, so the marker reaches everything the box
+/// execs after it.
+#[cfg(target_os = "linux")]
+fn set_box_cover_marker(cover: &'static str) {
+    // A `&str` carries no NUL of its own, so the value is rebuilt as a
+    // `CString` first: `setenv(3)` reads to the terminator, and a bare
+    // `as_ptr()` would read past the literal into whatever rodata sits
+    // behind it.
+    let cover = std::ffi::CString::new(cover).expect("the cover name has no NUL in it");
+    // SAFETY: `setenv(3)` with NUL-terminated literal name and value; it
+    // allocates, which this closure's contract already allows (see
+    // `install_box_credentials`).
+    unsafe {
+        libc::setenv(c"MINIMAL_CLASSIFIER_COVER".as_ptr(), cover.as_ptr(), 1);
+    }
+}
+
 /// The body of the launch closure in [`install_box_credentials`]: place the
-/// box in its classifier leaf, take the box's credentials, install the box's
-/// socket-family filter if it has one, then exec the program the caller asked
-/// for.  Never returns; a failure is reported on the child's stderr and exits
-/// it with the shell's "cannot run" status.
+/// box in its classifier leaf, cover the tree the join went through, take
+/// the box's credentials, install the box's socket-family filter if it has
+/// one, then exec the program the caller asked for.  Never returns; a
+/// failure is reported on the child's stderr, into the closure's report
+/// file, and exits the child with the shell's "cannot run" status.
 ///
 /// Split out of the closure so each unsafe operation sits in its own block
 /// rather than inheriting the one around `command_from_closure`.
@@ -1058,21 +1170,23 @@ fn exec_box_program(
     args: &[String],
     socket_family_filter: Option<&'static SocketFamilyFilter>,
     classifier_join: Option<&Path>,
+    force_cover_fallback: bool,
+    closure_report: Option<&Path>,
 ) -> ! {
     // The box's classifier leaf (NET-079), taken in the order the
     // confinement rests on: join first, *then* unshare the cgroup namespace,
     // so its root is the leaf the process just entered — the box's own view
     // of the hierarchy starts at the one cgroup its verdict is decided on.
     // The join is the last act that still runs in the daemon's namespaces,
-    // where the tree the sandbox bound resolves; the empty read-only tmpfs
-    // mounted over it afterwards is what keeps the host's cgroup mount out of
-    // the box's mount namespace, the design's own wording of the obligation,
-    // and leaves the box no cgroup path to resolve at all: none to read a
-    // limit from, and none to write a migration to. Failures exit the child:
-    // a box that cannot take the leaf its verdict is decided on must not run.
+    // where the tree the sandbox bound resolves; what covers that bind once
+    // the join has run is what keeps the host's cgroup mount out of the
+    // box's mount namespace — the design's own cgroup2 view of the
+    // namespace root, or the recorded tmpfs fallback below. Failures exit
+    // the child: a box that cannot take the leaf its verdict is decided on
+    // must not run.
     if let Some(procs) = classifier_join {
         if let Err(e) = classifier::place_pid(procs, std::process::id()) {
-            exit_child("joining the box's classifier leaf", &e);
+            exit_child("joining the box's classifier leaf", &e, closure_report);
         }
         // SAFETY: `unshare(2)` with the cgroup-namespace flag only;
         // async-signal-safe.
@@ -1080,40 +1194,95 @@ fn exec_box_program(
             exit_child(
                 "unsharing the cgroup namespace onto the box's leaf",
                 &std::io::Error::last_os_error(),
+                closure_report,
             );
         }
         let target = std::ffi::CString::new(classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT)
             .expect("the cgroup mountpoint has no NUL in it");
-        // SAFETY: `mount(2)` with valid C strings and no data; tmpfs takes
-        // no options but the flags (an empty one is all the cover needs).
-        // Async-signal-safe.
-        if unsafe {
-            libc::mount(
-                c"minimald-classifier-cover".as_ptr(),
-                target.as_ptr(),
-                c"tmpfs".as_ptr(),
-                libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-                std::ptr::null(),
-            )
-        } == -1
-        {
-            exit_child(
-                "covering the bound classifier tree",
-                &std::io::Error::last_os_error(),
-            );
+        // The cover the design asks for (architecture, *Box Resources*): a
+        // read-only cgroup2 mount of the namespace root — the box's own
+        // leaf, the cgroup its verdict is decided on — at the one place a
+        // cgroup-aware runtime looks. No data string, and the box's user
+        // namespace still holds CAP_SYS_ADMIN over this mount namespace, so
+        // the mount is the box's own to make. Inside it the box reads its
+        // own limit where a runtime looks for it (`memory.max`) and reaches
+        // no cgroup but its own: a sibling leaf is not below the namespace
+        // root and its path does not resolve, and the read-only mount (with
+        // `nsdelegate` on the host's side) leaves the root's own
+        // `cgroup.procs` unwritable, which is what makes leaving the leaf —
+        // let alone joining another box's — impossible.
+        //
+        // Where the kernel refuses that mount, the recorded fallback covers
+        // the bind with an empty read-only tmpfs instead: the host's cgroup
+        // mount still stays out of the box's mount namespace and no process
+        // the box runs is left a cgroup path to write a migration to, at
+        // the cost of the box reading no limit of its own either. That
+        // trade is why the fallback is *recorded* — reported through
+        // `/run` for the daemon to warn, marked in the box's environment —
+        // and never passed off as the design's cover. The fallback failing
+        // too is fatal, and not only in kind: a leaf-bearing box whose
+        // cover never came would keep the tree bind, writable, in its mount
+        // namespace.
+        let mut refused: Option<String> = None;
+        if force_cover_fallback {
+            // The test knob: the fallback branch, deterministically.
+            refused = Some("forced".to_string());
+        } else {
+            // SAFETY: `mount(2)` with valid C strings and no data; the
+            // cgroup2 view of a namespace root takes no options.
+            // Async-signal-safe.
+            if unsafe {
+                libc::mount(
+                    c"cgroup2".as_ptr(),
+                    target.as_ptr(),
+                    c"cgroup2".as_ptr(),
+                    libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                    std::ptr::null(),
+                )
+            } == -1
+            {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                refused = Some(format!("errno {errno}"));
+            } else {
+                write_closure_report(closure_report, "cover cgroup2");
+                set_box_cover_marker("cgroup2");
+            }
+        }
+        if let Some(why) = refused {
+            write_closure_report(closure_report, &format!("cover tmpfs-fallback {why}"));
+            set_box_cover_marker("tmpfs-fallback");
+            // SAFETY: `mount(2)` as above, with tmpfs, which takes no
+            // options but the flags (an empty one is all the cover needs).
+            if unsafe {
+                libc::mount(
+                    c"minimald-classifier-cover".as_ptr(),
+                    target.as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                    std::ptr::null(),
+                )
+            } == -1
+            {
+                exit_child(
+                    "covering the bound classifier tree with the recorded \
+                     fallback tmpfs",
+                    &std::io::Error::last_os_error(),
+                    closure_report,
+                );
+            }
         }
     }
     // SAFETY: `assume_box_credentials` is async-signal-safe; this is the
     // pre-exec moment it is for, with the namespace built and CAP_SETPCAP in
     // it still held.
     if let Err(e) = unsafe { assume_box_credentials() } {
-        exit_child("taking the box credentials", &e);
+        exit_child("taking the box credentials", &e, closure_report);
     }
     if let Some(filter) = socket_family_filter {
         // SAFETY: `install_socket_family_filter` is async-signal-safe, and
         // `filter` is `&'static`, so it stays valid for the call.
         if let Err(e) = unsafe { install_socket_family_filter(filter) } {
-            exit_child("installing the socket-family filter", &e);
+            exit_child("installing the socket-family filter", &e, closure_report);
         }
     }
     // `command_from_closure` replaces the program with this closure; exec
@@ -1121,7 +1290,7 @@ fn exec_box_program(
     // with the box's credentials (and, for a none box, its seccomp filter)
     // in place.
     let e = execv_in_child(program, args);
-    exit_child(&format!("exec {program}"), &e)
+    exit_child(&format!("exec {program}"), &e, closure_report)
 }
 
 /// Takes the credentials every box process execs with: sets `no_new_privs`,
@@ -1263,11 +1432,17 @@ fn execv_in_child(program: &str, args: &[String]) -> std::io::Error {
 
 /// Reports a failure of the forked child on its stderr and exits it with 127,
 /// the shell's "cannot run" status, so a spawn that never reached the program
-/// is distinguishable from the program's own exit codes.  Called after the
-/// fork, so it uses `write(2)` and `_exit(2)` rather than the Rust stdio and
-/// exit machinery.
+/// is distinguishable from the program's own exit codes.  The failure is
+/// reported into the closure's report file first, with its errno: the box's
+/// stderr is the session's own stdio, so without that line a `127` reaches no
+/// daemon log at all.  Called after the fork, so it uses `write(2)` and
+/// `_exit(2)` rather than the Rust stdio and exit machinery.
 #[cfg(target_os = "linux")]
-fn exit_child(what: &str, err: &std::io::Error) -> ! {
+fn exit_child(what: &str, err: &std::io::Error, report: Option<&Path>) -> ! {
+    write_closure_report(
+        report,
+        &format!("failed {what} errno {}", err.raw_os_error().unwrap_or(0)),
+    );
     let msg = format!("minimal: sandbox: {what} failed: {err}\n");
     // SAFETY: `write` and `_exit` are async-signal-safe; `msg` outlives the
     // write, and `_exit` does not return.
@@ -1408,10 +1583,11 @@ impl<C: Channel> Sandbox<C> {
         // The tree the leaf belongs to is bound at the conventional cgroup
         // mountpoint, so the box's own pre-exec closure can write its way
         // into the leaf — the one migration primitive the whole placement
-        // rests on — and the closure then covers the bind with an empty
-        // read-only tmpfs, so the host's cgroup mount stays out of the box's
-        // mount namespace and no process the box runs is left a cgroup path
-        // at all. The host's own cgroup2 mount is never bound into the box.
+        // rests on — and the closure then covers the bind with a read-only
+        // cgroup2 mount of the box's own namespace root, or with an empty
+        // read-only tmpfs where the kernel refuses that mount, so the
+        // host's cgroup mount stays out of the box's mount namespace either
+        // way. The host's own cgroup2 mount is never bound into the box.
         if let Some(leaf) = self.config.classifier_leaf.clone() {
             let mountpoint = classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT;
             let in_rootfs = self.rootfs().join(
@@ -1438,9 +1614,10 @@ impl<C: Channel> Sandbox<C> {
 
             // What the host's mount table says about cgroup2, for the launch
             // log: the box's confinement holds without `nsdelegate` — the
-            // cover leaves no cgroup path to write a migration to at all —
-            // but the absence of it is what a diagnostics bundle would look
-            // for first.
+            // cover leaves no cgroup path to write a migration to at all on
+            // the fallback, and on the design's own cover the namespace root
+            // is the leaf itself — but the absence of it is what a
+            // diagnostics bundle would look for first.
             let mountinfo = classifier::own_mountinfo().unwrap_or_default();
             let host_mounts = classifier::host_cgroup2_mounts(&mountinfo);
             let named = if host_mounts.is_empty() {
@@ -1461,7 +1638,9 @@ impl<C: Channel> Sandbox<C> {
             tracing::info!(
                 leaf = %leaf.dir().display(),
                 join_procs = %Path::new(mountpoint).join(leaf.relative_dir()).join("cgroup.procs").display(),
-                cover = "empty read-only tmpfs over the bound tree",
+                cover = "design: read-only cgroup2 of the box's namespace root; fallback: empty \
+                         read-only tmpfs where the kernel refuses that mount, recorded and \
+                         warned after the spawn",
                 host_cgroup_mount = %named,
                 "sandbox launch: box joins its classifier leaf before its \
                  cgroup namespace is unshared onto it"
@@ -3554,14 +3733,6 @@ mod tests {
         );
     }
 
-    /// C source for the probe this proof runs inside a box. It reports its
-    /// own pid (the one that wrote itself into its leaf), the box's own
-    /// cgroup as the kernel names it, what filesystem sits at the cgroup
-    /// mountpoint (the empty read-only tmpfs cover, when a leaf was
-    /// configured), whether the box can *read* the controllers file that
-    /// would sit there without the cover, and whether the paths that would
-    /// let it migrate anywhere open for writing at all.
-    #[cfg(target_os = "linux")]
     /// The files the kernel makes when a cgroup is created, modelled over a
     /// stand-in tree: `cgroup.procs` and `cgroup.threads` — the two migration
     /// files, empty because a fresh cgroup holds no process — and
@@ -3584,16 +3755,34 @@ mod tests {
         }
     }
 
+    /// C source for the probe this proof runs inside a box. It reports its
+    /// own pid (the one that wrote itself into its leaf), the box's own
+    /// cgroup as the kernel names it, the cover its pre-exec closure took
+    /// (`MINIMAL_CLASSIFIER_COVER`: the design's `cgroup2` view of its own
+    /// namespace root, or the recorded `tmpfs-fallback`), and then whatever
+    /// its argv asks of the mountpoint — what filesystem sits there, what
+    /// the box can read there, which migration paths open for writing — and
+    /// can hold the box in its leaf until a release file appears, so the
+    /// test can read the host's side of the tree while the box is still in
+    /// it.
+    #[cfg(target_os = "linux")]
     const CGROUP_PROBE_C: &str = r#"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/statfs.h>
 #include <time.h>
 #include <unistd.h>
 
 int main(int argc, char **argv) {
+    /* Unbuffered: every line is through the pipe the moment it is printed,
+       so a box held in its leaf reports live — the report does not wait for
+       the exit the hold delays, and a lost release file still leaves the
+       reader a report it can read. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     /* The box's own cgroup as the kernel names it: once the box has joined
        its leaf and unshared its cgroup namespace onto it, this is 0::/ — the
        box stands at the root of its own cgroup namespace, its own leaf. */
@@ -3611,55 +3800,69 @@ int main(int argc, char **argv) {
        cgroup.procs afterwards. */
     printf("pid: %ld\n", (long)getpid());
 
-    /* argv[1]: the cgroup mountpoint — statfs reports what is mounted there. */
-    if (argc > 1) {
-        struct statfs st;
-        if (statfs(argv[1], &st) == 0)
-            printf("fstype %s: magic %lu\n", argv[1], (unsigned long)st.f_type);
-        else
-            printf("fstype %s: errno %d\n", argv[1], errno);
-    }
+    /* The cover the box's pre-exec closure took over its classifier tree,
+       marked in the box's own environment: the design's read-only cgroup2
+       mount of the namespace root, or the recorded tmpfs fallback where the
+       kernel refused that mount. What each branch can reach — its own
+       limit, another leaf — is what the test asserts per branch. */
+    const char *cover = getenv("MINIMAL_CLASSIFIER_COVER");
+    printf("cover: %s\n", cover ? cover : "unset");
 
-    /* argv[2]: the controllers file that would sit at the mountpoint without
-       the cover — where a cgroup-aware runtime starts looking for the box's
-       limit, and where the cover leaves no cgroup file to find. */
-    if (argc > 2) {
-        int fd = open(argv[2], O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) {
-            printf("read %s: errno 0\n", argv[2]);
-            close(fd);
-        } else {
-            printf("read %s: errno %d\n", argv[2], errno);
-        }
-    }
-
-    /* argv[3]…: paths that must not open for writing — the box's own root
-       cgroup.procs (writing a pid there is leaving the leaf, which is what
-       confinement forbids) and a sibling box's cgroup.procs (the file a pid
-       is written into to join another box's verdict). */
-    for (int i = 3; i < argc; i++) {
-        int fd = open(argv[i], O_WRONLY | O_CLOEXEC);
-        if (fd >= 0) {
-            printf("open %s: errno 0\n", argv[i]);
-            close(fd);
-        } else {
-            printf("open %s: errno %d\n", argv[i], errno);
-        }
-    }
-
-    /* argv[i] of the form "HOLD:<path>": the box then stays alive until that
-       path appears, so the test can read the host's side of the tree — the
-       leaf's cgroup.procs, which the kernel empties the moment the box's
-       last process exits — while the box is still in it. 30s of waiting, so
-       a lost release file is a held box the test notices, not one it hangs
-       on. */
+    /* argv[i] names an operation on a path:
+         STATFS:<path>  what filesystem is mounted there — the cover itself;
+         READ:<path>    what the box can read: its own limit
+                        (<mountpoint>/memory.max) where a cgroup-aware
+                        runtime looks, or nothing at all;
+         WRITE:<path>   the migration paths that must not open: the box's
+                        own root cgroup.procs (writing a pid there is
+                        leaving the leaf, which is what confinement forbids)
+                        and a sibling leaf's cgroup.procs (the file a pid is
+                        written into to join another box's verdict);
+         HOLD:<path>    stay in the leaf until that path appears, so the test
+                        can read the host's side of the tree — the leaf's
+                        cgroup.procs, which the kernel empties the moment the
+                        box's last process exits — while the box is still in
+                        it. The hold runs last, when every line of the report
+                        is already out. */
+    const char *release = NULL;
     for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "HOLD:", 5) == 0) {
-            const char *release = argv[i] + 5;
-            for (int tries = 0; tries < 600 && access(release, F_OK) != 0; tries++) {
-                struct timespec ts = {0, 50 * 1000 * 1000};
-                nanosleep(&ts, 0);
+        if (strncmp(argv[i], "STATFS:", 7) == 0) {
+            const char *path = argv[i] + 7;
+            struct statfs st;
+            if (statfs(path, &st) == 0)
+                printf("fstype %s: magic %lu\n", path, (unsigned long)st.f_type);
+            else
+                printf("fstype %s: errno %d\n", path, errno);
+        } else if (strncmp(argv[i], "READ:", 5) == 0) {
+            const char *path = argv[i] + 5;
+            int fd = open(path, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                printf("read %s: errno 0\n", path);
+                close(fd);
+            } else {
+                printf("read %s: errno %d\n", path, errno);
             }
+        } else if (strncmp(argv[i], "WRITE:", 6) == 0) {
+            const char *path = argv[i] + 6;
+            int fd = open(path, O_WRONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                printf("open %s: errno 0\n", path);
+                close(fd);
+            } else {
+                printf("open %s: errno %d\n", path, errno);
+            }
+        } else if (strncmp(argv[i], "HOLD:", 5) == 0) {
+            release = argv[i] + 5;
+        }
+    }
+
+    /* 10s of waiting — shorter than the reader's deadline, so a lost release
+       file is a box the reader still sees out, never a report that times
+       out. */
+    if (release) {
+        for (int tries = 0; tries < 200 && access(release, F_OK) != 0; tries++) {
+            struct timespec ts = {0, 50 * 1000 * 1000};
+            nanosleep(&ts, 0);
         }
     }
     return 0;
@@ -3804,16 +4007,85 @@ int main(int argc, char **argv) {
         std::fs::create_dir_all(dir.join("etc")).expect("creating the probe rootfs etc");
     }
 
+    /// A probe box this proof launched and is holding in its leaf: the
+    /// report is not read yet — the probe's `HOLD:` argument keeps the box
+    /// in its leaf until the release file appears — so the test can read the
+    /// host's side of the tree while the box is still in it.
+    ///
+    /// The release handshake and the closure's report both run through the
+    /// sandbox's `/run`: it is the one live directory the host and the box
+    /// share — the bind is of the same directory, not a copy — where the
+    /// rootfs is assembled by hardlink, so a file created in its source
+    /// directory after the build never appears inside the box at all.
+    #[cfg(target_os = "linux")]
+    struct HeldProbe {
+        /// The probe's `key: value` report, read to EOF in the background:
+        /// the read finishes when the box exits, which the hold delays, and
+        /// the probe's stdout is unbuffered, so every line it prints is
+        /// already through the pipe while the box is held.
+        report: tokio::task::JoinHandle<Result<std::collections::BTreeMap<String, String>, String>>,
+        /// Creating this file releases the box's hold: the host-side twin of
+        /// the `HOLD:/run/<name>` path the probe polls.
+        release: PathBuf,
+        /// The box's sandbox base directory, whose `run` is the box's `/run`
+        /// — also where the pre-exec closure's cover report lands.
+        base: PathBuf,
+        /// Keeps the box's sandbox — and with it that base directory —
+        /// alive: the sandbox's own `Drop` removes the directory, and a held
+        /// probe reads the release and report files out of it. Dropped when
+        /// the probe's report is read.
+        keep_alive: Box<dyn Send>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl HeldProbe {
+        /// Ends the box's hold: creates the file the box is polling for.
+        fn release_hold(&self) {
+            std::fs::write(&self.release, b"released\n")
+                .unwrap_or_else(|e| panic!("releasing the held box: {e}"));
+        }
+
+        /// The probe's report, once the box has run to its end.
+        async fn report(self) -> std::collections::BTreeMap<String, String> {
+            // The box's sandbox stays alive until the report is in: the
+            // report is read from the child's stdout, and the tests read the
+            // base directory's other files — the closure's report, the
+            // hold's release — while the box is still held, which is this
+            // value's whole purpose.
+            let keep_alive = self.keep_alive;
+            let report = self.report;
+            let placed = report
+                .await
+                .expect("reading the held probe's report")
+                .expect("the probe in the box reported");
+            drop(keep_alive);
+            placed
+        }
+
+        /// Releases the box and reads what it printed, in one step — for the
+        /// boxes held only to keep their launch alive for the assertions.
+        async fn release_and_report(self) -> std::collections::BTreeMap<String, String> {
+            self.release_hold();
+            self.report().await
+        }
+    }
+
     /// Launches a box — from the production launch path, the same
     /// `Sandbox::new_container` every session runs — named `name`, placed in
-    /// `leaf` when there is one, running the probe with `probe_args`, and
-    /// returns its `key: value` report.
+    /// `leaf` when there is one, running the probe with `probe_args` — and
+    /// hands the box back *held*: the probe holds (`HOLD:/run/<name>` among
+    /// its args) until [`HeldProbe::release_hold`] creates that file, and
+    /// [`HeldProbe::report`] reads what the probe printed. With
+    /// `force_cover_fallback` the box's cover is forced onto its tmpfs
+    /// fallback — the branch a host whose kernel allows the design's
+    /// cgroup2 mount would otherwise never take.
     #[cfg(target_os = "linux")]
-    async fn box_probe_report(
+    async fn launch_box_probe(
         name: &str,
         leaf: Option<config::ClassifierLeaf>,
         probe_args: &[String],
-    ) -> std::collections::BTreeMap<String, String> {
+        force_cover_fallback: bool,
+    ) -> HeldProbe {
         use std::io::Read as _;
 
         let base_dir = box_base_dir(name);
@@ -3828,6 +4100,9 @@ int main(int argc, char **argv) {
             .with_dns(false);
         if let Some(leaf) = leaf {
             config = config.with_classifier_leaf(leaf);
+        }
+        if force_cover_fallback {
+            config = config.with_forced_cover_fallback();
         }
         let sandbox_home = tempfile::tempdir_in(&base_dir)
             .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
@@ -3851,41 +4126,83 @@ int main(int argc, char **argv) {
         command.stdout(hakoniwa::Stdio::MakePipe);
         let mut child = command.spawn().expect("spawning the probe in the box");
 
-        let stdout = child.stdout.take().expect("the probe's stdout pipe");
-        let report = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            tokio::task::spawn_blocking(move || {
-                let mut buf = Vec::new();
-                std::io::BufReader::new(stdout)
-                    .read_to_end(&mut buf)
-                    .expect("reading the probe's report");
-                buf
-            }),
-        )
-        .await
-        .expect("the probe in the box did not report in time")
-        .expect("spawn_blocking join");
-        let status = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || child.wait()),
-        )
-        .await
-        .expect("waiting for the probe in the box timed out")
-        .expect("spawn_blocking join")
-        .expect("waiting for the probe in the box");
-        assert!(
-            status.success(),
-            "the probe in the box failed: {status:?}\nreport: {}",
-            String::from_utf8_lossy(&report)
-        );
+        // The box's own `/run`, host-side: the hold's release file lands
+        // here, and so does the report the box's pre-exec closure wrote.
+        let run = sandbox.base_dir.join("run");
+        let release = probe_args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("HOLD:/run/"))
+            .map_or_else(|| run.join("probe-not-held"), |file| run.join(file));
 
-        String::from_utf8_lossy(&report)
-            .lines()
-            .filter_map(|line| {
-                line.split_once(": ")
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-            })
-            .collect()
+        let stdout = child.stdout.take().expect("the probe's stdout pipe");
+        // The reader runs in the background: its EOF is the box's exit, which
+        // the hold delays — this is the handshake's point — and its deadline
+        // counts from the spawn. The box's 10s hold is the shorter of the
+        // two, so a lost release file is a box that leaves on its own, never
+        // a report that times out.
+        let report = tokio::task::spawn(async move {
+            let report = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                tokio::task::spawn_blocking(move || {
+                    let mut buf = Vec::new();
+                    std::io::BufReader::new(stdout)
+                        .read_to_end(&mut buf)
+                        .expect("reading the probe's report");
+                    buf
+                }),
+            )
+            .await
+            .map_err(|_| "the probe in the box did not report in time".to_string())?
+            .expect("spawn_blocking join");
+            let status = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tokio::task::spawn_blocking(move || child.wait()),
+            )
+            .await
+            .map_err(|_| "waiting for the probe in the box timed out".to_string())?
+            .expect("spawn_blocking join")
+            .expect("waiting for the probe in the box");
+            if !status.success() {
+                return Err(format!(
+                    "the probe in the box failed: {status:?}\nreport: {}",
+                    String::from_utf8_lossy(&report)
+                ));
+            }
+            Ok(String::from_utf8_lossy(&report)
+                .lines()
+                .filter_map(|line| {
+                    line.split_once(": ")
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                .collect())
+        });
+
+        HeldProbe {
+            report,
+            release,
+            base: sandbox.base_dir.clone(),
+            // The box's sandbox stays alive for as long as the probe holds
+            // the box: its own `Drop` removes the base directory, and the
+            // two files this harness reads out of it — the closure's report
+            // and the hold's release — live in that directory's `/run`.
+            keep_alive: Box::new((sandbox, sandbox_home)),
+        }
+    }
+
+    /// Launches a box — from the production launch path, the same
+    /// `Sandbox::new_container` every session runs — named `name`, placed in
+    /// `leaf` when there is one, running the probe with `probe_args`, and
+    /// returns its `key: value` report: released at once, for the probes
+    /// that hold nothing.
+    #[cfg(target_os = "linux")]
+    async fn box_probe_report(
+        name: &str,
+        leaf: Option<config::ClassifierLeaf>,
+        probe_args: &[String],
+    ) -> std::collections::BTreeMap<String, String> {
+        let held = launch_box_probe(name, leaf, probe_args, false).await;
+        held.release_hold();
+        held.report().await
     }
 
     /// The daemon-side probe: a throwaway child of this process migrates
@@ -3957,14 +4274,22 @@ int main(int argc, char **argv) {
     ///   written by itself, and `/proc/self/cgroup` reads `0::/`: the box
     ///   stands at the root of its own cgroup namespace, which on a
     ///   tree-bearing host is its own leaf.
-    /// * **visibility**, in the same box: the empty read-only tmpfs
-    ///   covering the tree the join went through holds — the host's cgroup
-    ///   mount stays out of the box's mount namespace, and no cgroup file
-    ///   resolves at all — and every migration write fails, as it must
-    ///   without a path to write to: the root's own `cgroup.procs` (writing
-    ///   a pid there is leaving the leaf, which is what confinement
-    ///   forbids), and a sibling leaf's, which no path the box can spell
-    ///   reaches.
+    /// * **visibility**, in the same box, asserted per branch: the box's
+    ///   cover over the tree it joined through is the design's read-only
+    ///   cgroup2 view of its own namespace root where the kernel allows
+    ///   that mount, and the empty read-only tmpfs recorded as a fallback
+    ///   where it refuses it — the branch the box reports it took, in its
+    ///   environment and in the one-line report its pre-exec closure leaves
+    ///   for the daemon in the sandbox's `/run`, is the one whose assertions
+    ///   run. On the design's branch the host's cgroup mount stays out of
+    ///   the box's mount namespace while the box's own hierarchy is there
+    ///   to read, a sibling leaf's path does not resolve, and the root's
+    ///   own `cgroup.procs` is readable but not writable (writing a pid
+    ///   there is leaving the leaf, which is what confinement forbids); on
+    ///   the fallback no cgroup file resolves at all, so no migration
+    ///   write has a file to open. The fallback branch is also forced for
+    ///   a second box, so it is exercised wherever the tests run rather
+    ///   than only on a host the design's mount refuses.
     ///
     /// A box *without* a leaf is launched exactly as before: the placement is
     /// an opt-in per box, not a change to every sandbox (NET-079's exception).
@@ -4130,13 +4455,41 @@ int main(int argc, char **argv) {
             .to_string_lossy()
             .into_owned();
         let probe_args = vec![
-            mountpoint.clone(),
-            controllers.clone(),
-            root_procs.clone(),
-            sibling_procs.clone(),
+            format!("STATFS:{mountpoint}"),
+            format!("READ:{controllers}"),
+            format!("WRITE:{root_procs}"),
+            format!("WRITE:{sibling_procs}"),
         ];
 
-        let placed = box_probe_report("cg-probe", Some(leaf.clone()), &probe_args).await;
+        let held = launch_box_probe("cg-probe", Some(leaf.clone()), &probe_args, false).await;
+        // The channel the daemon reads, proved end to end: the box's
+        // pre-exec closure leaves its one-line report in the sandbox's
+        // `/run`, spelled there from the join path and here from the leaf
+        // directory, so the daemon can say after the spawn which cover the
+        // box took — or why it never reached its program. The closure has
+        // written it before the probe it execs runs at all, so it is there
+        // while the box is held.
+        let report_path = held
+            .base
+            .join("run")
+            .join(classifier::closure_report_name("cg-probe"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let closure_report = loop {
+            match std::fs::read_to_string(&report_path) {
+                Ok(report) => break report,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the box's pre-exec closure wrote no report into {}",
+                        report_path.display()
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(e) => panic!("reading the box's closure report: {e}"),
+            }
+        };
+        held.release_hold();
+        let placed = held.report().await;
         eprintln!(
             "a box with a leaf reports its own cgroup as: {}",
             placed
@@ -4183,57 +4536,138 @@ int main(int argc, char **argv) {
              the reading, is what `host_address_box_placed_in_leaf` proves"
         );
 
-        // The cover, mounted over the tree the box just joined through: the
-        // host's cgroup mount stays out of the box's mount namespace — the
-        // design's own wording of the obligation — and what sits at the one
-        // place a cgroup-aware runtime looks is an empty read-only tmpfs.
-        let what_sits_there = placed
-            .get(&format!("fstype {mountpoint}"))
+        // The cover over the tree the box just joined through, asserted per
+        // branch: the branch the box reports it took — in its environment
+        // and in the closure's report — is the one whose assertions run, so
+        // neither branch is pinned by claims the other disproves.
+        let cover = placed
+            .get("cover")
             .cloned()
             .unwrap_or_else(|| "no report".to_string());
+        eprintln!("the box took the {cover} cover over its bound classifier tree");
+        assert!(
+            closure_report.trim().starts_with(&format!("cover {cover}")),
+            "the closure's report into the sandbox's /run and its marker in \
+             the box's environment name the same cover: the report says \
+             {closure_report:?} while the box says {cover:?}"
+        );
+        match cover.as_str() {
+            "cgroup2" => {
+                // The design's cover: the host's cgroup mount stays out of
+                // the box's mount namespace — the design's own wording of
+                // the obligation — while the box keeps the view a
+                // cgroup-aware runtime expects of a box: its own hierarchy,
+                // rooted at its own leaf, there to read.
+                let what_sits_there = placed
+                    .get(&format!("fstype {mountpoint}"))
+                    .cloned()
+                    .unwrap_or_else(|| "no report".to_string());
+                assert_eq!(
+                    what_sits_there,
+                    format!("magic {CGROUP2_SUPER_MAGIC}"),
+                    "the box's own cgroup is mounted where a cgroup-aware \
+                     runtime looks, read-only — covered, not hidden from \
+                     itself"
+                );
+                assert_eq!(
+                    placed
+                        .get(&format!("read {controllers}"))
+                        .map(String::as_str),
+                    Some("errno 0"),
+                    "the box's own cgroup resolves: the controllers file a \
+                     cgroup-aware runtime starts from is there to read"
+                );
+                // And the barrier, on this branch asked of a kernel that
+                // holds the memberships: the root's own cgroup.procs is
+                // there to read but not to write — writing a pid there is
+                // leaving the leaf — and which refusal answers depends on
+                // who owns the file: the read-only mount answers `EROFS`
+                // where the box's uid owns it (a systemd delegation chowns
+                // its subtree to the daemon's account, which the box's uid
+                // maps onto), and `EACCES` where it does not, the kernel
+                // checking permission before the mount's flag. Either way
+                // the migration is refused, not granted.
+                let wrote_root = placed
+                    .get(&format!("open {root_procs}"))
+                    .cloned()
+                    .unwrap_or_else(|| "no report".to_string());
+                assert!(
+                    wrote_root == "errno 30" || wrote_root == "errno 13",
+                    "the box must not be able to write its own root's \
+                     cgroup.procs — writing a pid there is leaving the leaf \
+                     its verdict is decided on — but it reports {wrote_root:?}"
+                );
+                assert_eq!(
+                    placed
+                        .get(&format!("open {sibling_procs}"))
+                        .map(String::as_str),
+                    Some("errno 2"),
+                    "a sibling leaf is not below the box's cgroup namespace \
+                     root, so its path does not resolve at all — invisible, \
+                     not merely unwritable"
+                );
+            }
+            "tmpfs-fallback" => {
+                // The recorded fallback: the box is left no cgroup hierarchy
+                // to see at all, which is why the branch is recorded rather
+                // than passed off as the design's cover.
+                let what_sits_there = placed
+                    .get(&format!("fstype {mountpoint}"))
+                    .cloned()
+                    .unwrap_or_else(|| "no report".to_string());
+                assert_eq!(
+                    what_sits_there,
+                    format!("magic {TMPFS_SUPER_MAGIC}"),
+                    "where the kernel refuses the design's cgroup2 mount, the \
+                     tree the join went through is covered by an empty \
+                     read-only tmpfs instead"
+                );
+                assert_eq!(
+                    placed
+                        .get(&format!("read {controllers}"))
+                        .map(String::as_str),
+                    Some("errno 2"),
+                    "the cover holds on the fallback too: the controllers \
+                     file a cgroup-aware runtime starts from is not there to \
+                     find, so no cgroup file the box could name resolves at \
+                     the mountpoint"
+                );
+                for (path, whose) in [
+                    (&root_procs, "its own root's"),
+                    (&sibling_procs, "another box's"),
+                ] {
+                    assert_eq!(
+                        placed.get(&format!("open {path}")).map(String::as_str),
+                        Some("errno 2"),
+                        "the fallback leaves the box no cgroup path to open \
+                         {whose} cgroup.procs through — a migration out of \
+                         its leaf has no file to open, let alone permission \
+                         to write"
+                    );
+                }
+            }
+            other => panic!("the box reported a cover this proof does not know: {other}"),
+        }
+
+        // The fallback branch is exercised deterministically wherever the
+        // tests run, including on a host whose kernel allows the design's
+        // mount: forced there for a second box, so the recorded branch is
+        // never the one only a refusing host gets to see.
+        let forced = launch_box_probe("cg-probe-fallback", Some(leaf), &probe_args, true)
+            .await
+            .release_and_report()
+            .await;
         assert_eq!(
-            what_sits_there,
-            format!("magic {TMPFS_SUPER_MAGIC}"),
-            "with a leaf configured, the tree the join went through is \
-             covered: the box is left no cgroup hierarchy to see at all"
+            forced.get("cover").map(String::as_str),
+            Some("tmpfs-fallback"),
+            "the forced-fallback box reports the recorded tmpfs cover"
         );
         assert_eq!(
-            placed
-                .get(&format!("read {controllers}"))
+            forced
+                .get(&format!("fstype {mountpoint}"))
                 .map(String::as_str),
-            Some("errno 2"),
-            "the cover holds: the controllers file a cgroup-aware runtime \
-             starts from is not there to find, so no cgroup file the box \
-             could name resolves at the mountpoint"
-        );
-
-        // And the barrier. The root's own cgroup.procs is the one migration
-        // the cover forbids outright — writing a pid there is leaving the
-        // leaf — and under it the path does not resolve at all, before the
-        // kernel's migration rules are even asked.
-        let wrote_root = placed
-            .get(&format!("open {root_procs}"))
-            .cloned()
-            .unwrap_or_else(|| "no report".to_string());
-        assert_ne!(
-            wrote_root, "errno 0",
-            "the box must not be able to open its own root's cgroup.procs for \
-             writing — writing a pid there is leaving the leaf its verdict is \
-             decided on. It reports {wrote_root:?}"
-        );
-
-        // A sibling leaf is invisible: the cover leaves the box no path to
-        // spell another leaf's, so the file a pid would be written into to
-        // join another box's verdict does not even open.
-        let opened_sibling = placed
-            .get(&format!("open {sibling_procs}"))
-            .cloned()
-            .unwrap_or_else(|| "no report".to_string());
-        assert_ne!(
-            opened_sibling, "errno 0",
-            "the box must not be able to open another box's cgroup.procs — the \
-             file a pid is written into to join its verdict. It reports \
-             {opened_sibling:?}"
+            Some(&format!("magic {TMPFS_SUPER_MAGIC}")[..]),
+            "the recorded fallback is the empty read-only tmpfs, deterministically"
         );
 
         // The placement is an opt-in per box: a box with no classifier leaf
@@ -4259,6 +4693,14 @@ int main(int argc, char **argv) {
     /// performed — the host-side `cgroup.procs` of the leaf names the box's
     /// process while the box reads `0::/` — which no stand-in tree can prove,
     /// because a stand-in has no kernel to hold the membership.
+    ///
+    /// The box is held in its leaf by a real release-file handshake through
+    /// its own `/run` while the kernel's half is read, and the cover it took
+    /// — the design's cgroup2 view of its own namespace root, or the recorded
+    /// tmpfs where the kernel refuses that mount — is asserted per branch,
+    /// against the branch the box itself reports: on the design's branch the
+    /// sibling's path does not resolve while the box's own `memory.max` is
+    /// readable, and on the fallback nothing cgroup-shaped is.
     ///
     /// Gated, with the reason printed, on the two halves the kernel needs:
     /// the tree installed and writable by this account, and a child of this
@@ -4318,27 +4760,51 @@ int main(int argc, char **argv) {
             .expect("creating the sibling's leaf in the real tree");
         let mountpoint = classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT.to_string();
         let controllers = format!("{mountpoint}/cgroup.controllers");
+        let memory_max = format!("{mountpoint}/memory.max");
         let root_procs = format!("{mountpoint}/cgroup.procs");
         let sibling_procs = classifier::box_leaf(Path::new(&mountpoint), &sibling_id)
             .join("cgroup.procs")
             .to_string_lossy()
             .into_owned();
 
+        // The memory controller on the cohort, the same enabling a running
+        // daemon performs at its start (`enter_daemon_leaf`): without it a
+        // leaf carries no `memory.max` at all, and this proof reads the box's
+        // own limit under the design's cover — the assertion that the box's
+        // verdict is where a runtime looks. Best-effort and warned, as in
+        // the daemon; a host without the controller is one the design's own
+        // diagnostics already tell.
+        if let Err(e) = std::fs::write(boxes.join("cgroup.subtree_control"), "+memory\n")
+            && e.kind() != std::io::ErrorKind::NotFound
+            && e.kind() != std::io::ErrorKind::PermissionDenied
+        {
+            panic!("enabling the memory controller on the real cohort: {e}");
+        }
+
         // The probe holds the box in its leaf for a while — the kernel drops
         // the membership the moment the box's last process exits, so the
         // host's side of the tree has to be read while the box is still in
-        // it, and the box's build takes its own time to get there.
+        // it, and the box's build takes its own time to get there. The hold
+        // is a real handshake: the probe polls for a release file in its own
+        // `/run` — the one live directory the box and the host share — and
+        // ends on its own after 10s if no file appears, so a lost handshake
+        // costs a slow run, not a hung one.
+        let release_name = format!("probe-release-{}", std::process::id());
         let probe_args = vec![
-            mountpoint.clone(),
-            controllers.clone(),
-            root_procs.clone(),
-            sibling_procs.clone(),
-            "HOLD:15000".to_string(),
+            format!("STATFS:{mountpoint}"),
+            format!("READ:{controllers}"),
+            format!("READ:{memory_max}"),
+            format!("WRITE:{root_procs}"),
+            format!("WRITE:{sibling_procs}"),
+            format!("HOLD:/run/{release_name}"),
         ];
-        let held_name = box_id.clone();
-        let held_leaf = Some(config::ClassifierLeaf::new(leaf.clone()));
-        let report =
-            tokio::spawn(async move { box_probe_report(&held_name, held_leaf, &probe_args).await });
+        let held = launch_box_probe(
+            &box_id,
+            Some(config::ClassifierLeaf::new(leaf.clone())),
+            &probe_args,
+            false,
+        )
+        .await;
 
         // The kernel's own half of the placement: the leaf's `cgroup.procs`
         // on the host side, holding the box's own first process. The box
@@ -4374,36 +4840,147 @@ int main(int argc, char **argv) {
             "the member is the box's process, not this test's"
         );
 
-        let placed = report.await.expect("the probe's box");
+        // The closure's one-line report, read on the host side while the box
+        // is still held: the channel the daemon reads after every launch, on
+        // the real tree too — the cover the box took is not something the
+        // daemon has to guess from the absence of a 127.
+        let report_path = held
+            .base
+            .join("run")
+            .join(classifier::closure_report_name(&box_id));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let closure_report = loop {
+            match std::fs::read_to_string(&report_path) {
+                Ok(report) => break report,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the box's pre-exec closure wrote no report into {}",
+                        report_path.display()
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(e) => panic!("reading the box's closure report: {e}"),
+            }
+        };
+        held.release_hold();
+        let placed = held.report().await;
         assert_eq!(
             placed.get("self_cgroup").map(String::as_str),
             Some("0::/"),
             "the box reads the root of its own cgroup namespace — and the \
              kernel holds that process in the leaf, so the root is the leaf"
         );
-        // The barrier holds on the real tree as on the stand-in: the cover
-        // leaves the box no cgroup path at all, so the migration out of its
-        // leaf — to the tree root's own `cgroup.procs` or a sibling leaf's —
-        // has no file to open, let alone permission to write.
-        let wrote_root = placed
-            .get(&format!("open {root_procs}"))
+
+        // The cover, per branch — the branch the box reports it took, in its
+        // environment and in the closure's report, is the one asserted, so a
+        // host whose kernel refuses the design's cgroup2 mount proves the
+        // recorded fallback here rather than failing a claim it was never in
+        // a position to make.
+        let cover = placed
+            .get("cover")
             .cloned()
             .unwrap_or_else(|| "no report".to_string());
-        assert_ne!(
-            wrote_root, "errno 0",
-            "the box must not be able to open its own tree root's cgroup.procs \
-             for writing — writing a pid there is leaving the leaf. It reports \
-             {wrote_root:?}"
+        eprintln!("the box on the real tree took the {cover} cover");
+        assert!(
+            closure_report.trim().starts_with(&format!("cover {cover}")),
+            "the closure's report into the sandbox's /run and its marker in \
+             the box's environment name the same cover: the report says \
+             {closure_report:?} while the box says {cover:?}"
         );
-        let opened_sibling = placed
-            .get(&format!("open {sibling_procs}"))
-            .cloned()
-            .unwrap_or_else(|| "no report".to_string());
-        assert_ne!(
-            opened_sibling, "errno 0",
-            "the box must not be able to open a sibling leaf's cgroup.procs on \
-             the real tree either. It reports {opened_sibling:?}"
-        );
+        match cover.as_str() {
+            "cgroup2" => {
+                assert_eq!(
+                    placed
+                        .get(&format!("fstype {mountpoint}"))
+                        .map(String::as_str),
+                    Some(&format!("magic {CGROUP2_SUPER_MAGIC}")[..]),
+                    "the box's own cgroup is mounted where a cgroup-aware \
+                     runtime looks, read-only"
+                );
+                assert_eq!(
+                    placed
+                        .get(&format!("read {memory_max}"))
+                        .map(String::as_str),
+                    Some("errno 0"),
+                    "the box's own memory.max — the limit its verdict is \
+                     decided on — is readable under the design's cover, while \
+                     the sibling's whole path does not resolve"
+                );
+                assert_eq!(
+                    placed
+                        .get(&format!("read {controllers}"))
+                        .map(String::as_str),
+                    Some("errno 0"),
+                    "the controllers file a cgroup-aware runtime starts from \
+                     is there to read in the box's own cgroup"
+                );
+                let wrote_root = placed
+                    .get(&format!("open {root_procs}"))
+                    .cloned()
+                    .unwrap_or_else(|| "no report".to_string());
+                assert!(
+                    wrote_root == "errno 30" || wrote_root == "errno 13",
+                    "the box must not be able to write its own root's \
+                     cgroup.procs — writing a pid there is leaving the leaf \
+                     the kernel holds it in — but it reports {wrote_root:?} \
+                     (either refusal is the barrier: `EROFS` from the \
+                     read-only mount where the box's uid owns the file, \
+                     `EACCES` where it does not)"
+                );
+                assert_eq!(
+                    placed
+                        .get(&format!("open {sibling_procs}"))
+                        .map(String::as_str),
+                    Some("errno 2"),
+                    "the sibling's path does not resolve at all below the \
+                     box's cgroup namespace root — invisible, not merely \
+                     unwritable, so no pid of the box's can reach another \
+                     box's verdict"
+                );
+            }
+            "tmpfs-fallback" => {
+                assert_eq!(
+                    placed
+                        .get(&format!("fstype {mountpoint}"))
+                        .map(String::as_str),
+                    Some(&format!("magic {TMPFS_SUPER_MAGIC}")[..]),
+                    "where the kernel refuses the design's cgroup2 mount, the \
+                     box is left the recorded empty read-only tmpfs instead"
+                );
+                assert_eq!(
+                    placed
+                        .get(&format!("read {memory_max}"))
+                        .map(String::as_str),
+                    Some("errno 2"),
+                    "the fallback costs the box its own limit too: nothing \
+                     cgroup-shaped resolves, which is why the branch is \
+                     recorded rather than passed off as the design's cover"
+                );
+                assert_eq!(
+                    placed
+                        .get(&format!("read {controllers}"))
+                        .map(String::as_str),
+                    Some("errno 2"),
+                    "the controllers file a cgroup-aware runtime starts from \
+                     does not resolve under the fallback either"
+                );
+                for (path, whose) in [
+                    (&root_procs, "its own root's"),
+                    (&sibling_procs, "another box's"),
+                ] {
+                    assert_eq!(
+                        placed.get(&format!("open {path}")).map(String::as_str),
+                        Some("errno 2"),
+                        "the fallback leaves the box no cgroup path through \
+                         which to open {whose} cgroup.procs — a migration out \
+                         of its leaf has no file to open, let alone \
+                         permission to write"
+                    );
+                }
+            }
+            other => panic!("the box reported a cover this proof does not know: {other}"),
+        }
 
         // The box is out, so its leaf is empty and removable — and this test
         // owes the real tree both of the leaves it made in it.

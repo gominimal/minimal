@@ -334,6 +334,16 @@ pub struct Config {
     /// decide per box — where the box runs unenforced rather than being
     /// refused (NET-079's exception).
     pub classifier_leaf: Option<ClassifierLeaf>,
+
+    /// Whether the box's classifier cover is forced onto its tmpfs fallback —
+    /// the branch the design takes only where the kernel refuses the
+    /// read-only cgroup2 mount of the namespace root. A test knob
+    /// ([`Self::with_forced_cover_fallback`]), never set in production: on a
+    /// host whose kernel does mount cgroup2 inside a box's user namespace, it
+    /// is the only way to exercise the recorded-fallback branch
+    /// deterministically — the branch every launch takes on a host whose
+    /// kernel refuses that mount.
+    pub(crate) force_cover_fallback: bool,
 }
 
 /// A command to be run in the sandbox.
@@ -514,6 +524,7 @@ impl Config {
             cpu_weight: None,
             daemon_id: None,
             classifier_leaf: None,
+            force_cover_fallback: false,
         }
     }
 
@@ -667,6 +678,17 @@ impl Config {
     /// the daemon, which owns the pids to move and the leaf's lifetime.
     pub fn with_classifier_leaf(mut self, leaf: ClassifierLeaf) -> Self {
         self.classifier_leaf = Some(leaf);
+        self
+    }
+
+    /// Forces a leaf-bearing box's cover onto its recorded tmpfs fallback,
+    /// skipping the design's read-only cgroup2 mount of the namespace root.
+    /// Test-only, so a host whose kernel *does* allow that mount can still
+    /// exercise the fallback branch deterministically: the branch the box
+    /// tests assert per cover, split by the cover the box reports it took.
+    #[cfg(test)]
+    pub(crate) fn with_forced_cover_fallback(mut self) -> Self {
+        self.force_cover_fallback = true;
         self
     }
 
