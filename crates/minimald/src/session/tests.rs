@@ -2782,7 +2782,7 @@ async fn name_registered_at_finalize() {
     let logged = capture.contents();
     let lease_line = logged
         .lines()
-        .find(|line| line.contains("loopback-lease") && line.contains("session_name=web"))
+        .find(|line| line.contains("loopback-lease") && line.contains("session_name=\"web\""))
         .unwrap_or_else(|| panic!("the lease must be logged, got: {logged}"));
     assert!(
         lease_line.contains(&format!("ip={address}")),
@@ -2933,7 +2933,7 @@ async fn destroyed_box_name_is_nxdomain() {
     let logged = capture.contents();
     let release_line = logged
         .lines()
-        .find(|line| line.contains("loopback-release") && line.contains("session_name=web"))
+        .find(|line| line.contains("loopback-release") && line.contains("session_name=\"web\""))
         .unwrap_or_else(|| panic!("the release must be logged, got: {logged}"));
     assert!(
         release_line.contains(&format!("ip={address}")),
