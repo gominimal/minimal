@@ -38,7 +38,10 @@
 //! published box did not declare is dropped where it stands, silently — a
 //! drop is not a reset (NET-062) — with one rate-limited warn line per source
 //! address per rule, so a diagnostic bundle's daemon log tail carries what
-//! the host is dropping and why without a flood's noise.
+//! the host is dropping and why without a flood's noise. The table those
+//! lines are keyed in is bounded, because the source address a frame is keyed
+//! by is the frame's own bytes: a guest flooding distinct spoofed addresses
+//! cannot turn the throttling into host-memory growth.
 
 use std::collections::HashMap;
 use std::io;
@@ -96,6 +99,24 @@ const fn max_frame() -> usize {
 /// One drop warning per source address per rule per interval — the cadence the
 /// daemon's policy warnings use, so a host's log speaks with one voice.
 const DROP_WARN_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How many distinct `(source, rule)` pairs the limiter keeps a window for —
+/// the gate's memory bound on its drop lines. The source address a dropped
+/// frame is keyed by is the frame's own bytes, read off the wire, and the
+/// guest chooses those: flooding the shuttle with frames from ever-different
+/// spoofed addresses would otherwise grow host memory one entry per frame,
+/// an amplification against the very path the gate exists to protect. Past
+/// the cap, a pair the table holds no window for shares one line per rule
+/// ([`DropKey::Overflow`]), so a flood costs at most one line per rule per
+/// interval and no memory at all.
+///
+/// The cap sits far past any honest host's need: the pairs that exist
+/// legitimately are the published boxes' few addresses under a closed
+/// handful of rules, while more distinct sources dropping within one
+/// interval than this is a spoofed flood by shape. Stale windows are pruned
+/// before the fallback is taken, so a flood that has ended restores
+/// per-source lines within one interval.
+const DROP_WARN_MAX_TRACKED_PAIRS: usize = 1024;
 
 /// The rule name for NET-081's failure case: a frame whose source address no
 /// published namespace holds. Its own rule, not the lease check's, because
@@ -414,15 +435,40 @@ fn family_drop(family: FrameFamily) -> DropReason {
     }
 }
 
-/// The rate-limit key: the source address the dropped frame carried — `None`
-/// for a frame with no readable source — and the rule that dropped it, the two
-/// things the drop line names.
-type DropKey = (Option<[u8; 4]>, &'static str);
+/// The rate-limit key: a dropped frame's source address under the rule that
+/// dropped it — `None` for a frame with no readable source — or, past
+/// [`DROP_WARN_MAX_TRACKED_PAIRS`], the rule alone.
+#[derive(Debug, Hash, PartialEq, Eq)]
+enum DropKey {
+    /// One source address under one rule: the two things the drop line names.
+    Source(Option<[u8; 4]>, &'static str),
+    /// The rule's shared window, which every pair the table held no room for
+    /// is folded into.
+    Overflow(&'static str),
+}
+
+/// What the limiter decided for one dropped frame: whether a warning fires,
+/// and which window it fires under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarnDecision {
+    /// The pair's own window fired: emit the line naming its source.
+    Named,
+    /// The pair table is full of live windows, so the rule's shared window
+    /// fired instead: emit the flood line, naming no source.
+    Overflow,
+    /// A window fired inside the interval: emit nothing.
+    Silent,
+}
 
 /// The gate's rate limiter: one drop warning per source address per rule per
 /// [`DROP_WARN_MIN_INTERVAL`], keyed by the two things the drop line names.
 /// Keyed per source and per rule both, so one address's flood neither silences
 /// another's single drop nor merges two rules into one line.
+///
+/// The window table is bounded at [`DROP_WARN_MAX_TRACKED_PAIRS`] — the
+/// source address it keys by is the frame's own bytes, chosen by the guest,
+/// and the guest is the side this gate exists to contain — so the throttling
+/// cannot be turned into host-memory growth.
 #[derive(Debug, Default)]
 struct DropLimiter {
     last: Mutex<HashMap<DropKey, Instant>>,
@@ -434,21 +480,48 @@ impl DropLimiter {
         Self::default()
     }
 
-    /// Whether enough time has elapsed since the last emission for `src`
-    /// under `rule` to warn again at `now`, recording `now` as that pair's
-    /// last emission when it returns `true`. Split from [`emit`](Self::emit)
-    /// so the rate-limit decision is testable without a clock or a `tracing`
-    /// subscriber.
-    fn should_warn_at(&self, src: Option<[u8; 4]>, rule: &'static str, now: Instant) -> bool {
+    /// Whether the drop of `src` under `rule` warns at `now`, and which
+    /// window the warning comes under, recording `now` in that window when
+    /// one fires. Split from [`emit`](Self::emit) so the rate-limit decision
+    /// is testable without a clock or a `tracing` subscriber.
+    fn should_warn_at(
+        &self,
+        src: Option<[u8; 4]>,
+        rule: &'static str,
+        now: Instant,
+    ) -> WarnDecision {
         let mut last = self
             .last
             .lock()
             .expect("the limiter's lock is held only across this lookup, never across a panic");
-        match last.get(&(src, rule)) {
-            Some(prev) if now.duration_since(*prev) < DROP_WARN_MIN_INTERVAL => false,
+        let key = DropKey::Source(src, rule);
+        if let Some(prev) = last.get(&key)
+            && now.duration_since(*prev) < DROP_WARN_MIN_INTERVAL
+        {
+            return WarnDecision::Silent;
+        }
+        if last.len() >= DROP_WARN_MAX_TRACKED_PAIRS {
+            // The table is at its bound. Drop the windows that have gone
+            // stale — their pairs would fire afresh on re-insertion anyway —
+            // before folding this one into a shared line: a flood that has
+            // ended must not leave honest sources unnamed forever after.
+            last.retain(|_, at| now.duration_since(*at) < DROP_WARN_MIN_INTERVAL);
+        }
+        if last.len() < DROP_WARN_MAX_TRACKED_PAIRS {
+            last.insert(key, now);
+            return WarnDecision::Named;
+        }
+        // Still full: every window is live, so more distinct sources are
+        // dropping within this interval than the table holds — a spoofed
+        // flood by shape. One shared window per rule, so the flood costs no
+        // memory and at most one line per rule per interval.
+        match last.get(&DropKey::Overflow(rule)) {
+            Some(prev) if now.duration_since(*prev) < DROP_WARN_MIN_INTERVAL => {
+                WarnDecision::Silent
+            }
             _ => {
-                last.insert((src, rule), now);
-                true
+                last.insert(DropKey::Overflow(rule), now);
+                WarnDecision::Overflow
             }
         }
     }
@@ -456,19 +529,32 @@ impl DropLimiter {
     /// Emits the drop warning for one dropped frame if the rate limit allows:
     /// the source address the frame carried — `none` when the frame carried
     /// none to read, as for an IPv6 or truncated drop — and the rule that
-    /// dropped it, the two fields NET-081's observability asks for. Returns
-    /// whether a line was written.
+    /// dropped it, the two fields NET-081's observability asks for; or, when
+    /// more distinct sources are dropping than the table keeps windows for,
+    /// one line per rule naming the flood instead. Returns whether a line
+    /// was written.
     fn emit(&self, src: Option<[u8; 4]>, rule: &'static str) -> bool {
-        if !self.should_warn_at(src, rule, Instant::now()) {
-            return false;
+        match self.should_warn_at(src, rule, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                let source =
+                    src.map_or_else(|| "none".to_string(), |src| Ipv4Addr::from(src).to_string());
+                tracing::warn!(
+                    source = %source,
+                    rule_matched = rule,
+                    "dropped a frame leaving the VM at the host-side egress gate",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = rule,
+                    "dropped frames from more distinct source addresses than the gate \
+                     keeps a window per source for; one line per rule covers the rest",
+                );
+                true
+            }
         }
-        let source = src.map_or_else(|| "none".to_string(), |src| Ipv4Addr::from(src).to_string());
-        tracing::warn!(
-            source = %source,
-            rule_matched = rule,
-            "dropped a frame leaving the VM at the host-side egress gate",
-        );
-        true
     }
 }
 
@@ -856,8 +942,8 @@ mod tests {
         ipv6_frame, send_frame, wait_for_log,
     };
     use super::{
-        CONNECT_REQUEST, DROP_WARN_MIN_INTERVAL, DropLimiter, GateDrop, HANDSHAKE_TIMEOUT,
-        MAX_HEAD, gate_verdict, serve_connection,
+        CONNECT_REQUEST, DROP_WARN_MAX_TRACKED_PAIRS, DROP_WARN_MIN_INTERVAL, DropLimiter,
+        GateDrop, HANDSHAKE_TIMEOUT, MAX_HEAD, WarnDecision, gate_verdict, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry};
 
@@ -1244,26 +1330,119 @@ mod tests {
         let t0 = Instant::now();
         let src = [100, 64, 0, 9];
 
-        assert!(limiter.should_warn_at(Some(src), "egress-undeclared-subnet", t0));
-        assert!(!limiter.should_warn_at(
-            Some(src),
-            "egress-undeclared-subnet",
-            t0 + Duration::from_millis(10)
-        ));
+        assert_eq!(
+            limiter.should_warn_at(Some(src), "egress-undeclared-subnet", t0),
+            WarnDecision::Named
+        );
+        assert_eq!(
+            limiter.should_warn_at(
+                Some(src),
+                "egress-undeclared-subnet",
+                t0 + Duration::from_millis(10)
+            ),
+            WarnDecision::Silent
+        );
         // A different source under the same rule keeps its own line…
-        assert!(limiter.should_warn_at(Some([100, 64, 0, 10]), "egress-undeclared-subnet", t0));
+        assert_eq!(
+            limiter.should_warn_at(Some([100, 64, 0, 10]), "egress-undeclared-subnet", t0),
+            WarnDecision::Named
+        );
         // …and the same source under a different rule keeps its own.
-        assert!(limiter.should_warn_at(Some(src), "egress-foreign-source", t0));
+        assert_eq!(
+            limiter.should_warn_at(Some(src), "egress-foreign-source", t0),
+            WarnDecision::Named
+        );
         // A sourceless frame is a key of its own, and so are two family rules
         // between themselves.
-        assert!(limiter.should_warn_at(None, "egress-ipv6", t0));
-        assert!(limiter.should_warn_at(None, "egress-undeclared-ethertype", t0));
-        assert!(!limiter.should_warn_at(None, "egress-ipv6", t0 + Duration::from_millis(10)));
+        assert_eq!(
+            limiter.should_warn_at(None, "egress-ipv6", t0),
+            WarnDecision::Named
+        );
+        assert_eq!(
+            limiter.should_warn_at(None, "egress-undeclared-ethertype", t0),
+            WarnDecision::Named
+        );
+        assert_eq!(
+            limiter.should_warn_at(None, "egress-ipv6", t0 + Duration::from_millis(10)),
+            WarnDecision::Silent
+        );
         // Once the interval has elapsed, the line fires again.
-        assert!(limiter.should_warn_at(
-            Some(src),
-            "egress-undeclared-subnet",
-            t0 + DROP_WARN_MIN_INTERVAL
-        ));
+        assert_eq!(
+            limiter.should_warn_at(
+                Some(src),
+                "egress-undeclared-subnet",
+                t0 + DROP_WARN_MIN_INTERVAL
+            ),
+            WarnDecision::Named
+        );
+    }
+
+    /// The limiter's window table is bounded, because the source address it
+    /// keys by is the dropped frame's own bytes and a hostile guest chooses
+    /// those: flooding distinct spoofed addresses must not grow host memory
+    /// one entry per frame. Past the cap a new pair shares one line per rule,
+    /// a pair the table already holds keeps its own window, and stale
+    /// windows make room again — so the fold is a flood's shape, not a
+    /// permanent state.
+    #[test]
+    fn drop_limiter_bounds_its_source_table() {
+        let limiter = DropLimiter::new();
+        let t0 = Instant::now();
+        let rule = "egress-unknown-source";
+        // A source address per index: distinct bytes, so distinct keys.
+        let source = |i: usize| u32::try_from(i).expect("an index fits a u32").to_be_bytes();
+
+        // Fill the table to its cap, one window per distinct pair.
+        for i in 0..DROP_WARN_MAX_TRACKED_PAIRS {
+            assert_eq!(
+                limiter.should_warn_at(Some(source(i)), rule, t0),
+                WarnDecision::Named,
+                "pair {i} takes a window of its own while the table has room"
+            );
+        }
+        // At the cap, a pair the table holds no window for no longer gets
+        // one: it falls to the rule's shared line…
+        assert_eq!(
+            limiter.should_warn_at(Some(source(DROP_WARN_MAX_TRACKED_PAIRS)), rule, t0),
+            WarnDecision::Overflow,
+            "past the cap a new pair folds into the rule's shared line"
+        );
+        // …and so does every distinct source after it, at the shared line's
+        // own cadence — no window per frame.
+        assert_eq!(
+            limiter.should_warn_at(Some(source(DROP_WARN_MAX_TRACKED_PAIRS + 1)), rule, t0),
+            WarnDecision::Silent,
+            "the rule's shared line is rate-limited like any other"
+        );
+        let windows = || {
+            limiter
+                .last
+                .lock()
+                .expect("the limiter's lock is held only across this read")
+                .len()
+        };
+        assert!(
+            windows() <= DROP_WARN_MAX_TRACKED_PAIRS + 1,
+            "a flood of distinct sources added no window per frame: {} windows",
+            windows()
+        );
+        // A pair the table already holds keeps its own window, full or not.
+        assert_eq!(
+            limiter.should_warn_at(Some(source(0)), rule, t0 + Duration::from_millis(10)),
+            WarnDecision::Silent,
+            "a held pair is still rate-limited by its own window"
+        );
+        // Once every window has gone stale, the flood is over by shape: the
+        // prune frees the table and an honest source is named per line again.
+        assert_eq!(
+            limiter.should_warn_at(
+                Some(source(DROP_WARN_MAX_TRACKED_PAIRS + 2)),
+                rule,
+                t0 + DROP_WARN_MIN_INTERVAL
+            ),
+            WarnDecision::Named,
+            "stale windows make room; a new source gets its own line again"
+        );
+        assert_eq!(windows(), 1, "the stale windows were pruned, not kept");
     }
 }
