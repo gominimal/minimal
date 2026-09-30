@@ -2850,6 +2850,55 @@ async fn each_box_gets_own_loopback_address() {
     }
 }
 
+/// NET-010's cross-record collision report, at the moment the design puts it
+/// (design §7.1: cross-node collisions are reported at session start, like a
+/// port collision). The daemon's own start takes the same report once, over
+/// whatever was live before it came up; this is the half that catches a grant
+/// a second state root's daemon made **after** this one booted, which no
+/// report this daemon ran at its start can ever see again. The stand-in for
+/// that second root's publish is a live listener at an address this daemon's
+/// record never names — the shape no `EADDRINUSE` ever reports, because the
+/// collision is on the address, not a port — bound here *after* the daemon
+/// has started, so the report that names it below can only be the session's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_start_reports_a_publish_no_grant_names() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+
+    // The pool's last address: grantable, so nothing rules it out on shape,
+    // and not one this daemon's empty record has named — a second root's
+    // grant, as the kernel's socket table sees it.
+    let foreign = sessions::core::loopback::POOL_LAST;
+    let _listener = std::net::TcpListener::bind((foreign, 0))
+        .unwrap_or_else(|error| panic!("the unrecorded address binds: {error}"));
+
+    // Everything the buffer holds here predates the box, so a line naming
+    // the address in what follows is the session-start report's — the
+    // daemon-start report ran at `TestServer::new`, before the bind.
+    let before_finalize = capture.contents().len();
+    let _web = finalize_own_ip_session(&mut client, "web").await;
+    let logged = &capture.contents()[before_finalize..];
+    assert!(
+        logged.lines().any(|line| {
+            line.contains("loopback-publish-collision") && line.contains(&format!("ip={foreign}"))
+        }),
+        "a session start must report the live publish no grant names: {logged}"
+    );
+
+    // And the box itself is untouched by the report: it is advisory, so the
+    // box published at the address its own grant gave it, as though the
+    // other root were not there.
+    let (_, address) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the box's name answers at its own address");
+    assert_eq!(
+        address,
+        sessions::core::loopback::POOL_FIRST,
+        "the collision report costs the box nothing: its own grant stands"
+    );
+}
+
 /// NET-013: a box's name answers whether or not a client is attached. The
 /// finalize above attached nothing; the answer here is a full A record at the
 /// box's own address — held, in-zone, at the port the box declared — and the

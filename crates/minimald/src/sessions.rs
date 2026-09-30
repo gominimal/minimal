@@ -352,23 +352,21 @@ impl Manager {
                 );
             }
             // The collision report the record's own arbitration cannot make
-            // (NET-010, reported at session start like a port collision):
-            // every reserved-range address a live publish holds on this
-            // host that this record does not name. That is the shape a
-            // second state root produces — its daemon grants an address
-            // this root's record already gave out, neither record naming
-            // the other's grants, and the collision being on the address
-            // means no bind ever fails to tell either daemon. Advisory: a
-            // warn per address, the operator's signal to separate the roots
-            // or land the host-side arbiter that closes the gap.
+            // (NET-010, reported like a port collision): every
+            // reserved-range address a live publish holds on this host that
+            // this record does not name. That is the shape a second state
+            // root produces — its daemon grants an address this root's
+            // record already gave out, neither record naming the other's
+            // grants, and the collision being on the address means no bind
+            // ever fails to tell either daemon. Advisory: a warn per
+            // address, the operator's signal to separate the roots or land
+            // the host-side arbiter that closes the gap. This is the
+            // daemon-start half — over whatever was live before this daemon
+            // came up; the session-start half
+            // (`Session::report_unrecorded_publishes`) catches the grants a
+            // second root makes after it.
             for address in book.unrecorded_publishes() {
-                tracing::warn!(
-                    ip = %address,
-                    action = "loopback-publish-collision",
-                    "a live publish holds a reserved local address no grant in \
-                     this state root's record names; another state root's daemon \
-                     may be publishing at it",
-                );
+                crate::net::dns::warn_publish_collision(address);
             }
             let node = if on_switch {
                 match book.grant(crate::net::dns::LeaseNamespace::Node) {

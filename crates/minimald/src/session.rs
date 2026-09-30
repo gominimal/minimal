@@ -851,6 +851,38 @@ impl Session {
             }
             _ => {}
         }
+        // The cross-record collision report, at the moment the design puts it
+        // (NET-010, design §7.1: cross-node collisions are reported at session
+        // start, like a port collision) — the same moment the port collision
+        // report above fires at, and the half the daemon's own start report
+        // cannot cover: a grant another state root's daemon makes after this
+        // one booted is one no report this daemon ran at its start will ever
+        // see again. Outside the registry's lock, like the lease ask above:
+        // the report is a read of the record under its lock file beside a
+        // read of the kernel's socket table, and no DNS answer this daemon
+        // serves waits behind it.
+        if matches!(record.network, sessions::NetworkMode::OwnIp) {
+            self.report_unrecorded_publishes();
+        }
+    }
+
+    /// One warn line per reserved-range address a live publish holds on this
+    /// host that the answerer's record for this daemon's state root does not
+    /// name — the cross-record collision report (NET-010), at session start
+    /// like a port collision, through the one emitter the daemon's own start
+    /// report shares
+    /// ([`warn_publish_collision`](crate::net::dns::warn_publish_collision))
+    /// so the two read as one report in a diagnostics bundle's log tail.
+    ///
+    /// A box that publishes on the shared-address interim — a spent pool, an
+    /// absent range, an unreadable record — starts too, and still gets the
+    /// report: the addresses it names are other roots' grants, not this
+    /// box's, and the moment the design asks for is this session's start.
+    #[cfg(target_os = "linux")]
+    fn report_unrecorded_publishes(&self) {
+        for address in self.loopback.unrecorded_publishes() {
+            crate::net::dns::warn_publish_collision(address);
+        }
     }
 
     /// Asks the answerer for this box's host loopback address (NET-010) — a

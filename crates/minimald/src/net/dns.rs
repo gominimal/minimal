@@ -1078,13 +1078,18 @@ pub(crate) fn host_component(host_header: &str) -> &str {
 // in that writing the record already means holding the filesystem identity
 // the daemon state root is protected by. Closing the cross-root half needs
 // the host-side answerer as the one arbiter over every root's allocation,
-// not a per-root file; that is the filed follow-up's work. Until it lands
-// the daemon-start collision report
+// not a per-root file; that work is **not** in this change and no issue for
+// it exists yet — it is the follow-up this PR's body asks its reader to
+// file, as a host-side answerer serving the design's authenticated channel
+// (design §7.1, the answerer as the arbiter, "cross-node collisions
+// reported at session start"). Until it lands the collision report
 // ([`LoopbackLeaseBook::unrecorded_publishes`]) is the half this record can
 // do on its own: the kernel's socket table is the one list of addresses that
 // is global to the whole host whatever record granted them, and every
 // reserved-range address a live publish holds that this record does not name
-// is reported at session start, like a port collision.
+// is reported — once at this daemon's start, and again at every session
+// start on it, like a port collision, so a grant a second root's daemon
+// makes after this one booted is still reported.
 
 /// The answerer's record of granted addresses, under the daemon's state
 /// root — the one directory every daemon instance on this host shares
@@ -1564,6 +1569,22 @@ fn entry_address(entries: &[LeaseEntry], namespace: LeaseNamespace) -> Option<Ip
         .iter()
         .find(|entry| entry.namespace == namespace)
         .map(|entry| entry.address)
+}
+
+/// One warn line for `address`, a reserved local address a live publish
+/// holds on this host that no grant in this daemon's record names
+/// (NET-010) — the line both collision reports emit, the daemon's start and
+/// a session's, so the two say the same thing the same way and a
+/// diagnostics bundle's daemon-log tail reads them as one report.
+#[cfg(target_os = "linux")]
+pub(crate) fn warn_publish_collision(address: Ipv4Addr) {
+    tracing::warn!(
+        ip = %address,
+        action = "loopback-publish-collision",
+        "a live publish holds a reserved local address no grant in \
+         this state root's record names; another state root's daemon \
+         may be publishing at it",
+    );
 }
 
 /// The wall clock the record stamps grants with, in Unix seconds — the same
