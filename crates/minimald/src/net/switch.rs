@@ -1021,9 +1021,15 @@ impl SessionGate {
     /// to check.
     ///
     /// One debug line per connection names both boxes and each side's verdict;
-    /// a source refusal is also said through the shared limiter once per
-    /// source box and rule per minute (R2.7), under the source's label, the
-    /// line its own egress leg would have emitted had it seen the frame.
+    /// a source refusal is also said once per source box and rule per minute
+    /// (R2.7), under the source's label, through the source's *own* limiter —
+    /// the same one its egress leg rate-limits by — so one refusal is one
+    /// line, whichever leg said it. On traffic the source's relay carried,
+    /// that leg has already dropped the frame its rules refuse (a box-zone
+    /// answer pins nothing, so no pin lifts the identical verdict it makes),
+    /// which makes this half the conjunction's backstop: it holds the
+    /// source's rules true at the target even for a frame that reached the
+    /// switch without the source relay's verdict on it.
     fn refuse_zone_connect(&self, frame: &[u8]) -> bool {
         let Some(pkt) = parse_ipv4_l4(frame) else {
             return false;
@@ -1062,7 +1068,12 @@ impl SessionGate {
             return false;
         }
         let reason = refusal.expect("refusal known when the source half fails");
-        self.limiter.warn(
+        // The source's own limiter, not this relay's: the refusal stands for
+        // the line the source's own egress leg would have said, and sharing
+        // its limiter is what makes that true — one refusal is one line per
+        // source box and rule per minute (R2.7), whichever leg said it, so
+        // the two legs' says of one violation can never be two lines.
+        peer.limiter.warn(
             &peer.label,
             Direction::Egress,
             Some(SocketAddr::V4(pkt.dst)),
@@ -2653,8 +2664,10 @@ pub(crate) mod tests {
             "a connection the source's rules refuse never reaches the target box"
         );
         // The refusal is the source's own, named under the source's own
-        // label, exactly as its egress leg would have said it had the frame
-        // come from the box instead — which the leg says for itself below.
+        // label, through the source's own limiter — the very line its egress
+        // leg would have said had the frame come from the box instead, which
+        // is why the leg's refusal of the same frame below adds no second
+        // line: one refusal is one line, whichever leg said it.
         let logged = capture.contents();
         for expected in [
             "source=100.64.0.10",
@@ -2687,6 +2700,19 @@ pub(crate) mod tests {
         assert_eq!(
             out, sentinel,
             "the source's own leg refuses the connection its rules deny"
+        );
+        // The leg's refusal says no second line for it: both legs warn
+        // through the source's own limiter, so the same (box, rule) refusal
+        // is rate-limited as one, whichever leg saw the frame — the R2.7
+        // contract, held across the connect-time half and the leg's own.
+        assert_eq!(
+            capture
+                .contents()
+                .matches("network policy violation")
+                .count(),
+            1,
+            "one refusal is one line, whichever leg said it: {}",
+            capture.contents()
         );
 
         // The conjunction is real: a port the target did not declare is
@@ -2750,11 +2776,13 @@ pub(crate) mod tests {
             "one debug line per box-zone connection, and none for the fabric's: {logged}"
         );
         // Each refusal says its own line and nothing else does: the
-        // connect-time one under the source's label, the source's own leg's
-        // for the same connection, and the target's ingress one.
+        // connect-time one under the source's label — the source's own leg
+        // refused the same frame above and said no second line for it, one
+        // refusal being one line through the limiter the two share — and the
+        // target's ingress one.
         assert_eq!(
             logged.matches("network policy violation").count(),
-            3,
+            2,
             "each refusal says its own line, and nothing else does: {logged}"
         );
     }
