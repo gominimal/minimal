@@ -2023,16 +2023,16 @@ fn remove_box_leaf_patiently(
     attempts: usize,
     mut pause: impl FnMut(usize),
 ) -> io::Result<()> {
-    for attempt in 1..=attempts.max(1) {
-        match sandbox2::classifier::remove_box_leaf(leaf) {
-            Ok(()) => return Ok(()),
-            // A refusal that is not the last attempt's is what the pause is
-            // for; the last one is returned for the caller to warn.
-            Err(_) if attempt < attempts.max(1) => pause(attempt),
-            Err(e) => return Err(e),
+    let attempts = attempts.max(1);
+    for attempt in 1..attempts {
+        if sandbox2::classifier::remove_box_leaf(leaf).is_ok() {
+            return Ok(());
         }
+        pause(attempt);
     }
-    unreachable!("the loop returns on its last attempt at the latest")
+    // The last attempt is the return, not another pause: its refusal is
+    // what the caller warns with.
+    sandbox2::classifier::remove_box_leaf(leaf)
 }
 
 /// A launched session process backed by a sandboxed [`hakoniwa::Child`].
