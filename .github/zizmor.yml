@@ -1,5 +1,6 @@
-# zizmor configuration for the nightly `hygiene` job
-# (`zizmor .github/workflows/`, see .github/workflows/nightly-tests.yml).
+# zizmor configuration for the PR gate (`workflow-lint` in ci.yml) and the
+# nightly `hygiene` job (nightly-tests.yml), both of which run
+# `zizmor .github/workflows/`.
 rules:
   # zizmor 1.30.0 added `self-repository`, which asks for GitHub's new
   # `uses: $/...` syntax (github.blog changelog, 2026-07-30) in place of

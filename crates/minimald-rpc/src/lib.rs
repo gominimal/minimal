@@ -471,6 +471,22 @@ pub struct CreateSessionResponse {
     /// daemon's ports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone_answerer_port: Option<u16>,
+    /// Whether the daemon's session-start bind probe found the reserved local
+    /// range absent — the interim verdict, true when this session is on the
+    /// shared `127.0.0.1` interim rather than the range (NET-123).
+    ///
+    /// A client that reads `true` surfaces the naming advisory again
+    /// (NET-122): a session on the interim is a fact nothing else shows.
+    /// The interim ends when the range is installed on the host — on macOS
+    /// the root-held boot step design §7.1 folds into the same advisory
+    /// command, not yet part of the command the client renders.
+    /// `false` from a daemon that predates
+    /// the field is the safe read — nothing downstream is gated on it; the
+    /// advisory a client prints from its own host-resolver detection is not,
+    /// and the [`Self::daemon_version`] gate already refuses a daemon that
+    /// old.
+    #[serde(default)]
+    pub interim_loopback: bool,
     /// Whether the serving daemon opted out of the deny-all egress default
     /// (NET-077). The rollout's one fact the client cannot know from its
     /// own build: the phase is a build-time constant both sides share
@@ -1475,6 +1491,9 @@ mod tests {
             hostname_routing_unavailable: None,
             hostname_proxy_port: None,
             zone_answerer_port: None,
+            // The interim flag survives the wire: the re-advise a client
+            // prints on it (NET-123) must not be able to silently drop off.
+            interim_loopback: true,
             deny_all_opt_out: None,
         };
         assert_eq!(round_trip(&resp), resp);
@@ -1494,6 +1513,7 @@ mod tests {
             hostname_routing_unavailable: None,
             hostname_proxy_port: None,
             zone_answerer_port: None,
+            interim_loopback: false,
         };
         let json = serde_json_lenient::to_string(&opted_out).expect("serializes");
         assert!(
@@ -1539,6 +1559,11 @@ mod tests {
                 assert!(c.hostname_routing_unavailable.is_none());
                 assert!(c.hostname_proxy_port.is_none());
                 assert!(c.zone_answerer_port.is_none());
+                // The interim flag's legacy default is `false`, the read that
+                // changes nothing: an older daemon's reply is not evidence the
+                // reserved range is absent, and nothing downstream is gated
+                // on the flag.
+                assert!(!c.interim_loopback);
                 assert!(c.deny_all_opt_out.is_none());
             }
             Errorable::Err { error } => panic!("expected Ok, got {error}"),
