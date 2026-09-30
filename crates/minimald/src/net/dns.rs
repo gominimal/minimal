@@ -2339,8 +2339,12 @@ mod tests {
                     .ok()
                     .and_then(|info| {
                         info.lines().find_map(|line| {
-                            line.strip_prefix("flags:")
-                                .and_then(|rest| rest.trim().parse::<u32>().ok())
+                            line.strip_prefix("flags:").and_then(|rest| {
+                                // Octal, as printed: a decimal read of
+                                // `0100002` would take the low bits from the
+                                // eights digit, and `& 0o3` from it.
+                                u32::from_str_radix(rest.trim(), 8).ok()
+                            })
                         })
                     })
                     .unwrap_or(0);
