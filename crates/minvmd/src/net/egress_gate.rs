@@ -70,7 +70,10 @@
 //! was handed over — is backed off from and retried, rate-limited, because a
 //! gate that dies takes every live relay and every box's egress with it, for
 //! the rest of the VM's life; only a listener that is genuinely gone stops
-//! it.
+//! it. And a guest's connections are counted: each live relay costs the host
+//! a socket, a switch dial and a task — two host sockets and a task where the
+//! pre-gate splice cost one — so past a bound the gate refuses a connection
+//! rather than let one guest pin host resources without one.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -172,6 +175,27 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// listener's own end.
 const ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
+/// How many live guest connections the gate will hold a relay for at once.
+/// The bound exists because of what a relay costs the host: a socket for the
+/// guest's connection, a dial of the switch, and a task — two host sockets
+/// and a task where the pre-gate splice cost one — and the peer that decides
+/// how many of those to open lives inside the escape boundary this gate
+/// exists to contain. A guest that connects, completes the upgrade and then
+/// sits idle holds all three for as long as it likes; past this bound the
+/// next connection is refused instead, closed rather than hung, so the
+/// amplification is bounded without the guest being told why by any byte it
+/// can read.
+///
+/// A cap, not an idle timeout: an idle frame relay is the honest case, not
+/// the hostile one — the guest's shuttle opens one connection per box and
+/// holds it for the box's lifetime (`attach_to_switch_vsock` in the guest's
+/// relay, which does not reconnect), so a box that makes no egress for
+/// minutes would lose its relay to a timeout and never get it back. The bound
+/// sits far past the honest need — the daemon's own client holds one control
+/// connection at a time — and costs a hostile guest nothing an honest one
+/// ever reaches.
+const MAX_LIVE_RELAYS: usize = 64;
+
 /// Largest Ethernet frame the gate relays: MTU + 14-byte header + 4-byte
 /// 802.1Q VLAN tag — the same bound the in-guest relay reads to, so the two
 /// halves of the path agree on what a frame may weigh.
@@ -226,6 +250,14 @@ const UNDECLARED_VERB_RULE: &str = "egress-undeclared-verb";
 /// connection as cheaply as it can send a frame, and the refusal must not
 /// become the flood the frame drops are rate-limited against.
 const CONTROL_UPGRADE_RULE: &str = "egress-control-upgrade";
+
+/// The rule name for a guest connection refused because the gate is already
+/// holding [`MAX_LIVE_RELAYS`] relays: not a frame the verdict decided, but
+/// the same class of refusal — a guest taking host resources it was not
+/// given — and it is emitted at the frame drops' cadence for the same reason
+/// a drop is: a guest can attempt it as cheaply as it can send a frame, and
+/// the refusal must not become the flood.
+const CONNECTION_CAP_RULE: &str = "egress-connection-cap";
 
 /// The rule name for an accept failure the gate is riding out rather than
 /// dying on. It is the limiter's key, not a verdict — no frame was decided —
@@ -540,7 +572,10 @@ impl AcceptFailure {
 /// classified rather than assumed ([`AcceptFailure`]): the transient ones are
 /// backed off from and retried, and said so at the gate's own cadence, so a
 /// momentary resource shortage costs a tenth of a second and a line a minute
-/// — not the gate, its live relays, and the next guest's connect.
+/// — not the gate, its live relays, and the next guest's connect. And the
+/// live relays are counted against [`MAX_LIVE_RELAYS`], so a guest that opens
+/// connections and then sits idle — precisely the peer this gate exists to
+/// contain — cannot pin host sockets and tasks without bound.
 async fn accept_loop<A: GuestSource>(
     mut source: A,
     switch_sock: PathBuf,
@@ -580,6 +615,28 @@ async fn accept_loop<A: GuestSource>(
                 }
             },
         };
+        // Reap the finished so a long-lived gate accumulates no handles for
+        // connections long gone — and so the bound below counts only the
+        // relays that are live, not the ones already ended.
+        while relays.try_join_next().is_some() {}
+        if relays.len() >= MAX_LIVE_RELAYS {
+            // Refused, closed rather than hung, at the frame drops' cadence:
+            // the guest's end is dropped here, so it sees a connection that
+            // failed instead of one that never answers. Nothing of it is
+            // dialed into the switch, so past the bound a guest buys no host
+            // socket, no relay task, and no frame through the gate.
+            if limiter.should_warn_at(None, CONNECTION_CAP_RULE, Instant::now())
+                != WarnDecision::Silent
+            {
+                tracing::warn!(
+                    live = relays.len(),
+                    max = MAX_LIVE_RELAYS,
+                    rule_matched = CONNECTION_CAP_RULE,
+                    "refused a guest connection past the egress gate's live-relay bound",
+                );
+            }
+            continue;
+        }
         relays.spawn(serve_connection(
             guest,
             switch_sock.clone(),
@@ -1411,6 +1468,14 @@ pub(crate) mod test_support {
         pub(crate) log: CaptureWriter,
         /// The gate's own view of the registry: the read-only lookup surface.
         pub(crate) table: crate::box_registry::BoxTable,
+        /// The gate's socket path, for a test that opens a second guest
+        /// connection on the same gate ([`connect_over`]).
+        pub(crate) gate_sock: std::path::PathBuf,
+        /// The stand-in switch's listener, kept alive past the first
+        /// connection so the gate's later dials have something to reach
+        /// ([`connect_over`]). Held for its lifetime, not read: a listener is
+        /// accepted *from*.
+        pub(crate) switch_listener: UnixListener,
         /// Keeps the sockets' directory alive for the gate's lifetime.
         /// Underscore-named: held for its `Drop`, never read.
         pub(crate) _dir: TempDir,
@@ -1463,6 +1528,8 @@ pub(crate) mod test_support {
             switch,
             log,
             table: registry.table(),
+            gate_sock,
+            switch_listener: listener,
             _dir: dir,
             _guard,
         }
@@ -1532,6 +1599,37 @@ pub(crate) mod test_support {
             "the gate forwards a control request's head verbatim"
         );
         harness
+    }
+
+    /// Opens one more guest connection on the harness's gate and completes the
+    /// upgrade on it, returning the guest's end and the switch end the gate
+    /// dialed for it: the shape [`gate_over`] builds for a gate's first
+    /// connection, opened again for the tests that need several live ones on
+    /// the same gate. The forwarded head is read back off the switch end and
+    /// asserted verbatim, so every connection built this way proves its
+    /// upgrade passed through before the test goes on.
+    pub(crate) async fn connect_over(harness: &GateHarness) -> (UnixStream, UnixStream) {
+        let mut guest = UnixStream::connect(&harness.gate_sock)
+            .await
+            .expect("connecting another guest");
+        // The gate's dial of the switch it fronts, accepted before the guest
+        // speaks, exactly as the first connection's is.
+        let (mut switch, _) = harness
+            .switch_listener
+            .accept()
+            .await
+            .expect("accepting the gate's dial");
+        guest
+            .write_all(CONNECT_REQUEST)
+            .await
+            .expect("writing the upgrade head");
+        let mut head = vec![0u8; CONNECT_REQUEST.len()];
+        read_within(&mut switch, &mut head).await;
+        assert_eq!(
+            head, CONNECT_REQUEST,
+            "the gate forwards the switch upgrade head verbatim"
+        );
+        (guest, switch)
     }
 
     /// Writes one length-framed frame from the guest end.
@@ -1689,15 +1787,15 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::test_support::{
-        CaptureWriter, DEADLINE, arp_frame, capture_log, expect_frame, expect_silence,
-        expect_teardown, gate_connected, gate_over, gate_over_control, gate_over_with, ipv4_frame,
-        ipv6_frame, read_within, send_frame, wait_for_log,
+        CaptureWriter, DEADLINE, arp_frame, capture_log, connect_over, expect_frame,
+        expect_silence, expect_teardown, gate_connected, gate_over, gate_over_control,
+        gate_over_with, ipv4_frame, ipv6_frame, read_within, send_frame, wait_for_log,
     };
     use super::{
         AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, DROP_WARN_MAX_TRACKED_PAIRS,
         DROP_WARN_MIN_INTERVAL, DropLimiter, EgressGate, GateDrop, GuestSource, GuestSpeak,
-        HANDSHAKE_TIMEOUT, MAX_HEAD, MAX_NAMED_TARGET, WarnDecision, accept_loop, gate_verdict,
-        max_frame, serve_connection,
+        HANDSHAKE_TIMEOUT, MAX_HEAD, MAX_LIVE_RELAYS, MAX_NAMED_TARGET, WarnDecision, accept_loop,
+        gate_verdict, max_frame, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry};
 
@@ -2928,6 +3026,70 @@ mod tests {
             Ok(Err(error)) => panic!("the accept loop joined on an error: {error}"),
             Err(_) => panic!("the accept loop outlived the failure that stopped it"),
         }
+    }
+
+    /// The relays a guest can pin are bounded: each live connection costs the
+    /// host a socket, a dial of the switch and a task — two host sockets and a
+    /// task where the pre-gate splice cost one — so a guest that connects,
+    /// completes the upgrade and then sits idle is refused past the bound,
+    /// closed rather than hung, and said so at the gate's own cadence. The
+    /// bound costs the guest that hits it and nobody else: a connection freed
+    /// up makes room for the next one.
+    #[tokio::test]
+    async fn a_guest_past_the_live_connection_bound_is_refused() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        // One live connection arrives with the harness; the rest are opened
+        // the same way, upgraded and then left idle.
+        let h = gate_over(registry).await;
+        let mut idle: Vec<(UnixStream, UnixStream)> = Vec::with_capacity(MAX_LIVE_RELAYS);
+        while idle.len() + 1 < MAX_LIVE_RELAYS {
+            idle.push(connect_over(&h).await);
+        }
+
+        // Past the bound the next connection is refused: closed, not hung, and
+        // nothing of it dialed into the switch.
+        let mut extra = UnixStream::connect(&h.gate_sock)
+            .await
+            .expect("connecting past the bound");
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, extra.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("the gate left {n} byte(s) for a refused connection to read"),
+            Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            Ok(Err(e)) => panic!("reading a refused connection failed: {e}"),
+            Err(_) => panic!("the gate left a connection past its live-relay bound hanging"),
+        }
+        wait_for_log(&h.log, "egress-connection-cap").await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("refused a guest connection past the egress gate's live-relay bound"),
+            "the refusal says what it refused, got: {logged}"
+        );
+
+        // Free two connections, and watch the gate's side of them come down —
+        // the proof their relays are done — before asking for another.
+        for (guest, mut switch) in idle.drain(..2) {
+            drop(guest);
+            let mut probe = [0u8; 1];
+            match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => panic!("{n} byte(s) arrived at the switch of a closed guest"),
+                Ok(Err(e)) => panic!("reading a freed connection's switch end failed: {e}"),
+                Err(_) => panic!("the gate held a relay for a closed guest past {DEADLINE:?}"),
+            }
+        }
+
+        // Room again: the next connection is served, and it relays — the
+        // bound refuses a guest, not egress.
+        let (mut guest, mut switch) = connect_over(&h).await;
+        let declared = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut guest, &declared).await;
+        let seen = expect_frame(&mut switch).await;
+        assert_eq!(
+            seen, declared,
+            "a connection past a freed one is relayed again"
+        );
     }
 
     /// The accept loop's one decision, apart from the loop: which errors the
