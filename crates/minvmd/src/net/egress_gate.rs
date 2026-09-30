@@ -452,59 +452,88 @@ async fn relay_frames(
 /// path, which would hand the guest the ungated frame stream this gate exists
 /// to prevent ([`ControlEnd::Upgrade`]).
 ///
-/// The two legs do not race, because a control exchange is a request *and*
-/// its response: the guest's leg ends when it has said all it means to say,
-/// and that is not the connection's end — the response it is waiting for is
-/// still to come. So the request leg half-closes the switch's side when it is
-/// done and the response leg drains what gvproxy answers with before the
+/// The legs race, because neither can see the other's end. The splice blocks
+/// on the guest, which has no reason to speak while it is idle waiting for
+/// the response, so it has no way to learn the switch hung up this one
+/// connection's end — the per-connection close a keep-alive control channel
+/// makes without the process exit the supervisor catches, the same close
+/// [`relay_frames`] races its legs for — and would otherwise hold the relay
+/// task, the gate's dial, and both socket halves open until the guest next
+/// spoke. The response leg ending is the only thing on this side that knows,
+/// so whichever leg ends first takes the relay down with it.
+///
+/// One ending is *not* the connection's end, though: a control exchange is a
+/// request **and** its response, and a guest that has said all it means to
+/// say is still waiting for the answer. So the request leg half-closes the
+/// switch's side when it is done and the response leg is drained before the
 /// relay comes off, bounded by the peers' own lifetimes: a gvproxy that will
 /// neither answer nor die holds one relay until the supervisor tears the
 /// switch — and with it the gate — down.
 async fn relay_control(
     guest: Prefixed<OwnedReadHalf>,
-    mut switch: OwnedWriteHalf,
+    switch: OwnedWriteHalf,
     switch_rx: OwnedReadHalf,
     guest_tx: OwnedWriteHalf,
     limiter: Arc<DropLimiter>,
 ) {
-    let response = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
-    match splice_control(guest, &mut switch).await {
-        ControlEnd::GuestClosed => {
-            // Half-close the switch's side, so gvproxy sees the request's end
-            // the moment the guest is done speaking it.
-            if let Err(error) = switch.shutdown().await {
-                tracing::warn!(
-                    %error,
-                    "egress gate could not close the switch's side of a control connection"
-                );
-            }
-            match response.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "egress gate control response leg ended on an error");
+    let mut response = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
+    let splice = splice_control(guest, switch);
+    tokio::pin!(splice);
+    tokio::select! {
+        (end, mut switch) = &mut splice => match end {
+            ControlEnd::GuestClosed => {
+                // Half-close the switch's side, so gvproxy sees the request's
+                // end the moment the guest is done speaking it.
+                if let Err(error) = switch.shutdown().await {
+                    tracing::warn!(
+                        %error,
+                        "egress gate could not close the switch's side of a control connection"
+                    );
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "egress gate control response leg ended");
+                match response.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "egress gate control response leg ended on an error");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "egress gate control response leg ended");
+                    }
                 }
             }
-        }
-        ControlEnd::Upgrade => {
-            // Refused, at the same cadence as the frame drops: a guest can
-            // attempt this on a fresh connection as cheaply as it can send a
-            // frame, and the refusal must not become the flood.
-            if limiter.should_warn_at(None, CONTROL_UPGRADE_RULE, Instant::now())
-                != WarnDecision::Silent
-            {
-                tracing::warn!(
-                    rule_matched = CONTROL_UPGRADE_RULE,
-                    "a control connection tried to upgrade into the frame stream; \
-                     the egress gate refused it",
-                );
+            ControlEnd::Upgrade => {
+                // Refused, at the same cadence as the frame drops: a guest can
+                // attempt this on a fresh connection as cheaply as it can send
+                // a frame, and the refusal must not become the flood.
+                if limiter.should_warn_at(None, CONTROL_UPGRADE_RULE, Instant::now())
+                    != WarnDecision::Silent
+                {
+                    tracing::warn!(
+                        rule_matched = CONTROL_UPGRADE_RULE,
+                        "a control connection tried to upgrade into the frame stream; \
+                         the egress gate refused it",
+                    );
+                }
+                // Both halves drop with the relay, so gvproxy never sees the
+                // request that would have hijacked it.
+                response.abort();
             }
-            // Both halves drop with the relay, so gvproxy never sees the
-            // request that would have hijacked it.
-            response.abort();
-        }
+        },
+        result = &mut response => match result {
+            // The switch closed its side of the connection while the guest was
+            // still on it: no answer is coming, so the relay — and the dial and
+            // both socket halves it holds — comes down now, with a line saying
+            // which leg ended, rather than waiting on an idle guest.
+            Ok(Ok(())) => tracing::warn!(
+                "the switch closed its side of the control connection; the \
+                 egress gate relay is down for it"
+            ),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "egress gate control response leg ended on an error");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "egress gate control response leg ended");
+            }
+        },
     }
 }
 
@@ -512,6 +541,9 @@ async fn relay_control(
 /// never parsing them as anything, and watches for the connect path — gvproxy
 /// hijacks on it, so those bytes are the one reach a control exchange could
 /// buy, and the leg ends in [`ControlEnd::Upgrade`] the moment they appear.
+/// The switch half comes back out beside the leg's end, so its caller can
+/// half-close the switch's side once the request is spoken — the half is the
+/// splice's to write on, not its caller's to hold while the splice runs.
 ///
 /// The watch is exact across read boundaries, however many a path is split
 /// over: each read is searched together with a rolling tail of the stream
@@ -528,8 +560,8 @@ async fn relay_control(
 )]
 async fn splice_control(
     mut guest: Prefixed<OwnedReadHalf>,
-    switch: &mut OwnedWriteHalf,
-) -> ControlEnd {
+    mut switch: OwnedWriteHalf,
+) -> (ControlEnd, OwnedWriteHalf) {
     let mut chunk = vec![0u8; CONTROL_READ];
     let mut window: Vec<u8> = Vec::with_capacity(CONNECT_WATCH_TAIL + CONTROL_READ);
     let mut tail: Vec<u8> = Vec::with_capacity(CONNECT_WATCH_TAIL);
@@ -537,22 +569,22 @@ async fn splice_control(
         let n = match guest.read(&mut chunk).await {
             // The guest's side is done; nothing is held back, so there is
             // nothing left to flush.
-            Ok(0) => return ControlEnd::GuestClosed,
+            Ok(0) => return (ControlEnd::GuestClosed, switch),
             Ok(n) => n,
             Err(error) => {
                 tracing::warn!(%error, "egress gate control leg ended on an error");
-                return ControlEnd::GuestClosed;
+                return (ControlEnd::GuestClosed, switch);
             }
         };
         window.clear();
         window.extend_from_slice(&tail);
         window.extend_from_slice(&chunk[..n]);
         if find_subslice(&window, CONNECT_PATH).is_some() {
-            return ControlEnd::Upgrade;
+            return (ControlEnd::Upgrade, switch);
         }
         if let Err(error) = switch.write_all(&chunk[..n]).await {
             tracing::warn!(%error, "egress gate control leg ended on an error");
-            return ControlEnd::GuestClosed;
+            return (ControlEnd::GuestClosed, switch);
         }
         // Roll the tail forward: it is the last few bytes of the *stream*,
         // carried read to read — not the tail of this one read — because a
@@ -1861,6 +1893,46 @@ mod tests {
             Ok(Ok(n)) => panic!("the gate left {n} byte(s) for a hung-up-on guest to read"),
             Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
             Err(_) => panic!("a hung-up switch left the relay up past {DEADLINE:?}"),
+        }
+    }
+
+    /// The control relay comes down with a switch that hangs up on an idle
+    /// control connection — the same per-connection close the frame relay
+    /// races its legs for. gvproxy closes this one connection's end while the
+    /// guest is still on it, idle, waiting for the answer to the request it
+    /// already spoke: a keep-alive control channel's normal event, not a
+    /// process exit the supervisor catches. A relay that watched only its
+    /// request leg would never learn of it and hold the splice, the gate's
+    /// dial and both socket halves open until the guest next spoke or closed.
+    #[tokio::test]
+    async fn a_switch_that_hangs_up_takes_the_control_relay_down_with_it() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        // One live control exchange, so the connection really is relaying
+        // control traffic and the guest is on it, idle, waiting.
+        let request =
+            b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+                .to_vec();
+        let mut h = gate_over_control(registry, request).await;
+
+        // The switch hangs up while the guest is idle: no request is in
+        // flight, so nothing but this close can end the exchange.
+        h.switch
+            .shutdown()
+            .await
+            .expect("closing the stand-in switch's end");
+
+        // The gate says which leg ended — the line a bundle's daemon log tail
+        // carries for a control connection the host closed under an idle guest.
+        wait_for_log(&h, "the switch closed its side of the control connection").await;
+        // And the guest's side comes down with the relay, promptly, rather than
+        // hanging on until a guest with nothing more to say speaks again.
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, h.guest.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("the gate left {n} byte(s) for a hung-up-on guest to read"),
+            Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
+            Err(_) => panic!("a hung-up switch left the control relay up past {DEADLINE:?}"),
         }
     }
 
