@@ -1260,6 +1260,18 @@ proof_own_ip_egress_declared_and_enforced() {
       cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
       fail
     fi
+    # Two outcomes are legitimate for this box, and only two: the resolver
+    # refuses the name outright (example.com is in no allow list, and the
+    # address it resolves to sits inside the 0.0.0.0/0 deny), or the SYN
+    # leaves, matches the deny, and gets no answer until the timeout — the
+    # silent drop NET-062 binds, which is what an enforcing filter looks like
+    # from inside the box. A fast failure that is neither of those means the
+    # connection reached something that answered it, and the control that
+    # gated this branch completed https://example.com from the declared box in
+    # this run, so the destination answers on this lane: the fast failure is
+    # the box's own escaping SYN (or a broken probe), never weather. The
+    # disallowed-IP probe above hard-fails this same shape; accepting it here
+    # would print a policy hole as `NET-074 OK`.
     deny_all_outcome="fast refusal"
     if grep -qi 'could not resolve' "$WORK/egress-deny-all-curl.err" 2>/dev/null; then
       deny_all_outcome="fast resolver refusal"
@@ -1267,6 +1279,16 @@ proof_own_ip_egress_declared_and_enforced() {
       deny_all_outcome="timeout with no reset"
     fi
     echo "deny-all GET https://example.com -> rc=$deny_all_rc status=${deny_all_status:-<none>} elapsed=${deny_all_elapsed_ms}ms ($deny_all_outcome) curl: ${deny_all_err:-<none>}"
+    if printf '%s' "$deny_all_err" | grep -qi 'reset by peer'; then
+      echo "::error::NET-074: the deny-all box's connection to https://example.com was reset by the destination — the SYN escaped the 0.0.0.0/0 deny and reached a server this run's control proved answers"
+      cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
+      fail
+    fi
+    if [ "$deny_all_outcome" = "fast refusal" ]; then
+      echo "::error::NET-074: the deny-all box failed in ${deny_all_elapsed_ms}ms — a fast refusal that is neither a resolver refusal nor a silent drop. The control above completed https://example.com from the declared box in this run, so the destination answers on this lane and the fast failure is the box's own escaping connection or a broken probe, not weather"
+      cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
+      fail
+    fi
     echo "NET-074 OK: a box with no effective external reach gets nothing (explicit deny-all stand-in for the in-force default)"
   fi
 
