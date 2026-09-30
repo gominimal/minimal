@@ -81,6 +81,7 @@ pub struct PortMapping {
 /// The hostnames NET-068's integration test exercises. Kept in `sessions` so
 /// the `minimald` unit fixture and the `minvmd` integration test share one
 /// list and cannot drift.
+#[doc(hidden)]
 pub const NET068_TOOLCHAIN_EGRESS_HOSTS: &[&str] = &[
     "deb.debian.org",
     "security.debian.org",

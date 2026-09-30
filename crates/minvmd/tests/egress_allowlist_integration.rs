@@ -13,9 +13,9 @@
 //! - `#[ignore]` + `MINVMD_E2E=1`: skipped unless explicitly enabled.
 //! - `MINVMD_KERNEL_PATH`, `MINVMD_ROOTFS_PATH`, `MINVMD_INITRAMFS` must point to
 //!   the kernel, generic rootfs, and minimald initramfs cpio.
-//! - `MINVMD_GVPROXY_BIN` must point to the host gvproxy switch: the own-IP
-//!   boot spawns it, so this test skips when it is unset (matching how CI
-//!   treats gvproxy as opt-in and only exports it for the session-e2e step).
+//! - `MINVMD_GVPROXY_BIN` must point to the host gvproxy switch: `just test-vm`
+//!   fetches it and exports this variable, and the test skips with a reason
+//!   when the variable is unset.
 //!
 //! The test writes each tool's exit status and the boot-log admissions/drops
 //! that arrived during it, so a stalled fetch names the host that was not
@@ -321,7 +321,8 @@ async fn hostname_allowlist_toolchain_completes() {
 
     assert!(
         failures.is_empty(),
-        "hostname-only allowlist toolchain operations failed: {failures:?}"
+        "hostname-only allowlist toolchain operations failed: {failures:?}\n\
+         note: apt is not exercised because the composed box has no Debian userland"
     );
 }
 
