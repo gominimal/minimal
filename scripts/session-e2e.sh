@@ -5523,6 +5523,267 @@ echo "::group::retired surfaces gone (ssh-forward, login, :7655, direct-tcpip)"
 }
 
 # ---------------------------------------------------------------------------
+# Shared helper for the NET-049/NET-051 fresh-install KVM activation proofs.
+# Stages a real install.sh run that ships the VM stack, then activates a
+# session with --provider local-minvmd and no MINVMD_* path overrides,
+# asserting that the VM host daemon resolves its images from the installed data
+# prefix and logs them.
+proof_fresh_kvm_activate_local_minvmd_for_arch() {
+  local target_arch="$1"
+  if [ -z "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
+    echo "fresh-install KVM activate ($target_arch) SKIPPED (VM-backed Linux lane only)"
+    return 0
+  fi
+  local host_arch
+  case "$(uname -m)" in
+    x86_64) host_arch=amd64 ;;
+    aarch64|arm64) host_arch=arm64 ;;
+    *)
+      echo "fresh-install KVM activate ($target_arch) SKIPPED (no release arch for $(uname -m))"
+      return 0
+      ;;
+  esac
+  if [ "$host_arch" != "$target_arch" ]; then
+    echo "fresh-install KVM activate ($target_arch) SKIPPED (host is $host_arch)"
+    return 0
+  fi
+  if [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; then
+    echo "fresh-install KVM activate ($target_arch) SKIPPED (no writable /dev/kvm)"
+    return 0
+  fi
+
+  echo "::group::fresh-install KVM activation ($target_arch) with local-minvmd (NET-049/NET-051)"
+
+  local fk_root fk_home fk_bucket fk_stubbin fk_out fk_seed
+  fk_root="$WORK/fresh-kvm-$target_arch"
+  fk_home="$fk_root/home"
+  fk_bucket="$fk_root/bucket"
+  fk_stubbin="$fk_root/stubbin"
+  fk_out="$fk_root/install.out"
+  fk_seed="$fk_root/seed"
+  mkdir -p "$fk_home" "$fk_bucket/versions/v1" "$fk_stubbin" "$fk_seed"
+
+  hook_seed_preamble > "$fk_seed/minimal.toml"
+  mkdir "$fk_seed/.git"
+
+  local fk_bucket_host="https://mock.invalid/minimal-fresh-kvm-$target_arch"
+
+  # Locate the guest images the lane already built/fetched.
+  local fk_kernel fk_rootfs fk_initramfs fk_gvproxy
+  if [ -n "${MINVMD_KERNEL_PATH:-}" ] && [ -f "$MINVMD_KERNEL_PATH" ]; then
+    fk_kernel="$MINVMD_KERNEL_PATH"
+  else
+    fk_kernel="$ROOT/.scratch/vmlinuz"
+  fi
+  if [ -n "${MINVMD_ROOTFS_PATH:-}" ] && [ -f "$MINVMD_ROOTFS_PATH" ]; then
+    fk_rootfs="$MINVMD_ROOTFS_PATH"
+  else
+    fk_rootfs="$ROOT/.scratch/rootfs.img"
+  fi
+  if [ -n "${MINVMD_INITRAMFS:-}" ] && [ -f "$MINVMD_INITRAMFS" ]; then
+    fk_initramfs="$MINVMD_INITRAMFS"
+  else
+    fk_initramfs="$ROOT/.scratch/initramfs.cpio"
+  fi
+  if [ -n "${MINVMD_GVPROXY_BIN:-}" ] && [ -x "$MINVMD_GVPROXY_BIN" ]; then
+    fk_gvproxy="$MINVMD_GVPROXY_BIN"
+  elif [ -x "$ROOT/.scratch/gvproxy" ]; then
+    fk_gvproxy="$ROOT/.scratch/gvproxy"
+  else
+    fk_gvproxy=""
+  fi
+
+  if [ ! -f "$fk_kernel" ] || [ ! -f "$fk_rootfs" ] || [ ! -f "$fk_initramfs" ]; then
+    echo "fresh-install KVM activate ($target_arch) SKIPPED (guest images not available)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # Verify the binaries we'll stage are available.
+  if ! command -v min >/dev/null 2>&1 || ! command -v minimald >/dev/null 2>&1 || ! command -v minvmd >/dev/null 2>&1; then
+    echo "::error::fresh-install KVM activate requires min, minimald, and minvmd on PATH"
+    fail
+  fi
+
+  cp "$(command -v min)"      "$fk_bucket/versions/v1/minimal-linux-$target_arch"
+  cp "$(command -v minimald)" "$fk_bucket/versions/v1/minimald-linux-$target_arch"
+  cp "$(command -v minvmd)"   "$fk_bucket/versions/v1/minvmd-linux-$target_arch"
+  cp "$fk_kernel"             "$fk_bucket/versions/v1/vmlinuz-$target_arch"
+  cp "$fk_rootfs"             "$fk_bucket/versions/v1/rootfs-$target_arch.img"
+  cp "$fk_initramfs"          "$fk_bucket/versions/v1/initramfs-$target_arch.cpio"
+  if [ -n "$fk_gvproxy" ]; then
+    cp "$fk_gvproxy"          "$fk_bucket/versions/v1/gvproxy-min-linux-$target_arch"
+  fi
+
+  printf 'v1\n' >"$fk_bucket/stable"
+
+  fk_sha() { sha256sum "$1" | awk '{print $1}'; }
+  local h_minimald h_minimal h_minvmd h_kernel h_rootfs h_initramfs h_gvproxy
+  h_minimald="$(fk_sha "$fk_bucket/versions/v1/minimald-linux-$target_arch")"
+  h_minimal="$(fk_sha "$fk_bucket/versions/v1/minimal-linux-$target_arch")"
+  h_minvmd="$(fk_sha "$fk_bucket/versions/v1/minvmd-linux-$target_arch")"
+  h_kernel="$(fk_sha "$fk_bucket/versions/v1/vmlinuz-$target_arch")"
+  h_rootfs="$(fk_sha "$fk_bucket/versions/v1/rootfs-$target_arch.img")"
+  h_initramfs="$(fk_sha "$fk_bucket/versions/v1/initramfs-$target_arch.cpio")"
+  if [ -n "$fk_gvproxy" ]; then
+    h_gvproxy="$(fk_sha "$fk_bucket/versions/v1/gvproxy-min-linux-$target_arch")"
+  fi
+
+  {
+    printf '# format: 1\n'
+    printf '# component   os      arch    version   sha256   kind   dest                 src\n'
+    printf '\n'
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      minimald linux "$target_arch" v1 "$h_minimald" file bin/minimald "versions/v1/minimald-linux-$target_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      minimal linux "$target_arch" v1 "$h_minimal" file bin/min "versions/v1/minimal-linux-$target_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      minvmd linux "$target_arch" v1 "$h_minvmd" file bin/minvmd "versions/v1/minvmd-linux-$target_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      vmlinuz linux "$target_arch" v1 "$h_kernel" file data/vmlinuz "versions/v1/vmlinuz-$target_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      rootfs linux "$target_arch" v1 "$h_rootfs" file data/rootfs.img "versions/v1/rootfs-$target_arch.img"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      initramfs linux "$target_arch" v1 "$h_initramfs" file data/initramfs.cpio "versions/v1/initramfs-$target_arch.cpio"
+    if [ -n "$fk_gvproxy" ]; then
+      printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+        gvproxy-min linux "$target_arch" v1 "$h_gvproxy" file bin/gvproxy-min "versions/v1/gvproxy-min-linux-$target_arch"
+    fi
+  } >"$fk_bucket/versions/v1/components"
+
+  # Stub curl that serves the mock bucket.
+  cat >"$fk_stubbin/curl" <<STUB
+#!/bin/sh
+# Fake curl: map the pinned bucket host to this local dir.
+out= url=
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    https://*|http://*) url="\$1"; shift ;;
+    *) shift ;;
+  esac
+done
+[ -n "\$url" ] || { echo "stub curl: no url" >&2; exit 2; }
+rel="\${url#$fk_bucket_host/}"
+src="$fk_bucket/\$rel"
+[ -f "\$src" ] || { echo "stub curl: 404 \$url" >&2; exit 22; }
+if [ -n "\$out" ]; then cp "\$src" "\$out"; else cat "\$src"; fi
+STUB
+  chmod +x "$fk_stubbin/curl"
+  cat >"$fk_stubbin/wget" <<'STUB'
+#!/bin/sh
+echo "stub wget should not be used here" >&2
+exit 1
+STUB
+  chmod +x "$fk_stubbin/wget"
+
+  if (
+    # Fresh install into the throwaway home, no path overrides. The PATH change
+    # is intentionally scoped to this subshell (SC2031).
+    # shellcheck disable=SC2031
+    HOME="$fk_home" MINIMAL_BIN="$fk_home/.local/bin" \
+      PATH="$fk_stubbin:$PATH" \
+      MINIMAL_OVERRIDE_INSTALLER_BUCKET="$fk_bucket_host" \
+      sh "$ROOT/scripts/install.sh" >"$fk_out" 2>&1 || {
+        echo "::error::the fresh install (VM stack) failed"
+        echo "--- install output ---"; cat "$fk_out" 2>/dev/null || true
+        exit 1
+      }
+
+    [ -x "$fk_home/.local/bin/min" ] \
+      && [ -x "$fk_home/.local/bin/minimald" ] \
+      && [ -x "$fk_home/.local/bin/minvmd" ] || {
+      echo "::error::the fresh install did not ship min/minimald/minvmd"
+      tail -25 "$fk_out" 2>/dev/null || true
+      exit 1
+    }
+    [ -f "$fk_home/.local/share/minimal/vmlinuz" ] \
+      && [ -f "$fk_home/.local/share/minimal/rootfs.img" ] \
+      && [ -f "$fk_home/.local/share/minimal/initramfs.cpio" ] || {
+      echo "::error::the fresh install did not ship the guest images into the data prefix"
+      exit 1
+    }
+    if [ -n "$fk_gvproxy" ]; then
+      grep -qE 'switch-binary +verified +[^ ]*/bin/gvproxy-min$' "$fk_out" || {
+        echo "::error::the install output does not name the switch binary it verified"
+        tail -25 "$fk_out" 2>/dev/null || true
+        exit 1
+      }
+      [ -x "$fk_home/.local/bin/gvproxy-min" ] || {
+        echo "::error::the fresh install did not ship an executable gvproxy-min"
+        exit 1
+      }
+    fi
+
+    # Drive the installed pair with no MINVMD_* overrides, so resolution must
+    # come from the installed data prefix. Env swap is scoped to this subshell
+    # (SC2030/SC2031).
+    # shellcheck disable=SC2030,SC2031
+    export HOME="$fk_home" MINIMAL_BIN="$fk_home/.local/bin" PATH="$fk_home/.local/bin:$PATH"
+    unset MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS MINVMD_GVPROXY_BIN
+    mnl stop --force >/dev/null 2>&1 || true
+
+    local fk_sid fk_log fk_rec
+    fk_sid="$(cd "$fk_seed" && mnl session activate . --no-prompt --name "e2e-fresh-kvm-$target_arch" 2>"$fk_root/activate.err")" || {
+      echo "::error::the installed pair failed to activate a session with local-minvmd and no image overrides"
+      echo "--- activate stderr ---"; cat "$fk_root/activate.err" 2>/dev/null || true
+      exit 1
+    }
+    fk_sid="$(printf '%s\n' "$fk_sid" | tail -n1 | tr -d '\r')"
+
+    if ! printf '%s' "$fk_sid" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+      echo "::error::activate's last stdout line is not a session UUID: '$fk_sid'"
+      exit 1
+    fi
+    mnl ls --raw 2>/dev/null | grep -Fqx "$fk_sid" || {
+      echo "::error::'min ls --raw' does not list the fresh-install KVM session $fk_sid"
+      exit 1
+    }
+
+    # NET-049/NET-051 observability: the VM host daemon's start log line names
+    # the kernel, rootfs, initramfs and switch it resolved.
+    fk_log="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f 2>/dev/null | sort | tail -n1)"
+    fk_rec=""
+    for _ in $(seq 1 20); do
+      fk_rec="$(grep -h -- 'starting VM' "$fk_log" 2>/dev/null | tail -n1)"
+      [ -n "$fk_rec" ] && break
+      sleep 0.25
+    done
+    if [ -z "$fk_rec" ]; then
+      echo "::error::no 'starting VM' record in the VM host daemon log"
+      echo "--- minvmd log (tail) ---"; tail -30 "$fk_log" 2>/dev/null || true
+      exit 1
+    fi
+    case "$fk_rec" in
+      *'"kernel":'*'"rootfs":'*'"initramfs":'*'"switch":'*) ;;
+      *)
+        echo "::error::the VM host daemon start line does not name the kernel, rootfs, initramfs and switch"
+        echo "--- record ---"; printf '%s\n' "$fk_rec"
+        exit 1
+        ;;
+    esac
+    echo "VM host daemon start log line names the images and switch"
+
+    mnl session destroy --force "$fk_sid" >/dev/null 2>&1 || true
+    mnl stop --force >/dev/null 2>&1 || true
+  ); then
+    :
+  else
+    fail
+  fi
+  echo "fresh-install KVM activation ($target_arch) OK"
+  echo "::endgroup::"
+}
+
+proof_fresh_linux_kvm_activate_local_minvmd() {
+  proof_fresh_kvm_activate_local_minvmd_for_arch amd64
+}
+
+proof_fresh_arm64_kvm_activate_local_minvmd() {
+  proof_fresh_kvm_activate_local_minvmd_for_arch arm64
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch on the first argument: every proof in today's order when none is
 # given, or exactly the named one. The names are the proof functions' suffixes.
 case "${1:-}" in
@@ -5538,6 +5799,8 @@ case "${1:-}" in
     proof_restart
     proof_fresh_install_own_ip_ingress_publishes_loopback
     proof_network_posture_from_stock_install
+    proof_fresh_linux_kvm_activate_local_minvmd
+    proof_fresh_arm64_kvm_activate_local_minvmd
     proof_native_resolution_without_proxy_env
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
@@ -5548,7 +5811,8 @@ case "${1:-}" in
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | network_posture_from_stock_install | native_resolution_without_proxy_env \
     | hostnames_recover_and_two_daemons_route \
-    | min_internal_names_through_proxy | proxy_refuses_like_direct | retired_surfaces_gone)
+    | min_internal_names_through_proxy | proxy_refuses_like_direct | retired_surfaces_gone \
+    | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd)
     "proof_$1"
     ;;
   *)
@@ -5557,6 +5821,7 @@ case "${1:-}" in
     echo "  cases: lifecycle session_exec session_outbound_request own_ip task_run hooks"
     echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
+    echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
     echo "         hostnames_recover_and_two_daemons_route"
     echo "         min_internal_names_through_proxy proxy_refuses_like_direct retired_surfaces_gone"
     exit 2
