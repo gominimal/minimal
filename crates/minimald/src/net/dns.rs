@@ -1129,7 +1129,7 @@ mod tests {
         // Finalize's publish leases the box its own address (NET-010), and the
         // re-registration that follows it moves the name there — still with no
         // client attached.
-        let own = Ipv4Addr::new(127, 64, 0, 9);
+        let own = Ipv4Addr::new(127, 0, 64, 9);
         assert!(
             reg.publish_own_address(SessionId::nil(), "web", own, declared_ports())
                 .is_empty(),
@@ -1274,7 +1274,7 @@ mod tests {
 
         // A VM node: the node holds one allocated address of its own, and its
         // host-address boxes answer at it.
-        let node = Ipv4Addr::new(127, 64, 0, 200);
+        let node = Ipv4Addr::new(127, 0, 64, 200);
         let mut vm = HostnameRegistry::new("dev", true).with_node_address(node);
         vm.register_host_net(id("2"), "web");
         assert_eq!(
@@ -1307,7 +1307,7 @@ mod tests {
     /// address answers for it alone, and a lookup says where the box would be.
     #[test]
     fn stopped_shared_address_box_is_nodata() {
-        let node = Ipv4Addr::new(127, 64, 0, 200);
+        let node = Ipv4Addr::new(127, 0, 64, 200);
         let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
         let shared = id("1");
         let own = id("2");
@@ -1318,7 +1318,7 @@ mod tests {
         // does.
         reg.publish_own_address(shared, "shared", node, port.clone());
         reg.register_own_ip(shared, "shared", port.clone());
-        let own_address = Ipv4Addr::new(127, 64, 0, 9);
+        let own_address = Ipv4Addr::new(127, 0, 64, 9);
         reg.publish_own_address(own, "own", own_address, port.clone());
         reg.register_own_ip(own, "own", port);
 
@@ -1338,7 +1338,7 @@ mod tests {
         else {
             panic!("a registered box's name is held");
         };
-        assert_eq!(own_address, Some(Ipv4Addr::new(127, 64, 0, 9)));
+        assert_eq!(own_address, Some(Ipv4Addr::new(127, 0, 64, 9)));
 
         // The hosts exit: both names stay held — never absent, so neither is
         // negatively cached — but the shared one answers NODATA while the
@@ -1357,7 +1357,7 @@ mod tests {
             reg.zone_entry("own.min.internal", &[]),
             ZoneEntry::Held {
                 owner: "own".to_string(),
-                address: Some(Ipv4Addr::new(127, 64, 0, 9)),
+                address: Some(Ipv4Addr::new(127, 0, 64, 9)),
             },
             "a stopped box on its own address keeps answering A"
         );
@@ -1373,7 +1373,7 @@ mod tests {
         );
         assert_eq!(
             rows.pop().expect("the own box's row").address,
-            Some(Ipv4Addr::new(127, 64, 0, 9))
+            Some(Ipv4Addr::new(127, 0, 64, 9))
         );
 
         // Running again answers again — the stop is a state, not an end.
@@ -1395,7 +1395,7 @@ mod tests {
     /// place — so nothing remaps around it.
     #[test]
     fn shared_address_port_collision_reported_not_translated() {
-        let node = Ipv4Addr::new(127, 64, 0, 200);
+        let node = Ipv4Addr::new(127, 0, 64, 200);
         let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
         let first = id("1");
         let second = id("2");
@@ -1460,7 +1460,7 @@ mod tests {
         // A third box at an address of its own names the same port with no
         // collision at all (NET-010): different address, no shared port.
         let third = id("3");
-        let own_address = Ipv4Addr::new(127, 64, 0, 9);
+        let own_address = Ipv4Addr::new(127, 0, 64, 9);
         assert!(
             reg.publish_own_address(third, "third", own_address, second_ports)
                 .is_empty(),

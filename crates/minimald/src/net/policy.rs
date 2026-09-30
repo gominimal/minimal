@@ -703,9 +703,9 @@ mod tests {
             internal_port: 80,
             proto: IpProto::Tcp,
         };
-        let published = Ipv4Addr::new(127, 64, 0, 9);
+        let published = Ipv4Addr::new(127, 0, 64, 9);
         let req = expose_request(&mapping, published, Ipv4Addr::new(100, 64, 0, 2));
-        assert_eq!(req.local, "127.64.0.9:18080");
+        assert_eq!(req.local, "127.0.64.9:18080");
         assert_eq!(req.remote, "100.64.0.2:80");
         assert_eq!(req.protocol, "tcp");
     }

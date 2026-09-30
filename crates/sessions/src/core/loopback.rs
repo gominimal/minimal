@@ -2,7 +2,7 @@
 //!
 //! An own-address or `none` box publishes its ports on a host loopback
 //! address of its own, leased from the reserved local range —
-//! `127.64.0.0/24`, a loopback block no stock host service claims (design
+//! `127.0.64.0/24`, a loopback block no stock host service claims (design
 //! §7.1). The range is carved at [`SLICE_PREFIX`] into [`SLICE_COUNT`]
 //! disjoint slices, one per gvproxy daemon on the host: a daemon's slice is a
 //! function of its slice octet (`octet % SLICE_COUNT`, the
@@ -25,11 +25,11 @@
 use std::net::Ipv4Addr;
 
 /// The reserved local range a published box's address is leased from:
-/// `127.64.0.0/24` (design §7.1).
+/// `127.0.64.0/24` (design §7.1).
 ///
 /// Restated from `switch::DEFAULT_ADDRESS_PLAN`, which owns the definition;
 /// pinned to it by `minimald`'s carve cross-check test.
-pub const RESERVED_LOCAL_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 64, 0, 0), 24);
+pub const RESERVED_LOCAL_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 0, 64, 0), 24);
 
 /// The prefix each daemon's slice of the range is carved at: a `/27`, so a
 /// slice holds [`SLICE_ADDRESSES`] addresses.

@@ -2731,6 +2731,16 @@ async fn zone_answer_for(server: &TestServer, name: &str) -> Option<(String, std
     }
 }
 
+/// Whether `addr` falls inside the reserved local range a published box's own
+/// address is leased from (NET-010): the design's `127.0.64.0/24`, read from
+/// the one definition the allocator carves rather than restated as literals —
+/// so the assertion below follows the range if the design moves it again.
+fn in_reserved_local_range(addr: std::net::Ipv4Addr) -> bool {
+    let (network, prefix) = sessions::core::loopback::RESERVED_LOCAL_RANGE;
+    let mask = u32::MAX << (32 - u32::from(prefix));
+    u32::from(network) & mask == u32::from(addr) & mask
+}
+
 /// NET-011: a session's finalisation is what registers its box's
 /// `<name>.min.internal` — the reply to `FinalizeSession` comes back with the
 /// name already held, at the box's own leased loopback address, and the lease
@@ -2752,7 +2762,7 @@ async fn name_registered_at_finalize() {
             .expect("the name is held at finalize");
     assert_eq!(owner, "web", "the session owns its box name");
     assert!(
-        address.octets()[0] == 127 && address.octets()[1] == 64,
+        in_reserved_local_range(address),
         "the box's own address comes from the reserved local range, got {address}"
     );
 
@@ -2814,7 +2824,7 @@ async fn each_box_gets_own_loopback_address() {
     );
     for (name, address) in [("alpha", alpha_address), ("beta", beta_address)] {
         assert!(
-            address.octets()[0] == 127 && address.octets()[1] == 64,
+            in_reserved_local_range(address),
             "{name}'s address comes from the reserved local range, got {address}"
         );
     }
