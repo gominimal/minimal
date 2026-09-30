@@ -5734,8 +5734,16 @@ STUB
     unset MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS MINVMD_GVPROXY_BIN
     mnl stop --force >/dev/null 2>&1 || true
 
-    local fk_sid fk_log fk_rec
-    fk_sid="$(cd "$fk_seed" && mnl session activate . --no-prompt --name "e2e-fresh-kvm-$target_arch" 2>"$fk_root/activate.err")" || {
+    local fk_sid fk_log fk_rec fk_cand fk_key fk_want fk_data
+    # The start record this proof asserts is INFO, and a daemon's filter comes
+    # from RUST_LOG at autospawn (it inherits the CLI's env). This harness
+    # quiets the whole run to `warn` for output parsing, which drops the record
+    # before it reaches any sink — so the ONE activate that autospawns the
+    # daemon carries a filter that admits it, as a command-local assignment
+    # (never a subshell export) so nothing leaks past this proof. `minvmd` is
+    # the daemon's crate, so the CLI's own stdout stays quiet and the last-line
+    # UUID extraction below keeps working.
+    fk_sid="$(cd "$fk_seed" && RUST_LOG="warn,minvmd=info" mnl session activate . --no-prompt --name "e2e-fresh-kvm-$target_arch" 2>"$fk_root/activate.err")" || {
       echo "::error::the installed pair failed to activate a session with local-minvmd and no image overrides"
       echo "--- activate stderr ---"; cat "$fk_root/activate.err" 2>/dev/null || true
       exit 1
@@ -5753,27 +5761,104 @@ STUB
 
     # NET-049/NET-051 observability: the VM host daemon's start log line names
     # the kernel, rootfs, initramfs and switch it resolved.
-    fk_log="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f 2>/dev/null | sort | tail -n1)"
+    #
+    # WHERE the record lives: an autospawned daemon is a detached supervisor,
+    # which routes its tracing to the daily-rotated file sink under the state
+    # base's logs dir (`minvmd.log*`, dated and unsuffixed — crates/minvmd/src/
+    # main.rs). Its stderr — run.log, where a boot failure's diagnosis lands —
+    # carries only what tracing does not. Both are searched, file sink first;
+    # the first file that carries the record is the one that proves it.
+    #
+    # WHEN it lands: activate returns once the VM is serving, which can precede
+    # the appender's first flush, and the dated file is created by the daemon's
+    # own start — after the CLI's autospawn call returned. So the LOOKUP runs
+    # inside the retry loop (it used to run once, before it, and grep whatever
+    # it resolved there 20 times over) and the total wait is 20 s, well past
+    # the seconds a first flush can take.
+    fk_log_candidates() {
+      # Newest first: the dated file sorts after the unsuffixed name, and a
+      # later date after an earlier one.
+      find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null | sort -r
+      printf '%s\n' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/run.log"
+    }
     fk_rec=""
-    for _ in $(seq 1 20); do
-      fk_rec="$(grep -h -- 'starting VM' "$fk_log" 2>/dev/null | tail -n1)"
+    fk_log=""
+    for _ in $(seq 1 40); do
+      while IFS= read -r fk_cand; do
+        [ -f "$fk_cand" ] || continue
+        fk_rec="$(grep -h -- 'starting VM' "$fk_cand" 2>/dev/null | tail -n1)"
+        [ -z "$fk_rec" ] && continue
+        fk_log="$fk_cand"
+        break
+      done < <(fk_log_candidates)
       [ -n "$fk_rec" ] && break
-      sleep 0.25
+      sleep 0.5
     done
     if [ -z "$fk_rec" ]; then
-      echo "::error::no 'starting VM' record in the VM host daemon log"
-      echo "--- minvmd log (tail) ---"; tail -30 "$fk_log" 2>/dev/null || true
+      echo "::error::no 'starting VM' record in any VM host daemon log after 20 s"
+      echo "--- paths searched (tail of each) ---"
+      while IFS= read -r fk_cand; do
+        echo "--- $fk_cand ---"
+        if [ -f "$fk_cand" ]; then
+          tail -30 "$fk_cand" 2>/dev/null || true
+        else
+          echo "(no such file)"
+        fi
+      done < <(fk_log_candidates)
+      echo "--- log dir listing ---"
+      ls -la "$XDG_STATE_HOME/minimal/logs" 2>/dev/null || echo "(no log dir)"
       exit 1
     fi
-    case "$fk_rec" in
-      *'"kernel":'*'"rootfs":'*'"initramfs":'*'"switch":'*) ;;
-      *)
-        echo "::error::the VM host daemon start line does not name the kernel, rootfs, initramfs and switch"
-        echo "--- record ---"; printf '%s\n' "$fk_rec"
-        exit 1
-        ;;
-    esac
-    echo "VM host daemon start log line names the images and switch"
+
+    # The file sink writes one flat JSON object per line (crates/mlog) with the
+    # record's own fields nested under "fields", in the subscriber's key order —
+    # alphabetical (a BTreeMap in json-subscriber), not the record's declaration
+    # order. So each field is matched on its own: one ordered pattern would pin
+    # an ordering the JSON layer does not promise.
+    for fk_key in kernel rootfs initramfs switch; do
+      fk_want="\"$fk_key\":"
+      case "$fk_rec" in
+        *"$fk_want"*) ;;
+        *)
+          echo "::error::the VM host daemon start line does not name its $fk_key"
+          echo "--- record ---"; printf '%s\n' "$fk_rec"
+          exit 1
+          ;;
+      esac
+    done
+
+    # And the values are the proof's point: with no MINVMD_* overrides, the
+    # daemon must have resolved each guest image from the installed data prefix
+    # — the same paths the install checks above verified the installer stamped —
+    # and the switch from the installed bin dir when this proof staged one.
+    fk_data="$fk_home/.local/share/minimal"
+    for fk_pair in "kernel=$fk_data/vmlinuz" "rootfs=$fk_data/rootfs.img" \
+                   "initramfs=$fk_data/initramfs.cpio"; do
+      fk_key="${fk_pair%%=*}"
+      fk_want="\"$fk_key\":\"${fk_pair#*=}\""
+      case "$fk_rec" in
+        *"$fk_want"*) ;;
+        *)
+          echo "::error::the VM host daemon start line does not resolve its $fk_key from the installed data prefix"
+          echo "--- record ---"; printf '%s\n' "$fk_rec"
+          echo "--- expected ---"; printf '%s\n' "$fk_want"
+          exit 1
+          ;;
+      esac
+    done
+    if [ -n "$fk_gvproxy" ]; then
+      fk_want="\"switch\":\"$fk_home/.local/bin/gvproxy-min\""
+      case "$fk_rec" in
+        *"$fk_want"*) ;;
+        *)
+          echo "::error::the VM host daemon start line does not resolve the switch from the installed bin dir"
+          echo "--- record ---"; printf '%s\n' "$fk_rec"
+          echo "--- expected ---"; printf '%s\n' "$fk_want"
+          exit 1
+          ;;
+      esac
+    fi
+    echo "VM host daemon start line ($fk_log): $fk_rec"
 
     mnl session destroy --force "$fk_sid" >/dev/null 2>&1 || true
     mnl stop --force >/dev/null 2>&1 || true
