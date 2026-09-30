@@ -312,6 +312,9 @@ pub struct TaskRunArgs {
     /// Keep the session after the task exits instead of destroying it
     #[arg(long)]
     pub keep: bool,
+    /// Arguments to the task, passed through to its declared `args`.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+    pub args: Vec<String>,
 }
 
 /// Arguments for the hidden top-level `run` catch. Everything after `run` is

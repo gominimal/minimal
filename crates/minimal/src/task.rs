@@ -55,16 +55,17 @@ fn exit_outcome(code: Option<u32>) -> Result<(), anyhow::Error> {
     }
 }
 
-/// The exec request a task run sends: the task, plus the owns-box flag —
-/// set unless `--keep` retains the session (NET-131). The flag is what moves
-/// the destroy off this client: with it set, the daemon ends the session
-/// once the task's exit status is on the wire, whether or not this process
-/// is still there. `--keep` withholds it, because a kept session is meant to
-/// outlive the run — its end stays with whoever holds it.
-fn task_run_request(task: &str, keep: bool) -> minimald_rpc::exec::ExecRequest {
+/// The exec request a task run sends: the task, its declared arguments, plus
+/// the owns-box flag — set unless `--keep` retains the session (NET-131). The
+/// flag is what moves the destroy off this client: with it set, the daemon
+/// ends the session once the task's exit status is on the wire, whether or
+/// not this process is still there. `--keep` withholds it, because a kept
+/// session is meant to outlive the run — its end stays with whoever holds it.
+fn task_run_request(task: &str, args: &[String], keep: bool) -> minimald_rpc::exec::ExecRequest {
     minimald_rpc::exec::ExecRequest::TaskRun {
         task: task.to_string(),
         owns_box: !keep,
+        args: args.to_vec(),
     }
 }
 
@@ -866,7 +867,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     let outcome = match client
         .open_session_exec_channel(
             id,
-            &task_run_request(&args.task, args.keep).encode(),
+            &task_run_request(&args.task, &args.args, args.keep).encode(),
             &task_env,
         )
         .await
@@ -1010,24 +1011,26 @@ mod tests {
         use minimald_rpc::exec::ExecRequest;
 
         // A normal run: the request names the box as the run's own.
-        let req = task_run_request("build", false);
+        let req = task_run_request("build", &[], false);
         assert_eq!(
             req,
             ExecRequest::TaskRun {
                 task: "build".to_string(),
-                owns_box: true
+                owns_box: true,
+                args: vec![],
             }
         );
         // The flag is carried, not inferred: it survives the wire.
         assert_eq!(ExecRequest::parse(&req.encode()), Ok(req.clone()));
 
         // `--keep` keeps the box: no owns-box flag, nothing ends it here.
-        let kept = task_run_request("build", true);
+        let kept = task_run_request("build", &[], true);
         assert_eq!(
             kept,
             ExecRequest::TaskRun {
                 task: "build".to_string(),
-                owns_box: false
+                owns_box: false,
+                args: vec![],
             }
         );
         assert_eq!(ExecRequest::parse(&kept.encode()), Ok(kept));
@@ -1567,6 +1570,7 @@ mod tests {
             task: "deploy".into(),
             path: None,
             keep: false,
+            args: vec![],
         };
 
         let err = cmd_task_run(&global, args)
@@ -1613,6 +1617,7 @@ mod tests {
             task: "build".into(),
             path: None,
             keep: false,
+            args: vec![],
         };
 
         let err = cmd_task_run(&global, args)
@@ -1667,6 +1672,7 @@ mod tests {
             task: "build".into(),
             path: None,
             keep: false,
+            args: vec![],
         };
 
         let err = cmd_task_run(&global, args)

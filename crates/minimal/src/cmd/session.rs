@@ -716,6 +716,7 @@ pub async fn cmd_session_run(
             minimald_rpc::exec::ExecRequest::TaskRun {
                 task: args.task,
                 owns_box: false,
+                args: vec![],
             }
             .encode(),
         ),

@@ -32,9 +32,10 @@
 //! ```text
 //! min://shell <command>          run <command> with the session's shell
 //! min://argv ["a","b"]           exec this argv in the session, no shell
-//! min://task/run [--owns-box] <task>
+//! min://task/run [--owns-box] <task> [args]
 //!                                daemon-serviced: run a declared task;
-//!                                --owns-box ends the box with the run (NET-131)
+//!                                --owns-box ends the box with the run (NET-131);
+//!                                args is a JSON array of the task's arguments
 //! min://package/build [args]     daemon-serviced: build packages
 //! min://check [args]             daemon-serviced: lint the session's config
 //! <anything else>                a shell command for the session
@@ -80,6 +81,11 @@ pub enum ExecRequest {
         task: String,
         /// The run owns its box: the daemon ends the session with the run.
         owns_box: bool,
+        /// The task's declared arguments, as the client typed them after the
+        /// task name. Empty when the client sent none — an older `min`, or a
+        /// task that declares no args — in which case the daemon binds only
+        /// the task's defaults.
+        args: Vec<String>,
     },
     /// Build packages against the session.
     PackageBuild(String),
@@ -122,9 +128,23 @@ impl ExecRequest {
                     .expect("a Vec<String> always serializes to JSON");
                 format!("{EXEC_SCHEME}{ARGV} {json}")
             }
-            Self::TaskRun { task, owns_box } => {
+            Self::TaskRun {
+                task,
+                owns_box,
+                args,
+            } => {
                 let marker = if *owns_box { TASK_RUN_OWNS_BOX } else { "" };
-                format!("{EXEC_SCHEME}{TASK_RUN} {marker}{task}")
+                // Args ride only when present: the bare form is the legacy
+                // spelling every pre-args client sends, and it is also what
+                // keeps a task actually named `--owns-box` from colliding
+                // with the owns-box marker.
+                if args.is_empty() {
+                    format!("{EXEC_SCHEME}{TASK_RUN} {marker}{task}")
+                } else {
+                    let json = serde_json_lenient::to_string(args)
+                        .expect("a Vec<String> always serializes to JSON");
+                    format!("{EXEC_SCHEME}{TASK_RUN} {marker}{task} {json}")
+                }
             }
             Self::PackageBuild(args) => format!("{EXEC_SCHEME}{PACKAGE_BUILD} {args}"),
             Self::Check(args) => format!("{EXEC_SCHEME}{CHECK} {args}"),
@@ -171,12 +191,23 @@ impl ExecRequest {
                 // the run owns its box (NET-131); without it the payload is
                 // the task name itself, which is also every payload a client
                 // from before the flag sends.
-                let (owns_box, task) = payload
+                let (owns_box, rest) = payload
                     .strip_prefix(TASK_RUN_OWNS_BOX)
                     .map_or((false, payload), |task| (true, task));
+                // The task name runs to the first space; everything after it
+                // is the JSON-encoded argument list. A payload with no space
+                // is a task name with no args — the legacy form every client
+                // from before args sends.
+                let (task, args_json) = match rest.split_once(' ') {
+                    Some((task, args_json)) => (task, args_json),
+                    None => (rest, "[]"),
+                };
+                let args: Vec<String> = serde_json_lenient::from_str(args_json)
+                    .map_err(|e| ExecParseError::TaskArgs(e.to_string()))?;
                 Ok(Self::TaskRun {
                     task: task.to_string(),
                     owns_box,
+                    args,
                 })
             }
             PACKAGE_BUILD => Ok(Self::PackageBuild(payload.to_string())),
@@ -194,6 +225,8 @@ pub enum ExecParseError {
     UnknownTag(String),
     /// The `argv` payload was not a JSON array of strings.
     Argv(String),
+    /// The `task/run` argument payload was not a JSON array of strings.
+    TaskArgs(String),
     /// The `argv` payload was a well-formed but empty array, which names no
     /// program to run.
     EmptyArgv,
@@ -210,6 +243,10 @@ impl fmt::Display for ExecParseError {
             Self::Argv(e) => write!(
                 f,
                 "the {EXEC_SCHEME}{ARGV} payload is not a JSON array of strings: {e}"
+            ),
+            Self::TaskArgs(e) => write!(
+                f,
+                "the {EXEC_SCHEME}{TASK_RUN} argument payload is not a JSON array of strings: {e}"
             ),
             Self::EmptyArgv => write!(f, "the {EXEC_SCHEME}{ARGV} payload names no program"),
         }
@@ -231,6 +268,7 @@ mod tests {
             ExecRequest::TaskRun {
                 task: "build".to_string(),
                 owns_box: false,
+                args: vec![],
             },
             ExecRequest::PackageBuild("--verbose pkg".to_string()),
             ExecRequest::Check(String::new()),
@@ -303,6 +341,7 @@ mod tests {
         let owned = ExecRequest::TaskRun {
             task: "build".to_string(),
             owns_box: true,
+            args: vec![],
         };
         assert_eq!(owned.encode(), "min://task/run --owns-box build");
         assert_eq!(
@@ -315,6 +354,7 @@ mod tests {
         let plain = ExecRequest::TaskRun {
             task: "build".to_string(),
             owns_box: false,
+            args: vec![],
         };
         assert_eq!(plain.encode(), "min://task/run build");
         assert_eq!(ExecRequest::parse("min://task/run build"), Ok(plain));
@@ -324,6 +364,7 @@ mod tests {
         let marked = ExecRequest::TaskRun {
             task: "--owns-box".to_string(),
             owns_box: false,
+            args: vec![],
         };
         assert_eq!(
             ExecRequest::parse(&marked.encode()),
@@ -341,6 +382,37 @@ mod tests {
         assert!(err.to_string().contains("min://teleport"), "{err}");
         // The message lists what this daemon does serve.
         assert!(err.to_string().contains("min://task/run"), "{err}");
+    }
+
+    /// A task run's declared arguments ride the request as a JSON array, so
+    /// they survive the wire byte-exact — spaces, quotes and newlines
+    /// included — and a payload with no args parses as the empty list.
+    #[test]
+    fn a_task_run_round_trips_its_args() {
+        let req = ExecRequest::TaskRun {
+            task: "build".to_string(),
+            owns_box: false,
+            args: vec!["--count".into(), "42".into(), "it's \"quoted\"".into()],
+        };
+        assert_eq!(
+            ExecRequest::parse(&req.encode()),
+            Ok(req),
+            "the args survive the round trip"
+        );
+
+        // A task name with no args is the legacy form.
+        let plain = ExecRequest::TaskRun {
+            task: "build".to_string(),
+            owns_box: false,
+            args: vec![],
+        };
+        assert_eq!(ExecRequest::parse("min://task/run build"), Ok(plain));
+
+        // A malformed args payload is refused rather than guessed at.
+        assert!(matches!(
+            ExecRequest::parse("min://task/run build not-json"),
+            Err(ExecParseError::TaskArgs(_))
+        ));
     }
 
     /// A malformed or program-less argv is refused rather than guessed at.

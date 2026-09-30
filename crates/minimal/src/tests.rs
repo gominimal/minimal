@@ -1074,6 +1074,7 @@ fn session_run_encodes_a_task_form_not_a_command() {
     let request = minimald_rpc::exec::ExecRequest::TaskRun {
         task: "check".to_string(),
         owns_box: false,
+        args: vec![],
     };
     let wire = request.encode();
     assert_eq!(
@@ -1081,6 +1082,7 @@ fn session_run_encodes_a_task_form_not_a_command() {
         Ok(minimald_rpc::exec::ExecRequest::TaskRun {
             task: "check".to_string(),
             owns_box: false,
+            args: vec![],
         })
     );
 }

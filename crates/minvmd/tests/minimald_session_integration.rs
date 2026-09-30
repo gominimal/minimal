@@ -180,6 +180,7 @@ async fn minimald_exec_over_bridge() {
         let task = minimald_rpc::exec::ExecRequest::TaskRun {
             task: "echo_ok".to_string(),
             owns_box: false,
+            args: vec![],
         }
         .encode();
         result = run_session_exec(&guest.sock_path, Some(&mfile), &task).await;

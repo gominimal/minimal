@@ -86,7 +86,12 @@ pub trait Process: Send + 'static {
 #[derive(Debug, Clone)]
 pub struct TaskExec {
     pub task: String,
-    pub args: Option<args::ArgsSet>,
+    /// The task's declared arguments, as the client typed them after the
+    /// task name. Parsed against the task's `args` schema in
+    /// [`task_producer`], where the schema is first available. Empty when
+    /// the client sent none — an older `min`, or a task that declares no
+    /// args — in which case the task's defaults apply.
+    pub args: Vec<String>,
     /// The task's `env_vars`, already resolved against the invoking shell
     /// by the client and carried on the channel environment (see
     /// [`minimald_rpc::taskenv`]). Applied over the task's own
@@ -225,6 +230,23 @@ async fn attach_or_reap<P: Reapable>(
     }
 }
 
+/// Parse a task run's argv against the task's declared `args` schema.
+///
+/// Returns `None` when the task declares no args (nothing to bind), and
+/// `Some` otherwise — even for an empty argv, which `parse_argv_named`
+/// fills with the task's defaults. This mirrors the in-sandbox path in
+/// `mctx::env`, so a task using `%{arg}` resolves the same way whether it
+/// runs in-box or through the daemon.
+fn parse_task_args(task: &mfile::Task, argv: &[String]) -> Result<Option<args::ArgsSet>, String> {
+    if task.args.is_empty() {
+        return Ok(None);
+    }
+    task.args
+        .parse_argv_named("task", argv.iter().cloned())
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
 /// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
 /// `env` lives on a single stack frame across every spawn — that frame
 /// is alive for the whole life of this tokio task, which in turn is
@@ -248,7 +270,9 @@ async fn task_producer(
         if let Some(task) = ctx.minimal_file().task(&exec.task)
             && task.action.as_echo().is_some()
         {
-            let task = mctx::interpolate_task_strings(&task, exec.args.as_ref())
+            let parsed_args =
+                parse_task_args(&task, &exec.args).map_err(|e| io::Error::other(e.to_string()))?;
+            let task = mctx::interpolate_task_strings(&task, parsed_args.as_ref())
                 .map_err(|e| io::Error::other(e.to_string()))?;
             let text = task.action.as_echo().unwrap_or_default().to_string();
             if req_rx.recv().await.is_some() {
@@ -276,6 +300,12 @@ async fn task_producer(
             .task(graph, &exec.task)
             .map_err(|e| io::Error::other(e.to_string()))?
             .ok_or_else(|| io::Error::other(format!("No such task: {}", exec.task)))?;
+        // Parse the client's args against the task's declared schema. This
+        // is where the schema is first available: the dispatch arm only has
+        // the raw argv off the wire. An empty argv still parses, applying
+        // the task's defaults — the all-defaults case the issue reports.
+        let parsed_args =
+            parse_task_args(&task, &exec.args).map_err(|e| io::Error::other(e.to_string()))?;
         // Values the client resolved against the invoking shell win over the
         // task's own declarations. That is what turns `{ inherit = true }`
         // into something the daemon can apply: resolving it here would read
@@ -319,7 +349,7 @@ async fn task_producer(
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
         let (_interactive, invocations) = env
-            .task_invocations(&task, exec.args.as_ref())
+            .task_invocations(&task, parsed_args.as_ref())
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -1362,7 +1392,11 @@ pub(crate) async fn handle_exec(
                 .instrument(span),
             );
         }
-        ExecRequest::TaskRun { task, owns_box } => {
+        ExecRequest::TaskRun {
+            task,
+            owns_box,
+            args,
+        } => {
             let task = task.trim().to_string();
             if task.is_empty() {
                 tracing::warn!(%session_id, "execution request rejected: task/run names no task");
@@ -1386,7 +1420,7 @@ pub(crate) async fn handle_exec(
                     session: session_handle,
                     channel_id: id,
                     exec: TaskExec {
-                        args: None,
+                        args,
                         // The name stays behind for the run-box-end log line.
                         task: task.clone(),
                         env: task_env,
@@ -2910,6 +2944,7 @@ mod tests {
                     &ExecRequest::TaskRun {
                         task: "echo_ok".to_string(),
                         owns_box: false,
+                        args: vec![],
                     }
                     .encode(),
                     &[],
@@ -2956,6 +2991,7 @@ mod tests {
                     &ExecRequest::TaskRun {
                         task: "echo_ok".to_string(),
                         owns_box: true,
+                        args: vec![],
                     }
                     .encode(),
                     &[],
@@ -3016,6 +3052,7 @@ mod tests {
                     &ExecRequest::TaskRun {
                         task: "echo_ok".to_string(),
                         owns_box: false,
+                        args: vec![],
                     }
                     .encode(),
                     &[],
@@ -3057,6 +3094,7 @@ mod tests {
                     &ExecRequest::TaskRun {
                         task: "some_task".to_string(),
                         owns_box: false,
+                        args: vec![],
                     }
                     .encode(),
                     &[],
@@ -3076,6 +3114,7 @@ mod tests {
                     &ExecRequest::TaskRun {
                         task: String::new(),
                         owns_box: false,
+                        args: vec![],
                     }
                     .encode(),
                     &[],
