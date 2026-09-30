@@ -2796,12 +2796,12 @@ async fn name_registered_at_finalize() {
 }
 
 /// NET-010, runtime half: two own-address boxes that declare the *same* port
-/// each get a host loopback address of their own out of the daemon's slice of
-/// the reserved local range, so both publish — at their own addresses, at
-/// their own port numbers, never translated — where one loopback address
-/// would have made the second box's port a collision. NET-129's sub-requirement
-/// (report, don't translate) covers the boxes that *do* share an address; this
-/// is the case the shared-address mode exists to avoid.
+/// each get a host loopback address of their own, granted from the answerer's
+/// record for the reserved local range, so both publish — at their own
+/// addresses, at their own port numbers, never translated — where one loopback
+/// address would have made the second box's port a collision. NET-129's
+/// sub-requirement (report, don't translate) covers the boxes that *do* share
+/// an address; this is the case the shared-address mode exists to avoid.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_box_gets_own_loopback_address() {
     let server = TestServer::new().await;
@@ -2886,9 +2886,9 @@ async fn name_answers_without_attached_client() {
 
 /// NET-012: destroying the box is what ends the name. Every later lookup
 /// answers NXDOMAIN — held while the box existed (NET-013), absent the moment
-/// it is destroyed — and the address it held returns to the daemon's slice with
-/// the release line the observability contract asks for, so the next box may
-/// publish on it (NET-010).
+/// it is destroyed — and the address it held returns to the answerer's record
+/// with the release line the observability contract asks for, so the next box
+/// may publish on it (NET-010).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn destroyed_box_name_is_nxdomain() {
     let capture = crate::test_harness::captured_log();

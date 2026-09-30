@@ -472,10 +472,10 @@ pub struct HostnameRegistry {
     /// published-loopback model.
     on_switch: bool,
     /// The host loopback address this node's `HostNet` boxes answer at
-    /// (R3.6, NET-129): the address the daemon leased from its slice of the
-    /// reserved local range when it started, which its boxes' listeners are
-    /// forwarded to. Default `127.0.0.1` — a native host's node address is the
-    /// host loopback itself.
+    /// (R3.6, NET-129): the address the answerer's record holds for the node,
+    /// which its boxes' listeners are forwarded to. Default `127.0.0.1` — a
+    /// native node's address is the host loopback itself, and it asks for
+    /// nothing.
     node: Ipv4Addr,
     /// Published own-address state, by stable session id (NET-010): the
     /// address and ports an `OwnIp` box's declaration publishes at, from
@@ -544,10 +544,10 @@ impl HostnameRegistry {
         }
     }
 
-    /// Sets the node's host loopback address — the address the daemon leased
-    /// from its slice for itself (NET-129) — and returns the registry, for
+    /// Sets the node's host loopback address — the address the answerer's
+    /// record holds for this node (NET-129) — and returns the registry, for
     /// the sessions manager to build its registry with at init, after it has
-    /// leased. `HostNet` boxes answer at it; an own-address box that asked for
+    /// asked. `HostNet` boxes answer at it; an own-address box that asked for
     /// the shared node address publishes on it too.
     #[must_use]
     pub fn with_node_address(mut self, node: Ipv4Addr) -> Self {
@@ -729,9 +729,9 @@ impl HostnameRegistry {
     }
 
     /// Publishes an `OwnIp` box's ingress declaration at `address` (NET-010):
-    /// the host loopback address the session leased for the box from the
-    /// daemon's slice of the reserved local range, with the external ports its
-    /// declaration names — the box's own port numbers, never translated.
+    /// the host loopback address the answerer's record granted the box, with
+    /// the external ports its declaration names — the box's own port numbers,
+    /// never translated.
     /// Recorded by stable id from finalize until destroy, so the name answers
     /// with no client attached (NET-011) and the box keeps its address across a
     /// rename or a re-attach.
@@ -1093,9 +1093,16 @@ pub enum LeaseNamespace {
     /// survives. *Not* the session's name, which a user may reuse for the
     /// next box the moment this one exits.
     Box { session: SessionId },
-    /// The node itself: the address its host-address boxes answer at
-    /// (NET-129). One per host — a native node already owns the host
-    /// loopback and asks for nothing.
+    /// The node itself: the one address its host-address boxes answer at and
+    /// publish on (NET-129). A native node already owns the host loopback and
+    /// asks for nothing; a VM node holds one for its lifetime — granted at its
+    /// first daemon's start and re-answered to every daemon the node restarts,
+    /// because the node's identity on the host does not change with its
+    /// daemon, so its grant is never swept. The state root the node's daemon
+    /// runs from is the node for keying it: a guest's root is the guest's own,
+    /// so two co-resident VMs hold two grants in two records — the host-side
+    /// channel across them is the minvmd answerer's to carry, not this
+    /// record's.
     Node,
 }
 
