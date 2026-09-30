@@ -423,8 +423,15 @@ impl Container {
         // only moment that is possible, while the process still holds
         // CAP_SETPCAP in its user namespace. A none box additionally installs
         // its socket-family filter at the same moment hakoniwa would load a
-        // libseccomp filter.
-        install_box_credentials(&self.container, &mut command, self.socket_family_filter)?;
+        // libseccomp filter. A box with a classifier leaf also joins it in the
+        // same closure — the last moment the process still sits in the
+        // daemon's cgroup namespace, where the leaf is reachable.
+        install_box_credentials(
+            &self.container,
+            &mut command,
+            self.socket_family_filter,
+            sandbox.config.classifier_leaf.clone(),
+        )?;
 
         Ok(command)
     }
@@ -453,19 +460,22 @@ impl Container {
 /// roots its own tree under the cgroup2 mount the guest boot path makes with
 /// namespace delegation.
 ///
-/// **Why a box stays in its leaf.** The sandbox unshares *every* namespace —
-/// cgroup namespace included — in one call, before any placement, so the
-/// cgroup-namespace root of every box process is the cgroup its forking
-/// parent was in at that moment: the daemon's own leaf, which has no children.
-/// The box's leaf is therefore a *sibling* of its namespace root, and with
-/// cgroup2 mounted `nsdelegate` the namespace root is a delegation boundary:
-/// a write to any cgroup outside it is refused, so a box process can migrate
-/// nowhere at all — not into another box's leaf, and not even into a child of
-/// its own. The barrier is the root-owned tree, since the daemon's uid —
-/// which a box runs as, via its user-namespace map — has no write access above
-/// `boxes/`; the one cgroup view that is *not* rooted at the namespace root,
-/// the host's own cgroup2 mount, is kept out of the box's mount namespace
-/// ([`hidden_mountpoints`], applied in [`Sandbox::new_container`]).
+/// **Why a box stays in its leaf.** The box's leaf is the root of its cgroup
+/// namespace (architecture, *Box Resources*): the box's first process joins
+/// the leaf in its pre-exec closure, *then* unshares the cgroup namespace, so
+/// the namespace is rooted where the box already stands. A cgroup view
+/// mounted after that starts at the namespace root — the leaf itself — so a
+/// sibling leaf is below neither and invisible, and with cgroup2 mounted
+/// `nsdelegate` the root's own `cgroup.procs` is not writable from inside the
+/// namespace (it is a delegation boundary, and the process running as the
+/// delegated uid inside it holds no capability over it). The box gets one
+/// such view, mounted read-only, over the tree the sandbox binds at the
+/// conventional mountpoint — so the box can *read* where a cgroup-aware
+/// runtime looks for its limit (`/sys/fs/cgroup/memory.max`, architecture
+/// line 1226) while every migration write it attempts, at the root or below,
+/// fails. The root-owned tree above `boxes/` is the barrier behind that: a
+/// box runs as the daemon's uid via its user-namespace map, which is
+/// delegated `boxes/` and nothing above it.
 pub mod classifier {
     use std::path::{Path, PathBuf};
 
@@ -484,11 +494,12 @@ pub mod classifier {
     /// daemon never places itself under it (NET-078's two identities).
     pub const BOXES_DIR: &str = "boxes";
 
-    /// The conventional cgroup2 mountpoint, masked in every leaf-bearing box
-    /// whether or not this host's mount table has cgroup2 there: a host can
-    /// mount it elsewhere, and a box that could see it could see a sibling
-    /// leaf through it — the one cgroup view not rooted at the box's
-    /// cgroup-namespace root.
+    /// The conventional cgroup2 mountpoint: where the box's classifier tree
+    /// is bound for the join, and where the box's read-only cgroup2 view —
+    /// rooted at its own leaf, once the cgroup namespace is unshared onto it
+    /// — is mounted over it. It is the one place a cgroup-aware runtime
+    /// looks, so it is the place the box must be able to *read* its limit
+    /// from, and the one place every migration write it attempts fails.
     pub const CONVENTIONAL_CGROUP2_MOUNTPOINT: &str = "/sys/fs/cgroup";
 
     /// The daemon's own leaf under `root`.
@@ -595,15 +606,22 @@ pub mod classifier {
     }
 
     /// Moves this process into `root`'s [`DAEMON_LEAF`], as the daemon does at
-    /// startup: its own traffic then leaves from a leaf of its own (NET-080)
-    /// and the cgroup-namespace root every box it later forks gets — created
-    /// by the sandbox's single `unshare()`, while its forking parent sits
-    /// here — is a childless leaf a box cannot see past.
+    /// startup: its own traffic then leaves from a leaf of its own (NET-080),
+    /// never classed with a box's, and the daemon sits in a *sibling* of every
+    /// box leaf — never above them, where a controller it enabled for its own
+    /// benefit could make the box leaves `domain invalid` (spike finding F).
     ///
     /// Creates the tree first where this process has the privilege to (the
     /// guest's pid 1); natively the tree is the privileged step's to install,
     /// so a missing one surfaces as the error it is and the daemon keeps
     /// running, and its boxes, unenforced.
+    ///
+    /// Also asks the kernel for the `memory` controller on the cohort —
+    /// best-effort, and safe: `boxes/` holds no process, so enabling a
+    /// controller on it breaks no internal-process rule. Without it a box
+    /// leaf has no `memory.max` for the read-only cgroup2 view the box gets
+    /// to show, and the limit a cgroup-aware runtime looks for would be
+    /// invisible where the runtime looks for it.
     pub fn enter_daemon_leaf(root: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(root.join(BOXES_DIR))?;
         let daemon = daemon_leaf(root);
@@ -614,6 +632,20 @@ pub mod classifier {
                 Err(e)
             }
         })?;
+        // Over a stand-in tree (a test's) this writes a plain file; over a
+        // real tree the kernel takes `+memory` as a subtree_control command
+        // and may refuse it — a host without the memory controller, or one
+        // that has it threaded off, still gets its boxes placed.
+        if let Err(e) = std::fs::write(root.join(BOXES_DIR).join("cgroup.subtree_control"), "+memory\n")
+            && e.kind() != std::io::ErrorKind::NotFound
+            && e.kind() != std::io::ErrorKind::PermissionDenied
+        {
+            tracing::warn!(
+                error = %e,
+                "enabling the memory controller on the box cohort; a box leaf \
+                 may have no memory.max for its own view to show"
+            );
+        }
         place_pid(&daemon.join("cgroup.procs"), std::process::id())
     }
 
@@ -648,35 +680,65 @@ pub mod classifier {
             .collect()
     }
 
-    /// The mountpoints overmounted in every box configured with a classifier
-    /// leaf, so no cgroup view inside the box can reach a sibling leaf: the
-    /// conventional cgroup2 mountpoint always, plus every cgroup2 mount this
-    /// host's mount table names. Deduplicated, conventional first.
+    /// The cgroup2 mount that decides where a tree named `root` actually
+    /// lives: the deepest one containing it, with whether that mount treats
+    /// cgroup namespaces as delegation boundaries (`nsdelegate`). A `root`
+    /// under no cgroup2 mount is not a cgroup tree at all — plain
+    /// directories, whose `cgroup.procs` moves nothing.
+    ///
+    /// Pure over its input, so the daemon can refuse exactly the hosts whose
+    /// "tree" decides nothing and a test can pin the shape it refuses.
     #[must_use]
-    pub fn hidden_mountpoints(mountinfo: &str) -> Vec<PathBuf> {
-        let mut hidden = vec![PathBuf::from(CONVENTIONAL_CGROUP2_MOUNTPOINT)];
-        for (mountpoint, _) in host_cgroup2_mounts(mountinfo) {
-            if !hidden.contains(&mountpoint) {
-                hidden.push(mountpoint);
-            }
-        }
-        hidden
+    pub fn cgroup2_covering(root: &Path, mountinfo: &str) -> Option<(PathBuf, bool)> {
+        host_cgroup2_mounts(mountinfo)
+            .into_iter()
+            .filter(|(mountpoint, _)| root.starts_with(mountpoint))
+            // Two mounts can both contain `root` (a nested overmount); the
+            // deeper one is the one the tree actually sits on.
+            .max_by_key(|(mountpoint, _)| mountpoint.components().count())
     }
 
-    /// This host's mount table, as [`hidden_mountpoints`] and
+    /// Whether the classifier tree at `root` can decide a box's verdict on
+    /// this host: the tree must sit on a cgroup2 mount — a directory tree
+    /// anywhere else is plain directories, and a box "placed" there is
+    /// unenforced while looking placed — and in a guest, where this daemon is
+    /// pid 1 and its own boot path is the only thing that could have mounted
+    /// that cgroup2, the mount must carry `nsdelegate`: a guest tree without
+    /// namespace delegation is a broken image, not a deployment state
+    /// (design §7.1).
+    ///
+    /// Natively a tree on a cgroup2 mounted without `nsdelegate` still
+    /// counts: the privileged step refuses to install one there, so a tree
+    /// that exists anyway was built by hand, and the confinement does not
+    /// rest on the host's mount options alone — see [`Self`]'s placement
+    /// order. Pure over its inputs, so the exact hosts a daemon must run
+    /// unenforced on — or refuse, in the guest — are pinned by a test.
+    #[must_use]
+    pub fn tree_is_real(root: &Path, mountinfo: Option<&str>, guest: bool) -> bool {
+        match mountinfo.and_then(|mi| cgroup2_covering(root, mi)) {
+            Some((_, true)) => true,
+            Some((_, false)) => !guest,
+            None => false,
+        }
+    }
+
+    /// This host's mount table, as [`cgroup2_covering`] and
     /// [`host_cgroup2_mounts`] read it. `None` where it cannot be read — a
-    /// host whose mount table cannot be read has no cgroup2 to hide either.
+    /// host whose mount table cannot be read has no cgroup2 to build a tree
+    /// on either.
     #[must_use]
     pub fn own_mountinfo() -> Option<String> {
         std::fs::read_to_string("/proc/self/mountinfo").ok()
     }
 }
 
-/// Install the box's credentials — and, for a none box, its seccomp-BPF
-/// filter — into a hakoniwa command as a program-closure.
+/// Install the box's classifier placement, credentials — and, for a none box,
+/// its seccomp-BPF filter — into a hakoniwa command as a program-closure.
 ///
 /// The closure runs after namespaces and credentials are configured but before
-/// the supervised program execs, which is the correct moment for both.  It
+/// the supervised program execs, which is the correct moment for all three.
+/// For a box with a classifier leaf it joins the leaf, unshares the cgroup
+/// namespace onto it, and mounts the read-only cgroup2 view over it; it
 /// takes the box's credentials, loads the `&'static` filter the `Container`
 /// holds if there is one, and then execs the original program, since
 /// `command_from_closure` otherwise replaces the program entirely.
@@ -692,11 +754,23 @@ fn install_box_credentials(
     container: &hakoniwa::Container,
     command: &mut hakoniwa::Command,
     socket_family_filter: Option<&'static SocketFamilyFilter>,
+    classifier_leaf: Option<config::ClassifierLeaf>,
 ) -> Result<(), Error> {
     let program = command.get_program().to_string();
     let args = command.get_args();
     let current_dir = command.get_current_dir().map(Path::to_path_buf);
     let envs = command.get_envs();
+    // The leaf's `cgroup.procs` as the box itself will spell it: through the
+    // tree the sandbox bound at the conventional mountpoint, the only place
+    // the leaf is reachable from inside the box. The write happens before the
+    // cgroup namespace is unshared, and the view mounted over the tree
+    // afterwards is rooted at the leaf — so this is also the last spelling of
+    // the leaf that ever opens for anything the box runs.
+    let classifier_join = classifier_leaf.map(|leaf| {
+        Path::new(classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT)
+            .join(leaf.relative_dir())
+            .join("cgroup.procs")
+    });
     // SAFETY: `command_from_closure` is unsafe because the closure runs in a
     // forked child.  `socket_family_filter` is `&'static`: it is the
     // process-wide `socket_family_filter_for_none_box()` `OnceLock` value,
@@ -708,8 +782,14 @@ fn install_box_credentials(
     // single-threaded, so no allocator lock can be held across the fork.  The
     // closure never returns: it execs, or `_exit`s.
     let mut closure = unsafe {
-        container
-            .command_from_closure(move || exec_box_program(&program, &args, socket_family_filter))
+        container.command_from_closure(move || {
+            exec_box_program(
+                &program,
+                &args,
+                socket_family_filter,
+                classifier_join.as_deref(),
+            )
+        })
     };
     if let Some(dir) = current_dir {
         closure.current_dir(dir);
@@ -719,11 +799,11 @@ fn install_box_credentials(
     Ok(())
 }
 
-/// The body of the launch closure in [`install_box_credentials`]: take the
-/// box's credentials, install the box's socket-family filter if it has one,
-/// then exec the program the caller asked for.  Never returns; a failure is
-/// reported on the child's stderr and exits it with the shell's "cannot run"
-/// status.
+/// The body of the launch closure in [`install_box_credentials`]: place the
+/// box in its classifier leaf, take the box's credentials, install the box's
+/// socket-family filter if it has one, then exec the program the caller asked
+/// for.  Never returns; a failure is reported on the child's stderr and exits
+/// it with the shell's "cannot run" status.
 ///
 /// Split out of the closure so each unsafe operation sits in its own block
 /// rather than inheriting the one around `command_from_closure`.
@@ -732,7 +812,53 @@ fn exec_box_program(
     program: &str,
     args: &[String],
     socket_family_filter: Option<&'static SocketFamilyFilter>,
+    classifier_join: Option<&Path>,
 ) -> ! {
+    // The box's classifier leaf (NET-079), taken in the order the
+    // confinement rests on: join first, *then* unshare the cgroup namespace,
+    // so its root is the leaf the process just entered — the box's own view
+    // of the hierarchy starts at the one cgroup its verdict is decided on,
+    // and every other leaf is below neither it nor any view it can mount.
+    // The join is the last act that still runs in the daemon's namespaces,
+    // where the tree the sandbox bound resolves; the read-only cgroup2 view
+    // mounted over it afterwards is what the box reads its limit from, and
+    // what a migration write dies on. Failures exit the child: a box that
+    // cannot take the leaf its verdict is decided on must not run.
+    if let Some(procs) = classifier_join {
+        if let Err(e) = classifier::place_pid(procs, std::process::id()) {
+            exit_child("joining the box's classifier leaf", &e);
+        }
+        // SAFETY: `unshare(2)` with the cgroup-namespace flag only;
+        // async-signal-safe.
+        if unsafe { libc::unshare(libc::CLONE_NEWCGROUP) } == -1 {
+            exit_child(
+                "unsharing the cgroup namespace onto the box's leaf",
+                &std::io::Error::last_os_error(),
+            );
+        }
+        let target = std::ffi::CString::new(
+            classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT,
+        )
+        .expect("the cgroup mountpoint has no NUL in it");
+        // SAFETY: `mount(2)` with valid C strings and no data; cgroup2 takes
+        // no options but the flags, and the `nsdelegate` property is a
+        // superblock one the host's mount already fixed. Async-signal-safe.
+        if unsafe {
+            libc::mount(
+                c"cgroup2".as_ptr(),
+                target.as_ptr(),
+                c"cgroup2".as_ptr(),
+                libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                std::ptr::null(),
+            )
+        } == -1
+        {
+            exit_child(
+                "mounting the box's read-only cgroup2 view",
+                &std::io::Error::last_os_error(),
+            );
+        }
+    }
     // SAFETY: `assume_box_credentials` is async-signal-safe; this is the
     // pre-exec moment it is for, with the namespace built and CAP_SETPCAP in
     // it still held.
@@ -999,8 +1125,22 @@ impl<C: Channel> Sandbox<C> {
             .gidmap(config::BOX_GID)
             .devfsmount("/dev")
             .tmpfsmount("/tmp")
-            .unshare(hakoniwa::Namespace::Cgroup)
             .runctl(hakoniwa::Runctl::IgnoreCgroupSetupFailed);
+
+        // The cgroup namespace, whose root decides what the box can ever
+        // reach. A box with no classifier leaf takes it here, in the one
+        // `unshare()` every namespace goes through: its root is then the
+        // cgroup its forking parent sits in — the daemon's leaf, which has
+        // no children, and on a host with no per-box classifier is the
+        // whole of the confinement. A box *with* a leaf does not unshare it
+        // here: the pre-exec closure joins the leaf first and unshares the
+        // namespace second, so the root is the leaf itself (see
+        // `exec_box_program`) — and the tree the join writes through has to
+        // be bound into the box while the process still sits in the
+        // daemon's namespaces, where the tree's paths resolve.
+        if self.config.classifier_leaf.is_none() {
+            container.unshare(hakoniwa::Namespace::Cgroup);
+        }
 
         // Every box's launch posture (NET-083), applied by the pre-exec
         // closure on every command spawned from this container: exec as the
@@ -1019,38 +1159,47 @@ impl<C: Channel> Sandbox<C> {
             "sandbox launch: box execs as the box uid with no capability a box may not hold"
         );
 
-        // The box's classifier leaf (NET-079): the cgroup its egress verdict is
-        // decided on, and the one every process of the box must stay in. The
-        // host's own cgroup2 mount is the one cgroup view not rooted at the
-        // box's cgroup-namespace root, so a box that could see it could name a
-        // sibling leaf — and, running as the daemon's uid in a delegated tree,
-        // write its way into one. Every mountpoint that mount could be at is
-        // therefore overmounted with an empty tmpfs: the box's own cgroup2
-        // views are all rooted at a childless leaf that is a sibling of its
-        // own, so they cannot see a sibling either (see `classifier` for the
-        // namespace half of the confinement, which needs nothing from this
-        // launch).
+        // The box's classifier leaf (NET-079): the cgroup its egress verdict
+        // is decided on, and the one every process of the box must stay in.
+        // The tree the leaf belongs to is bound at the conventional cgroup
+        // mountpoint, so the box's own pre-exec closure can write its way
+        // into the leaf — the one migration primitive the whole placement
+        // rests on — and the read-only cgroup2 view it mounts over the leaf
+        // afterwards is rooted at the leaf itself, the one cgroup a
+        // cgroup-aware runtime looks for its limit in. The host's own cgroup2
+        // mount is never bound: a box that could see it could name a sibling
+        // leaf, and the box's view is the only cgroup it can see at all.
         if let Some(leaf) = self.config.classifier_leaf.clone() {
+            let mountpoint = classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT;
+            let in_rootfs = self.rootfs().join(
+                Path::new(mountpoint)
+                    .strip_prefix("/")
+                    .unwrap_or(Path::new(mountpoint)),
+            );
+            std::fs::create_dir_all(&in_rootfs).map_err(|e| {
+                Error::IO(
+                    "creating the cgroup mountpoint in the box rootfs",
+                    in_rootfs,
+                    e,
+                )
+            })?;
+            Self::bind_mount(
+                &leaf.tree_root(),
+                mountpoint,
+                BindOpts {
+                    read_only: false,
+                    recursive: true,
+                },
+                &mut container,
+            )?;
+
+            // What the host's mount table says about cgroup2, for the launch
+            // log: the box's confinement holds without `nsdelegate` — the
+            // read-only view a capability-less process cannot write through
+            // is the barrier in front of it — but the absence of it is what
+            // a diagnostics bundle would look for first.
             let mountinfo = classifier::own_mountinfo().unwrap_or_default();
             let host_mounts = classifier::host_cgroup2_mounts(&mountinfo);
-            let mut host_mount_hidden = false;
-            for mountpoint in classifier::hidden_mountpoints(&mountinfo) {
-                let in_rootfs = self
-                    .rootfs()
-                    .join(mountpoint.strip_prefix("/").unwrap_or(mountpoint.as_path()));
-                std::fs::create_dir_all(&in_rootfs).map_err(|e| {
-                    Error::IO(
-                        "creating the cgroup mountpoint in the box rootfs",
-                        in_rootfs,
-                        e,
-                    )
-                })?;
-                let Some(target) = mountpoint.to_str() else {
-                    continue;
-                };
-                container.tmpfsmount(target);
-                host_mount_hidden = true;
-            }
             let named = if host_mounts.is_empty() {
                 "none on this host".to_string()
             } else {
@@ -1068,11 +1217,11 @@ impl<C: Channel> Sandbox<C> {
             };
             tracing::info!(
                 leaf = %leaf.dir().display(),
-                procs = %leaf.procs().display(),
+                join_procs = %Path::new(mountpoint).join(leaf.relative_dir()).join("cgroup.procs").display(),
+                view = "cgroup2, read-only, rooted at the leaf",
                 host_cgroup_mount = %named,
-                host_mount_hidden,
-                "sandbox launch: box runs in its classifier leaf, the host's \
-                 cgroup mounts kept out of it"
+                "sandbox launch: box joins its classifier leaf before its \
+                 cgroup namespace is unshared onto it"
             );
         }
 
@@ -3069,13 +3218,13 @@ mod tests {
     // NET-079: each host-address box in its own classifier leaf, kept there.
     // ---------------------------------------------------------------------
 
-    /// The mount-table half of the mask: which cgroup2 mounts a host's
-    /// `mountinfo` names, and whether each carries `nsdelegate` — the option
-    /// that makes a cgroup namespace a delegation boundary, without which a
-    /// box running as the daemon's uid could write its way into a sibling
-    /// leaf (spike finding D2). Pure over its input, so the reading a real
-    /// host's mount table gives can be asserted against a mount table this
-    /// test controls.
+    /// The mount-table half of the confinement: which cgroup2 mounts a host's
+    /// `mountinfo` names, which one a classifier tree lives on, and whether
+    /// it carries `nsdelegate` — the option that makes a cgroup namespace a
+    /// delegation boundary, without which a guest's pid 1 refuses to place
+    /// boxes at all (design §7.1). Pure over its input, so the reading a
+    /// real host's mount table gives can be asserted against a mount table
+    /// this test controls.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_mount_table_names_the_cgroup2_mounts_and_their_nsdelegate() {
@@ -3100,21 +3249,75 @@ mod tests {
             "only cgroup2 rows count, each with its own nsdelegate state"
         );
 
+        let tree = Path::new("/sys/fs/cgroup/minimald.slice");
         assert_eq!(
-            classifier::hidden_mountpoints(mountinfo),
-            vec![
-                PathBuf::from(classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT),
-                PathBuf::from("/custom/cgroup"),
-            ],
-            "the conventional mountpoint is masked even on a host that mounts \
-             cgroup2 elsewhere, and a mount named twice is masked once"
+            classifier::cgroup2_covering(tree, mountinfo),
+            Some((PathBuf::from("/sys/fs/cgroup"), true)),
+            "the deepest cgroup2 mount containing the tree is the one it lives on"
+        );
+        assert!(
+            classifier::tree_is_real(tree, Some(mountinfo), false)
+                && classifier::tree_is_real(tree, Some(mountinfo), true),
+            "a tree on a cgroup2 mounted nsdelegate decides boxes, for a \
+             native daemon and for the guest's pid 1 alike"
+        );
+
+        // A tree on a cgroup2 without `nsdelegate`: natively still a tree —
+        // the privileged step refuses to install one there, so whatever is
+        // found under it is treated as one, the box's own read-only view
+        // being the barrier in front of it either way — but for a guest,
+        // whose own boot path is the only thing that could have mounted that
+        // cgroup2, it is a broken image, and the guest refuses boxes rather
+        // than run them unenforced (design §7.1).
+        let undelegated = Path::new("/custom/cgroup/minimald.slice");
+        assert_eq!(
+            classifier::cgroup2_covering(undelegated, mountinfo),
+            Some((PathBuf::from("/custom/cgroup"), false)),
+            "the covering mount is found wherever cgroup2 was mounted"
+        );
+        assert!(
+            classifier::tree_is_real(undelegated, Some(mountinfo), false),
+            "natively, a tree on a cgroup2 without nsdelegate still places boxes"
+        );
+        assert!(
+            !classifier::tree_is_real(undelegated, Some(mountinfo), true),
+            "in a guest, a tree on a cgroup2 without nsdelegate decides nothing"
+        );
+
+        // A deeper cgroup2 mount the tree could sit under is the one that
+        // decides — a nested mount changes where the tree's files live.
+        let nested = concat!(
+            "35 30 0:26 / /sys/fs/cgroup rw,relatime shared:2 - cgroup2 cgroup2 rw,nsdelegate\n",
+            "37 35 0:26 /minimald.slice /sys/fs/cgroup/minimald.slice rw - cgroup2 cgroup2 rw\n",
+        );
+        assert_eq!(
+            classifier::cgroup2_covering(tree, nested),
+            Some((PathBuf::from("/sys/fs/cgroup/minimald.slice"), false)),
+            "the deepest mount containing the tree wins over the shallower one"
+        );
+
+        // And the states that decide nothing at all: a directory tree under
+        // no cgroup2 mount is plain directories — a box "placed" there would
+        // run unenforced while looking placed — and a mount table that cannot
+        // be read is a host nothing can be checked against.
+        let no_cgroup2 = "33 22 0:24 / / rw - ext4 /dev/root rw\n";
+        assert!(
+            !classifier::tree_is_real(tree, Some(no_cgroup2), false),
+            "a tree under no cgroup2 mount moves nothing and decides nothing"
+        );
+        assert!(
+            !classifier::tree_is_real(tree, None, false),
+            "a host whose mount table cannot be read has no tree to check"
         );
     }
 
-    /// C source for the probe this proof runs inside a box. It reports the
-    /// box's own cgroup as the kernel names it, what filesystem sits at the
-    /// cgroup mountpoint (the mask, if one was mounted there), and whether
-    /// the paths that would let it reach a sibling leaf open at all.
+    /// C source for the probe this proof runs inside a box. It reports its
+    /// own pid (the one that wrote itself into its leaf), the box's own
+    /// cgroup as the kernel names it, what filesystem sits at the cgroup
+    /// mountpoint (the read-only cgroup2 view, when a leaf was configured),
+    /// whether the box can *read* its own view where a cgroup-aware runtime
+    /// looks, and whether the paths that would let it migrate anywhere open
+    /// for writing at all.
     #[cfg(target_os = "linux")]
     const CGROUP_PROBE_C: &str = r#"
 #include <errno.h>
@@ -3125,6 +3328,9 @@ mod tests {
 #include <unistd.h>
 
 int main(int argc, char **argv) {
+    /* The box's own cgroup as the kernel names it: once the box has joined
+       its leaf and unshared its cgroup namespace onto it, this is 0::/ — the
+       box stands at the root of its own cgroup namespace, its own leaf. */
     FILE *cg = fopen("/proc/self/cgroup", "r");
     char line[256];
     if (cg && fgets(line, sizeof line, cg)) {
@@ -3135,6 +3341,10 @@ int main(int argc, char **argv) {
     }
     if (cg) fclose(cg);
 
+    /* The pid that joined the leaf, for the test to find in the leaf's own
+       cgroup.procs afterwards. */
+    printf("pid: %ld\n", (long)getpid());
+
     /* argv[1]: the cgroup mountpoint — statfs reports what is mounted there. */
     if (argc > 1) {
         struct statfs st;
@@ -3144,9 +3354,24 @@ int main(int argc, char **argv) {
             printf("fstype %s: errno %d\n", argv[1], errno);
     }
 
-    /* argv[2]…: paths that must not open — a sibling box's cgroup.procs, the
-       file a pid is written to in order to join its leaf. */
-    for (int i = 2; i < argc; i++) {
+    /* argv[2]: a path the box must be able to *read* — its own view's
+       controllers file, the place a cgroup-aware runtime starts looking for
+       the box's limit. */
+    if (argc > 2) {
+        int fd = open(argv[2], O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            printf("read %s: errno 0\n", argv[2]);
+            close(fd);
+        } else {
+            printf("read %s: errno %d\n", argv[2], errno);
+        }
+    }
+
+    /* argv[3]…: paths that must not open for writing — the box's own root
+       cgroup.procs (writing a pid there is leaving the leaf, which is what
+       confinement forbids) and a sibling box's cgroup.procs (the file a pid
+       is written into to join another box's verdict). */
+    for (int i = 3; i < argc; i++) {
         int fd = open(argv[i], O_WRONLY | O_CLOEXEC);
         if (fd >= 0) {
             printf("open %s: errno 0\n", argv[i]);
@@ -3159,10 +3384,11 @@ int main(int argc, char **argv) {
 }
 "#;
 
-    /// `TMPFS_MAGIC` — what the mask overmounts every cgroup mountpoint with,
-    /// so that what sits there is an empty directory and nothing else.
+    /// `CGROUP2_SUPER_MAGIC` — what the read-only view mounted over the box's
+    /// leaf reports, so the box reads its limit where a cgroup-aware runtime
+    /// looks and can write nothing anywhere in the hierarchy.
     #[cfg(target_os = "linux")]
-    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 
     /// The longest path an `AF_UNIX` socket may take: `sockaddr_un::sun_path`
     /// holds 108 bytes including the terminating NUL.
@@ -3373,30 +3599,33 @@ int main(int argc, char **argv) {
     }
 
     /// NET-079. A box placed in its own classifier leaf can neither see nor
-    /// join another box's leaf.
+    /// join another box's leaf: the leaf is the root of its cgroup namespace.
     ///
-    /// Two halves, each asserting the layer it owns:
+    /// Three parts, each asserting the layer it owns:
     ///
     /// * **placement**, over a stand-in tree: the daemon's half is plain
-    ///   filesystem work — the leaf created before the spawn, the box's
-    ///   processes written into its `cgroup.procs` right after, the leaf
+    ///   filesystem work — the leaf created before the spawn, a process
+    ///   moved by writing its pid to the leaf's `cgroup.procs`, the leaf
     ///   removed once the box is gone — asserted exactly, so the
     ///   daemon-side flow that mirrors it cannot drift from the primitive it
     ///   rests on.
-    /// * **visibility**, in a real box: with a leaf configured, every
-    ///   mountpoint the host's cgroup2 could be at is overmounted with an
-    ///   empty tmpfs, so the box cannot even open a sibling leaf's
-    ///   `cgroup.procs` — the file a pid is written to in order to join its
-    ///   verdict. The namespace half of the confinement — every namespace
-    ///   unshared in one call before the placement, so the box's
-    ///   cgroup-namespace root is the daemon's childless leaf and, with
-    ///   `nsdelegate`, nothing outside it can be written — is structural,
-    ///   and a box with no path to a sibling never reaches the kernel's
-    ///   migration check to test it.
+    /// * **join order**, in a real box: the box's own first process joins
+    ///   its leaf, through the tree the sandbox binds at the conventional
+    ///   mountpoint, and *then* unshares its cgroup namespace onto it — so
+    ///   the pid the box reports is the one in its leaf's `cgroup.procs`,
+    ///   written by itself, and `/proc/self/cgroup` reads `0::/`: the box
+    ///   stands at the root of its own cgroup namespace, which on a
+    ///   tree-bearing host is its own leaf.
+    /// * **visibility**, in the same box: the read-only cgroup2 view
+    ///   mounted over the leaf is readable where a cgroup-aware runtime
+    ///   looks for the box's limit, and every migration write fails — the
+    ///   root's own `cgroup.procs` (writing a pid there is leaving the
+    ///   leaf, which is what confinement forbids), and a sibling leaf's,
+    ///   which is below neither the namespace root nor any view the box
+    ///   can mount.
     ///
-    /// A box *without* a leaf keeps the mountpoint it always had: the mask
-    /// belongs to leaf-bearing boxes, and a host that cannot decide per box
-    /// keeps launching boxes exactly as it did (NET-079's exception).
+    /// A box *without* a leaf is launched exactly as before: the placement is
+    /// an opt-in per box, not a change to every sandbox (NET-079's exception).
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn box_cannot_see_or_join_a_sibling_leaf() {
@@ -3431,10 +3660,9 @@ int main(int argc, char **argv) {
             "the leaf exists before the box's first process does"
         );
 
-        // The box's processes are moved in by writing their pids to the
-        // leaf's cgroup.procs — the container supervisor hakoniwa forks and
-        // the program it execs, which was forked before the placement and so
-        // does not move with its parent.
+        // A process is moved by writing its pid to the leaf's cgroup.procs —
+        // the one migration primitive the whole placement rests on, the same
+        // one the box's own first process and an injected process both use.
         for pid in [1_u32, 4242] {
             classifier::place_pid(&leaf.join("cgroup.procs"), pid)
                 .expect("moving a box process into its leaf");
@@ -3463,7 +3691,8 @@ int main(int argc, char **argv) {
 
         // A host without the tree says so in the error, not in a refusal: the
         // daemon reads this as "no per-box classifier on this host" and runs
-        // the box unenforced (NET-079's exception).
+        // the box unenforced (NET-079's exception) — or, in the guest, refuses
+        // a host-address box rather than run it unenforced (design §7.1).
         let missing = classifier::create_box_leaf(tree.path().join("no-such-tree").as_path(), "b")
             .expect_err("a tree that was never installed refuses the leaf");
         assert_eq!(
@@ -3472,64 +3701,140 @@ int main(int argc, char **argv) {
             "the missing tree is the one failure a launch must survive"
         );
 
-        // --- visibility: the sandbox's half, in a real box -----------------
+        // --- in a real box: the box's own half -----------------------------
+        // A tree with two leaves in it, standing in for the one the
+        // privileged step installs: the box's own, and a sibling's it must
+        // not be able to reach. Every path the box resolves below goes
+        // through the tree bound at the conventional mountpoint — the same
+        // spelling on a real tree and on a stand-in (see
+        // `ClassifierLeaf::relative_dir`).
+        let box_tree = tempfile::tempdir().expect("a temp dir standing in for the box's tree");
+        std::fs::create_dir_all(box_tree.path().join(classifier::BOXES_DIR))
+            .expect("creating the cohort directory");
+        let leaf = config::ClassifierLeaf::new(
+            classifier::create_box_leaf(box_tree.path(), "cg-probe")
+                .expect("creating the box's leaf before its first process exists"),
+        );
+        let _sibling = classifier::create_box_leaf(box_tree.path(), "the-other-box")
+            .expect("creating the sibling's leaf, for the box to fail to reach");
+
         let mountpoint = classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT.to_string();
-        let sibling_procs = classifier::box_leaf(Path::new(classifier::TREE_ROOT), "the-other-box")
+        let controllers = format!("{mountpoint}/cgroup.controllers");
+        let root_procs = format!("{mountpoint}/cgroup.procs");
+        let sibling_procs = classifier::box_leaf(Path::new(&mountpoint), "the-other-box")
             .join("cgroup.procs")
             .to_string_lossy()
             .into_owned();
-        let probe_args = vec![mountpoint.clone(), sibling_procs.clone()];
+        let probe_args = vec![
+            mountpoint.clone(),
+            controllers.clone(),
+            root_procs.clone(),
+            sibling_procs.clone(),
+        ];
 
-        let masked = box_probe_report(
-            "cg-probe",
-            Some(config::ClassifierLeaf::new(classifier::box_leaf(
-                Path::new(classifier::TREE_ROOT),
-                "cg-probe",
-            ))),
-            &probe_args,
-        )
-        .await;
+        let placed = box_probe_report("cg-probe", Some(leaf.clone()), &probe_args).await;
         eprintln!(
             "a box with a leaf reports its own cgroup as: {}",
-            masked
+            placed
                 .get("self_cgroup")
                 .cloned()
                 .unwrap_or_else(|| "nothing".to_string())
         );
-        let what_sits_there = masked
+
+        // The join, in the order the confinement rests on: the pid the box
+        // reports is the one pid in its leaf's `cgroup.procs`, written by
+        // the box's own first process through the tree the sandbox bound —
+        // the daemon no longer places the program, the box places itself,
+        // and it does so *before* it unshares its cgroup namespace onto the
+        // leaf. Nothing else writes the file: no daemon-side placement runs
+        // for this box, and a supervisor that never exec'd never reaches the
+        // closure that joins.
+        let pid = placed
+            .get("pid")
+            .cloned()
+            .unwrap_or_else(|| "no report".to_string());
+        let members =
+            std::fs::read_to_string(leaf.procs()).expect("reading the leaf's procs afterwards");
+        assert_eq!(
+            members.lines().collect::<Vec<_>>(),
+            vec![pid.as_str()],
+            "the box's own first process wrote itself into its leaf before it \
+             unshared its cgroup namespace onto it"
+        );
+
+        // The box stands at the root of its own cgroup namespace — `0::/` —
+        // which on a tree-bearing host is its own leaf, never the daemon's
+        // and never a leaf with a sibling in it.
+        assert_eq!(
+            placed.get("self_cgroup").map(String::as_str),
+            Some("0::/"),
+            "the box's cgroup namespace is rooted where the box stands: the \
+             leaf it joined, which is what keeps every other leaf outside it"
+        );
+
+        // The read-only cgroup2 view, mounted over the tree the box just
+        // joined through: a cgroup-aware runtime looks for its limit at the
+        // conventional mountpoint, so the box must be able to *read* there.
+        let what_sits_there = placed
             .get(&format!("fstype {mountpoint}"))
             .cloned()
             .unwrap_or_else(|| "no report".to_string());
         assert_eq!(
             what_sits_there,
-            format!("magic {TMPFS_MAGIC}"),
-            "with a leaf configured, the cgroup mountpoint is overmounted with \
-             an empty tmpfs, so no cgroup2 view survives there for the box to \
-             see a sibling leaf through"
+            format!("magic {CGROUP2_SUPER_MAGIC}"),
+            "with a leaf configured, the cgroup mountpoint carries a read-only \
+             cgroup2 view rooted at the leaf — the one cgroup the box can see"
         );
-        let opened = masked
+        assert_eq!(
+            placed.get(&format!("read {controllers}")).map(String::as_str),
+            Some("errno 0"),
+            "the box reads its own cgroup view: the limit a cgroup-aware \
+             runtime looks for is where it looks for it"
+        );
+
+        // And the barrier. The root's own cgroup.procs is the one migration
+        // the view offers — writing a pid there is leaving the leaf — and it
+        // dies on the read-only mount before the kernel's migration rules
+        // are even asked.
+        let wrote_root = placed
+            .get(&format!("open {root_procs}"))
+            .cloned()
+            .unwrap_or_else(|| "no report".to_string());
+        assert_ne!(
+            wrote_root, "errno 0",
+            "the box must not be able to open its own root's cgroup.procs for \
+             writing — writing a pid there is leaving the leaf its verdict is \
+             decided on. It reports {wrote_root:?}"
+        );
+
+        // A sibling leaf is invisible: it is outside the box's cgroup
+        // namespace, below neither the namespace root nor any view the box
+        // can mount, so the file a pid would be written into to join another
+        // box's verdict does not even open.
+        let opened_sibling = placed
             .get(&format!("open {sibling_procs}"))
             .cloned()
             .unwrap_or_else(|| "no report".to_string());
         assert_ne!(
-            opened, "errno 0",
-            "the box must not be able to open another box's cgroup.procs — \
-             the file a pid is written to in order to join its verdict. It \
-             reports {opened:?}"
+            opened_sibling, "errno 0",
+            "the box must not be able to open another box's cgroup.procs — the \
+             file a pid is written into to join its verdict. It reports \
+             {opened_sibling:?}"
         );
 
-        // The mask belongs to leaf-bearing boxes: a box with no leaf keeps
-        // whatever the rootfs had at the mountpoint, so a host that cannot
-        // decide per box launches boxes exactly as it did.
-        let unmasked = box_probe_report("cg-probe-plain", None, &probe_args).await;
-        let still_there = unmasked
+        // The placement is an opt-in per box: a box with no classifier leaf
+        // is launched exactly as it always was — no tree bound, no view
+        // mounted, no join — so a host that cannot decide per box keeps
+        // launching boxes (NET-079's exception).
+        let unplaced = box_probe_report("cg-probe-plain", None, &probe_args).await;
+        let still_there = unplaced
             .get(&format!("fstype {mountpoint}"))
             .cloned()
             .unwrap_or_else(|| "no report".to_string());
         assert_ne!(
             still_there,
-            format!("magic {TMPFS_MAGIC}"),
-            "a box with no classifier leaf must not be masked: the tree is an \
+            format!("magic {CGROUP2_SUPER_MAGIC}"),
+            "a box with no classifier leaf gets no cgroup2 view: the tree is an \
              opt-in per box, not a change to every sandbox"
         );
     }

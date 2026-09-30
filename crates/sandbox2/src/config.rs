@@ -191,16 +191,18 @@ impl WdSetup {
 /// decided on (NET-079, design §4.1), and the one no process of the box may
 /// leave or let another box join.
 ///
-/// A *path*, not a kernel handle: the daemon creates the leaf before the spawn
-/// and moves the box's processes into it right after, and this option is how
-/// the rest of the sandbox learns the box has one — the host's own cgroup2
-/// mount is kept out of the box's mount namespace ([`Self::dir`]'s tree is the
-/// only hierarchy the box could be told apart in) and the launch log names the
-/// leaf.
+/// A *path*, not a kernel handle. The daemon creates the leaf before the
+/// spawn; the box's first process joins it in its own pre-exec closure,
+/// *before* it unshares the cgroup namespace, so the leaf becomes the
+/// namespace's root — the cgroup every view the box can ever mount starts at,
+/// and the only one it can reach. This option is how the rest of the sandbox
+/// learns the box has one: the launch log names the leaf, and the sandbox
+/// binds the leaf's tree into the box so the join has a path to write.
 ///
-/// The path is resolved in the *daemon's* namespaces. Inside the box it names
-/// nothing: the leaf is a sibling of the box's cgroup-namespace root, so the
-/// kernel hides it from every cgroup view the box can mount.
+/// The path is resolved in the *daemon's* namespaces, where the leaf is
+/// created; inside the box it is reached through the tree bound at the
+/// conventional cgroup mountpoint — see [`Self::tree_root`] and
+/// [`Self::relative_dir`], which name the two halves of that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassifierLeaf {
     /// The leaf's directory in the daemon's classifier tree, e.g.
@@ -222,12 +224,40 @@ impl ClassifierLeaf {
     }
 
     /// The leaf's `cgroup.procs`: writing a pid here moves that process into
-    /// the leaf. A box is placed by writing the pids of its first processes;
-    /// an injected process joins by writing its own before it enters the
-    /// box's namespaces, where the path no longer resolves.
+    /// the leaf. A box's first process writes its own in its pre-exec
+    /// closure, before it unshares the cgroup namespace; an injected process
+    /// writes its own before it joins the box's namespaces, where the root's
+    /// own `cgroup.procs` is no longer writable.
     #[must_use]
     pub fn procs(&self) -> PathBuf {
         self.dir.join("cgroup.procs")
+    }
+
+    /// The tree this leaf belongs to — `dir`'s parent's parent, since every
+    /// leaf is `<tree>/<BOXES_DIR>/<box-id>`. The daemon resolves the leaf
+    /// through it, and the sandbox binds *it* into the box at the
+    /// conventional cgroup mountpoint, so the box's own join — and, on a
+    /// tree-bearing host, its read-only cgroup2 view — starts at the tree it
+    /// is a leaf of.
+    #[must_use]
+    pub fn tree_root(&self) -> PathBuf {
+        self.dir
+            .parent()
+            .and_then(Path::parent)
+            .map_or_else(|| self.dir.clone(), Path::to_path_buf)
+    }
+
+    /// The leaf's path under its [`tree_root`](Self::tree_root) —
+    /// `<BOXES_DIR>/<box-id>`. The box joins its leaf through the tree bound
+    /// at the conventional mountpoint, so this is the one spelling of the
+    /// leaf that resolves *inside* the box, before its cgroup namespace is
+    /// unshared onto the leaf.
+    #[must_use]
+    pub fn relative_dir(&self) -> PathBuf {
+        self.dir
+            .strip_prefix(self.tree_root())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| self.dir.clone())
     }
 }
 
