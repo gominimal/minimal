@@ -2939,64 +2939,129 @@ async fn destroyed_box_name_is_nxdomain() {
 /// NET-010's durability half (design §7.1): the grant is the answerer's
 /// record, not the daemon's memory, so a daemon that restarts re-derives its
 /// live boxes' grants from the record rather than starting from an empty
-/// table. The restarted daemon below adopts nothing by itself — the box's
+/// table. The restarted daemon below adopts nothing by itself — a box's
 /// resumed session asks again the moment its actor comes up, and the record
 /// answers with the address it already holds, so the box's name answers at
 /// the same address from before the restart to long after it, from finalize
 /// to destroy (NET-011), with no client ever attached (NET-013).
+///
+/// The restart below is a real one: `shutdown(true)` **stops** both boxes —
+/// the manager's shutdown path, which is a stop and not a delete — before
+/// the first server is torn down. A stop keeps the grant (NET-013: the
+/// address is the box's own from finalize to destroy, and a stopped box
+/// that resumes must find it where it left it), so the record the second
+/// daemon reads still names both addresses. Resuming the **second** box
+/// first is the check that keeps this from being vacuous: if the stop had
+/// released its grant, the fresh record would have handed the resumed box
+/// the lowest free address — the first box's `.2` — and only the recorded
+/// `.3` it kept proves the grant survived the stop and the restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_daemon_re_derives_the_box_s_address_from_the_answerer() {
     use minimald_rpc::{SessionDelta, SessionDeltaRequest};
 
+    let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let id = finalize_own_ip_session(&mut client, "web").await;
-    let (_, address) = zone_answer_for(&server, "web.min.internal")
+    let alpha = finalize_own_ip_session(&mut client, "alpha").await;
+    let beta = finalize_own_ip_session(&mut client, "beta").await;
+    let (_, alpha_address) = zone_answer_for(&server, "alpha.min.internal")
         .await
-        .expect("the name answers at the first daemon");
+        .expect("alpha's name answers at the first daemon");
+    let (_, beta_address) = zone_answer_for(&server, "beta.min.internal")
+        .await
+        .expect("beta's name answers at the first daemon");
+    let pool_second = {
+        // The address the allocator hands the second of two fresh boxes:
+        // one octet above the pool's first, well short of the pool's last.
+        let [a, b, c, d] = sessions::core::loopback::POOL_FIRST.octets();
+        std::net::Ipv4Addr::new(a, b, c, d + 1)
+    };
+    assert_eq!(
+        alpha_address,
+        sessions::core::loopback::POOL_FIRST,
+        "a fresh host's first grant is the pool's lowest address"
+    );
+    assert_eq!(
+        beta_address, pool_second,
+        "the second box's grant is the next one up, so keeping it and not \
+         being re-granted the first is a difference this test can see"
+    );
 
-    // "Restart the daemon": tear the first server down and boot a second
-    // one on the same state root — the one record every daemon on this host
-    // grants through.
+    // "Restart the daemon": stop every session the way a daemon that is
+    // going down stops them — grants kept, records kept; a stop is not a
+    // destroy — then tear the first server down and boot a second one on
+    // the same state root, the one record every daemon on this host grants
+    // through.
+    server
+        .state
+        .sessions_manager()
+        .await
+        .shutdown(true)
+        .await
+        .expect("a forced shutdown has nothing left to refuse it");
+    let stopped = capture.contents();
+    assert!(
+        !stopped
+            .lines()
+            .any(|line| line.contains("loopback-release")),
+        "shutdown stops the boxes without releasing their grants: {stopped}"
+    );
     drop(client);
     let state = server.into_state_dir();
     let server = TestServer::new_in(state).await;
     let mut client = server.connect().await;
 
-    // Bring the box's session up on the restarted daemon — the resume path
-    // any RPC that names the session takes — which registers its name
-    // before the actor is observable. The reply's shape is not the point
-    // here; the actor being up is.
+    // Bring beta's session up on the restarted daemon **first** — the
+    // resume path any RPC that names the session takes, which registers
+    // its name before the actor is observable. The reply's shape is not
+    // the point here; the actor being up is.
     let _ = client
-        .call::<SessionDelta>(&SessionDeltaRequest { id })
+        .call::<SessionDelta>(&SessionDeltaRequest { id: beta })
         .await;
 
-    // The name answers again, at the address the record already held the
-    // box: the re-derivation, not a fresh grant — a restarted daemon that
-    // started from an empty table would have handed the box a different
-    // address and left the recorded one spent.
-    let (owner, resumed) = zone_answer_for(&server, "web.min.internal")
+    // Beta answers at the address the record already held it — the
+    // re-derivation, not the fresh grant a record emptied by the stop
+    // would have made, which is the first box's `.2`.
+    let (owner, resumed_beta) = zone_answer_for(&server, "beta.min.internal")
         .await
-        .expect("the box's name answers after the restart");
+        .expect("beta's name answers after the restart");
     assert_eq!(
-        owner, "web",
+        owner, "beta",
         "the session owns its box name across the restart"
     );
     assert_eq!(
-        resumed, address,
+        resumed_beta, beta_address,
         "the restarted daemon re-derives the box's recorded address, not a fresh one"
     );
+    assert_ne!(
+        resumed_beta, alpha_address,
+        "the resumed box was not handed the first box's address"
+    );
 
-    // And the box keeps the record's line, not a second one: the re-ask
-    // spent nothing, and a second box still gets its own address — the
-    // host-global arbitration the restart must not fall over.
-    let registry = server.state.sessions_manager().await.hostnames();
+    // And alpha too: both boxes are where the record left them, each with
+    // the record's line it always had — the re-ask spent nothing, and the
+    // pair still holds one address between them.
+    let _ = client
+        .call::<SessionDelta>(&SessionDeltaRequest { id: alpha })
+        .await;
+    let (_, resumed_alpha) = zone_answer_for(&server, "alpha.min.internal")
+        .await
+        .expect("alpha's name answers after the restart");
     assert_eq!(
-        registry
-            .read()
-            .expect("registry lock")
-            .published_own_address(id),
-        Some(resumed),
+        resumed_alpha, alpha_address,
+        "the first box's grant survived the stop and the restart too"
+    );
+
+    let registry = server.state.sessions_manager().await.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert_eq!(
+        routes.published_own_address(beta),
+        Some(resumed_beta),
         "the registry the restarted daemon built answers with the recorded address"
+    );
+    assert_eq!(
+        routes.published_own_address(alpha),
+        Some(resumed_alpha),
+        "and so does the first box's"
     );
 }

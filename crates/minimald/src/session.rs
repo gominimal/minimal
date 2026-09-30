@@ -795,27 +795,44 @@ impl Session {
         // Scoped: the switch lock is dropped before the registry is taken, so
         // no path holds both.
         let subnet = self.net_switch.lock().await.subnet();
-        let mut reg = self
-            .hostnames
-            .write()
-            .expect("hostname registry lock poisoned");
         match record.network {
             sessions::NetworkMode::OwnIp => {
-                reg.register_caller(record.id, &name, &record.policy, subnet);
-                // NET-010/NET-011: finalize publishes the box's declaration at
-                // a host loopback address of its own — granted through the
+                // NET-010/NET-011: finalize publishes the box's declaration
+                // at a host loopback address of its own — granted through the
                 // answerer's record the first time, kept by the stable
                 // session id across a rename, a restart of the actor, or a
                 // restart of the daemon — so the name answers from here to
                 // destroy, whether or not a client ever attaches (NET-013).
-                // Every grant is one synchronous read-modify-write under the
-                // record's lock file, taken briefly here with the registry
-                // held and never the other way round, so the two orders
-                // cannot cycle.
+                //
+                // The address is asked for **before** the registry's write
+                // lock, and never underneath it: the ask is a synchronous
+                // read-modify-write of the answerer's record under its lock
+                // file, and this daemon's registry is what every DNS answer
+                // it serves reads — holding one across another daemon's
+                // in-flight grant would stall the answers for the length of
+                // the stall, and the registry is never held across the
+                // record, so the two orders cannot cycle either way. A box
+                // that already published one — a rename, a resume — is
+                // answered from the registry alone, without asking, so no
+                // ask is logged on its account; and two paths that both
+                // miss and both ask are still safe, the ask idempotent by
+                // namespace and answered with the address the first one
+                // recorded.
+                let already_published = {
+                    let reg = self
+                        .hostnames
+                        .read()
+                        .expect("hostname registry lock poisoned");
+                    reg.published_own_address(record.id)
+                };
+                let published =
+                    already_published.or_else(|| self.lease_loopback_address(record, &name));
+                let mut reg = self
+                    .hostnames
+                    .write()
+                    .expect("hostname registry lock poisoned");
+                reg.register_caller(record.id, &name, &record.policy, subnet);
                 let declared = crate::net::switch::declared_request_ports(Some(&record.policy));
-                let published = reg
-                    .published_own_address(record.id)
-                    .or_else(|| self.lease_loopback_address(record, &name));
                 if let Some(address) = published {
                     // One warn line per port another box at the same address
                     // also publishes (NET-129): intrinsic to the shared-address
@@ -826,6 +843,10 @@ impl Session {
                 reg.register_own_ip(record.id, &name, declared);
             }
             sessions::NetworkMode::HostNet => {
+                let mut reg = self
+                    .hostnames
+                    .write()
+                    .expect("hostname registry lock poisoned");
                 reg.register_host_net(record.id, &name);
             }
             _ => {}
@@ -936,6 +957,19 @@ impl Session {
     /// registry nor the answerer's record outlives the box they pointed at:
     /// the address returns to the host's pool (NET-010) and every later
     /// lookup of the name answers NXDOMAIN (NET-012).
+    ///
+    /// A stop is not that: a stopped box still exists — its session record
+    /// survives, and a resume brings the same box back — so `for_good` is
+    /// the destroy paths' alone. A stop withdraws the name's route and
+    /// keeps both halves of the publish, the registry's row and the
+    /// answerer's grant (NET-013: the box's address is its own from
+    /// finalize to destroy, and a stopped box that resumes must find the
+    /// same address waiting, whether the same daemon or a restarted one
+    /// answers — a stop that released the grant would hand the address to
+    /// the next box to finalize and leave the resumed one published
+    /// somewhere else). Shutdown stops every session the same way, which is
+    /// how the grant a restarted daemon re-derives from the answerer's
+    /// record is the very one the box held before the restart.
     ///
     /// Gated on [`Self::owns_hostname_route`] rather than relying on the
     /// registry's no-op behavior: the registry is keyed by name alone, so an
@@ -1134,8 +1168,15 @@ impl Session {
             }
             SessionMessage::Stop(r) => {
                 self.stop_running(true).await;
+                // NET-013: a stop withdraws the name's route — the stopped
+                // box is not answering for clients — but keeps the grant and
+                // the registry's publish row: the session still exists, a
+                // resume brings the same box back, and its address is its
+                // own until destroy. Releasing here would let the next box
+                // to finalize take the address and leave a resumed box
+                // published somewhere else than before it stopped.
                 #[cfg(target_os = "linux")]
-                self.deregister_hostname(true).await;
+                self.deregister_hostname(false).await;
                 let _ = r.send(());
                 return ControlFlow::Break(Teardown::ManagerInitiated);
             }
