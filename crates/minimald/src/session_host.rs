@@ -26,7 +26,6 @@ use crate::RequestedPty;
 use crate::session::SessionPaths;
 use crate::session_delta::DeltaSource;
 use crate::sessions::SessionControl;
-#[cfg(not(test))]
 use sessions::NetworkMode;
 use sessions::keys::{ChordMatcher, FeedOutcome, KeyAction, SessionKeys};
 use std::sync::Arc;
@@ -2275,10 +2274,11 @@ impl Drop for SpawnedProcessGuard {
 /// The box's classifier leaf during its launch, removed if the launch is
 /// abandoned before the leaf is handed off (NET-079).
 ///
-/// The leaf is created before the spawn — the sandbox layer needs it to keep
-/// the host's cgroup mounts out of the box — so every way out of
-/// [`SandboxLauncher::launch`] between that and the handoff into
-/// [`Launched`] has to account for a leaf with no box in it: an `Err` return
+/// The leaf is created before the spawn — the sandbox layer needs it to bind
+/// the tree into the box and root the box's cgroup namespace at the leaf — so
+/// every way out of [`SandboxLauncher::launch`] between that and the handoff
+/// into [`Launched`] has to account for a leaf with no box in it: an `Err`
+/// return
 /// for a build that failed, and — the one no `return` covers — the future's
 /// own `Drop`, which is what a teardown transition bounding its launch with
 /// a timeout (`session::HOOK_LAUNCH_TIMEOUT`) takes. This guard owns the
@@ -2335,16 +2335,34 @@ impl Drop for BoxLeafGuard {
 /// (`scripts/install-host-classifier.sh`) and the guest daemon mounts for
 /// itself.
 ///
+/// The tree has to be *real* first — on this host's cgroup2, and in the
+/// guest with `nsdelegate` — or the leaf this function would create decides
+/// nothing while looking placed; see [`refuses_unenforced_host_address_box`]
+/// for the guest, where that state refuses a host-address launch instead of
+/// running it unenforced.
+///
 /// `None` means this host places no box: the tree is absent, or refuses the
 /// leaf. The session still launches, and its box runs unenforced — NET-079's
 /// exception, that a host which cannot decide per box never refuses the box
 /// or its connections on that ground.
 #[cfg(not(test))]
 fn create_session_leaf(session_name: &str) -> Option<sandbox2::config::ClassifierLeaf> {
-    match sandbox2::classifier::create_box_leaf(
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT),
-        session_name,
+    let root = std::path::Path::new(sandbox2::classifier::TREE_ROOT);
+    if !sandbox2::classifier::tree_is_real(
+        root,
+        sandbox2::classifier::own_mountinfo().as_deref(),
+        crate::guest::is_microvm_daemon(),
     ) {
+        tracing::info!(
+            session = session_name,
+            tree = sandbox2::classifier::TREE_ROOT,
+            install = "sudo scripts/install-host-classifier.sh --user <this daemon's account>",
+            "this host has no classifier tree to place a box in; the session's \
+             box runs unenforced",
+        );
+        return None;
+    }
+    match sandbox2::classifier::create_box_leaf(root, session_name) {
         Ok(leaf) => Some(sandbox2::config::ClassifierLeaf::new(leaf)),
         // `NotFound` is the ordinary shape of "no tree on this host": the
         // privileged step has not run. Info, not warn — it is a deployment
@@ -2369,26 +2387,36 @@ fn create_session_leaf(session_name: &str) -> Option<sandbox2::config::Classifie
     }
 }
 
-/// Moves the box's processes into its classifier leaf, now that they exist.
+/// Whether a session that could not be placed in a classifier leaf must be
+/// refused rather than launched unenforced.
 ///
-/// Two of them do, because both were forked before the placement could run:
-/// hakoniwa forks the container supervisor inside `spawn()`, and that
-/// supervisor forks the program it execs before `spawn()` returns. Both are
-/// written in; everything either one forks later takes the leaf from its
-/// parent, and the processes the shim injects join it in
-/// [`crate::nsenter`] before they join the namespaces — so the box is in its
-/// leaf from its first process to its last.
+/// In the guest — this daemon being the microVM's pid 1 — the tree was this
+/// daemon's own to build, so a host-address box that cannot be placed in one
+/// has no verdict to run with and no privileged step a person could run to fix
+/// it: the image is broken, and the launch is refused with the error that
+/// says so (design §7.1). Natively the same state is the deployment
+/// exception instead — NET-079's advisory posture, never a refusal.
+fn refuses_unenforced_host_address_box(guest: bool, network_mode: NetworkMode) -> bool {
+    guest && matches!(network_mode, NetworkMode::HostNet)
+}
+
+/// Moves the box's container supervisor into its classifier leaf, now that
+/// it exists.
+///
+/// The supervisor is the one process of the box that never passes through the
+/// sandbox's pre-exec closure: hakoniwa forks it inside `spawn()`, before the
+/// program's own child runs the closure that joins the leaf and unshares the
+/// cgroup namespace onto it. It is written in by the daemon, from its own
+/// namespaces where the leaf is reachable — the same place the shim later
+/// writes an injected process. Everything the program forks later takes the
+/// leaf from its parent, so the box is in its leaf from its first process to
+/// its last.
 #[cfg(not(test))]
 fn place_box_processes(
     leaf: &sandbox2::config::ClassifierLeaf,
     supervisor: u32,
 ) -> std::io::Result<()> {
-    let program = crate::nsenter::session_leader_pid(supervisor)
-        .map_err(|e| std::io::Error::other(format!("resolving the session program's pid: {e}")))?;
-    for pid in [supervisor, program] {
-        sandbox2::classifier::place_pid(&leaf.procs(), pid)?;
-    }
-    Ok(())
+    sandbox2::classifier::place_pid(&leaf.procs(), supervisor)
 }
 
 #[cfg(not(test))]
@@ -2455,6 +2483,34 @@ impl SessionLauncher for SandboxLauncher {
         // processes are gone before their leaf is removed.
         let leaf = create_session_leaf(&session_name);
         let mut leaf_guard = leaf.clone().map(BoxLeafGuard::new);
+
+        // A host-address box this daemon cannot place is refused in the guest
+        // — the one place a missing tree is a broken image rather than a
+        // deployment state, and the one place there is no installer to run
+        // (design §7.1). Natively the same state runs the box unenforced and
+        // says so in the log instead (NET-079's exception).
+        if leaf.is_none()
+            && refuses_unenforced_host_address_box(
+                crate::guest::is_microvm_daemon(),
+                network_mode,
+            )
+        {
+            tracing::error!(
+                session = %session_name,
+                network_mode = ?network_mode,
+                tree = sandbox2::classifier::TREE_ROOT,
+                "refusing a host-address box this guest cannot place in a \
+                 classifier leaf: its cgroup2 tree is missing or mounted \
+                 without namespace delegation, so the box's egress verdict \
+                 could not be decided — a broken guest image"
+            );
+            return Err(io::Error::other(
+                "this guest has no classifier tree to place a host-address \
+                 box in: its cgroup2 is not mounted with nsdelegate, so the \
+                 box's verdict could not be decided and the box was refused \
+                 rather than run unenforced (broken guest image)",
+            ));
+        }
 
         // Package + env-var union of the launcher baseline and every
         // contribution the composer collected. Packages: baseline set
@@ -2572,9 +2628,10 @@ impl SessionLauncher for SandboxLauncher {
                     .with_network(plan.clone())
                     .with_username(username);
             // NET-079: the leaf created before this build, so the sandbox
-            // keeps the host's cgroup mounts out of the box and names the leaf
-            // it entered on its launch log line. The guard keeps the leaf for
-            // the launch's duration; this copy travels into the config.
+            // binds the tree into the box, joins the box's own first process
+            // to the leaf in its pre-exec closure, and names the leaf it
+            // entered on its launch log line. The guard keeps the leaf for the
+            // launch's duration; this copy travels into the config.
             if let Some(leaf) = leaf_guard.as_ref().and_then(BoxLeafGuard::get).cloned() {
                 env_args = env_args.with_classifier_leaf(leaf);
             }
@@ -2660,13 +2717,15 @@ impl SessionLauncher for SandboxLauncher {
         // handoff at the bottom; an `Err` return or a drop reaps it.
         let mut process = SpawnedProcessGuard::new(process);
 
-        // NET-079: the box's processes are moved into its leaf right after the
+        // NET-079: the box's supervisor is moved into its leaf right after the
         // spawn, from the daemon's own namespaces where the leaf is
         // reachable — the same place the shim later writes an injected
-        // process. Never fatal: a box the host could not place runs in the
-        // daemon's leaf, which confines it just as tightly (it is the cgroup
-        // namespace every box gets as its root), at the cost of being
-        // classified as the daemon rather than itself.
+        // process. The program placed itself already, in the pre-exec closure
+        // it ran inside the box, before it unshared the cgroup namespace onto
+        // the leaf; the supervisor is the one process that never ran that
+        // closure. Never fatal: a supervisor the host could not place runs in
+        // the daemon's leaf, at the cost of being classified as the daemon
+        // rather than its box.
         if let Some(leaf) = leaf_guard.as_ref().and_then(BoxLeafGuard::get) {
             let supervisor = process.get_mut().id();
             match place_box_processes(leaf, supervisor) {
@@ -2674,13 +2733,14 @@ impl SessionLauncher for SandboxLauncher {
                     session = %session_label,
                     leaf = %leaf.dir().display(),
                     supervisor,
-                    "placed the session's processes in their classifier leaf",
+                    "placed the session's box in its classifier leaf: the \
+                     supervisor here, the program in its own pre-exec closure",
                 ),
                 Err(e) => tracing::warn!(
                     session = %session_label,
                     leaf = %leaf.dir().display(),
                     error = %e,
-                    "placing the session's processes in their classifier leaf",
+                    "placing the session's supervisor in its classifier leaf",
                 ),
             }
         }

@@ -614,25 +614,42 @@ async fn async_main() -> Result<(), MainError> {
     }
 
     // NET-079: the daemon's own classifier leaf, entered at start so its own
-    // traffic is decided as the daemon's, and — the part the boxes rely on —
-    // so every box it forks is unshared into a cgroup namespace whose root is
-    // a *childless* leaf: the sandbox's single `unshare()` runs with this
-    // process already in its leaf, which is what keeps a box out of every
-    // other leaf on the tree (see `sandbox2::classifier`).
+    // traffic is decided as the daemon's (NET-080), never classed with a
+    // box's, and so the daemon sits in a *sibling* of every box leaf — never
+    // above them, where a controller it enabled could make the box leaves
+    // domain invalid (spike finding F). Each box then joins its own leaf in
+    // the sandbox's pre-exec closure and unshares its cgroup namespace onto
+    // it, which is what keeps a box out of every other leaf on the tree (see
+    // `sandbox2::classifier`).
     //
     // Natively the tree is the privileged step's to install
     // (`scripts/install-host-classifier.sh`); in the guest this is pid 1,
     // which mounts cgroup2 itself (`guest::enter_rootfs`) and so builds the
-    // tree here. Best effort in both: a host without the tree runs the daemon
-    // — and its boxes — unenforced, never refusing them on that ground.
+    // tree here. Best effort natively — a host without the tree runs the
+    // daemon, and its boxes, unenforced, never refusing them on that ground.
+    // In the guest a tree that could not be built is a broken image, not a
+    // deployment state: the failure is an error and `session_host` refuses a
+    // host-address box on it (design §7.1).
     if let Err(e) = sandbox2::classifier::enter_daemon_leaf(std::path::Path::new(
         sandbox2::classifier::TREE_ROOT,
     )) {
-        tracing::warn!(
-            error = %e,
-            tree = sandbox2::classifier::TREE_ROOT,
-            "entering the daemon's own classifier leaf; its boxes run unenforced"
-        );
+        if guest::is_microvm_daemon() {
+            tracing::error!(
+                error = %e,
+                tree = sandbox2::classifier::TREE_ROOT,
+                "entering the daemon's own classifier leaf: this guest image \
+                 cannot decide per box, and host-address boxes will be refused"
+            );
+        } else {
+            tracing::warn!(
+                error = %e,
+                tree = sandbox2::classifier::TREE_ROOT,
+                install = "sudo scripts/install-host-classifier.sh --user <this \
+                          daemon's account>",
+                "entering the daemon's own classifier leaf; its boxes run \
+                 unenforced"
+            );
+        }
     }
 
     // R1.5/R1.6: when the microVM config requested a data volume

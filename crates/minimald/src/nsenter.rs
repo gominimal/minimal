@@ -419,13 +419,12 @@ impl Injection {
     /// The leaf is the cgroup the box's egress verdict is decided on, and the
     /// one the injected process must share with the box it joins. The join is
     /// the shim's own — and it happens *before* `setns`, the only place it
-    /// can: joining the box's namespaces puts the shim in the box's cgroup
-    /// namespace, whose root is the daemon's leaf, from which the box's own
-    /// leaf (a sibling of that root) is unreachable by design — with
-    /// `nsdelegate` mounted, no cgroup outside the namespace root can be
-    /// written, and the host's own cgroup mount is kept out of the box's
-    /// mount namespace. Writing the shim's pid from the daemon's namespaces
-    /// puts it, and the program it forks, in the leaf.
+    /// can: the box's cgroup namespace is rooted at its own leaf, and from
+    /// inside it that root is not writable — with `nsdelegate` mounted the
+    /// root's `cgroup.procs` is a delegation boundary, and the read-only
+    /// cgroup2 view the box holds dies on the write even where the host
+    /// mounts cgroup2 plain. Writing the shim's pid from the daemon's
+    /// namespaces puts it, and the program it forks, in the leaf.
     pub fn with_classifier_leaf(mut self, leaf: sandbox2::config::ClassifierLeaf) -> Self {
         self.leaf = Some(leaf);
         self
@@ -588,14 +587,14 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     let pidfd = unsafe { OwnedFd::from_raw_fd(args.pidfd) };
 
     // NET-079: join the box's classifier leaf before its namespaces. This is
-    // the one write that has to happen *before* `setns`: joining puts this
-    // process in the box's cgroup namespace, whose root is the daemon's leaf,
-    // from which the box's own leaf (a sibling of that root) is unreachable
-    // by design — with `nsdelegate` mounted, no cgroup outside the namespace
-    // root can be written, and the host's own cgroup mount is masked out of
-    // the box's mount namespace. Writing our pid here, from the daemon's own
-    // namespaces, moves this shim into the leaf, and the program forked below
-    // inherits it with everything else.
+    // the one write that has to happen *before* `setns`: the box's cgroup
+    // namespace is rooted at its own leaf, and from inside it that root is
+    // not writable — with `nsdelegate` mounted the root's `cgroup.procs` is
+    // a delegation boundary, and the read-only cgroup2 view the box holds
+    // dies on the write even where the host mounts cgroup2 plain. Writing
+    // our pid here, from the daemon's own namespaces, moves this shim into
+    // the leaf, and the program forked below inherits it with everything
+    // else.
     //
     // Not fatal: a host that cannot place an injected process does not refuse
     // it on that ground (NET-079's exception) — it runs in the daemon's leaf

@@ -1663,6 +1663,18 @@ fn daemon_enters_its_own_leaf() {
         "the cohort directory exists for the boxes to come"
     );
 
+    // The cohort asks the kernel for the memory controller: a box leaf's
+    // own read-only cgroup2 view can only show `memory.max` — the limit a
+    // cgroup-aware runtime looks for, at the one mountpoint it looks — when
+    // the cgroup above the leaf carries the controller, and `boxes/` holds
+    // no process, so enabling it breaks no internal-process rule.
+    assert_eq!(
+        std::fs::read_to_string(cohort.join("cgroup.subtree_control"))
+            .expect("the daemon enables the memory controller on the cohort"),
+        "+memory\n",
+        "a box's own view must be able to show the limit a runtime looks for"
+    );
+
     // The two identities: a box's leaf lives in the cohort, a sibling of the
     // daemon's, so no box is ever placed in the daemon's leaf and the daemon
     // never in a box's.
@@ -1691,4 +1703,43 @@ fn daemon_enters_its_own_leaf() {
             .any(|member| member == std::process::id().to_string()),
         "the daemon is still a member of its own leaf: {members:?}"
     );
+}
+
+/// Only the guest refuses an unplaceable box, and only a host-address one
+/// (design §7.1). In the guest, a missing or undelegated cgroup2 tree is a
+/// broken image — the daemon's own boot path is the only thing that could
+/// have built it — so a box that would speak with the VM's address and no
+/// verdict of its own is refused rather than run unenforced. Natively the
+/// same state is NET-079's exception: advisory, never a refusal; and a box
+/// that isolates its own network is never the box the refusal is for.
+#[test]
+fn only_the_guest_refuses_an_unplaceable_host_address_box() {
+    use sessions::NetworkMode;
+
+    assert!(
+        refuses_unenforced_host_address_box(true, NetworkMode::HostNet),
+        "a guest that cannot place a host-address box refuses it: it would \
+         run with the VM's address and no verdict at all"
+    );
+    for (guest, mode, why) in [
+        (true, NetworkMode::NoNet, "a none box claims no address to speak with"),
+        (
+            true,
+            NetworkMode::OwnIp,
+            "an own-IP box's address is the switch's to decide, not the cgroup's",
+        ),
+        (
+            false,
+            NetworkMode::HostNet,
+            "natively the same state is the exception: advisory, never a refusal",
+        ),
+        (false, NetworkMode::NoNet, "a native none box, likewise"),
+        (false, NetworkMode::OwnIp, "a native own-IP box, likewise"),
+    ] {
+        assert!(
+            !refuses_unenforced_host_address_box(guest, mode),
+            "{why}: the box launches, enforced where the tree allowed it and \
+             unenforced with a log line where it did not"
+        );
+    }
 }
