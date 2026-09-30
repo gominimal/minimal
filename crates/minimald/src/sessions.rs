@@ -278,6 +278,14 @@ impl Manager {
         // loopback itself, which it already owns.
         #[cfg(target_os = "linux")]
         let (hostnames, loopback) = {
+            // This daemon's start, on the record's own clock: the stamp the
+            // sweep's race guard reads. A grant another daemon on this host
+            // makes from this moment on — most importantly for a session
+            // whose record the liveness snapshot below was read without —
+            // is never this sweep's to free, so a stopped host's fresh
+            // grants survive this daemon's start rather than being read as
+            // dead by a snapshot that predates them.
+            let daemon_start = crate::net::dns::unix_now_secs();
             let switch = net_switch.lock().await;
             let transport = switch.transport();
             let on_switch = matches!(transport, crate::net::SwitchTransport::HostShuttle { .. });
@@ -336,11 +344,30 @@ impl Manager {
             // absent ranges grant nothing, the interim's business.
             let book =
                 crate::net::dns::LoopbackLeaseBook::open(&minimal_state_dir, probe.present())?;
-            let swept = book.release_dead_boxes(&live_session_ids(&store).await?);
+            let swept = book.release_dead_boxes(&live_session_ids(&store).await?, daemon_start);
             if !swept.is_empty() {
                 tracing::info!(
                     addresses = ?swept,
                     "released loopback leases whose sessions are gone from the store",
+                );
+            }
+            // The collision report the record's own arbitration cannot make
+            // (NET-010, reported at session start like a port collision):
+            // every reserved-range address a live publish holds on this
+            // host that this record does not name. That is the shape a
+            // second state root produces — its daemon grants an address
+            // this root's record already gave out, neither record naming
+            // the other's grants, and the collision being on the address
+            // means no bind ever fails to tell either daemon. Advisory: a
+            // warn per address, the operator's signal to separate the roots
+            // or land the host-side arbiter that closes the gap.
+            for address in book.unrecorded_publishes() {
+                tracing::warn!(
+                    ip = %address,
+                    action = "loopback-publish-collision",
+                    "a live publish holds a reserved local address no grant in \
+                     this state root's record names; another state root's daemon \
+                     may be publishing at it",
                 );
             }
             let node = if on_switch {
@@ -814,7 +841,9 @@ impl Manager {
                     self.in_shutdown = true;
                     // Stop live sessions. Each actor kills its host and
                     // withdraws its own PTask hostname (R3.5) on the way
-                    // down; records are kept — shutdown is not deletion.
+                    // down; records — and, with them, the loopback grants
+                    // their boxes would resume at — are kept, since shutdown
+                    // is not deletion.
                     for hnd in self.running.values() {
                         hnd.stop().await;
                     }
@@ -824,6 +853,14 @@ impl Manager {
                     // the post-drain quiesce (R2.1 syncfs + unmount) fail
                     // EBUSY, leaving the ext4 journal dirty on clean stops.
                     self.daemon_ctx.release_cache_read_tracker();
+                    #[cfg(target_os = "linux")]
+                    // And the answerer's lease book's lock-file fd — the one
+                    // descriptor the book holds open, on the same state
+                    // volume, for the same quiesce contract. Read-only, so
+                    // it holds no journal back on its own, but the contract
+                    // is that the stop leaves *no* descriptor of the
+                    // daemon's on the volume.
+                    self.loopback.close();
                     Ok(Ok(()))
                 })
                 .await

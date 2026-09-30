@@ -1063,6 +1063,28 @@ pub(crate) fn host_component(host_header: &str) -> &str {
 // table. "No daemon asks another" holds the way the design means it: a
 // daemon's only peer conversation is with the answerer's record, never with
 // another daemon.
+//
+// A bounded interim, stated plainly. This record arbitrates the daemons that
+// share one state root — however many native node daemons run beside each
+// other on one host, it is their one answerer and no two of them ever hold
+// one address. It does **not** arbitrate across roots, and the design's
+// LocalVM condition — one owned set per host, whatever the guest — is
+// unmet here: a microVM guest's state root is the guest's own, so a second
+// root on the same host keeps a second record the first cannot read. Each
+// grants from its own pool and neither record names the other's grant, which
+// is exactly the cross-root collision NET-010 cannot tolerate. The design's
+// authenticated channel — grants written only by owning node daemons
+// through it — holds here for the single-operator case this interim covers
+// in that writing the record already means holding the filesystem identity
+// the daemon state root is protected by. Closing the cross-root half needs
+// the host-side answerer as the one arbiter over every root's allocation,
+// not a per-root file; that is the filed follow-up's work. Until it lands
+// the daemon-start collision report
+// ([`LoopbackLeaseBook::unrecorded_publishes`]) is the half this record can
+// do on its own: the kernel's socket table is the one list of addresses that
+// is global to the whole host whatever record granted them, and every
+// reserved-range address a live publish holds that this record does not name
+// is reported at session start, like a port collision.
 
 /// The answerer's record of granted addresses, under the daemon's state
 /// root — the one directory every daemon instance on this host shares
@@ -1106,12 +1128,23 @@ pub enum LeaseNamespace {
     Node,
 }
 
-/// One line of the answerer's record: a namespace and the address it holds.
+/// One line of the answerer's record: a namespace, the address it holds,
+/// and when that was granted.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 struct LeaseEntry {
     namespace: LeaseNamespace,
     address: Ipv4Addr,
+    /// The grant's stamp, in Unix seconds — the clock
+    /// [`LoopbackLeaseBook::release_dead_boxes`] guards the start sweep
+    /// with, so a grant another daemon made while this one was starting is
+    /// never read as dead. `#[serde(default)]` keeps a record written
+    /// before the field existed reading as stamped at the epoch: older than
+    /// every daemon now running, which the sweep treats as unguarded
+    /// liveness decides it — the sweep's behaviour before the guard, safe
+    /// for the same reason, since no daemon running now granted it.
+    #[serde(default)]
+    granted_at: u64,
 }
 
 /// What asking the answerer for an address comes back with.
@@ -1124,9 +1157,12 @@ pub enum LoopbackGrant {
     /// without ever holding it in memory.
     Granted(Ipv4Addr),
     /// Every address the answerer may grant on this host is held: the
-    /// published-namespace budget is spent. The asker reports it and
-    /// publishes nothing — never falls back to an address outside the range,
-    /// which another host's answerer may have granted to someone else.
+    /// published-namespace budget is spent. The asker reports it and is
+    /// granted nothing — the box's ports publish on the node's shared
+    /// `127.0.0.1` interim, the mode the registry already answers for and
+    /// NET-129 keeps honest (same-port collisions reported, never
+    /// translated) — never on a reserved-range address another namespace on
+    /// this host holds.
     PoolSpent,
     /// The reserved local range is not bindable on this host (NET-123's
     /// absent verdict): no address from it can be published, so none is
@@ -1178,7 +1214,18 @@ pub struct LoopbackLeaseBook {
     /// `Mutex` because `fd_lock`'s `write` API takes `&mut` — the mutex
     /// serializes books sharing one process, the flock inside it books
     /// sharing one host.
-    lock: std::sync::Mutex<fd_lock::RwLock<std::fs::File>>,
+    ///
+    /// The handle is **read-only**: `flock` asks the kernel about the file
+    /// rather than through it, so the lock holds with no write access, and
+    /// a write-open descriptor on the state volume is one the quiesce
+    /// contract forbids at shutdown — a live write-open fd at unmount time
+    /// is what defeats the journal's clean-replay check and wedges the
+    /// volume read-only on the next boot. That contract is also why the
+    /// field is an `Option`: [`LoopbackLeaseBook::close`] — called from the
+    /// manager's shutdown arm, beside the cache's read-tracker release —
+    /// takes the handle and drops it, so the daemon's stop leaves the state
+    /// volume with no descriptor the book holds open.
+    lock: std::sync::Mutex<Option<fd_lock::RwLock<std::fs::File>>>,
     /// Whether the reserved local range is bindable on this host: the
     /// daemon-start bind probe's verdict (NET-123), read once at start.
     /// While it is absent every grant answers
@@ -1211,22 +1258,42 @@ impl LoopbackLeaseBook {
             .sub_path_unchecked(LEASE_LOCK_FILE)
             .as_utf8_path()
             .to_path_buf();
-        // The lock file is opened — not locked: the flock is taken per
-        // read-modify-write, so two daemons on one host serialize per grant
-        // rather than for their lifetimes.
-        let lock = std::fs::OpenOptions::new()
+        // Created once, then reopened read-only with the creating handle
+        // dropped at once. The lock file is opened — not locked: the flock
+        // is taken per read-modify-write, so two daemons on one host
+        // serialize per grant rather than for their lifetimes. And the
+        // handle the book keeps for its lifetime is read-only on purpose:
+        // `flock` needs no write access, and this is the one fd the book
+        // holds open across its life, so it must not be the write-open
+        // descriptor on the state volume that defeats the quiesce contract
+        // at shutdown — see the field's doc and [`Self::close`].
+        std::fs::OpenOptions::new()
             .create(true)
-            .read(true)
-            .write(true)
             .truncate(false)
-            .open(lock_path.as_std_path())
-            .map(fd_lock::RwLock::new)?;
+            .write(true)
+            .open(lock_path.as_std_path())?;
+        let lock = std::fs::File::open(lock_path.as_std_path()).map(fd_lock::RwLock::new)?;
         Ok(Self {
             record,
             staging,
-            lock: std::sync::Mutex::new(lock),
+            lock: std::sync::Mutex::new(Some(lock)),
             present,
         })
+    }
+
+    /// Closes the book's lock-file handle, so a daemon shutting down leaves
+    /// the state volume with no descriptor the book holds open — the same
+    /// quiesce contract the cache's read-tracker release serves in the
+    /// manager's shutdown arm, which calls this beside it.
+    ///
+    /// After a close every method answers as over a closed book: grants
+    /// withhold ([`LoopbackGrant::RecordUnavailable`]), and releases,
+    /// sweeps, and collision reports report nothing — which is the
+    /// shutdown-time answer anyway, since the manager stops every session
+    /// before it closes the book. Closing an already-closed book is a
+    /// no-op.
+    pub fn close(&self) {
+        drop(self.lock.lock().ok().and_then(|mut held| held.take()));
     }
 
     /// Grants `namespace` an address from the host's pool, or answers with
@@ -1238,14 +1305,23 @@ impl LoopbackLeaseBook {
     /// record back with the new line. A record that cannot be read or
     /// written withholds the grant rather than risking an address another
     /// namespace holds.
+    ///
+    /// The ask is idempotent by namespace, which is what lets a caller ask
+    /// before taking its own registry lock: two paths asking for the same
+    /// namespace — a rename racing a finalize — are both answered with the
+    /// one address, the second by the line the first wrote.
     pub fn grant(&self, namespace: LeaseNamespace) -> LoopbackGrant {
         if !self.present {
             return LoopbackGrant::RangeAbsent;
         }
-        let Ok(mut lock) = self.lock.lock() else {
+        let Ok(mut held) = self.lock.lock() else {
             return LoopbackGrant::RecordUnavailable;
         };
-        let Ok(_held) = lock.write() else {
+        let Some(lock) = held.as_mut() else {
+            // The book was closed for shutdown: nothing more is granted.
+            return LoopbackGrant::RecordUnavailable;
+        };
+        let Ok(_flock) = lock.write() else {
             return LoopbackGrant::RecordUnavailable;
         };
         let Ok(mut entries) = self.read() else {
@@ -1265,7 +1341,11 @@ impl LoopbackLeaseBook {
         let Some(address) = owned.lease() else {
             return LoopbackGrant::PoolSpent;
         };
-        entries.push(LeaseEntry { namespace, address });
+        entries.push(LeaseEntry {
+            namespace,
+            address,
+            granted_at: unix_now_secs(),
+        });
         // A failed write leaves the record as it was, so the namespace's
         // address stays unrecorded and the next ask grants a fresh one — the
         // failed grant leaks nothing. The caller must not publish an address
@@ -1286,10 +1366,11 @@ impl LoopbackLeaseBook {
     /// another namespace now holds.
     #[must_use]
     pub fn release(&self, namespace: LeaseNamespace) -> Option<Ipv4Addr> {
-        let Ok(mut lock) = self.lock.lock() else {
+        let Ok(mut held) = self.lock.lock() else {
             return None;
         };
-        let _held = lock.write().ok()?;
+        let lock = held.as_mut()?;
+        let _flock = lock.write().ok()?;
         let mut entries = self.read().ok()?;
         let index = entries
             .iter()
@@ -1312,15 +1393,35 @@ impl LoopbackLeaseBook {
     /// daemon on the host the same way this record is, so the sweep is the
     /// answerer's own view of liveness, not one daemon's.
     ///
+    /// `daemon_start` is the moment this daemon began starting, in the Unix
+    /// seconds the record stamps grants with, and it bounds the sweep: a
+    /// line stamped at or after it is one some daemon granted while this one
+    /// was starting — the race the liveness snapshot alone cannot see, since
+    /// another daemon's fresh grant is for a session this daemon read the
+    /// store before — so the sweep leaves such lines to liveness, and
+    /// nothing is freed that a live neighbour may just have handed out. A
+    /// line stamped before it predates this daemon, so no daemon granted it
+    /// while this one was starting, and liveness alone decides it. A line
+    /// with no stamp — a record written before the field existed — reads as
+    /// stamped at the epoch: old, so the sweep decides it, which is the
+    /// guardless behaviour and is safe for the same reason.
+    ///
     /// Returns the addresses it freed, for the start line that reports them;
     /// a record it could not read or write sweeps nothing and answers empty,
     /// since grants are withheld for the same failure.
     #[must_use]
-    pub fn release_dead_boxes(&self, live: &BTreeSet<SessionId>) -> Vec<Ipv4Addr> {
-        let Ok(mut lock) = self.lock.lock() else {
+    pub fn release_dead_boxes(
+        &self,
+        live: &BTreeSet<SessionId>,
+        daemon_start: u64,
+    ) -> Vec<Ipv4Addr> {
+        let Ok(mut held) = self.lock.lock() else {
             return Vec::new();
         };
-        let Ok(_held) = lock.write() else {
+        let Some(lock) = held.as_mut() else {
+            return Vec::new();
+        };
+        let Ok(_flock) = lock.write() else {
             return Vec::new();
         };
         let mut entries = match self.read() {
@@ -1338,14 +1439,20 @@ impl LoopbackLeaseBook {
         let freed: Vec<Ipv4Addr> = entries
             .iter()
             .filter(|entry| match entry.namespace {
-                LeaseNamespace::Box { session } => !live.contains(&session),
+                // The node's grant is for the node's lifetime, not a
+                // session's: never swept, whatever liveness says.
                 LeaseNamespace::Node => false,
+                LeaseNamespace::Box { session } => {
+                    !live.contains(&session) && entry.granted_at < daemon_start
+                }
             })
             .map(|entry| entry.address)
             .collect();
         entries.retain(|entry| match entry.namespace {
-            LeaseNamespace::Box { session } => live.contains(&session),
             LeaseNamespace::Node => true,
+            LeaseNamespace::Box { session } => {
+                live.contains(&session) || entry.granted_at >= daemon_start
+            }
         });
         if entries.len() == before || self.write(&entries).is_err() {
             // Nothing swept, or the sweep could not be written back: either
@@ -1353,6 +1460,56 @@ impl LoopbackLeaseBook {
             return Vec::new();
         }
         freed
+    }
+
+    /// The reserved-range addresses a live publish is holding on this host
+    /// that this record does not name — the cross-record collision report
+    /// (NET-010, design §7.1: reported at session start, like a port
+    /// collision).
+    ///
+    /// A publish is a listener: a box's gvproxy holds one bind at
+    /// `address:port` for every port it publishes, from finalize until it
+    /// exits. The kernel's table of listening sockets is therefore the one
+    /// list of what is actually published that is global to the whole host
+    /// whatever record file granted each bind — which is what makes this the
+    /// second root's check: two state roots on one host keep two records,
+    /// the second daemon grants `.2` again, neither record names the other's
+    /// grant, and `EADDRINUSE` never tells either daemon (the collision is
+    /// on the address, not a port) — but both binds are in the one kernel
+    /// table this reads. An address this record does name is the record's
+    /// own grant, reported by nobody; an address with a listener the record
+    /// does not name is reported, for the start line the manager logs and
+    /// the operator acts on.
+    ///
+    /// Reading the record under its lock keeps the report from firing on
+    /// this host's own mid-grant boxes: the grant writes the record's line
+    /// before the box publishes, so a listener on an unnamed address is
+    /// never a grant still between the write and the publish. In a microVM
+    /// guest the socket table is the guest's own network namespace, so no
+    /// host-side publish appears and this answers empty — the same LocalVM
+    /// boundary the record has (see the module comment): the cross-root
+    /// report across co-resident guests is the host-side answerer's to
+    /// carry.
+    ///
+    /// Reports nothing — like the sweep — when the book is closed for
+    /// shutdown or the record cannot be read: the sweep already logged the
+    /// latter's advisory, and a report that cannot see the record must not
+    /// guess what it names.
+    #[must_use]
+    pub fn unrecorded_publishes(&self) -> Vec<Ipv4Addr> {
+        let Ok(mut held) = self.lock.lock() else {
+            return Vec::new();
+        };
+        let recorded: BTreeSet<Ipv4Addr> = match held.as_mut().map(|lock| lock.write()) {
+            Some(Ok(_flock)) => match self.read() {
+                Ok(entries) => entries.iter().map(|entry| entry.address).collect(),
+                Err(_) => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
+        listening_reserved_range_addresses()
+            .filter(|address| !recorded.contains(address))
+            .collect()
     }
 
     /// Reads the record, or `Err` when it cannot be trusted: a missing file
@@ -1396,6 +1553,95 @@ fn entry_address(entries: &[LeaseEntry], namespace: LeaseNamespace) -> Option<Ip
         .iter()
         .find(|entry| entry.namespace == namespace)
         .map(|entry| entry.address)
+}
+
+/// The wall clock the record stamps grants with, in Unix seconds — the same
+/// clock a daemon stamps its own start with (the stamp the manager passes
+/// to [`LoopbackLeaseBook::release_dead_boxes`]), so the sweep's
+/// [`LeaseEntry::granted_at`] guard compares like with like. `0` on a host
+/// whose clock reports a moment before the epoch: the stamp of "older than
+/// any daemon now running", which the sweep reads as sweepable.
+///
+/// One clock for both stamps is the whole contract, so this is the only
+/// definition — the daemon-start stamp and the grant stamp must never come
+/// from two clocks, or the guard's "at or after this daemon's start" is
+/// measured against a start that means something else.
+#[cfg(target_os = "linux")]
+pub(crate) fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// The reserved local range's addresses that a listening socket holds on
+/// this host right now, read from the kernel's socket tables — the one list
+/// of what is published that is global to the whole host, whatever record
+/// file granted each bind. See [`LoopbackLeaseBook::unrecorded_publishes`]
+/// for what the list is for; the tables are this host's own network
+/// namespace, which in a microVM guest is the guest's.
+#[cfg(target_os = "linux")]
+fn listening_reserved_range_addresses() -> impl Iterator<Item = Ipv4Addr> {
+    let mut seen = BTreeSet::new();
+    for (table, v6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            // The table itself missing — a kernel with it disabled — reads
+            // as "nothing is published", not as a failure to look: there is
+            // nothing to report either way.
+            continue;
+        };
+        // The first line is the table's header.
+        for line in text.lines().skip(1) {
+            let Some(address) = listen_local_v4(line, v6) else {
+                continue;
+            };
+            if in_reserved_local_range(address) {
+                seen.insert(address);
+            }
+        }
+    }
+    seen.into_iter()
+}
+
+/// The local IPv4 address of one line of the kernel's socket table, or
+/// `None` for any other line: the header, a truncated row, a socket in any
+/// state but `TCP_LISTEN` — an established or time-wait socket at an
+/// in-range address is a client of a publish, not a publish — or a v6
+/// address that is not the v4-mapped shape, which names no IPv4 address.
+#[cfg(target_os = "linux")]
+fn listen_local_v4(line: &str, v6: bool) -> Option<Ipv4Addr> {
+    let mut fields = line.split_whitespace();
+    // `sl:` — the table's index column, always first.
+    fields.next()?;
+    let local = fields.next()?;
+    // `rem_address`, then `st`: `0A` is `TCP_LISTEN`.
+    let _remote = fields.next()?;
+    if fields.next()? != "0A" {
+        return None;
+    }
+    let word = if v6 {
+        // Four little-endian 32-bit words. Only the v4-mapped shape names an
+        // IPv4 address: two zero words, the `::ffff:0:0/96` marker
+        // (`0xFFFF0000` printed little-endian), then the address in the
+        // last word.
+        if local.len() < 33
+            || local.as_bytes()[32] != b':'
+            || &local[..16] != "0000000000000000"
+            || &local[16..24] != "FFFF0000"
+        {
+            return None;
+        }
+        &local[24..32]
+    } else {
+        if local.len() < 9 || local.as_bytes()[8] != b':' {
+            return None;
+        }
+        &local[..8]
+    };
+    // The kernel prints each 32-bit word little-endian, so the address is
+    // the byte-swapped word: `0100007F` reads as `127.0.0.1`.
+    Some(Ipv4Addr::from(
+        u32::from_str_radix(word, 16).ok()?.swap_bytes(),
+    ))
 }
 
 #[cfg(test)]
@@ -2053,6 +2299,46 @@ mod tests {
         }
     }
 
+    /// A `daemon_start` stamp that is strictly after every grant the calling
+    /// test has already made: the start of a daemon whose liveness snapshot
+    /// — read from the store as it began — predates none of them, so the
+    /// sweep decides those lines on liveness alone.
+    #[cfg(target_os = "linux")]
+    fn a_later_daemon_start() -> u64 {
+        unix_now_secs() + 1
+    }
+
+    /// This process's open file descriptors whose path lies under `dir`, as
+    /// `(fd, flags, path)`: the flags are the descriptor's status flags in
+    /// octal, whose low two bits are the access mode — `00` `O_RDONLY`,
+    /// `01` `O_WRONLY`, `02` `O_RDWR`.
+    #[cfg(target_os = "linux")]
+    fn fds_under(dir: &std::path::Path) -> Vec<(u32, u32, String)> {
+        let mut held: Vec<(u32, u32, String)> = std::fs::read_dir("/proc/self/fd")
+            .expect("the kernel always serves its fd table")
+            .flatten()
+            .filter_map(|entry| {
+                let fd = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+                let target = std::fs::read_link(entry.path()).ok()?;
+                if !target.starts_with(dir) {
+                    return None;
+                }
+                let flags = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+                    .ok()
+                    .and_then(|info| {
+                        info.lines().find_map(|line| {
+                            line.strip_prefix("flags:")
+                                .and_then(|rest| rest.trim().parse::<u32>().ok())
+                        })
+                    })
+                    .unwrap_or(0);
+                Some((fd, flags, target.to_string_lossy().into_owned()))
+            })
+            .collect();
+        held.sort();
+        held
+    }
+
     /// The start-time sweep: a box whose session is gone from the store
     /// loses its grant, and a live box — even one another daemon instance
     /// owns — keeps it. The node's grant is not a box's and is never swept.
@@ -2081,7 +2367,7 @@ mod tests {
 
         // The store's live set names the live box alone.
         let live_ids = BTreeSet::from([live]);
-        let freed = book.release_dead_boxes(&live_ids);
+        let freed = book.release_dead_boxes(&live_ids, a_later_daemon_start());
         assert_eq!(
             freed,
             vec![dead_address],
@@ -2110,7 +2396,7 @@ mod tests {
         // An empty store sweeps every box — a host whose sessions were all
         // destroyed while no daemon was running starts with the whole pool.
         let swept: BTreeSet<Ipv4Addr> = book
-            .release_dead_boxes(&BTreeSet::new())
+            .release_dead_boxes(&BTreeSet::new(), a_later_daemon_start())
             .into_iter()
             .collect();
         assert_eq!(
@@ -2118,6 +2404,209 @@ mod tests {
             BTreeSet::from([dead_address, live_address]),
             "every box's grant goes, the node's stays"
         );
+    }
+
+    /// The sweep's race guard: a grant another daemon made while this one
+    /// was starting is not this sweep's to free, however stale the liveness
+    /// snapshot this daemon took — the snapshot was read from the store
+    /// before the granting session ever appeared in it. The stamp bounds
+    /// the sweep; the next daemon, starting after the grant, is the one
+    /// whose sweep liveness alone decides it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_start_sweep_spares_a_grant_made_as_this_daemon_was_starting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let book = lease_book(&state_root);
+        let namespace = LeaseNamespace::Box {
+            session: session_id(1),
+        };
+        let granted = match book.grant(namespace) {
+            LoopbackGrant::Granted(address) => address,
+            other => panic!("a fresh host grants the box: {other:?}"),
+        };
+        // This daemon started the same second the peer granted: everything
+        // it stamps at or after its start is not its sweep's to free.
+        let daemon_start = book
+            .read()
+            .expect("the record the grant wrote")
+            .first()
+            .expect("the grant wrote one line")
+            .granted_at;
+        let live: BTreeSet<SessionId> = BTreeSet::new();
+        assert_eq!(
+            book.release_dead_boxes(&live, daemon_start),
+            Vec::<Ipv4Addr>::new(),
+            "a grant made while this daemon was starting is not read as dead"
+        );
+        assert_eq!(
+            book.grant(namespace),
+            LoopbackGrant::Granted(granted),
+            "the spared grant still answers the same address"
+        );
+
+        // The next daemon starts after the grant: nothing of the guard
+        // protects it, and liveness alone decides.
+        assert_eq!(
+            book.release_dead_boxes(&live, daemon_start + 1),
+            vec![granted],
+            "the next daemon's start predates nothing, and sweeps it"
+        );
+        assert_eq!(
+            book.read().unwrap(),
+            Vec::new(),
+            "the swept line is gone from the record"
+        );
+    }
+
+    /// A record written before the stamp existed — the format a daemon on
+    /// the previous release leaves behind — still parses, its lines read as
+    /// stamped at the epoch, and the sweep decides them on liveness alone,
+    /// the guardless behaviour.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_record_from_before_grants_were_stamped_still_sweeps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let record = state_root.sub_path_unchecked(LEASE_RECORD_FILE);
+        let live = session_id(1);
+        let dead = session_id(2);
+        // Two lines of the old field set: a live box's and a dead box's,
+        // hand-written in the shape the previous release wrote.
+        let pre_stamp_record = format!(
+            concat!(
+                r#"[{{"namespace":{{"box":{{"session":"{}"}}}},"#,
+                r#""address":"127.0.64.2"}},"#,
+                r#"{{"namespace":{{"box":{{"session":"{}"}}}},"#,
+                r#""address":"127.0.64.3"}}]"#
+            ),
+            live, dead
+        );
+        std::fs::write(record.as_utf8_path(), pre_stamp_record).unwrap();
+        let book = lease_book(&state_root);
+        let entries = book.read().unwrap();
+        assert_eq!(entries.len(), 2, "the pre-stamp record parses");
+        assert!(
+            entries.iter().all(|entry| entry.granted_at == 0),
+            "a pre-stamp line reads as stamped at the epoch"
+        );
+        // Re-granting a pre-stamp line answers the recorded address, keeping
+        // the box stable across the release that added the stamp.
+        assert_eq!(
+            book.grant(LeaseNamespace::Box { session: live }),
+            LoopbackGrant::Granted(sessions::core::loopback::POOL_FIRST)
+        );
+        // A daemon started now — after the epoch, whenever that was —
+        // sweeps the pre-stamp lines on liveness alone.
+        let freed = book.release_dead_boxes(&BTreeSet::from([live]), a_later_daemon_start());
+        assert_eq!(freed, vec![std::net::Ipv4Addr::new(127, 0, 64, 3)]);
+    }
+
+    /// The cross-record collision report: a live publish holding a
+    /// reserved-range address this record does not name is reported, and one
+    /// the record does name is not — this record's own grant, whatever it is
+    /// publishing. Both binds sit in the one kernel table the whole host
+    /// shares, which is what makes this the check a second state root cannot
+    /// dodge by keeping its own record.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_publish_the_record_does_not_name_is_reported_at_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let book = lease_book(&state_root);
+        let recorded = match book.grant(LeaseNamespace::Node) {
+            LoopbackGrant::Granted(address) => address,
+            other => panic!("a fresh host grants the node: {other:?}"),
+        };
+
+        // One publish at the recorded address, one at an address no line of
+        // this record names — the shape a second state root's daemon
+        // publishes at, having granted it from its own record.
+        let recorded_listener =
+            std::net::TcpListener::bind((recorded, 0)).expect("the recorded address binds");
+        let foreign = std::net::Ipv4Addr::new(127, 0, 64, 250);
+        let foreign_listener =
+            std::net::TcpListener::bind((foreign, 0)).expect("the unrecorded address binds");
+
+        let reported = book.unrecorded_publishes();
+        assert!(
+            reported.contains(&foreign),
+            "the unrecorded publish is reported: {reported:?}"
+        );
+        assert!(
+            !reported.contains(&recorded),
+            "the record's own publish is not: {reported:?}"
+        );
+
+        // Neither the answerer's own address — never grantable, and not this
+        // report's to question — nor a client of a publish is one: a
+        // connected socket at an in-range address holds no listener.
+        drop(recorded_listener);
+        drop(foreign_listener);
+    }
+
+    /// The quiesce contract: the state volume must not carry a live
+    /// write-open descriptor across the daemon's stop — the fd the journal's
+    /// clean-replay check trips over. The book's one held-open descriptor is
+    /// the lock file, opened read-only, and `close` — the call the
+    /// manager's shutdown arm makes beside the cache's read-tracker
+    /// release — drops it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_closed_book_holds_no_file_descriptor_on_the_state_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let book = lease_book(&state_root);
+        let namespace = LeaseNamespace::Box {
+            session: session_id(1),
+        };
+        assert_eq!(
+            book.grant(namespace),
+            LoopbackGrant::Granted(sessions::core::loopback::POOL_FIRST)
+        );
+
+        // One fd, the lock file, and it is read-only — the low two bits of
+        // its status flags are the access mode, `00` `O_RDONLY`. `flock`
+        // asks the kernel about the file, not through it, so the record's
+        // lock holds anyway.
+        let held = fds_under(tmp.path());
+        assert_eq!(
+            held.len(),
+            1,
+            "the book holds one descriptor over the state volume: {held:?}"
+        );
+        let (_, flags, _) = &held[0];
+        assert_eq!(
+            flags & 0o3,
+            0,
+            "the lock file's descriptor is opened read-only: {flags:o}"
+        );
+
+        // The shutdown arm's close leaves none, and a second close is a
+        // no-op.
+        book.close();
+        book.close();
+        assert!(
+            fds_under(tmp.path()).is_empty(),
+            "after the shutdown-arm close, the state volume carries no descriptor the book holds"
+        );
+
+        // Over a closed book every answer is the closed-book answer: grants
+        // withhold, and releases, sweeps, and collision reports report
+        // nothing. The record on disk stands as the grants left it.
+        assert_eq!(
+            book.grant(LeaseNamespace::Box {
+                session: session_id(2)
+            }),
+            LoopbackGrant::RecordUnavailable
+        );
+        assert_eq!(book.release(namespace), None);
+        assert!(
+            book.release_dead_boxes(&BTreeSet::new(), a_later_daemon_start())
+                .is_empty()
+        );
+        assert!(book.unrecorded_publishes().is_empty());
+        assert_eq!(book.read().unwrap().len(), 1, "the record stands");
     }
 
     /// An absent reserved local range grants nothing — NET-123's interim:
