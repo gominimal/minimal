@@ -692,18 +692,22 @@ mod tests {
     /// The box that allows the toolchain's remote hosts and, by address,
     /// nothing else: TCP declared, no subnets, only `egress.allow_dns_hosts`
     /// (NET-068's hostname-only allowlist).
+    ///
+    /// The TCP-only protocol rule does not block DNS resolution: the relay's
+    /// verdict carves out UDP/53 to the resolver before it checks protocol
+    /// rules (NET-079), so `allow_protocols: Some([Tcp])` still lets the box
+    /// resolve every allowed name.
     fn toolchain_hosts_egress() -> sessions::SessionPolicy {
         sessions::SessionPolicy {
             egress: Some(sessions::EgressPolicy {
                 allow_protocols: Some(vec![sessions::IpProto::Tcp]),
                 allow_subnets: Some(Vec::new()),
-                allow_dns_hosts: Some(vec![
-                    "deb.debian.org".to_string(),
-                    "github.com".to_string(),
-                    "registry.npmjs.org".to_string(),
-                    "pypi.org".to_string(),
-                    "registry-1.docker.io".to_string(),
-                ]),
+                allow_dns_hosts: Some(
+                    sessions::NET068_TOOLCHAIN_EGRESS_HOSTS
+                        .iter()
+                        .map(|h| (*h).to_string())
+                        .collect(),
+                ),
                 deny_subnets: None,
             }),
             ingress: None,
@@ -1088,10 +1092,22 @@ mod tests {
         // so the shape is the same for every host.
         let toolchain = [
             ("deb.debian.org.", Ipv4Addr::new(146, 59, 118, 203)),
+            ("security.debian.org.", Ipv4Addr::new(151, 101, 2, 132)),
             ("github.com.", Ipv4Addr::new(140, 82, 121, 3)),
+            ("codeload.github.com.", Ipv4Addr::new(140, 82, 113, 10)),
+            (
+                "raw.githubusercontent.com.",
+                Ipv4Addr::new(185, 199, 108, 133),
+            ),
             ("registry.npmjs.org.", Ipv4Addr::new(104, 16, 26, 34)),
             ("pypi.org.", Ipv4Addr::new(151, 101, 128, 223)),
+            ("files.pythonhosted.org.", Ipv4Addr::new(146, 75, 38, 223)),
             ("registry-1.docker.io.", Ipv4Addr::new(44, 205, 64, 79)),
+            ("auth.docker.io.", Ipv4Addr::new(3, 94, 213, 199)),
+            (
+                "production.cloudflare.docker.com.",
+                Ipv4Addr::new(104, 16, 124, 175),
+            ),
         ];
         for (index, (name, address)) in toolchain.iter().enumerate() {
             // A unique source port per name so the DNS conntrack windows do not collide.
@@ -1144,7 +1160,11 @@ mod tests {
             assert_eq!(out, connect, "{address} resolved from {name} is admitted");
         }
 
-        // An address resolved for a name the box did not declare is refused.
+        // An address resolved for a name the box did not declare is not
+        // admitted. Under the shipped interim, the query is forwarded and only
+        // the resulting pin is withheld; the architecture's design would refuse
+        // the resolution itself. Either way the TCP flow is dropped, so the
+        // assertion holds for both behaviours.
         let undeclared_query = udp_payload_frame(
             LEASE,
             41000,

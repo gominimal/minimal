@@ -1,21 +1,23 @@
 //! VM box egress under a hostname-only allowlist (NET-068).
 //!
-//! Boots a real microVM with the guest `minimald`, creates an `OwnIp` box
-//! whose egress is only a list of toolchain hostnames, then runs the actual
-//! toolchain operations inside it: apt update, git clone, npm install,
-//! pip install, and a container image pull. The VM's only path out is through
-//! the host gvproxy switch; the guest's PTask relay enforces the
-//! DNS-pinned hostname allowlist outside the VM.
+//! Boots a real microVM with the guest `minimald`, creates an `OwnIp` box whose
+//! egress is only a list of toolchain hostnames, then runs the actual toolchain
+//! operations inside it: apt update, git clone, npm install, pip install, and a
+//! container image pull with `skopeo`. The VM's only path out is through the
+//! host gvproxy switch; the guest's relay enforces the DNS-pinned hostname
+//! allowlist at the VM boundary.
 //!
 //! Gates:
 //! - `#[cfg(minvmd_libkrun)]`: needs libkrun (macOS, or Linux with libkrun).
 //! - `#[ignore]` + `MINVMD_E2E=1`: skipped unless explicitly enabled.
-//! - `MINVMD_KERNEL_PATH`, `MINVMD_ROOTFS_PATH`, `MINVMD_INITRAMFS` must point
-//!   to the kernel, generic rootfs, and minimald initramfs cpio.
-//! - `MINVMD_VM_OWN_IP=1`: own-IP box whose egress the switch enforces.
+//! - `MINVMD_KERNEL_PATH`, `MINVMD_ROOTFS_PATH`, `MINVMD_INITRAMFS` must point to
+//!   the kernel, generic rootfs, and minimald initramfs cpio.
+//! - `MINVMD_GVPROXY_BIN` must point to the host gvproxy switch: the own-IP
+//!   boot spawns it, so this test skips when it is unset (matching how CI
+//!   treats gvproxy as opt-in and only exports it for the session-e2e step).
 //!
-//! The test writes each tool's exit status and a tail of the daemon log's
-//! admissions/drops during it, so a stalled fetch names the host that was not
+//! The test writes each tool's exit status and the boot-log admissions/drops
+//! that arrived during it, so a stalled fetch names the host that was not
 //! admitted (diagnostics requirement).
 
 #![cfg(minvmd_libkrun)]
@@ -29,16 +31,11 @@ use std::time::Duration;
 use serial_test::serial;
 use tempfile::TempDir;
 
-/// Hostnames the toolchain contacts. The box declares `egress.allow_dns_hosts`
-/// with these names only (no subnets, no protocols beyond TCP) so every
-/// operation's reach must be earned by DNS-pinned admission.
-const TOOLCHAIN_HOSTS: &[&str] = &[
-    "deb.debian.org",
-    "github.com",
-    "registry.npmjs.org",
-    "pypi.org",
-    "registry-1.docker.io",
-];
+/// Hostnames the box declares in `egress.allow_dns_hosts` only (no subnets, no
+/// protocols beyond TCP). Every operation's reach must be earned by DNS-pinned
+/// admission. The list is shared with the `minimald` unit fixture so the two
+/// cannot drift.
+const TOOLCHAIN_HOSTS: &[&str] = sessions::NET068_TOOLCHAIN_EGRESS_HOSTS;
 
 /// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
 /// provider sockets beneath a default tempdir would overflow sun_path (104).
@@ -57,12 +54,23 @@ fn minvmd_bin() -> std::ffi::OsString {
 }
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
+const EXEC_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Env var the server reads to scope an exec to a session.
 const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
 
+/// Host-side boot-console path. `std::env::var_os` result is empty-safe.
+const MINVMD_BOOT_LOG_ENV: &str = "MINVMD_BOOT_LOG";
+
+/// Host-side gvproxy path env.
+const MINVMD_GVPROXY_BIN_ENV: &str = "MINVMD_GVPROXY_BIN";
+
+/// Guest log filter that promotes the DNS-gate admission lines to debug.
+const GUEST_LOG_FILTER: &str = "info,minimald::net::dns_gate=debug";
+
 /// Returns true if the e2e suite is enabled (`MINVMD_E2E=1`), asserting the
-/// required env vars are present when so.
+/// required env vars are present when so. Skips quietly when gvproxy is not
+/// available, because an own-IP boot without it has no host-side switch.
 fn e2e_enabled() -> bool {
     if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
         eprintln!("egress_allowlist_integration: MINVMD_E2E != 1, skipping");
@@ -72,17 +80,19 @@ fn e2e_enabled() -> bool {
         "MINVMD_KERNEL_PATH",
         "MINVMD_ROOTFS_PATH",
         "MINVMD_INITRAMFS",
-        "MINVMD_VM_OWN_IP",
     ] {
         assert!(
             std::env::var(var).is_ok(),
             "egress_allowlist_integration: {var} must be set when MINVMD_E2E=1"
         );
     }
-    assert!(
-        minvmd::cmd::own_ip_requested(),
-        "this test requires an own-IP VM (MINVMD_VM_OWN_IP=1)"
-    );
+    if std::env::var_os(MINVMD_GVPROXY_BIN_ENV).is_none() {
+        eprintln!(
+            "egress_allowlist_integration: {MINVMD_GVPROXY_BIN_ENV} is not set, \
+             skipping own-IP test (gvproxy is opt-in in CI)"
+        );
+        return false;
+    }
     true
 }
 
@@ -90,7 +100,9 @@ fn e2e_enabled() -> bool {
 struct Guest {
     child: Child,
     sock_path: PathBuf,
-    state: TempDir,
+    boot_log_path: PathBuf,
+    boot_log_offset: usize,
+    _state: TempDir,
 }
 
 impl Drop for Guest {
@@ -108,16 +120,30 @@ impl Guest {
         let sock_path = state
             .path()
             .join("minimal/providers/local-minvmd0/ssh.sock");
+        let boot_log_path = std::env::var_os(MINVMD_BOOT_LOG_ENV)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                state
+                    .path()
+                    .join("minimal/providers/local-minvmd0/boot.log")
+            });
 
         let exe = minvmd_bin();
-        let mut child = Command::new(exe)
-            .args(["boot", "--foreground"])
+        let mut cmd = Command::new(exe);
+        cmd.args(["boot", "--foreground"])
+            // minimald boots as the initramfs `/init` (MINVMD_INITRAMFS, set by
+            // the caller); the rootfs stays generic.
             .env("XDG_STATE_HOME", state.path())
             .env("MINVMD_VM_OWN_IP", "1")
+            .env("RUST_LOG", GUEST_LOG_FILTER)
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawning minvmd boot --foreground");
+            .stderr(Stdio::inherit());
+        if let Some(gvproxy) = std::env::var_os(MINVMD_GVPROXY_BIN_ENV) {
+            cmd.env(MINVMD_GVPROXY_BIN_ENV, gvproxy);
+        }
+
+        let mut child = cmd.spawn().expect("spawning minvmd boot --foreground");
 
         let stdout = child.stdout.take().expect("child stdout");
         let (tx, rx) = std::sync::mpsc::channel::<bool>();
@@ -146,13 +172,33 @@ impl Guest {
         Guest {
             child,
             sock_path,
-            state,
+            boot_log_path,
+            boot_log_offset: 0,
+            _state: state,
         }
     }
 
-    /// Path to the provider directory, where the guest daemon writes its log.
-    fn provider_dir(&self) -> PathBuf {
-        self.state.path().join("minimal/providers/local-minvmd0")
+    /// Return the bytes appended to the guest boot log since the last call,
+    /// so each tool failure is paired with the admissions/drops that happened
+    /// while it ran. Falls back to a literal reason if the log is not present.
+    fn tail_boot_log(&mut self) -> String {
+        let contents = match std::fs::read_to_string(&self.boot_log_path) {
+            Ok(c) => c,
+            Err(e) => return format!("(no boot log at {}: {e})", self.boot_log_path.display()),
+        };
+        let total_len = contents.len();
+        let tail = if total_len >= self.boot_log_offset {
+            &contents[self.boot_log_offset..]
+        } else {
+            // Log was truncated/rotated; just print the whole current contents.
+            &contents[..]
+        };
+        self.boot_log_offset = total_len;
+        // Capped generously: a single tool can produce many lines, but we want
+        // the admissions/refusals at the tail to stay readable.
+        let mut lines: Vec<&str> = tail.lines().rev().take(80).collect();
+        lines.reverse();
+        lines.join("\n")
     }
 }
 
@@ -172,18 +218,17 @@ impl russh::client::Handler for ClientHandler {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-#[ignore = "gated MINVMD_E2E=1; requires own-IP VM with libkrun + images + network"]
+#[ignore = "gated MINVMD_E2E=1; requires own-IP VM with libkrun + images + gvproxy + network"]
 async fn hostname_allowlist_toolchain_completes() {
     if !e2e_enabled() {
         return;
     }
-    let guest = Guest::boot();
+    let mut guest = Guest::boot();
 
     // Wait for post-READY startup to settle before driving SSH.
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     let mut session_id = None;
-    let mut last_err = String::new();
     for attempt in 1..=6 {
         match create_toolchain_session(&guest.sock_path).await {
             Ok(id) => {
@@ -191,8 +236,7 @@ async fn hostname_allowlist_toolchain_completes() {
                 break;
             }
             Err(e) => {
-                last_err = e;
-                eprintln!("session create attempt {attempt}: {last_err}");
+                eprintln!("session create attempt {attempt}: {e}");
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
@@ -200,63 +244,60 @@ async fn hostname_allowlist_toolchain_completes() {
     let session_id = session_id.expect("failed to create toolchain session");
 
     let tools = [
-        (
-            "apt",
-            minimald_rpc::exec::ExecRequest::Shell("apt-get update -qq".to_string()),
-        ),
+        ("apt", "apt-get update -qq"),
         (
             "git",
-            minimald_rpc::exec::ExecRequest::Shell(
-                "git clone --depth 1 https://github.com/torvalds/linux /tmp/linux-stub".to_string(),
-            ),
+            "git clone --depth 1 https://github.com/octocat/Hello-World /tmp/hello-world",
         ),
         (
             "npm",
-            minimald_rpc::exec::ExecRequest::Shell(
-                "mkdir -p /tmp/npm-stub && cd /tmp/npm-stub && npm install is-odd --prefix ."
-                    .to_string(),
-            ),
+            "mkdir -p /tmp/npm-stub && cd /tmp/npm-stub && npm install is-odd --prefix .",
         ),
+        ("pip", "pip install --target /tmp/pip-stub requests"),
         (
-            "pip",
-            minimald_rpc::exec::ExecRequest::Shell(
-                "pip install --target /tmp/pip-stub requests".to_string(),
-            ),
-        ),
-        (
-            "podman",
-            minimald_rpc::exec::ExecRequest::Shell(
-                "podman pull --quiet docker.io/library/hello-world".to_string(),
-            ),
+            "skopeo",
+            "skopeo copy docker://docker.io/library/hello-world dir:/tmp/hw",
         ),
     ];
 
     let mut failures = Vec::new();
-    for (name, exec) in &tools {
-        match run_session_exec(&guest.sock_path, session_id, &exec.encode()).await {
-            Ok((stdout, stderr, exit)) => {
-                // Print the tool's exit status and a tail of the daemon log
-                // admissions/drops during it, so a stalled fetch names the host
+    for (name, command) in &tools {
+        let encoded = minimald_rpc::exec::ExecRequest::Shell((*command).to_string()).encode();
+        let result = tokio::time::timeout(
+            EXEC_TIMEOUT,
+            run_session_exec(&guest.sock_path, session_id, &encoded),
+        )
+        .await;
+        match result {
+            Ok(Ok((stdout, stderr, exit))) => {
+                // Print the tool's exit status and the boot-log tail that
+                // accumulated while it ran, so a stalled fetch names the host
                 // that was not admitted.
-                let log_tail = tail_daemon_log(&guest.provider_dir());
+                let log_tail = guest.tail_boot_log();
                 eprintln!(
                     "egress_allowlist_integration: {name} exit={exit:?}\n\
                      --- stdout tail ---\n{stdout}\n\
                      --- stderr tail ---\n{stderr}\n\
-                     --- daemon log tail ---\n{log_tail}",
+                     --- boot log tail ---\n{log_tail}",
                 );
                 if exit != Some(0) {
                     failures.push((*name, exit, stdout, stderr, log_tail));
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
+                let log_tail = guest.tail_boot_log();
                 eprintln!("egress_allowlist_integration: {name} exec failed: {e}");
+                failures.push((*name, None, String::new(), e, log_tail));
+            }
+            Err(_) => {
+                let log_tail = guest.tail_boot_log();
+                eprintln!("egress_allowlist_integration: {name} timed out after {EXEC_TIMEOUT:?}");
                 failures.push((
                     *name,
                     None,
                     String::new(),
-                    e,
-                    tail_daemon_log(&guest.provider_dir()),
+                    format!("timed out after {EXEC_TIMEOUT:?}"),
+                    log_tail,
                 ));
             }
         }
@@ -268,41 +309,42 @@ async fn hostname_allowlist_toolchain_completes() {
     );
 }
 
-/// Create an `OwnIp` box with the hostname-only toolchain allowlist.
-async fn create_toolchain_session(sock_path: &Path) -> Result<minimald_rpc::SessionId, String> {
+/// Project file to upload into the session workspace. Its `[session]` packages
+/// provide the toolchain binaries the test execs; `[upstream]` points at the
+/// shared package repo the composer needs to resolve them.
+fn toolchain_project_toml() -> String {
+    let upstream = r#"
+[upstream]
+repo = "https://github.com/gominimal/pkgs"
+branch = "main"
+locked_commit = "f4de33d06dada4edcf5076dded10e9c303cf597e"
+"#;
+    format!(
+        r#"{}
+
+[session]
+packages = [
+    "base",
+    "coreutils",
+    "git",
+    "python",
+    "node",
+    "skopeo",
+    "ca-certificates",
+]
+"#,
+        upstream.trim()
+    )
+}
+
+/// Open a russh client over the bridge UDS, authenticate, create a session,
+/// upload a `minimal.toml` with the toolchain packages, compose the loadout, and
+/// finalize it. Returns the session id.
+async fn create_toolchain_session(sock_path: &Path) -> Result<sessions::SessionId, String> {
     use minimald_rpc::{CreateSession, CreateSessionRequest, OneshotSshRpc};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let stream = {
-        let mut conn = None;
-        let mut last_err = None;
-        for _ in 0..20 {
-            match tokio::net::UnixStream::connect(sock_path).await {
-                Ok(s) => {
-                    conn = Some(s);
-                    break;
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-        conn.ok_or_else(|| format!("connect to bridge UDS: {}", last_err.unwrap()))?
-    };
-
-    let config = Arc::new(russh::client::Config::default());
-    let mut handle = russh::client::connect_stream(config, stream, ClientHandler)
-        .await
-        .map_err(|e| format!("ssh connect: {e}"))?;
-
-    let auth = handle
-        .authenticate_none("minvmd-e2e")
-        .await
-        .map_err(|e| format!("authenticate_none: {e}"))?;
-    if !auth.success() {
-        return Err("auth_none rejected".into());
-    }
+    let mut handle = connect_and_auth(sock_path).await?;
 
     let channel = handle
         .channel_open_session()
@@ -313,6 +355,9 @@ async fn create_toolchain_session(sock_path: &Path) -> Result<minimald_rpc::Sess
         .await
         .map_err(|e| format!("request_subsystem: {e}"))?;
 
+    // Unique name per invocation — minimald dedups sessions by name, so the
+    // outer retry loop would otherwise collide on `AlreadyExists` after any
+    // prior attempt persisted a record.
     let uniq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -355,111 +400,30 @@ async fn create_toolchain_session(sock_path: &Path) -> Result<minimald_rpc::Sess
         .map_err(|e| format!("read response: {e}"))?;
     let resp: <CreateSession as OneshotSshRpc>::Response =
         serde_json_lenient::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
-    let id = resp
+    let session_id = resp
         .ok()
         .ok_or_else(|| "CreateSession returned an error".to_string())?
         .id;
 
-    // ConfigureLoadout + FinalizeSession: the task-only workspace needs no
-    // project files, so the empty contribution fast-path finalizes immediately.
-    configure_and_finalize(&mut handle, id).await?;
+    // Upload the project's `minimal.toml` into the session workspace, then
+    // configure and finalize the loadout. The workspace must contain the
+    // project file before `ConfigureLoadout` composes the packages into the box.
+    upload_workspace_file(
+        &mut handle,
+        session_id,
+        "/workbench/minimal.toml",
+        &toolchain_project_toml(),
+    )
+    .await?;
+    configure_and_finalize(&mut handle, session_id).await?;
 
-    Ok(id)
+    Ok(session_id)
 }
 
-async fn configure_and_finalize(
-    handle: &mut russh::client::Handle<ClientHandler>,
-    session_id: minimald_rpc::SessionId,
-) -> Result<(), String> {
-    use minimald_rpc::{
-        ConfigureLoadout, ConfigureLoadoutRequest, ConfigureLoadoutResponse, FinalizeSession,
-        FinalizeSessionRequest, OneshotSshRpc,
-    };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    {
-        let channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| format!("open ConfigureLoadout channel: {e}"))?;
-        channel
-            .request_subsystem(false, ConfigureLoadout::NAME)
-            .await
-            .map_err(|e| format!("request_subsystem: {e}"))?;
-        let req = ConfigureLoadoutRequest {
-            session_id,
-            contribution: Default::default(),
-        };
-        let body = serde_json_lenient::to_vec(&req)
-            .map_err(|e| format!("serialize ConfigureLoadout request: {e}"))?;
-        let mut rpc = channel.into_stream();
-        rpc.write_all(&body)
-            .await
-            .map_err(|e| format!("write ConfigureLoadout request: {e}"))?;
-        rpc.shutdown()
-            .await
-            .map_err(|e| format!("shutdown ConfigureLoadout write half: {e}"))?;
-        let mut buf = Vec::new();
-        rpc.read_to_end(&mut buf)
-            .await
-            .map_err(|e| format!("read ConfigureLoadout response: {e}"))?;
-        let resp: <ConfigureLoadout as OneshotSshRpc>::Response =
-            serde_json_lenient::from_slice(&buf)
-                .map_err(|e| format!("decode ConfigureLoadout response: {e}"))?;
-        match resp.ok() {
-            Some(ConfigureLoadoutResponse::Materialized) => {}
-            Some(ConfigureLoadoutResponse::Pending { .. }) => {
-                return Err(
-                    "ConfigureLoadout returned Pending; this test's workspace gates nothing".into(),
-                );
-            }
-            None => return Err("ConfigureLoadout returned an error".into()),
-        }
-    }
-
-    {
-        let channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| format!("open FinalizeSession channel: {e}"))?;
-        channel
-            .request_subsystem(false, FinalizeSession::NAME)
-            .await
-            .map_err(|e| format!("request_subsystem: {e}"))?;
-        let req = FinalizeSessionRequest { session_id };
-        let body = serde_json_lenient::to_vec(&req)
-            .map_err(|e| format!("serialize FinalizeSession request: {e}"))?;
-        let mut rpc = channel.into_stream();
-        rpc.write_all(&body)
-            .await
-            .map_err(|e| format!("write FinalizeSession request: {e}"))?;
-        rpc.shutdown()
-            .await
-            .map_err(|e| format!("shutdown FinalizeSession write half: {e}"))?;
-        let mut buf = Vec::new();
-        rpc.read_to_end(&mut buf)
-            .await
-            .map_err(|e| format!("read FinalizeSession response: {e}"))?;
-        let resp: <FinalizeSession as OneshotSshRpc>::Response =
-            serde_json_lenient::from_slice(&buf)
-                .map_err(|e| format!("decode FinalizeSession response: {e}"))?;
-        resp.ok()
-            .ok_or_else(|| "FinalizeSession returned an error".into())?;
-    }
-
-    Ok(())
-}
-
-/// Exec `command` in the session identified by `session_id`, returning
-/// `(stdout, stderr, exit_status)`.
-async fn run_session_exec(
+/// Reusable SSH connect + none-auth over the bridge UDS.
+async fn connect_and_auth(
     sock_path: &Path,
-    session_id: minimald_rpc::SessionId,
-    command: &str,
-) -> Result<(String, String, Option<u32>), String> {
-    use russh::ChannelMsg;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+) -> Result<russh::client::Handle<ClientHandler>, String> {
     let stream = {
         let mut conn = None;
         let mut last_err = None;
@@ -490,6 +454,152 @@ async fn run_session_exec(
     if !auth.success() {
         return Err("auth_none rejected".into());
     }
+    Ok(handle)
+}
+
+/// Upload a string into the session workspace over SFTP. The path is absolute
+/// in the workspace (the SFTP subsystem presents `/workbench` as the root).
+async fn upload_workspace_file(
+    handle: &mut russh::client::Handle<ClientHandler>,
+    session_id: sessions::SessionId,
+    remote_path: &str,
+    contents: &str,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("open sftp channel: {e}"))?;
+    channel
+        .set_env(true, MINIMAL_SESSION_ID_ENV, session_id.to_string())
+        .await
+        .map_err(|e| format!("sftp set_env: {e}"))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| format!("request sftp subsystem: {e}"))?;
+    let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|e| format!("open sftp session: {e}"))?;
+    // `create` (CREATE|WRITE|TRUNCATE), not the high-level `write` helper —
+    // the latter opens WRITE-only and so fails on a not-yet-existing file.
+    let mut file = sftp
+        .create(remote_path)
+        .await
+        .map_err(|e| format!("sftp create {remote_path}: {e}"))?;
+    file.write_all(contents.as_bytes())
+        .await
+        .map_err(|e| format!("sftp write {remote_path}: {e}"))?;
+    file.shutdown()
+        .await
+        .map_err(|e| format!("sftp close {remote_path}: {e}"))?;
+    sftp.close()
+        .await
+        .map_err(|e| format!("close sftp session: {e}"))?;
+
+    Ok(())
+}
+
+async fn configure_and_finalize(
+    handle: &mut russh::client::Handle<ClientHandler>,
+    session_id: sessions::SessionId,
+) -> Result<(), String> {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, ConfigureLoadoutResponse, FinalizeSession,
+        FinalizeSessionRequest, OneshotSshRpc,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    {
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("open ConfigureLoadout channel: {e}"))?;
+        channel
+            .request_subsystem(false, ConfigureLoadout::NAME)
+            .await
+            .map_err(|e| format!("request_subsystem: {e}"))?;
+
+        let req = ConfigureLoadoutRequest {
+            session_id,
+            contribution: Default::default(),
+        };
+        let body = serde_json_lenient::to_vec(&req)
+            .map_err(|e| format!("serialize ConfigureLoadout request: {e}"))?;
+        let mut rpc = channel.into_stream();
+        rpc.write_all(&body)
+            .await
+            .map_err(|e| format!("write ConfigureLoadout request: {e}"))?;
+        rpc.shutdown()
+            .await
+            .map_err(|e| format!("shutdown ConfigureLoadout write half: {e}"))?;
+        let mut buf = Vec::new();
+        rpc.read_to_end(&mut buf)
+            .await
+            .map_err(|e| format!("read ConfigureLoadout response: {e}"))?;
+        let resp: <ConfigureLoadout as OneshotSshRpc>::Response =
+            serde_json_lenient::from_slice(&buf)
+                .map_err(|e| format!("decode ConfigureLoadout response: {e}"))?;
+        match resp.ok() {
+            Some(ConfigureLoadoutResponse::Materialized) => {}
+            Some(ConfigureLoadoutResponse::Pending { .. }) => {
+                return Err(
+                    "ConfigureLoadout returned Pending; the project file should need no gating"
+                        .into(),
+                );
+            }
+            None => return Err("ConfigureLoadout returned an error".into()),
+        }
+    }
+
+    {
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("open FinalizeSession channel: {e}"))?;
+        channel
+            .request_subsystem(false, FinalizeSession::NAME)
+            .await
+            .map_err(|e| format!("request_subsystem: {e}"))?;
+
+        let req = FinalizeSessionRequest { session_id };
+        let body = serde_json_lenient::to_vec(&req)
+            .map_err(|e| format!("serialize FinalizeSession request: {e}"))?;
+        let mut rpc = channel.into_stream();
+        rpc.write_all(&body)
+            .await
+            .map_err(|e| format!("write FinalizeSession request: {e}"))?;
+        rpc.shutdown()
+            .await
+            .map_err(|e| format!("shutdown FinalizeSession write half: {e}"))?;
+        let mut buf = Vec::new();
+        rpc.read_to_end(&mut buf)
+            .await
+            .map_err(|e| format!("read FinalizeSession response: {e}"))?;
+        let resp: <FinalizeSession as OneshotSshRpc>::Response =
+            serde_json_lenient::from_slice(&buf)
+                .map_err(|e| format!("decode FinalizeSession response: {e}"))?;
+        // The response is `FinalizeSessionResponse`; the outer `Errorable`
+        // only carries success/failure here. Returning `Ok(())` discards the
+        // empty-ish hook list, which is fine for this test.
+        resp.ok()
+            .ok_or_else(|| "FinalizeSession returned an error".to_string())?;
+    }
+
+    Ok(())
+}
+
+/// Exec `command` in the session identified by `session_id`, returning
+/// `(stdout, stderr, exit_status)`.
+async fn run_session_exec(
+    sock_path: &Path,
+    session_id: sessions::SessionId,
+    command: &str,
+) -> Result<(String, String, Option<u32>), String> {
+    use russh::ChannelMsg;
+
+    let handle = connect_and_auth(sock_path).await?;
 
     let mut channel = handle
         .channel_open_session()
@@ -511,7 +621,7 @@ async fn run_session_exec(
     while let Some(msg) = channel.wait().await {
         match msg {
             ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-            ChannelMsg::ExtendedData { data, ext } if ext == 1 => stderr.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
             ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
             ChannelMsg::Failure => return Err("exec request rejected (CHANNEL_FAILURE)".into()),
             _ => {}
@@ -523,23 +633,4 @@ async fn run_session_exec(
         String::from_utf8_lossy(&stderr).into_owned(),
         exit_status,
     ))
-}
-
-/// Return the last lines of the guest daemon log, when it exists, so a
-/// failure names the host that was not admitted.
-fn tail_daemon_log(provider_dir: &Path) -> String {
-    let log_path = provider_dir.join("daemon.log");
-    let contents = match std::fs::read_to_string(&log_path) {
-        Ok(c) => c,
-        Err(e) => return format!("(no daemon log at {}: {e})", log_path.display()),
-    };
-    contents
-        .lines()
-        .rev()
-        .take(40)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n")
 }

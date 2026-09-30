@@ -78,7 +78,24 @@ pub struct PortMapping {
     pub proto: IpProto,
 }
 
-/// Effective egress policy for a session.
+/// The hostnames NET-068's integration test exercises. Kept in `sessions` so
+/// the `minimald` unit fixture and the `minvmd` integration test share one
+/// list and cannot drift.
+pub const NET068_TOOLCHAIN_EGRESS_HOSTS: &[&str] = &[
+    "deb.debian.org",
+    "security.debian.org",
+    "github.com",
+    "codeload.github.com",
+    "raw.githubusercontent.com",
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "registry-1.docker.io",
+    "auth.docker.io",
+    "production.cloudflare.docker.com",
+];
+
+/// Effective ingress policy for a session.
 ///
 /// Each `allow_*` field is `None` to mean allow-all for that dimension, and
 /// `deny_subnets` is `None` to mean nothing is denied. Absent `egress` config
