@@ -236,9 +236,9 @@ impl ClassifierLeaf {
     /// The tree this leaf belongs to — `dir`'s parent's parent, since every
     /// leaf is `<tree>/<BOXES_DIR>/<box-id>`. The daemon resolves the leaf
     /// through it, and the sandbox binds *it* into the box at the
-    /// conventional cgroup mountpoint, so the box's own join — and, on a
-    /// tree-bearing host, its read-only cgroup2 view — starts at the tree it
-    /// is a leaf of.
+    /// conventional cgroup mountpoint, so the box's own join goes through the
+    /// tree it is a leaf of — which the box then covers, so no process it
+    /// runs is left a cgroup path at all.
     #[must_use]
     pub fn tree_root(&self) -> PathBuf {
         self.dir
