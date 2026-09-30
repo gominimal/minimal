@@ -80,7 +80,7 @@ fn e2e_enabled() -> bool {
         );
     }
     assert!(
-        crate::cmd::own_ip_requested(),
+        minvmd::cmd::own_ip_requested(),
         "this test requires an own-IP VM (MINVMD_VM_OWN_IP=1)"
     );
     true
