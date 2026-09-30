@@ -1622,20 +1622,21 @@ fn listen_local_v4(line: &str, v6: bool) -> Option<Ipv4Addr> {
         // Four little-endian 32-bit words. Only the v4-mapped shape names an
         // IPv4 address: two zero words, the `::ffff:0:0/96` marker
         // (`0xFFFF0000` printed little-endian), then the address in the
-        // last word.
-        if local.len() < 33
-            || local.as_bytes()[32] != b':'
-            || &local[..16] != "0000000000000000"
-            || &local[16..24] != "FFFF0000"
+        // last word. `get` reads every slice out of bounds as `None`, so a
+        // short or malformed row is skipped, never panicked on.
+        if local.get(..16) != Some("0000000000000000")
+            || local.get(16..24) != Some("FFFF0000")
+            || local.get(32..33) != Some(":")
         {
             return None;
         }
-        &local[24..32]
+        local.get(24..32)?
     } else {
-        if local.len() < 9 || local.as_bytes()[8] != b':' {
+        // The one little-endian word, then the port.
+        if local.get(8..9) != Some(":") {
             return None;
         }
-        &local[..8]
+        local.get(..8)?
     };
     // The kernel prints each 32-bit word little-endian, so the address is
     // the byte-swapped word: `0100007F` reads as `127.0.0.1`.
