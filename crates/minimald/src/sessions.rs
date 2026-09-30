@@ -279,26 +279,51 @@ impl Manager {
         #[cfg(target_os = "linux")]
         let (hostnames, loopback) = {
             let switch = net_switch.lock().await;
-            let on_switch = matches!(
-                switch.transport(),
-                crate::net::SwitchTransport::HostShuttle { .. }
-            );
+            let transport = switch.transport();
+            let on_switch = matches!(transport, crate::net::SwitchTransport::HostShuttle { .. });
             // The daemon-start bind probe (NET-123's obligation): the
             // addresses the book grants are only publishable where the
-            // reserved local range binds, so the probe is run once here, over
-            // this daemon's own host, and its verdict gates every grant. The
-            // real probe, never the session-start stand-in `rpc.rs`'s tests
-            // install: the stand-in is process-global, and a daemon built in
-            // one test must not see another test's absent verdict.
-            let probe = tokio::task::spawn_blocking(crate::net::loopback::probe)
-                .await
-                .unwrap_or_else(|join_error| {
-                    tracing::warn!(
-                        error = %join_error,
-                        "the daemon-start loopback probe was lost; reading the range absent",
+            // reserved local range binds, so the probe is run once here —
+            // over the host the publishes will bind on — and its verdict
+            // gates every grant. Which host that is depends on where this
+            // daemon's forwarder lives: a native daemon spawns its gvproxy
+            // itself, so its own loopback is the publish surface and the
+            // local bind probe is the honest one; a daemon on the gvproxy
+            // switch is inside a microVM, and its forwarder binds the
+            // *host's* loopback — a machine the guest cannot see, and whose
+            // verdict its own `lo` would lie about, since the guest carries
+            // the whole `127/8` whatever the host carries. So that shape
+            // conducts the same whole-range walk through the forwarder
+            // itself, over the same shuttle the publishes ride: the bind is
+            // the only question that decides whether an address is
+            // publishable, and the forwarder is the only thing that can do
+            // the binding there. Either arm is the real probe, never the
+            // session-start stand-in `rpc.rs`'s tests install: the stand-in
+            // is process-global, and a daemon built in one test must not see
+            // another test's absent verdict.
+            let probe = match transport {
+                crate::net::SwitchTransport::HostShuttle { cid, port } => {
+                    let via = "forwarder";
+                    let probe = crate::net::policy::probe_publish_surface(
+                        &crate::net::policy::ControlChannel::Vsock { cid, port },
+                    )
+                    .await;
+                    tracing::info!(
+                        via,
+                        "the daemon-start range probe walked the forwarder's loopback",
                     );
-                    crate::net::loopback::RangeProbe::failed_to_run()
-                });
+                    probe
+                }
+                _ => tokio::task::spawn_blocking(crate::net::loopback::probe)
+                    .await
+                    .unwrap_or_else(|join_error| {
+                        tracing::warn!(
+                            error = %join_error,
+                            "the daemon-start loopback probe was lost; reading the range absent",
+                        );
+                        crate::net::loopback::RangeProbe::failed_to_run()
+                    }),
+            };
             tracing::info!(
                 surface = probe.surface(),
                 interim = probe.interim(),
