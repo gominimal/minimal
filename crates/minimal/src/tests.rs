@@ -1087,8 +1087,9 @@ fn session_run_encodes_a_task_form_not_a_command() {
     );
 }
 
-/// `min task run <task>` parses with `--keep` off by default; the flag
-/// and the optional path positional are accepted in any order.
+/// `min task run <task>` parses with `--keep` off by default; the `--path`
+/// option and the `--keep` flag are accepted in any order, and every
+/// positional after the task name is a task argument, never a project path.
 #[test]
 fn task_run_parses_task_keep_and_path() {
     use clap::Parser as _;
@@ -1105,14 +1106,26 @@ fn task_run_parses_task_keep_and_path() {
     assert_eq!(a.task, "build");
     assert!(!a.keep);
     assert!(a.path.is_none());
+    assert!(a.args.is_empty());
 
     let a = run_args(&["min", "task", "run", "build", "--keep"]);
     assert!(a.keep);
 
-    let a = run_args(&["min", "task", "run", "--keep", "build", "sub/dir"]);
+    let a = run_args(&["min", "task", "run", "--keep", "build", "--path", "sub/dir"]);
     assert_eq!(a.task, "build");
     assert_eq!(a.path.as_deref(), Some("sub/dir"));
     assert!(a.keep);
+
+    // A positional after the task name is a task argument, not a path.
+    let a = run_args(&["min", "task", "run", "greet", "Alice"]);
+    assert_eq!(a.task, "greet");
+    assert!(a.path.is_none());
+    assert_eq!(a.args, ["Alice"]);
+
+    // `--path` may precede the task name.
+    let a = run_args(&["min", "task", "run", "--path", "sub/dir", "build"]);
+    assert_eq!(a.task, "build");
+    assert_eq!(a.path.as_deref(), Some("sub/dir"));
 
     // The task name is required.
     assert!(Cli::try_parse_from(["min", "task", "run"]).is_err());

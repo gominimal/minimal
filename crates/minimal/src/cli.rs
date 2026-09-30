@@ -307,7 +307,10 @@ pub struct TaskRunArgs {
     /// Name of a task declared in the project's minimal.toml
     pub task: String,
     /// Project path. Defaults to the directory set by `-C`/`--repo-dir`,
-    /// or the current working directory when neither is given.
+    /// or the current working directory when neither is given. A named
+    /// option rather than a positional so that every positional after the
+    /// task name is a task argument, never a project path.
+    #[arg(long)]
     pub path: Option<String>,
     /// Keep the session after the task exits instead of destroying it
     #[arg(long)]
