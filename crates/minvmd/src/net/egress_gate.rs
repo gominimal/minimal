@@ -226,7 +226,10 @@ async fn serve_connection(
         let (head, carry) = match read_connect_head(&mut guest).await {
             Ok(pair) => pair,
             Err(error) => {
-                tracing::warn!(%error, "egress gate could not read the switch upgrade head");
+                tracing::warn!(
+                    %error,
+                    "egress gate could not read the switch upgrade head from the guest"
+                );
                 return Err(());
             }
         };
