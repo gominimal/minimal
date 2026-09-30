@@ -305,7 +305,11 @@ async fn probe_publish_surface_within(
         // never reached, and the address whose round the budget expired
         // inside is named as the record's first failure — where the vouching
         // stopped.
-        let stuck = hosts[probe.probed.saturating_sub(1)];
+        let stuck = hosts
+            .get(probe.probed.saturating_sub(1))
+            .copied()
+            .or_else(|| hosts.first().copied())
+            .expect("the reserved range's usable-host list is never empty");
         probe.probed = hosts.len();
         probe
             .first_failure
