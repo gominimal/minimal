@@ -5599,14 +5599,14 @@ proof_fresh_kvm_activate_local_minvmd_for_arch() {
     return 0
   fi
 
-  # Verify the binaries we'll stage are available.
-  if ! command -v min >/dev/null 2>&1 || ! command -v minimald >/dev/null 2>&1 || ! command -v minvmd >/dev/null 2>&1; then
-    echo "::error::fresh-install KVM activate requires min, minimald, and minvmd on PATH"
+  # Verify the binaries we'll stage are available. A --provider local-minvmd
+  # activation only needs min and minvmd (the guest runs minimald, not the host).
+  if ! command -v min >/dev/null 2>&1 || ! command -v minvmd >/dev/null 2>&1; then
+    echo "::error::fresh-install KVM activate requires min and minvmd on PATH"
     fail
   fi
 
   cp "$(command -v min)"      "$fk_bucket/versions/v1/minimal-linux-$target_arch"
-  cp "$(command -v minimald)" "$fk_bucket/versions/v1/minimald-linux-$target_arch"
   cp "$(command -v minvmd)"   "$fk_bucket/versions/v1/minvmd-linux-$target_arch"
   cp "$fk_kernel"             "$fk_bucket/versions/v1/vmlinuz-$target_arch"
   cp "$fk_rootfs"             "$fk_bucket/versions/v1/rootfs-$target_arch.img"
@@ -5618,8 +5618,7 @@ proof_fresh_kvm_activate_local_minvmd_for_arch() {
   printf 'v1\n' >"$fk_bucket/stable"
 
   fk_sha() { sha256sum "$1" | awk '{print $1}'; }
-  local h_minimald h_minimal h_minvmd h_kernel h_rootfs h_initramfs h_gvproxy
-  h_minimald="$(fk_sha "$fk_bucket/versions/v1/minimald-linux-$target_arch")"
+  local h_minimal h_minvmd h_kernel h_rootfs h_initramfs h_gvproxy
   h_minimal="$(fk_sha "$fk_bucket/versions/v1/minimal-linux-$target_arch")"
   h_minvmd="$(fk_sha "$fk_bucket/versions/v1/minvmd-linux-$target_arch")"
   h_kernel="$(fk_sha "$fk_bucket/versions/v1/vmlinuz-$target_arch")"
@@ -5633,8 +5632,6 @@ proof_fresh_kvm_activate_local_minvmd_for_arch() {
     printf '# format: 1\n'
     printf '# component   os      arch    version   sha256   kind   dest                 src\n'
     printf '\n'
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-      minimald linux "$target_arch" v1 "$h_minimald" file bin/minimald "versions/v1/minimald-linux-$target_arch"
     printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
       minimal linux "$target_arch" v1 "$h_minimal" file bin/min "versions/v1/minimal-linux-$target_arch"
     printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
@@ -5691,9 +5688,8 @@ STUB
       }
 
     [ -x "$fk_home/.local/bin/min" ] \
-      && [ -x "$fk_home/.local/bin/minimald" ] \
       && [ -x "$fk_home/.local/bin/minvmd" ] || {
-      echo "::error::the fresh install did not ship min/minimald/minvmd"
+      echo "::error::the fresh install did not ship min/minvmd"
       tail -25 "$fk_out" 2>/dev/null || true
       exit 1
     }
