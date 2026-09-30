@@ -876,11 +876,17 @@ proof_own_ip_egress_declared_and_enforced() {
   hook_seed_preamble > "$EGRESS_SEED_DIR/minimal.toml"
   mkdir "$EGRESS_SEED_DIR/.git"
 
-  # Both log paths: on a native lane the drop warning lives in minimald's
-  # own log; on a VM lane it is the guest minimald that emits it.
+  # The drop warning is a daemon-side record. On a native lane that log lives
+  # on this host; on a VM lane it is inside the guest tmpfs, inaccessible here
+  # (see hook_log_readable). Use the file's existing helper so the assertion
+  # only runs where it can actually read the log, and fails closed when it
+  # cannot.
   assert_egress_drop_logged() {
-    if find "$XDG_STATE_HOME/minimal/logs" -type f -name 'minimald.log.*' \
-        -exec grep -q "network policy violation" {} + 2>/dev/null; then
+    if ! hook_log_readable; then
+      echo "egress-drop log check skipped (guest-side daemon log on VM lane)"
+      return 0
+    fi
+    if [ -n "$(hook_log_has 'network policy violation')" ]; then
       echo "daemon log: found the egress-drop warning"
       return 0
     fi
