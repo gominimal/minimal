@@ -733,22 +733,18 @@ pub(crate) mod test_support {
         pub(crate) _guard: tracing::subscriber::DefaultGuard,
     }
 
-    /// Brings up one gate over a stand-in switch, deciding by `registry`'s
-    /// table, with the guest sending the plain upgrade head first.
-    pub(crate) async fn gate_over(registry: BoxRegistry) -> GateHarness {
-        gate_over_with(registry, CONNECT_REQUEST.to_vec()).await
-    }
-
-    /// [`gate_over`] with the guest's first write supplied by the caller, so a
-    /// test can pipeline frames behind the upgrade head in a single write and
-    /// exercise the gate's carry-over of the bytes its head-read read past the
-    /// head's end.
+    /// Brings up one gate over a stand-in switch with the guest's connection
+    /// accepted and the gate's dial of the switch taken off the accept queue,
+    /// but the upgrade head not yet spoken: the harness every test that drives
+    /// the handshake itself builds on. [`gate_over`] and [`gate_over_with`]
+    /// complete the handshake before returning; a test that refuses a guest
+    /// **mid**-handshake — a head that never ends — starts here instead,
+    /// because no head is ever forwarded for the switch end to read back.
     ///
     /// The guest's connect plays libkrun's vsock bridge dialing the gate's
-    /// socket; the forwarded head is read back off the switch end and asserted
-    /// verbatim, so every harness proves the upgrade passes through untouched
-    /// before the frame stream begins.
-    pub(crate) async fn gate_over_with(registry: BoxRegistry, first_write: Vec<u8>) -> GateHarness {
+    /// socket, so what the guest writes next meets a gate already holding the
+    /// switch connection it will relay into.
+    pub(crate) async fn gate_connected(registry: BoxRegistry) -> GateHarness {
         let dir = TempDir::new().expect("a tempdir is creatable");
         let switch_sock = dir.path().join("gvproxy-switch.sock");
         let gate_sock = dir.path().join("gvproxy-gate.sock");
@@ -770,28 +766,13 @@ pub(crate) mod test_support {
             .expect("spawning the egress gate");
 
         // The guest's connect: the shuttle's vsock connection, arrived…
-        let mut guest = UnixStream::connect(&gate_sock)
+        let guest = UnixStream::connect(&gate_sock)
             .await
             .expect("connecting the guest end");
-        // …and the gate's dial of the switch it fronts.
-        let (mut switch, _) = listener.accept().await.expect("accepting the gate's dial");
-        // The guest's first write — the upgrade head, alone or with frames
-        // pipelined behind it.
-        guest
-            .write_all(&first_write)
-            .await
-            .expect("writing the guest's first bytes");
-        // The upgrade head, forwarded verbatim and read back off the switch
-        // end, so the frame stream begins at a known point.
-        let mut head = vec![0u8; CONNECT_REQUEST.len()];
-        switch
-            .read_exact(&mut head)
-            .await
-            .expect("reading the forwarded head");
-        assert_eq!(
-            head, CONNECT_REQUEST,
-            "the gate forwards the switch upgrade head verbatim"
-        );
+        // …and the gate's dial of the switch it fronts, accepted before the
+        // guest speaks, so what it writes next is decided by a gate whose
+        // switch connection is already up.
+        let (switch, _) = listener.accept().await.expect("accepting the gate's dial");
 
         GateHarness {
             _gate: gate,
@@ -802,6 +783,44 @@ pub(crate) mod test_support {
             _dir: dir,
             _guard,
         }
+    }
+
+    /// Brings up one gate over a stand-in switch, deciding by `registry`'s
+    /// table, with the guest sending the plain upgrade head first.
+    pub(crate) async fn gate_over(registry: BoxRegistry) -> GateHarness {
+        gate_over_with(registry, CONNECT_REQUEST.to_vec()).await
+    }
+
+    /// [`gate_over`] with the guest's first write supplied by the caller, so a
+    /// test can pipeline frames behind the upgrade head in a single write and
+    /// exercise the gate's carry-over of the bytes its head-read read past the
+    /// head's end.
+    ///
+    /// The forwarded head is read back off the switch end and asserted
+    /// verbatim, so every harness built this way proves the upgrade passes
+    /// through untouched before the frame stream begins.
+    pub(crate) async fn gate_over_with(registry: BoxRegistry, first_write: Vec<u8>) -> GateHarness {
+        let mut harness = gate_connected(registry).await;
+        // The guest's first write — the upgrade head, alone or with frames
+        // pipelined behind it.
+        harness
+            .guest
+            .write_all(&first_write)
+            .await
+            .expect("writing the guest's first bytes");
+        // The upgrade head, forwarded verbatim and read back off the switch
+        // end, so the frame stream begins at a known point.
+        let mut head = vec![0u8; CONNECT_REQUEST.len()];
+        harness
+            .switch
+            .read_exact(&mut head)
+            .await
+            .expect("reading the forwarded head");
+        assert_eq!(
+            head, CONNECT_REQUEST,
+            "the gate forwards the switch upgrade head verbatim"
+        );
+        harness
     }
 
     /// Writes one length-framed frame from the guest end.
@@ -938,12 +957,13 @@ mod tests {
     use tokio::net::{UnixListener, UnixStream};
 
     use super::test_support::{
-        DEADLINE, arp_frame, expect_frame, expect_silence, gate_over, gate_over_with, ipv4_frame,
-        ipv6_frame, send_frame, wait_for_log,
+        DEADLINE, arp_frame, expect_frame, expect_silence, gate_connected, gate_over,
+        gate_over_with, ipv4_frame, ipv6_frame, send_frame, wait_for_log,
     };
     use super::{
         CONNECT_REQUEST, DROP_WARN_MAX_TRACKED_PAIRS, DROP_WARN_MIN_INTERVAL, DropLimiter,
-        GateDrop, HANDSHAKE_TIMEOUT, MAX_HEAD, WarnDecision, gate_verdict, serve_connection,
+        GateDrop, HANDSHAKE_TIMEOUT, MAX_HEAD, WarnDecision, gate_verdict, max_frame,
+        serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry};
 
@@ -1147,12 +1167,19 @@ mod tests {
     }
 
     /// A guest that never ends an upgrade head is refused, not buffered, and
-    /// nothing of it ever reaches the switch: the gate fails closed on a peer
-    /// that will not speak the protocol.
+    /// nothing of it ever reaches the switch. The head read is bounded at
+    /// [`MAX_HEAD`] bytes, so a peer that talks past the bound without ever
+    /// writing the head's end — a peer that is speaking, not silent, so the
+    /// handshake timeout is not what catches it — is failed closed on at the
+    /// bound itself.
     #[tokio::test]
     async fn a_head_that_never_ends_refuses_the_connection() {
+        // No namespace needs publishing: a peer refused at the head is refused
+        // before any frame is read, whatever the table holds.
         let registry = BoxRegistry::new(SUBNET);
-        let mut h = gate_over(registry).await;
+        // The guest's first write is the noise itself — no head is spoken, so
+        // the bytes the head reader sees have no end to find.
+        let mut h = gate_connected(registry).await;
 
         // `MAX_HEAD + 1` bytes with no `\r\n\r\n` anywhere in them.
         let noise = vec![b'x'; MAX_HEAD + 1];
@@ -1160,6 +1187,11 @@ mod tests {
             .write_all(&noise)
             .await
             .expect("writing the endless head");
+
+        // Refused on the head's own bound: the log names the over-long head,
+        // so the byte-count check is what refused the connection, not the
+        // handshake timeout waiting out a silent peer.
+        wait_for_log(&h, &format!("exceeded {MAX_HEAD} bytes without ending")).await;
         // The gate must close the guest's side rather than leave it hanging…
         let mut probe = [0u8; 1];
         let refused = tokio::time::timeout(DEADLINE, h.guest.read_exact(&mut probe))
@@ -1173,6 +1205,48 @@ mod tests {
         match tokio::time::timeout(DEADLINE, h.switch.read(&mut probe)).await {
             Ok(Ok(0)) => {}
             Ok(Ok(n)) => panic!("{n} byte(s) of an endless head reached the switch"),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+    }
+
+    /// A frame the guest claims is past the largest frame the gate relays is
+    /// refused, not sized to: the length prefix is the guest's own bytes, so a
+    /// claim past the MTU-derived maximum is a malformed or hostile peer's,
+    /// and the connection comes down rather than the gate either allocating
+    /// to the claim or forwarding what it carried.
+    #[tokio::test]
+    async fn a_frame_claimed_past_the_maximum_is_refused() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_over(registry).await;
+
+        // A two-byte prefix claiming a frame past `max_frame()`, with no body
+        // behind it: the claim alone is the refusal.
+        assert!(
+            usize::from(u16::MAX) > max_frame(),
+            "the claim must be past the largest frame the gate relays"
+        );
+        h.guest
+            .write_all(&u16::MAX.to_le_bytes())
+            .await
+            .expect("writing the oversized claim");
+
+        // The refusal says so: the relay ended on the claim's length, and…
+        wait_for_log(&h, &format!("exceeds max {}", max_frame())).await;
+        // …the gate closes the guest's side rather than leave it hanging.
+        let mut probe = [0u8; 1];
+        let refused = tokio::time::timeout(DEADLINE, h.guest.read_exact(&mut probe))
+            .await
+            .expect("the gate refuses within the deadline")
+            .is_err();
+        assert!(refused, "the guest connection is closed, not left hanging");
+        // The switch side comes down with it, and nothing arrived there past
+        // the forwarded head: the claim was never read into a frame.
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, h.switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("{n} byte(s) arrived at the switch past the head"),
             Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
             Err(_) => panic!("the gate left the switch side hanging"),
         }
