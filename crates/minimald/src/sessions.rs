@@ -2534,10 +2534,14 @@ pub(crate) mod tests {
             allocator.release(first_a),
             "a released address returns to the slice"
         );
-        assert_eq!(allocator.lease(), Some(first_a));
         assert!(
             !allocator.release(first_a),
             "a released address is no longer leased, so releasing it again frees nothing"
+        );
+        assert_eq!(
+            allocator.lease(),
+            Some(first_a),
+            "the address a destroyed box returned is the next one handed out"
         );
         assert!(
             !allocator.release(Ipv4Addr::LOCALHOST),
