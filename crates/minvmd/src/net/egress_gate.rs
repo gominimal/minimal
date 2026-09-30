@@ -73,6 +73,19 @@ const HEAD_END: &[u8] = b"\r\n\r\n";
 /// ending one is malformed or hostile, and is refused rather than buffered.
 const MAX_HEAD: usize = 4 * 1024;
 
+/// Bound on the gate's half of the handshake: dialing the switch it fronts,
+/// reading the upgrade head off the guest, and forwarding it. A healthy
+/// shuttle writes the head the moment it connects, so one still unfinished
+/// this far in is a peer that is wedged, silent, or hostile — and the peer
+/// the head comes from lives **inside** the escape boundary this gate exists
+/// for, so the host does not wait on it. Bounding the handshake is what
+/// releases the host switch connection the dial opened and the relay task
+/// holding it, instead of letting a silent guest keep both for the gate's
+/// lifetime — the same fail-fast the native relay's `VSOCK_CONNECT_TIMEOUT`
+/// gives the connect + `/connect` upgrade from the guest's side
+/// (`crates/minimald/src/net/switch.rs`).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Largest Ethernet frame the gate relays: MTU + 14-byte header + 4-byte
 /// 802.1Q VLAN tag — the same bound the in-guest relay reads to, so the two
 /// halves of the path agree on what a frame may weigh.
@@ -156,6 +169,7 @@ async fn accept_loop(
                     switch_sock.clone(),
                     table.clone(),
                     Arc::clone(&limiter),
+                    HANDSHAKE_TIMEOUT,
                 ));
                 // Reap the finished so a long-lived gate accumulates no
                 // handles for connections long gone.
@@ -177,37 +191,64 @@ async fn accept_loop(
 /// forward the upgrade head the guest wrote verbatim, then relay frames both
 /// ways for as long as the guest stays connected — egress through the
 /// verdict, ingress untouched.
+///
+/// `handshake_timeout` bounds everything up to and including the forwarded
+/// head. It is a parameter only so a test can shrink it; every caller outside
+/// this module's tests reaches a connection through [`accept_loop`], which
+/// passes [`HANDSHAKE_TIMEOUT`].
 async fn serve_connection(
     mut guest: UnixStream,
     switch_sock: PathBuf,
     table: BoxTable,
     limiter: Arc<DropLimiter>,
+    handshake_timeout: Duration,
 ) {
-    // Fail closed before anything else: with no switch to relay into there is
-    // no egress either way, but the guest gets a closed connection rather
-    // than a silent one.
-    let mut switch = match UnixStream::connect(&switch_sock).await {
-        Ok(switch) => switch,
-        Err(error) => {
+    // The handshake is bounded front to back: the guest is the untrusted side
+    // here, so a peer that connects and then sends nothing — or a head it
+    // never ends — is refused within the bound and the host switch connection
+    // the dial opened comes down with it, rather than either being held for
+    // the gate's lifetime.
+    let handshake = async {
+        // Fail closed before anything else: with no switch to relay into
+        // there is no egress either way, but the guest gets a closed
+        // connection rather than a silent one.
+        let mut switch = match UnixStream::connect(&switch_sock).await {
+            Ok(switch) => switch,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    switch_socket = %switch_sock.display(),
+                    "egress gate could not reach the switch; refusing the guest connection"
+                );
+                return Err(());
+            }
+        };
+        let (head, carry) = match read_connect_head(&mut guest).await {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::warn!(%error, "egress gate could not read the switch upgrade head");
+                return Err(());
+            }
+        };
+        if let Err(error) = switch.write_all(&head).await {
+            tracing::warn!(%error, "egress gate could not forward the switch upgrade head");
+            return Err(());
+        }
+        Ok((switch, carry))
+    };
+    let (switch, carry) = match tokio::time::timeout(handshake_timeout, handshake).await {
+        Ok(Ok(pair)) => pair,
+        // Whichever step failed has already said why; the connection is
+        // refused either way.
+        Ok(Err(())) => return,
+        Err(_) => {
             tracing::warn!(
-                %error,
-                switch_socket = %switch_sock.display(),
-                "egress gate could not reach the switch; refusing the guest connection"
+                handshake_timeout = ?handshake_timeout,
+                "egress gate handshake timed out; refusing the guest connection"
             );
             return;
         }
     };
-    let (head, carry) = match read_connect_head(&mut guest).await {
-        Ok(pair) => pair,
-        Err(error) => {
-            tracing::warn!(%error, "egress gate could not read the switch upgrade head");
-            return;
-        }
-    };
-    if let Err(error) = switch.write_all(&head).await {
-        tracing::warn!(%error, "egress gate could not forward the switch upgrade head");
-        return;
-    }
     let (switch_rx, switch_tx) = switch.into_split();
     let (guest_rx, guest_tx) = guest.into_split();
     // Ingress (switch → guest), untouched and un-parsed. The gate's job is
@@ -797,19 +838,23 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use sessions::EgressPolicy;
     use sessions::core::egress::{DropReason, FrameFamily, FrameVerdict};
     use switch::SwitchSubnet;
+    use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{UnixListener, UnixStream};
 
     use super::test_support::{
         DEADLINE, arp_frame, expect_frame, expect_silence, gate_over, gate_over_with, ipv4_frame,
         ipv6_frame, send_frame, wait_for_log,
     };
     use super::{
-        CONNECT_REQUEST, DROP_WARN_MIN_INTERVAL, DropLimiter, GateDrop, MAX_HEAD, gate_verdict,
+        CONNECT_REQUEST, DROP_WARN_MIN_INTERVAL, DropLimiter, GateDrop, HANDSHAKE_TIMEOUT,
+        MAX_HEAD, gate_verdict, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry};
 
@@ -1041,6 +1086,73 @@ mod tests {
             Ok(Ok(n)) => panic!("{n} byte(s) of an endless head reached the switch"),
             Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
             Err(_) => panic!("the gate left the switch side hanging"),
+        }
+    }
+
+    /// The peer the gate's handshake reads from lives inside the escape
+    /// boundary NET-081 exists for, so the handshake is bounded: a guest that
+    /// connects and then stays silent — saying nothing at all, or starting a
+    /// head it never ends — is refused within the bound, and the host switch
+    /// connection the gate's dial opened comes down with it, with nothing of
+    /// the guest ever written on. Without the bound a silent guest would hold
+    /// a host switch connection and a relay task for the gate's lifetime.
+    #[tokio::test]
+    async fn a_silent_guest_is_refused_within_the_handshake_bound() {
+        // The bound shrunk from [`HANDSHAKE_TIMEOUT`] — the one `accept_loop`
+        // passes every real connection — so the refusal is watched in
+        // milliseconds rather than five seconds.
+        let bound = Duration::from_millis(200);
+        assert!(
+            bound < HANDSHAKE_TIMEOUT,
+            "the refusal must be watched in less time than the real bound allows"
+        );
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let table = registry.table();
+        let dir = TempDir::new().expect("a tempdir is creatable");
+        let switch_sock = dir.path().join("gvproxy-switch.sock");
+        // The stand-in switch: a listener the gate's handshake dials.
+        let listener = UnixListener::bind(&switch_sock).expect("binding the stand-in switch");
+
+        // The two shapes of a silent peer: a guest that says nothing at all,
+        // and one that starts a head and never ends it. Both are refused the
+        // same way.
+        for first_write in [Vec::new(), b"POST /connec".to_vec()] {
+            let (mut guest, gate_end) = UnixStream::pair().expect("pairing the guest's socket");
+            tokio::spawn(serve_connection(
+                gate_end,
+                switch_sock.clone(),
+                table.clone(),
+                Arc::new(DropLimiter::new()),
+                bound,
+            ));
+            if !first_write.is_empty() {
+                guest
+                    .write_all(&first_write)
+                    .await
+                    .expect("writing the never-ended head");
+            }
+            // The gate dials the switch first, so a silent guest is holding a
+            // live host switch connection at this point — the thing the bound
+            // exists to release.
+            let (mut switch, _) = listener.accept().await.expect("accepting the gate's dial");
+
+            // The switch side comes down within the deadline, and nothing of
+            // the guest was written on before it did.
+            let mut probe = [0u8; 1];
+            match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => panic!("{n} byte(s) of a silent guest reached the switch"),
+                Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+                Err(_) => panic!("a silent guest held the switch connection past {DEADLINE:?}"),
+            }
+            // And the guest's side is closed too, not left hanging.
+            match tokio::time::timeout(DEADLINE, guest.read(&mut probe)).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => panic!("the gate left {n} byte(s) for a silent guest to read"),
+                Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
+                Err(_) => panic!("the gate left the silent guest's connection hanging"),
+            }
         }
     }
 
