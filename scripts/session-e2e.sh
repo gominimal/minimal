@@ -925,6 +925,20 @@ proof_own_ip_egress_declared_and_enforced() {
     fail
   }
 
+  # Whether one of this proof's curl probes actually reached a server. curl
+  # ALWAYS writes its -w line — and writes `HTTP:000` when nothing answered —
+  # so a completed exchange is a zero exit OR any real status back, whatever
+  # the code and whatever curl then thought of the certificate. Judging by
+  # `HTTP:200` alone (an earlier draft) would read a redirect or a TLS
+  # complaint after a live answer as a drop, and prove enforcement nobody
+  # enforced.
+  egress_curl_answered() {
+    local eca_rc="$1" eca_status="$2"
+    [ "$eca_rc" -eq 0 ] && return 0
+    [ -n "$eca_status" ] && [ "$eca_status" != "HTTP:000" ] && return 0
+    return 1
+  }
+
   # ---- NET-076: the coming deny-all default is announced -------------------
   # A bare own-address box still allows everything while the default is only
   # announced, but the user is told what is coming and how to keep the current
@@ -1005,6 +1019,56 @@ proof_own_ip_egress_declared_and_enforced() {
   else
     echo "allowed-connection WARNING: the bare box could not prove external reachability; the announcement text and opt-out were still verified above"
   fi
+
+  # ---- the destination the declared box must be refused, proven live first --
+  # NET-062's drop is only meaningful against a destination this lane can
+  # actually reach: a connection nobody could have completed reads as a
+  # "silent drop" on a networkless lane, which is enforcement nobody enforced.
+  # So the SAME run first asks a box with NO egress section — the announce box
+  # above, which the announcement phase still leaves unrestricted — to
+  # complete the exact connection the declared box must be refused. Its
+  # completing proves the destination is live and reachable through this
+  # switch fabric, so the declared box's non-completion below can only be its
+  # own rules — and it doubles as the reach the coming deny-all default takes
+  # away (NET-074).
+  #
+  # The destination is a LITERAL public address, and it is chosen so nothing
+  # the declared box admits can ever cover it. Its allow subnets are a
+  # documentation range and its deny subnets another, which leaves the one
+  # other way an address outside `allow_subnets` still connects: a DNS pin,
+  # design §5.3's DNS-pinned admission, which admits an *address* for the
+  # window its name resolved in — and admits it however the application
+  # learned it, `curl --resolve` included, because the pin table is keyed by
+  # address alone (crates/minimald/src/net/dns_gate.rs). An earlier round
+  # probed a host-resolved address of example.com itself on the belief that
+  # "the box's own resolution" and the host's never agree; the macOS lane is
+  # where they do — both ride the same upstream — so the pinned address was
+  # held, the "disallowed" connection was an allowed one, and the proof read
+  # a completed connection as a failure to enforce. 1.1.1.1 is a public
+  # anycast service endpoint, live on 443 and stable by design, that the one
+  # name this box pins (example.com) can never resolve to — and being a
+  # literal, no resolver has to agree with anything for the probe to run.
+  egress_disallowed_dst="1.1.1.1"
+  egress_disallowed_live=0
+  for egress_dst_try in 1 2 3; do
+    egress_dst_out="$(mnl session exec "$announce_sid" \
+      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 20 https://$egress_disallowed_dst/" \
+      2>"$WORK/egress-dst-live.err")"
+    egress_dst_rc=$?
+    if egress_curl_answered "$egress_dst_rc" "${egress_dst_out:-}"; then
+      egress_disallowed_live=1
+      echo "control GET https://$egress_disallowed_dst/ from the bare box -> ${egress_dst_out:-<none>} (attempt ${egress_dst_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
+      break
+    fi
+    echo "control GET https://$egress_disallowed_dst/ from the bare box failed on attempt ${egress_dst_try}/3 (rc ${egress_dst_rc}, got '${egress_dst_out:-<none>}')"
+    cat "$WORK/egress-dst-live.err" 2>/dev/null || true
+    if [ "$egress_dst_try" -lt 3 ]; then
+      sleep 3
+    fi
+  done
+  if [ "$egress_disallowed_live" -ne 1 ]; then
+    echo "::warning::the bare box could not complete https://$egress_disallowed_dst/ on this run, so the disallowed-connection drop below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
+  fi
   mnl session destroy --force "$announce_sid" >/dev/null 2>&1 || true
 
   # ---- NET-060/061/062/063: four-field declaration, effective rules, drop --
@@ -1069,48 +1133,32 @@ proof_own_ip_egress_declared_and_enforced() {
     declared_reach_ok=1
     echo "NET-063 OK: https://example.com completed — allowed by name and protocol, and the control that separates a policy drop below from a dead network"
 
-    # ---- NET-062: a packet to an unadmitted destination drops silently -----
+    # ---- NET-062: a packet to an unadmitted address drops silently ---------
     # The silent drop NET-062 binds is a packet property, not a name one: a
     # name outside `allow_dns_hosts` is a resolver matter (design §5.3 refuses
     # non-matching names at resolution), so the drop is proven against a
-    # destination ADDRESS no rule admits. DNS-pinned admission admits an
-    # address only through the box's own resolution, so a host-resolved
-    # literal of even the allowed name is unadmitted: resolve example.com on
-    # the HOST, then connect from the box with curl --resolve, which bypasses
-    # the box's resolver and carries the host's answer to the box unchanged.
-    # Resolution tries dig (the resolver tool every macOS host ships), then
-    # getent, then host, and retries for DNS weather.
-    egress_ip=""
-    for _ in 1 2 3; do
-      if command -v dig >/dev/null 2>&1; then
-        egress_ip="$(dig +short example.com A 2>/dev/null \
-          | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n1)"
-      fi
-      if [ -z "$egress_ip" ] && command -v getent >/dev/null 2>&1; then
-        egress_ip="$(getent ahostsv4 example.com 2>/dev/null \
-          | awk '$1 ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/ { print $1; exit }')"
-      fi
-      if [ -z "$egress_ip" ] && command -v host >/dev/null 2>&1; then
-        egress_ip="$(host example.com 2>/dev/null \
-          | awk '$(NF-1) == "address" && $NF ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/ { print $NF; exit }')"
-      fi
-      [ -n "$egress_ip" ] && break
-      sleep 2
-    done
-    if [ -z "$egress_ip" ]; then
-      echo "::warning::NET-062: the host could not resolve example.com to an address to pin the disallowed probe to; the drop assertion is skipped as a weather warning (the box completed its allowed connection above, so the lane itself has reach)"
+    # destination ADDRESS no rule and no pin admits — the literal chosen and
+    # proven live further up, from the bare box, in this same run. Two
+    # controls bracket it: the bare box's completed connection to the very
+    # destination (a live destination on this lane, reached through the same
+    # fabric) and this box's own completed connection to example.com above
+    # (this box's network and its allowed path), so a non-completion here is
+    # neither a dead route nor a dead box, and a fast refusal is the box's own
+    # doing rather than weather.
+    if [ "$egress_disallowed_live" -ne 1 ]; then
+      echo "::warning::NET-062: the disallowed-address drop is skipped as a weather warning (the bare box could not complete https://$egress_disallowed_dst/ above, so a drop here would prove nothing about the rules)"
     else
       deny_start_ms="$(now_ms)"
       mnl session exec "$declare_sid" \
-        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 --resolve example.com:443:$egress_ip https://example.com/" \
+        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://$egress_disallowed_dst/" \
         >"$WORK/egress-deny-ip.out" 2>"$WORK/egress-deny-ip.err"
       deny_rc=$?
       deny_elapsed_ms=$(( $(now_ms) - deny_start_ms ))
       deny_status="$(cat "$WORK/egress-deny-ip.out" 2>/dev/null)"
       deny_err="$(tr '\n' ' ' < "$WORK/egress-deny-ip.err" 2>/dev/null)"
-      echo "disallowed-IP GET https://$egress_ip/ (example.com:443, resolved host-side) -> rc=$deny_rc status=${deny_status:-<none>} elapsed=${deny_elapsed_ms}ms curl: ${deny_err:-<none>}"
-      if [ "$deny_rc" -eq 0 ] || [ "$deny_status" = "HTTP:200" ]; then
-        echo "::error::NET-062: a connection to an address no rule admits (host-resolved $egress_ip) completed; the egress rules did not enforce"
+      echo "disallowed-address GET https://$egress_disallowed_dst/ -> rc=$deny_rc status=${deny_status:-<none>} elapsed=${deny_elapsed_ms}ms curl: ${deny_err:-<none>}"
+      if egress_curl_answered "$deny_rc" "${deny_status:-}"; then
+        echo "::error::NET-062: a connection to an address no rule admits ($egress_disallowed_dst) completed — the bare box completed this same connection above, so the lane reaches the destination and the egress rules did not enforce"
         cat "$WORK/egress-deny-ip.err" 2>/dev/null || true
         fail
       fi
@@ -1120,11 +1168,11 @@ proof_own_ip_egress_declared_and_enforced() {
         fail
       fi
       if [ "$deny_elapsed_ms" -ge 6000 ]; then
-        echo "NET-062 OK: the disallowed connection dropped silently (no answer and no reset until the 10 s timeout)"
+        echo "NET-062 OK: the disallowed connection to $egress_disallowed_dst dropped silently (no answer and no reset until the 10 s timeout), while the bare box completed the same connection in this run"
         assert_egress_drop_logged
         echo "NET-062 (rate-limited warning) OK: the drop is logged"
       else
-        echo "::error::NET-062: the disallowed connection failed in ${deny_elapsed_ms}ms — a fast refusal, not a silent drop. The control above completed https://example.com on this same run, so the network path is alive and the fast failure is the box's own doing"
+        echo "::error::NET-062: the disallowed connection failed in ${deny_elapsed_ms}ms — a fast refusal, not a silent drop. The controls bracketing this probe (the bare box's completed connection to the same destination, and this box's own to https://example.com) both completed on this run, so the network path is alive and the fast failure is the box's own doing"
         cat "$WORK/egress-deny-ip.err" 2>/dev/null || true
         fail
       fi
@@ -1147,7 +1195,7 @@ proof_own_ip_egress_declared_and_enforced() {
     name_elapsed_ms=$(( $(now_ms) - name_deny_start_ms ))
     name_status="$(cat "$WORK/egress-deny-name.out" 2>/dev/null)"
     name_err="$(tr '\n' ' ' < "$WORK/egress-deny-name.err" 2>/dev/null)"
-    if [ "$name_rc" -eq 0 ] || [ "$name_status" = "HTTP:200" ]; then
+    if egress_curl_answered "$name_rc" "${name_status:-}"; then
       echo "::error::https://example.org completed — a name outside allow_dns_hosts reached its destination; the egress rules did not enforce"
       cat "$WORK/egress-deny-name.err" 2>/dev/null || true
       fail
@@ -1200,7 +1248,7 @@ proof_own_ip_egress_declared_and_enforced() {
     deny_all_elapsed_ms=$(( $(now_ms) - deny_all_start_ms ))
     deny_all_status="$(cat "$WORK/egress-deny-all.out" 2>/dev/null)"
     deny_all_err="$(tr '\n' ' ' < "$WORK/egress-deny-all-curl.err" 2>/dev/null)"
-    if [ "$deny_all_rc" -eq 0 ] || [ "$deny_all_status" = "HTTP:200" ]; then
+    if egress_curl_answered "$deny_all_rc" "${deny_all_status:-}"; then
       echo "::error::a deny-all box reached an external destination"
       cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
       fail
