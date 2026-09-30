@@ -719,11 +719,7 @@ mod tests {
         };
         // A box with no address of its own publishes on the node's shared
         // one, still at its own port numbers (NET-123's interim, NET-129).
-        let req = expose_request(
-            &mapping,
-            Ipv4Addr::LOCALHOST,
-            Ipv4Addr::new(100, 64, 0, 7),
-        );
+        let req = expose_request(&mapping, Ipv4Addr::LOCALHOST, Ipv4Addr::new(100, 64, 0, 7));
         let json = serde_json_lenient::to_string(&req).unwrap();
         assert!(json.contains("\"local\":\"127.0.0.1:5353\""), "got: {json}");
         assert!(json.contains("\"remote\":\"100.64.0.7:53\""), "got: {json}");

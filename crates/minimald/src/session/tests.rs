@@ -2716,19 +2716,17 @@ async fn finalize_own_ip_session(client: &mut TestClient, name: &str) -> Session
 
 /// The A answer a live box's name carries, and the session that owns it —
 /// `None` when the name is absent (NXDOMAIN, NET-125).
-fn zone_answer_for(
-    server: &TestServer,
-    name: &str,
-) -> Option<(String, std::net::Ipv4Addr)> {
+fn zone_answer_for(server: &TestServer, name: &str) -> Option<(String, std::net::Ipv4Addr)> {
     let registry = server.state.sessions_manager().await.hostnames();
     match registry
         .read()
         .expect("registry lock")
         .zone_entry(name, &[])
     {
-        crate::net::dns::ZoneEntry::Held { owner, address } => {
-            Some((owner, address.expect("a live box's name answers with an A record")))
-        }
+        crate::net::dns::ZoneEntry::Held { owner, address } => Some((
+            owner,
+            address.expect("a live box's name answers with an A record"),
+        )),
         crate::net::dns::ZoneEntry::Absent => None,
     }
 }
@@ -2864,7 +2862,10 @@ async fn name_answers_without_attached_client() {
         .expect("the name routes with no client attached");
     assert_eq!(
         route.upstream(18080),
-        Some(std::net::SocketAddr::new(std::net::IpAddr::V4(address), 18080)),
+        Some(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(address),
+            18080
+        )),
         "a request for the box's declared port is forwarded to the box's own address"
     );
 }

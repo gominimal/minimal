@@ -807,8 +807,7 @@ impl Session {
                 // attaches (NET-013). The allocator is a leaf lock, taken
                 // briefly here with the registry held and never the other way
                 // round, so the two orders cannot cycle.
-                let declared =
-                    crate::net::switch::declared_request_ports(Some(&record.policy));
+                let declared = crate::net::switch::declared_request_ports(Some(&record.policy));
                 let published = reg
                     .published_own_address(record.id)
                     .or_else(|| self.lease_loopback_address(&record, &name));
@@ -840,7 +839,7 @@ impl Session {
     /// answers for, where NET-128 keeps a stopped box from impersonating the
     /// node and NET-129 keeps the collision reported rather than translated.
     #[cfg(target_os = "linux")]
-    fn lease_loopback_address(&self, record: &Record, name: &str) -> Option<Ipv4Addr> {
+    fn lease_loopback_address(&self, record: &Record, name: &str) -> Option<std::net::Ipv4Addr> {
         let mut allocator = self
             .loopback
             .lock()

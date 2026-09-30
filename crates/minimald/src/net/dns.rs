@@ -756,7 +756,7 @@ impl HostnameRegistry {
                     .intersection(&ports)
                     .map(move |port| SharedPortCollision {
                         port: *port,
-                        other: other_name,
+                        other: other_name.clone(),
                     })
             })
             .collect();
@@ -771,7 +771,8 @@ impl HostnameRegistry {
                 "two boxes publish one port at a shared loopback address"
             );
         }
-        self.own_published.insert(session_id, OwnPublished { address, ports });
+        self.own_published
+            .insert(session_id, OwnPublished { address, ports });
         collisions
     }
 
@@ -838,13 +839,22 @@ impl HostnameRegistry {
     /// set, always a gate for an own-address box — empty when the box declares
     /// no ingress; on a lease route the applied map carries it already, so the
     /// translation and the gate stay one declaration.
-    fn own_route(&self, session_id: SessionId, session_name: &str, declared: BTreeSet<u16>) -> Route {
+    fn own_route(
+        &self,
+        session_id: SessionId,
+        session_name: &str,
+        declared: BTreeSet<u16>,
+    ) -> Route {
         if self.on_switch
             && let Some(own) = self.own.get(&session_id)
         {
             return Route::lease(session_name, own.lease, own.ports.clone());
         }
-        Route::loopback(session_name, self.published_or_node(session_id), Some(declared))
+        Route::loopback(
+            session_name,
+            self.published_or_node(session_id),
+            Some(declared),
+        )
     }
 
     /// The host loopback address an `OwnIp` box's declaration publishes on
@@ -1232,10 +1242,8 @@ mod tests {
     /// two ids — sharing [`SessionId::nil`] would fake a collision and a
     /// shared publish.
     fn id(last: &str) -> SessionId {
-        SessionId::parse_str(&format!(
-            "00000000-0000-0000-0000-00000000000{last}"
-        ))
-        .expect("a literal uuid")
+        SessionId::parse_str(&format!("00000000-0000-0000-0000-00000000000{last}"))
+            .expect("a literal uuid")
     }
 
     /// NET-129: a host-address box answers its name with its **node's**
@@ -1464,7 +1472,8 @@ mod tests {
     /// two-label one (NET-002). Matching keys on the `<host-id>` label, so a
     /// dotted session name is not stripped at the wrong label.
     #[test]
-    fn legacy_three_label_resolves_to_the_same_entry() {        let mut reg = HostnameRegistry::new("local", false);
+    fn legacy_three_label_resolves_to_the_same_entry() {
+        let mut reg = HostnameRegistry::new("local", false);
         reg.register_host_net(SessionId::nil(), "web");
 
         let legacy = reg

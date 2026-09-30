@@ -294,11 +294,9 @@ impl Manager {
             } else {
                 Ipv4Addr::LOCALHOST
             };
-            let registry = crate::net::dns::HostnameRegistry::new(
-                switch.host_id().to_owned(),
-                on_switch,
-            )
-            .with_node_address(node);
+            let registry =
+                crate::net::dns::HostnameRegistry::new(switch.host_id().to_owned(), on_switch)
+                    .with_node_address(node);
             (
                 Arc::new(RwLock::new(registry)),
                 Arc::new(std::sync::Mutex::new(allocator)),
