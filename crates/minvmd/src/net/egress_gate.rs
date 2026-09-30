@@ -215,8 +215,8 @@ async fn serve_connection(
     // policy, decided in the guest where its declarations are enforced.
     // Aborted when the egress leg ends, which is the guest going away.
     let ingress = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
-    let egress = relay_guest_to_switch(Prefixed::new(carry, guest_rx), switch_tx, table, limiter)
-        .await;
+    let egress =
+        relay_guest_to_switch(Prefixed::new(carry, guest_rx), switch_tx, table, limiter).await;
     ingress.abort();
     match egress {
         // The guest closed its side: the shuttle reconnects per boot and
@@ -418,8 +418,7 @@ impl DropLimiter {
         if !self.should_warn_at(src, rule, Instant::now()) {
             return false;
         }
-        let source =
-            src.map_or_else(|| "none".to_string(), |src| Ipv4Addr::from(src).to_string());
+        let source = src.map_or_else(|| "none".to_string(), |src| Ipv4Addr::from(src).to_string());
         tracing::warn!(
             source = %source,
             rule_matched = rule,
@@ -470,7 +469,8 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return None;
     }
-    hay.windows(needle.len()).position(|window| window == needle)
+    hay.windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// A reader that yields `carry` first, then the wrapped stream: the bytes a
@@ -485,7 +485,11 @@ struct Prefixed<R> {
 
 impl<R> Prefixed<R> {
     fn new(carry: Vec<u8>, inner: R) -> Self {
-        Self { carry, pos: 0, inner }
+        Self {
+            carry,
+            pos: 0,
+            inner,
+        }
     }
 }
 
@@ -795,8 +799,8 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::time::{Duration, Instant};
 
-    use sessions::core::egress::{DropReason, FrameFamily, FrameVerdict};
     use sessions::EgressPolicy;
+    use sessions::core::egress::{DropReason, FrameFamily, FrameVerdict};
     use switch::SwitchSubnet;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -892,9 +896,7 @@ mod tests {
         );
         expect_silence(&mut h.switch).await;
         assert_eq!(
-            h.log.contents()
-                .matches("egress-undeclared-subnet")
-                .count(),
+            h.log.contents().matches("egress-undeclared-subnet").count(),
             1,
             "one drop line per source address per rule per interval, got: {}",
             h.log.contents()
@@ -1128,12 +1130,13 @@ mod tests {
         let src = [100, 64, 0, 9];
 
         assert!(limiter.should_warn_at(Some(src), "egress-undeclared-subnet", t0));
-        assert!(!limiter
-            .should_warn_at(Some(src), "egress-undeclared-subnet", t0 + Duration::from_millis(10)));
+        assert!(!limiter.should_warn_at(
+            Some(src),
+            "egress-undeclared-subnet",
+            t0 + Duration::from_millis(10)
+        ));
         // A different source under the same rule keeps its own line…
-        assert!(
-            limiter.should_warn_at(Some([100, 64, 0, 10]), "egress-undeclared-subnet", t0)
-        );
+        assert!(limiter.should_warn_at(Some([100, 64, 0, 10]), "egress-undeclared-subnet", t0));
         // …and the same source under a different rule keeps its own.
         assert!(limiter.should_warn_at(Some(src), "egress-foreign-source", t0));
         // A sourceless frame is a key of its own, and so are two family rules

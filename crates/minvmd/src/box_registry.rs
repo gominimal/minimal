@@ -27,8 +27,8 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, RwLock};
 
-use sessions::core::egress::EgressRules;
 use sessions::EgressPolicy;
+use sessions::core::egress::EgressRules;
 use switch::SwitchSubnet;
 
 /// The guest node namespace's name in the table: the in-VM daemon, whose own
@@ -405,7 +405,11 @@ mod tests {
         );
         assert_eq!(
             db.egress(),
-            &EgressRules::from_policy(None, SUBNET.dns_server().octets(), db.switch_addr().octets())
+            &EgressRules::from_policy(
+                None,
+                SUBNET.dns_server().octets(),
+                db.switch_addr().octets()
+            )
         );
 
         // Withdrawal retires the row: the address is held by no namespace,
@@ -474,7 +478,12 @@ mod tests {
         registry.register_node_namespace();
         let mut harness = gate_over(registry).await;
 
-        let before: Vec<_> = harness.table.rows().iter().map(|row| row_identity(row)).collect();
+        let before: Vec<_> = harness
+            .table
+            .rows()
+            .iter()
+            .map(|row| row_identity(row))
+            .collect();
 
         // Guest-side traffic, hostile included: a frame the published box did
         // not declare, a frame from an address no namespace holds, a frame
@@ -506,7 +515,12 @@ mod tests {
         );
         expect_silence(&mut harness.switch).await;
 
-        let after: Vec<_> = harness.table.rows().iter().map(|row| row_identity(row)).collect();
+        let after: Vec<_> = harness
+            .table
+            .rows()
+            .iter()
+            .map(|row| row_identity(row))
+            .collect();
         assert_eq!(
             before, after,
             "no guest frame published, replaced, or withdrew a row: the gate reads \
