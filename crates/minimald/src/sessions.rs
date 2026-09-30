@@ -448,6 +448,23 @@ impl Manager {
                     }
                     let node = match book.grant(crate::net::dns::LeaseNamespace::Node) {
                         crate::net::dns::LoopbackGrant::Granted(address) => address,
+                        crate::net::dns::LoopbackGrant::RecordUnavailable => {
+                            // The shutdown shape: a daemon that went down
+                            // mid-walk has closed its book, and the grant that
+                            // comes back is the closed book's, not a fault on
+                            // the host — the manager stops every session
+                            // before it closes, so there is nothing left to
+                            // publish an interim for either. An unreadable
+                            // record lands here too, said at the same level:
+                            // neither is a verdict about this host's range.
+                            tracing::debug!(
+                                grant = ?crate::net::dns::LoopbackGrant::RecordUnavailable,
+                                "the node's own loopback address was not granted — \
+                                 the book was closed for shutdown, or its record could \
+                                 not be read or written",
+                            );
+                            return;
+                        }
                         other => {
                             tracing::warn!(
                                 grant = ?other,
