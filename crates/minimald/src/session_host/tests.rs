@@ -1722,7 +1722,11 @@ fn only_the_guest_refuses_an_unplaceable_host_address_box() {
          run with the VM's address and no verdict at all"
     );
     for (guest, mode, why) in [
-        (true, NetworkMode::NoNet, "a none box claims no address to speak with"),
+        (
+            true,
+            NetworkMode::NoNet,
+            "a none box claims no address to speak with",
+        ),
         (
             true,
             NetworkMode::OwnIp,

@@ -290,8 +290,8 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     // The initramfs itself has no /proc at this point; the one just mounted
     // under the new root shows this very mount namespace, which is the table
     // the question is about.
-    let mountinfo = std::fs::read_to_string(format!("{NEWROOT}/proc/self/mountinfo"))
-        .unwrap_or_default();
+    let mountinfo =
+        std::fs::read_to_string(format!("{NEWROOT}/proc/self/mountinfo")).unwrap_or_default();
     let delegated = sandbox2::classifier::host_cgroup2_mounts(&mountinfo)
         .into_iter()
         .any(|(mountpoint, nsdelegate)| nsdelegate && mountpoint.ends_with("sys/fs/cgroup"));
@@ -301,9 +301,9 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
             "mounted cgroup2 with nsdelegate for the per-box classifier tree"
         ),
         (failure, _) => {
-            let error = failure.map(|e| e.to_string()).unwrap_or_else(|| {
-                "the existing cgroup2 mount carries no nsdelegate".to_string()
-            });
+            let error = failure
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "the existing cgroup2 mount carries no nsdelegate".to_string());
             tracing::error!(
                 error = %error,
                 "mounting cgroup2 with nsdelegate: a broken guest image; \
@@ -1420,7 +1420,11 @@ mod tests {
             );
         }
         for (pid, argv0, why) in [
-            (1_u32, Some(OsStr::new("/sbin/minimald")), "pid 1 run as itself"),
+            (
+                1_u32,
+                Some(OsStr::new("/sbin/minimald")),
+                "pid 1 run as itself",
+            ),
             (1, None, "no argv[0] at all"),
             (2, Some(OsStr::new("/init")), "the first fork, not pid 1"),
         ] {

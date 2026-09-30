@@ -2490,10 +2490,7 @@ impl SessionLauncher for SandboxLauncher {
         // (design §7.1). Natively the same state runs the box unenforced and
         // says so in the log instead (NET-079's exception).
         if leaf.is_none()
-            && refuses_unenforced_host_address_box(
-                crate::guest::is_microvm_daemon(),
-                network_mode,
-            )
+            && refuses_unenforced_host_address_box(crate::guest::is_microvm_daemon(), network_mode)
         {
             tracing::error!(
                 session = %session_name,

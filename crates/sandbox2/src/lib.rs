@@ -636,8 +636,10 @@ pub mod classifier {
         // real tree the kernel takes `+memory` as a subtree_control command
         // and may refuse it — a host without the memory controller, or one
         // that has it threaded off, still gets its boxes placed.
-        if let Err(e) = std::fs::write(root.join(BOXES_DIR).join("cgroup.subtree_control"), "+memory\n")
-            && e.kind() != std::io::ErrorKind::NotFound
+        if let Err(e) = std::fs::write(
+            root.join(BOXES_DIR).join("cgroup.subtree_control"),
+            "+memory\n",
+        ) && e.kind() != std::io::ErrorKind::NotFound
             && e.kind() != std::io::ErrorKind::PermissionDenied
         {
             tracing::warn!(
@@ -836,10 +838,8 @@ fn exec_box_program(
                 &std::io::Error::last_os_error(),
             );
         }
-        let target = std::ffi::CString::new(
-            classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT,
-        )
-        .expect("the cgroup mountpoint has no NUL in it");
+        let target = std::ffi::CString::new(classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT)
+            .expect("the cgroup mountpoint has no NUL in it");
         // SAFETY: `mount(2)` with valid C strings and no data; cgroup2 takes
         // no options but the flags, and the `nsdelegate` property is a
         // superblock one the host's mount already fixed. Async-signal-safe.
@@ -3786,7 +3786,9 @@ int main(int argc, char **argv) {
              cgroup2 view rooted at the leaf — the one cgroup the box can see"
         );
         assert_eq!(
-            placed.get(&format!("read {controllers}")).map(String::as_str),
+            placed
+                .get(&format!("read {controllers}"))
+                .map(String::as_str),
             Some("errno 0"),
             "the box reads its own cgroup view: the limit a cgroup-aware \
              runtime looks for is where it looks for it"
