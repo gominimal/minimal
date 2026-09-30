@@ -69,6 +69,18 @@ use super::SwitchSubnet;
 /// The DNS suffix every PTask box name carries (see the module docs).
 pub const HOSTNAME_SUFFIX: &str = "min.internal";
 
+/// Whether `name` is a box-zone name — the zone apex itself or any name under
+/// it (NET-072). `name` is an already-normalized qname: lowercased, no root
+/// dot, exactly what [`super::dns_gate`]'s gate asks about. Mirrors the
+/// answerer's zone-suffix match so both layers cannot drift.
+#[must_use]
+pub fn is_zone_name(name: &str) -> bool {
+    name == HOSTNAME_SUFFIX
+        || name
+            .strip_suffix(HOSTNAME_SUFFIX)
+            .is_some_and(|stem| stem.ends_with('.'))
+}
+
 /// Default `<host-id>` of the deprecated three-label zone: a stable short name
 /// for this `minimald` instance. The host-id is configurable; this is the value
 /// used when none is configured.
@@ -1766,6 +1778,32 @@ mod tests {
     /// declaration behind it.
     fn leased_ports() -> BTreeMap<u16, u16> {
         BTreeMap::from([(18080, 8080)])
+    }
+
+    /// NET-072's name boundary: the zone the gate carves out of the
+    /// infrastructure deny set is the zone's own apex and the names under it —
+    /// never a name that merely carries the zone's words. The matcher mirrors
+    /// the answerer's `in_zone` suffix match, so the two layers cannot drift
+    /// apart on a lookalike.
+    #[test]
+    fn is_zone_name_matches_the_zone_apex_and_its_names_only() {
+        assert!(is_zone_name(HOSTNAME_SUFFIX), "the apex is the zone");
+        assert!(is_zone_name("web.min.internal"), "a box name is the zone");
+        assert!(
+            is_zone_name("host.min.internal"),
+            "the host record is the zone"
+        );
+        assert!(
+            is_zone_name("web.local.min.internal"),
+            "the deprecated three-label form is the zone too (NET-002)"
+        );
+        // Lookalikes are not: the zone's words inside a longer name, or glued
+        // to a label without the separating dot.
+        assert!(!is_zone_name("min.internal.example.com"));
+        assert!(!is_zone_name("web.min.internal.example.com"));
+        assert!(!is_zone_name("webmin.internal"));
+        assert!(!is_zone_name("example.com"));
+        assert!(!is_zone_name(""), "no name is no zone");
     }
 
     /// Proof artifact 1 (registry/proxy contract): registering a `HostNet`
