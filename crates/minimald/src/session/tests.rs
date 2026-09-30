@@ -2935,3 +2935,68 @@ async fn destroyed_box_name_is_nxdomain() {
         "the release line names the address it returned to the slice, got: {release_line}"
     );
 }
+
+/// NET-010's durability half (design §7.1): the grant is the answerer's
+/// record, not the daemon's memory, so a daemon that restarts re-derives its
+/// live boxes' grants from the record rather than starting from an empty
+/// table. The restarted daemon below adopts nothing by itself — the box's
+/// resumed session asks again the moment its actor comes up, and the record
+/// answers with the address it already holds, so the box's name answers at
+/// the same address from before the restart to long after it, from finalize
+/// to destroy (NET-011), with no client ever attached (NET-013).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_daemon_re_derives_the_box_s_address_from_the_answerer() {
+    use minimald_rpc::{SessionDelta, SessionDeltaRequest};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_own_ip_session(&mut client, "web").await;
+    let (_, address) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the name answers at the first daemon");
+
+    // "Restart the daemon": tear the first server down and boot a second
+    // one on the same state root — the one record every daemon on this host
+    // grants through.
+    drop(client);
+    let state = server.into_state_dir();
+    let server = TestServer::new_in(state).await;
+    let mut client = server.connect().await;
+
+    // Bring the box's session up on the restarted daemon — the resume path
+    // any RPC that names the session takes — which registers its name
+    // before the actor is observable. The reply's shape is not the point
+    // here; the actor being up is.
+    let _ = client
+        .call::<SessionDelta>(&SessionDeltaRequest { id })
+        .await;
+
+    // The name answers again, at the address the record already held the
+    // box: the re-derivation, not a fresh grant — a restarted daemon that
+    // started from an empty table would have handed the box a different
+    // address and left the recorded one spent.
+    let (owner, resumed) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the box's name answers after the restart");
+    assert_eq!(
+        owner, "web",
+        "the session owns its box name across the restart"
+    );
+    assert_eq!(
+        resumed, address,
+        "the restarted daemon re-derives the box's recorded address, not a fresh one"
+    );
+
+    // And the box keeps the record's line, not a second one: the re-ask
+    // spent nothing, and a second box still gets its own address — the
+    // host-global arbitration the restart must not fall over.
+    let registry = server.state.sessions_manager().await.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(id),
+        Some(resumed),
+        "the registry the restarted daemon built answers with the recorded address"
+    );
+}

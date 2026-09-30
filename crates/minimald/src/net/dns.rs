@@ -60,6 +60,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use serde::Serialize;
 use sessions::core::egress::EgressRules;
+#[cfg(target_os = "linux")]
+use sessions::core::loopback::LoopbackAllocator;
 use sessions::{SessionId, SessionPolicy};
 
 use super::SwitchSubnet;
@@ -1048,6 +1050,347 @@ pub(crate) fn host_component(host_header: &str) -> &str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The answerer's lease record (NET-010): the host-global arbitration.
+//
+// Allocation in the reserved local range is host-global (design §7.1): one
+// owned set per host, arbitrated through the answerer's authenticated
+// channel, and no daemon self-assigns. The record below is this host's
+// answerer-side half of that: which namespace — a box or the node — holds
+// which granted address, written by every node daemon on the host through
+// this one type, and read back by each of them on start so a restarted
+// daemon re-derives its live grants rather than starting from an empty
+// table. "No daemon asks another" holds the way the design means it: a
+// daemon's only peer conversation is with the answerer's record, never with
+// another daemon.
+
+/// The answerer's record of granted addresses, under the daemon's state
+/// root — the one directory every daemon instance on this host shares
+/// (`minimal_state_dir`; the session store under it is shared the same way,
+/// which is what makes a box's session id a host-global key below).
+#[cfg(target_os = "linux")]
+const LEASE_RECORD_FILE: &str = "loopback-leases.json";
+
+/// The lock file serializing every read-modify-write of the lease record:
+/// a plain advisory lock, so two daemons on one host asking at the same
+/// moment still hand out two different addresses rather than both reading
+/// the same free bit. The lock is per record file, held for one
+/// read-modify-write — never across an await, never for a daemon's
+/// lifetime.
+#[cfg(target_os = "linux")]
+const LEASE_LOCK_FILE: &str = "loopback-leases.lock";
+
+/// Who a granted address belongs to: the namespace the answerer budgets one
+/// address per (design §7.1 — the budget is per published namespace, a box
+/// or a node, never per daemon).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseNamespace {
+    /// One box, by the session's stable id — the identifier the session
+    /// store keys records by, unique across every daemon instance on the
+    /// host, and stable across the daemon restarts a resumed session
+    /// survives. *Not* the session's name, which a user may reuse for the
+    /// next box the moment this one exits.
+    Box { session: SessionId },
+    /// The node itself: the address its host-address boxes answer at
+    /// (NET-129). One per host — a native node already owns the host
+    /// loopback and asks for nothing.
+    Node,
+}
+
+/// One line of the answerer's record: a namespace and the address it holds.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+struct LeaseEntry {
+    namespace: LeaseNamespace,
+    address: Ipv4Addr,
+}
+
+/// What asking the answerer for an address comes back with.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopbackGrant {
+    /// The address the namespace holds — granted now, or already in the
+    /// record: a namespace that already holds one is answered with it, which
+    /// is how a resumed session takes its address back after a restart
+    /// without ever holding it in memory.
+    Granted(Ipv4Addr),
+    /// Every address the answerer may grant on this host is held: the
+    /// published-namespace budget is spent. The asker reports it and
+    /// publishes nothing — never falls back to an address outside the range,
+    /// which another host's answerer may have granted to someone else.
+    PoolSpent,
+    /// The reserved local range is not bindable on this host (NET-123's
+    /// absent verdict): no address from it can be published, so none is
+    /// granted. The asker publishes on the `127.0.0.1` interim and re-surfaces
+    /// the naming advisory.
+    RangeAbsent,
+    /// The answerer's record could not be read or written. Grants are
+    /// **withheld**: a daemon that guessed would risk granting an address
+    /// another namespace already holds — the one failure NET-010 cannot
+    /// tolerate — where a withheld grant costs one box its published address.
+    RecordUnavailable,
+}
+
+/// The answerer's channel a daemon grants and releases through: the durable
+/// half of [`RESERVED_LOCAL_RANGE`]'s allocation, one record per host,
+/// guarded by its own lock file, spent through the pure allocator
+/// ([`sessions::core::loopback::LoopbackAllocator`]) the injectivity proof
+/// covers.
+///
+/// Every method is a synchronous read-modify-write under the lock file, so a
+/// book handle can be shared behind an `Arc` without a second mutex, and two
+/// daemons on one host — or two handles in one process, in a test — are
+/// serialized by the file system rather than by each other.
+///
+/// The record's shape is a list of `{"namespace": …, "address": …}` lines,
+/// written staged-then-renamed like every other record under the state root
+/// (a crash mid-write leaves the last complete record, never a partial
+/// one), read leniently, and versioned by its field set: an unknown field is
+/// ignored, so a future format can add to it without invalidating a record a
+/// live daemon still reads. A record that cannot be parsed withholds grants
+/// (see [`LoopbackGrant::RecordUnavailable`]); a record that is simply
+/// missing is a host's first boot, and reads as empty.
+///
+/// A microVM guest's state root is the guest's own, so two co-resident VMs
+/// keep two records and do not see each other — the host-side channel that
+/// arbitrates across the `minvmd` boundary is the minvmd-side answerer's to
+/// carry, and this type is where its grant path will plug in. Within one
+/// host — one state root, however many native daemon instances share it —
+/// this record *is* the arbitration.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct LoopbackLeaseBook {
+    /// The record file, `<state root>/<LEASE_RECORD_FILE>`.
+    record: camino::Utf8PathBuf,
+    /// The staged sibling the record is written through, before its rename.
+    staging: camino::Utf8PathBuf,
+    /// The lock file's open handle, held for the book's lifetime so the
+    /// flock is one `open()` per daemon, not one per grant. Behind a
+    /// `Mutex` because `fd_lock`'s `write` API takes `&mut` — the mutex
+    /// serializes books sharing one process, the flock inside it books
+    /// sharing one host.
+    lock: std::sync::Mutex<fd_lock::RwLock<std::fs::File>>,
+    /// Whether the reserved local range is bindable on this host: the
+    /// daemon-start bind probe's verdict (NET-123), read once at start.
+    /// While it is absent every grant answers
+    /// [`LoopbackGrant::RangeAbsent`] — the addresses this book would grant
+    /// are not publishable, so none is spent.
+    present: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LoopbackLeaseBook {
+    /// Opens this host's book under `state_root`, binding its lock file.
+    ///
+    /// `present` is the daemon-start bind probe's verdict over the reserved
+    /// local range (NET-123): while it is `false` the book answers every
+    /// grant with [`LoopbackGrant::RangeAbsent`] rather than granting
+    /// addresses nothing can bind.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the failure to create or open the lock file — the one
+    /// artefact the book cannot run without, since without it two daemons
+    /// cannot arbitrate.
+    pub fn open(state_root: &paths::DaemonAbsPath, present: bool) -> std::io::Result<Self> {
+        let record = state_root
+            .sub_path_unchecked(LEASE_RECORD_FILE)
+            .as_utf8_path()
+            .to_path_buf();
+        let staging = camino::Utf8PathBuf::from(format!("{record}.tmp"));
+        let lock_path = state_root
+            .sub_path_unchecked(LEASE_LOCK_FILE)
+            .as_utf8_path()
+            .to_path_buf();
+        // The lock file is opened — not locked: the flock is taken per
+        // read-modify-write, so two daemons on one host serialize per grant
+        // rather than for their lifetimes.
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path.as_std_path())
+            .map(fd_lock::RwLock::new)?;
+        Ok(Self {
+            record,
+            staging,
+            lock: std::sync::Mutex::new(lock),
+            present,
+        })
+    }
+
+    /// Grants `namespace` an address from the host's pool, or answers with
+    /// the one it already holds.
+    ///
+    /// The whole grant is one read-modify-write under the record's lock:
+    /// read the record, restore the allocator from the addresses it names,
+    /// lease the lowest free address (never the answerer's own), write the
+    /// record back with the new line. A record that cannot be read or
+    /// written withholds the grant rather than risking an address another
+    /// namespace holds.
+    pub fn grant(&self, namespace: LeaseNamespace) -> LoopbackGrant {
+        if !self.present {
+            return LoopbackGrant::RangeAbsent;
+        }
+        let Ok(mut lock) = self.lock.lock() else {
+            return LoopbackGrant::RecordUnavailable;
+        };
+        let Ok(_held) = lock.write() else {
+            return LoopbackGrant::RecordUnavailable;
+        };
+        let Ok(mut entries) = self.read() else {
+            return LoopbackGrant::RecordUnavailable;
+        };
+        // The namespace may already hold an address — a resumed session
+        // asking again after a restart, or a re-finalize. Answering with the
+        // recorded one is what keeps a box's address stable across the
+        // restart, and costs no second line in the record.
+        if let Some(address) = entry_address(&entries, namespace) {
+            return LoopbackGrant::Granted(address);
+        }
+        // The pool the record's addresses are drawn against: the pure
+        // allocator's restore ignores anything outside it, so a stale or
+        // hand-edited record can only narrow what a grant may take.
+        let mut owned = LoopbackAllocator::restore(entries.iter().map(|entry| entry.address));
+        let Some(address) = owned.lease() else {
+            return LoopbackGrant::PoolSpent;
+        };
+        entries.push(LeaseEntry { namespace, address });
+        // A failed write leaves the record as it was, so the namespace's
+        // address stays unrecorded and the next ask grants a fresh one — the
+        // failed grant leaks nothing. The caller must not publish an address
+        // the record does not name.
+        if self.write(&entries).is_err() {
+            return LoopbackGrant::RecordUnavailable;
+        }
+        LoopbackGrant::Granted(address)
+    }
+
+    /// Returns the address `namespace` holds to the pool, and reports which
+    /// address that was.
+    ///
+    /// `None` — and no change — when the namespace holds nothing this
+    /// record names, or when the record cannot be read: a release that
+    /// cannot see the record cannot rewrite it, and leaving the line in
+    /// place only costs one address, where removing it blind could free one
+    /// another namespace now holds.
+    #[must_use]
+    pub fn release(&self, namespace: LeaseNamespace) -> Option<Ipv4Addr> {
+        let Ok(mut lock) = self.lock.lock() else {
+            return None;
+        };
+        let _held = lock.write().ok()?;
+        let mut entries = self.read().ok()?;
+        let index = entries
+            .iter()
+            .position(|entry| entry.namespace == namespace)?;
+        let address = entries.remove(index).address;
+        self.write(&entries).ok()?;
+        Some(address)
+    }
+
+    /// Re-derives the record from the sessions that are still live: every
+    /// box whose session is gone from `live` loses its grant, and the
+    /// addresses it freed come back.
+    ///
+    /// The start-time half of the record's durability: a daemon that restarts
+    /// does not start from an empty table — it adopts every live box's line
+    /// as it re-registers their names — but a box whose session was destroyed
+    /// while no daemon was running must not keep its address, or a host that
+    /// cycles its boxes would run the pool down without a live box on it.
+    /// `live` is the session store's set of ids, which is shared by every
+    /// daemon on the host the same way this record is, so the sweep is the
+    /// answerer's own view of liveness, not one daemon's.
+    ///
+    /// Returns the addresses it freed, for the start line that reports them;
+    /// a record it could not read or write sweeps nothing and answers empty,
+    /// since grants are withheld for the same failure.
+    #[must_use]
+    pub fn release_dead_boxes(&self, live: &BTreeSet<SessionId>) -> Vec<Ipv4Addr> {
+        let Ok(mut lock) = self.lock.lock() else {
+            return Vec::new();
+        };
+        let Ok(_held) = lock.write() else {
+            return Vec::new();
+        };
+        let mut entries = match self.read() {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(
+                    record = %self.record,
+                    error = %error,
+                    "the answerer's lease record could not be read at start; grants are withheld",
+                );
+                return Vec::new();
+            }
+        };
+        let before = entries.len();
+        let freed: Vec<Ipv4Addr> = entries
+            .iter()
+            .filter(|entry| match entry.namespace {
+                LeaseNamespace::Box { session } => !live.contains(&session),
+                LeaseNamespace::Node => false,
+            })
+            .map(|entry| entry.address)
+            .collect();
+        entries.retain(|entry| match entry.namespace {
+            LeaseNamespace::Box { session } => live.contains(&session),
+            LeaseNamespace::Node => true,
+        });
+        if entries.len() == before || self.write(&entries).is_err() {
+            // Nothing swept, or the sweep could not be written back: either
+            // way the record stands, and the next start sweeps again.
+            return Vec::new();
+        }
+        freed
+    }
+
+    /// Reads the record, or `Err` when it cannot be trusted: a missing file
+    /// is a host's first boot and reads as empty; anything else that cannot
+    /// be parsed withholds.
+    fn read(&self) -> std::io::Result<Vec<LeaseEntry>> {
+        match std::fs::read(&self.record) {
+            Ok(bytes) => {
+                // Empty (or whitespace-only, for a file someone touched):
+                // nothing granted, rather than a parse failure.
+                if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    return Ok(Vec::new());
+                }
+                serde_json_lenient::from_slice(&bytes).map_err(std::io::Error::other)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Writes the record staged-then-renamed, so a crash mid-write leaves
+    /// the last complete record rather than a partial one — the same
+    /// crash-safety every other record under the state root is written with.
+    fn write(&self, entries: &[LeaseEntry]) -> std::io::Result<()> {
+        let file = std::fs::File::create(&self.staging)?;
+        serde_json_lenient::to_writer(&file, &entries)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(target_os = "linux")]
+        common::renameat2::renameat2_cwd(self.staging.as_std_path(), self.record.as_std_path(), 0)?;
+        #[cfg(not(target_os = "linux"))]
+        std::fs::rename(&self.staging, &self.record)?;
+        Ok(())
+    }
+}
+
+/// The address `namespace` holds in the record, if any.
+#[cfg(target_os = "linux")]
+fn entry_address(entries: &[LeaseEntry], namespace: LeaseNamespace) -> Option<Ipv4Addr> {
+    entries
+        .iter()
+        .find(|entry| entry.namespace == namespace)
+        .map(|entry| entry.address)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1518,5 +1861,327 @@ mod tests {
     fn deregister_unknown_session_is_a_noop() {
         let mut reg = HostnameRegistry::new("dev", false);
         assert_eq!(reg.deregister("ghost"), None);
+    }
+
+    // The answerer's lease record (NET-010): the host-global arbitration.
+
+    /// A tempdir turned into a state root two books can share, the way two
+    /// daemon instances on one host share the daemon state dir.
+    #[cfg(target_os = "linux")]
+    fn lease_root(tmp: &tempfile::TempDir) -> paths::DaemonAbsPath {
+        paths::DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap()
+    }
+
+    /// A book open on `state_root` with the range present, the verdict a
+    /// Linux daemon's bind probe always returns.
+    #[cfg(target_os = "linux")]
+    fn lease_book(state_root: &paths::DaemonAbsPath) -> LoopbackLeaseBook {
+        LoopbackLeaseBook::open(state_root, true).expect("opening the lease record")
+    }
+
+    /// A distinct session id, so each box namespace in a test is its own.
+    #[cfg(target_os = "linux")]
+    fn session_id(millis: u128) -> SessionId {
+        SessionId::parse_str(&format!("00000000-0000-0000-0000-{millis:012}")).unwrap()
+    }
+
+    /// The record the answerer holds over one host: two daemons asking over
+    /// the same state root — the two gvproxy instances one host runs — never
+    /// hold one address, and neither is ever granted the answerer's own
+    /// (design §7.1: 127.0.64.1 is the answerer's, and no lease may include
+    /// it).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn two_daemons_on_one_host_never_share_a_granted_address() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        // Two books over the one record: two daemon instances, each with its
+        // own open handle, serialized by the record's lock file rather than
+        // by any memory they share (they share none).
+        let daemon_a = lease_book(&state_root);
+        let daemon_b = lease_book(&state_root);
+
+        // Interleaved asks, the adversarial order: each daemon asks while
+        // the other holds grants the first must have seen.
+        let a1 = daemon_a.grant(LeaseNamespace::Box {
+            session: session_id(1),
+        });
+        let b1 = daemon_b.grant(LeaseNamespace::Box {
+            session: session_id(2),
+        });
+        let a2 = daemon_a.grant(LeaseNamespace::Box {
+            session: session_id(3),
+        });
+        let b2 = daemon_b.grant(LeaseNamespace::Box {
+            session: session_id(4),
+        });
+        let grants = [a1, b1, a2, b2];
+        let addresses: Vec<Ipv4Addr> = grants
+            .iter()
+            .map(|grant| match grant {
+                LoopbackGrant::Granted(address) => *address,
+                other => panic!("a fresh host grants every namespace: {other:?}"),
+            })
+            .collect();
+        let distinct: BTreeSet<_> = addresses.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            addresses.len(),
+            "two daemons on one host hold one address between them: {addresses:?}"
+        );
+        for address in &addresses {
+            assert_ne!(
+                *address,
+                sessions::core::loopback::ANSWERER_ADDRESS,
+                "the answerer's own address was granted"
+            );
+            assert!(
+                in_reserved_local_range(*address),
+                "{address} is not from the reserved local range"
+            );
+        }
+    }
+
+    /// The grant a namespace already holds is answered with it — a resumed
+    /// session's ask after a daemon restart — so a box's address is stable
+    /// across the restart, and neither the record nor the pool is spent
+    /// twice on one namespace.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_grant_survives_a_daemon_restart_and_answers_the_same_address() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let namespace = LeaseNamespace::Box {
+            session: session_id(5),
+        };
+
+        // The daemon that first granted, then the one that starts after it —
+        // the same session resuming on the second.
+        let first = lease_book(&state_root);
+        let granted = match first.grant(namespace) {
+            LoopbackGrant::Granted(address) => address,
+            other => panic!("a fresh host grants the box: {other:?}"),
+        };
+        drop(first);
+        let restarted = lease_book(&state_root);
+        match restarted.grant(namespace) {
+            LoopbackGrant::Granted(address) => assert_eq!(
+                address, granted,
+                "the resumed box did not get its recorded address back"
+            ),
+            other => panic!("the record survives the restart: {other:?}"),
+        }
+
+        // And the namespace holds exactly one line in the record: the
+        // re-ask spent nothing.
+        let entries = restarted.read().expect("the record the restart re-opened");
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.namespace == namespace)
+                .count(),
+            1,
+            "the resumed box spent a second grant"
+        );
+
+        // Releasing on the restarted daemon returns the recorded address to
+        // the pool, and the next box's ask takes it — not a fresh one.
+        assert_eq!(restarted.release(namespace), Some(granted));
+        let next = match restarted.grant(LeaseNamespace::Box {
+            session: session_id(6),
+        }) {
+            LoopbackGrant::Granted(address) => address,
+            other => panic!("the freed address is grantable: {other:?}"),
+        };
+        assert_eq!(next, granted, "the released address is the lowest free");
+    }
+
+    /// The pool the answerer may grant is the range's usable addresses minus
+    /// its own `.1` — and when that budget is spent, `PoolSpent` rather than
+    /// the answerer's address or anything outside the range; releasing makes
+    /// room again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_spent_pool_reports_spent_rather_than_granting_the_answerer_s_address() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let book = lease_book(&state_root);
+
+        let mut granted = BTreeSet::new();
+        for millis in 1..=sessions::core::loopback::POOL_LEN {
+            let namespace = LeaseNamespace::Box {
+                session: session_id(u128::from(millis)),
+            };
+            match book.grant(namespace) {
+                LoopbackGrant::Granted(address) => {
+                    assert_ne!(
+                        address,
+                        sessions::core::loopback::ANSWERER_ADDRESS,
+                        "no lease may include the answerer's own address"
+                    );
+                    assert!(granted.insert(address), "{address} granted twice");
+                }
+                other => panic!("the host's budget covers every namespace: {other:?}"),
+            }
+        }
+
+        // The budget is spent: the node's ask — the next namespace, a
+        // different kind than every box before it — reports the spent pool,
+        // never an address that would break the property.
+        assert_eq!(book.grant(LeaseNamespace::Node), LoopbackGrant::PoolSpent);
+
+        // Releasing one box makes room for exactly the next ask.
+        let released = session_id(1);
+        assert!(
+            book.release(LeaseNamespace::Box { session: released })
+                .is_some(),
+            "the box's grant is in the record"
+        );
+        match book.grant(LeaseNamespace::Node) {
+            LoopbackGrant::Granted(address) => assert!(
+                granted.contains(&address),
+                "{address} is one of the released addresses"
+            ),
+            other => panic!("the released address is grantable: {other:?}"),
+        }
+    }
+
+    /// The start-time sweep: a box whose session is gone from the store
+    /// loses its grant, and a live box — even one another daemon instance
+    /// owns — keeps it. The node's grant is not a box's and is never swept.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_start_sweep_frees_only_dead_boxes_grants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let book = lease_book(&state_root);
+        let dead = session_id(1);
+        let live = session_id(2);
+        let dead_namespace = LeaseNamespace::Box { session: dead };
+        let live_namespace = LeaseNamespace::Box { session: live };
+        let dead_address = match book.grant(dead_namespace) {
+            LoopbackGrant::Granted(address) => address,
+            other => panic!("a fresh host grants the box: {other:?}"),
+        };
+        let live_address = match book.grant(live_namespace) {
+            LoopbackGrant::Granted(address) => address,
+            other => panic!("a fresh host grants the box: {other:?}"),
+        };
+        let node_address = match book.grant(LeaseNamespace::Node) {
+            LoopbackGrant::Granted(address) => address,
+            other => panic!("the node grants after the boxes: {other:?}"),
+        };
+
+        // The store's live set names the live box alone.
+        let live_ids = BTreeSet::from([live]);
+        let freed = book.release_dead_boxes(&live_ids);
+        assert_eq!(
+            freed,
+            vec![dead_address],
+            "only the destroyed box's grant is swept"
+        );
+
+        // The live box keeps its grant; the freed address is grantable
+        // again; the node keeps its own line, un-swept.
+        assert_eq!(
+            book.grant(live_namespace),
+            LoopbackGrant::Granted(live_address)
+        );
+        assert_eq!(
+            book.grant(LeaseNamespace::Box {
+                session: session_id(3)
+            }),
+            LoopbackGrant::Granted(dead_address),
+            "the swept address is the lowest free"
+        );
+        assert_eq!(
+            book.grant(LeaseNamespace::Node),
+            LoopbackGrant::Granted(node_address),
+            "the node's grant is not a box's, and is never swept"
+        );
+
+        // An empty store sweeps every box — a host whose sessions were all
+        // destroyed while no daemon was running starts with the whole pool.
+        let swept: BTreeSet<Ipv4Addr> = book
+            .release_dead_boxes(&BTreeSet::new())
+            .into_iter()
+            .collect();
+        assert_eq!(
+            swept,
+            BTreeSet::from([dead_address, live_address]),
+            "every box's grant goes, the node's stays"
+        );
+    }
+
+    /// An absent reserved local range grants nothing — NET-123's interim:
+    /// the addresses the book would grant are not bindable, so no namespace
+    /// is ever handed one it cannot publish.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_absent_range_grants_nothing_and_publishes_on_the_interim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let book = LoopbackLeaseBook::open(&state_root, false).unwrap();
+        assert_eq!(book.grant(LeaseNamespace::Node), LoopbackGrant::RangeAbsent);
+        assert_eq!(
+            book.grant(LeaseNamespace::Box {
+                session: session_id(1)
+            }),
+            LoopbackGrant::RangeAbsent
+        );
+        // The record stays empty: an absent range spends nothing.
+        assert_eq!(book.read().unwrap(), Vec::new());
+    }
+
+    /// A record that cannot be trusted withholds grants rather than guessing:
+    /// the one failure NET-010 cannot tolerate is two namespaces on one
+    /// address, and a record that will not parse could name one either way.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreadable_record_withholds_grants_rather_than_guessing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let book = lease_book(&state_root);
+        let namespace = LeaseNamespace::Box {
+            session: session_id(1),
+        };
+        assert_eq!(
+            book.grant(namespace),
+            LoopbackGrant::Granted(sessions::core::loopback::POOL_FIRST)
+        );
+
+        // A hand-corrupted record: a grant may not proceed over it.
+        std::fs::write(
+            state_root
+                .sub_path_unchecked(LEASE_RECORD_FILE)
+                .as_utf8_path(),
+            "{not json",
+        )
+        .unwrap();
+        assert_eq!(
+            book.grant(LeaseNamespace::Box {
+                session: session_id(2)
+            }),
+            LoopbackGrant::RecordUnavailable
+        );
+        // And a release over it frees nothing, rather than rewriting the
+        // record blind.
+        assert_eq!(book.release(namespace), None);
+
+        // An empty file is a first boot, not a corruption.
+        std::fs::write(
+            state_root
+                .sub_path_unchecked(LEASE_RECORD_FILE)
+                .as_utf8_path(),
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            book.grant(LeaseNamespace::Box {
+                session: session_id(3)
+            }),
+            LoopbackGrant::Granted(sessions::core::loopback::POOL_FIRST),
+            "an empty record reads as a fresh host"
+        );
     }
 }
