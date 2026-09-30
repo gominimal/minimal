@@ -108,6 +108,21 @@ set -uo pipefail # not -e: capture failures so we can dump diagnostics
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 E2E_VM="${E2E_VM:-}"
 
+# The two Linux fresh-install KVM proofs are documented as VM-backed cases
+# (NET-049/NET-051) and are invoked directly by their task test lines. When
+# called that way, behave as if the caller exported the KVM lane environment
+# variables: E2E_VM=1 and E2E_MINIMAL_ARGS="--provider local-minvmd". Without
+# this the script's min_daemon probe defaults to minimald on Linux and the
+# standalone case fails before it reaches the proof.
+case "${1:-}" in
+  fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd)
+    E2E_VM="${E2E_VM:-1}"
+    if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
+      E2E_MINIMAL_ARGS="--provider local-minvmd"
+    fi
+    ;;
+esac
+
 # The non-baseline package the sandbox proof adds and then runs. It must be a
 # real upstream package that is genuinely ABSENT from a fresh shell-stack
 # sandbox — the `shell` stack composes `base` (bash, coreutils, tar, gzip, …)
