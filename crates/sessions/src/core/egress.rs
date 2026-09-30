@@ -682,7 +682,7 @@ impl RebindingRefusal {
 /// (`*.min.internal`, NET-072). Such an answer is expected to name a
 /// sibling's switch lease, so the fabric plane is carved out for it and no
 /// other range is — the one carve-out a zone name earns, and the reason a
-/// box reaches a sibling by name with no `allow_dns_hosts` entry. The
+/// box *resolves* a sibling's name with no `allow_dns_hosts` entry. The
 /// carve-out is exact in both directions: a zone answer is admitted inside
 /// the plane and nowhere else, so an answer to a zone name that names any
 /// other address — RFC 1918, a public host — is refused as infrastructure
@@ -691,6 +691,13 @@ impl RebindingRefusal {
 /// refuses a zone answer: the fixed ranges (the metadata service, loopback,
 /// the gateway's own addresses) and the plane's own addresses when the name
 /// is not a zone name.
+///
+/// Admitted here means *may be* admitted: the intersection only splits the
+/// answer set, and whether a survivor becomes reach is the caller's. The
+/// daemon's gate pins a declared name's answers and a zone answer never —
+/// NET-072's carve-out is the resolution's alone, so the reach to the lease
+/// a zone name answered with is decided by the connecting box's declared
+/// subnets at connection time, never by the answer.
 ///
 /// Pure over owned addresses and CIDRs, and deliberately separate from any
 /// resolver: the daemon hands this function the addresses a resolver already
@@ -1442,8 +1449,8 @@ mod tests {
         // And the plane is the carve-out's whole width: a zone answer
         // outside it is refused as infrastructure under every declaration —
         // RFC 1918, where `allow_subnets` exempts an ordinary name's answer,
-        // as much as a public address — so a zone name pins nothing but a
-        // sibling's lease.
+        // as much as a public address — so a zone answer may name nothing
+        // but a sibling's lease.
         let allow_lan = cidrs(&["10.0.0.0/8"]);
         let allow_none = cidrs(&[]);
         for (answer, allow, because) in [
