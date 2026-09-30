@@ -63,8 +63,17 @@
 //! lines are keyed in is bounded, because the source address a frame is keyed
 //! by is the frame's own bytes: a guest flooding distinct spoofed addresses
 //! cannot turn the throttling into host-memory growth.
+//!
+//! Fail-closed faces the guest; the gate itself is what the host is left
+//! holding, so it stays up where it can. An accept failure the host can ride
+//! out — a momentary fd or memory shortage, a connection that died before it
+//! was handed over — is backed off from and retried, rate-limited, because a
+//! gate that dies takes every live relay and every box's egress with it, for
+//! the rest of the VM's life; only a listener that is genuinely gone stops
+//! it.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -154,6 +163,15 @@ const MAX_HEAD: usize = 4 * 1024;
 /// (`crates/minimald/src/net/switch.rs`).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the accept loop backs off before retrying an accept that failed
+/// transiently. Long enough that a sustained shortage is a bounded number of
+/// retries a second and not a spin; short enough that a guest connecting
+/// while the host was briefly out of fds waits a tenth of a second and gets
+/// its relay. The retry is what keeps the gate — and with it every live relay
+/// and every box's egress — alive through a hiccup that is not the
+/// listener's own end.
+const ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
 /// Largest Ethernet frame the gate relays: MTU + 14-byte header + 4-byte
 /// 802.1Q VLAN tag — the same bound the in-guest relay reads to, so the two
 /// halves of the path agree on what a frame may weigh.
@@ -208,6 +226,12 @@ const UNDECLARED_VERB_RULE: &str = "egress-undeclared-verb";
 /// connection as cheaply as it can send a frame, and the refusal must not
 /// become the flood the frame drops are rate-limited against.
 const CONTROL_UPGRADE_RULE: &str = "egress-control-upgrade";
+
+/// The rule name for an accept failure the gate is riding out rather than
+/// dying on. It is the limiter's key, not a verdict — no frame was decided —
+/// but it names what a drop line names: what the host refused and why, once
+/// per interval, for as long as the condition lasts.
+const ACCEPT_RETRY_RULE: &str = "egress-accept-failed";
 
 /// What the guest's first request head says it came for: gvproxy's switch
 /// socket speaks two protocols on one listener, and the head's request line
@@ -384,6 +408,12 @@ enum ControlEnd {
 /// one relay task per live guest connection, all on the tokio runtime the
 /// gate was started on. Dropping the handle stops them — the gate lives and
 /// dies with the switch runtime it was started on ([`crate::net`]).
+///
+/// What stops the gate is decided, not assumed: an accept failure that is the
+/// listener's own end stops it ([`AcceptFailure::Fatal`]); one the host can
+/// ride out does not ([`AcceptFailure::RideOut`]), because a gate that dies
+/// takes every box's egress with it and a momentary fd or memory shortage is
+/// not that. See [`accept_loop`].
 #[derive(Debug)]
 #[must_use = "dropping the handle stops the gate and every live relay"]
 pub struct EgressGate {
@@ -428,39 +458,135 @@ impl Drop for EgressGate {
     }
 }
 
+/// The one thing the accept loop needs from the socket it accepts on, as a
+/// trait so the loop's failure handling can be driven by a test without first
+/// having to hit a real process fd limit: the only production implementation
+/// is [`UnixListener`]'s, unchanged.
+trait GuestSource {
+    /// Accepts the next guest connection, or the error that failed the
+    /// accept.
+    fn accept(&mut self) -> impl Future<Output = io::Result<UnixStream>> + Send;
+}
+
+impl GuestSource for UnixListener {
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "an `async fn` in a trait returns a future that is not known `Send`, and this \
+                  loop is spawned on the tokio runtime, which needs the Send"
+    )]
+    fn accept(&mut self) -> impl Future<Output = io::Result<UnixStream>> + Send {
+        async { UnixListener::accept(self).await.map(|(guest, _)| guest) }
+    }
+}
+
+/// What an accept failure means for the gate: a condition the host can ride
+/// out, or the listener's own end. The distinction is the whole fix for the
+/// failure mode a long-lived host daemon meets — an accept error is *not*
+/// necessarily a gate that has stopped deciding frames, and treating every
+/// one as if it were severs every box's egress for the rest of the VM's life
+/// over a condition that clears on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptFailure {
+    /// The host's own momentary shortage — the process is briefly out of
+    /// descriptors, memory, or the per-connection buffers — or the death of
+    /// one connection before it was handed over. Neither says anything about
+    /// the listener, so the gate backs off and keeps accepting.
+    RideOut,
+    /// The listener itself is gone. The gate stops, fail-closed.
+    Fatal,
+}
+
+impl AcceptFailure {
+    /// Classifies one accept error.
+    ///
+    /// The ride-out set is the accept(2) errors that are per-attempt rather
+    /// than per-listener — the fd-limit and memory shortages a host daemon
+    /// holding a socket and a dial per live relay can be pushed into, and the
+    /// aborted or malformed connection, which says nothing about the next
+    /// one. `std` leaves the fd-limit errors uncategorized
+    /// (`io::ErrorKind::Uncategorized`), so they are read off the raw errno
+    /// and not off the kind; the kind check catches the same two conditions
+    /// in an error with no errno behind it. Everything else — a bad
+    /// descriptor, a listener no longer willing to accept — is fatal: the
+    /// guest's next connect fails, and a gate that cannot accept must not
+    /// keep deciding frames either.
+    fn of(error: &io::Error) -> Self {
+        if matches!(
+            error.raw_os_error(),
+            Some(
+                libc::EMFILE
+                    | libc::ENFILE
+                    | libc::ENOMEM
+                    | libc::ENOBUFS
+                    | libc::ECONNABORTED
+                    | libc::EPROTO
+            )
+        ) || matches!(
+            error.kind(),
+            io::ErrorKind::OutOfMemory | io::ErrorKind::ConnectionAborted
+        ) {
+            return Self::RideOut;
+        }
+        Self::Fatal
+    }
+}
+
 /// Accepts guest connections on the bound listener and gives each one a relay
 /// task, held in a [`JoinSet`] this loop owns: aborting the loop — what the
 /// [`EgressGate`] handle's `Drop` does — aborts every relay with it.
-async fn accept_loop(
-    listener: UnixListener,
+///
+/// Two things here would otherwise cost the VM every box's egress for the
+/// rest of its life, so neither is allowed to. An accept failure is
+/// classified rather than assumed ([`AcceptFailure`]): the transient ones are
+/// backed off from and retried, and said so at the gate's own cadence, so a
+/// momentary resource shortage costs a tenth of a second and a line a minute
+/// — not the gate, its live relays, and the next guest's connect.
+async fn accept_loop<A: GuestSource>(
+    mut source: A,
     switch_sock: PathBuf,
     table: BoxTable,
     limiter: Arc<DropLimiter>,
 ) {
     let mut relays = JoinSet::new();
     loop {
-        match listener.accept().await {
-            Ok((guest, _)) => {
-                relays.spawn(serve_connection(
-                    guest,
-                    switch_sock.clone(),
-                    table.clone(),
-                    Arc::clone(&limiter),
-                    HANDSHAKE_TIMEOUT,
-                ));
-                // Reap the finished so a long-lived gate accumulates no
-                // handles for connections long gone.
-                while relays.try_join_next().is_some() {}
-            }
-            Err(error) => {
-                // Fail closed, and say so: a gate that cannot accept cannot be
-                // bypassed — the guest's connect fails and its relay reports
-                // no egress, the same posture as a host gvproxy that never
-                // came up.
-                tracing::warn!(%error, "egress gate accept failed; the gate has stopped");
-                return;
-            }
-        }
+        let guest = match source.accept().await {
+            Ok(guest) => guest,
+            Err(error) => match AcceptFailure::of(&error) {
+                AcceptFailure::RideOut => {
+                    // Ride it out, and say so at the frame drops' cadence: the
+                    // error repeats once per backoff for as long as the
+                    // shortage lasts, which on a long-lived host daemon is a
+                    // line a minute rather than one a tenth of a second.
+                    if limiter.should_warn_at(None, ACCEPT_RETRY_RULE, Instant::now())
+                        != WarnDecision::Silent
+                    {
+                        tracing::warn!(
+                            %error,
+                            rule_matched = ACCEPT_RETRY_RULE,
+                            retry_backoff = ?ACCEPT_RETRY_BACKOFF,
+                            "egress gate accept failed transiently; the gate is retrying",
+                        );
+                    }
+                    tokio::time::sleep(ACCEPT_RETRY_BACKOFF).await;
+                    continue;
+                }
+                AcceptFailure::Fatal => {
+                    // Fail closed, and say so: a gate that cannot accept
+                    // cannot be bypassed — the guest's connect fails and its
+                    // relay reports no egress, the same posture as a host
+                    // gvproxy that never came up.
+                    tracing::warn!(%error, "egress gate accept failed; the gate has stopped");
+                    return;
+                }
+            },
+        };
+        relays.spawn(serve_connection(
+            guest,
+            switch_sock.clone(),
+            table.clone(),
+            Arc::clone(&limiter),
+            HANDSHAKE_TIMEOUT,
+        ));
     }
 }
 
@@ -1251,6 +1377,22 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Installs the thread-local capture the gate's own tests assert through,
+    /// returning it with the guard that keeps it installed: the gate's tasks
+    /// run on this thread's current-thread runtime, so the thread-local
+    /// default applies to them too. Split from [`gate_connected`] so a test
+    /// that drives [`super::accept_loop`] itself — rather than a gate it
+    /// spawned — sees the same lines.
+    pub(crate) fn capture_log() -> (CaptureWriter, tracing::subscriber::DefaultGuard) {
+        let log = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (log, guard)
+    }
+
     /// One gate over a stand-in switch. `guest` is the end that plays the
     /// guest shuttle — frames written here are decided by the gate;
     /// `switch` is the stand-in switch's accepted end, which reads only what
@@ -1292,19 +1434,16 @@ pub(crate) mod test_support {
         let dir = TempDir::new().expect("a tempdir is creatable");
         let switch_sock = dir.path().join("gvproxy-switch.sock");
         let gate_sock = dir.path().join("gvproxy-gate.sock");
-        // The stand-in switch: a listener the gate's connection task dials.
+        // The stand-in switch: a listener the gate's connection task dials,
+        // kept alive for the harness's lifetime so a later guest connection
+        // on the same gate has something to dial.
         let listener = UnixListener::bind(&switch_sock).expect("binding the stand-in switch");
 
         // Capture this thread's tracing output before the gate starts, so its
         // drop lines are assertable. The gate runs on this test's
         // current-thread runtime, so the thread-local default applies to its
         // tasks too.
-        let log = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (log, _guard) = capture_log();
 
         let gate = EgressGate::spawn(gate_sock.clone(), switch_sock.clone(), registry.table())
             .expect("spawning the egress gate");
@@ -1535,6 +1674,8 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::io;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1545,16 +1686,18 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{UnixListener, UnixStream};
+    use tokio::sync::mpsc;
 
     use super::test_support::{
-        CaptureWriter, DEADLINE, arp_frame, expect_frame, expect_silence, expect_teardown,
-        gate_connected, gate_over, gate_over_control, gate_over_with, ipv4_frame, ipv6_frame,
-        read_within, send_frame, wait_for_log,
+        CaptureWriter, DEADLINE, arp_frame, capture_log, expect_frame, expect_silence,
+        expect_teardown, gate_connected, gate_over, gate_over_control, gate_over_with, ipv4_frame,
+        ipv6_frame, read_within, send_frame, wait_for_log,
     };
     use super::{
-        CONNECT_REQUEST, CONTROL_VERBS, DROP_WARN_MAX_TRACKED_PAIRS, DROP_WARN_MIN_INTERVAL,
-        DropLimiter, EgressGate, GateDrop, GuestSpeak, HANDSHAKE_TIMEOUT, MAX_HEAD,
-        MAX_NAMED_TARGET, WarnDecision, gate_verdict, max_frame, serve_connection,
+        AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, DROP_WARN_MAX_TRACKED_PAIRS,
+        DROP_WARN_MIN_INTERVAL, DropLimiter, EgressGate, GateDrop, GuestSource, GuestSpeak,
+        HANDSHAKE_TIMEOUT, MAX_HEAD, MAX_NAMED_TARGET, WarnDecision, accept_loop, gate_verdict,
+        max_frame, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry};
 
@@ -2594,6 +2737,255 @@ mod tests {
                 Err(_) => panic!("the gate left the silent guest's connection hanging"),
             }
         }
+    }
+
+    /// The guest source a test scripts by hand: the connections and the accept
+    /// failures to hand [`accept_loop`], in the order the test says and no
+    /// sooner, so the loop's failure handling can be driven without first
+    /// having to hit a real process fd limit. A script that runs out is a test
+    /// bug, so it panics rather than answer an accept silently.
+    struct ScriptedGuests(mpsc::UnboundedReceiver<io::Result<UnixStream>>);
+
+    impl GuestSource for ScriptedGuests {
+        #[expect(
+            clippy::manual_async_fn,
+            reason = "an `async fn` in a trait returns a future that is not known `Send`, and the \
+                      loop this feeds is spawned on the tokio runtime"
+        )]
+        fn accept(&mut self) -> impl Future<Output = io::Result<UnixStream>> + Send {
+            async {
+                self.0
+                    .recv()
+                    .await
+                    .expect("the script ran out before the test was done accepting")
+            }
+        }
+    }
+
+    /// The guest connections and accept failures the accept-loop tests share:
+    /// a stand-in switch behind `switch_sock`, the gate's log captured, and
+    /// the loop started on a scripted source with a ready-made channel to feed
+    /// it through.
+    async fn loop_over_script(
+        switch_sock: &std::path::Path,
+        table: &super::BoxTable,
+    ) -> (
+        mpsc::UnboundedSender<io::Result<UnixStream>>,
+        tokio::task::JoinHandle<()>,
+        CaptureWriter,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let (log, guard) = capture_log();
+        let (feed, script) = mpsc::unbounded_channel();
+        let accept = tokio::spawn(accept_loop(
+            ScriptedGuests(script),
+            switch_sock.to_path_buf(),
+            table.clone(),
+            Arc::new(DropLimiter::new()),
+        ));
+        (feed, accept, log, guard)
+    }
+
+    /// An accept failure the host can ride out is ridden out: a momentary fd
+    /// or memory shortage — the failure a long-lived host daemon holding a
+    /// socket and a dial per live relay can be pushed into, and one this loop
+    /// used to read as the listener's own end — costs a backoff and one line,
+    /// not the gate, every live relay, and every box's egress for the rest of
+    /// the VM's life. The connection already relayed still relays, and the
+    /// next one is served.
+    #[tokio::test]
+    async fn a_transient_accept_failure_is_ridden_out_and_keeps_the_gate_serving() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let table = registry.table();
+        let dir = TempDir::new().expect("a tempdir is creatable");
+        let switch_sock = dir.path().join("gvproxy-switch.sock");
+        // The stand-in switch: a listener the gate's handshake dials.
+        let listener = UnixListener::bind(&switch_sock).expect("binding the stand-in switch");
+
+        // The gate's first connection: a real one, already connected, so what
+        // happens to a live relay across the failure is observable.
+        let (mut guest, gate_end) = UnixStream::pair().expect("pairing the guest's socket");
+        let (feed, accept, log, _guard) = loop_over_script(&switch_sock, &table).await;
+        feed.send(Ok(gate_end))
+            .expect("queueing the first connection");
+
+        // Complete the first connection's upgrade: the gate dials, the guest
+        // speaks, the head is forwarded verbatim.
+        let (mut switch_one, _) = listener.accept().await.expect("accepting the gate's dial");
+        guest
+            .write_all(CONNECT_REQUEST)
+            .await
+            .expect("writing the upgrade head");
+        let mut head = vec![0u8; CONNECT_REQUEST.len()];
+        read_within(&mut switch_one, &mut head).await;
+        assert_eq!(
+            head, CONNECT_REQUEST,
+            "the gate forwards the upgrade head verbatim"
+        );
+
+        // Now the transient failure: the process fd limit, which `std` leaves
+        // uncategorized and which the gate must not read as a dead listener.
+        feed.send(Err(io::Error::from_raw_os_error(libc::EMFILE)))
+            .expect("queueing the transient failure");
+        wait_for_log(&log, "accept failed transiently").await;
+        let logged = log.contents();
+        assert!(
+            logged.contains("the gate is retrying"),
+            "the retry line says the gate is staying up, got: {logged}"
+        );
+        assert!(
+            logged.contains("rule_matched=\"egress-accept-failed\""),
+            "the retry line names its own class, got: {logged}"
+        );
+        assert!(
+            !logged.contains("the gate has stopped"),
+            "a transient failure is not the listener's own end, got: {logged}"
+        );
+
+        // The live relay is untouched: while the gate is backing off, a frame
+        // the box declared still goes through, decided by the table.
+        let declared = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut guest, &declared).await;
+        let seen = expect_frame(&mut switch_one).await;
+        assert_eq!(
+            seen, declared,
+            "a live relay still relays through the gate's transient failure"
+        );
+
+        // And the connection after the failure is served: accepted past the
+        // backoff, dialed for, and its head forwarded.
+        let (mut guest_two, gate_end_two) = UnixStream::pair().expect("pairing a second guest");
+        feed.send(Ok(gate_end_two))
+            .expect("queueing the post-failure connection");
+        let (mut switch_two, _) = listener
+            .accept()
+            .await
+            .expect("accepting the gate's second dial");
+        guest_two
+            .write_all(CONNECT_REQUEST)
+            .await
+            .expect("writing the second upgrade head");
+        let mut head = vec![0u8; CONNECT_REQUEST.len()];
+        read_within(&mut switch_two, &mut head).await;
+        assert_eq!(
+            head, CONNECT_REQUEST,
+            "the gate serves the connection that arrives after the failure"
+        );
+        accept.abort();
+    }
+
+    /// An accept failure that really is the listener's own end stops the gate,
+    /// fail-closed: its relays are aborted with it — the guest's ends see the
+    /// close rather than a gate that stopped deciding frames silently — and
+    /// the loop's task ends, which is the other half of the distinction: a
+    /// gate that stops must actually stop.
+    #[tokio::test]
+    async fn a_fatal_accept_failure_stops_the_gate_and_its_live_relays() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let table = registry.table();
+        let dir = TempDir::new().expect("a tempdir is creatable");
+        let switch_sock = dir.path().join("gvproxy-switch.sock");
+        let listener = UnixListener::bind(&switch_sock).expect("binding the stand-in switch");
+
+        // One live connection, upgraded, so the relay the gate is holding is
+        // observable coming down with it.
+        let (guest, gate_end) = UnixStream::pair().expect("pairing the guest's socket");
+        let (feed, mut accept, log, _guard) = loop_over_script(&switch_sock, &table).await;
+        feed.send(Ok(gate_end)).expect("queueing the connection");
+        let (mut switch, _) = listener.accept().await.expect("accepting the gate's dial");
+        let mut guest = guest;
+        guest
+            .write_all(CONNECT_REQUEST)
+            .await
+            .expect("writing the upgrade head");
+        let mut head = vec![0u8; CONNECT_REQUEST.len()];
+        read_within(&mut switch, &mut head).await;
+        assert_eq!(
+            head, CONNECT_REQUEST,
+            "the gate forwards the upgrade head verbatim"
+        );
+
+        // The fatal failure: a descriptor no retry will bring back.
+        feed.send(Err(io::Error::from_raw_os_error(libc::EBADF)))
+            .expect("queueing the fatal failure");
+        wait_for_log(&log, "the gate has stopped").await;
+
+        // The live relay is down with the gate: the switch end sees the close,
+        // because the relay the loop owned was aborted when the loop ended.
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("the gate left {n} byte(s) for a relay it aborted"),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left a live relay past its own stop"),
+        }
+        // And the loop itself has ended: the task is no longer accepting, and
+        // a task that is no longer accepting is what "stopped" means here.
+        match tokio::time::timeout(DEADLINE, &mut accept).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("the accept loop joined on an error: {error}"),
+            Err(_) => panic!("the accept loop outlived the failure that stopped it"),
+        }
+    }
+
+    /// The accept loop's one decision, apart from the loop: which errors the
+    /// gate rides out and which stop it. The fd and memory shortages a
+    /// long-lived host daemon holding a socket and a dial per live relay can
+    /// be pushed into, and the death of one connection before it was handed
+    /// over, are per-attempt — they clear on their own, and a gate that died
+    /// on one would take every box's egress down with it. The errors that say
+    /// the listener itself is gone are fatal, because no retry will clear
+    /// them: the guest's next connect fails rather than reaching a gate that
+    /// has quietly stopped deciding frames.
+    #[test]
+    fn accept_failures_split_transient_from_fatal() {
+        let ride_out = [
+            libc::EMFILE,       // the process's fd limit
+            libc::ENFILE,       // the system's
+            libc::ENOMEM,       // no memory for the new connection
+            libc::ENOBUFS,      // no buffers for it
+            libc::ECONNABORTED, // it died before the gate was handed it
+            libc::EPROTO,
+        ];
+        for errno in ride_out {
+            assert_eq!(
+                AcceptFailure::of(&io::Error::from_raw_os_error(errno)),
+                AcceptFailure::RideOut,
+                "{errno} is a per-attempt failure, not the listener's end"
+            );
+        }
+        let fatal = [
+            libc::EBADF,    // the listener's descriptor is gone
+            libc::EINVAL,   // it is no longer willing to accept
+            libc::ENOTSOCK, // it was never a listener
+        ];
+        for errno in fatal {
+            assert_eq!(
+                AcceptFailure::of(&io::Error::from_raw_os_error(errno)),
+                AcceptFailure::Fatal,
+                "{errno} is the listener's own end"
+            );
+        }
+        // The same two per-attempt conditions in an error with no errno behind
+        // it — the shape `std` itself constructs — are read off the kind, and
+        // anything else is fatal.
+        assert_eq!(
+            AcceptFailure::of(&io::Error::new(io::ErrorKind::OutOfMemory, "no memory")),
+            AcceptFailure::RideOut,
+            "an out-of-memory accept is a per-attempt failure"
+        );
+        assert_eq!(
+            AcceptFailure::of(&io::Error::new(io::ErrorKind::ConnectionAborted, "aborted")),
+            AcceptFailure::RideOut,
+            "a connection that died before it was handed over is per-attempt"
+        );
+        assert_eq!(
+            AcceptFailure::of(&io::Error::new(io::ErrorKind::Unsupported, "not a socket")),
+            AcceptFailure::Fatal,
+            "an error that says nothing about the next attempt is fatal"
+        );
     }
 
     /// The pure decision, apart from the relay: the families that carry no
