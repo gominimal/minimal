@@ -66,6 +66,19 @@
 //! that carries any other address — the A records of an upstream path the
 //! question reached, RFC 1918, a public host — is refused by the rebinding
 //! intersection like any other infrastructure answer and pins nothing.
+//!
+//! The zone's host row is the one zone answer that never reaches the
+//! intersection (NET-003): inside a box, `host.min.internal` answers with
+//! the switch's NAT'd host alias — an address the infrastructure deny set
+//! names in its fixed range, because it is infrastructure by design — so
+//! its reply passes through, pins nothing, and warns nothing. The
+//! intersection would refuse the answer the spec mandates and the limiter
+//! would write a false infrastructure refusal for every box that resolves
+//! the host; refusing the *reach* is right — reach over the name is local
+//! reach under the box's egress rules, decided at connect by the frame
+//! verdict, never by a pin — and skipping the pass keeps that verdict the
+//! only decider without logging the lookup as a violation.
+//!
 //! What a box may then *do* with an admitted answer is the connect-time
 //! conjunction (NET-073): the sibling's ingress rules beside the resolving
 //! box's own egress ones.
@@ -262,6 +275,16 @@ pub(crate) struct DnsGate {
     /// The infrastructure deny set the intersection subtracts from every
     /// answer (design §5.3, NET-067).
     infrastructure: InfrastructureDenySet,
+    /// The subnet's host-alias address — the answer the zone's host row
+    /// (`host.min.internal`, NET-003) carries inside a box, and the one
+    /// the deny set above names in its fixed range, because the alias is
+    /// infrastructure by design. The row's reply never reaches the
+    /// intersection ([`Self::observe_response`]): the mandated answer would
+    /// be refused and warned as infrastructure, while the reach it grants
+    /// was never the intersection's to give — reach over the name is local
+    /// reach under the box's own egress rules, decided at connect by the
+    /// frame verdict, never by a pin.
+    host_alias: [u8; 4],
     /// The addresses admitted by resolution, each with the name that
     /// admitted it — §5.3's cap is per name, so the owner is what the cap
     /// counts — and the instant its window ends.
@@ -299,12 +322,16 @@ fn normalized(name: &str) -> String {
 impl DnsGate {
     /// Builds one box's gate at attach: the names its policy declared
     /// (normalized), the compiled egress rules the intersection reads, the
-    /// switch's infrastructure deny set, and the session's shared limiter.
+    /// switch's infrastructure deny set, the subnet's host-alias address
+    /// (the answer the zone's host row carries, NET-003 — the one address
+    /// the deny set names that the gate passes through without a refusal),
+    /// and the session's shared limiter.
     pub(crate) fn new(
         label: &str,
         policy: Option<&sessions::EgressPolicy>,
         rules: EgressRules,
         infrastructure: InfrastructureDenySet,
+        host_alias: [u8; 4],
         limiter: Arc<PolicyWarnLimiter>,
     ) -> Self {
         Self {
@@ -313,6 +340,7 @@ impl DnsGate {
                 .map(|hosts| hosts.iter().map(|host| normalized(host)).collect()),
             rules,
             infrastructure,
+            host_alias,
             admitted: Mutex::new(HashMap::new()),
             flows: Mutex::new(HashMap::new()),
             window: ADMISSION_WINDOW,
@@ -476,6 +504,22 @@ impl DnsGate {
                 _ => None,
             })
             .collect();
+        // The zone's host row (NET-003) is the one zone answer that names an
+        // infrastructure address by design: inside a box, `host.min.internal`
+        // answers with the switch's NAT'd host alias, which the deny set's
+        // fixed range names — so the intersection would refuse the mandated
+        // answer and the limiter would write a false infrastructure refusal
+        // for every box that resolves the host. The row's reply skips the
+        // pass entirely: it passes through (as every reply does), pins
+        // nothing, warns nothing — the reach it grants was never the
+        // intersection's to give (see the module doc). A reply to the row's
+        // name that carries any other address is not the row, and the
+        // intersection refuses it below like any other subverted zone answer.
+        if asked == super::switch::HOST_MIN_INTERNAL
+            && answers.iter().all(|answer| *answer == self.host_alias)
+        {
+            return;
+        }
         let split = egress::rebinding_intersection(
             &answers,
             super::dns::is_zone_name(&asked),
@@ -699,6 +743,14 @@ pub(crate) mod tests {
     /// resolution is keyed to the same resolver.
     pub(crate) const RESOLVER: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
 
+    /// The default switch subnet's host alias (its `broadcast - 1`): the
+    /// address `host.min.internal` answers a box with (NET-003), the one the
+    /// infrastructure deny set names in its fixed range and the host-row
+    /// carve-out is keyed to — the same derivation the relay harness's gates
+    /// are built with, so these fixtures and the relay-level proofs agree on
+    /// what the row's answer is.
+    const HOST_ALIAS: Ipv4Addr = Ipv4Addr::new(100, 64, 255, 254);
+
     /// The box that allows `github.com` and, by address, nothing else: TCP
     /// declared, no subnets, the one name — the proof sentence's box.
     fn github_only_egress() -> sessions::SessionPolicy {
@@ -837,7 +889,8 @@ pub(crate) mod tests {
     }
 
     /// A fresh gate over `policy`, on the default switch's resolver and
-    /// infrastructure set, for the unit tests that drive the gate directly.
+    /// infrastructure set and host alias, for the unit tests that drive the
+    /// gate directly.
     fn gate_for(policy: &sessions::SessionPolicy) -> DnsGate {
         let label = LEASE.to_string();
         DnsGate::new(
@@ -848,7 +901,8 @@ pub(crate) mod tests {
                 RESOLVER.octets(),
                 LEASE.octets(),
             ),
-            InfrastructureDenySet::new(RESOLVER.octets(), [100, 64, 0, 254]),
+            InfrastructureDenySet::new(RESOLVER.octets(), HOST_ALIAS.octets()),
+            HOST_ALIAS.octets(),
             Arc::new(PolicyWarnLimiter::new()),
         )
     }
@@ -1621,7 +1675,11 @@ pub(crate) mod tests {
     /// box's policy's — and the lease its answer carries is admitted as
     /// reach: the fabric plane, which the infrastructure deny set refuses
     /// for every name outside the zone, is carved out for the zone and is
-    /// the whole of its answer's reach. The carve-out is the zone's alone:
+    /// the whole of its answer's reach. The zone's host row is the one zone
+    /// answer that never meets the intersection (NET-003):
+    /// `host.min.internal` answers with the switch's NAT'd host alias, an
+    /// infrastructure address by design, so its reply passes through with no
+    /// refusal line and nothing admitted. The carve-out is the zone's alone:
     /// an ordinary name still needs its own entry, and a lookalike that
     /// merely ends in the zone's words pins nothing. Resolution itself
     /// stays honest in every case — each reply passes through to the box.
@@ -1676,6 +1734,84 @@ pub(crate) mod tests {
             .expect("the sibling's lease is reachable for the window")
             .expect("the switch side stays open");
         assert_eq!(out, connect, "a zone answer is admitted with no entry");
+
+        // The zone's host row (NET-003) is the one zone answer the
+        // intersection never sees: inside a box, `host.min.internal` answers
+        // with the switch's NAT'd host alias — an infrastructure address by
+        // design, named in the deny set's fixed range — so the mandated reply
+        // passes through, emits no refusal line, and admits nothing. Reach
+        // over the name is local reach under the box's own egress rules,
+        // decided at connect by the frame verdict, never by a pin.
+        let capture = captured_log();
+        let refusal_lines = || {
+            capture
+                .contents()
+                .matches("an allowed name resolved into a refused range")
+                .count()
+        };
+        let before = refusal_lines();
+        let host_query = udp_payload_frame(
+            LEASE,
+            40002,
+            RESOLVER,
+            53,
+            &dns_query("host.min.internal.", RecordType::A),
+        );
+        harness.box_end.write_all(&host_query).unwrap();
+        let host_forwarded =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                .await
+                .expect("the host row's query is forwarded")
+                .expect("the switch side stays open");
+        assert_eq!(
+            host_forwarded, host_query,
+            "the host row's lookup rides the resolver carve-out like any other"
+        );
+        // The row's answer is the attached switch's host alias — the same
+        // derivation the gate was built with, never a second spelling of it.
+        let alias = crate::net::SwitchSubnet::default().host_alias();
+        assert_eq!(alias, HOST_ALIAS, "the default subnet's host alias");
+        let host_reply = udp_payload_frame(
+            RESOLVER,
+            53,
+            LEASE,
+            40002,
+            &dns_response("host.min.internal.", &[alias]),
+        );
+        harness
+            .switch
+            .write_all(&wire_frame(&host_reply))
+            .await
+            .unwrap();
+        let host_passed = read_box_frame(&harness)
+            .await
+            .expect("the host row's reply passes through");
+        assert_eq!(
+            host_passed, host_reply,
+            "a reply is never kept from the box, the host row's included"
+        );
+        assert_eq!(
+            refusal_lines(),
+            before,
+            "the mandated host lookup is not logged as a refusal: {}",
+            capture.contents()
+        );
+
+        // And nothing was admitted: the connection to the alias is refused
+        // exactly as any undeclared destination — the carve-out never made
+        // the host a pin — the sentinel standing in for it.
+        let to_host = egress_tcp_frame(LEASE, alias, 8080);
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&to_host).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay keeps deciding")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "the host row's answer is never admitted as reach"
+        );
 
         // The carve-out is the zone's alone. An ordinary name with no entry
         // resolves — the reply passes through — but admits nothing; and a

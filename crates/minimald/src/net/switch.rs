@@ -665,8 +665,11 @@ pub(crate) const IPPROTO_TCP: u8 = 6;
 pub(crate) const IPPROTO_UDP: u8 = 17;
 
 /// The zone record name a box can resolve the host by (NET-003) — the name the
-/// deprecation notice tells a box to use instead of the literal.
-const HOST_MIN_INTERNAL: &str = "host.min.internal";
+/// deprecation notice tells a box to use instead of the literal. `pub(crate)`:
+/// the DNS gate answers for the same row, whose reply carries the switch's
+/// NAT'd host alias, and reads the name here rather than a second spelling
+/// of it.
+pub(crate) const HOST_MIN_INTERNAL: &str = "host.min.internal";
 
 /// The limiter key the deprecation notice logs under: its own rule, so a
 /// policy warning on the same relay never consumes the notice's interval and
@@ -930,14 +933,17 @@ impl SessionGate {
             subnet.host_alias().octets(),
         );
         let limiter = Arc::new(PolicyWarnLimiter::new());
-        // One DNS gate per box, sharing the limiter and the resolver address
+        // One DNS gate per box, sharing the limiter, the resolver address
         // the egress rules already resolved from `subnet` (NET-079's
-        // carve-out, the address this gate watches replies from).
+        // carve-out, the address this gate watches replies from), and the
+        // subnet's host alias — the answer the zone's host row carries
+        // (NET-003), which the gate passes through without a refusal.
         let dns = DnsGate::new(
             &label,
             policy.egress.as_ref(),
             rules.clone(),
             infrastructure,
+            subnet.host_alias().octets(),
             Arc::clone(&limiter),
         );
         Self {
@@ -996,6 +1002,13 @@ impl SessionGate {
     /// event is a bare SYN; a source that is not a live box on this daemon's
     /// switch (the resolver, the daemon's own relay, a box behind another
     /// daemon) finds no gate and keeps today's target-ingress-only behavior.
+    /// The box behind another daemon is ingress-only because no such source
+    /// can arrive on this switch, not because its egress goes unchecked:
+    /// each daemon's gvproxy is its own L2 segment, so no frame from that
+    /// box's switch lease ever rides this one, and its host-address reach
+    /// travels the host's loopback, where the host-side classifier owns the
+    /// per-box verdict (NET-078, NET-079) — this switch sees nothing of it
+    /// to check.
     ///
     /// One debug line per connection names both boxes and each side's verdict;
     /// a source refusal is also said through the shared limiter once per
