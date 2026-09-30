@@ -396,8 +396,10 @@ fn run_foreground() -> Result<()> {
     // can name: the guest node's own namespace, the daemon's root-netns tap,
     // whose reach is the allow-all interim until the node-plane baseline set is
     // enumerated (NET-130). Its address is this host's derivation from the
-    // subnet the switch was configured with, so the daemon keeps the egress it
-    // had before the gate existed — its own package fetches above all.
+    // registry's subnet, and the switch is configured with that same subnet
+    // below — one value handed to both, so the row's lease and the switch's
+    // address plan cannot drift apart. The daemon therefore keeps the egress
+    // it had before the gate existed, its own package fetches above all.
     let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
     boxes.register_node_namespace();
 
@@ -435,7 +437,7 @@ fn run_foreground() -> Result<()> {
                 binary,
                 switch_sock,
                 crate::net::DEFAULT_DATAPATH_CHECK_INTERVAL,
-                boxes.table(),
+                &boxes,
             ) {
                 Ok(gvproxy) => {
                     tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");

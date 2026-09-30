@@ -664,10 +664,18 @@ impl HostGvproxy {
     /// [`resolve_switch_sock`]); `datapath_check_interval` is the cadence of
     /// the periodic liveness probe that warns on a lost switch datapath
     /// ([`DEFAULT_DATAPATH_CHECK_INTERVAL`]; NET-023 — keep it under a
-    /// minute); `table` is the host-side table of published namespaces
+    /// minute); `registry` is the host-side table of published namespaces
     /// ([`crate::box_registry`]) the gate decides every frame leaving the VM
-    /// by. The gate binds the socket beside `switch_sock`
-    /// ([`resolve_gate_sock`]) and is started before readiness is reported,
+    /// by. One value wires both halves: the switch is configured with the
+    /// registry's subnet, and the gate gets the registry's read-only view, so
+    /// the rows a frame is decided by can never be compiled against an
+    /// address plan the switch does not serve — a drift that would leave the
+    /// daemon's own frames dropped as an unknown source. The registry is
+    /// borrowed, not taken: the caller keeps holding it as the registration
+    /// surface, and the view the gate holds shares its rows, so every later
+    /// registration reaches the running gate. The gate binds the socket
+    /// beside `switch_sock` ([`resolve_gate_sock`]) and is started before
+    /// readiness is reported,
     /// so the guest that boots next meets a listening gate, never an open
     /// switch; a gate that cannot bind its socket is a host that cannot
     /// enforce egress, so the bring-up fails rather than booting wide open.
@@ -683,10 +691,15 @@ impl HostGvproxy {
         binary: PathBuf,
         switch_sock: PathBuf,
         datapath_check_interval: Duration,
-        table: crate::box_registry::BoxTable,
+        registry: &crate::box_registry::BoxRegistry,
     ) -> io::Result<Self> {
         let config = GvproxyConfig::new(binary, switch_sock)
-            .with_datapath_check_interval(datapath_check_interval);
+            .with_datapath_check_interval(datapath_check_interval)
+            // The switch serves the registry's address plan — the same subnet
+            // its rows were compiled against — so a lease the gate checks a
+            // frame's source by is one the switch actually routes.
+            .with_subnet(registry.subnet());
+        let table = registry.table();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u32>>();
 
@@ -1232,12 +1245,12 @@ mod tests {
         );
     }
 
-    /// An empty host-side box table for the supervision tests: no frames flow
-    /// through a stand-in switch, so the table's contents are not what these
-    /// tests are about — only that the switch runtime starts the gate with
-    /// one.
-    fn empty_box_table() -> crate::box_registry::BoxTable {
-        crate::box_registry::BoxRegistry::new(SwitchSubnet::default()).table()
+    /// An empty host-side box registry for the supervision tests: no frames
+    /// flow through a stand-in switch, so the rows are not what these tests
+    /// are about — only that the switch runtime starts the gate with the
+    /// registry's view of them (and is configured with its subnet).
+    fn empty_box_registry() -> crate::box_registry::BoxRegistry {
+        crate::box_registry::BoxRegistry::new(SwitchSubnet::default())
     }
 
     #[test]
@@ -1255,7 +1268,7 @@ mod tests {
             stayalive_gvproxy(dir.path()),
             sock,
             DEFAULT_DATAPATH_CHECK_INTERVAL,
-            empty_box_table(),
+            &empty_box_registry(),
         )
         .expect("spawn host gvproxy");
         let pid = gvproxy.pid();
@@ -1282,7 +1295,7 @@ mod tests {
             stayalive_gvproxy(dir.path()),
             sock,
             DEFAULT_DATAPATH_CHECK_INTERVAL,
-            empty_box_table(),
+            &empty_box_registry(),
         )
         .expect("spawn host gvproxy");
         let pid = gvproxy.pid();
@@ -1302,7 +1315,7 @@ mod tests {
             PathBuf::from("/nonexistent/definitely/not/gvproxy"),
             sock,
             DEFAULT_DATAPATH_CHECK_INTERVAL,
-            empty_box_table(),
+            &empty_box_registry(),
         )
         .expect_err("spawning a missing binary must fail");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
@@ -1322,7 +1335,7 @@ mod tests {
             stayalive_gvproxy(dir.path()),
             sock.clone(),
             DEFAULT_DATAPATH_CHECK_INTERVAL,
-            empty_box_table(),
+            &empty_box_registry(),
         )
         .expect("spawn host gvproxy");
 
@@ -1340,6 +1353,43 @@ mod tests {
             "the gate is listening before the switch runtime reports ready"
         );
 
+        gvproxy.stop();
+    }
+
+    /// NET-081/NET-138: the switch the gate guards is configured with the
+    /// registry's subnet — the address plan the gate's rows compile against —
+    /// not a default the two halves merely share today. A registry built for
+    /// another plan hands the gate rows keyed to addresses that plan routes,
+    /// which is the only way a node row can keep matching the switch it
+    /// leaves frames on.
+    #[test]
+    fn host_gvproxy_serves_the_registrys_subnet() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let sock = dir.path().join("gvproxy-switch.sock");
+        let _switch_listener =
+            std::os::unix::net::UnixListener::bind(&sock).expect("bind stand-in switch socket");
+        // Not the default plan: the default is what the registry and the config
+        // coincidentally use anyway, so it could not tell the coupling from
+        // the coincidence.
+        let subnet =
+            SwitchSubnet::new(Ipv4Addr::new(100, 80, 0, 0), 16).expect("a /16 is a valid plan");
+        let registry = crate::box_registry::BoxRegistry::new(subnet);
+        let gvproxy = HostGvproxy::spawn(
+            stayalive_gvproxy(dir.path()),
+            sock,
+            DEFAULT_DATAPATH_CHECK_INTERVAL,
+            &registry,
+        )
+        .expect("spawn host gvproxy");
+
+        // The config the runtime hands gvproxy carries that plan, so the
+        // switch serves the very subnet the gate's rows were keyed to.
+        let config = dir.path().join("gvproxy.yaml");
+        let yaml = std::fs::read_to_string(&config).expect("the switch runtime wrote its config");
+        assert!(
+            yaml.contains("subnet: \"100.80.0.0/16\""),
+            "the switch serves the registry's subnet, not a default one, got: {yaml}"
+        );
         gvproxy.stop();
     }
 
