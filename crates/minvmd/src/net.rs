@@ -45,8 +45,12 @@
 //! of published namespaces ([`crate::box_registry`], NET-138) — per source
 //! address, by the rules the namespace's row compiled from its declaration —
 //! and relays only what its verdict admits on to the switch. A frame whose
-//! source address no namespace holds never leaves the VM. The gate lives and
-//! dies with the switch runtime it was started on.
+//! source is an address the plan could never hand to a box never leaves the
+//! VM; an address the plan could hand out but no namespace holds is the
+//! announced interim's — admitted, and warned as such, until the
+//! creator-side registration (T66, #1711) supplies the rows the per-box
+//! default binds to ([`egress_gate`] carries the phase and its reasons). The
+//! gate lives and dies with the switch runtime it was started on.
 
 use std::io;
 use std::net::Ipv4Addr;

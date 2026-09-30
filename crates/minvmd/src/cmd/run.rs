@@ -424,6 +424,17 @@ fn run_foreground() -> Result<()> {
     // below — one value handed to both, so the row's lease and the switch's
     // address plan cannot drift apart. The daemon therefore keeps the egress
     // it had before the gate existed, its own package fetches above all.
+    //
+    // An own-address box's lease is not a row this process can name: the guest
+    // daemon's own allocator mints it inside the VM, so no host-side process
+    // knows it — not this supervisor, and not the CLI that asked for the box.
+    // Until the creator-side registration (T66, #1711) supplies those rows,
+    // such a source is what the gate's announced interim is for: an address
+    // inside the plan's lease block but held by no row is admitted — with a
+    // warn naming T66 on every admit — so an own-address box keeps the egress
+    // it had before the gate existed, while everything outside the block, and
+    // every row that *is* published, stays exactly as decided.
+    // `UNREGISTERED_SOURCE_PHASE` (egress_gate) is the constant T66 flips.
     let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
     boxes.register_node_namespace();
 
