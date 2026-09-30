@@ -1097,14 +1097,23 @@ mod tests {
             // A unique source port per name so the DNS conntrack windows do not collide.
             let src_port = 40000 + u16::try_from(index).unwrap();
 
-            let query = udp_payload_frame(LEASE, src_port, RESOLVER, 53, &dns_query(name, RecordType::A));
+            let query = udp_payload_frame(
+                LEASE,
+                src_port,
+                RESOLVER,
+                53,
+                &dns_query(name, RecordType::A),
+            );
             harness.box_end.write_all(&query).unwrap();
             let forwarded =
                 tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
                     .await
                     .expect("the query is forwarded")
                     .expect("the switch side stays open");
-            assert_eq!(forwarded, query, "query for {name} reaches the resolver verbatim");
+            assert_eq!(
+                forwarded, query,
+                "query for {name} reaches the resolver verbatim"
+            );
 
             let response = dns_response(name, &[*address]);
             let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, src_port, &response);
@@ -1116,7 +1125,10 @@ mod tests {
             let passed = read_box_frame(&harness)
                 .await
                 .expect("the reply itself passes through to the box");
-            assert_eq!(passed, response_frame, "reply for {name} is never kept from the box");
+            assert_eq!(
+                passed, response_frame,
+                "reply for {name} is never kept from the box"
+            );
 
             // The pinned address completes a TCP flow — the only thing the
             // toolchain needs from each allowed name. Use a distinct, bounded
@@ -1150,7 +1162,10 @@ mod tests {
             forwarded, undeclared_query,
             "resolution itself is never blocked, only the resulting pin"
         );
-        let response = dns_response("not-in-allowlist.example.", &[Ipv4Addr::new(198, 51, 100, 7)]);
+        let response = dns_response(
+            "not-in-allowlist.example.",
+            &[Ipv4Addr::new(198, 51, 100, 7)],
+        );
         let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, 41000, &response);
         harness
             .switch
