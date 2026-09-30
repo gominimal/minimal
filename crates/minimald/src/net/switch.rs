@@ -2534,8 +2534,9 @@ pub(crate) mod tests {
         let mut source = spawn_relay_for(ZONE_SOURCE, Some(&zone_source_egress()), |_| {});
         let mut target = spawn_relay_for(ZONE_TARGET, Some(&zone_target_policy()), |_| {});
         // A new connection from either caller to the target, and the ARP
-        // sentinel that stands behind one: whatever has reached the target's
-        // box end when the sentinel does is everything the relay admitted.
+        // sentinel that stands behind a refused one: whatever has reached the
+        // target's box end when the sentinel does is everything the relay
+        // admitted.
         let connect =
             |src: Ipv4Addr, port: u16| egress_tcp_segment(src, 40000, ZONE_TARGET, port, SYN);
         let sentinel = arp_frame(ZONE_SOURCE);
@@ -2601,12 +2602,15 @@ pub(crate) mod tests {
             &dns_query("box-b.min.internal.", RecordType::A),
         );
         source.box_end.write_all(&query).unwrap();
-        let forwarded =
+        let forwarded_query =
             tokio::time::timeout(Duration::from_secs(5), read_framed(&mut source.switch))
                 .await
                 .expect("the query is forwarded")
                 .expect("the switch side stays open");
-        assert_eq!(forwarded, query, "a zone name needs no allowlist entry");
+        assert_eq!(
+            forwarded_query, query,
+            "a zone name needs no allowlist entry"
+        );
         let response = udp_payload_frame(
             RESOLVER,
             53,
