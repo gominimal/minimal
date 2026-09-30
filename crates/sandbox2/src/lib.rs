@@ -742,9 +742,10 @@ pub mod classifier {
 /// the supervised program execs, which is the correct moment for all three.
 /// For a box with a classifier leaf it joins the leaf, unshares the cgroup
 /// namespace onto it, and covers the tree the join went through with an
-/// empty read-only tmpfs; it takes the box's credentials, loads the `&'static` filter the `Container`
-/// holds if there is one, and then execs the original program, since
-/// `command_from_closure` otherwise replaces the program entirely.
+/// empty read-only tmpfs; it takes the box's credentials, loads the
+/// `&'static` filter the `Container` holds if there is one, and then execs
+/// the original program, since `command_from_closure` otherwise replaces
+/// the program entirely.
 ///
 /// `command_from_closure` starts a fresh `Command`, so the working directory
 /// and environment already set on `command` are carried over to it: hakoniwa
