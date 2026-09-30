@@ -700,8 +700,14 @@ impl HostnameRegistry {
             ports: ports.clone(),
         };
         self.by_lease.insert(lease, session_id);
-        let route = self.own_route(session_id, session_name, declared_keys(&ports));
+        // Recorded before the route is derived from it, so the route this
+        // registration installs already targets the lease it is reporting:
+        // [`Self::own_route`] reads the box's lease from this map, and a box
+        // that has just attached holds one — the first report is exactly the
+        // moment a VM host's route turns from the published address onto the
+        // lease, not the one case that misses it.
         self.own.insert(session_id, own);
+        let route = self.own_route(session_id, session_name, declared_keys(&ports));
         self.register(session_id, session_name, route)
     }
 
