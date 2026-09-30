@@ -67,6 +67,17 @@
 //! question reached, RFC 1918, a public host — is refused by the rebinding
 //! intersection like any other infrastructure answer and pins nothing.
 //!
+//! And the carve-out is the *resolution's* alone: a zone answer is
+//! validated by that intersection and never enters the pin table. The
+//! design's admission windows come from `egress.allow_dns_hosts` matches
+//! alone (§5.3), and a zone answer that became a pin would be a
+//! name-scoped grant of a sibling's lease — the one thing the connect-time
+//! half of NET-073 exists to refuse. A sibling is reached by a CIDR entry
+//! the box declared in `allow_subnets`, and what the zone's answer grants
+//! is the name's resolution, nothing more: the connection to it is decided
+//! by the resolving box's own egress rules and the target's ingress ones,
+//! never by a pin.
+//!
 //! The zone's host row is the one zone answer that never reaches the
 //! intersection (NET-003): inside a box, `host.min.internal` answers with
 //! the switch's NAT'd host alias — an address the infrastructure deny set
@@ -367,10 +378,13 @@ impl DnsGate {
         self.flow_idle_cap = cap;
     }
 
-    /// Whether `name` is one the box's policy allowed — the trigger for
-    /// pinning. An undeclared allowlist allows no name, with the box zone as
-    /// the one exception (NET-072): every attached box's name is registered
-    /// there, so a sibling resolves with no entry of the box's own.
+    /// Whether `name` is one whose replies this gate processes: a name the
+    /// box's `allow_dns_hosts` declared, or a box-zone name (NET-072), where
+    /// every attached box's name is registered by the daemon itself so a
+    /// sibling resolves with no entry of the box's own. Processing is not
+    /// pinning — a declared name's answers are pinned for their window
+    /// (§5.3), while a zone answer is validated and never pinned (see the
+    /// module doc).
     fn allows_name(&self, name: &str) -> bool {
         self.names
             .as_ref()
@@ -445,8 +459,11 @@ impl DnsGate {
     /// The ingress leg, NET-066 and NET-067: observes a datagram from `src`,
     /// and when it is a reply from this box's own resolver answering a query
     /// for a name the box allowed, splits its A answers by the rebinding
-    /// intersection — the survivors are admitted for the window, and each
-    /// refusal logs the name and the answer through the limiter.
+    /// intersection — the survivors of an ordinary name are admitted for the
+    /// window, each refusal logs the name and the answer through the limiter,
+    /// and a box-zone answer is validated by that same intersection and pins
+    /// nothing (NET-072: the carve-out is the resolution's alone; see the
+    /// module doc).
     ///
     /// Every failure mode is quiet by design: a datagram that is not from
     /// the resolver, not a reply, not parseable, or carrying no question
@@ -520,14 +537,35 @@ impl DnsGate {
         {
             return;
         }
+        let zone = super::dns::is_zone_name(&asked);
         let split = egress::rebinding_intersection(
             &answers,
-            super::dns::is_zone_name(&asked),
+            zone,
             self.rules.allow_subnets(),
             self.rules.deny_subnets(),
             &self.infrastructure,
         );
-        self.admit(&asked, &split.admitted, now);
+        // A zone answer is validated by the intersection above — each
+        // refusal below is logged like any other — and never pinned: the
+        // carve-out is the resolution's alone (NET-072), and reach to a
+        // sibling is the connect-time conjunction's to give (NET-073),
+        // decided by the box's declared subnets, never by a name's answer.
+        // An ordinary name's survivors keep their §5.3 window.
+        if zone {
+            if !split.admitted.is_empty() {
+                let addresses: Vec<Ipv4Addr> =
+                    split.admitted.iter().copied().map(Ipv4Addr::from).collect();
+                tracing::debug!(
+                    component = COMPONENT,
+                    session_id = %self.label,
+                    name = %asked,
+                    ?addresses,
+                    "validated a box-zone answer; it pins nothing, reach is decided at connect"
+                );
+            }
+        } else {
+            self.admit(&asked, &split.admitted, now);
+        }
         for (address, refusal) in split.refused {
             self.limiter.warn_dns_refusal(
                 &self.label,
@@ -1672,10 +1710,13 @@ pub(crate) mod tests {
     /// NET-072: a box-zone name resolves with no `egress.allow_dns_hosts`
     /// entry for it — every attached box's name is registered in the zone by
     /// the daemon itself, so the grant is the daemon's and not the resolving
-    /// box's policy's — and the lease its answer carries is admitted as
-    /// reach: the fabric plane, which the infrastructure deny set refuses
-    /// for every name outside the zone, is carved out for the zone and is
-    /// the whole of its answer's reach. The zone's host row is the one zone
+    /// box's policy's — and the answer is *validated*, never pinned: the
+    /// fabric plane, which the infrastructure deny set refuses for every
+    /// name outside the zone, is carved out for the zone and is the whole of
+    /// its answer's reach, while the reach to the lease it named stays the
+    /// connecting box's declared subnets' to give, never a name's — so the
+    /// connection to it is refused as any undeclared destination, and the
+    /// pin table holds no entry for it. The zone's host row is the one zone
     /// answer that never meets the intersection (NET-003):
     /// `host.min.internal` answers with the switch's NAT'd host alias, an
     /// infrastructure address by design, so its reply passes through with no
@@ -1711,7 +1752,8 @@ pub(crate) mod tests {
 
         // The resolver answers with the sibling's lease. The reply passes
         // through to the box — resolution is honest, and it is the connection
-        // that is governed — and the zone's carve-out admits the answer.
+        // that is governed — while the zone's carve-out validates the answer:
+        // in the plane, so nothing about it is refused, and pinned nowhere.
         let response = dns_response("box-b.min.internal.", &[sibling]);
         let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, 40000, &response);
         harness
@@ -1724,16 +1766,53 @@ pub(crate) mod tests {
             .expect("the reply itself passes through");
         assert_eq!(passed, response_frame, "a reply is never kept from the box");
 
-        // The sibling's lease is pinned: the connection completes with no
-        // allow entry naming it and no subnet declaring it — NET-072's
-        // carve-out at the gate, composed with NET-066's lift.
+        // The answer created no pin, so the connection to the lease it named
+        // is refused exactly as any undeclared destination — the sentinel
+        // stands in for it. The carve-out is the resolution's alone: what the
+        // zone's answer granted is the name's resolution, and the reach to
+        // the sibling is the box's declared subnets' to give at connection
+        // time, never a pin's (NET-073).
         let connect = egress_tcp_frame(LEASE, sibling, 8080);
+        let sentinel = arp_frame(LEASE);
         harness.box_end.write_all(&connect).unwrap();
-        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
             .await
-            .expect("the sibling's lease is reachable for the window")
+            .expect("the relay keeps deciding")
             .expect("the switch side stays open");
-        assert_eq!(out, connect, "a zone answer is admitted with no entry");
+        assert_eq!(
+            next, sentinel,
+            "a zone answer is never admitted as reach: it pinned nothing"
+        );
+
+        // And the pin table says so outright: the same reply observed on a
+        // gate of the same policy enters no admission window for the lease —
+        // the negative the relay-level refusal above stands on.
+        let gate = gate_for(&github_only_egress());
+        let now = Instant::now();
+        gate.observe_response(
+            &SocketAddrV4::new(RESOLVER, DNS_PORT),
+            &dns_response("box-b.min.internal.", &[sibling]),
+            now,
+        );
+        assert!(
+            !gate.admits_flow(sibling.octets(), None, now),
+            "a zone answer enters the pin table for no window"
+        );
+
+        // The contrast that names whose entries the box *did* declare: the
+        // same gate pins github.com's answer for its window, so the zone
+        // answer's refusal above is the carve-out's, not the gate's.
+        let pinned = Ipv4Addr::new(140, 82, 121, 3);
+        gate.observe_response(
+            &SocketAddrV4::new(RESOLVER, DNS_PORT),
+            &dns_response("github.com.", &[pinned]),
+            now,
+        );
+        assert!(
+            gate.admits_flow(pinned.octets(), None, now),
+            "a declared name's answer keeps its window"
+        );
 
         // The zone's host row (NET-003) is the one zone answer the
         // intersection never sees: inside a box, `host.min.internal` answers
