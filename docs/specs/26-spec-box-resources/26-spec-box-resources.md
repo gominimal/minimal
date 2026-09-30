@@ -169,7 +169,7 @@ memory than the host has is refused end to end, with the numbers, before any lim
 - **BRES-001** WHEN `minvmd` boots the guest and neither `MINVMD_VM_RAM_MIB` nor the persisted config sets guest RAM THE SYSTEM SHALL size the guest at the larger of the per-architecture constant (2048 MiB on x86_64, 4096 MiB on aarch64) and the smaller of one half of host memory and host memory minus a 4 GiB reserve.
   tier:     T1
   verify:   cargo nextest run -p minvmd prop_derived_guest_ram_never_below_arch_constant
-  property: For every host memory size and architecture, the derived guest RAM is at least that architecture's constant and, above twice the constant, at most the larger of that constant and host memory minus 4 GiB.
+  property: For every host memory size above twice the constant and each architecture, the derived guest RAM equals the larger of that architecture's constant and the smaller of one half of host memory and host memory minus 4 GiB, after BRES-002's rounding on x86_64; for every host size it is at least the constant.
 
 - **BRES-002** WHEN `minvmd` derives guest RAM on x86_64 and the derived value is from 3073 MiB to 6143 MiB inclusive THE SYSTEM SHALL round it down to 3072 MiB.
   tier:     T1
@@ -294,7 +294,7 @@ memory than the host has is refused end to end, with the numbers, before any lim
 - **BRES-031** WHEN admission resolves a box whose `ram` is omitted or `"auto"` THE SYSTEM SHALL resolve it to the host's default box size, one half of allocatable on `local0` and `local-minvmd0`, and record its source as `default`.
   tier:     T2
   verify:   cargo nextest run -p minimald auto_ram_resolves_to_half_allocatable
-  property: For every allocatable above zero, the default box size is less than all of it; at an allocatable of zero no box is admitted.
+  property: For every allocatable, the default box size equals one half of it rounded down, so above zero it is less than all of it; at an allocatable of zero no box is admitted.
   harness:  `crates/sessions/src/core/admission.rs` `kani_default_box_size_below_allocatable`, 8 boxes in all (7 counted plus the new one), symbolic `u64` byte sizes, `#[kani::unwind(9)]`
 
 - **BRES-032** WHEN a box's `ram` is written THE SYSTEM SHALL write exactly that value to the leaf's `memory.max`, without clamping or shrinking it, so that the leaf's `memory.max` reads back equal to the written `ram` rounded down to the host page size, and record its source as `entry`, enforced by `minimald` and the kernel outside the box, on the host side of TB2 (inside the guest on `local-minvmd0`, on the developer's machine on `local0`), against every process in the box including root inside it.
@@ -314,7 +314,7 @@ memory than the host has is refused end to end, with the numbers, before any lim
     tier:   T0
     verify: cargo nextest run -p minimald local0_capacity_at_or_below_reserve_refuses_every_box
 
-- **BRES-035** WHEN admission refuses a box with exit 8 because it does not fit (BRES-034) or its reservation cannot be met (BRES-038, BRES-039) THE SYSTEM SHALL carry the machine form `{"schema":"min/v1/error","code":"insufficient_resources",…}` with the dimension, the requested size and the layer it came from, the host's allocatable and allocated, and the remedy (omit `ram`, or give the host more memory), enforced by the Box Host daemon at admission, on the host side of TB2.
+- **BRES-035** WHEN admission refuses a box with exit 8 because it does not fit (BRES-034) or its reservation cannot be met (BRES-038, BRES-039) THE SYSTEM SHALL carry the machine form `{"schema":"min/v1/error","code":"insufficient_resources",…}` with the dimension, the requested size and the layer it came from, the host's allocatable and allocated, and the remedy for the refused dimension (for `ram`: omit `ram`, or give the host more memory; for `cpus` or `disk`: write a smaller value, or give the host more of it), enforced by the Box Host daemon at admission, on the host side of TB2.
   tier:     T2
   verify:   cargo nextest run -p minimald exit_8_refusal_carries_insufficient_resources_figures
   property: Every fit or reservation refusal carries the `min/v1/error` machine form with the requested size, its layer, and the host's allocatable and allocated as admission computed them.
@@ -422,6 +422,9 @@ memory than the host has is refused end to end, with the numbers, before any lim
   tier:     T1
   verify:   cargo nextest run -p minimald prop_missed_oom_kills_counted_at_next_tick
   property: For every pair of successive cumulative `oom_kill` snapshots, however many ticks lie between them, the next tick reports exactly the difference for each leaf, or the new value where the counter went down, so no kill is lost or counted twice.
+  - WHEN `minimald` removes a box's leaf THE SYSTEM SHALL read the leaf's `memory.events` once more first and account any `oom_kill` increase since the last sample, so a kill between the last tick and the box's end is not lost.
+    tier:   T0
+    verify: cargo nextest run -p minimald leaf_removal_accounts_final_oom_kills
 
 - **BRES-055** THE SYSTEM SHALL emit the pressure and OOM-kill log lines as `tracing` events with the structured fields `box_id`, `box_name`, `oom_kills`, `task` and `psi_some_avg10`.
   tier:     T0
@@ -739,9 +742,10 @@ against root inside the box.
 The epic's hard constraint follows from those four:
 
 - **Invariant:** THE SYSTEM SHALL, on a host that reports `enforced`, confine every out-of-memory
-  kill a box causes to that box, never another box or the daemon.
-  enforced by: the kernel's OOM killer acting within the leaf and the subtree above; Minimal
-  itself never kills for memory, clamps or shrinks a size
+  kill caused by a box reaching its own `memory.max` to that box, and every kill caused by the
+  boxes subtree reaching allocatable to the boxes subtree, never the daemon.
+  enforced by: the kernel's OOM killer, which acts within the cgroup whose limit was reached;
+  Minimal itself never kills for memory, clamps or shrinks a size
   covered by: BRES-020, BRES-024, BRES-025, BRES-028, BRES-032, BRES-044, BRES-045, BRES-046
 
 The other invariants:
@@ -765,7 +769,11 @@ The other invariants:
 Isolation Model). All four controls sit on the host side of TB2, so a box that crosses TB2 is
 outside every one of them, and this spec claims nothing about memory after that escape. AT26's
 own residuals (overcommit, swap contention, and an `advisory` host enforcing none of this) stand
-unchanged.
+unchanged. Two follow from the hard constraint's scope: when overcommitted boxes together reach
+allocatable, the kernel may kill in a box other than the one that grew, protected only by each
+box's `memory.min`; and on `local0` a machine-wide OOM caused by processes outside the boxes
+subtree is outside every claim here, since the reserve is a figure admission subtracts, not a
+limit on the rest of the desktop.
 
 ## Open questions
 
