@@ -828,6 +828,32 @@ mod tests {
         BTreeMap::from([(18080, 8080)])
     }
 
+    /// NET-072's name boundary: the zone the gate carves out of the
+    /// infrastructure deny set is the zone's own apex and the names under it —
+    /// never a name that merely carries the zone's words. The matcher mirrors
+    /// the answerer's `in_zone` suffix match, so the two layers cannot drift
+    /// apart on a lookalike.
+    #[test]
+    fn is_zone_name_matches_the_zone_apex_and_its_names_only() {
+        assert!(is_zone_name(HOSTNAME_SUFFIX), "the apex is the zone");
+        assert!(is_zone_name("web.min.internal"), "a box name is the zone");
+        assert!(
+            is_zone_name("host.min.internal"),
+            "the host record is the zone"
+        );
+        assert!(
+            is_zone_name("web.local.min.internal"),
+            "the deprecated three-label form is the zone too (NET-002)"
+        );
+        // Lookalikes are not: the zone's words inside a longer name, or glued
+        // to a label without the separating dot.
+        assert!(!is_zone_name("min.internal.example.com"));
+        assert!(!is_zone_name("web.min.internal.example.com"));
+        assert!(!is_zone_name("webmin.internal"));
+        assert!(!is_zone_name("example.com"));
+        assert!(!is_zone_name(""), "no name is no zone");
+    }
+
     /// Proof artifact 1 (registry/proxy contract): registering a `HostNet`
     /// PTask makes the host-side proxy route its `Host:` header to `127.0.0.1`;
     /// deregistering withdraws it so the proxy no longer routes it. `*.min.internal`

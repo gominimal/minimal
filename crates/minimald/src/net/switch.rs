@@ -2410,6 +2410,264 @@ pub(crate) mod tests {
         assert_eq!(next, allowed, "TCP to the declared subnet completes");
     }
 
+    /// The source box of the box-zone connection proof: TCP declared, every
+    /// destination refused — the only reach it can ever hold is the one a
+    /// zone name's resolution granted, so what its half of the connect-time
+    /// conjunction admits is exactly the zone's answer and nothing else.
+    fn zone_source_egress() -> sessions::SessionPolicy {
+        sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy {
+                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: None,
+                deny_subnets: None,
+            }),
+            ingress: None,
+        }
+    }
+
+    /// The target box of the same proof: one published TCP port at its own
+    /// number — the internal port a direct connection terminates on — so its
+    /// ingress gate admits that port alone and every other port is a refusal
+    /// the source's half cannot lift.
+    fn zone_target_policy() -> sessions::SessionPolicy {
+        sessions::SessionPolicy {
+            egress: None,
+            ingress: Some(sessions::IngressPolicy {
+                port_mappings: vec![sessions::PortMapping {
+                    external_port: ZONE_TARGET_PORT,
+                    internal_port: ZONE_TARGET_PORT,
+                    proto: sessions::IpProto::Tcp,
+                }],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+        }
+    }
+
+    /// The two boxes the box-zone proofs connect, and the port the target
+    /// publishes. Leases no other proof uses: the source's gate is looked up
+    /// by lease in [`LIVE_GATES`], which is process-wide under the libtest
+    /// target's shared process.
+    const ZONE_SOURCE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 10);
+    const ZONE_TARGET: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 11);
+    const ZONE_TARGET_PORT: u16 = 8080;
+
+    /// NET-073 end to end, across two live boxes' relays — with NET-072's
+    /// resolution riding in front of it: a box that declared no destination
+    /// resolves its sibling's zone name with no allowlist entry for it, and
+    /// the connection that follows succeeds only when both boxes' rules allow
+    /// it. The connection is decided at the target's relay, on the SYN
+    /// itself, against both policies at once — the source's own egress
+    /// verdict, with the pin its own relay granted at resolution, beside the
+    /// target's ingress gate — and each decision is said in one debug line
+    /// carrying the source box, the target box and each side's verdict, while
+    /// each refusal is also a warn line through the shared limiter, so the
+    /// daemon log (the diagnostics bundle's tail) names both boxes and the
+    /// refusing rule for every refused box-zone connection.
+    #[tokio::test]
+    async fn box_zone_connection_enforced_at_connect() {
+        use crate::net::dns_gate::tests::{
+            RESOLVER, dns_query, dns_response, read_box_frame, udp_payload_frame, wire_frame,
+        };
+        use hickory_proto::rr::RecordType;
+
+        // The debug line is the test's window on the connect-time decision,
+        // so the capture reads at DEBUG — the harness's global capture reads
+        // at INFO and would never see it.
+        let capture = crate::test_harness::CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Both boxes' relays are live at once: the connection is judged by
+        // the source's *live* gate, so the source's relay must be running for
+        // its half to be consulted at all.
+        let mut source = spawn_relay_for(ZONE_SOURCE, Some(&zone_source_egress()), |_| {});
+        let mut target = spawn_relay_for(ZONE_TARGET, Some(&zone_target_policy()), |_| {});
+        // A new connection from the source box to the target, and the ARP
+        // sentinel that stands behind it: whatever has reached the target's
+        // box end when the sentinel does is everything the relay admitted.
+        let connect = |port| egress_tcp_segment(ZONE_SOURCE, 40000, ZONE_TARGET, port, SYN);
+        let sentinel = arp_frame(ZONE_SOURCE);
+
+        // Before the resolution, the source's own rules refuse the target:
+        // no subnet declares it and no name's answer has admitted it, so the
+        // SYN never reaches the box — even though the port it names is one
+        // the target publishes (the source's half is decided first, and a
+        // refused connection is never put to the target's ingress gate).
+        let refused = connect(ZONE_TARGET_PORT);
+        target
+            .switch
+            .write_all(&wire_frame(&refused))
+            .await
+            .unwrap();
+        target
+            .switch
+            .write_all(&wire_frame(&sentinel))
+            .await
+            .unwrap();
+        let reached = read_box_frame(&target)
+            .await
+            .expect("the relay keeps admitting what its rules allow");
+        assert_eq!(
+            reached, sentinel,
+            "a connection the source's rules refuse never reaches the target box"
+        );
+        // Both halves are said — and the refusal is the source's, named under
+        // the source's own label, exactly as its egress leg would have said
+        // it had the frame come from the box instead.
+        let logged = capture.contents();
+        for expected in [
+            "box-zone connection decided at connect",
+            "source=100.64.0.10",
+            "target=100.64.0.11",
+            "source_pass=false",
+            "target_pass=true",
+            "port=8080",
+            "network policy violation",
+            "session_id=\"100.64.0.10\"",
+            "direction=egress",
+            "remote_addr=100.64.0.11:8080",
+            "rule_matched=\"egress-undeclared-subnet\"",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
+
+        // NET-072 rides in: the source resolves the sibling by name with no
+        // allowlist entry for it — the query rides the resolver carve-out,
+        // and the answer's address is admitted by the zone alone.
+        let query = udp_payload_frame(
+            ZONE_SOURCE,
+            40000,
+            RESOLVER,
+            53,
+            &dns_query("box-b.min.internal.", RecordType::A),
+        );
+        source.box_end.write_all(&query).unwrap();
+        let forwarded =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut source.switch))
+                .await
+                .expect("the query is forwarded")
+                .expect("the switch side stays open");
+        assert_eq!(forwarded, query, "a zone name needs no allowlist entry");
+        let response = udp_payload_frame(
+            RESOLVER,
+            53,
+            ZONE_SOURCE,
+            40000,
+            &dns_response("box-b.min.internal.", &[ZONE_TARGET]),
+        );
+        source
+            .switch
+            .write_all(&wire_frame(&response))
+            .await
+            .unwrap();
+        let passed = read_box_frame(&source)
+            .await
+            .expect("the reply itself passes through");
+        assert_eq!(passed, response, "resolution is honest, reach is governed");
+
+        // And now the same connection completes: the source's half admits the
+        // address the zone's answer granted, the target's half admits the
+        // port it publishes, and the SYN reaches the box exactly as the
+        // switch sent it. Nothing is logged against it.
+        let allowed = connect(ZONE_TARGET_PORT);
+        target
+            .switch
+            .write_all(&wire_frame(&allowed))
+            .await
+            .unwrap();
+        let reached = read_box_frame(&target)
+            .await
+            .expect("both halves allow: the SYN reaches the target box");
+        assert_eq!(reached, allowed);
+        let logged = capture.contents();
+        for expected in ["source_pass=true", "target_pass=true", "port=8080"] {
+            assert!(
+                logged.contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
+        assert_eq!(
+            logged.matches("network policy violation").count(),
+            1,
+            "an allowed box-zone connection is not a violation: {logged}"
+        );
+
+        // The conjunction is real: a port the target did not declare is
+        // refused by the target's own ingress gate even though the source's
+        // half admits the address — the source's pin names a box, not a
+        // right to every port on it.
+        let undeclared = connect(9999);
+        target
+            .switch
+            .write_all(&wire_frame(&undeclared))
+            .await
+            .unwrap();
+        target
+            .switch
+            .write_all(&wire_frame(&sentinel))
+            .await
+            .unwrap();
+        let next = read_box_frame(&target)
+            .await
+            .expect("the relay keeps admitting what its rules allow");
+        assert_eq!(
+            next, sentinel,
+            "an undeclared port is refused, source's half or no source's half"
+        );
+        let logged = capture.contents();
+        for expected in [
+            "source_pass=true",
+            "target_pass=false",
+            "port=9999",
+            // The refusal is the target's own, under the target's own label,
+            // naming the source box that came (`remote_addr` is the peer on
+            // an ingress line) and the port it came to.
+            "session_id=\"100.64.0.11\"",
+            "direction=ingress",
+            "remote_addr=100.64.0.10:40000",
+            "dst_port=9999",
+            "rule_matched=\"no ingress mapping\"",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
+
+        // A source that is not a live box on this daemon's switch — the
+        // resolver itself, here — finds no gate and keeps the target's own
+        // ingress decision alone: the fabric's traffic is never put to a
+        // box's egress rules, and no connect-time line is said for it.
+        let fabric = egress_tcp_segment(RESOLVER, 53, ZONE_TARGET, ZONE_TARGET_PORT, SYN);
+        target.switch.write_all(&wire_frame(&fabric)).await.unwrap();
+        let last = read_box_frame(&target)
+            .await
+            .expect("the target's own ingress decides fabric traffic");
+        assert_eq!(last, fabric);
+        let logged = capture.contents();
+        assert_eq!(
+            logged
+                .matches("box-zone connection decided at connect")
+                .count(),
+            3,
+            "one debug line per box-zone connection, and none for the fabric's: {logged}"
+        );
+        assert_eq!(
+            logged.matches("network policy violation").count(),
+            2,
+            "each refusal says its own line, and nothing else does: {logged}"
+        );
+    }
+
     #[test]
     fn frame_header_is_little_endian_length() {
         // The HyperKit framing the relay emits: a 2-byte LE length prefix.
