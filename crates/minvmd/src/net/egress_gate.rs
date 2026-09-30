@@ -210,8 +210,8 @@ async fn accept_loop(
 
 /// Serves one guest connection end to end: dial the switch this gate fronts,
 /// forward the upgrade head the guest wrote verbatim, then relay frames both
-/// ways for as long as the guest stays connected — egress through the
-/// verdict, ingress untouched.
+/// ways for as long as the connection lives — until either the guest or the
+/// switch goes away — egress through the verdict, ingress untouched.
 ///
 /// `handshake_timeout` bounds everything up to and including the forwarded
 /// head. It is a parameter only so a test can shrink it; every caller outside
@@ -278,20 +278,48 @@ async fn serve_connection(
     // Ingress (switch → guest), untouched and un-parsed. The gate's job is
     // the egress direction; what a box may receive is the target's ingress
     // policy, decided in the guest where its declarations are enforced.
-    // Aborted when the egress leg ends, which is the guest going away.
-    let ingress = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
-    let egress =
-        relay_guest_to_switch(Prefixed::new(carry, guest_rx), switch_tx, table, limiter).await;
-    ingress.abort();
-    match egress {
-        // The guest closed its side: the shuttle reconnects per boot and
-        // drops the connection at teardown.
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
-        Err(error) => {
-            tracing::warn!(%error, "egress gate relay ended on an error");
-        }
+    let mut ingress = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
+    let egress = relay_guest_to_switch(Prefixed::new(carry, guest_rx), switch_tx, table, limiter);
+    tokio::pin!(egress);
+    // The two legs race, because neither can see the other's end. The egress
+    // leg blocks on the guest, which has no reason to speak while it is idle,
+    // so it has no way to learn the switch hung up this one connection's end
+    // — the per-connection close a switch makes without the process exit the
+    // supervisor catches — and would otherwise hold the relay task, the gate's
+    // dial, and the switch write half open until the guest's next frame came
+    // and failed to write. The ingress leg ending is the only thing on this
+    // side that knows, so whichever leg ends first takes the relay down with
+    // it.
+    tokio::select! {
+        result = &mut egress => match result {
+            // The guest closed its side: the shuttle reconnects per boot and
+            // drops the connection at teardown.
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+            Err(error) => {
+                tracing::warn!(%error, "egress gate relay ended on an error");
+            }
+        },
+        result = &mut ingress => match result {
+            // The switch closed its side of the connection while the guest was
+            // still on it: the guest's egress is down, so say so — the guest
+            // has nothing else to tell it why — before the relay comes off.
+            Ok(Ok(())) => tracing::warn!(
+                "the switch closed its side of the connection; the egress gate \
+                 relay is down for it"
+            ),
+            Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "egress gate ingress leg ended on an error");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "egress gate ingress leg ended");
+            }
+        },
     }
+    // The leg that lost the race is torn down with the relay, not left to
+    // hold what the guest or the switch end of it was holding.
+    ingress.abort();
 }
 
 /// switch → guest, untouched. The gate applies no ingress policy and parses
@@ -1249,6 +1277,41 @@ mod tests {
             Ok(Ok(n)) => panic!("{n} byte(s) arrived at the switch past the head"),
             Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
             Err(_) => panic!("the gate left the switch side hanging"),
+        }
+    }
+
+    /// The relay ends when either leg ends, not only when the guest goes away:
+    /// a switch that closes this one connection's end — without the whole
+    /// gvproxy process exiting behind it, which the supervisor catches and
+    /// tears the gate down for — must not leave the egress leg waiting on a
+    /// guest that is idle and has nothing more to send. The ingress leg's
+    /// completion is raced against the egress leg, so the relay, the gate's
+    /// dial, and the switch write half come down at once, with a line saying
+    /// which leg ended, instead of lingering until the guest's next frame.
+    #[tokio::test]
+    async fn a_switch_that_hangs_up_takes_the_relay_down_with_it() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_over(registry).await;
+
+        // The switch hangs up while the guest is on the connection and idle:
+        // no frame is in flight, so nothing but this close can end the relay.
+        h.switch
+            .shutdown()
+            .await
+            .expect("closing the stand-in switch's end");
+
+        // The gate says which leg ended — the line a bundle's daemon log tail
+        // carries for a box whose egress went dark with the guest still there.
+        wait_for_log(&h, "the switch closed its side of the connection").await;
+        // And the guest's side comes down with the relay, promptly, rather
+        // than hanging on until its next frame finds nowhere to write.
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, h.guest.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("the gate left {n} byte(s) for a hung-up-on guest to read"),
+            Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
+            Err(_) => panic!("a hung-up switch left the relay up past {DEADLINE:?}"),
         }
     }
 
