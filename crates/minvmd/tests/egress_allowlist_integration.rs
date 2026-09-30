@@ -2,10 +2,11 @@
 //!
 //! Boots a real microVM with the guest `minimald`, creates an `OwnIp` box whose
 //! egress is only a list of toolchain hostnames, then runs the actual toolchain
-//! operations inside it: apt update, git clone, npm install, pip install, and a
-//! container image pull with `skopeo`. The VM's only path out is through the
-//! host gvproxy switch; the guest's relay enforces the DNS-pinned hostname
-//! allowlist at the VM boundary.
+//! operations inside it: git clone, npm install, pip install, and a container
+//! image pull with `skopeo`. The VM's only path out is through the host gvproxy
+//! switch; the guest's relay enforces the DNS-pinned hostname allowlist at the
+//! VM boundary. The composed box has no Debian userland, so apt is not exercised
+//! (recorded as a NET-068 deviation in the PR body).
 //!
 //! Gates:
 //! - `#[cfg(minvmd_libkrun)]`: needs libkrun (macOS, or Linux with libkrun).
@@ -54,7 +55,7 @@ fn minvmd_bin() -> std::ffi::OsString {
 }
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
-const EXEC_TIMEOUT: Duration = Duration::from_secs(180);
+const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Env var the server reads to scope an exec to a session.
 const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
@@ -178,12 +179,14 @@ impl Guest {
         }
     }
 
-    /// Return the bytes appended to the guest boot log since the last call,
+    /// Return the lines appended to the guest boot log since the last call,
     /// so each tool failure is paired with the admissions/drops that happened
-    /// while it ran. Falls back to a literal reason if the log is not present.
+    /// while it ran. The tail is filtered to DNS-gate and policy lines so a
+    /// chatty tool cannot push the admission/refusal evidence out of the cap,
+    /// and invalid UTF-8 is replaced rather than losing the whole tail.
     fn tail_boot_log(&mut self) -> String {
-        let contents = match std::fs::read_to_string(&self.boot_log_path) {
-            Ok(c) => c,
+        let contents = match std::fs::read(&self.boot_log_path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(e) => return format!("(no boot log at {}: {e})", self.boot_log_path.display()),
         };
         let total_len = contents.len();
@@ -194,9 +197,19 @@ impl Guest {
             &contents[..]
         };
         self.boot_log_offset = total_len;
-        // Capped generously: a single tool can produce many lines, but we want
-        // the admissions/refusals at the tail to stay readable.
-        let mut lines: Vec<&str> = tail.lines().rev().take(80).collect();
+        // Keep only the evidence the DNS gate and policy warnings emit; the
+        // diagnostics requirement is to name the host that was not admitted.
+        let mut lines: Vec<&str> = tail
+            .lines()
+            .filter(|line| {
+                line.contains("dns-gate")
+                    || line.contains("admitted")
+                    || line.contains("refused")
+                    || line.contains("rule_matched")
+            })
+            .rev()
+            .take(120)
+            .collect();
         lines.reverse();
         lines.join("\n")
     }
@@ -243,8 +256,11 @@ async fn hostname_allowlist_toolchain_completes() {
     }
     let session_id = session_id.expect("failed to create toolchain session");
 
+    // Toolchain exercises: git, npm, pip, and a container pull. The composed
+    // box has no Debian userland or `apt` package, so the apt leg NET-068 named
+    // is not exercised here; the hostname-only allowlist still must admit every
+    // host these four tools contact.
     let tools = [
-        ("apt", "apt-get update -qq"),
         (
             "git",
             "git clone --depth 1 https://github.com/octocat/Hello-World /tmp/hello-world",
@@ -253,10 +269,10 @@ async fn hostname_allowlist_toolchain_completes() {
             "npm",
             "mkdir -p /tmp/npm-stub && cd /tmp/npm-stub && npm install is-odd --prefix .",
         ),
-        ("pip", "pip install --target /tmp/pip-stub requests"),
+        ("pip", "pip3 install --target /tmp/pip-stub requests"),
         (
             "skopeo",
-            "skopeo copy docker://docker.io/library/hello-world dir:/tmp/hw",
+            "skopeo --insecure-policy copy docker://docker.io/library/hello-world dir:/tmp/hw",
         ),
     ];
 
