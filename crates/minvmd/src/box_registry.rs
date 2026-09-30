@@ -9,8 +9,9 @@
 //! guest's shuttle and the switch socket. This module is the table that gate
 //! reads: one row per published namespace, holding its name, its addresses on
 //! the switch and on the loopback, the ports it admitted, and its compiled
-//! [`EgressRules`] — the same rule set the in-guest relay applies, now held
-//! where nothing inside the VM can change it.
+//! [`EgressRules`] — the rules the gate decides every frame by, the same set
+//! the in-guest relay applies, now held where nothing inside the VM can change
+//! it.
 //!
 //! The trust boundary is the type boundary. Rows are filled **in this
 //! process**, from the host side — the host's own derivation of the guest
@@ -42,12 +43,14 @@ const NODE_NAMESPACE: &str = "minimald";
 /// every time (a hash map's would vary run to run).
 type Rows = BTreeMap<[u8; 4], Arc<BoxRecord>>;
 
-/// One published namespace's row in the host-side table: what the gate needs
-/// to decide a frame from this namespace's address — its name (diagnostics),
-/// its switch address (the lease the shared verdict checks every frame's
-/// source against, NET-084), its loopback address, the ports it admitted, and
-/// its compiled egress rules. Owned outright, so no borrow of a client's
-/// declaration survives the registration that built it.
+/// One published namespace's row in the host-side table. Of what it holds,
+/// two dimensions decide a frame from this namespace's address: its switch
+/// address, the lease the shared verdict checks every frame's source against
+/// (NET-084), and its compiled egress rules. The rest — its name
+/// (diagnostics), its loopback address, the ports it admitted — is the
+/// declaration itself, carried for the host-side paths that attach and name
+/// the namespace, not for the gate's per-frame verdict. Owned outright, so no
+/// borrow of a client's declaration survives the registration that built it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct BoxRecord {
     name: String,
@@ -79,6 +82,15 @@ impl BoxRecord {
 
     /// The ports this namespace admitted, in the order the declaration
     /// carried them.
+    ///
+    /// An **ingress** dimension: what may be sent *to* this namespace, which
+    /// the host attaches it by on the registration path (T66's client-driven
+    /// one, the same path that fills this table) — and deliberately not one
+    /// the egress gate decides a frame by. NET-081 binds egress only, so the
+    /// frame verdict reads [`Self::egress`] alone and never this. It is
+    /// carried in the row because NET-138's row holds a namespace's whole
+    /// declaration, where the attaching side reaches it without a second
+    /// table.
     #[must_use]
     pub fn admitted_ports(&self) -> &[u16] {
         &self.admitted_ports
@@ -121,7 +133,9 @@ impl BoxRegistration {
         }
     }
 
-    /// The ports this namespace admitted.
+    /// The ports this namespace admitted — the ingress dimension
+    /// [`BoxRecord::admitted_ports`] documents, not a dimension the gate's
+    /// frame verdict reads.
     #[must_use]
     pub fn with_admitted_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
         self.admitted_ports = ports.into_iter().collect();
