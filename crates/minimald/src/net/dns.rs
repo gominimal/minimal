@@ -1078,11 +1078,12 @@ pub(crate) fn host_component(host_header: &str) -> &str {
 // in that writing the record already means holding the filesystem identity
 // the daemon state root is protected by. Closing the cross-root half needs
 // the host-side answerer as the one arbiter over every root's allocation,
-// not a per-root file; that work is **not** in this change and no issue for
-// it exists yet — it is the follow-up this PR's body asks its reader to
-// file, as a host-side answerer serving the design's authenticated channel
-// (design §7.1, the answerer as the arbiter, "cross-node collisions
-// reported at session start"). Until it lands the collision report
+// not a per-root file. That work is outside this change and **no issue for
+// it exists**: the follow-up to file is a host-side answerer serving the
+// design's authenticated channel (design §7.1, the answerer as the
+// arbiter, "cross-node collisions reported at session start"), and the
+// change that shipped this interim carries the ask. Until it lands the
+// collision report
 // ([`LoopbackLeaseBook::unrecorded_publishes`]) is the half this record can
 // do on its own: the kernel's socket table is the one list of addresses that
 // is global to the whole host whatever record granted them, and every
