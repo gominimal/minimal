@@ -60,11 +60,15 @@
 //! The box zone is the one carve-out (NET-072): a sibling's
 //! `<box>.min.internal` resolves with no entry, because every attached
 //! box's name is registered in that zone by the daemon itself — the grant
-//! is the daemon's, not the box's policy's. A zone answer is admitted past
-//! the rebinding intersection even where the infrastructure deny would
-//! refuse a plane address, and what a box may then *do* with it is the
-//! connect-time conjunction (NET-073): the sibling's ingress rules beside
-//! the resolving box's own egress ones.
+//! is the daemon's, not the box's policy's. The carve-out is the fabric
+//! plane's alone, and it is exact in both directions: a zone answer is
+//! admitted inside the plane and nowhere else, so a reply to a zone name
+//! that carries any other address — the A records of an upstream path the
+//! question reached, RFC 1918, a public host — is refused by the rebinding
+//! intersection like any other infrastructure answer and pins nothing.
+//! What a box may then *do* with an admitted answer is the connect-time
+//! conjunction (NET-073): the sibling's ingress rules beside the resolving
+//! box's own egress ones.
 //!
 //! ## The window, and the one place this gate departs from design §5.3
 //!
@@ -1615,10 +1619,11 @@ pub(crate) mod tests {
     /// entry for it — every attached box's name is registered in the zone by
     /// the daemon itself, so the grant is the daemon's and not the resolving
     /// box's policy's — and the lease its answer carries is admitted as
-    /// reach, carved out of the fabric plane the infrastructure deny set
-    /// refuses for every name outside the zone. The carve-out is the zone's
-    /// alone: an ordinary name still needs its own entry, and a lookalike
-    /// that merely ends in the zone's words pins nothing. Resolution itself
+    /// reach: the fabric plane, which the infrastructure deny set refuses
+    /// for every name outside the zone, is carved out for the zone and is
+    /// the whole of its answer's reach. The carve-out is the zone's alone:
+    /// an ordinary name still needs its own entry, and a lookalike that
+    /// merely ends in the zone's words pins nothing. Resolution itself
     /// stays honest in every case — each reply passes through to the box.
     #[tokio::test]
     async fn box_zone_resolution_needs_no_allow_entry() {

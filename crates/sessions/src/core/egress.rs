@@ -603,8 +603,9 @@ fn verdict_ipv4(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
 pub struct InfrastructureDenySet {
     /// Ranges refused under every declaration, for every name.
     fixed: Vec<Ipv4Cidr>,
-    /// The switch-fabric plane, refused for answers outside the box zone
-    /// only — NET-072 carves box-zone answers out of it.
+    /// The switch-fabric plane, the one range a box-zone answer is admitted
+    /// in (NET-072): it refuses every answer outside the zone, and every
+    /// zone answer outside it.
     plane: Ipv4Cidr,
     /// RFC 1918 space, refused unless `allow_subnets` covers the answer.
     rfc1918: Vec<Ipv4Cidr>,
@@ -679,12 +680,17 @@ impl RebindingRefusal {
 ///
 /// `box_zone` marks the answer as one to a name in the box zone
 /// (`*.min.internal`, NET-072). Such an answer is expected to name a
-/// sibling's switch lease, so the fabric plane does not refuse it — the one
-/// carve-out a zone name earns, and the reason a box reaches a sibling by
-/// name with no `allow_dns_hosts` entry. Everything else the set refuses
-/// still refuses a zone answer: the fixed ranges (the metadata service,
-/// loopback, the gateway's own addresses) and RFC 1918 the box's
-/// `allow_subnets` does not cover.
+/// sibling's switch lease, so the fabric plane is carved out for it and no
+/// other range is — the one carve-out a zone name earns, and the reason a
+/// box reaches a sibling by name with no `allow_dns_hosts` entry. The
+/// carve-out is exact in both directions: a zone answer is admitted inside
+/// the plane and nowhere else, so an answer to a zone name that names any
+/// other address — RFC 1918, a public host — is refused as infrastructure
+/// exactly as the plane's own addresses are for a name outside the zone,
+/// whatever `allow_subnets` covers. Everything else the set refuses still
+/// refuses a zone answer: the fixed ranges (the metadata service, loopback,
+/// the gateway's own addresses) and the plane's own addresses when the name
+/// is not a zone name.
 ///
 /// Pure over owned addresses and CIDRs, and deliberately separate from any
 /// resolver: the daemon hands this function the addresses a resolver already
@@ -693,11 +699,12 @@ impl RebindingRefusal {
 ///
 /// The order of the checks is part of the contract: the box's own denies
 /// first — a declared deny outranks every allowance — then the fixed
-/// infrastructure ranges, then the plane unless the name is a box-zone
-/// name, then RFC 1918 under its `allow_subnets` exemption. An undeclared
-/// `allow_subnets` (`None`, allow-all) counts as covering the answer: the
-/// box's address dimension is open, so the name path opens with it rather
-/// than refusing answers the box can already reach.
+/// infrastructure ranges, then the plane, which a zone name and any other
+/// name answer from opposite sides — inside it for a zone name, outside it
+/// for every other — then RFC 1918 under its `allow_subnets` exemption.
+/// An undeclared `allow_subnets` (`None`, allow-all) counts as covering
+/// the answer: the box's address dimension is open, so the name path opens
+/// with it rather than refusing answers the box can already reach.
 ///
 /// # Errors
 ///
@@ -723,9 +730,11 @@ pub fn rebinding_admits(
         return Err(RebindingRefusal::Infrastructure);
     }
     // NET-072: outside the box zone the plane refuses every answer, so no
-    // ordinary name can ever name a box, the gateway, or the daemon. A zone
-    // name's answer is exempt: naming a sibling's lease is what it is for.
-    if !box_zone && infrastructure.plane.contains(answer) {
+    // ordinary name can ever name a box, the gateway, or the daemon. Inside
+    // the box zone the plane is the whole of the answer's reach: a zone
+    // name names a sibling's lease, so an answer anywhere else is refused
+    // as infrastructure, `allow_subnets` covering it or not.
+    if box_zone != infrastructure.plane.contains(answer) {
         return Err(RebindingRefusal::Infrastructure);
     }
     if infrastructure
@@ -1386,8 +1395,10 @@ mod tests {
 
     /// NET-072: a box-zone answer is carved out of the fabric plane — a
     /// sibling's lease is admitted for a zone name with no `allow_dns_hosts`
-    /// entry — while everything else the infrastructure set refuses still
-    /// refuses a zone answer, and the box's own deny still outranks the zone.
+    /// entry — and the plane is the whole of the carve-out: a zone answer
+    /// anywhere else is refused as infrastructure like any other, while
+    /// everything else the infrastructure set refuses still refuses a zone
+    /// answer, and the box's own deny still outranks the zone.
     #[test]
     fn box_zone_answers_carved_out_of_infrastructure_deny() {
         let infrastructure = InfrastructureDenySet::new(RESOLVER, HOST_ALIAS);
@@ -1396,8 +1407,14 @@ mod tests {
         };
 
         // A sibling's lease — the plane address a zone name must resolve to
-        // — is admitted with no declarations at all (NET-072).
-        admit([100, 64, 0, 5], None, None).unwrap();
+        // — is admitted with no declarations at all (NET-072), and the
+        // admission holds across the plane's whole span, from its first
+        // address to its last, whatever the box declares.
+        let allow_all = cidrs(&["0.0.0.0/0"]);
+        for lease in [[100, 64, 0, 5], [100, 100, 0, 1], [100, 127, 255, 255]] {
+            admit(lease, None, None).unwrap();
+            admit(lease, Some(allow_all.as_slice()), None).unwrap();
+        }
 
         // The carve-out is the plane's alone: the fixed ranges still refuse
         // a zone answer under every declaration — the metadata service,
@@ -1415,7 +1432,6 @@ mod tests {
             );
             // And an explicit allow does not exempt them: the exemption is
             // RFC 1918's alone.
-            let allow_all = cidrs(&["0.0.0.0/0"]);
             assert_eq!(
                 admit(refused, Some(allow_all.as_slice()), None),
                 Err(RebindingRefusal::Infrastructure),
@@ -1423,16 +1439,41 @@ mod tests {
             );
         }
 
-        // RFC 1918 is still the one class `allow_subnets` exempts — the
-        // zone earns no second exemption.
-        let private = [10, 1, 2, 3];
-        admit(private, None, None).unwrap();
+        // And the plane is the carve-out's whole width: a zone answer
+        // outside it is refused as infrastructure under every declaration —
+        // RFC 1918, where `allow_subnets` exempts an ordinary name's answer,
+        // as much as a public address — so a zone name pins nothing but a
+        // sibling's lease.
+        let allow_lan = cidrs(&["10.0.0.0/8"]);
         let allow_none = cidrs(&[]);
-        assert_eq!(
-            admit(private, Some(allow_none.as_slice()), None),
-            Err(RebindingRefusal::Infrastructure),
-            "a deny-all address declaration refuses private answers, zone name or not"
-        );
+        for (answer, allow, because) in [
+            (
+                [10, 1, 2, 3],
+                None,
+                "an open address dimension exempts nothing",
+            ),
+            (
+                [10, 1, 2, 3],
+                Some(allow_lan.as_slice()),
+                "a covering allow entry exempts nothing",
+            ),
+            (
+                [10, 1, 2, 3],
+                Some(allow_none.as_slice()),
+                "a deny-all declaration refuses it outright",
+            ),
+            (
+                [203, 0, 113, 9],
+                None,
+                "a public answer is refused the same",
+            ),
+        ] {
+            assert_eq!(
+                admit(answer, allow, None),
+                Err(RebindingRefusal::Infrastructure),
+                "{because}: no zone answer is admitted outside the plane"
+            );
+        }
 
         // The box's own deny still outranks the zone: a declared deny
         // refuses a zone answer pointing at the denied range.
@@ -1722,12 +1763,14 @@ mod kani_proofs {
             rfc1918: two_cidrs().unwrap_or_default(),
         };
         // Whether the answers below come for a box-zone name (NET-072) —
-        // the one fact that carves the fabric plane out of the refusal set.
+        // the one fact that decides which side of the fabric plane an
+        // answer is admitted on.
         let box_zone: bool = kani::any();
         // The oracle's one question, restated over CIDR math alone: may this
         // answer be admitted — not denied by the box, not in a fixed
-        // infrastructure range, not in the plane a zone answer is exempt
-        // from, and not in RFC 1918 that `allow_subnets` does not cover?
+        // infrastructure range, on the plane's zone-answering side (inside
+        // for a zone name, outside for any other), and not in RFC 1918 that
+        // `allow_subnets` does not cover?
         let admissible = |answer: [u8; 4]| {
             let denied = deny
                 .as_deref()
@@ -1736,7 +1779,7 @@ mod kani_proofs {
                 .fixed
                 .iter()
                 .any(|cidr| cidr.contains(answer));
-            let plane = !box_zone && infrastructure.plane.contains(answer);
+            let plane = box_zone != infrastructure.plane.contains(answer);
             let rfc1918 = infrastructure
                 .rfc1918
                 .iter()
