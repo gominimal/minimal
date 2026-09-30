@@ -1620,6 +1620,8 @@ STUB
     want_ok "install names the tree it laid out"   grep -q "installed the classifier tree" "$OUT"
     want_ok "install names the delegated account" grep -q "delegated to" "$OUT"
     want_ok "install names the contract it delegated" grep -q "v2 contract" "$OUT"
+    want_ok "install says what a daemon in the slice does per launch, not on its next start" \
+        grep -q "once minimald is in the slice, each box it launches" "$OUT"
     want_ok "the slice's cgroup.procs is there for the daemon to write" \
         test -e "$tree/cgroup.procs"
     want_ok "the daemon leaf's cgroup.procs is there for --pid to write" \
@@ -1673,7 +1675,10 @@ STUB
     want_ok "the daemon leaf holds exactly that pid" \
         grep -qx "$$" "$tree/daemon/cgroup.procs"
     want_ok "the placement names the leaf it wrote" grep -q "placed .* in .*daemon" "$OUT"
-    want_ok "the placement says what the next start does" grep -q "next start" "$OUT"
+    want_ok "the placement says it takes effect on the next launch, not the next start" \
+        grep -q "per launch" "$OUT"
+    want_ok "the placement says a plain restart loses it" \
+        grep -q "Delegate=yes unit" "$OUT"
 
     run_hc place_dead "$root/mi-on" --pid 999999999
     check 1 "$rc" "--pid dies for a process that does not exist"

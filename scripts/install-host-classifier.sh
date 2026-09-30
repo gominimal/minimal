@@ -251,7 +251,8 @@ place_daemon() {
     printf '%s\n' "$pid" >"$procs" ||
         die "cannot place $pid in $procs (is $pid a process root may move, and is it the running minimald?)"
     note "placed $pid in $tree_root/$DAEMON_LEAF"
-    note "minimald's next start finds itself inside the slice and places each box it launches in a leaf of its own"
+    note "the running minimald is inside the slice now: the placement probe runs per launch, so the next box it launches is placed in a leaf of its own"
+    note "a plain restart loses this placement — a new minimald starts in its starter's cgroup unless a Delegate=yes unit starts it in the slice, so pass --pid again afterwards"
 }
 
 if [ "$mode" = check ]; then
@@ -320,4 +321,4 @@ note "  $BOXES_DIR/   one leaf per session box, created before its spawn and rem
 note "delegated to $owner_uid:$owner_gid per the v2 contract: each directory plus its cgroup.procs, cgroup.threads and cgroup.subtree_control"
 note "the cgroup2 mount above the slice stays root-owned"
 note "place the running daemon next: sudo $0 --pid <pid of minimald> (or start it from a Delegate=yes unit)"
-note "minimald's next start places each box in its leaf; its launch log names the leaf each box entered"
+note "once minimald is in the slice, each box it launches runs in a leaf of its own; its launch log names the leaf each box entered"
