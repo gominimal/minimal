@@ -1484,7 +1484,12 @@ impl LoopbackLeaseBook {
     /// Reading the record under its lock keeps the report from firing on
     /// this host's own mid-grant boxes: the grant writes the record's line
     /// before the box publishes, so a listener on an unnamed address is
-    /// never a grant still between the write and the publish. In a microVM
+    /// never a grant still between the write and the publish — and the lock
+    /// is held across the socket-table read too, so the record's view and
+    /// the table's are one moment: a peer that grants and publishes between
+    /// two unlocked reads would appear in the older record as absent and in
+    /// the newer table as listening, and be reported once as a collision
+    /// that is not one. In a microVM
     /// guest the socket table is the guest's own network namespace, so no
     /// host-side publish appears and this answers empty — the same LocalVM
     /// boundary the record has (see the module comment): the cross-root
@@ -1500,13 +1505,19 @@ impl LoopbackLeaseBook {
         let Ok(mut held) = self.lock.lock() else {
             return Vec::new();
         };
-        let recorded: BTreeSet<Ipv4Addr> = match held.as_mut().map(|lock| lock.write()) {
-            Some(Ok(_flock)) => match self.read() {
-                Ok(entries) => entries.iter().map(|entry| entry.address).collect(),
-                Err(_) => return Vec::new(),
-            },
-            _ => return Vec::new(),
+        let Some(lock) = held.as_mut() else {
+            return Vec::new();
         };
+        let Ok(_flock) = lock.write() else {
+            return Vec::new();
+        };
+        let Ok(entries) = self.read() else {
+            return Vec::new();
+        };
+        let recorded: BTreeSet<Ipv4Addr> = entries.iter().map(|entry| entry.address).collect();
+        // The flock is still held here — see the doc above: the record's view
+        // and the kernel's are one moment, or a peer's grant that lands
+        // between the two reads is reported as a collision it is not.
         listening_reserved_range_addresses()
             .filter(|address| !recorded.contains(address))
             .collect()
