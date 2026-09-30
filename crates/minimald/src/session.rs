@@ -892,14 +892,16 @@ impl Session {
     /// bundle's log tail carries these beside each release).
     ///
     /// `None` — with the warn line that says why — when the host's pool is
-    /// spent or the answerer cannot answer (an absent range, an unreadable
-    /// record): the box then publishes on the node's shared address, the mode
+    /// spent or the answerer cannot answer (an absent range, a pending verdict
+    /// inside the deferred walk's window, an unreadable record): the box then
+    /// publishes on the node's shared address, the mode
     /// [`HostnameRegistry`](crate::net::dns::HostnameRegistry) already
     /// answers for, where NET-128 keeps a stopped box from impersonating the
     /// node and NET-129 keeps the collision reported rather than translated.
     /// A grant the box already holds — a resumed session asking again after
     /// a restart — answers with the recorded address, which is how a box's
-    /// address stays stable across a daemon restart.
+    /// address stays stable across a daemon restart, whether or not the
+    /// restarted daemon's range verdict has landed yet (NET-013).
     #[cfg(target_os = "linux")]
     fn lease_loopback_address(&self, record: &Record, name: &str) -> Option<std::net::Ipv4Addr> {
         let namespace = crate::net::dns::LeaseNamespace::Box { session: record.id };
@@ -921,6 +923,17 @@ impl Session {
                     action = "loopback-pool-spent",
                     "the host's reserved local range is spent; \
                      the box's ports publish on the node's shared address"
+                );
+                None
+            }
+            crate::net::dns::LoopbackGrant::RangePending => {
+                tracing::warn!(
+                    session_id = %record.id,
+                    session_name = name,
+                    action = "loopback-range-pending",
+                    "the verdict over the reserved local range is still pending; \
+                     the box's ports publish on the node's shared address \
+                     until the publish-surface walk lands"
                 );
                 None
             }

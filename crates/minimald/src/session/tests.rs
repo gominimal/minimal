@@ -3123,3 +3123,104 @@ async fn a_restarted_daemon_re_derives_the_box_s_address_from_the_answerer() {
         "and so does the first box's"
     );
 }
+
+/// NET-013 inside the deferred probe's window. A microVM daemon cannot measure
+/// the range its publishes bind on — the host's loopback, a machine the guest
+/// cannot see — so its verdict comes from the forwarder-conducted walk, and
+/// that walk is long enough that the daemon must not hold its accept loop for
+/// it: the book opens **pending** and the walk lands when it lands. A daemon
+/// restarted with a live own-address box is therefore serving the RPC that
+/// brings the box's actor up — an attach right after `min up` — before its own
+/// verdict has, and that actor's ask is the resumed box's. The ask must be
+/// answered with the address the record already names: telling it the range is
+/// absent would publish the box on the node's shared `127.0.0.1` and leave its
+/// recorded line spent until a rename or a re-finalize asked again, so the
+/// box's name would answer somewhere else from finalize to destroy.
+///
+/// The window is held here by hand: the harness daemon is a native one, whose
+/// own loopback *is* its publish surface, so it reads the probe's answer
+/// before the book opens — its verdict has to be put back in the pending state
+/// the daemon inside a microVM holds its book in.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resumed_box_answers_at_its_own_address_while_the_verdict_is_pending() {
+    use minimald_rpc::{SessionDelta, SessionDeltaRequest};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let web = finalize_own_ip_session(&mut client, "web").await;
+    let (_, address) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the box's name answers at the first daemon");
+    assert_eq!(
+        address,
+        sessions::core::loopback::POOL_FIRST,
+        "a fresh host's first grant is the pool's lowest address"
+    );
+
+    // "Restart the daemon" — the same shape the restart test above drives: a
+    // stop, not a destroy, so the record keeps the box's line — then a second
+    // daemon on the same state root, held in the pending verdict a VM daemon
+    // whose walk has not answered holds its book in.
+    server
+        .state
+        .sessions_manager()
+        .await
+        .shutdown(true)
+        .await
+        .expect("a forced shutdown has nothing left to refuse it");
+    drop(client);
+    let state = server.into_state_dir();
+    let server = TestServer::new_in(state).await;
+    server
+        .state
+        .sessions_manager()
+        .await
+        .hold_range_verdict_pending();
+    let mut client = server.connect().await;
+
+    // Resume inside the window: the first RPC that names the box brings its
+    // actor up, and the ask that actor makes is the resumed box's.
+    let _ = client
+        .call::<SessionDelta>(&SessionDeltaRequest { id: web })
+        .await;
+
+    let (owner, resumed) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the resumed box's name answers inside the window");
+    assert_eq!(
+        owner, "web",
+        "the session owns its box name across the restart"
+    );
+    assert_eq!(
+        resumed, address,
+        "the resumed box keeps the recorded address, whatever the walk is doing"
+    );
+    assert_ne!(
+        resumed,
+        std::net::Ipv4Addr::LOCALHOST,
+        "the pending window must not publish the box on the node's shared address"
+    );
+
+    // And the publish is the box's own, not the interim: the registry the
+    // restarted daemon built holds the recorded address, so a connection to
+    // the box's declared port is forwarded to it and not to the node.
+    let registry = server.state.sessions_manager().await.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert_eq!(
+        routes.published_own_address(web),
+        Some(address),
+        "the resumed box's publish is at its own address, not the interim"
+    );
+    assert_eq!(
+        routes
+            .resolve("web.min.internal:18080")
+            .expect("the name routes inside the window")
+            .upstream(18080),
+        Some(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(address),
+            18080
+        )),
+        "the box's own port number is published at its own address, not translated"
+    );
+}

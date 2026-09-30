@@ -322,13 +322,14 @@ impl Manager {
             // verdict would make every `minvmd stop` race the probe instead
             // of reaching the daemon behind it. So that arm is spawned here
             // and its verdict applied when it lands — the book opens on the
-            // interim verdict (grants withheld, nothing published at an
-            // address nothing has vouched for) and the walk, once it has an
-            // answer, both un-withholds and hands the node its address; the
-            // registry re-points the names that answered the interim. A box
-            // published in that window keeps the interim address it got — the
-            // same publish a range-absent host gives it — until a rename or a
-            // re-finalize asks again.
+            // pending verdict (no *fresh* grant at an address nothing has
+            // vouched for; a namespace the record already names is still
+            // answered with the address it holds, NET-013) and the walk, once
+            // it has an answer, both un-withholds and hands the node its
+            // address; the registry re-points the names that answered the
+            // interim. A box that asks for a fresh grant in that window keeps
+            // the interim address it got — the same publish a range-absent
+            // host gives it — until a rename or a re-finalize asks again.
             let (probe, shuttle) = match transport {
                 crate::net::SwitchTransport::HostShuttle { cid, port } => (None, Some((cid, port))),
                 _ => (
@@ -356,11 +357,24 @@ impl Manager {
                 );
             }
             let present = probe.as_ref().is_some_and(|probe| probe.present());
+            // The state the book opens on. Where a probe ran, its answer is
+            // the host's: a native daemon's own loopback is its publish
+            // surface, so it measures the range itself on the way here. The
+            // one arm that leaves `probe` unset — the gvproxy switch above —
+            // is the daemon that cannot measure its own, so its book opens
+            // pending and the spawned walk below lands the verdict. That a
+            // book can be open without one is the whole reason the verdict is
+            // a state and not a fact.
+            let verdict = match (&probe, present) {
+                (None, _) => crate::net::dns::RangeVerdict::Pending,
+                (Some(_), true) => crate::net::dns::RangeVerdict::Present,
+                (Some(_), false) => crate::net::dns::RangeVerdict::Absent,
+            };
             // The answerer's record for this host, under the state root every
             // daemon instance on it shares. Unreadable records withhold
             // grants (never guess an address another namespace may hold);
             // absent ranges grant nothing, the interim's business.
-            let book = crate::net::dns::LoopbackLeaseBook::open(&minimal_state_dir, present)?;
+            let book = crate::net::dns::LoopbackLeaseBook::open(&minimal_state_dir, verdict)?;
             let swept = book.release_dead_boxes(&live_session_ids(&store).await?, daemon_start);
             if !swept.is_empty() {
                 tracing::info!(
@@ -419,7 +433,11 @@ impl Manager {
                         "the daemon-start range probe walked the forwarder's loopback \
                          and picked the publish surface",
                     );
-                    book.set_range_present(probe.present());
+                    book.set_range_verdict(if probe.present() {
+                        crate::net::dns::RangeVerdict::Present
+                    } else {
+                        crate::net::dns::RangeVerdict::Absent
+                    });
                     if !probe.present() {
                         tracing::warn!(
                             first_failure = ?probe.first_failure,
@@ -451,6 +469,8 @@ impl Manager {
             sender,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
+            #[cfg(all(test, target_os = "linux"))]
+            loopback: Arc::clone(&loopback),
         };
         // A non-owning path back to this actor, handed to each spawned session
         // so its binding can request destruction (see `weak_self`).
@@ -941,6 +961,12 @@ pub struct ManagerHandle {
     /// through the actor mainloop.
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// The actor's lease book, held only for the one test seam below: a test
+    /// that needs this daemon to be in the state a daemon whose deferred
+    /// probe is still walking holds its book in. Production callers reach
+    /// the book through the manager actor, which owns it.
+    #[cfg(all(test, target_os = "linux"))]
+    loopback: Arc<crate::net::dns::LoopbackLeaseBook>,
 }
 
 /// A non-owning handle to the [`Manager`] actor.
@@ -957,6 +983,10 @@ pub struct WeakManagerHandle {
     /// keep the actor alive (only live senders do).
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// Mirrors [`ManagerHandle::loopback`], for the same reason: the test seam
+    /// must survive an upgrade.
+    #[cfg(all(test, target_os = "linux"))]
+    loopback: Arc<crate::net::dns::LoopbackLeaseBook>,
 }
 
 impl WeakManagerHandle {
@@ -968,6 +998,8 @@ impl WeakManagerHandle {
             sender: self.sender.upgrade()?,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
+            #[cfg(all(test, target_os = "linux"))]
+            loopback: Arc::clone(&self.loopback),
         })
     }
 }
@@ -1034,6 +1066,8 @@ impl ManagerHandle {
             sender: self.sender.downgrade(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
+            #[cfg(all(test, target_os = "linux"))]
+            loopback: Arc::clone(&self.loopback),
         }
     }
 
@@ -1044,6 +1078,20 @@ impl ManagerHandle {
     #[must_use]
     pub fn hostnames(&self) -> Arc<RwLock<crate::net::dns::HostnameRegistry>> {
         Arc::clone(&self.hostnames)
+    }
+
+    /// Puts this daemon's verdict over the reserved local range back in the
+    /// state a daemon whose forwarder-conducted probe is still walking holds
+    /// its book in ([`crate::net::dns::RangeVerdict::Pending`]) — the window a
+    /// microVM daemon is already serving RPCs in, and the one a box resumed
+    /// by the first of them must still be answered in (NET-013).
+    ///
+    /// Test-only: no production path needs to *un-know* a verdict it has, and
+    /// one that did would want a message, not a setter.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn hold_range_verdict_pending(&self) {
+        self.loopback
+            .set_range_verdict(crate::net::dns::RangeVerdict::Pending);
     }
 
     /// Lists the sessions known to this (minimald) instance.

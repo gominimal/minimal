@@ -1229,6 +1229,18 @@ pub enum LoopbackGrant {
     /// translated) — never on a reserved-range address another namespace on
     /// this host holds.
     PoolSpent,
+    /// The verdict over the reserved local range has not landed yet: the
+    /// probe that produces it — on a microVM daemon, the forwarder-conducted
+    /// walk [`crate::sessions::Manager::init`] defers so the accept loop is
+    /// never held for it — is still running, so nothing has yet vouched for
+    /// an address of the range. Only an ask for a namespace the record does
+    /// not name is answered this way: one it already names is answered with
+    /// the address it holds ([`LoopbackGrant::Granted`]), so a box resumed
+    /// inside the window finds its address waiting (NET-013) instead of being
+    /// published on the interim. The fresh asker publishes on the node's
+    /// shared `127.0.0.1` interim until the verdict lands and a rename or a
+    /// re-finalize asks again.
+    RangePending,
     /// The reserved local range is not bindable on this host (NET-123's
     /// absent verdict): no address from it can be published, so none is
     /// granted. The asker publishes on the `127.0.0.1` interim and re-surfaces
@@ -1239,6 +1251,62 @@ pub enum LoopbackGrant {
     /// another namespace already holds — the one failure NET-010 cannot
     /// tolerate — where a withheld grant costs one box its published address.
     RecordUnavailable,
+}
+
+/// The verdict over the reserved local range on this host — NET-123's bind
+/// probe's answer, as it stands **right now**, which is why it is a state and
+/// not a fact. A daemon that can bind on its own publish surface has the
+/// answer before the book opens; a daemon inside a microVM does not, because
+/// the surface its publishes bind on is the *host's* loopback, a machine the
+/// guest can only measure through the forwarder-conducted walk
+/// [`crate::sessions::Manager::init`] defers rather than holding its accept
+/// loop for. The book opens holding whichever state the opening daemon is in
+/// and the walk applies its own when it lands.
+///
+/// The state is what a grant waits on, and the one thing that decides whether
+/// a namespace the record does not name may be handed an address: a recorded
+/// namespace is answered whatever the state, because the address it holds was
+/// vouched for by the verdict that granted it (NET-013 — a box resumed while
+/// the probe is still walking finds its address waiting, whether the same
+/// daemon or a restarted one answers).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeVerdict {
+    /// The probe that produces the verdict is still walking: nothing has
+    /// vouched for an address of the range yet, so no new one is granted —
+    /// the asker publishes on the interim — while a recorded namespace keeps
+    /// the address it already holds.
+    Pending,
+    /// The range binds on the publish surface: grants proceed.
+    Present,
+    /// The range does not bind (NET-123's absent verdict): no address from it
+    /// can be published, so no namespace is granted one, recorded or not.
+    Absent,
+}
+
+#[cfg(target_os = "linux")]
+impl RangeVerdict {
+    /// The discriminant the book's atomic verdict holds: one `u8` per state,
+    /// so the verdict moves through one store rather than a swap.
+    fn key(self) -> u8 {
+        match self {
+            RangeVerdict::Pending => 0,
+            RangeVerdict::Present => 1,
+            RangeVerdict::Absent => 2,
+        }
+    }
+
+    /// The state a stored discriminant names. Only [`Self::key`]'s three
+    /// values are ever stored; the fallback reads as the interim state, which
+    /// is also the one that grants nothing to a namespace the record does not
+    /// name, so a value that cannot have been written still fails safe.
+    fn from_key(key: u8) -> Self {
+        match key {
+            1 => RangeVerdict::Present,
+            2 => RangeVerdict::Absent,
+            _ => RangeVerdict::Pending,
+        }
+    }
 }
 
 /// The answerer's channel a daemon grants and releases through: the durable
@@ -1291,34 +1359,39 @@ pub struct LoopbackLeaseBook {
     /// takes the handle and drops it, so the daemon's stop leaves the state
     /// volume with no descriptor the book holds open.
     lock: std::sync::Mutex<Option<fd_lock::RwLock<std::fs::File>>>,
-    /// Whether the reserved local range is bindable on this host: the
-    /// daemon-start bind probe's verdict (NET-123), applied once at start —
-    /// or, on a host whose publish surface the probe can only reach through
-    /// the forwarder, once that walk lands, by
-    /// [`LoopbackLeaseBook::set_range_present`]. While it is absent every
-    /// grant answers [`LoopbackGrant::RangeAbsent`] — the addresses this book
-    /// would grant are not publishable, so none is spent — which is also the
-    /// verdict the book opens on while a deferred probe is still walking, so
-    /// a box that asks before the walk lands is published on the interim and
-    /// never handed an address nothing has vouched for.
-    present: std::sync::atomic::AtomicBool,
+    /// The verdict over the reserved local range on this host, as it stands
+    /// right now: the daemon-start bind probe's (NET-123), applied once at
+    /// start — or, on a host whose publish surface the probe can only reach
+    /// through the forwarder, once that walk lands, by
+    /// [`LoopbackLeaseBook::set_range_verdict`]. A landed absent verdict gates
+    /// every ask ([`LoopbackGrant::RangeAbsent`]: the addresses this book
+    /// would grant are not publishable, so none is spent); a pending one gates
+    /// only the asks for namespaces the record does not name, so a box that
+    /// asks for a fresh grant inside the walk's window is published on the
+    /// interim and never handed an address nothing has vouched for, while a
+    /// box the record already names keeps its address (NET-013).
+    verdict: std::sync::atomic::AtomicU8,
 }
 
 #[cfg(target_os = "linux")]
 impl LoopbackLeaseBook {
     /// Opens this host's book under `state_root`, binding its lock file.
     ///
-    /// `present` is the daemon-start bind probe's verdict over the reserved
-    /// local range (NET-123): while it is `false` the book answers every
-    /// grant with [`LoopbackGrant::RangeAbsent`] rather than granting
-    /// addresses nothing can bind.
+    /// `verdict` is the state the reserved local range's probe stands in as
+    /// this book opens: [`RangeVerdict::Present`] or [`RangeVerdict::Absent`]
+    /// where the probe has answered — a native daemon's own loopback is its
+    /// publish surface, so it reads the answer before it gets here — and
+    /// [`RangeVerdict::Pending`] where it has not, the microVM daemon's
+    /// shape, whose walk is deferred so its accept loop is never held for it.
+    /// See [`LoopbackGrant::RangePending`] for which asks the pending state
+    /// gates.
     ///
     /// # Errors
     ///
     /// Propagates the failure to create or open the lock file — the one
     /// artefact the book cannot run without, since without it two daemons
     /// cannot arbitrate.
-    pub fn open(state_root: &paths::DaemonAbsPath, present: bool) -> std::io::Result<Self> {
+    pub fn open(state_root: &paths::DaemonAbsPath, verdict: RangeVerdict) -> std::io::Result<Self> {
         let record = state_root
             .sub_path_unchecked(LEASE_RECORD_FILE)
             .as_utf8_path()
@@ -1347,7 +1420,7 @@ impl LoopbackLeaseBook {
             record,
             staging,
             lock: std::sync::Mutex::new(Some(lock)),
-            present: std::sync::atomic::AtomicBool::new(present),
+            verdict: std::sync::atomic::AtomicU8::new(verdict.key()),
         })
     }
 
@@ -1366,17 +1439,17 @@ impl LoopbackLeaseBook {
         drop(self.lock.lock().ok().and_then(|mut held| held.take()));
     }
 
-    /// Whether the reserved local range is bindable on this host — the verdict
-    /// every grant is gated on, as it stands right now.
+    /// The verdict over the reserved local range on this host, as it stands
+    /// right now — what every grant is gated on.
     ///
     /// An interior read rather than a field because the verdict is not always
     /// known when the book opens: a daemon inside a microVM can only measure
     /// its publish surface through the host's forwarder, and that walk takes
     /// long enough that the daemon must not hold its accept loop for it (see
-    /// [`crate::sessions::Manager::init`]), so the book opens on the interim
+    /// [`crate::sessions::Manager::init`]), so the book opens on the pending
     /// verdict and the walk applies its own when it lands.
-    fn range_present(&self) -> bool {
-        self.present.load(std::sync::atomic::Ordering::Acquire)
+    fn verdict(&self) -> RangeVerdict {
+        RangeVerdict::from_key(self.verdict.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// Applies the bind probe's verdict over the reserved local range, when
@@ -1384,14 +1457,14 @@ impl LoopbackLeaseBook {
     ///
     /// The one transition this exists for is the deferred forwarder-conducted
     /// walk of a microVM daemon ([`crate::net::policy::probe_publish_surface`]):
-    /// the book opens holding the interim verdict — absent, so nothing is
+    /// the book opens holding the pending verdict — so nothing is *freshly*
     /// granted at an address nothing has vouched for — and the walk, once it
     /// has an answer, applies it here. Only the verdict moves: no grant is
     /// made or taken back by this call, and a book that already holds the
     /// verdict it is asked for changes nothing.
-    pub fn set_range_present(&self, present: bool) {
-        self.present
-            .store(present, std::sync::atomic::Ordering::Release);
+    pub fn set_range_verdict(&self, verdict: RangeVerdict) {
+        self.verdict
+            .store(verdict.key(), std::sync::atomic::Ordering::Release);
     }
 
     /// Grants `namespace` an address from the host's pool, or answers with
@@ -1408,8 +1481,18 @@ impl LoopbackLeaseBook {
     /// before taking its own registry lock: two paths asking for the same
     /// namespace — a rename racing a finalize — are both answered with the
     /// one address, the second by the line the first wrote.
+    ///
+    /// A **landed absent** verdict gates the ask before the record is read
+    /// (NET-123: an address the publish surface cannot bind is not grantable,
+    /// to a namespace that holds one any more than to one that does not); a
+    /// **pending** one does not, because the address a recorded namespace
+    /// holds was vouched for by the verdict that granted it — so the read
+    /// below comes first, and the resumed box's ask is answered from the
+    /// record whatever the deferred walk is doing (NET-013). Only an ask for
+    /// a namespace the record does not name waits on the state, and while it
+    /// is pending that ask is granted nothing.
     pub fn grant(&self, namespace: LeaseNamespace) -> LoopbackGrant {
-        if !self.range_present() {
+        if self.verdict() == RangeVerdict::Absent {
             return LoopbackGrant::RangeAbsent;
         }
         let Ok(mut held) = self.lock.lock() else {
@@ -1431,6 +1514,14 @@ impl LoopbackLeaseBook {
         // restart, and costs no second line in the record.
         if let Some(address) = entry_address(&entries, namespace) {
             return LoopbackGrant::Granted(address);
+        }
+        // A namespace the record does not name is the one the verdict gates:
+        // while it is pending, nothing has vouched for an address of the
+        // range, so none is spent on this ask — the asker publishes on the
+        // interim, and a rename or a re-finalize after the walk lands asks
+        // again.
+        if self.verdict() != RangeVerdict::Present {
+            return LoopbackGrant::RangePending;
         }
         // The pool the record's addresses are drawn against: the pure
         // allocator's restore ignores anything outside it, so a stale or
@@ -2335,7 +2426,8 @@ mod tests {
     /// Linux daemon's bind probe always returns.
     #[cfg(target_os = "linux")]
     fn lease_book(state_root: &paths::DaemonAbsPath) -> LoopbackLeaseBook {
-        LoopbackLeaseBook::open(state_root, true).expect("opening the lease record")
+        LoopbackLeaseBook::open(state_root, RangeVerdict::Present)
+            .expect("opening the lease record")
     }
 
     /// A distinct session id, so each box namespace in a test is its own.
@@ -2827,7 +2919,7 @@ mod tests {
     fn an_absent_range_grants_nothing_and_publishes_on_the_interim() {
         let tmp = tempfile::tempdir().unwrap();
         let state_root = lease_root(&tmp);
-        let book = LoopbackLeaseBook::open(&state_root, false).unwrap();
+        let book = LoopbackLeaseBook::open(&state_root, RangeVerdict::Absent).unwrap();
         assert_eq!(book.grant(LeaseNamespace::Node), LoopbackGrant::RangeAbsent);
         assert_eq!(
             book.grant(LeaseNamespace::Box {
@@ -2842,22 +2934,26 @@ mod tests {
     /// The verdict a book opens on while the probe that produces it is still
     /// walking — a microVM daemon's shape, the one daemon whose publish surface
     /// it cannot bind on itself and whose walk it must not hold its accept loop
-    /// for. Grants are withheld — the interim, never a guess at an address —
-    /// until the verdict lands and is applied, and then the same ask grants; a
-    /// verdict the book already holds, applied again, spends nothing.
+    /// for. Grants for namespaces the record does not name are withheld — the
+    /// interim, never a guess at an address — until the verdict lands and is
+    /// applied, and then the same ask grants; a verdict the book already holds,
+    /// applied again, spends nothing.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_book_opens_interim_until_the_range_verdict_lands() {
         let tmp = tempfile::tempdir().unwrap();
         let state_root = lease_root(&tmp);
         let namespace = LeaseNamespace::Node;
-        let book = LoopbackLeaseBook::open(&state_root, false).unwrap();
-        assert_eq!(book.grant(namespace), LoopbackGrant::RangeAbsent);
+        let book = LoopbackLeaseBook::open(&state_root, RangeVerdict::Pending).unwrap();
+        assert_eq!(book.grant(namespace), LoopbackGrant::RangePending);
+        // The pending window spends nothing: the walk's verdict has not said
+        // an address is publishable, so the record is not written to either.
+        assert_eq!(book.read().unwrap(), Vec::new());
 
         // The walk lands, present: the book un-withholds, and the node's ask —
         // the one the walk itself makes — is answered from the same record any
         // later ask reads.
-        book.set_range_present(true);
+        book.set_range_verdict(RangeVerdict::Present);
         let granted = match book.grant(namespace) {
             LoopbackGrant::Granted(address) => address,
             other => panic!("the landed verdict lets the same ask grant: {other:?}"),
@@ -2866,11 +2962,95 @@ mod tests {
 
         // And applying the verdict a second time changes nothing: the walk
         // lands once, and a book that already holds it is not re-opened.
-        book.set_range_present(true);
+        book.set_range_verdict(RangeVerdict::Present);
         assert_eq!(
             book.grant(namespace),
             LoopbackGrant::Granted(granted),
             "the namespace still holds the address the first landed verdict granted"
+        );
+    }
+
+    /// The pending window does not take a resumed box's address away from it
+    /// (NET-013): a namespace the record already names is answered with the
+    /// address it holds whatever the deferred probe is doing, so a daemon that
+    /// restarts inside its walk window — the shape a VM host's is, where an
+    /// attach right after `min up` brings a live box's actor up before the
+    /// forwarder-conducted walk has answered — re-derives the box's grant
+    /// rather than being told the range is absent. Only an ask the record
+    /// cannot answer waits on the verdict, and a landed absent verdict is the
+    /// one that refuses a recorded namespace too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pending_verdict_answers_a_recorded_namespace_and_withholds_a_fresh_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let namespace = LeaseNamespace::Box {
+            session: session_id(1),
+        };
+
+        // The box's own daemon, on a host whose verdict has landed: its grant
+        // is the line the record carries across the restart.
+        let first = lease_book(&state_root);
+        let recorded = match first.grant(namespace) {
+            LoopbackGrant::Granted(address) => address,
+            other => panic!("a present range grants the box its address: {other:?}"),
+        };
+        assert_eq!(recorded, sessions::core::loopback::POOL_FIRST);
+        let fresh = LeaseNamespace::Box {
+            session: session_id(2),
+        };
+
+        // The restarted daemon, whose walk has not landed: the same ask the
+        // resume path makes is answered with the recorded address, and a box
+        // the record does not name is granted nothing — the interim, not a
+        // guess at an address nothing has vouched for.
+        let restarted = LoopbackLeaseBook::open(&state_root, RangeVerdict::Pending).unwrap();
+        assert_eq!(
+            restarted.grant(namespace),
+            LoopbackGrant::Granted(recorded),
+            "a resumed box finds its recorded address while the verdict is pending"
+        );
+        assert_eq!(
+            restarted.grant(fresh),
+            LoopbackGrant::RangePending,
+            "a namespace the record does not name waits for the verdict"
+        );
+        assert_eq!(
+            restarted.read().unwrap().len(),
+            1,
+            "the pending window spends nothing: the record carries the one grant it held"
+        );
+
+        // The walk lands present: both asks grant now, and the resumed box
+        // keeps the address it held through the window.
+        restarted.set_range_verdict(RangeVerdict::Present);
+        assert_eq!(
+            restarted.grant(namespace),
+            LoopbackGrant::Granted(recorded),
+            "the landed verdict does not move a recorded namespace's address"
+        );
+        // The next address up: the one the allocator hands a fresh ask over a
+        // pool whose lowest address is taken.
+        let [a, b, c, d] = recorded.octets();
+        let next_up = std::net::Ipv4Addr::new(a, b, c, d + 1);
+        assert_eq!(
+            restarted.grant(fresh),
+            LoopbackGrant::Granted(next_up),
+            "the landed verdict grants the fresh ask the next address up"
+        );
+
+        // A landed absent verdict is the one that refuses everything: an
+        // address the publish surface cannot bind is not grantable to a
+        // namespace that holds one any more than to one that does not.
+        restarted.set_range_verdict(RangeVerdict::Absent);
+        assert_eq!(
+            restarted.grant(namespace),
+            LoopbackGrant::RangeAbsent,
+            "a landed absent verdict refuses a recorded namespace too"
+        );
+        assert_eq!(
+            restarted.grant(LeaseNamespace::Node),
+            LoopbackGrant::RangeAbsent
         );
     }
 
