@@ -218,6 +218,44 @@ pub enum AllocationError {
     UnplannedSubnet(SwitchSubnet),
 }
 
+/// Why a client-driven withdrawal was refused. The pair a withdrawal
+/// presents is the proof that its client is the row's creator (T66), so a
+/// refusal is the daemon saying the proof does not match the row the
+/// switch address publishes — never a failure of the goal state, which
+/// [`BoxRegistry::withdraw_client_box`] reports as `Ok(None)`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WithdrawError {
+    /// A row is published at the switch address under another box's name:
+    /// the requesting client is not its creator.
+    #[error(
+        "the row at switch address {switch_addr} is held by box {held_name:?}, \
+         not by the withdrawing {asked_name:?}"
+    )]
+    NotTheCreatorsRow {
+        /// The switch address the withdrawal named.
+        switch_addr: Ipv4Addr,
+        /// The name the published row carries.
+        held_name: String,
+        /// The name the withdrawal presented.
+        asked_name: String,
+    },
+    /// The row at the switch address carries the requested name but another
+    /// loopback address than the pair presented: not the pair the
+    /// registration handed back.
+    #[error(
+        "the row at switch address {switch_addr} carries loopback address \
+         {held_loopback}, not the {asked_loopback} the withdrawal presented"
+    )]
+    NotTheHandedPair {
+        /// The switch address the withdrawal named.
+        switch_addr: Ipv4Addr,
+        /// The loopback address the published row carries.
+        held_loopback: Ipv4Addr,
+        /// The loopback address the withdrawal presented.
+        asked_loopback: Ipv4Addr,
+    },
+}
+
 /// The writable half of the host-side table, held by the host process: the
 /// registration surface — the host's own node-namespace row, and T66's
 /// client-driven path — and the source of the read-only [`BoxTable`] the
@@ -364,6 +402,14 @@ impl BoxRegistry {
     /// rate-limit slots, the switch's static lease table — is keyed by it,
     /// and re-issuing it to a new box would inherit all of that; a fresh
     /// address starts clean.
+    ///
+    /// While a row this registration filled stands, the box's frames are
+    /// decided by its rules; what a box with **no** row runs as — one whose
+    /// registration never reached the daemon, or whose row was withdrawn —
+    /// is the gate's announced unregistered-source interim, and putting the
+    /// per-box default that eventually refuses it in force is the flip that
+    /// lands with the last row source (T66's follow-up), not a change this
+    /// registration makes.
     pub fn register_client_box(
         &self,
         spec: ClientBoxSpec,
@@ -386,6 +432,58 @@ impl BoxRegistry {
             registration = registration.with_egress_policy(policy);
         }
         Ok(self.register(registration))
+    }
+
+    /// Withdraws the client box's row when the pair `(name, switch_addr,
+    /// loopback_addr)` proves its client is the row's creator, returning the
+    /// row removed — `Ok(None)` when no row is published at `switch_addr` at
+    /// all: the row is already withdrawn, or the daemon restarted since the
+    /// registration, and either way the goal state — nothing admits the
+    /// pair's addresses by a row — already holds. Lookup, proof, and removal
+    /// happen under one write of the row lock, so no registration can land
+    /// between the proof and the removal.
+    ///
+    /// The proof is the same pair the registration handed back
+    /// ([`ClientBoxSpec`]'s allocation), which only the registering session's
+    /// record carries; a row published under another name or another
+    /// loopback is not the requesting client's to remove and is refused with
+    /// [`WithdrawError`]. The withdrawn addresses are not returned to the
+    /// allocation cursors — spent for good, as [`Self::register_client_box`]
+    /// documents — and what their frames do next is the gate phase's to say
+    /// ([`Self::withdraw`]).
+    ///
+    /// This is the host-side half of the withdrawal a destroyed or failed
+    /// activation sends over the control socket
+    /// ([`crate::control::serve_request`]) — the guest daemon never asserts
+    /// or withdraws address→box facts (NET-138).
+    pub fn withdraw_client_box(
+        &self,
+        name: &str,
+        switch_addr: Ipv4Addr,
+        loopback_addr: Ipv4Addr,
+    ) -> Result<Option<Arc<BoxRecord>>, WithdrawError> {
+        let mut rows = self
+            .rows
+            .write()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        let Some(record) = rows.get(&switch_addr.octets()) else {
+            return Ok(None);
+        };
+        if record.name() != name {
+            return Err(WithdrawError::NotTheCreatorsRow {
+                switch_addr,
+                held_name: record.name().to_string(),
+                asked_name: name.to_string(),
+            });
+        }
+        if record.loopback_addr() != loopback_addr {
+            return Err(WithdrawError::NotTheHandedPair {
+                switch_addr,
+                held_loopback: record.loopback_addr(),
+                asked_loopback: loopback_addr,
+            });
+        }
+        Ok(rows.remove(&switch_addr.octets()))
     }
 
     /// Publishes the guest **node's** own namespace: the in-VM daemon's

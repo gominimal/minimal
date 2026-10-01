@@ -414,16 +414,18 @@ fn default_hooks_enabled() -> bool {
     true
 }
 
-/// The wire types of the VM host daemon's box-registration control socket
-/// (T66): the one door a client has to the host-side box table (NET-138).
+/// The wire types of the VM host daemon's box control socket (T66): the
+/// one door a client has to the host-side box table (NET-138).
 ///
 /// On a minvmd-backed host, `min session activate` opens this socket — a
 /// UDS beside the daemon's ssh socket in the provider's state dir — writes
-/// one [`RegisterBoxRequest`] as a line of JSON, and reads one
-/// [`RegisterBoxReply`] line back. Nothing else crosses it: the session
-/// RPCs are the daemon crate's HTTP-shaped socket, and the box's switch
-/// and loopback addresses come from here so the daemon's create request
-/// can carry them (see [`SessionConfig`]).
+/// one [`BoxControlRequest`] line of JSON — a registration when the box is
+/// created, a withdrawal when the session that registered it is destroyed
+/// or its activation fails — and reads one [`BoxControlReply`] line back.
+/// Nothing else crosses it: the session RPCs are the daemon crate's
+/// HTTP-shaped socket, and the box's switch and loopback addresses come
+/// from here so the daemon's create request can carry them (see
+/// [`SessionConfig`]).
 ///
 /// These types live here rather than in `minvmd` because both ends depend
 /// on this crate — the activating client and the host daemon — and the
@@ -447,23 +449,79 @@ pub struct RegisterBoxRequest {
     pub egress: Option<EgressPolicy>,
 }
 
+/// The withdrawal a destroyed session's client sends for the row its
+/// activation registered: the name the row went by and the pair the
+/// registration handed back. The pair is the proof that the withdrawer is
+/// the row's creator — a row is its registering side's to withdraw (NET-138),
+/// and no other client holds the pair, which no session record but the
+/// creator's carries.
+///
+/// Withdrawal answers [`BoxControlReply::Addresses`] echoing the pair back
+/// when the row is gone. The daemon answers a row already withdrawn — or a
+/// daemon restarted since the registration — the same way: no row at the
+/// named switch address is the goal state either way, so the withdrawal
+/// succeeds. A row that *is* published there under a different name or pair
+/// is refused with [`BoxControlReply::Error`]: the requesting client is not
+/// its creator, and no client may remove another box's row.
+///
+/// The addresses themselves are spent for good by design — the host's
+/// allocation cursors never regress — so a withdrawal ends a row's
+/// admissions without ever returning its addresses to the plan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WithdrawBoxRequest {
+    /// The name the row to withdraw was registered under.
+    pub name: String,
+    /// The switch address the registration handed back, which keys the row
+    /// in the host table.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The loopback address the registration handed back, which the pair
+    /// proof checks against the row's own.
+    pub loopback_address: std::net::Ipv4Addr,
+}
+
+/// The one request line the control socket takes: which verb the client
+/// wants, `register` or `withdraw`, tagged in the line itself.
+///
+/// The tag is the version corner, and it leans the safe way. A daemon that
+/// predates a verb cannot parse the tagged line and refuses it — and an old
+/// CLI's registration, untagged, fails the new daemon's parse the same way,
+/// so the daemon is autospawned by the CLI from the same install and the
+/// mixed-version pair is the corner, not the rule. Ordered dispatch would
+/// parse an old daemon's withdraw line as a *spurious registration* — a row
+/// with no ports and an allow-all policy, spending a finite hand-out
+/// address — which is worse than the refusal: the registering side's row
+/// stays published either way, but only the refusal leaves no new fact on
+/// the host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum BoxControlRequest {
+    /// Register the box's declaration: allocate the box's addresses on the
+    /// host and fill the row the egress gate decides by.
+    Register(RegisterBoxRequest),
+    /// Withdraw the row a registration filled: the destroyed or failed
+    /// session's creator presenting the pair the registration handed back.
+    Withdraw(WithdrawBoxRequest),
+}
+
 /// The addresses a successful registration hands back
 /// ([`sessions::BoxAddresses`]): the box's switch address and its published
 /// loopback address, both allocated on the host from the address plan the
 /// host switch serves — the same pair the create request carries so the
 /// in-VM daemon attaches with it.
 ///
-/// The one reply line the control socket answers a registration with: the
-/// handed addresses, or the reason the registration did not happen. Untagged
-/// so the reply stays one flat JSON object either way.
+/// The one reply line the control socket answers either verb with: the
+/// handed addresses, or the reason the verb did not happen. A registration
+/// hands the allocated pair back; a withdrawal echoes the pair it withdrew
+/// by, so the client can check the daemon meant the row it asked about.
+/// Untagged so the reply stays one flat JSON object either way.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
-pub enum RegisterBoxReply {
-    /// Registration succeeded: both addresses are allocated and the host
-    /// table's row is filled.
+pub enum BoxControlReply {
+    /// The verb succeeded: a registration's allocated addresses, or a
+    /// withdrawal's echo of the pair the row went by.
     Addresses(BoxAddresses),
-    /// Registration failed: `error` is a sentence naming why, for the
-    /// activating client to warn with.
+    /// The verb failed: `error` is a sentence naming why, for the client to
+    /// warn with.
     Error { error: String },
 }
 
