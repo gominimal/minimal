@@ -109,7 +109,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -178,8 +178,9 @@ const CONTROL_VERBS: [(ControlVerb, &[u8]); 3] = [
 /// Which of the daemon's own publish verbs a control request speaks — the
 /// key to the body shape the gate parses, and the verb the decision decides
 /// by: an expose and a zone-add publish *at* an address the request names,
-/// while a retraction names only the listener it retracts and is decided
-/// table-wide.
+/// while a retraction names only the listener it retracts, and the address
+/// it is decided at is the gate's attribution — the one the publish it
+/// retracts was applied at ([`PublishedForwards`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlVerb {
     /// `POST /services/forwarder/expose`: publish a host-port forwarder.
@@ -350,10 +351,13 @@ const UNKNOWN_PUBLISH_ADDRESS_RULE: &str = "egress-unknown-publish-address";
 /// resolve where, stops at what the host published.
 const UNDECLARED_PUBLISH_RECORD_RULE: &str = "egress-undeclared-publish-record";
 
-/// The rule name for a retraction refused once the per-box default binds:
-/// the record it names is declared by no published row, so there is no
-/// publication left to retract. Under the interim a matching-nothing
-/// retraction is applied — the teardowns of publications whose rows are
+/// The rule name for a retraction the decision is applied by nothing at: a
+/// listener no applied publish names — keyed at the unspecified address the
+/// ledger's absence keys it at, and no row holds that — or a listener whose
+/// attributed address's row does not hold the record it names. In both there
+/// is no publication left to retract at the address the retraction is
+/// decided by. Under the interim a retraction keyed at an in-plan address no
+/// row holds is still applied — the teardowns of publications whose rows are
 /// still to come are the ones that must work — and refused here only after
 /// the flip.
 const UNDECLARED_RETRACT_RULE: &str = "egress-undeclared-retract";
@@ -673,6 +677,11 @@ impl EgressGate {
         // One limiter for the whole gate: a guest that reconnects must not
         // reset the rate window its drops are counted in.
         let limiter = Arc::new(DropLimiter::new());
+        // One publish ledger for the whole gate, beside the limiter: the
+        // address a listener's publish was applied at is a fact of the gate,
+        // not of the connection that carried it — the publish and the
+        // teardown that retracts it arrive on different connections.
+        let forwards = Arc::new(PublishedForwards::new());
         Ok(Self {
             accept: tokio::spawn(accept_loop(
                 listener,
@@ -680,6 +689,7 @@ impl EgressGate {
                 table,
                 baseline,
                 limiter,
+                forwards,
                 phase,
             )),
         })
@@ -786,6 +796,7 @@ async fn accept_loop<A: GuestSource>(
     table: BoxTable,
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
+    forwards: Arc<PublishedForwards>,
     phase: UnregisteredSourcePhase,
 ) {
     let mut relays = JoinSet::new();
@@ -849,6 +860,7 @@ async fn accept_loop<A: GuestSource>(
             table.clone(),
             baseline.clone(),
             Arc::clone(&limiter),
+            Arc::clone(&forwards),
             HANDSHAKE_TIMEOUT,
             phase,
         ));
@@ -868,12 +880,20 @@ async fn accept_loop<A: GuestSource>(
 /// follows the request's end. It is a parameter only so a test can shrink
 /// it; every caller outside this module's tests reaches a connection through
 /// [`accept_loop`], which passes [`HANDSHAKE_TIMEOUT`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two sockets, the table, the baseline, the limiter, the publish \
+              ledger, the drain bound and the phase are each a distinct input to \
+              what one connection does; grouping them would name the bundle \
+              without naming the members"
+)]
 async fn serve_connection(
     mut guest: UnixStream,
     switch_sock: PathBuf,
     table: BoxTable,
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
+    forwards: Arc<PublishedForwards>,
     handshake_timeout: Duration,
     phase: UnregisteredSourcePhase,
 ) {
@@ -973,6 +993,7 @@ async fn serve_connection(
                 body,
                 table,
                 limiter,
+                &forwards,
                 handshake_timeout,
                 phase,
             )
@@ -1114,9 +1135,9 @@ async fn relay_frames(
 /// holds no gate task and no socket past it.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the four socket halves, the framed request, the table, the limiter and the \
-              drain bound are each a distinct input to one leg; grouping them would name \
-              the bundle without naming the members"
+    reason = "the four socket halves, the framed request, the table, the limiter, the \
+              publish ledger and the drain bound are each a distinct input to one leg; \
+              grouping them would name the bundle without naming the members"
 )]
 async fn relay_control(
     mut guest: Prefixed<OwnedReadHalf>,
@@ -1128,6 +1149,7 @@ async fn relay_control(
     body: usize,
     table: BoxTable,
     limiter: Arc<DropLimiter>,
+    forwards: &PublishedForwards,
     drain_timeout: Duration,
     phase: UnregisteredSourcePhase,
 ) {
@@ -1141,7 +1163,7 @@ async fn relay_control(
         // request owes.
         return;
     };
-    let decision = match decide_control_request(verb, &request, &table, phase) {
+    let decision = match decide_control_request(verb, &request, &table, phase, forwards) {
         Ok(decision) => decision,
         Err(refused) => {
             // Refused, and said so at the frame drops' cadence: a guest can
@@ -1167,6 +1189,25 @@ async fn relay_control(
         // The interim's admission is the one publish the gate applies whose
         // reach no row bounds, and the host must be able to see it pass.
         warn_interim_publish(&limiter, &decision);
+    }
+    // The applied request is filed with the publish ledger: a forwarder's
+    // listener and the address its publish was applied at are what a later
+    // retraction of it is keyed by, and an applied retraction's listener
+    // leaves the ledger with it — the publication is gone. The note is taken
+    // after the write: a forward the gate could not deliver published
+    // nothing, and attributes nothing.
+    match verb {
+        ControlVerb::Expose => {
+            if let Some(Record::Port(listener)) = decision.request.records().next() {
+                forwards.note_published(listener, decision.request.switch_addr());
+            }
+        }
+        ControlVerb::Unexpose => {
+            if let Some(Record::Port(listener)) = decision.request.records().next() {
+                forwards.note_retracted(listener);
+            }
+        }
+        ControlVerb::DnsAdd => {}
     }
     let mut response = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
     // The legs race, as the frame relay's do: the switch's side can end under
@@ -1340,11 +1381,12 @@ async fn control_request_probe(
 }
 
 /// A control request the gate refused, as its warn line names it: the rule
-/// that refused it, the switch address it published at (`None` — the
-/// request named no address the gate could read, or named none at all, as a
-/// retraction does), the port or name the refusal is about when one is
-/// nameable, and the reason. Built by [`decide_control_request`], rendered
-/// by [`refuse_request`].
+/// that refused it, the switch address it published at or the retraction is
+/// keyed at (`None` only when the body never parsed far enough to name one —
+/// a retraction's is always present, the attribution or the unspecified
+/// address its absence keys at), the port or name the refusal is about when
+/// one is nameable, and the reason. Built by [`decide_control_request`],
+/// rendered by [`refuse_request`].
 struct RefusedRequest {
     rule: &'static str,
     addr: Option<[u8; 4]>,
@@ -1359,6 +1401,84 @@ struct ControlDecision {
     applied: Applied,
     request: SwitchRequest,
     dictionary: Vec<String>,
+}
+
+/// The listener ports whose publishes the gate has applied, each with the
+/// switch address it was applied at: the ledger a retraction is attributed
+/// by. The unexpose body names only the loopback listener it retracts — the
+/// wire carries no switch address — but the decision is keyed per address
+/// (`switch_request::applied` applies a retract by the row at the request's
+/// own address), so the gate supplies the address from the one place it is
+/// a host-side fact: the publish the listener's forward came from. A
+/// retraction for a listener no applied publish names is keyed at the
+/// unspecified address, which no row holds, and refused — a guest cannot
+/// retract a publication the gate never admitted by naming a port some row
+/// happens to declare.
+///
+/// The ledger is shared by the gate's connections: the publish and its
+/// teardown arrive on different ones — the daemon's client speaks one
+/// request per connection — so a per-connection ledger would refuse every
+/// honest teardown. The lock is held only across a lookup or an update,
+/// never across an await.
+///
+/// The table is bounded like the limiter's window table
+/// ([`DROP_WARN_MAX_TRACKED_PAIRS`]): the honest guest's forwards are a
+/// handful per box, and a guest that fills the bound is not rewarded — the
+/// oldest attribution is evicted, which can only turn a later retraction of
+/// that listener into a refusal.
+#[derive(Debug, Default)]
+struct PublishedForwards {
+    applied: Mutex<Vec<(u16, [u8; 4])>>,
+}
+
+/// How many applied publishes' attributions the ledger keeps.
+const PUBLISHED_FORWARDS_TRACKED: usize = 1024;
+
+impl PublishedForwards {
+    /// A ledger with no applied publishes in it.
+    fn new() -> Self {
+        Self {
+            applied: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Notes the address an applied publish's listener was applied at. The
+    /// listener is keyed first — gvproxy binds one forwarder per loopback
+    /// listener, so a second publish for a held listener never becomes live —
+    /// and the ledger is bounded oldest-first, so the honest handful never
+    /// reaches the bound.
+    fn note_published(&self, listener: u16, addr: [u8; 4]) {
+        let mut applied = self.lock();
+        if applied.iter().any(|(held, _)| *held == listener) {
+            return;
+        }
+        if applied.len() >= PUBLISHED_FORWARDS_TRACKED {
+            applied.remove(0);
+        }
+        applied.push((listener, addr));
+    }
+
+    /// Drops the attribution an applied retraction's listener carried: the
+    /// publication is gone, and a later retraction of the same listener has
+    /// nothing left to name.
+    fn note_retracted(&self, listener: u16) {
+        self.lock().retain(|(held, _)| *held != listener);
+    }
+
+    /// The address the applied publish of `listener` was applied at, when
+    /// one is in the ledger.
+    fn address_of(&self, listener: u16) -> Option<[u8; 4]> {
+        self.lock()
+            .iter()
+            .find(|(held, _)| *held == listener)
+            .map(|(_, addr)| *addr)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<(u16, [u8; 4])>> {
+        self.applied.lock().expect(
+            "the ledger's lock is held only across a lookup or an update, never across a panic",
+        )
+    }
 }
 
 /// Decides one control request against the host-side table (NET-081's
@@ -1379,11 +1499,17 @@ struct ControlDecision {
 /// decision with more distinct names in play than an index can name is
 /// refused rather than wrapped, because an index that wraps is a different
 /// record than the one the guest named.
+///
+/// A retraction's summary is keyed at the address the gate's ledger holds
+/// for the listener it names — the one the publish it retracts was applied
+/// at ([`PublishedForwards`]) — or at the unspecified one when no applied
+/// publish names that listener, which no row holds and nothing applies.
 fn decide_control_request(
     verb: ControlVerb,
     body: &[u8],
     table: &BoxTable,
     phase: UnregisteredSourcePhase,
+    forwards: &PublishedForwards,
 ) -> Result<ControlDecision, RefusedRequest> {
     let mut dictionary = Vec::new();
     let rows = table.rows();
@@ -1401,7 +1527,7 @@ fn decide_control_request(
     let switch_table = SwitchTable::of(switch_rows, first_ptask, last_ptask);
     let request = match verb {
         ControlVerb::Expose => summarize_expose(body)?,
-        ControlVerb::Unexpose => summarize_unexpose(body)?,
+        ControlVerb::Unexpose => summarize_unexpose(body, forwards)?,
         ControlVerb::DnsAdd => summarize_dns_add(body, &mut dictionary)?,
     };
     let applied = switch_request::applied(&request, &switch_table, phase.into_sessions_phase());
@@ -1421,9 +1547,9 @@ fn decide_control_request(
                     Some(*addr),
                     Some(render_record(*record, &dictionary)),
                 ),
-                Refusal::Unheld { record } => (
+                Refusal::Unheld { addr, record } => (
                     UNDECLARED_RETRACT_RULE,
-                    None,
+                    Some(*addr),
                     record.map(|record| render_record(record, &dictionary)),
                 ),
             };
@@ -1491,11 +1617,13 @@ fn render_record(record: Record, dictionary: &[String]) -> String {
     }
 }
 
-/// Emits the interim's line for one admitted publish: the same rate limit a
+/// Emits the interim's line for one admitted request: the same rate limit a
 /// drop's line answers to — one per address per interval — because a box
 /// whose row no creator has supplied yet publishes on every daemon boot, and
 /// the point of the line is that a host running the interim can see it, not
-/// that it can be flooded by it. Returns whether a line was written.
+/// that it can be flooded by it. The line is marked `interim`, so a bundle's
+/// log tail tells an applied interim from a refusal under the same rule.
+/// Returns whether a line was written.
 fn warn_interim_publish(limiter: &DropLimiter, decision: &ControlDecision) -> bool {
     let request = &decision.request;
     let addr = request.switch_addr();
@@ -1507,10 +1635,11 @@ fn warn_interim_publish(limiter: &DropLimiter, decision: &ControlDecision) -> bo
         WarnDecision::Silent => false,
         WarnDecision::Named => {
             tracing::warn!(
+                interim = true,
                 source = %Ipv4Addr::from(addr),
                 port_or_name = %what.as_deref().unwrap_or("none"),
                 rule_matched = UNREGISTERED_PUBLISH_RULE,
-                "applied a switch publish at an in-plan address no published \
+                "applied a switch request at an in-plan address no published \
                  namespace holds; the row that bounds it is T66 (#1711), the \
                  creator-side registration that supplies it",
             );
@@ -1518,10 +1647,11 @@ fn warn_interim_publish(limiter: &DropLimiter, decision: &ControlDecision) -> bo
         }
         WarnDecision::Overflow => {
             tracing::warn!(
+                interim = true,
                 rule_matched = UNREGISTERED_PUBLISH_RULE,
-                "applying publishes from more distinct unregistered addresses \
-                 than the gate keeps a window per source for; the row that \
-                 bounds them is T66 (#1711)",
+                "applying switch requests from more distinct unregistered \
+                 addresses than the gate keeps a window per source for; the \
+                 row that bounds them is T66 (#1711)",
             );
             true
         }
@@ -1580,9 +1710,9 @@ struct ExposeBody {
 }
 
 /// The body shape for a retraction: the loopback listener it retracts. The
-/// wire carries no address — the retraction is decided by what the rows
-/// hold — and the protocol is checked as the client's shape and nothing
-/// more.
+/// wire carries no address — the gate attributes the retraction to the
+/// address its listener's publish was applied at ([`PublishedForwards`]) —
+/// and the protocol is checked as the client's shape and nothing more.
 #[derive(Debug, serde::Deserialize)]
 struct UnexposeBody {
     local: String,
@@ -1651,10 +1781,16 @@ fn summarize_expose(body: &[u8]) -> Result<SwitchRequest, RefusedRequest> {
     .ok_or_else(|| malformed(None))
 }
 
-/// Summarizes a retraction: the listener it names, and nothing else — the
-/// wire carries no switch address, so the summary carries the unspecified
-/// one, which the pure decision never reads for a retract.
-fn summarize_unexpose(body: &[u8]) -> Result<SwitchRequest, RefusedRequest> {
+/// Summarizes a retraction: the listener it names, keyed at the address the
+/// gate's ledger holds for that listener — the one the publish it retracts
+/// was applied at ([`PublishedForwards`]) — or, when no applied publish
+/// names the listener, at the unspecified one, which no row holds and
+/// nothing applies. The wire carries no address; the attribution is the
+/// gate's, from where the publication happened and nowhere else.
+fn summarize_unexpose(
+    body: &[u8],
+    forwards: &PublishedForwards,
+) -> Result<SwitchRequest, RefusedRequest> {
     let malformed = |what: Option<String>| RefusedRequest {
         rule: MALFORMED_PUBLISH_RULE,
         addr: None,
@@ -1672,9 +1808,10 @@ fn summarize_unexpose(body: &[u8]) -> Result<SwitchRequest, RefusedRequest> {
     if !is_client_protocol(&parsed.protocol) {
         return Err(malformed(Some(parsed.protocol)));
     }
+    let published_at = forwards.address_of(local_port);
     SwitchRequest::of(
         SwitchVerb::Retract,
-        [0, 0, 0, 0],
+        published_at.unwrap_or([0, 0, 0, 0]),
         &[Record::Port(local_port)],
     )
     .ok_or_else(|| malformed(None))
@@ -1924,6 +2061,16 @@ async fn relay_frames_to_switch(
 /// admit says so, rate-limited, naming T66. Sources outside the lease block
 /// are rule 0's under either phase: the plan never hands them out, so no row
 /// will ever hold them, and they are refused before any interim is consulted.
+///
+/// Two bounds the interim's admits carry, the same for as long as the
+/// announced arm is shipped: the phase is read once per build — one constant,
+/// [`UNREGISTERED_SOURCE_PHASE`] — and never changes while a VM runs, so a
+/// flip is the next release's boot and a bundle's logs read one posture per
+/// daemon lifetime; and the interim admits lease-run addresses only — the
+/// plan's ptask lease run is what in-plan means — never the node plane's own
+/// address and never the plan's reserved pair, the infrastructure the plan
+/// keeps for itself, which no lease run hands out and which are refused under
+/// either phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnregisteredSourcePhase {
     /// The per-box default is announced, not yet binding: an unregistered
@@ -2704,6 +2851,27 @@ pub(crate) mod test_support {
         (guest, switch)
     }
 
+    /// Opens one more connection on the harness's gate for a control request,
+    /// and nothing else: the guest's end and the switch end the gate dialed
+    /// for it, with no byte written on either. A control connection speaks
+    /// its one request — verb, head and body in one write — where a frame
+    /// connection's upgrade head would go, and the gate decides that request
+    /// before any of it is written on, so what a test reads off the switch
+    /// end next is either the whole request or nothing.
+    pub(crate) async fn connect_control(harness: &GateHarness) -> (UnixStream, UnixStream) {
+        let guest = UnixStream::connect(&harness.gate_sock)
+            .await
+            .expect("connecting another guest");
+        // The gate's dial of the switch it fronts, accepted before the guest
+        // speaks, exactly as every connection's is.
+        let (switch, _) = harness
+            .switch_listener
+            .accept()
+            .await
+            .expect("accepting the gate's dial");
+        (guest, switch)
+    }
+
     /// Writes one length-framed frame from the guest end.
     pub(crate) async fn send_frame(guest: &mut UnixStream, frame: &[u8]) {
         let mut framed = Vec::with_capacity(2 + frame.len());
@@ -2859,18 +3027,19 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::test_support::{
-        CaptureWriter, DEADLINE, arp_frame, capture_log, connect_over, expect_frame,
-        expect_silence, expect_teardown, gate_connected, gate_over, gate_over_control,
-        gate_over_with, gate_over_with_node_baseline, gate_over_with_phase, ipv4_frame, ipv6_frame,
-        read_within, send_frame, wait_for_log,
+        CaptureWriter, DEADLINE, arp_frame, capture_log, connect_control, connect_over,
+        expect_frame, expect_silence, expect_teardown, gate_connected, gate_connected_with_phase,
+        gate_over, gate_over_control, gate_over_with, gate_over_with_node_baseline,
+        gate_over_with_phase, ipv4_frame, ipv6_frame, read_within, send_frame, wait_for_log,
     };
     use super::{
         AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DROP_WARN_MAX_TRACKED_PAIRS,
         DROP_WARN_MIN_INTERVAL, DropLimiter, EgressGate, GateAdmit, GateDrop, GuestSource,
         GuestSpeak, HANDSHAKE_TIMEOUT, MAX_HEAD, MAX_LIVE_RELAYS, MAX_NAMED_TARGET,
-        UNDECLARED_PUBLISH_RECORD_RULE, UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE,
-        UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision, accept_loop, gate_verdict,
-        max_frame, serve_connection,
+        PublishedForwards, UNDECLARED_PUBLISH_RECORD_RULE, UNDECLARED_RETRACT_RULE,
+        UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE,
+        UnregisteredSourcePhase, WarnDecision, accept_loop, gate_verdict, max_frame,
+        serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
     use crate::net::baseline::{BaselineCategory, NodeBaselinePhase, NodePlaneBaseline};
@@ -3295,11 +3464,15 @@ mod tests {
         );
 
         // The exchange was decided, and admitted under the interim — which
-        // says so, once, naming the address the publish went out at. Nothing
-        // was dropped: a control exchange is not a frame, and no frame
-        // verdict ran on it.
+        // says so, once, marked as the interim's own line and naming the
+        // address the publish went out at. Nothing was dropped: a control
+        // exchange is not a frame, and no frame verdict ran on it.
         wait_for_log(&h.log, "egress-unregistered-publish").await;
         let logged = h.log.contents();
+        assert!(
+            logged.contains("interim=true"),
+            "an applied interim says so on its own line, got: {logged}"
+        );
         assert!(
             logged.contains("source=100.64.0.10"),
             "the interim's line names the address the publish went out at, got: {logged}"
@@ -4033,6 +4206,7 @@ mod tests {
             table,
             NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
+            Arc::new(PublishedForwards::new()),
             bound,
             UNREGISTERED_SOURCE_PHASE,
         ));
@@ -4116,6 +4290,7 @@ mod tests {
             table,
             NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
+            Arc::new(PublishedForwards::new()),
             bound,
             UNREGISTERED_SOURCE_PHASE,
         ));
@@ -4198,6 +4373,7 @@ mod tests {
                 table.clone(),
                 NodePlaneBaseline::built_in(SUBNET),
                 Arc::new(DropLimiter::new()),
+                Arc::new(PublishedForwards::new()),
                 bound,
                 UNREGISTERED_SOURCE_PHASE,
             ));
@@ -4275,6 +4451,7 @@ mod tests {
             table.clone(),
             NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
+            Arc::new(PublishedForwards::new()),
             UNREGISTERED_SOURCE_PHASE,
         ));
         (feed, accept, log, guard)
@@ -5527,18 +5704,203 @@ mod tests {
         expect_teardown(&mut h.guest).await;
     }
 
-    /// NET-133, at the table: a box's row is withdrawn when its shuttle
-    /// connection ends. The gate attributes every admitted frame's source to
-    /// the connection that carried it and files the report at the relay's
-    /// end — whatever ended it — and the registry's drainer withdraws a row
-    /// per reported address, so the namespace whose connection closed holds
-    /// no row after. Here that is immediate: the report rides the same close
-    /// that ended the traffic, far inside the box-end bound the requirement
-    /// names. A re-attachment starts from a registration, not from a row
-    /// whose connection is gone; and the guest relay never reconnects a
-    /// closed shuttle connection, so the traffic was already down.
+    /// A retraction is decided by the row at the address the gate attributes
+    /// it to: the ledger keeps every applied publish's listener → address
+    /// pair, so the daemon's teardown — whose body names only the listener,
+    /// the wire carrying no switch address — is keyed at the publication's
+    /// own address and applied by the row that holds it, and a retraction
+    /// for a listener no applied publish names is keyed at the unspecified
+    /// address no row holds and refused. The refused one is the change: the
+    /// same request was applied table-wide before — any row holding the
+    /// port applied it — so a fabricated retraction of a port some row
+    /// declared travelled to the switch.
     #[tokio::test]
-    async fn host_table_row_withdrawn_within_60s_of_box_end() {
+    async fn a_retraction_is_keyed_at_the_address_its_publication_was_applied_at() {
+        for phase in [
+            UnregisteredSourcePhase::Announced,
+            UnregisteredSourcePhase::InForce,
+        ] {
+            let registry = BoxRegistry::new(SUBNET);
+            tcp_lan_box(&registry, LEASE);
+            let mut h = gate_connected_with_phase(registry, phase).await;
+
+            // An honest expose at the row's own address — the shape the
+            // daemon's client sends, the listener and the remote both ports
+            // the row declares — admitted by the row under either phase.
+            let body = br#"{"local":"127.0.0.1:8080","remote":"100.64.0.9:8080","protocol":"tcp"}"#;
+            let mut expose =
+                b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+            expose.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+            expose.extend_from_slice(body);
+            h.guest
+                .write_all(&expose)
+                .await
+                .expect("writing the expose");
+            let mut spoken = vec![0u8; expose.len()];
+            read_within(&mut h.switch, &mut spoken).await;
+            assert_eq!(spoken, expose, "the admitted expose reached the switch");
+
+            // The publish is answered, and the answer read back off the
+            // guest's end: gvproxy's answer passing the gate proves the relay
+            // got past its ledger note, so the attribution is in place before
+            // the teardown is spoken.
+            let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            h.switch
+                .write_all(answer)
+                .await
+                .expect("writing gvproxy's answer");
+            let mut seen = vec![0u8; answer.len()];
+            read_within(&mut h.guest, &mut seen).await;
+            assert_eq!(
+                seen, answer,
+                "the publish's answer reaches the guest verbatim"
+            );
+
+            // The teardown, on its own connection as the daemon's client
+            // speaks it — one request per connection, the body naming only
+            // the listener. The gate keys it at the address the publish was
+            // applied at, the row's own, whose row holds the port: applied.
+            let body = br#"{"local":"127.0.0.1:8080","protocol":"tcp"}"#;
+            let mut unexpose =
+                b"POST /services/forwarder/unexpose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+            unexpose
+                .extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+            unexpose.extend_from_slice(body);
+            let (mut guest, mut switch) = connect_control(&h).await;
+            guest
+                .write_all(&unexpose)
+                .await
+                .expect("writing the retraction");
+            let mut spoken = vec![0u8; unexpose.len()];
+            read_within(&mut switch, &mut spoken).await;
+            assert_eq!(
+                spoken, unexpose,
+                "a retraction keyed at its publication's address reaches the switch"
+            );
+
+            // A retraction for a listener no applied publish names: keyed at
+            // the unspecified address, refused before a byte of it is written
+            // on — gvproxy never sees it — and the refusal is the retraction's
+            // own rule, naming the unspecified source, the port, and the
+            // reason.
+            let body = br#"{"local":"127.0.0.1:9999","protocol":"tcp"}"#;
+            let mut stray =
+                b"POST /services/forwarder/unexpose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+            stray.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+            stray.extend_from_slice(body);
+            let (mut guest, mut switch) = connect_control(&h).await;
+            guest
+                .write_all(&stray)
+                .await
+                .expect("writing the stray retraction");
+            wait_for_log(&h.log, UNDECLARED_RETRACT_RULE).await;
+            let logged = h.log.contents();
+            assert!(
+                logged.contains("rule_matched=\"egress-undeclared-retract\""),
+                "the refusal names its own class, got: {logged}"
+            );
+            assert!(
+                logged.contains("source=0.0.0.0"),
+                "a retraction no publish attributes is keyed at the unspecified \
+                 address, got: {logged}"
+            );
+            assert!(
+                logged.contains("port_or_name=port 9999"),
+                "the refusal names the listener it was refused for, got: {logged}"
+            );
+            assert!(
+                logged.contains("nothing published at its address admits what it retracts"),
+                "the refusal says no publication is there to retract, got: {logged}"
+            );
+            let mut probe = [0u8; 1];
+            match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => panic!("{n} byte(s) of a refused retraction reached the switch"),
+                Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+                Err(_) => panic!("the gate left the switch side hanging"),
+            }
+            expect_teardown(&mut guest).await;
+        }
+    }
+
+    /// The interim's own teardowns keep working: a publish the interim
+    /// applied — at an in-plan lease no published row holds — leaves its
+    /// listener in the ledger, and the retraction of it is keyed at that
+    /// lease, where no row holds it and the announced interim applies it.
+    /// The teardown the flip refuses is the same one whose publish the flip
+    /// refuses: once the default binds, nothing is attributed, so nothing is
+    /// left to retract.
+    #[tokio::test]
+    async fn an_interim_publications_teardown_is_keyed_at_its_own_address() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_connected_with_phase(registry, UnregisteredSourcePhase::Announced).await;
+
+        // The interim's publish: the daemon's expose shape, at an in-plan
+        // lease the plan could hand out and no row holds. Applied — and said
+        // so, marked as the interim's own line, naming the address.
+        let body = br#"{"local":"127.0.0.1:8080","remote":"100.64.0.10:8080","protocol":"tcp"}"#;
+        let mut expose =
+            b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        expose.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        expose.extend_from_slice(body);
+        h.guest
+            .write_all(&expose)
+            .await
+            .expect("writing the expose");
+        let mut spoken = vec![0u8; expose.len()];
+        read_within(&mut h.switch, &mut spoken).await;
+        assert_eq!(spoken, expose, "the interim's publish reached the switch");
+        wait_for_log(&h.log, UNREGISTERED_PUBLISH_RULE).await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("interim=true"),
+            "an applied interim says so on its own line, got: {logged}"
+        );
+        assert!(
+            logged.contains("source=100.64.0.10"),
+            "the interim's line names the address the publish went out at, got: {logged}"
+        );
+
+        // And the teardown of it works the same way: keyed at the lease the
+        // publish went out at, where no row holds it and the announced
+        // interim applies it — the publications whose rows are still to come
+        // are the ones whose teardowns must work.
+        let body = br#"{"local":"127.0.0.1:8080","protocol":"tcp"}"#;
+        let mut unexpose =
+            b"POST /services/forwarder/unexpose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        unexpose.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        unexpose.extend_from_slice(body);
+        let (mut guest, mut switch) = connect_control(&h).await;
+        guest
+            .write_all(&unexpose)
+            .await
+            .expect("writing the retraction");
+        let mut spoken = vec![0u8; unexpose.len()];
+        read_within(&mut switch, &mut spoken).await;
+        assert_eq!(
+            spoken, unexpose,
+            "the interim publication's teardown reaches the switch"
+        );
+    }
+
+    /// NET-133, at the table: a box's row is withdrawn within the
+    /// requirement's bound of its relay's end. The connection whose end
+    /// withdraws the row is the box's own shuttle connection — the one the
+    /// guest's relay opens per box and never reopens — so the withdrawal this
+    /// test proves is keyed to the relay's end, not to the box's own end:
+    /// creator-driven withdrawal at destroy is T66's (#1711), and lands with
+    /// it. The gate attributes every admitted frame's source to the
+    /// connection that carried it and files the report at the relay's end —
+    /// whatever ended it — and the registry's drainer withdraws a row per
+    /// reported address, so the namespace whose connection closed holds no
+    /// row after. Here that is immediate: the report rides the same close
+    /// that ended the traffic, far inside the bound the requirement names. A
+    /// re-attachment starts from a registration, not from a row whose
+    /// connection is gone; and the guest relay never reconnects a closed
+    /// shuttle connection, so the traffic was already down.
+    #[tokio::test]
+    async fn host_table_row_withdrawn_within_60s_of_relay_end() {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
         registry.spawn_withdrawal_drainer();

@@ -363,9 +363,11 @@ impl BoxRegistry {
     /// Spawns the thread that applies the gate's withdrawal reports: one
     /// report — the switch addresses whose relayed traffic ended with a
     /// connection — drives one [`Self::withdraw`] per address, so a box's
-    /// row goes with its connection (NET-133: withdrawn within the box-end
-    /// bound, and a row whose traffic never ends is never withdrawn). The
-    /// thread holds a clone of this registry, so it withdraws the same rows
+    /// row goes with its connection. The bound the withdrawal keeps is
+    /// NET-133's, keyed to the relay's end: the box's own shuttle
+    /// connection, the one its frames travel by, is what the report rides
+    /// (and a row whose traffic never ends is never withdrawn). The thread
+    /// holds a clone of this registry, so it withdraws the same rows
     /// every other handle sees, and it runs until the reports' senders are
     /// all gone — the gate and every table handed out — because that is
     /// when there is nothing left to withdraw.

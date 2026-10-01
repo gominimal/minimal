@@ -292,11 +292,11 @@ impl std::fmt::Display for Refusal {
             Self::Undeclared { .. } => {
                 f.write_str("the namespace holding its address does not admit it")
             }
-            Self::Unheld { record: Some(_), .. } => f.write_str(
-                "the namespace holding its address does not admit what it retracts",
-            ),
+            Self::Unheld {
+                record: Some(_), ..
+            } => f.write_str("nothing published at its address admits what it retracts"),
             Self::Unheld { record: None, .. } => {
-                f.write_str("no published namespace holds the address it retracts at")
+                f.write_str("nothing is published at the address it retracts at")
             }
         }
     }
