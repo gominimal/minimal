@@ -643,8 +643,9 @@ mod tests {
 
     #[test]
     fn allocator_exhausts_a_tiny_subnet() {
-        // /29 => 8 addresses; network, gateway, daemon, host-alias, broadcast
-        // reserved, leaving exactly three allocatable hosts (.2 through .4).
+        // /29 => 8 addresses; network, gateway, the proxy's address, daemon,
+        // host-alias and broadcast reserved, leaving exactly two allocatable
+        // hosts (.2 through .3).
         let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
         let mut a = IpAllocator::new(subnet);
         let got: Vec<_> = std::iter::from_fn(|| a.allocate().ok())
@@ -652,11 +653,7 @@ mod tests {
             .collect();
         assert_eq!(
             got,
-            vec![
-                Ipv4Addr::new(10, 0, 0, 2),
-                Ipv4Addr::new(10, 0, 0, 3),
-                Ipv4Addr::new(10, 0, 0, 4),
-            ]
+            vec![Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3),]
         );
         assert!(matches!(a.allocate(), Err(NetError::SubnetExhausted(_))));
     }
@@ -694,6 +691,13 @@ mod tests {
         // shows — `host` answered in `min.internal.` at the NAT'd alias.
         assert!(cfg.contains("    - name: \"min.internal.\"\n"));
         assert!(cfg.contains("        - name: \"host\"\n          ip: \"100.64.255.254\"\n"));
+        // The box-egress-proxy address is owned by the host-side stack peer,
+        // not the switch, so the rendered configuration leaves it out of both
+        // the virtual-IP list (no ARP answered for it) and `nat` (no
+        // translation of it).
+        let bep = a.subnet().box_egress_proxy_address();
+        assert!(!cfg.contains(&format!("    - \"{bep}\"")));
+        assert!(!cfg.contains(&format!("nat:\n    \"{bep}\":")));
     }
 
     #[test]
