@@ -2975,8 +2975,7 @@ impl SessionLauncher for SandboxLauncher {
         // A launch minted for lifecycle hooks advises on neither surface: a
         // hook run is not a session start, and its record would count one
         // hook run as one. The placement itself is not gated with it.
-        let advise =
-            advises_unenforced_placement(guest, network_mode, leaf.as_ref()) && !for_hooks;
+        let advise = advises_unenforced_placement(guest, network_mode, leaf.as_ref()) && !for_hooks;
         if advise {
             let notice = unenforced_placement_notice();
             tracing::info!(
