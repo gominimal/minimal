@@ -1265,12 +1265,26 @@ async fn splice_control(
 }
 
 /// switch → guest, untouched. The gate applies no ingress policy and parses
-/// nothing on this leg — bytes flow as they came, frames included. The
-/// delivery leg's socket, when one was dialed for this relay, is a second
-/// source of the same shape: the leg's frames are copied to the guest
-/// verbatim beside the switch's, and the leg's own death takes nothing with
-/// it but its own reads — the switch's side of the relay keeps running, so a
-/// dead delivery leg costs only the frames it was delivering.
+/// nothing on this leg — frames flow as they came, whole. The delivery leg's
+/// socket, when one was dialed for this relay, is a second source of the same
+/// shape: the leg's frames are relayed to the guest beside the switch's, and
+/// the leg's own death takes nothing with it but its own reads — the switch's
+/// side of the relay keeps running, so a dead delivery leg costs only the
+/// frames it was delivering.
+///
+/// Two sources, one guest, means the copy cannot be a byte copy: the guest
+/// reads one length-framed stream, so a frame delivered as two socket reads
+/// with a read from the other source between its halves would interleave the
+/// streams inside the frame and desync the guest's parser for good. Each
+/// source's bytes are therefore reassembled into whole `[len][frame]` units
+/// ([`Reassembler`]) before anything reaches the guest, and whole units are
+/// what the guest sees — units from different sources may abut, but never
+/// overlap.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every staging-buffer slice is bounded by the length check that \
+              produced it, inside `Reassembler::absorb`"
+)]
 async fn copy_switch_to_guest(
     mut switch: OwnedReadHalf,
     leg: Option<OwnedReadHalf>,
@@ -1286,12 +1300,16 @@ async fn copy_switch_to_guest(
         Switch(io::Result<usize>),
         Leg(io::Result<usize>),
     }
-    // Two sources, one guest: reads from either are written on whole — never
-    // interleaved mid-frame — so the length-framing each source carries
-    // survives the copy intact. Each source keeps its own read buffer: a
-    // `select!` polls both at once, so one buffer could not serve them.
+    // Two sources, one guest: each keeps its own read buffer and its own
+    // reassembly, and a `select!` polls both at once — one set could not
+    // serve them. A chunk is absorbed into whole units before the units are
+    // written on, so the guest's framing survives reads that split frames.
     let mut switch_buf = vec![0u8; 16 * 1024];
     let mut leg_buf = vec![0u8; 16 * 1024];
+    let mut switch_frames = Reassembler::default();
+    let mut leg_frames = Reassembler::default();
+    // The units one absorb produced, written on whole.
+    let mut units = Vec::new();
     let mut leg_alive = true;
     loop {
         let read = if leg_alive {
@@ -1302,27 +1320,122 @@ async fn copy_switch_to_guest(
         } else {
             Read::Switch(switch.read(&mut switch_buf).await)
         };
-        let (switch_end, n) = match read {
-            Read::Switch(Ok(n)) => (true, n),
-            Read::Leg(Ok(n)) => (false, n),
-            Read::Switch(Err(error)) | Read::Leg(Err(error)) => return Err(error),
-        };
         // The switch's side is the relay's: its end takes the ingress leg
         // down with it, as it did before the delivery leg joined. The leg's
-        // own end only takes its own reads away.
+        // own end — EOF, error, or a stream that claims what no frame is —
+        // only takes its own reads away.
+        let (source, read) = match read {
+            Read::Switch(read) => (true, read),
+            Read::Leg(read) => (false, read),
+        };
+        let n = match read {
+            Ok(n) => n,
+            Err(error) if !source => {
+                tracing::warn!(
+                    %error,
+                    "the box egress proxy's delivery leg went away; its frames \
+                     drop, the switch's side of the relay keeps running"
+                );
+                leg_alive = false;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if n == 0 {
-            if switch_end {
+            if source {
                 return Ok(());
             }
             leg_alive = false;
             continue;
         }
-        let buffer = if switch_end {
-            &switch_buf[..]
+        units.clear();
+        let absorbed = if source {
+            switch_frames.absorb(&switch_buf[..n], &mut units)
         } else {
-            &leg_buf[..]
+            leg_frames.absorb(&leg_buf[..n], &mut units)
         };
-        guest.write_all(&buffer[..n]).await?;
+        if let Err(error) = absorbed {
+            if source {
+                // The switch's own stream claims what no frame is: the same
+                // posture the egress side gives a guest's, fail closed.
+                return Err(error);
+            }
+            tracing::warn!(
+                %error,
+                "the box egress proxy's delivery leg sent what no frame is; its \
+                 frames drop, the switch's side of the relay keeps running"
+            );
+            leg_alive = false;
+            continue;
+        }
+        guest.write_all(&units).await?;
+    }
+}
+
+/// One length-framed stream's reassembly: the bytes of frames not yet
+/// complete, consumed from the front as their lengths let them. The guest
+/// reads one stream ([`relay_switch_to_tap`] beside it in the guest), so
+/// what leaves here for it is whole units only — a socket read that split a
+/// frame is held until the frame's rest arrives, and only then handed on.
+#[derive(Default)]
+struct Reassembler {
+    /// Frames in flight: the head from `start` is whole units the caller has
+    /// not yet drained; the tail is the next frame's bytes so far.
+    buf: Vec<u8>,
+    start: usize,
+}
+
+impl Reassembler {
+    /// Appends one read chunk and drains every complete `[len][frame]` unit
+    /// now at the stream's head into `out`, in the order the stream carried
+    /// them, so the caller writes them whole. A zero-length claim carries no
+    /// frame and is passed through as the claim it is — the guest skips it —
+    /// and a claim past the MTU-derived maximum is a desynced or hostile
+    /// source: refused, never sized to (the same bound the egress side
+    /// enforces).
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` when the stream claims a frame longer than the maximum.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "every staging slice is bounded by the length check immediately above it"
+    )]
+    fn absorb(&mut self, chunk: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+        self.buf.extend_from_slice(chunk);
+        loop {
+            let avail = self.buf.len() - self.start;
+            if avail < 2 {
+                break;
+            }
+            let n = u16::from_le_bytes([self.buf[self.start], self.buf[self.start + 1]]) as usize;
+            if n == 0 {
+                out.extend_from_slice(&self.buf[self.start..self.start + 2]);
+                self.start += 2;
+                continue;
+            }
+            if n > max_frame() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("frame length {n} exceeds max {}", max_frame()),
+                ));
+            }
+            if avail < 2 + n {
+                break;
+            }
+            out.extend_from_slice(&self.buf[self.start..self.start + 2 + n]);
+            self.start += 2 + n;
+        }
+        if self.start == self.buf.len() {
+            self.buf.clear();
+            self.start = 0;
+        } else if self.start > 0 {
+            let held = self.buf.len() - self.start;
+            self.buf.copy_within(self.start.., 0);
+            self.buf.truncate(held);
+            self.start = 0;
+        }
+        Ok(())
     }
 }
 
@@ -2470,7 +2583,7 @@ mod tests {
         DROP_WARN_MIN_INTERVAL, DropLimiter, EgressGate, GateAdmit, GateDrop, GuestSource,
         GuestSpeak, HANDSHAKE_TIMEOUT, MAX_HEAD, MAX_LIVE_RELAYS, MAX_NAMED_TARGET,
         UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision,
-        accept_loop, gate_verdict, max_frame, serve_connection,
+        accept_loop, copy_switch_to_guest, gate_verdict, max_frame, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry};
     use crate::net::baseline::{BaselineCategory, NodeBaselinePhase, NodePlaneBaseline};
@@ -2671,6 +2784,66 @@ mod tests {
         // And the switch end stayed silent throughout: nothing addressed to
         // the proxy's address ever reached it.
         expect_silence(&mut h.switch).await;
+    }
+
+    /// Two sources, one guest, with a frame the socket delivers in two reads:
+    /// the guest reads one length-framed stream, so the copy cannot be a byte
+    /// copy — a frame split across reads, with a frame from the other source
+    /// between its halves, would interleave the streams inside the frame and
+    /// desync the guest's parser for good. Each source's bytes are
+    /// reassembled into whole units before anything reaches the guest, so
+    /// what arrives is the split frame whole, then the leg's — abutting
+    /// frames, never overlapping ones.
+    #[tokio::test]
+    async fn a_frame_split_across_reads_never_interleaves_the_legs_frame() {
+        let (mut switch_tx, switch_rx) = UnixStream::pair().expect("a switch pair");
+        let (guest_tx, mut guest_rx) = UnixStream::pair().expect("a guest pair");
+        let (mut leg_tx, leg_rx) = UnixStream::pair().expect("a leg pair");
+        let relay = tokio::spawn(copy_switch_to_guest(
+            switch_rx.into_split().0,
+            Some(leg_rx.into_split().0),
+            guest_tx.into_split().1,
+        ));
+
+        // The switch's frame, delivered in two reads with the leg's whole
+        // frame written between its halves.
+        let switch_frame = ipv4_frame([100, 64, 0, 2], 6, [10, 0, 0, 1], 443);
+        let mut framed = Vec::with_capacity(2 + switch_frame.len());
+        framed.extend_from_slice(&(switch_frame.len() as u16).to_le_bytes());
+        framed.extend_from_slice(&switch_frame);
+        let split = framed.len() / 2;
+        switch_tx
+            .write_all(&framed[..split])
+            .await
+            .expect("writing the switch frame's head");
+        // The head is absorbed incomplete: a beat, so the schedule is not
+        // whether the relay read yet but that it had nothing to hand on.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let leg_frame = ipv4_frame([100, 64, 0, 3], 6, [10, 0, 0, 2], 443);
+        let mut leg_framed = Vec::with_capacity(2 + leg_frame.len());
+        leg_framed.extend_from_slice(&(leg_frame.len() as u16).to_le_bytes());
+        leg_framed.extend_from_slice(&leg_frame);
+        leg_tx
+            .write_all(&leg_framed)
+            .await
+            .expect("writing the leg's frame");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        switch_tx
+            .write_all(&framed[split..])
+            .await
+            .expect("writing the switch frame's rest");
+
+        // The guest sees whole units only: the leg's frame first (the switch's
+        // was still being reassembled when it arrived), then the switch's
+        // frame whole — the order frames may abut in, never overlap.
+        let arrived = expect_frame(&mut guest_rx).await;
+        assert_eq!(
+            arrived, leg_frame,
+            "the leg's frame arrived whole and first"
+        );
+        let arrived = expect_frame(&mut guest_rx).await;
+        assert_eq!(arrived, switch_frame, "the split frame arrived whole");
+        relay.abort();
     }
 
     /// NET-081's failure case, as the phase this build ships holds it: a frame
