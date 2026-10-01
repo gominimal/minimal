@@ -369,7 +369,6 @@ pub(crate) async fn activate_session(
         hook_scripts,
         hook_budget: finalize_hook_budget,
         rename_on_collision,
-        max_rename_attempts: AUTOGEN_NAME_RETRIES,
         interrupt_socket: client::resolve_socket_path(
             global.minimal_dir.as_deref(),
             global.use_minvmd(),
@@ -468,11 +467,12 @@ impl minimal_client::activate::ActivationGate for CliActivationGate<'_> {
         if non_interactive {
             // NoPromptHook fake-approves every unapproved item so
             // handle_response finishes both the var and patch gates and
-            // records everything in `summary`. If anything was recorded, we
-            // abort *before* actually shipping the verdict — the daemon must
-            // not see those fake approvals. Only when `summary` is empty
-            // (every daemon-sent item was already handled by the user's
-            // policy) do we submit and let the session go Active.
+            // records everything in `summary`. If anything was recorded we
+            // bail *before* actually shipping the verdict — the daemon must
+            // not see those fake approvals, and the core tears the session
+            // down on the error. Only when `summary` is empty (every
+            // daemon-sent item was already handled by the user's policy) do we
+            // submit and let the session go Active.
             let session_id = response.session_id;
             let hooks = prompt::NoPromptHook::new();
             let verdict = match compute_verdict(
@@ -483,7 +483,6 @@ impl minimal_client::activate::ActivationGate for CliActivationGate<'_> {
             ) {
                 Ok((verdict, _final_policy)) => verdict,
                 Err(e) => {
-                    send_abort(client, session_id).await;
                     // The route an activation actually reaches today: the
                     // daemon routes project config back for gating, so a
                     // project it cannot compose surfaces here rather than as
@@ -496,7 +495,6 @@ impl minimal_client::activate::ActivationGate for CliActivationGate<'_> {
             };
             let summary = hooks.into_summary();
             if summary.count() > 0 {
-                send_abort(client, session_id).await;
                 let count = summary.count();
                 let snippet = summary.as_toml_snippet();
                 bail!(

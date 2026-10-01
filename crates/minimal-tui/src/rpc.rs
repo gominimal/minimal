@@ -303,7 +303,6 @@ pub async fn activate(
         hook_budget: std::time::Duration::ZERO,
         // The name is user-supplied from the form (or unset); nothing retries.
         rename_on_collision: None,
-        max_rename_attempts: 0,
         interrupt_socket: None,
         compose_failure: Box::new(|error: &str| anyhow::anyhow!("{error}")),
     };
@@ -311,24 +310,17 @@ pub async fn activate(
 }
 
 /// The dashboard's activation gate: a `Pending` composition asks for
-/// interactive policy gating the TUI has no wizard for, so it aborts the
-/// session and points at the CLI. The core creates and tears down; this only
-/// supplies the refusal.
+/// interactive policy gating the TUI has no wizard for, so it refuses and
+/// points at the CLI. The core owns the record's teardown on a refusal; this
+/// only supplies the error.
 struct TuiGate;
 
 impl minimal_client::activate::ActivationGate for TuiGate {
     async fn on_pending(
         &mut self,
-        client: &mut Client,
-        response: sessions::wire::request::ContributionResponse,
+        _client: &mut Client,
+        _response: sessions::wire::request::ContributionResponse,
     ) -> Result<Vec<(PathBuf, paths::SandboxRelPath)>, anyhow::Error> {
-        // A failed flow must not orphan the record — it would hold its name
-        // until the next daemon restart reaps it.
-        let _ = client
-            .oneshot_rpc::<minimald_rpc::AbortSession>(minimald_rpc::AbortSessionRequest {
-                id: response.session_id,
-            })
-            .await;
         anyhow::bail!(
             "this project needs interactive policy gating; \
              create it with `min session activate` instead"
