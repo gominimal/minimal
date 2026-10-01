@@ -408,7 +408,15 @@ impl Injection {
     }
 
     /// Mark this injection as entering a none box, so the shim reinstalls the
-    /// socket-family seccomp filter after joining the namespaces.
+    /// none plan's full socket-family seal — every family but `AF_UNIX` —
+    /// after joining the namespaces.
+    ///
+    /// Every injection is sealed: without this marker the shim reinstalls the
+    /// confined-families seal, the one every networked box launches under,
+    /// which admits the families the box's own network namespace confines
+    /// and refuses the rest.  Either way the filter installed at launch is
+    /// inherited by children of the filtered process only, and an injected
+    /// process joins the namespaces later.
     pub fn seal_none_box(mut self) -> Self {
         self.seal_none_box = true;
         self
@@ -484,6 +492,22 @@ impl Injection {
         if let Some(leaf) = &self.leaf {
             cmd.arg("--classifier-leaf").arg(leaf.dir());
         }
+        // One debug line per injection naming the seal the joined process will
+        // run under (observability). Resolved through the filters rather than
+        // restated here, so the log names exactly what the shim installs; the
+        // shim itself has no tracing subscriber — it is the daemon re-exec'd
+        // before its runtime is built.
+        let seal = if self.seal_none_box {
+            sandbox2::socket_family_filter_for_none_box().seal
+        } else {
+            sandbox2::socket_family_filter_for_confined_families().seal
+        };
+        tracing::debug!(
+            leader_pid = self.leader_pid,
+            program = %self.program.to_string_lossy(),
+            socket_seal = %seal,
+            "nsenter injection: joining the box under its socket-family seal"
+        );
         if let Some(env) = self.env {
             // The shim needs nothing from the daemon's environment — it holds
             // its pidfd on a descriptor and everything else in argv — so this
@@ -544,9 +568,13 @@ pub struct ShimArgs {
     chdir: Option<PathBuf>,
 
     /// When present, the target session is a none box and the shim must
-    /// re-install its socket-family seccomp filter after joining the namespaces.
-    /// The filter is inherited by children of the filtered process, but an
-    /// injected process joins the namespaces later and must load it itself.
+    /// re-install its full socket-family seal — every family but `AF_UNIX` —
+    /// after joining the namespaces. When absent the shim re-installs the
+    /// confined-families seal, the one every other box launches under, which
+    /// admits the families the box's namespace confines and refuses the
+    /// rest.  Either way the filter is inherited by children of the filtered
+    /// process, but an injected process joins the namespaces later and must
+    /// load it itself.
     #[arg(long)]
     seal_none_box: bool,
 
@@ -647,10 +675,14 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
 
     // Resolved here, before the fork: building the filter allocates, and the
     // first `OnceLock` access is what builds it. Only the `&'static` result
-    // crosses into the child.
-    let none_box_filter = args
-        .seal_none_box
-        .then(sandbox2::socket_family_filter_for_none_box);
+    // crosses into the child. Every injection is sealed — the none box's
+    // full seal, or the confined-families seal every other box launches
+    // under.
+    let socket_family_filter = if args.seal_none_box {
+        sandbox2::socket_family_filter_for_none_box()
+    } else {
+        sandbox2::socket_family_filter_for_confined_families()
+    };
 
     // SAFETY: the closures run in the forked child between `fork` and `exec`,
     // where only async-signal-safe calls are legal. `prctl` and the raw
@@ -694,18 +726,17 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
             sandbox2::assume_box_credentials()
         });
 
-        if let Some(filter) = none_box_filter {
-            cmd.pre_exec(move || {
-                // Re-install the none-box socket-family filter.  The filter
-                // installed at sandbox launch is inherited by children of the
-                // filtered process, but this injected process joins the
-                // namespaces later and must load it itself.
-                // SAFETY: `filter` is a `&'static` owned by the process-wide
-                // OnceLock, valid and immutable for the program's lifetime.
-                sandbox2::install_socket_family_filter(filter)?;
-                Ok(())
-            });
-        }
+        cmd.pre_exec(move || {
+            // Re-install the box's socket-family seal — the none box's full
+            // seal, or the confined-families seal every other box launches
+            // under.  The filter installed at sandbox launch is inherited by
+            // children of the filtered process, but this injected process
+            // joins the namespaces later and must load it itself.
+            // SAFETY: `filter` is a `&'static` owned by the process-wide
+            // OnceLock, valid and immutable for the program's lifetime.
+            sandbox2::install_socket_family_filter(socket_family_filter)?;
+            Ok(())
+        });
     }
 
     let program = PathBuf::from(program);
