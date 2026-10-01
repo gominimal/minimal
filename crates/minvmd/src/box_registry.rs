@@ -462,6 +462,12 @@ impl BoxRegistry {
         switch_addr: Ipv4Addr,
         loopback_addr: Ipv4Addr,
     ) -> Result<Option<Arc<BoxRecord>>, WithdrawError> {
+        #[expect(
+            clippy::unwrap_in_result,
+            reason = "the expect is the lock's poison guard, not this function's error \
+                      handling: the row lock is never held across a panic, so it cannot be \
+                      poisoned"
+        )]
         let mut rows = self
             .rows
             .write()
