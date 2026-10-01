@@ -19,7 +19,7 @@ use minimal_client::{ensure_version_match, ensure_version_reported};
 // plus the teardown helpers it shares — lives in `minimal-client`, beside the
 // transport. Re-exported so `crate::` paths and `min task run` keep working.
 pub(crate) use minimal_client::activate::{
-    ActivationInterrupt, best_effort_destroy, upload_and_finalize,
+    ActivationInterrupt, best_effort_destroy, should_retry_autogen, upload_and_finalize,
 };
 
 use crate::*;
@@ -133,10 +133,6 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     }
 }
 
-/// Bounded retries when a freshly minted autogen name collides with an
-/// existing session built from the same directory.
-pub(crate) const AUTOGEN_NAME_RETRIES: u32 = 8;
-
 /// Longest component [`sanitize_name_component`] returns, so a minted
 /// `task-<component>-<hex>` (the longest wrapper) stays inside the 63-octet
 /// DNS label `validate_session_name` requires.
@@ -186,21 +182,6 @@ pub(crate) fn random_hex4() -> String {
     use std::hash::BuildHasher;
     let seed = RandomState::new().hash_one("minimal-session-name");
     format!("{:04x}", seed & 0xffff)
-}
-
-/// The daemon collapses the session-store `AlreadyExists` into a plain message
-/// (see `serve_create_session` in `crates/minimald/src/rpc.rs`); match it so an
-/// autogen name clash can be told apart from any other `CreateSession` failure.
-pub(crate) fn is_name_collision(error: &str) -> bool {
-    error.contains("already exists")
-}
-
-/// Whether a failed `CreateSession` should retry under a freshly minted name:
-/// only autogen names (`autogen`), only on a name collision, and only within
-/// the bounded budget. A user-supplied name never retries, so its collision
-/// surfaces verbatim.
-pub(crate) fn should_retry_autogen(autogen: bool, attempts: u32, error: &str) -> bool {
-    autogen && attempts < AUTOGEN_NAME_RETRIES && is_name_collision(error)
 }
 
 /// Connect to the daemon, resolving the socket path from global args, and

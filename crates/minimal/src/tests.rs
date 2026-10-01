@@ -995,6 +995,8 @@ fn random_hex4_is_four_lowercase_hex_digits() {
 /// through, and a non-collision failure is never retried.
 #[test]
 fn autogen_collision_retry_is_bounded_and_skips_user_names() {
+    use crate::client::activate::AUTOGEN_NAME_RETRIES;
+
     let collision = "A session with that name already exists";
     assert!(should_retry_autogen(true, 0, collision));
     assert!(should_retry_autogen(
