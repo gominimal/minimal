@@ -11,7 +11,8 @@
 //! * entering the generic upstream rootfs — mount the ext4 root block device
 //!   and `chroot` into it so the userland (`/bin/sh`, libs) resolves;
 //! * the node ports the VM host hands the boot line — read into the daemon's
-//!   listener config, so it binds them as handed (NET-025).
+//!   listener config, so it binds them as handed (NET-025); a token present
+//!   but unusable is a surfaced boot failure, not a fallback.
 //!
 //! Per the spec we keep this minimal and "run as pid-1, revisit if zombie
 //! reaping bites".
@@ -47,37 +48,108 @@ pub const HANDED_ANSWERER_PORT_TOKEN: &str = "MINIMALD_ZONE_ANSWERER_PORT";
 /// refuses to carry (NET-081) — and strand every client pointed at the
 /// handed one.
 ///
-/// `None` when the boot carries no token — an older minvmd, a native run —
-/// leaving the daemon its pre-handoff default-then-select behaviour.
-pub fn handed_proxy_port() -> Option<u16> {
+/// `Ok(None)` when the boot carries no token — an older minvmd, a native
+/// run, or a host that handed `0` as its "pick one yourself" — leaving the
+/// daemon its pre-handoff default-then-select behaviour. An error when the
+/// token is present but carries no usable port: a surfaced boot failure
+/// ([`HandedPortError`]), never a fallback.
+pub fn handed_proxy_port() -> Result<Option<u16>, HandedPortError> {
     handed_port(HANDED_PROXY_PORT_TOKEN)
 }
 
 /// The zone-answerer port the VM host handed this daemon on the boot line,
 /// if it handed one; see [`handed_proxy_port`] for the handoff and its
 /// binding rule.
-pub fn handed_answerer_port() -> Option<u16> {
+pub fn handed_answerer_port() -> Result<Option<u16>, HandedPortError> {
     handed_port(HANDED_ANSWERER_PORT_TOKEN)
 }
 
-/// Reads one handed port off the boot line's environment. A token that is
-/// present but not a usable port — unparseable, or the OS-picks `0` the host
-/// never hands — warns and counts as absent: the daemon falls back to its
-/// own selection rather than failing its boot over a port.
-fn handed_port(token: &str) -> Option<u16> {
-    let raw = std::env::var(token).ok()?;
-    match raw.trim().parse::<u16>() {
-        Ok(port) if port != 0 => Some(port),
-        _ => {
-            tracing::warn!(
-                component = "guest",
-                token,
-                value = %raw,
-                "boot token carries no usable port; treating it as absent"
-            );
-            None
-        }
+/// A boot token the host put a port on that does not carry one (NET-025):
+/// present on the command line but not a port number. Surfaced, not
+/// swallowed: a handoff that arrived broken is a host or transport fault
+/// the boot must name — falling back to the daemon's own selection would
+/// publish a listener the host's box table does not name (NET-138), and
+/// strand every client pointed at the handed one.
+#[derive(Debug)]
+pub struct HandedPortError {
+    /// The boot token the unusable value arrived on.
+    pub token: &'static str,
+    /// The value as it arrived on the boot line.
+    pub value: String,
+}
+
+impl std::fmt::Display for HandedPortError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "boot token {} carries no usable port: {:?}",
+            self.token, self.value
+        )
     }
+}
+
+impl std::error::Error for HandedPortError {}
+
+/// Reads one handed port off the boot line's environment. `Ok(None)` — the
+/// token is absent, or carries `0`, the host's "pick one yourself" — leaves
+/// the daemon its default-then-select fallback; an error — the token is
+/// present but not a usable port — is a surfaced boot failure, never a
+/// fallback.
+fn handed_port(token: &'static str) -> Result<Option<u16>, HandedPortError> {
+    let Some(raw) = std::env::var(token).ok() else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<u16>() {
+        Ok(0) => Ok(None),
+        Ok(port) => Ok(Some(port)),
+        Err(_) => Err(HandedPortError { token, value: raw }),
+    }
+}
+
+/// Probes that the handed node ports can actually be bound, in the microVM's
+/// bind base (`0.0.0.0`, what the daemon's own listeners use) — binding each
+/// handed one, the proxy over TCP and the answerer over UDP, and dropping
+/// the probe bindings at once. Called on the pid-1 boot path before the
+/// daemon starts, so a handed port that cannot bind — held by something
+/// already in the guest, or reserved by the kernel — fails the boot here,
+/// with the error surfaced to the host, rather than after READY, when the
+/// host already believes the VM healthy and no log line would reach it.
+///
+/// No guest process exists before READY — this runs on the boot path — so
+/// the probe window is the daemon's own: nothing competes for the ports
+/// between this probe and the listeners' bind.
+pub fn probe_handed_node_ports(
+    proxy_port: Option<u16>,
+    answerer_port: Option<u16>,
+) -> std::io::Result<()> {
+    let bind = |label: &str, transport: &str, port: u16| {
+        format!("binding the handed {label} port {port} ({transport}) in the guest")
+    };
+    if let Some(port) = proxy_port {
+        std::net::TcpListener::bind(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::UNSPECIFIED,
+            port,
+        )))
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", bind("hostname-proxy", "tcp", port)),
+            )
+        })?;
+    }
+    if let Some(port) = answerer_port {
+        std::net::UdpSocket::bind(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::UNSPECIFIED,
+            port,
+        )))
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", bind("zone-answerer", "udp", port)),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Writes the two-line beacon payload (`READY\n<openssh-pubkey>\n`) to the
@@ -1362,9 +1434,11 @@ mod tests {
 
     /// The handed ports are read off the environment the kernel passes
     /// through from the boot tokens: a present token parses, an absent one
-    /// counts as not handed, and a present-but-unusable one counts as absent
-    /// too — the daemon falls back to its own selection rather than failing
-    /// its boot over a port (NET-025).
+    /// counts as not handed, `0` is the host's own "pick one yourself", and
+    /// a present-but-unusable one is a surfaced boot error naming the token
+    /// and the value it carried — a broken handoff is not papered over with
+    /// a fallback that would publish a listener the host's box table does
+    /// not name (NET-025, NET-138).
     // SAFETY: env mutation here races only other reads of the same variables,
     // and nextest runs every test in its own process.
     #[test]
@@ -1373,22 +1447,73 @@ mod tests {
             std::env::set_var(HANDED_PROXY_PORT_TOKEN, "7654");
             std::env::set_var(HANDED_ANSWERER_PORT_TOKEN, "7656");
         }
-        assert_eq!(handed_proxy_port(), Some(7654));
-        assert_eq!(handed_answerer_port(), Some(7656));
+        assert_eq!(handed_proxy_port().unwrap(), Some(7654));
+        assert_eq!(handed_answerer_port().unwrap(), Some(7656));
 
-        // Garbage and the OS-picks `0` the host never hands count as absent.
+        // A present token that carries no port is the surfaced error, not a
+        // quiet absence: the boot names the token and the value it carried.
         unsafe { std::env::set_var(HANDED_PROXY_PORT_TOKEN, "no-port-here") };
-        assert_eq!(handed_proxy_port(), None);
+        let error = handed_proxy_port().expect_err("an unusable token is an error");
+        assert_eq!(error.token, HANDED_PROXY_PORT_TOKEN);
+        assert_eq!(error.value, "no-port-here");
+
+        // The OS-picks `0` the host never hands is its "pick one yourself":
+        // not handed, and the daemon falls back to its own selection.
         unsafe { std::env::set_var(HANDED_PROXY_PORT_TOKEN, "0") };
-        assert_eq!(handed_proxy_port(), None);
+        assert_eq!(handed_proxy_port().unwrap(), None);
 
         // No token at all: the pre-handoff default-then-select behaviour.
         unsafe {
             std::env::remove_var(HANDED_PROXY_PORT_TOKEN);
             std::env::remove_var(HANDED_ANSWERER_PORT_TOKEN);
         }
-        assert_eq!(handed_proxy_port(), None);
-        assert_eq!(handed_answerer_port(), None);
+        assert_eq!(handed_proxy_port().unwrap(), None);
+        assert_eq!(handed_answerer_port().unwrap(), None);
+    }
+
+    /// The eager bind the pid-1 boot owes its handed ports: each handed one
+    /// binds in the microVM's bind base — the proxy over TCP, the answerer
+    /// over UDP — and nothing left bound when the probe returns. An absent
+    /// port is probed by nothing, and a held port fails with the port and
+    /// its transport named: the boot-fatal case
+    /// `vm_hosted_daemon_binds_handed_port` drives end to end.
+    #[test]
+    fn the_handed_node_ports_bind_for_the_probe_and_free_again() {
+        // Two ports nothing else holds, probed both at once: the proxy's TCP
+        // bind and the answerer's UDP bind succeed and are dropped.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let held = listener.local_addr().unwrap().port();
+        let free_tcp = loop {
+            let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = probe.local_addr().unwrap().port();
+            if port != held {
+                break port;
+            }
+        };
+        let free_udp = loop {
+            let probe = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+            let port = probe.local_addr().unwrap().port();
+            if port != held && port != free_tcp {
+                break port;
+            }
+        };
+        probe_handed_node_ports(Some(free_tcp), Some(free_udp))
+            .expect("two free ports bind for the probe and free again");
+        // The probe's bindings were dropped: the ports bind again at once.
+        assert!(std::net::TcpListener::bind(("127.0.0.1", free_tcp)).is_ok());
+        assert!(std::net::UdpSocket::bind(("127.0.0.1", free_udp)).is_ok());
+
+        // A handed port something already holds fails the probe, with the
+        // port and its transport in the reason.
+        let error = probe_handed_node_ports(Some(held), None)
+            .expect_err("a held port cannot bind for the probe");
+        assert!(
+            error.to_string().contains(&held.to_string()),
+            "the failure names the port it could not bind, got: {error}"
+        );
+
+        // Nothing handed is nothing bound: the no-token boot probes nothing.
+        probe_handed_node_ports(None, None).expect("no handed port binds nothing");
     }
 
     /// The derivation in [`FITRIM`] must land on the number the kernel
