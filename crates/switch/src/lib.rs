@@ -284,6 +284,25 @@ impl SwitchSubnet {
         Ipv4Addr::from(u32::from(self.broadcast()) - 2)
     }
 
+    /// The box-egress-proxy address (`broadcast - 3`), the switch's second
+    /// infrastructure address above the lease pool: a PTask's connection is
+    /// delivered to its egress proxy at this address on the host-gateway
+    /// subnet, and a host-side stack peer of the switch — not the switch
+    /// itself — owns it. Reserved like the daemon and host-alias addresses.
+    #[must_use]
+    pub fn box_egress_proxy_address(self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.broadcast()) - 3)
+    }
+
+    /// The MAC derived for [`box_egress_proxy_address`](Self::box_egress_proxy_address),
+    /// by the same low-octet derivation every switch-owned address carries. The
+    /// peer announces it at attach so the switch learns the binding and steers
+    /// frames addressed to this MAC to the peer's connection.
+    #[must_use]
+    pub fn box_egress_proxy_mac(self) -> MacAddr {
+        MacAddr::for_switch_ip(self.box_egress_proxy_address())
+    }
+
     /// The first address that may be allocated to a PTask (`network + 2`,
     /// i.e. the first host after the gateway).
     #[must_use]
@@ -291,12 +310,13 @@ impl SwitchSubnet {
         u32::from(self.network()) + 2
     }
 
-    /// The last address that may be allocated to a PTask (`broadcast - 3`),
-    /// leaving the daemon address at `broadcast - 2` and the host alias at
-    /// `broadcast - 1` reserved.
+    /// The last address that may be allocated to a PTask (`broadcast - 4`),
+    /// leaving the box-egress-proxy address at `broadcast - 3`, the daemon
+    /// address at `broadcast - 2` and the host alias at `broadcast - 1`
+    /// reserved.
     #[must_use]
     pub fn last_ptask(self) -> u32 {
-        u32::from(self.broadcast()) - 3
+        u32::from(self.broadcast()) - 4
     }
 }
 
@@ -584,6 +604,11 @@ mod tests {
         assert_eq!(net.gateway(), Ipv4Addr::new(100, 64, 0, 1));
         assert_eq!(net.host_alias(), Ipv4Addr::new(100, 64, 255, 254));
         assert_eq!(net.daemon_ip(), Ipv4Addr::new(100, 64, 255, 253));
+        assert_eq!(net.box_egress_proxy_address(), Ipv4Addr::new(100, 64, 255, 252));
+        assert_eq!(
+            net.box_egress_proxy_mac().to_string(),
+            "52:54:00:40:ff:fc"
+        );
     }
 
     #[test]
@@ -626,6 +651,43 @@ mod tests {
     fn mac_is_derived_from_low_octets() {
         let mac = MacAddr::for_switch_ip(Ipv4Addr::new(100, 64, 1, 2));
         assert_eq!(mac.to_string(), "52:54:00:40:01:02");
+    }
+
+    /// The proxy's address is the second infrastructure address above the
+    /// lease pool on every prefix the subnet accepts: the pool ends one below
+    /// it, and the reserved block sits daemon, alias, proxy under broadcast.
+    #[test]
+    fn box_egress_proxy_address_sits_above_the_lease_pool() {
+        for prefix in 8..=29 {
+            let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), prefix).unwrap();
+            let bep = subnet.box_egress_proxy_address();
+            assert!(subnet.last_ptask() < u32::from(bep), "prefix {prefix}");
+            assert_eq!(u32::from(bep), u32::from(subnet.broadcast()) - 3);
+            assert_eq!(u32::from(subnet.daemon_ip()), u32::from(bep) + 1);
+            assert_eq!(u32::from(subnet.host_alias()), u32::from(bep) + 2);
+        }
+    }
+
+    /// The switch neither answers ARP for the proxy's address (it is not a
+    /// virtual IP of the gateway stack) nor translates it (no `nat` entry):
+    /// the rendered configuration leaves the address out of both, so frames
+    /// for it are steered to the owning peer by MAC alone.
+    #[test]
+    fn proxy_address_is_neither_virtual_ip_nor_translated() {
+        let subnet = SwitchSubnet::default();
+        let bep = subnet.box_egress_proxy_address();
+        let yaml = render_gvproxy_config(subnet, &[]);
+        let translated = format!("nat:\n    \"{}\":", bep);
+        let virtual_ip = format!("    - \"{}\"", bep);
+        assert!(!yaml.contains(&translated), "proxy address translated:\n{yaml}");
+        assert!(!yaml.contains(&virtual_ip), "proxy address is a virtual IP:\n{yaml}");
+
+        // The proxy address is not a general relaxation of the alias's
+        // entries: the host alias keeps both, unchanged.
+        let alias_nat = format!("nat:\n    \"{}\": \"127.0.0.1\"\n", subnet.host_alias());
+        let alias_vip = format!("    - \"{}\"\n", subnet.host_alias());
+        assert!(yaml.contains(&alias_nat), "config was:\n{yaml}");
+        assert!(yaml.contains(&alias_vip), "config was:\n{yaml}");
     }
 
     #[test]
