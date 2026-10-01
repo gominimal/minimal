@@ -27,27 +27,28 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     activate_session(global, args, true).await
 }
 
-/// How long a box registration may take before this activation gives up on
-/// it. The control socket answers with two map writes and an allocation, so
-/// healthy is milliseconds; the bound exists so a hung VM host daemon cannot
-/// hang the activation the user asked for.
-const BOX_REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a box control request — a registration, or the withdrawal of
+/// the row a registration bought — may take before this invocation gives
+/// up on it. The control socket answers with map writes and an allocation,
+/// so healthy is milliseconds; the bound exists so a hung VM host daemon
+/// cannot hang the activation or destroy the user asked for.
+const BOX_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Registers an own-address box with the VM host daemon over its control
-/// socket (T66), returning the addresses it handed back.
+/// One control-socket exchange with the VM host daemon (T66): one JSON
+/// line in — the verb's request — and one line out — the untagged reply
+/// the verb is answered with.
 ///
 /// The control socket lives beside the ssh socket in the minvmd
-/// provider-instance dir — the dir the daemon connection resolves through —
-/// and speaks one JSON line each way: the box's expanded declaration in, the
-/// allocated switch and loopback addresses out
-/// ([`minimald_rpc::RegisterBoxReply`]). A refused registration (an
-/// exhausted address plan, a malformed declaration) surfaces here as an
-/// error naming the reason; the caller degrades it to a warning rather than
-/// failing the activation.
-async fn register_box_with_vm_host(
+/// provider-instance dir — the dir the daemon connection resolves through.
+/// A refusal (an exhausted address plan, a malformed declaration, a pair
+/// that is not the row's) surfaces here as an error naming the reason; the
+/// caller degrades a failed registration to a warning rather than failing
+/// the activation, and a failed withdrawal to one rather than failing the
+/// destroy it rides on.
+async fn control_request_with_vm_host(
     sock_path: &std::path::Path,
-    request: minimald_rpc::RegisterBoxRequest,
-) -> anyhow::Result<sessions::BoxAddresses> {
+    request: minimald_rpc::BoxControlRequest,
+) -> anyhow::Result<minimald_rpc::BoxControlReply> {
     use tokio::io::AsyncBufReadExt as _;
     use tokio::io::AsyncWriteExt as _;
 
@@ -55,35 +56,152 @@ async fn register_box_with_vm_host(
         .await
         .with_context(|| {
             format!(
-                "connecting to the VM host daemon's box-registration control socket at {}",
+                "connecting to the VM host daemon's box control socket at {}",
                 sock_path.display()
             )
         })?;
-    let mut line = serde_json_lenient::to_string(&request)
-        .context("serializing the box registration request")?;
+    let mut line =
+        serde_json_lenient::to_string(&request).context("serializing the box control request")?;
     line.push('\n');
     stream
         .write_all(line.as_bytes())
         .await
-        .context("writing the box registration request")?;
+        .context("writing the box control request")?;
     let mut reply = String::new();
     tokio::io::BufReader::new(stream)
         .read_line(&mut reply)
         .await
-        .context("reading the box registration reply")?;
+        .context("reading the box control reply")?;
     if reply.trim().is_empty() {
         anyhow::bail!(
-            "the VM host daemon closed its control socket without answering the box registration"
+            "the VM host daemon closed its control socket without answering the box control request"
         );
     }
-    let reply: minimald_rpc::RegisterBoxReply = serde_json_lenient::from_str(reply.trim())
-        .with_context(|| {
-            format!("the VM host daemon's box registration reply did not parse: {reply}")
-        })?;
-    match reply {
-        minimald_rpc::RegisterBoxReply::Addresses(addresses) => Ok(addresses),
-        minimald_rpc::RegisterBoxReply::Error { error } => {
+    let reply: minimald_rpc::BoxControlReply = serde_json_lenient::from_str(reply.trim())
+        .with_context(|| format!("the VM host daemon's box control reply did not parse: {reply}"))?;
+    Ok(reply)
+}
+
+/// Registers an own-address box with the VM host daemon over its control
+/// socket (T66), returning the addresses it handed back.
+async fn register_box_with_vm_host(
+    sock_path: &std::path::Path,
+    request: minimald_rpc::RegisterBoxRequest,
+) -> anyhow::Result<sessions::BoxAddresses> {
+    match control_request_with_vm_host(
+        sock_path,
+        minimald_rpc::BoxControlRequest::Register(request),
+    )
+    .await?
+    {
+        minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(addresses),
+        minimald_rpc::BoxControlReply::Error { error } => {
             anyhow::bail!("the VM host daemon refused the box registration: {error}")
+        }
+    }
+}
+
+/// The VM host daemon's control socket, when this invocation can reach one
+/// (T66): it sits beside the ssh socket in the provider dir the daemon
+/// connection resolves through, so the client finds both by the same rule
+/// — named VMs included, since the resolution reads the same process-global
+/// VM name.
+///
+/// Silent by design: an invocation that owes nothing — no VM host, an
+/// unresolvable dir — asks for nothing, and the withdrawal's own warning is
+/// the one that names the row left published.
+pub(crate) fn vm_host_control_sock(global: &GlobalArgs) -> Option<std::path::PathBuf> {
+    if !global.use_minvmd() {
+        return None;
+    }
+    let ssh_sock = client::resolve_socket_path(global.minimal_dir.as_deref(), true).ok()?;
+    ssh_sock
+        .parent()
+        .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
+}
+
+/// Withdraws the box's host row (T66) when the session that registered it
+/// is gone — destroyed, or an activation that failed after registering:
+/// the row has no holder left, so its creator presents the pair the
+/// registration handed back and the daemon stops the pair's addresses
+/// admitting anything.
+///
+/// Always quiet when it owes nothing: a session that registered no box — a
+/// native host, a host-ip box sharing the node's own row, a refused
+/// registration — withdraws nothing and says nothing. A withdrawal that
+/// cannot be made — no control socket, a daemon that predates the verb and
+/// refuses the line, the deadline — leaves the row published and warns
+/// rather than failing the destroy or the activation error it rides on;
+/// the daemon restarting between registration and withdrawal answers the
+/// withdrawal as already gone, which is the goal state either way.
+pub(crate) async fn withdraw_box_row(
+    control_sock: Option<std::path::PathBuf>,
+    name: Option<&str>,
+    box_addresses: Option<sessions::BoxAddresses>,
+) {
+    let Some(name) = name else { return };
+    let Some(addresses) = box_addresses else { return };
+    let Some(sock_path) = control_sock else {
+        tracing::warn!(
+            box = %name,
+            "cannot resolve the VM host daemon's control socket; the box's \
+             host row stays published until the daemon next restarts"
+        );
+        return;
+    };
+    let request = minimald_rpc::WithdrawBoxRequest {
+        name: name.to_string(),
+        switch_address: addresses.switch_address,
+        loopback_address: addresses.loopback_address,
+    };
+    let withdrawn = tokio::time::timeout(
+        BOX_CONTROL_TIMEOUT,
+        control_request_with_vm_host(
+            &sock_path,
+            minimald_rpc::BoxControlRequest::Withdraw(request),
+        ),
+    )
+    .await;
+    match withdrawn {
+        Ok(Ok(reply)) => match reply {
+            // The daemon answers the withdrawal with the pair it went by; a
+            // pair back that is not the pair asked is a daemon speaking
+            // another protocol's answer — the row asked for is not
+            // withdrawn, so say so.
+            minimald_rpc::BoxControlReply::Addresses(handed) if handed == addresses => {
+                tracing::debug!(box = %name, "withdrew the box's host row");
+            }
+            minimald_rpc::BoxControlReply::Addresses(handed) => {
+                tracing::warn!(
+                    box = %name,
+                    switch_address = %handed.switch_address,
+                    "the VM host daemon answered the withdrawal with a different \
+                     address pair; the row asked for stays published"
+                );
+            }
+            minimald_rpc::BoxControlReply::Error { error } => {
+                tracing::warn!(
+                    box = %name,
+                    %error,
+                    "the VM host daemon refused the box row withdrawal; the row \
+                     stays published"
+                );
+            }
+        },
+        Ok(Err(error)) => {
+            tracing::warn!(
+                box = %name,
+                %error,
+                "the box row withdrawal failed; the row stays published"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                after = ?BOX_CONTROL_TIMEOUT,
+                box = %name,
+                "the VM host daemon did not answer the box row withdrawal in \
+                 time; the row stays published"
+            );
         }
     }
 }
@@ -162,7 +280,7 @@ async fn register_box_for_activation(
         egress: policy.egress.clone(),
     };
     let registration = tokio::time::timeout(
-        BOX_REGISTRATION_TIMEOUT,
+        BOX_CONTROL_TIMEOUT,
         register_box_with_vm_host(&sock_path, request),
     )
     .await;
@@ -187,7 +305,7 @@ async fn register_box_for_activation(
         }
         Err(_) => {
             tracing::warn!(
-                after = ?BOX_REGISTRATION_TIMEOUT,
+                after = ?BOX_CONTROL_TIMEOUT,
                 "the VM host daemon did not answer the box registration in time; \
                  the box runs unregistered — its frames unattributed — until \
                  the egress gate's per-box default is in force (fail-closed \
@@ -269,24 +387,17 @@ pub(crate) async fn activate_session(
 
     let network: sessions::NetworkMode = args.network.into();
 
-    // T66: an own-address box on a VM-backed host registers with the VM host
-    // daemon before the create — the host allocates its switch and loopback
-    // addresses into the table its egress gate decides by and hands them
-    // back, and the create request carries them so the in-VM daemon attaches
-    // with the handed switch address instead of drawing its own. Every
-    // other shape of activation — a host-ip box sharing the node's own row,
-    // a none box with no switch address, a native daemon with no box table
-    // — registers nothing and attaches as it always has.
-    let box_addresses = register_box_for_activation(global, network, &session_name, &policy).await;
-
     // The daemon sources `username` from the authenticated SSH
-    // connection context; the client doesn't send it.
-    let config = minimald_rpc::SessionConfig {
+    // connection context; the client doesn't send it. `box_addresses`
+    // lands just before the create (T66): the registration is the last
+    // fallible client-side step, so a loadout, policy, or hook failure
+    // between here and there never strands a row on the host.
+    let mut config = minimald_rpc::SessionConfig {
         name: Some(session_name),
         project_path: abs_path.clone(),
         network,
         policy,
-        box_addresses,
+        box_addresses: None,
         hooks_enabled: !args.no_hooks,
         attrs: Default::default(),
     };
@@ -419,6 +530,27 @@ pub(crate) async fn activate_session(
         }
     }
 
+    // T66: an own-address box on a VM-backed host registers with the VM host
+    // daemon just before the create — the host allocates the box's switch
+    // and loopback addresses into the table its egress gate decides by and
+    // hands them back, and the create request carries them so the in-VM
+    // daemon attaches with the handed switch address instead of drawing its
+    // own. Every other shape of activation — a host-ip box sharing the
+    // node's own row, a none box with no switch address, a native daemon
+    // with no box table — registers nothing and attaches as it always has.
+    // This is the last fallible client-side step, so a failure from here on
+    // owes the row its creator's withdrawal (T66): the sites below send it.
+    // The control socket is resolved once, here, and the withdrawals ride
+    // on it.
+    let control_sock = vm_host_control_sock(global);
+    config.box_addresses = register_box_for_activation(
+        global,
+        config.network,
+        config.name.as_deref().expect("the session name is minted before the create"),
+        &config.policy,
+    )
+    .await;
+
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
     };
@@ -427,7 +559,6 @@ pub(crate) async fn activate_session(
     // re-mint the hex suffix and retry a bounded number of times. A
     // user-supplied name never retries — its collision, and any other failure
     // (e.g. a policy/network-mode validation error), surfaces unchanged.
-    let mut config = config;
     let mut attempts = 0u32;
     let created = loop {
         let resp = client
@@ -439,20 +570,34 @@ pub(crate) async fn activate_session(
                 // operator proceed.
                 must_match_version: version_assertion(),
             })
-            .await
-            .context("CreateSession RPC failed")?;
+            .await;
+        let resp = match resp {
+            Ok(resp) => resp,
+            // A transport failure abandons the activation and the row its
+            // registration bought: the create never happened, so no session
+            // holds the pair (T66).
+            Err(error) => {
+                withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+                return Err(error.context("CreateSession RPC failed"));
+            }
+        };
         match resp {
             minimald_rpc::Errorable::Ok(r) => break r,
             minimald_rpc::Errorable::Err { error } => {
                 if should_retry_autogen(autogen, attempts, &error) {
                     attempts += 1;
+                    // The row the first attempt bought is this attempt's to
+                    // leave behind: its creator withdraws it before
+                    // re-registering under the re-minted name (T66) — it was
+                    // bought for a session this create never made.
+                    withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
                     config.name = Some(autogen_session_name(&utf8_path, &random_hex4()));
                     // A registered box's row carries the name it was
-                    // registered under (T66), so the re-mint re-registers —
-                    // the row the first attempt made stays published behind
-                    // it: the control socket has no withdraw verb yet, its
-                    // addresses are spent for good by design, and the rare
-                    // colliding autogen retry leaves at most one such row.
+                    // registered under (T66), so the re-mint re-registers;
+                    // the abandoned row's addresses stay spent by design
+                    // (the host's cursors never regress), but its
+                    // admissions are withdrawn above, and the retry leaves
+                    // no row behind.
                     config.box_addresses = register_box_for_activation(
                         global,
                         config.network,
@@ -462,6 +607,9 @@ pub(crate) async fn activate_session(
                     .await;
                     continue;
                 }
+                // A create failure that is not a retryable autogen collision
+                // abandons the activation and its row the same way.
+                withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
                 bail!("CreateSession failed: {error}");
             }
         }
@@ -472,7 +620,12 @@ pub(crate) async fn activate_session(
     // itself proof of a skew, so refuse here — still before the upload, the
     // loadout, and the finalize that #1251 died at, and with the session left
     // unfinalized for the daemon to reap when this connection drops.
-    ensure_version_reported(created.daemon_version.as_deref())?;
+    if let Err(error) = ensure_version_reported(created.daemon_version.as_deref()) {
+        // A skewed daemon's refusal abandons the unfinalized session and its
+        // row; the withdrawal rides out with the error (T66).
+        withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+        return Err(error);
+    }
     warn_if_hostname_routing_down(
         created.hostname_routing_unavailable.as_deref(),
         "min session activate",
@@ -596,10 +749,15 @@ pub(crate) async fn activate_session(
                 )?,
             };
             if should_upload {
-                client
+                let uploaded = client
                     .upload_workspace_files(id, upload_root.as_std_path())
-                    .await
-                    .context("Failed to upload project files")?;
+                    .await;
+                if let Err(error) = uploaded {
+                    // The upload failed: the activation is abandoned, and the
+                    // row its registration bought goes with it (T66).
+                    withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+                    return Err(error.context("Failed to upload project files"));
+                }
             } else if !headless {
                 eprintln!(
                     "Skipping file upload; the session will start with an \
@@ -636,13 +794,22 @@ pub(crate) async fn activate_session(
             session_id: id,
             contribution,
         })
-        .await
-        .context("ConfigureLoadout RPC failed")?;
+        .await;
+    let configured = match configured {
+        // A transport failure abandons the activation and its row (T66).
+        Err(error) => {
+            withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+            return Err(error.context("ConfigureLoadout RPC failed"));
+        }
+        Ok(configured) => configured,
+    };
     let configured = match configured {
         minimald_rpc::Errorable::Ok(r) => r,
         // Bails before the `println!("{id}")` below: a session that cannot
         // compose never puts an id on stdout for a script to capture.
         minimald_rpc::Errorable::Err { error } => {
+            // The session cannot compose and is abandoned with its row (T66).
+            withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
             bail!(composition_failure_message(&utf8_path, &error));
         }
     };
@@ -674,6 +841,9 @@ pub(crate) async fn activate_session(
                 Ok((verdict, _final_policy)) => verdict,
                 Err(e) => {
                     send_abort(&mut client, session_id).await;
+                    // The session is aborted and its row withdrawn (T66):
+                    // the path failed after registering.
+                    withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
                     // The route an activation actually reaches today: the
                     // daemon routes project config back for gating, so a
                     // project it cannot compose surfaces here rather than as
@@ -684,6 +854,9 @@ pub(crate) async fn activate_session(
             let summary = hooks.into_summary();
             if summary.count() > 0 {
                 send_abort(&mut client, session_id).await;
+                // The session is aborted and its row withdrawn (T66): the
+                // path failed after registering.
+                withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
                 let count = summary.count();
                 let snippet = summary.as_toml_snippet();
                 bail!(
@@ -696,7 +869,13 @@ pub(crate) async fn activate_session(
                 );
             }
             collected_patches.extend(approved_patches_from_verdict(&verdict));
-            submit_verdict_and_wait(&mut client, session_id, verdict).await?;
+            let submitted = submit_verdict_and_wait(&mut client, session_id, verdict).await;
+            if let Err(error) = submitted {
+                // The verdict never landed: the activation is abandoned with
+                // its row (T66).
+                withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+                return Err(error);
+            }
         } else {
             // The hook stashes policy mutations in interior
             // `RefCell`s so a `DenyPermanent` (which returns
@@ -734,6 +913,11 @@ pub(crate) async fn activate_session(
                     Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
                 }
             }
+            if result.is_err() {
+                // The activation failed after registering: its row is
+                // withdrawn with it (T66).
+                withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+            }
             result?;
         }
     }
@@ -763,8 +947,10 @@ pub(crate) async fn activate_session(
     {
         // Best-effort teardown: the session is stuck in
         // Materializing on the daemon. Destroy it so the operator's
-        // `min ls` doesn't fill with half-finalized sessions.
+        // `min ls` doesn't fill with half-finalized sessions, and
+        // withdraw the row the registration bought with it (T66).
         best_effort_destroy(&mut client, id).await;
+        withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
         return Err(e);
     }
 
@@ -1561,7 +1747,7 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
     let mut client = connect_daemon(global).await?;
 
     if args.all {
-        return destroy_all_sessions(&mut client, args.force).await;
+        return destroy_all_sessions(global, &mut client, args.force).await;
     }
 
     let session = args
@@ -1601,7 +1787,14 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
         }
     }
 
-    destroy_session(&mut client, record.id, record.name.as_deref()).await
+    destroy_session(
+        &mut client,
+        global,
+        record.id,
+        record.name.as_deref(),
+        record.box_addresses,
+    )
+    .await
 }
 
 /// What the daemon's at-risk report means for the destroy gate.
@@ -1737,6 +1930,7 @@ pub(crate) async fn session_delta(
 }
 
 pub(crate) async fn destroy_all_sessions(
+    global: &GlobalArgs,
     client: &mut client::Client,
     force: bool,
 ) -> Result<(), anyhow::Error> {
@@ -1766,7 +1960,20 @@ pub(crate) async fn destroy_all_sessions(
     let session_count = sessions.len();
     let mut failures = 0;
     for session in sessions {
-        if let Err(error) = destroy_session(client, session.id, session.name.as_deref()).await {
+        // The record carries the pair the box's registration handed back
+        // (T66), which the destroy-side withdrawal presents; a session that
+        // registered no box holds none, and the withdrawal stays silent for
+        // it. A record the daemon cannot answer destroys the session all the
+        // same — nothing is left on this path to withdraw the row by.
+        let box_addresses = get_session_record(client, &session.id.to_string())
+            .await
+            .ok()
+            .and_then(|resp| resp.record)
+            .and_then(|record| record.box_addresses);
+        if let Err(error) =
+            destroy_session(client, global, session.id, session.name.as_deref(), box_addresses)
+                .await
+        {
             failures += 1;
             eprintln!(
                 "Failed to destroy session {} ({}): {error:#}",
@@ -1785,8 +1992,10 @@ pub(crate) async fn destroy_all_sessions(
 
 pub(crate) async fn destroy_session(
     client: &mut client::Client,
+    global: &GlobalArgs,
     id: sessions::SessionId,
     name: Option<&str>,
+    box_addresses: Option<sessions::BoxAddresses>,
 ) -> Result<(), anyhow::Error> {
     use minimald_rpc::{DestroySession, DestroySessionRequest};
 
@@ -1797,6 +2006,12 @@ pub(crate) async fn destroy_session(
 
     if resp.ok().is_some() {
         println!("Destroyed session {} ({})", id, name.unwrap_or("-"));
+        // The session is gone; the row its activation bought outlives it on
+        // the VM host daemon, and its creator withdraws it here (T66) —
+        // presenting the pair the registration handed back. Best-effort: a
+        // withdrawal that cannot be made leaves the row published and warns
+        // rather than failing a destroy that already succeeded.
+        withdraw_box_row(vm_host_control_sock(global), name, box_addresses).await;
     } else {
         bail!("DestroySession returned an error from the daemon");
     }
@@ -2198,8 +2413,11 @@ mod tests {
             // below is exactly what the await-holding-lock lint names.
             let seen = requests.lock().unwrap();
             assert_eq!(seen.len(), 1, "one registration, one request");
-            let request: minimald_rpc::RegisterBoxRequest =
+            let request: minimald_rpc::BoxControlRequest =
                 serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type");
+            let minimald_rpc::BoxControlRequest::Register(request) = request else {
+                panic!("a registration is carried by the register verb");
+            };
             assert_eq!(request.name, "web");
             assert_eq!(request.ingress_ports, vec![8080, 5432]);
             assert_eq!(request.egress.as_ref(), policy.egress.as_ref());
@@ -2251,6 +2469,71 @@ mod tests {
         assert!(
             refused.to_string().contains("address plan is exhausted"),
             "the refusal surfaces with its reason: {refused}"
+        );
+    }
+
+    /// T66's destroy side: the client holding a destroyed session's record
+    /// withdraws the row its activation registered — one withdraw request
+    /// naming the pair the registration handed back — and a session that
+    /// registered no box (no pair, no name, no VM host) sends nothing at
+    /// all.
+    #[tokio::test]
+    async fn destroy_sends_the_withdraw() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let requests = fake_vm_host(
+            sock_path.clone(),
+            r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
+        )
+        .await;
+        let global = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            minimal_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handed = sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+        };
+        // The withdrawal the destroy side owes: the pair comes off the
+        // session record, the control socket off the provider dir the
+        // daemon connection resolves through.
+        withdraw_box_row(vm_host_control_sock(&global), Some("web"), Some(handed)).await;
+        {
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one withdrawal, one request");
+            let request: minimald_rpc::BoxControlRequest =
+                serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type");
+            let minimald_rpc::BoxControlRequest::Withdraw(request) = request else {
+                panic!("a withdrawal is carried by the withdraw verb");
+            };
+            assert_eq!(request.name, "web");
+            assert_eq!(request.switch_address, handed.switch_address);
+            assert_eq!(request.loopback_address, handed.loopback_address);
+        }
+
+        // And a session that registered nothing owes nothing: no pair, no
+        // name, no VM host — each sends nothing, on the same socket.
+        withdraw_box_row(vm_host_control_sock(&global), Some("web"), None).await;
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "no pair on the record, no withdrawal"
+        );
+        withdraw_box_row(vm_host_control_sock(&global), None, Some(handed)).await;
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "no name on the record, no withdrawal"
+        );
+        let native = GlobalArgs::default();
+        withdraw_box_row(vm_host_control_sock(&native), Some("web"), Some(handed)).await;
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "no VM host to withdraw from, no withdrawal"
         );
     }
 }

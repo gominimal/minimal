@@ -23,6 +23,11 @@ mod net;
 mod project;
 mod session;
 
+// The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
+// activation registered with the VM host daemon; the withdrawal lives with
+// the session commands.
+use session::{vm_host_control_sock, withdraw_box_row};
+
 pub use admin::*;
 pub use list::*;
 pub use net::*;
@@ -663,6 +668,9 @@ pub(crate) fn arm_activation_interrupt(
     session_id: sessions::SessionId,
 ) -> ActivationInterrupt {
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
+    // Resolved here, not inside the task: the withdrawal's socket is the
+    // same provider dir's, and the borrow must not cross the spawn.
+    let control_sock = vm_host_control_sock(global);
     let task = tokio::spawn(async move {
         // Only the first Ctrl-C is intercepted; a second falls through to
         // the default disposition so a wedged cleanup can still be killed.
@@ -677,9 +685,27 @@ pub(crate) fn arm_activation_interrupt(
             && let Ok(mut client) = client::Client::connect(&sock).await
         {
             use minimald_rpc::{AbortSession, AbortSessionRequest};
+            // The record is fetched **before** the abort, which may take it
+            // with the session: it carries the pair the box's registration
+            // handed back (T66), whose row is withdrawn after the abort —
+            // the creator's withdrawal, best-effort. A session that
+            // registered no box (a task session, a native host) holds no
+            // pair, and the withdrawal stays silent for it.
+            let row = get_session_record(&mut client, &session_id.to_string())
+                .await
+                .ok()
+                .and_then(|resp| resp.record);
             let _ = client
                 .oneshot_rpc::<AbortSession>(AbortSessionRequest { id: session_id })
                 .await;
+            if let Some(record) = row {
+                withdraw_box_row(
+                    control_sock,
+                    record.name.as_deref(),
+                    record.box_addresses,
+                )
+                .await;
+            }
         }
         std::process::exit(130);
     });
