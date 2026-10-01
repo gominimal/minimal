@@ -351,11 +351,11 @@ fn every_create_session_asserts_the_daemon_build() {
     assert_eq!(
         create_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
-            "cmd/boxes/create.rs::activate_box = asserts",
             // A unit test's request, never sent: it checks the box spec.
             "cmd/boxes/create.rs::activation_puts_the_spec_on_the_create_request = asserts nothing",
             // A unit test's request, never sent: it checks the project root.
             "cmd/boxes/create.rs::create_from_a_subdirectory_sends_the_project_root = asserts nothing",
+            "cmd/boxes/create.rs::create_session_for_activation = asserts",
             // The dashboard's activation: the same create, the same assertion.
             "dash/rpc.rs::activate = asserts",
             // A unit test's request, never sent: it checks the project root.
@@ -385,7 +385,7 @@ fn every_create_session_asserts_the_daemon_build() {
 fn the_activation_path_makes_no_version_round_trip() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
-        ("src/cmd/boxes/create.rs", "activate_box"),
+        ("src/cmd/boxes/create.rs", "create_session_for_activation"),
         ("src/task.rs", "cmd_task_run"),
     ] {
         let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
@@ -2147,7 +2147,12 @@ fn composition_failure_does_not_blame_config_for_git_lock() {
 fn both_creators_share_the_composition_failure_message() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func, uses) in [
-        ("src/cmd/boxes/create.rs", "activate_box", 2),
+        (
+            "src/cmd/boxes/create.rs",
+            "create_session_for_activation",
+            1,
+        ),
+        ("src/cmd/boxes/create.rs", "finish_headless", 1),
         ("src/task.rs", "cmd_task_run", 2),
         ("src/cmd/mod.rs", "drive_pending_to_active", 1),
     ] {
