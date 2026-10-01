@@ -38,8 +38,12 @@ pub(crate) async fn activate_session(
     args: ActivateArgs,
     offer_scaffold: bool,
 ) -> Result<(), anyhow::Error> {
-    let ActivatedSession { id, name, attach } =
-        activate_session_inner(global, args, offer_scaffold).await?;
+    let ActivatedSession {
+        id,
+        name,
+        attach,
+        uploaded: _,
+    } = activate_session_inner(global, args, offer_scaffold).await?;
 
     println!("{id}");
 
@@ -71,6 +75,11 @@ pub(crate) struct ActivatedSession {
     /// Whether the caller asked to attach immediately (`--attach`), which only
     /// [`activate_session`] acts on.
     pub attach: bool,
+    /// Whether the working tree was uploaded into the session. `false` means
+    /// the upload was skipped (empty or `$HOME` root, a non-VCS directory
+    /// under a headless caller, or an explicit `--sync none`), so the session
+    /// starts with an empty workspace.
+    pub uploaded: bool,
 }
 
 /// Everything an activation resolves before the daemon conversation: the
@@ -87,6 +96,9 @@ pub(crate) struct PreparedActivation {
     pub project_dir: camino::Utf8PathBuf,
     pub no_prompt: bool,
     pub attach: bool,
+    /// Whether an upload root was resolved and an upload attempted; see
+    /// [`ActivatedSession::uploaded`].
+    pub uploaded: bool,
 }
 
 /// Resolve every client-side input for an activation and connect to the
@@ -407,6 +419,10 @@ pub(crate) async fn prepare_activation(
         Box::new(move || autogen_session_name(&dir, &random_hex4()))
             as Box<dyn Fn() -> String + Send + Sync>
     });
+    // Whether the tree will actually reach `/workbench`, surfaced to callers
+    // (the MCP server) that report it back. Computed before `upload` moves
+    // into the request.
+    let uploaded = upload.is_some();
     let request = client::activate::ActivateRequest {
         config,
         upload_root: upload.map(|p| p.into_std_path_buf()),
@@ -432,6 +448,7 @@ pub(crate) async fn prepare_activation(
         project_dir,
         no_prompt: args.no_prompt,
         attach: args.attach,
+        uploaded,
     })
 }
 
@@ -452,6 +469,7 @@ pub(crate) async fn activate_session_inner(
         project_dir,
         no_prompt,
         attach,
+        uploaded,
     } = prepare_activation(global, args, offer_scaffold).await?;
     let name = request.config.name.clone();
     let mut gate = CliActivationGate {
@@ -466,12 +484,18 @@ pub(crate) async fn activate_session_inner(
         egress_declared: request.config.policy.egress.is_some(),
     };
     let id = client::activate::activate(&mut client, request, &mut gate).await?;
-    Ok(ActivatedSession { id, name, attach })
+    Ok(ActivatedSession {
+        id,
+        name,
+        attach,
+        uploaded,
+    })
 }
 
 /// Create a session headlessly, for a caller that cannot prompt (the MCP
-/// server): a `Pending` composition is aborted and refused. The returned
-/// future is `Send`, so `rmcp` tool handlers can await it.
+/// server): a `Pending` composition the policy auto-decides is resolved
+/// without a prompt, while one that genuinely needs an operator is refused.
+/// The returned future is `Send`, so `rmcp` tool handlers can await it.
 pub(crate) async fn create_headless_session(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -485,6 +509,7 @@ pub(crate) async fn create_headless_session(
         compose_options,
         project_dir,
         attach,
+        uploaded,
         ..
     } = prepare_activation(global, args, offer_scaffold).await?;
     let name = request.config.name.clone();
@@ -495,7 +520,12 @@ pub(crate) async fn create_headless_session(
         project_dir: &project_dir,
     };
     let id = client::activate::activate(&mut client, request, &mut gate).await?;
-    Ok(ActivatedSession { id, name, attach })
+    Ok(ActivatedSession {
+        id,
+        name,
+        attach,
+        uploaded,
+    })
 }
 
 /// The headless gate `min mcp` creates sessions through.

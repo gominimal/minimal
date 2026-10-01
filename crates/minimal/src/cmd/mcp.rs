@@ -38,16 +38,20 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::GlobalArgs;
-use crate::{CliNetworkMode, McpArgs, parse_network_mode};
+use crate::{CliNetworkMode, McpArgs, SyncMode, parse_network_mode};
 use sessions::SessionId;
 
 /// The MCP `instructions` field: the contract a model needs before it uses any
 /// tool. Static so the wording is one thing, asserted by a test.
 pub const INSTRUCTIONS: &str = "\
 Every session is a fully isolated sandbox: it has its own filesystem, its own \
-process tree, and none of your host's state. Creating a session uploads the \
+process tree, and none of your host's state. Creating a session can upload the \
 named working directory into it, and that tree lands at /workbench inside the \
-sandbox; file paths are absolute or relative to /workbench. The first exec or \
+sandbox; file paths are absolute or relative to /workbench. By default the \
+upload happens only when the directory is a version-control root or carries a \
+minimal.toml, unless create_session's sync argument overrides it (tarball \
+forces the upload, none starts with an empty workspace); the result's uploaded \
+field reports whether the tree was sent. The first exec or \
 file call that omits a session_id creates a default \
 session from the server's --workdir and reuses it for later calls; sessions \
 you create explicitly with create_session are independent of each other and of \
@@ -130,18 +134,19 @@ impl McpServer {
         if let Some(id) = *default {
             return Ok(id);
         }
-        let activated = self.create(None, None).await?;
+        let activated = self.create(None, None, None).await?;
         *default = Some(activated.id);
         Ok(activated.id)
     }
 
-    /// Create a session through the shared activation core, headless: the
-    /// gate refuses a `Pending` composition (the server has no prompt) and
-    /// aborts the draft.
+    /// Create a session through the shared activation core, headless: a
+    /// `Pending` composition the policy auto-decides is resolved without a
+    /// prompt, while one that genuinely needs an operator is refused.
     async fn create(
         &self,
         working_dir: Option<PathBuf>,
         name: Option<String>,
+        sync: Option<SyncMode>,
     ) -> Result<crate::cmd::session::ActivatedSession, anyhow::Error> {
         let path = working_dir
             .or_else(|| self.state.opts.workdir.clone())
@@ -150,7 +155,7 @@ impl McpServer {
         let args = crate::ActivateArgs {
             name,
             path,
-            sync: None,
+            sync,
             network: self.state.opts.network,
             ingress: Vec::new(),
             allow_subnets: Vec::new(),
@@ -160,8 +165,9 @@ impl McpServer {
             loadout: self.state.opts.loadout.clone(),
             no_loadouts: self.state.opts.no_loadouts,
             no_hooks: self.state.opts.no_hooks,
-            // The server can't prompt: a `Pending` composition refuses with the
-            // `user_policy.toml` snippet rather than hanging on a terminal.
+            // The server can't prompt: a `Pending` composition the policy
+            // can't auto-decide is refused with the `user_policy.toml` snippet
+            // rather than hanging on a terminal.
             no_prompt: true,
             attach: false,
         };
@@ -203,7 +209,18 @@ fn resolve_sandbox_path(path: &str) -> String {
     }
 }
 
-/// Quote one argv element for `/bin/sh`.
+/// Parses `create_session`'s `sync` value: `tarball` force-uploads the tree
+/// and `none` starts the sandbox empty. Omitting it keeps the activation
+/// default, which uploads only a VCS root or a directory carrying a
+/// `minimal.toml`.
+fn parse_sync_mode(raw: &str) -> Result<SyncMode, String> {
+    match raw {
+        "tarball" => Ok(SyncMode::Tarball),
+        "none" => Ok(SyncMode::None),
+        _ => Err("expected one of tarball, none".to_owned()),
+    }
+}
+
 fn shell_quote(arg: &str) -> String {
     let safe = !arg.is_empty()
         && arg
@@ -234,6 +251,11 @@ struct CreateSessionParams {
     /// server's configured loadouts.
     #[serde(default)]
     loadouts: Vec<String>,
+    /// Whether to upload the working directory into the sandbox. `tarball`
+    /// force-uploads it, `none` starts with an empty workspace, and omitting
+    /// it uploads only a VCS root or a directory carrying a `minimal.toml`.
+    #[serde(default)]
+    sync: Option<String>,
     /// Network mode for the sandbox: `none`, `host_ip` (default), or `own_ip`.
     #[serde(default)]
     network: Option<String>,
@@ -330,12 +352,17 @@ impl McpServer {
         Ok(json_result(&Value::Array(rows)))
     }
 
-    /// Create an isolated sandbox, uploading the named directory into it.
-    #[tool(description = "Create a new isolated sandbox and upload a working \
-                       directory into it. Returns the session id, its name, \
-                       and the workspace path (/workbench). The sandbox \
-                       persists until destroy_session; it is independent of \
-                       the default session.")]
+    /// Create an isolated sandbox, optionally uploading the named directory
+    /// into it.
+    #[tool(description = "Create a new isolated sandbox. By default the working \
+                       directory is uploaded into it and becomes /workbench, but \
+                       only when it is a version-control root or carries a \
+                       minimal.toml; pass sync=\"tarball\" to upload it regardless, \
+                       or sync=\"none\" to start with an empty workspace. Returns \
+                       the session id, its name, the workspace path (/workbench), \
+                       and `uploaded` (whether the tree was actually sent). The \
+                       sandbox persists until destroy_session; it is independent \
+                       of the default session.")]
     async fn create_session(
         &self,
         Parameters(p): Parameters<CreateSessionParams>,
@@ -347,10 +374,18 @@ impl McpServer {
             },
             None => self.state.opts.network,
         };
+        let sync = match p.sync.as_deref() {
+            Some(raw) => match parse_sync_mode(raw) {
+                Ok(mode) => Some(mode),
+                Err(e) => return Ok(tool_error(format!("invalid sync: {e}"))),
+            },
+            None => None,
+        };
         // A per-call network override becomes the server's network for the
         // activation carried out here.
         let session = if network == self.state.opts.network && p.loadouts.is_empty() {
-            self.create(p.working_dir.clone(), p.name.clone()).await
+            self.create(p.working_dir.clone(), p.name.clone(), sync)
+                .await
         } else {
             let args = crate::ActivateArgs {
                 name: p.name.clone(),
@@ -359,7 +394,7 @@ impl McpServer {
                     .clone()
                     .or_else(|| self.state.opts.workdir.clone())
                     .map(|p| p.to_string_lossy().into_owned()),
-                sync: None,
+                sync,
                 network,
                 ingress: Vec::new(),
                 allow_subnets: Vec::new(),
@@ -386,6 +421,7 @@ impl McpServer {
             "session_id": session.id.to_string(),
             "name": session.name,
             "workspace": "/workbench",
+            "uploaded": session.uploaded,
         })))
     }
 
@@ -675,6 +711,13 @@ mod tests {
                 "instructions must mention {needle}: {INSTRUCTIONS}"
             );
         }
+    }
+
+    #[test]
+    fn sync_modes_parse_and_reject_unknown() {
+        assert!(matches!(parse_sync_mode("tarball"), Ok(SyncMode::Tarball)));
+        assert!(matches!(parse_sync_mode("none"), Ok(SyncMode::None)));
+        assert!(parse_sync_mode("bogus").is_err());
     }
 
     #[test]

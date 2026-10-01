@@ -180,11 +180,33 @@ async fn mcp_creates_lists_and_destroys_a_session() {
     );
     let session = result_json(&created);
     assert_eq!(session["workspace"], "/workbench");
+    assert_eq!(
+        session["uploaded"], true,
+        "a VCS root should upload by default: {session}"
+    );
     let id = session["session_id"]
         .as_str()
         .expect("a session id")
         .to_string();
     assert_eq!(session["name"], "mcp-itest");
+
+    // sync="none" starts the sandbox empty even from a VCS root, and the
+    // result reports that with uploaded=false.
+    let empty = mcp
+        .call(
+            "tools/call",
+            r#"{"name":"create_session","arguments":{"name":"mcp-itest-empty","sync":"none"}}"#,
+        )
+        .await;
+    assert_ne!(
+        empty["result"]["isError"], true,
+        "create_session sync=none failed: {empty}"
+    );
+    assert_eq!(
+        result_json(&empty)["uploaded"],
+        false,
+        "sync=none must not upload: {empty}"
+    );
 
     // It shows up in the daemon's listing, under the name we gave it.
     let listed = mcp
