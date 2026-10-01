@@ -109,17 +109,17 @@ fn the_activation_path_makes_no_version_round_trip() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let text =
         std::fs::read_to_string(manifest.join("src/cmd/session.rs")).expect("readable source");
-    let body = function_body(&text, "activate_session")
-        .expect("src/cmd/session.rs no longer defines activate_session");
+    let body = function_body(&text, "activate_session_inner")
+        .expect("src/cmd/session.rs no longer defines activate_session_inner");
     for round_trip in ["GetVersion", "ensure_version_match", "connect_daemon("] {
         assert!(
             !body.contains(round_trip),
-            "activate_session reintroduced a version round trip ({round_trip})"
+            "activate_session_inner reintroduced a version round trip ({round_trip})"
         );
     }
     assert!(
         body.contains("client::activate::activate("),
-        "activate_session no longer delegates to the version-gated core"
+        "activate_session_inner no longer delegates to the version-gated core"
     );
 
     let text = std::fs::read_to_string(manifest.join("src/task.rs")).expect("readable source");
@@ -1314,7 +1314,7 @@ fn composition_failure_leads_with_the_directory_not_the_daemon_step() {
 fn both_creators_share_the_composition_failure_message() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func, uses) in [
-        ("src/cmd/session.rs", "activate_session", 1),
+        ("src/cmd/session.rs", "prepare_activation", 1),
         ("src/task.rs", "cmd_task_run", 2),
         ("src/cmd/mod.rs", "drive_pending_to_active", 1),
     ] {

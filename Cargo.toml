@@ -197,8 +197,14 @@ prost-types = "0.14"
 # Property testing (dev-dependency only; NET-071 proxy parity is the first consumer).
 proptest = "1"
 resolv-conf = "0.7"
+# The official Rust MCP SDK, for `min mcp`'s stdio server. `transport-io` is
+# the server-side stdio transport; `schemars` derives each tool's input schema.
+rmcp = { version = "3.5", features = ["transport-io", "schemars"] }
 russh = { version = "0.63", default-features = false, features = ["aws-lc-rs", "flate2"] }
 russh-sftp = "2.4"
+# JSON Schema generation for MCP tool inputs (`schema_for!`); kept in the same
+# major as rmcp's own schemars dependency.
+schemars = "1"
 serde_json_lenient = { version = "0.2" }
 serial_test = "4"
 sha2 = "0.11"

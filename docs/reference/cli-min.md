@@ -80,6 +80,79 @@ upload, loadout compose, finalize), `q` quits. The cursor's last position
 is restored on the next launch from `<state>/dash-state.json`; TUI
 diagnostics go to `<state>/dash.log`.
 
+### `mcp`
+
+```text
+min mcp [OPTIONS]
+```
+
+Serves the [Model Context Protocol](https://modelcontextprotocol.io) over
+stdio, exposing the session plane as a sandboxed shell-execution surface for an
+agent harness. The model can create isolated sandboxes, run commands in them,
+read and write files, and manage sessions. stdout carries the JSON-RPC channel
+and nothing else. Logs go to stderr.
+
+The global flags choose the daemon the sandboxes live on (`--provider`, `--vm`,
+`--minimal-dir`). The flags below shape the sessions tools create.
+
+| Flag | Description |
+|------|-------------|
+| `--workdir <DIR>` | Directory uploaded into the lazily-created default session. Without it, the first call with no `session_id` uses the current directory |
+| `--network <none\|host_ip\|own_ip>` | Network mode for sessions created by tools. Defaults to `host_ip`, so installs inside a sandbox work |
+| `--loadout <NAME>` | Loadout applied to sessions created by tools. Repeatable |
+| `--no-loadouts` | Apply no loadouts to sessions created by tools. Conflicts with `--loadout` |
+| `--no-hooks` | Run none of the lifecycle hooks of sessions created by tools |
+| `--timeout <SECONDS>` | Default seconds an `exec` call can run before the daemon kills it. Defaults to 120 |
+
+Tools:
+
+| Tool | Arguments | Result |
+|------|-----------|--------|
+| `list_loadouts` | None | The available environments: name, description, packages, variables, patches |
+| `create_session` | `working_dir?`, `name?`, `loadouts?`, `network?` | `session_id`, `name`, `workspace` (`/workbench`) |
+| `exec` | `session_id?`, `command?` or `argv?`, `stdin?`, `timeout_secs?` | `stdout`, `stderr`, `exit_code` |
+| `read_file` | `session_id?`, `path`, `offset?`, `limit?` | `content`, `bytes_read`, `eof` |
+| `write_file` | `session_id?`, `path`, `content` | `path`, `bytes_written` |
+| `list_sessions` | None | Every session on the daemon: `id`, `name`, `project`, `state` |
+| `destroy_session` | `session_id` | `destroyed` |
+
+A session is a fully isolated sandbox. Creating one uploads the named working
+directory into it. That tree becomes `/workbench`, and file paths resolve at
+the session home. The first `exec` or file call with no `session_id` creates a
+default session from `--workdir` and reuses it. Sessions created with
+`create_session` are independent, and every session persists until destroyed.
+
+`exec` runs non-interactively. There is no PTY, and the server writes `stdin`
+once and then closes it. A command that a sandbox's composed environment cannot
+spawn, such as one whose loadout names a package the daemon cannot materialize,
+fails at the daemon, and the tool returns that message.
+
+Sample client configuration:
+
+```json
+{
+  "mcpServers": {
+    "minimal": {
+      "command": "min",
+      "args": ["mcp", "--workdir", "/path/to/project"]
+    }
+  }
+}
+```
+
+Sample client configuration:
+
+```json
+{
+  "mcpServers": {
+    "minimal": {
+      "command": "min",
+      "args": ["mcp", "--workdir", "/path/to/project"]
+    }
+  }
+}
+```
+
 ### `session activate`
 
 ```

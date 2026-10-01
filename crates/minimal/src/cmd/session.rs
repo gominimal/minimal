@@ -31,13 +31,71 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 /// `offer_scaffold` gates the `minimal.toml` scaffold offer: `cmd_activate`
 /// keeps it (its long-standing behavior, unchanged), while bare `min`
 /// suppresses it — that path must land in a session, never in a config
-/// prompt. Everything else, including the session id on stdout, is
-/// identical for both callers.
+/// prompt. Prints the session id to stdout and, with `--attach`, hands off to
+/// the attach path.
 pub(crate) async fn activate_session(
     global: &GlobalArgs,
     args: ActivateArgs,
     offer_scaffold: bool,
 ) -> Result<(), anyhow::Error> {
+    let ActivatedSession { id, name, attach } =
+        activate_session_inner(global, args, offer_scaffold).await?;
+
+    println!("{id}");
+
+    if attach {
+        // Chain into attach. Announce the freshly created session first: the
+        // bare id printed to stdout above is the scripting contract, while this
+        // stderr line tells an interactive operator which session they just
+        // created and are entering.
+        if should_announce_session(global) {
+            eprintln!(
+                "Created session {}",
+                session_announce_label(&id, name.as_deref())
+            );
+        }
+        let attach_args = AttachArgs {
+            session: Some(id.to_string()),
+        };
+        return cmd_attach(global, attach_args).await;
+    }
+
+    Ok(())
+}
+
+/// A session the activation flow brought up `Active`, for a caller that wants
+/// the id rather than the CLI's stdout contract (the MCP server).
+pub(crate) struct ActivatedSession {
+    pub id: sessions::SessionId,
+    pub name: Option<String>,
+    /// Whether the caller asked to attach immediately (`--attach`), which only
+    /// [`activate_session`] acts on.
+    pub attach: bool,
+}
+
+/// Everything an activation resolves before the daemon conversation: the
+/// authenticated client, the core request, and the inputs a front-end gate
+/// needs. Split from the thin wrappers so the headless path (MCP) can share
+/// every client-side step while supplying its own `Send` gate.
+pub(crate) struct PreparedActivation {
+    pub client: minimal_client::Client,
+    pub request: client::activate::ActivateRequest,
+    pub policy_path: std::path::PathBuf,
+    pub user_policy: sessions::core::policy::UserPolicy,
+    pub initial_policy: sessions::core::policy::UserPolicy,
+    pub compose_options: sessions::core::compose::ComposeOptions,
+    pub project_dir: camino::Utf8PathBuf,
+    pub no_prompt: bool,
+    pub attach: bool,
+}
+
+/// Resolve every client-side input for an activation and connect to the
+/// daemon, stopping short of the create. See [`PreparedActivation`].
+pub(crate) async fn prepare_activation(
+    global: &GlobalArgs,
+    args: ActivateArgs,
+    offer_scaffold: bool,
+) -> Result<PreparedActivation, anyhow::Error> {
     ensure_daemon(global)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
@@ -337,10 +395,8 @@ pub(crate) async fn activate_session(
     // The create/upload/configure/finalize sequence is shared with the TUI and
     // with `min mcp`; the headless core lives in `minimal-client`. Everything
     // above this line is resolution the front-end owns — loadouts, policy, the
-    // scaffold offer, the upload gate. The gate below carries the interactive
-    // half: the announcements the create reply feeds, and the user-policy
-    // prompt a `Pending` composition demands.
-    let session_name = config.name.clone();
+    // scaffold offer, the upload gate. The gate itself is supplied by the
+    // caller.
     let project_dir = utf8_path.clone();
     let compose_failure: Box<dyn Fn(&str) -> anyhow::Error + Send + Sync> = {
         let dir = project_dir.clone();
@@ -351,17 +407,6 @@ pub(crate) async fn activate_session(
         Box::new(move || autogen_session_name(&dir, &random_hex4()))
             as Box<dyn Fn() -> String + Send + Sync>
     });
-    let mut gate = CliActivationGate {
-        policy_path: &policy_path,
-        user_policy,
-        initial_policy,
-        compose_options,
-        project_dir: &project_dir,
-        no_prompt: args.no_prompt,
-        no_input: global.no_input,
-        network: config.network,
-        egress_declared: config.policy.egress.is_some(),
-    };
     let request = client::activate::ActivateRequest {
         config,
         upload_root: upload.map(|p| p.into_std_path_buf()),
@@ -377,28 +422,70 @@ pub(crate) async fn activate_session(
         .ok(),
         compose_failure,
     };
+    Ok(PreparedActivation {
+        client,
+        request,
+        policy_path,
+        user_policy,
+        initial_policy,
+        compose_options,
+        project_dir,
+        no_prompt: args.no_prompt,
+        attach: args.attach,
+    })
+}
+
+/// [`activate_session`] without the stdout contract: resolve the inputs, run
+/// the shared core with the CLI's interactive gate, and hand the id back.
+pub(crate) async fn activate_session_inner(
+    global: &GlobalArgs,
+    args: ActivateArgs,
+    offer_scaffold: bool,
+) -> Result<ActivatedSession, anyhow::Error> {
+    let PreparedActivation {
+        mut client,
+        request,
+        policy_path,
+        user_policy,
+        initial_policy,
+        compose_options,
+        project_dir,
+        no_prompt,
+        attach,
+    } = prepare_activation(global, args, offer_scaffold).await?;
+    let name = request.config.name.clone();
+    let mut gate = CliActivationGate {
+        policy_path: &policy_path,
+        user_policy,
+        initial_policy,
+        compose_options,
+        project_dir: &project_dir,
+        no_prompt,
+        no_input: global.no_input,
+        network: request.config.network,
+        egress_declared: request.config.policy.egress.is_some(),
+    };
     let id = client::activate::activate(&mut client, request, &mut gate).await?;
+    Ok(ActivatedSession { id, name, attach })
+}
 
-    println!("{id}");
-
-    if args.attach {
-        // Chain into attach. Announce the freshly created session first: the
-        // bare id printed to stdout above is the scripting contract, while this
-        // stderr line tells an interactive operator which session they just
-        // created and are entering.
-        if should_announce_session(global) {
-            eprintln!(
-                "Created session {}",
-                session_announce_label(&id, session_name.as_deref())
-            );
-        }
-        let attach_args = AttachArgs {
-            session: Some(id.to_string()),
-        };
-        return cmd_attach(global, attach_args).await;
-    }
-
-    Ok(())
+/// Create a session headlessly, for a caller that cannot prompt (the MCP
+/// server): a `Pending` composition is aborted and refused. The returned
+/// future is `Send`, so `rmcp` tool handlers can await it.
+pub(crate) async fn create_headless_session(
+    global: &GlobalArgs,
+    args: ActivateArgs,
+    offer_scaffold: bool,
+) -> Result<ActivatedSession, anyhow::Error> {
+    let PreparedActivation {
+        mut client,
+        request,
+        attach,
+        ..
+    } = prepare_activation(global, args, offer_scaffold).await?;
+    let name = request.config.name.clone();
+    let id = client::activate::activate_headless(&mut client, request).await?;
+    Ok(ActivatedSession { id, name, attach })
 }
 
 /// The CLI's half of [`minimal_client::activate::activate`]: the announcements

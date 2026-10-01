@@ -141,6 +141,9 @@ pub enum Command {
     /// sessions across every running provider on the host (native minimald
     /// and the minvmd microVM). Requires a terminal.
     Dash,
+    /// Serve the Model Context Protocol over stdio, exposing sessions as a
+    /// sandboxed shell-execution surface for an agent harness.
+    Mcp(McpArgs),
     /// Print or install the shell tab-completion integration
     #[command(
         visible_alias = "completion",
@@ -386,7 +389,7 @@ pub struct MeshJoinArgs {
 // Deliberately NOT a doc comment: clap propagates a flattened struct's doc
 // comment into the parent command's long_about, which would replace the
 // top-level `min --help` description with this text.
-#[derive(Debug, Default, Args)]
+#[derive(Debug, Default, Clone, Args)]
 pub struct GlobalArgs {
     /// Use the given directory as the repository root, instead of the current
     /// working directory.
@@ -547,6 +550,41 @@ pub struct ActivateArgs {
     /// Automatically attach after creation
     #[arg(long)]
     pub attach: bool,
+}
+
+/// Flags for `min mcp`.
+///
+/// The global flags (`--provider`, `--vm`, `--minimal-dir`) choose which
+/// daemon hosts the sandboxes the server creates; the flags here shape the
+/// sessions it creates from them.
+#[derive(Debug, Args)]
+pub struct McpArgs {
+    /// Directory uploaded into the lazily-created default session. Used for
+    /// the first `exec`/file call that names no session; without it that call
+    /// uses the current directory.
+    #[arg(long, value_name = "DIR")]
+    pub workdir: Option<PathBuf>,
+    /// Network mode for sessions created by tools.
+    #[arg(
+        long,
+        value_name = "none|host_ip|own_ip",
+        value_parser = parse_network_mode,
+        default_value = "host_ip"
+    )]
+    pub network: CliNetworkMode,
+    /// Apply the named loadout to sessions created by tools. Repeatable.
+    #[arg(long = "loadout", value_name = "NAME")]
+    pub loadout: Vec<String>,
+    /// Apply no loadouts to sessions created by tools (also skips the
+    /// config's `default_loadouts`).
+    #[arg(long, conflicts_with = "loadout")]
+    pub no_loadouts: bool,
+    /// Run none of the lifecycle hooks of sessions created by tools.
+    #[arg(long)]
+    pub no_hooks: bool,
+    /// Default seconds an `exec` tool call may run before it is killed.
+    #[arg(long, default_value_t = 120)]
+    pub timeout: u64,
 }
 
 /// Which daemon backend ("provider") hosts sessions.

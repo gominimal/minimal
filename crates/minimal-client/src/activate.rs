@@ -62,12 +62,13 @@ pub struct ActivateRequest {
 /// The front-end's half of activation: the announcements that bracket the
 /// create, and the policy gate a `Pending` composition demands.
 ///
-/// The futures are not `Send`-bounded, and need not be: an activation runs on
-/// one task. `async fn` in a public trait is exactly that shape, so silence the
-/// lint that wants the explicit bound we deliberately omit.
+/// The gate's futures are not `Send`-bounded here: the CLI's interactive gate
+/// holds a non-`Send` prompter, and an activation runs on one task. A caller
+/// that needs a `Send` future (the MCP server, whose `rmcp` handlers require
+/// it) uses [`activate_headless`], whose concrete gate is `Send`.
 #[allow(
     async_fn_in_trait,
-    reason = "an activation runs on one task, so the futures need no Send bound"
+    reason = "the interactive gate is deliberately single-threaded; headless callers use activate_headless"
 )]
 pub trait ActivationGate {
     /// Called once the record exists and its build has been checked, before
@@ -82,6 +83,43 @@ pub trait ActivationGate {
         client: &mut Client,
         response: sessions::wire::request::ContributionResponse,
     ) -> Result<Vec<(PathBuf, paths::SandboxRelPath)>, anyhow::Error>;
+}
+
+/// A gate that refuses any `Pending` composition: the headless default for a
+/// caller that cannot prompt.
+///
+/// Concrete (not boxed) so [`activate_headless`]'s future is provably `Send` —
+/// the CLI's interactive gate is not, since the prompt machinery is not.
+struct RefusePending;
+
+impl ActivationGate for RefusePending {
+    async fn on_pending(
+        &mut self,
+        client: &mut Client,
+        response: sessions::wire::request::ContributionResponse,
+    ) -> Result<Vec<(PathBuf, paths::SandboxRelPath)>, anyhow::Error> {
+        // Abort the draft before refusing: the session is parked in `Pending`
+        // and would otherwise hold its name until the connection drops.
+        let _ = client
+            .oneshot_rpc::<AbortSession>(AbortSessionRequest {
+                id: response.session_id,
+            })
+            .await;
+        bail!(
+            "this project needs interactive policy gating, which a headless \
+             caller cannot supply; run `min session activate` to gate it"
+        )
+    }
+}
+
+/// [`activate`] for a caller with no prompt: a `Pending` composition is
+/// aborted and refused. The returned future is `Send`.
+pub async fn activate_headless(
+    client: &mut Client,
+    request: ActivateRequest,
+) -> Result<sessions::SessionId, anyhow::Error> {
+    let mut gate = RefusePending;
+    activate(client, request, &mut gate).await
 }
 
 /// Create, populate, compose, gate, and finalize a session, returning its id.

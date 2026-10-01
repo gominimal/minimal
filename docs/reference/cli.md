@@ -56,6 +56,7 @@ ergonomic choices, not leftovers — do not "fix" them:
 |------|--------------|
 | `min ls` | Visible top-level alias of the canonical `min session list`; the highest-traffic command keeps its bare form. |
 | `min stop` | Acts on the daemon backend rather than any session, and is the daemon-lifecycle command people reach for. |
+| `min dash`, `min mcp` | Whole-tool modes (an interactive dashboard and a stdio protocol server) rather than operations on a session. |
 | `min init`, `min add`, `min update` | Passthroughs to the `mip` commands of the same name; keeping the spelling identical across the two CLIs beats the hierarchy. |
 
 ## Platform availability
