@@ -732,6 +732,10 @@ fn run_foreground() -> Result<()> {
 /// boots: default-first, so a VM sharing a host with a native daemon still
 /// lands on the defaults when they are free and only falls to OS-assigned
 /// ports when the defaults are actually held.
+// Only `run_foreground` calls these, and it needs libkrun; without it the
+// crate is a runtime-bailing stub, but the tests below still cover this on
+// every target.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NodePorts {
     proxy: u16,
@@ -740,11 +744,13 @@ pub(crate) struct NodePorts {
 
 impl NodePorts {
     /// The hostname proxy's TCP port the guest daemon binds as handed (NET-025).
+    #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
     pub(crate) fn proxy_port(&self) -> u16 {
         self.proxy
     }
 
     /// The zone answerer's UDP port the guest daemon binds as handed (NET-025).
+    #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
     pub(crate) fn answerer_port(&self) -> u16 {
         self.answerer
     }
@@ -754,10 +760,13 @@ impl NodePorts {
 /// own defaults (`DEFAULT_EGRESS_PROXY_PORT` in minimald's `net/proxy.rs`,
 /// `ANSWERER_PORT` in its `net/answerer.rs`): `minvmd` does not depend on the
 /// daemon, so the values are pinned here beside the constants they mirror.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const NODE_DEFAULT_PROXY_PORT: u16 = 7654;
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const NODE_DEFAULT_ANSWERER_PORT: u16 = 7656;
 
 /// Assigns both node ports: TCP for the proxy, UDP for the answerer.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn assign_node_ports() -> Result<NodePorts> {
     let proxy = assign_node_port(NODE_DEFAULT_PROXY_PORT, false)?;
     let answerer = assign_node_port(NODE_DEFAULT_ANSWERER_PORT, true)?;
@@ -770,6 +779,7 @@ fn assign_node_ports() -> Result<NodePorts> {
 /// the assignment and the guest's bind inside the VM the port could still be
 /// taken by another process — a lost race the guest's own log tail shows
 /// (a handed port never silently moves, NET-024).
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn assign_node_port(preferred: u16, udp: bool) -> Result<u16> {
     use anyhow::Context as _;
     let probe = |port: u16| -> std::io::Result<u16> {
