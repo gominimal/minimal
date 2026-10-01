@@ -480,12 +480,81 @@ pub(crate) async fn create_headless_session(
     let PreparedActivation {
         mut client,
         request,
+        policy_path,
+        user_policy,
+        compose_options,
+        project_dir,
         attach,
         ..
     } = prepare_activation(global, args, offer_scaffold).await?;
     let name = request.config.name.clone();
-    let id = client::activate::activate_headless(&mut client, request).await?;
+    let mut gate = HeadlessActivationGate {
+        policy_path: &policy_path,
+        user_policy,
+        compose_options,
+        project_dir: &project_dir,
+    };
+    let id = client::activate::activate(&mut client, request, &mut gate).await?;
     Ok(ActivatedSession { id, name, attach })
+}
+
+/// The headless gate `min mcp` creates sessions through.
+///
+/// It mirrors the CLI's `--no-prompt` lane rather than refusing every `Pending`
+/// composition outright: the user policy still auto-decides what it can, and
+/// only items that genuinely need a prompt are refused, naming the
+/// `user_policy.toml` snippet that would fix them. Refusing all `Pending` made
+/// the server unable to create sessions the CLI creates without a prompt,
+/// because the daemon routes project config back for gating even when the
+/// policy approves every item.
+struct HeadlessActivationGate<'a> {
+    policy_path: &'a std::path::Path,
+    user_policy: sessions::core::policy::UserPolicy,
+    compose_options: sessions::core::compose::ComposeOptions,
+    project_dir: &'a camino::Utf8Path,
+}
+
+impl minimal_client::activate::ActivationGate for HeadlessActivationGate<'_> {
+    async fn on_pending(
+        &mut self,
+        client: &mut client::Client,
+        response: sessions::wire::request::ContributionResponse,
+    ) -> Result<Vec<(std::path::PathBuf, paths::SandboxRelPath)>, anyhow::Error> {
+        let session_id = response.session_id;
+        let hooks = prompt::NoPromptHook::new();
+        let verdict = match compute_verdict(
+            response,
+            self.user_policy.clone(),
+            self.compose_options,
+            &hooks,
+        ) {
+            Ok((verdict, _final_policy)) => verdict,
+            Err(e) => {
+                send_abort(client, session_id).await;
+                bail!(composition_failure_message(
+                    self.project_dir,
+                    &e.to_string()
+                ));
+            }
+        };
+        let summary = hooks.into_summary();
+        if summary.count() > 0 {
+            send_abort(client, session_id).await;
+            let count = summary.count();
+            let snippet = summary.as_toml_snippet();
+            bail!(
+                "{count} item{s} would require interactive approval, which a \
+                 headless caller cannot supply.\n\n\
+                 Add the following to {}:\n\n{snippet}\n\
+                 Then create the session again.",
+                self.policy_path.display(),
+                s = if count == 1 { "" } else { "s" },
+            );
+        }
+        let approved: Vec<_> = approved_patches_from_verdict(&verdict).collect();
+        submit_verdict_and_wait(client, session_id, verdict).await?;
+        Ok(approved)
+    }
 }
 
 /// The CLI's half of [`minimal_client::activate::activate`]: the announcements
