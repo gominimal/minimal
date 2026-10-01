@@ -124,6 +124,11 @@ anyhow = "1.0"
 arbitrary = "1"
 async-compression = { version = "0.4", features = ["tokio", "zstd", "zstdmt"] }
 async-tar = { version = "0.6", default-features = false, features = ["runtime-tokio"] }
+# HTTP server for `min mcp --transport http`: it drives the rmcp streamable-HTTP
+# tower service (rmcp's own tests serve it the same way). `tokio` provides
+# `axum::serve`; `http1` serves plaintext HTTP/1.1, which is what rmcp's
+# streamable-HTTP transport speaks. Kept in sync with rmcp's axum dev-dep.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 base64 = "0.23"
 blake3 = { version = "1", features = ["serde"] }
 # WireGuard mesh peer (Unit 4, behind the `networking-wg` feature). Pure-Rust
@@ -197,9 +202,14 @@ prost-types = "0.14"
 # Property testing (dev-dependency only; NET-071 proxy parity is the first consumer).
 proptest = "1"
 resolv-conf = "0.7"
-# The official Rust MCP SDK, for `min mcp`'s stdio server. `transport-io` is
-# the server-side stdio transport; `schemars` derives each tool's input schema.
-rmcp = { version = "3.5", features = ["transport-io", "schemars"] }
+# The official Rust MCP SDK, for `min mcp`. `transport-io` is the server-side
+# stdio transport, `transport-streamable-http-server` the HTTP one (a tower
+# service that axum serves); `schemars` derives each tool's input schema.
+rmcp = { version = "3.5", features = [
+    "transport-io",
+    "transport-streamable-http-server",
+    "schemars",
+] }
 russh = { version = "0.63", default-features = false, features = ["aws-lc-rs", "flate2"] }
 russh-sftp = "2.4"
 # JSON Schema generation for MCP tool inputs (`schema_for!`); kept in the same
