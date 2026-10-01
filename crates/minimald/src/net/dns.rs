@@ -606,15 +606,6 @@ impl HostnameRegistry {
     /// — so that is the rule. Nothing else about a route moves: the ports a
     /// request may name are the box's own declaration, not a fact about where
     /// it publishes.
-    /// Returns the node's host loopback address as the registry currently
-    /// holds it. `Session::register_hostname` reads this to run the
-    /// shared-address port collision check for a box that publishes on the
-    /// node's shared interim without recording that address as the box's own.
-    #[must_use]
-    pub fn node_address(&self) -> Ipv4Addr {
-        self.node
-    }
-
     pub fn set_node_address(&mut self, node: Ipv4Addr) {
         let was = std::mem::replace(&mut self.node, node);
         if was == node {
@@ -632,6 +623,15 @@ impl HostnameRegistry {
         // Shared-address interim publishes do not record the address in the box's
         // own state, so there is nothing to repoint there; the collision check
         // consults the current node address directly.
+    }
+
+    /// Returns the node's host loopback address as the registry currently
+    /// holds it. `Session::register_hostname` reads this to run the
+    /// shared-address port collision check for a box that publishes on the
+    /// node's shared interim without recording that address as the box's own.
+    #[must_use]
+    pub fn node_address(&self) -> Ipv4Addr {
+        self.node
     }
 
     /// Registers `session_name`'s box name routing it along `route`, and
@@ -858,6 +858,7 @@ impl HostnameRegistry {
                 "two boxes publish one port at a shared loopback address"
             );
         }
+        self.shared_published.remove(&session_id);
         self.own_published
             .insert(session_id, OwnPublished { address, ports });
         collisions
@@ -924,7 +925,7 @@ impl HostnameRegistry {
         let shared_collisions = self
             .shared_published
             .iter()
-            .filter(|(other, _)| **other != session_id)
+            .filter(|(other, _)| **other != session_id && address == self.node)
             .flat_map(|(other, other_ports)| {
                 let other_name = self
                     .by_session

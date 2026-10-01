@@ -848,9 +848,9 @@ impl Session {
                     // `published_own_address` and would need `set_node_address`
                     // to re-point a recorded node address when the node's grant
                     // lands. Collisions are reported at the same moment as an
-                    // own-address publish (NET-129), through the same emitter,
-                    // and reach the listing surface via `shared_published` in
-                    // the registry.
+                    // own-address publish (NET-129), through the same emitter;
+                    // the warn line is the surface today, and the list is kept
+                    // for a listing consumer to come.
                     let node_address = reg.node_address();
                     let _collisions = reg.report_shared_address_collisions(
                         record.id,
