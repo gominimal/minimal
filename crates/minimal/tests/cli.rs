@@ -841,7 +841,7 @@ async fn policy_shows_effective_egress() {
     );
 
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -883,7 +883,7 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -916,7 +916,7 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert_eq!(
         text, "No network policy (NoNet)\n",
@@ -989,7 +989,7 @@ async fn policy_shows_deny_all_default() {
         "the in-force default for a bare own-address box is deny-all"
     );
     let mut out = Vec::new();
-    format_policy(&mut out, &in_force, sessions::NetworkMode::OwnIp).unwrap();
+    format_policy(&mut out, &in_force, sessions::NetworkMode::OwnIp, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  deny all\n"),
@@ -1039,7 +1039,7 @@ async fn policy_shows_deny_all_default() {
     };
     assert_eq!(policy.egress, sessions::EffectiveEgress::AllowAll);
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  allow all\n"),
@@ -1054,14 +1054,20 @@ async fn policy_shows_deny_all_default() {
 /// daemon's own fetches under — announced, the shipped posture, the run
 /// path's allow-all interim node row still decides those fetches, so the
 /// rows are what the set will bound, not what bounds them today; in force,
-/// it decides them whatever the box's own declaration resolves to. A
-/// host-address box shares its host's namespace, so it has no switch fabric
-/// and the baseline set has nothing to describe there.
+/// it decides them whatever the box's own declaration resolves to. The set
+/// is shown where the fabric the helper gates is named — the microVM
+/// backend's plan — and nowhere it is not: a host-address box shares its
+/// host's namespace and has no switch fabric, and a backend with no
+/// host-side helper beside its switch (the native daemon's own per-daemon
+/// switch, a plan the reply does not carry) names no fabric either, so the
+/// block is left out there rather than printed from a plan the session does
+/// not attach to.
 #[test]
 fn policy_shows_baseline_set() {
     // The deny-all resolution the rollout ends at (NET-075), rendered the
     // way the command renders it: the box's own rules, and the helper's
-    // enumeration beside them.
+    // enumeration beside them — the microVM backend's fabric, the plan the
+    // helper's run path builds its registry and this set from.
     let deny_all = sessions::EffectiveSessionPolicy {
         egress: sessions::effective_egress(
             None,
@@ -1071,8 +1077,15 @@ fn policy_shows_baseline_set() {
         ),
         ingress: None,
     };
+    let fabric = switch::SwitchSubnet::default();
     let mut out = Vec::new();
-    format_policy(&mut out, &deny_all, sessions::NetworkMode::OwnIp).unwrap();
+    format_policy(
+        &mut out,
+        &deny_all,
+        sessions::NetworkMode::OwnIp,
+        Some(fabric),
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  deny all\n"),
@@ -1095,7 +1108,7 @@ fn policy_shows_baseline_set() {
     // The rows are the enumeration the helper carries, one per category —
     // the set the host-side gate decides the daemon's own frames by once the
     // baseline is in force.
-    let baseline = minvmd::net::NodePlaneBaseline::built_in(switch::SwitchSubnet::default());
+    let baseline = minvmd::net::NodePlaneBaseline::built_in(fabric);
     let rendered_baseline = baseline
         .entries()
         .iter()
@@ -1125,13 +1138,31 @@ fn policy_shows_baseline_set() {
     );
 
     // A host-address box has no switch fabric, so the baseline set has
-    // nothing to describe there.
+    // nothing to describe there — even with a fabric named.
     let mut out = Vec::new();
-    format_policy(&mut out, &deny_all, sessions::NetworkMode::HostNet).unwrap();
+    format_policy(
+        &mut out,
+        &deny_all,
+        sessions::NetworkMode::HostNet,
+        Some(fabric),
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         !text.contains("node-plane baseline set"),
         "a host-address box carries no baseline set:\n{text}"
+    );
+
+    // A backend with no helper beside its switch — the native daemon's own
+    // per-daemon switch, a plan the reply does not carry — names no fabric,
+    // and the set is left out rather than printed from the microVM plan the
+    // session does not attach to.
+    let mut out = Vec::new();
+    format_policy(&mut out, &deny_all, sessions::NetworkMode::OwnIp, None).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        !text.contains("node-plane baseline set"),
+        "an unnamed fabric carries no baseline set:\n{text}"
     );
 }
 
