@@ -44,7 +44,10 @@
 //! reported, it decides every frame leaving the VM against the host-side table
 //! of published namespaces ([`crate::box_registry`], NET-138) — per source
 //! address, by the rules the namespace's row compiled from its declaration —
-//! and relays only what its verdict admits on to the switch. A frame whose
+//! and relays only what its verdict admits on to the switch. The node
+//! plane's own traffic — the in-VM daemon's registry and cache fetches
+//! (NET-080) — is decided by the baseline set the helper enumerates
+//! ([`NodePlaneBaseline`], NET-130), beside the boxes' rows. A frame whose
 //! source is an address the plan could never hand to a box never leaves the
 //! VM; an address the plan could hand out but no namespace holds is the
 //! announced interim's — admitted, and warned as such, until the
@@ -74,6 +77,8 @@ pub(crate) mod egress_gate;
 pub use egress_gate::EgressGate;
 mod shuttle;
 pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_gate_sock, resolve_switch_sock};
+mod baseline;
+pub use baseline::NodePlaneBaseline;
 
 /// Default time to wait for gvproxy to exit on SIGTERM before escalating to
 /// SIGKILL.
@@ -704,6 +709,12 @@ impl HostGvproxy {
             // frame's source by is one the switch actually routes.
             .with_subnet(registry.subnet());
         let table = registry.table();
+        // The node-plane baseline set: the helper's built-in enumeration of
+        // the categories the in-VM daemon's own traffic may reach (NET-130),
+        // built from the same address plan the rows were compiled against.
+        // The gate decides a frame from the daemon's own address by it,
+        // beside the boxes' rows.
+        let baseline = NodePlaneBaseline::built_in(registry.subnet());
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u32>>();
 
@@ -734,7 +745,9 @@ impl HostGvproxy {
                     // reported ready: the guest's shuttle connects to it (the
                     // vsock bridge points here, not at the switch), and every
                     // frame it relays on is one its verdict admitted against
-                    // `table`. Underscore-bound and never read: it is held for
+                    // `table` — the node plane's own traffic against the
+                    // baseline set, everything else against the boxes' rows.
+                    // Underscore-bound and never read: it is held for
                     // its lifetime — to the end of this block — so it lives and
                     // dies with the switch runtime, and dropping it stops the
                     // gate and every live relay.
@@ -743,6 +756,7 @@ impl HostGvproxy {
                         shuttle::gate_sock_beside(&sock),
                         sock.clone(),
                         table,
+                        baseline,
                     ) {
                         Ok(gate) => gate,
                         Err(e) => {
