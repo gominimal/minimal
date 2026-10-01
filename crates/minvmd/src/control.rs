@@ -114,6 +114,14 @@ fn serve_connection(stream: UnixStream, boxes: &BoxRegistry) -> std::io::Result<
 /// Read one line (terminated by `\n`) of the registration request. A
 /// connection that closes before sending a line reads as no request; a line
 /// past [`MAX_REQUEST_LINE`] is refused.
+///
+/// The slices are cut at `read`, the byte count `read()` reported filling
+/// `buf` with, or at `newline`, an index `position` found inside
+/// `buf[..read]` — so neither range can be out of bounds.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "cut at `read`, the byte count `read()` reported, or at `newline`, an index `position` found inside `buf[..read]`"
+)]
 fn read_request_line(stream: &mut UnixStream) -> std::io::Result<Option<String>> {
     let mut line = Vec::new();
     let mut buf = [0u8; 1024];
@@ -265,7 +273,9 @@ mod tests {
         request: &RegisterBoxRequest,
     ) -> std::io::Result<RegisterBoxReply> {
         let mut stream = TestStream::connect(sock_path)?;
-        let mut line = serde_json_lenient::to_string(request).expect("request serializes");
+        let mut line = serde_json_lenient::to_string(request).map_err(|error| {
+            std::io::Error::other(format!("request did not serialize: {error}"))
+        })?;
         line.push('\n');
         stream.write_all(line.as_bytes())?;
         let mut reader = BufReader::new(stream);

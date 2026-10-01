@@ -2050,8 +2050,12 @@ mod tests {
                 }
                 seen.lock().unwrap().push(line.trim().to_string());
                 let mut writer = lines.into_inner();
-                let _ = writer.write_all(reply.as_bytes()).await;
-                let _ = writer.write_all(b"\n").await;
+                if writer.write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+                if writer.write_all(b"\n").await.is_err() {
+                    return;
+                }
             }
         });
         requests

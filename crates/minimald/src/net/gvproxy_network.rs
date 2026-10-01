@@ -95,7 +95,10 @@ impl NetGuard for OwnIpGuard {
 /// honored its handed address from one that did not.
 // Left positional: a single call site that has just planned the launch, so a
 // struct would be single-use ceremony.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "left positional: a single call site that has just planned the launch, so a struct would be single-use ceremony"
+)]
 pub(crate) async fn complete_own_ip_attach(
     switch: &Arc<Mutex<SwitchClient>>,
     tap_fd: OwnedFd,
@@ -583,6 +586,8 @@ mod tests {
         // SAFETY: each fd in `fds` is a fresh, valid, owned descriptor just
         // returned by socketpair.
         let tap_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: each fd in `fds` is a fresh, valid, owned descriptor just
+        // returned by socketpair.
         let _box_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
         let guard = crate::net::gvproxy_network::complete_own_ip_attach(
             &switch,
