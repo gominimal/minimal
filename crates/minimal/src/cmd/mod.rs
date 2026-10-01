@@ -22,6 +22,7 @@ mod auth;
 mod box_spec;
 mod finalize_install;
 mod list;
+mod mcp;
 mod net;
 mod project;
 mod session;
@@ -35,6 +36,7 @@ pub use admin::*;
 pub use auth::{cmd_auth_login, cmd_auth_status};
 pub use finalize_install::*;
 pub use list::*;
+pub use mcp::*;
 pub use net::*;
 pub use project::*;
 pub use session::*;
@@ -229,6 +231,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         })) => cmd_net_forward(&cli.global_args, args).await,
         Some(Command::FinalizeInstall(args)) => cmd_finalize_install(&cli.global_args, args).await,
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
+        Some(Command::Mcp(args)) => cmd_mcp(&cli.global_args, args).await,
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         Some(Command::Diag(diag::DiagArgs { command })) => match command {
             diag::DiagCommand::Collect(args) => diag::cmd_bug(&cli.global_args, args).await,
