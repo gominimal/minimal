@@ -60,30 +60,35 @@ pub enum Resolver {
 
 /// How far a plan's socket-family seal refuses.
 ///
-/// A network namespace confines the internet families (`AF_INET`,
-/// `AF_INET6`) but not every family a process can ask for: `AF_VSOCK`
-/// reaches the host whatever namespace the caller sits in. Every plan
-/// refuses at least those namespace-bypass families, and what varies is how
-/// much more the seal refuses. A property of the plan, not the shape of it:
-/// an own-address box starts as an isolated plan with no tap — the daemon
-/// moves the tap in after the process exists — so the seal cannot be read
+/// Every seal is an allowlist of the socket families it admits, and what
+/// varies is the list: a network namespace confines the families it exists
+/// to confine — the internet families (`AF_INET`, `AF_INET6`), netlink,
+/// packet, unix — but not every family a process can ask for, and
+/// `AF_VSOCK` reaches the host whatever namespace the caller sits in. What
+/// each seal admits is therefore decided with the plan, not read from its
+/// shape: an own-address box starts as an isolated plan with no tap — the
+/// daemon moves the tap in after the process exists — so it cannot be read
 /// back from `isolate_netns` and `tap`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketSeal {
-    /// Refuses only the namespace-bypass families (`AF_VSOCK`), admitting the
-    /// rest — the seal every plan but [`NetPlan::none`] runs under, so an
-    /// own-address or host-address box keeps its inet sockets.
-    BypassFamilies,
-    /// Refuses every family but `AF_UNIX` — the `none` plan's promise of no
-    /// reach outside the sandbox at all.
+    /// Admits the families the box's own network namespace confines — unix,
+    /// inet, inet6, netlink, packet — and refuses everything else with
+    /// `EAFNOSUPPORT`, the namespace-bypass families (`AF_VSOCK`) included,
+    /// so no socket reaches past the namespace. The seal every plan but
+    /// [`NetPlan::none`] runs under, so an own-address or host-address box
+    /// keeps its inet sockets; `AF_PACKET` is admitted here and refused by
+    /// the missing `CAP_NET_RAW` no box holds, as NET-083 binds.
+    ConfinedFamilies,
+    /// Admits `AF_UNIX` alone and refuses every other family — the `none`
+    /// plan's promise of no reach outside the sandbox at all.
     Full,
 }
 
 impl std::fmt::Display for SocketSeal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BypassFamilies => write!(f, "bypass-families"),
-            Self::Full => write!(f, "none"),
+            Self::ConfinedFamilies => write!(f, "confined-families"),
+            Self::Full => write!(f, "full"),
         }
     }
 }
@@ -102,8 +107,8 @@ pub struct NetPlan {
     tap: Option<TapSpec>,
     /// How far the box's socket-family seal refuses. [`NetPlan::none`] seals
     /// [`SocketSeal::Full`] — no reach outside the sandbox at all; every other
-    /// plan seals [`SocketSeal::BypassFamilies`] — the namespace-bypass
-    /// families refused, inet and unix sockets kept.
+    /// plan seals [`SocketSeal::ConfinedFamilies`] — the families the
+    /// namespace confines admitted, everything else refused.
     seal: SocketSeal,
     resolver: Resolver,
     hosts: Vec<HostEntry>,
@@ -141,7 +146,7 @@ impl NetPlan {
         Self {
             isolate_netns: false,
             tap: None,
-            seal: SocketSeal::BypassFamilies,
+            seal: SocketSeal::ConfinedFamilies,
             resolver: Resolver::None,
             hosts: Vec::new(),
         }
@@ -154,15 +159,15 @@ impl NetPlan {
         Self {
             isolate_netns: true,
             tap: None,
-            seal: SocketSeal::BypassFamilies,
+            seal: SocketSeal::ConfinedFamilies,
             resolver: Resolver::None,
             hosts: Vec::new(),
         }
     }
 
     /// A none box: an unshared network namespace that will never get a tap,
-    /// with every socket family the namespace does not confine refused as
-    /// well (`AF_VSOCK` reaches the host regardless of the namespace). Unlike
+    /// with every socket family but `AF_UNIX` refused on top (`AF_VSOCK`
+    /// reaches the host regardless of the namespace). Unlike
     /// [`NetPlan::isolated`], which an own-address box also starts from when
     /// its tap is moved in after spawn, this plan is the promise of no reach.
     #[must_use]
@@ -182,7 +187,7 @@ impl NetPlan {
         Self {
             isolate_netns: true,
             tap: Some(tap),
-            seal: SocketSeal::BypassFamilies,
+            seal: SocketSeal::ConfinedFamilies,
             resolver: Resolver::None,
             hosts: Vec::new(),
         }
@@ -222,7 +227,7 @@ impl NetPlan {
     }
 
     /// The socket-family seal this plan's box runs under — the families it
-    /// refuses, decided with the plan rather than read from its shape.
+    /// admits, decided with the plan rather than read from its shape.
     #[must_use]
     pub fn seal(&self) -> SocketSeal {
         self.seal

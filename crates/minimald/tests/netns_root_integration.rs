@@ -978,12 +978,14 @@ impl Drop for LiveBox {
 /// with the box's credentials, so joining a box is not a way around the
 /// posture every box process already execs with.
 ///
-/// The box is an *open* one (a host plan, no socket-family filter), so the
-/// only thing that can refuse the injected process a raw socket is the missing
-/// capability: the refusal this proof pins is the one NET-083 is about. The
-/// hold process keeps the box alive for the injection and reports first,
-/// which is also how the proof tells a launch that never reached the program
-/// (exit 125 in hakoniwa's mount setup, no report) from one that did.
+/// The box is an *open* one (a host plan), sealed to the families its own
+/// network namespace confines — the inet family the probe's raw and stream
+/// sockets use is on that list — so the only thing that can refuse the
+/// injected process a raw socket is the missing capability: the refusal this
+/// proof pins is the one NET-083 is about. The hold process keeps the box
+/// alive for the injection and reports first, which is also how the proof
+/// tells a launch that never reached the program (exit 125 in hakoniwa's
+/// mount setup, no report) from one that did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn injected_process_lacks_cap_net_raw() {
     if let Some(reason) = sandbox2::user_namespaces_restriction() {
@@ -1108,9 +1110,9 @@ async fn injected_process_lacks_cap_net_raw() {
     let report = parse_report(&String::from_utf8_lossy(&output.stdout));
     assert_box_credentials(&report, "the injected process");
 
-    // The capability-dependent operation itself. An open box's network is the
-    // host's and carries no family filter, so a raw socket refused with
-    // anything but EPERM is a capability that survived the join.
+    // The capability-dependent operation itself. The box's confined-families
+    // seal admits the inet family, so a raw socket refused with anything but
+    // EPERM is a capability that survived the join, not the seal's work.
     let raw = reported_errno(&report, "raw_socket_errno", "the injected process");
     assert_eq!(
         raw,
@@ -1130,21 +1132,22 @@ async fn injected_process_lacks_cap_net_raw() {
 /// running box carries the box's socket-family seal. The filter installed at
 /// launch is inherited by children of the filtered process only, so the
 /// injection shim reinstalls it after joining — the none plan's full seal for
-/// a none box, and for every other box the bypass-family seal, which refuses
-/// only the families no network namespace confines (`AF_VSOCK`) and keeps
-/// the box's own sockets.
+/// a none box, and for every other box the confined-families seal, which
+/// admits the families the box's network namespace confines and refuses
+/// everything else, `AF_VSOCK` included, while keeping the box's own
+/// sockets.
 ///
 /// The box here is a networked one (a host plan), so the injection runs the
-/// shim's default — the bypass-family seal, exactly as `command_in_session`
-/// sends it for every box that is not a none box. The assertions are that the
-/// injected process is refused `AF_VSOCK` while its `AF_INET` stream sockets
-/// still work: an injection with no filter would have created the vsock
-/// socket whenever the kernel itself can (the host-side control below runs
-/// the same probe unfiltered), and the full none seal would have refused the
-/// stream socket too. The hold process keeps the box alive for the injection
-/// and reports first, which is also how the proof tells a launch that never
-/// reached the program (exit 125 in hakoniwa's mount setup, no report) from
-/// one that did.
+/// shim's default — the confined-families seal, exactly as
+/// `command_in_session` sends it for every box that is not a none box. The
+/// assertions are that the injected process is refused `AF_VSOCK` while its
+/// `AF_INET` stream sockets still work: an injection with no filter would
+/// have created the vsock socket whenever the kernel itself can (the
+/// host-side control below runs the same probe unfiltered), and the full
+/// none seal would have refused the stream socket too. The hold process
+/// keeps the box alive for the injection and reports first, which is also
+/// how the proof tells a launch that never reached the program (exit 125 in
+/// hakoniwa's mount setup, no report) from one that did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn joined_process_refuses_namespace_bypass_families() {
     if let Some(reason) = sandbox2::user_namespaces_restriction() {
@@ -1183,7 +1186,7 @@ async fn joined_process_refuses_namespace_bypass_families() {
             "note: this kernel creates no AF_VSOCK sockets unfiltered (errno \
              {host_vsock}), so the refusal the box is held to is also what it \
              already answers; the stream socket below still separates the \
-             bypass seal from the full one"
+             confined seal from the full one"
         );
     }
 
@@ -1296,14 +1299,15 @@ async fn joined_process_refuses_namespace_bypass_families() {
         "the injected process must be refused the namespace-bypass family by \
          the seal the shim reinstalls, not left unfiltered"
     );
-    // ...while the box's own sockets keep working: the bypass-family seal,
-    // not the none seal, is what the shim installs for a networked box.
+    // ...while the box's own sockets keep working: the confined-families
+    // seal, not the none seal, is what the shim installs for a networked box.
     let stream = reported_errno(&report, "stream_socket_errno", "the injected process");
     assert_eq!(
         stream, 0,
-        "the injected process must keep its ordinary sockets: the bypass \
-         seal refuses only the namespace-bypass families, and a refusal here \
-         would be the none seal installed where the bypass one belongs"
+        "the injected process must keep its ordinary sockets: the \
+         confined-families seal admits the box's own families, and a refusal \
+         here would be the none seal installed where the confined one \
+         belongs"
     );
 }
 

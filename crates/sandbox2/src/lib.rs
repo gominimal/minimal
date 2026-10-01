@@ -369,9 +369,9 @@ pub struct Container {
     /// exec. Stored as a `&'static` because a hakoniwa command closure is
     /// `'static` and the filter must live as long as any command spawned from
     /// this container.  The value is one of the process-wide `OnceLock`
-    /// builds ([`socket_family_filter_for_none_box`], or the bypass-family
-    /// one), shared by every container running under that seal; nothing is
-    /// leaked per sandbox.
+    /// builds ([`socket_family_filter_for_none_box`], or the
+    /// confined-families one), shared by every container running under that
+    /// seal; nothing is leaked per sandbox.
     socket_family_filter: &'static SocketFamilyFilter,
 }
 
@@ -788,10 +788,15 @@ impl<C: Channel> Sandbox<C> {
         // Socket-family seal for every plan. A fresh network namespace blocks
         // IP/UNIX flows, but AF_VSOCK is not subject to the network namespace,
         // so a process in any box could still reach the host over vsock.  The
-        // seal refuses at least those namespace-bypass families, and the `none`
-        // plan's seal refuses every family but AF_UNIX.  The filter is
-        // installed in the child after hakoniwa has set up namespaces and
-        // credentials but before exec, using `prctl` + `seccomp` via libc only.
+        // seal is an allowlist: the `none` plan's seal admits AF_UNIX alone,
+        // and every other plan's seal admits the families the box's own
+        // network namespace confines, so a family that reaches past the
+        // namespace is refused in every box.  The filter is installed in the
+        // child after hakoniwa has set up namespaces and credentials but
+        // before exec, using `prctl` + `seccomp` via libc only.  A caller on a
+        // foreign ABI — a 32-bit binary on an x86_64 host, say — dies with
+        // SIGSYS on its first syscall in every box; the family list names
+        // native-ABI calls only.
         #[cfg(target_os = "linux")]
         let socket_family_filter = {
             let filter = socket_family_filter_for_plan(plan);
@@ -1714,12 +1719,19 @@ const SYS_SOCKET: i64 = libc::SYS_socket;
 const SYS_SOCKETPAIR: i64 = libc::SYS_socketpair;
 
 /// Build the socket-family filter for a seal: a classic BPF seccomp program
-/// that refuses `socket()`/`socketpair()` calls whose address family the seal
-/// refuses, with `EAFNOSUPPORT`.  The bypass-family seal refuses only
-/// `AF_VSOCK` — the family no network namespace confines — and admits the
-/// rest; the `none` seal refuses every family but `AF_UNIX`, which stays
-/// working so the in-sandbox `min` helper and the minenv socket keep
-/// functioning.
+/// that admits the `socket()`/`socketpair()` calls whose address family the
+/// seal lists and refuses the rest with `EAFNOSUPPORT`.  Both seals are
+/// allowlists.  The `none` seal admits `AF_UNIX` alone, which stays working
+/// so the in-sandbox `min` helper and the minenv socket keep functioning;
+/// the confined-families seal admits the families the box's own network
+/// namespace confines — `AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`,
+/// `AF_PACKET` — so no family that reaches past the namespace survives it.
+/// `AF_PACKET` sits on the admitted list because its refusal is the missing
+/// `CAP_NET_RAW` no box holds (NET-083), not this filter's.
+///
+/// This program is the first instalment of the seccomp profile applied
+/// inside boxes (architecture.md AT9, open gap 2): the family list is
+/// published here, reviewable where the design promised it.
 #[cfg(target_os = "linux")]
 fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     // Return EAFNOSUPPORT for a socket() or socketpair() the seal refuses.
@@ -1727,10 +1739,27 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     // Return the default allow action when the syscall is not one we restrict
     // or when the address family is allowed.
     let allow_action = libc::SECCOMP_RET_ALLOW;
-    // A caller on a foreign ABI (another audit arch, or x32 on x86_64) is not
-    // something a none box ever runs legitimately, and the syscall numbers
-    // below would not mean the same thing there: kill it rather than guess.
+    // A caller on a foreign ABI (another audit arch, or x32 on x86_64) dies
+    // with SIGSYS on its first syscall in every box, networked ones included:
+    // this check sits before the syscall-number dispatch, and the numbers
+    // would not mean the same thing on another ABI, so the filter kills
+    // rather than guesses.  A 32-bit binary in a host-address or own-address
+    // box dies here, where it ran before the seal reached every box.
     let kill_action = libc::SECCOMP_RET_KILL_PROCESS;
+
+    // The families the seal admits, in the order the verdict tail compares
+    // them.  The `none` seal admits `AF_UNIX` alone; the confined-families
+    // seal admits the namespace-confined set.
+    let admitted: &[u32] = match seal {
+        network::SocketSeal::Full => &[libc::AF_UNIX as u32],
+        network::SocketSeal::ConfinedFamilies => &[
+            libc::AF_UNIX as u32,
+            libc::AF_INET as u32,
+            libc::AF_INET6 as u32,
+            libc::AF_NETLINK as u32,
+            libc::AF_PACKET as u32,
+        ],
+    };
 
     // Offsets into struct seccomp_data in bytes:
     //   int nr;                  // 0
@@ -1789,26 +1818,31 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     }
     // 6: socket() -> 8; else -> 7.
     filter.push(jeq(SYS_SOCKET as u32, 1, 0));
-    // 7: socketpair() -> 8; anything else -> 12 (default allow).
-    filter.push(jeq(SYS_SOCKETPAIR as u32, 0, 4));
+    // 7: socketpair() -> 8; anything else jumps past the whole verdict tail
+    // to the default allow — one skip per admitted-family verdict pair plus
+    // the refuse and allow returns that end it.
+    filter.push(jeq(
+        SYS_SOCKETPAIR as u32,
+        0,
+        (2 * admitted.len() + 2) as u8,
+    ));
     // 8: load arg0 (the address family).
     filter.push(load(OFFSET_ARG0));
-    // The verdict tail: the seal decides which family is compared and what
-    // happens on a match.  A full seal allows its one admitted family
-    // (AF_UNIX) and refuses the rest; a bypass-family seal refuses its one
-    // refused family (AF_VSOCK) and allows the rest.  Relative jumps from
-    // here stay correct for both shapes.
-    let (family, on_match, other_action) = match seal {
-        network::SocketSeal::Full => (libc::AF_UNIX as u32, allow_action, refuse_action),
-        network::SocketSeal::BypassFamilies => (libc::AF_VSOCK as u32, refuse_action, allow_action),
-    };
-    // 9: family -> 10; else -> 11.
-    filter.push(jeq(family, 0, 1));
-    // 10: allow or refuse, per the seal.
-    filter.push(ret(on_match));
-    // 11: the seal's verdict for every other family, EAFNOSUPPORT.
-    filter.push(ret(other_action));
-    // 12: allow: not a socket-creating syscall.
+    // The verdict tail: both seals are allowlists, so each admitted family
+    // gets an allow return and whatever is left over is refused.  The `none`
+    // seal's one-family list is the tail the `none` box has always run; the
+    // confined-families seal's list is the namespace-confined set.  Relative
+    // jumps stay correct for either list.
+    for family in admitted {
+        // family matches -> the allow return; anything else falls through to
+        // the next comparison, or to the refuse return past the last one.
+        filter.push(jeq(*family, 0, 1));
+        filter.push(ret(allow_action));
+    }
+    // The seal's verdict for every family it does not admit, EAFNOSUPPORT.
+    filter.push(ret(refuse_action));
+    // The default allow for every syscall that creates no socket, reached
+    // both by falling through and by instruction 7's jump.
     filter.push(ret(allow_action));
 
     SocketFamilyFilter {
@@ -1816,7 +1850,9 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
         seal,
         refused_families: match seal {
             network::SocketSeal::Full => "every family but unix",
-            network::SocketSeal::BypassFamilies => "vsock",
+            network::SocketSeal::ConfinedFamilies => {
+                "every family but unix, inet, inet6, netlink, packet"
+            }
         },
     }
 }
@@ -1860,7 +1896,7 @@ pub unsafe fn install_socket_family_filter(filter: &SocketFamilyFilter) -> std::
 }
 
 /// Returns a pointer to the built-in socket-family filter for a seal — the
-/// full `none` seal, or the bypass-family seal every other box launches
+/// full `none` seal, or the confined-families seal every other box launches
 /// under.  Used both when launching a box and when re-installing the same
 /// filter during `nsenter` injection (the filter is inherited by children,
 /// not by processes that join the namespaces later).
@@ -1871,25 +1907,28 @@ pub fn socket_family_filter_for_none_box() -> &'static SocketFamilyFilter {
     FILTER.get_or_init(|| build_socket_family_filter(network::SocketSeal::Full))
 }
 
-/// Returns a pointer to the built-in bypass-family socket-family filter: it
-/// refuses only `AF_VSOCK` — the family that reaches the host whatever
-/// network namespace the caller sits in — and admits every other family, so
-/// an own-address or host-address box keeps its inet sockets.
+/// Returns a pointer to the built-in confined-families socket-family filter:
+/// it admits the families the box's own network namespace confines — unix,
+/// inet, inet6, netlink, packet — and refuses everything else with
+/// `EAFNOSUPPORT`, `AF_VSOCK` (the family that reaches the host whatever
+/// network namespace the caller sits in) included, so an own-address or
+/// host-address box keeps its inet sockets and cannot reach past its
+/// namespace.
 #[cfg(target_os = "linux")]
 #[must_use]
-pub fn socket_family_filter_for_bypass_families() -> &'static SocketFamilyFilter {
+pub fn socket_family_filter_for_confined_families() -> &'static SocketFamilyFilter {
     static FILTER: std::sync::OnceLock<SocketFamilyFilter> = std::sync::OnceLock::new();
-    FILTER.get_or_init(|| build_socket_family_filter(network::SocketSeal::BypassFamilies))
+    FILTER.get_or_init(|| build_socket_family_filter(network::SocketSeal::ConfinedFamilies))
 }
 
 /// The socket-family filter a box runs under, decided by its plan: the full
-/// `none` seal for [`NetPlan::none`], the bypass-family seal for every other
-/// plan.
+/// `none` seal for [`NetPlan::none`], the confined-families seal for every
+/// other plan.
 #[cfg(target_os = "linux")]
 fn socket_family_filter_for_plan(plan: &network::NetPlan) -> &'static SocketFamilyFilter {
     match plan.seal() {
         network::SocketSeal::Full => socket_family_filter_for_none_box(),
-        network::SocketSeal::BypassFamilies => socket_family_filter_for_bypass_families(),
+        network::SocketSeal::ConfinedFamilies => socket_family_filter_for_confined_families(),
     }
 }
 
@@ -2609,15 +2648,16 @@ mod tests {
     /// filter against the live kernel this test runs on, so the shipped BPF is
     /// exercised by real `socket(2)` calls on every host that runs the suite,
     /// not only where the root harness can.
-    /// Only a none plan refuses the families it does not need: every other
-    /// plan's box is sealed against the namespace-bypass families only, so it
-    /// keeps the inet sockets an own-address or host-address box exists to
-    /// open (see `every_box_refuses_namespace_bypass_families`). An isolated
+    /// Every plan carries a seal, and only the none plan's refuses the
+    /// families it does not need: every other plan's box is sealed to the
+    /// families its own namespace confines, so it keeps the inet sockets an
+    /// own-address or host-address box exists to open (see
+    /// `every_box_refuses_namespace_bypass_families`). An isolated
     /// plan without a tap is also what an own-address box starts from inside
     /// a microVM, where the daemon moves the tap in after spawn; giving it
     /// the none seal would refuse the `AF_INET` sockets that box needs.
     #[test]
-    fn only_a_none_plan_seals_sockets() {
+    fn each_plan_carries_its_socket_seal() {
         assert!(network::NetPlan::none().blocks_outside_sockets());
         assert!(!network::NetPlan::isolated().blocks_outside_sockets());
         assert!(!network::NetPlan::host().blocks_outside_sockets());
@@ -2633,11 +2673,11 @@ mod tests {
         assert_eq!(network::NetPlan::none().seal(), network::SocketSeal::Full);
         assert_eq!(
             network::NetPlan::isolated().seal(),
-            network::SocketSeal::BypassFamilies
+            network::SocketSeal::ConfinedFamilies
         );
         assert_eq!(
             network::NetPlan::host().seal(),
-            network::SocketSeal::BypassFamilies
+            network::SocketSeal::ConfinedFamilies
         );
         assert_eq!(
             network::NetPlan::isolated_with_tap(network::TapSpec {
@@ -2647,11 +2687,20 @@ mod tests {
                 mtu: 1500,
             })
             .seal(),
-            network::SocketSeal::BypassFamilies
+            network::SocketSeal::ConfinedFamilies
         );
         assert_eq!(network::NetPlan::none().to_string(), "none");
         assert_eq!(network::NetPlan::isolated().to_string(), "isolated");
         assert_eq!(network::NetPlan::host().to_string(), "host_ip");
+        assert_eq!(
+            network::SocketSeal::Full.to_string(),
+            "full",
+            "the full seal must not display as the plan name `none`, which reads as no seal"
+        );
+        assert_eq!(
+            network::SocketSeal::ConfinedFamilies.to_string(),
+            "confined-families"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2776,17 +2825,22 @@ mod tests {
 
     /// Every box refuses the socket families its network namespace does not
     /// confine, whatever its network mode.  The plan picks the seal — the
-    /// full `none` seal for [`NetPlan::none`], the bypass-family seal for
-    /// every other plan — and the seal picks the filter; every filter refuses
-    /// `AF_VSOCK`, the family that reaches the host whatever namespace the
-    /// caller sits in, while a bypass-family-sealed box keeps its unix and
-    /// inet sockets.  The bypass seal's program is what ships; these probes
-    /// run the shipped filter against the kernel this test executes on,
-    /// exactly the way a host-address or own-address box experiences it:
-    /// install via `prctl` + `seccomp`, then call `socket(2)` for real.  A
-    /// control child runs unfiltered, so a family the kernel itself cannot
-    /// create (no AF_VSOCK driver, say) is told apart from one the filter
-    /// refused.
+    /// full `none` seal for [`NetPlan::none`], the confined-families seal for
+    /// every other plan — and the seal picks the filter.  Both are
+    /// allowlists: the none seal admits `AF_UNIX` alone; the
+    /// confined-families seal admits the families the box's own network
+    /// namespace confines (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`,
+    /// `AF_PACKET`), so it refuses `AF_VSOCK` — the family that reaches the
+    /// host whatever namespace the caller sits in — along with every other
+    /// family outside its list, without needing any of them named: the
+    /// simulated families below include `AF_BLUETOOTH` and `AF_ALG`, refused
+    /// because the allowlist does not carry them.  The confined seal's
+    /// program is what ships; these probes run the shipped filter against
+    /// the kernel this test executes on, exactly the way a host-address or
+    /// own-address box experiences it: install via `prctl` + `seccomp`, then
+    /// call `socket(2)` for real.  A control child runs unfiltered, so a
+    /// family the kernel itself cannot create (no AF_VSOCK driver, say) is
+    /// told apart from one the filter refused.
     #[cfg(target_os = "linux")]
     #[test]
     fn every_box_refuses_namespace_bypass_families() {
@@ -2800,19 +2854,19 @@ mod tests {
             (
                 "host_ip",
                 network::NetPlan::host(),
-                network::SocketSeal::BypassFamilies,
+                network::SocketSeal::ConfinedFamilies,
                 true,
             ),
             (
                 "isolated",
                 network::NetPlan::isolated(),
-                network::SocketSeal::BypassFamilies,
+                network::SocketSeal::ConfinedFamilies,
                 true,
             ),
             (
                 "own_ip",
                 network::NetPlan::isolated_with_tap(tap),
-                network::SocketSeal::BypassFamilies,
+                network::SocketSeal::ConfinedFamilies,
                 true,
             ),
             (
@@ -2851,6 +2905,18 @@ mod tests {
                 libc::SECCOMP_RET_ALLOW,
                 "{name}: a syscall that creates no socket must stay allowed"
             );
+            // The allowlist is what meets "every family the namespace does
+            // not confine" without enumerating it: a family outside the
+            // list is refused whatever it is, the bypass families the old
+            // denylist named beside AF_VSOCK included.
+            for bypassed in [libc::AF_BLUETOOTH, libc::AF_ALG] {
+                assert_eq!(
+                    run(libc::SYS_socket, AUDIT_ARCH, bypassed as u32),
+                    refuse,
+                    "{name}: socket({bypassed}) must fail with EAFNOSUPPORT — \
+                     no family outside the seal's list may survive it"
+                );
+            }
             if admits_inet {
                 assert_eq!(
                     run(libc::SYS_socket, AUDIT_ARCH, libc::AF_INET as u32),
@@ -2867,6 +2933,19 @@ mod tests {
                     libc::SECCOMP_RET_ALLOW,
                     "{name}: a networked box must keep its unix sockets"
                 );
+                assert_eq!(
+                    run(libc::SYS_socket, AUDIT_ARCH, libc::AF_NETLINK as u32),
+                    libc::SECCOMP_RET_ALLOW,
+                    "{name}: a networked box must keep its netlink sockets — \
+                     the namespace confines them"
+                );
+                assert_eq!(
+                    run(libc::SYS_socket, AUDIT_ARCH, libc::AF_PACKET as u32),
+                    libc::SECCOMP_RET_ALLOW,
+                    "{name}: the packet family must stay admitted by the seal — \
+                     its refusal is the missing CAP_NET_RAW (NET-083), not \
+                     this filter's"
+                );
             } else {
                 assert_eq!(
                     run(libc::SYS_socket, AUDIT_ARCH, libc::AF_INET as u32),
@@ -2876,33 +2955,34 @@ mod tests {
             }
         }
 
-        // The bypass seal, against the live kernel: the shipped filter is
-        // installed in a forked child and every probed family is asked for
-        // for real, with the unfiltered control child from above as the
-        // witness for what the kernel could do on its own.
+        // The confined-families seal, against the live kernel: the shipped
+        // filter is installed in a forked child and every probed family is
+        // asked for for real, with the unfiltered control child from above as
+        // the witness for what the kernel could do on its own.
         let unfiltered = probe_socket_families_in_child(None)
             .expect("running the unfiltered socket-family probe");
-        let bypass =
-            probe_socket_families_in_child(Some(socket_family_filter_for_bypass_families()))
-                .expect("running the bypass-family socket-family probe");
-        let [unix, inet, inet6, vsock] = bypass;
+        let confined =
+            probe_socket_families_in_child(Some(socket_family_filter_for_confined_families()))
+                .expect("running the confined-families socket-family probe");
+        let [unix, inet, inet6, vsock] = confined;
         assert_eq!(
             unix, 0,
-            "a bypass-family-sealed box keeps AF_UNIX sockets (errno {unix})"
+            "a confined-families-sealed box keeps AF_UNIX sockets (errno {unix})"
         );
         assert_eq!(
             inet, 0,
-            "a bypass-family-sealed box keeps AF_INET sockets (errno {inet})"
+            "a confined-families-sealed box keeps AF_INET sockets (errno {inet})"
         );
         assert_eq!(
             inet6, 0,
-            "a bypass-family-sealed box keeps AF_INET6 sockets (errno {inet6})"
+            "a confined-families-sealed box keeps AF_INET6 sockets (errno {inet6})"
         );
         assert_eq!(
             vsock,
             libc::EAFNOSUPPORT as u8,
-            "the bypass seal must refuse AF_VSOCK with EAFNOSUPPORT — the \
-             family that bypasses the network namespace is the point of the seal"
+            "the confined-families seal must refuse AF_VSOCK with EAFNOSUPPORT \
+             — the family that bypasses the network namespace is the point of \
+             the seal"
         );
         for (i, (name, _)) in PROBED_FAMILIES.iter().enumerate().skip(1) {
             if unfiltered[i] != 0 {
