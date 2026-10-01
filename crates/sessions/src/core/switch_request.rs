@@ -671,9 +671,11 @@ mod kani_proofs {
     /// harness pattern). The admitting half is restated over the same
     /// request and table — the row at the address first, then the records
     /// it holds, then the phase's interim for an address (or, for a
-    /// retraction, a record) nothing holds — so a decision that checks in a
-    /// different order, or that reads an empty row dimension as allow-all,
-    /// fails here.
+    /// retraction, a record) *nothing* holds — so a decision that checks in
+    /// a different order, or that reads an empty row dimension as
+    /// allow-all, fails here. The interim's arm carries that nothing-holds
+    /// bound: a publish at a held address whose declaration refuses a
+    /// record must not be read as the interim's to apply.
     ///
     /// The table is one fully symbolic row beside symbolic plan bounds.
     /// One row is what the retraction's table-wide *some row* needs — a
@@ -728,8 +730,14 @@ mod kani_proofs {
         };
         let interim = phase == EgressDefaultPhase::Announced
             && match verb {
-                SwitchVerb::Publish | SwitchVerb::PublishName => table.in_plan(addr),
-                SwitchVerb::Retract => true,
+                SwitchVerb::Publish | SwitchVerb::PublishName => {
+                    // The interim is the phase's decision over an address no
+                    // row holds, never a second chance past the row that
+                    // does: a held address whose declaration refuses a
+                    // record is refused under either phase.
+                    table.row_at(addr).is_none() && table.in_plan(addr)
+                }
+                SwitchVerb::Retract => !declared,
             };
         assert_eq!(applied_ok, declared || interim);
     }
