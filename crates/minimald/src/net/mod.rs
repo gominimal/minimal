@@ -106,6 +106,18 @@ pub enum NetError {
         address: Ipv4Addr,
         subnet: SwitchSubnet,
     },
+    /// The host handed the box a switch address this daemon has already
+    /// drawn a lease for itself (T66). The host's registration cursor and
+    /// this daemon's allocation cursor run over the same address run without
+    /// seeing each other's draws — task sandboxes still self-allocate, and
+    /// so does any box the control socket could not register — so the same
+    /// address can be spent on both sides. The collision is refused, never
+    /// shared: attaching the box at a lease another PTask already holds
+    /// would key that PTask's frames to the box's host-side row.
+    #[error(
+        "handed switch address {address} is already held by a locally-drawn lease (MAC {holder})"
+    )]
+    HandedAddressCollision { address: Ipv4Addr, holder: MacAddr },
     /// Spawning the gvproxy binary failed.
     #[error("spawning gvproxy at {path:?}: {source}")]
     Spawn {
@@ -157,6 +169,14 @@ pub struct IpAllocator {
     /// Every address handed out, in allocation order. Doubles as the
     /// static-lease table written into gvproxy's config.
     leases: Vec<PtaskLease>,
+    /// The addresses of [`Self::leases`] the host handed in (T66) rather than
+    /// ones [`Self::allocate`] drew. Membership decides what [`Self::hand`]
+    /// may match: an address whose lease is already recorded **and handed**
+    /// is the legitimate re-attach (a session restarting against the same
+    /// daemon, or re-attaching after a daemon restart), while a lease the
+    /// daemon drew itself at a handed address is two cursors over one run —
+    /// refused, never shared.
+    handed: Vec<Ipv4Addr>,
 }
 
 impl IpAllocator {
@@ -168,6 +188,7 @@ impl IpAllocator {
             next: subnet.first_ptask(),
             subnet,
             leases: Vec::new(),
+            handed: Vec::new(),
         }
     }
 
@@ -226,13 +247,24 @@ impl IpAllocator {
     ///
     /// A re-attach of a box the daemon already knows — the shape a daemon
     /// restart produces, every session re-attaching with the address its
-    /// record carries — finds the lease already recorded and adds no
-    /// duplicate to the table.
+    /// record carries — finds the lease already recorded, marked handed,
+    /// and adds no duplicate to the table.
+    ///
+    /// A lease this daemon **drew itself** at the handed address is the one
+    /// match this method refuses ([`NetError::HandedAddressCollision`]):
+    /// the host's registration cursor and this daemon's allocation cursor
+    /// run over the same address run without seeing each other's draws, so
+    /// the host can hand an address a task sandbox (or an unregistered box)
+    /// already holds. Two taps on one address would key one of their frames
+    /// to the other's host-side row, so the collision is an error and the
+    /// address stays with its original holder.
     ///
     /// # Errors
     ///
     /// [`NetError::HandedAddressOutsidePlan`] when `ip` is outside the
     /// plan's PTask run: the address cannot be honored on this subnet.
+    /// [`NetError::HandedAddressCollision`] when a locally-drawn lease
+    /// already holds `ip`.
     pub fn hand(&mut self, ip: Ipv4Addr) -> Result<PtaskLease, NetError> {
         let ip_num = u32::from(ip);
         if ip_num < self.subnet.first_ptask() || ip_num > self.subnet.last_ptask() {
@@ -243,8 +275,15 @@ impl IpAllocator {
         }
         self.next = self.next.max(ip_num + 1);
         if let Some(lease) = self.leases.iter().find(|lease| lease.ip == ip) {
-            return Ok(*lease);
+            if self.handed.contains(&ip) {
+                return Ok(*lease);
+            }
+            return Err(NetError::HandedAddressCollision {
+                address: ip,
+                holder: lease.mac,
+            });
         }
+        self.handed.push(ip);
         let lease = PtaskLease {
             ip,
             mac: MacAddr::for_switch_ip(ip),
@@ -438,8 +477,10 @@ impl SwitchClient {
     /// # Errors
     ///
     /// [`NetError::HandedAddressOutsidePlan`] when the host handed an
-    /// address this daemon's subnet cannot honor; propagates config-write,
-    /// spawn, and socket-readiness failures as [`Self::attach`] does.
+    /// address this daemon's subnet cannot honor, and
+    /// [`NetError::HandedAddressCollision`] when a locally-drawn lease
+    /// already holds the handed address; propagates config-write, spawn,
+    /// and socket-readiness failures as [`Self::attach`] does.
     pub async fn attach_handed(&mut self, handed: Ipv4Addr) -> Result<AttachResult, NetError> {
         let lease = self.allocator.hand(handed)?;
         // DM2 spawns + configures gvproxy locally; DM1/3/4 (HostShuttle) leaves
@@ -751,6 +792,47 @@ mod tests {
             ]
         );
         assert!(matches!(a.allocate(), Err(NetError::SubnetExhausted(_))));
+    }
+
+    #[test]
+    fn hand_refuses_an_address_a_local_lease_holds() {
+        // The host's registration cursor and the daemon's allocation cursor
+        // run over the same address run without seeing each other's draws —
+        // task sandboxes still self-allocate beside the handed boxes — so
+        // the host can hand an address a locally-drawn lease already holds.
+        // The collision is refused, never shared: two taps on one address
+        // would key one PTask's frames to the other's host-side row.
+        let mut a = IpAllocator::new(SwitchSubnet::default());
+        let handed_box = a.hand(Ipv4Addr::new(100, 64, 0, 2)).unwrap();
+        assert_eq!(handed_box.ip, Ipv4Addr::new(100, 64, 0, 2));
+        // The next self-allocation draws past the handed address...
+        let task = a.allocate().unwrap();
+        assert_eq!(task.ip, Ipv4Addr::new(100, 64, 0, 3));
+        // ...so a box handed the task's address is a collision, not a match
+        // on the task's lease.
+        let err = a.hand(task.ip).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NetError::HandedAddressCollision { address, holder }
+                    if address == task.ip && holder == task.mac
+            ),
+            "handing a locally-drawn address is refused with the holder named"
+        );
+        // The refusal changes nothing: no duplicate joined the table, and
+        // handing the same address again refuses just the same — the
+        // address stays with its original holder for the allocator's life.
+        assert_eq!(a.leases().len(), 2);
+        assert!(matches!(
+            a.hand(task.ip),
+            Err(NetError::HandedAddressCollision { .. })
+        ));
+        // A re-attach of a *handed* lease stays legitimate — the only match
+        // this method makes: the box re-attaching with the address its
+        // record carries (same daemon lifetime or after a restart) finds
+        // the lease marked handed and takes it back without a duplicate.
+        assert_eq!(a.hand(Ipv4Addr::new(100, 64, 0, 2)).unwrap(), handed_box);
+        assert_eq!(a.leases().len(), 2);
     }
 
     #[test]

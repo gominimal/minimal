@@ -494,7 +494,9 @@ mod tests {
     /// self-allocation spent beside it, and the next unregistered box still
     /// draws sequentially from the run, never re-issuing the handed one.
     /// And the attach names the handed address in one debug line, with the
-    /// handed/self-drawn distinction a log tail reads.
+    /// handed/self-drawn distinction a log tail reads. A handed address a
+    /// locally-drawn lease already holds is refused at the attach path
+    /// rather than shared with it.
     #[tokio::test]
     async fn own_ip_attach_uses_handed_address() {
         let switch = vm_host_switch();
@@ -560,6 +562,43 @@ mod tests {
             Ipv4Addr::from(u32::from(Ipv4Addr::new(100, 64, 0, 9)) + 1),
             "the self-allocation draws past the handed address — the run never \
              re-issues it, got {leases:?}"
+        );
+
+        // And the collision is refused at the attach path, never shared: the
+        // host's registration cursor and this daemon's allocation cursor run
+        // over the same address run without seeing each other's takes — the
+        // task sandbox above just drew .10 — so a box handed that address
+        // must fail its plan rather than put a second tap on it. The refusal
+        // spends nothing: no lease joins the table, no attach is counted.
+        let colliding = network_for(
+            sessions::NetworkMode::OwnIp,
+            &switch,
+            "third",
+            None,
+            None,
+            Some(BoxAddresses {
+                switch_address: leases[1].ip,
+                loopback_address: Ipv4Addr::LOCALHOST,
+            }),
+        );
+        let err = colliding
+            .plan()
+            .await
+            .expect_err("a handed address a locally-drawn lease holds refuses");
+        assert!(
+            err.to_string()
+                .contains("already held by a locally-drawn lease"),
+            "the refusal names the locally-drawn holder: {err}"
+        );
+        assert_eq!(
+            switch.lock().await.leases().len(),
+            2,
+            "the refusal added no lease to the table"
+        );
+        assert_eq!(
+            switch.lock().await.attached(),
+            1,
+            "only the self-allocated attach counts; the refused one never did"
         );
 
         // The attach's one debug line names the address the box carries and
