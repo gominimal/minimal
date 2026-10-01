@@ -1927,7 +1927,10 @@ impl Session {
     /// run.
     // Left positional: three call sites, each naming every argument it means,
     // so a struct would be ceremony rather than clarity.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "three call sites, each naming every argument it means"
+    )]
     async fn launch_host(
         &mut self,
         session_hnd: SessionHandle,
