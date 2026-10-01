@@ -94,9 +94,48 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum NetError {
-    /// The configured subnet has no remaining host address to hand out.
-    #[error("gvproxy subnet {0} is exhausted; no free PTask address remains")]
+    /// The daemon's self-allocation reserve — the sub-run of the plan's PTask
+    /// run it draws task sandboxes and unregistered boxes from — has no
+    /// address left. Explicit, never wrapped: a spent address stays spent.
+    #[error(
+        "the self-allocation reserve on subnet {0} is exhausted; no daemon-side address remains"
+    )]
     SubnetExhausted(SwitchSubnet),
+    /// The host handed the box a switch address outside the plan's PTask run
+    /// (T66): the daemon's subnet cannot honor it, and attaching with it
+    /// would source frames from an address no row of the host-side table is
+    /// keyed by.
+    #[error("handed switch address {address} is outside the plan's PTask run on subnet {subnet}")]
+    HandedAddressOutsidePlan {
+        address: Ipv4Addr,
+        subnet: SwitchSubnet,
+    },
+    /// The host handed the box a switch address an attach still holds (T66):
+    /// two taps on one address would key one PTask's frames to the other's
+    /// host-side row, so the collision is refused, never shared. Every lease
+    /// is withdrawn when its attach ends ([`IpAllocator::release`], via
+    /// [`SwitchClient::detach`]), so the same box re-attaching — the
+    /// re-attach an in-process host rebuild produces, where this allocator
+    /// survives the rebuild — re-hands its own address instead of meeting
+    /// this refusal.
+    #[error("handed switch address {address} is already held by a lease (MAC {holder})")]
+    HandedAddressCollision { address: Ipv4Addr, holder: MacAddr },
+    /// The host handed the box a switch address inside this daemon's
+    /// self-allocation reserve (T66) — the sub-run task sandboxes and
+    /// unregistered boxes draw from. Host and daemon keep disjoint sub-runs
+    /// of the plan's PTask run (the daemon's half is [`self_allocation_run`],
+    /// the host's mirror `minvmd`'s `box_registry::hand_out_run`), so a
+    /// handed address inside the reserve means the two sides disagree about
+    /// the split — a skewed pair, a misconfigured host. Attaching with it
+    /// would put the box's tap beside the daemon's own draws; refused, never
+    /// shared.
+    #[error(
+        "handed switch address {address} is inside this daemon's self-allocation reserve on subnet {subnet}"
+    )]
+    HandedAddressInReserve {
+        address: Ipv4Addr,
+        subnet: SwitchSubnet,
+    },
     /// Spawning the gvproxy binary failed.
     #[error("spawning gvproxy at {path:?}: {source}")]
     Spawn {
@@ -138,15 +177,69 @@ pub struct AttachResult {
     pub exit_signal: watch::Receiver<bool>,
 }
 
-/// Hands out unique switch addresses, never reusing one for the lifetime of
-/// the allocator (R1.6).
+/// The sub-run of `subnet`'s PTask run this daemon **self-allocates** from:
+/// the run's lower half, `[first_ptask, midpoint]`, as an inclusive
+/// `(first, last)` pair — the hand-out run above it keeps one address
+/// more, a PTask run holding an odd number of addresses.
+///
+/// The plan's PTask run is split into two disjoint sub-runs so the two
+/// allocators that draw on it cannot meet: this daemon self-allocates task
+/// sandboxes and unregistered boxes from the lower half, and the VM host
+/// daemon hands registered boxes only from the upper half — the run above
+/// this reserve. The host's half is the same midpoint rule mirrored in
+/// `minvmd`'s `box_registry::hand_out_run`; one rule, two statements, so
+/// change both together — each side's tests pin the default plan's split
+/// literally.
+///
+/// This is the interim allocation shape (NET-138): task sandboxes
+/// self-allocate from the reserve until the task registering every live box
+/// host-side retires daemon-side allocation, after which a daemon with a
+/// control socket draws nothing — every own-address box arrives handed.
+#[must_use]
+pub fn self_allocation_run(subnet: SwitchSubnet) -> (u32, u32) {
+    let first = subnet.first_ptask();
+    let last = subnet.last_ptask();
+    let reserve_len = (last - first).div_ceil(2);
+    (first, first + reserve_len - 1)
+}
+
+/// Hands out unique switch addresses, never reusing a drawn one for the
+/// lifetime of the allocator (R1.6).
+///
+/// Two allocation shapes: [`Self::allocate`] draws a self-allocation from
+/// the plan run's lower half — the sub-run [`self_allocation_run`] reserves
+/// for this daemon (task sandboxes, unregistered boxes) — and [`Self::hand`]
+/// records the address the VM host daemon handed a registered box, from the
+/// upper half. The two sub-runs are disjoint, so a self-allocation can never
+/// spend a handed address, nor the reverse. A lease's life is its
+/// attachment's, handed or drawn alike: it joins the static-lease table the
+/// switch is configured from when the tap arrives and leaves with the attach
+/// ([`Self::release`], via [`SwitchClient::detach`]), so the table holds only
+/// live taps. The never-reuse rule is carried by the draw cursor, not by the
+/// table — `next` never regresses, so a withdrawn drawn address is never
+/// re-drawn, and it is never handed either (it sits in the reserve, which
+/// [`Self::hand`] refuses). A handed address, by contrast, is the registered
+/// box's — the host-side row is keyed by it — and the same box re-attaching
+/// re-hands it; that re-hand is not a reuse: it is the same row coming back,
+/// and the collision refusal guards only an address an attach still holds.
+///
+/// The interim this shape ships in: task sandboxes self-allocate from the
+/// reserve until the task registering every live box host-side (NET-138)
+/// retires self-allocation, after which no daemon-side draw happens once a
+/// control socket exists — every own-address box arrives handed.
 #[derive(Debug)]
 pub struct IpAllocator {
     subnet: SwitchSubnet,
-    /// The next host offset to try; only ever advances.
+    /// This daemon's self-allocation reserve, inclusive — both bounds from
+    /// [`self_allocation_run`]. `allocate` draws inside it and nothing else.
+    reserve: (u32, u32),
+    /// The next host offset to draw for a self-allocation; only ever
+    /// advances, within the reserve.
     next: u32,
     /// Every address handed out, in allocation order. Doubles as the
-    /// static-lease table written into gvproxy's config.
+    /// static-lease table written into gvproxy's config, which therefore
+    /// holds only live taps: a lease leaves with its attach
+    /// ([`Self::release`]), handed or drawn alike.
     leases: Vec<PtaskLease>,
 }
 
@@ -157,6 +250,7 @@ impl IpAllocator {
     pub fn new(subnet: SwitchSubnet) -> Self {
         Self {
             next: subnet.first_ptask(),
+            reserve: self_allocation_run(subnet),
             subnet,
             leases: Vec::new(),
         }
@@ -178,7 +272,8 @@ impl IpAllocator {
         self.subnet
     }
 
-    /// Allocates the next free address and its derived MAC.
+    /// Allocates the next free address and its derived MAC, drawing from the
+    /// daemon's self-allocation reserve — the plan run's lower half.
     ///
     /// Addresses are sequential and never reused, even after the PTask
     /// detaches, so a stale frame from a torn-down PTask can never be
@@ -186,10 +281,10 @@ impl IpAllocator {
     ///
     /// # Errors
     ///
-    /// Returns [`NetError::SubnetExhausted`] once the subnet's host range is
-    /// used up.
+    /// Returns [`NetError::SubnetExhausted`] once the reserve is used up —
+    /// explicitly, with no wrap and no reuse; a spent address stays spent.
     pub fn allocate(&mut self) -> Result<PtaskLease, NetError> {
-        if self.next > self.subnet.last_ptask() {
+        if self.next > self.reserve.1 {
             return Err(NetError::SubnetExhausted(self.subnet));
         }
         let ip = Ipv4Addr::from(self.next);
@@ -206,6 +301,88 @@ impl IpAllocator {
     #[must_use]
     pub fn leases(&self) -> &[PtaskLease] {
         &self.leases
+    }
+
+    /// Records `ip` as the switch address a registered box attaches at (T66):
+    /// the VM host daemon allocated it into its table and handed it back, so
+    /// the daemon mints nothing. The lease joins [`Self::leases`] — the
+    /// static-lease table the switch is configured from — and leaves with
+    /// the box's attach ([`Self::release`]), so the same box re-attaching
+    /// re-hands it: the host's persisted row still holds the address, and
+    /// detach never touches that row. A drawn lease ([`Self::allocate`])
+    /// leaves the same way, and its address is never seen again — the draw
+    /// cursor never regresses, and the reserve [`Self::hand`] refuses — so
+    /// the never-reuse rule (R1.6) is carried by the cursor, not by a lease
+    /// the table keeps for a tap that is gone.
+    ///
+    /// Three refusals, never a share:
+    ///
+    /// * an address outside the plan's PTask run
+    ///   ([`NetError::HandedAddressOutsidePlan`]) — the subnet cannot honor
+    ///   it;
+    /// * an address inside this daemon's self-allocation reserve
+    ///   ([`NetError::HandedAddressInReserve`]) — the host hands only from
+    ///   the run above the reserve, so one there means the two sides
+    ///   disagree about the split;
+    /// * an address a recorded lease still holds
+    ///   ([`NetError::HandedAddressCollision`]) — two taps on one address
+    ///   would key one PTask's frames to the other's host-side row. What the
+    ///   refusal guards is a live attach: the lease of an attach that ended
+    ///   is withdrawn ([`Self::release`]), so the same box's re-attach
+    ///   re-hands its own address instead of meeting this refusal.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::HandedAddressOutsidePlan`] when `ip` is outside the
+    /// plan's PTask run: the address cannot be honored on this subnet.
+    /// [`NetError::HandedAddressInReserve`] when `ip` is inside the daemon's
+    /// self-allocation reserve. [`NetError::HandedAddressCollision`] when a
+    /// recorded lease still holds `ip`.
+    pub fn hand(&mut self, ip: Ipv4Addr) -> Result<PtaskLease, NetError> {
+        let ip_num = u32::from(ip);
+        if ip_num < self.subnet.first_ptask() || ip_num > self.subnet.last_ptask() {
+            return Err(NetError::HandedAddressOutsidePlan {
+                address: ip,
+                subnet: self.subnet,
+            });
+        }
+        let (reserve_first, reserve_last) = self.reserve;
+        if (reserve_first..=reserve_last).contains(&ip_num) {
+            return Err(NetError::HandedAddressInReserve {
+                address: ip,
+                subnet: self.subnet,
+            });
+        }
+        if let Some(lease) = self.leases.iter().find(|lease| lease.ip == ip) {
+            return Err(NetError::HandedAddressCollision {
+                address: ip,
+                holder: lease.mac,
+            });
+        }
+        let lease = PtaskLease {
+            ip,
+            mac: MacAddr::for_switch_ip(ip),
+        };
+        self.leases.push(lease);
+        Ok(lease)
+    }
+
+    /// Withdraws the lease for `ip`, when the allocator holds one: the
+    /// attachment ended, so the lease ends with it — every attachment's,
+    /// handed or drawn alike. A handed address is free for the same box to
+    /// re-hand on the re-attach an in-process host rebuild or a restart
+    /// produces (T66): the host's persisted row still holds it, and nothing
+    /// here does. A drawn address is never re-drawn — the draw cursor never
+    /// regresses (R1.6), so a stale frame from a torn-down PTask can never be
+    /// misdelivered to a freshly-attached one — and never handed either: it
+    /// sits in the reserve [`Self::hand`] refuses. An address the allocator
+    /// never recorded withdraws nothing.
+    ///
+    /// Returns whether a lease was withdrawn.
+    pub(crate) fn release(&mut self, ip: Ipv4Addr) -> bool {
+        let held = self.leases.iter().any(|lease| lease.ip == ip);
+        self.leases.retain(|lease| lease.ip != ip);
+        held
     }
 }
 
@@ -330,6 +507,17 @@ impl SwitchClient {
         self.allocator.subnet()
     }
 
+    /// Every lease this switch knows — self-allocated and handed (T66)
+    /// alike, oldest first — the table the generated config is written
+    /// from. A diagnostic surface for the addresses the switch has handed
+    /// out and which shape of attach took them, without reaching into the
+    /// allocator.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn leases(&self) -> &[PtaskLease] {
+        self.allocator.leases()
+    }
+
     fn config_path(&self) -> PathBuf {
         self.state_dir.join("gvproxy.yaml")
     }
@@ -368,14 +556,77 @@ impl SwitchClient {
         Ok(AttachResult { lease, exit_signal })
     }
 
-    /// Records that a PTask detached. When the last one leaves, the switch is
-    /// stopped.
+    /// Attaches a PTask with the switch address the host handed it (T66)
+    /// instead of drawing one: the box was registered on the host-side table
+    /// keyed by this address, so the daemon reuses it and mints nothing.
+    ///
+    /// The handed address is recorded like an allocated one — it joins the
+    /// static-lease table the switch is configured from
+    /// ([`IpAllocator::hand`]) — and leaves with the attach: [`Self::detach`]
+    /// withdraws it, so the same box's re-attach re-hands it. That re-handed
+    /// address comes from the host's persisted row — the registration
+    /// allocated it into the host-side table and nothing on the host
+    /// withdraws it — and detach never touches that row: the daemon-side
+    /// lease ends with the attach, the host-side row does not. What this
+    /// daemon cannot yet check is that the address it is handed is still the
+    /// row's for this box: the host-row check by box id — the same address
+    /// for the same box, a refusal on mismatch — lands with the box id in
+    /// the registration (T44, #1660, NET-133), which names it as the gap;
+    /// until then this daemon attaches with whatever the create request
+    /// carries. A drawn lease, by contrast, is never re-drawn: the draw
+    /// cursor never regresses (the never-reuse rule). Everything else
+    /// matches [`Self::attach`], including the DM2 config/spawn steps
+    /// and the attach count.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::HandedAddressOutsidePlan`] when the host handed an
+    /// address this daemon's subnet cannot honor,
+    /// [`NetError::HandedAddressInReserve`] when it handed one from the
+    /// daemon's own self-allocation reserve, and
+    /// [`NetError::HandedAddressCollision`] when an attach still holds the
+    /// handed address; propagates config-write, spawn, and socket-readiness
+    /// failures as [`Self::attach`] does.
+    pub async fn attach_handed(&mut self, handed: Ipv4Addr) -> Result<AttachResult, NetError> {
+        let lease = self.allocator.hand(handed)?;
+        // DM2 spawns + configures gvproxy locally; DM1/3/4 (HostShuttle) leaves
+        // gvproxy to `minvmd` on the host, so skip the spawn/config steps and
+        // only track the attach count — same shape as [`Self::attach`].
+        if matches!(self.transport, SwitchTransport::LocalSpawn) {
+            self.write_config().await?;
+            self.ensure_running().await?;
+        }
+        self.attached += 1;
+        tracing::info!(
+            ip = %lease.ip,
+            mac = %lease.mac,
+            attached = self.attached,
+            "attached OwnIp PTask to gvproxy switch at its handed address"
+        );
+        let exit_signal = self.exit_tx.subscribe();
+        Ok(AttachResult { lease, exit_signal })
+    }
+
+    /// Records that a PTask detached, withdrawing its lease with it (T66):
+    /// a lease's life is its attachment's, handed or drawn alike — a task
+    /// sandbox's self-drawn address ends with the sandbox the way a
+    /// registered box's handed one ends with the box's attach. The handed
+    /// address is the registered box's, keyed by the host-side row, so once
+    /// the box's attach ends the same box re-attaching re-hands it — the
+    /// collision refusal then guards only an address an attach still holds.
+    /// A drawn address is never re-drawn: the allocator's draw cursor never
+    /// regresses (R1.6), so the rule holds without the table keeping a lease
+    /// for a tap that is gone; see [`IpAllocator::release`]. When the last
+    /// one leaves, the switch is stopped.
     ///
     /// # Errors
     ///
     /// Propagates teardown failures from [`stop`](Self::stop).
-    pub async fn detach(&mut self) -> Result<(), NetError> {
+    pub async fn detach(&mut self, released: Ipv4Addr) -> Result<(), NetError> {
         self.attached = self.attached.saturating_sub(1);
+        if self.allocator.release(released) {
+            tracing::debug!(ip = %released, "released the lease with the attach");
+        }
         tracing::info!(attached = self.attached, "detached OwnIp PTask from switch");
         if self.attached == 0 {
             self.stop().await?;
@@ -645,20 +896,185 @@ mod tests {
     fn allocator_exhausts_a_tiny_subnet() {
         // /29 => 8 addresses; network, gateway, daemon, host-alias, broadcast
         // reserved, leaving exactly three allocatable hosts (.2 through .4).
+        // The run splits at its midpoint, so this daemon's reserve is .2
+        // alone and the host's hand-out run is .3 and .4 — exhaustion is
+        // explicit on each side, with no wrap and no reuse.
         let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
         let mut a = IpAllocator::new(subnet);
-        let got: Vec<_> = std::iter::from_fn(|| a.allocate().ok())
-            .map(|l| l.ip)
-            .collect();
-        assert_eq!(
-            got,
-            vec![
-                Ipv4Addr::new(10, 0, 0, 2),
-                Ipv4Addr::new(10, 0, 0, 3),
-                Ipv4Addr::new(10, 0, 0, 4),
-            ]
-        );
+        assert_eq!(a.allocate().unwrap().ip, Ipv4Addr::new(10, 0, 0, 2));
         assert!(matches!(a.allocate(), Err(NetError::SubnetExhausted(_))));
+        // The reserve bounds only the daemon's draws: the run's remainder is
+        // still there for the host's hand-outs, none of them ever drawn.
+        a.hand(Ipv4Addr::new(10, 0, 0, 3)).unwrap();
+        a.hand(Ipv4Addr::new(10, 0, 0, 4)).unwrap();
+        assert!(matches!(
+            a.hand(Ipv4Addr::new(10, 0, 0, 3)),
+            Err(NetError::HandedAddressCollision { .. })
+        ));
+    }
+
+    #[test]
+    fn self_allocation_run_splits_the_plan_ptask_run() {
+        // The default plan's split, pinned literally: the daemon's reserve
+        // is the PTask run's lower half and the host hands registered boxes
+        // from the run above it. The mirror is `minvmd`'s
+        // `box_registry::hand_out_run` — one rule, two statements; change
+        // both together.
+        let subnet = SwitchSubnet::default();
+        let (reserve_first, reserve_last) = self_allocation_run(subnet);
+        assert_eq!(
+            (reserve_first, reserve_last),
+            (
+                u32::from(Ipv4Addr::new(100, 64, 0, 2)),
+                u32::from(Ipv4Addr::new(100, 64, 127, 254)),
+            ),
+            "the reserve is the run's lower half, starting at the first PTask address"
+        );
+        assert_eq!(
+            reserve_last + 1,
+            u32::from(Ipv4Addr::new(100, 64, 127, 255)),
+            "the host's hand-out run starts immediately above the reserve"
+        );
+        assert!(
+            subnet.first_ptask() <= reserve_first && reserve_last < subnet.last_ptask(),
+            "both sub-runs are inside the plan's PTask run, and neither is empty"
+        );
+        // A tiny subnet splits in half, so both sides keep at least one
+        // address: a /29's three PTask addresses give the reserve .2 and the
+        // hand-out run .3 and .4.
+        let tiny = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
+        assert_eq!(
+            self_allocation_run(tiny),
+            (
+                u32::from(Ipv4Addr::new(10, 0, 0, 2)),
+                u32::from(Ipv4Addr::new(10, 0, 0, 2)),
+            )
+        );
+    }
+
+    #[test]
+    fn hand_refuses_an_address_in_the_self_allocation_reserve() {
+        // The host hands registered boxes only from the run above this
+        // daemon's self-allocation reserve, so an address inside the reserve
+        // means the two sides disagree about the split — a skewed pair, a
+        // misconfigured host. Refused, never attached beside the daemon's
+        // own draws: the sequence a shared run once allowed, a task sandbox
+        // self-allocating an address a box is then handed, ends at the
+        // refusal.
+        let mut a = IpAllocator::new(SwitchSubnet::default());
+        let task = a.allocate().unwrap();
+        assert_eq!(task.ip, Ipv4Addr::new(100, 64, 0, 2));
+        let err = a.hand(task.ip).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NetError::HandedAddressInReserve { address, .. } if address == task.ip
+            ),
+            "handing a reserve address is refused, held or not"
+        );
+        // The refusal is positional, not lease-dependent: an unheld reserve
+        // address refuses the same way, and a refusal records nothing — the
+        // table holds the task's draw alone.
+        assert!(matches!(
+            a.hand(Ipv4Addr::new(100, 64, 64, 128)),
+            Err(NetError::HandedAddressInReserve { .. })
+        ));
+        assert_eq!(a.leases().len(), 1, "a refusal adds no lease");
+        // The task's address stays the task's: the next draw takes the
+        // reserve's next address, never the refused one again.
+        assert_eq!(a.allocate().unwrap().ip, Ipv4Addr::new(100, 64, 0, 3));
+    }
+
+    #[test]
+    fn hand_refuses_an_address_a_local_lease_holds() {
+        // An address a recorded lease still holds refuses a second hand:
+        // two taps on one address would key one PTask's frames to the
+        // other's host-side row. What the refusal guards is a live attach —
+        // `handed_lease_releases_on_detach_and_the_box_rehands` covers the
+        // release that lets the same box re-attach. With the run split, a
+        // locally-drawn lease always sits in the daemon's reserve
+        // (`hand_refuses_an_address_in_the_self_allocation_reserve` refuses
+        // that shape outright), so the lease this one exercises is a handed
+        // one — the same refusal rule.
+        let mut a = IpAllocator::new(SwitchSubnet::default());
+        let box_a = a.hand(Ipv4Addr::new(100, 64, 127, 255)).unwrap();
+        // A task's sandbox self-allocates beside it, from the reserve...
+        let task = a.allocate().unwrap();
+        assert_eq!(task.ip, Ipv4Addr::new(100, 64, 0, 2));
+        // ...and handing the box's address again is refused with the holder
+        // named. The refusal changes nothing: no duplicate joined the table,
+        // and handing the same address again refuses just the same — the
+        // address stays with its holder while its attach lives.
+        let err = a.hand(box_a.ip).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NetError::HandedAddressCollision { address, holder }
+                    if address == box_a.ip && holder == box_a.mac
+            ),
+            "handing a lease's address is refused with the holder named"
+        );
+        assert_eq!(a.leases().len(), 2);
+        assert!(matches!(
+            a.hand(box_a.ip),
+            Err(NetError::HandedAddressCollision { .. })
+        ));
+    }
+
+    #[test]
+    fn handed_lease_releases_on_detach_and_the_box_rehands() {
+        // T66's re-attach: a lease — handed or drawn alike — leaves the
+        // table when its attach ends, so the same box re-attaching — the
+        // re-attach an in-process host rebuild produces, where this
+        // allocator survives the rebuild — re-hands its own address instead
+        // of meeting the collision refusal.
+        let mut a = IpAllocator::new(SwitchSubnet::default());
+        let handed_ip = Ipv4Addr::new(100, 64, 128, 9);
+        let lease = a
+            .hand(handed_ip)
+            .expect("the hand-out run's address is handed");
+        assert_eq!(a.leases().len(), 1);
+
+        // A drawn lease leaves the same way — a task sandbox's self-drawn
+        // address ends with its sandbox — and the never-reuse rule (R1.6) is
+        // carried by the cursor, not by the table: the next draw is a higher
+        // address, never the withdrawn one.
+        let task = a.allocate().unwrap();
+        assert!(a.release(task.ip), "the drawn lease is withdrawn");
+        assert_eq!(a.leases(), &[lease], "only the handed lease remains");
+        let redrawn = a.allocate().unwrap();
+        assert_eq!(
+            redrawn.ip,
+            Ipv4Addr::new(100, 64, 0, 3),
+            "the withdrawn address is never re-drawn"
+        );
+        // An address the allocator never recorded releases nothing.
+        assert!(!a.release(Ipv4Addr::new(100, 64, 200, 1)));
+        assert_eq!(a.leases().len(), 2);
+
+        // A handed address an attach still holds refuses a second hand: the
+        // refusal guards a live attach, and the lease's withdrawal is what
+        // lets the re-attach through.
+        assert!(matches!(
+            a.hand(handed_ip),
+            Err(NetError::HandedAddressCollision { .. })
+        ));
+
+        // The handed lease releases, and the re-hand records the same lease
+        // again — the same address, the same derived MAC, the same row the
+        // host-side table is keyed by — beside the draw that replaced the
+        // withdrawn one.
+        assert!(a.release(handed_ip));
+        assert_eq!(
+            a.leases(),
+            &[redrawn],
+            "the table holds the live draw alone"
+        );
+        let rehanded = a
+            .hand(handed_ip)
+            .expect("the same box re-attaching re-hands its own address");
+        assert_eq!(rehanded.ip, lease.ip);
+        assert_eq!(rehanded.mac, lease.mac);
     }
 
     #[test]
@@ -739,7 +1155,9 @@ mod tests {
 
         let result = switch.attach().await.expect("host-shuttle attach");
         assert_eq!(result.lease.ip, Ipv4Addr::new(100, 64, 0, 2));
-        // No gvproxy child was spawned; detach just decrements the count.
-        switch.detach().await.expect("detach");
+        // No gvproxy child was spawned; detach decrements the count and
+        // withdraws the lease with the attach — the drawn address stays
+        // spent regardless, the draw cursor never regresses.
+        switch.detach(result.lease.ip).await.expect("detach");
     }
 }

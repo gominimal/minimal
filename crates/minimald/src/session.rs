@@ -2384,6 +2384,12 @@ impl Session {
                 Arc::clone(&self.hostnames),
                 record.id,
             )),
+            // The addresses the VM host daemon handed this box's registration
+            // (T66), persisted on the record: the `OwnIp` attach reuses the
+            // handed switch address instead of drawing one the host-side row
+            // would not match — including on a re-attach after a restart,
+            // where the record is the only thing that still knows it.
+            box_addresses: record.box_addresses,
             composition: self.composition(),
             // A weak handle so in-sandbox `min build` can drive session
             // side-ops without keeping the actor alive past teardown.

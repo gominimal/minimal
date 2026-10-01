@@ -447,6 +447,29 @@ fn run_foreground() -> Result<()> {
     let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
     boxes.register_node_namespace();
 
+    // The host-side door to the box table (T66): the control socket the
+    // activating client registers an own-address box on and reads its
+    // allocated switch and loopback addresses from — the addresses the
+    // create request then carries, so the in-VM daemon attaches with the
+    // handed one. Bound before the guest boots, so a session activated
+    // against this VM can only ever be handed an address this table holds.
+    // Best-effort at startup, like the switch above: a bind failure is
+    // warned and the VM still boots — a registration then degrades to the
+    // gate's announced interim, exactly as against a supervisor predating
+    // the socket — rather than failing a boot the client could still
+    // activate against.
+    let _control = crate::control::resolve_control_sock()
+        .and_then(|sock_path| crate::control::spawn(sock_path, boxes.clone()))
+        .inspect_err(|error| {
+            tracing::warn!(
+                %error,
+                "failed to bind the box-registration control socket; own-address \
+                 activations will not be handed addresses (the egress gate's \
+                 announced interim applies)"
+            );
+        })
+        .ok();
+
     // Spawn + supervise the host gvproxy switch before the VMM child boots, so
     // its `-listen` switch socket exists when the gate relays into it for the
     // guest shuttle. The switch runtime starts the gate on the socket beside

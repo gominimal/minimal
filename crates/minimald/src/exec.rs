@@ -188,6 +188,21 @@ pub(crate) fn task_network(
         &format!("{session}-task"),
         egress.map(|section| sessions::SessionPolicy::new(Some(section), None)),
         None,
+        // Deliberately not the record's handed addresses (T66): the task's
+        // sandbox is not the box the registration named — attaching it at the
+        // session box's address would key its frames to the session's row.
+        // A task's sandbox self-allocates, as it always has.
+        //
+        // The interim, stated plainly: task sandboxes self-allocate from the
+        // daemon's reserve — the plan run's lower half
+        // (`crate::net::self_allocation_run`) — until the task registering
+        // every live box host-side (NET-138) retires self-allocation, after
+        // which no daemon-side draw happens once a control socket exists.
+        // The VM host daemon hands registered boxes only from the run above
+        // the reserve, so the two allocators cannot meet; the daemon-side
+        // refusals (`IpAllocator::hand`) stay the guard against a pair that
+        // disagrees about the split.
+        None,
     )
 }
 
@@ -2169,6 +2184,7 @@ mod tests {
             project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
             network: mode,
             policy: sessions::SessionPolicy::default(),
+            box_addresses: None,
             status: sessions::SessionStatus::Active,
             hooks_enabled: true,
             attrs: Default::default(),
