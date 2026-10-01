@@ -957,19 +957,6 @@ impl Session {
                 );
                 None
             }
-            crate::net::dns::LoopbackGrant::AddressInUse { address, holder } => {
-                tracing::warn!(
-                    session_id = %record.id,
-                    session_name = name,
-                    ip = %address,
-                    other_namespace = ?holder,
-                    action = "loopback-address-in-use",
-                    "the address this box would lease is already held by another \
-                     namespace in the lease record; the box's ports publish on \
-                     the node's shared address"
-                );
-                None
-            }
         }
     }
 

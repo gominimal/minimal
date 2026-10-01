@@ -1155,12 +1155,11 @@ pub(crate) fn host_component(host_header: &str) -> &str {
 // in that writing the record already means holding the filesystem identity
 // the daemon state root is protected by. Closing the cross-root half needs
 // the host-side answerer as the one arbiter over every root's allocation,
-// not a per-root file. That work is outside this change and **no issue for
-// it exists**: the follow-up to file is a host-side answerer serving the
-// design's authenticated channel (design §7.1, the answerer as the
-// arbiter, "cross-node collisions reported at session start"), and the
-// change that shipped this interim carries the ask. Until it lands the
-// collision report
+// not a per-root file. That work is outside this change and is filed as
+// #1772: the host answerer as the one arbiter over every root's
+// allocation, serving the design's authenticated channel (design §7.1,
+// the answerer as the arbiter, "cross-node collisions reported at session
+// start"). Until it lands the collision report
 // ([`LoopbackLeaseBook::unrecorded_publishes`]) is the half this record can
 // do on its own: the kernel's socket table is the one list of addresses that
 // is global to the whole host whatever record granted them, and every
@@ -1269,17 +1268,6 @@ pub enum LoopbackGrant {
     /// another namespace already holds — the one failure NET-010 cannot
     /// tolerate — where a withheld grant costs one box its published address.
     RecordUnavailable,
-    /// The address this grant would hand the namespace is already held by
-    /// another namespace in the record — a duplicate in a stale or
-    /// hand-edited record. A fresh namespace is refused; a recorded namespace
-    /// is granted anyway (with a collision warning) so a resumed box is not
-    /// stranded at the moment it re-asks.
-    AddressInUse {
-        /// The address that would have been handed out twice.
-        address: Ipv4Addr,
-        /// The namespace that already holds it.
-        holder: LeaseNamespace,
-    },
 }
 
 /// The verdict over the reserved local range on this host — NET-123's bind
@@ -1573,12 +1561,6 @@ impl LoopbackLeaseBook {
         let Some(address) = owned.lease() else {
             return LoopbackGrant::PoolSpent;
         };
-        // The allocator should never hand out an address the record already
-        // names; this is the stale-record guard against a hand-edited or
-        // pre-allocator duplicate surviving long enough to grant it twice.
-        if let Some(holder) = namespace_holding(&entries, address, namespace) {
-            return LoopbackGrant::AddressInUse { address, holder };
-        }
         entries.push(LeaseEntry {
             namespace,
             address,
@@ -3117,13 +3099,14 @@ mod tests {
         );
     }
 
-    /// The grant path detects a duplicate address already held by another
-    /// namespace in the same record. A recorded namespace is granted anyway so
-    /// a resumed box is not stranded, and the collision is warned about at
-    /// grant time with no daemon restart.
+    /// A stale record holding two namespaces on one address answers both
+    /// with the recorded address rather than stranding the second: a
+    /// recorded namespace is granted, never refused. The grant emits the
+    /// `loopback-grant-collision` warn for the duplicate; that warn is not
+    /// asserted here.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_duplicate_address_in_the_record_is_reported_at_grant_time() {
+    fn a_duplicate_address_in_the_record_is_granted_not_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let state_root = lease_root(&tmp);
         let first = session_id(1);
