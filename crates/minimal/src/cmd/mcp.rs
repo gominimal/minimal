@@ -47,7 +47,8 @@ pub const INSTRUCTIONS: &str = "\
 Every session is a fully isolated sandbox: it has its own filesystem, its own \
 process tree, and none of your host's state. Creating a session uploads the \
 named working directory into it, and that tree lands at /workbench inside the \
-sandbox. The first exec or file call that omits a session_id creates a default \
+sandbox; file paths are absolute or relative to /workbench. The first exec or \
+file call that omits a session_id creates a default \
 session from the server's --workdir and reuses it for later calls; sessions \
 you create explicitly with create_session are independent of each other and of \
 the default. Sessions persist until you destroy them, so create one per unit of \
@@ -188,6 +189,18 @@ fn json_result(value: &Value) -> CallToolResult {
 /// missing). The message is the diagnostic.
 fn tool_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message.into())])
+}
+
+/// Resolve a tool's file path inside the sandbox. An absolute path is used as
+/// given. A relative path is anchored at `/workbench`, the uploaded tree and
+/// the exec working directory, because the SFTP server resolves a bare relative
+/// path against the sandbox root, which is never what a caller means.
+fn resolve_sandbox_path(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/workbench/{path}")
+    }
 }
 
 /// Quote one argv element for `/bin/sh`.
@@ -443,9 +456,9 @@ impl McpServer {
     }
 
     /// Read a file inside a sandbox.
-    #[tool(description = "Read a file inside a sandbox. Paths resolve at the \
-                       session home; the uploaded working tree is at \
-                       /workbench. Omit session_id to use the default session.")]
+    #[tool(description = "Read a file inside a sandbox. Paths are absolute, or \
+                       relative to /workbench (the uploaded working tree). \
+                       Omit session_id to use the default session.")]
     async fn read_file(
         &self,
         Parameters(p): Parameters<ReadFileParams>,
@@ -466,9 +479,10 @@ impl McpServer {
             Ok(s) => s,
             Err(e) => return Ok(tool_error(format!("opening SFTP failed: {e:#}"))),
         };
-        let bytes = match sftp.read(&p.path).await {
+        let path = resolve_sandbox_path(&p.path);
+        let bytes = match sftp.read(&path).await {
             Ok(b) => b,
-            Err(e) => return Ok(tool_error(format!("reading {}: {e}", p.path))),
+            Err(e) => return Ok(tool_error(format!("reading {path}: {e}"))),
         };
         let offset = usize::try_from(p.offset.unwrap_or(0)).unwrap_or(usize::MAX);
         let start = offset.min(bytes.len());
@@ -489,13 +503,15 @@ impl McpServer {
 
     /// Write a file inside a sandbox.
     #[tool(description = "Write a file inside a sandbox, replacing it if it \
-                       exists. Paths resolve at the session home; the uploaded \
-                       working tree is at /workbench. Omit session_id to use \
-                       the default session.")]
+                       exists. Paths are absolute, or relative to /workbench \
+                       (the uploaded working tree). Omit session_id to use the \
+                       default session.")]
     async fn write_file(
         &self,
         Parameters(p): Parameters<WriteFileParams>,
     ) -> Result<CallToolResult, McpError> {
+        use tokio::io::AsyncWriteExt as _;
+
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => {
@@ -512,12 +528,23 @@ impl McpServer {
             Ok(s) => s,
             Err(e) => return Ok(tool_error(format!("opening SFTP failed: {e:#}"))),
         };
+        let path = resolve_sandbox_path(&p.path);
         let written = p.content.len();
-        if let Err(e) = sftp.write(&p.path, p.content.as_bytes()).await {
-            return Ok(tool_error(format!("writing {}: {e}", p.path)));
+        // `SftpSession::write` opens with `OpenFlags::WRITE` alone, so it fails
+        // on a file that does not exist yet and never truncates. `create` opens
+        // with `CREATE | TRUNCATE | WRITE`, which is what a writer means.
+        let mut file = match sftp.create(&path).await {
+            Ok(f) => f,
+            Err(e) => return Ok(tool_error(format!("creating {path}: {e}"))),
+        };
+        if let Err(e) = file.write_all(p.content.as_bytes()).await {
+            return Ok(tool_error(format!("writing {path}: {e}")));
+        }
+        if let Err(e) = file.shutdown().await {
+            return Ok(tool_error(format!("closing {path}: {e}")));
         }
         Ok(json_result(
-            &json!({ "path": p.path, "bytes_written": written }),
+            &json!({ "path": path, "bytes_written": written }),
         ))
     }
 
@@ -618,6 +645,17 @@ mod tests {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("$(rm -rf /)"), "'$(rm -rf /)'");
+    }
+
+    #[test]
+    fn relative_paths_anchor_at_workbench() {
+        assert_eq!(resolve_sandbox_path("/etc/hosts"), "/etc/hosts");
+        assert_eq!(resolve_sandbox_path("src/main.rs"), "/workbench/src/main.rs");
+        assert_eq!(
+            resolve_sandbox_path("/workbench/x"),
+            "/workbench/x",
+            "an absolute workspace path is not double-prefixed"
+        );
     }
 
     #[test]
