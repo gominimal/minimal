@@ -3224,3 +3224,100 @@ async fn a_resumed_box_answers_at_its_own_address_while_the_verdict_is_pending()
         "the box's own port number is published at its own address, not translated"
     );
 }
+
+/// NET-129 session path: two own-address boxes finalizing while the daemon's
+/// range verdict is held pending both publish on the node's shared address.
+/// Declaring the same port, the collision is reported as a
+/// `shared-address-port-collision` warn (the diagnostics contract) and the
+/// registry records the shared-address interim publishes so listings can see
+/// the collision. The ports are never translated. This uses the manager's
+/// `hold_range_verdict_pending` test seam, which is the supported way to put a
+/// native daemon's book into the pending state a microVM daemon opens in.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_address_port_collision_reported_at_finalize_without_attached_client() {
+    let server = TestServer::new().await;
+    server
+        .state
+        .sessions_manager()
+        .await
+        .hold_range_verdict_pending();
+    let capture = crate::test_harness::captured_log();
+    let mut client = server.connect().await;
+
+    let first = finalize_own_ip_session(&mut client, "first").await;
+    let second = finalize_own_ip_session(&mut client, "second").await;
+
+    // Both names answer at the node's shared address while no client is attached.
+    let (_, first_address) = zone_answer_for(&server, "first.min.internal")
+        .await
+        .expect("first's name answers on the shared address");
+    let (_, second_address) = zone_answer_for(&server, "second.min.internal")
+        .await
+        .expect("second's name answers on the shared address");
+    assert_eq!(
+        first_address, second_address,
+        "both interim boxes publish at the node's shared address"
+    );
+    assert_eq!(
+        first_address,
+        std::net::Ipv4Addr::LOCALHOST,
+        "a native node's interim address is host loopback"
+    );
+
+    // No own-address publish is recorded: the boxes are on the interim, not
+    // holding a grant, so neither published_own_address returns anything.
+    let registry = server.state.sessions_manager().await.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert!(
+        routes.published_own_address(first).is_none(),
+        "a shared-address box does not record the node address as its own"
+    );
+    assert!(
+        routes.published_own_address(second).is_none(),
+        "the second shared-address box does not record the node address as its own"
+    );
+    assert_eq!(
+        routes
+            .resolve("first.min.internal:18080")
+            .expect("first's name routes")
+            .upstream(18080),
+        Some(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(first_address),
+            18080,
+        )),
+        "the first box's port is published at the number it asked for"
+    );
+    assert_eq!(
+        routes
+            .resolve("second.min.internal:18080")
+            .expect("second's name routes")
+            .upstream(18080),
+        Some(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(second_address),
+            18080,
+        )),
+        "the second box's port is published at the number it asked for"
+    );
+    drop(routes);
+
+    // The collision reached the log and named both boxes and the port.
+    let logged = capture.contents();
+    let collision_lines: Vec<_> = logged
+        .lines()
+        .filter(|line| {
+            line.contains("action=\"shared-address-port-collision\"") && line.contains("port=18080")
+        })
+        .collect();
+    assert_eq!(
+        collision_lines.len(),
+        1,
+        "one warn line reports the collision, naming one box and the port: {collision_lines:?}"
+    );
+    assert!(
+        collision_lines[0].contains("session_name=\"second\"")
+            && collision_lines[0].contains("other=first.min.internal"),
+        "the collision line names the publishing box and the other box: {}",
+        collision_lines[0]
+    );
+}

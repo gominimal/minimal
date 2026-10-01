@@ -507,6 +507,13 @@ pub struct HostnameRegistry {
     /// address and ports an `OwnIp` box's declaration publishes at, from
     /// finalize until destroy.
     own_published: HashMap<SessionId, OwnPublished>,
+    /// Shared-address interim publishes, by stable session id (NET-129): the
+    /// ports an `OwnIp` box publishes on the node's shared address while it has
+    /// no grant. Recorded separately from `own_published` so a shared-address
+    /// box does not short-circuit future lease asks and is not repointed by a
+    /// later `set_node_address`, while still being visible to the same-address
+    /// port collision check.
+    shared_published: HashMap<SessionId, BTreeSet<u16>>,
     /// Sessions whose box has stopped (NET-128): its name stays *held* —
     /// answered, not absent, so a stopped box is never mistaken for one that
     /// never existed — but a name it shares with the node answers NODATA, so
@@ -561,6 +568,7 @@ impl HostnameRegistry {
             on_switch,
             node: Ipv4Addr::LOCALHOST,
             own_published: HashMap::new(),
+            shared_published: HashMap::new(),
             stopped: HashSet::new(),
             by_host: HashMap::new(),
             by_session: HashMap::new(),
@@ -598,6 +606,15 @@ impl HostnameRegistry {
     /// — so that is the rule. Nothing else about a route moves: the ports a
     /// request may name are the box's own declaration, not a fact about where
     /// it publishes.
+    /// Returns the node's host loopback address as the registry currently
+    /// holds it. `Session::register_hostname` reads this to run the
+    /// shared-address port collision check for a box that publishes on the
+    /// node's shared interim without recording that address as the box's own.
+    #[must_use]
+    pub fn node_address(&self) -> Ipv4Addr {
+        self.node
+    }
+
     pub fn set_node_address(&mut self, node: Ipv4Addr) {
         let was = std::mem::replace(&mut self.node, node);
         if was == node {
@@ -612,6 +629,9 @@ impl HostnameRegistry {
         for route in self.by_host.values_mut() {
             route.repoint(was, node);
         }
+        // Shared-address interim publishes do not record the address in the box's
+        // own state, so there is nothing to repoint there; the collision check
+        // consults the current node address directly.
     }
 
     /// Registers `session_name`'s box name routing it along `route`, and
@@ -826,25 +846,7 @@ impl HostnameRegistry {
         address: Ipv4Addr,
         ports: BTreeSet<u16>,
     ) -> Vec<SharedPortCollision> {
-        let collisions: Vec<_> = self
-            .own_published
-            .iter()
-            .filter(|(other, own)| **other != session_id && own.address == address)
-            .flat_map(|(other, own)| {
-                let other_name = self
-                    .by_session
-                    .values()
-                    .find(|registration| registration.id == *other)
-                    .map(|registration| registration.hostname.to_string())
-                    .unwrap_or_else(|| other.to_string());
-                own.ports
-                    .intersection(&ports)
-                    .map(move |port| SharedPortCollision {
-                        port: *port,
-                        other: other_name.clone(),
-                    })
-            })
-            .collect();
+        let collisions = self.own_address_collisions(session_id, address, &ports);
         for collision in &collisions {
             tracing::warn!(
                 session_id = %session_id,
@@ -861,6 +863,96 @@ impl HostnameRegistry {
         collisions
     }
 
+    /// Reports same-address port collisions that `publish_own_address` would
+    /// report, records the shared-address interim publish, but does *not* record
+    /// the node's shared address as the box's own. Used when a box publishes on
+    /// the node's shared address in the interim — the collision is intrinsic to
+    /// the mode and must reach the session-start report and the log (NET-129),
+    /// but recording the shared node address in `own_published` would
+    /// short-circuit future lease asks and would need `set_node_address` to
+    /// re-point those entries on a VM node.
+    pub fn report_shared_address_collisions(
+        &mut self,
+        session_id: SessionId,
+        session_name: &str,
+        address: Ipv4Addr,
+        ports: BTreeSet<u16>,
+    ) -> Vec<SharedPortCollision> {
+        let collisions = self.shared_address_collisions(session_id, address, &ports);
+        for collision in &collisions {
+            tracing::warn!(
+                session_id = %session_id,
+                session_name,
+                address = %address,
+                port = collision.port,
+                other = %collision.other,
+                action = "shared-address-port-collision",
+                "two boxes publish one port at a shared loopback address"
+            );
+        }
+        self.shared_published.insert(session_id, ports);
+        collisions
+    }
+
+    /// The collision list between `session_id`/address/ports and every other
+    /// recorded publish — own-address or shared-address interim — sharing the
+    /// same address and a port.
+    fn shared_address_collisions(
+        &self,
+        session_id: SessionId,
+        address: Ipv4Addr,
+        ports: &BTreeSet<u16>,
+    ) -> Vec<SharedPortCollision> {
+        let own_collisions = self
+            .own_published
+            .iter()
+            .filter(|(other, own)| **other != session_id && own.address == address)
+            .flat_map(|(other, own)| {
+                let other_name = self
+                    .by_session
+                    .values()
+                    .find(|registration| registration.id == *other)
+                    .map(|registration| registration.hostname.to_string())
+                    .unwrap_or_else(|| other.to_string());
+                own.ports
+                    .intersection(ports)
+                    .map(move |port| SharedPortCollision {
+                        port: *port,
+                        other: other_name.clone(),
+                    })
+            });
+        let shared_collisions = self
+            .shared_published
+            .iter()
+            .filter(|(other, _)| **other != session_id)
+            .flat_map(|(other, other_ports)| {
+                let other_name = self
+                    .by_session
+                    .values()
+                    .find(|registration| registration.id == *other)
+                    .map(|registration| registration.hostname.to_string())
+                    .unwrap_or_else(|| other.to_string());
+                other_ports
+                    .intersection(ports)
+                    .map(move |port| SharedPortCollision {
+                        port: *port,
+                        other: other_name.clone(),
+                    })
+            });
+        own_collisions.chain(shared_collisions).collect()
+    }
+
+    /// The collision list between `session_id`/address/ports and every other
+    /// recorded own-address publish sharing the same address and a port.
+    fn own_address_collisions(
+        &self,
+        session_id: SessionId,
+        address: Ipv4Addr,
+        ports: &BTreeSet<u16>,
+    ) -> Vec<SharedPortCollision> {
+        self.shared_address_collisions(session_id, address, ports)
+    }
+
     /// The address a session's box publishes at, if it has one — for the
     /// session actor to keep across a rename or re-register without leasing a
     /// second address for the same box (NET-010).
@@ -873,9 +965,12 @@ impl HostnameRegistry {
     /// for the session actor to release into the allocator (NET-010) — the
     /// lease's other half, at the same place the release is logged. A box
     /// whose publish is gone stops answering at the address: its name is
-    /// withdrawn by [`Self::deregister`] in the same deregister.
+    /// withdrawn by [`Self::deregister`] in the same deregister. Also drops any
+    /// shared-address interim publish the session held (NET-129), so a
+    /// destroyed interim box no longer participates in collision checks.
     pub fn unpublish_own_address(&mut self, session_id: SessionId) -> Option<Ipv4Addr> {
         self.stopped.remove(&session_id);
+        self.shared_published.remove(&session_id);
         self.own_published
             .remove(&session_id)
             .map(|own| own.address)
@@ -959,8 +1054,12 @@ impl HostnameRegistry {
     /// actually removed, so calling it for an unregistered session is a silent
     /// no-op. The event carries the same stable `session_id` the matching
     /// `registered` event did, and formats `ip` with `Display` to match it.
+    /// Also drops any shared-address interim publish for the deregistered
+    /// session, so a stopped or renamed interim box no longer participates in
+    /// collision checks (NET-129).
     pub fn deregister(&mut self, session_name: &str) -> Option<Hostname> {
         let Registration { id, hostname } = self.by_session.remove(session_name)?;
+        self.shared_published.remove(&id);
         let route = self
             .by_host
             .remove(&hostname)

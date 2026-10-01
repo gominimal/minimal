@@ -839,6 +839,25 @@ impl Session {
                     // mode, reported — the session-start report — and never
                     // translated.
                     reg.publish_own_address(record.id, &name, address, declared.clone());
+                } else {
+                    // The box publishes on the node's shared address (spent pool,
+                    // absent range, pending verdict, unreadable record). The same
+                    // shared-address collision check still applies, but the node
+                    // address itself is *not* recorded as the box's own: doing so
+                    // would short-circuit future lease asks through
+                    // `published_own_address` and would need `set_node_address`
+                    // to re-point a recorded node address when the node's grant
+                    // lands. Collisions are reported at the same moment as an
+                    // own-address publish (NET-129), through the same emitter,
+                    // and reach the listing surface via `shared_published` in
+                    // the registry.
+                    let node_address = reg.node_address();
+                    let _collisions = reg.report_shared_address_collisions(
+                        record.id,
+                        &name,
+                        node_address,
+                        declared.clone(),
+                    );
                 }
                 reg.register_own_ip(record.id, &name, declared);
             }
