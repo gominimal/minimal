@@ -388,20 +388,28 @@ impl BoxRegistry {
     /// Addresses are handed out in plan order from shared cursors: each
     /// registration takes the next address the plan has not spent, and no
     /// address is ever handed to two rows (clones of this registry share the
-    /// cursors, so that holds across every clone). The switch cursor draws
-    /// only from the hand-out run — the plan run's upper half, above the
-    /// daemon's self-allocation reserve (`hand_out_run`) — so the two
+    /// cursors, so that holds across every clone). The loopback draw comes
+    /// first — the slice is the run a host exhausts, 32 published addresses
+    /// per switch against a hand-out run of at least 126 — so an exhausted
+    /// slice refuses before the switch cursor moves. The switch cursor
+    /// draws only from the hand-out run — the plan run's upper half, above
+    /// the daemon's self-allocation reserve (`hand_out_run`) — so the two
     /// allocators cannot meet. The runs are finite — the hand-out run ends
     /// at the plan's last PTask address, the slice ends where the plan's
     /// next switch begins — and exhausting one is the [`AllocationError`]
     /// the control socket hands back as the registration's failure.
     ///
-    /// An address is spent for good: withdrawing its row does not return it
-    /// to the cursor, and neither does an allocation whose other run is
-    /// exhausted. A spent address's host-side state — the gate's
-    /// rate-limit slots, the switch's static lease table — is keyed by it,
-    /// and re-issuing it to a new box would inherit all of that; a fresh
-    /// address starts clean.
+    /// An address a row was published at is spent for good: withdrawing
+    /// the row does not return it to the cursor. A spent address's
+    /// host-side state — the gate's rate-limit slots, the switch's static
+    /// lease table — is keyed by it, and re-issuing it to a new box would
+    /// inherit all of that; a fresh address starts clean. An address no
+    /// row was ever published at carries none of that, so a refusal spends
+    /// nothing: the exhausted slice refuses first, and the one refusal
+    /// that could still follow a landed draw — a switch-run exhaustion
+    /// while the slice has room — is kept out of reach by the plan's shape
+    /// ([`switch::AddressPlan::loopback_slice_for_switch`]), whose planned
+    /// hand-out runs all outnumber their slices.
     ///
     /// While a row this registration filled stands, the box's frames are
     /// decided by its rules; what a box with **no** row runs as — one whose
@@ -417,15 +425,17 @@ impl BoxRegistry {
         let slice = self
             .loopback_slice
             .ok_or(AllocationError::UnplannedSubnet(self.subnet))?;
-        let (hand_out_first, hand_out_last) = hand_out_run(self.subnet);
-        let switch_addr = take_next(&self.next_switch_addr, hand_out_first, hand_out_last)
-            .ok_or(AllocationError::SwitchExhausted)?;
+        // The loopback draw comes first: the slice is the run a host
+        // exhausts, so its refusal costs the hand-out run nothing.
         let loopback_addr = take_next(
             &self.next_loopback_addr,
             u32::from(slice.first()),
             u32::from(slice.last()),
         )
         .ok_or(AllocationError::LoopbackExhausted)?;
+        let (hand_out_first, hand_out_last) = hand_out_run(self.subnet);
+        let switch_addr = take_next(&self.next_switch_addr, hand_out_first, hand_out_last)
+            .ok_or(AllocationError::SwitchExhausted)?;
         let mut registration = BoxRegistration::new(spec.name, switch_addr, loopback_addr)
             .with_admitted_ports(spec.ingress_ports);
         if let Some(policy) = spec.egress {
@@ -823,8 +833,8 @@ mod tests {
     /// The host hands registered boxes only from the hand-out run — the plan
     /// run's upper half, above the daemon's self-allocation reserve — and
     /// the loopback run's exhaustion stays an explicit refusal, with no
-    /// wrap. Driven on a planned carved /24, whose runs are small enough to
-    /// see both edges of.
+    /// wrap, that costs the hand-out run nothing. Driven on a planned
+    /// carved /24, whose runs are small enough to see both edges of.
     #[test]
     fn client_boxes_hand_out_from_the_run_above_the_reserve() {
         // The plan's default subnet splits at 100.64.127.255 — pinned
@@ -892,6 +902,14 @@ mod tests {
                 "exhaustion is explicit and never wraps"
             );
         }
+        // And the refusals are free: the loopback draw comes first, so the
+        // exhausted slice stops the registration before the switch cursor
+        // moves — 32 successes advanced it, not one refusal more.
+        assert_eq!(
+            registry.next_switch_addr.load(Ordering::Relaxed),
+            u32::from(Ipv4Addr::new(100, 64, 1, 127)) + 32,
+            "a refused registration spends no hand-out address"
+        );
     }
 
     /// NET-138's trust boundary: the guest never sources a row. The table the
