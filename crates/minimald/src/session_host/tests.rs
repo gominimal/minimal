@@ -2342,8 +2342,16 @@ async fn a_hook_launch_does_not_advise_unenforced_placement() {
     let capture = crate::test_harness::captured_log();
     const RECORD: &str = "the session's host-address box runs unenforced on this host";
     // The per-launch note from the placement decision itself — not the
-    // advisory, and not gated with it.
-    const HOOK_UNGATED_NOTE: &str = "this host has no classifier tree to place a box in";
+    // advisory, and not gated with it. Which note a tree-less host records
+    // depends on what covers the tree root: under no cgroup2 mount the tree
+    // is not real; under one with no tree installed — every cgroup2 host,
+    // this test's CI runner included — the placement probe's throwaway leaf
+    // is what finds the tree missing. Either pins the launch to the same
+    // decision point.
+    const HOOK_UNGATED_NOTES: [&str; 2] = [
+        "this host has no classifier tree to place a box in",
+        "the classifier tree is not installed on this host",
+    ];
     const SESSION: &str = "advice-proof-session";
     const HOOK: &str = "advice-proof-hook";
 
@@ -2404,7 +2412,8 @@ async fn a_hook_launch_does_not_advise_unenforced_placement() {
             // That note's field is logged as a borrowed string, which
             // tracing quotes (`session="…"`), unlike the advisory's
             // `Display` field this test's other asserts match on.
-            line.contains(HOOK_UNGATED_NOTE) && line.contains(&format!("session=\"{HOOK}\""))
+            HOOK_UNGATED_NOTES.iter().any(|note| line.contains(note))
+                && line.contains(&format!("session=\"{HOOK}\""))
         }),
         "the hook launch reached the placement decision, got: {logged}"
     );
