@@ -100,9 +100,12 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     // caller so the user sees the error directly, even under --detach.
     crate::cmd::ensure_hypervisor_accessible()?;
     // Likewise the sun_path limit: libkrun aborts on an over-long UDS path
-    // deep in the VMM child; catch it here with a clear error instead.
+    // deep in the VMM child; catch it here with a clear error instead. The
+    // egress gate's socket (NET-081) is bridged by the same mechanism the
+    // switch socket is, so it carries the same limit.
     crate::sock::check_uds_path_len(&crate::sock::resolve_uds_path()?)?;
     crate::sock::check_uds_path_len(&crate::net::resolve_switch_sock()?)?;
+    crate::sock::check_uds_path_len(&crate::net::resolve_gate_sock()?)?;
 
     if detach {
         return run_detach(timeout_secs);
@@ -409,12 +412,52 @@ fn run_foreground() -> Result<()> {
         .set_nonblocking(false)
         .context("setting listener to blocking")?;
 
+    // The host-side table of published namespaces (NET-138): the rows the
+    // egress gate (NET-081) decides every frame leaving the VM by, filled in
+    // this process on the host — never from anything the guest says. Held for
+    // the supervisor's lifetime as the registration surface (the client-driven
+    // path is a later task); published here with the one row the host itself
+    // can name: the guest node's own namespace, the daemon's root-netns tap,
+    // whose reach is the allow-all interim until the node-plane baseline set is
+    // enumerated (NET-130). Its address is this host's derivation from the
+    // registry's subnet, and the switch is configured with that same subnet
+    // below — one value handed to both, so the row's lease and the switch's
+    // address plan cannot drift apart. The daemon therefore keeps the egress
+    // it had before the gate existed, its own package fetches above all.
+    //
+    // An own-address box's lease is not a row this process can name: the guest
+    // daemon's own allocator mints it inside the VM, so no host-side process
+    // knows it — not this supervisor, and not the CLI that asked for the box.
+    // Until the creator-side registration (T66, #1711) supplies those rows,
+    // such a source is what the gate's announced interim is for: an address
+    // inside the plan's lease block but held by no row is admitted — with a
+    // warn naming T66 on every admit — so an own-address box keeps the egress
+    // it had before the gate existed, while everything outside the block, and
+    // every row that *is* published, stays exactly as decided.
+    //
+    // What that admits, said plainly: under the interim the host-side gate
+    // cannot attribute a frame to the box it came from unless a row holds the
+    // address, so a box with restrictive rules can be escaped by sourcing
+    // frames from any unregistered in-block address — NET-081's host-side
+    // guarantee is deferred to T66 until its rows land and its flip of
+    // `UNREGISTERED_SOURCE_PHASE` (egress_gate) puts the per-box default in
+    // force. Every admit under the interim is rate-limited-warned, so a
+    // diagnostic bundle's daemon log tail shows a host running it.
+    // `UNREGISTERED_SOURCE_PHASE` (egress_gate) is the constant T66 flips.
+    let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+    boxes.register_node_namespace();
+
     // Spawn + supervise the host gvproxy switch before the VMM child boots, so
-    // its `-listen` switch socket exists when libkrun dials it for the guest
-    // shuttle. The guest's root netns (the daemon) attaches a primary tap for
-    // egress, and own-IP PTasks attach further taps; both
-    // are L2 clients on this one switch. The handle lives for the VM's lifetime
-    // and stops gvproxy on drop (after the VMM child exits below).
+    // its `-listen` switch socket exists when the gate relays into it for the
+    // guest shuttle. The switch runtime starts the gate on the socket beside
+    // the switch socket — the one libkrun bridges the shuttle's vsock port to
+    // — before reporting ready, so the guest that boots next can only reach
+    // the switch through it, decided per source address against `boxes`.
+    // The guest's root netns (the daemon) attaches a primary tap for egress,
+    // and own-IP PTasks attach further taps; both are L2 clients on this one
+    // switch, both through the gate. The handle lives for the VM's lifetime
+    // and stops gvproxy on drop (after the VMM child exits below), taking the
+    // gate with it.
     //
     // Best-effort: when the gvproxy binary is absent (e.g. the boot/session e2e
     // lanes that exercise only the vsock bridge) we warn and boot without
@@ -427,10 +470,18 @@ fn run_foreground() -> Result<()> {
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
+            // The gate binds the socket beside the switch socket, so a stale
+            // file from a prior run must go or the bind fails EEXIST — the
+            // same discipline the switch socket gets.
+            let gate_sock =
+                crate::net::resolve_gate_sock().context("resolving egress gate socket")?;
+            crate::sock::remove_stale_socket(&gate_sock)
+                .context("removing stale egress gate socket")?;
             match crate::net::HostGvproxy::spawn(
                 binary,
                 switch_sock,
                 crate::net::DEFAULT_DATAPATH_CHECK_INTERVAL,
+                &boxes,
             ) {
                 Ok(gvproxy) => {
                     tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");
