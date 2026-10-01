@@ -6390,6 +6390,10 @@ proof_fresh_arm64_kvm_activate_local_minvmd() {
 #   * the VM host daemon's start record names the images and the switch it
 #     booted (the run's diagnostics), and destroying the session delists it.
 #
+#   The case prints the installed components on success and again whenever
+#   the activation or the exec fails: the installed pair's provenance is
+#   the first thing a reader needs when the stock minvmd will not boot.
+#
 # Lane gating, decided by where the proof's pieces actually run:
 #   * VM-backed Linux only, for the arch of the host (an arch without a
 #     release binary for this channel is skipped the same way): the proof
@@ -6488,6 +6492,16 @@ proof_linux_stock_install_runs_vm_boxes() {
     sb_gvproxy="$sb_root/gvproxy"
   fi
 
+  # Verify the binaries we'll stage are available BEFORE anything is staged:
+  # a missing one must not surface later as "the stock install (VM stack)
+  # failed" with the cause buried in the install log. A --provider
+  # local-minvmd activation only needs min and minvmd (the guest runs
+  # minimald, not the host) — the same guard the fresh-kvm proofs keep.
+  if ! command -v min >/dev/null 2>&1 || ! command -v minvmd >/dev/null 2>&1; then
+    echo "::error::the stock-install case requires min and minvmd on PATH"
+    fail
+  fi
+
   # Stage the bucket: every component a Linux release ships for this arch,
   # so the install under test IS the stock one.
   cp "$(command -v min)"      "$sb_bucket/versions/v1/minimal-linux-$sb_arch"
@@ -6553,6 +6567,17 @@ exit 1
 STUB
   chmod +x "$sb_stubbin/wget"
 
+  # The installed pair's provenance, in the installer's own words: printed
+  # after the install (observability) and again by every activate/exec
+  # failure below (the plan's "the case prints the install log") — when the
+  # stock minvmd will not boot, which components this install actually
+  # shipped is the first thing a reader needs.
+  sb_print_installed_components() {
+    echo "--- installed components ---"
+    grep -E '^  [a-z0-9-]+ +(installed|current|verified|skipped)' "$sb_out" 2>/dev/null \
+      || { echo "--- install log (tail) ---"; tail -25 "$sb_out" 2>/dev/null || true; }
+  }
+
   if (
     # XDG_DATA_HOME outranks HOME in both the installer's data-prefix
     # resolution (scripts/install.sh) and the daemon's image resolver
@@ -6574,9 +6599,9 @@ STUB
         exit 1
       }
 
-    # Observability: what the stock install placed, in its own words.
-    echo "--- installed components ---"
-    grep -E '^  [a-z0-9-]+ +(installed|current|verified|skipped)' "$sb_out" || true
+    # Observability: what the stock install placed, in its own words (the
+    # helper prints it again on any activate/exec failure below).
+    sb_print_installed_components
     for sb_comp in minvmd vmlinuz rootfs initramfs; do
       grep -qE "^  $sb_comp +(installed|current)" "$sb_out" || {
         echo "::error::the install output does not name $sb_comp as placed"
@@ -6584,6 +6609,15 @@ STUB
         exit 1
       }
     done
+    # The switch row, beside the four image rows: the installer says which
+    # path it verified (NET-041), and a stock install must be the row that
+    # names the shipped gvproxy-min — the same grep the fresh-kvm proofs
+    # keep (the switch is REQUIRED here, so no skip branch around it).
+    grep -qE 'switch-binary +verified +[^ ]*/bin/gvproxy-min$' "$sb_out" || {
+      echo "::error::the install output does not name the switch binary it verified"
+      echo "--- install log (tail) ---"; tail -25 "$sb_out" 2>/dev/null || true
+      exit 1
+    }
 
     # The VM stack is on disk where a stock install puts it.
     [ -x "$sb_home/.local/bin/min" ] \
@@ -6624,6 +6658,7 @@ STUB
     sb_sid="$(cd "$sb_seed" && RUST_LOG="warn,minvmd=info" mnl session activate . --no-prompt --name "$sb_name" 2>"$sb_root/activate.err")" || {
       echo "::error::the stock-installed pair failed to activate a VM box"
       echo "--- activate stderr ---"; cat "$sb_root/activate.err" 2>/dev/null || true
+      sb_print_installed_components
       exit 1
     }
     sb_sid="$(printf '%s\n' "$sb_sid" | tail -n1 | tr -d '\r')"
@@ -6646,9 +6681,13 @@ STUB
     sb_exec="$(mnl session exec "$sb_sid" 'echo STOCK_VM_BOX_OK $PWD' 2>"$sb_root/exec.err")" || {
       echo "::error::'min session exec' into the stock-installed VM box failed"
       echo "--- exec stderr ---"; cat "$sb_root/exec.err" 2>/dev/null || true
+      sb_print_installed_components
       exit 1
     }
-    if [ "$sb_exec" != "STOCK_VM_BOX_OK /workbench" ]; then
+    # The same substring match proof_session_exec uses (line ~678): the
+    # harness's contract for this command is "the marker is in the output",
+    # not byte equality — an exact compare breaks on a trailing banner line.
+    if [[ "$sb_exec" != *"STOCK_VM_BOX_OK /workbench"* ]]; then
       echo "::error::the exec did not run in the box (expected 'STOCK_VM_BOX_OK /workbench')"
       echo "--- exec stdout ---"; printf '%s\n' "$sb_exec"
       echo "--- exec stderr ---"; cat "$sb_root/exec.err" 2>/dev/null || true
