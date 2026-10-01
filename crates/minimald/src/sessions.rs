@@ -424,11 +424,12 @@ impl Manager {
                 // deliberate choice, not an oversight: it is the same class
                 // of ask a session actor's own `lease_loopback_address`
                 // makes on the same runtime, and both are bounded by the
-                // walk's own per-round and whole-probe caps, so neither
-                // parks a worker for an unbounded length. `spawn_blocking`
-                // would move the ask but not shorten it, and would add a
-                // thread whose whole job is to wait on a lock the actor
-                // path already waits on inline.
+                // other holders' critical sections (a small-file
+                // read-modify-write, a registry read), so neither parks a
+                // worker for an unbounded length. `spawn_blocking` would move
+                // the ask but not shorten it, and would add a thread whose
+                // whole job is to wait on a lock the actor path already waits
+                // on inline.
                 let book = Arc::clone(&loopback);
                 let registry = Arc::clone(&hostnames);
                 tokio::spawn(async move {
@@ -455,6 +456,20 @@ impl Manager {
                             "the reserved local range is absent on the publish surface; \
                              publishing boxes on the 127.0.0.1 interim",
                         );
+                        for (name, address) in registry
+                            .read()
+                            .expect("hostname registry lock poisoned")
+                            .own_address_names_in_reserved_range()
+                        {
+                            tracing::warn!(
+                                session_name = %name,
+                                ip = %address,
+                                action = "loopback-range-absent-box",
+                                "a box already published at a reserved local address, but \
+                                 the range is now absent; the name stays until a rename \
+                                 or re-finalize",
+                            );
+                        }
                         return;
                     }
                     let node = match book.grant(crate::net::dns::LeaseNamespace::Node) {

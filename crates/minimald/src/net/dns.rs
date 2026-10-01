@@ -733,6 +733,24 @@ impl HostnameRegistry {
         })
     }
 
+    /// The own-address boxes whose published address falls in the reserved
+    /// local range, as `(session_name, address)` pairs. Used when the range
+    /// verdict lands `Absent` so the daemon can warn by name about boxes that
+    /// were answered from the record while no verdict was available.
+    #[must_use]
+    pub fn own_address_names_in_reserved_range(&self) -> Vec<(String, Ipv4Addr)> {
+        self.own_published
+            .iter()
+            .filter(|(_, own)| in_reserved_local_range(own.address))
+            .filter_map(|(id, own)| {
+                self.by_session
+                    .iter()
+                    .find(|(_, registration)| registration.id == *id)
+                    .map(|(name, _)| (name.clone(), own.address))
+            })
+            .collect()
+    }
+
     /// Reports the lease an `OwnIp` box attached with (from the attach path)
     /// and registers the session's box name against it now, so the name routes
     /// exactly when the box is reachable. The lease is kept by the stable
@@ -1251,6 +1269,17 @@ pub enum LoopbackGrant {
     /// another namespace already holds — the one failure NET-010 cannot
     /// tolerate — where a withheld grant costs one box its published address.
     RecordUnavailable,
+    /// The address this grant would hand the namespace is already held by
+    /// another namespace in the record — a duplicate in a stale or
+    /// hand-edited record. A fresh namespace is refused; a recorded namespace
+    /// is granted anyway (with a collision warning) so a resumed box is not
+    /// stranded at the moment it re-asks.
+    AddressInUse {
+        /// The address that would have been handed out twice.
+        address: Ipv4Addr,
+        /// The namespace that already holds it.
+        holder: LeaseNamespace,
+    },
 }
 
 /// The verdict over the reserved local range on this host — NET-123's bind
@@ -1329,12 +1358,12 @@ impl RangeVerdict {
 /// (see [`LoopbackGrant::RecordUnavailable`]); a record that is simply
 /// missing is a host's first boot, and reads as empty.
 ///
-/// A microVM guest's state root is the guest's own, so two co-resident VMs
-/// keep two records and do not see each other — the host-side channel that
-/// arbitrates across the `minvmd` boundary is the minvmd-side answerer's to
-/// carry, and this type is where its grant path will plug in. Within one
-/// host — one state root, however many native daemon instances share it —
-/// this record *is* the arbitration.
+/// Within one state root this record *is* the arbitration: every native node
+/// daemon on that root asks it for a lease, and its lock file serializes the
+/// asks so no two namespaces receive the same address. Across roots and across
+/// the `minvmd` boundary, the host answerer of #1772 is the arbiter, and this
+/// book is the per-root cache it will write through. See the module comment
+/// for the bound this interim has and the work that closes the cross-root gap.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct LoopbackLeaseBook {
@@ -1513,6 +1542,20 @@ impl LoopbackLeaseBook {
         // recorded one is what keeps a box's address stable across the
         // restart, and costs no second line in the record.
         if let Some(address) = entry_address(&entries, namespace) {
+            // A stale or hand-edited record can map two namespaces to one
+            // address. Refusing a recorded namespace would strand its resumed
+            // box, so the grant stands and the duplicate is warned about at
+            // the moment it would otherwise go unnoticed.
+            if let Some(other) = namespace_holding(&entries, address, namespace) {
+                tracing::warn!(
+                    namespace = ?namespace,
+                    other_namespace = ?other,
+                    ip = %address,
+                    action = "loopback-grant-collision",
+                    "a recorded namespace shares its address with another namespace; \
+                     granting rather than stranding it",
+                );
+            }
             return LoopbackGrant::Granted(address);
         }
         // A namespace the record does not name is the one the verdict gates:
@@ -1530,6 +1573,12 @@ impl LoopbackLeaseBook {
         let Some(address) = owned.lease() else {
             return LoopbackGrant::PoolSpent;
         };
+        // The allocator should never hand out an address the record already
+        // names; this is the stale-record guard against a hand-edited or
+        // pre-allocator duplicate surviving long enough to grant it twice.
+        if let Some(holder) = namespace_holding(&entries, address, namespace) {
+            return LoopbackGrant::AddressInUse { address, holder };
+        }
         entries.push(LeaseEntry {
             namespace,
             address,
@@ -1753,6 +1802,20 @@ fn entry_address(entries: &[LeaseEntry], namespace: LeaseNamespace) -> Option<Ip
         .iter()
         .find(|entry| entry.namespace == namespace)
         .map(|entry| entry.address)
+}
+
+/// The first namespace other than `exclude` that holds `address` in the
+/// record, if any — the other half of a duplicate-address collision.
+#[cfg(target_os = "linux")]
+fn namespace_holding(
+    entries: &[LeaseEntry],
+    address: Ipv4Addr,
+    exclude: LeaseNamespace,
+) -> Option<LeaseNamespace> {
+    entries
+        .iter()
+        .find(|entry| entry.namespace != exclude && entry.address == address)
+        .map(|entry| entry.namespace)
 }
 
 /// One warn line for `address`, a reserved local address a live publish
@@ -3051,6 +3114,44 @@ mod tests {
         assert_eq!(
             restarted.grant(LeaseNamespace::Node),
             LoopbackGrant::RangeAbsent
+        );
+    }
+
+    /// The grant path detects a duplicate address already held by another
+    /// namespace in the same record. A recorded namespace is granted anyway so
+    /// a resumed box is not stranded, and the collision is warned about at
+    /// grant time with no daemon restart.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_duplicate_address_in_the_record_is_reported_at_grant_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let first = session_id(1);
+        let second = session_id(2);
+        let address = sessions::core::loopback::POOL_FIRST;
+        // A stale or hand-edited record with two namespaces on one address.
+        let corrupted = format!(
+            concat!(
+                r#"[{{"namespace":{{"box":{{"session":"{}"}}}},"address":"{}","#,
+                r#""granted_at":1}},"#,
+                r#"{{"namespace":{{"box":{{"session":"{}"}}}},"address":"{}","#,
+                r#""granted_at":2}}]"#
+            ),
+            first, address, second, address
+        );
+        let record = state_root.sub_path_unchecked(LEASE_RECORD_FILE);
+        std::fs::write(record.as_utf8_path(), corrupted).unwrap();
+
+        let book = lease_book(&state_root);
+        // Both recorded namespaces are answered with the address the record
+        // holds, and the second ask is not refused (which would strand it).
+        assert_eq!(
+            book.grant(LeaseNamespace::Box { session: first }),
+            LoopbackGrant::Granted(address)
+        );
+        assert_eq!(
+            book.grant(LeaseNamespace::Box { session: second }),
+            LoopbackGrant::Granted(address)
         );
     }
 
