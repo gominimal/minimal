@@ -1534,6 +1534,8 @@ impl SessionLauncher for SealingMockLauncher {
 
     async fn launch(
         self,
+        _guest: bool,
+        _session_id: sessions::SessionId,
         _name: String,
         _username: String,
         _paths: SessionPaths,
@@ -1559,6 +1561,9 @@ impl SessionLauncher for SealingMockLauncher {
             net_guard: None,
             tty_path,
             seal_injection: self.seal_injection,
+            // This mock has no sandbox, so no classifier placed it anywhere.
+            leaf: None,
+            host_ip_enforcement: None,
         })
     }
 }
@@ -1614,4 +1619,808 @@ async fn hook_injections_carry_the_session_s_none_box_seal() {
             "the hook injection must carry the session's none-box seal",
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// NET-079: the daemon in a classifier leaf of its own, and every box's
+// leaf placed in a cohort it is a sibling of.
+// ---------------------------------------------------------------------
+
+/// The files the kernel makes when it makes a cgroup — `cgroup.procs`,
+/// `cgroup.threads`, `cgroup.subtree_control` — modelled empty over a
+/// stand-in tree, which has no kernel behind it to make them. Modelling them
+/// is what makes a stand-in the installer's tree: directories delegated to
+/// the daemon's account, with the kernel's own files in them, and nothing
+/// left for the entry to make but the migration.
+const CGROUP_KERNEL_FILES: [&str; 3] = ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"];
+
+/// Stands in for the kernel over a stand-in tree: writes
+/// [`CGROUP_KERNEL_FILES`] into `dir`, empty, as the kernel leaves them when
+/// it makes a cgroup.
+fn model_cgroup_files(dir: &std::path::Path) {
+    for name in CGROUP_KERNEL_FILES {
+        std::fs::write(dir.join(name), "")
+            .unwrap_or_else(|e| panic!("modeling {name} in {}: {e}", dir.display()));
+    }
+}
+
+/// The daemon enters a classifier leaf of its own at start: `<root>/daemon`,
+/// a **sibling** of every box leaf — never the tree root, where enabling a
+/// controller would make the box leaves unusable and where the daemon's own
+/// fetches could not be told apart from a box's, and never inside `boxes/`,
+/// the cohort that holds boxes and nothing else.
+///
+/// The placement is this process's pid written to its leaf's `cgroup.procs`,
+/// the one migration primitive the whole classifier rests on. Asserted over
+/// a stand-in tree because the host running this test may have no cgroup2 of
+/// its own: on a real tree the kernel holds the membership, and the write
+/// that performs the migration is the same either way. Natively the
+/// installer owns the tree — the slice itself delegated to the daemon's
+/// account, `daemon/` and `boxes/` made, the kernel's files in them — and a
+/// daemon that cannot enter it is left outside, its boxes unenforced; only
+/// the guest's pid 1 builds the tree, on the cgroup2 it mounted itself.
+#[test]
+fn daemon_enters_its_own_leaf() {
+    let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+    let root = tree.path();
+
+    // The installer's tree, as a stand-in holds it: both directories made,
+    // and the kernel's files modelled into the daemon's leaf, because
+    // nothing behind the stand-in makes them at `mkdir` time.
+    std::fs::create_dir_all(sandbox2::classifier::daemon_leaf(root))
+        .expect("the installer makes the daemon's leaf");
+    std::fs::create_dir_all(root.join(sandbox2::classifier::BOXES_DIR))
+        .expect("the installer makes the box cohort");
+    model_cgroup_files(&sandbox2::classifier::daemon_leaf(root));
+
+    sandbox2::classifier::enter_daemon_leaf(root)
+        .expect("the daemon enters its own leaf in the installer's tree");
+
+    let daemon = sandbox2::classifier::daemon_leaf(root);
+    let procs = daemon.join("cgroup.procs");
+    assert_eq!(
+        std::fs::read_to_string(&procs).expect("reading the daemon leaf's procs file"),
+        format!("{}\n", std::process::id()),
+        "the daemon is placed by writing its own pid to its leaf's cgroup.procs"
+    );
+    assert_eq!(
+        daemon,
+        root.join(sandbox2::classifier::DAEMON_LEAF),
+        "the daemon's leaf is one component under the tree root"
+    );
+    let cohort = root.join(sandbox2::classifier::BOXES_DIR);
+    assert!(
+        cohort.is_dir(),
+        "the cohort directory exists for the boxes to come"
+    );
+
+    // The cohort asks the kernel for the memory controller: a box leaf only
+    // carries a `memory.max` — the limit a host-side reader or a future
+    // box-held view would name — when the cgroup above the leaf carries the
+    // controller, and `boxes/` holds no process, so enabling it breaks no
+    // internal-process rule.
+    assert_eq!(
+        std::fs::read_to_string(cohort.join("cgroup.subtree_control"))
+            .expect("the daemon enables the memory controller on the cohort"),
+        "+memory\n",
+        "the leaf must carry the limit a reader would look for in it"
+    );
+
+    // The two identities: a box's leaf lives in the cohort, a sibling of the
+    // daemon's, so no box is ever placed in the daemon's leaf and the daemon
+    // never in a box's.
+    let a_box = sandbox2::classifier::create_box_leaf(root, "a session")
+        .expect("creating a box's leaf in the same tree");
+    assert_eq!(
+        a_box.parent(),
+        Some(root.join(sandbox2::classifier::BOXES_DIR).as_path()),
+        "a box's leaf lives in the cohort, not beside it: {}",
+        a_box.display()
+    );
+    assert_ne!(
+        a_box.parent(),
+        daemon.parent(),
+        "a box's leaf and the daemon's are siblings, never the same directory"
+    );
+
+    // Entering again is harmless: a daemon that restarts into the leaf it
+    // already holds stays one member, and on a real tree the kernel keeps
+    // the membership set — the second write is a no-op there.
+    sandbox2::classifier::enter_daemon_leaf(root).expect("re-entering the daemon's leaf");
+    let members = std::fs::read_to_string(&procs).expect("re-reading the daemon leaf's procs");
+    assert!(
+        members
+            .lines()
+            .any(|member| member == std::process::id().to_string()),
+        "the daemon is still a member of its own leaf: {members:?}"
+    );
+
+    // And the one daemon that builds the tree itself — the guest's pid 1, on
+    // the cgroup2 it mounted — makes both directories where there was
+    // nothing, and then reports the stand-in's one gap as what it is: no
+    // kernel made the `cgroup.procs` its entry writes into, so the write
+    // says the leaf is missing, which over a real tree it never is. Nothing
+    // boxes into a tree the entry could not enter.
+    let bare = tempfile::tempdir().expect("a bare stand-in tree, nothing installed in it");
+    let entry = sandbox2::classifier::enter_daemon_leaf(bare.path())
+        .expect_err("over a bare stand-in no kernel made the daemon leaf's cgroup.procs");
+    assert_eq!(
+        entry.kind(),
+        std::io::ErrorKind::NotFound,
+        "the entry's write is a migration into a leaf that must already hold \
+         its kernel-made files: a missing one is a missing leaf"
+    );
+    assert!(
+        bare.path().join(sandbox2::classifier::BOXES_DIR).is_dir(),
+        "the pid-1 entry builds the cohort directory where it has the \
+         privilege to"
+    );
+    assert!(
+        sandbox2::classifier::daemon_leaf(bare.path()).is_dir(),
+        "the pid-1 entry builds its own leaf where it has the privilege to"
+    );
+}
+
+/// Only the guest refuses an unplaceable box, and only a host-address one
+/// (design §7.1). In the guest, a missing or undelegated cgroup2 tree is a
+/// broken image — the daemon's own boot path is the only thing that could
+/// have built it — so a box that would speak with the VM's address and no
+/// verdict of its own is refused rather than run unenforced. Natively the
+/// same state is NET-079's exception: advisory, never a refusal; and a box
+/// that isolates its own network is never the box the refusal is for.
+#[test]
+fn only_the_guest_refuses_an_unplaceable_host_address_box() {
+    use sessions::NetworkMode;
+
+    assert!(
+        refuses_unenforced_host_address_box(true, NetworkMode::HostNet),
+        "a guest that cannot place a host-address box refuses it: it would \
+         run with the VM's address and no verdict at all"
+    );
+    for (guest, mode, why) in [
+        (
+            true,
+            NetworkMode::NoNet,
+            "a none box claims no address to speak with",
+        ),
+        (
+            true,
+            NetworkMode::OwnIp,
+            "an own-IP box's address is the switch's to decide, not the cgroup's",
+        ),
+        (
+            false,
+            NetworkMode::HostNet,
+            "natively the same state is the exception: advisory, never a refusal",
+        ),
+        (false, NetworkMode::NoNet, "a native none box, likewise"),
+        (false, NetworkMode::OwnIp, "a native own-IP box, likewise"),
+    ] {
+        assert!(
+            !refuses_unenforced_host_address_box(guest, mode),
+            "{why}: the box launches, enforced where the tree allowed it and \
+             unenforced with a log line where it did not"
+        );
+    }
+}
+
+/// A leaf a fresh launch finds, and what it may be (NET-079): a leftover
+/// from a daemon death the start sweep could not have seen — the daemon died
+/// between creating the leaf and spawning the box into it — or another
+/// session's, which the same session id cannot be. The kernel's own
+/// emptiness test tells them apart, and it is the `rmdir` of
+/// [`sandbox2::classifier::remove_box_leaf`]: a cgroup holding a process
+/// cannot be removed, so a leftover that goes was nobody's and one that
+/// stays belongs to a session the daemon no longer knows. Driven over a
+/// stand-in tree, where the modelled kernel files stand in for the members:
+/// the reclaims are the same code paths, and only the emptiness test is the
+/// kernel's.
+#[test]
+fn a_leftover_leaf_is_reclaimed_but_a_held_one_refuses_the_launch() {
+    let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+    std::fs::create_dir_all(tree.path().join(sandbox2::classifier::BOXES_DIR))
+        .expect("the cohort directory");
+    let id = sessions::SessionId::nil();
+    let named = sandbox2::classifier::box_leaf(tree.path(), &id.to_string());
+
+    // The fresh launch: nothing to find, so nothing to reclaim.
+    let (leaf, reclaimed) = super::create_or_reclaim_box_leaf(tree.path(), &id)
+        .expect("the fresh launch creates its leaf");
+    assert!(!reclaimed, "a fresh launch reclaims nothing");
+    assert_eq!(
+        leaf, named,
+        "the leaf is named by the session that holds it"
+    );
+
+    // The leftover: empty, as a launch that never reached its spawn leaves
+    // it. The emptiness test lets it go, and the launch creates the leaf
+    // again for this box rather than reusing the directory as-is.
+    let (leaf, reclaimed) = super::create_or_reclaim_box_leaf(tree.path(), &id)
+        .expect("an empty leftover is reclaimed");
+    assert!(
+        reclaimed,
+        "an empty leftover is reclaimed: the launch tried its rmdir, the \
+         kernel's own test that a cgroup holds no process, and it went"
+    );
+    assert_eq!(
+        leaf, named,
+        "the reclaimed leaf is this session's, recreated"
+    );
+
+    // A leaf that still holds a session: over a real tree the kernel refuses
+    // the rmdir while the cgroup holds a process; over this stand-in the
+    // modelled procs file stands in for the members, and the refusal is the
+    // same `rmdir`'s. The launch is refused rather than placing this box in
+    // another session's cgroup, and the refusal names the test that refused.
+    model_cgroup_files(&leaf);
+    let held = super::create_or_reclaim_box_leaf(tree.path(), &id)
+        .expect_err("a leaf another session holds is not taken over");
+    assert_eq!(
+        held.kind(),
+        std::io::ErrorKind::AlreadyExists,
+        "the held leaf surfaces as the collision it is, not as a leftover"
+    );
+    for named in [
+        "its rmdir",
+        "another session holds this one's classifier leaf",
+    ] {
+        assert!(
+            held.to_string().contains(named),
+            "the refusal says what would have had to be true for the leaf to \
+             have been reclaimable: {held}"
+        );
+    }
+    assert!(
+        leaf.is_dir(),
+        "the held leaf outlives the launch that would have taken it over"
+    );
+}
+
+/// What the launch's leaf decision means for the box's egress verdict — the
+/// declared-and-enforced attribute a session carries from its launch
+/// (design §7.2): a host-address box with a leaf is enforced, a
+/// host-address box without one runs with the host's address and no verdict
+/// of its own, and a none box or an own-IP box has no host address to decide
+/// on at all. Pure over its inputs, so each mapping is pinned where it is
+/// written — beside the refusal predicate, the two halves of what a launch
+/// says about the box it is about to run.
+#[test]
+fn host_ip_enforcement_says_what_the_launch_decided() {
+    use sessions::NetworkMode;
+
+    let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+    std::fs::create_dir_all(tree.path().join(sandbox2::classifier::BOXES_DIR))
+        .expect("the cohort directory");
+    let leaf = sandbox2::config::ClassifierLeaf::new(
+        sandbox2::classifier::create_box_leaf(tree.path(), "a placed box")
+            .expect("the leaf the launch places its box in"),
+    );
+    let decided = |mode, leaf: Option<sandbox2::config::ClassifierLeaf>| {
+        super::host_ip_enforcement(mode, leaf.as_ref())
+    };
+
+    assert_eq!(
+        decided(NetworkMode::HostNet, Some(leaf.clone())),
+        Some(super::HostIpEnforcement::Enforced),
+        "a host-address box with a leaf has its egress verdict decided on it"
+    );
+    assert_eq!(
+        decided(NetworkMode::HostNet, None),
+        Some(super::HostIpEnforcement::Unenforced),
+        "a host-address box with no leaf runs with the host's address and no \
+         verdict of its own — the state the session-start notice names"
+    );
+    for (mode, why) in [
+        (NetworkMode::NoNet, "a none box has no traffic to decide"),
+        (
+            NetworkMode::OwnIp,
+            "an own-IP box's verdict is its own, on the address it holds",
+        ),
+    ] {
+        for leaf in [Some(leaf.clone()), None] {
+            assert_eq!(
+                decided(mode, leaf),
+                None,
+                "{why}: there is no host address to decide on, leaf or no leaf"
+            );
+        }
+    }
+}
+
+/// A torn-down box's leaf goes when the box's cgroup stops refusing it, not
+/// when the teardown's first `rmdir` happens to land: a SIGKILLed box's
+/// cgroup answers `EBUSY` for a few milliseconds after the reap, while the
+/// kernel empties it, and a leaf that leaked on that window would outlive
+/// its box until a later launch of the same session id reclaimed it. Over
+/// this stand-in tree the modelled `cgroup.procs` is the obstruction —
+/// `rmdir` refuses a non-empty directory the way the kernel refuses a
+/// cgroup that still holds a process — and the seam's pause callback clears
+/// it between two attempts, so the proof is the retry itself: the removal
+/// succeeds on the attempt after the obstruction went, and an obstruction
+/// that never goes gives up after the attempts it was given, with the
+/// `rmdir`'s own refusal for the caller to warn.
+#[test]
+fn a_torn_down_boxs_leaf_removal_outlasts_its_last_moments() {
+    let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+    std::fs::create_dir_all(tree.path().join(sandbox2::classifier::BOXES_DIR))
+        .expect("the cohort directory");
+    let leaf = sandbox2::classifier::create_box_leaf(tree.path(), "a torn-down box")
+        .expect("the box's leaf, as its teardown finds it");
+    model_cgroup_files(&leaf);
+
+    let outcome = super::remove_box_leaf_patiently(&leaf, 5, |attempt| {
+        if attempt == 2 {
+            for name in CGROUP_KERNEL_FILES {
+                std::fs::remove_file(leaf.join(name))
+                    .unwrap_or_else(|e| panic!("clearing {name} in {}: {e}", leaf.display()));
+            }
+        }
+    });
+    assert!(
+        outcome.is_ok(),
+        "the leaf went on the attempt after the box's cgroup stopped \
+         refusing its removal: {outcome:?}"
+    );
+    assert!(
+        !leaf.exists(),
+        "a leaf whose refusal was only the box's last moments does not \
+         outlive the box"
+    );
+
+    // A leaf that keeps refusing is warned about, not parked behind: the
+    // attempts are spent, and the refusal the caller warns with is the
+    // kernel's own test that the cgroup still holds a process — here, the
+    // `rmdir`'s ENOTEMPTY over the modelled file.
+    let held = sandbox2::classifier::create_box_leaf(tree.path(), "a box still dying")
+        .expect("the leaf of a box whose teardown could not remove it");
+    model_cgroup_files(&held);
+    let refused =
+        super::remove_box_leaf_patiently(&held, 3, |_| ()).expect_err("the obstruction stays");
+    assert_eq!(
+        refused.raw_os_error(),
+        Some(libc::ENOTEMPTY),
+        "the warn a teardown raises names the rmdir's own refusal, not a \
+         retry's: {refused}"
+    );
+    assert!(
+        held.is_dir(),
+        "a leaf that keeps refusing outlives the teardown that owes it, to \
+         be reclaimed by the same session's next launch"
+    );
+}
+
+/// Which line of a box's closure report settles the box's fate — the one
+/// fact the removal of the report rests on. A `failed` line is written by
+/// the closure's own exit path and nothing follows it, so the fate is known
+/// the moment it is read; a `cover` line is written while the closure is
+/// still heading for its exec, and a line the daemon does not read settles
+/// nothing at all.
+#[test]
+fn a_failed_closure_line_settles_the_boxs_fate_a_cover_line_does_not() {
+    assert!(
+        !super::say_closure_line("cover cgroup2", "a session"),
+        "a cover line leaves the closure still heading for its exec, so the \
+         file has to stay for the failure that can still replace it"
+    );
+    assert!(
+        !super::say_closure_line("cover tmpfs-fallback errno 22", "a session"),
+        "the recorded fallback is as non-terminal as the design's cover"
+    );
+    assert!(
+        super::say_closure_line(
+            "failed covering the bound classifier tree errno 1",
+            "a session"
+        ),
+        "a failed line is the closure's own exit path — nothing follows it, \
+         so the fate is known and the tree is owed its removal"
+    );
+    assert!(
+        !super::say_closure_line("a line this daemon does not read", "a session"),
+        "an unknown line settles nothing: the watch owes the file to the end \
+         of its window"
+    );
+}
+
+/// The closure report is taken away only once the box's fate is known: a
+/// `failed` line is terminal, so the file goes the moment it is read, while
+/// a `cover` line is not — the closure that covered and then died past that
+/// point replaces its line with the diagnosis a bare `127` would otherwise
+/// lose, and taking the file on the first read would drop that line into a
+/// file nobody reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_closure_report_is_removed_only_once_the_boxs_fate_is_known() {
+    let dir = tempfile::tempdir().expect("a temp dir for the closure reports");
+    let failed = dir.path().join("a-failed-closure");
+    std::fs::write(
+        &failed,
+        "failed joining the box's classifier leaf errno 1\n",
+    )
+    .expect("the closure's dying line");
+
+    super::report_box_closure(
+        failed.clone(),
+        "a session".to_string(),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        !failed.exists(),
+        "a failed line settles the fate: the removal is owed the moment it \
+         is read, not ten seconds later"
+    );
+
+    let covered = dir.path().join("a-covered-closure");
+    std::fs::write(&covered, "cover cgroup2\n").expect("the cover the closure took");
+    let watching = tokio::spawn(super::report_box_closure(
+        covered.clone(),
+        "a session".to_string(),
+        Duration::from_millis(300),
+    ));
+    // The watch has read the cover line by now — the file is there from the
+    // first poll — and still holds it: the fate is not known yet.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        covered.exists(),
+        "a cover line does not settle the fate, so the report stays for the \
+         failure that can still replace it"
+    );
+    watching.await.expect("the watch ends on its own");
+    assert!(
+        !covered.exists(),
+        "the watch's window is the fate known by default: the removal is \
+         owed at the end of it, and only then"
+    );
+}
+
+/// A [`SandboxLauncher`] for the launch-path test: the fakerepo context the
+/// channel tests use, a switch client pointed at a binary that is not there,
+/// and no composition — everything a launch needs to reach its own
+/// decisions, and nothing that could fetch or build. The state dir travels
+/// out with the launcher, because the context reads it long after this
+/// returns.
+fn sandbox_launcher(network_mode: sessions::NetworkMode) -> (SandboxLauncher, tempfile::TempDir) {
+    let state = tempfile::tempdir().expect("a state dir for the launcher's context");
+    (launcher_in(network_mode, state.path()), state)
+}
+
+/// The same launcher over a *given* state dir, so a test that drives more
+/// than one launch can hold one daemon's state under all of them — the real
+/// daemon builds one launcher per launch, so the per-launch construction is
+/// production's shape; only the state dir is shared.
+fn launcher_in(
+    network_mode: sessions::NetworkMode,
+    state_path: &std::path::Path,
+) -> SandboxLauncher {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let config = mctx::ConfigBuilder::new()
+        .with_state_dir(state_path.to_path_buf())
+        .with_repo_dir(manifest_dir.join("../mctx/testdata/fakerepo"))
+        .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
+        .with_no_fetch(true)
+        .build()
+        .expect("the fakerepo context builds");
+    SandboxLauncher {
+        ctx: mctx::Context::new(config).expect("the fakerepo context loads"),
+        attach_env: AttachEnv::default(),
+        network_mode,
+        net_switch: std::sync::Arc::new(tokio::sync::Mutex::new(crate::net::SwitchClient::new(
+            "/nonexistent/gvproxy",
+            state_path.to_path_buf(),
+        ))),
+        policy: sessions::SessionPolicy::default(),
+        own_address: None,
+        composition: None,
+        session: crate::session::WeakSessionHandle::dangling(),
+        // The tests here drive the session's own launches unless one sets
+        // the purpose itself (`a_hook_launch_does_not_advise_unenforced_placement`).
+        for_hooks: false,
+    }
+}
+
+/// The launch-path half of the guest refusal: the predicate says which
+/// launch must be refused, and this drives the launcher itself, with the
+/// guest flag handed in as production hands it in, so the refusal the
+/// predicate names is the one `launch` returns — for the host-address box in
+/// the guest, and for no other launch. A none box, an own-IP box and a
+/// native host-address box go through the same tree-less host and none is
+/// stopped by the classifier: what each returns is whatever its launch
+/// found next, because the baseline packages are not materializable in the
+/// unit-test environment — which is exactly why the refusal's *absence* is
+/// the assertion, and a launched-and-dropped [`Launched`] is what its `Drop`
+/// promises it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_launch_refuses_only_the_unplaced_host_address_box() {
+    use sessions::NetworkMode;
+
+    // The one host state this proof cannot run on: a tree this daemon can
+    // place a child in. The refusal it asserts is the guest's answer to a
+    // leaf decision that came back `None`, and on a delegated host the launch
+    // gets a leaf instead, so the guest's host-address launch proceeds past
+    // the gate and the proof's assertions would be measuring a different
+    // launch's answer. The placement probe is the same one the launch runs,
+    // so the skip is the deployment's own state, printed rather than passed
+    // off as a pass.
+    if sandbox2::classifier::probe_child_placement(std::path::Path::new(
+        sandbox2::classifier::TREE_ROOT,
+    ))
+    .is_ok()
+    {
+        eprintln!(
+            "skipping guest_launch_refuses_only_the_unplaced_host_address_box: this \
+             daemon can place a child in its classifier tree, so a guest \
+             host-address launch gets a leaf here and is not refused; the refusal \
+             is proved on a host with no placeable tree"
+        );
+        return;
+    }
+
+    const REFUSAL: &str = "this guest has no classifier tree to place a host-address box in";
+    for (guest, mode, refused, why) in [
+        (
+            true,
+            NetworkMode::HostNet,
+            true,
+            "a guest's host-address box",
+        ),
+        (true, NetworkMode::NoNet, false, "a guest's none box"),
+        (true, NetworkMode::OwnIp, false, "a guest's own-IP box"),
+        (
+            false,
+            NetworkMode::HostNet,
+            false,
+            "a native host-address box",
+        ),
+    ] {
+        let (launcher, _state) = sandbox_launcher(mode);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            launcher.launch(
+                guest,
+                sessions::SessionId::nil(),
+                "refusal-proof".to_string(),
+                "guest".to_string(),
+                test_paths(),
+                DEFAULT_SIZE,
+            ),
+        )
+        .await
+        .expect("the launch decides within its timeout")
+        .map(|launched| {
+            // Nothing a launch returns outlives this block: the process and
+            // its leaf are what the guard's `Drop` reaps when it goes.
+            drop(launched);
+        });
+        match (outcome, refused) {
+            (Err(e), true) => {
+                eprintln!("{why}: refused with {e}");
+                assert!(
+                    e.to_string().contains(REFUSAL),
+                    "{why} is refused with the named error, not: {e}"
+                );
+            }
+            (Err(e), false) => {
+                eprintln!("{why}: launches past the classifier gate, and stops at {e}");
+                assert!(
+                    !e.to_string().contains(REFUSAL),
+                    "{why} is not a host-address box this guest cannot place, so \
+                     it is not refused on that ground: {e}"
+                );
+            }
+            (Ok(()), false) => eprintln!("{why}: launched"),
+            (Ok(()), true) => panic!("{why} must be refused, and was launched"),
+        }
+    }
+}
+
+/// The unenforced-placement record is not a once-per-daemon latch: the
+/// resolver-hook advisory it is modelled on (NET-122, design §7.1) advises on
+/// every session start, so two launches on one daemon each write the record
+/// the launch emits at its placement decision — attributed to its session,
+/// carrying the same text the session's banner gets and the decision in the
+/// machine spelling a reader greps for (`host_ip_enforcement`, spelled
+/// `per_box` / `none`).
+///
+/// Both forms are the daemon's surfaces, and no client reads either: the
+/// record lives on the daemon's log stream — not the session reply, not the
+/// CLI's start output — and the banner is written onto the session's own pty,
+/// the in-session surface. Carrying the field out to a client over the
+/// session reply and `min doctor` is issue #1773, outside this task's layers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_unenforced_record_fires_on_every_launch_and_carries_the_field() {
+    use sessions::NetworkMode;
+
+    // The one host state this proof cannot run on: a tree this daemon can
+    // place a child in (the guest refusal test's skip, for the same reason).
+    // The record fires only for a native host-address launch that got no
+    // leaf, and on a delegated host the launch gets one, so there is nothing
+    // to record — the skip is the deployment's own state, printed rather than
+    // passed off as a pass.
+    if sandbox2::classifier::probe_child_placement(std::path::Path::new(
+        sandbox2::classifier::TREE_ROOT,
+    ))
+    .is_ok()
+    {
+        eprintln!(
+            "skipping the_unenforced_record_fires_on_every_launch_and_carries_the_field: \
+             this daemon can place a child in its classifier tree, so a native \
+             host-address launch gets a leaf here and the record never fires; \
+             the record is proved on a host with no placeable tree"
+        );
+        return;
+    }
+
+    let capture = crate::test_harness::captured_log();
+    const NOTICE: &str = "this host places no classifier leaf for this session";
+    const RECORD: &str = "the session's host-address box runs unenforced on this host";
+    const MACHINE_FIELD: &str = "host_ip_enforcement=none";
+
+    // One daemon: one state dir, two launches of it. The real daemon builds
+    // its launcher per launch, so the launchers are per-launch while the
+    // state they read and write stays the daemon's own.
+    let state = tempfile::tempdir().expect("a state dir for the daemon's context");
+    for (label, name) in [
+        ("first", "notice-proof-first"),
+        ("second", "notice-proof-second"),
+    ] {
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            launcher_in(NetworkMode::HostNet, state.path()).launch(
+                // Native: a guest's unplaced host-address box is refused
+                // instead of advised, so only the native launch reaches the
+                // record.
+                false,
+                sessions::SessionId::nil(),
+                name.to_string(),
+                "user".to_string(),
+                test_paths(),
+                DEFAULT_SIZE,
+            ),
+        )
+        .await
+        .expect("the launch decides within its timeout");
+        // The launch is driven for its record, which fires at the placement
+        // decision — before the env build, which fails on this box's
+        // unit-test graph ("no such package: base") — so the launch need not
+        // complete, and nothing of it is kept: whatever it returned, its
+        // guards run on the drop.
+        drop(outcome);
+
+        // The daemon-log record, per launch: this launch's own, attributed
+        // and carrying the decision in the machine spelling — a
+        // once-per-daemon latch would leave this launch without one.
+        let logged = capture.contents();
+        let record = logged
+            .lines()
+            .find(|line| line.contains(RECORD) && line.contains(&format!("session={name}")))
+            .unwrap_or_else(|| {
+                panic!("no unenforced-placement record for the {label} launch, got: {logged}")
+            });
+        assert!(
+            record.contains(NOTICE),
+            "the record carries the same text the session's banner gets: {record}"
+        );
+        assert!(
+            record.contains(MACHINE_FIELD),
+            "the record carries the decision in the machine spelling: {record}"
+        );
+    }
+}
+
+/// A launch minted for lifecycle hooks is not a session start, so it advises
+/// on neither surface: the record would count one hook run as one session
+/// start on the daemon's log, and the banner would be written into a hook pty
+/// nobody reads. The same tree-less host, the same native host-address mode:
+/// the session's own launch records the advisory, the hook launch — whose box
+/// is placed (or left unenforced) exactly like the session's — stays silent.
+///
+/// The record is the form this box can observe: the banner's write sits after
+/// the env build, which fails on this box's unit-test graph before any pty is
+/// opened, so the banner is pinned to the same `advise` gate by construction
+/// and its suppression is proved at the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hook_launch_does_not_advise_unenforced_placement() {
+    use sessions::NetworkMode;
+
+    // The one host state this proof cannot run on: a tree this daemon can
+    // place a child in (the guest refusal test's skip, for the same reason).
+    // On a delegated host the launch gets a leaf and neither launch advises,
+    // so there is nothing to tell apart here.
+    if sandbox2::classifier::probe_child_placement(std::path::Path::new(
+        sandbox2::classifier::TREE_ROOT,
+    ))
+    .is_ok()
+    {
+        eprintln!(
+            "skipping a_hook_launch_does_not_advise_unenforced_placement: this \
+             daemon can place a child in its classifier tree, so a native \
+             host-address launch gets a leaf here and neither launch advises; \
+             the gate is proved on a host with no placeable tree"
+        );
+        return;
+    }
+
+    let capture = crate::test_harness::captured_log();
+    const RECORD: &str = "the session's host-address box runs unenforced on this host";
+    // The per-launch note from the placement decision itself — not the
+    // advisory, and not gated with it. Which note a tree-less host records
+    // depends on what covers the tree root: under no cgroup2 mount the tree
+    // is not real; under one with no tree installed — every cgroup2 host,
+    // this test's CI runner included — the placement probe's throwaway leaf
+    // is what finds the tree missing. Either pins the launch to the same
+    // decision point.
+    const HOOK_UNGATED_NOTES: [&str; 2] = [
+        "this host has no classifier tree to place a box in",
+        "the classifier tree is not installed on this host",
+    ];
+    const SESSION: &str = "advice-proof-session";
+    const HOOK: &str = "advice-proof-hook";
+
+    let state = tempfile::tempdir().expect("a state dir for the daemon's context");
+
+    // The session's own launch, first: its record is the control that keeps
+    // the absence below honest — if the advisory stopped firing entirely,
+    // both launches would be silent and the absence would prove nothing.
+    let session_launch = tokio::time::timeout(
+        Duration::from_secs(30),
+        launcher_in(NetworkMode::HostNet, state.path()).launch(
+            false,
+            sessions::SessionId::nil(),
+            SESSION.to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+        ),
+    )
+    .await
+    .expect("the launch decides within its timeout");
+    drop(session_launch);
+    let logged = capture.contents();
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains(RECORD) && line.contains(&format!("session={SESSION}"))),
+        "the session's own launch records the advisory, got: {logged}"
+    );
+
+    // The hook launch: the same launch with the hook purpose on, which is
+    // how the session's hook path mints it (`launch_host_for_hooks`).
+    let mut hook_launcher = launcher_in(NetworkMode::HostNet, state.path());
+    hook_launcher.for_hooks = true;
+    let hook_launch = tokio::time::timeout(
+        Duration::from_secs(30),
+        hook_launcher.launch(
+            false,
+            sessions::SessionId::nil(),
+            HOOK.to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+        ),
+    )
+    .await
+    .expect("the launch decides within its timeout");
+    drop(hook_launch);
+
+    let logged = capture.contents();
+    // The hook launch got to the placement decision: the tree-absent note
+    // `create_session_leaf` records per launch is not the advisory and is
+    // not gated with it, so its presence pins the launch's path to the same
+    // point the session's launch recorded from — the absence below is the
+    // gate, not an early exit.
+    assert!(
+        logged.lines().any(|line| {
+            // That note's field is logged as a borrowed string, which
+            // tracing quotes (`session="…"`), unlike the advisory's
+            // `Display` field this test's other asserts match on.
+            HOOK_UNGATED_NOTES.iter().any(|note| line.contains(note))
+                && line.contains(&format!("session=\"{HOOK}\""))
+        }),
+        "the hook launch reached the placement decision, got: {logged}"
+    );
+    assert!(
+        !logged
+            .lines()
+            .any(|line| line.contains(RECORD) && line.contains(&format!("session={HOOK}"))),
+        "a hook launch is not a session start and records no advisory, got: {logged}"
+    );
 }

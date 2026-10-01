@@ -1916,6 +1916,21 @@ impl Session {
     /// in and comes back out because progress rendering borrows it for the
     /// duration; storing the result is left to the caller, since attach only
     /// keeps a host it could bind to.
+    ///
+    /// `for_hooks` says what the launch is *for*, which `phase` cannot say:
+    /// the phase records the status-gate posture (an attach and a teardown
+    /// hook launch are both `Attached`; finalize's activation launch is
+    /// `Activating`), while this flag marks the launches minted only for
+    /// lifecycle hooks, whose pty nobody reads. It is the launcher's to
+    /// carry, so the launch-scoped decisions downstream (the
+    /// unenforced-placement advisory) can tell a session start from a hook
+    /// run.
+    // Left positional: three call sites, each naming every argument it means,
+    // so a struct would be ceremony rather than clarity.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "three call sites, each naming every argument it means"
+    )]
     async fn launch_host(
         &mut self,
         session_hnd: SessionHandle,
@@ -1924,6 +1939,7 @@ impl Session {
         attach_env: session_host::AttachEnv,
         progress: Option<ChannelProgress>,
         phase: LaunchPhase,
+        for_hooks: bool,
     ) -> Result<(Option<Channel<Msg>>, LaunchedHost), AttachError> {
         let record = self.record.record().await.unwrap();
         let paths = self.paths().await;
@@ -1933,7 +1949,7 @@ impl Session {
         // republish them for the shell to re-read.
         let connection_env = attach_env.connection_env();
         let launcher = self
-            .session_launcher(session_hnd, &record, attach_env, phase)
+            .session_launcher(session_hnd, &record, attach_env, phase, for_hooks)
             .await?;
         // Where the shell-exit prompt's save-then-delete lane archives the
         // changed files. Daemon-side and session-independent; created on
@@ -2096,6 +2112,7 @@ impl Session {
                 session_host::AttachEnv::default(),
                 None,
                 LaunchPhase::Attached,
+                false,
             )
             .await?;
 
@@ -2128,6 +2145,7 @@ impl Session {
                 attach_env,
                 Some(progress),
                 LaunchPhase::Attached,
+                false,
             )
             .await?;
         let channel = channel.expect("progress hands back the channel it was given");
@@ -2298,6 +2316,10 @@ impl Session {
                 session_host::AttachEnv::default(),
                 None,
                 phase,
+                // This launch exists only so the hooks have namespaces to
+                // join — a hook run, not a session start. See
+                // [`Session::launch_host`].
+                true,
             )
             .await
             .map_err(|e| {
@@ -2334,6 +2356,7 @@ impl Session {
         record: &Record,
         attach_env: session_host::AttachEnv,
         phase: LaunchPhase,
+        for_hooks: bool,
     ) -> Result<session_host::SandboxLauncher, AttachError> {
         // R2.1: reject a policy that is incompatible with the network mode
         // (e.g. ingress forwards on a non-`OwnIp` PTask) before launching the
@@ -2394,6 +2417,8 @@ impl Session {
             // A weak handle so in-sandbox `min build` can drive session
             // side-ops without keeping the actor alive past teardown.
             session: session.downgrade(),
+            // What this launch is for; see [`Session::launch_host`].
+            for_hooks,
         })
     }
 
@@ -2413,6 +2438,7 @@ impl Session {
         record: &Record,
         _attach_env: session_host::AttachEnv,
         _phase: LaunchPhase,
+        _for_hooks: bool,
     ) -> Result<session_host::MockLauncher, AttachError> {
         // Mirror the production R2.1 gate so test launches reject a
         // policy/network-mode mismatch the same way production does.
