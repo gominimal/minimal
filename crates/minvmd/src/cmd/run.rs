@@ -908,8 +908,11 @@ mod tests {
     fn node_port_assigned_on_host_and_handed_to_daemon() {
         // A port the test holds is busy: the assignment falls through to an
         // OS-assigned port rather than failing the boot over a shared-host
-        // conflict — the case of a native daemon and a VM on one host.
-        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        // conflict — the case of a native daemon and a VM on one host. The
+        // hold is on the wildcard address the assigner itself probes, so the
+        // collision is one every host agrees on: a specific-address hold
+        // collides with a wildcard probe on Linux and not everywhere else.
+        let held = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
         let busy = held.local_addr().unwrap().port();
         let assigned = super::assign_node_port(busy, false).unwrap();
         assert_ne!(assigned, busy, "a held port is not assigned as-is");
@@ -917,8 +920,9 @@ mod tests {
 
         // A port the test just released is free again: the default-first
         // probe assigns it as asked — the case the session e2e's hardcoded
-        // default proxy port depends on.
-        let freed = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        // default proxy port depends on. Released on the wildcard the probe
+        // addresses, like the hold above.
+        let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
         let free = freed.local_addr().unwrap().port();
         drop(freed);
         assert_eq!(
@@ -927,8 +931,9 @@ mod tests {
             "a free port is assigned as asked"
         );
 
-        // The answerer's probe is the same default-first over UDP.
-        let held_udp = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        // The answerer's probe is the same default-first over UDP, held on
+        // the same wildcard the UDP probe addresses.
+        let held_udp = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
         let busy_udp = held_udp.local_addr().unwrap().port();
         let assigned_udp = super::assign_node_port(busy_udp, true).unwrap();
         assert_ne!(
