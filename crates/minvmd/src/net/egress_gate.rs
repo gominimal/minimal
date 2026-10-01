@@ -468,6 +468,12 @@ enum ControlEnd {
     /// hijacking request however late in the connection's life it arrives
     /// and the only safe number of further bytes to relay is none.
     SpokePastRequest,
+    /// The guest spoke its one request's body and then said nothing for the
+    /// whole drain bound. Its silence is its normal posture — it is waiting
+    /// for the answer — so the gate does not read it as a close, but it does
+    /// not hold the leg past the bound either: the leg ends so the exchange
+    /// can finish bounded whichever peer has gone quiet.
+    GuestSilent,
 }
 
 /// A running host-side egress gate: the accept loop on the gate socket, plus
@@ -721,10 +727,11 @@ async fn accept_loop<A: GuestSource>(
 /// the connection lives, until the guest or the switch goes away.
 ///
 /// `handshake_timeout` bounds everything up to and including the forwarded
-/// head, and, on a control connection, the drain of the answer that follows
-/// the request's end. It is a parameter only so a test can shrink it; every
-/// caller outside this module's tests reaches a connection through
-/// [`accept_loop`], which passes [`HANDSHAKE_TIMEOUT`].
+/// head, and, on a control connection, the wait on a guest gone silent past
+/// its request and the drain of the answer that follows the request's end.
+/// It is a parameter only so a test can shrink it; every caller outside this
+/// module's tests reaches a connection through [`accept_loop`], which passes
+/// [`HANDSHAKE_TIMEOUT`].
 async fn serve_connection(
     mut guest: UnixStream,
     switch_sock: PathBuf,
@@ -915,6 +922,15 @@ async fn relay_frames(
 /// spoke. The response leg ending is the only thing on this side that knows,
 /// so whichever leg ends first takes the relay down with it.
 ///
+/// The request leg's own wait is bounded past the body, where the guest's
+/// silence is at its widest: the guest has no reason to speak while it waits
+/// for the answer, so the probe that ends the leg on a byte past the request
+/// runs under `drain_timeout` as well. A guest that spoke its one request and
+/// then waits — its normal posture — no longer holds the relay, the dial and
+/// the socket halves for the gate's lifetime on a switch that neither answers
+/// nor hangs up: the leg ends at the bound, and the release runs through the
+/// same bounded drain [`finish_control`] gives every other end.
+///
 /// Whichever way the request leg ends, the exchange's answer is still owed:
 /// the switch's side is half-closed, so gvproxy sees the request's end and
 /// answers the one request it was given — refused or not, the guest made a
@@ -933,11 +949,17 @@ async fn relay_control(
     drain_timeout: Duration,
 ) {
     let mut response = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
-    let splice = splice_control(guest, switch, body);
+    let splice = splice_control(guest, switch, body, drain_timeout);
     tokio::pin!(splice);
     tokio::select! {
         (end, mut switch) = &mut splice => match end {
-            ControlEnd::GuestClosed => {
+            // A guest that closed, and one that spoke its request and then
+            // said nothing for the whole bound — its silence is its normal
+            // posture while it waits on the answer — both leave the request
+            // leg done. The answer is owed either way: the switch's side is
+            // half-closed, so gvproxy sees the request's end and answers it,
+            // and the drain that delivers it is bounded.
+            ControlEnd::GuestClosed | ControlEnd::GuestSilent => {
                 finish_control(&mut response, &mut switch, drain_timeout).await;
             }
             ControlEnd::SpokePastRequest => {
@@ -1027,10 +1049,14 @@ async fn finish_control(
 /// those bytes are refused **unread**: the gate parses no second request,
 /// because gvproxy hijacks a hijacking request however late in the
 /// connection's life it arrives, and the only safe number of further bytes
-/// to relay is none. The switch half comes back out beside the leg's end, so
-/// its caller can half-close the switch's side once the request is spoken —
-/// the half is the splice's to write on, not its caller's to hold while the
-/// splice runs.
+/// to relay is none. And a guest that says nothing for the whole
+/// `drain_timeout` past its body has gone quiet in its normal posture —
+/// waiting on the answer — so the leg's wait on it ends at the bound
+/// ([`ControlEnd::GuestSilent`]) rather than holding the exchange for the
+/// gate's lifetime on a switch that never speaks. The switch half comes back
+/// out beside the leg's end, so its caller can half-close the switch's side
+/// once the request is spoken — the half is the splice's to write on, not
+/// its caller's to hold while the splice runs.
 ///
 /// The body is never parsed, and not only because it is the guest daemon's
 /// own plumbing — a `Content-Length`-framed JSON blob, and a control exchange
@@ -1047,6 +1073,7 @@ async fn splice_control(
     mut guest: Prefixed<OwnedReadHalf>,
     mut switch: OwnedWriteHalf,
     body: usize,
+    drain_timeout: Duration,
 ) -> (ControlEnd, OwnedWriteHalf) {
     let mut remaining = body;
     let mut chunk = vec![0u8; CONTROL_READ];
@@ -1073,14 +1100,26 @@ async fn splice_control(
     // The body is spoken. One request per connection: the next byte —
     // whatever it is, and the gate does not read what it would be — ends
     // the leg as spoken-past, and is never written on.
+    //
+    // The probe is bounded by the drain bound, because the guest's silence
+    // past its request is its normal posture — it is waiting for the answer
+    // — and an unbounded wait here would hold this leg, and with it the
+    // relay task, the gate's dial and both socket halves, for the gate's
+    // lifetime on a switch that neither answers nor closes. Past the bound
+    // the leg ends ([`ControlEnd::GuestSilent`]) and the caller gives the
+    // switch the same bound to answer through the drain it already runs, so
+    // the exchange ends bounded whichever peer has gone quiet.
     let mut probe = [0u8; 1];
-    match guest.read(&mut probe).await {
-        Ok(0) => (ControlEnd::GuestClosed, switch),
-        Ok(_) => (ControlEnd::SpokePastRequest, switch),
-        Err(error) => {
+    match tokio::time::timeout(drain_timeout, guest.read(&mut probe)).await {
+        Ok(Ok(0)) => (ControlEnd::GuestClosed, switch),
+        Ok(Ok(_)) => (ControlEnd::SpokePastRequest, switch),
+        Ok(Err(error)) => {
             tracing::warn!(%error, "egress gate control leg ended on an error");
             (ControlEnd::GuestClosed, switch)
         }
+        // No byte came and no close either: the guest is only waiting, and
+        // the bound is what releases the leg.
+        Err(_) => (ControlEnd::GuestSilent, switch),
     }
 }
 
@@ -3217,6 +3256,89 @@ mod tests {
             Ok(Ok(n)) => panic!("the gate left {n} byte(s) for a drained guest to read"),
             Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
             Err(_) => panic!("a switch that never answered held the relay past {DEADLINE:?}"),
+        }
+    }
+
+    /// A guest that speaks its control request and then stays connected
+    /// releases the relay at the drain bound when the switch neither answers
+    /// nor closes — the shape the bound was added for that a guest-close does
+    /// not reach: the guest is in its normal posture, waiting for the answer,
+    /// so it neither closes nor speaks past its request, and a wedged
+    /// gvproxy neither answers nor hangs up. Neither leg of the exchange then
+    /// has anything to end it, and the relay task, the gate's dial and both
+    /// socket halves would hang for the gate's lifetime; the probe read
+    /// running under the same bound the drain runs under is what ends the
+    /// request leg at the bound and hands the release to the drain.
+    #[tokio::test]
+    async fn a_guest_silent_after_its_request_releases_the_control_relay_at_the_drain_bound() {
+        // The bound shrunk from [`HANDSHAKE_TIMEOUT`] — the one every real
+        // connection reads and drains under — so the release is watched in
+        // milliseconds rather than five seconds.
+        let bound = Duration::from_millis(200);
+        assert!(
+            bound < HANDSHAKE_TIMEOUT,
+            "the release must be watched in less time than the real bound allows"
+        );
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let table = registry.table();
+        let dir = TempDir::new().expect("a tempdir is creatable");
+        let switch_sock = dir.path().join("gvproxy-switch.sock");
+        let listener = UnixListener::bind(&switch_sock).expect("binding the stand-in switch");
+
+        let log = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (mut guest, gate_end) = UnixStream::pair().expect("pairing the guest's socket");
+        tokio::spawn(serve_connection(
+            gate_end,
+            switch_sock.clone(),
+            table,
+            Arc::new(DropLimiter::new()),
+            bound,
+            UNREGISTERED_SOURCE_PHASE,
+        ));
+        // One control request, spoken whole, and then the guest stays on the
+        // connection: no close, nothing more to say — the posture it waits
+        // an answer in, which is why neither leg can end the exchange.
+        let request =
+            b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+        guest
+            .write_all(request)
+            .await
+            .expect("writing the control request");
+        // The gate's dial is accepted and the request arrives at the switch,
+        // where the stand-in switch reads it and says nothing back, closing
+        // nothing: the wedged switch, byte for byte.
+        let (mut switch, _) = listener.accept().await.expect("accepting the gate's dial");
+        let mut seen = vec![0u8; request.len()];
+        read_within(&mut switch, &mut seen).await;
+        assert_eq!(seen, request, "the one request reached the switch");
+
+        // The bound ends the guest's silent wait, and the release runs
+        // through the drain: the line naming the bound the gate waited out,
+        // with the guest still on the connection — the state whose release
+        // no leg could otherwise supply.
+        wait_for_log(&log, "did not answer a control request within the bound").await;
+        let logged = log.contents();
+        assert!(
+            logged.contains(&format!("drain_timeout={bound:?}")),
+            "the release names the bound it waited out, got: {logged}"
+        );
+        // And the guest's side comes down with the relay, promptly, rather
+        // than hanging on a guest that is only waiting for its answer.
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, guest.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("the gate left {n} byte(s) for a waiting guest to read"),
+            Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
+            Err(_) => {
+                panic!("a silent guest on a wedged switch held the relay past {DEADLINE:?}")
+            }
         }
     }
 
