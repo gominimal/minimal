@@ -643,20 +643,21 @@ mod tests {
 
     #[test]
     fn allocator_exhausts_a_tiny_subnet() {
-        // /29 => 8 addresses; network, gateway, daemon, host-alias, broadcast
-        // reserved, leaving exactly three allocatable hosts (.2 through .4).
+        // /29 => 8 addresses; network, gateway, the Box Egress Proxy's address
+        // (`broadcast - 3`, reserved NET-132), daemon, host-alias, broadcast —
+        // leaving exactly two allocatable hosts (.2 and .3).
         let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
+        assert_eq!(
+            subnet.box_egress_proxy_address(),
+            Ipv4Addr::new(10, 0, 0, 4)
+        );
         let mut a = IpAllocator::new(subnet);
         let got: Vec<_> = std::iter::from_fn(|| a.allocate().ok())
             .map(|l| l.ip)
             .collect();
         assert_eq!(
             got,
-            vec![
-                Ipv4Addr::new(10, 0, 0, 2),
-                Ipv4Addr::new(10, 0, 0, 3),
-                Ipv4Addr::new(10, 0, 0, 4),
-            ]
+            vec![Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3)]
         );
         assert!(matches!(a.allocate(), Err(NetError::SubnetExhausted(_))));
     }
