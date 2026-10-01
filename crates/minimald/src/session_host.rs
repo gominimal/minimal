@@ -1110,10 +1110,11 @@ pub(crate) struct Launched<P, G> {
     /// Path of the session PTY's slave side, so hooks can open the
     /// terminal briefly rather than the host retaining a descriptor.
     tty_path: std::path::PathBuf,
-    /// Whether processes injected into this session should reinstall the
-    /// none-box socket-family filter; `true` when the session was launched
-    /// with [`NetworkMode::NoNet`], since the filter is inherited only by
-    /// children of the filtered process.
+    /// Whether processes injected into this session are entering a none box,
+    /// so the shim must reinstall the none plan's full socket-family seal;
+    /// every other box's injected processes reinstall the confined-families
+    /// seal the shim defaults to.  Every injection is sealed, since the
+    /// filter is inherited only by children of the filtered process.
     seal_injection: bool,
 }
 
@@ -1621,10 +1622,12 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // the baseline snapshot could not be armed.
     workspace_root: std::path::PathBuf,
 
-    // Whether to reinstall the none-box socket-family filter on every process
-    // injected into this session. Set at launch from the network mode, since the
-    // original seccomp filter is inherited by children of the first process, not by
-    // later processes that join its namespaces via `nsenter`.
+    // Whether processes injected into this session are entering a none box.
+    // Set at launch from the plan's seal — the none plan's full seal is the
+    // one an injected process must be told about explicitly, every other
+    // box's confined-families seal is the shim's default — since the filter
+    // installed at launch is inherited by children of the first process, not
+    // by later processes that join its namespaces via `nsenter`.
     #[cfg_attr(test, allow(dead_code))]
     seal_injection: bool,
 
@@ -2272,6 +2275,13 @@ impl SessionLauncher for SandboxLauncher {
         .await
         .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;
 
+        // The none plan's full seal is the one an injected process has to be
+        // told about explicitly (`--seal-none-box`); every other box's
+        // confined-families seal is the shim's default. Derived from the plan
+        // itself — the same data `new_container` seals the box from — so
+        // launch and injection agree by construction.
+        let seal_injection = planned.plan().seal() == sandbox2::SocketSeal::Full;
+
         // Package + env-var union of the launcher baseline and every
         // contribution the composer collected. Packages: baseline set
         // (required for a usable interactive shell) unioned with
@@ -2497,7 +2507,7 @@ impl SessionLauncher for SandboxLauncher {
             guard: env,
             net_guard,
             tty_path,
-            seal_injection: network_mode == NetworkMode::NoNet,
+            seal_injection,
         })
     }
 }
@@ -2706,6 +2716,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         let injection = crate::nsenter::Injection::new(self.session_leader_pid()?, program, args)
             .with_cwd(environment.cwd)
             .with_env(vars);
+        // Every injection is sealed: a none box's full seal is named
+        // explicitly, and any other box's confined-families seal is the
+        // shim's default — either way the shim reinstalls the filter the
+        // launch installed, which the joined process does not inherit.
         let injection = if self.seal_injection {
             injection.seal_none_box()
         } else {
@@ -2777,9 +2791,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 cwd: environment.cwd,
                 vars: environment.vars,
                 // A hook joins the namespaces rather than being forked from the
-                // filtered shell, so a none box's seal has to be handed to it
-                // the same way the interactive attach path hands it to an
-                // injected command.
+                // filtered shell, so the box's seal has to be handed to it the
+                // same way the interactive attach path hands it to an injected
+                // command: the none box's full seal by flag, the shim's
+                // confined-families default for the rest.
                 seal_none_box: self.seal_injection,
             },
             composition,
