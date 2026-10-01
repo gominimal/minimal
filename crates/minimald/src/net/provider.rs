@@ -385,7 +385,12 @@ impl Network for OwnIpNetwork {
     /// box's address spent behind a lease nothing holds.
     fn abandon(&self) -> AbandonFuture<'_> {
         Box::pin(async move {
-            let Some(reserved) = self.reserved.lock().unwrap().take() else {
+            let Some(reserved) = self
+                .reserved
+                .lock()
+                .expect("reserved mutex poisoned")
+                .take()
+            else {
                 // The plan failed or an attach took it; detaching anyway would
                 // decrement the switch's count below the truth.
                 return;
