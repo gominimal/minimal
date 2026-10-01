@@ -112,6 +112,10 @@
 #                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
 #                                    and a direct-tcpip forward relays for real
+#   proxy_sees_each_vm_box_by_its_switch_address
+#                                    NET-132: two VM boxes dial the proxy's
+#                                    address and the leg's stub listener sees
+#                                    each from its own switch address
 #
 # Usage: scripts/session-e2e.sh [case]
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
@@ -128,7 +132,7 @@ E2E_VM="${E2E_VM:-}"
 # before it reaches the proof.
 case "${1:-}" in
   fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
-    | linux_stock_install_runs_vm_boxes)
+    | linux_stock_install_runs_vm_boxes | proxy_sees_each_vm_box_by_its_switch_address)
     E2E_VM="${E2E_VM:-1}"
     if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
       E2E_MINIMAL_ARGS="--provider local-minvmd"
@@ -181,6 +185,8 @@ RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
+BEP_SEED_DIR_A="" # the proxy-delivery proof's first box's seed; removed on teardown
+BEP_SEED_DIR_B="" # its second box's seed; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -471,6 +477,8 @@ teardown() {
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
+  [ -n "$BEP_SEED_DIR_A" ] && rm -rf "$BEP_SEED_DIR_A"
+  [ -n "$BEP_SEED_DIR_B" ] && rm -rf "$BEP_SEED_DIR_B"
   # The forward holds the laptop-side listener; INT is the documented stop,
   # KILL the backstop so a hung relay cannot outlive the run.
   if [ -n "$RETIRED_FWD_PID" ]; then
@@ -6701,6 +6709,169 @@ proof_linux_stock_install_runs_vm_boxes() {
 }
 
 # ---------------------------------------------------------------------------
+# The proxy's address delivers each box by its own switch address (NET-132).
+# Two VM boxes dial the Box Egress Proxy's address on the switch — the
+# virtual IP the plan carves beside the daemon and host-alias addresses —
+# and the delivery leg's stub listener on the host answers each connection
+# with the source address it was presented: `source <addr>`, then an echo.
+# What the stub must see is each box's own switch address. The nat row
+# gvproxy would otherwise render for the proxy's address (the host alias
+# gets one, and the proxy's used to) turns every box's dial into the same
+# host-loopback source — the exact failure this case exists to catch, and
+# the one the leg's unit tests assert the divert prevents. The dial is raw
+# TCP (the shell stack's bash /dev/tcp), so the client adds nothing between
+# the box's stack and the leg; the probe's first line is the record the
+# assertion reads.
+#
+# Lane gating, by where the pieces run: VM-backed Linux (a non-VM lane has
+# no switch fabric and no leg), /dev/kvm present and writable, the guest
+# images staged, and a switch binary available (a switchless boot has no
+# proxy address to dial). Each missing piece skips the case with its name,
+# as the other VM proofs do. Nothing here needs a fresh install, so the
+# lane's own pair drives it: stop the daemon, register two boxes, probe,
+# destroy, stop.
+proof_proxy_sees_each_vm_box_by_its_switch_address() {
+  if [ -z "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
+    echo "proxy sees each VM box by its switch address SKIPPED (VM-backed Linux lane only)"
+    return 0
+  fi
+  if [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; then
+    echo "proxy sees each VM box by its switch address SKIPPED (no writable /dev/kvm)"
+    return 0
+  fi
+  locate_vm_guest_images
+  if [ ! -f "$STAGED_KERNEL" ] || [ ! -f "$STAGED_ROOTFS" ] || [ ! -f "$STAGED_INITRAMFS" ]; then
+    echo "proxy sees each VM box by its switch address SKIPPED (guest images not available)"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ ! -x "$ROOT/.scratch/gvproxy" ]; then
+    echo "proxy sees each VM box by its switch address SKIPPED (no switch binary; set MINVMD_GVPROXY_BIN)"
+    return 0
+  fi
+
+  echo "::group::proxy sees each VM box by its switch address (NET-132: two boxes, the leg, the stub)"
+  # Cold VM boots overrun the default lifecycle timeouts (a generic guest
+  # kernel spends 40-70s probing hardware before pid-1): the same bound the
+  # justfile exports for every recipe, exported here so a standalone run of
+  # this case — no justfile — boots its boxes on the same clock.
+  export MINVMD_READY_TIMEOUT_SECS="${MINVMD_READY_TIMEOUT_SECS:-150}"
+  export MINIMAL_SPAWN_TIMEOUT_SECS="${MINIMAL_SPAWN_TIMEOUT_SECS:-150}"
+  export MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS="${MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS:-150}"
+
+  BEP_SEED_DIR_A="$(mktemp -d /tmp/mnlba.XXXXXX)"
+  BEP_SEED_DIR_A="$(cd "$BEP_SEED_DIR_A" && pwd -P)"
+  BEP_SEED_DIR_B="$(mktemp -d /tmp/mnlbb.XXXXXX)"
+  BEP_SEED_DIR_B="$(cd "$BEP_SEED_DIR_B" && pwd -P)"
+  hook_seed_preamble >"$BEP_SEED_DIR_A/minimal.toml"
+  hook_seed_preamble >"$BEP_SEED_DIR_B/minimal.toml"
+  # Two dirs, not one: a path that already has a session mints no second
+  # one, so the two boxes need two seeds.
+  mkdir "$BEP_SEED_DIR_A/.git" "$BEP_SEED_DIR_B/.git"
+
+  # The proxy's address and the stub's port, hardcoded beside their
+  # definitions: the switch plan carves the proxy at broadcast-3 of the
+  # default subnet (`switch::SwitchSubnet::box_egress_proxy_address`), and
+  # the leg's stub listener binds the DEFAULT_BEP_DELIVERY_ADDR port
+  # (`crate::net::bep_leg::DEFAULT_BEP_DELIVERY_ADDR`) on the host.
+  BEP_PROXY_ADDR="100.64.255.252"
+  BEP_PROXY_PORT="18654"
+  # The plan's first two PTasks — `network + 2` and `+3` — what a fresh
+  # daemon hands the first two boxes it registers, in activation order.
+  BEP_LEASE_A="100.64.0.2"
+  BEP_LEASE_B="100.64.0.3"
+
+  if (
+    mnl stop --force >/dev/null 2>&1 || true
+    bep_a_sid="$(cd "$BEP_SEED_DIR_A" && mnl session activate . --no-prompt --name e2e-bep-a 2>"$WORK/bep-a-activate.err")" || {
+      echo "::error::the first VM box failed to activate"
+      echo "--- activate stderr ---"; cat "$WORK/bep-a-activate.err" 2>/dev/null || true
+      exit 1
+    }
+    bep_a_sid="$(printf '%s\n' "$bep_a_sid" | tail -n1 | tr -d '\r')"
+    echo "box A activated: $bep_a_sid"
+    bep_b_sid="$(cd "$BEP_SEED_DIR_B" && mnl session activate . --no-prompt --name e2e-bep-b 2>"$WORK/bep-b-activate.err")" || {
+      echo "::error::the second VM box failed to activate"
+      echo "--- activate stderr ---"; cat "$WORK/bep-b-activate.err" 2>/dev/null || true
+      exit 1
+    }
+    bep_b_sid="$(printf '%s\n' "$bep_b_sid" | tail -n1 | tr -d '\r')"
+    echo "box B activated: $bep_b_sid"
+
+    # One dial per box, bounded by `timeout` so a leg that never answers
+    # (a frame dropped at the gate) fails the case in seconds, not in
+    # bash's minutes-long connect retries.
+    bep_probe() {
+      local bp_sid="$1" bp_label="$2" bp_out bp_src
+      local bp_err="$WORK/bep-$bp_label-probe.err"
+      bp_out="$(mnl session exec "$bp_sid" \
+        "timeout 45 bash -c 'exec 3<>/dev/tcp/$BEP_PROXY_ADDR/$BEP_PROXY_PORT && head -n1 <&3'" \
+        2>"$bp_err")" || {
+        echo "::error::the probe from $bp_label failed (dialing $BEP_PROXY_ADDR:$BEP_PROXY_PORT)"
+        echo "--- exec stderr ---"; cat "$bp_err" 2>/dev/null || true
+        return 1
+      }
+      bp_src="$(printf '%s\n' "$bp_out" | sed -n 's/^source //p' | head -n1)"
+      if [ -z "$bp_src" ]; then
+        echo "::error::$bp_label's dial did not answer with the stub's source line"
+        echo "--- exec stdout ---"; printf '%s\n' "$bp_out"
+        echo "--- exec stderr ---"; cat "$bp_err" 2>/dev/null || true
+        return 1
+      fi
+      printf '%s\n' "$bp_src"
+    }
+
+    bep_a_src="$(bep_probe "$bep_a_sid" a)" || exit 1
+    echo "box A was presented to the stub as: $bep_a_src"
+    bep_b_src="$(bep_probe "$bep_b_sid" b)" || exit 1
+    echo "box B was presented to the stub as: $bep_b_src"
+
+    # What each source must NOT be — the shapes a translation or a bypass
+    # would present: the nat row's host loopback (the pre-NET-132 shape,
+    # where every box arrives as 127.0.0.1 — also what the stub answers a
+    # host-process dial with), and every reserved address of the subnet:
+    # the network, the gateway, the proxy itself, the daemon, the host
+    # alias and the broadcast.
+    bep_not_shared_or_reserved() {
+      case "$1" in
+        127.0.0.1 | 100.64.0.0 | 100.64.0.1 | 100.64.255.252 | 100.64.255.253 | 100.64.255.254 | 100.64.255.255)
+          echo "::error::$2 was presented as $1 — a shared or reserved address, not a box's own switch address"
+          return 1
+          ;;
+      esac
+      return 0
+    }
+    bep_not_shared_or_reserved "$bep_a_src" "box A" || exit 1
+    bep_not_shared_or_reserved "$bep_b_src" "box B" || exit 1
+
+    # Each box its own: the two sources differ —
+    if [ "$bep_a_src" = "$bep_b_src" ]; then
+      echo "::error::both boxes were presented as $bep_a_src — one shared source, not each box's own"
+      exit 1
+    fi
+    # — and the pair is the plan's first two PTasks, so each really is its
+    # own box's lease (either activation order; any third address would
+    # mean something else took a lease beside these two boxes).
+    if { [ "$bep_a_src" = "$BEP_LEASE_A" ] && [ "$bep_b_src" = "$BEP_LEASE_B" ]; } \
+      || { [ "$bep_a_src" = "$BEP_LEASE_B" ] && [ "$bep_b_src" = "$BEP_LEASE_A" ]; }; then
+      echo "delivered: each box arrived at the stub from its own switch address ($bep_a_src, $bep_b_src)"
+    else
+      echo "::error::the presented sources ($bep_a_src, $bep_b_src) are not the plan's first two PTasks ($BEP_LEASE_A, $BEP_LEASE_B) — the stub saw sources no box holds"
+      exit 1
+    fi
+
+    # The boxes leave with the proof, and the daemon with them.
+    mnl session destroy --force "$bep_a_sid" >/dev/null 2>&1 || true
+    mnl session destroy --force "$bep_b_sid" >/dev/null 2>&1 || true
+    mnl stop --force >/dev/null 2>&1 || true
+  ); then
+    :
+  else
+    fail
+  fi
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch on the first argument: every proof in today's order when none is
 # given, or exactly the named one. The names are the proof functions' suffixes.
 case "${1:-}" in
@@ -6720,6 +6891,7 @@ case "${1:-}" in
     proof_fresh_linux_kvm_activate_local_minvmd
     proof_fresh_arm64_kvm_activate_local_minvmd
     proof_linux_stock_install_runs_vm_boxes
+    proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_native_resolution_without_proxy_env
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
@@ -6732,7 +6904,7 @@ case "${1:-}" in
     | hostnames_recover_and_two_daemons_route \
     | min_internal_names_through_proxy | proxy_refuses_like_direct | retired_surfaces_gone \
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
-    | linux_stock_install_runs_vm_boxes)
+    | linux_stock_install_runs_vm_boxes | proxy_sees_each_vm_box_by_its_switch_address)
     "proof_$1"
     ;;
   *)
@@ -6743,6 +6915,7 @@ case "${1:-}" in
     echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
     echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
     echo "         linux_stock_install_runs_vm_boxes"
+    echo "         proxy_sees_each_vm_box_by_its_switch_address"
     echo "         hostnames_recover_and_two_daemons_route"
     echo "         min_internal_names_through_proxy proxy_refuses_like_direct retired_surfaces_gone"
     exit 2
