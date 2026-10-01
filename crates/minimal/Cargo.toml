@@ -27,6 +27,8 @@ remote-access = []
 anyhow.workspace = true
 async-compression.workspace = true
 async-tar.workspace = true
+# `min mcp --transport http` serves rmcp's streamable-HTTP tower service.
+axum.workspace = true
 clap.workspace = true
 # `unstable-dynamic` buys the completion engine behind `min`'s runtime session
 # completion. Three files depend on it:

@@ -93,23 +93,35 @@ diagnostics go to `<state>/dash.log`.
 min mcp [OPTIONS]
 ```
 
-Serves the [Model Context Protocol](https://modelcontextprotocol.io) over
-stdio, exposing the session plane as a sandboxed shell-execution surface for an
-agent harness. The model can create isolated sandboxes, run commands in them,
-read and write files, and manage sessions. stdout carries the JSON-RPC channel
-and nothing else. Logs go to stderr.
+Serves the [Model Context Protocol](https://modelcontextprotocol.io), exposing
+the session plane as a sandboxed shell-execution surface for an agent harness.
+The model can create isolated sandboxes and run commands in them. It reads and
+writes files and manages the sessions it started.
+
+The default transport is stdio. stdout carries the JSON-RPC channel and nothing
+else, and logs go to stderr. `--transport http` instead serves the MCP
+streamable-HTTP transport, so a client connects over a socket rather than
+inheriting the process's pipes. The endpoint is `/mcp`, and the address actually
+bound goes to stderr.
 
 The global flags choose the daemon the sandboxes live on (`--provider`, `--vm`,
 `--minimal-dir`). The flags below shape the sessions tools create.
 
 | Flag | Description |
 |------|-------------|
+| `--transport <stdio\|http>` | Protocol transport. Defaults to `stdio` |
+| `--bind <ADDR:PORT>` | Address the HTTP transport listens on. Ignored by `stdio`. Defaults to `127.0.0.1:3000` |
 | `--workdir <DIR>` | Directory uploaded into the lazily-created default session. Without it, the first call with no `session_id` uses the current directory |
 | `--network <none\|host_ip\|own_ip>` | Network mode for sessions created by tools. Defaults to `host_ip`, so installs inside a sandbox work |
 | `--loadout <NAME>` | Loadout applied to sessions created by tools. Repeatable |
 | `--no-loadouts` | Apply no loadouts to sessions created by tools. Conflicts with `--loadout` |
 | `--no-hooks` | Run none of the lifecycle hooks of sessions created by tools |
 | `--timeout <SECONDS>` | Default seconds an `exec` call can run before the daemon kills it. Defaults to 120 |
+
+The HTTP transport binds to loopback by default. The server runs unrestricted
+commands inside the sandboxes it creates, so anything that can reach the port can
+run them. A non-loopback `--bind` is a deliberate exposure and carries no
+authentication. The server warns on stderr when it starts that way.
 
 Tools:
 
@@ -136,8 +148,8 @@ destroyed.
 
 `exec` runs non-interactively. There is no PTY, and the server writes `stdin`
 once and then closes it. A command that a sandbox's composed environment cannot
-spawn, such as one whose loadout names a package the daemon cannot materialize,
-fails at the daemon, and the tool returns that message.
+spawn fails at the daemon, and the tool returns that message. This includes a
+command whose loadout names a package the daemon cannot materialize.
 
 Sample client configuration:
 
