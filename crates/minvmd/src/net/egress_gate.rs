@@ -4006,7 +4006,7 @@ mod tests {
         // the line a diagnostic bundle's daemon log tail carries.
         wait_for_log(&h.log, "node-plane baseline set").await;
         let logged = h.log.contents();
-        for category in ["registry=", "cache=", "fabric="] {
+        for category in ["registry=", "cache="] {
             assert!(
                 logged.contains(category),
                 "the start-up line names the baseline entries by category, got: {logged}"

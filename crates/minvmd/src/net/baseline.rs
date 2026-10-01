@@ -36,16 +36,17 @@ use sessions::core::egress::{EgressRules, Ipv4Cidr};
 use switch::SwitchSubnet;
 
 /// A category of the node-plane baseline enumeration: one of the design's
-/// named planes the node plane's own traffic may reach.
+/// named service planes the node plane's own traffic may reach. The set is
+/// bounded to these categories and never a general-purpose allowance for
+/// the switch fabric itself — a frame the node plane sends to a box is the
+/// target box's ingress rules to decide, not this set's, so the categories
+/// name nothing of the boxes' leases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaselineCategory {
     /// The package registry the node plane resolves and fetches from.
     Registry,
     /// The content cache the node plane fetches package content from.
     Cache,
-    /// The switch fabric itself — the node's own plane: its own address, the
-    /// resolver, the host alias, the box leases.
-    Fabric,
 }
 
 impl BaselineCategory {
@@ -57,7 +58,6 @@ impl BaselineCategory {
         match self {
             Self::Registry => "registry",
             Self::Cache => "cache",
-            Self::Fabric => "fabric",
         }
     }
 }
@@ -188,9 +188,14 @@ impl NodePlaneBaseline {
     ///   [`with_registry`](Self::with_registry) and
     ///   [`with_cache`](Self::with_cache) replace these endpoints within
     ///   their category, and a category is replaced, never absent.
-    /// - `fabric`: the whole switch subnet — the node's own plane, its
-    ///   resolver and the box leases included, reachable because it is the
-    ///   plane the node plane lives on.
+    ///
+    /// The set carries no row for the switch fabric itself: the categories
+    /// are the design's named service planes, and the plane the node lives
+    /// on is no allowance of its own — a node-plane frame aimed at a box is
+    /// the target box's ingress rules to decide, so a row naming the box
+    /// leases would hand whoever wears the node's address every box's
+    /// listener, the reach the escape bound (NET-085) exists to keep inside
+    /// the enumerated set.
     ///
     /// The compiled set allows every IP protocol within the admitted
     /// subnets — the categories bound destinations, not protocols — and is
@@ -213,10 +218,6 @@ impl NodePlaneBaseline {
                 BaselineEntry {
                     category: BaselineCategory::Cache,
                     endpoints: vec![format!("{host_alias}/32")],
-                },
-                BaselineEntry {
-                    category: BaselineCategory::Fabric,
-                    endpoints: vec![format!("{}/{}", subnet.network(), subnet.prefix())],
                 },
             ],
         )
@@ -407,9 +408,10 @@ mod tests {
     fn baseline_enumeration_always_carries_registry_and_cache() {
         let baseline = NodePlaneBaseline::built_in(SUBNET);
 
-        // The built-in enumeration carries every category, the registry and
-        // the cache among them, each with an endpoint to admit.
-        assert_eq!(baseline.entries().len(), 3);
+        // The built-in enumeration carries every category — the registry and
+        // the cache, the two the design names — each with an endpoint to
+        // admit.
+        assert_eq!(baseline.entries().len(), 2);
         assert!(
             !entry(&baseline, BaselineCategory::Registry)
                 .endpoints()
@@ -417,11 +419,6 @@ mod tests {
         );
         assert!(
             !entry(&baseline, BaselineCategory::Cache)
-                .endpoints()
-                .is_empty()
-        );
-        assert!(
-            !entry(&baseline, BaselineCategory::Fabric)
                 .endpoints()
                 .is_empty()
         );
