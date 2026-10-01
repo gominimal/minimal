@@ -1482,31 +1482,99 @@ async fn finish_interactive(
 }
 
 /// Finish an activation with no terminal to prompt on: a `Pending` composition
-/// is refused outright, since a headless caller cannot answer the prompt the
-/// daemon routed back, and naming what the daemon could not compose. Every
-/// piece here is `Send`, so the MCP server's [`create_headless_session`] future
-/// is too.
+/// the user policy can auto-decide is resolved without a prompt, while one that
+/// genuinely needs an operator is refused, naming the `user_policy.toml`
+/// snippet that would fix it. Every piece here is `Send`, so the MCP server's
+/// [`create_headless_session`] future is too.
 async fn finish_headless(mut session: CreatedSession) -> Result<ActivatedSession, anyhow::Error> {
     if let Some(minimald_rpc::ConfigureLoadoutResponse::Pending { response }) =
         session.configured.take()
     {
-        send_abort(&mut session.client, response.session_id).await;
-        // The session is aborted and its row withdrawn (T66): the path failed
-        // after registering.
-        withdraw_box_row(
-            session.control_sock.clone(),
-            session.config.name.as_deref(),
-            session.config.box_addresses,
-            session
-                .registered
-                .as_ref()
-                .and_then(|registration| registration.box_id),
-        )
-        .await;
-        bail!(composition_failure_message(
-            &session.utf8_path,
-            "this project needs interactive policy gating, which a headless caller cannot supply"
-        ));
+        // NoPromptHook fake-approves every unapproved item so handle_response
+        // finishes both the var and patch gates and records everything in
+        // `summary`. If anything was recorded, we abort *before* actually
+        // shipping the verdict — the daemon must not see those fake approvals.
+        // Only when `summary` is empty (every daemon-sent item was already
+        // handled by the user's policy) do we submit and let the session go
+        // Active.
+        let session_id = response.session_id;
+        let hooks = prompt::NoPromptHook::new();
+        let verdict = match compute_verdict(
+            response,
+            session.user_policy.clone(),
+            session.compose_options,
+            &hooks,
+        ) {
+            Ok((verdict, _final_policy)) => verdict,
+            Err(e) => {
+                send_abort(&mut session.client, session_id).await;
+                // The session is aborted and its row withdrawn (T66): the path
+                // failed after registering.
+                withdraw_box_row(
+                    session.control_sock.clone(),
+                    session.config.name.as_deref(),
+                    session.config.box_addresses,
+                    session
+                        .registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
+                )
+                .await;
+                // The route an activation actually reaches today: the daemon
+                // routes project config back for gating, so a project it cannot
+                // compose surfaces here rather than as the `Errorable::Err`
+                // before the configure.
+                bail!(composition_failure_message(
+                    &session.utf8_path,
+                    &e.to_string()
+                ));
+            }
+        };
+        let summary = hooks.into_summary();
+        if summary.count() > 0 {
+            send_abort(&mut session.client, session_id).await;
+            // The session is aborted and its row withdrawn (T66): the path
+            // failed after registering.
+            withdraw_box_row(
+                session.control_sock.clone(),
+                session.config.name.as_deref(),
+                session.config.box_addresses,
+                session
+                    .registered
+                    .as_ref()
+                    .and_then(|registration| registration.box_id),
+            )
+            .await;
+            let count = summary.count();
+            let snippet = summary.as_toml_snippet();
+            bail!(
+                "{count} item{s} would require interactive approval, but \
+                 --no-prompt was set (or stdin/stderr is not a terminal).\n\n\
+                 Add the following to {}:\n\n{snippet}\n\
+                 Then re-run this command.",
+                session.policy_path.display(),
+                s = if count == 1 { "" } else { "s" },
+            );
+        }
+        session
+            .collected_patches
+            .extend(approved_patches_from_verdict(&verdict));
+        let submitted = submit_verdict_and_wait(&mut session.client, session_id, verdict).await;
+        if let Err(error) = submitted {
+            // The verdict never landed: the activation is abandoned with its
+            // row (T66).
+            withdraw_box_row(
+                session.control_sock.clone(),
+                session.config.name.as_deref(),
+                session.config.box_addresses,
+                session
+                    .registered
+                    .as_ref()
+                    .and_then(|registration| registration.box_id),
+            )
+            .await;
+            return Err(error);
+        }
     }
     finalize(session).await
 }

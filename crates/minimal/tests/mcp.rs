@@ -211,7 +211,10 @@ async fn mcp_creates_lists_and_destroys_a_session() {
             r#"{"name":"write_file","arguments":{"path":"from-agent.txt","content":"hello from mcp\n"}}"#,
         )
         .await;
-    assert_ne!(write["result"]["isError"], true, "write_file failed: {write}");
+    assert_ne!(
+        write["result"]["isError"], true,
+        "write_file failed: {write}"
+    );
     assert_eq!(
         result_json(&write)["path"],
         "/workbench/from-agent.txt",
