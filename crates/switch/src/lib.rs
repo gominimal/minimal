@@ -284,6 +284,23 @@ impl SwitchSubnet {
         Ipv4Addr::from(u32::from(self.broadcast()) - 2)
     }
 
+    /// The Box Egress Proxy's address (`broadcast - 3`): a second virtual IP of
+    /// the host-gateway, rendered into gvproxy's `gatewayVirtualIPs` so a box
+    /// can route to it, and kept out of the `nat` loopback translation — the
+    /// translation would give the proxy one source for every box and every
+    /// host process, and the box's connection must arrive at the proxy's
+    /// listener from its own switch address (NET-132). The egress gate diverts
+    /// the frames addressed here to the host-side delivery leg before the
+    /// switch sees them, which is what keeps the source.
+    ///
+    /// Reserved from the top alongside the daemon and host-alias addresses and
+    /// never handed to a PTask: [`last_ptask`](Self::last_ptask) stops below
+    /// it.
+    #[must_use]
+    pub fn box_egress_proxy_address(self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.broadcast()) - 3)
+    }
+
     /// The first address that may be allocated to a PTask (`network + 2`,
     /// i.e. the first host after the gateway).
     #[must_use]
@@ -291,12 +308,13 @@ impl SwitchSubnet {
         u32::from(self.network()) + 2
     }
 
-    /// The last address that may be allocated to a PTask (`broadcast - 3`),
-    /// leaving the daemon address at `broadcast - 2` and the host alias at
-    /// `broadcast - 1` reserved.
+    /// The last address that may be allocated to a PTask (`broadcast - 4`),
+    /// leaving the daemon address at `broadcast - 2`, the host alias at
+    /// `broadcast - 1` and the Box Egress Proxy's address at `broadcast - 3`
+    /// reserved.
     #[must_use]
     pub fn last_ptask(self) -> u32 {
-        u32::from(self.broadcast()) - 3
+        u32::from(self.broadcast()) - 4
     }
 }
 
@@ -552,6 +570,16 @@ pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[(Ipv4Addr, MacAddr)
     s.push_str(&format!("    \"{}\": \"127.0.0.1\"\n", subnet.host_alias()));
     s.push_str("  gatewayVirtualIPs:\n");
     s.push_str(&format!("    - \"{}\"\n", subnet.host_alias()));
+    // NET-132: the Box Egress Proxy's address is a second virtual IP of the
+    // host-gateway, so a box can address the proxy on the switch at all, and
+    // it is deliberately nowhere in `nat`: the loopback translation rewrites
+    // every box to one source, and the proxy's listener must see each box by
+    // its own switch address. The egress gate diverts the frames addressed
+    // here to the host-side delivery leg, which is what keeps the source.
+    s.push_str(&format!(
+        "    - \"{}\"\n",
+        subnet.box_egress_proxy_address()
+    ));
     // NET-003: the switch answers `host.min.internal` itself, with the host
     // alias — the address its `nat` table maps to the host's loopback. Rendered
     // from first boot, ahead of any dynamic `min.internal.` registration; the
@@ -584,6 +612,58 @@ mod tests {
         assert_eq!(net.gateway(), Ipv4Addr::new(100, 64, 0, 1));
         assert_eq!(net.host_alias(), Ipv4Addr::new(100, 64, 255, 254));
         assert_eq!(net.daemon_ip(), Ipv4Addr::new(100, 64, 255, 253));
+        assert_eq!(
+            net.box_egress_proxy_address(),
+            Ipv4Addr::new(100, 64, 255, 252)
+        );
+    }
+
+    #[test]
+    fn box_egress_proxy_address_sits_outside_the_lease_pool() {
+        // The proxy's address is reserved from the top like the daemon's and
+        // the host alias's, so no PTask lease can ever collide with it: the
+        // allocatable range stops one address below it, at every prefix the
+        // constructor accepts.
+        for prefix in 8..=29 {
+            let net = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), prefix).unwrap();
+            let proxy = net.box_egress_proxy_address();
+            assert_eq!(proxy, Ipv4Addr::from(u32::from(net.broadcast()) - 3));
+            assert_eq!(net.last_ptask(), u32::from(net.broadcast()) - 4);
+            assert!(u32::from(proxy) > net.last_ptask());
+            assert_ne!(proxy, net.daemon_ip());
+            assert_ne!(proxy, net.host_alias());
+            assert_ne!(proxy, net.broadcast());
+        }
+    }
+
+    #[test]
+    fn proxy_gateway_address_not_translated() {
+        // NET-132: the Box Egress Proxy's address is a gateway virtual IP a
+        // box can route to, and it is deliberately not in the `nat` loopback
+        // translation — the translation would hand the proxy one source for
+        // every box and every host process, and a box's connection to the
+        // proxy must arrive from its own switch address. The host alias keeps
+        // its translation: `host.min.internal` (NET-003) still reaches the
+        // host's loopback through it.
+        let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
+        assert!(
+            yaml.contains("\"100.64.255.254\": \"127.0.0.1\""),
+            "the host alias keeps its nat translation, config was:\n{yaml}"
+        );
+        let nat = yaml
+            .split("  nat:\n")
+            .nth(1)
+            .and_then(|rest| rest.split("  gatewayVirtualIPs:").next())
+            .unwrap_or_default();
+        assert!(
+            !nat.contains("100.64.255.252"),
+            "the proxy's address must not be translated, nat table was:\n{nat}"
+        );
+        assert!(
+            yaml.contains("    - \"100.64.255.252\"\n"),
+            "the proxy's address is a gateway virtual IP a box can route to, \
+             config was:\n{yaml}"
+        );
     }
 
     #[test]
