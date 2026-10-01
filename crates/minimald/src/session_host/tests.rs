@@ -2111,6 +2111,9 @@ fn launcher_in(
         own_address: None,
         composition: None,
         session: crate::session::WeakSessionHandle::dangling(),
+        // The tests here drive the session's own launches unless one sets
+        // the purpose itself (`a_hook_launch_does_not_advise_unenforced_placement`).
+        for_hooks: false,
     }
 }
 
@@ -2209,60 +2212,28 @@ async fn guest_launch_refuses_only_the_unplaced_host_address_box() {
     }
 }
 
-/// Reads a launch's terminal until `needle` has arrived or the deadline
-/// passes, returning everything it saw. The notice is written onto the pty's
-/// slave before the spawn, so it is queued in the kernel by the time the
-/// launch returns — but a pty delivers its queue in chunks, and a
-/// non-blocking read of an empty queue answers `WouldBlock`, so the read
-/// loops with a pause between the empties instead of trusting one chunk to
-/// carry a whole line.
-fn read_terminal_until(
-    master: &mut std::fs::File,
-    needle: &str,
-    deadline: std::time::Instant,
-) -> String {
-    use std::io::Read as _;
-    let mut seen = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        match master.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => seen.extend_from_slice(&chunk[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            // `EIO` and friends: the terminal's other end is gone, and what
-            // was queued before it went is what the terminal received.
-            Err(_) => break,
-        }
-        if std::str::from_utf8(&seen).is_ok_and(|text| text.contains(needle))
-            || std::time::Instant::now() >= deadline
-        {
-            break;
-        }
-    }
-    String::from_utf8_lossy(&seen).into_owned()
-}
-
-/// The unenforced-placement notice is not a once-per-daemon banner: the
+/// The unenforced-placement record is not a once-per-daemon latch: the
 /// resolver-hook advisory it is modelled on (NET-122, design §7.1) advises on
-/// every session start, so two launches on one daemon both print it into
-/// their session terminals, and both carry it in the session's non-TTY form —
-/// the diagnostic record each launch writes for its session, holding the same
-/// text and the decision in the machine spelling a script or an agent reads
-/// without a terminal (`host_ip_enforcement`, spelled `per_box` / `none`).
-/// Each [`Launched`] also carries the decision as the field the launch
-/// returns: `Unenforced`, decided by that launch, never re-derived.
+/// every session start, so two launches on one daemon each write the record
+/// the launch emits at its placement decision — attributed to its session,
+/// carrying the same text the session's banner gets and the decision in the
+/// machine spelling a reader greps for (`host_ip_enforcement`, spelled
+/// `per_box` / `none`).
+///
+/// Both forms are the daemon's surfaces, and no client reads either: the
+/// record lives on the daemon's log stream — not the session reply, not the
+/// CLI's start output — and the banner is written onto the session's own pty,
+/// the in-session surface. Carrying the field out to a client over the
+/// session reply and `min doctor` is issue #1773, outside this task's layers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_unenforced_notice_reaches_every_launch_and_carries_the_field() {
+async fn the_unenforced_record_fires_on_every_launch_and_carries_the_field() {
     use sessions::NetworkMode;
 
     // The one host state this proof cannot run on: a tree this daemon can
     // place a child in (the guest refusal test's skip, for the same reason).
-    // The notice fires only for a native host-address launch that got no
+    // The record fires only for a native host-address launch that got no
     // leaf, and on a delegated host the launch gets one, so there is nothing
-    // to notice — the skip is the deployment's own state, printed rather than
+    // to record — the skip is the deployment's own state, printed rather than
     // passed off as a pass.
     if sandbox2::classifier::probe_child_placement(std::path::Path::new(
         sandbox2::classifier::TREE_ROOT,
@@ -2270,10 +2241,10 @@ async fn the_unenforced_notice_reaches_every_launch_and_carries_the_field() {
     .is_ok()
     {
         eprintln!(
-            "skipping the_unenforced_notice_reaches_every_launch_and_carries_the_field: \
+            "skipping the_unenforced_record_fires_on_every_launch_and_carries_the_field: \
              this daemon can place a child in its classifier tree, so a native \
-             host-address launch gets a leaf here and the notice never fires; \
-             the notice is proved on a host with no placeable tree"
+             host-address launch gets a leaf here and the record never fires; \
+             the record is proved on a host with no placeable tree"
         );
         return;
     }
@@ -2296,7 +2267,7 @@ async fn the_unenforced_notice_reaches_every_launch_and_carries_the_field() {
             launcher_in(NetworkMode::HostNet, state.path()).launch(
                 // Native: a guest's unplaced host-address box is refused
                 // instead of advised, so only the native launch reaches the
-                // notice.
+                // record.
                 false,
                 sessions::SessionId::nil(),
                 name.to_string(),
@@ -2307,13 +2278,16 @@ async fn the_unenforced_notice_reaches_every_launch_and_carries_the_field() {
         )
         .await
         .expect("the launch decides within its timeout");
+        // The launch is driven for its record, which fires at the placement
+        // decision — before the env build, which fails on this box's
+        // unit-test graph ("no such package: base") — so the launch need not
+        // complete, and nothing of it is kept: whatever it returned, its
+        // guards run on the drop.
+        drop(outcome);
 
-        // The non-TTY form, per launch: this launch's own record, attributed
+        // The daemon-log record, per launch: this launch's own, attributed
         // and carrying the decision in the machine spelling — a
-        // once-per-daemon latch would leave this launch without one. The
-        // record fires at the placement decision, which is before the env
-        // build that fails on this box's unit-test graph ("no such package:
-        // base"), so a launch need not complete for its record to exist.
+        // once-per-daemon latch would leave this launch without one.
         let logged = capture.contents();
         let record = logged
             .lines()
@@ -2323,46 +2297,104 @@ async fn the_unenforced_notice_reaches_every_launch_and_carries_the_field() {
             });
         assert!(
             record.contains(NOTICE),
-            "the non-TTY record carries the same text the terminal gets: {record}"
+            "the record carries the same text the session's banner gets: {record}"
         );
         assert!(
             record.contains(MACHINE_FIELD),
             "the record carries the decision in the machine spelling: {record}"
         );
-
-        // The terminal form, for a launch that completes: on this box the
-        // graph has no baseline packages, so the env build stops the launch
-        // and there is no terminal to read — the record above is the form
-        // the unit-test environment can prove, and the terminal write shares
-        // its gate and its text.
-        let launched = match outcome {
-            Ok(launched) => launched,
-            Err(e) => {
-                eprintln!("{label}: launch stopped at {e} — no terminal to read");
-                continue;
-            }
-        };
-        assert_eq!(
-            launched.host_ip_enforcement,
-            Some(super::HostIpEnforcement::Unenforced),
-            "the {label} launch carries its own decision about the box's egress \
-             verdict, not a re-derivation"
-        );
-
-        // The terminal form: the notice reaches this launch's own session
-        // terminal, on this launch — the second launch's terminal is not
-        // relied on to carry the first's.
-        let mut master = std::fs::File::from(launched.master);
-        super::set_nonblocking(master.as_raw_fd())
-            .expect("the test reads the launch terminal without blocking");
-        let terminal = read_terminal_until(
-            &mut master,
-            NOTICE,
-            std::time::Instant::now() + Duration::from_secs(10),
-        );
-        assert!(
-            terminal.contains(NOTICE),
-            "the {label} launch's terminal carries the notice, got: {terminal:?}"
-        );
     }
+}
+
+/// A launch minted for lifecycle hooks is not a session start, so it advises
+/// on neither surface: the record would count one hook run as one session
+/// start on the daemon's log, and the banner would be written into a hook pty
+/// nobody reads. The same tree-less host, the same native host-address mode:
+/// the session's own launch records the advisory, the hook launch — whose box
+/// is placed (or left unenforced) exactly like the session's — stays silent.
+///
+/// The record is the form this box can observe: the banner's write sits after
+/// the env build, which fails on this box's unit-test graph before any pty is
+/// opened, so the banner is pinned to the same `advise` gate by construction
+/// and its suppression is proved at the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hook_launch_does_not_advise_unenforced_placement() {
+    use sessions::NetworkMode;
+
+    // The one host state this proof cannot run on: a tree this daemon can
+    // place a child in (the guest refusal test's skip, for the same reason).
+    // On a delegated host the launch gets a leaf and neither launch advises,
+    // so there is nothing to tell apart here.
+    if sandbox2::classifier::probe_child_placement(std::path::Path::new(
+        sandbox2::classifier::TREE_ROOT,
+    ))
+    .is_ok()
+    {
+        eprintln!(
+            "skipping a_hook_launch_does_not_advise_unenforced_placement: this \
+             daemon can place a child in its classifier tree, so a native \
+             host-address launch gets a leaf here and neither launch advises; \
+             the gate is proved on a host with no placeable tree"
+        );
+        return;
+    }
+
+    let capture = crate::test_harness::captured_log();
+    const RECORD: &str = "the session's host-address box runs unenforced on this host";
+    const SESSION: &str = "advice-proof-session";
+    const HOOK: &str = "advice-proof-hook";
+
+    let state = tempfile::tempdir().expect("a state dir for the daemon's context");
+
+    // The session's own launch, first: its record is the control that keeps
+    // the absence below honest — if the advisory stopped firing entirely,
+    // both launches would be silent and the absence would prove nothing.
+    let session_launch = tokio::time::timeout(
+        Duration::from_secs(30),
+        launcher_in(NetworkMode::HostNet, state.path()).launch(
+            false,
+            sessions::SessionId::nil(),
+            SESSION.to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+        ),
+    )
+    .await
+    .expect("the launch decides within its timeout");
+    drop(session_launch);
+    let logged = capture.contents();
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains(RECORD) && line.contains(&format!("session={SESSION}"))),
+        "the session's own launch records the advisory, got: {logged}"
+    );
+
+    // The hook launch: the same launch with the hook purpose on, which is
+    // how the session's hook path mints it (`launch_host_for_hooks`).
+    let mut hook_launcher = launcher_in(NetworkMode::HostNet, state.path());
+    hook_launcher.for_hooks = true;
+    let hook_launch = tokio::time::timeout(
+        Duration::from_secs(30),
+        hook_launcher.launch(
+            false,
+            sessions::SessionId::nil(),
+            HOOK.to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+        ),
+    )
+    .await
+    .expect("the launch decides within its timeout");
+    drop(hook_launch);
+
+    let logged = capture.contents();
+    assert!(
+        !logged
+            .lines()
+            .any(|line| line.contains(RECORD) && line.contains(&format!("session={HOOK}"))),
+        "a hook launch is not a session start and records no advisory, got: {logged}"
+    );
 }

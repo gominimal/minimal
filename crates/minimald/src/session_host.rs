@@ -2315,6 +2315,19 @@ pub(crate) struct SandboxLauncher {
     /// Weak handle back to the owning session actor, for  `min` commands
     /// (e.g. `min build`) to drive session side-ops.
     pub(crate) session: crate::session::WeakSessionHandle,
+    /// Whether this launch exists to run lifecycle hooks rather than to serve
+    /// a person: minted by the session's hook path — activation at finalize,
+    /// teardown at detach or destroy — headless, its pty read by nobody.
+    ///
+    /// The unenforced-placement advisory is a session surface, and a hook run
+    /// is not a session start: its daemon-log record would count one hook run
+    /// as one session start, and its banner would be written into a hook pty
+    /// no one reads. So a hook launch emits neither form. This is *not* the
+    /// launch phase (`LaunchPhase`): the destroy path's hook launch is
+    /// `Attached` exactly like an attach's, and finalize's activation launch
+    /// is `Activating` — only the caller that mints the launch knows what it
+    /// is for, which is why it travels on the launcher.
+    pub(crate) for_hooks: bool,
 }
 
 /// Reaps a freshly-spawned sandbox process if the launch is abandoned
@@ -2798,11 +2811,14 @@ fn refuses_unenforced_host_address_box(guest: bool, network_mode: NetworkMode) -
 ///
 /// The counterpart of [`refuses_unenforced_host_address_box`]: natively an
 /// unplaced host-address box is NET-079's advisory posture, never a refusal
-/// (design §7.4), so every launch that ends without a leaf says so — once per
-/// launch, like the resolver advisory it is modelled on (design §7.1), never
-/// once per daemon. A guest never advises: its unplaced box is refused, and
-/// a box that was placed needs no advice. Pure over its inputs, so the gate
-/// is pinned where it is written.
+/// (design §7.4), so every *session* launch that ends without a leaf says so
+/// — once per launch, like the resolver advisory it is modelled on (design
+/// §7.1), never once per daemon. A guest never advises: its unplaced box is
+/// refused, and a box that was placed needs no advice. What this predicate
+/// does not carry is the launch's audience — a launch minted for lifecycle
+/// hooks advises nobody (a hook run is not a session start), which the
+/// launch itself folds in over [`SandboxLauncher::for_hooks`]. Pure over its
+/// inputs, so the gate is pinned where it is written.
 fn advises_unenforced_placement(
     guest: bool,
     network_mode: NetworkMode,
@@ -2871,6 +2887,12 @@ impl SessionLauncher for SandboxLauncher {
         let composition = self.composition;
         let attach_env = self.attach_env;
         let session = self.session;
+        // What this launch is for, decided by the caller that minted it (see
+        // [`SandboxLauncher::for_hooks`]): it gates the advisory below, never
+        // the placement itself — a hook launch's box is placed like any
+        // other's, or runs unenforced like any other's; only the advice is
+        // for the session's audience.
+        let for_hooks = self.for_hooks;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
@@ -2928,23 +2950,34 @@ impl SessionLauncher for SandboxLauncher {
             ));
         }
 
-        // The advisory for that same state, natively, as a diagnostic
-        // record per launch: the same text the attached terminal gets
-        // below, on the daemon's log stream — the surface a scripted
-        // start, an agent and a diagnostics bundle read without a
-        // terminal. At the placement decision, not after the build: a
-        // launch that goes no further than this (a tree-less host, an
-        // env that fails to build) has still been told apart, and every
-        // launch is — the resolver-hook advisory this is modelled on
-        // (NET-122, design §7.1) advises on every session start, the
-        // install hint it carries is the answer to a host without the
-        // tree, and silencing every launch after the first takes the
-        // notice away from exactly the session a person is about to
-        // work in. The decision is carried in the machine spelling a
-        // reader greps for (`host_ip_enforcement`), so the record is
-        // the session's machine-readable start output as well as its
-        // prose.
-        if advises_unenforced_placement(guest, network_mode, leaf.as_ref()) {
+        // The advisory for that same state, natively, as a diagnostic record
+        // per launch — on the daemon's log stream, and nowhere else. This is
+        // not the session's stderr channel and not a field any client reads:
+        // the session reply and the CLI's start output are untouched by it,
+        // so a scripted `min session start` never sees this line. What a
+        // person in a session gets is the banner below, written onto the
+        // session's own pty — that banner is the in-session surface, and
+        // this record is its daemon-log twin, attributed to the session and
+        // carrying the decision in the machine spelling a reader greps for
+        // (`host_ip_enforcement`). Carrying the field out to a client — over
+        // the session reply, and surfaced by `min doctor` — is issue #1773,
+        // outside this task's layers.
+        //
+        // At the placement decision, not after the build: a launch that goes
+        // no further than this (a tree-less host, an env that fails to
+        // build) has still been told apart, and every launch is — the
+        // resolver-hook advisory this is modelled on (NET-122, design §7.1)
+        // advises on every session start, the install hint it carries is the
+        // answer to a host without the tree, and silencing every launch
+        // after the first takes the notice away from exactly the session a
+        // person is about to work in.
+        //
+        // A launch minted for lifecycle hooks advises on neither surface: a
+        // hook run is not a session start, and its record would count one
+        // hook run as one. The placement itself is not gated with it.
+        let advise =
+            advises_unenforced_placement(guest, network_mode, leaf.as_ref()) && !for_hooks;
+        if advise {
             let notice = unenforced_placement_notice();
             tracing::info!(
                 session = %session_name,
@@ -3101,15 +3134,18 @@ impl SessionLauncher for SandboxLauncher {
             let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
 
             // NET-079: a host-address box this native launch could not place
-            // gets the advisory in the terminal itself, as the terminal form
-            // of the record the launch emitted at its placement decision —
-            // the person about to type in this session is the one whose
-            // egress is not being decided, and the state is the
-            // deployment's, not the session's, so the notice says what
-            // would change it. Never in the guest: a guest's unplaced
-            // host-address box never gets this far, its launch being refused
-            // (design §7.1).
-            if advises_unenforced_placement(guest, network_mode, leaf.as_ref()) {
+            // gets the advisory in the terminal itself — this banner is the
+            // in-session surface, the prose a person at the terminal reads;
+            // the record for that same decision went to the daemon's log at
+            // the placement decision, which no client reads (issue #1773
+            // tracks carrying it out). The person about to type in this
+            // session is the one whose egress is not being decided, and the
+            // state is the deployment's, not the session's, so the notice
+            // says what would change it. Never in the guest: a guest's
+            // unplaced host-address box never gets this far, its launch
+            // being refused (design §7.1). And never on a hook launch: its
+            // pty is read by nobody, and a hook run is not a session start.
+            if advise {
                 let notice = unenforced_placement_notice();
                 // The same write the shell fallback notice uses, for the
                 // same reasons: onto the pty's slave, best-effort, CRLF —
