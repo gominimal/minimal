@@ -885,7 +885,7 @@ fn refuse_head(limiter: &DropLimiter, refused: &RefusedHead) {
 /// and un-parsed — the gate's job is the egress direction, and what a box may
 /// receive is the target's ingress policy, decided in the guest where its
 /// declarations are enforced.
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "the relay's full state in one place: both directions' halves, the \
               deciding table and the node-plane baseline set, the limiter, and \
