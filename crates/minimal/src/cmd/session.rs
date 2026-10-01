@@ -194,6 +194,10 @@ pub(crate) async fn activate_session(
     // the `CreateSession` below rather than on a `GetVersion` sent ahead of it.
     // Activation is the hot path #1251's gate landed on, and it must not pay a
     // round trip for a check its own first RPC can make.
+    // Deliberately not `connect_daemon`: this path's version gate travels on
+    // the `CreateSession` below rather than on a `GetVersion` sent ahead of it.
+    // Activation is the hot path #1251's gate landed on, and it must not pay a
+    // round trip for a check its own first RPC can make.
     let mut client = connect_daemon_unchecked(global).await?;
 
     // Warn before minting a second session for a path that already has one:
@@ -235,346 +239,144 @@ pub(crate) async fn activate_session(
         }
     }
 
-    use minimald_rpc::{
-        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
-    };
-    // An autogen name can (rarely) collide with an existing session built
-    // from the same directory; on the daemon's already-exists rejection,
-    // re-mint the hex suffix and retry a bounded number of times. A
-    // user-supplied name never retries — its collision, and any other failure
-    // (e.g. a policy/network-mode validation error), surfaces unchanged.
-    let mut config = config;
-    let mut attempts = 0u32;
-    let created = loop {
-        let resp = client
-            .oneshot_rpc::<CreateSession>(CreateSessionRequest {
-                config: config.clone(),
-                // The version gate: a daemon of another build refuses this
-                // call outright, before it has allocated anything to tear
-                // down. `None` under the skew override, which is what lets an
-                // operator proceed.
-                must_match_version: version_assertion(),
-            })
-            .await
-            .context("CreateSession RPC failed")?;
-        match resp {
-            minimald_rpc::Errorable::Ok(r) => break r,
-            minimald_rpc::Errorable::Err { error } => {
-                if should_retry_autogen(autogen, attempts, &error) {
-                    attempts += 1;
-                    config.name = Some(autogen_session_name(&utf8_path, &random_hex4()));
-                    continue;
-                }
-                bail!("CreateSession failed: {error}");
-            }
-        }
-    };
-    // The other half of the gate: a daemon old enough to predate
-    // `must_match_version` ignored the assertion instead of answering it, and
-    // says so by echoing no version at all. Being older than the field is
-    // itself proof of a skew, so refuse here — still before the upload, the
-    // loadout, and the finalize that #1251 died at, and with the session left
-    // unfinalized for the daemon to reap when this connection drops.
-    ensure_version_reported(created.daemon_version.as_deref())?;
-    warn_if_hostname_routing_down(
-        created.hostname_routing_unavailable.as_deref(),
-        "min session activate",
-    );
-    // NET-122/NET-123: the naming advisory, printed once per session start —
-    // after the create, and re-surfaced when the daemon reports this session
-    // at the 127.0.0.1 interim because its session-start bind probe found
-    // the reserved range absent. It only ever names the command that
-    // points the host's resolver at the answerer; running it (and any
-    // privilege prompt it carries) is the user's act, never the session
-    // start's.
-    if let Some(advisory) =
-        crate::resolver::session_advisory(created.zone_answerer_port, created.interim_loopback)
-            .await
-    {
-        eprintln!("{advisory}");
-    }
-    let id = created.id;
-
-    // The coming-change notice (NET-076), printed while the deny-all egress
-    // default is announced but not yet in force. Scoped to the box it would
-    // change — an own-address session that declared no egress — on a daemon
-    // that has not opted out of the change (NET-077): the opt-out is the
-    // one rollout fact this side cannot know, so it is read off the create
-    // reply above, and a daemon that has already set the flag has already
-    // taken the remedy the notice names. Silent once the phase turns (see
-    // [`deny_all_default_notice`]). Printed after the session exists and
-    // before the work on it, so the warning is not lost above a failed
-    // activate's output.
-    if config.network == minimald_rpc::NetworkMode::OwnIp
-        && config.policy.egress.is_none()
-        && created.deny_all_opt_out != Some(true)
-        && let Some(notice) = deny_all_default_notice(sessions::EGRESS_DEFAULT_PHASE)
-    {
-        eprintln!("{notice}");
-    }
-
-    // From here the session exists on the daemon in an unfinalized state.
-    // Arm a Ctrl-C guard so an interrupt during the (blocking) gating
-    // prompt tears it down instead of orphaning it in `Pending` — see
-    // [`ActivationInterrupt`]. Disarmed once the session is `Active`.
-    let interrupt_guard = arm_activation_interrupt(global, id);
-
-    // Upload the project directory to the daemon so the session
-    // workspace holds the user's files — `ConfigureLoadout`'s compose
-    // reads the mfile (and any local `packages/`, `stacks/`,
-    // `profiles/` used by graph resolution) off that workspace, so it
-    // has to run before `ConfigureLoadout`. `--sync none` opts out;
-    // the daemon then composes against an empty workspace and the
-    // caller is on their own for getting files there.
-    match sync_mode {
-        SyncMode::None => {}
-        SyncMode::Tarball if skip_empty_or_home => {
-            // An empty directory has nothing to sync, and `$HOME` is far
-            // too much to ship on a stray confirmation keypress — and if
-            // `$HOME` is itself a VCS root the old gate uploaded it with
-            // no prompt at all. Skip both silently by default; a
-            // deliberate `--sync tarball` (via `sync_explicit`) is the
-            // escape hatch that still uploads them.
-            eprintln!("Starting with an empty box (nothing here to sync)");
-        }
+    // Decide the upload and announce it before the record exists: a root the
+    // operator declines to send, or one whose skipped upload would silently
+    // drop declared hooks, is a client-side refusal that must not leave a
+    // draft behind. `--sync none` opts out entirely.
+    let upload: Option<camino::Utf8PathBuf> = match sync_mode {
+        SyncMode::None => None,
         SyncMode::Tarball => {
-            // Upload from the project root — the directory the mfile
-            // lives in — rather than wherever the user invoked us. This
-            // matches the CLI's config-discovery walk: a user running
-            // `minimal activate ./subdir` still uploads the whole
-            // project. Falls back to `utf8_path` when no mfile is found
-            // anywhere up the tree (#770).
-            let upload_root = upload_root.expect("upload_root is set for SyncMode::Tarball above");
-            if upload_root != utf8_path {
-                eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
-            }
-            // Guard against accidentally uploading a non-VCS directory
-            // (e.g. `~`). A VCS root, or a directory carrying a
-            // `minimal.toml` (a declared project), uploads unconditionally.
-            // For an undeclared non-VCS root an interactive caller gets the
-            // confirm (default No); a headless caller (CI, pipes, agents,
-            // `--no-prompt`, `--no-input`) can't be asked, so it skips the
-            // upload with a warning rather than silently shipping a directory
-            // nobody confirmed — `--sync tarball` (via `sync_explicit`) is the
-            // escape hatch that force-uploads it anyway (#770).
-            let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
-            let should_upload = match file_upload::upload_gate(
-                file_upload::is_vcs_root(upload_root.as_std_path()),
-                sync_explicit,
-                project_has_mfile(&upload_root),
-                headless,
-            ) {
-                file_upload::UploadGate::Upload => true,
-                file_upload::UploadGate::SkipHeadless => {
-                    // Skipping the upload means the project's minimal.toml
-                    // never reaches the daemon, so any lifecycle hooks it
-                    // declares are discarded and never run. Refuse loudly
-                    // instead of exiting 0 on a session silently missing
-                    // them; the caller can force the upload or opt out on
-                    // purpose.
-                    let dropped_hooks = project_lifecycle_hook_count(&upload_root);
-                    if dropped_hooks > 0 {
-                        bail!(
-                            "{upload_root} is not a version control repository root, so its \
-                             file upload is being skipped — but its {name} declares \
-                             {dropped_hooks} lifecycle hook(s) that reach the session only \
-                             through that upload. They would be silently dropped and never \
-                             run. Pass `--sync tarball` to upload the project (hooks \
-                             included), or `--sync none` to start without them deliberately.",
-                            name = mfile::MFILE_NAME,
+            let root = upload_root
+                .as_ref()
+                .expect("upload_root is set for SyncMode::Tarball above");
+            if skip_empty_or_home {
+                // An empty directory has nothing to sync, and `$HOME` is far
+                // too much to ship on a stray confirmation keypress — and if
+                // `$HOME` is itself a VCS root the old gate uploaded it with
+                // no prompt at all. Skip both silently by default; a
+                // deliberate `--sync tarball` (via `sync_explicit`) is the
+                // escape hatch that still uploads them.
+                eprintln!("Starting with an empty box (nothing here to sync)");
+                None
+            } else {
+                // Upload from the project root — the directory the mfile
+                // lives in — rather than wherever the user invoked us. This
+                // matches the CLI's config-discovery walk: a user running
+                // `minimal activate ./subdir` still uploads the whole
+                // project. Falls back to `utf8_path` when no mfile is found
+                // anywhere up the tree (#770).
+                if *root != utf8_path {
+                    eprintln!("Uploading from project root {root} (resolved from {utf8_path})");
+                }
+                // Guard against accidentally uploading a non-VCS directory
+                // (e.g. `~`). A VCS root, or a directory carrying a
+                // `minimal.toml` (a declared project), uploads
+                // unconditionally. For an undeclared non-VCS root an
+                // interactive caller gets the confirm (default No); a
+                // headless caller (CI, pipes, agents, `--no-prompt`,
+                // `--no-input`) can't be asked, so it skips the upload with a
+                // warning rather than silently shipping a directory nobody
+                // confirmed — `--sync tarball` (via `sync_explicit`) is the
+                // escape hatch that force-uploads it anyway (#770).
+                let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
+                let should_upload = match file_upload::upload_gate(
+                    file_upload::is_vcs_root(root.as_std_path()),
+                    sync_explicit,
+                    project_has_mfile(root),
+                    headless,
+                ) {
+                    file_upload::UploadGate::Upload => true,
+                    file_upload::UploadGate::SkipHeadless => {
+                        // Skipping the upload means the project's minimal.toml
+                        // never reaches the daemon, so any lifecycle hooks it
+                        // declares are discarded and never run. Refuse loudly
+                        // instead of exiting 0 on a session silently missing
+                        // them; the caller can force the upload or opt out on
+                        // purpose.
+                        let dropped_hooks = project_lifecycle_hook_count(root);
+                        if dropped_hooks > 0 {
+                            bail!(
+                                "{root} is not a version control repository root, so its \
+                                 file upload is being skipped — but its {name} declares \
+                                 {dropped_hooks} lifecycle hook(s) that reach the session only \
+                                 through that upload. They would be silently dropped and never \
+                                 run. Pass `--sync tarball` to upload the project (hooks \
+                                 included), or `--sync none` to start without them deliberately.",
+                                name = mfile::MFILE_NAME,
+                            );
+                        }
+                        eprintln!(
+                            "{}",
+                            file_upload::skipped_upload_warning(root.as_std_path())
+                        );
+                        false
+                    }
+                    file_upload::UploadGate::Prompt => confirm(
+                        &format!(
+                            "{root} is not a version control repository root. \
+                             Upload all files from this directory?"
+                        ),
+                        false,
+                    )?,
+                };
+                if should_upload {
+                    Some(root.clone())
+                } else {
+                    if !headless {
+                        eprintln!(
+                            "Skipping file upload; the session will start with an \
+                             empty workspace."
                         );
                     }
-                    eprintln!(
-                        "{}",
-                        file_upload::skipped_upload_warning(upload_root.as_std_path())
-                    );
-                    false
+                    None
                 }
-                file_upload::UploadGate::Prompt => confirm(
-                    &format!(
-                        "{upload_root} is not a version control repository root. \
-                         Upload all files from this directory?"
-                    ),
-                    false,
-                )?,
-            };
-            if should_upload {
-                client
-                    .upload_workspace_files(id, upload_root.as_std_path())
-                    .await
-                    .context("Failed to upload project files")?;
-            } else if !headless {
-                eprintln!(
-                    "Skipping file upload; the session will start with an \
-                     empty workspace."
-                );
             }
         }
     };
 
-    // Collect the client-side patches (from loadouts, already gated
-    // in Phase 1) *before* the wire contribution moves into the
-    // ConfigureLoadout RPC. These land in the final Composition
-    // whether the response is `Materialized` or `Pending`, so the
-    // client is authoritative for them. Any daemon-side patches
-    // that come back through a `Pending` response's `SubmitVerdict`
-    // get appended below.
-    let mut collected_patches: Vec<(std::path::PathBuf, paths::SandboxRelPath)> = contribution
-        .patches
-        .iter()
-        .map(|p| {
-            (
-                p.patch.host_path.as_utf8_path().as_std_path().to_path_buf(),
-                p.patch.destination.clone(),
-            )
-        })
-        .collect();
-
-    // The session exists but has no loadout yet; composing it is a
-    // second round-trip because the daemon's composer reads the
-    // project config out of the session's workspace, not from a path
-    // on this machine.
-    let configured = client
-        .oneshot_rpc::<ConfigureLoadout>(ConfigureLoadoutRequest {
-            session_id: id,
-            contribution,
-        })
-        .await
-        .context("ConfigureLoadout RPC failed")?;
-    let configured = match configured {
-        minimald_rpc::Errorable::Ok(r) => r,
-        // Bails before the `println!("{id}")` below: a session that cannot
-        // compose never puts an id on stdout for a script to capture.
-        minimald_rpc::Errorable::Err { error } => {
-            bail!(composition_failure_message(&utf8_path, &error));
-        }
+    // The create/upload/configure/finalize sequence is shared with the TUI and
+    // with `min mcp`; the headless core lives in `minimal-client`. Everything
+    // above this line is resolution the front-end owns — loadouts, policy, the
+    // scaffold offer, the upload gate. The gate below carries the interactive
+    // half: the announcements the create reply feeds, and the user-policy
+    // prompt a `Pending` composition demands.
+    let session_name = config.name.clone();
+    let project_dir = utf8_path.clone();
+    let compose_failure: Box<dyn Fn(&str) -> anyhow::Error + Send + Sync> = {
+        let dir = project_dir.clone();
+        Box::new(move |error: &str| anyhow::anyhow!(composition_failure_message(&dir, error)))
     };
-    // The daemon may finalize immediately (`Ready`) or ask the
-    // client to gate items first (`Pending`). On the pending path
-    // we run the user-policy prompt loop; on ready there's nothing
-    // to gate.
-    //
-    // Decide up front whether we can prompt: `--no-prompt` forces
-    // the abort path, and a non-TTY stderr triggers it implicitly
-    // (a script or CI run should never expect to read a keypress).
-    // Both fall through to `NoPromptHook`, which accumulates every
-    // item it would have prompted for so we can print a
-    // `user_policy.toml` snippet on the error path.
-    if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
-        let non_interactive = args.no_prompt || global.no_input || !can_prompt_interactively();
-        if non_interactive {
-            // NoPromptHook fake-approves every unapproved item so
-            // handle_response finishes both the var and patch gates
-            // and records everything in `summary`. If anything was
-            // recorded, we abort *before* actually shipping the
-            // verdict — the daemon must not see those fake
-            // approvals. Only when `summary` is empty (every daemon-
-            // sent item was already handled by the user's policy)
-            // do we submit and let the session go Active.
-            let session_id = response.session_id;
-            let hooks = prompt::NoPromptHook::new();
-            let verdict = match compute_verdict(response, user_policy, compose_options, &hooks) {
-                Ok((verdict, _final_policy)) => verdict,
-                Err(e) => {
-                    send_abort(&mut client, session_id).await;
-                    // The route an activation actually reaches today: the
-                    // daemon routes project config back for gating, so a
-                    // project it cannot compose surfaces here rather than as
-                    // the `Errorable::Err` above.
-                    bail!(composition_failure_message(&utf8_path, &e.to_string()));
-                }
-            };
-            let summary = hooks.into_summary();
-            if summary.count() > 0 {
-                send_abort(&mut client, session_id).await;
-                let count = summary.count();
-                let snippet = summary.as_toml_snippet();
-                bail!(
-                    "{count} item{s} would require interactive approval, but \
-                     --no-prompt was set (or stdin/stderr is not a terminal).\n\n\
-                     Add the following to {}:\n\n{snippet}\n\
-                     Then re-run this command.",
-                    policy_path.display(),
-                    s = if count == 1 { "" } else { "s" },
-                );
-            }
-            collected_patches.extend(approved_patches_from_verdict(&verdict));
-            submit_verdict_and_wait(&mut client, session_id, verdict).await?;
-        } else {
-            // The hook stashes policy mutations in interior
-            // `RefCell`s so a `DenyPermanent` (which returns
-            // `HookResult::Abort` and can't pipe an
-            // `updated_policy` back through the composer) still
-            // survives to `into_final_policy`. We save
-            // unconditionally before propagating the result, so a
-            // deny-and-abort still writes the rule.
-            let hooks = prompt::InteractivePrompt::new(&policy_path, user_policy.clone());
-            let result = drive_pending_to_active(
-                &mut client,
-                response,
-                user_policy,
-                compose_options,
-                &hooks,
-                &utf8_path,
-            )
-            .await;
-            if let Ok((_, _, ref approved)) = result {
-                collected_patches.extend(approved.iter().cloned());
-            }
-            let final_policy = hooks.into_final_policy();
-            if final_policy != initial_policy {
-                // A `save_user_policy` failure is reported to
-                // stderr and *doesn't* propagate: if the activation
-                // itself also failed (`DenyPermanent` returns Err
-                // and still wants its rule saved; a real
-                // composition fault), `result?` below is what the
-                // operator needs to see. Blindly `?`ing the save
-                // would clobber that error with a spurious
-                // "updating user_policy.toml" message that hides
-                // the true failure.
-                match prompt::save_user_policy(&policy_path, &final_policy) {
-                    Ok(()) => eprintln!("Updated {}", policy_path.display()),
-                    Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
-                }
-            }
-            result?;
-        }
-    }
-
-    // On the Ready path (loadouts auto-decided; no prompt fired)
-    // `initial_policy` is only referenced inside the Pending branch
-    // above, so it appears unused to the compiler. Explicit `_` to
-    // squash the lint without dropping the useful name.
-    let _ = initial_policy;
-
-    // Upload composition patches and finalize the session. This
-    // has to happen before attach is allowed — a Materializing
-    // session isn't attachable, and the launcher reads patches
-    // from `<workspace>/patches/`. Dedup by sandbox destination:
-    // the composer's post-gate check guarantees any duplicates
-    // are exact matches (same source), so collapsing is safe.
-    collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
-    collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
-    if let Err(e) = upload_and_finalize(
-        &mut client,
-        id,
-        &collected_patches,
-        &hook_scripts,
-        finalize_hook_budget,
-    )
-    .await
-    {
-        // Best-effort teardown: the session is stuck in
-        // Materializing on the daemon. Destroy it so the operator's
-        // `min ls` doesn't fill with half-finalized sessions.
-        best_effort_destroy(&mut client, id).await;
-        return Err(e);
-    }
-
-    // The session is `Active` now — a Ctrl-C must no longer tear it down
-    // (the attach hand-off below and the user's own session are fair game
-    // for interrupts, but not this cleanup).
-    drop(interrupt_guard);
+    let rename_on_collision: Option<Box<dyn Fn() -> String + Send + Sync>> = autogen.then(|| {
+        let dir = project_dir.clone();
+        Box::new(move || autogen_session_name(&dir, &random_hex4()))
+            as Box<dyn Fn() -> String + Send + Sync>
+    });
+    let mut gate = CliActivationGate {
+        policy_path: &policy_path,
+        user_policy,
+        initial_policy,
+        compose_options,
+        project_dir: &project_dir,
+        no_prompt: args.no_prompt,
+        no_input: global.no_input,
+        network: config.network,
+        egress_declared: config.policy.egress.is_some(),
+    };
+    let request = client::activate::ActivateRequest {
+        config,
+        upload_root: upload.map(|p| p.into_std_path_buf()),
+        contribution,
+        hook_scripts,
+        hook_budget: finalize_hook_budget,
+        rename_on_collision,
+        interrupt_socket: client::resolve_socket_path(
+            global.minimal_dir.as_deref(),
+            global.use_minvmd(),
+        )
+        .ok(),
+        compose_failure,
+    };
+    let id = client::activate::activate(&mut client, request, &mut gate).await?;
 
     println!("{id}");
 
@@ -586,7 +388,7 @@ pub(crate) async fn activate_session(
         if should_announce_session(global) {
             eprintln!(
                 "Created session {}",
-                session_announce_label(&id, config.name.as_deref())
+                session_announce_label(&id, session_name.as_deref())
             );
         }
         let attach_args = AttachArgs {
@@ -596,6 +398,153 @@ pub(crate) async fn activate_session(
     }
 
     Ok(())
+}
+
+/// The CLI's half of [`minimal_client::activate::activate`]: the announcements
+/// the create reply feeds, and the interactive user-policy prompt a `Pending`
+/// composition gates. Every input is resolved by `activate_session` before the
+/// daemon is touched; this only decides what the operator sees and whether the
+/// session may proceed.
+struct CliActivationGate<'a> {
+    policy_path: &'a std::path::Path,
+    user_policy: sessions::core::policy::UserPolicy,
+    initial_policy: sessions::core::policy::UserPolicy,
+    compose_options: sessions::core::compose::ComposeOptions,
+    project_dir: &'a camino::Utf8Path,
+    no_prompt: bool,
+    no_input: bool,
+    network: sessions::NetworkMode,
+    egress_declared: bool,
+}
+
+impl minimal_client::activate::ActivationGate for CliActivationGate<'_> {
+    async fn on_created(&mut self, created: &minimald_rpc::CreateSessionResponse) {
+        // NET-122/NET-123: the naming advisory, printed once per session start
+        // — after the create, and re-surfaced when the daemon reports this
+        // session at the 127.0.0.1 interim because its session-start bind probe
+        // found the reserved range absent. It only ever names the command that
+        // points the host's resolver at the answerer; running it (and any
+        // privilege prompt it carries) is the user's act, never the session
+        // start's.
+        warn_if_hostname_routing_down(
+            created.hostname_routing_unavailable.as_deref(),
+            "min session activate",
+        );
+        if let Some(advisory) =
+            crate::resolver::session_advisory(created.zone_answerer_port, created.interim_loopback)
+                .await
+        {
+            eprintln!("{advisory}");
+        }
+        // The coming-change notice (NET-076), printed while the deny-all egress
+        // default is announced but not yet in force. Scoped to the box it would
+        // change — an own-address session that declared no egress — on a daemon
+        // that has not opted out of the change (NET-077): the opt-out is the
+        // one rollout fact this side cannot know, so it is read off the create
+        // reply above, and a daemon that has already set the flag has already
+        // taken the remedy the notice names. Silent once the phase turns (see
+        // [`deny_all_default_notice`]).
+        if self.network == sessions::NetworkMode::OwnIp
+            && !self.egress_declared
+            && created.deny_all_opt_out != Some(true)
+            && let Some(notice) = deny_all_default_notice(sessions::EGRESS_DEFAULT_PHASE)
+        {
+            eprintln!("{notice}");
+        }
+    }
+
+    async fn on_pending(
+        &mut self,
+        client: &mut client::Client,
+        response: sessions::wire::request::ContributionResponse,
+    ) -> Result<Vec<(std::path::PathBuf, paths::SandboxRelPath)>, anyhow::Error> {
+        // Decide up front whether we can prompt: `--no-prompt` forces the
+        // abort path, and a non-TTY stderr triggers it implicitly (a script or
+        // CI run should never expect to read a keypress). Both fall through to
+        // `NoPromptHook`, which accumulates every item it would have prompted
+        // for so we can print a `user_policy.toml` snippet on the error path.
+        let non_interactive = self.no_prompt || self.no_input || !can_prompt_interactively();
+        if non_interactive {
+            // NoPromptHook fake-approves every unapproved item so
+            // handle_response finishes both the var and patch gates and
+            // records everything in `summary`. If anything was recorded we
+            // bail *before* actually shipping the verdict — the daemon must
+            // not see those fake approvals, and the core tears the session
+            // down on the error. Only when `summary` is empty (every
+            // daemon-sent item was already handled by the user's policy) do we
+            // submit and let the session go Active.
+            let session_id = response.session_id;
+            let hooks = prompt::NoPromptHook::new();
+            let verdict = match compute_verdict(
+                response,
+                self.user_policy.clone(),
+                self.compose_options,
+                &hooks,
+            ) {
+                Ok((verdict, _final_policy)) => verdict,
+                Err(e) => {
+                    // The route an activation actually reaches today: the
+                    // daemon routes project config back for gating, so a
+                    // project it cannot compose surfaces here rather than as
+                    // the `Errorable::Err` the core handles.
+                    bail!(composition_failure_message(
+                        self.project_dir,
+                        &e.to_string()
+                    ));
+                }
+            };
+            let summary = hooks.into_summary();
+            if summary.count() > 0 {
+                let count = summary.count();
+                let snippet = summary.as_toml_snippet();
+                bail!(
+                    "{count} item{s} would require interactive approval, but \
+                     --no-prompt was set (or stdin/stderr is not a terminal).\n\n\
+                     Add the following to {}:\n\n{snippet}\n\
+                     Then re-run this command.",
+                    self.policy_path.display(),
+                    s = if count == 1 { "" } else { "s" },
+                );
+            }
+            let approved: Vec<_> = approved_patches_from_verdict(&verdict).collect();
+            submit_verdict_and_wait(client, session_id, verdict).await?;
+            return Ok(approved);
+        }
+
+        // The hook stashes policy mutations in interior `RefCell`s so a
+        // `DenyPermanent` (which returns `HookResult::Abort` and can't pipe an
+        // `updated_policy` back through the composer) still survives to
+        // `into_final_policy`. We save unconditionally before propagating the
+        // result, so a deny-and-abort still writes the rule.
+        let hooks = prompt::InteractivePrompt::new(self.policy_path, self.user_policy.clone());
+        let result = drive_pending_to_active(
+            client,
+            response,
+            self.user_policy.clone(),
+            self.compose_options,
+            &hooks,
+            self.project_dir,
+        )
+        .await;
+        let final_policy = hooks.into_final_policy();
+        if final_policy != self.initial_policy {
+            // A `save_user_policy` failure is reported to stderr and *doesn't*
+            // propagate: if the activation itself also failed (`DenyPermanent`
+            // returns Err and still wants its rule saved; a real composition
+            // fault), the error below is what the operator needs to see.
+            // Blindly propagating the save would clobber that error with a
+            // spurious "updating user_policy.toml" message that hides the true
+            // failure.
+            match prompt::save_user_policy(self.policy_path, &final_policy) {
+                Ok(()) => eprintln!("Updated {}", self.policy_path.display()),
+                Err(e) => eprintln!(
+                    "warning: failed to update {}: {e}",
+                    self.policy_path.display()
+                ),
+            }
+        }
+        result.map(|(_id, _policy, approved)| approved)
+    }
 }
 
 /// Attach to an existing session. Both interactive and `--command` paths

@@ -206,7 +206,7 @@ Notable crates, in roughly the order the build pipeline drives them:
 | `mctx` | shared | Top-level 'minimal context' API tying configuration, decoding, graph, and cache together. |
 | `mfile` | build | Finding and reading the `minimal.toml` file. |
 | `minimal` | session | The `min` session CLI, which pairs with and talks to `minimald`. |
-| `minimal-client` | session | SSH client transport to `minimald` over the UDS bridge, shared by `min` and the TUI. |
+| `minimal-client` | session | SSH client transport to `minimald` over the UDS bridge, plus the shared client-side session-activation orchestration (create → upload → configure → finalize); shared by `min` and the TUI. |
 | `minimal-tui` | session | `min dash`: the session-manager TUI (ratatui/crossterm, Elm-style loop). |
 | `minimald` | session | The session daemon: an SSH server hosting sessions and task/sandbox executions. |
 | `minimald-rpc` | session | Wire contract for `minimald`'s oneshot SSH RPCs and for the exec channel's request vocabulary. |
