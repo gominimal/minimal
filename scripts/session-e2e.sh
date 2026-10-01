@@ -6003,11 +6003,15 @@ echo "::group::retired surfaces gone (ssh-forward, login, :7655, direct-tcpip)"
 }
 
 # ---------------------------------------------------------------------------
-# Shared helper for the NET-049/NET-051 fresh-install KVM activation proofs.
-# Stages a real install.sh run that ships the VM stack, then activates a
-# session with --provider local-minvmd and no MINVMD_* path overrides,
-# asserting that the VM host daemon resolves its images from the installed data
-# prefix and logs them.
+# Shared by the NET-049/NET-051 fresh-install KVM activation proofs and the
+# stock-install integration case: locate the lane's guest images, stage the
+# mock bucket the real install.sh installs from, write the stub downloaders,
+# run the installer into a fresh HOME, and drive the installed pair (activate,
+# UUID, listed) — then the start-record assertion below. What each proof keeps
+# for itself is policy: the arch it gates on, whether the switch is required
+# (fetch-or-fail) or optional (omit the row), which rows the installer's
+# output must carry, and how far the box is driven (activation only, or exec
+# and destroy too).
 # ---------------------------------------------------------------------------
 # Shared by the fresh-install VM proofs (the NET-049/NET-051 activation case
 # and the stock-install case below): the VM host daemon's start record must
@@ -6120,6 +6124,206 @@ fresh_vm_start_record_asserts_installed_images() {
   echo "VM host daemon start line ($fsr_log): $fsr_rec"
 }
 
+# ---------------------------------------------------------------------------
+# The mock-bucket install-and-drive half the two proofs share.
+# ---------------------------------------------------------------------------
+
+# Locate the guest images the lane already built/fetched — the caller's
+# MINVMD_*_PATH overrides when set and present, else the justfile's .scratch
+# copies (the same sources every VM proof reads). Sets STAGED_KERNEL,
+# STAGED_ROOTFS and STAGED_INITRAMFS; the CALLER owns the availability check
+# and its skip message, because where the check sits is the caller's policy:
+# the stock-install case must skip before it would fetch a switch it cannot
+# use, the fresh-kvm proofs resolve their (optional) switch first.
+locate_vm_guest_images() {
+  if [ -n "${MINVMD_KERNEL_PATH:-}" ] && [ -f "$MINVMD_KERNEL_PATH" ]; then
+    STAGED_KERNEL="$MINVMD_KERNEL_PATH"
+  else
+    STAGED_KERNEL="$ROOT/.scratch/vmlinuz"
+  fi
+  if [ -n "${MINVMD_ROOTFS_PATH:-}" ] && [ -f "$MINVMD_ROOTFS_PATH" ]; then
+    STAGED_ROOTFS="$MINVMD_ROOTFS_PATH"
+  else
+    STAGED_ROOTFS="$ROOT/.scratch/rootfs.img"
+  fi
+  if [ -n "${MINVMD_INITRAMFS:-}" ] && [ -f "$MINVMD_INITRAMFS" ]; then
+    STAGED_INITRAMFS="$MINVMD_INITRAMFS"
+  else
+    STAGED_INITRAMFS="$ROOT/.scratch/initramfs.cpio"
+  fi
+}
+
+# Stage the mock bucket the real install.sh below installs from: the seed
+# project (a pinned minimal.toml plus a bare .git marker, so the headless
+# upload gate ships it), then every component a Linux release ships for the
+# arch — min, minvmd, the guest kernel, rootfs and initramfs, and, when $5 is
+# non-empty, the switch — the stable pointer, and the components manifest the
+# installer hashes. The caller owns the dirs (and creates them, because the
+# stock-install case's fetch below writes its own log under the root first).
+# $5 is the caller's SWITCH POLICY: the stock-install case resolves one or
+# fails (a switchless guest cannot mint a session — its in-guest package pull
+# has no other end — so a bucket without a switch would prove nothing), the
+# fresh-kvm proofs may ship none and the row is omitted.
+# Fails the run naming the missing binary when min/minvmd are not on PATH,
+# BEFORE anything is staged: a missing one must not surface later as "the
+# install failed" with the cause buried in the install log. A --provider
+# local-minvmd activation needs only these two on the host — the guest runs
+# minimald, not the host.
+stage_vm_mock_bucket() {
+  local smb_label="$1" smb_bucket="$2" smb_seed="$3" smb_arch="$4" smb_switch="$5"
+  local smb_h_minimal smb_h_minvmd smb_h_kernel smb_h_rootfs smb_h_initramfs smb_h_switch
+  hook_seed_preamble > "$smb_seed/minimal.toml"
+  mkdir "$smb_seed/.git"
+  if ! command -v min >/dev/null 2>&1 || ! command -v minvmd >/dev/null 2>&1; then
+    echo "::error::$smb_label requires min and minvmd on PATH"
+    fail
+  fi
+  cp "$(command -v min)"      "$smb_bucket/versions/v1/minimal-linux-$smb_arch"
+  cp "$(command -v minvmd)"   "$smb_bucket/versions/v1/minvmd-linux-$smb_arch"
+  cp "$STAGED_KERNEL"         "$smb_bucket/versions/v1/vmlinuz-$smb_arch"
+  cp "$STAGED_ROOTFS"         "$smb_bucket/versions/v1/rootfs-$smb_arch.img"
+  cp "$STAGED_INITRAMFS"      "$smb_bucket/versions/v1/initramfs-$smb_arch.cpio"
+  if [ -n "$smb_switch" ]; then
+    cp "$smb_switch"          "$smb_bucket/versions/v1/gvproxy-min-linux-$smb_arch"
+  fi
+  printf 'v1\n' >"$smb_bucket/stable"
+  smb_sha() { sha256sum "$1" | awk '{print $1}'; }
+  smb_h_minimal="$(smb_sha "$smb_bucket/versions/v1/minimal-linux-$smb_arch")"
+  smb_h_minvmd="$(smb_sha "$smb_bucket/versions/v1/minvmd-linux-$smb_arch")"
+  smb_h_kernel="$(smb_sha "$smb_bucket/versions/v1/vmlinuz-$smb_arch")"
+  smb_h_rootfs="$(smb_sha "$smb_bucket/versions/v1/rootfs-$smb_arch.img")"
+  smb_h_initramfs="$(smb_sha "$smb_bucket/versions/v1/initramfs-$smb_arch.cpio")"
+  if [ -n "$smb_switch" ]; then
+    smb_h_switch="$(smb_sha "$smb_bucket/versions/v1/gvproxy-min-linux-$smb_arch")"
+  fi
+  {
+    printf '# format: 1\n'
+    printf '# component   os      arch    version   sha256   kind   dest                 src\n'
+    printf '\n'
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      minimal linux "$smb_arch" v1 "$smb_h_minimal" file bin/min "versions/v1/minimal-linux-$smb_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      minvmd linux "$smb_arch" v1 "$smb_h_minvmd" file bin/minvmd "versions/v1/minvmd-linux-$smb_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      vmlinuz linux "$smb_arch" v1 "$smb_h_kernel" file data/vmlinuz "versions/v1/vmlinuz-$smb_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      rootfs linux "$smb_arch" v1 "$smb_h_rootfs" file data/rootfs.img "versions/v1/rootfs-$smb_arch.img"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      initramfs linux "$smb_arch" v1 "$smb_h_initramfs" file data/initramfs.cpio "versions/v1/initramfs-$smb_arch.cpio"
+    if [ -n "$smb_switch" ]; then
+      printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+        gvproxy-min linux "$smb_arch" v1 "$smb_h_switch" file bin/gvproxy-min "versions/v1/gvproxy-min-linux-$smb_arch"
+    fi
+  } >"$smb_bucket/versions/v1/components"
+}
+
+# The stub downloaders the installer resolves first on PATH: a fake curl
+# mapping the pinned mock-bucket host to the local dir (the same trick
+# install_test.sh uses, so the real installer runs unmodified and its own
+# HTTPS/TLS flags are accepted and ignored), and a wget that refuses, so the
+# downloader selection is deterministic.
+write_install_stubs() {
+  local wis_stubbin="$1" wis_bucket="$2" wis_bucket_host="$3"
+  cat >"$wis_stubbin/curl" <<STUB
+#!/bin/sh
+# Fake curl: map the pinned bucket host to this local dir.
+out= url=
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    https://*|http://*) url="\$1"; shift ;;
+    *) shift ;;
+  esac
+done
+[ -n "\$url" ] || { echo "stub curl: no url" >&2; exit 2; }
+rel="\${url#$wis_bucket_host/}"
+src="$wis_bucket/\$rel"
+[ -f "\$src" ] || { echo "stub curl: 404 \$url" >&2; exit 22; }
+if [ -n "\$out" ]; then cp "\$src" "\$out"; else cat "\$src"; fi
+STUB
+  chmod +x "$wis_stubbin/curl"
+  cat >"$wis_stubbin/wget" <<'STUB'
+#!/bin/sh
+echo "stub wget should not be used here" >&2
+exit 1
+STUB
+  chmod +x "$wis_stubbin/wget"
+}
+
+# A REAL scripts/install.sh run into the fresh HOME the caller made, off the
+# mock bucket, with no path overrides. Runs INSIDE the caller's install-proof
+# subshell, so a failed install `exit 1`s the subshell — naming the cause and
+# printing the installer's own log — and the caller's `if ( ... )` turns the
+# unwind into its own `fail`.
+#
+# XDG_DATA_HOME outranks HOME in both the installer's data-prefix resolution
+# (scripts/install.sh) and the daemon's image resolver
+# (crates/minvmd/src/image.rs), and the harness does not hermeticize it — a
+# host or CI that exports it would land the guest images in a different
+# prefix from the $home/.local/share/minimal the caller asserts, for the
+# install check below and the start-line values alike. A genuinely fresh
+# install has it unset, so drop it (this subshell only, like the PATH change
+# the drive helper below scopes).
+run_mock_bucket_install() {
+  local rmi_home="$1" rmi_bucket_host="$2" rmi_stubbin="$3" rmi_out="$4" rmi_label="$5"
+  unset XDG_DATA_HOME
+  # Fresh install into the throwaway home, no path overrides. The PATH change
+  # is intentionally scoped to this subshell (SC2031).
+  # shellcheck disable=SC2031
+  HOME="$rmi_home" MINIMAL_BIN="$rmi_home/.local/bin" \
+    PATH="$rmi_stubbin:$PATH" \
+    MINIMAL_OVERRIDE_INSTALLER_BUCKET="$rmi_bucket_host" \
+    sh "$ROOT/scripts/install.sh" >"$rmi_out" 2>&1 || {
+      echo "::error::$rmi_label"
+      echo "--- install log ---"; cat "$rmi_out" 2>/dev/null || true
+      exit 1
+    }
+}
+
+# Drive the INSTALLED pair: swap HOME/MINIMAL_BIN/PATH to the installed
+# prefixes and drop every MINVMD_* override, so image and switch resolution
+# must come from the installed prefixes alone; stop any daemon under the
+# harness's state base; then activate a VM box and check the outcome: the
+# CLI's last stdout line is the new session's UUID, and `min ls --raw` lists
+# it. Prints the UUID on stdout — every diagnostic goes to STDERR, so the
+# capture keeps only the id. Returns nonzero on any failure; the caller (in
+# its install-proof subshell) unwinds with `exit 1`, printing any extra
+# diagnostics of its own first.
+#
+# The RUST_LOG filter rides on the ONE activate that autospawns the daemon:
+# the 'starting VM' record the start-record helper asserts on is INFO, and a
+# daemon's filter comes from RUST_LOG at autospawn (it inherits the CLI's
+# env), while this harness quiets the whole run to `warn` for output parsing —
+# which would drop the record before it reaches any sink. A command-local
+# assignment (never an export) so nothing leaks past the proof, and `minvmd`
+# is the daemon's crate, so the CLI's own stdout stays quiet and the
+# last-line UUID extraction keeps working.
+drive_installed_vm_pair() {
+  local dvp_home="$1" dvp_seed="$2" dvp_name="$3" dvp_err="$4"
+  local dvp_activate_label="$5" dvp_ls_label="$6"
+  local dvp_sid
+  # Env swap is scoped to the caller's subshell (SC2030/SC2031).
+  # shellcheck disable=SC2030,SC2031
+  export HOME="$dvp_home" MINIMAL_BIN="$dvp_home/.local/bin" PATH="$dvp_home/.local/bin:$PATH"
+  unset MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS MINVMD_GVPROXY_BIN
+  mnl stop --force >/dev/null 2>&1 || true
+  dvp_sid="$(cd "$dvp_seed" && RUST_LOG="warn,minvmd=info" mnl session activate . --no-prompt --name "$dvp_name" 2>"$dvp_err")" || {
+    echo "::error::$dvp_activate_label" >&2
+    echo "--- activate stderr ---" >&2
+    cat "$dvp_err" 1>&2 2>/dev/null || true
+    return 1
+  }
+  dvp_sid="$(printf '%s\n' "$dvp_sid" | tail -n1 | tr -d '\r')"
+  if ! printf '%s' "$dvp_sid" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+    echo "::error::activate's last stdout line is not a session UUID: '$dvp_sid'" >&2
+    return 1
+  fi
+  if ! mnl ls --raw 2>/dev/null | grep -Fqx "$dvp_sid"; then
+    echo "::error::'min ls --raw' does not list $dvp_ls_label $dvp_sid" >&2
+    return 1
+  fi
+  printf '%s\n' "$dvp_sid"
+}
 proof_fresh_kvm_activate_local_minvmd_for_arch() {
   local target_arch="$1"
   if [ -z "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
@@ -6155,28 +6359,18 @@ proof_fresh_kvm_activate_local_minvmd_for_arch() {
   fk_seed="$fk_root/seed"
   mkdir -p "$fk_home" "$fk_bucket/versions/v1" "$fk_stubbin" "$fk_seed"
 
-  hook_seed_preamble > "$fk_seed/minimal.toml"
-  mkdir "$fk_seed/.git"
-
   local fk_bucket_host="https://mock.invalid/minimal-fresh-kvm-$target_arch"
 
-  # Locate the guest images the lane already built/fetched.
-  local fk_kernel fk_rootfs fk_initramfs fk_gvproxy
-  if [ -n "${MINVMD_KERNEL_PATH:-}" ] && [ -f "$MINVMD_KERNEL_PATH" ]; then
-    fk_kernel="$MINVMD_KERNEL_PATH"
-  else
-    fk_kernel="$ROOT/.scratch/vmlinuz"
-  fi
-  if [ -n "${MINVMD_ROOTFS_PATH:-}" ] && [ -f "$MINVMD_ROOTFS_PATH" ]; then
-    fk_rootfs="$MINVMD_ROOTFS_PATH"
-  else
-    fk_rootfs="$ROOT/.scratch/rootfs.img"
-  fi
-  if [ -n "${MINVMD_INITRAMFS:-}" ] && [ -f "$MINVMD_INITRAMFS" ]; then
-    fk_initramfs="$MINVMD_INITRAMFS"
-  else
-    fk_initramfs="$ROOT/.scratch/initramfs.cpio"
-  fi
+  # Locate the guest images the lane already built/fetched (the shared
+  # helper reads the same MINVMD_*_PATH / .scratch sources).
+  locate_vm_guest_images
+
+  # The switch the fresh install may ship: the lane's env override or the
+  # justfile's .scratch copy — never a fetch. An install without a switch
+  # still proves the activation half (a --provider local-minvmd activation
+  # needs no switch), so the empty path downgrades to a switchless install;
+  # the assertions and the start-record check below wrap on it.
+  local fk_gvproxy
   if [ -n "${MINVMD_GVPROXY_BIN:-}" ] && [ -x "$MINVMD_GVPROXY_BIN" ]; then
     fk_gvproxy="$MINVMD_GVPROXY_BIN"
   elif [ -x "$ROOT/.scratch/gvproxy" ]; then
@@ -6185,108 +6379,26 @@ proof_fresh_kvm_activate_local_minvmd_for_arch() {
     fk_gvproxy=""
   fi
 
-  if [ ! -f "$fk_kernel" ] || [ ! -f "$fk_rootfs" ] || [ ! -f "$fk_initramfs" ]; then
+  if [ ! -f "$STAGED_KERNEL" ] || [ ! -f "$STAGED_ROOTFS" ] || [ ! -f "$STAGED_INITRAMFS" ]; then
     echo "fresh-install KVM activate ($target_arch) SKIPPED (guest images not available)"
     echo "::endgroup::"
     return 0
   fi
 
-  # Verify the binaries we'll stage are available. A --provider local-minvmd
-  # activation only needs min and minvmd (the guest runs minimald, not the host).
-  if ! command -v min >/dev/null 2>&1 || ! command -v minvmd >/dev/null 2>&1; then
-    echo "::error::fresh-install KVM activate requires min and minvmd on PATH"
-    fail
-  fi
-
-  cp "$(command -v min)"      "$fk_bucket/versions/v1/minimal-linux-$target_arch"
-  cp "$(command -v minvmd)"   "$fk_bucket/versions/v1/minvmd-linux-$target_arch"
-  cp "$fk_kernel"             "$fk_bucket/versions/v1/vmlinuz-$target_arch"
-  cp "$fk_rootfs"             "$fk_bucket/versions/v1/rootfs-$target_arch.img"
-  cp "$fk_initramfs"          "$fk_bucket/versions/v1/initramfs-$target_arch.cpio"
-  if [ -n "$fk_gvproxy" ]; then
-    cp "$fk_gvproxy"          "$fk_bucket/versions/v1/gvproxy-min-linux-$target_arch"
-  fi
-
-  printf 'v1\n' >"$fk_bucket/stable"
-
-  fk_sha() { sha256sum "$1" | awk '{print $1}'; }
-  local h_minimal h_minvmd h_kernel h_rootfs h_initramfs h_gvproxy
-  h_minimal="$(fk_sha "$fk_bucket/versions/v1/minimal-linux-$target_arch")"
-  h_minvmd="$(fk_sha "$fk_bucket/versions/v1/minvmd-linux-$target_arch")"
-  h_kernel="$(fk_sha "$fk_bucket/versions/v1/vmlinuz-$target_arch")"
-  h_rootfs="$(fk_sha "$fk_bucket/versions/v1/rootfs-$target_arch.img")"
-  h_initramfs="$(fk_sha "$fk_bucket/versions/v1/initramfs-$target_arch.cpio")"
-  if [ -n "$fk_gvproxy" ]; then
-    h_gvproxy="$(fk_sha "$fk_bucket/versions/v1/gvproxy-min-linux-$target_arch")"
-  fi
-
-  {
-    printf '# format: 1\n'
-    printf '# component   os      arch    version   sha256   kind   dest                 src\n'
-    printf '\n'
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-      minimal linux "$target_arch" v1 "$h_minimal" file bin/min "versions/v1/minimal-linux-$target_arch"
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-      minvmd linux "$target_arch" v1 "$h_minvmd" file bin/minvmd "versions/v1/minvmd-linux-$target_arch"
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-      vmlinuz linux "$target_arch" v1 "$h_kernel" file data/vmlinuz "versions/v1/vmlinuz-$target_arch"
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-      rootfs linux "$target_arch" v1 "$h_rootfs" file data/rootfs.img "versions/v1/rootfs-$target_arch.img"
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-      initramfs linux "$target_arch" v1 "$h_initramfs" file data/initramfs.cpio "versions/v1/initramfs-$target_arch.cpio"
-    if [ -n "$fk_gvproxy" ]; then
-      printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-        gvproxy-min linux "$target_arch" v1 "$h_gvproxy" file bin/gvproxy-min "versions/v1/gvproxy-min-linux-$target_arch"
-    fi
-  } >"$fk_bucket/versions/v1/components"
-
-  # Stub curl that serves the mock bucket.
-  cat >"$fk_stubbin/curl" <<STUB
-#!/bin/sh
-# Fake curl: map the pinned bucket host to this local dir.
-out= url=
-while [ \$# -gt 0 ]; do
-  case "\$1" in
-    -o) out="\$2"; shift 2 ;;
-    https://*|http://*) url="\$1"; shift ;;
-    *) shift ;;
-  esac
-done
-[ -n "\$url" ] || { echo "stub curl: no url" >&2; exit 2; }
-rel="\${url#$fk_bucket_host/}"
-src="$fk_bucket/\$rel"
-[ -f "\$src" ] || { echo "stub curl: 404 \$url" >&2; exit 22; }
-if [ -n "\$out" ]; then cp "\$src" "\$out"; else cat "\$src"; fi
-STUB
-  chmod +x "$fk_stubbin/curl"
-  cat >"$fk_stubbin/wget" <<'STUB'
-#!/bin/sh
-echo "stub wget should not be used here" >&2
-exit 1
-STUB
-  chmod +x "$fk_stubbin/wget"
+  # Stage the mock bucket (the empty switch above omits the gvproxy-min row
+  # the stock install always ships) and the stub downloaders the installer
+  # resolves first on PATH.
+  stage_vm_mock_bucket \
+    "fresh-install KVM activate" \
+    "$fk_bucket" "$fk_seed" "$target_arch" "$fk_gvproxy"
+  write_install_stubs "$fk_stubbin" "$fk_bucket" "$fk_bucket_host"
 
   if (
-    # XDG_DATA_HOME outranks HOME in both the installer's data-prefix
-    # resolution (scripts/install.sh) and the daemon's image resolver
-    # (crates/minvmd/src/image.rs), and the harness does not hermeticize it —
-    # a host or CI that exports it would land the guest images in a different
-    # prefix from the $fk_home/.local/share/minimal this proof asserts, for the
-    # install check below and the start-line values alike. A genuinely fresh
-    # install has it unset, so drop it (this subshell only, like the PATH
-    # below) and let the HOME-based path be the one actually exercised.
-    unset XDG_DATA_HOME
-    # Fresh install into the throwaway home, no path overrides. The PATH change
-    # is intentionally scoped to this subshell (SC2031).
-    # shellcheck disable=SC2031
-    HOME="$fk_home" MINIMAL_BIN="$fk_home/.local/bin" \
-      PATH="$fk_stubbin:$PATH" \
-      MINIMAL_OVERRIDE_INSTALLER_BUCKET="$fk_bucket_host" \
-      sh "$ROOT/scripts/install.sh" >"$fk_out" 2>&1 || {
-        echo "::error::the fresh install (VM stack) failed"
-        echo "--- install output ---"; cat "$fk_out" 2>/dev/null || true
-        exit 1
-      }
+    # A REAL install.sh run into the throwaway home, off the mock bucket
+    # (the shared helper owns the XDG_DATA_HOME drop and the install
+    # failure's diagnostics).
+    run_mock_bucket_install "$fk_home" "$fk_bucket_host" "$fk_stubbin" "$fk_out" \
+      "the fresh install (VM stack) failed"
 
     [ -x "$fk_home/.local/bin/min" ] \
       && [ -x "$fk_home/.local/bin/minvmd" ] || {
@@ -6312,43 +6424,17 @@ STUB
       }
     fi
 
-    # Drive the installed pair with no MINVMD_* overrides, so resolution must
-    # come from the installed data prefix. Env swap is scoped to this subshell
-    # (SC2030/SC2031).
-    # shellcheck disable=SC2030,SC2031
-    export HOME="$fk_home" MINIMAL_BIN="$fk_home/.local/bin" PATH="$fk_home/.local/bin:$PATH"
-    unset MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS MINVMD_GVPROXY_BIN
-    mnl stop --force >/dev/null 2>&1 || true
+    # NET-049/NET-051 observability: activate and list through the shared
+    # driver (the UUID the destroy below takes), then the VM host daemon's
+    # start log line must name the kernel, rootfs, initramfs and switch it
+    # resolved — from the installed prefix, with no MINVMD_* override
+    # anywhere (the assertion lives in the shared helper, which names where
+    # the record is searched and why).
+    fk_sid="$(drive_installed_vm_pair \
+      "$fk_home" "$fk_seed" "e2e-fresh-kvm-$target_arch" "$fk_root/activate.err" \
+      "the installed pair failed to activate a session with local-minvmd and no image overrides" \
+      "the fresh-install KVM session")" || exit 1
 
-    local fk_sid
-    # The start record this proof asserts is INFO, and a daemon's filter comes
-    # from RUST_LOG at autospawn (it inherits the CLI's env). This harness
-    # quiets the whole run to `warn` for output parsing, which drops the record
-    # before it reaches any sink — so the ONE activate that autospawns the
-    # daemon carries a filter that admits it, as a command-local assignment
-    # (never a subshell export) so nothing leaks past this proof. `minvmd` is
-    # the daemon's crate, so the CLI's own stdout stays quiet and the last-line
-    # UUID extraction below keeps working.
-    fk_sid="$(cd "$fk_seed" && RUST_LOG="warn,minvmd=info" mnl session activate . --no-prompt --name "e2e-fresh-kvm-$target_arch" 2>"$fk_root/activate.err")" || {
-      echo "::error::the installed pair failed to activate a session with local-minvmd and no image overrides"
-      echo "--- activate stderr ---"; cat "$fk_root/activate.err" 2>/dev/null || true
-      exit 1
-    }
-    fk_sid="$(printf '%s\n' "$fk_sid" | tail -n1 | tr -d '\r')"
-
-    if ! printf '%s' "$fk_sid" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
-      echo "::error::activate's last stdout line is not a session UUID: '$fk_sid'"
-      exit 1
-    fi
-    mnl ls --raw 2>/dev/null | grep -Fqx "$fk_sid" || {
-      echo "::error::'min ls --raw' does not list the fresh-install KVM session $fk_sid"
-      exit 1
-    }
-
-    # NET-049/NET-051 observability: the VM host daemon's start log line names
-    # the kernel, rootfs, initramfs and switch it resolved — from the installed
-    # prefix, with no MINVMD_* override anywhere (the assertion lives in the
-    # shared helper, which names where the record is searched and why).
     fresh_vm_start_record_asserts_installed_images "$fk_home" "$fk_gvproxy"
 
     mnl session destroy --force "$fk_sid" >/dev/null 2>&1 || true
@@ -6437,7 +6523,7 @@ proof_linux_stock_install_runs_vm_boxes() {
   echo "::group::stock install runs VM boxes end to end ($sb_arch, installed pair, KVM)"
 
   local sb_root sb_home sb_bucket sb_stubbin sb_out sb_seed sb_name
-  local sb_kernel sb_rootfs sb_initramfs sb_gvproxy sb_bucket_host
+  local sb_gvproxy sb_bucket_host
   sb_root="$WORK/stock-vm-$sb_arch"
   sb_bucket_host="https://mock.invalid/minimal-stock-vm-$sb_arch"
   sb_home="$sb_root/home"
@@ -6448,27 +6534,13 @@ proof_linux_stock_install_runs_vm_boxes() {
   sb_name="e2e-stock-vm-$sb_arch"
   mkdir -p "$sb_home" "$sb_bucket/versions/v1" "$sb_stubbin" "$sb_seed"
 
-  hook_seed_preamble > "$sb_seed/minimal.toml"
-  mkdir "$sb_seed/.git"
-
-  # Locate the guest images the lane already built/fetched (same sources as
-  # the fresh-kvm proofs).
-  if [ -n "${MINVMD_KERNEL_PATH:-}" ] && [ -f "$MINVMD_KERNEL_PATH" ]; then
-    sb_kernel="$MINVMD_KERNEL_PATH"
-  else
-    sb_kernel="$ROOT/.scratch/vmlinuz"
-  fi
-  if [ -n "${MINVMD_ROOTFS_PATH:-}" ] && [ -f "$MINVMD_ROOTFS_PATH" ]; then
-    sb_rootfs="$MINVMD_ROOTFS_PATH"
-  else
-    sb_rootfs="$ROOT/.scratch/rootfs.img"
-  fi
-  if [ -n "${MINVMD_INITRAMFS:-}" ] && [ -f "$MINVMD_INITRAMFS" ]; then
-    sb_initramfs="$MINVMD_INITRAMFS"
-  else
-    sb_initramfs="$ROOT/.scratch/initramfs.cpio"
-  fi
-  if [ ! -f "$sb_kernel" ] || [ ! -f "$sb_rootfs" ] || [ ! -f "$sb_initramfs" ]; then
+  # Locate the guest images the lane already built/fetched (the shared
+  # helper reads the same MINVMD_*_PATH / .scratch sources), and skip when
+  # they are not there — BEFORE the switch resolution below, so a lane
+  # without the images never pays for (or fails on) a gvproxy fetch it
+  # cannot use.
+  locate_vm_guest_images
+  if [ ! -f "$STAGED_KERNEL" ] || [ ! -f "$STAGED_ROOTFS" ] || [ ! -f "$STAGED_INITRAMFS" ]; then
     echo "stock-install VM boxes SKIPPED (guest images not available)"
     echo "::endgroup::"
     return 0
@@ -6492,80 +6564,13 @@ proof_linux_stock_install_runs_vm_boxes() {
     sb_gvproxy="$sb_root/gvproxy"
   fi
 
-  # Verify the binaries we'll stage are available BEFORE anything is staged:
-  # a missing one must not surface later as "the stock install (VM stack)
-  # failed" with the cause buried in the install log. A --provider
-  # local-minvmd activation only needs min and minvmd (the guest runs
-  # minimald, not the host) — the same guard the fresh-kvm proofs keep.
-  if ! command -v min >/dev/null 2>&1 || ! command -v minvmd >/dev/null 2>&1; then
-    echo "::error::the stock-install case requires min and minvmd on PATH"
-    fail
-  fi
-
-  # Stage the bucket: every component a Linux release ships for this arch,
-  # so the install under test IS the stock one.
-  cp "$(command -v min)"      "$sb_bucket/versions/v1/minimal-linux-$sb_arch"
-  cp "$(command -v minvmd)"   "$sb_bucket/versions/v1/minvmd-linux-$sb_arch"
-  cp "$sb_kernel"             "$sb_bucket/versions/v1/vmlinuz-$sb_arch"
-  cp "$sb_rootfs"             "$sb_bucket/versions/v1/rootfs-$sb_arch.img"
-  cp "$sb_initramfs"          "$sb_bucket/versions/v1/initramfs-$sb_arch.cpio"
-  cp "$sb_gvproxy"            "$sb_bucket/versions/v1/gvproxy-min-linux-$sb_arch"
-  printf 'v1\n' >"$sb_bucket/stable"
-
-  sb_sha() { sha256sum "$1" | awk '{print $1}'; }
-  local h_minimal h_minvmd h_kernel h_rootfs h_initramfs h_gvproxy
-  h_minimal="$(sb_sha "$sb_bucket/versions/v1/minimal-linux-$sb_arch")"
-  h_minvmd="$(sb_sha "$sb_bucket/versions/v1/minvmd-linux-$sb_arch")"
-  h_kernel="$(sb_sha "$sb_bucket/versions/v1/vmlinuz-$sb_arch")"
-  h_rootfs="$(sb_sha "$sb_bucket/versions/v1/rootfs-$sb_arch.img")"
-  h_initramfs="$(sb_sha "$sb_bucket/versions/v1/initramfs-$sb_arch.cpio")"
-  h_gvproxy="$(sb_sha "$sb_bucket/versions/v1/gvproxy-min-linux-$sb_arch")"
-
-  {
-    printf '# format: 1\n'
-    printf '# component   os      arch    version   sha256   kind   dest                 src\n'
-    printf '\n'
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-      minimal linux "$sb_arch" v1 "$h_minimal" file bin/min "versions/v1/minimal-linux-$sb_arch"
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-      minvmd linux "$sb_arch" v1 "$h_minvmd" file bin/minvmd "versions/v1/minvmd-linux-$sb_arch"
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-      vmlinuz linux "$sb_arch" v1 "$h_kernel" file data/vmlinuz "versions/v1/vmlinuz-$sb_arch"
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-      rootfs linux "$sb_arch" v1 "$h_rootfs" file data/rootfs.img "versions/v1/rootfs-$sb_arch.img"
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-      initramfs linux "$sb_arch" v1 "$h_initramfs" file data/initramfs.cpio "versions/v1/initramfs-$sb_arch.cpio"
-    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-      gvproxy-min linux "$sb_arch" v1 "$h_gvproxy" file bin/gvproxy-min "versions/v1/gvproxy-min-linux-$sb_arch"
-  } >"$sb_bucket/versions/v1/components"
-
-  # Stub curl that serves the mock bucket (the same trick install_test.sh
-  # uses, so the real installer runs unmodified), and a wget that forces the
-  # downloader selection deterministic.
-  cat >"$sb_stubbin/curl" <<STUB
-#!/bin/sh
-# Fake curl: map the pinned bucket host to this local dir.
-out= url=
-while [ \$# -gt 0 ]; do
-  case "\$1" in
-    -o) out="\$2"; shift 2 ;;
-    https://*|http://*) url="\$1"; shift ;;
-    *) shift ;;
-  esac
-done
-[ -n "\$url" ] || { echo "stub curl: no url" >&2; exit 2; }
-rel="\${url#$sb_bucket_host/}"
-src="$sb_bucket/\$rel"
-[ -f "\$src" ] || { echo "stub curl: 404 \$url" >&2; exit 22; }
-if [ -n "\$out" ]; then cp "\$src" "\$out"; else cat "\$src"; fi
-STUB
-  chmod +x "$sb_stubbin/curl"
-  cat >"$sb_stubbin/wget" <<'STUB'
-#!/bin/sh
-echo "stub wget should not be used here" >&2
-exit 1
-STUB
-  chmod +x "$sb_stubbin/wget"
+  # Stage the mock bucket — every component a Linux release ships for this
+  # arch, switch REQUIRED, so the install under test IS the stock one — and
+  # the stub downloaders the installer resolves first on PATH.
+  stage_vm_mock_bucket \
+    "the stock-install case" \
+    "$sb_bucket" "$sb_seed" "$sb_arch" "$sb_gvproxy"
+  write_install_stubs "$sb_stubbin" "$sb_bucket" "$sb_bucket_host"
 
   # The installed pair's provenance, in the installer's own words: printed
   # after the install (observability) and again by every activate/exec
@@ -6579,25 +6584,11 @@ STUB
   }
 
   if (
-    # XDG_DATA_HOME outranks HOME in both the installer's data-prefix
-    # resolution (scripts/install.sh) and the daemon's image resolver
-    # (crates/minvmd/src/image.rs), and the harness does not hermeticize it —
-    # a host or CI that exports it would land the guest images in a different
-    # prefix from the $sb_home/.local/share/minimal this proof asserts. A
-    # genuinely fresh install has it unset, so drop it (this subshell only,
-    # like the PATH change below).
-    unset XDG_DATA_HOME
-    # Fresh install into the throwaway home, no path overrides. The PATH
-    # change is intentionally scoped to this subshell (SC2031).
-    # shellcheck disable=SC2031
-    HOME="$sb_home" MINIMAL_BIN="$sb_home/.local/bin" \
-      PATH="$sb_stubbin:$PATH" \
-      MINIMAL_OVERRIDE_INSTALLER_BUCKET="$sb_bucket_host" \
-      sh "$ROOT/scripts/install.sh" >"$sb_out" 2>&1 || {
-        echo "::error::the stock install (VM stack) failed"
-        echo "--- install log ---"; cat "$sb_out" 2>/dev/null || true
-        exit 1
-      }
+    # A REAL install.sh run into the throwaway home, off the mock bucket
+    # (the shared helper owns the XDG_DATA_HOME drop and the install
+    # failure's diagnostics).
+    run_mock_bucket_install "$sb_home" "$sb_bucket_host" "$sb_stubbin" "$sb_out" \
+      "the stock install (VM stack) failed"
 
     # Observability: what the stock install placed, in its own words (the
     # helper prints it again on any activate/exec failure below).
@@ -6637,42 +6628,16 @@ STUB
       exit 1
     }
 
-    # Drive the installed pair with no MINVMD_* overrides, so image and
-    # switch resolution must come from the installed prefixes. Env swap is
-    # scoped to this subshell (SC2030/SC2031).
-    # shellcheck disable=SC2030,SC2031
-    export HOME="$sb_home" MINIMAL_BIN="$sb_home/.local/bin" PATH="$sb_home/.local/bin:$PATH"
-    unset MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS MINVMD_GVPROXY_BIN
-    mnl stop --force >/dev/null 2>&1 || true
-
-    local sb_sid sb_exec
-    # The 'starting VM' record this proof reads later is INFO, and a daemon's
-    # filter comes from RUST_LOG at autospawn (it inherits the CLI's env).
-    # This harness quiets the whole run to `warn` for output parsing, which
-    # drops the record before it reaches any sink — so the ONE activate that
-    # autospawns the daemon carries a filter that admits it, as a
-    # command-local assignment (never a subshell export) so nothing leaks
-    # past this proof. `minvmd` is the daemon's crate, so the CLI's own
-    # stdout stays quiet and the last-line UUID extraction below keeps
-    # working.
-    sb_sid="$(cd "$sb_seed" && RUST_LOG="warn,minvmd=info" mnl session activate . --no-prompt --name "$sb_name" 2>"$sb_root/activate.err")" || {
-      echo "::error::the stock-installed pair failed to activate a VM box"
-      echo "--- activate stderr ---"; cat "$sb_root/activate.err" 2>/dev/null || true
+    # Activate, list: the shared driver, whose UUID the whole path below is
+    # driven by.
+    sb_sid="$(drive_installed_vm_pair \
+      "$sb_home" "$sb_seed" "$sb_name" "$sb_root/activate.err" \
+      "the stock-installed pair failed to activate a VM box" \
+      "the stock-installed VM session")" || {
       sb_print_installed_components
       exit 1
     }
-    sb_sid="$(printf '%s\n' "$sb_sid" | tail -n1 | tr -d '\r')"
-
-    if ! printf '%s' "$sb_sid" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
-      echo "::error::activate's last stdout line is not a session UUID: '$sb_sid'"
-      exit 1
-    fi
     echo "activation: the stock-installed pair brought up VM box '$sb_name' as session $sb_sid"
-
-    mnl ls --raw 2>/dev/null | grep -Fqx "$sb_sid" || {
-      echo "::error::'min ls --raw' does not list the stock-installed VM session $sb_sid"
-      exit 1
-    }
 
     # End to end: a command run IN the box, over the bridge, from the
     # installed pair alone. The cwd proves it ran in the session's mount
