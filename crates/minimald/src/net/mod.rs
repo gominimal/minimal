@@ -97,6 +97,15 @@ pub enum NetError {
     /// The configured subnet has no remaining host address to hand out.
     #[error("gvproxy subnet {0} is exhausted; no free PTask address remains")]
     SubnetExhausted(SwitchSubnet),
+    /// The host handed the box a switch address outside the plan's PTask run
+    /// (T66): the daemon's subnet cannot honor it, and attaching with it
+    /// would source frames from an address no row of the host-side table is
+    /// keyed by.
+    #[error("handed switch address {address} is outside the plan's PTask run on subnet {subnet}")]
+    HandedAddressOutsidePlan {
+        address: Ipv4Addr,
+        subnet: SwitchSubnet,
+    },
     /// Spawning the gvproxy binary failed.
     #[error("spawning gvproxy at {path:?}: {source}")]
     Spawn {
@@ -206,6 +215,42 @@ impl IpAllocator {
     #[must_use]
     pub fn leases(&self) -> &[PtaskLease] {
         &self.leases
+    }
+
+    /// Records `ip` as handed out by the host (T66) rather than drawn here,
+    /// returning its lease. The lease joins [`Self::leases`] — the
+    /// static-lease table the switch is configured from — and the cursor
+    /// advances past it, so a later [`Self::allocate`] never re-issues an
+    /// address the host has (or had) someone else's box on. The
+    /// never-reuse rule is one rule across both allocation shapes.
+    ///
+    /// A re-attach of a box the daemon already knows — the shape a daemon
+    /// restart produces, every session re-attaching with the address its
+    /// record carries — finds the lease already recorded and adds no
+    /// duplicate to the table.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::HandedAddressOutsidePlan`] when `ip` is outside the
+    /// plan's PTask run: the address cannot be honored on this subnet.
+    pub fn hand(&mut self, ip: Ipv4Addr) -> Result<PtaskLease, NetError> {
+        let ip_num = u32::from(ip);
+        if ip_num < self.subnet.first_ptask() || ip_num > self.subnet.last_ptask() {
+            return Err(NetError::HandedAddressOutsidePlan {
+                address: ip,
+                subnet: self.subnet,
+            });
+        }
+        self.next = self.next.max(ip_num + 1);
+        if let Some(lease) = self.leases.iter().find(|lease| lease.ip == ip) {
+            return Ok(*lease);
+        }
+        let lease = PtaskLease {
+            ip,
+            mac: MacAddr::for_switch_ip(ip),
+        };
+        self.leases.push(lease);
+        Ok(lease)
     }
 }
 
@@ -330,6 +375,17 @@ impl SwitchClient {
         self.allocator.subnet()
     }
 
+    /// Every lease this switch knows — self-allocated and handed (T66)
+    /// alike, oldest first — the table the generated config is written
+    /// from. A diagnostic surface for the addresses the switch has handed
+    /// out and which shape of attach took them, without reaching into the
+    /// allocator.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn leases(&self) -> &[PtaskLease] {
+        self.allocator.leases()
+    }
+
     fn config_path(&self) -> PathBuf {
         self.state_dir.join("gvproxy.yaml")
     }
@@ -363,6 +419,42 @@ impl SwitchClient {
             mac = %lease.mac,
             attached = self.attached,
             "attached OwnIp PTask to gvproxy switch"
+        );
+        let exit_signal = self.exit_tx.subscribe();
+        Ok(AttachResult { lease, exit_signal })
+    }
+
+    /// Attaches a PTask with the switch address the host handed it (T66)
+    /// instead of drawing one: the box was registered on the host-side table
+    /// keyed by this address, so the daemon reuses it and mints nothing.
+    ///
+    /// The handed address is recorded like an allocated one — it joins the
+    /// static-lease table the switch is configured from, and the allocator's
+    /// cursor advances past it ([`IpAllocator::hand`]) — so the
+    /// never-reuse rule holds across both allocation shapes. Everything
+    /// else matches [`Self::attach`], including the DM2 config/spawn steps
+    /// and the attach count.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::HandedAddressOutsidePlan`] when the host handed an
+    /// address this daemon's subnet cannot honor; propagates config-write,
+    /// spawn, and socket-readiness failures as [`Self::attach`] does.
+    pub async fn attach_handed(&mut self, handed: Ipv4Addr) -> Result<AttachResult, NetError> {
+        let lease = self.allocator.hand(handed)?;
+        // DM2 spawns + configures gvproxy locally; DM1/3/4 (HostShuttle) leaves
+        // gvproxy to `minvmd` on the host, so skip the spawn/config steps and
+        // only track the attach count — same shape as [`Self::attach`].
+        if matches!(self.transport, SwitchTransport::LocalSpawn) {
+            self.write_config().await?;
+            self.ensure_running().await?;
+        }
+        self.attached += 1;
+        tracing::info!(
+            ip = %lease.ip,
+            mac = %lease.mac,
+            attached = self.attached,
+            "attached OwnIp PTask to gvproxy switch at its handed address"
         );
         let exit_signal = self.exit_tx.subscribe();
         Ok(AttachResult { lease, exit_signal })

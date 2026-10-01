@@ -188,6 +188,11 @@ pub(crate) fn task_network(
         &format!("{session}-task"),
         egress.map(|section| sessions::SessionPolicy::new(Some(section), None)),
         None,
+        // Deliberately not the record's handed addresses (T66): the task's
+        // sandbox is not the box the registration named — attaching it at the
+        // session box's address would key its frames to the session's row.
+        // A task's sandbox self-allocates, as it always has.
+        None,
     )
 }
 
