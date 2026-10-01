@@ -1,6 +1,6 @@
 [package]
 name = "minimal-client"
-description = "SSH client transport for talking to minimald over the UDS bridge, shared by the min CLI and the TUI"
+description = "SSH client transport and shared activation orchestration for talking to minimald over the UDS bridge, shared by the min CLI and the TUI"
 rust-version.workspace = true
 version.workspace = true
 edition.workspace = true
