@@ -94,6 +94,13 @@
 #                                    --ingress in help+reference+hints, a none
 #                                    box that attaches and reaches nothing,
 #                                    the stock posture's reach, own-IP again
+#   linux_stock_install_runs_vm_boxes
+#                                    from a real install.sh run on a KVM host:
+#                                    the VM stack the stock install ships runs
+#                                    a box end to end — activate, listed, exec,
+#                                    destroy delisted — off the images and
+#                                    switch the install placed, with the VM
+#                                    host daemon's start record naming them
 #   min_internal_names_through_proxy NET-001..004 through the shipped proxy
 #   proxy_refuses_like_direct        the proxy refuses exactly as the switch
 #                                    does: paired direct/proxied attempts,
@@ -112,14 +119,16 @@ set -uo pipefail # not -e: capture failures so we can dump diagnostics
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 E2E_VM="${E2E_VM:-}"
 
-# The two Linux fresh-install KVM proofs are documented as VM-backed cases
-# (NET-049/NET-051) and are invoked directly by their task test lines. When
-# called that way, behave as if the caller exported the KVM lane environment
-# variables: E2E_VM=1 and E2E_MINIMAL_ARGS="--provider local-minvmd". Without
-# this the script's min_daemon probe defaults to minimald on Linux and the
-# standalone case fails before it reaches the proof.
+# The three Linux fresh-install KVM proofs are documented as VM-backed cases
+# (NET-049/NET-051, plus the stock-install integration case) and are invoked
+# directly by their task test lines. When called that way, behave as if the
+# caller exported the KVM lane environment variables: E2E_VM=1 and
+# E2E_MINIMAL_ARGS="--provider local-minvmd". Without this the script's
+# min_daemon probe defaults to minimald on Linux and the standalone case fails
+# before it reaches the proof.
 case "${1:-}" in
-  fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd)
+  fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
+    | linux_stock_install_runs_vm_boxes)
     E2E_VM="${E2E_VM:-1}"
     if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
       E2E_MINIMAL_ARGS="--provider local-minvmd"
@@ -5999,6 +6008,118 @@ echo "::group::retired surfaces gone (ssh-forward, login, :7655, direct-tcpip)"
 # session with --provider local-minvmd and no MINVMD_* path overrides,
 # asserting that the VM host daemon resolves its images from the installed data
 # prefix and logs them.
+# ---------------------------------------------------------------------------
+# Shared by the fresh-install VM proofs (the NET-049/NET-051 activation case
+# and the stock-install case below): the VM host daemon's start record must
+# exist and name the kernel, rootfs and initramfs it resolved — from the
+# installed data prefix of the home $1 was installed into — and, when $2 is
+# non-empty (the proof shipped a switch), that switch from the installed bin
+# dir. Runs INSIDE the caller's install-proof subshell, so every failure
+# `exit 1`s and the caller's `if ( ... )` turns the unwind into its own
+# `fail`; prints the record it matched.
+#
+# WHERE the record lives: an autospawned daemon is a detached supervisor,
+# which routes its tracing to the daily-rotated file sink under the state
+# base's logs dir (`minvmd.log*`, dated and unsuffixed — crates/minvmd/src/
+# main.rs). Its stderr — run.log, where a boot failure's diagnosis lands —
+# carries only what tracing does not. Both are searched, file sink first;
+# the first file that carries the record is the one that proves it.
+#
+# WHEN it lands: activate returns once the VM is serving, which can precede
+# the appender's first flush, and the dated file is created by the daemon's
+# own start — after the CLI's autospawn call returned. So the LOOKUP runs
+# inside the retry loop (it used to run once, before it, and grep whatever
+# it resolved there 20 times over) and the total wait is 20 s, well past
+# the seconds a first flush can take.
+fresh_vm_start_record_asserts_installed_images() {
+  local fsr_home="$1" fsr_switch="$2"
+  local fsr_rec fsr_log fsr_cand fsr_key fsr_want fsr_data
+  fsr_log_candidates() {
+    # Newest first: the dated file sorts after the unsuffixed name, and a
+    # later date after an earlier one.
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null | sort -r
+    printf '%s\n' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/run.log"
+  }
+  fsr_rec=""
+  fsr_log=""
+  for _ in $(seq 1 40); do
+    while IFS= read -r fsr_cand; do
+      [ -f "$fsr_cand" ] || continue
+      fsr_rec="$(grep -h -- 'starting VM' "$fsr_cand" 2>/dev/null | tail -n1)"
+      [ -z "$fsr_rec" ] && continue
+      fsr_log="$fsr_cand"
+      break
+    done < <(fsr_log_candidates)
+    [ -n "$fsr_rec" ] && break
+    sleep 0.5
+  done
+  if [ -z "$fsr_rec" ]; then
+    echo "::error::no 'starting VM' record in any VM host daemon log after 20 s"
+    echo "--- paths searched (tail of each) ---"
+    while IFS= read -r fsr_cand; do
+      echo "--- $fsr_cand ---"
+      if [ -f "$fsr_cand" ]; then
+        tail -30 "$fsr_cand" 2>/dev/null || true
+      else
+        echo "(no such file)"
+      fi
+    done < <(fsr_log_candidates)
+    echo "--- log dir listing ---"
+    ls -la "$XDG_STATE_HOME/minimal/logs" 2>/dev/null || echo "(no log dir)"
+    exit 1
+  fi
+
+  # The file sink writes one flat JSON object per line (crates/mlog) with the
+  # record's own fields nested under "fields", in the subscriber's key order —
+  # alphabetical (a BTreeMap in json-subscriber), not the record's declaration
+  # order. So each field is matched on its own: one ordered pattern would pin
+  # an ordering the JSON layer does not promise.
+  for fsr_key in kernel rootfs initramfs switch; do
+    fsr_want="\"$fsr_key\":"
+    case "$fsr_rec" in
+      *"$fsr_want"*) ;;
+      *)
+        echo "::error::the VM host daemon start line does not name its $fsr_key"
+        echo "--- record ---"; printf '%s\n' "$fsr_rec"
+        exit 1
+        ;;
+    esac
+  done
+
+  # And the values are the point: with no MINVMD_* overrides, the daemon must
+  # have resolved each guest image from the installed data prefix — the same
+  # paths the install check verified the installer stamped — and the switch
+  # from the installed bin dir when the proof staged one.
+  fsr_data="$fsr_home/.local/share/minimal"
+  for fsr_pair in "kernel=$fsr_data/vmlinuz" "rootfs=$fsr_data/rootfs.img" \
+                  "initramfs=$fsr_data/initramfs.cpio"; do
+    fsr_key="${fsr_pair%%=*}"
+    fsr_want="\"$fsr_key\":\"${fsr_pair#*=}\""
+    case "$fsr_rec" in
+      *"$fsr_want"*) ;;
+      *)
+        echo "::error::the VM host daemon start line does not resolve its $fsr_key from the installed data prefix"
+        echo "--- record ---"; printf '%s\n' "$fsr_rec"
+        echo "--- expected ---"; printf '%s\n' "$fsr_want"
+        exit 1
+        ;;
+    esac
+  done
+  if [ -n "$fsr_switch" ]; then
+    fsr_want="\"switch\":\"$fsr_home/.local/bin/gvproxy-min\""
+    case "$fsr_rec" in
+      *"$fsr_want"*) ;;
+      *)
+        echo "::error::the VM host daemon start line does not resolve the switch from the installed bin dir"
+        echo "--- record ---"; printf '%s\n' "$fsr_rec"
+        echo "--- expected ---"; printf '%s\n' "$fsr_want"
+        exit 1
+        ;;
+    esac
+  fi
+  echo "VM host daemon start line ($fsr_log): $fsr_rec"
+}
+
 proof_fresh_kvm_activate_local_minvmd_for_arch() {
   local target_arch="$1"
   if [ -z "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
@@ -6199,7 +6320,7 @@ STUB
     unset MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS MINVMD_GVPROXY_BIN
     mnl stop --force >/dev/null 2>&1 || true
 
-    local fk_sid fk_log fk_rec fk_cand fk_key fk_want fk_data
+    local fk_sid
     # The start record this proof asserts is INFO, and a daemon's filter comes
     # from RUST_LOG at autospawn (it inherits the CLI's env). This harness
     # quiets the whole run to `warn` for output parsing, which drops the record
@@ -6225,105 +6346,10 @@ STUB
     }
 
     # NET-049/NET-051 observability: the VM host daemon's start log line names
-    # the kernel, rootfs, initramfs and switch it resolved.
-    #
-    # WHERE the record lives: an autospawned daemon is a detached supervisor,
-    # which routes its tracing to the daily-rotated file sink under the state
-    # base's logs dir (`minvmd.log*`, dated and unsuffixed — crates/minvmd/src/
-    # main.rs). Its stderr — run.log, where a boot failure's diagnosis lands —
-    # carries only what tracing does not. Both are searched, file sink first;
-    # the first file that carries the record is the one that proves it.
-    #
-    # WHEN it lands: activate returns once the VM is serving, which can precede
-    # the appender's first flush, and the dated file is created by the daemon's
-    # own start — after the CLI's autospawn call returned. So the LOOKUP runs
-    # inside the retry loop (it used to run once, before it, and grep whatever
-    # it resolved there 20 times over) and the total wait is 20 s, well past
-    # the seconds a first flush can take.
-    fk_log_candidates() {
-      # Newest first: the dated file sorts after the unsuffixed name, and a
-      # later date after an earlier one.
-      find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null | sort -r
-      printf '%s\n' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/run.log"
-    }
-    fk_rec=""
-    fk_log=""
-    for _ in $(seq 1 40); do
-      while IFS= read -r fk_cand; do
-        [ -f "$fk_cand" ] || continue
-        fk_rec="$(grep -h -- 'starting VM' "$fk_cand" 2>/dev/null | tail -n1)"
-        [ -z "$fk_rec" ] && continue
-        fk_log="$fk_cand"
-        break
-      done < <(fk_log_candidates)
-      [ -n "$fk_rec" ] && break
-      sleep 0.5
-    done
-    if [ -z "$fk_rec" ]; then
-      echo "::error::no 'starting VM' record in any VM host daemon log after 20 s"
-      echo "--- paths searched (tail of each) ---"
-      while IFS= read -r fk_cand; do
-        echo "--- $fk_cand ---"
-        if [ -f "$fk_cand" ]; then
-          tail -30 "$fk_cand" 2>/dev/null || true
-        else
-          echo "(no such file)"
-        fi
-      done < <(fk_log_candidates)
-      echo "--- log dir listing ---"
-      ls -la "$XDG_STATE_HOME/minimal/logs" 2>/dev/null || echo "(no log dir)"
-      exit 1
-    fi
-
-    # The file sink writes one flat JSON object per line (crates/mlog) with the
-    # record's own fields nested under "fields", in the subscriber's key order —
-    # alphabetical (a BTreeMap in json-subscriber), not the record's declaration
-    # order. So each field is matched on its own: one ordered pattern would pin
-    # an ordering the JSON layer does not promise.
-    for fk_key in kernel rootfs initramfs switch; do
-      fk_want="\"$fk_key\":"
-      case "$fk_rec" in
-        *"$fk_want"*) ;;
-        *)
-          echo "::error::the VM host daemon start line does not name its $fk_key"
-          echo "--- record ---"; printf '%s\n' "$fk_rec"
-          exit 1
-          ;;
-      esac
-    done
-
-    # And the values are the proof's point: with no MINVMD_* overrides, the
-    # daemon must have resolved each guest image from the installed data prefix
-    # — the same paths the install checks above verified the installer stamped —
-    # and the switch from the installed bin dir when this proof staged one.
-    fk_data="$fk_home/.local/share/minimal"
-    for fk_pair in "kernel=$fk_data/vmlinuz" "rootfs=$fk_data/rootfs.img" \
-                   "initramfs=$fk_data/initramfs.cpio"; do
-      fk_key="${fk_pair%%=*}"
-      fk_want="\"$fk_key\":\"${fk_pair#*=}\""
-      case "$fk_rec" in
-        *"$fk_want"*) ;;
-        *)
-          echo "::error::the VM host daemon start line does not resolve its $fk_key from the installed data prefix"
-          echo "--- record ---"; printf '%s\n' "$fk_rec"
-          echo "--- expected ---"; printf '%s\n' "$fk_want"
-          exit 1
-          ;;
-      esac
-    done
-    if [ -n "$fk_gvproxy" ]; then
-      fk_want="\"switch\":\"$fk_home/.local/bin/gvproxy-min\""
-      case "$fk_rec" in
-        *"$fk_want"*) ;;
-        *)
-          echo "::error::the VM host daemon start line does not resolve the switch from the installed bin dir"
-          echo "--- record ---"; printf '%s\n' "$fk_rec"
-          echo "--- expected ---"; printf '%s\n' "$fk_want"
-          exit 1
-          ;;
-      esac
-    fi
-    echo "VM host daemon start line ($fk_log): $fk_rec"
+    # the kernel, rootfs, initramfs and switch it resolved — from the installed
+    # prefix, with no MINVMD_* override anywhere (the assertion lives in the
+    # shared helper, which names where the record is searched and why).
+    fresh_vm_start_record_asserts_installed_images "$fk_home" "$fk_gvproxy"
 
     mnl session destroy --force "$fk_sid" >/dev/null 2>&1 || true
     mnl stop --force >/dev/null 2>&1 || true
@@ -6345,6 +6371,317 @@ proof_fresh_arm64_kvm_activate_local_minvmd() {
 }
 
 # ---------------------------------------------------------------------------
+# The stock install runs VM boxes, end to end (the S14 integration case).
+# From a REAL scripts/install.sh run into a fresh HOME — the mock-bucket
+# install the fresh-kvm proofs use, shipping the VM stack the Linux releases
+# ship (min, minvmd, the guest kernel, rootfs and initramfs, and the switch) —
+# the INSTALLED pair must run a VM box through the user's whole path, with no
+# MINVMD_* override anywhere:
+#
+#   * the install places every component and says so; the pair it leaves
+#     behind is a stock one: the images in the installed data prefix, the
+#     switch in the installed bin dir (NET-048/NET-050's runtime half);
+#   * `min session activate --provider local-minvmd` boots the microVM and
+#     prints the new session — the activation's outcome, observed — and the
+#     session is listed;
+#   * a command run in the box (`min session exec`) returns its output: the
+#     bridge, the guest, and the session namespace all work from the
+#     installed pair alone (NET-049/NET-051 end to end, not just activation);
+#   * the VM host daemon's start record names the images and the switch it
+#     booted (the run's diagnostics), and destroying the session delists it.
+#
+# Lane gating, decided by where the proof's pieces actually run:
+#   * VM-backed Linux only, for the arch of the host (an arch without a
+#     release binary for this channel is skipped the same way): the proof
+#     boots a microVM, and the driving pair it installs is the one the
+#     lane's release would ship.
+#   * /dev/kvm must be present and writable: KVM is the isolation tier this
+#     proof is for, and a host without it cannot run a VM box at all.
+#   * the guest images, from the same sources the fresh-kvm proofs read.
+#   * the switch is REQUIRED, never skipped: a stock install ships
+#     gvproxy-min, and a switchless guest cannot mint a session (its
+#     in-guest package pull has no other end), so a bucket without a switch
+#     would prove nothing. MINVMD_GVPROXY_BIN, the justfile's .scratch
+#     copy, or the pinned fetch — and when the fetch itself fails the case
+#     fails, saying what a lane needs to run it.
+#
+# Ordered after the fresh-kvm activation proofs for the same reason they
+# are ordered where they are: the case swaps the driving pair to the
+# installed one and stops the daemon under the harness's state base before
+# it activates — both inside its own subshell, so nothing that shares the
+# lane's session may run beside it, and the lane env the later proofs see
+# is the one this script started with.
+proof_linux_stock_install_runs_vm_boxes() {
+  local sb_arch
+  if [ -z "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
+    echo "stock-install VM boxes SKIPPED (VM-backed Linux lane only)"
+    return 0
+  fi
+  case "$(uname -m)" in
+    x86_64)        sb_arch=amd64 ;;
+    aarch64|arm64) sb_arch=arm64 ;;
+    *)
+      echo "stock-install VM boxes SKIPPED (no release arch for $(uname -m))"
+      return 0
+      ;;
+  esac
+  if [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; then
+    echo "stock-install VM boxes SKIPPED (no writable /dev/kvm)"
+    return 0
+  fi
+
+  echo "::group::stock install runs VM boxes end to end ($sb_arch, installed pair, KVM)"
+
+  local sb_root sb_home sb_bucket sb_stubbin sb_out sb_seed sb_name
+  local sb_kernel sb_rootfs sb_initramfs sb_gvproxy sb_bucket_host
+  sb_root="$WORK/stock-vm-$sb_arch"
+  sb_bucket_host="https://mock.invalid/minimal-stock-vm-$sb_arch"
+  sb_home="$sb_root/home"
+  sb_bucket="$sb_root/bucket"
+  sb_stubbin="$sb_root/stubbin"
+  sb_out="$sb_root/install.out"
+  sb_seed="$sb_root/seed"
+  sb_name="e2e-stock-vm-$sb_arch"
+  mkdir -p "$sb_home" "$sb_bucket/versions/v1" "$sb_stubbin" "$sb_seed"
+
+  hook_seed_preamble > "$sb_seed/minimal.toml"
+  mkdir "$sb_seed/.git"
+
+  # Locate the guest images the lane already built/fetched (same sources as
+  # the fresh-kvm proofs).
+  if [ -n "${MINVMD_KERNEL_PATH:-}" ] && [ -f "$MINVMD_KERNEL_PATH" ]; then
+    sb_kernel="$MINVMD_KERNEL_PATH"
+  else
+    sb_kernel="$ROOT/.scratch/vmlinuz"
+  fi
+  if [ -n "${MINVMD_ROOTFS_PATH:-}" ] && [ -f "$MINVMD_ROOTFS_PATH" ]; then
+    sb_rootfs="$MINVMD_ROOTFS_PATH"
+  else
+    sb_rootfs="$ROOT/.scratch/rootfs.img"
+  fi
+  if [ -n "${MINVMD_INITRAMFS:-}" ] && [ -f "$MINVMD_INITRAMFS" ]; then
+    sb_initramfs="$MINVMD_INITRAMFS"
+  else
+    sb_initramfs="$ROOT/.scratch/initramfs.cpio"
+  fi
+  if [ ! -f "$sb_kernel" ] || [ ! -f "$sb_rootfs" ] || [ ! -f "$sb_initramfs" ]; then
+    echo "stock-install VM boxes SKIPPED (guest images not available)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The switch the stock install must ship: the lane's env override, the
+  # justfile's .scratch copy, or the pinned fetch — the same sources the
+  # loopback-publish proof reads, minus the skip: a lane that cannot ship a
+  # switch cannot run a box end to end, which is what this case exists for.
+  if [ -n "${MINVMD_GVPROXY_BIN:-}" ] && [ -x "$MINVMD_GVPROXY_BIN" ]; then
+    sb_gvproxy="$MINVMD_GVPROXY_BIN"
+  elif [ -x "$ROOT/.scratch/gvproxy" ]; then
+    sb_gvproxy="$ROOT/.scratch/gvproxy"
+  else
+    if ! "$ROOT/scripts/fetch-gvproxy.sh" "$sb_root/gvproxy" \
+        >"$sb_root/fetch-gvproxy.out" 2>&1; then
+      echo "::error::could not fetch the pinned gvproxy the stock install must ship (set MINVMD_GVPROXY_BIN or stage $ROOT/.scratch/gvproxy)"
+      cat "$sb_root/fetch-gvproxy.out" 2>/dev/null || true
+      fail
+    fi
+    sb_gvproxy="$sb_root/gvproxy"
+  fi
+
+  # Stage the bucket: every component a Linux release ships for this arch,
+  # so the install under test IS the stock one.
+  cp "$(command -v min)"      "$sb_bucket/versions/v1/minimal-linux-$sb_arch"
+  cp "$(command -v minvmd)"   "$sb_bucket/versions/v1/minvmd-linux-$sb_arch"
+  cp "$sb_kernel"             "$sb_bucket/versions/v1/vmlinuz-$sb_arch"
+  cp "$sb_rootfs"             "$sb_bucket/versions/v1/rootfs-$sb_arch.img"
+  cp "$sb_initramfs"          "$sb_bucket/versions/v1/initramfs-$sb_arch.cpio"
+  cp "$sb_gvproxy"            "$sb_bucket/versions/v1/gvproxy-min-linux-$sb_arch"
+  printf 'v1\n' >"$sb_bucket/stable"
+
+  sb_sha() { sha256sum "$1" | awk '{print $1}'; }
+  local h_minimal h_minvmd h_kernel h_rootfs h_initramfs h_gvproxy
+  h_minimal="$(sb_sha "$sb_bucket/versions/v1/minimal-linux-$sb_arch")"
+  h_minvmd="$(sb_sha "$sb_bucket/versions/v1/minvmd-linux-$sb_arch")"
+  h_kernel="$(sb_sha "$sb_bucket/versions/v1/vmlinuz-$sb_arch")"
+  h_rootfs="$(sb_sha "$sb_bucket/versions/v1/rootfs-$sb_arch.img")"
+  h_initramfs="$(sb_sha "$sb_bucket/versions/v1/initramfs-$sb_arch.cpio")"
+  h_gvproxy="$(sb_sha "$sb_bucket/versions/v1/gvproxy-min-linux-$sb_arch")"
+
+  {
+    printf '# format: 1\n'
+    printf '# component   os      arch    version   sha256   kind   dest                 src\n'
+    printf '\n'
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      minimal linux "$sb_arch" v1 "$h_minimal" file bin/min "versions/v1/minimal-linux-$sb_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      minvmd linux "$sb_arch" v1 "$h_minvmd" file bin/minvmd "versions/v1/minvmd-linux-$sb_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      vmlinuz linux "$sb_arch" v1 "$h_kernel" file data/vmlinuz "versions/v1/vmlinuz-$sb_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      rootfs linux "$sb_arch" v1 "$h_rootfs" file data/rootfs.img "versions/v1/rootfs-$sb_arch.img"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      initramfs linux "$sb_arch" v1 "$h_initramfs" file data/initramfs.cpio "versions/v1/initramfs-$sb_arch.cpio"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      gvproxy-min linux "$sb_arch" v1 "$h_gvproxy" file bin/gvproxy-min "versions/v1/gvproxy-min-linux-$sb_arch"
+  } >"$sb_bucket/versions/v1/components"
+
+  # Stub curl that serves the mock bucket (the same trick install_test.sh
+  # uses, so the real installer runs unmodified), and a wget that forces the
+  # downloader selection deterministic.
+  cat >"$sb_stubbin/curl" <<STUB
+#!/bin/sh
+# Fake curl: map the pinned bucket host to this local dir.
+out= url=
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    https://*|http://*) url="\$1"; shift ;;
+    *) shift ;;
+  esac
+done
+[ -n "\$url" ] || { echo "stub curl: no url" >&2; exit 2; }
+rel="\${url#$sb_bucket_host/}"
+src="$sb_bucket/\$rel"
+[ -f "\$src" ] || { echo "stub curl: 404 \$url" >&2; exit 22; }
+if [ -n "\$out" ]; then cp "\$src" "\$out"; else cat "\$src"; fi
+STUB
+  chmod +x "$sb_stubbin/curl"
+  cat >"$sb_stubbin/wget" <<'STUB'
+#!/bin/sh
+echo "stub wget should not be used here" >&2
+exit 1
+STUB
+  chmod +x "$sb_stubbin/wget"
+
+  if (
+    # XDG_DATA_HOME outranks HOME in both the installer's data-prefix
+    # resolution (scripts/install.sh) and the daemon's image resolver
+    # (crates/minvmd/src/image.rs), and the harness does not hermeticize it —
+    # a host or CI that exports it would land the guest images in a different
+    # prefix from the $sb_home/.local/share/minimal this proof asserts. A
+    # genuinely fresh install has it unset, so drop it (this subshell only,
+    # like the PATH change below).
+    unset XDG_DATA_HOME
+    # Fresh install into the throwaway home, no path overrides. The PATH
+    # change is intentionally scoped to this subshell (SC2031).
+    # shellcheck disable=SC2031
+    HOME="$sb_home" MINIMAL_BIN="$sb_home/.local/bin" \
+      PATH="$sb_stubbin:$PATH" \
+      MINIMAL_OVERRIDE_INSTALLER_BUCKET="$sb_bucket_host" \
+      sh "$ROOT/scripts/install.sh" >"$sb_out" 2>&1 || {
+        echo "::error::the stock install (VM stack) failed"
+        echo "--- install log ---"; cat "$sb_out" 2>/dev/null || true
+        exit 1
+      }
+
+    # Observability: what the stock install placed, in its own words.
+    echo "--- installed components ---"
+    grep -E '^  [a-z0-9-]+ +(installed|current|verified|skipped)' "$sb_out" || true
+    for sb_comp in minvmd vmlinuz rootfs initramfs; do
+      grep -qE "^  $sb_comp +(installed|current)" "$sb_out" || {
+        echo "::error::the install output does not name $sb_comp as placed"
+        echo "--- install log (tail) ---"; tail -25 "$sb_out" 2>/dev/null || true
+        exit 1
+      }
+    done
+
+    # The VM stack is on disk where a stock install puts it.
+    [ -x "$sb_home/.local/bin/min" ] \
+      && [ -x "$sb_home/.local/bin/minvmd" ] || {
+      echo "::error::the stock install did not ship min/minvmd"
+      echo "--- install log (tail) ---"; tail -25 "$sb_out" 2>/dev/null || true
+      exit 1
+    }
+    [ -f "$sb_home/.local/share/minimal/vmlinuz" ] \
+      && [ -f "$sb_home/.local/share/minimal/rootfs.img" ] \
+      && [ -f "$sb_home/.local/share/minimal/initramfs.cpio" ] || {
+      echo "::error::the stock install did not ship the guest images into the data prefix"
+      exit 1
+    }
+    [ -x "$sb_home/.local/bin/gvproxy-min" ] || {
+      echo "::error::the stock install did not ship an executable gvproxy-min"
+      exit 1
+    }
+
+    # Drive the installed pair with no MINVMD_* overrides, so image and
+    # switch resolution must come from the installed prefixes. Env swap is
+    # scoped to this subshell (SC2030/SC2031).
+    # shellcheck disable=SC2030,SC2031
+    export HOME="$sb_home" MINIMAL_BIN="$sb_home/.local/bin" PATH="$sb_home/.local/bin:$PATH"
+    unset MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS MINVMD_GVPROXY_BIN
+    mnl stop --force >/dev/null 2>&1 || true
+
+    local sb_sid sb_exec
+    # The 'starting VM' record this proof reads later is INFO, and a daemon's
+    # filter comes from RUST_LOG at autospawn (it inherits the CLI's env).
+    # This harness quiets the whole run to `warn` for output parsing, which
+    # drops the record before it reaches any sink — so the ONE activate that
+    # autospawns the daemon carries a filter that admits it, as a
+    # command-local assignment (never a subshell export) so nothing leaks
+    # past this proof. `minvmd` is the daemon's crate, so the CLI's own
+    # stdout stays quiet and the last-line UUID extraction below keeps
+    # working.
+    sb_sid="$(cd "$sb_seed" && RUST_LOG="warn,minvmd=info" mnl session activate . --no-prompt --name "$sb_name" 2>"$sb_root/activate.err")" || {
+      echo "::error::the stock-installed pair failed to activate a VM box"
+      echo "--- activate stderr ---"; cat "$sb_root/activate.err" 2>/dev/null || true
+      exit 1
+    }
+    sb_sid="$(printf '%s\n' "$sb_sid" | tail -n1 | tr -d '\r')"
+
+    if ! printf '%s' "$sb_sid" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+      echo "::error::activate's last stdout line is not a session UUID: '$sb_sid'"
+      exit 1
+    fi
+    echo "activation: the stock-installed pair brought up VM box '$sb_name' as session $sb_sid"
+
+    mnl ls --raw 2>/dev/null | grep -Fqx "$sb_sid" || {
+      echo "::error::'min ls --raw' does not list the stock-installed VM session $sb_sid"
+      exit 1
+    }
+
+    # End to end: a command run IN the box, over the bridge, from the
+    # installed pair alone. The cwd proves it ran in the session's mount
+    # namespace, not on the host (the session exec proof's own marker).
+    # shellcheck disable=SC2016 # $PWD must expand in the SESSION's shell, not here.
+    sb_exec="$(mnl session exec "$sb_sid" 'echo STOCK_VM_BOX_OK $PWD' 2>"$sb_root/exec.err")" || {
+      echo "::error::'min session exec' into the stock-installed VM box failed"
+      echo "--- exec stderr ---"; cat "$sb_root/exec.err" 2>/dev/null || true
+      exit 1
+    }
+    if [ "$sb_exec" != "STOCK_VM_BOX_OK /workbench" ]; then
+      echo "::error::the exec did not run in the box (expected 'STOCK_VM_BOX_OK /workbench')"
+      echo "--- exec stdout ---"; printf '%s\n' "$sb_exec"
+      echo "--- exec stderr ---"; cat "$sb_root/exec.err" 2>/dev/null || true
+      exit 1
+    fi
+    echo "end to end: the box answered its exec with: $sb_exec"
+
+    # And the box leaves when the user destroys it: delisted, not lingering.
+    mnl session destroy --force "$sb_sid" >/dev/null 2>&1 || {
+      echo "::error::could not destroy the stock-installed VM session $sb_sid"
+      exit 1
+    }
+    if mnl ls --raw 2>/dev/null | grep -Fqx "$sb_sid"; then
+      echo "::error::the stock-installed VM session survived its destroy"
+      exit 1
+    fi
+    echo "destroy: the box is gone from 'min ls'"
+
+    # Diagnostics: the VM host daemon's start record names the images and the
+    # switch it booted, resolved from the prefixes this install stamped.
+    fresh_vm_start_record_asserts_installed_images "$sb_home" "$sb_gvproxy"
+
+    mnl stop --force >/dev/null 2>&1 || true
+  ); then
+    :
+  else
+    fail
+  fi
+  echo "stock install runs VM boxes OK ($sb_arch: VM stack shipped, box activated, exec'd, destroyed delisted, images logged)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch on the first argument: every proof in today's order when none is
 # given, or exactly the named one. The names are the proof functions' suffixes.
 case "${1:-}" in
@@ -6363,6 +6700,7 @@ case "${1:-}" in
     proof_network_posture_from_stock_install
     proof_fresh_linux_kvm_activate_local_minvmd
     proof_fresh_arm64_kvm_activate_local_minvmd
+    proof_linux_stock_install_runs_vm_boxes
     proof_native_resolution_without_proxy_env
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
@@ -6374,7 +6712,8 @@ case "${1:-}" in
     | network_posture_from_stock_install | native_resolution_without_proxy_env \
     | hostnames_recover_and_two_daemons_route \
     | min_internal_names_through_proxy | proxy_refuses_like_direct | retired_surfaces_gone \
-    | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd)
+    | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
+    | linux_stock_install_runs_vm_boxes)
     "proof_$1"
     ;;
   *)
@@ -6384,6 +6723,7 @@ case "${1:-}" in
     echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
     echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
+    echo "         linux_stock_install_runs_vm_boxes"
     echo "         hostnames_recover_and_two_daemons_route"
     echo "         min_internal_names_through_proxy proxy_refuses_like_direct retired_surfaces_gone"
     exit 2
