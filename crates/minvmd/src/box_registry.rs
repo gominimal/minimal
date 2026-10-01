@@ -373,7 +373,11 @@ impl BoxRegistry {
     /// Idempotent by the take underneath: a second call finds no receiver
     /// and spawns nothing.
     pub fn spawn_withdrawal_drainer(&self) {
-        let Some(reports) = self.clone().take_withdrawal_reports() else {
+        // Taken from this registry, never a clone: the receiver lives only
+        // on the registry that created the channel, and a clone carries
+        // `None` for it, so a clone's take would return `None` and spawn
+        // nothing.
+        let Some(reports) = self.take_withdrawal_reports() else {
             return;
         };
         let registry = self.clone();
