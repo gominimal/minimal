@@ -2908,10 +2908,13 @@ mod tests {
             // The allowlist is what meets "every family the namespace does
             // not confine" without enumerating it: a family outside the
             // list is refused whatever it is, the bypass families the old
-            // denylist named beside AF_VSOCK included.
-            for bypassed in [libc::AF_BLUETOOTH, libc::AF_ALG] {
+            // denylist named beside AF_VSOCK included.  The family numbers
+            // are cast where they are known-positive constants, the same
+            // shape the seal's admitted list uses.
+            const BYPASSED_FAMILIES: [u32; 2] = [libc::AF_BLUETOOTH as u32, libc::AF_ALG as u32];
+            for bypassed in BYPASSED_FAMILIES {
                 assert_eq!(
-                    run(libc::SYS_socket, AUDIT_ARCH, bypassed as u32),
+                    run(libc::SYS_socket, AUDIT_ARCH, bypassed),
                     refuse,
                     "{name}: socket({bypassed}) must fail with EAFNOSUPPORT — \
                      no family outside the seal's list may survive it"
