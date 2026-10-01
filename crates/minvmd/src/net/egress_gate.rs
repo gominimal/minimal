@@ -1126,7 +1126,37 @@ async fn relay_control(
         warn_interim_publish(&limiter, &decision);
     }
     let mut response = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
-    let end = control_request_probe(&mut guest, drain_timeout).await;
+    // The legs race, as the frame relay's do: the switch's side can end under
+    // an idle guest — the per-connection close a keep-alive control channel
+    // makes while the guest waits on the answer — and only the response leg
+    // can see it, so whichever leg ends first takes the relay down with it.
+    // On the response leg's end the relay comes off at once: the answer the
+    // request leg was waiting on is not coming, and holding the dial and both
+    // socket halves past it would be holding a dead exchange.
+    let end = tokio::select! {
+        result = &mut response => {
+            match result {
+                // The switch closed its side of the connection while the guest
+                // was still on it: say so — the line a bundle's daemon log
+                // tail carries for a control connection the host closed under
+                // an idle guest — before the relay comes off.
+                Ok(Ok(())) => {
+                    tracing::warn!(
+                        "the switch closed its side of the control connection; \
+                         the egress gate relay is down for it"
+                    );
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "egress gate control response leg ended on an error");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "egress gate control response leg ended");
+                }
+            }
+            return;
+        }
+        end = control_request_probe(&mut guest, drain_timeout) => end,
+    };
     match end {
         // A guest that closed, and one that spoke its request and then said
         // nothing for the whole bound — its silence is its normal posture
@@ -3201,15 +3231,28 @@ mod tests {
             .to_vec();
         request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
         request.extend_from_slice(body);
-        let mut h = gate_over_control(registry, request).await;
+        let mut h = gate_connected(registry).await;
+        h.guest
+            .write_all(&request)
+            .await
+            .expect("writing the control request");
+
+        // The request the gate admitted arrives whole — head and body
+        // together — exactly as the guest sent it, so what gvproxy holds is
+        // the request the table decided on.
+        let mut spoken = vec![0u8; request.len()];
+        read_within(&mut h.switch, &mut spoken).await;
+        assert_eq!(
+            spoken, request,
+            "the gate forwards the admitted control request verbatim, head and body together"
+        );
 
         // The body arrives exactly as written, connect path and all: the
         // path is what a request *line* says, and this connection's one
         // request line was already spoken.
-        let mut seen_body = vec![0u8; body.len()];
-        read_within(&mut h.switch, &mut seen_body).await;
         assert_eq!(
-            seen_body, body,
+            &spoken[request.len() - body.len()..],
+            &body[..],
             "a body carrying the connect path reaches gvproxy exactly as the guest sent it"
         );
 
@@ -3355,6 +3398,9 @@ mod tests {
         let mut request = b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\n".to_vec();
         request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
         request.extend_from_slice(body);
+        // The boundary the switch end's read is pinned to: the one request the
+        // head declared, everything behind it being the gate's to refuse.
+        let spoken_len = request.len();
         // Pipelined behind it in the same write: a whole second request, and
         // a frame from a source no box holds.
         request.extend_from_slice(
@@ -3363,14 +3409,22 @@ mod tests {
         let frame = ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80);
         request.extend_from_slice(&(frame.len() as u16).to_le_bytes());
         request.extend_from_slice(&frame);
-        let mut h = gate_over_control(registry, request).await;
+        // Written by hand rather than through [`gate_over_control`]: the
+        // pipelined bytes behind the first request are the gate's to refuse,
+        // so the switch end reads only the first request back.
+        let mut h = gate_connected(registry).await;
+        h.guest
+            .write_all(&request)
+            .await
+            .expect("writing the pipelined request");
 
-        // The body arrives — the request it belongs to was relayed, and the
-        // gate owes it an answer — and not one byte more.
-        let mut seen_body = vec![0u8; body.len()];
-        read_within(&mut h.switch, &mut seen_body).await;
+        // The one request the head declared arrives whole — head and body —
+        // and not one byte more.
+        let mut spoken = vec![0u8; spoken_len];
+        read_within(&mut h.switch, &mut spoken).await;
         assert_eq!(
-            seen_body, body,
+            spoken,
+            &request[..spoken_len],
             "the one request the head declared arrived whole, and alone"
         );
         // The smuggled request was refused unread: the gate relays exactly
