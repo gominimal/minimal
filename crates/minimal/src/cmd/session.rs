@@ -32,13 +32,11 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 // library's, shared with `min dash` so the two front-ends cannot drift.
 pub(crate) use minimal_client::box_registration::withdraw_box_row;
 use minimal_client::box_registration::{
-    BOX_CONTROL_TIMEOUT, control_request_with_vm_host, finalize_holding_lease,
-    register_box_reminting_autogen, resume_box_row,
+    BOX_CONTROL_TIMEOUT, RegisteredWithVmHost, control_request_with_vm_host,
+    finalize_holding_lease, register_box_reminting_autogen, resume_box_row,
 };
 #[cfg(test)]
-use minimal_client::box_registration::{
-    RegisteredWithVmHost, register_box_for_activation, register_box_with_vm_host,
-};
+use minimal_client::box_registration::{register_box_for_activation, register_box_with_vm_host};
 
 /// The provider kind this invocation's daemon connection resolves through:
 /// `client_provider_kind`, the same key the socket resolution itself and the
@@ -434,11 +432,33 @@ fn refuse_ingress_off_own_ip(
     Ok(())
 }
 
-pub(crate) async fn activate_session(
+/// The activation flow's shared prefix: resolve every client-side input,
+/// create the session, register its box, upload the workspace, and compose the
+/// loadout — stopping with the session unfinalized on the daemon.
+///
+/// The tail that finishes the activation diverges on the `Pending`
+/// composition: [`finish_interactive`] may prompt a terminal, while
+/// [`finish_headless`] auto-decides through the user policy and refuses only
+/// what genuinely needs an operator. The interactive prompt machinery is not
+/// `Send`, so the two tails are separate functions; the MCP server's
+/// [`create_headless_session`] never reaches the interactive one, keeping its
+/// future `Send` for `rmcp`'s tool handlers.
+///
+/// `offer_scaffold` gates the `minimal.toml` scaffold offer: `cmd_activate`
+/// keeps it (its long-standing behavior, unchanged), while bare `min` and the
+/// MCP server suppress it — those paths must land in a session, never in a
+/// config prompt.
+///
+/// Refuses a dynamic ingress declaration on a box that is not `own_ip`:
+/// only an own-IP box has a published address a runtime publish could
+/// apply to, so a stance or range on a `host_ip` or `none` box would be a
+/// declaration `min session policy` shows and nothing ever honours. The
+/// CLI reference documents the flags as requiring `--network own_ip`.
+async fn create_session_for_activation(
     global: &GlobalArgs,
     args: ActivateArgs,
     offer_scaffold: bool,
-) -> Result<(), anyhow::Error> {
+) -> Result<CreatedSession, anyhow::Error> {
     // Before anything is created, and before the daemon is spawned (a cold
     // VM boot), since both are argument errors: a dynamic declaration needs
     // an own-IP box. Every stance stands on a VM-backed host: an `ask` there is
@@ -613,6 +633,10 @@ pub(crate) async fn activate_session(
         SyncMode::None => None,
         SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
     };
+    // Whether a tree will reach `/workbench`, surfaced to callers (the MCP
+    // server) that report it back. `--sync none` resolves no root and sends
+    // nothing; computed before `upload_root` moves into the upload below.
+    let upload_planned = upload_root.is_some();
 
     // Deliberately not `connect_daemon`: this path's version gate travels on
     // the `CreateSession` below rather than on a `GetVersion` sent ahead of it.
@@ -1221,7 +1245,7 @@ pub(crate) async fn activate_session(
     // client is authoritative for them. Any daemon-side patches
     // that come back through a `Pending` response's `SubmitVerdict`
     // get appended below.
-    let mut collected_patches = minimal_client::contribution_patch_uploads(&contribution);
+    let collected_patches = minimal_client::contribution_patch_uploads(&contribution);
 
     // The session exists but has no loadout yet; composing it is a
     // second round-trip because the daemon's composer reads the
@@ -1267,223 +1291,52 @@ pub(crate) async fn activate_session(
             bail!(composition_failure_message(&utf8_path, &error));
         }
     };
-    // The daemon may finalize immediately (`Ready`) or ask the
-    // client to gate items first (`Pending`). On the pending path
-    // we run the user-policy prompt loop; on ready there's nothing
-    // to gate.
-    //
-    // Decide up front whether we can prompt: `--no-prompt` forces
-    // the abort path, and a non-TTY stderr triggers it implicitly
-    // (a script or CI run should never expect to read a keypress).
-    // Both fall through to `NoPromptHook`, which accumulates every
-    // item it would have prompted for so we can print a
-    // `user_policy.toml` snippet on the error path.
-    if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
-        let non_interactive = args.no_prompt || global.no_input || !can_prompt_interactively();
-        if non_interactive {
-            // NoPromptHook fake-approves every unapproved item so
-            // handle_response finishes both the var and patch gates
-            // and records everything in `summary`. If anything was
-            // recorded, we abort *before* actually shipping the
-            // verdict — the daemon must not see those fake
-            // approvals. Only when `summary` is empty (every daemon-
-            // sent item was already handled by the user's policy)
-            // do we submit and let the session go Active.
-            let session_id = response.session_id;
-            let hooks = prompt::NoPromptHook::new();
-            let verdict = match compute_verdict(response, user_policy, compose_options, &hooks) {
-                Ok((verdict, _final_policy)) => verdict,
-                Err(e) => {
-                    send_abort(&mut client, session_id).await;
-                    // The session is aborted and its row withdrawn (T66):
-                    // the path failed after registering.
-                    withdraw_box_row(
-                        control_sock.clone(),
-                        config.name.as_deref(),
-                        config.box_addresses,
-                        registered
-                            .as_ref()
-                            .and_then(|registration| registration.box_id),
-                    )
-                    .await;
-                    // The route an activation actually reaches today: the
-                    // daemon routes project config back for gating, so a
-                    // project it cannot compose surfaces here rather than as
-                    // the `Errorable::Err` above.
-                    bail!(composition_failure_message(&utf8_path, &e.to_string()));
-                }
-            };
-            let summary = hooks.into_summary();
-            if summary.count() > 0 {
-                send_abort(&mut client, session_id).await;
-                // The session is aborted and its row withdrawn (T66): the
-                // path failed after registering.
-                withdraw_box_row(
-                    control_sock.clone(),
-                    config.name.as_deref(),
-                    config.box_addresses,
-                    registered
-                        .as_ref()
-                        .and_then(|registration| registration.box_id),
-                )
-                .await;
-                let count = summary.count();
-                let snippet = summary.as_toml_snippet();
-                bail!(
-                    "{count} item{s} would require interactive approval, but \
-                     --no-prompt was set (or stdin/stderr is not a terminal).\n\n\
-                     Add the following to {}:\n\n{snippet}\n\
-                     Then re-run this command.",
-                    policy_path.display(),
-                    s = if count == 1 { "" } else { "s" },
-                );
-            }
-            collected_patches.extend(approved_patches_from_verdict(&verdict));
-            let submitted = submit_verdict_and_wait(&mut client, session_id, verdict).await;
-            if let Err(error) = submitted {
-                // The verdict never landed: the activation is abandoned with
-                // its row (T66).
-                withdraw_box_row(
-                    control_sock.clone(),
-                    config.name.as_deref(),
-                    config.box_addresses,
-                    registered
-                        .as_ref()
-                        .and_then(|registration| registration.box_id),
-                )
-                .await;
-                return Err(error);
-            }
-        } else {
-            // The hook stashes policy mutations in interior
-            // `RefCell`s so a `DenyPermanent` (which returns
-            // `HookResult::Abort` and can't pipe an
-            // `updated_policy` back through the composer) still
-            // survives to `into_final_policy`. We save
-            // unconditionally before propagating the result, so a
-            // deny-and-abort still writes the rule.
-            let hooks = prompt::InteractivePrompt::new(&policy_path, user_policy.clone());
-            let result = drive_pending_to_active(
-                &mut client,
-                response,
-                user_policy,
-                compose_options,
-                &hooks,
-                &utf8_path,
-            )
-            .await;
-            if let Ok((_, _, ref approved)) = result {
-                collected_patches.extend(approved.iter().cloned());
-            }
-            let final_policy = hooks.into_final_policy();
-            if final_policy != initial_policy {
-                // A `save_user_policy` failure is reported to
-                // stderr and *doesn't* propagate: if the activation
-                // itself also failed (`DenyPermanent` returns Err
-                // and still wants its rule saved; a real
-                // composition fault), `result?` below is what the
-                // operator needs to see. Blindly `?`ing the save
-                // would clobber that error with a spurious
-                // "updating user_policy.toml" message that hides
-                // the true failure.
-                match prompt::save_user_policy(&policy_path, &final_policy) {
-                    Ok(()) => eprintln!("Updated {}", policy_path.display()),
-                    Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
-                }
-            }
-            if result.is_err() {
-                // The activation failed after registering: its row is
-                // withdrawn with it (T66).
-                withdraw_box_row(
-                    control_sock.clone(),
-                    config.name.as_deref(),
-                    config.box_addresses,
-                    registered
-                        .as_ref()
-                        .and_then(|registration| registration.box_id),
-                )
-                .await;
-            }
-            result?;
-        }
-    }
+    Ok(CreatedSession {
+        client,
+        id,
+        config,
+        kind,
+        control_sock,
+        registered,
+        interrupt_guard,
+        utf8_path,
+        policy_path,
+        user_policy,
+        initial_policy,
+        compose_options,
+        hook_scripts,
+        finalize_hook_budget,
+        collected_patches,
+        configured: Some(configured),
+        // A `Pending` composition is gated by a terminal prompt only when one
+        // is there to answer it: `--no-prompt` forces the abort path, and a
+        // non-TTY stderr triggers it implicitly (a script or CI run should
+        // never expect to read a keypress).
+        interactive: !(args.no_prompt || global.no_input || !can_prompt_interactively()),
+        attach: args.attach,
+        uploaded: upload_planned,
+    })
+}
 
-    // On the Ready path (loadouts auto-decided; no prompt fired)
-    // `initial_policy` is only referenced inside the Pending branch
-    // above, so it appears unused to the compiler. Explicit `_` to
-    // squash the lint without dropping the useful name.
-    let _ = initial_policy;
-
-    // Upload composition patches and finalize the session. This
-    // has to happen before attach is allowed — a Materializing
-    // session isn't attachable, and the launcher reads patches
-    // from `<workspace>/patches/`. Dedup by sandbox destination:
-    // the composer's post-gate check guarantees any duplicates
-    // are exact matches (same source), so collapsing is safe.
-    minimal_client::dedup_patch_uploads(&mut collected_patches);
-    // The registration's lease is held across the finalize and committed
-    // only once the session is active: until then an activation that dies
-    // leaves the VM host daemon to withdraw the row on the lease's close.
-    let lease = registered
-        .as_mut()
-        .and_then(|registration| registration.lease.take());
-    if let Err(e) = finalize_holding_lease(
-        lease,
-        upload_and_finalize(
-            &mut client,
-            id,
-            &collected_patches,
-            &hook_scripts,
-            finalize_hook_budget,
-        ),
-    )
-    .await
-    {
-        // Best-effort teardown: the session is stuck in
-        // Materializing on the daemon. Destroy it so the operator's
-        // `min ls` doesn't fill with half-finalized sessions, and
-        // withdraw the row the registration bought with it (T66).
-        best_effort_destroy(&mut client, id).await;
-        withdraw_box_row(
-            control_sock.clone(),
-            config.name.as_deref(),
-            config.box_addresses,
-            registered
-                .as_ref()
-                .and_then(|registration| registration.box_id),
-        )
-        .await;
-        return Err(e);
-    }
-
-    // The session is `Active` now — a Ctrl-C must no longer tear it down
-    // (the attach hand-off below and the user's own session are fair game
-    // for interrupts, but not this cleanup).
-    drop(interrupt_guard);
-
-    // The `host_ip` interim: the box shares the node's own row, so its name
-    // is held in the zone with no row behind it and answers NODATA instead
-    // of NXDOMAIN (best-effort, warned within the helper). Held only now
-    // the session is active, so an activation that dies or fails earlier
-    // — its unfinalized session reaped with the connection — leaves no
-    // hold behind; the destroy releases it ([`release_held_box_name`]).
-    // Only this activate/destroy pair holds: `min task run` (task.rs) mints
-    // an ephemeral, auto-generated host_ip session through raw
-    // `CreateSession`/`DestroySession` RPCs and never passes through here,
-    // so its name is neither held nor released — a task box's name is not
-    // meant to be reached, and widening the interim to that path is a
-    // design ruling for the name-registry work, not a change a review
-    // pass may make in passing.
-    if kind == paths::ProviderKind::Minvmd
-        && config.network == sessions::NetworkMode::HostNet
-        && let Some(name) = config.name.as_deref()
-    {
-        hold_box_name_with_vm_host(control_sock.clone(), name, Some(id), true).await;
-    }
+/// The CLI's entry to the activation flow: run the shared prefix, finish the
+/// session ([`finish_interactive`], which may prompt a terminal), then honour
+/// the stdout/attach contract.
+pub(crate) async fn activate_session(
+    global: &GlobalArgs,
+    args: ActivateArgs,
+    offer_scaffold: bool,
+) -> Result<(), anyhow::Error> {
+    let session = create_session_for_activation(global, args, offer_scaffold).await?;
+    let ActivatedSession {
+        id,
+        name,
+        attach,
+        uploaded: _,
+    } = finish_interactive(session).await?;
 
     println!("{id}");
 
-    if args.attach {
+    if attach {
         // Chain into attach. Announce the freshly created session first: the
         // bare id printed to stdout above is the scripting contract, while this
         // stderr line tells an interactive operator which session they just
@@ -1491,7 +1344,7 @@ pub(crate) async fn activate_session(
         if should_announce_session(global) {
             eprintln!(
                 "Created session {}",
-                session_announce_label(&id, config.name.as_deref())
+                session_announce_label(&id, name.as_deref())
             );
         }
         let attach_args = AttachArgs {
@@ -1501,6 +1354,240 @@ pub(crate) async fn activate_session(
     }
 
     Ok(())
+}
+
+/// Create a session for a caller with no terminal to prompt on (the MCP
+/// server): the shared prefix, then [`finish_headless`]. A `Pending`
+/// composition the user policy can auto-decide is resolved without a prompt;
+/// one that genuinely needs an operator is refused, naming the
+/// `user_policy.toml` snippet that would fix it. The future stays `Send`, so
+/// `rmcp`'s tool handlers can await it. Never attaches — the caller owns the
+/// session, not a shell on it.
+pub(crate) async fn create_headless_session(
+    global: &GlobalArgs,
+    args: ActivateArgs,
+    offer_scaffold: bool,
+) -> Result<ActivatedSession, anyhow::Error> {
+    let session = create_session_for_activation(global, args, offer_scaffold).await?;
+    finish_headless(session).await
+}
+
+/// A session the activation flow brought up `Active`, for a caller that wants
+/// the id rather than the CLI's stdout contract (the MCP server).
+pub(crate) struct ActivatedSession {
+    pub id: sessions::SessionId,
+    /// The session's final name: an autogen name re-minted past a collision is
+    /// the one the create actually used.
+    pub name: Option<String>,
+    /// Whether the caller asked to attach immediately (`--attach`), which only
+    /// [`activate_session`] acts on.
+    pub attach: bool,
+    /// Whether an upload root was resolved and the tree sent into the
+    /// session's workspace. `false` for `--sync none`; the MCP server reports
+    /// it so the model knows whether `/workbench` is populated.
+    pub uploaded: bool,
+}
+
+/// The state [`create_session_for_activation`] produced: the session exists on
+/// the daemon, unfinalized, with its box registered and its loadout response
+/// in hand. A `finish_*` function gates the response and finalizes.
+struct CreatedSession {
+    client: client::Client,
+    id: sessions::SessionId,
+    config: minimald_rpc::SessionConfig,
+    kind: paths::ProviderKind,
+    control_sock: Option<std::path::PathBuf>,
+    registered: Option<RegisteredWithVmHost>,
+    interrupt_guard: crate::cmd::ActivationInterrupt,
+    utf8_path: camino::Utf8PathBuf,
+    policy_path: std::path::PathBuf,
+    user_policy: sessions::core::policy::UserPolicy,
+    initial_policy: sessions::core::policy::UserPolicy,
+    compose_options: sessions::core::compose::ComposeOptions,
+    hook_scripts: Vec<sessions::client::hookscripts::StagedScript>,
+    finalize_hook_budget: std::time::Duration,
+    collected_patches: Vec<(std::path::PathBuf, paths::SandboxRelPath)>,
+    configured: Option<minimald_rpc::ConfigureLoadoutResponse>,
+    /// Whether a terminal is there to answer a `Pending` prompt.
+    interactive: bool,
+    attach: bool,
+    uploaded: bool,
+}
+
+/// Finish an activation for the CLI: prompt the terminal for a `Pending`
+/// composition when one is there to answer it, otherwise fall through to the
+/// headless lane. The interactive prompt machinery is not `Send`, so this
+/// function is the CLI's alone — the MCP path calls [`finish_headless`].
+async fn finish_interactive(
+    mut session: CreatedSession,
+) -> Result<ActivatedSession, anyhow::Error> {
+    if !session.interactive {
+        return finish_headless(session).await;
+    }
+    if let Some(minimald_rpc::ConfigureLoadoutResponse::Pending { response }) =
+        session.configured.take()
+    {
+        // The hook stashes policy mutations in interior `RefCell`s so a
+        // `DenyPermanent` (which returns `HookResult::Abort` and can't pipe an
+        // `updated_policy` back through the composer) still survives to
+        // `into_final_policy`. We save unconditionally before propagating the
+        // result, so a deny-and-abort still writes the rule.
+        let hooks =
+            prompt::InteractivePrompt::new(&session.policy_path, session.user_policy.clone());
+        let result = drive_pending_to_active(
+            &mut session.client,
+            response,
+            session.user_policy.clone(),
+            session.compose_options,
+            &hooks,
+            &session.utf8_path,
+        )
+        .await;
+        if let Ok((_, _, ref approved)) = result {
+            session.collected_patches.extend(approved.iter().cloned());
+        }
+        let final_policy = hooks.into_final_policy();
+        if final_policy != session.initial_policy {
+            // A `save_user_policy` failure is reported to stderr and *doesn't*
+            // propagate: if the activation itself also failed (`DenyPermanent`
+            // returns Err and still wants its rule saved; a real composition
+            // fault), `result?` below is what the operator needs to see.
+            // Blindly `?`ing the save would clobber that error with a spurious
+            // "updating user_policy.toml" message that hides the true failure.
+            match prompt::save_user_policy(&session.policy_path, &final_policy) {
+                Ok(()) => eprintln!("Updated {}", session.policy_path.display()),
+                Err(e) => eprintln!(
+                    "warning: failed to update {}: {e}",
+                    session.policy_path.display()
+                ),
+            }
+        }
+        if result.is_err() {
+            // The activation failed after registering: its row is withdrawn
+            // with it (T66).
+            withdraw_box_row(
+                session.control_sock.clone(),
+                session.config.name.as_deref(),
+                session.config.box_addresses,
+                session
+                    .registered
+                    .as_ref()
+                    .and_then(|registration| registration.box_id),
+            )
+            .await;
+        }
+        result?;
+    }
+    finalize(session).await
+}
+
+/// Finish an activation with no terminal to prompt on: a `Pending` composition
+/// is refused outright, since a headless caller cannot answer the prompt the
+/// daemon routed back, and naming what the daemon could not compose. Every
+/// piece here is `Send`, so the MCP server's [`create_headless_session`] future
+/// is too.
+async fn finish_headless(mut session: CreatedSession) -> Result<ActivatedSession, anyhow::Error> {
+    if let Some(minimald_rpc::ConfigureLoadoutResponse::Pending { response }) =
+        session.configured.take()
+    {
+        send_abort(&mut session.client, response.session_id).await;
+        // The session is aborted and its row withdrawn (T66): the path failed
+        // after registering.
+        withdraw_box_row(
+            session.control_sock.clone(),
+            session.config.name.as_deref(),
+            session.config.box_addresses,
+            session
+                .registered
+                .as_ref()
+                .and_then(|registration| registration.box_id),
+        )
+        .await;
+        bail!(composition_failure_message(
+            &session.utf8_path,
+            "this project needs interactive policy gating, which a headless caller cannot supply"
+        ));
+    }
+    finalize(session).await
+}
+
+/// Upload the composition's patches and finalize the session, then hold a
+/// `host_ip` box's name in the zone. Shared by both finish lanes.
+async fn finalize(mut session: CreatedSession) -> Result<ActivatedSession, anyhow::Error> {
+    // Upload composition patches and finalize the session. This has to happen
+    // before attach is allowed — a Materializing session isn't attachable, and
+    // the launcher reads patches from `<workspace>/patches/`. Dedup by sandbox
+    // destination: the composer's post-gate check guarantees any duplicates are
+    // exact matches (same source), so collapsing is safe.
+    minimal_client::dedup_patch_uploads(&mut session.collected_patches);
+    // The registration's lease is held across the finalize and committed only
+    // once the session is active: until then an activation that dies leaves the
+    // VM host daemon to withdraw the row on the lease's close.
+    let lease = session
+        .registered
+        .as_mut()
+        .and_then(|registration| registration.lease.take());
+    if let Err(e) = finalize_holding_lease(
+        lease,
+        upload_and_finalize(
+            &mut session.client,
+            session.id,
+            &session.collected_patches,
+            &session.hook_scripts,
+            session.finalize_hook_budget,
+        ),
+    )
+    .await
+    {
+        // Best-effort teardown: the session is stuck in Materializing on the
+        // daemon. Destroy it so the operator's `min ls` doesn't fill with
+        // half-finalized sessions, and withdraw the row the registration
+        // bought with it (T66).
+        best_effort_destroy(&mut session.client, session.id).await;
+        withdraw_box_row(
+            session.control_sock.clone(),
+            session.config.name.as_deref(),
+            session.config.box_addresses,
+            session
+                .registered
+                .as_ref()
+                .and_then(|registration| registration.box_id),
+        )
+        .await;
+        return Err(e);
+    }
+
+    // The session is `Active` now — a Ctrl-C must no longer tear it down (the
+    // attach hand-off and the user's own session are fair game for interrupts,
+    // but not this cleanup).
+    drop(session.interrupt_guard);
+
+    // The `host_ip` interim: the box shares the node's own row, so its name is
+    // held in the zone with no row behind it and answers NODATA instead of
+    // NXDOMAIN (best-effort, warned within the helper). Held only now the
+    // session is active, so an activation that dies or fails earlier — its
+    // unfinalized session reaped with the connection — leaves no hold behind;
+    // the destroy releases it ([`release_held_box_name`]). Only this
+    // activate/destroy pair holds: `min task run` (task.rs) mints an ephemeral,
+    // auto-generated host_ip session through raw `CreateSession`/`DestroySession`
+    // RPCs and never passes through here, so its name is neither held nor
+    // released — a task box's name is not meant to be reached, and widening the
+    // interim to that path is a design ruling for the name-registry work, not a
+    // change a review pass may make in passing.
+    if session.kind == paths::ProviderKind::Minvmd
+        && session.config.network == sessions::NetworkMode::HostNet
+        && let Some(name) = session.config.name.as_deref()
+    {
+        hold_box_name_with_vm_host(session.control_sock.clone(), name, Some(session.id), true)
+            .await;
+    }
+
+    Ok(ActivatedSession {
+        id: session.id,
+        name: session.config.name.clone(),
+        attach: session.attach,
+        uploaded: session.uploaded,
+    })
 }
 
 /// Attach to an existing session. Both interactive and `--command` paths

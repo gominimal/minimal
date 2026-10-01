@@ -311,7 +311,7 @@ fn every_create_session_asserts_the_daemon_build() {
     assert_eq!(
         create_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
-            "cmd/session.rs::activate_session = asserts",
+            "cmd/session.rs::create_session_for_activation = asserts",
             // The dashboard's activation: the same create, the same assertion.
             "dash/rpc.rs::activate = asserts",
             "task.rs::cmd_task_run = asserts",
@@ -334,7 +334,7 @@ fn every_create_session_asserts_the_daemon_build() {
 fn the_activation_path_makes_no_version_round_trip() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func) in [
-        ("src/cmd/session.rs", "activate_session"),
+        ("src/cmd/session.rs", "create_session_for_activation"),
         ("src/task.rs", "cmd_task_run"),
     ] {
         let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
@@ -1805,7 +1805,8 @@ fn composition_failure_does_not_blame_config_for_git_lock() {
 fn both_creators_share_the_composition_failure_message() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func, uses) in [
-        ("src/cmd/session.rs", "activate_session", 2),
+        ("src/cmd/session.rs", "create_session_for_activation", 1),
+        ("src/cmd/session.rs", "finish_headless", 1),
         ("src/task.rs", "cmd_task_run", 2),
         ("src/cmd/mod.rs", "drive_pending_to_active", 1),
     ] {

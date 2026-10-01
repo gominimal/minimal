@@ -253,6 +253,15 @@ pub struct Client {
     handle: russh::client::Handle<MinimalClientHandler>,
 }
 
+/// The collected result of an in-process exec (see [`Client::exec_collect`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExecOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// The child's exit status, or `None` when the channel closed without one.
+    pub exit_code: Option<u32>,
+}
+
 impl Client {
     /// Connect to minimald over the UDS at `sock_path`, authenticate, and
     /// return a ready [`Client`].
@@ -611,6 +620,100 @@ impl Client {
                 None => anyhow::bail!("channel closed before the exec request was acknowledged"),
             }
         }
+    }
+
+    /// Run `command` in `session_id` and collect its output, rather than
+    /// bridging it to this process's stdio.
+    ///
+    /// Builds on [`Self::open_session_exec_channel`]. `stdin` is written to the
+    /// child and then half-closed, so a command that reads until EOF
+    /// terminates; `None` sends an immediate EOF. `timeout`, when set, bounds
+    /// the whole run: a command that outlives it fails with a timeout error
+    /// and the channel is dropped (the daemon reaps the process). The exec
+    /// path has no PTY — interactive shells stay in `min session attach`.
+    pub async fn exec_collect(
+        &mut self,
+        session_id: sessions::SessionId,
+        command: &str,
+        stdin: Option<&[u8]>,
+        timeout: Option<Duration>,
+    ) -> Result<ExecOutput, anyhow::Error> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut channel = self
+            .open_session_exec_channel(
+                session_id,
+                command,
+                &minimald_rpc::taskenv::TaskEnv::default(),
+            )
+            .await?;
+
+        // Feed stdin and half-close before draining: the daemon pumps client
+        // bytes into the child's stdin and turns the EOF into its EOF. Sending
+        // everything up front (rather than interleaving with the read loop) is
+        // enough for the non-interactive commands this serves, and avoids a
+        // second task borrowing the channel.
+        {
+            let mut writer = channel.make_writer();
+            if let Some(input) = stdin
+                && !input.is_empty()
+            {
+                writer.write_all(input).await.context("write exec stdin")?;
+            }
+            writer.shutdown().await.context("half-close exec stdin")?;
+        }
+
+        let drain = async {
+            let mut output = ExecOutput::default();
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    russh::ChannelMsg::Data { data } => output.stdout.extend_from_slice(&data),
+                    russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                        output.stderr.extend_from_slice(&data);
+                    }
+                    russh::ChannelMsg::ExitStatus { exit_status } => {
+                        output.exit_code = Some(exit_status);
+                    }
+                    _ => {}
+                }
+            }
+            output
+        };
+
+        match timeout {
+            Some(limit) => tokio::time::timeout(limit, drain)
+                .await
+                .map_err(|_| anyhow::anyhow!("exec timed out after {limit:?}")),
+            None => Ok(drain.await),
+        }
+    }
+
+    /// Open an SFTP session attached to `session_id`, mirroring the daemon's
+    /// own test harness: set `MINIMAL_SESSION_ID`, request the `sftp`
+    /// subsystem, and wrap the channel stream.
+    ///
+    /// Paths resolve at the session user's home; the uploaded workspace is
+    /// `/workbench`.
+    pub async fn open_sftp(
+        &mut self,
+        session_id: sessions::SessionId,
+    ) -> Result<russh_sftp::client::SftpSession, anyhow::Error> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .context("open SFTP channel")?;
+        channel
+            .set_env(true, "MINIMAL_SESSION_ID", session_id.to_string())
+            .await
+            .context("set MINIMAL_SESSION_ID env")?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .context("request sftp subsystem")?;
+        russh_sftp::client::SftpSession::new(channel.into_stream())
+            .await
+            .context("start SFTP client")
     }
 
     /// Stream a zstd-compressed tarball of `dir` to the daemon's
