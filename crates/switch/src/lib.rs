@@ -19,6 +19,11 @@ pub const DEFAULT_MTU: u16 = 1500;
 /// Stable, locally-administered MAC for the switch gateway.
 pub const GATEWAY_MAC: MacAddr = MacAddr([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
 
+/// Stable, locally-administered MAC for the Box Egress Proxy on the default
+/// [`DEFAULT_SUBNET`]. It matches [`MacAddr::for_switch_ip`] applied to
+/// [`SwitchSubnet::box_egress_proxy_address`] on that subnet.
+pub const BEP_MAC: MacAddr = MacAddr([0x52, 0x54, 0x00, 0x40, 0xff, 0xfc]);
+
 /// AF_VSOCK CID of the host as seen from inside a libkrun guest. Well-known:
 /// `VMADDR_CID_HOST == 2`. The per-PTask shuttle dials this CID to reach the
 /// host gvproxy switch (DM1/3/4).
@@ -197,8 +202,8 @@ impl SwitchSubnet {
     /// # Errors
     ///
     /// Returns [`InvalidPrefix`] for a prefix outside `8..=29`. A prefix narrower
-    /// than /29 has no room for the reserved network/gateway/host-alias/broadcast
-    /// addresses plus a PTask address. A prefix wider than /8 lets the high octet
+    /// than /29 has no room for the reserved network/gateway/proxy/daemon/
+    /// host-alias/broadcast addresses plus a PTask address. A prefix wider than /8 lets the high octet
     /// vary, which [`MacAddr::for_switch_ip`] does not fold into the derived MAC,
     /// so two addresses differing only in that octet would collide.
     pub fn new(base: Ipv4Addr, prefix: u8) -> Result<Self, InvalidPrefix> {
@@ -275,6 +280,22 @@ impl SwitchSubnet {
         Ipv4Addr::from(u32::from(self.broadcast()) - 1)
     }
 
+    /// The Box Egress Proxy address (`broadcast - 3`): a second infrastructure
+    /// address above the PTask lease pool that the host-side stack peer owns
+    /// directly. Reserved, never handed to a PTask, and kept out of gvproxy's
+    /// NAT/virtual-IP tables so the peer can answer ARP and reset stray TCP
+    /// packets itself.
+    #[must_use]
+    pub fn box_egress_proxy_address(self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.broadcast()) - 3)
+    }
+
+    /// The locally-administered MAC for [`Self::box_egress_proxy_address`].
+    #[must_use]
+    pub fn bep_mac(self) -> MacAddr {
+        MacAddr::for_switch_ip(self.box_egress_proxy_address())
+    }
+
     /// The daemon address (`broadcast - 2`): the guest root netns' primary tap,
     /// which gives `minimald` itself egress through the host gvproxy (so it can
     /// fetch upstream packages). Reserved from the top so the PTask range still
@@ -291,12 +312,12 @@ impl SwitchSubnet {
         u32::from(self.network()) + 2
     }
 
-    /// The last address that may be allocated to a PTask (`broadcast - 3`),
-    /// leaving the daemon address at `broadcast - 2` and the host alias at
-    /// `broadcast - 1` reserved.
+    /// The last address that may be allocated to a PTask (`broadcast - 4`),
+    /// leaving the proxy at `broadcast - 3`, the daemon at `broadcast - 2`
+    /// and the host alias at `broadcast - 1` reserved.
     #[must_use]
     pub fn last_ptask(self) -> u32 {
-        u32::from(self.broadcast()) - 3
+        u32::from(self.broadcast()) - 4
     }
 }
 
@@ -582,8 +603,25 @@ mod tests {
         let net = SwitchSubnet::default();
         assert_eq!(net.to_string(), "100.64.0.0/16");
         assert_eq!(net.gateway(), Ipv4Addr::new(100, 64, 0, 1));
-        assert_eq!(net.host_alias(), Ipv4Addr::new(100, 64, 255, 254));
+        assert_eq!(net.box_egress_proxy_address(), Ipv4Addr::new(100, 64, 255, 252));
+        assert_eq!(net.bep_mac(), BEP_MAC);
+        assert_eq!(BEP_MAC.to_string(), "52:54:00:40:ff:fc");
         assert_eq!(net.daemon_ip(), Ipv4Addr::new(100, 64, 255, 253));
+        assert_eq!(net.host_alias(), Ipv4Addr::new(100, 64, 255, 254));
+    }
+
+    #[test]
+    fn proxy_address_is_neither_virtual_ip_nor_translated() {
+        let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
+        let net = SwitchSubnet::default();
+        // The proxy address must not appear in gvproxy's NAT map or in its
+        // gatewayVirtualIPs list — the host-side stack peer owns it directly.
+        assert!(!yaml.contains(&format!("\"{}\"", net.box_egress_proxy_address())));
+        assert!(!yaml.contains("100.64.255.252"));
+        // The daemon address is also infrastructure and should not be listed.
+        assert!(!yaml.contains("100.64.255.253"));
+        // The host alias, by contrast, is both NAT'd and a virtual IP.
+        assert!(yaml.contains("100.64.255.254"));
     }
 
     #[test]
