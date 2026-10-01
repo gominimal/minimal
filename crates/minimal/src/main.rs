@@ -144,6 +144,7 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
         None | Some(
             minimal::Command::CompleteSessionStr(_)
                 | minimal::Command::Completions(_)
+                | minimal::Command::Mcp(_)
                 | minimal::Command::Session(minimal::SessionArgs {
                     command: minimal::SessionCommand::Exec(ExecArgs { .. })
                         | minimal::SessionCommand::Run(_),

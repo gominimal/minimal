@@ -62,12 +62,13 @@ pub struct ActivateRequest {
 /// The front-end's half of activation: the announcements that bracket the
 /// create, and the policy gate a `Pending` composition demands.
 ///
-/// The futures are not `Send`-bounded, and need not be: an activation runs on
-/// one task. `async fn` in a public trait is exactly that shape, so silence the
-/// lint that wants the explicit bound we deliberately omit.
+/// The gate's futures are not `Send`-bounded here: the CLI's interactive gate
+/// holds a non-`Send` prompter, and an activation runs on one task. A caller
+/// that needs a `Send` future (the MCP server) supplies a concrete, `Send`
+/// gate and calls [`activate`] directly.
 #[allow(
     async_fn_in_trait,
-    reason = "an activation runs on one task, so the futures need no Send bound"
+    reason = "the interactive gate is deliberately single-threaded; a Send caller supplies its own gate"
 )]
 pub trait ActivationGate {
     /// Called once the record exists and its build has been checked, before

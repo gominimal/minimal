@@ -527,88 +527,187 @@ fn resolve_loadouts_dir(args: &LoadoutListArgs, global: &GlobalArgs) -> PathBuf 
     if let Some(dir) = &args.dir {
         return dir.clone();
     }
+    default_loadouts_dir(global)
+}
+
+/// The loadouts directory when no `--dir` override is given: the client's
+/// config dir plus `loadouts`. Shared by `min loadout list` and the MCP
+/// server's `list_loadouts` tool.
+pub(crate) fn default_loadouts_dir(global: &GlobalArgs) -> PathBuf {
     resolve_minimal_config_dir(global).join("loadouts")
 }
 
-/// List loadouts discovered in the loadouts directory, in both
-/// layouts (`<name>.toml` and `<name>/loadout.toml`). One row per
-/// parseable loadout; ones that fail to load — a parse error, or a
-/// name defined in both layouts at once — are reported on stderr and
-/// make the command exit non-zero, leaving the table of valid
-/// loadouts intact. Loadouts named in
-/// `[loadouts].default_loadouts` in the client config are marked
-/// with a leading `*`.
-pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    let dir = resolve_loadouts_dir(&args, global);
-    let entries = match sessions::client::disk::list_loadouts(&dir) {
+/// A structured description of one available loadout, shared by the
+/// `min loadout list` table and the MCP server's `list_loadouts` tool.
+pub(crate) struct LoadoutSummary {
+    pub name: String,
+    pub description: String,
+    pub packages: Vec<String>,
+    /// Every declared variable's name, strict and lenient unified.
+    pub vars: Vec<String>,
+    /// Every patch's sandbox destination.
+    pub patches: Vec<String>,
+    /// The always-available built-in `default` loadout.
+    pub builtin: bool,
+    /// Listed in `[loadouts].default_loadouts`.
+    pub is_default: bool,
+}
+
+/// Every loadout discoverable for a directory, plus the load failures and
+/// warnings a caller may want to surface. Splitting this out of
+/// [`cmd_loadout_list`] lets the MCP server list the same environments without
+/// re-deriving the rows.
+pub(crate) struct LoadoutListing {
+    pub summaries: Vec<LoadoutSummary>,
+    /// One `Display` string per loadout that failed to parse.
+    pub failures: Vec<String>,
+    /// Names listed in `default_loadouts` with no matching loadout file.
+    pub missing_defaults: Vec<String>,
+    /// Set when the loadouts directory does not exist yet.
+    pub missing_dir: Option<PathBuf>,
+}
+
+/// Enumerate the loadouts under `dir`, appending the built-in `default` row
+/// unless a user loadout shadows it. The caller renders the warnings and the
+/// failures; this only classifies them.
+pub(crate) fn loadout_listing(
+    dir: &std::path::Path,
+    defaults: &std::collections::HashSet<String>,
+) -> Result<LoadoutListing, anyhow::Error> {
+    let entries = match sessions::client::disk::list_loadouts(dir) {
         Ok(entries) => entries,
-        // A missing directory is the fresh-install case: there are no
-        // user loadouts yet, but the built-in `default` row below still
-        // orients the user. Note where to add their own and continue.
+        // A missing directory is the fresh-install case: there are no user
+        // loadouts yet, but the built-in `default` row still orients the user.
         Err(sessions::client::disk::ListError::NotFound { path }) => {
-            eprintln!(
-                "No loadouts directory at {} yet — add your own as `<name>.toml` \
-                 there, or as `<name>/loadout.toml` to keep one under version control.",
-                path.display()
-            );
-            Vec::new()
+            return Ok(LoadoutListing {
+                summaries: vec![builtin_summary(defaults)],
+                failures: Vec::new(),
+                missing_defaults: defaults.iter().cloned().collect(),
+                missing_dir: Some(path),
+            });
         }
         Err(e) => bail!("{e}"),
     };
 
-    // Load `<config>/minimal/config.toml` to discover which
-    // loadouts should be marked as defaults. Missing file → no
-    // defaults; malformed file → error out so the user can see it.
-    // Routes through `read_client_config` so this and `cmd_activate`
-    // share one config-loading path.
+    let present: std::collections::HashSet<&str> =
+        entries.iter().map(|e| e.name.as_str()).collect();
+    let mut summaries = Vec::with_capacity(entries.len() + 1);
+    let mut failures = Vec::new();
+    for entry in &entries {
+        match &entry.loadout {
+            Ok(loadout) => {
+                summaries.push(summarize(
+                    &entry.name,
+                    loadout,
+                    defaults.contains(&entry.name),
+                    false,
+                ));
+            }
+            // `LoadError`'s Display already names the file.
+            Err(e) => failures.push(e.to_string()),
+        }
+    }
+    // The built-in `default` loadout is always available, so it gets a row
+    // unless the user has shadowed it with a `default` of their own.
+    if !present.contains(BUILTIN_DEFAULT_NAME) {
+        summaries.push(builtin_summary(defaults));
+    }
+    // Warn about defaults that don't have a matching file — a silent typo in
+    // `default_loadouts` would otherwise be invisible until the user wondered
+    // why their loadout wasn't active.
+    let missing_defaults = defaults
+        .iter()
+        .filter(|missing| !present.contains(missing.as_str()))
+        .cloned()
+        .collect();
+    Ok(LoadoutListing {
+        summaries,
+        failures,
+        missing_defaults,
+        missing_dir: None,
+    })
+}
+
+/// Shape a parsed loadout into a [`LoadoutSummary`].
+fn summarize(
+    name: &str,
+    loadout: &sessions::core::loadout::Loadout,
+    is_default: bool,
+    builtin: bool,
+) -> LoadoutSummary {
+    LoadoutSummary {
+        name: name.to_string(),
+        description: loadout.description().unwrap_or("").to_string(),
+        packages: loadout.packages().to_vec(),
+        vars: loadout.all_vars().map(|(n, _)| n.to_string()).collect(),
+        patches: loadout
+            .patches()
+            .iter()
+            .map(|p| p.dest().as_sandbox_path().as_str().to_string())
+            .collect(),
+        builtin,
+        is_default,
+    }
+}
+
+/// The summary for the built-in `default` loadout.
+fn builtin_summary(defaults: &std::collections::HashSet<String>) -> LoadoutSummary {
+    summarize(
+        BUILTIN_DEFAULT_NAME,
+        &builtin_default_loadout(),
+        defaults.contains(BUILTIN_DEFAULT_NAME),
+        true,
+    )
+}
+
+/// List loadouts discovered in the loadouts directory, in both layouts
+/// (`<name>.toml` and `<name>/loadout.toml`). One row per parseable loadout;
+/// ones that fail to load — a parse error, or a name defined in both layouts
+/// at once — are reported on stderr and make the command exit non-zero,
+/// leaving the table of valid loadouts intact. Loadouts named in
+/// `[loadouts].default_loadouts` in the client config are marked with a
+/// leading `*`.
+pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<(), anyhow::Error> {
+    let dir = resolve_loadouts_dir(&args, global);
+
+    // Load `<config>/minimal/config.toml` to discover which loadouts should be
+    // marked as defaults. Missing file → no defaults; malformed file → error
+    // out so the user can see it. Routes through `read_client_config` so this
+    // and `cmd_activate` share one config-loading path.
     let defaults: std::collections::HashSet<String> = read_client_config(global)?
         .loadouts
         .default_loadouts
         .into_iter()
         .collect();
 
-    // Warn about defaults that don't have a matching file — a
-    // silent typo in `default_loadouts` would otherwise be
-    // invisible until the user wondered why their loadout wasn't
-    // active.
-    let present: std::collections::HashSet<&str> =
-        entries.iter().map(|e| e.name.as_str()).collect();
-    defaults
+    let listing = loadout_listing(&dir, &defaults)?;
+    if let Some(path) = &listing.missing_dir {
+        eprintln!(
+            "No loadouts directory at {} yet — add your own as `<name>.toml` \
+             there, or as `<name>/loadout.toml` to keep one under version control.",
+            path.display()
+        );
+    }
+    for missing in &listing.missing_defaults {
+        eprintln!(
+            "Warning: `{missing}` listed in default_loadouts but no `{missing}.toml` \
+             or `{missing}/loadout.toml` in {}",
+            dir.display(),
+        );
+    }
+    // Parse failures go to stderr — their multi-line text would corrupt the
+    // table — and force a non-zero exit so a script can detect a broken file.
+    for failure in &listing.failures {
+        eprintln!("{failure}");
+    }
+    let failures = listing.failures.len();
+
+    let show_builtin = listing.summaries.iter().any(|s| s.builtin);
+    let rows: Vec<LoadoutRow> = listing
+        .summaries
         .iter()
-        .filter(|missing| !present.contains(missing.as_str()))
-        .for_each(|missing| {
-            eprintln!(
-                "Warning: `{missing}` listed in default_loadouts but no `{missing}.toml` \
-                 or `{missing}/loadout.toml` in {}",
-                dir.display(),
-            );
-        });
-
-    // The built-in `default` loadout is always available, so it gets a
-    // row unless the user has shadowed it with a `default` of their own.
-    let show_builtin = !present.contains(BUILTIN_DEFAULT_NAME);
-
-    // Partition discovered entries: parsed loadouts become table rows,
-    // while parse failures go to stderr and force a non-zero exit so a
-    // script running `loadout list` can detect a broken file. Keeping
-    // failures out of the table also preserves the layout their
-    // multi-line parse errors would otherwise corrupt.
-    let mut rows: Vec<LoadoutRow> = Vec::with_capacity(entries.len());
-    let mut failures = 0usize;
-    for entry in &entries {
-        match &entry.loadout {
-            Ok(loadout) => rows.push(LoadoutRow::from_entry(entry, loadout, &defaults)),
-            Err(e) => {
-                // `LoadError`'s Display already names the file, so the
-                // path is not repeated here.
-                eprintln!("{e}");
-                failures += 1;
-            }
-        }
-    }
-    if show_builtin {
-        rows.push(LoadoutRow::builtin_default());
-    }
+        .map(LoadoutRow::from_summary)
+        .collect();
 
     let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
     let desc_w = rows
@@ -660,46 +759,23 @@ struct LoadoutRow {
 }
 
 impl LoadoutRow {
-    /// Build a row from a successfully parsed loadout. Parse failures
-    /// never reach here — the caller reports them on stderr and keeps
-    /// them out of the table (see [`cmd_loadout_list`]).
-    fn from_entry(
-        entry: &sessions::client::disk::LoadoutEntry,
-        loadout: &sessions::core::loadout::Loadout,
-        defaults: &std::collections::HashSet<String>,
-    ) -> Self {
-        let marker = if defaults.contains(&entry.name) {
-            "*"
-        } else {
-            " "
-        };
+    /// Build a row from a [`LoadoutSummary`]. The built-in `default`
+    /// row carries its `(built-in)` tag so the listing distinguishes it
+    /// from a user file of the same stem.
+    fn from_summary(s: &LoadoutSummary) -> Self {
         Self {
-            marker,
-            name: entry.name.clone(),
-            desc: loadout.description().unwrap_or("").to_string(),
+            marker: if s.is_default { "*" } else { " " },
+            name: if s.builtin {
+                format!("{} (built-in)", s.name)
+            } else {
+                s.name.clone()
+            },
+            desc: s.description.clone(),
             counts: format!(
                 "{} pkg / {} var / {} patch",
-                loadout.packages().len(),
-                loadout.vars().len() + loadout.vars_lenient().len(),
-                loadout.patches().iter().count(),
-            ),
-        }
-    }
-
-    /// Row for the built-in `default` loadout. Its name column carries
-    /// the `(built-in)` tag so the listing distinguishes it from a
-    /// user file of the same stem.
-    fn builtin_default() -> Self {
-        let l = builtin_default_loadout();
-        Self {
-            marker: " ",
-            name: format!("{BUILTIN_DEFAULT_NAME} (built-in)"),
-            desc: l.description().unwrap_or("").to_string(),
-            counts: format!(
-                "{} pkg / {} var / {} patch",
-                l.packages().len(),
-                l.vars().len() + l.vars_lenient().len(),
-                l.patches().iter().count(),
+                s.packages.len(),
+                s.vars.len(),
+                s.patches.len(),
             ),
         }
     }
@@ -1303,7 +1379,8 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
     /// zero-package contributes cell.
     #[test]
     fn builtin_default_row_is_tagged_and_packageless() {
-        let row = LoadoutRow::builtin_default();
+        let summary = builtin_summary(&std::collections::HashSet::new());
+        let row = LoadoutRow::from_summary(&summary);
         assert_eq!(row.name, format!("{BUILTIN_DEFAULT_NAME} (built-in)"));
         assert_eq!(row.marker, " ");
         assert!(row.counts.starts_with("0 pkg"), "got: {}", row.counts);

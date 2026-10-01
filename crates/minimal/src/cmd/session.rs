@@ -31,13 +31,83 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 /// `offer_scaffold` gates the `minimal.toml` scaffold offer: `cmd_activate`
 /// keeps it (its long-standing behavior, unchanged), while bare `min`
 /// suppresses it — that path must land in a session, never in a config
-/// prompt. Everything else, including the session id on stdout, is
-/// identical for both callers.
+/// prompt. Prints the session id to stdout and, with `--attach`, hands off to
+/// the attach path.
 pub(crate) async fn activate_session(
     global: &GlobalArgs,
     args: ActivateArgs,
     offer_scaffold: bool,
 ) -> Result<(), anyhow::Error> {
+    let ActivatedSession {
+        id,
+        name,
+        attach,
+        uploaded: _,
+    } = activate_session_inner(global, args, offer_scaffold).await?;
+
+    println!("{id}");
+
+    if attach {
+        // Chain into attach. Announce the freshly created session first: the
+        // bare id printed to stdout above is the scripting contract, while this
+        // stderr line tells an interactive operator which session they just
+        // created and are entering.
+        if should_announce_session(global) {
+            eprintln!(
+                "Created session {}",
+                session_announce_label(&id, name.as_deref())
+            );
+        }
+        let attach_args = AttachArgs {
+            session: Some(id.to_string()),
+        };
+        return cmd_attach(global, attach_args).await;
+    }
+
+    Ok(())
+}
+
+/// A session the activation flow brought up `Active`, for a caller that wants
+/// the id rather than the CLI's stdout contract (the MCP server).
+pub(crate) struct ActivatedSession {
+    pub id: sessions::SessionId,
+    pub name: Option<String>,
+    /// Whether the caller asked to attach immediately (`--attach`), which only
+    /// [`activate_session`] acts on.
+    pub attach: bool,
+    /// Whether the working tree was uploaded into the session. `false` means
+    /// the upload was skipped (empty or `$HOME` root, a non-VCS directory
+    /// under a headless caller, or an explicit `--sync none`), so the session
+    /// starts with an empty workspace.
+    pub uploaded: bool,
+}
+
+/// Everything an activation resolves before the daemon conversation: the
+/// authenticated client, the core request, and the inputs a front-end gate
+/// needs. Split from the thin wrappers so the headless path (MCP) can share
+/// every client-side step while supplying its own `Send` gate.
+pub(crate) struct PreparedActivation {
+    pub client: minimal_client::Client,
+    pub request: client::activate::ActivateRequest,
+    pub policy_path: std::path::PathBuf,
+    pub user_policy: sessions::core::policy::UserPolicy,
+    pub initial_policy: sessions::core::policy::UserPolicy,
+    pub compose_options: sessions::core::compose::ComposeOptions,
+    pub project_dir: camino::Utf8PathBuf,
+    pub no_prompt: bool,
+    pub attach: bool,
+    /// Whether an upload root was resolved and an upload attempted; see
+    /// [`ActivatedSession::uploaded`].
+    pub uploaded: bool,
+}
+
+/// Resolve every client-side input for an activation and connect to the
+/// daemon, stopping short of the create. See [`PreparedActivation`].
+pub(crate) async fn prepare_activation(
+    global: &GlobalArgs,
+    args: ActivateArgs,
+    offer_scaffold: bool,
+) -> Result<PreparedActivation, anyhow::Error> {
     ensure_daemon(global)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
@@ -337,10 +407,8 @@ pub(crate) async fn activate_session(
     // The create/upload/configure/finalize sequence is shared with the TUI and
     // with `min mcp`; the headless core lives in `minimal-client`. Everything
     // above this line is resolution the front-end owns — loadouts, policy, the
-    // scaffold offer, the upload gate. The gate below carries the interactive
-    // half: the announcements the create reply feeds, and the user-policy
-    // prompt a `Pending` composition demands.
-    let session_name = config.name.clone();
+    // scaffold offer, the upload gate. The gate itself is supplied by the
+    // caller.
     let project_dir = utf8_path.clone();
     let compose_failure: Box<dyn Fn(&str) -> anyhow::Error + Send + Sync> = {
         let dir = project_dir.clone();
@@ -351,17 +419,10 @@ pub(crate) async fn activate_session(
         Box::new(move || autogen_session_name(&dir, &random_hex4()))
             as Box<dyn Fn() -> String + Send + Sync>
     });
-    let mut gate = CliActivationGate {
-        policy_path: &policy_path,
-        user_policy,
-        initial_policy,
-        compose_options,
-        project_dir: &project_dir,
-        no_prompt: args.no_prompt,
-        no_input: global.no_input,
-        network: config.network,
-        egress_declared: config.policy.egress.is_some(),
-    };
+    // Whether the tree will actually reach `/workbench`, surfaced to callers
+    // (the MCP server) that report it back. Computed before `upload` moves
+    // into the request.
+    let uploaded = upload.is_some();
     let request = client::activate::ActivateRequest {
         config,
         upload_root: upload.map(|p| p.into_std_path_buf()),
@@ -377,28 +438,153 @@ pub(crate) async fn activate_session(
         .ok(),
         compose_failure,
     };
+    Ok(PreparedActivation {
+        client,
+        request,
+        policy_path,
+        user_policy,
+        initial_policy,
+        compose_options,
+        project_dir,
+        no_prompt: args.no_prompt,
+        attach: args.attach,
+        uploaded,
+    })
+}
+
+/// [`activate_session`] without the stdout contract: resolve the inputs, run
+/// the shared core with the CLI's interactive gate, and hand the id back.
+pub(crate) async fn activate_session_inner(
+    global: &GlobalArgs,
+    args: ActivateArgs,
+    offer_scaffold: bool,
+) -> Result<ActivatedSession, anyhow::Error> {
+    let PreparedActivation {
+        mut client,
+        request,
+        policy_path,
+        user_policy,
+        initial_policy,
+        compose_options,
+        project_dir,
+        no_prompt,
+        attach,
+        uploaded,
+    } = prepare_activation(global, args, offer_scaffold).await?;
+    let name = request.config.name.clone();
+    let mut gate = CliActivationGate {
+        policy_path: &policy_path,
+        user_policy,
+        initial_policy,
+        compose_options,
+        project_dir: &project_dir,
+        no_prompt,
+        no_input: global.no_input,
+        network: request.config.network,
+        egress_declared: request.config.policy.egress.is_some(),
+    };
     let id = client::activate::activate(&mut client, request, &mut gate).await?;
+    Ok(ActivatedSession {
+        id,
+        name,
+        attach,
+        uploaded,
+    })
+}
 
-    println!("{id}");
+/// Create a session headlessly, for a caller that cannot prompt (the MCP
+/// server): a `Pending` composition the policy auto-decides is resolved
+/// without a prompt, while one that genuinely needs an operator is refused.
+/// The returned future is `Send`, so `rmcp` tool handlers can await it.
+pub(crate) async fn create_headless_session(
+    global: &GlobalArgs,
+    args: ActivateArgs,
+    offer_scaffold: bool,
+) -> Result<ActivatedSession, anyhow::Error> {
+    let PreparedActivation {
+        mut client,
+        request,
+        policy_path,
+        user_policy,
+        compose_options,
+        project_dir,
+        attach,
+        uploaded,
+        ..
+    } = prepare_activation(global, args, offer_scaffold).await?;
+    let name = request.config.name.clone();
+    let mut gate = HeadlessActivationGate {
+        policy_path: &policy_path,
+        user_policy,
+        compose_options,
+        project_dir: &project_dir,
+    };
+    let id = client::activate::activate(&mut client, request, &mut gate).await?;
+    Ok(ActivatedSession {
+        id,
+        name,
+        attach,
+        uploaded,
+    })
+}
 
-    if args.attach {
-        // Chain into attach. Announce the freshly created session first: the
-        // bare id printed to stdout above is the scripting contract, while this
-        // stderr line tells an interactive operator which session they just
-        // created and are entering.
-        if should_announce_session(global) {
-            eprintln!(
-                "Created session {}",
-                session_announce_label(&id, session_name.as_deref())
+/// The headless gate `min mcp` creates sessions through.
+///
+/// It mirrors the CLI's `--no-prompt` lane rather than refusing every `Pending`
+/// composition outright: the user policy still auto-decides what it can, and
+/// only items that genuinely need a prompt are refused, naming the
+/// `user_policy.toml` snippet that would fix them. Refusing all `Pending` made
+/// the server unable to create sessions the CLI creates without a prompt,
+/// because the daemon routes project config back for gating even when the
+/// policy approves every item.
+struct HeadlessActivationGate<'a> {
+    policy_path: &'a std::path::Path,
+    user_policy: sessions::core::policy::UserPolicy,
+    compose_options: sessions::core::compose::ComposeOptions,
+    project_dir: &'a camino::Utf8Path,
+}
+
+impl minimal_client::activate::ActivationGate for HeadlessActivationGate<'_> {
+    async fn on_pending(
+        &mut self,
+        client: &mut client::Client,
+        response: sessions::wire::request::ContributionResponse,
+    ) -> Result<Vec<(std::path::PathBuf, paths::SandboxRelPath)>, anyhow::Error> {
+        let session_id = response.session_id;
+        let hooks = prompt::NoPromptHook::new();
+        let verdict = match compute_verdict(
+            response,
+            self.user_policy.clone(),
+            self.compose_options,
+            &hooks,
+        ) {
+            Ok((verdict, _final_policy)) => verdict,
+            Err(e) => {
+                send_abort(client, session_id).await;
+                bail!(composition_failure_message(
+                    self.project_dir,
+                    &e.to_string()
+                ));
+            }
+        };
+        let summary = hooks.into_summary();
+        if summary.count() > 0 {
+            send_abort(client, session_id).await;
+            let count = summary.count();
+            let snippet = summary.as_toml_snippet();
+            bail!(
+                "{count} item{s} would require interactive approval, which a \
+                 headless caller cannot supply.\n\n\
+                 Add the following to {}:\n\n{snippet}\n\
+                 Then create the session again.",
+                self.policy_path.display(),
+                s = if count == 1 { "" } else { "s" },
             );
         }
-        let attach_args = AttachArgs {
-            session: Some(id.to_string()),
-        };
-        return cmd_attach(global, attach_args).await;
+        let approved: Vec<_> = approved_patches_from_verdict(&verdict).collect();
+        submit_verdict_and_wait(client, session_id, verdict).await?;
+        Ok(approved)
     }
-
-    Ok(())
 }
 
 /// The CLI's half of [`minimal_client::activate::activate`]: the announcements
