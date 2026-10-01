@@ -56,6 +56,12 @@
 //! creator-side registration (T66, #1711) supplies the rows the per-box
 //! default binds to ([`egress_gate`] carries the phase and its reasons). The
 //! gate lives and dies with the switch runtime it was started on.
+//!
+//! The Box Egress Proxy's host leg is separate from all of that
+//! (`bep_host`, NET-132): a userspace smoltcp stack over a channel-backed
+//! device, standing in for the proxy's listener on the switch's plan. It is
+//! declared here and wired into the leg that carries a box's connection to
+//! the proxy's listener when the proxy's own work lands.
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -81,6 +87,8 @@ mod shuttle;
 pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_gate_sock, resolve_switch_sock};
 mod baseline;
 pub use baseline::{NodeBaselinePhase, NodePlaneBaseline};
+pub(crate) mod bep_host;
+pub use bep_host::{BepDevice, BepDeviceEnds, BepHost};
 
 /// Default time to wait for gvproxy to exit on SIGTERM before escalating to
 /// SIGKILL.
