@@ -6125,7 +6125,7 @@ fresh_vm_start_record_asserts_installed_images() {
 }
 
 # ---------------------------------------------------------------------------
-# The mock-bucket install-and-drive half the two proofs share.
+# The mock-bucket install-and-drive half the VM proofs share.
 # ---------------------------------------------------------------------------
 
 # Locate the guest images the lane already built/fetched — the caller's
