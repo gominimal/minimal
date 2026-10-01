@@ -21,11 +21,13 @@
 //! read-only view whose only operations are lookups, so the one component
 //! that reads guest frames cannot add, replace, or withdraw a row. The
 //! registration path that carries a client's box declarations into this
-//! registry is T66's; what lands here is the table's shape, the gate that
-//! reads it, and the rows the host itself can name.
+//! registry is [`crate::control`] — the host daemon's control socket, over
+//! which the activating client registers a box and reads the addresses the
+//! allocation hands back.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use sessions::EgressPolicy;
@@ -151,21 +153,77 @@ impl BoxRegistration {
     }
 }
 
+/// A box declaration as the activating client carries it over the host's
+/// control socket: the facts a row is compiled from, without the addresses —
+/// a client-driven registration allocates those on the host, from the
+/// address plan this registry's switch serves, and hands them back with the
+/// row ([`BoxRegistry::register_client_box`]).
+#[derive(Debug, Clone)]
+pub struct ClientBoxSpec {
+    /// The box's name: what the row is named by, and the name the create
+    /// request will carry — a box's id on the host is its name.
+    pub name: String,
+    /// The external ports the box's ingress rules admit, as the client
+    /// expanded them.
+    pub ingress_ports: Vec<u16>,
+    /// The box's egress policy, as the client declared it. Absent compiles
+    /// the allow-all default, the same meaning the create request's absent
+    /// policy carries.
+    pub egress: Option<EgressPolicy>,
+}
+
+/// Why a client-driven registration could not be allocated. Both runs a
+/// box address comes from — the plan's switch lease run and the published
+/// loopback slice — are finite; exhausting one is an answer to hand back
+/// over the control socket, not a panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AllocationError {
+    /// Every switch address in the plan's lease run is published.
+    #[error("the switch's address plan is exhausted; no box address remains")]
+    SwitchExhausted,
+    /// Every address in the loopback slice this subnet's switch publishes
+    /// at is handed out.
+    #[error("the host's loopback slice is exhausted; no published address remains")]
+    LoopbackExhausted,
+    /// The address plan does not serve this registry's subnet, so no box
+    /// address can be allocated against it. An explicit registration
+    /// ([`BoxRegistry::register`]) still works: it brings its own
+    /// addresses.
+    #[error("the address plan does not serve subnet {0}; no box address can be allocated")]
+    UnplannedSubnet(SwitchSubnet),
+}
+
 /// The writable half of the host-side table, held by the host process: the
 /// registration surface — the host's own node-namespace row, and T66's
 /// client-driven path — and the source of the read-only [`BoxTable`] the
 /// gate reads.
 ///
-/// Cheap to clone, and every clone shares the rows: the table the gate holds
-/// is the same one every later registration lands in, which is how a box
-/// published after the gate started is decided by its rules from that moment
-/// on. The subnet a registry is built with fixes the address plan its rows
-/// compile against — the resolver the carve-out is keyed to, and the node
-/// address — so it must be the same subnet the gate's switch serves.
+/// Cheap to clone, and every clone shares the rows and the allocation
+/// cursors: the table the gate holds is the same one every later registration
+/// lands in, which is how a box published after the gate started is decided
+/// by its rules from that moment on, and an address a registration takes on
+/// one clone is never handed twice. The subnet a registry is built with
+/// fixes the address plan its rows compile against — the resolver the
+/// carve-out is keyed to, the node address, and the runs the client-driven
+/// allocation draws from — so it must be the same subnet the gate's switch
+/// serves.
 #[derive(Debug, Clone)]
 pub struct BoxRegistry {
     subnet: SwitchSubnet,
     rows: Arc<RwLock<Rows>>,
+    /// The next switch address the client-driven allocation hands out,
+    /// shared by every clone of this registry.
+    next_switch_addr: Arc<AtomicU32>,
+    /// The next published loopback address the client-driven allocation
+    /// hands out, shared the same way.
+    next_loopback_addr: Arc<AtomicU32>,
+    /// The loopback slice this subnet's switch publishes at, when the
+    /// address plan serves it: the run [`Self::register_client_box`]
+    /// allocates published addresses from. `None` for a subnet the plan
+    /// does not serve — such a registry still holds explicit registrations
+    /// (the node's own row among them), it just cannot allocate for a
+    /// client box.
+    loopback_slice: Option<switch::LoopbackSlice>,
 }
 
 impl BoxRegistry {
@@ -175,9 +233,15 @@ impl BoxRegistry {
     /// configured with.
     #[must_use]
     pub fn new(subnet: SwitchSubnet) -> Self {
+        let loopback_slice = switch::AddressPlan::default().loopback_slice_for_switch(subnet);
         Self {
             subnet,
             rows: Arc::new(RwLock::new(BTreeMap::new())),
+            next_switch_addr: Arc::new(AtomicU32::new(subnet.first_ptask())),
+            next_loopback_addr: Arc::new(AtomicU32::new(
+                loopback_slice.map_or(0, |slice| u32::from(slice.first())),
+            )),
+            loopback_slice,
         }
     }
 
@@ -249,6 +313,56 @@ impl BoxRegistry {
             .remove(&switch_addr.octets())
     }
 
+    /// Registers a client box: allocates its switch address from the plan's
+    /// lease run and its published loopback address from the slice this
+    /// subnet's switch serves at, then fills the row from `spec` — the same
+    /// compile [`Self::register`] does, addressed at the allocation — and
+    /// returns the row, whose addresses are the ones to hand back over the
+    /// control socket.
+    ///
+    /// Addresses are handed out in plan order from shared cursors: each
+    /// registration takes the next address the plan has not spent, and no
+    /// address is ever handed to two rows (clones of this registry share the
+    /// cursors, so that holds across every clone). The runs are finite — the
+    /// lease run ends below the daemon's reserved address, the slice ends
+    /// where the plan's next switch begins — and exhausting one is the
+    /// [`AllocationError`] the control socket hands back as the
+    /// registration's failure.
+    ///
+    /// An address is spent for good: withdrawing its row does not return it
+    /// to the cursor, and neither does an allocation whose other run is
+    /// exhausted. A spent address's host-side state — the gate's
+    /// rate-limit slots, the switch's static lease table — is keyed by it,
+    /// and re-issuing it to a new box would inherit all of that; a fresh
+    /// address starts clean.
+    pub fn register_client_box(
+        &self,
+        spec: ClientBoxSpec,
+    ) -> Result<Arc<BoxRecord>, AllocationError> {
+        let slice = self
+            .loopback_slice
+            .ok_or(AllocationError::UnplannedSubnet(self.subnet))?;
+        let switch_addr = take_next(
+            &self.next_switch_addr,
+            self.subnet.first_ptask(),
+            self.subnet.last_ptask(),
+        )
+        .ok_or(AllocationError::SwitchExhausted)?;
+        let loopback_addr = take_next(
+            &self.next_loopback_addr,
+            u32::from(slice.first()),
+            u32::from(slice.last()),
+        )
+        .ok_or(AllocationError::LoopbackExhausted)?;
+        let mut registration =
+            BoxRegistration::new(spec.name, switch_addr, loopback_addr)
+                .with_admitted_ports(spec.ingress_ports);
+        if let Some(policy) = spec.egress {
+            registration = registration.with_egress_policy(policy);
+        }
+        Ok(self.register(registration))
+    }
+
     /// Publishes the guest **node's** own namespace: the in-VM daemon's
     /// root-netns tap, the plane design §5.1 names node-plane. The address is
     /// the host's own derivation from the subnet it configured the switch
@@ -279,6 +393,16 @@ impl BoxRegistry {
             subnet: self.subnet,
         }
     }
+}
+
+/// Takes the next unspent address from `cursor`, when `first..=last` still
+/// holds one. Relaxed ordering: a cursor's only invariant is that no two
+/// takes return the same address, which an atomic add gives on every
+/// ordering; the run's bounds are checked on the taken value, so even a
+/// cursor advanced past its run's end (or wrapped) hands out nothing.
+fn take_next(cursor: &AtomicU32, first: u32, last: u32) -> Option<Ipv4Addr> {
+    let next = cursor.fetch_add(1, Ordering::Relaxed);
+    (first <= next && next <= last).then(|| Ipv4Addr::from(next))
 }
 
 /// The read-only view of the published rows the egress gate decides by: the

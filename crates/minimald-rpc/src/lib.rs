@@ -9,6 +9,8 @@
 //!
 //! The server-side serving glue lives in the `minimald` crate.
 
+use std::net::Ipv4Addr;
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sessions::SessionId;
@@ -403,6 +405,67 @@ pub struct SessionConfig {
 /// `#[serde(default)]`.
 fn default_hooks_enabled() -> bool {
     true
+}
+
+/// The wire types of the VM host daemon's box-registration control socket
+/// (T66): the one door a client has to the host-side box table (NET-138).
+///
+/// On a minvmd-backed host, `min session activate` opens this socket — a
+/// UDS beside the daemon's ssh socket in the provider's state dir — writes
+/// one [`RegisterBoxRequest`] as a line of JSON, and reads one
+/// [`RegisterBoxReply`] line back. Nothing else crosses it: the session
+/// RPCs are the daemon crate's HTTP-shaped socket, and the box's switch
+/// and loopback addresses come from here so the daemon's create request
+/// can carry them (see [`SessionConfig`]).
+///
+/// These types live here rather than in `minvmd` because both ends depend
+/// on this crate — the activating client and the host daemon — and the
+/// protocol must not drift between them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterBoxRequest {
+    /// The box's name — the session name the following create request
+    /// carries, so the host-side row and the session identify the same box.
+    /// A box's id on the host is its name.
+    pub name: String,
+    /// The external ports the box's ingress rules admit, as the client
+    /// expanded them. The host row holds the expanded ports rather than the
+    /// rules so the rule grammar stays the client's: the attaching side
+    /// reaches ports without re-parsing declarations.
+    #[serde(default)]
+    pub ingress_ports: Vec<u16>,
+    /// The box's egress policy, as the client expanded it. Absent means the
+    /// allow-all default — the same meaning the create request's policy
+    /// carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressPolicy>,
+}
+
+/// The addresses a successful registration hands back: the box's switch
+/// address and its published loopback address, both allocated on the host
+/// from the address plan the host switch serves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterBoxAddresses {
+    /// The box's address on the switch. The create request carries it so
+    /// the in-VM daemon attaches with this address instead of drawing its
+    /// own — the row the host's egress gate decides by is keyed by it.
+    pub switch_address: Ipv4Addr,
+    /// The box's address on the guest's loopback, from the slice the host
+    /// switch publishes at.
+    pub loopback_address: Ipv4Addr,
+}
+
+/// The one reply line the control socket answers a registration with: the
+/// handed addresses, or the reason the registration did not happen. Untagged
+/// so the reply stays one flat JSON object either way.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum RegisterBoxReply {
+    /// Registration succeeded: both addresses are allocated and the host
+    /// table's row is filled.
+    Addresses(RegisterBoxAddresses),
+    /// Registration failed: `error` is a sentence naming why, for the
+    /// activating client to warn with.
+    Error { error: String },
 }
 
 /// The request for a [`CreateSession`] RPC.

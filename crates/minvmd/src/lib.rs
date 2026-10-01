@@ -12,6 +12,7 @@
 
 pub mod box_registry;
 pub mod cmd;
+pub mod control;
 pub mod config;
 pub mod error;
 pub mod image;
