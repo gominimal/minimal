@@ -13,6 +13,7 @@
 pub mod box_registry;
 pub mod cmd;
 pub mod config;
+pub mod control;
 pub mod error;
 pub mod image;
 pub mod lifecycle;

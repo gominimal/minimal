@@ -2619,6 +2619,7 @@ async fn own_ip_default_deny_all() {
                 project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
                 network: sessions::NetworkMode::OwnIp,
                 policy: sessions::SessionPolicy::default(),
+                box_addresses: None,
                 hooks_enabled: true,
                 attrs: Default::default(),
             },

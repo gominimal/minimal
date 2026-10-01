@@ -2147,6 +2147,13 @@ pub(crate) struct SandboxLauncher {
     /// on attach, so the box's `<name>.min.internal` route exists exactly
     /// while the box does (NET-001). Ignored by every other network mode.
     pub(crate) own_address: Option<crate::net::provider::OwnAddressReporter>,
+    /// The addresses the VM host daemon handed this box's registration
+    /// (T66), when it was registered: the switch address this `OwnIp` PTask
+    /// attaches with instead of drawing one, and the published loopback
+    /// address the host side names the box by. Ignored by every other
+    /// network mode; `None` for a session the activating client did not
+    /// register, which self-allocates as it always has.
+    pub(crate) box_addresses: Option<sessions::BoxAddresses>,
     /// Composition to merge into the launcher's baseline packages and
     /// vars. Patches and lifecycle hooks are ignored today.
     pub(crate) composition: Option<std::sync::Arc<sessions::core::compose::Composition>>,
@@ -2242,6 +2249,7 @@ impl SessionLauncher for SandboxLauncher {
         let network_mode = self.network_mode;
         let net_switch = self.net_switch;
         let own_address = self.own_address;
+        let box_addresses = self.box_addresses;
         // The session name, registered as this PTask's `*.min.internal` hostname on
         // an own-IP attach (finding #3 / UC6); cloned because `name` is consumed by
         // the sandbox env below.
@@ -2271,6 +2279,7 @@ impl SessionLauncher for SandboxLauncher {
             &session_name,
             Some(policy),
             own_address,
+            box_addresses,
         ))
         .await
         .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;

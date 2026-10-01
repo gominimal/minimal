@@ -78,6 +78,11 @@ fn build_record(
         project_path: config.project_path,
         network: config.network,
         policy: config.policy,
+        // The handed addresses ride the record: the attach path reads the
+        // switch address back out of it, so a re-attach — after a restart
+        // included — reuses the address the host table still holds instead
+        // of drawing a new one the row would not match.
+        box_addresses: config.box_addresses,
         status,
         hooks_enabled: config.hooks_enabled,
         attrs: config.attrs,
@@ -1248,6 +1253,7 @@ pub(crate) mod tests {
             project_path: HostAbsPath::try_new("/proj").unwrap(),
             network: sessions::NetworkMode::default(),
             policy: Default::default(),
+            box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),
         }
