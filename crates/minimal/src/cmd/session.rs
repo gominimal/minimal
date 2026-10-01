@@ -980,14 +980,20 @@ pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'
 /// resolved to its list or its default (`allow all`; `deny subnets` reads
 /// `(none)` when nothing is denied), or, for a box that declared no egress
 /// at all, the default its daemon resolved to (`deny all` once the deny-all
-/// default is in force; `allow all` behind the opt-out or before it) — and
-/// the ingress mappings spelled out.
+/// default is in force; `allow all` behind the opt-out or before it) — the
+/// node-plane baseline set the helper enumerates beside it (NET-130: the
+/// in-VM daemon's own registry and cache fetches are decided by that set at
+/// the host-side gate, whatever the box's own declaration resolves to, so
+/// the set is what a deny-all box reads beside), and the ingress mappings
+/// spelled out.
 /// `network` is the session's network mode, and the modes without a surface
 /// to describe are held to the TUI's detail pane: a none box has no network
 /// at all, so it prints the pane's one-line note in place of both blocks
 /// (`allow all` egress would claim a reach a box with no network does not
 /// have), and a host-address session shares its host's namespace, so it has
-/// no per-session ingress policy to show and the block is omitted entirely.
+/// no per-session ingress policy — the block is omitted entirely, and with
+/// it the baseline set, which is a switch-fabric surface and has nothing to
+/// describe there either.
 /// Shared by `min session policy`'s printer and the integration
 /// tests that pin the rendering (NET-061, NET-075).
 pub fn format_policy(
@@ -1027,6 +1033,24 @@ pub fn format_policy(
                 )?,
             }
             write_rules(out, "deny subnets", egress.deny_subnets.as_ref(), "(none)")?;
+        }
+    }
+    // The node-plane baseline set, beside the box's rules (NET-130): the
+    // helper's built-in enumeration of the categories the in-VM daemon's own
+    // traffic may reach, one row per category under its name. A
+    // switch-fabric surface, so it is the own-address modes that carry it —
+    // the enumeration is built the way the host-side gate builds it, from
+    // the fabric's own address plan.
+    if network == sessions::NetworkMode::OwnIp {
+        let baseline = minvmd::net::NodePlaneBaseline::built_in(switch::SwitchSubnet::default());
+        writeln!(out, "node-plane baseline set (helper enumeration)")?;
+        for entry in baseline.entries() {
+            writeln!(
+                out,
+                "  {}  {}",
+                entry.category().as_str(),
+                entry.endpoints().join(", ")
+            )?;
         }
     }
     // Ingress is an own-address surface: the switch's static forwarder is the

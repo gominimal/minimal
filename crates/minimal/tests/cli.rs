@@ -1047,6 +1047,82 @@ async fn policy_shows_deny_all_default() {
     );
 }
 
+/// `min session policy` shows the node-plane baseline set beside the box's
+/// rules (NET-130): the helper's built-in enumeration of the categories the
+/// in-VM daemon's own traffic may reach, one row per category, on an
+/// own-address box — where the host-side gate decides the daemon's own
+/// fetches by it, whatever the box's own declaration resolves to, so a
+/// deny-all box still reads beside the reach its daemon keeps. A
+/// host-address box shares its host's namespace, so it has no switch fabric
+/// and the baseline set has nothing to describe there.
+#[test]
+fn policy_shows_baseline_set() {
+    // The deny-all resolution the rollout ends at (NET-075), rendered the
+    // way the command renders it: the box's own rules, and the helper's
+    // enumeration beside them.
+    let deny_all = sessions::EffectiveSessionPolicy {
+        egress: sessions::effective_egress(
+            None,
+            sessions::NetworkMode::OwnIp,
+            sessions::EgressDefaultPhase::InForce,
+            false,
+        ),
+        ingress: None,
+    };
+    let mut out = Vec::new();
+    format_policy(&mut out, &deny_all, sessions::NetworkMode::OwnIp).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("egress\n  deny all\n"),
+        "the box's own rules are shown:\n{text}"
+    );
+    assert!(
+        text.contains("node-plane baseline set (helper enumeration)"),
+        "the helper's baseline set is shown beside the box's rules:\n{text}"
+    );
+
+    // The rows are the enumeration the helper carries, one per category —
+    // the same set the host-side gate decides the daemon's own frames by.
+    let baseline = minvmd::net::NodePlaneBaseline::built_in(switch::SwitchSubnet::default());
+    let rendered_baseline = baseline
+        .entries()
+        .iter()
+        .map(|entry| {
+            format!(
+                "  {}  {}",
+                entry.category().as_str(),
+                entry.endpoints().join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains(&rendered_baseline),
+        "the baseline rows are the enumeration's entries, one per category:\n{text}"
+    );
+    // Beside, not instead: the egress block comes first, the baseline set
+    // after it, the ingress block last.
+    let egress_at = text.find("egress").expect("the egress block renders");
+    let baseline_at = text
+        .find("node-plane baseline set")
+        .expect("the baseline set renders");
+    let ingress_at = text.find("ingress").expect("the ingress block renders");
+    assert!(
+        egress_at < baseline_at && baseline_at < ingress_at,
+        "the baseline set renders beside the rules, between egress and ingress:\n{text}"
+    );
+
+    // A host-address box has no switch fabric, so the baseline set has
+    // nothing to describe there.
+    let mut out = Vec::new();
+    format_policy(&mut out, &deny_all, sessions::NetworkMode::HostNet).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        !text.contains("node-plane baseline set"),
+        "a host-address box carries no baseline set:\n{text}"
+    );
+}
+
 /// While the deny-all egress default is announced but not yet in force,
 /// `min session activate` prints the coming change (NET-076) — what turns
 /// for a bare own-address box, and how to keep the shipped default. Driven
