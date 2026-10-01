@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use minimald_rpc::{RegisterBoxAddresses, RegisterBoxReply, RegisterBoxRequest};
+use minimald_rpc::{BoxAddresses, RegisterBoxReply, RegisterBoxRequest};
 
 use crate::box_registry::{BoxRegistry, ClientBoxSpec};
 
@@ -171,7 +171,7 @@ fn register_and_reply(
                 loopback_address = %record.loopback_addr(),
                 "registered box with the VM host daemon; addresses allocated"
             );
-            RegisterBoxReply::Addresses(RegisterBoxAddresses {
+            RegisterBoxReply::Addresses(BoxAddresses {
                 switch_address: record.switch_addr(),
                 loopback_address: record.loopback_addr(),
             })
@@ -277,7 +277,7 @@ mod tests {
 
     /// The registered box's two addresses, asserted as the reply the daemon
     /// hands back.
-    fn handed(reply: RegisterBoxReply) -> RegisterBoxAddresses {
+    fn handed(reply: RegisterBoxReply) -> BoxAddresses {
         match reply {
             RegisterBoxReply::Addresses(addresses) => addresses,
             RegisterBoxReply::Error { error } => {

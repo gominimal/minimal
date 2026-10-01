@@ -1115,10 +1115,15 @@ mod tests {
                 None,
             ),
             status: SessionStatus::default(),
-            // Deliberately the non-default (`--no-hooks`): `true` is the
-            // serde default, so a fixture using it would round-trip
+            // Deliberately the non-default shapes: `hooks_enabled: false`
+            // and a present `box_addresses` are both serde defaults to
+            // `None`/`true`, so a fixture using those would round-trip
             // green even if the field were dropped on write.
             hooks_enabled: false,
+            box_addresses: Some(crate::BoxAddresses {
+                switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+                loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+            }),
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),

@@ -9,8 +9,6 @@
 //!
 //! The server-side serving glue lives in the `minimald` crate.
 
-use std::net::Ipv4Addr;
-
 use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sessions::SessionId;
@@ -20,8 +18,8 @@ pub mod taskenv;
 pub mod trace;
 
 pub use sessions::{
-    DynamicIngress, EffectiveEgress, EffectiveSessionPolicy, EgressPolicy, IngressPolicy, IpProto,
-    NetworkMode, PortMapping, SessionPolicy,
+    BoxAddresses, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy, EgressPolicy,
+    IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
 };
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
@@ -387,6 +385,15 @@ pub struct SessionConfig {
     /// Per-session networking policy (egress + ingress).
     #[serde(default)]
     pub policy: SessionPolicy,
+    /// The addresses the VM host daemon handed this box's registration
+    /// (T66), when the activating client registered one: its switch
+    /// address, which the in-VM daemon attaches with instead of drawing
+    /// its own, and its published loopback address. `None` for every other
+    /// activation — a host that is not minvmd-backed, a box that is not
+    /// own-address — and the daemon then attaches exactly as it always
+    /// has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_addresses: Option<BoxAddresses>,
     /// Whether the session runs the lifecycle hooks composed into it.
     /// Cleared by `min session activate --no-hooks`, and persisted onto
     /// the session record so the later attach/detach/destroy
@@ -440,20 +447,12 @@ pub struct RegisterBoxRequest {
     pub egress: Option<EgressPolicy>,
 }
 
-/// The addresses a successful registration hands back: the box's switch
-/// address and its published loopback address, both allocated on the host
-/// from the address plan the host switch serves.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RegisterBoxAddresses {
-    /// The box's address on the switch. The create request carries it so
-    /// the in-VM daemon attaches with this address instead of drawing its
-    /// own — the row the host's egress gate decides by is keyed by it.
-    pub switch_address: Ipv4Addr,
-    /// The box's address on the guest's loopback, from the slice the host
-    /// switch publishes at.
-    pub loopback_address: Ipv4Addr,
-}
-
+/// The addresses a successful registration hands back
+/// ([`sessions::BoxAddresses`]): the box's switch address and its published
+/// loopback address, both allocated on the host from the address plan the
+/// host switch serves — the same pair the create request carries so the
+/// in-VM daemon attaches with it.
+///
 /// The one reply line the control socket answers a registration with: the
 /// handed addresses, or the reason the registration did not happen. Untagged
 /// so the reply stays one flat JSON object either way.
@@ -462,7 +461,7 @@ pub struct RegisterBoxAddresses {
 pub enum RegisterBoxReply {
     /// Registration succeeded: both addresses are allocated and the host
     /// table's row is filled.
-    Addresses(RegisterBoxAddresses),
+    Addresses(BoxAddresses),
     /// Registration failed: `error` is a sentence naming why, for the
     /// activating client to warn with.
     Error { error: String },
@@ -1468,6 +1467,13 @@ mod tests {
                 project_path: paths::HostAbsPath::try_new("/home/u/proj").unwrap(),
                 network: NetworkMode::OwnIp,
                 policy: SessionPolicy::default(),
+                // The non-`None` shape of the handed addresses: a fixture
+                // leaving it `None` would round-trip green even if the
+                // field never reached the wire.
+                box_addresses: Some(BoxAddresses {
+                    switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+                    loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+                }),
                 // The non-default (`--no-hooks`): `true` is the serde
                 // default, so a fixture using it would round-trip green
                 // even if the field never reached the wire.

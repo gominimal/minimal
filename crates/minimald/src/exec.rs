@@ -2040,6 +2040,7 @@ mod tests {
             project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
             network: mode,
             policy: sessions::SessionPolicy::default(),
+            box_addresses: None,
             status: sessions::SessionStatus::Active,
             hooks_enabled: true,
             attrs: Default::default(),

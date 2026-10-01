@@ -1628,6 +1628,7 @@ async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> Sess
         project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
         network: sessions::NetworkMode::NoNet,
         policy: Default::default(),
+        box_addresses: None,
         hooks_enabled: true,
         attrs: Default::default(),
     };
@@ -1701,6 +1702,7 @@ async fn create_session_with(
         project_path,
         network,
         policy,
+        box_addresses: None,
         hooks_enabled: true,
         attrs: Default::default(),
     };

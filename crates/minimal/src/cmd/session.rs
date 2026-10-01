@@ -27,6 +27,171 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     activate_session(global, args, true).await
 }
 
+/// How long a box registration may take before this activation gives up on
+/// it. The control socket answers with two map writes and an allocation, so
+/// healthy is milliseconds; the bound exists so a hung VM host daemon cannot
+/// hang the activation the user asked for.
+const BOX_REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Registers an own-address box with the VM host daemon over its control
+/// socket (T66), returning the addresses it handed back.
+///
+/// The control socket lives beside the ssh socket in the minvmd
+/// provider-instance dir — the dir the daemon connection resolves through —
+/// and speaks one JSON line each way: the box's expanded declaration in, the
+/// allocated switch and loopback addresses out
+/// ([`minimald_rpc::RegisterBoxReply`]). A refused registration (an
+/// exhausted address plan, a malformed declaration) surfaces here as an
+/// error naming the reason; the caller degrades it to a warning rather than
+/// failing the activation.
+async fn register_box_with_vm_host(
+    sock_path: &std::path::Path,
+    request: minimald_rpc::RegisterBoxRequest,
+) -> anyhow::Result<sessions::BoxAddresses> {
+    use tokio::io::AsyncBufReadExt as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut stream = tokio::net::UnixStream::connect(sock_path)
+        .await
+        .with_context(|| {
+            format!(
+                "connecting to the VM host daemon's box-registration control socket at {}",
+                sock_path.display()
+            )
+        })?;
+    let mut line = serde_json_lenient::to_string(&request)
+        .context("serializing the box registration request")?;
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .await
+        .context("writing the box registration request")?;
+    let mut reply = String::new();
+    tokio::io::BufReader::new(stream)
+        .read_line(&mut reply)
+        .await
+        .context("reading the box registration reply")?;
+    if reply.trim().is_empty() {
+        anyhow::bail!(
+            "the VM host daemon closed its control socket without answering the box registration"
+        );
+    }
+    let reply: minimald_rpc::RegisterBoxReply = serde_json_lenient::from_str(reply.trim())
+        .with_context(|| {
+            format!("the VM host daemon's box registration reply did not parse: {reply}")
+        })?;
+    match reply {
+        minimald_rpc::RegisterBoxReply::Addresses(addresses) => Ok(addresses),
+        minimald_rpc::RegisterBoxReply::Error { error } => {
+            anyhow::bail!("the VM host daemon refused the box registration: {error}")
+        }
+    }
+}
+
+/// Registers this activation's box with the VM host daemon, when there is
+/// one to register with (T66), returning the addresses it handed back —
+/// `None` when there is nothing to register or the registration could not
+/// be made.
+///
+/// The box this activation creates is registerable only on a minvmd-backed
+/// host, and only when it is an own-address box: a `host_ip` box shares the
+/// node's own row in the host table, and a `none` box has no switch address
+/// at all — both register nothing and attach exactly as they always have.
+///
+/// A registration that cannot be made — no control socket (a supervisor
+/// predating it), a refusal, the deadline — degrades to a warning and
+/// `None`, never to a failed activation: the box still creates, attaching
+/// under the egress gate's announced interim the same way a pre-T66 box
+/// does. Its egress is then what the interim admits until the daemon-side
+/// default flips, not what this activation declared — the warning says so.
+async fn register_box_for_activation(
+    global: &GlobalArgs,
+    network: sessions::NetworkMode,
+    name: &str,
+    policy: &sessions::SessionPolicy,
+) -> Option<sessions::BoxAddresses> {
+    if !global.use_minvmd() || network != sessions::NetworkMode::OwnIp {
+        return None;
+    }
+    // The control socket sits beside the ssh socket in the provider dir the
+    // daemon connection resolves through, so the client finds both by the
+    // same rule — named VMs included, since the resolution reads the same
+    // process-global VM name.
+    let ssh_sock = match client::resolve_socket_path(global.minimal_dir.as_deref(), true) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "cannot resolve the VM host provider dir; the box will not be \
+                 registered with the VM host daemon (its declared egress is not \
+                 enforced host-side)"
+            );
+            return None;
+        }
+    };
+    let Some(sock_path) = ssh_sock.parent().map(|dir| {
+        dir.join(minvmd::control::CONTROL_SOCK_FILE)
+    }) else {
+        tracing::warn!(
+            "no provider dir resolved for the ssh socket; the box will not be \
+             registered with the VM host daemon (its declared egress is not \
+             enforced host-side)"
+        );
+        return None;
+    };
+    // The declaration, as this activation expanded it: the ingress rules
+    // reduced to the external ports they admit — the shape the host row
+    // holds — and the egress policy verbatim.
+    let request = minimald_rpc::RegisterBoxRequest {
+        name: name.to_string(),
+        ingress_ports: policy
+            .ingress
+            .as_ref()
+            .map(|ingress| {
+                ingress
+                    .port_mappings
+                    .iter()
+                    .map(|mapping| mapping.external_port)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        egress: policy.egress.clone(),
+    };
+    let registration = tokio::time::timeout(
+        BOX_REGISTRATION_TIMEOUT,
+        register_box_with_vm_host(&sock_path, request),
+    )
+    .await;
+    match registration {
+        Ok(Ok(addresses)) => {
+            tracing::debug!(
+                box = %name,
+                switch_address = %addresses.switch_address,
+                loopback_address = %addresses.loopback_address,
+                "VM host daemon handed the box its addresses"
+            );
+            Some(addresses)
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                %error,
+                "the box will not be registered with the VM host daemon; its \
+                 declared egress is not enforced host-side"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                after = ?BOX_REGISTRATION_TIMEOUT,
+                "the VM host daemon did not answer the box registration in time; \
+                 the box will not be registered (its declared egress is not \
+                 enforced host-side)"
+            );
+            None
+        }
+    }
+}
+
 /// The activation flow shared by [`cmd_activate`] and the bare-`min` router.
 /// `offer_scaffold` gates the `minimal.toml` scaffold offer: `cmd_activate`
 /// keeps it (its long-standing behavior, unchanged), while bare `min`
@@ -96,13 +261,27 @@ pub(crate) async fn activate_session(
         .clone()
         .unwrap_or_else(|| autogen_session_name(&utf8_path, &random_hex4()));
 
+    let network: sessions::NetworkMode = args.network.into();
+
+    // T66: an own-address box on a VM-backed host registers with the VM host
+    // daemon before the create — the host allocates its switch and loopback
+    // addresses into the table its egress gate decides by and hands them
+    // back, and the create request carries them so the in-VM daemon attaches
+    // with the handed switch address instead of drawing its own. Every
+    // other shape of activation — a host-ip box sharing the node's own row,
+    // a none box with no switch address, a native daemon with no box table
+    // — registers nothing and attaches as it always has.
+    let box_addresses =
+        register_box_for_activation(global, network, &session_name, &policy).await;
+
     // The daemon sources `username` from the authenticated SSH
     // connection context; the client doesn't send it.
     let config = minimald_rpc::SessionConfig {
         name: Some(session_name),
         project_path: abs_path.clone(),
-        network: args.network.into(),
+        network,
         policy,
+        box_addresses,
         hooks_enabled: !args.no_hooks,
         attrs: Default::default(),
     };
@@ -263,6 +442,19 @@ pub(crate) async fn activate_session(
                 if should_retry_autogen(autogen, attempts, &error) {
                     attempts += 1;
                     config.name = Some(autogen_session_name(&utf8_path, &random_hex4()));
+                    // A registered box's row carries the name it was
+                    // registered under (T66), so the re-mint re-registers —
+                    // the row the first attempt made stays published behind
+                    // it: the control socket has no withdraw verb yet, its
+                    // addresses are spent for good by design, and the rare
+                    // colliding autogen retry leaves at most one such row.
+                    config.box_addresses = register_box_for_activation(
+                        global,
+                        config.network,
+                        config.name.as_deref().expect("just re-minted"),
+                        &config.policy,
+                    )
+                    .await;
                     continue;
                 }
                 bail!("CreateSession failed: {error}");
@@ -1830,6 +2022,162 @@ mod tests {
         assert!(
             rendered.contains("egress\n  allow all\n"),
             "an opted-out bare box must show allow-all: {rendered}"
+        );
+    }
+
+    /// Spawns a stand-in VM host control server at `sock_path`: answers
+    /// every registration with `reply` (one JSON line, newline appended),
+    /// recording each request line it received. Mirrors the line protocol
+    /// [`minvmd::control`](minvmd::control) serves, from the server side.
+    async fn fake_vm_host(
+        sock_path: std::path::PathBuf,
+        reply: String,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let seen = std::sync::Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(_) => return,
+                };
+                let mut lines = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                if lines.read_line(&mut line).await.is_err() {
+                    return;
+                }
+                seen.lock().unwrap().push(line.trim().to_string());
+                let mut writer = lines.into_inner();
+                let _ = writer.write_all(reply.as_bytes()).await;
+                let _ = writer.write_all(b"\n").await;
+            }
+        });
+        requests
+    }
+
+    /// T66: an own-address box on a VM-backed host registers with the VM
+    /// host daemon over its control socket — the request carries the box's
+    /// name, its expanded ingress ports, and its egress policy; the reply
+    /// hands back the two addresses the create request then carries — and
+    /// the decision about whether to register at all is the activation's:
+    /// only a minvmd-backed host with an own-address box registers, and a
+    /// refusal surfaces as a sentence, not a failed activation.
+    #[tokio::test]
+    async fn activate_registers_box_with_vm_host() {
+        let policy = sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                allow_dns_hosts: None,
+                allow_protocols: Some(vec![IpProto::Tcp]),
+                deny_subnets: None,
+            }),
+            ingress: Some(IngressPolicy {
+                port_mappings: vec![
+                    PortMapping {
+                        external_port: 8080,
+                        internal_port: 80,
+                        proto: IpProto::Tcp,
+                    },
+                    PortMapping {
+                        external_port: 5432,
+                        internal_port: 5432,
+                        proto: IpProto::Tcp,
+                    },
+                ],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+        };
+
+        // The successful shape, driven the way the activation drives it:
+        // through `register_box_for_activation`, whose socket resolution
+        // lands on the provider dir the daemon connection uses — here the
+        // stand-in bound where a real minvmd's control socket would be.
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let requests = fake_vm_host(
+            sock_path.clone(),
+            r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
+        )
+        .await;
+        let global = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            minimal_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let handed = register_box_for_activation(&global, NetworkMode::OwnIp, "web", &policy)
+            .await
+            .expect("the registration is answered with addresses");
+        assert_eq!(
+            handed.switch_address,
+            std::net::Ipv4Addr::new(100, 64, 0, 2)
+        );
+        assert_eq!(
+            handed.loopback_address,
+            std::net::Ipv4Addr::new(127, 0, 64, 0)
+        );
+        {
+            // The lock is scoped: holding a std MutexGuard across the awaits
+            // below is exactly what the await-holding-lock lint names.
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one registration, one request");
+            let request: minimald_rpc::RegisterBoxRequest =
+                serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type");
+            assert_eq!(request.name, "web");
+            assert_eq!(request.ingress_ports, vec![8080, 5432]);
+            assert_eq!(request.egress.as_ref(), policy.egress.as_ref());
+        }
+
+        // Every other shape of activation registers nothing: a native
+        // daemon has no box table, a host-ip box shares the node's own row.
+        // Neither touches a socket, so a plain global (no provider, no
+        // dir) suffices.
+        let native = GlobalArgs::default();
+        assert!(
+            register_box_for_activation(&native, NetworkMode::OwnIp, "web", &policy)
+                .await
+                .is_none(),
+            "a native daemon hosts no box table to register on"
+        );
+        let vm_host = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            ..Default::default()
+        };
+        assert!(
+            register_box_for_activation(&vm_host, NetworkMode::HostNet, "web", &policy)
+                .await
+                .is_none(),
+            "a host-ip box shares the node's own row and registers nothing"
+        );
+
+        // The refusal shape: a daemon that answers with a reason produces an
+        // error naming it — what the activation warns on and continues
+        // from, never a failed create.
+        let refused_dir = tempfile::TempDir::new().unwrap();
+        let refused_path = refused_dir.path().join("control.sock");
+        let _refused_requests = fake_vm_host(
+            refused_path.clone(),
+            r#"{"error":"the switch's address plan is exhausted; no box address remains"}"#
+                .to_string(),
+        )
+        .await;
+        let refused = register_box_with_vm_host(
+            &refused_path,
+            minimald_rpc::RegisterBoxRequest {
+                name: "db".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+            },
+        )
+        .await
+        .expect_err("a refused registration is an error");
+        assert!(
+            refused.to_string().contains("address plan is exhausted"),
+            "the refusal surfaces with its reason: {refused}"
         );
     }
 }
