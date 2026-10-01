@@ -177,7 +177,8 @@ pub struct AttachResult {
 
 /// The sub-run of `subnet`'s PTask run this daemon **self-allocates** from:
 /// the run's lower half, `[first_ptask, midpoint]`, as an inclusive
-/// `(first, last)` pair.
+/// `(first, last)` pair — the hand-out run above it keeps one address
+/// more, a PTask run holding an odd number of addresses.
 ///
 /// The plan's PTask run is split into two disjoint sub-runs so the two
 /// allocators that draw on it cannot meet: this daemon self-allocates task
@@ -196,7 +197,7 @@ pub struct AttachResult {
 pub fn self_allocation_run(subnet: SwitchSubnet) -> (u32, u32) {
     let first = subnet.first_ptask();
     let last = subnet.last_ptask();
-    let reserve_len = (last - first + 1) / 2;
+    let reserve_len = (last - first).div_ceil(2);
     (first, first + reserve_len - 1)
 }
 

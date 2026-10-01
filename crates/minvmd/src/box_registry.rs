@@ -174,7 +174,8 @@ pub struct ClientBoxSpec {
 
 /// The run of `subnet`'s address plan the host hands registered boxes from:
 /// the PTask run's upper half, `[midpoint + 1, last_ptask]`, as an inclusive
-/// `(first, last)` pair.
+/// `(first, last)` pair — one address more than the daemon's reserve below
+/// it, a PTask run holding an odd number of addresses.
 ///
 /// The plan's PTask run is split into two disjoint sub-runs so the two
 /// allocators that draw on it cannot meet: this host hands a registered box
@@ -192,7 +193,7 @@ pub struct ClientBoxSpec {
 fn hand_out_run(subnet: SwitchSubnet) -> (u32, u32) {
     let first = subnet.first_ptask();
     let last = subnet.last_ptask();
-    let reserve_len = (last - first + 1) / 2;
+    let reserve_len = (last - first).div_ceil(2);
     (first + reserve_len, last)
 }
 
@@ -238,7 +239,7 @@ pub struct BoxRegistry {
     /// The next switch address the client-driven allocation hands out,
     /// shared by every clone of this registry. Draws from the hand-out run
     /// — the plan run's upper half, above the daemon's self-allocation
-    /// reserve ([`hand_out_run`]) — never from the reserve itself.
+    /// reserve (`hand_out_run`) — never from the reserve itself.
     next_switch_addr: Arc<AtomicU32>,
     /// The next published loopback address the client-driven allocation
     /// hands out, shared the same way.
@@ -351,7 +352,7 @@ impl BoxRegistry {
     /// address is ever handed to two rows (clones of this registry share the
     /// cursors, so that holds across every clone). The switch cursor draws
     /// only from the hand-out run — the plan run's upper half, above the
-    /// daemon's self-allocation reserve ([`hand_out_run`]) — so the two
+    /// daemon's self-allocation reserve (`hand_out_run`) — so the two
     /// allocators cannot meet. The runs are finite — the hand-out run ends
     /// at the plan's last PTask address, the slice ends where the plan's
     /// next switch begins — and exhausting one is the [`AllocationError`]
@@ -371,12 +372,8 @@ impl BoxRegistry {
             .loopback_slice
             .ok_or(AllocationError::UnplannedSubnet(self.subnet))?;
         let (hand_out_first, hand_out_last) = hand_out_run(self.subnet);
-        let switch_addr = take_next(
-            &self.next_switch_addr,
-            hand_out_first,
-            hand_out_last,
-        )
-        .ok_or(AllocationError::SwitchExhausted)?;
+        let switch_addr = take_next(&self.next_switch_addr, hand_out_first, hand_out_last)
+            .ok_or(AllocationError::SwitchExhausted)?;
         let loopback_addr = take_next(
             &self.next_loopback_addr,
             u32::from(slice.first()),
@@ -472,7 +469,7 @@ impl BoxTable {
     /// self-allocation reserve included, because a task sandbox holds a
     /// reserve address and stays an unregistered source the interim admits;
     /// the host hands registered boxes only from the upper half
-    /// ([`hand_out_run`]). The subnet's own infrastructure sits outside that
+    /// (`hand_out_run`). The subnet's own infrastructure sits outside that
     /// run: the gateway the resolver carve-out is keyed to, the host alias,
     /// and the guest daemon's own tap, which the registry publishes a row for
     /// itself. The announced interim the gate ships admits an unregistered
