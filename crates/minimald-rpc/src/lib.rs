@@ -486,12 +486,13 @@ pub struct WithdrawBoxRequest {
 /// predates a verb cannot parse the tagged line and refuses it — and an old
 /// CLI's registration, untagged, fails the new daemon's parse the same way,
 /// so the daemon is autospawned by the CLI from the same install and the
-/// mixed-version pair is the corner, not the rule. Ordered dispatch would
-/// parse an old daemon's withdraw line as a *spurious registration* — a row
-/// with no ports and an allow-all policy, spending a finite hand-out
-/// address — which is worse than the refusal: the registering side's row
-/// stays published either way, but only the refusal leaves no new fact on
-/// the host.
+/// mixed-version pair is the corner, not the rule. Without the tag, dispatch
+/// ordered register-then-withdraw would parse a withdraw line on a daemon
+/// that predates the verb as a *spurious registration* — the line's extra
+/// fields ignored, a row with no ports and an allow-all policy filling in,
+/// spending a finite hand-out address — which is worse than the refusal:
+/// the registering side's row stays published either way, but only the
+/// refusal leaves no new fact on the host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "verb", rename_all = "snake_case")]
 pub enum BoxControlRequest {

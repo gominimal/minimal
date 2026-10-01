@@ -143,7 +143,7 @@ fn serve_request(
     }
 }
 
-/// Read one line (terminated by `\n`) of the registration request. A
+/// Read one line (terminated by `\n`) of the box control request. A
 /// connection that closes before sending a line reads as no request; a line
 /// past [`MAX_REQUEST_LINE`] is refused.
 ///
@@ -177,9 +177,7 @@ fn read_request_line(stream: &mut UnixStream) -> std::io::Result<Option<String>>
         if line.len() > MAX_REQUEST_LINE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "box registration request exceeded {MAX_REQUEST_LINE} bytes without a newline"
-                ),
+                format!("box control request exceeded {MAX_REQUEST_LINE} bytes without a newline"),
             ));
         }
     }
