@@ -165,6 +165,16 @@ const HEAD_END: &[u8] = b"\r\n\r\n";
 /// ending one is malformed or hostile, and is refused rather than buffered.
 const MAX_HEAD: usize = 4 * 1024;
 
+/// How many bytes one read of the first request head takes. The head is read
+/// into a fixed-size scratch, not into a buffer a read can grow: a growable
+/// read doubles its reserve read by read, so a guest talking past [`MAX_HEAD`]
+/// without ending a head pushes each read's own allocation up with it, and the
+/// bound is checked only after the growth it drove. The chunk fixes the read's
+/// size — the head buffer's high-water mark is the bound plus one chunk,
+/// whatever the guest writes, the same deliberate cap every other guest-scaled
+/// cost on this path carries.
+const HEAD_READ_CHUNK: usize = 512;
+
 /// Bound on the gate's half of the handshake: dialing the switch it fronts,
 /// reading the upgrade head off the guest, and forwarding it. A healthy
 /// shuttle writes the head the moment it connects, so one still unfinished
@@ -1493,7 +1503,11 @@ impl DropLimiter {
 ///
 /// The head is read for both protocols the switch socket speaks, not only the
 /// upgrade: what it asks for is what picks the relay ([`GuestSpeak`]) — and
-/// decides whether the gate forwards it at all.
+/// decides whether the gate forwards it at all. Each read takes at most
+/// [`HEAD_READ_CHUNK`] bytes, from a fixed-size scratch, so the head's buffer
+/// grows by bounded steps and its high-water mark is [`MAX_HEAD`] plus one
+/// chunk — the bound is checked after each read, but the growth a read can
+/// drive is no longer the read's own to choose.
 ///
 /// # Errors
 ///
@@ -1503,14 +1517,16 @@ impl DropLimiter {
 /// buffered.
 async fn read_request_head(guest: &mut UnixStream) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let mut head = Vec::with_capacity(CONNECT_REQUEST.len());
+    let mut chunk = [0u8; HEAD_READ_CHUNK];
     loop {
-        let n = guest.read_buf(&mut head).await?;
+        let n = guest.read(&mut chunk).await?;
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "guest closed the connection before the switch upgrade head ended",
             ));
         }
+        head.extend(chunk.iter().take(n).copied());
         if let Some(end) = find_subslice(&head, HEAD_END) {
             let carry = head.split_off(end + HEAD_END.len());
             return Ok((head, carry));
