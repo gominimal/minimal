@@ -30,15 +30,19 @@
 //!   outside the block is refused under either phase. Once the per-box
 //!   default is in force (T66, #1711, the creator-side registration that
 //!   supplies the rows), only row-held addresses publish at all.
-//! * **A retract is decided by what the rows hold, not where the guest
-//!   sits** — the wire carries the listener a retraction names, and no
-//!   address at all, so the decision is table-wide: a retraction is applied
-//!   when some published row holds the record it names — the owner's own
-//!   teardown — and refused, once the default binds, when no row does.
-//!   Under the announced interim a retraction matching no row is applied:
-//!   the publications whose rows are still to come are the ones whose
-//!   teardowns must work, and retracting what does not exist is a no-op on
-//!   the switch.
+//! * **A retract is decided by the row at its own address, like a publish**
+//!   — the address a retraction's summary carries is the publication's own:
+//!   the gate attributes each retraction to the address the publish it
+//!   retracts was applied at, because the wire itself carries only the
+//!   listener. The decision reads that row exactly as it reads a publish's:
+//!   a retraction is applied when the row holding its address holds every
+//!   record it names — the owner's own teardown — and refused with
+//!   [`Refusal::Unheld`] when that row holds the address but not every
+//!   record, or when no row holds the address and the phase grants no
+//!   interim. Under the announced interim a retraction at an in-plan address
+//!   no row holds is applied: the publications whose rows are still to come
+//!   are the ones whose teardowns must work, and retracting what does not
+//!   exist is a no-op on the switch.
 //!
 //! The record a request carries is a **port number or a name index**: the
 //! port the forwarder listens on or dials, the name's index in the
@@ -65,7 +69,10 @@ pub enum SwitchVerb {
     /// the switch address the request names.
     Publish,
     /// `POST /services/forwarder/unexpose`: retract a forwarder, named by
-    /// the listener it bound — the wire carries no address.
+    /// the listener it bound. The wire carries no address, so the summary's
+    /// address is the one the gate attributes the retraction to — the
+    /// address the publish it retracts was applied at — and the summary is
+    /// decided by the row there, exactly as a publish's is.
     Retract,
     /// `POST /services/dns/add`: publish the zone records' names at the
     /// address the records carry.
@@ -93,10 +100,10 @@ pub enum Record {
 pub struct SwitchRequest {
     verb: SwitchVerb,
     /// The switch address the request publishes at: the forwarder's remote
-    /// for an expose, the zone records' address for a name publish. A
-    /// retraction carries no address on the wire, and the field is then the
-    /// unspecified address — the one value [`applied`] never reads for a
-    /// retract.
+    /// for an expose, the zone records' address for a name publish, and for
+    /// a retraction the address the gate attributes it to — the publication's
+    /// own, or the unspecified address when the gate holds no publication
+    /// for the forward the retraction names.
     switch_addr: [u8; 4],
     /// The records the request carries, in the order the wire gave them;
     /// the trailing slots are `None`.
@@ -231,8 +238,7 @@ pub enum Applied {
     /// every record it carries is one the row admits.
     Row,
     /// The announced interim applied the request: the address it publishes
-    /// at is one the plan could lease but no row holds (or, for a
-    /// retraction, the record it names is declared by no row), so no row's
+    /// at is one the plan could lease but no row holds, so no row's
     /// declaration was consulted. The relay says so, rate-limited, naming
     /// T66 (#1711).
     Interim,
@@ -258,12 +264,19 @@ pub enum Refusal {
         /// The first record the row does not admit.
         record: Record,
     },
-    /// A retraction names records no published row holds, and the per-box
-    /// default is in force: there is no publication left to retract.
-    /// `record` is the first record the retraction carries, `None` when it
-    /// carries none — a shape the wire parse never builds, refused closed.
+    /// A retraction the table refuses. Two shapes share it: no published
+    /// row holds the address the retraction carries and the phase's interim
+    /// does not admit it, or the row holding that address does not hold
+    /// every record the retraction names — the retraction asks to withdraw
+    /// a publication the row holding its address never made. `record` is
+    /// the first record the row does not admit when one holds the address,
+    /// and `None` when no row held it (or the retraction carried no record
+    /// at all — a shape the wire parse never builds, refused closed).
     Unheld {
-        /// The first record no row holds, when the retraction named one.
+        /// The address the retraction carries.
+        addr: [u8; 4],
+        /// The first record the row holding `addr` does not admit, when a
+        /// row holds it.
         record: Option<Record>,
     },
 }
@@ -279,7 +292,12 @@ impl std::fmt::Display for Refusal {
             Self::Undeclared { .. } => {
                 f.write_str("the namespace holding its address does not admit it")
             }
-            Self::Unheld { .. } => f.write_str("no published namespace holds what it retracts"),
+            Self::Unheld { record: Some(_), .. } => f.write_str(
+                "the namespace holding its address does not admit what it retracts",
+            ),
+            Self::Unheld { record: None, .. } => {
+                f.write_str("no published namespace holds the address it retracts at")
+            }
         }
     }
 }
@@ -290,12 +308,13 @@ impl std::fmt::Display for Refusal {
 /// separate from the relay loop that applies it, the same discipline the
 /// frame verdict keeps.
 ///
-/// The address is the whole of the routing for a publish: the row that
-/// holds it supplies the records its publishes are decided by, and an
-/// address no row holds is the phase's to decide
-/// ([`EgressDefaultPhase`] carries what that means and why). A retraction
-/// carries no address, so its decision is table-wide: some row must hold
-/// the record it names, or the phase's interim applies it.
+/// The address is the whole of the routing for every verb: the row that
+/// holds it supplies the records the request is decided by, and an address
+/// no row holds is the phase's to decide ([`EgressDefaultPhase`] carries
+/// what that means and why). A retraction's summary carries the address the
+/// gate attributes it to — the publication's own — so it is read exactly
+/// like a publish: applied by the row holding its address when that row
+/// holds every record it names, refused otherwise.
 ///
 /// # Errors
 ///
@@ -303,8 +322,9 @@ impl std::fmt::Display for Refusal {
 /// row of the table holds and the phase grants it no interim, and
 /// [`Refusal::Undeclared`] when the row that holds the address does not
 /// admit the port or name the request publishes. A retraction is refused
-/// with [`Refusal::Unheld`] when no published namespace holds the record it
-/// names.
+/// with [`Refusal::Unheld`] when no published namespace holds the address it
+/// carries and the phase grants it no interim, or when the row holding that
+/// address does not hold every record it names.
 pub fn applied(
     request: &SwitchRequest,
     table: &SwitchTable,
@@ -332,18 +352,29 @@ pub fn applied(
             Err(Refusal::Undeclared { addr, record })
         }
         SwitchVerb::Retract => {
-            if table
-                .rows
-                .iter()
-                .any(|row| request.records().all(|record| row.holds(record)))
-            {
+            // A retraction is decided by the row at the address its summary
+            // carries — the publication's own — exactly as a publish is:
+            // the teardown it asks for is the owner's, never whoever else's
+            // row happens to declare the same listener. The unspecified
+            // address a retraction the gate could not attribute carries is
+            // read like any other: no row holds it, it is outside the plan's
+            // lease block, and nothing is applied by it.
+            let addr = request.switch_addr();
+            let Some(row) = table.row_at(addr) else {
+                if phase == EgressDefaultPhase::Announced && table.in_plan(addr) {
+                    return Ok(Applied::Interim);
+                }
+                return Err(Refusal::Unheld {
+                    addr,
+                    record: request.records().next(),
+                });
+            };
+            let Some(record) = request.records().find(|record| !row.holds(*record)) else {
                 return Ok(Applied::Row);
-            }
-            if phase == EgressDefaultPhase::Announced {
-                return Ok(Applied::Interim);
-            }
+            };
             Err(Refusal::Unheld {
-                record: request.records().next(),
+                addr,
+                record: Some(record),
             })
         }
     }
@@ -399,8 +430,11 @@ mod tests {
             .expect("two name records fit the summary")
     }
 
-    fn retract(record: Record) -> SwitchRequest {
-        SwitchRequest::of(SwitchVerb::Retract, [0, 0, 0, 0], &[record])
+    /// A retraction of `record`, carried at `addr` — the address the gate
+    /// attributes it to, which under the keyed decision is the publication's
+    /// own.
+    fn retract(addr: [u8; 4], record: Record) -> SwitchRequest {
+        SwitchRequest::of(SwitchVerb::Retract, addr, &[record])
             .expect("one port record fits the summary")
     }
 
@@ -409,8 +443,9 @@ mod tests {
         a_held_address_publishes_what_its_row_admits();
         a_held_address_refuses_what_its_row_omits();
         an_unheld_address_publishes_as_its_phase_decides();
-        a_retraction_is_decided_table_wide();
-        a_retraction_reads_no_address();
+        a_retraction_is_applied_by_the_row_at_its_address();
+        a_retraction_of_a_record_its_row_omits_is_refused();
+        an_unheld_address_retracts_as_its_phase_decides();
         a_wider_request_has_no_summary();
     }
 
@@ -568,58 +603,118 @@ mod tests {
         }
     }
 
-    /// A retraction is decided table-wide: a row that holds the record
-    /// applies it under either phase — the owner's own teardown — and a
-    /// record no row holds is the interim's to apply, refused once the
-    /// default binds.
-    fn a_retraction_is_decided_table_wide() {
+    /// A retraction is decided by the row at the address it carries — the
+    /// publication's own, exactly as a publish is: the row that holds the
+    /// address and every record the retraction names applies it under
+    /// either phase, the owner's own teardown.
+    fn a_retraction_is_applied_by_the_row_at_its_address() {
         let t = table(vec![node_row(), box_row()]);
         for phase in both_phases() {
             assert_eq!(
-                applied(&retract(Record::Port(8080)), &t, phase),
-                Ok(Applied::Row),
-                "a declared port's retraction is applied by its row under {phase:?}"
-            );
-            assert_eq!(
-                applied(&retract(Record::Port(7654)), &t, phase),
+                applied(&retract(NODE_ADDR, Record::Port(7654)), &t, phase),
                 Ok(Applied::Row),
                 "the node's own port's retraction is applied by its row under {phase:?}"
             );
+            assert_eq!(
+                applied(&retract(ROW_LEASE, Record::Port(8080)), &t, phase),
+                Ok(Applied::Row),
+                "a declared port's retraction is applied by its row under {phase:?}"
+            );
         }
+    }
+
+    /// A retraction at an address whose row does not hold the record it
+    /// names is refused, under either phase — even when some *other* row
+    /// holds the record: a retraction is the owner's teardown, not a
+    /// withdrawal justified by a namespace the publication does not belong
+    /// to.
+    fn a_retraction_of_a_record_its_row_omits_is_refused() {
+        let t = table(vec![node_row(), box_row()]);
+        for phase in both_phases() {
+            assert_eq!(
+                applied(&retract(ROW_LEASE, Record::Port(7654)), &t, phase),
+                Err(Refusal::Unheld {
+                    addr: ROW_LEASE,
+                    record: Some(Record::Port(7654)),
+                }),
+                "a retraction justified only by the node's row is refused under {phase:?}"
+            );
+            assert_eq!(
+                applied(&retract(NODE_ADDR, Record::Port(8080)), &t, phase),
+                Err(Refusal::Unheld {
+                    addr: NODE_ADDR,
+                    record: Some(Record::Port(8080)),
+                }),
+                "a retraction justified only by the box's row is refused under {phase:?}"
+            );
+            // The scan is over the retraction's own records: the first one
+            // its row does not hold is the one the refusal names.
+            let two = SwitchRequest::of(
+                SwitchVerb::Retract,
+                ROW_LEASE,
+                &[Record::Port(8080), Record::Port(22)],
+            )
+            .expect("two port records fit the summary");
+            assert_eq!(
+                applied(&two, &t, phase),
+                Err(Refusal::Unheld {
+                    addr: ROW_LEASE,
+                    record: Some(Record::Port(22)),
+                }),
+                "the refusal names the first record the row does not admit under {phase:?}"
+            );
+        }
+    }
+
+    /// A retraction at an address no row holds: the phase decides, as for a
+    /// publish. Inside the lease run the announced interim applies it — the
+    /// teardowns of publications whose rows are still to come, and of
+    /// publications whose rows a withdrawal has just retired, must work —
+    /// and the per-box default refuses it. Outside the run — the gateway,
+    /// anything past the plan, and the unspecified address a retraction the
+    /// gate could not attribute carries — both phases refuse: a retraction
+    /// at the unspecified address is applied by nothing, however many rows
+    /// hold what it names.
+    fn an_unheld_address_retracts_as_its_phase_decides() {
+        let t = table(vec![node_row()]);
         assert_eq!(
             applied(
-                &retract(Record::Port(9999)),
+                &retract(FREE_LEASE, Record::Port(8080)),
                 &t,
                 EgressDefaultPhase::Announced
             ),
             Ok(Applied::Interim),
-            "a retraction no row holds is applied under the announced interim"
+            "an in-plan retraction no row holds is applied under the announced interim"
         );
         assert_eq!(
             applied(
-                &retract(Record::Port(9999)),
+                &retract(FREE_LEASE, Record::Port(8080)),
                 &t,
                 EgressDefaultPhase::InForce
             ),
             Err(Refusal::Unheld {
-                record: Some(Record::Port(9999)),
+                addr: FREE_LEASE,
+                record: Some(Record::Port(8080)),
             }),
-            "a retraction no row holds is refused once the default binds"
+            "an in-plan retraction no row holds is refused once the default binds"
         );
-    }
-
-    /// The unspecified address a retraction carries is never read: the
-    /// decision is what the rows hold, not where the request claims to
-    /// sit.
-    fn a_retraction_reads_no_address() {
-        let t = table(vec![node_row()]);
-        let request = SwitchRequest::of(SwitchVerb::Retract, [9, 9, 9, 9], &[Record::Port(7654)])
-            .expect("one port record fits the summary");
-        assert_eq!(
-            applied(&request, &t, EgressDefaultPhase::InForce),
-            Ok(Applied::Row),
-            "a retraction is decided by what the rows hold, not by the address it carries"
-        );
+        for (addr, what) in [
+            ([100, 64, 0, 2], "the gateway"),
+            ([192, 0, 2, 9], "an address outside the plan"),
+            ([0, 0, 0, 0], "the unspecified address"),
+        ] {
+            for phase in both_phases() {
+                assert_eq!(
+                    applied(&retract(addr, Record::Port(7654)), &t, phase),
+                    Err(Refusal::Unheld {
+                        addr,
+                        record: Some(Record::Port(7654)),
+                    }),
+                    "{what} is not an address a retraction is applied at under {phase:?}, even \
+                     for a port a published row holds"
+                );
+            }
+        }
     }
 
     /// The summary holds at most [`MAX_REQUEST_RECORDS`] records; a wider
@@ -669,19 +764,20 @@ mod kani_proofs {
     /// A request is applied exactly when the table admits it: stated as an
     /// iff so neither arm can silently become unreachable (the rcache
     /// harness pattern). The admitting half is restated over the same
-    /// request and table — the row at the address first, then the records
-    /// it holds, then the phase's interim for an address (or, for a
-    /// retraction, a record) *nothing* holds — so a decision that checks in
-    /// a different order, or that reads an empty row dimension as
-    /// allow-all, fails here. The interim's arm carries that nothing-holds
-    /// bound: a publish at a held address whose declaration refuses a
-    /// record must not be read as the interim's to apply.
+    /// request and table, per address and for every verb alike — the row at
+    /// the request's own address first, then the records it holds — so a
+    /// decision that keys a retraction by some other row's address, or
+    /// table-wide by *any* row that happens to hold its records, or that
+    /// checks in a different order, or that reads an empty row dimension as
+    /// allow-all, fails here. The interim's arm carries the nothing-holds
+    /// bound: a request at a held address whose declaration refuses a record
+    /// must not be read as the interim's to apply.
     ///
-    /// The table is one fully symbolic row beside symbolic plan bounds.
-    /// One row is what the retraction's table-wide *some row* needs — a
-    /// scan that skipped it, or stopped short of its records, fails the iff
-    /// — and a second adds no failure shape while it multiplies CBMC's
-    /// search; the multi-row shapes are the unit test's.
+    /// The table is one fully symbolic row beside symbolic plan bounds. One
+    /// row is what the per-address decision needs — a retraction keyed by
+    /// the row's address is admitted, one keyed by any other address is the
+    /// phase's or refused — and a second adds no failure shape while it
+    /// multiplies CBMC's search; the multi-row shapes are the unit test's.
     ///
     /// The unwind bound is 6: the record scan walks at most four slots, the
     /// row's port and name scans at most two each, and comparing `[u8; 4]`
@@ -718,27 +814,18 @@ mod kani_proofs {
         let outcome = applied(&request, &table, phase);
         let applied_ok = outcome.is_ok();
 
-        let declared = match verb {
-            SwitchVerb::Publish | SwitchVerb::PublishName => {
-                let row = table.row_at(addr);
-                row.is_some_and(|row| request.records().all(|record| row.holds(record)))
-            }
-            SwitchVerb::Retract => table
-                .rows
-                .iter()
-                .any(|row| request.records().all(|record| row.holds(record))),
-        };
+        // The same row, at the request's own address, for every verb: a
+        // publish and a retraction are admitted by the row that holds the
+        // address they carry, and by no other.
+        let declared = table
+            .row_at(addr)
+            .is_some_and(|row| request.records().all(|record| row.holds(record)));
+        // The interim is the phase's decision over an address no row holds,
+        // never a second chance past the row that does: a held address whose
+        // declaration refuses a record is refused under either phase.
         let interim = phase == EgressDefaultPhase::Announced
-            && match verb {
-                SwitchVerb::Publish | SwitchVerb::PublishName => {
-                    // The interim is the phase's decision over an address no
-                    // row holds, never a second chance past the row that
-                    // does: a held address whose declaration refuses a
-                    // record is refused under either phase.
-                    table.row_at(addr).is_none() && table.in_plan(addr)
-                }
-                SwitchVerb::Retract => !declared,
-            };
+            && table.row_at(addr).is_none()
+            && table.in_plan(addr);
         assert_eq!(applied_ok, declared || interim);
     }
 }
