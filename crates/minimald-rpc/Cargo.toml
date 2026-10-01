@@ -1,5 +1,6 @@
 [package]
 name = "minimald-rpc"
+description = "Wire contract for minimald's oneshot SSH RPCs and for the exec channel's request vocabulary."
 rust-version.workspace = true
 version = "0.0.1"
 edition.workspace = true

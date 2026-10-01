@@ -1,5 +1,6 @@
 [package]
 name = "minimal"
+description = "The min session CLI, which pairs with and talks to minimald."
 rust-version.workspace = true
 version.workspace = true
 edition.workspace = true

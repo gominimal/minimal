@@ -24,11 +24,17 @@ The workspace builds `min`, `mip`, `minimald`, and `minvmd`:
 
 The CLI reference overview is [docs/reference/cli.md](docs/reference/cli.md).
 
-## Crate map
+## Workspace crates
 
-The crates are grouped by plane in
-[docs/architecture.md](docs/architecture.md) §0 and listed with roles in §3.
-`ls crates/` lists the current set.
+To list the workspace's crates and their descriptions, run:
+
+    cargo metadata --no-deps --format-version 1 \
+      | python3 -c "import json,sys
+    for p in sorted(json.load(sys.stdin)['packages'], key=lambda p: p['name']):
+        print('\t'.join([p['name'], p['description'] or '-']))"
+
+Use this when you need to know which crate is responsible for something, or
+where a change belongs.
 
 ## Platform matrix
 
@@ -192,7 +198,7 @@ proves, `nightly` ships.
   [docs/ci-strategy.md](docs/ci-strategy.md).
 - **Do not restate an inventory.** Counts and lists of crates, workflows,
   binaries, and recipes are wrong as soon as one changes. Link to the document
-  that owns the list, or give the command that prints it (`ls crates/`,
+  that owns the list, or give the command that prints it (`cargo metadata`,
   `ls .github/workflows/`, `just --list`). The prose rules reject a stated
   count (`inventory.StatedCount`).
 

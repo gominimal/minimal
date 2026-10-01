@@ -1,5 +1,6 @@
 [package]
 name = "minimald"
+description = "The session daemon: an SSH server hosting sessions and task/sandbox executions."
 rust-version.workspace = true
 version.workspace = true
 edition.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "sandbox2"
+description = "The low-level sandbox implementation (Linux user + mount namespaces)."
 version = "0.0.1"
 rust-version.workspace = true
 license.workspace = true

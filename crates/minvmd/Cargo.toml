@@ -1,5 +1,6 @@
 [package]
 name = "minvmd"
+description = "Host daemon that boots Linux microVMs via libkrun and bridges host UDS to in-VM vsock."
 rust-version.workspace = true
 version.workspace = true
 edition.workspace = true
