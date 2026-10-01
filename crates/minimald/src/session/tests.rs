@@ -2651,3 +2651,674 @@ async fn own_ip_default_deny_all() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Per-box loopback addresses and the name's finalize-to-destroy lifecycle
+// (NET-010 to NET-013)
+// ---------------------------------------------------------------------------
+
+/// An own-address session's config: a box that declares one published port —
+/// the ingress a publish is made of (NET-010) — under the session `name`.
+fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
+    minimald_rpc::CreateSessionRequest {
+        config: minimald_rpc::SessionConfig {
+            name: Some(name.to_string()),
+            project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
+            network: sessions::NetworkMode::OwnIp,
+            policy: sessions::SessionPolicy {
+                egress: None,
+                ingress: Some(sessions::IngressPolicy {
+                    port_mappings: vec![sessions::PortMapping {
+                        external_port: 18080,
+                        internal_port: 80,
+                        proto: sessions::IpProto::Tcp,
+                    }],
+                    ..Default::default()
+                }),
+            },
+            hooks_enabled: true,
+            attrs: Default::default(),
+        },
+        must_match_version: None,
+    }
+}
+
+/// Drives Create → ConfigureLoadout → FinalizeSession for an own-address box
+/// and returns its id. No attach ever happens along the way: the box is
+/// finalised and its name registered while no client has connected — the
+/// condition NET-013 answers under.
+async fn finalize_own_ip_session(client: &mut TestClient, name: &str) -> SessionId {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    let id = client
+        .call::<CreateSession>(&own_ip_session_req(name))
+        .await
+        .unwrap()
+        .id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .await
+    {
+        Errorable::Ok(_) => id,
+        Errorable::Err { error } => panic!("FinalizeSession failed for {name}: {error}"),
+    }
+}
+
+/// The A answer a live box's name carries, and the session that owns it —
+/// `None` when the name is absent (NXDOMAIN, NET-125).
+async fn zone_answer_for(server: &TestServer, name: &str) -> Option<(String, std::net::Ipv4Addr)> {
+    let registry = server.state.sessions_manager().await.hostnames();
+    match registry
+        .read()
+        .expect("registry lock")
+        .zone_entry(name, &[])
+    {
+        crate::net::dns::ZoneEntry::Held { owner, address } => Some((
+            owner,
+            address.expect("a live box's name answers with an A record"),
+        )),
+        crate::net::dns::ZoneEntry::Absent => None,
+    }
+}
+
+/// Whether `addr` falls inside the reserved local range a published box's own
+/// address is leased from (NET-010): the design's `127.0.64.0/24`, read from
+/// the one definition the allocator carves rather than restated as literals —
+/// so the assertion below follows the range if the design moves it again.
+fn in_reserved_local_range(addr: std::net::Ipv4Addr) -> bool {
+    let (network, prefix) = sessions::core::loopback::RESERVED_LOCAL_RANGE;
+    let mask = u32::MAX << (32 - u32::from(prefix));
+    u32::from(network) & mask == u32::from(addr) & mask
+}
+
+/// NET-011: a session's finalisation is what registers its box's
+/// `<name>.min.internal` — the reply to `FinalizeSession` comes back with the
+/// name already held, at the box's own leased loopback address, and the lease
+/// is the one the registry published: the two surfaces that must agree (the
+/// route a proxy follows and the address a resolver answers) name one address.
+/// The registration is in the daemon log, naming the box and the address —
+/// the line a diagnostics bundle's log tail carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn name_registered_at_finalize() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_own_ip_session(&mut client, "web").await;
+
+    // No attach has happened — the name is held at the box's own address.
+    let (owner, address) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the name is held at finalize");
+    assert_eq!(owner, "web", "the session owns its box name");
+    assert!(
+        in_reserved_local_range(address),
+        "the box's own address comes from the reserved local range, got {address}"
+    );
+
+    // The registry's publish and the zone's answer are one address — the two
+    // halves of the same publish (NET-010) cannot disagree.
+    let registry = server.state.sessions_manager().await.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(id),
+        Some(address),
+        "the address the name answers at is the one the finalize published"
+    );
+
+    // The registration is said out loud, naming the box and the address.
+    let logged = capture.contents();
+    let lease_line = logged
+        .lines()
+        .find(|line| line.contains("loopback-lease") && line.contains("session_name=\"web\""))
+        .unwrap_or_else(|| panic!("the lease must be logged, got: {logged}"));
+    assert!(
+        lease_line.contains(&format!("ip={address}")),
+        "the lease line names the address it leased, got: {lease_line}"
+    );
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains("registered PTask hostname") && line.contains("web")),
+        "the R3.5 registration is logged with the box's name, got: {logged}"
+    );
+}
+
+/// NET-010, runtime half: two own-address boxes that declare the *same* port
+/// each get a host loopback address of their own, granted from the answerer's
+/// record for the reserved local range, so both publish — at their own
+/// addresses, at their own port numbers, never translated — where one loopback
+/// address would have made the second box's port a collision. NET-129's
+/// sub-requirement (report, don't translate) covers the boxes that *do* share
+/// an address; this is the case the shared-address mode exists to avoid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_box_gets_own_loopback_address() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let _alpha = finalize_own_ip_session(&mut client, "alpha").await;
+    let _beta = finalize_own_ip_session(&mut client, "beta").await;
+
+    let (_, alpha_address) = zone_answer_for(&server, "alpha.min.internal")
+        .await
+        .expect("alpha's name is held");
+    let (_, beta_address) = zone_answer_for(&server, "beta.min.internal")
+        .await
+        .expect("beta's name is held");
+    assert_ne!(
+        alpha_address, beta_address,
+        "two live boxes on one daemon must never share a loopback address"
+    );
+    for (name, address) in [("alpha", alpha_address), ("beta", beta_address)] {
+        assert!(
+            in_reserved_local_range(address),
+            "{name}'s address comes from the reserved local range, got {address}"
+        );
+    }
+
+    // The same declared port is published at both addresses at the port
+    // number each box asked for — no translation, no remap around the pair.
+    let registry = server.state.sessions_manager().await.hostnames();
+    let routes = registry.read().expect("registry lock");
+    for (name, address) in [("alpha", alpha_address), ("beta", beta_address)] {
+        let route = routes
+            .resolve(&format!("{name}.min.internal"))
+            .unwrap_or_else(|| panic!("{name}'s name routes"));
+        assert_eq!(
+            route.upstream(18080),
+            Some(std::net::SocketAddr::new(
+                std::net::IpAddr::V4(address),
+                18080
+            )),
+            "{name}'s own port number is published at its own address, not translated"
+        );
+        assert_eq!(
+            route.upstream(9000),
+            None,
+            "a port outside {name}'s declaration routes nowhere"
+        );
+    }
+}
+
+/// NET-010's cross-record collision report, at the moment the design puts it
+/// (design §7.1: cross-node collisions are reported at session start, like a
+/// port collision). The daemon's own start takes the same report once, over
+/// whatever was live before it came up; this is the half that catches a grant
+/// a second state root's daemon made **after** this one booted, which no
+/// report this daemon ran at its start can ever see again. The stand-in for
+/// that second root's publish is a live listener at an address this daemon's
+/// record never names — the shape no `EADDRINUSE` ever reports, because the
+/// collision is on the address, not a port — bound here *after* the daemon
+/// has started, so the report that names it below can only be the session's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_start_reports_a_publish_no_grant_names() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+
+    // The pool's last address: grantable, so nothing rules it out on shape,
+    // and not one this daemon's empty record has named — a second root's
+    // grant, as the kernel's socket table sees it.
+    let foreign = sessions::core::loopback::POOL_LAST;
+    let _listener = std::net::TcpListener::bind((foreign, 0))
+        .unwrap_or_else(|error| panic!("the unrecorded address binds: {error}"));
+
+    // Everything the buffer holds here predates the box, so a line naming
+    // the address in what follows is the session-start report's — the
+    // daemon-start report ran at `TestServer::new`, before the bind.
+    let before_finalize = capture.contents().len();
+    let _web = finalize_own_ip_session(&mut client, "web").await;
+    let logged = &capture.contents()[before_finalize..];
+    assert!(
+        logged.lines().any(|line| {
+            line.contains("loopback-publish-collision") && line.contains(&format!("ip={foreign}"))
+        }),
+        "a session start must report the live publish no grant names: {logged}"
+    );
+
+    // And the box itself is untouched by the report: it is advisory, so the
+    // box published at the address its own grant gave it, as though the
+    // other root were not there.
+    let (_, address) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the box's name answers at its own address");
+    assert_eq!(
+        address,
+        sessions::core::loopback::POOL_FIRST,
+        "the collision report costs the box nothing: its own grant stands"
+    );
+}
+
+/// NET-013: a box's name answers whether or not a client is attached. The
+/// finalize above attached nothing; the answer here is a full A record at the
+/// box's own address — held, in-zone, at the port the box declared — and the
+/// route a request follows reaches the same address at the same port, so a
+/// client that resolves the name and one that connects through the hostname
+/// proxy are told one and the same place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn name_answers_without_attached_client() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let _id = finalize_own_ip_session(&mut client, "web").await;
+
+    // No attach: the zone answers A, not NODATA and not NXDOMAIN.
+    let (_, address) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the name answers with no client");
+
+    // And the routing half says the same address at the box's own port.
+    let registry = server.state.sessions_manager().await.hostnames();
+    let route = registry
+        .read()
+        .expect("registry lock")
+        .resolve("web.min.internal:18080")
+        .expect("the name routes with no client attached");
+    assert_eq!(
+        route.upstream(18080),
+        Some(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(address),
+            18080
+        )),
+        "a request for the box's declared port is forwarded to the box's own address"
+    );
+}
+
+/// NET-012: destroying the box is what ends the name. Every later lookup
+/// answers NXDOMAIN — held while the box existed (NET-013), absent the moment
+/// it is destroyed — and the address it held returns to the answerer's record
+/// with the release line the observability contract asks for, so the next box
+/// may publish on it (NET-010).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destroyed_box_name_is_nxdomain() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_own_ip_session(&mut client, "web").await;
+    let (_, address) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the name answers while the box lives");
+
+    use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
+    match client
+        .call::<DestroySession>(&DestroySessionRequest { id })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("DestroySession failed: {error}"),
+    }
+
+    // The name is gone: a later lookup is told NXDOMAIN, not a stale address.
+    assert_eq!(
+        zone_answer_for(&server, "web.min.internal").await,
+        None,
+        "a destroyed box's name must answer NXDOMAIN"
+    );
+    let registry = server.state.sessions_manager().await.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .resolve("web.min.internal"),
+        None,
+        "and nothing routes to a destroyed box"
+    );
+
+    // The release is said out loud, naming the box and the address it held.
+    let logged = capture.contents();
+    let release_line = logged
+        .lines()
+        .find(|line| line.contains("loopback-release") && line.contains("session_name=\"web\""))
+        .unwrap_or_else(|| panic!("the release must be logged, got: {logged}"));
+    assert!(
+        release_line.contains(&format!("ip={address}")),
+        "the release line names the address it returned to the slice, got: {release_line}"
+    );
+}
+
+/// NET-010's durability half (design §7.1): the grant is the answerer's
+/// record, not the daemon's memory, so a daemon that restarts re-derives its
+/// live boxes' grants from the record rather than starting from an empty
+/// table. The restarted daemon below adopts nothing by itself — a box's
+/// resumed session asks again the moment its actor comes up, and the record
+/// answers with the address it already holds, so the box's name answers at
+/// the same address from before the restart to long after it, from finalize
+/// to destroy (NET-011), with no client ever attached (NET-013).
+///
+/// The restart below is a real one: `shutdown(true)` **stops** both boxes —
+/// the manager's shutdown path, which is a stop and not a delete — before
+/// the first server is torn down. A stop keeps the grant (NET-013: the
+/// address is the box's own from finalize to destroy, and a stopped box
+/// that resumes must find it where it left it), so the record the second
+/// daemon reads still names both addresses. Resuming the **second** box
+/// first is the check that keeps this from being vacuous: if the stop had
+/// released its grant, the fresh record would have handed the resumed box
+/// the lowest free address — the first box's `.2` — and only the recorded
+/// `.3` it kept proves the grant survived the stop and the restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_daemon_re_derives_the_box_s_address_from_the_answerer() {
+    use minimald_rpc::{SessionDelta, SessionDeltaRequest};
+
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let alpha = finalize_own_ip_session(&mut client, "alpha").await;
+    let beta = finalize_own_ip_session(&mut client, "beta").await;
+    let (_, alpha_address) = zone_answer_for(&server, "alpha.min.internal")
+        .await
+        .expect("alpha's name answers at the first daemon");
+    let (_, beta_address) = zone_answer_for(&server, "beta.min.internal")
+        .await
+        .expect("beta's name answers at the first daemon");
+    let pool_second = {
+        // The address the allocator hands the second of two fresh boxes:
+        // one octet above the pool's first, well short of the pool's last.
+        let [a, b, c, d] = sessions::core::loopback::POOL_FIRST.octets();
+        std::net::Ipv4Addr::new(a, b, c, d + 1)
+    };
+    assert_eq!(
+        alpha_address,
+        sessions::core::loopback::POOL_FIRST,
+        "a fresh host's first grant is the pool's lowest address"
+    );
+    assert_eq!(
+        beta_address, pool_second,
+        "the second box's grant is the next one up, so keeping it and not \
+         being re-granted the first is a difference this test can see"
+    );
+
+    // "Restart the daemon": stop every session the way a daemon that is
+    // going down stops them — grants kept, records kept; a stop is not a
+    // destroy — then tear the first server down and boot a second one on
+    // the same state root, the one record every daemon on this host grants
+    // through.
+    server
+        .state
+        .sessions_manager()
+        .await
+        .shutdown(true)
+        .await
+        .expect("a forced shutdown has nothing left to refuse it");
+    let stopped = capture.contents();
+    // Scoped by session name, not by word alone: the capture buffer is
+    // process-wide and under libtest (`just test-cross`, minimald's macOS
+    // coverage) every test in the binary shares it, so an assertion that *no*
+    // line says `loopback-release` would fail on another test's destroy —
+    // `destroyed_box_name_is_nxdomain` releases on purpose. What this check
+    // owns is these two boxes: neither alpha nor beta may be released by a
+    // stop.
+    assert!(
+        !stopped.lines().any(|line| {
+            line.contains("loopback-release")
+                && (line.contains("session_name=\"alpha\"")
+                    || line.contains("session_name=\"beta\""))
+        }),
+        "shutdown stops the boxes without releasing their grants: {stopped}"
+    );
+    drop(client);
+    let state = server.into_state_dir();
+    let server = TestServer::new_in(state).await;
+    let mut client = server.connect().await;
+
+    // Bring beta's session up on the restarted daemon **first** — the
+    // resume path any RPC that names the session takes, which registers
+    // its name before the actor is observable. The reply's shape is not
+    // the point here; the actor being up is.
+    let _ = client
+        .call::<SessionDelta>(&SessionDeltaRequest { id: beta })
+        .await;
+
+    // Beta answers at the address the record already held it — the
+    // re-derivation, not the fresh grant a record emptied by the stop
+    // would have made, which is the first box's `.2`.
+    let (owner, resumed_beta) = zone_answer_for(&server, "beta.min.internal")
+        .await
+        .expect("beta's name answers after the restart");
+    assert_eq!(
+        owner, "beta",
+        "the session owns its box name across the restart"
+    );
+    assert_eq!(
+        resumed_beta, beta_address,
+        "the restarted daemon re-derives the box's recorded address, not a fresh one"
+    );
+    assert_ne!(
+        resumed_beta, alpha_address,
+        "the resumed box was not handed the first box's address"
+    );
+
+    // And alpha too: both boxes are where the record left them, each with
+    // the record's line it always had — the re-ask spent nothing, and the
+    // pair still holds one address between them.
+    let _ = client
+        .call::<SessionDelta>(&SessionDeltaRequest { id: alpha })
+        .await;
+    let (_, resumed_alpha) = zone_answer_for(&server, "alpha.min.internal")
+        .await
+        .expect("alpha's name answers after the restart");
+    assert_eq!(
+        resumed_alpha, alpha_address,
+        "the first box's grant survived the stop and the restart too"
+    );
+
+    let registry = server.state.sessions_manager().await.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert_eq!(
+        routes.published_own_address(beta),
+        Some(resumed_beta),
+        "the registry the restarted daemon built answers with the recorded address"
+    );
+    assert_eq!(
+        routes.published_own_address(alpha),
+        Some(resumed_alpha),
+        "and so does the first box's"
+    );
+}
+
+/// NET-013 inside the deferred probe's window. A microVM daemon cannot measure
+/// the range its publishes bind on — the host's loopback, a machine the guest
+/// cannot see — so its verdict comes from the forwarder-conducted walk, and
+/// that walk is long enough that the daemon must not hold its accept loop for
+/// it: the book opens **pending** and the walk lands when it lands. A daemon
+/// restarted with a live own-address box is therefore serving the RPC that
+/// brings the box's actor up — an attach right after `min up` — before its own
+/// verdict has, and that actor's ask is the resumed box's. The ask must be
+/// answered with the address the record already names: telling it the range is
+/// absent would publish the box on the node's shared `127.0.0.1` and leave its
+/// recorded line spent until a rename or a re-finalize asked again, so the
+/// box's name would answer somewhere else from finalize to destroy.
+///
+/// The window is held here by hand: the harness daemon is a native one, whose
+/// own loopback *is* its publish surface, so it reads the probe's answer
+/// before the book opens — its verdict has to be put back in the pending state
+/// the daemon inside a microVM holds its book in.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resumed_box_answers_at_its_own_address_while_the_verdict_is_pending() {
+    use minimald_rpc::{SessionDelta, SessionDeltaRequest};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let web = finalize_own_ip_session(&mut client, "web").await;
+    let (_, address) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the box's name answers at the first daemon");
+    assert_eq!(
+        address,
+        sessions::core::loopback::POOL_FIRST,
+        "a fresh host's first grant is the pool's lowest address"
+    );
+
+    // "Restart the daemon" — the same shape the restart test above drives: a
+    // stop, not a destroy, so the record keeps the box's line — then a second
+    // daemon on the same state root, held in the pending verdict a VM daemon
+    // whose walk has not answered holds its book in.
+    server
+        .state
+        .sessions_manager()
+        .await
+        .shutdown(true)
+        .await
+        .expect("a forced shutdown has nothing left to refuse it");
+    drop(client);
+    let state = server.into_state_dir();
+    let server = TestServer::new_in(state).await;
+    server
+        .state
+        .sessions_manager()
+        .await
+        .hold_range_verdict_pending();
+    let mut client = server.connect().await;
+
+    // Resume inside the window: the first RPC that names the box brings its
+    // actor up, and the ask that actor makes is the resumed box's.
+    let _ = client
+        .call::<SessionDelta>(&SessionDeltaRequest { id: web })
+        .await;
+
+    let (owner, resumed) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the resumed box's name answers inside the window");
+    assert_eq!(
+        owner, "web",
+        "the session owns its box name across the restart"
+    );
+    assert_eq!(
+        resumed, address,
+        "the resumed box keeps the recorded address, whatever the walk is doing"
+    );
+    assert_ne!(
+        resumed,
+        std::net::Ipv4Addr::LOCALHOST,
+        "the pending window must not publish the box on the node's shared address"
+    );
+
+    // And the publish is the box's own, not the interim: the registry the
+    // restarted daemon built holds the recorded address, so a connection to
+    // the box's declared port is forwarded to it and not to the node.
+    let registry = server.state.sessions_manager().await.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert_eq!(
+        routes.published_own_address(web),
+        Some(address),
+        "the resumed box's publish is at its own address, not the interim"
+    );
+    assert_eq!(
+        routes
+            .resolve("web.min.internal:18080")
+            .expect("the name routes inside the window")
+            .upstream(18080),
+        Some(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(address),
+            18080
+        )),
+        "the box's own port number is published at its own address, not translated"
+    );
+}
+
+/// NET-129 session path: two own-address boxes finalizing while the daemon's
+/// range verdict is held pending both publish on the node's shared address.
+/// Declaring the same port, the collision is reported as a
+/// `shared-address-port-collision` warn (the diagnostics contract) and the
+/// registry records the shared-address interim publishes so listings can see
+/// the collision. The ports are never translated. This uses the manager's
+/// `hold_range_verdict_pending` test seam, which is the supported way to put a
+/// native daemon's book into the pending state a microVM daemon opens in.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_address_port_collision_reported_at_finalize_without_attached_client() {
+    let server = TestServer::new().await;
+    server
+        .state
+        .sessions_manager()
+        .await
+        .hold_range_verdict_pending();
+    let capture = crate::test_harness::captured_log();
+    let mut client = server.connect().await;
+
+    let first = finalize_own_ip_session(&mut client, "first").await;
+    let second = finalize_own_ip_session(&mut client, "second").await;
+
+    // Both names answer at the node's shared address while no client is attached.
+    let (_, first_address) = zone_answer_for(&server, "first.min.internal")
+        .await
+        .expect("first's name answers on the shared address");
+    let (_, second_address) = zone_answer_for(&server, "second.min.internal")
+        .await
+        .expect("second's name answers on the shared address");
+    assert_eq!(
+        first_address, second_address,
+        "both interim boxes publish at the node's shared address"
+    );
+    assert_eq!(
+        first_address,
+        std::net::Ipv4Addr::LOCALHOST,
+        "a native node's interim address is host loopback"
+    );
+
+    // No own-address publish is recorded: the boxes are on the interim, not
+    // holding a grant, so neither published_own_address returns anything.
+    let registry = server.state.sessions_manager().await.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert!(
+        routes.published_own_address(first).is_none(),
+        "a shared-address box does not record the node address as its own"
+    );
+    assert!(
+        routes.published_own_address(second).is_none(),
+        "the second shared-address box does not record the node address as its own"
+    );
+    assert_eq!(
+        routes
+            .resolve("first.min.internal:18080")
+            .expect("first's name routes")
+            .upstream(18080),
+        Some(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(first_address),
+            18080,
+        )),
+        "the first box's port is published at the number it asked for"
+    );
+    assert_eq!(
+        routes
+            .resolve("second.min.internal:18080")
+            .expect("second's name routes")
+            .upstream(18080),
+        Some(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(second_address),
+            18080,
+        )),
+        "the second box's port is published at the number it asked for"
+    );
+    drop(routes);
+
+    // The collision reached the log and named both boxes and the port.
+    let logged = capture.contents();
+    let collision_lines: Vec<_> = logged
+        .lines()
+        .filter(|line| {
+            line.contains("action=\"shared-address-port-collision\"") && line.contains("port=18080")
+        })
+        .collect();
+    assert_eq!(
+        collision_lines.len(),
+        1,
+        "one warn line reports the collision, naming one box and the port: {collision_lines:?}"
+    );
+    assert!(
+        collision_lines[0].contains("session_name=\"second\"")
+            && collision_lines[0].contains("other=first.min.internal"),
+        "the collision line names the publishing box and the other box: {}",
+        collision_lines[0]
+    );
+}

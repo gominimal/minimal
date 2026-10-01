@@ -178,9 +178,17 @@ async fn finish_own_ip_attach(
     ingress: Option<&sessions::IngressPolicy>,
     own_address: Option<&crate::net::provider::OwnAddressReporter>,
 ) -> io::Result<OwnIpGuard> {
+    // The host loopback address this box's declaration publishes on (NET-010):
+    // the box's own leased address, read back from the registry rather than
+    // re-derived, so the forwards bind where the box's name answers. A launch
+    // without a reporter — a task, which owns no proxy route of its own —
+    // publishes on the node's shared address, the same interim a box without
+    // an address of its own does (NET-123).
+    let published =
+        own_address.map_or(Ipv4Addr::LOCALHOST, |reporter| reporter.published_address());
     let exposed = match ingress {
         Some(ingress) if !ingress.port_mappings.is_empty() => {
-            match crate::net::policy::apply_ingress(&control, lease_ip, ingress).await {
+            match crate::net::policy::apply_ingress(&control, published, lease_ip, ingress).await {
                 Ok(exposed) => exposed,
                 Err(e) => {
                     tracing::warn!(
