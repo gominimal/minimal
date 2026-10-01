@@ -3964,12 +3964,13 @@ mod tests {
     }
 
     /// NET-085's bound at the decision that makes it: a root process inside
-    /// the VM spoofs another resident box's address, and the gate decides the
-    /// spoofed frame by the row that holds the spoofed source — that box's
-    /// own declaration, never the union — so what a spoof buys is the
-    /// spoofed box's reach, and every destination still reachable through it
-    /// is inside the union the resident rows and the node plane's baseline
-    /// set spell together (design §5.1).
+    /// the VM spoofs another resident box's address, and the gate bounds the
+    /// spoofer to the spoofed box's own reach — the frame is decided by the
+    /// row that holds the spoofed source, that box's own declaration, never
+    /// the union (design §4.3 rule 2). The resident union of design §8 is
+    /// not what one spoof buys: it is what an attacker assembles by choosing
+    /// sources, one row's reach per spoofed source, plus the node plane's
+    /// baseline set (design §5.1).
     ///
     /// The table is the union's membership as T66 (#1711) will publish it:
     /// `web` and `db` with disjoint declared subnets, `locked` declaring
@@ -4091,7 +4092,10 @@ mod tests {
         let db_only = [192, 168, 4, 5];
         let outside = [203, 0, 113, 7];
         let stray = [100, 64, 0, 99];
-        let out_of_plan = [203, 0, 113, 7];
+        // The out-of-plan source keeps a literal of its own: `outside` above
+        // is a destination, this is a source, and the two share nothing but a
+        // TEST-NET spelling — one is not where the other goes.
+        let out_of_plan_src = [198, 51, 100, 7];
         // The node plane's own endpoint, read off the enumeration the way the
         // helper spells it (`a.b.c.d/n`), not hardcoded: the in-force bound's
         // admitted destination is the set's, not this test's.
@@ -4144,7 +4148,14 @@ mod tests {
             // The node plane's own address, shipped: the allow-all interim
             // node row admits even the outside destination — the gap the
             // baseline phase's flip (#1786) closes, into the in-force arm
-            // the in-force list pins.
+            // the in-force list pins. The node row stands in for the
+            // `host_ip` cohort's identity today (NET-078: outside the box
+            // host the cohort is one source), so a spoof of it exercises the
+            // row a cohort-wide identity will be decided by; once the cohort
+            // address exists (design §4.1) this table gains attempt rows
+            // asserting the cohort's any-admits rule across the live
+            // `host_ip` members, and that a revoked member's destinations no
+            // longer admit.
             (shipped, node, 6, outside, 443),
             // An in-plan address no row holds: announced, admitted with no
             // rules at all — the gap T66's flip (#1711) closes, into the
@@ -4152,7 +4163,7 @@ mod tests {
             // the plan's lease block is refused under both phases: outside
             // the plan there is no lease to spoof.
             (shipped, stray, 6, web_only, 80),
-            (shipped, out_of_plan, 6, web_only, 80),
+            (shipped, out_of_plan_src, 6, web_only, 80),
         ]
         .into_iter()
         .map(|(phase, src, proto, dst, port)| {
@@ -4179,7 +4190,7 @@ mod tests {
             (UnregisteredSourcePhase::InForce, stray, 6, web_only, 80),
             (
                 UnregisteredSourcePhase::InForce,
-                out_of_plan,
+                out_of_plan_src,
                 6,
                 web_only,
                 80,
@@ -4266,6 +4277,64 @@ mod tests {
                 // The shipped interim's admits are the gaps, each pinned to
                 // its in-force replacement by the verdict lookups below.
                 Verdict::AdmittedByNodeRow | Verdict::AdmittedByInterim | Verdict::Dropped(_) => {}
+            }
+        }
+
+        // The universal the table makes cheap, beside the membership loop
+        // above — NET-085 as a bound, not a list. Two halves:
+        //
+        // - no attempt decided against the in-force baseline set carries an
+        //   interim arm's verdict: with the per-box default and the compiled
+        //   baseline binding there is no allow-all node row and no rules-free
+        //   admit to fall through to, whichever way a future edit reorders
+        //   the decision;
+        // - every admit any phase gave a frame is the row that holds the
+        //   source's own doing: the row `table.by_source(src)` holds is the
+        //   row whose rules admit the destination, never another box's row
+        //   and never a union read out of the table. The per-pair pins below
+        //   name the destinations; this binds the shape over the whole
+        //   record, so a future attempt is covered without being pinned.
+        for attempt in &attempts {
+            if attempt.phase == UnregisteredSourcePhase::InForce {
+                assert!(
+                    !matches!(
+                        attempt.verdict,
+                        Verdict::AdmittedByNodeRow | Verdict::AdmittedByInterim
+                    ),
+                    "an in-force attempt of {} carries an interim arm's verdict \
+                     ({:?}); the in-force decision has no interim arm",
+                    Ipv4Addr::from(attempt.src),
+                    attempt.verdict,
+                );
+            }
+            if attempt.verdict == Verdict::AdmittedByRow {
+                let record = table.by_source(attempt.src).unwrap_or_else(|| {
+                    panic!(
+                        "the admit of {}:{} was not decided by a row: no row \
+                         holds the source {}",
+                        Ipv4Addr::from(attempt.dst),
+                        attempt.port,
+                        Ipv4Addr::from(attempt.src),
+                    )
+                });
+                let summary = sessions::core::egress::summarize(&ipv4_frame(
+                    attempt.src,
+                    attempt.proto,
+                    attempt.dst,
+                    attempt.port,
+                ));
+                assert!(
+                    matches!(
+                        sessions::core::egress::verdict(&summary, record.egress()),
+                        FrameVerdict::Admit
+                    ),
+                    "the admit of {}:{} from {} is not the source's own row's \
+                     decision: {}'s row does not admit it",
+                    Ipv4Addr::from(attempt.dst),
+                    attempt.port,
+                    Ipv4Addr::from(attempt.src),
+                    record.name(),
+                );
             }
         }
 
@@ -4381,13 +4450,13 @@ mod tests {
             Verdict::Dropped("egress-unknown-source"),
         );
         assert_eq!(
-            verdict_of(shipped, out_of_plan, 6, web_only, 80),
+            verdict_of(shipped, out_of_plan_src, 6, web_only, 80),
             Verdict::Dropped("egress-unknown-source"),
         );
         assert_eq!(
             verdict_of(
                 UnregisteredSourcePhase::InForce,
-                out_of_plan,
+                out_of_plan_src,
                 6,
                 web_only,
                 80
