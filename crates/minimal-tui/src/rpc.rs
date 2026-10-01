@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use minimal_client::Client;
 use minimald_rpc::{
-    CreateSession, CreateSessionRequest, DestroySession, DestroySessionRequest, Errorable,
-    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
-    GetVersion, ListSessions, OneshotSshRpc, RenameSession, RenameSessionRequest, SessionConfig,
+    DestroySession, DestroySessionRequest, Errorable, GetSessionPolicy, GetSessionPolicyRequest,
+    GetSessionRecord, GetSessionRecordRequest, GetVersion, ListSessions, OneshotSshRpc,
+    RenameSession, RenameSessionRequest, SessionConfig,
 };
 use sessions::{NetworkMode, SessionId, SessionPolicy};
 
@@ -237,17 +237,17 @@ pub async fn rename(
 /// attachable, and restart-persistent rather than dying as an unresumable
 /// `Pending` stub on the next daemon restart.
 ///
-/// Connects its own client so it can run as a background task without
-/// borrowing the provider's connection. A `ConfigureLoadout` that comes back
-/// `Pending` (items needing interactive policy gating) aborts the session
-/// and tells the user to run `min session activate` instead — the TUI has
-/// no gating wizard yet.
+/// Delegates to the shared headless core in `minimal-client`, which carries
+/// the same version gate `min session activate` gets: on a skewed pair the
+/// finalize fails after the record exists, and the core's teardown then
+/// destroys the session the user just created (#1251).
 ///
 /// The upload root is resolved like the CLI's: walk up from the form's path
 /// to the nearest `minimal.toml` repo root, and refuse the upload when that
 /// root isn't a VCS checkout — the CLI asks for confirmation there (#770),
 /// and a TUI form pre-filled with the current directory must not stream a
-/// home directory to the daemon on three Enters.
+/// home directory to the daemon on three Enters. The refusal happens before
+/// the record is created, so it leaves no draft behind.
 ///
 /// Loadout hooks that name an external script are dropped on the way — see
 /// [`without_external_hook_scripts`].
@@ -259,114 +259,81 @@ pub async fn activate(
     contribution: sessions::wire::request::WireContribution,
 ) -> Result<SessionId, anyhow::Error> {
     let mut client = Client::connect(sock).await?;
-    // The dashboard's own copy of the create/upload/configure/finalize
-    // sequence, so it needs the same gate `min session activate` gets: on a
-    // skewed pair `FinalizeSession` fails after the record exists, and the
-    // abort below then destroys the session the user just created (#1251).
-    // The gate is the `must_match_version` on the create below and the version
-    // the reply echoes back — not a `GetVersion` ahead of them. Activation is
-    // the one path where an extra round trip is felt, and the create can carry
-    // the check for free.
-    let created = match client
-        .oneshot_rpc::<CreateSession>(CreateSessionRequest {
-            config: SessionConfig {
-                name,
-                project_path: project_path.clone(),
-                network,
-                policy: SessionPolicy::default(),
-                // Same default as an activate with no flags: the dashboard
-                // has no `--no-hooks` of its own, and a session created here
-                // is attachable later like any other.
-                hooks_enabled: true,
-                attrs: Default::default(),
-            },
-            // A daemon of another build refuses this before it allocates
-            // anything; `None` under the skew override, which is how an
-            // operator still gets through.
-            must_match_version: minimal_client::version_assertion(),
-        })
-        .await
-        .context("CreateSession RPC failed")?
-    {
-        Errorable::Ok(resp) => resp,
-        Errorable::Err { error } => return Err(anyhow::anyhow!(error)),
+
+    // The upload-root walk and VCS-root stat are blocking filesystem
+    // traversals; run them off the async worker so a stalled mount can't stall
+    // the runtime.
+    let dir = project_path.as_utf8_path().to_path_buf();
+    let (upload_root, is_repo) = tokio::task::spawn_blocking(move || {
+        let root = resolve_upload_root(&dir)?;
+        let repo = minimal_client::file_upload::is_vcs_root(root.as_std_path());
+        Ok::<_, anyhow::Error>((root, repo))
+    })
+    .await
+    .context("resolving the upload root")??;
+    if !is_repo {
+        anyhow::bail!(
+            "refusing to upload '{upload_root}': not a repository root (no .git, .hg, or .jj). \
+             Run `min session activate` to upload a non-repo directory with confirmation"
+        );
+    }
+
+    // Drop hooks whose scripts live in a file. The dashboard has no hook-script
+    // upload — that staging lives in the `minimal` crate, above this one — and
+    // a composition naming a staged script that never arrived cannot finalize.
+    let contribution = without_external_hook_scripts(contribution);
+
+    let request = minimal_client::activate::ActivateRequest {
+        config: SessionConfig {
+            name,
+            project_path,
+            network,
+            policy: SessionPolicy::default(),
+            // Same default as an activate with no flags: the dashboard has no
+            // `--no-hooks` of its own, and a session created here is attachable
+            // later like any other.
+            hooks_enabled: true,
+            attrs: Default::default(),
+        },
+        upload_root: Some(upload_root.into_std_path_buf()),
+        contribution,
+        hook_scripts: Vec::new(),
+        // The dashboard runs no activate hooks of its own, so the finalize
+        // deadline needs no extension beyond the client's base RPC timeout.
+        hook_budget: std::time::Duration::ZERO,
+        // The name is user-supplied from the form (or unset); nothing retries.
+        rename_on_collision: None,
+        max_rename_attempts: 0,
+        interrupt_socket: None,
+        compose_failure: Box::new(|error: &str| anyhow::anyhow!("{error}")),
     };
-    // A daemon that predates the field ignored the assertion and echoes no
-    // version; that silence is itself the skew. Refuse now — before the
-    // upload and the finalize — leaving an unfinalized record the daemon
-    // reaps when this connection drops.
-    minimal_client::ensure_version_reported(created.daemon_version.as_deref())?;
-    let id = created.id;
+    minimal_client::activate::activate(&mut client, request, &mut TuiGate).await
+}
 
-    let flow = async {
-        // The upload-root walk and VCS-root stat are blocking filesystem
-        // traversals; run them off the async worker so a stalled mount
-        // can't stall the runtime.
-        let dir = project_path.as_utf8_path().to_path_buf();
-        let (upload_root, is_repo) = tokio::task::spawn_blocking(move || {
-            let root = resolve_upload_root(&dir)?;
-            let repo = minimal_client::file_upload::is_vcs_root(root.as_std_path());
-            Ok::<_, anyhow::Error>((root, repo))
-        })
-        .await
-        .context("resolving the upload root")??;
-        if !is_repo {
-            anyhow::bail!(
-                "refusing to upload '{upload_root}': not a repository root (no .git, .hg, or .jj). \
-                 Run `min session activate` to upload a non-repo directory with confirmation"
-            );
-        }
-        client
-            .upload_workspace_files_quiet(id, upload_root.as_std_path())
-            .await
-            .context("uploading project files")?;
-        // Drop hooks whose scripts live in a file. The dashboard has no
-        // hook-script upload — that staging lives in the `minimal` crate,
-        // which sits above this one — and the daemon refuses to finalize a
-        // session whose composition names a staged script that never
-        // arrived. Sending them would fail every dashboard activation for a
-        // user whose loadout happens to use an external hook. Inline hooks
-        // carry their body in the composition and are kept.
-        let contribution = without_external_hook_scripts(contribution);
-        let configured = client
-            .oneshot_rpc::<minimald_rpc::ConfigureLoadout>(minimald_rpc::ConfigureLoadoutRequest {
-                session_id: id,
-                contribution,
-            })
-            .await
-            .context("ConfigureLoadout RPC failed")?;
-        match configured {
-            Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Materialized) => {}
-            Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Pending { .. }) => {
-                anyhow::bail!(
-                    "this project needs interactive policy gating; \
-                     create it with `min session activate` instead"
-                );
-            }
-            Errorable::Err { error } => anyhow::bail!("{error}"),
-        }
-        match client
-            .oneshot_rpc::<minimald_rpc::FinalizeSession>(minimald_rpc::FinalizeSessionRequest {
-                session_id: id,
-            })
-            .await
-            .context("FinalizeSession RPC failed")?
-        {
-            Errorable::Ok(_) => Ok(()),
-            Errorable::Err { error } => anyhow::bail!("{error}"),
-        }
-    }
-    .await;
+/// The dashboard's activation gate: a `Pending` composition asks for
+/// interactive policy gating the TUI has no wizard for, so it aborts the
+/// session and points at the CLI. The core creates and tears down; this only
+/// supplies the refusal.
+struct TuiGate;
 
-    // A failed flow must not orphan the record: a `Pending` stub would hold
-    // its name and be reaped at the next daemon restart anyway.
-    if let Err(e) = flow {
+impl minimal_client::activate::ActivationGate for TuiGate {
+    async fn on_pending(
+        &mut self,
+        client: &mut Client,
+        response: sessions::wire::request::ContributionResponse,
+    ) -> Result<Vec<(PathBuf, paths::SandboxRelPath)>, anyhow::Error> {
+        // A failed flow must not orphan the record — it would hold its name
+        // until the next daemon restart reaps it.
         let _ = client
-            .oneshot_rpc::<minimald_rpc::AbortSession>(minimald_rpc::AbortSessionRequest { id })
+            .oneshot_rpc::<minimald_rpc::AbortSession>(minimald_rpc::AbortSessionRequest {
+                id: response.session_id,
+            })
             .await;
-        return Err(e);
+        anyhow::bail!(
+            "this project needs interactive policy gating; \
+             create it with `min session activate` instead"
+        );
     }
-    Ok(id)
 }
 
 /// Resolves the directory whose tree should be uploaded as the session
@@ -509,16 +476,16 @@ mod version_gate_tests {
         );
     }
 
-    /// The dashboard's activation must not spend a round trip on the version
-    /// either. Its gate is the assertion on the `CreateSession` it was already
-    /// sending plus the build the reply echoes back — never a `GetVersion`
-    /// ahead of them.
+    /// The dashboard's activation delegates to the shared, version-gated core
+    /// in `minimal-client` — the assertion on the `CreateSession` it was
+    /// already sending plus the build the reply echoes back — never a
+    /// `GetVersion` ahead of them.
     ///
     /// `refresh` still calls `GetVersion`, and must: the sidebar renders each
     /// provider's build. That is a display fetch on the idle loop, not a gate
     /// on the create path.
     #[test]
-    fn the_dashboard_activation_makes_no_version_round_trip() {
+    fn the_dashboard_activation_delegates_to_the_gated_core() {
         let body = function_code("activate").expect("rpc.rs no longer defines activate");
         for round_trip in ["GetVersion", "ensure_version_match"] {
             assert!(
@@ -527,12 +494,8 @@ mod version_gate_tests {
             );
         }
         assert!(
-            body.contains("must_match_version"),
-            "activate no longer asserts its build on the create"
-        );
-        assert!(
-            body.contains("ensure_version_reported"),
-            "activate no longer checks the build the create echoed back"
+            body.contains("activate::activate("),
+            "activate no longer delegates to the shared, version-gated core"
         );
         assert!(
             function_code("refresh").is_some_and(|f| f.contains("GetVersion")),
@@ -604,6 +567,8 @@ mod version_gate_tests {
                 l.contains("must_match_version")
                     || l.contains("ensure_version_reported")
                     || l.contains("ensure_version_match")
+                    // Delegation to the shared core, which carries the gate.
+                    || l.contains("activate::activate(")
             });
             let explained = body.iter().any(|l| l.contains("not version-gated"));
             let label = match (gated, explained) {
