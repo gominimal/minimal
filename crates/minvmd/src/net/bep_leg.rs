@@ -163,6 +163,9 @@ impl BepLeg {
     /// address on the switch; frames addressed elsewhere are dropped rather
     /// than terminated, so the leg terminates only what was diverted to it.
     ///
+    /// Must be called within a tokio runtime, as the switch's spawn is: the
+    /// handoff listener binds through the caller's runtime.
+    ///
     /// A stale socket file at `handoff_sock` must be removed by the caller
     /// first (the same discipline the switch and gate sockets get), or the
     /// bind fails.
@@ -193,7 +196,19 @@ impl BepLeg {
                         return;
                     }
                 };
-                let stub = match tokio::net::TcpListener::from_std(stub) {
+                // The handover below registers the stub listener with this
+                // runtime's selector, which reads the thread's current
+                // handle: enter the runtime for the handover's length.
+                let _guard = runtime.enter();
+                let stub = match stub
+                    // tokio's `from_std` registers the fd with the runtime's
+                    // selector, which a blocking fd cannot be: set the mode
+                    // here, at the one handover the leg owns, so both the
+                    // production listener and every test's come in blocking
+                    // and leave non-blocking.
+                    .set_nonblocking(true)
+                    .and_then(|()| tokio::net::TcpListener::from_std(stub))
+                {
                     Ok(stub) => stub,
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
@@ -333,7 +348,14 @@ async fn serve_handoff(sock: UnixStream, delivery: SocketAddr, bep_address: Ipv4
     let writer_task = tokio::spawn(async move {
         let mut writer = writer;
         while let Some(frame) = frame_rx.recv().await {
-            if writer.write_all(&frame).await.is_err() {
+            // Length-framed, as the switch's stream is: the gate relays these
+            // bytes to the guest whole, beside the switch's own, so the guest
+            // relays them to the switch's socket — a length-framed L2 stream
+            // — and a bare frame here would be read there as a length.
+            let mut framed = Vec::with_capacity(2 + frame.len());
+            framed.extend_from_slice(&(frame.len() as u16).to_le_bytes());
+            framed.extend_from_slice(&frame);
+            if writer.write_all(&framed).await.is_err() {
                 // The gate is gone; every flow on this pipe is torn down
                 // with it below.
                 return;
@@ -716,6 +738,10 @@ async fn handle_segment(
         }
         if fin_now {
             s.peer_fin = true;
+            // The FIN itself consumes a sequence number: the ACK naming it
+            // answers the sequence past it, so the box's half-close is
+            // acknowledged as consumed rather than left dangling.
+            s.rcv_nxt = s.rcv_nxt.wrapping_add(1);
             if s.upstream_eof && !s.fin_sent {
                 s.fin_seq = s.snd_nxt;
                 s.snd_nxt = s.snd_nxt.wrapping_add(1);
@@ -738,20 +764,26 @@ async fn handle_segment(
             &[],
         ));
     }
-    // ACK — always, so a retransmission is answered and the box's window
-    // never stalls on an ACK the leg withheld.
-    let (snd_nxt, rcv_nxt) = {
-        let s = flow.shared.lock().unwrap();
-        (s.snd_nxt, s.rcv_nxt)
-    };
-    let _ = frame_tx.send(build_frame(
-        &flow.addrs,
-        snd_nxt,
-        rcv_nxt,
-        TCP_ACK,
-        ADVERTISED_WINDOW,
-        &[],
-    ));
+    // ACK — when the segment carried sequence space (data, or a FIN), so a
+    // retransmission is answered again and the box's window never stalls on
+    // an ACK the leg withheld. A bare ACK — the box's acknowledgement of the
+    // leg's sends, or a window update — is answered with nothing: no stack
+    // answers a pure ACK, and one back here would be a duplicate the box's
+    // congestion control reads as loss.
+    if !segment.payload.is_empty() || fin {
+        let (snd_nxt, rcv_nxt) = {
+            let s = flow.shared.lock().unwrap();
+            (s.snd_nxt, s.rcv_nxt)
+        };
+        let _ = frame_tx.send(build_frame(
+            &flow.addrs,
+            snd_nxt,
+            rcv_nxt,
+            TCP_ACK,
+            ADVERTISED_WINDOW,
+            &[],
+        ));
+    }
     {
         let s = flow.shared.lock().unwrap();
         if s.fully_acked() {
@@ -991,11 +1023,14 @@ fn build_frame(
     ip[10] = ip_checksum[0];
     ip[11] = ip_checksum[1];
 
-    let mut frame = Vec::with_capacity(14 + ip.len());
+    let mut frame = Vec::with_capacity(14 + ip.len() + tcp.len());
     frame.extend_from_slice(&addrs.dst_mac);
     frame.extend_from_slice(&addrs.src_mac);
     frame.extend_from_slice(&0x0800u16.to_be_bytes());
     frame.extend_from_slice(&ip);
+    // The segment itself: without it the frame is an IP header with nothing
+    // behind it, and the box's stack (and `parse_frame`) reads no TCP in it.
+    frame.extend_from_slice(&tcp);
     frame
 }
 
@@ -1249,7 +1284,13 @@ mod tests {
                 std::net::TcpListener::bind(("127.0.0.1", 0)).expect("binding the stub listener");
             let delivery = stub.local_addr().expect("the stub listener's address");
             let listener = UnixListener::bind(&handoff).expect("binding the handoff socket");
-            let stub = TcpListener::from_std(stub).expect("the stub listener async");
+            // tokio's `from_std` registers the fd with the runtime's
+            // selector, which a blocking fd cannot be (BepLeg::bind does the
+            // same at its own handover).
+            let stub = stub
+                .set_nonblocking(true)
+                .and_then(|()| TcpListener::from_std(stub))
+                .expect("the stub listener async");
             let leg_task = tokio::spawn(run_leg(
                 listener,
                 stub,
@@ -1344,6 +1385,13 @@ mod tests {
             .write_all(b"probe\n")
             .await
             .expect("writing the probe");
+        // Half-close the probe's side: the stub answers and then echoes until
+        // its peer is gone, so the read below ends at the stub's EOF instead
+        // of waiting on a peer that is still open.
+        probe
+            .shutdown()
+            .await
+            .expect("half-closing the probe's side");
         let mut answer = String::new();
         match tokio::time::timeout(DEADLINE, probe.read_to_string(&mut answer)).await {
             Ok(read) => {
@@ -1471,7 +1519,9 @@ mod tests {
         assert_eq!(echo.expect("the stub's echo arrived"), b"ping\n");
 
         // The box half-closes; the leg's FIN comes back; the box acknowledges
-        // it and the flow is gone.
+        // it and the flow is gone. The box's ACK names everything the leg has
+        // sent so far — the SYN-ACK and the stub's 23 bytes of answer and
+        // echo — so `isn + 24` is the next sequence it expects from the leg.
         send_frame(
             &mut gate,
             &tcp_frame(
@@ -1480,7 +1530,7 @@ mod tests {
                 addrs.src_port,
                 addrs.dst_port,
                 1006,
-                isn.wrapping_add(26),
+                isn.wrapping_add(24),
                 TCP_ACK | TCP_FIN,
                 &[],
             ),
@@ -1504,9 +1554,26 @@ mod tests {
         }
         assert!(saw_ack, "the box's FIN is acknowledged");
         assert_ne!(fin_seq, 0, "the leg's FIN went out once both sides closed");
-        // The box's ACK of the leg's FIN: the flow must be dropped, so the
-        // next frame from the box — a stray ACK — is reset, not answered with
-        // a duplicate ACK from a flow that should be gone.
+        // The box's ACK of the leg's FIN: the flow is fully closed, and its
+        // last ACK is consumed silently — no stack answers the ACK that ends
+        // a connection it has finished closing.
+        send_frame(
+            &mut gate,
+            &tcp_frame(
+                addrs.src_ip,
+                addrs.dst_ip,
+                addrs.src_port,
+                addrs.dst_port,
+                1007,
+                fin_seq.wrapping_add(1),
+                TCP_ACK,
+                &[],
+            ),
+        )
+        .await;
+        // The next frame from the box — a stray ACK now that the flow is
+        // gone — is reset, not answered with a duplicate ACK from a flow
+        // that should be gone.
         send_frame(
             &mut gate,
             &tcp_frame(
@@ -1678,20 +1745,27 @@ mod tests {
     async fn a_refused_listener_resets_the_boxs_connection() {
         let dir = tempfile::tempdir().expect("a tempdir is creatable");
         let handoff = dir.path().join("gvproxy-bep.sock");
-        // A listener that accepts and immediately closes: a delivery that
-        // cannot be introduced.
+        // A port nothing listens on: the delivery is refused outright, the
+        // one failure the leg can see before it answers the box's SYN. (A
+        // listener that accepts and then closes is invisible to the leg's
+        // dial — the connect succeeds and the header's write lands in the
+        // kernel's buffer ahead of any RST — so the refusal is the case this
+        // asserts.)
         let dead =
             std::net::TcpListener::bind(("127.0.0.1", 0)).expect("binding the dead listener");
         let dead_port = dead.local_addr().expect("the dead listener's port").port();
-        let _dead_guard = std::thread::spawn(move || {
-            let (sock, _) = dead.accept().expect("the leg's delivery arrives");
-            drop(sock);
-        });
+        drop(dead);
         let subnet = SwitchSubnet::default();
         let stub =
             std::net::TcpListener::bind(("127.0.0.1", 0)).expect("binding the stub listener");
         let listener = UnixListener::bind(&handoff).expect("binding the handoff socket");
-        let stub = TcpListener::from_std(stub).expect("the stub listener async");
+        // tokio's `from_std` registers the fd with the runtime's selector,
+        // which a blocking fd cannot be (BepLeg::bind does the same at its
+        // own handover).
+        let stub = stub
+            .set_nonblocking(true)
+            .and_then(|()| TcpListener::from_std(stub))
+            .expect("the stub listener async");
         let leg_task = tokio::spawn(run_leg(
             listener,
             stub,
