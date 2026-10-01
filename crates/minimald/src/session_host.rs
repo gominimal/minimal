@@ -1669,6 +1669,13 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // net-guard-less tests.
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
 
+    /// The session's hostname-registry marker (NET-128): marked running when
+    /// this host's `mainloop` starts and stopped when it returns, so a name
+    /// the box shares with its node answers NODATA while no host is running.
+    /// `None` for hosts built without one (tests, and a task's host).
+    #[cfg(target_os = "linux")]
+    name_marker: Option<NameMarker>,
+
     /// Path of the session PTY's slave side. Attach and detach hooks
     /// open it briefly so their stdout is a real terminal; the host
     /// never holds a descriptor on it, because one open slave fd stops
@@ -3489,6 +3496,64 @@ pub(crate) struct HostParams {
     pub session_id: sessions::SessionId,
     pub composition: Option<Arc<sessions::core::compose::Composition>>,
     pub connection_env: ConnectionEnv,
+    /// The session's hostname-registry marker (NET-128): the host marks the
+    /// box's name running when it takes over and stopped when it exits, so a
+    /// name the box shares with its node answers NODATA while a dead box's
+    /// listeners would otherwise be spoken for by the node's own. `None` for
+    /// a host this daemon gave no name route to.
+    #[cfg(target_os = "linux")]
+    pub name_marker: Option<NameMarker>,
+}
+
+/// The host's half of the name lifecycle (NET-128): the registry and the
+/// stable session id, so the host can mark its box's name running when it
+/// starts and stopped when it exits. Held by [`HostParams`] and copied into
+/// the [`Host`], because the mark belongs to the *host's* lifetime, not the
+/// session's — a session whose host has exited keeps its name *held* (never
+/// NXDOMAIN, so the box's name is not negatively cached), answering NODATA
+/// at a shared address until a host runs again.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub(crate) struct NameMarker {
+    /// The daemon's registry the marks land in.
+    registry: std::sync::Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
+    /// The stable id of the session whose box's name is marked.
+    session_id: sessions::SessionId,
+}
+
+#[cfg(target_os = "linux")]
+impl NameMarker {
+    /// Marks one session's box name, in one registry.
+    pub(crate) fn new(
+        registry: std::sync::Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
+        session_id: sessions::SessionId,
+    ) -> Self {
+        Self {
+            registry,
+            session_id,
+        }
+    }
+
+    /// The box's host is running: its name answers at its address (NET-128) —
+    /// the state every box is in from finalize (NET-011), so a mark that finds
+    /// nothing stopped changes nothing.
+    pub(crate) fn mark_running(&self) {
+        self.registry
+            .write()
+            .expect("hostname registry lock poisoned")
+            .mark_running(self.session_id);
+    }
+
+    /// The box's host has exited (NET-128): its name stays held — a stopped
+    /// box is never mistaken for one that never existed — but a name it
+    /// shares with the node answers NODATA until a host runs again, so the
+    /// node's own listener at that port is not spoken for by a dead box.
+    pub(crate) fn mark_stopped(&self) {
+        self.registry
+            .write()
+            .expect("hostname registry lock poisoned")
+            .mark_stopped(self.session_id);
+    }
 }
 
 impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
@@ -3687,6 +3752,8 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             session_id,
             composition,
             connection_env,
+            #[cfg(target_os = "linux")]
+            name_marker,
         } = params;
         // The change-detection baseline (`delta`) is armed once per session and
         // handed in, so a host rebuilt on reattach keeps the activation-time
@@ -3766,6 +3833,8 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             stdout_buf: vec![0u8; 8 * 1024],
             stdin_buf: None,
             net_guard,
+            #[cfg(target_os = "linux")]
+            name_marker,
             tty_path,
             composition,
             session_id,
@@ -3809,6 +3878,13 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     }
 
     pub async fn mainloop(mut self) -> Result<i32, std::io::Error> {
+        // The box's host is running from here: its name answers at its
+        // address (NET-128) — the state it was in from finalize (NET-011), so
+        // this mark only speaks where a previous host's exit had stopped it.
+        #[cfg(target_os = "linux")]
+        if let Some(marker) = &self.name_marker {
+            marker.mark_running();
+        }
         let result = loop {
             match self.process.try_wait() {
                 Ok(Some(exit_code)) => {
@@ -3913,6 +3989,16 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 break code;
             }
         };
+
+        // The box's host has exited (NET-128): mark the name stopped *before*
+        // the forwards come down, so there is no window in which a lookup is
+        // answered at a forward whose process is already dead. The name stays
+        // held — answered, never NXDOMAIN — and answers NODATA while it
+        // shares an address with the node.
+        #[cfg(target_os = "linux")]
+        if let Some(marker) = self.name_marker.take() {
+            marker.mark_stopped();
+        }
 
         // Tear down the per-sandbox network attachment explicitly (own-IP switch
         // detach + ingress removal) on this live runtime, before `_guard` drops
