@@ -35,7 +35,11 @@ pub const GUEST_LOG_ENV: &str = "RUST_LOG";
 /// before registering anything, so the guest's IPv6 stack never comes up: no
 /// interface configures an IPv6 address and the route table never gains an
 /// IPv6 entry, loopback included — nothing inside the escape boundary gets a
-/// v6 family to ride or for an egress verdict to decide. `kernel_cmdline`
+/// v6 family to ride or for an egress verdict to decide. That is the inside
+/// half of the posture only: a guest kernel the attacker holds can be rebuilt
+/// with it, so the rule that survives an escape is the host-side egress gate
+/// dropping every foreign-family frame; this parameter removes the v6 family
+/// from inside the boundary, the gate is what enforces it. `kernel_cmdline`
 /// extends the line; nothing else in it is optional.
 const BASE_KERNEL_CMDLINE: &str = "console=hvc0 ipv6.disable=1";
 
