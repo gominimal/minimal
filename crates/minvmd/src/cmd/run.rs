@@ -434,6 +434,15 @@ fn run_foreground() -> Result<()> {
     // warn naming T66 on every admit — so an own-address box keeps the egress
     // it had before the gate existed, while everything outside the block, and
     // every row that *is* published, stays exactly as decided.
+    //
+    // What that admits, said plainly: under the interim the host-side gate
+    // cannot attribute a frame to the box it came from unless a row holds the
+    // address, so a box with restrictive rules can be escaped by sourcing
+    // frames from any unregistered in-block address — NET-081's host-side
+    // guarantee is deferred to T66 until its rows land and its flip of
+    // `UNREGISTERED_SOURCE_PHASE` (egress_gate) puts the per-box default in
+    // force. Every admit under the interim is rate-limited-warned, so a
+    // diagnostic bundle's daemon log tail shows a host running it.
     // `UNREGISTERED_SOURCE_PHASE` (egress_gate) is the constant T66 flips.
     let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
     boxes.register_node_namespace();
