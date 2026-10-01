@@ -112,6 +112,14 @@
 #                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
 #                                    and a direct-tcpip forward relays for real
+#   switch_steers_proxy_mac_frames_to_the_host_stack
+#                                    the pinned switch steers a unicast frame
+#                                    for the proxy's MAC to the lane that
+#                                    announced it, and to no other lane
+#   switch_answers_no_arp_for_the_proxy_address
+#                                    the pinned switch's netstack answers no
+#                                    ARP for the proxy's address, while the
+#                                    gateway's still gets answered
 #
 # Usage: scripts/session-e2e.sh [case]
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
@@ -6701,6 +6709,466 @@ proof_linux_stock_install_runs_vm_boxes() {
 }
 
 # ---------------------------------------------------------------------------
+# The box-egress-proxy's switch-side behaviour (NET-132). The host-side stack
+# peer minvmd runs beside the switch rests on two properties of the switch
+# binary itself, pinned here against the SAME pinned gvproxy the daemon runs:
+#
+#   - a unicast frame for the proxy's MAC goes to the connection that
+#     announced that MAC, and to no other connection on the switch — the
+#     peer receives the boxes' traffic by MAC steering, not by flooding;
+#   - the switch's own netstack answers no ARP for the proxy's address —
+#     the renderer keeps it out of gatewayVirtualIPs and nat (pinned by the
+#     switch crate's and minimald's config tests), so the switch neither
+#     answers for it nor translates it, and the HOST stack is what answers.
+#
+# Both cases drive the switch directly with a python stdlib client speaking
+# the switch's HyperKit protocol — one `POST /connect` head per connection
+# with no reply, then 2-byte little-endian length-framed Ethernet both ways —
+# with no daemon, no box and no VM, so they run anywhere the pinned binary
+# resolves. The config is the renderer's output for the default subnet,
+# written out with the switch crate's constants: GATEWAY_MAC for the
+# gateway, the proxy address (broadcast - 3 = 100.64.255.252, MAC
+# 52:54:00:40:ff:fc by MacAddr::for_switch_ip) absent from gatewayVirtualIPs
+# and nat.
+bep_switch_start() {
+  bep_root="$WORK/bep-switch"
+  mkdir -p "$bep_root"
+  if [ -n "${MINVMD_GVPROXY_BIN:-}" ] && [ -x "$MINVMD_GVPROXY_BIN" ]; then
+    bep_bin="$MINVMD_GVPROXY_BIN"
+  elif [ -x "$ROOT/.scratch/gvproxy" ]; then
+    bep_bin="$ROOT/.scratch/gvproxy"
+  elif "$ROOT/scripts/fetch-gvproxy.sh" "$bep_root/gvproxy" \
+      >"$bep_root/fetch-gvproxy.out" 2>&1; then
+    bep_bin="$bep_root/gvproxy"
+  else
+    echo "::error::could not fetch the pinned gvproxy the proxy-address cases drive (set MINVMD_GVPROXY_BIN or stage $ROOT/.scratch/gvproxy)"
+    cat "$bep_root/fetch-gvproxy.out" 2>/dev/null || true
+    return 1
+  fi
+  cat >"$bep_root/gvproxy.yaml" <<'BEP_YAML'
+stack:
+  mtu: 1500
+  subnet: "100.64.0.0/16"
+  gatewayIP: "100.64.0.1"
+  gatewayMacAddress: "5a:94:ef:e4:0c:dd"
+  nat:
+    "100.64.255.254": "127.0.0.1"
+  gatewayVirtualIPs:
+    - "100.64.255.254"
+  dns:
+    - name: "min.internal."
+      records:
+        - name: "host"
+          ip: "100.64.255.254"
+  dhcpStaticLeases:
+    {}
+BEP_YAML
+  cat >"$bep_root/bep_probe.py" <<'BEP_PY'
+"""The switch-side probe for the box-egress-proxy cases in session-e2e.sh.
+
+Speaks the pinned switch's HyperKit protocol directly, stdlib only: one
+`POST /connect` head per connection with no reply, then 2-byte little-endian
+length-framed Ethernet both ways. argv: <scenario> <switch-socket>.
+"""
+import socket
+import struct
+import sys
+import time
+
+CONNECT = b"POST /connect HTTP/1.0\r\nHost: localhost\r\n\r\n"
+PACE = 0.25  # seconds after the head: the hijack discards bytes still
+             # buffered when the connection flips to raw Ethernet
+
+GATEWAY_IP = "100.64.0.1"
+BEP_IP = "100.64.255.252"
+BEP_MAC = "52:54:00:40:ff:fc"
+BOX_A_IP, BOX_A_MAC = "100.64.0.2", "52:54:00:40:00:02"
+BOX_B_IP, BOX_B_MAC = "100.64.0.3", "52:54:00:40:00:03"
+
+ARP, IPV4 = 0x0806, 0x0800
+BROADCAST = "ff:ff:ff:ff:ff:ff"
+
+
+def mac(text):
+    return bytes(int(part, 16) for part in text.split(":"))
+
+
+def ipv4(text):
+    return bytes(int(part) for part in text.split("."))
+
+
+def mac_text(raw):
+    return ":".join(f"{octet:02x}" for octet in raw)
+
+
+def ipv4_text(raw):
+    return ".".join(str(octet) for octet in raw)
+
+
+def frame(src_mac, dst_mac, ethertype, payload):
+    # Ethernet's layout: destination first, source second.
+    return mac(dst_mac) + mac(src_mac) + struct.pack(">H", ethertype) + payload
+
+
+def arp_body(oper, sha, spa, tha, tpa):
+    return (
+        struct.pack(">HHBBH", 1, ARP, 6, 4, oper)
+        + mac(sha) + ipv4(spa) + mac(tha) + ipv4(tpa)
+    )
+
+
+def arp_request(src_mac, src_ip, target_ip):
+    # A box's first frame toward an address it has not resolved: a broadcast
+    # ARP request.
+    return frame(src_mac, BROADCAST, ARP,
+                 arp_body(1, src_mac, src_ip, "00:00:00:00:00:00", target_ip))
+
+
+def gratuitous_arp(src_mac, src_ip):
+    # The stack peer's attach announcement: a broadcast ARP request whose
+    # sender and target are both the proxy's address and MAC, so every
+    # listener learns where the proxy's MAC lives.
+    return frame(src_mac, BROADCAST, ARP,
+                 arp_body(1, src_mac, src_ip, "00:00:00:00:00:00", src_ip))
+
+
+def csum(data):
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) | data[i + 1]
+    while total > 0xFFFF:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def syn_frame(src_mac, src_ip, src_port, dst_ip, dst_port, seq):
+    # The real shape of the traffic the peer exists to receive: a box's
+    # opening TCP segment toward the proxy's address, unicast to the
+    # proxy's MAC.
+    tcp = struct.pack(">HHIIBBHHH",
+                      src_port, dst_port, seq, 0, 0x50, 0x02, 8192, 0, 0)
+    pseudo = ipv4(src_ip) + ipv4(dst_ip) + struct.pack(">BBH", 0, 6, len(tcp))
+    tcp = tcp[:16] + struct.pack(">H", csum(pseudo + tcp)) + tcp[18:]
+    hdr = struct.pack(">BBHHHBBH", 0x45, 0, 20 + len(tcp), 0, 0, 64, 6, 0)
+    hdr += ipv4(src_ip) + ipv4(dst_ip)
+    hdr = hdr[:10] + struct.pack(">H", csum(hdr)) + hdr[12:]
+    return frame(src_mac, BEP_MAC, IPV4, hdr + tcp)
+
+
+def open_lane(sock_path):
+    lane = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    lane.connect(sock_path)
+    lane.sendall(CONNECT)
+    time.sleep(PACE)
+    return lane
+
+
+def read_frame(lane, deadline):
+    """One framed frame, or None when the deadline passes first."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    lane.settimeout(remaining)
+    try:
+        head = b""
+        while len(head) < 2:
+            got = lane.recv(2 - len(head))
+            if not got:
+                raise EOFError("the switch closed the lane")
+            head += got
+        (length,) = struct.unpack("<H", head)
+        body = b""
+        while len(body) < length:
+            got = lane.recv(length - len(body))
+            if not got:
+                raise EOFError("the switch closed the lane mid-frame")
+            body += got
+        return body
+    except TimeoutError:
+        # The deadline, mid-frame or not: the caller's assertions judge
+        # whatever arrived, and a timed-out partial read is "nothing".
+        return None
+
+
+def drain(lane, seconds):
+    deadline = time.monotonic() + seconds
+    seen = []
+    while True:
+        got = read_frame(lane, deadline)
+        if got is None:
+            return seen
+        seen.append(got)
+
+
+def parse_arp_reply(payload):
+    """(sender_ip, sender_mac) when the frame is an ARP reply, else None."""
+    if len(payload) < 14 + 28 or struct.unpack(">H", payload[12:14])[0] != ARP:
+        return None
+    body = payload[14:]
+    _htype, ptype, hlen, plen, oper = struct.unpack(">HHBBH", body[:8])
+    if oper != 2 or ptype != ARP or hlen != 6 or plen != 4:
+        return None
+    return ipv4_text(body[14:18]), mac_text(body[8:14])
+
+
+def dhcp_frame(box_mac, xid, flags, opts):
+    # A minimal DHCP round: op REQUEST-as-discover, htype 1, hlen 6, the
+    # client's MAC in a 16-byte chaddr, the magic cookie, then options.
+    body = (
+        struct.pack(">BBBBIHH", 1, 1, 6, 0, xid, 0, flags)
+        + bytes(16)
+        + mac(box_mac) + bytes(10)
+        + bytes(192)
+        + b"\x63\x82\x53\x63"
+        + opts + b"\x00" * 32
+    )
+    udp = struct.pack(">HHHH", 68, 67, 8 + len(body), 0) + body
+    hdr = struct.pack(">BBHHHBBH", 0x45, 0, 20 + len(udp), 0, 0, 64, 17, 0)
+    hdr += ipv4("0.0.0.0") + ipv4("255.255.255.255")
+    hdr = hdr[:10] + struct.pack(">H", csum(hdr)) + hdr[12:]
+    return frame(box_mac, BROADCAST, IPV4, hdr + udp)
+
+
+def parse_dhcp(payload):
+    """(op, xid, yiaddr, msg_type, server_ip) of a DHCP reply, else None."""
+    if len(payload) < 14 + 20:
+        return None
+    ihl = (payload[14] & 0xF) * 4
+    if payload[14 + 9] != 17:
+        return None
+    udp = payload[14 + ihl:]
+    if udp[:4] != struct.pack(">HH", 67, 68):
+        return None
+    dhcp = udp[8:]
+    if len(dhcp) < 240 or dhcp[236:240] != b"\x63\x82\x53\x63":
+        return None
+    xid, = struct.unpack(">I", dhcp[4:8])
+    yiaddr, msg_type, server = ipv4_text(dhcp[16:20]), None, None
+    opts, i = dhcp[240:], 0
+    while i < len(opts):
+        code = opts[i]
+        if code == 0:
+            i += 1
+            continue
+        if code == 255:
+            break
+        length = opts[i + 1]
+        if code == 53 and length == 1:
+            msg_type = opts[i + 2]
+        if code == 54:
+            server = ipv4_text(opts[i + 2:i + 2 + length])
+        i += 2 + length
+    return dhcp[0], xid, yiaddr, msg_type, server
+
+
+def scenario_no_arp_for_proxy(sock_path):
+    # One box on the switch, brought up the way a real box is: a DHCP lease
+    # first, so the netstack demonstrably knows this lane and answers it.
+    # Then it asks twice by broadcast ARP — once for the proxy's address,
+    # once for the gateway's. The switch must stay silent on the first and
+    # answer the second: silence on a lane that provably works is the
+    # switch's answer, not a dead lane's.
+    box = open_lane(sock_path)
+    try:
+        box.sendall(dhcp_frame(BOX_A_MAC, 0x0BEA, 0x0000,
+                               bytes([53, 1, 1, 55, 3, 1, 3, 6, 255])))
+        offer = None
+        for got in drain(box, 3.0):
+            parsed = parse_dhcp(got)
+            if parsed and parsed[3] == 2:  # OFFER
+                offer = parsed
+                break
+        if offer is None:
+            print("FAIL: the switch never offered the box a lease — the "
+                  "lane is dead, so a silence below proves nothing")
+            return 1
+        box_ip = offer[2]
+        if box_ip in (BEP_IP, GATEWAY_IP):
+            print(f"FAIL: the lease pool offered the box {box_ip}, an "
+                  f"infrastructure address")
+            return 1
+        box.sendall(dhcp_frame(BOX_A_MAC, 0x0BEA, 0x8000,
+                               bytes([53, 1, 3, 50, 4]) + ipv4(box_ip)
+                               + bytes([54, 4]) + ipv4(GATEWAY_IP)
+                               + bytes([255])))
+        acked = False
+        for got in drain(box, 3.0):
+            parsed = parse_dhcp(got)
+            if parsed and parsed[3] == 5:  # ACK
+                acked = True
+                break
+        if not acked:
+            print("FAIL: the switch never confirmed the box's DHCP request")
+            return 1
+        print(f"PASS: the box holds the lease {box_ip}")
+
+        box.sendall(arp_request(BOX_A_MAC, box_ip, BEP_IP))
+        for got in drain(box, 2.0):
+            parsed = parse_arp_reply(got)
+            if parsed and parsed[0] == BEP_IP:
+                print(f"FAIL: the switch answered ARP for the proxy's "
+                      f"address from {parsed[1]}")
+                return 1
+        box.sendall(arp_request(BOX_A_MAC, box_ip, GATEWAY_IP))
+        gateway = None
+        for got in drain(box, 2.0):
+            parsed = parse_arp_reply(got)
+            if parsed and parsed[0] == GATEWAY_IP:
+                gateway = parsed
+                break
+        if gateway is None:
+            print("FAIL: the switch never answered the box's ARP for the "
+                  "gateway — the lane is dead, so the silence above "
+                  "proves nothing")
+            return 1
+        print(f"PASS: no ARP for {BEP_IP}, but the gateway's ARP answered "
+              f"from {gateway[1]}")
+        return 0
+    finally:
+        box.close()
+
+
+def scenario_steers_proxy_mac(sock_path):
+    # Three lanes: the peer announces the proxy's MAC; box A then unicasts a
+    # TCP SYN for that MAC. The switch must steer the SYN to the peer alone —
+    # never flood it, never echo it — and the broadcast control after it must
+    # still reach both boxes: steering by MAC, not silence.
+    peer = open_lane(sock_path)
+    box_a = open_lane(sock_path)
+    box_b = open_lane(sock_path)
+    try:
+        peer.sendall(gratuitous_arp(BEP_MAC, BEP_IP))
+        for lane in (box_a, box_b):
+            drain(lane, 0.4)  # the flood of the announcement itself
+
+        syn = syn_frame(BOX_A_MAC, BOX_A_IP, 40444, BEP_IP, 8080, 1000)
+        box_a.sendall(syn)
+
+        deadline = time.monotonic() + 2.0
+        at_peer = []
+        while True:
+            got = read_frame(peer, deadline)
+            if got is None:
+                break
+            at_peer.append(got)
+        if at_peer != [syn]:
+            first = at_peer[0][:32].hex() if at_peer else "(none)"
+            print(f"FAIL: the peer's lane saw {len(at_peer)} frame(s), "
+                  f"expected exactly the box's SYN; first: {first}")
+            return 1
+        print("PASS: the switch steered the box's unicast SYN for the "
+              "proxy's MAC to the announcing peer")
+
+        for name, lane in (("box A", box_a), ("box B", box_b)):
+            extra = drain(lane, 0.6)
+            if extra:
+                print(f"FAIL: {name} also received the unicast frame "
+                      f"({len(extra)} frame(s)) — the switch flooded it")
+                return 1
+        print("PASS: neither box received the unicast frame")
+
+        ask = arp_request(BOX_B_MAC, BOX_B_IP, GATEWAY_IP)
+        box_b.sendall(ask)
+        for name, lane in (("the peer", peer), ("box A", box_a)):
+            deadline = time.monotonic() + 2.0
+            hit = False
+            while True:
+                got = read_frame(lane, deadline)
+                if got is None:
+                    break
+                if got == ask:
+                    hit = True
+                    break
+            if not hit:
+                print(f"FAIL: the broadcast control never reached {name} — "
+                      f"that lane is dead, so its silence above proves "
+                      f"nothing")
+                return 1
+        print("PASS: the broadcast control reached both other lanes")
+        return 0
+    finally:
+        for lane in (peer, box_a, box_b):
+            lane.close()
+
+
+def main():
+    scenario, sock_path = sys.argv[1], sys.argv[2]
+    run = {
+        "no_arp_for_proxy": scenario_no_arp_for_proxy,
+        "steers_proxy_mac": scenario_steers_proxy_mac,
+    }[scenario]
+    return run(sock_path)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+BEP_PY
+  bep_sock="$bep_root/switch.sock"
+  rm -f "$bep_sock"
+  "$bep_bin" -listen "unix://$bep_sock" -config "$bep_root/gvproxy.yaml" \
+    >"$bep_root/switch.out" 2>&1 &
+  bep_pid=$!
+  bep_waits=0
+  while [ ! -S "$bep_sock" ] && [ "$bep_waits" -lt 150 ]; do
+    sleep 0.1
+    bep_waits=$((bep_waits + 1))
+  done
+  if [ ! -S "$bep_sock" ]; then
+    echo "::error::the pinned switch never created its listen socket $bep_sock"
+    echo "--- switch log (tail) ---"
+    tail -25 "$bep_root/switch.out" 2>/dev/null || true
+    return 1
+  fi
+}
+
+bep_switch_stop() {
+  if [ -n "${bep_pid:-}" ]; then
+    kill "$bep_pid" 2>/dev/null || true
+    wait "$bep_pid" 2>/dev/null || true
+    bep_pid=""
+  fi
+}
+
+bep_switch_run() {
+  # bep_switch_run <scenario>: the pinned switch up, the python probe on it,
+  # the switch reaped on every path out. Leaves bep_status for the caller.
+  bep_status=0
+  bep_switch_start || bep_status=1
+  if [ "$bep_status" -eq 0 ]; then
+    python3 "$bep_root/bep_probe.py" "$1" "$bep_sock" || bep_status=1
+  fi
+  bep_switch_stop
+  if [ "$bep_status" -ne 0 ]; then
+    echo "--- switch log (tail) ---"
+    tail -25 "$bep_root/switch.out" 2>/dev/null || true
+    echo "--- probe stderr is above; the pinned binary is $bep_bin" 2>/dev/null || true
+  fi
+  return "$bep_status"
+}
+
+proof_switch_answers_no_arp_for_the_proxy_address() {
+  echo "::group::proof: the switch answers no ARP for the proxy's address"
+  if ! bep_switch_run no_arp_for_proxy; then
+    echo "::error::the switch's ARP behaviour for the proxy's address is not as pinned"
+    fail
+  fi
+  echo "switch answers no ARP for the proxy's address OK"
+  echo "::endgroup::"
+}
+
+proof_switch_steers_proxy_mac_frames_to_the_host_stack() {
+  echo "::group::proof: the switch steers the proxy's MAC to the host stack peer"
+  if ! bep_switch_run steers_proxy_mac; then
+    echo "::error::the switch's steering of the proxy's MAC is not as pinned"
+    fail
+  fi
+  echo "switch steers proxy-MAC frames to the host stack peer OK"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch on the first argument: every proof in today's order when none is
 # given, or exactly the named one. The names are the proof functions' suffixes.
 case "${1:-}" in
@@ -6725,6 +7193,8 @@ case "${1:-}" in
     proof_min_internal_names_through_proxy
     proof_proxy_refuses_like_direct
     proof_retired_surfaces_gone
+    proof_switch_steers_proxy_mac_frames_to_the_host_stack
+    proof_switch_answers_no_arp_for_the_proxy_address
     ;;
   lifecycle | session_exec | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
@@ -6732,7 +7202,9 @@ case "${1:-}" in
     | hostnames_recover_and_two_daemons_route \
     | min_internal_names_through_proxy | proxy_refuses_like_direct | retired_surfaces_gone \
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
-    | linux_stock_install_runs_vm_boxes)
+    | linux_stock_install_runs_vm_boxes \
+    | switch_steers_proxy_mac_frames_to_the_host_stack \
+    | switch_answers_no_arp_for_the_proxy_address)
     "proof_$1"
     ;;
   *)
@@ -6745,6 +7217,7 @@ case "${1:-}" in
     echo "         linux_stock_install_runs_vm_boxes"
     echo "         hostnames_recover_and_two_daemons_route"
     echo "         min_internal_names_through_proxy proxy_refuses_like_direct retired_surfaces_gone"
+    echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
     exit 2
     ;;
 esac
