@@ -2072,26 +2072,6 @@ async fn the_closure_report_is_removed_only_once_the_boxs_fate_is_known() {
     );
 }
 
-/// The unenforced-placement notice is printed into a terminal once per
-/// daemon, not once per session: it names the host's deployment state, which
-/// no session this daemon runs can change, and on a host with no classifier
-/// tree (every dev machine today) a banner ahead of every prompt would be
-/// the default path rather than the exception. A fresh latch is a fresh
-/// daemon start; the daemon log still records the state per launch.
-#[test]
-fn the_unenforced_notice_prints_once_per_daemon() {
-    let latch = std::sync::atomic::AtomicBool::new(false);
-    assert!(
-        super::first_unenforced_notice(&latch),
-        "the daemon's first unenforced launch prints the notice"
-    );
-    assert!(
-        !super::first_unenforced_notice(&latch),
-        "every launch after it leaves the banner out: the state it names has \
-         not changed, and the daemon log still records it per launch"
-    );
-}
-
 /// A [`SandboxLauncher`] for the launch-path test: the fakerepo context the
 /// channel tests use, a switch client pointed at a binary that is not there,
 /// and no composition — everything a launch needs to reach its own
@@ -2100,28 +2080,38 @@ fn the_unenforced_notice_prints_once_per_daemon() {
 /// returns.
 fn sandbox_launcher(network_mode: sessions::NetworkMode) -> (SandboxLauncher, tempfile::TempDir) {
     let state = tempfile::tempdir().expect("a state dir for the launcher's context");
+    (launcher_in(network_mode, state.path()), state)
+}
+
+/// The same launcher over a *given* state dir, so a test that drives more
+/// than one launch can hold one daemon's state under all of them — the real
+/// daemon builds one launcher per launch, so the per-launch construction is
+/// production's shape; only the state dir is shared.
+fn launcher_in(
+    network_mode: sessions::NetworkMode,
+    state_path: &std::path::Path,
+) -> SandboxLauncher {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let config = mctx::ConfigBuilder::new()
-        .with_state_dir(state.path().to_path_buf())
+        .with_state_dir(state_path.to_path_buf())
         .with_repo_dir(manifest_dir.join("../mctx/testdata/fakerepo"))
         .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
         .with_no_fetch(true)
         .build()
         .expect("the fakerepo context builds");
-    let launcher = SandboxLauncher {
+    SandboxLauncher {
         ctx: mctx::Context::new(config).expect("the fakerepo context loads"),
         attach_env: AttachEnv::default(),
         network_mode,
         net_switch: std::sync::Arc::new(tokio::sync::Mutex::new(crate::net::SwitchClient::new(
             "/nonexistent/gvproxy",
-            state.path().to_path_buf(),
+            state_path.to_path_buf(),
         ))),
         policy: sessions::SessionPolicy::default(),
         own_address: None,
         composition: None,
         session: crate::session::WeakSessionHandle::dangling(),
-    };
-    (launcher, state)
+    }
 }
 
 /// The launch-path half of the guest refusal: the predicate says which
@@ -2216,5 +2206,163 @@ async fn guest_launch_refuses_only_the_unplaced_host_address_box() {
             (Ok(()), false) => eprintln!("{why}: launched"),
             (Ok(()), true) => panic!("{why} must be refused, and was launched"),
         }
+    }
+}
+
+/// Reads a launch's terminal until `needle` has arrived or the deadline
+/// passes, returning everything it saw. The notice is written onto the pty's
+/// slave before the spawn, so it is queued in the kernel by the time the
+/// launch returns — but a pty delivers its queue in chunks, and a
+/// non-blocking read of an empty queue answers `WouldBlock`, so the read
+/// loops with a pause between the empties instead of trusting one chunk to
+/// carry a whole line.
+fn read_terminal_until(
+    master: &mut std::fs::File,
+    needle: &str,
+    deadline: std::time::Instant,
+) -> String {
+    use std::io::Read as _;
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match master.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => seen.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // `EIO` and friends: the terminal's other end is gone, and what
+            // was queued before it went is what the terminal received.
+            Err(_) => break,
+        }
+        if std::str::from_utf8(&seen).is_ok_and(|text| text.contains(needle))
+            || std::time::Instant::now() >= deadline
+        {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&seen).into_owned()
+}
+
+/// The unenforced-placement notice is not a once-per-daemon banner: the
+/// resolver-hook advisory it is modelled on (NET-122, design §7.1) advises on
+/// every session start, so two launches on one daemon both print it into
+/// their session terminals, and both carry it in the session's non-TTY form —
+/// the diagnostic record each launch writes for its session, holding the same
+/// text and the decision in the machine spelling a script or an agent reads
+/// without a terminal (`host_ip_enforcement`, spelled `per_box` / `none`).
+/// Each [`Launched`] also carries the decision as the field the launch
+/// returns: `Unenforced`, decided by that launch, never re-derived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_unenforced_notice_reaches_every_launch_and_carries_the_field() {
+    use sessions::NetworkMode;
+
+    // The one host state this proof cannot run on: a tree this daemon can
+    // place a child in (the guest refusal test's skip, for the same reason).
+    // The notice fires only for a native host-address launch that got no
+    // leaf, and on a delegated host the launch gets one, so there is nothing
+    // to notice — the skip is the deployment's own state, printed rather than
+    // passed off as a pass.
+    if sandbox2::classifier::probe_child_placement(std::path::Path::new(
+        sandbox2::classifier::TREE_ROOT,
+    ))
+    .is_ok()
+    {
+        eprintln!(
+            "skipping the_unenforced_notice_reaches_every_launch_and_carries_the_field: \
+             this daemon can place a child in its classifier tree, so a native \
+             host-address launch gets a leaf here and the notice never fires; \
+             the notice is proved on a host with no placeable tree"
+        );
+        return;
+    }
+
+    let capture = crate::test_harness::captured_log();
+    const NOTICE: &str = "this host places no classifier leaf for this session";
+    const RECORD: &str = "the session's host-address box runs unenforced on this host";
+    const MACHINE_FIELD: &str = "host_ip_enforcement=none";
+
+    // One daemon: one state dir, two launches of it. The real daemon builds
+    // its launcher per launch, so the launchers are per-launch while the
+    // state they read and write stays the daemon's own.
+    let state = tempfile::tempdir().expect("a state dir for the daemon's context");
+    for (label, name) in [
+        ("first", "notice-proof-first"),
+        ("second", "notice-proof-second"),
+    ] {
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            launcher_in(NetworkMode::HostNet, state.path()).launch(
+                // Native: a guest's unplaced host-address box is refused
+                // instead of advised, so only the native launch reaches the
+                // notice.
+                false,
+                sessions::SessionId::nil(),
+                name.to_string(),
+                "user".to_string(),
+                test_paths(),
+                DEFAULT_SIZE,
+            ),
+        )
+        .await
+        .expect("the launch decides within its timeout");
+
+        // The non-TTY form, per launch: this launch's own record, attributed
+        // and carrying the decision in the machine spelling — a
+        // once-per-daemon latch would leave this launch without one. The
+        // record fires at the placement decision, which is before the env
+        // build that fails on this box's unit-test graph ("no such package:
+        // base"), so a launch need not complete for its record to exist.
+        let logged = capture.contents();
+        let record = logged
+            .lines()
+            .find(|line| line.contains(RECORD) && line.contains(&format!("session={name}")))
+            .unwrap_or_else(|| {
+                panic!("no unenforced-placement record for the {label} launch, got: {logged}")
+            });
+        assert!(
+            record.contains(NOTICE),
+            "the non-TTY record carries the same text the terminal gets: {record}"
+        );
+        assert!(
+            record.contains(MACHINE_FIELD),
+            "the record carries the decision in the machine spelling: {record}"
+        );
+
+        // The terminal form, for a launch that completes: on this box the
+        // graph has no baseline packages, so the env build stops the launch
+        // and there is no terminal to read — the record above is the form
+        // the unit-test environment can prove, and the terminal write shares
+        // its gate and its text.
+        let launched = match outcome {
+            Ok(launched) => launched,
+            Err(e) => {
+                eprintln!("{label}: launch stopped at {e} — no terminal to read");
+                continue;
+            }
+        };
+        assert_eq!(
+            launched.host_ip_enforcement,
+            Some(super::HostIpEnforcement::Unenforced),
+            "the {label} launch carries its own decision about the box's egress \
+             verdict, not a re-derivation"
+        );
+
+        // The terminal form: the notice reaches this launch's own session
+        // terminal, on this launch — the second launch's terminal is not
+        // relied on to carry the first's.
+        let mut master = std::fs::File::from(launched.master);
+        super::set_nonblocking(master.as_raw_fd())
+            .expect("the test reads the launch terminal without blocking");
+        let terminal = read_terminal_until(
+            &mut master,
+            NOTICE,
+            std::time::Instant::now() + Duration::from_secs(10),
+        );
+        assert!(
+            terminal.contains(NOTICE),
+            "the {label} launch's terminal carries the notice, got: {terminal:?}"
+        );
     }
 }

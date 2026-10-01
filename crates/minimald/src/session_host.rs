@@ -1566,6 +1566,22 @@ pub(crate) enum HostIpEnforcement {
     Unenforced,
 }
 
+impl HostIpEnforcement {
+    /// The spelling the machine-readable surfaces carry for this decision:
+    /// `per_box` when the box's verdict is decided on a classifier leaf of
+    /// its own, `none` when the host could not decide per box and the box
+    /// runs with the host's address and no verdict of its own — the state
+    /// the session-start notice names. The launch's diagnostic record spells
+    /// it with this, so a script or a bundle reads the decision as data and
+    /// not by parsing the prose around it.
+    pub(crate) fn machine_str(self) -> &'static str {
+        match self {
+            Self::Enforced => "per_box",
+            Self::Unenforced => "none",
+        }
+    }
+}
+
 /// What the launch's leaf decision means for the box's egress verdict:
 /// a host-address box with a leaf is enforced, a host-address box without
 /// one runs with the host's address and no verdict of its own, and any other
@@ -2408,7 +2424,19 @@ impl Drop for BoxLeafGuard {
         let Some(leaf) = self.leaf.take() else {
             return;
         };
-        if let Err(e) = sandbox2::classifier::remove_box_leaf(leaf.dir()) {
+        // The same shape the session-end teardown's `Drop` uses: this leaf's
+        // box was SIGKILLed and reaped by the [`SpawnedProcessGuard`] dropped
+        // just before it (the guard is declared after this one, so the launch's
+        // own drop order runs the process first), and a just-reaped box's
+        // cgroup can refuse its `rmdir` (`EBUSY`) for a few milliseconds while
+        // the kernel empties it. A single refusal would leak the leaf of an
+        // abandoned launch — a hook launch that timed out past its spawn, most
+        // notably — until the next same-id launch reclaimed it or the daemon
+        // restarted, so the removal is retried briefly before it is warned
+        // about.
+        if let Err(e) = remove_box_leaf_patiently(leaf.dir(), DROP_LEAF_REMOVAL_ATTEMPTS, |_| {
+            std::thread::sleep(DROP_LEAF_REMOVAL_PAUSE)
+        }) {
             tracing::warn!(
                 leaf = %leaf.dir().display(),
                 error = %e,
@@ -2765,24 +2793,33 @@ fn refuses_unenforced_host_address_box(guest: bool, network_mode: NetworkMode) -
     guest && matches!(network_mode, NetworkMode::HostNet)
 }
 
-/// Whether this daemon has already printed the unenforced-placement notice
-/// into a session terminal: the notice names the *host's* deployment state,
-/// which stays the same across every session one daemon runs, so one
-/// terminal per daemon start carries it — every launch still records the
-/// state in the daemon log — and the banner does not become the default
-/// path ahead of every prompt on the hosts that have no tree (every dev
-/// machine today). Cleared only by a restart: a new daemon start is a new
-/// first session.
-static UNENFORCED_NOTICE_PRINTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Whether a native launch whose host-address box was not placed in a
+/// classifier leaf advises about that state.
+///
+/// The counterpart of [`refuses_unenforced_host_address_box`]: natively an
+/// unplaced host-address box is NET-079's advisory posture, never a refusal
+/// (design §7.4), so every launch that ends without a leaf says so — once per
+/// launch, like the resolver advisory it is modelled on (design §7.1), never
+/// once per daemon. A guest never advises: its unplaced box is refused, and
+/// a box that was placed needs no advice. Pure over its inputs, so the gate
+/// is pinned where it is written.
+fn advises_unenforced_placement(
+    guest: bool,
+    network_mode: NetworkMode,
+    leaf: Option<&sandbox2::config::ClassifierLeaf>,
+) -> bool {
+    matches!(network_mode, NetworkMode::HostNet) && !guest && leaf.is_none()
+}
 
-/// Takes the once-per-daemon turn at printing the unenforced-placement
-/// notice: `true` for the launch that gets to print it, `false` for every
-/// launch after the first on this daemon. Split out over the raw `swap` so
-/// the once-only semantics are pinned where they are written, not only
-/// where they are relied on.
-fn first_unenforced_notice(latch: &std::sync::atomic::AtomicBool) -> bool {
-    !latch.swap(true, std::sync::atomic::Ordering::Relaxed)
+/// The advisory text for a native launch that was not placed in a classifier
+/// leaf: what the state is, and what would change it.
+fn unenforced_placement_notice() -> String {
+    format!(
+        "this host places no classifier leaf for this session: its box \
+         runs with the host's address and no egress verdict of its own \
+         — {}",
+        sandbox2::classifier::install_hint()
+    )
 }
 
 /// Moves the box's container supervisor into its classifier leaf, now that
@@ -2889,6 +2926,32 @@ impl SessionLauncher for SandboxLauncher {
                  box's verdict could not be decided and the box was refused \
                  rather than run unenforced (broken guest image)",
             ));
+        }
+
+        // The advisory for that same state, natively, as a diagnostic
+        // record per launch: the same text the attached terminal gets
+        // below, on the daemon's log stream — the surface a scripted
+        // start, an agent and a diagnostics bundle read without a
+        // terminal. At the placement decision, not after the build: a
+        // launch that goes no further than this (a tree-less host, an
+        // env that fails to build) has still been told apart, and every
+        // launch is — the resolver-hook advisory this is modelled on
+        // (NET-122, design §7.1) advises on every session start, the
+        // install hint it carries is the answer to a host without the
+        // tree, and silencing every launch after the first takes the
+        // notice away from exactly the session a person is about to
+        // work in. The decision is carried in the machine spelling a
+        // reader greps for (`host_ip_enforcement`), so the record is
+        // the session's machine-readable start output as well as its
+        // prose.
+        if advises_unenforced_placement(guest, network_mode, leaf.as_ref()) {
+            let notice = unenforced_placement_notice();
+            tracing::info!(
+                session = %session_name,
+                host_ip_enforcement = %HostIpEnforcement::Unenforced.machine_str(),
+                notice = %notice,
+                "the session's host-address box runs unenforced on this host",
+            );
         }
 
         // Step 1 (pre-spawn): the provider for this PTask's mode reserves what
@@ -3038,47 +3101,28 @@ impl SessionLauncher for SandboxLauncher {
             let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
 
             // NET-079: a host-address box this native launch could not place
-            // gets a session-start notice in the terminal itself, not only a
-            // daemon log line — the person about to type in this session is
-            // the one whose egress is not being decided, and the state is
-            // the deployment's, not the session's, so the notice says what
+            // gets the advisory in the terminal itself, as the terminal form
+            // of the record the launch emitted at its placement decision —
+            // the person about to type in this session is the one whose
+            // egress is not being decided, and the state is the
+            // deployment's, not the session's, so the notice says what
             // would change it. Never in the guest: a guest's unplaced
             // host-address box never gets this far, its launch being refused
             // (design §7.1).
-            if matches!(network_mode, NetworkMode::HostNet)
-                && !guest
-                && leaf_guard.as_ref().and_then(BoxLeafGuard::get).is_none()
-            {
-                let notice = format!(
-                    "this host places no classifier leaf for this session: its box \
-                     runs with the host's address and no egress verdict of its own \
-                     — {}",
-                    sandbox2::classifier::install_hint()
-                );
-                tracing::info!(session = %session_label, "{notice}");
-                // The terminal gets it once per daemon, not once per session:
-                // the notice names the deployment's state, which no session
-                // this daemon runs can change — every launch still records
-                // it in the daemon log — and on every host without the
-                // installer's tree (every dev machine today) a banner ahead
-                // of every prompt is the default path, not the exception.
-                // A daemon restart clears the latch: a new daemon start is a
-                // new first session.
-                if first_unenforced_notice(&UNENFORCED_NOTICE_PRINTED) {
-                    // The same write the shell fallback notice uses, for the
-                    // same reasons: onto the pty's slave, best-effort, CRLF —
-                    // see the comment there.
-                    let written = pty.dup_slave_fd().and_then(|fd| {
-                        use std::io::Write as _;
-                        std::fs::File::from(fd)
-                            .write_all(format!("minimal: {notice}\r\n").as_bytes())
-                    });
-                    if let Err(e) = written {
-                        tracing::debug!(
-                            error = %e,
-                            "could not print the placement notice to the terminal"
-                        );
-                    }
+            if advises_unenforced_placement(guest, network_mode, leaf.as_ref()) {
+                let notice = unenforced_placement_notice();
+                // The same write the shell fallback notice uses, for the
+                // same reasons: onto the pty's slave, best-effort, CRLF —
+                // see the comment there.
+                let written = pty.dup_slave_fd().and_then(|fd| {
+                    use std::io::Write as _;
+                    std::fs::File::from(fd).write_all(format!("minimal: {notice}\r\n").as_bytes())
+                });
+                if let Err(e) = written {
+                    tracing::debug!(
+                        error = %e,
+                        "could not print the placement notice to the terminal"
+                    );
                 }
             }
             // The shell, and the argv it needs to reach the daemon's
