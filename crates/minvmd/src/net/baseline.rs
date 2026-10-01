@@ -145,12 +145,12 @@ impl NodeBaselinePhase {
 
 /// The phase this build ships: announced, because the node plane's store
 /// surfaces are not yet configured to the endpoints the built-in enumeration
-/// names. The endpoint-configuration change — the deployment's registry and
-/// cache, answering where `with_registry` and `with_cache` point them — is
-/// the change that flips this constant, and the constant is the whole
-/// cutover: the gate's decision reads it off the baseline it was built with
-/// ([`NodePlaneBaseline::phase`]), the start-up line logs it, and the tests
-/// pin both of its arms, so the flip is one line and nothing else.
+/// names. The endpoint-configuration change (#1786) — the deployment's
+/// registry and cache, answering where `with_registry` and `with_cache`
+/// point them — is the change that flips this constant, and the constant is
+/// the whole cutover: the gate's decision reads it off the baseline it was
+/// built with ([`NodePlaneBaseline::phase`]), the start-up line logs it, and
+/// the tests pin both of its arms, so the flip is one line and nothing else.
 pub(crate) const NODE_BASELINE_PHASE: NodeBaselinePhase = NodeBaselinePhase::Announced;
 
 /// The node-plane baseline set: the categories in force, each with the

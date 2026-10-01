@@ -2206,7 +2206,7 @@ mod tests {
         accept_loop, gate_verdict, max_frame, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry};
-    use crate::net::baseline::{BaselineCategory, NodePlaneBaseline};
+    use crate::net::baseline::{BaselineCategory, NodeBaselinePhase, NodePlaneBaseline};
 
     /// The default switch subnet, the plan every registry below is built for.
     const SUBNET: SwitchSubnet = switch::DEFAULT_SUBNET;
@@ -3840,8 +3840,10 @@ mod tests {
     /// and a source no row holds is the phase's to decide, both of the
     /// phase's arms pinned here so T66's flip of the constant is the whole
     /// cutover. The node plane's own address is the baseline set's to decide
-    /// beside the rows, announced here — its arms are pinned in the
-    /// enumeration's own tests.
+    /// beside the rows: its shipped arm is pinned by
+    /// [`node_plane_source_decided_by_the_node_row_while_announced`], its
+    /// in-force arm at relay level by
+    /// [`unenrolled_baseline_set_from_helper_enumeration`].
     #[test]
     fn gate_verdict_decides_by_source_and_rules() {
         let registry = BoxRegistry::new(SUBNET);
@@ -3959,6 +3961,51 @@ mod tests {
         // The summaries agree with the families the frames were built as.
         assert_eq!(v6.family(), FrameFamily::Ipv6);
         assert_eq!(truncated.family(), FrameFamily::Truncated);
+    }
+
+    /// The shipped arm of the node-plane decision: the phase this build
+    /// ships is announced, and a frame wearing the in-VM daemon's own
+    /// address is decided by the run path's allow-all interim node row —
+    /// the row [`BoxRegistry::register_node_namespace`] publishes, the way
+    /// the run path registers it at boot — yielding [`GateAdmit::Row`] from
+    /// that row, never [`GateAdmit::Baseline`]. The baseline set's arm is
+    /// the store-surface configuration's to switch on (#1786), and the
+    /// in-force arm's proof is
+    /// [`unenrolled_baseline_set_from_helper_enumeration`]'s.
+    #[test]
+    fn node_plane_source_decided_by_the_node_row_while_announced() {
+        let registry = BoxRegistry::new(SUBNET);
+        // The run path's own registration: the allow-all interim node row at
+        // the daemon's address, registered at VM boot (cmd/run.rs).
+        registry.register_node_namespace();
+        let table = registry.table();
+        // Built without [`NodePlaneBaseline::in_force`], so this is the
+        // phase the build ships.
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        assert_eq!(
+            baseline.phase(),
+            NodeBaselinePhase::Announced,
+            "the shipped posture is announced, the arm this test pins"
+        );
+
+        // A node-plane frame to a destination no category of the enumeration
+        // names — the public store the shipped cache URL resolves to. The
+        // interim node row decides it, and the row allows all, so the frame
+        // is admitted by [`GateAdmit::Row`]: the enumeration's compiled set,
+        // which admits no such destination, decided nothing here.
+        let summarize = sessions::core::egress::summarize;
+        let node_frame = summarize(&ipv4_frame(
+            SUBNET.daemon_ip().octets(),
+            6,
+            [8, 8, 8, 8],
+            443,
+        ));
+        assert_eq!(
+            gate_verdict(&node_frame, &table, &baseline, UNREGISTERED_SOURCE_PHASE),
+            Ok(GateAdmit::Row),
+            "announced, the interim node row decides the node plane's frames — \
+             never the baseline set"
+        );
     }
 
     /// NET-130, un-enrolled, at the gate: the node-plane baseline set comes
