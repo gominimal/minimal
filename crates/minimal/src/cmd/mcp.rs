@@ -662,7 +662,10 @@ mod tests {
     #[test]
     fn relative_paths_anchor_at_workbench() {
         assert_eq!(resolve_sandbox_path("/etc/hosts"), "/etc/hosts");
-        assert_eq!(resolve_sandbox_path("src/main.rs"), "/workbench/src/main.rs");
+        assert_eq!(
+            resolve_sandbox_path("src/main.rs"),
+            "/workbench/src/main.rs"
+        );
         assert_eq!(
             resolve_sandbox_path("/workbench/x"),
             "/workbench/x",
