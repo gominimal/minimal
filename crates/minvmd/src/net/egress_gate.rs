@@ -520,7 +520,13 @@ impl EgressGate {
         table: BoxTable,
         baseline: NodePlaneBaseline,
     ) -> io::Result<Self> {
-        Self::spawn_with_phase(gate_sock, switch_sock, table, baseline, UNREGISTERED_SOURCE_PHASE)
+        Self::spawn_with_phase(
+            gate_sock,
+            switch_sock,
+            table,
+            baseline,
+            UNREGISTERED_SOURCE_PHASE,
+        )
     }
 
     /// [`spawn`](Self::spawn) with the unregistered-source phase named: the
@@ -3879,13 +3885,23 @@ mod tests {
         // the interim, the arm T66 (#1711) flips the constant onto.
         let unknown = summarize(&ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80));
         assert_eq!(
-            gate_verdict(&unknown, &table, &baseline, UnregisteredSourcePhase::Announced),
+            gate_verdict(
+                &unknown,
+                &table,
+                &baseline,
+                UnregisteredSourcePhase::Announced
+            ),
             Ok(GateAdmit::Unregistered {
                 src: [100, 64, 0, 99]
             })
         );
         assert_eq!(
-            gate_verdict(&unknown, &table, &baseline, UnregisteredSourcePhase::InForce),
+            gate_verdict(
+                &unknown,
+                &table,
+                &baseline,
+                UnregisteredSourcePhase::InForce
+            ),
             Err(GateDrop::UnknownSource {
                 src: [100, 64, 0, 99]
             })
@@ -3903,14 +3919,24 @@ mod tests {
             80,
         ));
         assert_eq!(
-            gate_verdict(&gateway, &table, &baseline, UnregisteredSourcePhase::Announced),
+            gate_verdict(
+                &gateway,
+                &table,
+                &baseline,
+                UnregisteredSourcePhase::Announced
+            ),
             Err(GateDrop::UnknownSource {
                 src: SUBNET.dns_server().octets()
             })
         );
         let foreign_arp = summarize(&arp_frame([203, 0, 113, 7]));
         assert_eq!(
-            gate_verdict(&foreign_arp, &table, &baseline, UnregisteredSourcePhase::Announced),
+            gate_verdict(
+                &foreign_arp,
+                &table,
+                &baseline,
+                UnregisteredSourcePhase::Announced
+            ),
             Err(GateDrop::UnknownSource {
                 src: [203, 0, 113, 7]
             })
@@ -3973,8 +3999,8 @@ mod tests {
             .parse::<Ipv4Addr>()
             .expect("an endpoint's address parses")
             .octets();
-        let mut h = gate_over_with_node_baseline(registry, UNREGISTERED_SOURCE_PHASE, baseline)
-            .await;
+        let mut h =
+            gate_over_with_node_baseline(registry, UNREGISTERED_SOURCE_PHASE, baseline).await;
 
         // VM start says what the node plane may reach, one term per category:
         // the line a diagnostic bundle's daemon log tail carries.

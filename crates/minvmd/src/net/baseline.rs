@@ -254,13 +254,7 @@ impl NodePlaneBaseline {
     pub(crate) fn render(&self) -> String {
         self.entries
             .iter()
-            .map(|entry| {
-                format!(
-                    "{}={}",
-                    entry.category.as_str(),
-                    entry.endpoints.join(",")
-                )
-            })
+            .map(|entry| format!("{}={}", entry.category.as_str(), entry.endpoints.join(",")))
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -306,7 +300,10 @@ impl NodePlaneBaseline {
             .find(|entry| entry.category == category)
         {
             Some(entry) => entry.endpoints = endpoints,
-            None => self.entries.push(BaselineEntry { category, endpoints }),
+            None => self.entries.push(BaselineEntry {
+                category,
+                endpoints,
+            }),
         }
         self.rules = Self::compile_rules(&self.entries, self.resolver, self.node_addr);
     }
@@ -344,9 +341,9 @@ impl NodePlaneBaseline {
 mod tests {
     use super::{BaselineCategory, BaselineEntry, NodePlaneBaseline};
     use sessions::core::egress::{FrameVerdict, summarize, verdict};
-    use switch::SwitchSubnet;
     use std::net::Ipv4Addr;
     use std::str::FromStr;
+    use switch::SwitchSubnet;
 
     /// The switch fabric these tests build the enumeration against: the
     /// default subnet the run path serves box addresses on.
