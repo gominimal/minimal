@@ -944,13 +944,18 @@ pub async fn cmd_session_policy(
             // The fabric the display builds the baseline set from: the
             // microVM backend's run path builds its registry and the
             // helper's enumeration from the default plan, so that is the
-            // plan the display can name for it. The native daemon's own
-            // per-daemon switch is a plan the reply does not carry — and it
-            // has no host-side gate the set would describe — so it passes
-            // `None` and the block is left out rather than printed from a
-            // plan the session does not attach to.
-            let fabric = global
-                .use_minvmd()
+            // plan the display can name for it. Keyed on the backend this
+            // command actually talks to — `client_provider_kind`, the same
+            // key `resolve_socket_path` turns on — not on `use_minvmd()`,
+            // which is true only under an explicit `--provider
+            // local-minvmd`: on macOS that kind is `Minvmd` without the
+            // flag, minvmd being the only backend there. The native
+            // daemon's own per-daemon switch is a plan the reply does not
+            // carry — and it has no host-side gate the set would describe —
+            // so that arm passes `None` and the block is left out rather
+            // than printed from a plan the session does not attach to.
+            let fabric = (client::client_provider_kind(global.use_minvmd())
+                == paths::ProviderKind::Minvmd)
                 .then_some(switch::SwitchSubnet::default());
             let mut out = std::io::stdout();
             format_policy(&mut out, &policy, record.network, fabric)?;
