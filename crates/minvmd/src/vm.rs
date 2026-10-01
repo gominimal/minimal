@@ -296,25 +296,36 @@ impl VmConfig {
         // new ones queue. Acceptable for v0.1 workloads (<10 concurrent).
         ctx.add_vsock_port2(crate::sock::VSOCK_BRIDGE_PORT, &uds_path, true)?;
 
-        // gvproxy shuttle bridge (extended to the root netns). The
-        // guest connects to AF_VSOCK CID 2 (the host) on
+        // gvproxy shuttle bridge, through the host-side egress gate (NET-081).
+        // The guest connects to AF_VSOCK CID 2 (the host) on
         // VSOCK_GVPROXY_SHUTTLE_PORT; with `listen = false` libkrun dials the
-        // host gvproxy `-listen` switch socket and splices the two, carrying raw
-        // L2 frames between a guest tap and the host gvproxy (the single gVisor
-        // stack). Registered for every VM, not just own-IP: the guest's root
-        // netns (the daemon) attaches a primary tap here for egress, and own-IP
-        // PTasks attach further taps as additional clients on the same switch.
-        // If the host gvproxy did not come up, the guest's connect simply fails
-        // and the relay reports no egress — boot is unaffected.
-        let switch_sock = crate::net::resolve_switch_sock()
+        // named host socket and splices the two, carrying raw L2 frames between
+        // a guest tap and the host. Since NET-081 the named socket is the
+        // **egress gate's**, not the switch's own: the gate — started by the
+        // switch runtime before the VM boots (see `crate::net`) — decides every
+        // frame against the host-side table of published namespaces
+        // (`crate::box_registry`) by the source address it carries, and relays
+        // only what the shared frame verdict admits on to the gvproxy switch (the
+        // single gVisor stack). Per-box egress rules are thereby applied **outside
+        // the VM**, where nothing inside the escape boundary can change them, and
+        // a frame whose source address no namespace holds is dropped outside the
+        // plan's lease block — everywhere, once the per-box default binds; under
+        // the announced interim this build ships, an in-plan source no row holds
+        // is admitted, every admit warned (`egress_gate` carries the phase and
+        // why). Registered for every VM, not just own-IP: the guest's root netns (the
+        // daemon) attaches a primary tap here for egress, and own-IP PTasks
+        // attach further taps as additional clients on the same switch. If the
+        // gate (or the switch behind it) did not come up, the guest's connect
+        // simply fails and the relay reports no egress — boot is unaffected.
+        let gate_sock = crate::net::resolve_gate_sock()
             .map_err(|source| crate::error::VmError::Io { source })?;
-        crate::sock::check_uds_path_len(&switch_sock)
+        crate::sock::check_uds_path_len(&gate_sock)
             .map_err(|source| crate::error::VmError::Io { source })?;
-        ctx.add_vsock_port2(crate::net::VSOCK_GVPROXY_SHUTTLE_PORT, &switch_sock, false)?;
+        ctx.add_vsock_port2(crate::net::VSOCK_GVPROXY_SHUTTLE_PORT, &gate_sock, false)?;
         tracing::info!(
             port = crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-            switch_sock = %switch_sock.display(),
-            "registered gvproxy shuttle vsock bridge",
+            gate_sock = %gate_sock.display(),
+            "registered gvproxy shuttle vsock bridge behind the host-side egress gate",
         );
         Ok(())
     }
