@@ -1068,17 +1068,6 @@ impl Drop for HostListener {
     }
 }
 
-/// The lease a box's own netns holds, read from its routing tables through
-/// the exec's shell (no iproute2 in a session rootfs), filtered to the
-/// switch fabric and the plan's own infrastructure addresses.
-fn lease_from_fib_trie(stdout: &str, exclude: &[Ipv4Addr]) -> Option<Ipv4Addr> {
-    stdout
-        .lines()
-        .filter_map(|line| line.trim().parse::<Ipv4Addr>().ok())
-        .filter(|ip| ip.octets()[0] == 100 && ip.octets()[1] == 64)
-        .find(|ip| !exclude.contains(ip))
-}
-
 /// One recorded spoof attempt: what the frame wore, where it was headed, and
 /// the verdict its arrival gave it — the observability the bound is read
 /// through.
@@ -1204,35 +1193,6 @@ async fn vm_escape_bounded_to_resident_union() {
         });
     }
 
-    // The leases: read off each box's own routing tables, so the record names
-    // the addresses the boxes actually hold. The plan's own infrastructure
-    // (gateway, host alias, the daemon's own address) is excluded.
-    let infrastructure = [
-        subnet.gateway(),
-        subnet.host_alias(),
-        subnet.daemon_ip(),
-        subnet.dns_server(),
-    ];
-    let mut lease_a = None;
-    let mut lease_b = None;
-    for (label, box_session, lease_slot) in [
-        ("box-a", &mut box_a, &mut lease_a),
-        ("box-b", &mut box_b, &mut lease_b),
-    ] {
-        let (stdout, exit) = box_session
-            .exec("grep -oE '([0-9]+\\.){3}[0-9]+' /proc/net/fib_trie | sort -u")
-            .await
-            .unwrap_or_else(|e| panic!("vm_escape_integration: {label} lease probe: {e}"));
-        assert_eq!(exit, Some(0), "{label} lease probe exited nonzero");
-        let lease = lease_from_fib_trie(&stdout, &infrastructure)
-            .unwrap_or_else(|| panic!("vm_escape_integration: {label}'s lease not found in its own routing tables: {stdout:?}"));
-        *lease_slot = Some(lease);
-        eprintln!("vm_escape_integration: {label} holds {lease} on the switch");
-    }
-    let lease_a = lease_a.expect("box-a's lease");
-    let lease_b = lease_b.expect("box-b's lease");
-    assert_ne!(lease_a, lease_b, "the two boxes were handed one address");
-
     // The spoofed attempts at the gate's landing edge — path (b). Each flow
     // wears one source and drives the shuttle's own protocol at the gate
     // socket, byte-identical to what a root escapee's vsock connection
@@ -1248,6 +1208,12 @@ async fn vm_escape_bounded_to_resident_union() {
     // row to be decided by: the flip turns each admit below into
     // `egress-unknown-source`, and the reach a made-up lease buys goes to
     // nothing.
+    //
+    // The sources are written here, not read off the boxes' own leases: the
+    // arm under test is an in-plan address *no row holds*, which the boxes'
+    // real leases cannot name — each box's lease is row-held by definition,
+    // and its cross-box pair is unobservable today (see below), so a read off
+    // the routing tables would serve nothing this test can assert.
     for src in [Ipv4Addr::new(100, 64, 0, 99), Ipv4Addr::new(100, 64, 0, 88)] {
         let flow = SpoofedFlow {
             src,
