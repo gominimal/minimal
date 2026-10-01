@@ -218,7 +218,8 @@ CI runs it (informational) in the `boot-e2e` job.
   boot-to-READY).
 - The kernel boots the **initramfs** (`krun_set_kernel`'s initramfs arg): it
   unpacks into a RAM root and runs `/init` (= minimald) as PID 1. cmdline is just
-  `console=hvc0` — no `root=`/`init=` (those are for a block root).
+  `console=hvc0 ipv6.disable=1` — no `root=`/`init=` (those are for a block
+  root).
 - minimald-as-`/init` mounts `/dev` (devtmpfs; the kernel does NOT auto-mount it
   for an initramfs root), mounts the rootfs (`krun_add_disk2` → `/dev/vda`) and
   `chroot`s into it so `/bin/sh` + libs resolve, then writes `READY\n` on vsock
