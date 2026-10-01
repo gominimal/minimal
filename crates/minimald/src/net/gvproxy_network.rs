@@ -31,8 +31,9 @@ use crate::net::switch::SwitchRelay;
 ///
 /// Teardown removes this PTask's ingress forwards then detaches it from the
 /// switch (decrementing the switch refcount — which stops gvproxy once the last
-/// `OwnIp` PTask leaves — and releasing the handed lease with the count, so
-/// the same box's re-attach re-hands it, T66). It is **explicit** — driven on a
+/// `OwnIp` PTask leaves — and releasing the lease with the count, handed or
+/// drawn alike; a handed lease released with it is what lets the same box's
+/// re-attach re-hand its address, T66). It is **explicit** — driven on a
 /// live runtime by the owner — rather than a `Drop` schedule, so it cannot be
 /// lost to a stopped runtime. Dropping the held [`SwitchRelay`] aborts the
 /// frame relay either way.
@@ -48,7 +49,8 @@ pub(crate) struct OwnIpGuard {
     /// teardown. Empty when no ingress was configured.
     exposed: Vec<ExposedMapping>,
     /// The lease ip this guard's attach holds, passed to `detach` so the
-    /// handed lease among them is released with the count (T66).
+    /// lease is released with the count (T66) — handed or drawn alike, a
+    /// lease's life is its attachment's.
     lease_ip: Ipv4Addr,
 }
 

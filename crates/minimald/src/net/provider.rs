@@ -380,9 +380,10 @@ impl Network for OwnIpNetwork {
     }
 
     /// Give the lease back; the sandbox layer runs this on every path out of a
-    /// launch that does not reach `attach`. The detach releases the handed
-    /// lease with the count (T66), so an abandoned launch does not leave the
-    /// box's address spent behind a lease nothing holds.
+    /// launch that does not reach `attach`. The detach releases the lease
+    /// with the count (T66), so an abandoned launch leaves no lease in the
+    /// static-lease table for a tap nothing holds — the handed one included,
+    /// which is what lets the same box's re-attach re-hand its address.
     fn abandon(&self) -> AbandonFuture<'_> {
         Box::pin(async move {
             let Some(reserved) = self
