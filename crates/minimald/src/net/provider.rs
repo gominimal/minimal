@@ -542,7 +542,16 @@ mod tests {
     async fn concurrent_own_ip_launches_do_not_serialize() {
         let switch = counting_switch();
         let launches: Vec<_> = (0..4)
-            .map(|i| network_for(NetworkMode::OwnIp, &switch, &format!("p{i}"), None, None, None))
+            .map(|i| {
+                network_for(
+                    NetworkMode::OwnIp,
+                    &switch,
+                    &format!("p{i}"),
+                    None,
+                    None,
+                    None,
+                )
+            })
             .collect();
         for net in &launches {
             net.plan().await.expect("planning leases an address");

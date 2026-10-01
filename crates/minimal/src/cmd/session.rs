@@ -129,9 +129,10 @@ async fn register_box_for_activation(
             return None;
         }
     };
-    let Some(sock_path) = ssh_sock.parent().map(|dir| {
-        dir.join(minvmd::control::CONTROL_SOCK_FILE)
-    }) else {
+    let Some(sock_path) = ssh_sock
+        .parent()
+        .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
+    else {
         tracing::warn!(
             "no provider dir resolved for the ssh socket; the box will not be \
              registered with the VM host daemon (its declared egress is not \
@@ -271,8 +272,7 @@ pub(crate) async fn activate_session(
     // other shape of activation — a host-ip box sharing the node's own row,
     // a none box with no switch address, a native daemon with no box table
     // — registers nothing and attaches as it always has.
-    let box_addresses =
-        register_box_for_activation(global, network, &session_name, &policy).await;
+    let box_addresses = register_box_for_activation(global, network, &session_name, &policy).await;
 
     // The daemon sources `username` from the authenticated SSH
     // connection context; the client doesn't send it.

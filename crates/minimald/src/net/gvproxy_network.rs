@@ -278,12 +278,12 @@ mod tests {
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::{Mutex, mpsc};
 
-    use crate::net::dns;
-    use crate::net::policy::{ControlChannel, register_dns_name};
-    use crate::net::provider::network_for;
     use crate::net::PtaskLease;
     use crate::net::SwitchClient;
     use crate::net::SwitchTransport;
+    use crate::net::dns;
+    use crate::net::policy::{ControlChannel, register_dns_name};
+    use crate::net::provider::network_for;
     use crate::test_harness::CaptureWriter;
     use sessions::BoxAddresses;
 
@@ -473,11 +473,12 @@ mod tests {
     /// the shape a VM-backed host's daemon carries.
     fn vm_host_switch() -> Arc<Mutex<SwitchClient>> {
         Arc::new(Mutex::new(
-            SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
-                .with_transport(SwitchTransport::HostShuttle {
+            SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy").with_transport(
+                SwitchTransport::HostShuttle {
                     cid: crate::net::VSOCK_HOST_CID,
                     port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-                }),
+                },
+            ),
         ))
     }
 
@@ -540,7 +541,10 @@ mod tests {
             None,
             None,
         );
-        let _ = unregistered.plan().await.expect("a self-allocated attach plans");
+        let _ = unregistered
+            .plan()
+            .await
+            .expect("a self-allocated attach plans");
         let leases = switch.lock().await.leases().to_vec();
         assert_eq!(
             leases.len(),

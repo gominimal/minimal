@@ -354,9 +354,8 @@ impl BoxRegistry {
             u32::from(slice.last()),
         )
         .ok_or(AllocationError::LoopbackExhausted)?;
-        let mut registration =
-            BoxRegistration::new(spec.name, switch_addr, loopback_addr)
-                .with_admitted_ports(spec.ingress_ports);
+        let mut registration = BoxRegistration::new(spec.name, switch_addr, loopback_addr)
+            .with_admitted_ports(spec.ingress_ports);
         if let Some(policy) = spec.egress {
             registration = registration.with_egress_policy(policy);
         }

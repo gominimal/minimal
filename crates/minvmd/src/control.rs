@@ -365,12 +365,14 @@ mod tests {
         );
         assert_eq!(
             db.loopback_address,
-            Ipv4Addr::from(u32::from(
-                switch::AddressPlan::default()
-                    .loopback_slice_for_switch(SUBNET)
-                    .expect("the default subnet is planned")
-                    .first()
-            ) + 1),
+            Ipv4Addr::from(
+                u32::from(
+                    switch::AddressPlan::default()
+                        .loopback_slice_for_switch(SUBNET)
+                        .expect("the default subnet is planned")
+                        .first()
+                ) + 1
+            ),
             "the second box takes the next published loopback address"
         );
 
