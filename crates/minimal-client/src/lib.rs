@@ -4,6 +4,7 @@
 //! domain socket, authenticates (passwordless), and invokes oneshot RPCs
 //! defined in the `minimald-rpc` wire contract.
 
+pub mod activate;
 pub mod ask_dialog;
 pub mod attach;
 pub mod file_upload;

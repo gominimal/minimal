@@ -13,7 +13,14 @@ use tokio::io::AsyncWriteExt as _;
 // `ensure_version_reported` asserts a build a reply already carried;
 // `ensure_version_match` is the round-trip form, for paths with no first RPC
 // of their own to carry it.
-use minimal_client::{ensure_version_match, ensure_version_reported, version_assertion};
+use minimal_client::{ensure_version_match, ensure_version_reported};
+
+// The headless activation sequence — its create/upload/configure/finalize core
+// plus the teardown helpers it shares — lives in `minimal-client`, beside the
+// transport. Re-exported so `crate::` paths and `min task run` keep working.
+pub(crate) use minimal_client::activate::{
+    ActivationInterrupt, best_effort_destroy, upload_and_finalize,
+};
 
 use crate::*;
 
@@ -22,11 +29,6 @@ mod list;
 mod net;
 mod project;
 mod session;
-
-// The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
-// activation registered with the VM host daemon; the withdrawal lives with
-// the session commands, as does the provider-kind rule its gate keys on.
-use session::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
 
 pub use admin::*;
 pub use list::*;
@@ -638,198 +640,17 @@ pub(crate) async fn send_abort(client: &mut client::Client, session_id: sessions
     }
 }
 
-/// Best-effort destroy for a `Materializing` session the client
-/// couldn't finalize (patch upload failed, network blip, etc.).
-/// Unlike `AbortSession`, `DestroySession` works on any status
-/// past `Pending`. Errors are logged, not propagated — the caller
-/// is already reporting a primary error.
+/// Arm the interrupt guard that tears down a half-built session if the user
+/// interrupts an activation with Ctrl-C.
 ///
-/// Bounded by a hard timeout: the same network conditions that
-/// caused the primary error (wedged daemon, half-open SSH channel,
-/// a VM whose bridge accepted but whose guest never answered) can
-/// make the RPC hang indefinitely, which would swallow the
-/// operator-visible primary error we're supposed to be racing
-/// back to `cmd_activate`.
-pub(crate) async fn best_effort_destroy(
-    client: &mut client::Client,
-    session_id: sessions::SessionId,
-) {
-    /// Ceiling on how long we let a cleanup RPC run. Chosen well
-    /// above a healthy `DestroySession` (single-digit milliseconds
-    /// on a UDS) so the timeout only fires against pathologies.
-    const DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-    use minimald_rpc::DestroySession;
-    let call = client
-        .oneshot_rpc::<DestroySession>(minimald_rpc::DestroySessionRequest { id: session_id });
-    match tokio::time::timeout(DESTROY_TIMEOUT, call).await {
-        Ok(Ok(minimald_rpc::Errorable::Ok(_))) => {}
-        Ok(Ok(minimald_rpc::Errorable::Err { error })) => {
-            eprintln!("DestroySession failed while cleaning up: {error}");
-        }
-        Ok(Err(e)) => {
-            eprintln!("DestroySession RPC failed while cleaning up: {e}");
-        }
-        Err(_) => {
-            eprintln!(
-                "DestroySession timed out after {DESTROY_TIMEOUT:?} while cleaning up \
-                 session {session_id}; the session may still be present on the daemon \
-                 (run `min session destroy {session_id}` to clean up manually)",
-            );
-        }
-    }
-}
-
-/// Upload the composition's patches and external hook scripts (if
-/// any) and finalize the session. The session is `Materializing` at
-/// entry; `Active` on success. On upload/finalize failure the session
-/// is left in `Materializing` — the caller is responsible for
-/// destroying it.
-///
-/// Both uploads precede `FinalizeSession`, which gates on each
-/// upload's ready-marker: a session must not become attachable while
-/// either its patches or its hook scripts are still missing from the
-/// daemon.
-///
-/// `hook_budget` is the summed declared timeout of the composition's
-/// `on_activate` hooks, which the daemon runs inside `FinalizeSession`;
-/// the call's deadline is extended by it so a hook declaring more than the
-/// base RPC timeout is not cut short.
-pub(crate) async fn upload_and_finalize(
-    client: &mut client::Client,
-    session_id: sessions::SessionId,
-    patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
-    hook_scripts: &[sessions::client::hookscripts::StagedScript],
-    hook_budget: std::time::Duration,
-) -> Result<(), anyhow::Error> {
-    client
-        .upload_patches(session_id, patches)
-        .await
-        .context("Failed to upload composition patches")?;
-
-    client
-        .upload_hook_scripts(session_id, hook_scripts)
-        .await
-        .context("Failed to upload lifecycle hook scripts")?;
-
-    use minimald_rpc::{FinalizeSession, FinalizeSessionRequest};
-    let resp = client
-        .oneshot_rpc_with_hook_budget::<FinalizeSession>(
-            FinalizeSessionRequest { session_id },
-            hook_budget,
-        )
-        .await
-        .context("FinalizeSession RPC failed")?;
-    match resp {
-        minimald_rpc::Errorable::Ok(ok) => {
-            // An activate hook runs headlessly, so without this the only
-            // trace of it is the daemon log. Say what ran — the user
-            // agreed to let this code execute, and is owed the receipt.
-            for hook in &ok.activate_hooks {
-                match hook.description.as_deref() {
-                    Some(d) => eprintln!("Ran activation hook from {}: {d}", hook.declared_by),
-                    None => eprintln!("Ran activation hook from {}", hook.declared_by),
-                }
-                // The description is an author-supplied label; what the
-                // hook actually said is its captured output. Echo it to
-                // stderr — stdout is reserved for the bare session id.
-                if !hook.output.is_empty() {
-                    eprint!("{}", hook.output);
-                    if !hook.output.ends_with('\n') {
-                        eprintln!();
-                    }
-                }
-            }
-            if ok.package_check_skipped {
-                eprintln!(
-                    "warning: the session package check was skipped (the package graph \
-                     did not resolve in time or could not be evaluated; see the daemon \
-                     log); unknown package names will surface at first exec"
-                );
-            }
-            Ok(())
-        }
-        minimald_rpc::Errorable::Err { error } => {
-            bail!("FinalizeSession failed: {error}");
-        }
-    }
-}
-
-/// Guard that tears down a half-built session if the user interrupts the
-/// activation with Ctrl-C.
-///
-/// inquire (crossterm raw mode) captures a Ctrl-C at the
-/// composition-gating prompt as an error return, so the abort-cleanup
-/// that [`drive_pending_to_active`] runs gets to execute. During the
-/// non-prompt phases (waiting on the daemon) a Ctrl-C is a plain
-/// SIGINT, which would kill `min` before that cleanup, leaving the
-/// daemon holding a `Pending` session that blocks its name.
-/// [`arm_activation_interrupt`] installs a SIGINT handler that best-effort
-/// `AbortSession`s the in-flight session over a fresh connection — the
-/// activation borrows the primary one — then exits. The daemon's
-/// connection-close reap is the backstop if the abort can't be
-/// delivered.
-///
-/// Dropping the guard cancels the handler, so a Ctrl-C after the session
-/// is safely `Active` (e.g. during the `--attach` hand-off) no longer
-/// tears it down.
-pub(crate) struct ActivationInterrupt {
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for ActivationInterrupt {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
+/// The guard itself lives in `minimal-client`, beside the activation it
+/// protects; this resolves the socket its cleanup reconnects to.
 pub(crate) fn arm_activation_interrupt(
     global: &GlobalArgs,
     session_id: sessions::SessionId,
 ) -> ActivationInterrupt {
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
-    // Resolved here, not inside the task: the withdrawal's socket is the
-    // same provider dir's, and the borrow must not cross the spawn. Keyed
-    // on the provider kind — the rule the socket resolution itself and the
-    // fabric display turn on — not on `use_minvmd()`, which is true only
-    // under an explicit `--provider local-minvmd`: on macOS every invocation
-    // is minvmd-backed with no flag at all, and a Ctrl-C that keyed on the
-    // flag would leave exactly that host's box row published.
-    let control_sock =
-        vm_host_control_sock(daemon_provider_kind(global), global.minimal_dir.as_deref());
-    let task = tokio::spawn(async move {
-        // Only the first Ctrl-C is intercepted; a second falls through to
-        // the default disposition so a wedged cleanup can still be killed.
-        if tokio::signal::ctrl_c().await.is_err() {
-            return;
-        }
-        eprintln!("\nAborting activation; cleaning up session {session_id}…");
-        // Deliberately not version-gated: this is the cleanup half of an
-        // activation the gate already cleared, and a cleanup that refuses to
-        // run is the orphaned session #1251 is about.
-        if let Ok(sock) = sock
-            && let Ok(mut client) = client::Client::connect(&sock).await
-        {
-            use minimald_rpc::{AbortSession, AbortSessionRequest};
-            // The record is fetched **before** the abort, which may take it
-            // with the session: it carries the pair the box's registration
-            // handed back (T66), whose row is withdrawn after the abort —
-            // the creator's withdrawal, best-effort. A session that
-            // registered no box (a task session, a native host) holds no
-            // pair, and the withdrawal stays silent for it.
-            let row = get_session_record(&mut client, &session_id.to_string())
-                .await
-                .ok()
-                .and_then(|resp| resp.record);
-            let _ = client
-                .oneshot_rpc::<AbortSession>(AbortSessionRequest { id: session_id })
-                .await;
-            if let Some(record) = row {
-                withdraw_box_row(control_sock, record.name.as_deref(), record.box_addresses).await;
-            }
-        }
-        std::process::exit(130);
-    });
-    ActivationInterrupt { task }
+    ActivationInterrupt::arm(sock.ok().as_deref(), session_id)
 }
 
 /// The user-facing text for a session that could not be composed, by

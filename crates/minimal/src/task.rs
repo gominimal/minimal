@@ -876,7 +876,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
     collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
-    if let Err(e) = crate::upload_and_finalize(
+    match crate::upload_and_finalize(
         &mut client,
         id,
         &collected_patches,
@@ -885,8 +885,19 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     )
     .await
     {
-        crate::best_effort_destroy(&mut client, id).await;
-        return Err(e);
+        Ok(package_check_skipped) => {
+            if package_check_skipped {
+                eprintln!(
+                    "warning: the session package check was skipped (the package graph \
+                     did not resolve in time or could not be evaluated; see the daemon \
+                     log); unknown package names will surface at first exec"
+                );
+            }
+        }
+        Err(e) => {
+            crate::best_effort_destroy(&mut client, id).await;
+            return Err(e);
+        }
     }
 
     // Active: from here an interrupt destroys (or, under `--keep`, keeps)

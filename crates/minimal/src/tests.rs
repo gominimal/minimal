@@ -268,7 +268,6 @@ fn every_daemon_connection_is_classified() {
             // operator still needs to see.
             "cmd/list.rs::list_other_vm = ungated",
             "cmd/list.rs::list_selected_vm = gated",
-            "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
             "cmd/net.rs::cmd_net_forward = gated",
             "cmd/session.rs::cmd_attach = gated",
@@ -299,7 +298,6 @@ fn every_create_session_asserts_the_daemon_build() {
     assert_eq!(
         create_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
-            "cmd/session.rs::activate_session = asserts",
             "task.rs::cmd_task_run = asserts",
             // Not a client path: the two-VM fixture's own create. It asserts
             // like the real ones, so the inventory stays "every site asserts".
@@ -314,33 +312,45 @@ fn every_create_session_asserts_the_daemon_build() {
 /// create, on the one path where an extra RTT is felt. The check now rides
 /// on the `CreateSession` the path was already sending, so the marks of
 /// the old mechanism — `GetVersion`, `ensure_version_match`, or the
-/// `connect_daemon` that issues it — must be absent from both creators,
-/// and the marks of the new one present.
+/// `connect_daemon` that issues it — must be absent, and the marks of the
+/// new one present. `min session activate` delegates to the shared core in
+/// `minimal-client` (whose own version-gate test lives there); `min task run`
+/// still carries the gate in its own create.
 #[test]
 fn the_activation_path_makes_no_version_round_trip() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    for (file, func) in [
-        ("src/cmd/session.rs", "activate_session"),
-        ("src/task.rs", "cmd_task_run"),
-    ] {
-        let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
-        let body =
-            function_body(&text, func).unwrap_or_else(|| panic!("{file} no longer defines {func}"));
-        for round_trip in ["GetVersion", "ensure_version_match", "connect_daemon("] {
-            assert!(
-                !body.contains(round_trip),
-                "{func} reintroduced a version round trip ({round_trip})"
-            );
-        }
+    let text =
+        std::fs::read_to_string(manifest.join("src/cmd/session.rs")).expect("readable source");
+    let body = function_body(&text, "activate_session")
+        .expect("src/cmd/session.rs no longer defines activate_session");
+    for round_trip in ["GetVersion", "ensure_version_match", "connect_daemon("] {
         assert!(
-            body.contains("must_match_version"),
-            "{func} no longer asserts its build on the create"
-        );
-        assert!(
-            body.contains("ensure_version_reported"),
-            "{func} no longer checks the build the create echoed back"
+            !body.contains(round_trip),
+            "activate_session reintroduced a version round trip ({round_trip})"
         );
     }
+    assert!(
+        body.contains("client::activate::activate("),
+        "activate_session no longer delegates to the version-gated core"
+    );
+
+    let text = std::fs::read_to_string(manifest.join("src/task.rs")).expect("readable source");
+    let body =
+        function_body(&text, "cmd_task_run").expect("src/task.rs no longer defines cmd_task_run");
+    for round_trip in ["GetVersion", "ensure_version_match", "connect_daemon("] {
+        assert!(
+            !body.contains(round_trip),
+            "cmd_task_run reintroduced a version round trip ({round_trip})"
+        );
+    }
+    assert!(
+        body.contains("must_match_version"),
+        "cmd_task_run no longer asserts its build on the create"
+    );
+    assert!(
+        body.contains("ensure_version_reported"),
+        "cmd_task_run no longer checks the build the create echoed back"
+    );
 }
 
 /// The code of the named free function, from its `fn` line to the next
@@ -1635,7 +1645,7 @@ fn composition_failure_leads_with_the_directory_not_the_daemon_step() {
 fn both_creators_share_the_composition_failure_message() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, func, uses) in [
-        ("src/cmd/session.rs", "activate_session", 2),
+        ("src/cmd/session.rs", "activate_session", 1),
         ("src/task.rs", "cmd_task_run", 2),
         ("src/cmd/mod.rs", "drive_pending_to_active", 1),
     ] {

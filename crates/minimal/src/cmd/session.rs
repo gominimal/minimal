@@ -757,10 +757,11 @@ pub(crate) async fn activate_session(
 
     // The daemon sources `username` from the authenticated SSH
     // connection context; the client doesn't send it. `box_addresses`
-    // lands just before the create (T66): the registration is the last
-    // fallible client-side step, so a loadout, policy, or hook failure
-    // between here and there never strands a row on the host.
-    let mut config = minimald_rpc::SessionConfig {
+    // lands just before the create (T66), set by the shared core from the
+    // [`CliBoxRegistry`] registration — the last fallible client-side step, so
+    // a loadout, policy, or hook failure between here and there never strands a
+    // row on the host.
+    let config = minimald_rpc::SessionConfig {
         name: Some(session_name),
         project_path: abs_path.clone(),
         network,
@@ -859,6 +860,10 @@ pub(crate) async fn activate_session(
     // the `CreateSession` below rather than on a `GetVersion` sent ahead of it.
     // Activation is the hot path #1251's gate landed on, and it must not pay a
     // round trip for a check its own first RPC can make.
+    // Deliberately not `connect_daemon`: this path's version gate travels on
+    // the `CreateSession` below rather than on a `GetVersion` sent ahead of it.
+    // Activation is the hot path #1251's gate landed on, and it must not pay a
+    // round trip for a check its own first RPC can make.
     let mut client = connect_daemon_unchecked(global).await?;
 
     // Warn before minting a second session for a path that already has one:
@@ -901,794 +906,200 @@ pub(crate) async fn activate_session(
     }
 
     // T66: an own-address box on a VM-backed host registers with the VM host
-    // daemon just before the create — the host allocates the box's switch
-    // and loopback addresses into the table its egress gate decides by and
-    // hands them back, and the create request carries them so the in-VM
-    // daemon attaches with the handed switch address instead of drawing its
-    // own. Every other shape of activation — a host-ip box sharing the
-    // node's own row, a none box with no switch address, a native daemon
-    // with no box table — registers nothing and attaches as it always has.
-    // A registration that cannot be made ends the activation here, with its
-    // cause: no session exists yet to clean up, and a box that went on to
-    // create unregistered would run with no host-side row to decide its
-    // egress by, so this is the one failure that never falls back. Past
-    // here, the row exists and every later failure owes it its creator's
-    // withdrawal (T66): the sites below send it. The control socket is
-    // resolved once, here, and the withdrawals ride on it.
+    // daemon as part of the create — the host allocates the box's switch and
+    // loopback addresses into the table its egress gate decides by and hands
+    // them back, and the create request carries them so the in-VM daemon
+    // attaches with the handed switch address instead of drawing its own.
+    // Every other shape of activation — a host-ip box sharing the node's own
+    // row, a `none` box with no switch address, a native daemon with no box
+    // table — registers nothing and attaches as it always has. A registration
+    // that cannot be made ends the activation with its cause: no session exists
+    // yet to clean up, and a box that went on to create unregistered would run
+    // with no host-side row to decide its egress by, so this is the one failure
+    // that never falls back.
+    //
+    // The registration reaches the VM host daemon, which the shared core
+    // deliberately does not depend on (`minvmd` sits above it), so the CLI
+    // supplies both halves — register before each create attempt, withdraw when
+    // the activation abandons a box — through [`CliBoxRegistry`]. The control
+    // socket the withdrawal rides is resolved once, here, by the same rule the
+    // registration and the fabric display use: the provider kind, never
+    // `use_minvmd()` alone, so the flagless VM-backed host (macOS) is included.
     let kind = daemon_provider_kind(global);
     let control_sock = vm_host_control_sock(kind, global.minimal_dir.as_deref());
-    let mut registered = register_box_for_activation(
-        kind,
-        global.minimal_dir.as_deref(),
-        config.network,
-        config
-            .name
-            .as_deref()
-            .expect("the session name is minted before the create"),
-        &config.policy,
-    )
-    .await?;
-    // The registration is the client's record of the box: the addresses
-    // the create carries, and the id the host minted for it (NET-133).
-    config.box_addresses = registered
-        .as_ref()
-        .map(|registration| registration.addresses);
+    let box_registry: std::sync::Arc<dyn client::activate::ActivationBox + Send + Sync> =
+        std::sync::Arc::new(CliBoxRegistry {
+            kind,
+            minimal_dir: global.minimal_dir.clone(),
+            network: config.network,
+            policy: config.policy.clone(),
+            control_sock,
+        });
 
-    use minimald_rpc::{
-        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
-    };
-    // An autogen name can (rarely) collide with an existing session built
-    // from the same directory; on the daemon's already-exists rejection,
-    // re-mint the hex suffix and retry a bounded number of times. A
-    // user-supplied name never retries — its collision, and any other failure
-    // (e.g. a policy/network-mode validation error), surfaces unchanged.
-    let mut attempts = 0u32;
-    let created = loop {
-        let resp = client
-            .oneshot_rpc::<CreateSession>(CreateSessionRequest {
-                config: config.clone(),
-                // The version gate: a daemon of another build refuses this
-                // call outright, before it has allocated anything to tear
-                // down. `None` under the skew override, which is what lets an
-                // operator proceed.
-                must_match_version: version_assertion(),
-            })
-            .await;
-        let resp = match resp {
-            Ok(resp) => resp,
-            // A transport failure abandons the activation and the row its
-            // registration bought: the create never happened, so no session
-            // holds the pair (T66).
-            Err(error) => {
-                withdraw_box_row(
-                    control_sock.clone(),
-                    config.name.as_deref(),
-                    config.box_addresses,
-                )
-                .await;
-                return Err(error.context("CreateSession RPC failed"));
-            }
-        };
-        match resp {
-            minimald_rpc::Errorable::Ok(r) => break r,
-            minimald_rpc::Errorable::Err { error } => {
-                if should_retry_autogen(autogen, attempts, &error) {
-                    attempts += 1;
-                    // The row the first attempt bought is this attempt's to
-                    // leave behind: its creator withdraws it before
-                    // re-registering under the re-minted name (T66) — it was
-                    // bought for a session this create never made.
-                    withdraw_box_row(
-                        control_sock.clone(),
-                        config.name.as_deref(),
-                        config.box_addresses,
-                    )
-                    .await;
-                    config.name = Some(autogen_session_name(&utf8_path, &random_hex4()));
-                    // A registered box's row carries the name it was
-                    // registered under (T66), so the re-mint re-registers;
-                    // the abandoned row's addresses stay spent by design
-                    // (the host's cursors never regress), but its
-                    // admissions are withdrawn above, and the retry leaves
-                    // no row behind. The re-registration can itself fail —
-                    // the plan can be exhausted by then — and that failure
-                    // ends the retry loop the same way the first one would
-                    // have, with its cause. The first registration's id is
-                    // discarded with its row: ids are never freed or
-                    // reused, so the re-registration is a new creation, and
-                    // the host mints it a new id, which replaces the record
-                    // (NET-133).
-                    registered = register_box_for_activation(
-                        kind,
-                        global.minimal_dir.as_deref(),
-                        config.network,
-                        config.name.as_deref().expect("just re-minted"),
-                        &config.policy,
-                    )
-                    .await?;
-                    config.box_addresses = registered
-                        .as_ref()
-                        .map(|registration| registration.addresses);
-                    continue;
-                }
-                // A create failure that is not a retryable autogen collision
-                // abandons the activation and its row the same way.
-                withdraw_box_row(
-                    control_sock.clone(),
-                    config.name.as_deref(),
-                    config.box_addresses,
-                )
-                .await;
-                bail!("CreateSession failed: {error}");
-            }
-        }
-    };
-    // The other half of the gate: a daemon old enough to predate
-    // `must_match_version` ignored the assertion instead of answering it, and
-    // says so by echoing no version at all. Being older than the field is
-    // itself proof of a skew, so refuse here — still before the upload, the
-    // loadout, and the finalize that #1251 died at, and with the session left
-    // unfinalized for the daemon to reap when this connection drops.
-    if let Err(error) = ensure_version_reported(created.daemon_version.as_deref()) {
-        // A skewed daemon's refusal abandons the unfinalized session and its
-        // row; the withdrawal rides out with the error (T66).
-        withdraw_box_row(
-            control_sock.clone(),
-            config.name.as_deref(),
-            config.box_addresses,
-        )
-        .await;
-        return Err(error);
-    }
-    // The registration's own half of the session-start output (T66): one line
-    // naming the VM host daemon the box's row lives on and the switch address
-    // it was handed, beside the `tracing::info!` line the same registration
-    // writes. The line is the one a bundle reads off the CLI transcript to say
-    // whether this box has a host row — which is the question the host that
-    // reaches the VM host daemon with no provider flag at all (NET-081's macOS
-    // half) otherwise answers nowhere in its own output. A box that registered
-    // nothing — a native host, a host-ip box sharing the node's own row, a
-    // `none` box with no switch address — prints nothing: it has no row to
-    // name. Keyed on the provider kind the registration itself keyed on, never
-    // on `use_minvmd()`, so the flagless VM-backed host prints it too.
-    if let Some(addresses) = config.box_addresses.as_ref() {
-        eprintln!(
-            "{}",
-            box_registered_start_line(
-                hostname_proxy_vm(kind),
-                config.name.as_deref().unwrap_or("-"),
-                addresses,
-            )
-        );
-    }
-    warn_if_hostname_routing_down(
-        created.hostname_routing_unavailable.as_deref(),
-        "min session activate",
-    );
-    // The other routing fact the create reply carries: the port this daemon's
-    // hostnames route through, printed where the session started — the same
-    // fact `min ls` prints on its routing line. NET-026's discovery on this
-    // surface; and the report a port has to carry when it is *not* the one the
-    // recipes assume — a VM whose host port the host already held walked to
-    // one of its own (NET-059), a native daemon whose default was busy asked
-    // the OS for a free one (NET-025) — so a walked port is never a log line
-    // alone. Absent while the proxy is still coming up, or from a daemon that
-    // predates the field: nothing to print for it then, exactly as in `min
-    // ls`.
-    if let Some(port) = created.hostname_proxy_port {
-        eprintln!(
-            "{}",
-            hostname_proxy_start_line(hostname_proxy_start_vm(global), port)
-        );
-    }
-    // NET-122/NET-123/NET-138: the naming lines, printed once per session
-    // start — after the create, and re-surfaced when the daemon reports this
-    // session at the 127.0.0.1 interim because its session-start bind
-    // probe found the reserved range absent. The advisory only ever names
-    // the command that points the host's resolver at the answerer; running
-    // it (and any privilege prompt it carries) is the user's act, never the
-    // session start's. One read of this host's resolver state decides the
-    // advisory and the surface verdict below it, so the two lines cannot
-    // disagree about one host.
-    //
-    // On a VM-backed host the answerer is the VM host daemon's (NET-138):
-    // the in-VM daemon starts none, so the port and the bound proof come
-    // from the host — the state read over minvmd's control socket (never
-    // through the in-VM daemon, because a guest relaying a host fact is
-    // forgeable from inside the escape boundary) and this CLI's own A
-    // query for the host's row at the port that read named, the proof the
-    // answerer is live rather than merely reported held. A native host
-    // keeps the daemon's own report. `held_no_channel` is the machine fact
-    // that ends the question: a port held by a process no channel reaches
-    // means this VM's names are not answered on the host whatever this
-    // host's hook and range say, so neither is read and the warning says
-    // the fact instead of the advisory.
-    let (vm_answerer, answerer_port, answerer_bound, held_no_channel, proxy_down) =
-        match vm_host_answerer_status(global).await {
-            Some(status) => {
-                let read = crate::resolver::host_answerer_read(status.clone()).await;
-                (
-                    Some(status),
-                    read.port,
-                    read.answerer_bound,
-                    read.held_no_channel,
-                    read.proxy_down,
-                )
-            }
-            None => (
-                None,
-                created.zone_answerer_port,
-                created.answerer_bound,
-                false,
-                None,
-            ),
-        };
-    // The interim itself, named at every session start on a VM-backed host
-    // — TTY and non-TTY, ahead of the warning, the advisory and the verdict
-    // below — because who answers the zone is the machine fact the names
-    // this session is about to rely on rest on, and a holder another VM's
-    // minvmd took is otherwise discoverable only from `min ls`. The
-    // pre-acquisition state prints nothing: nothing is held yet to name.
-    if let Some(status) = vm_answerer
-        && let Some(line) = vm_host_answerer_start_line(status)
-    {
-        eprintln!("{line}");
-    }
-    if held_no_channel && let Some(answerer_port) = answerer_port {
-        // NET-138's warning, at every session start — TTY and non-TTY: it
-        // rides stderr unconditionally, because the first lookup that
-        // fails is the one it explains, and a piped activate is as owed
-        // the fact as an interactive one.
-        eprintln!(
-            "{}",
-            crate::resolver::port_held_no_channel_warning(answerer_port)
-        );
-        // The verdict is the proxy's by the status's own word, without
-        // reading the hook or the range: both could only misreport native
-        // for a port no daemon answers, and the arm that cannot strand the
-        // user is the proxy's (NET-019 keeps it serving). Logged as the
-        // same session-start record the native arm logs, with the fact
-        // that decided it.
-        tracing::info!(
-            surface = ?crate::resolver::LiveSurface::Proxy,
-            held_no_channel = true,
-            answerer_bound = false,
-            answerer_port = answerer_port,
-            "session start decided the live name surface for this host"
-        );
-        eprintln!(
-            "{}",
-            crate::resolver::name_surface_line(
-                crate::resolver::LiveSurface::Proxy,
-                created.hostname_proxy_port,
-            )
-        );
-    } else if let Some((port, cause)) = proxy_down {
-        // T93: the VM host daemon's own verdict on the hostname proxy's
-        // publication — a terminal publish failure, named with the port it
-        // is about and its cause instead of a bare "not serving" — printed
-        // at every session start, TTY and non-TTY alike, because the names
-        // this session is about to rely on are the ones the line says
-        // cannot resolve. No host read runs in this arm — no detection, no
-        // liveness query, no range probe — because the status is the VM
-        // host daemon's answer on the proxy's publication, and no host
-        // probe can move it.
-        let surface = crate::resolver::LiveSurface::ProxyNotServing { port, cause };
-        tracing::info!(
-            surface = ?surface,
-            "session start decided the live name surface for this host"
-        );
-        eprintln!(
-            "{}",
-            crate::resolver::name_surface_line(surface, created.hostname_proxy_port)
-        );
-    } else if let Some(answerer_port) = answerer_port {
-        // The answerer service's step (NET-122's host service) is read
-        // beside the detection on every hooked host, VM-backed and native
-        // alike: whether the zone is manager-held or held only while a
-        // session holds it, and whether the installed copy speaks this
-        // daemon's channel protocol — the native daemon publishes into the
-        // same machine-global channel a VM host daemon does, so the same
-        // service is the one to hand its zone to.
-        let (detection, answerer_step) = tokio::join!(
-            crate::resolver::session_detection(),
-            crate::resolver::read_answerer_step()
-        );
-        // The daemons the step asks to release the hook port: this CLI's
-        // own state dir's — its VM host daemons, default VM and named VMs
-        // alike, or its native daemon — never another state dir's.
-        let controls = match daemon_provider_kind(global) {
-            paths::ProviderKind::Minvmd => {
-                client::enumerate_vm_sockets(global.minimal_dir.as_deref(), true)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|vm| control_sock_beside(&vm.sock))
-                    .map(|sock| sock.display().to_string())
-                    .collect()
-            }
-            paths::ProviderKind::Minimald => {
-                client::resolve_socket_path(global.minimal_dir.as_deref(), false)
-                    .ok()
-                    .and_then(|sock| control_sock_beside(&sock))
-                    .into_iter()
-                    .map(|sock| sock.display().to_string())
-                    .collect()
-            }
-        };
-        crate::resolver::set_handover_controls(controls);
-        // NET-018: name the live surface at the moment the user is about to
-        // rely on the names — decided in the one function both verbs share
-        // (`resolver`), from the same detection the advisory reads: this
-        // host's hook (and the stub-bypass blocker that says whether its
-        // lookups consult what the hook configures), the answerer-bound
-        // proof this start holds — the daemon's report on a native host,
-        // this CLI's own query on a VM-backed one — and the reserved range
-        // on this host's own loopback. Decided before the advisory prints
-        // only so the range its read holds can be the advisory's too — one
-        // probe, one host — while the printed order stays the advisory's
-        // and then the surface's. `None` — the answerer not bound — prints
-        // nothing: no native surface to name, and the ports and the
-        // advisory have told the proxy's story. The proxy's half is said
-        // with the native arm either way (NET-019): the `HTTP(S)_PROXY`
-        // recipes this activation prints keep working beside native DNS,
-        // so nothing already captured goes stale.
-        let surface_verdict = crate::resolver::live_name_surface_with_range_at(
-            &detection,
-            Some(answerer_port),
-            answerer_bound,
-        )
-        .await;
-        // The advisory shares that verdict's range read: the daemon's
-        // interim flag is not this host's range fact — on a VM-backed host
-        // it reads the guest's loopback, which always carries the range —
-        // so a hook that routes over a loopback that lacks the range is
-        // told the range is what is missing, not left with a silent
-        // advisory beside a verdict that names the proxy for exactly that.
-        let name_advisory = crate::resolver::session_advisory_at(
-            &detection,
-            Some(answerer_port),
-            created.interim_loopback,
-            surface_verdict
-                .as_ref()
-                .and_then(|verdict| verdict.range_present),
-            &answerer_step,
-        );
-        if let Some(advisory) = &name_advisory {
-            // Printed whole on every start, interactive or not (NET-122:
-            // the start names the exact command, and a scripted start's log
-            // is its only record), after a blank line so the note and its
-            // command block stand apart from the lines above them.
-            eprintln!("\n{advisory}");
-        }
-        if let Some(verdict) = surface_verdict {
-            // The host-side record of that verdict, the half the daemon's own
-            // log cannot make: a daemon can name only the answerer *it* binds
-            // (see the daemon's `log_live_name_surface`), so the surface this
-            // host's own reads decided — and the three facts behind it, with
-            // the range as the one fact only this read holds — is logged here,
-            // at the start that printed it, beside the daemon's line. `min`
-            // filters at `warn` unless `RUST_LOG` is set, so the line is visible
-            // under `RUST_LOG=info`. Logged, never printed: the line
-            // below is the user's. `min ls` does not log its verdict — a list
-            // re-reads the host every run, and the record that matters is the
-            // one at the starts that rely on the names.
-            tracing::info!(
-                surface = ?verdict.surface,
-                hook_routes = detection.0.routes(answerer_port),
-                blocker = ?detection.1,
-                answerer_bound = answerer_bound,
-                range_present = ?verdict.range_present,
-                range_unit_state = ?detection.2.state,
-                range_unit_check = ?detection.2.failed_check,
-                answerer_manager_held = answerer_step.holds(),
-                answerer_step = ?answerer_step,
-                "session start decided the live name surface for this host, \
-                 with the range unit's state beside it"
-            );
-            eprintln!(
-                "{}",
-                crate::resolver::name_surface_line(verdict.surface, created.hostname_proxy_port)
-            );
-        }
-    }
-    let id = created.id;
-
-    // NET-079: the host's verdict on whether it can decide a host-address
-    // box's egress per box, spelled by the daemon — the side that read the
-    // host — and printed verbatim, so the terminal, the daemon's log line
-    // for this same create, and the start all say the same thing. The
-    // advisory names the cause, the state it leaves the box in, and, when
-    // the missing privileged step is the cause, the exact command that
-    // installs it; it is never a prompt, and never load-bearing for the
-    // start either (see [`print_classifier_advisory`]). Printed after the
-    // session exists and before the work on it, like the notice below it,
-    // so a host that cannot decide per box is named at the start that
-    // runs there and not only in a log the person was not reading.
-    print_classifier_advisory(&mut std::io::stderr(), &created);
-
-    // The coming-change notice (NET-076), printed while the deny-all egress
-    // default is announced but not yet in force. Scoped to the box it would
-    // change — an own-address session that declared no egress — on a daemon
-    // that has not opted out of the change (NET-077): the opt-out is the
-    // one rollout fact this side cannot know, so it is read off the create
-    // reply above, and a daemon that has already set the flag has already
-    // taken the remedy the notice names. Silent once the phase turns (see
-    // [`deny_all_default_notice`]). Printed after the session exists and
-    // before the work on it, so the warning is not lost above a failed
-    // activate's output.
-    if config.network == minimald_rpc::NetworkMode::OwnIp
-        && config.policy.egress.is_none()
-        && created.deny_all_opt_out != Some(true)
-        && let Some(notice) = deny_all_default_notice(
-            sessions::EGRESS_DEFAULT_PHASE,
-            kind == paths::ProviderKind::Minvmd,
-        )
-    {
-        eprintln!("{notice}");
-    }
-
-    // When a subnet flag carries host bits (e.g. `--deny-subnets 10.0.0.1/8`),
-    // the enforcement layer reads it as the masked network (`10.0.0.0/8`).
-    // Print a one-line notice naming the normalized form so the user knows
-    // how their entry is read, rather than discovering it through a mismatch.
-    // The notice is computed from the original flags, not the stored policy:
-    // the policy now holds the normalized form, so reading it back would
-    // print nothing.
-    for entry in &args.allow_subnets {
-        if let Some(normalized) = sessions::normalized_cidr(entry) {
-            eprintln!("--allow-subnets {entry} is read as {normalized}");
-        }
-    }
-    for entry in &args.deny_subnets {
-        if let Some(normalized) = sessions::normalized_cidr(entry) {
-            eprintln!("--deny-subnets {entry} is read as {normalized}");
-        }
-    }
-
-    // From here the session exists on the daemon in an unfinalized state.
-    // Arm a Ctrl-C guard so an interrupt during the (blocking) gating
-    // prompt tears it down instead of orphaning it in `Pending` — see
-    // [`ActivationInterrupt`]. Disarmed once the session is `Active`.
-    let interrupt_guard = arm_activation_interrupt(global, id);
-
-    // Upload the project directory to the daemon so the session
-    // workspace holds the user's files — `ConfigureLoadout`'s compose
-    // reads the mfile (and any local `packages/`, `stacks/`,
-    // `profiles/` used by graph resolution) off that workspace, so it
-    // has to run before `ConfigureLoadout`. `--sync none` opts out;
-    // the daemon then composes against an empty workspace and the
-    // caller is on their own for getting files there.
-    match sync_mode {
+    // Decide the upload and announce it before the record exists: a root the
+    // operator declines to send, or one whose skipped upload would silently
+    // drop declared hooks, is a client-side refusal that must not leave a
+    // draft behind. `--sync none` opts out entirely.
+    let upload: Option<camino::Utf8PathBuf> = match sync_mode {
         SyncMode::None => {
-            // `--sync none` skips the upload, so the daemon composes against
-            // an empty workspace and the project's `minimal.toml` — packages,
-            // vars, patches, hooks — is silently dropped. Say so when there
-            // is a config to lose, so the default-config session is not a
+            // `--sync none` skips the upload, so the daemon composes against an
+            // empty workspace and the project's `minimal.toml` — packages,
+            // vars, patches, hooks — is silently dropped. Say so when there is
+            // a config to lose, so the default-config session is not a
             // surprise.
             if let Some(notice) = sync_none_notice(&utf8_path) {
                 eprintln!("{notice}");
             }
-        }
-        SyncMode::Tarball if skip_empty_or_home => {
-            // An empty directory has nothing to sync, and `$HOME` is far
-            // too much to ship on a stray confirmation keypress — and if
-            // `$HOME` is itself a VCS root the old gate uploaded it with
-            // no prompt at all. Skip both silently by default; a
-            // deliberate `--sync tarball` (via `sync_explicit`) is the
-            // escape hatch that still uploads them.
-            eprintln!("Starting with an empty box (nothing here to sync)");
+            None
         }
         SyncMode::Tarball => {
-            // Upload from the project root — the directory the mfile
-            // lives in — rather than wherever the user invoked us. This
-            // matches the CLI's config-discovery walk: a user running
-            // `minimal activate ./subdir` still uploads the whole
-            // project. Falls back to `utf8_path` when no mfile is found
-            // anywhere up the tree (#770).
-            let upload_root = upload_root.expect("upload_root is set for SyncMode::Tarball above");
-            if upload_root != utf8_path {
-                eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
-            }
-            // Guard against accidentally uploading a non-VCS directory
-            // (e.g. `~`). A VCS root, or a directory carrying a
-            // `minimal.toml` (a declared project), uploads unconditionally.
-            // For an undeclared non-VCS root an interactive caller gets the
-            // confirm (default No); a headless caller (CI, pipes, agents,
-            // `--no-prompt`, `--no-input`) can't be asked, so it skips the
-            // upload with a warning rather than silently shipping a directory
-            // nobody confirmed — `--sync tarball` (via `sync_explicit`) is the
-            // escape hatch that force-uploads it anyway (#770).
-            let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
-            let should_upload = match file_upload::upload_gate(
-                file_upload::is_vcs_root(upload_root.as_std_path()),
-                sync_explicit,
-                project_has_mfile(&upload_root),
-                headless,
-            ) {
-                file_upload::UploadGate::Upload => true,
-                file_upload::UploadGate::SkipHeadless => {
-                    // Skipping the upload means the project's minimal.toml
-                    // never reaches the daemon, so any lifecycle hooks it
-                    // declares are discarded and never run. Refuse loudly
-                    // instead of exiting 0 on a session silently missing
-                    // them; the caller can force the upload or opt out on
-                    // purpose.
-                    let dropped_hooks = project_lifecycle_hook_count(&upload_root);
-                    if dropped_hooks > 0 {
-                        bail!(
-                            "{upload_root} is not a version control repository root, so its \
-                             file upload is being skipped — but its {name} declares \
-                             {dropped_hooks} lifecycle hook(s) that reach the session only \
-                             through that upload. They would be silently dropped and never \
-                             run. Pass `--sync tarball` to upload the project (hooks \
-                             included), or `--sync none` to start without them deliberately.",
-                            name = mfile::MFILE_NAME,
+            let root = upload_root
+                .as_ref()
+                .expect("upload_root is set for SyncMode::Tarball above");
+            if skip_empty_or_home {
+                // An empty directory has nothing to sync, and `$HOME` is far
+                // too much to ship on a stray confirmation keypress — and if
+                // `$HOME` is itself a VCS root the old gate uploaded it with
+                // no prompt at all. Skip both silently by default; a
+                // deliberate `--sync tarball` (via `sync_explicit`) is the
+                // escape hatch that still uploads them.
+                eprintln!("Starting with an empty box (nothing here to sync)");
+                None
+            } else {
+                // Upload from the project root — the directory the mfile
+                // lives in — rather than wherever the user invoked us. This
+                // matches the CLI's config-discovery walk: a user running
+                // `minimal activate ./subdir` still uploads the whole
+                // project. Falls back to `utf8_path` when no mfile is found
+                // anywhere up the tree (#770).
+                if *root != utf8_path {
+                    eprintln!("Uploading from project root {root} (resolved from {utf8_path})");
+                }
+                // Guard against accidentally uploading a non-VCS directory
+                // (e.g. `~`). A VCS root, or a directory carrying a
+                // `minimal.toml` (a declared project), uploads
+                // unconditionally. For an undeclared non-VCS root an
+                // interactive caller gets the confirm (default No); a
+                // headless caller (CI, pipes, agents, `--no-prompt`,
+                // `--no-input`) can't be asked, so it skips the upload with a
+                // warning rather than silently shipping a directory nobody
+                // confirmed — `--sync tarball` (via `sync_explicit`) is the
+                // escape hatch that force-uploads it anyway (#770).
+                let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
+                let should_upload = match file_upload::upload_gate(
+                    file_upload::is_vcs_root(root.as_std_path()),
+                    sync_explicit,
+                    project_has_mfile(root),
+                    headless,
+                ) {
+                    file_upload::UploadGate::Upload => true,
+                    file_upload::UploadGate::SkipHeadless => {
+                        // Skipping the upload means the project's minimal.toml
+                        // never reaches the daemon, so any lifecycle hooks it
+                        // declares are discarded and never run. Refuse loudly
+                        // instead of exiting 0 on a session silently missing
+                        // them; the caller can force the upload or opt out on
+                        // purpose.
+                        let dropped_hooks = project_lifecycle_hook_count(root);
+                        if dropped_hooks > 0 {
+                            bail!(
+                                "{root} is not a version control repository root, so its \
+                                 file upload is being skipped — but its {name} declares \
+                                 {dropped_hooks} lifecycle hook(s) that reach the session only \
+                                 through that upload. They would be silently dropped and never \
+                                 run. Pass `--sync tarball` to upload the project (hooks \
+                                 included), or `--sync none` to start without them deliberately.",
+                                name = mfile::MFILE_NAME,
+                            );
+                        }
+                        eprintln!(
+                            "{}",
+                            file_upload::skipped_upload_warning(root.as_std_path())
+                        );
+                        false
+                    }
+                    file_upload::UploadGate::Prompt => confirm(
+                        &format!(
+                            "{root} is not a version control repository root. \
+                             Upload all files from this directory?"
+                        ),
+                        false,
+                    )?,
+                };
+                if should_upload {
+                    Some(root.clone())
+                } else {
+                    if !headless {
+                        eprintln!(
+                            "Skipping file upload; the session will start with an \
+                             empty workspace."
                         );
                     }
-                    eprintln!(
-                        "{}",
-                        file_upload::skipped_upload_warning(upload_root.as_std_path())
-                    );
-                    false
+                    None
                 }
-                file_upload::UploadGate::Prompt => confirm(
-                    &format!(
-                        "{upload_root} is not a version control repository root. \
-                         Upload all files from this directory?"
-                    ),
-                    false,
-                )?,
-            };
-            if should_upload {
-                let uploaded = client
-                    .upload_workspace_files(id, upload_root.as_std_path())
-                    .await;
-                if let Err(error) = uploaded {
-                    // The upload failed: the activation is abandoned, and the
-                    // row its registration bought goes with it (T66).
-                    withdraw_box_row(
-                        control_sock.clone(),
-                        config.name.as_deref(),
-                        config.box_addresses,
-                    )
-                    .await;
-                    return Err(error.context("Failed to upload project files"));
-                }
-            } else if !headless {
-                eprintln!(
-                    "Skipping file upload; the session will start with an \
-                     empty workspace."
-                );
             }
         }
     };
 
-    // Collect the client-side patches (from loadouts, already gated
-    // in Phase 1) *before* the wire contribution moves into the
-    // ConfigureLoadout RPC. These land in the final Composition
-    // whether the response is `Materialized` or `Pending`, so the
-    // client is authoritative for them. Any daemon-side patches
-    // that come back through a `Pending` response's `SubmitVerdict`
-    // get appended below.
-    let mut collected_patches: Vec<(std::path::PathBuf, paths::SandboxRelPath)> = contribution
-        .patches
-        .iter()
-        .map(|p| {
-            (
-                p.patch.host_path.as_utf8_path().as_std_path().to_path_buf(),
-                p.patch.destination.clone(),
-            )
-        })
-        .collect();
-
-    // The session exists but has no loadout yet; composing it is a
-    // second round-trip because the daemon's composer reads the
-    // project config out of the session's workspace, not from a path
-    // on this machine.
-    let configured = client
-        .oneshot_rpc::<ConfigureLoadout>(ConfigureLoadoutRequest {
-            session_id: id,
-            contribution,
-        })
-        .await;
-    let configured = match configured {
-        // A transport failure abandons the activation and its row (T66).
-        Err(error) => {
-            withdraw_box_row(
-                control_sock.clone(),
-                config.name.as_deref(),
-                config.box_addresses,
-            )
-            .await;
-            return Err(error.context("ConfigureLoadout RPC failed"));
-        }
-        Ok(configured) => configured,
+    // The create/upload/configure/finalize sequence is shared with the TUI and
+    // with `min mcp`; the headless core lives in `minimal-client`. Everything
+    // above this line is resolution the front-end owns — loadouts, policy, the
+    // scaffold offer, the upload gate. The gate below carries the interactive
+    // half: the announcements the create reply feeds, and the user-policy
+    // prompt a `Pending` composition demands.
+    let project_dir = utf8_path.clone();
+    let compose_failure: Box<dyn Fn(&str) -> anyhow::Error + Send + Sync> = {
+        let dir = project_dir.clone();
+        Box::new(move |error: &str| anyhow::anyhow!(composition_failure_message(&dir, error)))
     };
-    let configured = match configured {
-        minimald_rpc::Errorable::Ok(r) => r,
-        // Bails before the `println!("{id}")` below: a session that cannot
-        // compose never puts an id on stdout for a script to capture.
-        minimald_rpc::Errorable::Err { error } => {
-            // The session cannot compose and is abandoned with its row (T66).
-            withdraw_box_row(
-                control_sock.clone(),
-                config.name.as_deref(),
-                config.box_addresses,
-            )
-            .await;
-            bail!(composition_failure_message(&utf8_path, &error));
-        }
+    let rename_on_collision: Option<Box<dyn Fn() -> String + Send + Sync>> = autogen.then(|| {
+        let dir = project_dir.clone();
+        Box::new(move || autogen_session_name(&dir, &random_hex4()))
+            as Box<dyn Fn() -> String + Send + Sync>
+    });
+    let mut gate = CliActivationGate {
+        global,
+        args: &args,
+        kind,
+        session_name: config.name.clone(),
+        policy_path: &policy_path,
+        user_policy,
+        initial_policy,
+        compose_options,
+        project_dir: &project_dir,
+        no_prompt: args.no_prompt,
+        no_input: global.no_input,
+        network: config.network,
+        egress_declared: config.policy.egress.is_some(),
     };
-    // The daemon may finalize immediately (`Ready`) or ask the
-    // client to gate items first (`Pending`). On the pending path
-    // we run the user-policy prompt loop; on ready there's nothing
-    // to gate.
-    //
-    // Decide up front whether we can prompt: `--no-prompt` forces
-    // the abort path, and a non-TTY stderr triggers it implicitly
-    // (a script or CI run should never expect to read a keypress).
-    // Both fall through to `NoPromptHook`, which accumulates every
-    // item it would have prompted for so we can print a
-    // `user_policy.toml` snippet on the error path.
-    if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
-        let non_interactive = args.no_prompt || global.no_input || !can_prompt_interactively();
-        if non_interactive {
-            // NoPromptHook fake-approves every unapproved item so
-            // handle_response finishes both the var and patch gates
-            // and records everything in `summary`. If anything was
-            // recorded, we abort *before* actually shipping the
-            // verdict — the daemon must not see those fake
-            // approvals. Only when `summary` is empty (every daemon-
-            // sent item was already handled by the user's policy)
-            // do we submit and let the session go Active.
-            let session_id = response.session_id;
-            let hooks = prompt::NoPromptHook::new();
-            let verdict = match compute_verdict(response, user_policy, compose_options, &hooks) {
-                Ok((verdict, _final_policy)) => verdict,
-                Err(e) => {
-                    send_abort(&mut client, session_id).await;
-                    // The session is aborted and its row withdrawn (T66):
-                    // the path failed after registering.
-                    withdraw_box_row(
-                        control_sock.clone(),
-                        config.name.as_deref(),
-                        config.box_addresses,
-                    )
-                    .await;
-                    // The route an activation actually reaches today: the
-                    // daemon routes project config back for gating, so a
-                    // project it cannot compose surfaces here rather than as
-                    // the `Errorable::Err` above.
-                    bail!(composition_failure_message(&utf8_path, &e.to_string()));
-                }
-            };
-            let summary = hooks.into_summary();
-            if summary.count() > 0 {
-                send_abort(&mut client, session_id).await;
-                // The session is aborted and its row withdrawn (T66): the
-                // path failed after registering.
-                withdraw_box_row(
-                    control_sock.clone(),
-                    config.name.as_deref(),
-                    config.box_addresses,
-                )
-                .await;
-                let count = summary.count();
-                let snippet = summary.as_toml_snippet();
-                bail!(
-                    "{count} item{s} would require interactive approval, but \
-                     --no-prompt was set (or stdin/stderr is not a terminal).\n\n\
-                     Add the following to {}:\n\n{snippet}\n\
-                     Then re-run this command.",
-                    policy_path.display(),
-                    s = if count == 1 { "" } else { "s" },
-                );
-            }
-            collected_patches.extend(approved_patches_from_verdict(&verdict));
-            let submitted = submit_verdict_and_wait(&mut client, session_id, verdict).await;
-            if let Err(error) = submitted {
-                // The verdict never landed: the activation is abandoned with
-                // its row (T66).
-                withdraw_box_row(
-                    control_sock.clone(),
-                    config.name.as_deref(),
-                    config.box_addresses,
-                )
-                .await;
-                return Err(error);
-            }
-        } else {
-            // The hook stashes policy mutations in interior
-            // `RefCell`s so a `DenyPermanent` (which returns
-            // `HookResult::Abort` and can't pipe an
-            // `updated_policy` back through the composer) still
-            // survives to `into_final_policy`. We save
-            // unconditionally before propagating the result, so a
-            // deny-and-abort still writes the rule.
-            let hooks = prompt::InteractivePrompt::new(&policy_path, user_policy.clone());
-            let result = drive_pending_to_active(
-                &mut client,
-                response,
-                user_policy,
-                compose_options,
-                &hooks,
-                &utf8_path,
-            )
-            .await;
-            if let Ok((_, _, ref approved)) = result {
-                collected_patches.extend(approved.iter().cloned());
-            }
-            let final_policy = hooks.into_final_policy();
-            if final_policy != initial_policy {
-                // A `save_user_policy` failure is reported to
-                // stderr and *doesn't* propagate: if the activation
-                // itself also failed (`DenyPermanent` returns Err
-                // and still wants its rule saved; a real
-                // composition fault), `result?` below is what the
-                // operator needs to see. Blindly `?`ing the save
-                // would clobber that error with a spurious
-                // "updating user_policy.toml" message that hides
-                // the true failure.
-                match prompt::save_user_policy(&policy_path, &final_policy) {
-                    Ok(()) => eprintln!("Updated {}", policy_path.display()),
-                    Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
-                }
-            }
-            if result.is_err() {
-                // The activation failed after registering: its row is
-                // withdrawn with it (T66).
-                withdraw_box_row(
-                    control_sock.clone(),
-                    config.name.as_deref(),
-                    config.box_addresses,
-                )
-                .await;
-            }
-            result?;
-        }
-    }
-
-    // On the Ready path (loadouts auto-decided; no prompt fired)
-    // `initial_policy` is only referenced inside the Pending branch
-    // above, so it appears unused to the compiler. Explicit `_` to
-    // squash the lint without dropping the useful name.
-    let _ = initial_policy;
-
-    // Upload composition patches and finalize the session. This
-    // has to happen before attach is allowed — a Materializing
-    // session isn't attachable, and the launcher reads patches
-    // from `<workspace>/patches/`. Dedup by sandbox destination:
-    // the composer's post-gate check guarantees any duplicates
-    // are exact matches (same source), so collapsing is safe.
-    collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
-    collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
-    if let Err(e) = upload_and_finalize(
-        &mut client,
-        id,
-        &collected_patches,
-        &hook_scripts,
-        finalize_hook_budget,
-    )
-    .await
-    {
-        // Best-effort teardown: the session is stuck in
-        // Materializing on the daemon. Destroy it so the operator's
-        // `min ls` doesn't fill with half-finalized sessions, and
-        // withdraw the row the registration bought with it (T66).
-        best_effort_destroy(&mut client, id).await;
-        withdraw_box_row(
-            control_sock.clone(),
-            config.name.as_deref(),
-            config.box_addresses,
+    let request = client::activate::ActivateRequest {
+        config,
+        upload_root: upload.map(|p| p.into_std_path_buf()),
+        contribution,
+        hook_scripts,
+        hook_budget: finalize_hook_budget,
+        rename_on_collision,
+        max_rename_attempts: AUTOGEN_NAME_RETRIES,
+        interrupt_socket: client::resolve_socket_path(
+            global.minimal_dir.as_deref(),
+            global.use_minvmd(),
         )
-        .await;
-        return Err(e);
+        .ok(),
+        box_registry: Some(box_registry),
+        compose_failure,
+    };
+    let activated = client::activate::activate(&mut client, request, &mut gate).await?;
+    // The package check the daemon stepped aside on is the front-end's to
+    // report; the core hands the fact over so the dashboard can say it in
+    // place of a stderr line.
+    if activated.package_check_skipped {
+        eprintln!(
+            "warning: the session package check was skipped (the package graph \
+             did not resolve in time or could not be evaluated; see the daemon \
+             log); unknown package names will surface at first exec"
+        );
     }
-
-    // The session is `Active` now — a Ctrl-C must no longer tear it down
-    // (the attach hand-off below and the user's own session are fair game
-    // for interrupts, but not this cleanup).
-    drop(interrupt_guard);
+    let id = activated.id;
 
     println!("{id}");
 
@@ -1700,7 +1111,7 @@ pub(crate) async fn activate_session(
         if should_announce_session(global) {
             eprintln!(
                 "Created session {}",
-                session_announce_label(&id, config.name.as_deref())
+                session_announce_label(&id, gate.session_name.as_deref())
             );
         }
         let attach_args = AttachArgs {
@@ -1710,6 +1121,493 @@ pub(crate) async fn activate_session(
     }
 
     Ok(())
+}
+
+/// The CLI's half of [`minimal_client::activate::activate`]: the announcements
+/// the create reply feeds, and the interactive user-policy prompt a `Pending`
+/// composition gates. Every input is resolved by `activate_session` before the
+/// daemon is touched; this only decides what the operator sees and whether the
+/// session may proceed.
+struct CliActivationGate<'a> {
+    global: &'a GlobalArgs,
+    args: &'a ActivateArgs,
+    kind: paths::ProviderKind,
+    /// The session's name, updated from the create reply so a re-minted autogen
+    /// name is the one the announcements and the attach hand-off name.
+    session_name: Option<String>,
+    policy_path: &'a std::path::Path,
+    user_policy: sessions::core::policy::UserPolicy,
+    initial_policy: sessions::core::policy::UserPolicy,
+    compose_options: sessions::core::compose::ComposeOptions,
+    project_dir: &'a camino::Utf8Path,
+    no_prompt: bool,
+    no_input: bool,
+    network: sessions::NetworkMode,
+    egress_declared: bool,
+}
+
+impl minimal_client::activate::ActivationGate for CliActivationGate<'_> {
+    async fn on_created(
+        &mut self,
+        created: &minimald_rpc::CreateSessionResponse,
+        session_name: Option<&str>,
+        box_addresses: Option<sessions::BoxAddresses>,
+    ) {
+        self.session_name = session_name.map(str::to_string);
+        // T66: the registration's own half of the session-start output — one
+        // line naming the VM host daemon the box's row lives on and the switch
+        // address it was handed, beside the `tracing::info!` line the same
+        // registration writes. The line is the one a bundle reads off the CLI
+        // transcript to say whether this box has a host row — which is the
+        // question the host that reaches the VM host daemon with no provider
+        // flag at all (NET-081's macOS half) otherwise answers nowhere in its
+        // own output. A box that registered nothing — a native host, a host-ip
+        // box sharing the node's own row, a `none` box with no switch address —
+        // prints nothing: it has no row to name. Keyed on the provider kind the
+        // registration itself keyed on, never on `use_minvmd()`, so the
+        // flagless VM-backed host prints it too.
+        if let Some(addresses) = box_addresses {
+            eprintln!(
+                "{}",
+                box_registered_start_line(
+                    hostname_proxy_vm(self.kind),
+                    session_name.unwrap_or("-"),
+                    &addresses,
+                )
+            );
+        }
+        warn_if_hostname_routing_down(
+            created.hostname_routing_unavailable.as_deref(),
+            "min session activate",
+        );
+        // The other routing fact the create reply carries: the port this
+        // daemon's hostnames route through, printed where the session started —
+        // the same fact `min ls` prints on its routing line. NET-026's discovery
+        // on this surface; and the report a port has to carry when it is *not*
+        // the one the recipes assume — a VM whose host port the host already
+        // held walked to one of its own (NET-059), a native daemon whose default
+        // was busy asked the OS for a free one (NET-025) — so a walked port is
+        // never a log line alone. Absent while the proxy is still coming up, or
+        // from a daemon that predates the field: nothing to print for it then,
+        // exactly as in `min ls`.
+        if let Some(port) = created.hostname_proxy_port {
+            eprintln!(
+                "{}",
+                hostname_proxy_start_line(hostname_proxy_start_vm(self.global), port)
+            );
+        }
+        // NET-122/NET-123/NET-138: the naming lines, printed once per session
+        // start — after the create, and re-surfaced when the daemon reports
+        // this session at the 127.0.0.1 interim because its session-start bind
+        // probe found the reserved range absent. The advisory only ever names
+        // the command that points the host's resolver at the answerer; running
+        // it (and any privilege prompt it carries) is the user's act, never the
+        // session start's. One read of this host's resolver state decides the
+        // advisory and the surface verdict below it, so the two lines cannot
+        // disagree about one host.
+        //
+        // On a VM-backed host the answerer is the VM host daemon's (NET-138):
+        // the in-VM daemon starts none, so the port and the bound proof come
+        // from the host — the state read over minvmd's control socket (never
+        // through the in-VM daemon, because a guest relaying a host fact is
+        // forgeable from inside the escape boundary) and this CLI's own A
+        // query for the host's row at the port that read named, the proof the
+        // answerer is live rather than merely reported held. A native host
+        // keeps the daemon's own report. `held_no_channel` is the machine fact
+        // that ends the question: a port held by a process no channel reaches
+        // means this VM's names are not answered on the host whatever this
+        // host's hook and range say, so neither is read and the warning says
+        // the fact instead of the advisory.
+        let (vm_answerer, answerer_port, answerer_bound, held_no_channel, proxy_down) =
+            match vm_host_answerer_status(self.global).await {
+                Some(status) => {
+                    let read = crate::resolver::host_answerer_read(status.clone()).await;
+                    (
+                        Some(status),
+                        read.port,
+                        read.answerer_bound,
+                        read.held_no_channel,
+                        read.proxy_down,
+                    )
+                }
+                None => (
+                    None,
+                    created.zone_answerer_port,
+                    created.answerer_bound,
+                    false,
+                    None,
+                ),
+            };
+        // The interim itself, named at every session start on a VM-backed host
+        // — TTY and non-TTY, ahead of the warning, the advisory and the verdict
+        // below — because who answers the zone is the machine fact the names
+        // this session is about to rely on rest on, and a holder another VM's
+        // minvmd took is otherwise discoverable only from `min ls`. The
+        // pre-acquisition state prints nothing: nothing is held yet to name.
+        if let Some(status) = vm_answerer
+            && let Some(line) = vm_host_answerer_start_line(status)
+        {
+            eprintln!("{line}");
+        }
+        if held_no_channel && let Some(answerer_port) = answerer_port {
+            // NET-138's warning, at every session start — TTY and non-TTY: it
+            // rides stderr unconditionally, because the first lookup that
+            // fails is the one it explains, and a piped activate is as owed
+            // the fact as an interactive one.
+            eprintln!(
+                "{}",
+                crate::resolver::port_held_no_channel_warning(answerer_port)
+            );
+            // The verdict is the proxy's by the status's own word, without
+            // reading the hook or the range: both could only misreport native
+            // for a port no daemon answers, and the arm that cannot strand the
+            // user is the proxy's (NET-019 keeps it serving). Logged as the
+            // same session-start record the native arm logs, with the fact
+            // that decided it.
+            tracing::info!(
+                surface = ?crate::resolver::LiveSurface::Proxy,
+                held_no_channel = true,
+                answerer_bound = false,
+                answerer_port = answerer_port,
+                "session start decided the live name surface for this host"
+            );
+            eprintln!(
+                "{}",
+                crate::resolver::name_surface_line(
+                    crate::resolver::LiveSurface::Proxy,
+                    created.hostname_proxy_port,
+                )
+            );
+        } else if let Some((port, cause)) = proxy_down {
+            // T93: the VM host daemon's own verdict on the hostname proxy's
+            // publication — a terminal publish failure, named with the port it
+            // is about and its cause instead of a bare "not serving" — printed
+            // at every session start, TTY and non-TTY alike, because the names
+            // this session is about to rely on are the ones the line says
+            // cannot resolve. No host read runs in this arm — no detection, no
+            // liveness query, no range probe — because the status is the VM
+            // host daemon's answer on the proxy's publication, and no host
+            // probe can move it.
+            let surface = crate::resolver::LiveSurface::ProxyNotServing { port, cause };
+            tracing::info!(
+                surface = ?surface,
+                "session start decided the live name surface for this host"
+            );
+            eprintln!(
+                "{}",
+                crate::resolver::name_surface_line(surface, created.hostname_proxy_port)
+            );
+        } else if let Some(answerer_port) = answerer_port {
+            // The answerer service's step (NET-122's host service) is read
+            // beside the detection on every hooked host, VM-backed and native
+            // alike: whether the zone is manager-held or held only while a
+            // session holds it, and whether the installed copy speaks this
+            // daemon's channel protocol — the native daemon publishes into the
+            // same machine-global channel a VM host daemon does, so the same
+            // service is the one to hand its zone to.
+            let (detection, answerer_step) = tokio::join!(
+                crate::resolver::session_detection(),
+                crate::resolver::read_answerer_step()
+            );
+            // The daemons the step asks to release the hook port: this CLI's
+            // own state dir's — its VM host daemons, default VM and named VMs
+            // alike, or its native daemon — never another state dir's.
+            let controls = match daemon_provider_kind(self.global) {
+                paths::ProviderKind::Minvmd => {
+                    client::enumerate_vm_sockets(self.global.minimal_dir.as_deref(), true)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|vm| control_sock_beside(&vm.sock))
+                        .map(|sock| sock.display().to_string())
+                        .collect()
+                }
+                paths::ProviderKind::Minimald => {
+                    client::resolve_socket_path(self.global.minimal_dir.as_deref(), false)
+                        .ok()
+                        .and_then(|sock| control_sock_beside(&sock))
+                        .into_iter()
+                        .map(|sock| sock.display().to_string())
+                        .collect()
+                }
+            };
+            crate::resolver::set_handover_controls(controls);
+            // NET-018: name the live surface at the moment the user is about to
+            // rely on the names — decided in the one function both verbs share
+            // (`resolver`), from the same detection the advisory reads: this
+            // host's hook (and the stub-bypass blocker that says whether its
+            // lookups consult what the hook configures), the answerer-bound
+            // proof this start holds — the daemon's report on a native host,
+            // this CLI's own query on a VM-backed one — and the reserved range
+            // on this host's own loopback. Decided before the advisory prints
+            // only so the range its read holds can be the advisory's too — one
+            // probe, one host — while the printed order stays the advisory's
+            // and then the surface's. `None` — the answerer not bound — prints
+            // nothing: no native surface to name, and the ports and the
+            // advisory have told the proxy's story. The proxy's half is said
+            // with the native arm either way (NET-019): the `HTTP(S)_PROXY`
+            // recipes this activation prints keep working beside native DNS,
+            // so nothing already captured goes stale.
+            let surface_verdict = crate::resolver::live_name_surface_with_range_at(
+                &detection,
+                Some(answerer_port),
+                answerer_bound,
+            )
+            .await;
+            // The advisory shares that verdict's range read: the daemon's
+            // interim flag is not this host's range fact — on a VM-backed host
+            // it reads the guest's loopback, which always carries the range —
+            // so a hook that routes over a loopback that lacks the range is
+            // told the range is what is missing, not left with a silent
+            // advisory beside a verdict that names the proxy for exactly that.
+            let name_advisory = crate::resolver::session_advisory_at(
+                &detection,
+                Some(answerer_port),
+                created.interim_loopback,
+                surface_verdict
+                    .as_ref()
+                    .and_then(|verdict| verdict.range_present),
+                &answerer_step,
+            );
+            if let Some(advisory) = &name_advisory {
+                // Printed whole on every start, interactive or not (NET-122:
+                // the start names the exact command, and a scripted start's log
+                // is its only record), after a blank line so the note and its
+                // command block stand apart from the lines above them.
+                eprintln!("\n{advisory}");
+            }
+            if let Some(verdict) = surface_verdict {
+                // The host-side record of that verdict, the half the daemon's
+                // own log cannot make: a daemon can name only the answerer *it*
+                // binds (see the daemon's `log_live_name_surface`), so the
+                // surface this host's own reads decided — and the three facts
+                // behind it, with the range as the one fact only this read
+                // holds — is logged here, at the start that printed it, beside
+                // the daemon's line. `min` filters at `warn` unless `RUST_LOG`
+                // is set, so the line is visible under `RUST_LOG=info`. Logged,
+                // never printed: the line below is the user's. `min ls` does not
+                // log its verdict — a list re-reads the host every run, and the
+                // record that matters is the one at the starts that rely on the
+                // names.
+                tracing::info!(
+                    surface = ?verdict.surface,
+                    hook_routes = detection.0.routes(answerer_port),
+                    blocker = ?detection.1,
+                    answerer_bound = answerer_bound,
+                    range_present = ?verdict.range_present,
+                    range_unit_state = ?detection.2.state,
+                    range_unit_check = ?detection.2.failed_check,
+                    answerer_manager_held = answerer_step.holds(),
+                    answerer_step = ?answerer_step,
+                    "session start decided the live name surface for this host, \
+                     with the range unit's state beside it"
+                );
+                eprintln!(
+                    "{}",
+                    crate::resolver::name_surface_line(
+                        verdict.surface,
+                        created.hostname_proxy_port
+                    )
+                );
+            }
+        }
+        // NET-079: the host's verdict on whether it can decide a host-address
+        // box's egress per box, spelled by the daemon — the side that read the
+        // host — and printed verbatim, so the terminal, the daemon's log line
+        // for this same create, and the start all say the same thing. The
+        // advisory names the cause, the state it leaves the box in, and, when
+        // the missing privileged step is the cause, the exact command that
+        // installs it; it is never a prompt, and never load-bearing for the
+        // start either (see [`print_classifier_advisory`]). Printed after the
+        // session exists and before the work on it, like the notice below it,
+        // so a host that cannot decide per box is named at the start that runs
+        // there and not only in a log the person was not reading.
+        print_classifier_advisory(&mut std::io::stderr(), created);
+        // The coming-change notice (NET-076), printed while the deny-all egress
+        // default is announced but not yet in force. Scoped to the box it would
+        // change — an own-address session that declared no egress — on a daemon
+        // that has not opted out of the change (NET-077): the opt-out is the
+        // one rollout fact this side cannot know, so it is read off the create
+        // reply above, and a daemon that has already set the flag has already
+        // taken the remedy the notice names. Silent once the phase turns (see
+        // [`deny_all_default_notice`]), which picks the remedy the host can
+        // take: the native daemon's flag, or the VM host daemon's env var.
+        if self.network == sessions::NetworkMode::OwnIp
+            && !self.egress_declared
+            && created.deny_all_opt_out != Some(true)
+            && let Some(notice) = deny_all_default_notice(
+                sessions::EGRESS_DEFAULT_PHASE,
+                self.kind == paths::ProviderKind::Minvmd,
+            )
+        {
+            eprintln!("{notice}");
+        }
+        // When a subnet flag carries host bits (e.g. `--deny-subnets 10.0.0.1/8`),
+        // the enforcement layer reads it as the masked network (`10.0.0.0/8`).
+        // Print a one-line notice naming the normalized form so the user knows
+        // how their entry is read, rather than discovering it through a
+        // mismatch. The notice is computed from the original flags, not the
+        // stored policy: the policy now holds the normalized form, so reading
+        // it back would print nothing.
+        for entry in &self.args.allow_subnets {
+            if let Some(normalized) = sessions::normalized_cidr(entry) {
+                eprintln!("--allow-subnets {entry} is read as {normalized}");
+            }
+        }
+        for entry in &self.args.deny_subnets {
+            if let Some(normalized) = sessions::normalized_cidr(entry) {
+                eprintln!("--deny-subnets {entry} is read as {normalized}");
+            }
+        }
+    }
+
+    async fn on_pending(
+        &mut self,
+        client: &mut client::Client,
+        response: sessions::wire::request::ContributionResponse,
+    ) -> Result<Vec<(std::path::PathBuf, paths::SandboxRelPath)>, anyhow::Error> {
+        // Decide up front whether we can prompt: `--no-prompt` forces the
+        // abort path, and a non-TTY stderr triggers it implicitly (a script or
+        // CI run should never expect to read a keypress). Both fall through to
+        // `NoPromptHook`, which accumulates every item it would have prompted
+        // for so we can print a `user_policy.toml` snippet on the error path.
+        let non_interactive = self.no_prompt || self.no_input || !can_prompt_interactively();
+        if non_interactive {
+            // NoPromptHook fake-approves every unapproved item so
+            // handle_response finishes both the var and patch gates and
+            // records everything in `summary`. If anything was recorded, we
+            // abort *before* actually shipping the verdict — the daemon must
+            // not see those fake approvals. Only when `summary` is empty
+            // (every daemon-sent item was already handled by the user's
+            // policy) do we submit and let the session go Active.
+            let session_id = response.session_id;
+            let hooks = prompt::NoPromptHook::new();
+            let verdict = match compute_verdict(
+                response,
+                self.user_policy.clone(),
+                self.compose_options,
+                &hooks,
+            ) {
+                Ok((verdict, _final_policy)) => verdict,
+                Err(e) => {
+                    send_abort(client, session_id).await;
+                    // The route an activation actually reaches today: the
+                    // daemon routes project config back for gating, so a
+                    // project it cannot compose surfaces here rather than as
+                    // the `Errorable::Err` the core handles.
+                    bail!(composition_failure_message(
+                        self.project_dir,
+                        &e.to_string()
+                    ));
+                }
+            };
+            let summary = hooks.into_summary();
+            if summary.count() > 0 {
+                send_abort(client, session_id).await;
+                let count = summary.count();
+                let snippet = summary.as_toml_snippet();
+                bail!(
+                    "{count} item{s} would require interactive approval, but \
+                     --no-prompt was set (or stdin/stderr is not a terminal).\n\n\
+                     Add the following to {}:\n\n{snippet}\n\
+                     Then re-run this command.",
+                    self.policy_path.display(),
+                    s = if count == 1 { "" } else { "s" },
+                );
+            }
+            let approved: Vec<_> = approved_patches_from_verdict(&verdict).collect();
+            submit_verdict_and_wait(client, session_id, verdict).await?;
+            return Ok(approved);
+        }
+
+        // The hook stashes policy mutations in interior `RefCell`s so a
+        // `DenyPermanent` (which returns `HookResult::Abort` and can't pipe an
+        // `updated_policy` back through the composer) still survives to
+        // `into_final_policy`. We save unconditionally before propagating the
+        // result, so a deny-and-abort still writes the rule.
+        let hooks = prompt::InteractivePrompt::new(self.policy_path, self.user_policy.clone());
+        let result = drive_pending_to_active(
+            client,
+            response,
+            self.user_policy.clone(),
+            self.compose_options,
+            &hooks,
+            self.project_dir,
+        )
+        .await;
+        let final_policy = hooks.into_final_policy();
+        if final_policy != self.initial_policy {
+            // A `save_user_policy` failure is reported to stderr and *doesn't*
+            // propagate: if the activation itself also failed (`DenyPermanent`
+            // returns Err and still wants its rule saved; a real composition
+            // fault), the error below is what the operator needs to see.
+            // Blindly propagating the save would clobber that error with a
+            // spurious "updating user_policy.toml" message that hides the true
+            // failure.
+            match prompt::save_user_policy(self.policy_path, &final_policy) {
+                Ok(()) => eprintln!("Updated {}", self.policy_path.display()),
+                Err(e) => eprintln!(
+                    "warning: failed to update {}: {e}",
+                    self.policy_path.display()
+                ),
+            }
+        }
+        result.map(|(_id, _policy, approved)| approved)
+    }
+}
+
+/// The CLI's T66 half of activation: registering an own-address box with the VM
+/// host daemon before each create attempt, and withdrawing its host row
+/// whenever the activation abandons the box. The shared core drives the
+/// sequence but cannot reach the host daemon — it deliberately does not depend
+/// on `minvmd` — so the CLI supplies both halves here, and the core calls them
+/// around the create, on every teardown, and from the Ctrl-C guard.
+///
+/// `register` re-runs on a re-minted autogen name (the row carries the name it
+/// was registered under), and `abandon` is the creator's best-effort
+/// withdrawal: quiet when the activation registered nothing, and warning rather
+/// than failing when the row cannot be withdrawn.
+struct CliBoxRegistry {
+    kind: paths::ProviderKind,
+    minimal_dir: Option<std::path::PathBuf>,
+    network: sessions::NetworkMode,
+    policy: sessions::SessionPolicy,
+    control_sock: Option<std::path::PathBuf>,
+}
+
+impl client::activate::ActivationBox for CliBoxRegistry {
+    fn register(
+        &self,
+        name: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<sessions::BoxAddresses>, anyhow::Error>>
+                + Send
+                + '_,
+        >,
+    > {
+        let kind = self.kind;
+        let minimal_dir = self.minimal_dir.clone();
+        let network = self.network;
+        let policy = self.policy.clone();
+        let name = name.to_string();
+        Box::pin(async move {
+            register_box_for_activation(kind, minimal_dir.as_deref(), network, &name, &policy)
+                .await
+                .map(|registered| registered.map(|registration| registration.addresses))
+        })
+    }
+
+    fn abandon(
+        &self,
+        name: Option<&str>,
+        addresses: Option<sessions::BoxAddresses>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let control_sock = self.control_sock.clone();
+        let name = name.map(str::to_string);
+        Box::pin(async move {
+            withdraw_box_row(control_sock, name.as_deref(), addresses).await;
+        })
+    }
 }
 
 /// Attach to an existing session. Both interactive and `--command` paths
