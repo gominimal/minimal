@@ -202,6 +202,34 @@ async fn mcp_creates_lists_and_destroys_a_session() {
         "created session missing from the listing: {sessions}"
     );
 
+    // File I/O round-trips through SFTP. A relative path anchors at
+    // /workbench; the write must create the file (`SftpSession::write` opens
+    // with WRITE only and would fail here).
+    let write = mcp
+        .call(
+            "tools/call",
+            r#"{"name":"write_file","arguments":{"path":"from-agent.txt","content":"hello from mcp\n"}}"#,
+        )
+        .await;
+    assert_ne!(write["result"]["isError"], true, "write_file failed: {write}");
+    assert_eq!(
+        result_json(&write)["path"],
+        "/workbench/from-agent.txt",
+        "a relative path must resolve under /workbench: {write}"
+    );
+    let read = mcp
+        .call(
+            "tools/call",
+            r#"{"name":"read_file","arguments":{"path":"/workbench/from-agent.txt"}}"#,
+        )
+        .await;
+    assert_ne!(read["result"]["isError"], true, "read_file failed: {read}");
+    assert_eq!(
+        result_json(&read)["content"].as_str().unwrap_or(""),
+        "hello from mcp\n",
+        "read_file must return what write_file wrote: {read}"
+    );
+
     // destroy_session removes it.
     let destroyed = mcp
         .call(
