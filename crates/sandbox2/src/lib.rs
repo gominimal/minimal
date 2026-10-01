@@ -2815,14 +2815,22 @@ mod tests {
                 network::SocketSeal::BypassFamilies,
                 true,
             ),
-            ("none", network::NetPlan::none(), network::SocketSeal::Full, false),
+            (
+                "none",
+                network::NetPlan::none(),
+                network::SocketSeal::Full,
+                false,
+            ),
         ];
         let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
         for (name, plan, seal, admits_inet) in plans {
             assert_eq!(plan.to_string(), name, "the plan under test");
             assert_eq!(plan.seal(), seal, "plan {name} must run under its seal");
             let filter = socket_family_filter_for_plan(&plan);
-            assert_eq!(filter.seal, seal, "plan {name}: the seal selects the filter");
+            assert_eq!(
+                filter.seal, seal,
+                "plan {name}: the seal selects the filter"
+            );
             let run = |nr: i64, arch: u32, arg0: u32| {
                 run_seccomp_program(&filter.program, nr as u32, arch, arg0)
             };
