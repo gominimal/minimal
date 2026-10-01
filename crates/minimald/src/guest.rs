@@ -9,7 +9,9 @@
 //! * pid-1 hygiene — mount `/dev` (devtmpfs; the kernel does NOT auto-mount it
 //!   for an initramfs root), `/proc`, and `/sys`;
 //! * entering the generic upstream rootfs — mount the ext4 root block device
-//!   and `chroot` into it so the userland (`/bin/sh`, libs) resolves.
+//!   and `chroot` into it so the userland (`/bin/sh`, libs) resolves;
+//! * the node ports the VM host hands the boot line — read into the daemon's
+//!   listener config, so it binds them as handed (NET-025).
 //!
 //! Per the spec we keep this minimal and "run as pid-1, revisit if zombie
 //! reaping bites".
@@ -24,6 +26,59 @@ use tokio_vsock::{VMADDR_CID_HOST, VsockAddr, VsockStream};
 /// Vsock port the guest connects out to (on the host, CID 2) to announce it has
 /// booted. The host listens here for the one-shot `READY` marker.
 const BOOT_MARKER_PORT: u32 = 7350;
+
+// ── The node ports the boot line hands the daemon ───────────────────────
+
+/// Boot token the VM host puts on the kernel command line to hand the guest
+/// daemon its hostname-proxy port (NET-025): the kernel starts `/init` with
+/// every unrecognized `KEY=VALUE` token set as an environment variable, so
+/// the daemon reads it back from its environment. Mirrors the token `minvmd`'s
+/// `vm.rs` writes — keep the two in step.
+pub const HANDED_PROXY_PORT_TOKEN: &str = "MINIMALD_HOSTNAME_PROXY_PORT";
+
+/// Boot token the VM host hands the guest daemon its zone-answerer port on
+/// (NET-025); see [`HANDED_PROXY_PORT_TOKEN`] for how the tokens travel.
+pub const HANDED_ANSWERER_PORT_TOKEN: &str = "MINIMALD_ZONE_ANSWERER_PORT";
+
+/// The hostname-proxy port the VM host handed this daemon on the boot line,
+/// if it handed one. The daemon binds it as handed and never selects
+/// another: the host's box table already names exactly this port (NET-138),
+/// so a daemon-chosen replacement would publish a listener the host's gate
+/// refuses to carry (NET-081) — and strand every client pointed at the
+/// handed one.
+///
+/// `None` when the boot carries no token — an older minvmd, a native run —
+/// leaving the daemon its pre-handoff default-then-select behaviour.
+pub fn handed_proxy_port() -> Option<u16> {
+    handed_port(HANDED_PROXY_PORT_TOKEN)
+}
+
+/// The zone-answerer port the VM host handed this daemon on the boot line,
+/// if it handed one; see [`handed_proxy_port`] for the handoff and its
+/// binding rule.
+pub fn handed_answerer_port() -> Option<u16> {
+    handed_port(HANDED_ANSWERER_PORT_TOKEN)
+}
+
+/// Reads one handed port off the boot line's environment. A token that is
+/// present but not a usable port — unparseable, or the OS-picks `0` the host
+/// never hands — warns and counts as absent: the daemon falls back to its
+/// own selection rather than failing its boot over a port.
+fn handed_port(token: &str) -> Option<u16> {
+    let raw = std::env::var(token).ok()?;
+    match raw.trim().parse::<u16>() {
+        Ok(port) if port != 0 => Some(port),
+        _ => {
+            tracing::warn!(
+                component = "guest",
+                token,
+                value = %raw,
+                "boot token carries no usable port; treating it as absent"
+            );
+            None
+        }
+    }
+}
 
 /// Writes the two-line beacon payload (`READY\n<openssh-pubkey>\n`) to the
 /// given async writer.
@@ -1304,6 +1359,37 @@ fn mount_if_absent(target: &str, source: &str, fstype: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The handed ports are read off the environment the kernel passes
+    /// through from the boot tokens: a present token parses, an absent one
+    /// counts as not handed, and a present-but-unusable one counts as absent
+    /// too — the daemon falls back to its own selection rather than failing
+    /// its boot over a port (NET-025).
+    // SAFETY: env mutation here races only other reads of the same variables,
+    // and nextest runs every test in its own process.
+    #[test]
+    fn handed_ports_are_read_off_the_boot_line() {
+        unsafe {
+            std::env::set_var(HANDED_PROXY_PORT_TOKEN, "7654");
+            std::env::set_var(HANDED_ANSWERER_PORT_TOKEN, "7656");
+        }
+        assert_eq!(handed_proxy_port(), Some(7654));
+        assert_eq!(handed_answerer_port(), Some(7656));
+
+        // Garbage and the OS-picks `0` the host never hands count as absent.
+        unsafe { std::env::set_var(HANDED_PROXY_PORT_TOKEN, "no-port-here") };
+        assert_eq!(handed_proxy_port(), None);
+        unsafe { std::env::set_var(HANDED_PROXY_PORT_TOKEN, "0") };
+        assert_eq!(handed_proxy_port(), None);
+
+        // No token at all: the pre-handoff default-then-select behaviour.
+        unsafe {
+            std::env::remove_var(HANDED_PROXY_PORT_TOKEN);
+            std::env::remove_var(HANDED_ANSWERER_PORT_TOKEN);
+        }
+        assert_eq!(handed_proxy_port(), None);
+        assert_eq!(handed_answerer_port(), None);
+    }
 
     /// The derivation in [`FITRIM`] must land on the number the kernel
     /// actually decodes. `0xc018_5879` is the value every asm-generic Linux

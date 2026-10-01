@@ -480,15 +480,16 @@ async fn async_main() -> Result<(), MainError> {
                 // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
                 // vsock shuttle, so no in-guest gvproxy binary path is needed.
                 gvproxy_bin: None,
-                // Auto-select the hostname proxy's port: a VM daemon shares its
-                // host with whatever native daemon runs there, and the host
-                // gvproxy publishes whichever port this guest ends up on, so
-                // the two route both sets of names at the same time (NET-027)
-                // rather than fighting over one pinned port. `None` still
-                // tries the documented default first — it only relocates when
-                // something else on the machine holds it.
-                hostname_proxy_port: None,
-                zone_answerer_port: None,
+                // The node ports are the host's, not the daemon's: minvmd
+                // assigns them before the VM boots (NET-025) and hands them
+                // on the kernel command line, so the guest binds exactly
+                // what the host's box table already admits (NET-138) and the
+                // host gvproxy publishes it at the same number. Binds as
+                // handed and selects none; a boot that carries no tokens — an
+                // older minvmd, a native run — falls back to default-then-
+                // select, the pre-handoff behaviour.
+                hostname_proxy_port: guest::handed_proxy_port(),
+                zone_answerer_port: guest::handed_answerer_port(),
                 // The microVM's pid-1 has no flags to read: the guest runs
                 // the egress default its host's build ships — the rollout
                 // phase [`sessions::EGRESS_DEFAULT_PHASE`] carries — not
